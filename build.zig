@@ -111,27 +111,36 @@ pub fn build(b: *std.Build) void {
     }
 
     // ========================================================================
-    // LSP executable: cot-lsp (DISABLED - needs update for new parser API)
+    // DBL module (src/dbl/) - DBL syntax frontend
     // ========================================================================
-    // TODO: Update tools/lsp/main.zig to use NodeStore-based parser API
-    // The LSP code uses the old AST structure and needs rework.
-    // Uncomment when fixed:
-    // const lsp_exe = b.addExecutable(.{
-    //     .name = "cot-lsp",
-    //     .root_module = b.createModule(.{
-    //         .root_source_file = b.path("tools/lsp/main.zig"),
-    //         .target = target,
-    //         .optimize = optimize,
-    //         .imports = &.{
-    //             .{ .name = "cot", .module = cot_mod },
-    //             .{ .name = "cot_runtime", .module = cot_runtime_mod },
-    //             .{ .name = "build_options", .module = build_options_mod },
-    //         },
-    //     }),
-    // });
-    // lsp_exe.linkSystemLibrary("sqlite3");
-    // lsp_exe.linkSystemLibrary("c");
-    // b.installArtifact(lsp_exe);
+    const dbl_mod = b.addModule("dbl", .{
+        .root_source_file = b.path("src/dbl/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "cot", .module = cot_mod },
+        },
+    });
+
+    // ========================================================================
+    // LSP executable: cot-lsp
+    // ========================================================================
+    const lsp_exe = b.addExecutable(.{
+        .name = "cot-lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/lsp/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cot", .module = cot_mod },
+                .{ .name = "dbl", .module = dbl_mod },
+                .{ .name = "cot_runtime", .module = cot_runtime_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            },
+        }),
+    });
+    lsp_exe.linkSystemLibrary("sqlite3");
+    lsp_exe.linkSystemLibrary("c");
+    b.installArtifact(lsp_exe);
 
     // ========================================================================
     // Run step
