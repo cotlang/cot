@@ -1,0 +1,358 @@
+//! Type Checker
+//!
+//! Validates IR for type correctness before bytecode emission.
+//! This pass runs after IR lowering and reports all type errors with
+//! source locations for developer-friendly diagnostics.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ir = @import("../ir/ir.zig");
+const diagnostics = @import("diagnostics.zig");
+const DiagnosticCollector = @import("diagnostic_collector.zig");
+const type_rules = @import("type_rules.zig");
+const SourceRange = diagnostics.SourceRange;
+const Code = diagnostics.Code;
+const Type = ir.Type;
+
+const Self = @This();
+
+allocator: Allocator,
+collector: *DiagnosticCollector,
+module: *const ir.Module,
+file_path: []const u8,
+
+// Current context
+current_function: ?*const ir.Function = null,
+current_block: ?*const ir.Block = null,
+
+/// Initialize a new type checker
+pub fn init(
+    allocator: Allocator,
+    collector: *DiagnosticCollector,
+    module: *const ir.Module,
+    file_path: []const u8,
+) Self {
+    return .{
+        .allocator = allocator,
+        .collector = collector,
+        .module = module,
+        .file_path = file_path,
+    };
+}
+
+/// Run type checking on the entire module
+pub fn check(self: *Self) void {
+    // Check each function
+    for (self.module.functions.items) |func| {
+        self.checkFunction(func);
+    }
+}
+
+/// Check a single function
+fn checkFunction(self: *Self, func: *const ir.Function) void {
+    self.current_function = func;
+
+    // Check each block
+    for (func.blocks.items) |block| {
+        self.current_block = block;
+        self.checkBlock(block);
+    }
+
+    self.current_function = null;
+    self.current_block = null;
+}
+
+/// Check a block of instructions
+fn checkBlock(self: *Self, block: *const ir.Block) void {
+    for (block.instructions.items) |inst| {
+        self.checkInstruction(inst);
+    }
+}
+
+/// Check a single instruction
+fn checkInstruction(self: *Self, inst: ir.Instruction) void {
+    switch (inst) {
+        // Memory operations
+        .store => |s| self.checkStore(s),
+        .load => {}, // Loads are type-safe by construction
+
+        // Arithmetic operations
+        .add => |op| self.checkBinaryOp(op, .arithmetic, "+"),
+        .sub => |op| self.checkBinaryOp(op, .arithmetic, "-"),
+        .mul => |op| self.checkBinaryOp(op, .arithmetic, "*"),
+        .div => |op| self.checkBinaryOp(op, .arithmetic, "/"),
+        .mod => |op| self.checkBinaryOp(op, .arithmetic, "%"),
+
+        // Comparison operations
+        .cmp_eq => |op| self.checkBinaryOp(op, .comparison, "=="),
+        .cmp_ne => |op| self.checkBinaryOp(op, .comparison, "!="),
+        .cmp_lt => |op| self.checkBinaryOp(op, .comparison, "<"),
+        .cmp_le => |op| self.checkBinaryOp(op, .comparison, "<="),
+        .cmp_gt => |op| self.checkBinaryOp(op, .comparison, ">"),
+        .cmp_ge => |op| self.checkBinaryOp(op, .comparison, ">="),
+
+        // Logical operations (always valid)
+        .log_and, .log_or, .log_not => {},
+
+        // String operations
+        .str_concat => |op| self.checkStringConcat(op),
+        .str_slice => {}, // Slice operations are type-safe
+        .str_slice_store => {}, // Slice store operations are type-safe
+
+        // Function calls
+        .call => |c| self.checkCall(c),
+
+        // Array operations
+        .array_load => |a| self.checkArrayLoad(a),
+        .array_store => |a| self.checkArrayStore(a),
+
+        // These don't need type checking
+        .alloca, .field_ptr, .br, .cond_br, .switch_br, .ret => {},
+        .const_int, .const_float, .const_string, .const_bool, .const_null => {},
+        .int_to_float, .float_to_int, .int_extend, .int_truncate, .cast => {},
+        .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => {},
+        .load_struct_buf, .store_struct_buf, .str_compare, .str_copy, .str_len, .neg => {},
+        .try_begin, .try_end, .catch_begin, .throw => {},
+        .wrap_optional, .unwrap_optional, .is_null => {},
+        .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => {},
+        .array_len, .debug_line => {},
+    }
+}
+
+/// Check a store instruction
+fn checkStore(self: *Self, store: ir.Instruction.Store) void {
+    const target_ty = derefType(store.ptr.ty);
+    const value_ty = store.value.ty;
+    const loc = locToRange(store.loc);
+
+    const compat = type_rules.isAssignable(target_ty, value_ty);
+
+    switch (compat) {
+        .compatible, .implicit_conversion => {
+            // OK
+        },
+        .lossy_conversion => {
+            // Warn about potential data loss
+            var target_buf: [64]u8 = undefined;
+            var value_buf: [64]u8 = undefined;
+            self.collector.addWarning(
+                .W003_implicit_conversion,
+                self.file_path,
+                loc,
+                "assignment may lose precision: '{s}' to '{s}'",
+                .{
+                    type_rules.formatType(value_ty, &value_buf),
+                    type_rules.formatType(target_ty, &target_buf),
+                },
+            );
+        },
+        .incompatible => {
+            // Error
+            var target_buf: [64]u8 = undefined;
+            var value_buf: [64]u8 = undefined;
+            self.collector.addError(
+                .E200_type_mismatch,
+                self.file_path,
+                loc,
+                "cannot assign '{s}' to '{s}'",
+                .{
+                    type_rules.formatType(value_ty, &value_buf),
+                    type_rules.formatType(target_ty, &target_buf),
+                },
+            );
+        },
+    }
+}
+
+/// Check a binary operation
+fn checkBinaryOp(self: *Self, op: ir.Instruction.BinaryOp, op_type: type_rules.BinaryOpType, op_name: []const u8) void {
+    const result = type_rules.checkBinaryOp(op_type, op.lhs.ty, op.rhs.ty);
+    const loc = locToRange(op.loc);
+
+    if (!result.ok) {
+        var lhs_buf: [64]u8 = undefined;
+        var rhs_buf: [64]u8 = undefined;
+        self.collector.addError(
+            .E206_incompatible_operands,
+            self.file_path,
+            loc,
+            "operator '{s}' cannot be applied to '{s}' and '{s}'",
+            .{
+                op_name,
+                type_rules.formatType(op.lhs.ty, &lhs_buf),
+                type_rules.formatType(op.rhs.ty, &rhs_buf),
+            },
+        );
+    }
+}
+
+/// Check string concatenation
+fn checkStringConcat(self: *Self, op: ir.Instruction.BinaryOp) void {
+    const result = type_rules.checkBinaryOp(.string_concat, op.lhs.ty, op.rhs.ty);
+    const loc = locToRange(op.loc);
+
+    if (!result.ok) {
+        var lhs_buf: [64]u8 = undefined;
+        var rhs_buf: [64]u8 = undefined;
+        self.collector.addError(
+            .E206_incompatible_operands,
+            self.file_path,
+            loc,
+            "string concatenation requires string operands, got '{s}' and '{s}'",
+            .{
+                type_rules.formatType(op.lhs.ty, &lhs_buf),
+                type_rules.formatType(op.rhs.ty, &rhs_buf),
+            },
+        );
+    }
+}
+
+/// Check a function call
+fn checkCall(self: *Self, call: ir.Instruction.Call) void {
+    const loc = locToRange(call.loc);
+
+    // Look up the function in the module
+    for (self.module.functions.items) |func| {
+        if (std.mem.eql(u8, func.name, call.callee)) {
+            const params = func.signature.params;
+            // Found the function - check argument count
+            if (call.args.len != params.len) {
+                self.collector.addError(
+                    .E204_argument_count_mismatch,
+                    self.file_path,
+                    loc,
+                    "function '{s}' expects {d} arguments, got {d}",
+                    .{ call.callee, params.len, call.args.len },
+                );
+                return;
+            }
+
+            // Check argument types
+            for (call.args, 0..) |arg, i| {
+                const param = params[i];
+                const compat = type_rules.isAssignable(param.ty, arg.ty);
+
+                if (compat == .incompatible) {
+                    var expected_buf: [64]u8 = undefined;
+                    var actual_buf: [64]u8 = undefined;
+                    self.collector.addError(
+                        .E205_argument_type_mismatch,
+                        self.file_path,
+                        loc,
+                        "argument {d} to '{s}': expected '{s}', got '{s}'",
+                        .{
+                            i + 1,
+                            call.callee,
+                            type_rules.formatType(param.ty, &expected_buf),
+                            type_rules.formatType(arg.ty, &actual_buf),
+                        },
+                    );
+                }
+            }
+            return;
+        }
+    }
+
+    // Function not found in module - might be external or method
+    // For now, we skip these - they'll be caught at runtime if truly undefined
+}
+
+/// Check array load
+fn checkArrayLoad(self: *Self, arr: ir.Instruction.ArrayOp) void {
+    const loc = locToRange(arr.loc);
+
+    // Index must be numeric
+    if (!type_rules.isNumeric(arr.index.ty)) {
+        var buf: [64]u8 = undefined;
+        self.collector.addError(
+            .E208_array_index_type,
+            self.file_path,
+            loc,
+            "array index must be numeric, got '{s}'",
+            .{type_rules.formatType(arr.index.ty, &buf)},
+        );
+    }
+}
+
+/// Check array store
+fn checkArrayStore(self: *Self, arr: ir.Instruction.ArrayStore) void {
+    const loc = locToRange(arr.loc);
+
+    // Index must be numeric
+    if (!type_rules.isNumeric(arr.index.ty)) {
+        var buf: [64]u8 = undefined;
+        self.collector.addError(
+            .E208_array_index_type,
+            self.file_path,
+            loc,
+            "array index must be numeric, got '{s}'",
+            .{type_rules.formatType(arr.index.ty, &buf)},
+        );
+    }
+
+    // Value type must match array element type
+    const element_ty = getArrayElementType(arr.array_ptr.ty);
+    if (element_ty) |elem_ty| {
+        const compat = type_rules.isAssignable(elem_ty, arr.value.ty);
+        if (compat == .incompatible) {
+            var expected_buf: [64]u8 = undefined;
+            var actual_buf: [64]u8 = undefined;
+            self.collector.addError(
+                .E200_type_mismatch,
+                self.file_path,
+                loc,
+                "cannot store '{s}' in array of '{s}'",
+                .{
+                    type_rules.formatType(arr.value.ty, &actual_buf),
+                    type_rules.formatType(elem_ty, &expected_buf),
+                },
+            );
+        }
+    }
+}
+
+/// Convert IR source location to diagnostic SourceRange
+fn locToRange(loc: ?ir.SourceLoc) SourceRange {
+    if (loc) |l| {
+        return SourceRange.fromLoc(l.line, l.column);
+    }
+    return SourceRange.none;
+}
+
+/// Dereference a pointer type
+fn derefType(ty: Type) Type {
+    return switch (ty) {
+        .ptr => |p| p.*,
+        else => ty,
+    };
+}
+
+/// Get the element type of an array type
+fn getArrayElementType(ty: Type) ?Type {
+    const dereffed = derefType(ty);
+    return switch (dereffed) {
+        .array => |a| a.element.*,
+        else => null,
+    };
+}
+
+/// Check the module and return true if there are errors
+pub fn hasErrors(self: *const Self) bool {
+    return self.collector.hasErrors();
+}
+
+// Tests
+test "type checker initialization" {
+    const allocator = std.testing.allocator;
+    var collector = DiagnosticCollector.init(allocator);
+    defer collector.deinit();
+
+    var module = ir.Module.init(allocator);
+    defer module.deinit();
+
+    var checker = init(allocator, &collector, &module, "test.cot");
+    checker.check();
+
+    // Should have no errors on empty module
+    try std.testing.expect(!checker.hasErrors());
+}

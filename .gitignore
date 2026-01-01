@@ -1,0 +1,13 @@
+.zig-cache/
+zig-out/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM
+.DS_Store
+
+# Binaries
+cot
+cot-lsp
+*.cbo

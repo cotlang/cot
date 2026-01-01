@@ -1,0 +1,994 @@
+//! Cot IR - Intermediate Representation
+//!
+//! This module defines the IR used between the AST and code generation backends.
+//! The IR is designed to:
+//! - Support multiple backends (bytecode VM, native via LLVM, Zig transpiler)
+//! - Enable Cot functions to be exported with C ABI for .NET interop
+//! - Preserve type information for accurate code generation
+//! - Be inspectable for debugging and optimization
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Cot type representation in IR
+pub const Type = union(enum) {
+    /// Void type (for functions with no return)
+    void: void,
+
+    /// Boolean type
+    bool: void,
+
+    /// Signed integer types
+    i8: void,
+    i16: void,
+    i32: void,
+    i64: void,
+
+    /// Unsigned integer types
+    u8: void,
+    u16: void,
+    u32: void,
+    u64: void,
+
+    /// Floating point types
+    f32: void,
+    f64: void,
+
+    /// String type (dynamic length)
+    string: void,
+
+    /// Fixed-length string (for ISAM field compatibility)
+    string_fixed: u32,
+
+    /// Decimal type (for precise financial calculations)
+    decimal: DecimalType,
+
+    /// Pointer to another type
+    ptr: *const Type,
+
+    /// Optional type (nullable)
+    optional: *const Type,
+
+    /// Array of a type
+    array: struct {
+        element: *const Type,
+        length: u32,
+    },
+
+    /// Slice (dynamic array)
+    slice: *const Type,
+
+    /// Struct type
+    @"struct": *const StructType,
+
+    /// Function type
+    function: *const FunctionType,
+
+    pub const DecimalType = struct {
+        /// Total precision in digits
+        precision: u32,
+        /// Number of decimal places (scale)
+        scale: u8,
+    };
+
+    /// Get the size of this type in bytes
+    pub fn sizeInBytes(self: Type) u32 {
+        return switch (self) {
+            .void => 0,
+            .bool => 1,
+            .i8, .u8 => 1,
+            .i16, .u16 => 2,
+            .i32, .u32, .f32 => 4,
+            .i64, .u64, .f64 => 8,
+            .string => 16, // Pointer + length
+            .string_fixed => |len| len,
+            .decimal => |d| @max(8, (d.precision + 1) / 2), // At least 8 bytes
+            .ptr, .optional => 8, // 64-bit pointers
+            .array => |a| a.element.sizeInBytes() * a.length,
+            .slice => 16, // Pointer + length
+            .@"struct" => |s| s.size,
+            .function => 8, // Function pointer
+        };
+    }
+
+    /// Get alignment requirement for this type
+    pub fn alignment(self: Type) u32 {
+        return switch (self) {
+            .void => 1,
+            .bool => 1,
+            .i8, .u8 => 1,
+            .i16, .u16 => 2,
+            .i32, .u32, .f32 => 4,
+            .i64, .u64, .f64 => 8,
+            .string, .slice => 8,
+            .string_fixed => 1,
+            .decimal => 8,
+            .ptr, .optional => 8,
+            .array => |a| a.element.alignment(),
+            .@"struct" => |s| s.alignment,
+            .function => 8,
+        };
+    }
+
+    /// Get the C ABI type name for this type
+    pub fn cTypeName(self: Type) []const u8 {
+        return switch (self) {
+            .void => "void",
+            .bool => "bool",
+            .i8 => "int8_t",
+            .i16 => "int16_t",
+            .i32 => "int32_t",
+            .i64 => "int64_t",
+            .u8 => "uint8_t",
+            .u16 => "uint16_t",
+            .u32 => "uint32_t",
+            .u64 => "uint64_t",
+            .f32 => "float",
+            .f64 => "double",
+            .string, .string_fixed => "cot_string_t*",
+            .decimal => "cot_decimal_t",
+            .ptr, .optional => "void*",
+            .array, .slice => "void*",
+            .@"struct" => "void*",
+            .function => "void*",
+        };
+    }
+
+    /// Check if this type is numeric
+    pub fn isNumeric(self: Type) bool {
+        return switch (self) {
+            .i8, .i16, .i32, .i64 => true,
+            .u8, .u16, .u32, .u64 => true,
+            .f32, .f64, .decimal => true,
+            else => false,
+        };
+    }
+
+    /// Check if this type is an integer
+    pub fn isInteger(self: Type) bool {
+        return switch (self) {
+            .i8, .i16, .i32, .i64 => true,
+            .u8, .u16, .u32, .u64 => true,
+            else => false,
+        };
+    }
+
+    /// Check if this type is signed
+    pub fn isSigned(self: Type) bool {
+        return switch (self) {
+            .i8, .i16, .i32, .i64, .f32, .f64, .decimal => true,
+            else => false,
+        };
+    }
+};
+
+/// Struct (structure) type definition
+pub const StructType = struct {
+    name: []const u8,
+    fields: []const Field,
+    size: u32,
+    alignment: u32,
+
+    pub const Field = struct {
+        name: []const u8,
+        ty: Type,
+        offset: u32,
+    };
+};
+
+/// Function type definition
+pub const FunctionType = struct {
+    params: []const Param,
+    return_type: Type,
+    is_variadic: bool,
+
+    pub const Param = struct {
+        name: []const u8,
+        ty: Type,
+        direction: ParamDirection,
+    };
+
+    pub const ParamDirection = enum {
+        in, // Input only (read)
+        out, // Output only (write)
+        inout, // Both input and output
+    };
+};
+
+// ============================================================================
+// Values and Instructions
+// ============================================================================
+
+/// An SSA value reference
+pub const Value = struct {
+    id: u32,
+    ty: Type,
+
+    pub fn format(self: Value, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        try writer.print("%{d}", .{self.id});
+    }
+
+    // ========== Type Validation Methods ==========
+
+    /// Check if this value has a numeric type (suitable for arithmetic)
+    pub fn isNumeric(self: Value) bool {
+        return switch (self.ty) {
+            .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .decimal => true,
+            else => false,
+        };
+    }
+
+    /// Check if this value has a string type
+    pub fn isString(self: Value) bool {
+        return switch (self.ty) {
+            .string, .string_fixed => true,
+            else => false,
+        };
+    }
+
+    /// Check if this value has a boolean type
+    pub fn isBool(self: Value) bool {
+        return self.ty == .bool;
+    }
+
+    /// Check if this value has a pointer type
+    pub fn isPointer(self: Value) bool {
+        return self.ty == .ptr;
+    }
+
+    /// Check if this value has an optional type
+    pub fn isOptional(self: Value) bool {
+        return self.ty == .optional;
+    }
+
+    /// Check if this value has an integer type (signed or unsigned)
+    pub fn isInteger(self: Value) bool {
+        return switch (self.ty) {
+            .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64 => true,
+            else => false,
+        };
+    }
+
+    /// Check if this value has a floating point type
+    pub fn isFloat(self: Value) bool {
+        return switch (self.ty) {
+            .f32, .f64 => true,
+            else => false,
+        };
+    }
+
+    /// Get the pointee type if this is a pointer, otherwise return the type itself
+    pub fn pointeeType(self: Value) Type {
+        return if (self.ty == .ptr) self.ty.ptr.* else self.ty;
+    }
+
+    /// Check if two values have compatible types for arithmetic
+    pub fn compatibleForArithmetic(self: Value, other: Value) bool {
+        // Both numeric, or both strings (for concatenation)
+        return (self.isNumeric() and other.isNumeric()) or
+            (self.isString() and other.isString());
+    }
+
+    /// Check if two values have compatible types for comparison
+    pub fn compatibleForComparison(self: Value, other: Value) bool {
+        // Same category: numeric vs numeric, string vs string, bool vs bool
+        return (self.isNumeric() and other.isNumeric()) or
+            (self.isString() and other.isString()) or
+            (self.isBool() and other.isBool()) or
+            (self.isPointer() and other.isPointer()) or
+            (self.isOptional() or other.isOptional());
+    }
+};
+
+/// Source location for error reporting
+pub const SourceLoc = struct {
+    line: u32,
+    column: u32,
+};
+
+/// IR Instructions
+pub const Instruction = union(enum) {
+    // Memory operations
+    alloca: Alloca,
+    load: Load,
+    store: Store,
+    field_ptr: FieldPtr,
+
+    // Arithmetic
+    add: BinaryOp,
+    sub: BinaryOp,
+    mul: BinaryOp,
+    div: BinaryOp,
+    mod: BinaryOp,
+    neg: UnaryOp,
+
+    // Bitwise operations
+    bit_and: BinaryOp,
+    bit_or: BinaryOp,
+    bit_xor: BinaryOp,
+    bit_not: UnaryOp,
+    shl: BinaryOp, // Shift left
+    shr: BinaryOp, // Shift right (arithmetic for signed, logical for unsigned)
+
+    // Comparison
+    cmp_eq: BinaryOp,
+    cmp_ne: BinaryOp,
+    cmp_lt: BinaryOp,
+    cmp_le: BinaryOp,
+    cmp_gt: BinaryOp,
+    cmp_ge: BinaryOp,
+
+    // Logical
+    log_and: BinaryOp,
+    log_or: BinaryOp,
+    log_not: UnaryOp,
+
+    // String operations
+    str_concat: BinaryOp,
+    str_compare: BinaryOp,
+    str_copy: struct { dest: Value, src: Value },
+    str_slice: StrSlice,
+    str_slice_store: StrSliceStore,
+    str_len: UnaryOp, // Get string length
+
+    // Control flow
+    br: Branch,
+    cond_br: CondBranch,
+    switch_br: Switch,
+    ret: ?Value,
+
+    // Function calls
+    call: Call,
+
+    // Exception handling
+    try_begin: TryBegin, // Start of try block
+    try_end: void, // End of try block (normal exit)
+    catch_begin: CatchBegin, // Start of catch block
+    throw: Throw, // Throw exception
+
+    // Type conversions
+    cast: Cast,
+    int_to_float: UnaryOp,
+    float_to_int: UnaryOp,
+    int_extend: IntExtend, // Sign/zero extend
+    int_truncate: UnaryOp, // Truncate to smaller int
+
+    // Constants
+    const_int: struct { ty: Type, value: i64, result: Value },
+    const_float: struct { ty: Type, value: f64, result: Value },
+    const_string: struct { value: []const u8, result: Value },
+    const_bool: struct { value: bool, result: Value },
+    const_null: struct { ty: Type, result: Value },
+
+    // Optional operations
+    wrap_optional: UnaryOp, // Wrap value in optional
+    unwrap_optional: UnaryOp, // Unwrap optional (panic if null)
+    is_null: UnaryOp, // Check if optional is null
+
+    // I/O operations (ISAM file access)
+    io_open: IoOpen,
+    io_close: struct { channel: Value },
+    io_read: IoRead,
+    io_write: IoWrite,
+    io_delete: struct { channel: Value },
+    io_unlock: struct { channel: Value },
+
+    // Struct buffer operations - serialize struct fields into a buffer
+    load_struct_buf: struct { base_name: []const u8, struct_name: []const u8, result: Value },
+    store_struct_buf: struct { base_name: []const u8, struct_name: []const u8, value: Value },
+
+    // Array operations
+    array_load: ArrayOp,
+    array_store: ArrayStore,
+    array_len: UnaryOp,
+
+    // Debug information
+    debug_line: struct { line: u32, column: u32 },
+
+    // Allocate instruction
+    pub const Alloca = struct {
+        ty: Type,
+        name: []const u8,
+        result: Value,
+    };
+
+    // Load from memory
+    pub const Load = struct {
+        ptr: Value,
+        result: Value,
+    };
+
+    // Store to memory
+    pub const Store = struct {
+        ptr: Value,
+        value: Value,
+        loc: ?SourceLoc = null,
+    };
+
+    // Get pointer to struct field
+    pub const FieldPtr = struct {
+        struct_ptr: Value,
+        field_index: u32,
+        result: Value,
+    };
+
+    // Binary operation
+    pub const BinaryOp = struct {
+        lhs: Value,
+        rhs: Value,
+        result: Value,
+        loc: ?SourceLoc = null,
+    };
+
+    // Unary operation
+    pub const UnaryOp = struct {
+        operand: Value,
+        result: Value,
+    };
+
+    // Unconditional branch
+    pub const Branch = struct {
+        target: *Block,
+    };
+
+    // Conditional branch
+    pub const CondBranch = struct {
+        condition: Value,
+        then_block: *Block,
+        else_block: *Block,
+    };
+
+    // Switch/match branch
+    pub const Switch = struct {
+        value: Value,
+        cases: []const Case,
+        default: *Block,
+
+        pub const Case = struct {
+            value: i64,
+            target: *Block,
+        };
+    };
+
+    // Function call
+    pub const Call = struct {
+        callee: []const u8,
+        args: []const Value,
+        result: ?Value,
+        method_receiver: ?Value = null, // For method calls: obj.method()
+        loc: ?SourceLoc = null,
+    };
+
+    // Try block start
+    pub const TryBegin = struct {
+        catch_block: *Block,
+    };
+
+    // Catch block start
+    pub const CatchBegin = struct {
+        error_type: ?[]const u8, // null for catch-all
+        error_value: ?Value, // Local to bind error to
+    };
+
+    // Throw exception
+    pub const Throw = struct {
+        value: Value,
+        loc: ?SourceLoc = null,
+    };
+
+    // Type cast
+    pub const Cast = struct {
+        operand: Value,
+        target_type: Type,
+        result: Value,
+    };
+
+    // Integer sign/zero extend
+    pub const IntExtend = struct {
+        operand: Value,
+        target_type: Type,
+        signed: bool,
+        result: Value,
+    };
+
+    /// Array load - load element from array (0-indexed)
+    pub const ArrayOp = struct {
+        array_ptr: Value, // Pointer to array base
+        index: Value, // Index expression (0-based)
+        result: Value, // Result value
+        loc: ?SourceLoc = null,
+    };
+
+    /// Array store - store element to array (0-indexed)
+    pub const ArrayStore = struct {
+        array_ptr: Value, // Pointer to array base
+        index: Value, // Index expression (0-based)
+        value: Value, // Value to store
+        loc: ?SourceLoc = null,
+    };
+
+    /// String slice - extract portion of string (0-indexed)
+    pub const StrSlice = struct {
+        source: Value, // Source string
+        start: Value, // Start index (0-based)
+        length_or_end: Value, // Length or end index depending on is_length
+        is_length: bool = false, // If true, length_or_end is length; if false, end index (exclusive)
+        result: Value, // Result value
+        loc: ?SourceLoc = null,
+    };
+
+    /// String slice store - modify portion of string (0-indexed)
+    pub const StrSliceStore = struct {
+        target: Value, // Target string value
+        target_ptr: Value, // Target variable (for store after modification)
+        start: Value, // Start index (0-based)
+        length_or_end: Value, // Length or end index depending on is_length
+        is_length: bool = false, // If true, length_or_end is length; if false, end index (exclusive)
+        value: Value, // Value to store
+        loc: ?SourceLoc = null,
+    };
+
+    // I/O operations for ISAM file access
+    pub const IoOpen = struct {
+        channel: Value,
+        mode: OpenMode,
+        filename: Value,
+
+        pub const OpenMode = enum {
+            input, // Read-only
+            output, // Write-only, truncate
+            update, // Read-write
+            append, // Write-only, append
+            indexed, // ISAM indexed access
+        };
+    };
+
+    pub const IoRead = struct {
+        channel: Value,
+        buffer: Value,
+        key: ?Value,
+        qualifiers: IoQualifiers,
+        struct_name: ?[]const u8 = null, // For automatic struct unpacking
+        base_name: ?[]const u8 = null, // Variable name for struct unpacking (e.g., "cust")
+    };
+
+    pub const IoWrite = struct {
+        channel: Value,
+        buffer: Value,
+        is_insert: bool = false, // true for insert, false for update
+    };
+
+    pub const IoQualifiers = struct {
+        match_mode: MatchMode = .exact,
+        lock_mode: LockMode = .no_lock,
+        key_index: u8 = 0,
+
+        pub const MatchMode = enum { exact, greater_equal, greater, partial };
+        pub const LockMode = enum { no_lock, shared, exclusive };
+    };
+
+    // ========== Instruction Category System ==========
+
+    /// Categories of IR instructions for analysis and optimization
+    pub const Category = enum {
+        memory, // alloca, load, store, field_ptr, load_struct_buf, store_struct_buf
+        arithmetic, // add, sub, mul, div, mod, neg
+        bitwise, // bit_and, bit_or, bit_xor, bit_not, shl, shr
+        comparison, // cmp_eq, cmp_ne, cmp_lt, cmp_le, cmp_gt, cmp_ge
+        logical, // log_and, log_or, log_not
+        string, // str_concat, str_compare, str_copy, str_slice, str_slice_store, str_len
+        control, // br, cond_br, switch_br, ret, call
+        exception, // try_begin, try_end, catch_begin, throw
+        conversion, // cast, int_to_float, float_to_int, int_extend, int_truncate
+        constant, // const_int, const_float, const_string, const_bool, const_null
+        optional, // wrap_optional, unwrap_optional, is_null
+        io, // io_open, io_close, io_read, io_write, io_delete, io_unlock
+        array, // array_load, array_store, array_len
+        debug, // debug_line
+    };
+
+    /// Get the category of this instruction
+    pub fn category(self: Instruction) Category {
+        return switch (self) {
+            .alloca, .load, .store, .field_ptr, .load_struct_buf, .store_struct_buf => .memory,
+            .add, .sub, .mul, .div, .mod, .neg => .arithmetic,
+            .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => .bitwise,
+            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge => .comparison,
+            .log_and, .log_or, .log_not => .logical,
+            .str_concat, .str_compare, .str_copy, .str_slice, .str_slice_store, .str_len => .string,
+            .br, .cond_br, .switch_br, .ret, .call => .control,
+            .try_begin, .try_end, .catch_begin, .throw => .exception,
+            .cast, .int_to_float, .float_to_int, .int_extend, .int_truncate => .conversion,
+            .const_int, .const_float, .const_string, .const_bool, .const_null => .constant,
+            .wrap_optional, .unwrap_optional, .is_null => .optional,
+            .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
+            .array_load, .array_store, .array_len => .array,
+            .debug_line => .debug,
+        };
+    }
+
+    /// Check if this instruction is a memory operation
+    pub fn isMemory(self: Instruction) bool {
+        return self.category() == .memory;
+    }
+
+    /// Check if this instruction is an arithmetic operation
+    pub fn isArithmetic(self: Instruction) bool {
+        return self.category() == .arithmetic;
+    }
+
+    /// Check if this instruction is a comparison operation
+    pub fn isComparison(self: Instruction) bool {
+        return self.category() == .comparison;
+    }
+
+    /// Check if this instruction is a control flow operation
+    pub fn isControlFlow(self: Instruction) bool {
+        return self.category() == .control;
+    }
+
+    /// Check if this instruction is an I/O operation
+    pub fn isIo(self: Instruction) bool {
+        return self.category() == .io;
+    }
+
+    /// Check if this instruction is a terminator (ends a basic block)
+    pub fn isTerminator(self: Instruction) bool {
+        return switch (self) {
+            .br, .cond_br, .switch_br, .ret, .throw => true,
+            else => false,
+        };
+    }
+
+    /// Check if this instruction produces a value (has a result)
+    pub fn producesValue(self: Instruction) bool {
+        return self.getResult() != null;
+    }
+
+    /// Get the result value if this instruction produces one
+    pub fn getResult(self: Instruction) ?Value {
+        return switch (self) {
+            .alloca => |a| a.result,
+            .load => |l| l.result,
+            .field_ptr => |f| f.result,
+            .add, .sub, .mul, .div, .mod => |op| op.result,
+            .bit_and, .bit_or, .bit_xor, .shl, .shr => |op| op.result,
+            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge => |op| op.result,
+            .log_and, .log_or => |op| op.result,
+            .neg, .log_not, .bit_not => |op| op.result,
+            .str_concat, .str_compare => |op| op.result,
+            .str_len, .array_len => |op| op.result,
+            .str_slice => |s| s.result,
+            .const_int => |c| c.result,
+            .const_float => |c| c.result,
+            .const_string => |c| c.result,
+            .const_bool => |c| c.result,
+            .const_null => |c| c.result,
+            .call => |c| c.result,
+            .load_struct_buf => |l| l.result,
+            .array_load => |a| a.result,
+            .cast => |c| c.result,
+            .int_to_float, .float_to_int, .int_truncate => |op| op.result,
+            .int_extend => |e| e.result,
+            .wrap_optional, .unwrap_optional, .is_null => |op| op.result,
+            // Instructions that don't produce values
+            .store, .br, .cond_br, .switch_br, .ret, .io_open, .io_close, .io_read,
+            .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store,
+            .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy => null,
+        };
+    }
+
+    /// Check if this instruction has side effects (I/O, memory stores, exceptions)
+    pub fn hasSideEffects(self: Instruction) bool {
+        return switch (self) {
+            .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock,
+            .store_struct_buf, .array_store, .throw, .call, .str_copy, .str_slice_store => true,
+            else => false,
+        };
+    }
+};
+
+// ============================================================================
+// Blocks and Functions
+// ============================================================================
+
+/// A basic block in the control flow graph
+pub const Block = struct {
+    /// Block label (for debugging/printing)
+    label: []const u8,
+
+    /// Instructions in this block
+    instructions: std.ArrayListUnmanaged(Instruction),
+
+    /// Predecessor blocks
+    predecessors: std.ArrayListUnmanaged(*Block),
+
+    /// Successor blocks (determined by terminator)
+    successors: std.ArrayListUnmanaged(*Block),
+
+    /// Owning function
+    parent: *Function,
+
+    /// Allocator for this block
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, label: []const u8, parent: *Function) Block {
+        return .{
+            .label = label,
+            .instructions = .{},
+            .predecessors = .{},
+            .successors = .{},
+            .parent = parent,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Block) void {
+        self.instructions.deinit(self.allocator);
+        self.predecessors.deinit(self.allocator);
+        self.successors.deinit(self.allocator);
+    }
+
+    pub fn append(self: *Block, inst: Instruction) !void {
+        try self.instructions.append(self.allocator, inst);
+    }
+
+    pub fn isTerminated(self: *const Block) bool {
+        if (self.instructions.items.len == 0) return false;
+        const last = self.instructions.items[self.instructions.items.len - 1];
+        return last.isTerminator();
+    }
+};
+
+/// Linkage type for functions
+pub const Linkage = enum {
+    /// Internal function, not visible outside module
+    internal,
+
+    /// Exported with C ABI for external callers (.NET, etc.)
+    export_c,
+
+    /// Imported from external library
+    external,
+};
+
+/// A function in the IR
+pub const Function = struct {
+    /// Function name
+    name: []const u8,
+
+    /// Export name (may differ from internal name for C ABI)
+    export_name: ?[]const u8,
+
+    /// Function signature
+    signature: FunctionType,
+
+    /// Linkage/visibility
+    linkage: Linkage,
+
+    /// Entry block
+    entry: *Block,
+
+    /// All blocks in the function
+    blocks: std.ArrayListUnmanaged(*Block),
+
+    /// Local variables (allocas)
+    locals: std.ArrayListUnmanaged(Local),
+
+    /// SSA value counter
+    next_value_id: u32,
+
+    /// Allocator for blocks and instructions
+    allocator: Allocator,
+
+    pub const Local = struct {
+        name: []const u8,
+        ty: Type,
+        value: Value, // The alloca result
+    };
+
+    pub fn init(allocator: Allocator, name: []const u8, signature: FunctionType) !*Function {
+        const self = try allocator.create(Function);
+        self.* = .{
+            .name = name,
+            .export_name = null,
+            .signature = signature,
+            .linkage = .internal,
+            .entry = undefined,
+            .blocks = .{},
+            .locals = .{},
+            .next_value_id = 0,
+            .allocator = allocator,
+        };
+
+        // Create entry block
+        const entry = try allocator.create(Block);
+        entry.* = Block.init(allocator, "entry", self);
+        self.entry = entry;
+        try self.blocks.append(allocator, entry);
+
+        return self;
+    }
+
+    pub fn deinit(self: *Function) void {
+        for (self.blocks.items) |block| {
+            block.deinit();
+            self.allocator.destroy(block);
+        }
+        self.blocks.deinit(self.allocator);
+        self.locals.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    /// Create a new SSA value
+    pub fn newValue(self: *Function, ty: Type) Value {
+        const id = self.next_value_id;
+        self.next_value_id += 1;
+        return .{ .id = id, .ty = ty };
+    }
+
+    /// Create a new basic block
+    pub fn createBlock(self: *Function, label: []const u8) !*Block {
+        const block = try self.allocator.create(Block);
+        block.* = Block.init(self.allocator, label, self);
+        try self.blocks.append(self.allocator, block);
+        return block;
+    }
+
+    /// Mark this function for export with C ABI
+    pub fn setExport(self: *Function, export_name: []const u8) void {
+        self.linkage = .export_c;
+        self.export_name = export_name;
+    }
+};
+
+// ============================================================================
+// Module
+// ============================================================================
+
+/// An IR module (compilation unit)
+pub const Module = struct {
+    /// Module name
+    name: []const u8,
+
+    /// Library name for exports (if any)
+    library_name: ?[]const u8,
+
+    /// Struct type definitions
+    structs: std.ArrayListUnmanaged(*StructType),
+
+    /// Global variables
+    globals: std.ArrayListUnmanaged(Global),
+
+    /// Functions
+    functions: std.ArrayListUnmanaged(*Function),
+
+    /// Allocator
+    allocator: Allocator,
+
+    pub const Global = struct {
+        name: []const u8,
+        ty: Type,
+        initializer: ?[]const u8, // For initialized data
+        is_const: bool,
+    };
+
+    pub fn init(allocator: Allocator, name: []const u8) Module {
+        return .{
+            .name = name,
+            .library_name = null,
+            .structs = .{},
+            .globals = .{},
+            .functions = .{},
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Module) void {
+        for (self.functions.items) |func| {
+            func.deinit();
+        }
+        self.functions.deinit(self.allocator);
+
+        // Free struct types and their fields
+        for (self.structs.items) |struct_type| {
+            self.allocator.free(struct_type.fields);
+            self.allocator.destroy(struct_type);
+        }
+        self.structs.deinit(self.allocator);
+
+        self.globals.deinit(self.allocator);
+    }
+
+    /// Get all exported functions
+    pub fn getExports(self: *Module, allocator: Allocator) ![]*Function {
+        var exports = std.ArrayListUnmanaged(*Function){};
+        for (self.functions.items) |func| {
+            if (func.linkage == .export_c) {
+                try exports.append(allocator, func);
+            }
+        }
+        return exports.toOwnedSlice(allocator);
+    }
+
+    /// Add a function to the module
+    pub fn addFunction(self: *Module, func: *Function) !void {
+        try self.functions.append(self.allocator, func);
+    }
+
+    /// Add a global variable
+    pub fn addGlobal(self: *Module, name: []const u8, ty: Type, is_const: bool) !void {
+        try self.globals.append(self.allocator, .{
+            .name = name,
+            .ty = ty,
+            .initializer = null,
+            .is_const = is_const,
+        });
+    }
+
+    /// Add a struct type definition
+    pub fn addStruct(self: *Module, struct_type: *StructType) !void {
+        try self.structs.append(self.allocator, struct_type);
+    }
+};
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "ir type sizes" {
+    try std.testing.expectEqual(@as(u32, 1), (Type{ .i8 = {} }).sizeInBytes());
+    try std.testing.expectEqual(@as(u32, 2), (Type{ .i16 = {} }).sizeInBytes());
+    try std.testing.expectEqual(@as(u32, 4), (Type{ .i32 = {} }).sizeInBytes());
+    try std.testing.expectEqual(@as(u32, 8), (Type{ .i64 = {} }).sizeInBytes());
+    try std.testing.expectEqual(@as(u32, 4), (Type{ .f32 = {} }).sizeInBytes());
+    try std.testing.expectEqual(@as(u32, 8), (Type{ .f64 = {} }).sizeInBytes());
+    try std.testing.expectEqual(@as(u32, 1), (Type{ .bool = {} }).sizeInBytes());
+
+    const decimal_type = Type{ .decimal = .{ .precision = 18, .scale = 2 } };
+    try std.testing.expectEqual(@as(u32, 9), decimal_type.sizeInBytes());
+}
+
+test "ir function creation" {
+    const allocator = std.testing.allocator;
+
+    const sig = FunctionType{
+        .params = &[_]FunctionType.Param{
+            .{ .name = "x", .ty = .{ .i64 = {} }, .direction = .in },
+        },
+        .return_type = .{ .i64 = {} },
+        .is_variadic = false,
+    };
+
+    const func = try Function.init(allocator, "calculate_total", sig);
+    defer func.deinit();
+
+    func.setExport("cot_calculate_total");
+    try std.testing.expectEqual(Linkage.export_c, func.linkage);
+    try std.testing.expectEqualStrings("cot_calculate_total", func.export_name.?);
+}
+
+test "ir module with exports" {
+    const allocator = std.testing.allocator;
+
+    var module = Module.init(allocator, "pricing");
+    defer module.deinit();
+
+    module.library_name = "pricing";
+
+    const sig = FunctionType{
+        .params = &[_]FunctionType.Param{},
+        .return_type = .void,
+        .is_variadic = false,
+    };
+
+    const func = try Function.init(allocator, "my_func", sig);
+    func.setExport("cot_my_func");
+    try module.addFunction(func);
+
+    try std.testing.expectEqual(@as(usize, 1), module.functions.items.len);
+}

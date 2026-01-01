@@ -1,0 +1,65 @@
+//! System native functions
+//!
+//! flags, getlog, setlog, error, mem
+
+const std = @import("std");
+const native = @import("native.zig");
+const NativeContext = native.NativeContext;
+const NativeError = native.NativeError;
+const NativeFn = native.NativeFn;
+const Value = native.Value;
+
+/// Register all system functions
+pub fn register(registry: anytype) !void {
+    try registry.registerNative("flags", flags);
+    try registry.registerNative("getlog", getlog);
+    try registry.registerNative("setlog", setlog);
+    try registry.registerNative("error", getError);
+    try registry.registerNative("mem", mem);
+}
+
+/// FLAGS - Set runtime flags
+pub fn flags(ctx: *NativeContext) NativeError!?Value {
+    _ = ctx;
+    // TODO: Implement flags
+    return null;
+}
+
+/// GETLOG - Get logical name (environment variable)
+pub fn getlog(ctx: *NativeContext) NativeError!?Value {
+    if (ctx.args.len < 1) return NativeError.InvalidArgument;
+
+    const name = ctx.getArgString(0) catch return NativeError.InvalidArgument;
+
+    const value = std.process.getEnvVarOwned(ctx.allocator, name) catch {
+        return Value.initString(ctx.allocator, "") catch return NativeError.OutOfMemory;
+    };
+
+    return Value.initString(ctx.allocator, value) catch return NativeError.OutOfMemory;
+}
+
+/// SETLOG - Set logical name (environment variable)
+pub fn setlog(ctx: *NativeContext) NativeError!?Value {
+    _ = ctx;
+    // Environment variables can't be set in this process to affect it
+    return null;
+}
+
+/// ERROR - Get last error code
+pub fn getError(ctx: *NativeContext) NativeError!?Value {
+    _ = ctx;
+    // TODO: Track actual error codes from I/O operations
+    return Value.initInt(0);
+}
+
+/// MEM - Allocate memory handle
+pub fn mem(ctx: *NativeContext) NativeError!?Value {
+    const size_val = ctx.getArgInt(0) catch return NativeError.InvalidArgument;
+    if (size_val <= 0) return NativeError.InvalidArgument;
+
+    const buf = ctx.allocator.alloc(u8, @intCast(size_val)) catch return NativeError.OutOfMemory;
+    @memset(buf, 0);
+
+    // Return handle (pointer as integer)
+    return Value.initHandle(@intFromPtr(buf.ptr));
+}
