@@ -493,6 +493,49 @@ pub fn writeAppConfig(file: std.fs.File, name: []const u8) !void {
     try buffered.interface.flush();
 }
 
+/// Write a cot.json for an app with a custom main file
+pub fn writeAppConfigWithMain(file: std.fs.File, name: []const u8, main_file: []const u8) !void {
+    var write_buffer: [4096]u8 = undefined;
+    var buffered = file.writer(&write_buffer);
+    const writer = &buffered.interface;
+
+    try writer.print(
+        \\{{
+        \\  "name": "{s}",
+        \\  "version": "1.0.0",
+        \\  "type": "app",
+        \\  "main": "{s}",
+        \\  "dependencies": {{}},
+        \\  "screens": {{
+        \\    "autoDiscover": true,
+        \\    "directory": "screens"
+        \\  }},
+        \\  "reports": {{
+        \\    "autoDiscover": true,
+        \\    "directory": "reports"
+        \\  }},
+        \\  "jobs": {{
+        \\    "autoDiscover": true,
+        \\    "directory": "jobs"
+        \\  }},
+        \\  "subroutines": {{
+        \\    "directory": "subroutines"
+        \\  }},
+        \\  "build": {{
+        \\    "output": "bin",
+        \\    "target": "bytecode",
+        \\    "bundle": true,
+        \\    "generateManifest": true
+        \\  }},
+        \\  "link": {{
+        \\    "static": true
+        \\  }}
+        \\}}
+        \\
+    , .{ name, main_file });
+    try buffered.interface.flush();
+}
+
 /// Write a default cot.json for a library to a file
 pub fn writeLibraryConfig(file: std.fs.File, name: []const u8) !void {
     var write_buffer: [4096]u8 = undefined;

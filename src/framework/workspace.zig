@@ -231,7 +231,7 @@ pub const WorkspaceLoader = struct {
     }
 
     /// Create a new app in the workspace
-    pub fn createApp(self: *Self, workspace_root: []const u8, name: []const u8) !void {
+    pub fn createApp(self: *Self, workspace_root: []const u8, name: []const u8, use_dbl: bool) !void {
         const app_path = try std.fs.path.join(self.allocator, &.{ workspace_root, "apps", name });
         defer self.allocator.free(app_path);
 
@@ -246,29 +246,55 @@ pub const WorkspaceLoader = struct {
         defer file.close();
         try config.writeAppConfig(file, name);
 
-        // Create main.cot
-        const main_path = try std.fs.path.join(self.allocator, &.{ app_path, "main.cot" });
+        // Create main file with appropriate syntax
+        const ext = if (use_dbl) ".dbl" else ".cot";
+        const main_filename = if (use_dbl) "main.dbl" else "main.cot";
+        const main_path = try std.fs.path.join(self.allocator, &.{ app_path, main_filename });
         defer self.allocator.free(main_path);
 
         const main_file = try std.fs.cwd().createFile(main_path, .{});
         defer main_file.close();
-        try main_file.writeAll(
-            \\; Main entry point for the application
-            \\main
-            \\record
-            \\    message, a50
-            \\endrecord
-            \\proc
-            \\    message = "Hello from Cot!"
-            \\    display(0, message)
-            \\    stop
-            \\endmain
-            \\
-        );
+
+        if (use_dbl) {
+            // DBL syntax
+            try main_file.writeAll(
+                \\; Main entry point for the application
+                \\main
+                \\record
+                \\    message, a50
+                \\endrecord
+                \\proc
+                \\    message = "Hello from Cot!"
+                \\    display(0, message)
+                \\    stop
+                \\endmain
+                \\
+            );
+        } else {
+            // Modern Cot syntax
+            try main_file.writeAll(
+                \\// Main entry point for the application
+                \\
+                \\fn main() {
+                \\    let message = "Hello from Cot!"
+                \\    print(message)
+                \\}
+                \\
+            );
+        }
+
+        // Update cot.json to reference correct main file
+        if (use_dbl) {
+            // Rewrite config with .dbl extension
+            const config_file = try std.fs.cwd().createFile(config_path, .{});
+            defer config_file.close();
+            try config.writeAppConfigWithMain(config_file, name, "main.dbl");
+        }
+        _ = ext;
     }
 
     /// Create a new package in the workspace
-    pub fn createPackage(self: *Self, workspace_root: []const u8, name: []const u8) !void {
+    pub fn createPackage(self: *Self, workspace_root: []const u8, name: []const u8, use_dbl: bool) !void {
         const pkg_path = try std.fs.path.join(self.allocator, &.{ workspace_root, "packages", name });
         defer self.allocator.free(pkg_path);
 
@@ -287,17 +313,27 @@ pub const WorkspaceLoader = struct {
         defer file.close();
         try config.writeLibraryConfig(file, name);
 
-        // Create index.cot
-        const index_path = try std.fs.path.join(self.allocator, &.{ src_path, "index.cot" });
+        // Create index file with appropriate syntax
+        const index_filename = if (use_dbl) "index.dbl" else "index.cot";
+        const index_path = try std.fs.path.join(self.allocator, &.{ src_path, index_filename });
         defer self.allocator.free(index_path);
 
         const index_file = try std.fs.cwd().createFile(index_path, .{});
         defer index_file.close();
-        try index_file.writeAll(
-            \\; Package entry point
-            \\; Export shared records and subroutines here
-            \\
-        );
+
+        if (use_dbl) {
+            try index_file.writeAll(
+                \\; Package entry point
+                \\; Export shared records and subroutines here
+                \\
+            );
+        } else {
+            try index_file.writeAll(
+                \\// Package entry point
+                \\// Export shared types and functions here
+                \\
+            );
+        }
     }
 };
 

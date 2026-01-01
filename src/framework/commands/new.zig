@@ -12,9 +12,15 @@ pub const Template = enum {
     library,
 };
 
+pub const Syntax = enum {
+    cot,
+    dbl,
+};
+
 pub const NewOptions = struct {
     name: ?[]const u8 = null,
     template: Template = .app,
+    syntax: Syntax = .cot,
 };
 
 /// Create a new app or package
@@ -45,7 +51,7 @@ pub fn run(allocator: Allocator, options: NewOptions) !void {
 
     switch (options.template) {
         .app => {
-            try loader.createApp(workspace_root, name);
+            try loader.createApp(workspace_root, name, options.syntax == .dbl);
             try stdout.print("\n", .{});
             try stdout.print("  Created app: {s}\n", .{name});
             try stdout.print("  Location: apps/{s}/\n", .{name});
@@ -57,7 +63,7 @@ pub fn run(allocator: Allocator, options: NewOptions) !void {
             try stdout.flush();
         },
         .library => {
-            try loader.createPackage(workspace_root, name);
+            try loader.createPackage(workspace_root, name, options.syntax == .dbl);
             try stdout.print("\n", .{});
             try stdout.print("  Created package: @company/{s}\n", .{name});
             try stdout.print("\n", .{});
@@ -97,6 +103,8 @@ pub fn parseArgs(args: []const []const u8) NewOptions {
             options.template = .app;
         } else if (std.mem.eql(u8, arg, "--library") or std.mem.eql(u8, arg, "--lib")) {
             options.template = .library;
+        } else if (std.mem.eql(u8, arg, "--dbl")) {
+            options.syntax = .dbl;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             if (options.name == null) {
                 options.name = arg;
@@ -125,13 +133,14 @@ pub fn printHelp() !void {
         \\  -t, --template    Template type: app (default) or library
         \\  --app             Shorthand for --template app
         \\  --library, --lib  Shorthand for --template library
+        \\  --dbl             Use DBL syntax instead of modern Cot syntax
         \\  --help            Show this help
         \\
         \\Examples:
-        \\  cot new inventory                    Create a new app
-        \\  cot new inventory --template app    Create a new app (explicit)
-        \\  cot new common --template library   Create a shared package
-        \\  cot new utils --lib                 Create a shared package (shorthand)
+        \\  cot new inventory                    Create app with Cot syntax
+        \\  cot new inventory --dbl              Create app with DBL syntax
+        \\  cot new common --template library    Create a shared package
+        \\  cot new utils --lib                  Create a shared package (shorthand)
         \\
     );
 }
