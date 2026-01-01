@@ -7,7 +7,7 @@ zig-out/
 *.dSYM
 .DS_Store
 
-# Binaries
-cot
-cot-lsp
+# Binaries (in root directory only)
+/cot
+/cot-lsp
 *.cbo
