@@ -1,6 +1,6 @@
 //! Compile-time builtin functions
 //!
-//! @defined(), @os(), @arch(), @sizeof(), @date(), @time(), @version(), @file(), @line()
+//! Zig-style: @defined(), @os(), @arch(), @sizeOf(), @alignOf(), @TypeOf(), @date(), @time(), @version(), @file(), @line()
 
 const std = @import("std");
 const Value = @import("value.zig").Value;
@@ -79,12 +79,28 @@ pub fn evaluate(
         return Value.fromString(arch_name);
     }
 
-    // @sizeof(TYPE) - size of a type in bytes
-    if (std.mem.eql(u8, name, "sizeof")) {
+    // @sizeOf(TYPE) - size of a type in bytes (Zig-style)
+    if (std.mem.eql(u8, name, "sizeOf")) {
         if (args.len < 1) return BuiltinError.MissingArgument;
         // For now, just return a placeholder. Real implementation would
         // need type information from the semantic analysis phase.
         return Value.fromInt(0);
+    }
+
+    // @alignOf(TYPE) - alignment of a type in bytes (Zig-style)
+    if (std.mem.eql(u8, name, "alignOf")) {
+        if (args.len < 1) return BuiltinError.MissingArgument;
+        // For now, just return a placeholder. Real implementation would
+        // need type information from the semantic analysis phase.
+        return Value.fromInt(0);
+    }
+
+    // @TypeOf(x) - type of an expression (Zig-style)
+    if (std.mem.eql(u8, name, "TypeOf")) {
+        if (args.len < 1) return BuiltinError.MissingArgument;
+        // For now, just return a placeholder. Real implementation would
+        // need type information from the semantic analysis phase.
+        return Value.fromString("unknown");
     }
 
     // @date() - compile date as "YYYY-MM-DD"

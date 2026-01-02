@@ -98,8 +98,11 @@ pub const Lexer = struct {
             return self.makeToken(.minus, self.source[start_pos..self.position]);
         }
 
-        // Plus: + +=
+        // Plus: + ++ +=
         if (c == '+') {
+            if (self.match('+')) {
+                return self.makeToken(.plus_plus, self.source[start_pos..self.position]);
+            }
             if (self.match('=')) {
                 return self.makeToken(.plus_equals, self.source[start_pos..self.position]);
             }
@@ -377,8 +380,7 @@ pub const Lexer = struct {
         .{ "view", .kw_view },
         .{ "enum", .kw_enum },
         .{ "const", .kw_const },
-        .{ "let", .kw_let },
-        .{ "mut", .kw_mut },
+        .{ "var", .kw_var },
         .{ "type", .kw_type },
         .{ "impl", .kw_impl },
         .{ "trait", .kw_trait },
@@ -388,7 +390,7 @@ pub const Lexer = struct {
         // Control flow
         .{ "if", .kw_if },
         .{ "else", .kw_else },
-        .{ "match", .kw_match },
+        .{ "switch", .kw_switch },
         .{ "for", .kw_for },
         .{ "in", .kw_in },
         .{ "while", .kw_while },

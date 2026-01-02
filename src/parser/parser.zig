@@ -185,12 +185,12 @@ pub const Parser = struct {
             .kw_trait => self.parseTraitDef(),
             .kw_impl => self.parseImplBlock(),
             .kw_const => self.parseConstDecl(),
-            .kw_let => self.parseLetDecl(),
+            .kw_var => self.parseVarDecl(),
             .kw_type => self.parseTypeAlias(),
             .kw_import => self.parseImport(),
             .kw_pub => self.parsePubDecl(),
             else => {
-                self.addError("Expected 'fn', 'struct', 'union', 'enum', 'trait', 'impl', 'const', 'let', 'type', or 'import' at top level");
+                self.addError("Expected 'fn', 'struct', 'union', 'enum', 'trait', 'impl', 'const', 'var', 'type', or 'import' at top level");
                 _ = self.advance();
                 return error.UnexpectedToken;
             },
@@ -254,9 +254,9 @@ pub const Parser = struct {
 
         _ = try self.consume(.rparen, "Expected ')'");
 
-        // Optional return type
+        // Return type: Zig-style (type directly after ')', or void if '{' follows)
         var return_type: TypeIdx = .null;
-        if (self.match(&[_]TokenType{.arrow})) {
+        if (!self.check(.lbrace)) {
             return_type = try self.parseType();
         }
 
@@ -505,9 +505,9 @@ pub const Parser = struct {
 
             _ = try self.consume(.rparen, "Expected ')'");
 
-            // Optional return type
+            // Return type: Zig-style (type directly after ')', or void if terminator follows)
             var return_type: TypeIdx = .null;
-            if (self.match(&[_]TokenType{.arrow})) {
+            if (!self.check(.semicolon) and !self.check(.comma) and !self.check(.rbrace)) {
                 return_type = try self.parseType();
             }
 
@@ -629,12 +629,10 @@ pub const Parser = struct {
         return self.store.addConstDecl(name, type_idx, init_expr, loc) catch return error.OutOfMemory;
     }
 
-    fn parseLetDecl(self: *Self) ParseError!StmtIdx {
+    /// Parse var declaration (Zig-style mutable variable): var name: Type = expr
+    fn parseVarDecl(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
-        _ = try self.consume(.kw_let, "Expected 'let'");
-
-        // Check for 'mut' keyword
-        const is_mut = self.match(&[_]TokenType{.kw_mut});
+        _ = try self.consume(.kw_var, "Expected 'var'");
 
         const name_token = try self.consume(.identifier, "Expected variable name");
         const name = self.internString(name_token.lexeme) catch return error.OutOfMemory;
@@ -648,7 +646,8 @@ pub const Parser = struct {
         _ = try self.consume(.equals, "Expected '='");
         const init_expr = try self.parseExpression();
 
-        return self.store.addLetDecl(name, type_idx, init_expr, is_mut, loc) catch return error.OutOfMemory;
+        // var is always mutable (is_mut = true)
+        return self.store.addLetDecl(name, type_idx, init_expr, true, loc) catch return error.OutOfMemory;
     }
 
     /// Parse view declaration: view name: Type = @base_field or view name: Type = @base_field + offset
@@ -731,14 +730,14 @@ pub const Parser = struct {
 
         return switch (token.type) {
             .kw_if => self.parseIf(),
-            .kw_match => self.parseMatch(),
+            .kw_switch => self.parseSwitch(),
             .kw_for => self.parseFor(),
             .kw_while => self.parseWhile(),
             .kw_loop => self.parseLoop(),
             .kw_break => self.parseBreak(),
             .kw_continue => self.parseContinue(),
             .kw_return => self.parseReturn(),
-            .kw_let => self.parseLetDecl(),
+            .kw_var => self.parseVarDecl(),
             .kw_const => self.parseConstDecl(),
             .kw_view => self.parseViewDecl(),
             .kw_try => self.parseTry(),
@@ -808,13 +807,25 @@ pub const Parser = struct {
         return self.store.addIfStmt(condition, then_body, else_body, loc) catch return error.OutOfMemory;
     }
 
-    fn parseMatch(self: *Self) ParseError!StmtIdx {
+    /// Parse switch statement (Zig-style): switch (expr) { ... }
+    fn parseSwitch(self: *Self) ParseError!StmtIdx {
         try self.enterNesting();
         errdefer self.exitNesting();
 
         const loc = self.currentLoc();
-        _ = try self.consume(.kw_match, "Expected 'match'");
+        _ = try self.consume(.kw_switch, "Expected 'switch'");
+
+        // Zig-style: require parentheses around scrutinee
+        _ = try self.consume(.lparen, "Expected '(' after 'switch'");
         const scrutinee = try self.parseExpression();
+        _ = try self.consume(.rparen, "Expected ')' after switch expression");
+
+        return self.parseSwitchBody(scrutinee, loc);
+    }
+
+    /// Switch body parsing
+    fn parseSwitchBody(self: *Self, scrutinee: ExprIdx, loc: SourceLoc) ParseError!StmtIdx {
+        // Note: enterNesting already called by caller
 
         _ = try self.consume(.lbrace, "Expected '{'");
 
@@ -940,7 +951,7 @@ pub const Parser = struct {
             // Check if there's actually an expression following
             const next = self.peek().type;
             if (next != .kw_fn and next != .kw_struct and next != .kw_const and
-                next != .kw_let and next != .kw_if and next != .kw_for and
+                next != .kw_var and next != .kw_if and next != .kw_for and
                 next != .kw_while and next != .kw_loop and next != .kw_return)
             {
                 value = try self.parseExpression();
@@ -1818,7 +1829,7 @@ pub const Parser = struct {
                 .kw_struct,
                 .kw_enum,
                 .kw_const,
-                .kw_let,
+                .kw_var,
                 .kw_type,
                 .kw_if,
                 .kw_for,
@@ -1827,7 +1838,7 @@ pub const Parser = struct {
                 .kw_return,
                 .kw_import,
                 .kw_try,
-                .kw_match,
+                .kw_switch,
                 => return,
                 else => _ = self.advance(),
             }
@@ -1884,14 +1895,13 @@ test "parse const declaration" {
     try std.testing.expectEqual(StatementTag.const_decl, store.stmtTag(top_level[0]));
 }
 
-test "parse let declaration" {
+test "parse var declaration" {
     const tokens = [_]Token{
-        .{ .type = .kw_let, .lexeme = "let", .line = 1, .column = 1 },
-        .{ .type = .kw_mut, .lexeme = "mut", .line = 1, .column = 5 },
-        .{ .type = .identifier, .lexeme = "x", .line = 1, .column = 9 },
-        .{ .type = .equals, .lexeme = "=", .line = 1, .column = 11 },
-        .{ .type = .integer_literal, .lexeme = "0", .line = 1, .column = 13 },
-        .{ .type = .eof, .lexeme = "", .line = 1, .column = 14 },
+        .{ .type = .kw_var, .lexeme = "var", .line = 1, .column = 1 },
+        .{ .type = .identifier, .lexeme = "x", .line = 1, .column = 5 },
+        .{ .type = .equals, .lexeme = "=", .line = 1, .column = 7 },
+        .{ .type = .integer_literal, .lexeme = "0", .line = 1, .column = 9 },
+        .{ .type = .eof, .lexeme = "", .line = 1, .column = 10 },
     };
 
     var strings = StringInterner.init(std.testing.allocator);

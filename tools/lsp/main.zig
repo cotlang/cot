@@ -588,7 +588,7 @@ fn getCotSemanticTokenType(token: anytype, prev_token: anytype, next_token: anyt
         }
 
         // Access modifiers
-        if (token.type == TokenType.kw_pub or token.type == TokenType.kw_mut or
+        if (token.type == TokenType.kw_pub or
             token.type == TokenType.kw_const or token.type == TokenType.kw_comptime)
         {
             return STI.Modifier;

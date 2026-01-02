@@ -100,7 +100,7 @@ pub const rules: [TOKEN_COUNT]ParseRule = init: {
 
     // Binary operators - arithmetic
     r[@intFromEnum(TokenType.plus)] = .{ .infix = null, .precedence = .term };
-    r[@intFromEnum(TokenType.hash)] = .{ .infix = null, .precedence = .term }; // string concat
+    r[@intFromEnum(TokenType.plus_plus)] = .{ .infix = null, .precedence = .term }; // string concat (Zig-style)
     r[@intFromEnum(TokenType.slash)] = .{ .infix = null, .precedence = .factor };
     r[@intFromEnum(TokenType.percent)] = .{ .infix = null, .precedence = .factor };
 
@@ -138,7 +138,7 @@ pub const rules: [TOKEN_COUNT]ParseRule = init: {
 pub fn tokenToBinaryOp(token_type: TokenType) ?BinaryOp {
     return switch (token_type) {
         // Arithmetic
-        .plus, .hash => .add,
+        .plus, .plus_plus => .add,
         .minus => .sub,
         .star => .mul,
         .slash => .div,
@@ -219,7 +219,7 @@ pub fn isBinaryOperator(token_type: TokenType) bool {
         .star,
         .slash,
         .percent,
-        .hash,
+        .plus_plus,
         .eq,
         .ne,
         .lt,

@@ -130,6 +130,7 @@ pub const TokenType = enum {
     range, // ..
     range_inclusive, // ..=
     walrus, // :=
+    plus_plus, // ++ (string concatenation, Zig-style)
     plus_equals, // +=
     minus_equals, // -=
     star_equals, // *=
@@ -154,8 +155,7 @@ pub const TokenType = enum {
     kw_view,
     kw_enum,
     kw_const,
-    kw_let,
-    kw_mut,
+    kw_var,
     kw_type,
     kw_impl,
     kw_trait,
@@ -165,7 +165,7 @@ pub const TokenType = enum {
     // Keywords - control flow
     kw_if,
     kw_else,
-    kw_match,
+    kw_switch,
     kw_for,
     kw_in,
     kw_while,
@@ -212,8 +212,7 @@ pub const TokenType = enum {
             .kw_view,
             .kw_enum,
             .kw_const,
-            .kw_let,
-            .kw_mut,
+            .kw_var,
             .kw_type,
             .kw_impl,
             .kw_trait,
@@ -221,7 +220,7 @@ pub const TokenType = enum {
             .kw_static,
             .kw_if,
             .kw_else,
-            .kw_match,
+            .kw_switch,
             .kw_for,
             .kw_in,
             .kw_while,
@@ -254,10 +253,10 @@ pub const TokenType = enum {
     pub fn isOperator(self: TokenType) bool {
         return switch (self) {
             .plus,
+            .plus_plus,
             .minus,
             .star,
             .slash,
-            .hash,
             .equals,
             .eq,
             .ne,
