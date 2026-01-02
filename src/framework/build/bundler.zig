@@ -450,11 +450,16 @@ pub fn buildBundledProject(
     var bund = Bundler.init(allocator, output_dir);
     defer bund.deinit();
 
-    // Helper to add a module, preferring pre-compiled bytecode from cache
+    // Helper to add a module, preferring pre-compiled bytecode from cache if it's newer than source
     const addModule = struct {
         fn add(b: *Bundler, alloc: Allocator, proj_path: []const u8, name: []const u8, source_path: []const u8, module_type: Manifest.ModuleType) !bool {
+            // Get source file modification time
+            const source_mtime = getFileMtime(source_path) orelse {
+                // Source doesn't exist or can't be read - try to compile anyway
+                return b.addSource(name, source_path, module_type);
+            };
+
             // Check for pre-compiled bytecode in .cot-cache/
-            // The cache file is named <name>.cotc
             const cache_dir = try std.fs.path.join(alloc, &.{ proj_path, ".cot-cache" });
             defer alloc.free(cache_dir);
             const cache_filename = try std.fmt.allocPrint(alloc, "{s}.cotc", .{name});
@@ -462,20 +467,32 @@ pub fn buildBundledProject(
             const cache_path = try std.fs.path.join(alloc, &.{ cache_dir, cache_filename });
             defer alloc.free(cache_path);
 
-            // Try to use cached bytecode if it exists
-            if (std.fs.cwd().access(cache_path, .{})) |_| {
-                return b.addBytecode(name, cache_path, source_path, module_type);
-            } else |_| {
-                // Check for .cbo file next to source (legacy format: <source>.cbo)
-                const cbo_path = try std.fmt.allocPrint(alloc, "{s}.cbo", .{source_path});
-                defer alloc.free(cbo_path);
-                if (std.fs.cwd().access(cbo_path, .{})) |_| {
-                    return b.addBytecode(name, cbo_path, source_path, module_type);
-                } else |_| {
-                    // Fall back to compiling from source
-                    return b.addSource(name, source_path, module_type);
+            // Try to use cached bytecode if it exists AND is newer than source
+            if (getFileMtime(cache_path)) |cache_mtime| {
+                if (cache_mtime >= source_mtime) {
+                    return b.addBytecode(name, cache_path, source_path, module_type);
                 }
             }
+
+            // Check for .cbo file next to source (legacy format: <source>.cbo)
+            const cbo_path = try std.fmt.allocPrint(alloc, "{s}.cbo", .{source_path});
+            defer alloc.free(cbo_path);
+            if (getFileMtime(cbo_path)) |cbo_mtime| {
+                if (cbo_mtime >= source_mtime) {
+                    return b.addBytecode(name, cbo_path, source_path, module_type);
+                }
+            }
+
+            // Cache is stale or doesn't exist - compile from source
+            return b.addSource(name, source_path, module_type);
+        }
+
+        /// Get file modification time, returns null if file doesn't exist
+        fn getFileMtime(path: []const u8) ?i128 {
+            const file = std.fs.cwd().openFile(path, .{}) catch return null;
+            defer file.close();
+            const stat = file.stat() catch return null;
+            return stat.mtime;
         }
     }.add;
 

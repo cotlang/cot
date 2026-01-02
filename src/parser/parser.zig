@@ -233,9 +233,19 @@ pub const Parser = struct {
                 _ = try self.consume(.colon, "Expected ':'");
                 const param_type = try self.parseType();
 
-                // Store as [name, type] pairs in scratch u32 buffer
+                // Parse optional default value: param: Type = expr
+                var default_expr: u32 = 0; // 0 = ExprIdx.null (required param)
+                if (self.match(&[_]TokenType{.equals})) {
+                    const expr = try self.parseExpression();
+                    default_expr = expr.toInt();
+                }
+
+                // Store as [name, type, is_ref, default_value] in scratch u32 buffer
+                // is_ref: 0=val (default for Cot), 1=ref
                 self.store.pushScratchU32(@intFromEnum(param_name)) catch return error.OutOfMemory;
                 self.store.pushScratchU32(param_type.toInt()) catch return error.OutOfMemory;
+                self.store.pushScratchU32(0) catch return error.OutOfMemory; // val by default
+                self.store.pushScratchU32(default_expr) catch return error.OutOfMemory;
 
                 if (!self.match(&[_]TokenType{.comma})) break;
             }
@@ -411,7 +421,7 @@ pub const Parser = struct {
             _ = try self.consume(.lparen, "Expected '('");
 
             // Parse parameters - collect them first, store after we know param_count
-            var params_temp: [32]u32 = undefined; // Max 16 params per method
+            var params_temp: [64]u32 = undefined; // Max 16 params per method (4 values each: name, type, is_ref, default)
             var param_count: u32 = 0;
             if (!self.check(.rparen)) {
                 while (true) {
@@ -429,8 +439,10 @@ pub const Parser = struct {
                     _ = try self.consume(.colon, "Expected ':'");
                     const param_type = try self.parseType();
 
-                    params_temp[param_count * 2] = @intFromEnum(param_name_str);
-                    params_temp[param_count * 2 + 1] = param_type.toInt();
+                    params_temp[param_count * 4] = @intFromEnum(param_name_str);
+                    params_temp[param_count * 4 + 1] = param_type.toInt();
+                    params_temp[param_count * 4 + 2] = 0; // val (default for Cot)
+                    params_temp[param_count * 4 + 3] = 0; // no default value (required)
                     param_count += 1;
 
                     if (!self.match(&[_]TokenType{.comma})) break;
@@ -445,15 +457,17 @@ pub const Parser = struct {
                 return_type = try self.parseType();
             }
 
-            // Store method signature: [method_name, param_count, return_type, param_pairs...]
+            // Store method signature: [method_name, param_count, return_type, param_quads...]
             // This order makes parsing easier - we know param_count before reading params
             self.store.pushScratchU32(@intFromEnum(method_name)) catch return error.OutOfMemory;
             self.store.pushScratchU32(param_count) catch return error.OutOfMemory;
             self.store.pushScratchU32(return_type.toInt()) catch return error.OutOfMemory;
-            // Now store the param pairs
+            // Now store the param quads (name, type, is_ref, default_value)
             for (0..param_count) |i| {
-                self.store.pushScratchU32(params_temp[i * 2]) catch return error.OutOfMemory;
-                self.store.pushScratchU32(params_temp[i * 2 + 1]) catch return error.OutOfMemory;
+                self.store.pushScratchU32(params_temp[i * 4]) catch return error.OutOfMemory;
+                self.store.pushScratchU32(params_temp[i * 4 + 1]) catch return error.OutOfMemory;
+                self.store.pushScratchU32(params_temp[i * 4 + 2]) catch return error.OutOfMemory;
+                self.store.pushScratchU32(params_temp[i * 4 + 3]) catch return error.OutOfMemory;
             }
 
             method_count += 1;
@@ -1326,6 +1340,9 @@ pub const Parser = struct {
                 } else {
                     self.store.pushScratchU32(TypeIdx.null.toInt()) catch return error.OutOfMemory;
                 }
+
+                // Direction: in by default for lambdas
+                self.store.pushScratchU32(0) catch return error.OutOfMemory;
 
                 if (!self.match(&[_]TokenType{.comma})) break;
             }

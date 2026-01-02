@@ -141,6 +141,10 @@ pub const TokenType = enum {
     kw_out,
     kw_inout,
 
+    // Parameter optionality modifiers (DBL: optional by default for subroutines, required for class methods)
+    kw_req,
+    kw_opt,
+
     // Subroutine/function keywords
     kw_xcall,
     kw_xreturn,
@@ -272,6 +276,8 @@ pub const TokenType = enum {
             .kw_step,
             .kw_out,
             .kw_inout,
+            .kw_req,
+            .kw_opt,
             .kw_xcall,
             .kw_xreturn,
             .kw_call,

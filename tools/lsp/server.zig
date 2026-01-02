@@ -170,19 +170,66 @@ fn analyzeCot(allocator: Allocator, source: []const u8, diagnostics: *std.ArrayL
     var parser = cot.parser.Parser.init(allocator, tokens, &store, &strings);
     defer parser.deinit();
 
-    _ = parser.parse() catch {};
+    const top_level = parser.parse() catch {
+        // Collect parse errors
+        for (parser.errors.items) |err| {
+            const line: u32 = @intCast(if (err.line > 0) err.line - 1 else 0);
+            const col: u32 = @intCast(if (err.column > 0) err.column - 1 else 0);
+            try diagnostics.append(allocator, .{
+                .range = .{
+                    .start = .{ .line = line, .character = col },
+                    .end = .{ .line = line, .character = col + 10 },
+                },
+                .severity = .Error,
+                .message = err.message,
+            });
+        }
+        return;
+    };
+    defer allocator.free(top_level);
 
-    // Collect parse errors
-    for (parser.errors.items) |err| {
-        const line: u32 = @intCast(if (err.line > 0) err.line - 1 else 0);
-        const col: u32 = @intCast(if (err.column > 0) err.column - 1 else 0);
+    // Collect parse errors (multi-error collection)
+    if (parser.hasErrors()) {
+        for (parser.errors.items) |err| {
+            const line: u32 = @intCast(if (err.line > 0) err.line - 1 else 0);
+            const col: u32 = @intCast(if (err.column > 0) err.column - 1 else 0);
+            try diagnostics.append(allocator, .{
+                .range = .{
+                    .start = .{ .line = line, .character = col },
+                    .end = .{ .line = line, .character = col + 10 },
+                },
+                .severity = .Error,
+                .message = err.message,
+            });
+        }
+        return; // Don't run semantic analysis if there are parse errors
+    }
+
+    // Run semantic analysis to catch type errors, missing required params, etc.
+    const semantic_diags = cot.analyzeSemantics(allocator, &store, &strings, top_level) catch {
+        return; // Semantic analysis failed, just report parse results
+    };
+    defer {
+        for (semantic_diags) |diag| {
+            allocator.free(diag.message);
+        }
+        allocator.free(semantic_diags);
+    }
+
+    // Convert semantic diagnostics to LSP diagnostics
+    for (semantic_diags) |diag| {
+        const line: u32 = if (diag.line > 0) diag.line - 1 else 0;
+        const col: u32 = if (diag.column > 0) diag.column - 1 else 0;
         try diagnostics.append(allocator, .{
             .range = .{
                 .start = .{ .line = line, .character = col },
-                .end = .{ .line = line, .character = col + 10 },
+                .end = .{ .line = line, .character = col + 20 },
             },
-            .severity = .Error,
-            .message = err.message,
+            .severity = switch (diag.severity) {
+                .@"error" => .Error,
+                .warning => .Warning,
+            },
+            .message = try allocator.dupe(u8, diag.message),
         });
     }
 }
@@ -216,20 +263,68 @@ fn analyzeDbl(allocator: Allocator, source: []const u8, diagnostics: *std.ArrayL
     var parser = dbl.Parser.init(allocator, tokens, &store, &strings);
     defer parser.deinit();
 
-    _ = parser.parse() catch {};
+    const top_level = parser.parse() catch {
+        // Collect parse errors
+        for (parser.errors.items) |err| {
+            const line: u32 = @intCast(if (err.token.line > 0) err.token.line - 1 else 0);
+            const col: u32 = @intCast(if (err.token.column > 0) err.token.column - 1 else 0);
+            const len: u32 = @intCast(err.token.lexeme.len);
+            try diagnostics.append(allocator, .{
+                .range = .{
+                    .start = .{ .line = line, .character = col },
+                    .end = .{ .line = line, .character = col + len },
+                },
+                .severity = .Error,
+                .message = err.message,
+            });
+        }
+        return;
+    };
+    defer allocator.free(top_level);
 
-    // Collect parse errors
-    for (parser.errors.items) |err| {
-        const line: u32 = @intCast(if (err.token.line > 0) err.token.line - 1 else 0);
-        const col: u32 = @intCast(if (err.token.column > 0) err.token.column - 1 else 0);
-        const len: u32 = @intCast(err.token.lexeme.len);
+    // Collect parse errors (multi-error collection)
+    if (parser.errors.items.len > 0) {
+        for (parser.errors.items) |err| {
+            const line: u32 = @intCast(if (err.token.line > 0) err.token.line - 1 else 0);
+            const col: u32 = @intCast(if (err.token.column > 0) err.token.column - 1 else 0);
+            const len: u32 = @intCast(err.token.lexeme.len);
+            try diagnostics.append(allocator, .{
+                .range = .{
+                    .start = .{ .line = line, .character = col },
+                    .end = .{ .line = line, .character = col + len },
+                },
+                .severity = .Error,
+                .message = err.message,
+            });
+        }
+        return; // Don't run semantic analysis if there are parse errors
+    }
+
+    // Run semantic analysis to catch type errors, missing required params, etc.
+    const semantic_diags = cot.analyzeSemantics(allocator, &store, &strings, top_level) catch {
+        return; // Semantic analysis failed, just report parse results
+    };
+    defer {
+        for (semantic_diags) |diag| {
+            allocator.free(diag.message);
+        }
+        allocator.free(semantic_diags);
+    }
+
+    // Convert semantic diagnostics to LSP diagnostics
+    for (semantic_diags) |diag| {
+        const line: u32 = if (diag.line > 0) diag.line - 1 else 0;
+        const col: u32 = if (diag.column > 0) diag.column - 1 else 0;
         try diagnostics.append(allocator, .{
             .range = .{
                 .start = .{ .line = line, .character = col },
-                .end = .{ .line = line, .character = col + len },
+                .end = .{ .line = line, .character = col + 20 },
             },
-            .severity = .Error,
-            .message = err.message,
+            .severity = switch (diag.severity) {
+                .@"error" => .Error,
+                .warning => .Warning,
+            },
+            .message = try allocator.dupe(u8, diag.message),
         });
     }
 }

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const native = @import("native.zig");
+const debug = @import("../debug.zig");
 const NativeContext = native.NativeContext;
 const NativeError = native.NativeError;
 const NativeFn = native.NativeFn;
@@ -22,9 +23,59 @@ pub fn register(registry: anytype) !void {
 /// STRING - Convert to string
 pub fn string(ctx: *NativeContext) NativeError!?Value {
     const val = ctx.getArg(0) orelse return NativeError.InvalidArgument;
-    const str = val.asString();
-    const result = ctx.allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
-    return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
+
+    debug.print(.vm, "string(): input tag={s}", .{@tagName(val.tag())});
+
+    // Handle different value types
+    switch (val.tag()) {
+        .integer => {
+            // Format integer as string
+            var buf: [32]u8 = undefined;
+            const int_val = val.asInt();
+            const str = std.fmt.bufPrint(&buf, "{d}", .{int_val}) catch return NativeError.OutOfMemory;
+            const result = ctx.allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
+            return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
+        },
+        .decimal => {
+            // Format decimal as string
+            if (val.asDecimal()) |d| {
+                var buf: [64]u8 = undefined;
+                const precision = d.precision;
+                if (precision > 0) {
+                    // Format with decimal point
+                    const scale: u64 = std.math.powi(u64, 10, @intCast(precision)) catch 1;
+                    const abs_val: u64 = @abs(d.value);
+                    const int_part = @divTrunc(abs_val, scale);
+                    const frac_part = @mod(abs_val, scale);
+                    const sign: []const u8 = if (d.value < 0) "-" else "";
+                    const str = std.fmt.bufPrint(&buf, "{s}{d}.{d:0>[3]}", .{ sign, int_part, frac_part, precision }) catch return NativeError.OutOfMemory;
+                    const result = ctx.allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
+                    return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
+                } else {
+                    // Integer decimal
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{d.value}) catch return NativeError.OutOfMemory;
+                    const result = ctx.allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
+                    return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
+                }
+            }
+            return Value.initFixedString(ctx.allocator, ctx.allocator.dupe(u8, "0") catch return NativeError.OutOfMemory) catch return NativeError.OutOfMemory;
+        },
+        .boolean => {
+            const str = if (val.asBool()) "true" else "false";
+            const result = ctx.allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
+            return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
+        },
+        .fixed_string, .string => {
+            const str = val.asString();
+            const result = ctx.allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
+            return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
+        },
+        else => {
+            // Return empty string for unknown types
+            const result = ctx.allocator.dupe(u8, "") catch return NativeError.OutOfMemory;
+            return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
+        },
+    }
 }
 
 /// INTEGER - Convert to integer

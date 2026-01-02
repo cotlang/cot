@@ -252,6 +252,9 @@ pub const BytecodeEmitter = struct {
     // Current function being emitted (for label lookup)
     current_func: ?*const ir.Function,
 
+    // IR module being emitted (for looking up function signatures)
+    ir_module: ?*const ir.Module,
+
     // Register allocator for register-based bytecode
     reg_alloc: RegisterAllocator,
 
@@ -283,6 +286,7 @@ pub const BytecodeEmitter = struct {
             .value_consts = std.AutoHashMap(u32, u16).init(allocator),
             .current_routine_start = 0,
             .current_func = null,
+            .ir_module = null,
             .reg_alloc = RegisterAllocator.init(allocator),
         };
     }
@@ -306,6 +310,11 @@ pub const BytecodeEmitter = struct {
 
     /// Emit bytecode module from IR module
     pub fn emit(self: *Self, ir_module: *const ir.Module) EmitError!module.Module {
+        debug.print(.emit, "emit() called for module with {d} functions", .{ir_module.functions.items.len});
+
+        // Store IR module reference for looking up function signatures during emission
+        self.ir_module = ir_module;
+
         // Pre-pass: assign routine indices to all functions (for forward references)
         for (ir_module.functions.items, 0..) |func, i| {
             try self.function_indices.put(func.name, @intCast(i));
@@ -523,6 +532,18 @@ pub const BytecodeEmitter = struct {
             });
         }
 
+        // Build params array with ref info
+        var params_list: std.ArrayListUnmanaged(module.ParamDef) = .empty;
+        for (func.signature.params) |param| {
+            const param_name_idx = try self.addIdentifier(param.name);
+            try params_list.append(self.allocator, .{
+                .name_index = param_name_idx,
+                .data_type = irTypeToDataType(param.ty),
+                .mode = if (param.is_ref) .ref else .val,
+                .default_value = null,
+            });
+        }
+
         try self.routines.append(self.allocator, .{
             .name_index = name_idx,
             .flags = if (func.linkage == .external) module.RoutineFlags{ .is_public = true } else module.RoutineFlags{},
@@ -531,7 +552,7 @@ pub const BytecodeEmitter = struct {
             .param_count = @intCast(func.signature.params.len),
             .local_count = self.local_count,
             .max_stack = 0, // Register-based: stack not used
-            .params = &[_]module.ParamDef{}, // TODO: populate if needed
+            .params = try params_list.toOwnedSlice(self.allocator),
             .locals = try locals_list.toOwnedSlice(self.allocator),
         });
     }
@@ -644,7 +665,7 @@ pub const BytecodeEmitter = struct {
                     const is_global = (struct_slot & 0x8000) != 0;
                     try self.value_slots.put(fp.result.id, field_slot | (if (is_global) @as(u16, 0x8000) else 0));
                 } else {
-                    std.debug.print("[EMIT] WARNING: field_ptr struct_ptr.id={d} not in value_slots\n", .{fp.struct_ptr.id});
+                    debug.print(.emit, "WARNING: field_ptr struct_ptr.id={d} not in value_slots", .{fp.struct_ptr.id});
                 }
             },
 
@@ -772,8 +793,31 @@ pub const BytecodeEmitter = struct {
             .str_concat => |s| {
                 // Register-based: str_concat rd, rs1, rs2
                 // Format: [rd:4|rs1:4] [rs2:4|0]
+                //
+                // Important: If RHS is the last computed result in r0, we must move it
+                // to r1 before loading LHS into r0, otherwise LHS clobbers RHS.
+                debug.print(.emit, "str_concat: last_result_value={?d}, last_result_reg={d}, rhs.id={d}", .{
+                    self.last_result_value,
+                    self.last_result_reg,
+                    s.rhs.id,
+                });
+                var rs2: u4 = undefined;
+                if (self.last_result_value) |last_id| {
+                    if (last_id == s.rhs.id and self.last_result_reg == 0) {
+                        // RHS is in r0, move it to r1 before we load LHS into r0
+                        try self.emitOpcode(.mov);
+                        try self.emitU8((1 << 4) | 0); // mov r1, r0
+                        try self.emitU8(0);
+                        rs2 = 1;
+                        // Clear last_result since we moved it
+                        self.last_result_value = null;
+                    } else {
+                        rs2 = try self.getValueInReg(s.rhs, 1);
+                    }
+                } else {
+                    rs2 = try self.getValueInReg(s.rhs, 1);
+                }
                 const rs1 = try self.getValueInReg(s.lhs, 0);
-                const rs2 = try self.getValueInReg(s.rhs, 1);
                 const rd: u4 = 2;
                 try self.emitOpcode(.str_concat);
                 try self.emitU8((@as(u8, rd) << 4) | rs1);
@@ -961,7 +1005,10 @@ pub const BytecodeEmitter = struct {
                     try self.emitOpcode(.call_dynamic);
                     try self.emitU8(@intCast(c.args.len << 4));
                     try self.emitU16(name_idx);
-                    // Native functions return a value (result stays in r0)
+                    // Native functions return a value in r0 - track it if call has a result
+                    if (c.result) |result| {
+                        self.setLastResult(result.id, 0);
+                    }
                     return;
                 }
 
@@ -990,6 +1037,34 @@ pub const BytecodeEmitter = struct {
                     const argc: u8 = @intCast(c.args.len);
                     try self.emitU8(argc << 4); // argc in upper nibble
                     try self.emitU16(routine_idx);
+
+                    // Emit store-back for ref parameters
+                    if (self.ir_module) |ir_mod| {
+                        if (routine_idx < ir_mod.functions.items.len) {
+                            const callee_func = ir_mod.functions.items[routine_idx];
+                            for (callee_func.signature.params, 0..) |param, i| {
+                                if (param.is_ref and i < c.args.len) {
+                                    // Check if this arg has a known stack slot
+                                    if (self.value_slots.get(c.args[i].id)) |slot| {
+                                        // Emit store from register i back to stack slot
+                                        if (slot <= 255) {
+                                            try self.emitOpcode(.store_local);
+                                            try self.emitU8(@intCast(i)); // Source register
+                                            try self.emitU8(@intCast(slot)); // Destination slot (8-bit)
+                                        } else {
+                                            try self.emitOpcode(.store_local16);
+                                            try self.emitU8(@intCast(i)); // Source register
+                                            try self.emitU16(slot); // Destination slot (16-bit)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Track result in r0 for SSA value chaining
+                    if (c.result) |result| {
+                        self.setLastResult(result.id, 0);
+                    }
                 } else {
                     // Function not found - emit call_dynamic for runtime resolution
                     // Load arguments into registers r0, r1, r2, ...
@@ -1013,6 +1088,10 @@ pub const BytecodeEmitter = struct {
                     try self.emitOpcode(.call_dynamic);
                     try self.emitU8(@intCast(c.args.len << 4));
                     try self.emitU16(name_idx);
+                    // Track result in r0 for SSA value chaining
+                    if (c.result) |result| {
+                        self.setLastResult(result.id, 0);
+                    }
                 }
             },
 
@@ -1558,7 +1637,7 @@ pub const BytecodeEmitter = struct {
         }
 
         // Out of registers - need to spill (fall back to stack-based for now)
-        std.debug.print("[EMIT] ERROR: Out of registers for value.id={d}, free_regs=0x{x:0>4}\n", .{ value.id, self.reg_alloc.free_regs });
+        debug.print(.emit, "ERROR: Out of registers for value.id={d}, free_regs=0x{x:0>4}", .{ value.id, self.reg_alloc.free_regs });
         return EmitError.TooManyLocals;
     }
 

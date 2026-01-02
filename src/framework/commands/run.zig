@@ -403,7 +403,7 @@ fn runRegularBytecode(allocator: Allocator, bytes: []const u8) !void {
         _ = f.write("runRegularBytecode entered\n") catch {};
         f.close();
     } else |_| {}
-    std.debug.print("[RUN] Running regular bytecode ({d} bytes)\n", .{bytes.len});
+    debug.print(.general, "Running regular bytecode ({d} bytes)", .{bytes.len});
 
     // Initialize extension registry
     extension.initRegistry(allocator);
@@ -822,7 +822,7 @@ fn runBytecodeFileWithDeps(
 
 /// Run a bundled bytecode file
 fn runBundledFile(allocator: Allocator, bytes: []const u8) !void {
-    std.debug.print("[RUN] Running bundled file\n", .{});
+    debug.print(.general, "Running bundled file", .{});
     // Parse bundle header
     // Format: "CBUNDLE\0" (8 bytes) + version (1 byte) + module_count (4 bytes)
     if (bytes.len < 13) {

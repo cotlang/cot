@@ -93,6 +93,11 @@ pub const Parser = struct {
         return self.strings.intern(lower_str) catch return ParseError.OutOfMemory;
     }
 
+    /// Intern a string literal (preserves case)
+    fn internLiteral(self: *Self, str: []const u8) !base.StringId {
+        return self.strings.intern(str) catch return ParseError.OutOfMemory;
+    }
+
     /// Enter a nested context (expression, block, etc.)
     fn enterNesting(self: *Self) ParseError!void {
         if (self.nesting_depth >= MAX_NESTING_DEPTH) {
@@ -353,13 +358,30 @@ pub const Parser = struct {
 
         // Parse parameters until PROC
         // Format: param_name ,type
-        // Parameters are stored as [name_id, type_idx] pairs
+        // Parameters are stored as [name_id, type_idx, is_ref, default_value] quads
         var params: std.ArrayListUnmanaged(u32) = .{};
         errdefer params.deinit(self.allocator);
         var local_record_decls: std.ArrayListUnmanaged(StmtIdx) = .{};
         errdefer local_record_decls.deinit(self.allocator);
 
         while (!self.check(.kw_proc) and !self.check(.kw_endsubroutine) and !self.isAtEnd()) {
+            // Check for ref modifier (inout/out = ref, in = val)
+            // DBL subroutines default to ref (legacy inout behavior)
+            var is_ref: u32 = 1; // ref by default for subroutines
+            if (self.match(&[_]TokenType{.kw_inout})) {
+                is_ref = 1; // ref
+            } else if (self.match(&[_]TokenType{.kw_out})) {
+                is_ref = 1; // ref (out is also ref)
+            } else if (self.match(&[_]TokenType{.kw_in})) {
+                is_ref = 0; // val
+            }
+
+            // Check for required modifier (DBL subroutines are optional by default)
+            var is_required = false;
+            if (self.match(&[_]TokenType{.kw_req})) {
+                is_required = true;
+            }
+
             if (self.check(.identifier)) {
                 const param_name_tok = self.advance();
                 const param_name_id = try self.intern(param_name_tok.lexeme);
@@ -369,17 +391,62 @@ pub const Parser = struct {
 
                 // Parse type specifier
                 var param_type = TypeIdx.null;
+                var type_char: u8 = 'i'; // default to integer for type-based defaults
                 if (self.check(.identifier)) {
                     const type_tok = self.advance();
                     const type_result = self.parseDblTypeSpecWithInfo(type_tok.lexeme);
                     param_type = type_result.type_idx;
+                    // Get type character for default value generation
+                    if (type_tok.lexeme.len > 0) {
+                        type_char = type_tok.lexeme[0];
+                    }
                 } else {
                     param_type = self.store.addPrimitiveType(.i64) catch return ParseError.OutOfMemory;
                 }
 
-                // Add parameter as [name_id, type_idx] pair
+                // Check for trailing modifiers after type: ,req or ,opt
+                // This supports DBL syntax: param_name ,type ,req
+                // Save current position in case we need to backtrack
+                const saved_pos = self.current;
+                if (self.match(&[_]TokenType{.comma})) {
+                    if (self.match(&[_]TokenType{.kw_req})) {
+                        is_required = true;
+                    } else if (self.match(&[_]TokenType{.kw_opt})) {
+                        // is_required stays false (optional)
+                    } else {
+                        // Not a modifier, backtrack (it might be the next param)
+                        self.current = saved_pos;
+                    }
+                }
+
+                // Parse optional default value: = expr
+                // For DBL subroutines, params are optional by default (unless req specified)
+                var default_expr: u32 = 0; // 0 = no default (required)
+                if (self.match(&[_]TokenType{.equals})) {
+                    // Explicit default value
+                    const expr = try self.parseExpression();
+                    default_expr = expr.toInt();
+                } else if (!is_required) {
+                    // Optional without explicit default - generate type-based default
+                    // a (alpha) -> ""
+                    // d (decimal) -> 0
+                    // i (integer) -> 0
+                    const default_loc = self.currentLoc();
+                    if (type_char == 'a') {
+                        const empty_str = try self.internLiteral("");
+                        const str_expr = self.store.addStringLiteral(empty_str, default_loc) catch return ParseError.OutOfMemory;
+                        default_expr = str_expr.toInt();
+                    } else {
+                        const zero_expr = self.store.addIntLiteral(0, default_loc) catch return ParseError.OutOfMemory;
+                        default_expr = zero_expr.toInt();
+                    }
+                }
+
+                // Add parameter as [name_id, type_idx, is_ref, default_value] quad
                 params.append(self.allocator, @intFromEnum(param_name_id)) catch return ParseError.OutOfMemory;
                 params.append(self.allocator, param_type.toInt()) catch return ParseError.OutOfMemory;
+                params.append(self.allocator, is_ref) catch return ParseError.OutOfMemory;
+                params.append(self.allocator, default_expr) catch return ParseError.OutOfMemory;
             } else if (self.check(.kw_record)) {
                 // Handle inline record block for local variables
                 const record_block = try self.parseRecord();
@@ -1455,12 +1522,12 @@ pub const Parser = struct {
             },
             .string_literal => {
                 _ = self.advance();
-                // Remove quotes
+                // Remove quotes (preserve case for string literals)
                 const content = if (token.lexeme.len >= 2)
                     token.lexeme[1 .. token.lexeme.len - 1]
                 else
                     token.lexeme;
-                const str_id = try self.intern(content);
+                const str_id = try self.internLiteral(content);
                 return self.store.addStringLiteral(str_id, loc) catch return ParseError.OutOfMemory;
             },
             .kw_true => {
@@ -1559,6 +1626,13 @@ pub const Parser = struct {
             return Token{ .type = .eof, .lexeme = "", .line = 0, .column = 0 };
         }
         return self.tokens[self.current];
+    }
+
+    fn peekNext(self: *Self) Token {
+        if (self.current + 1 >= self.tokens.len) {
+            return Token{ .type = .eof, .lexeme = "", .line = 0, .column = 0 };
+        }
+        return self.tokens[self.current + 1];
     }
 
     fn previous(self: *Self) Token {

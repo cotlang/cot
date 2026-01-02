@@ -106,6 +106,10 @@ pub const Lowerer = struct {
     /// Counter for generating unique lambda names
     lambda_counter: u32,
 
+    /// Function parameter defaults (function name -> list of default ExprIdx per param)
+    /// If ExprIdx is null (0), the param is required
+    fn_param_defaults: std.StringHashMap([]const u32),
+
     /// Trait definitions (trait name -> TraitDef)
     trait_defs: std.StringHashMap(TraitDef),
 
@@ -201,6 +205,7 @@ pub const Lowerer = struct {
             .warnings = .{},
             .last_error = null,
             .lambda_counter = 0,
+            .fn_param_defaults = std.StringHashMap([]const u32).init(allocator),
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
             .impl_methods = ImplMethodsMap.init(allocator),
         };
@@ -262,6 +267,13 @@ pub const Lowerer = struct {
         self.trait_defs.deinit();
         self.impl_methods.deinit();
 
+        // Free function param defaults slices
+        var defaults_iter = self.fn_param_defaults.valueIterator();
+        while (defaults_iter.next()) |defaults| {
+            self.allocator.free(defaults.*);
+        }
+        self.fn_param_defaults.deinit();
+
         // NOTE: allocated_types ownership was transferred to the Module in lowerProgram.
         // No cleanup needed here.
 
@@ -316,7 +328,16 @@ pub const Lowerer = struct {
             }
         }
 
-        // Fifth pass: collect function definitions
+        // Fifth pass: collect function SIGNATURES (params/defaults only, no body)
+        // This must happen before body lowering so call sites can use defaults
+        for (top_level) |stmt_idx| {
+            const tag = self.store.stmtTag(stmt_idx);
+            if (tag == .fn_def) {
+                try self.collectFnSignature(stmt_idx);
+            }
+        }
+
+        // Sixth pass: lower function BODIES
         for (top_level) |stmt_idx| {
             const tag = self.store.stmtTag(stmt_idx);
             if (tag == .fn_def) {
@@ -668,6 +689,38 @@ pub const Lowerer = struct {
         return null;
     }
 
+    /// Collect function signature (params and defaults only, no body lowering)
+    /// This runs in an earlier pass so defaults are available at call sites
+    fn collectFnSignature(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const name_id = data.getName();
+        const name = self.strings.get(name_id);
+        if (name.len == 0) return LowerError.UndefinedVariable;
+
+        // Parse extra data: [param_count, param1_name, param1_type, param1_is_ref, param1_default, ..., return_type, body]
+        const extra_start = data.getParamsStart();
+        const param_count = self.store.getExtra(extra_start);
+
+        // Collect default expressions for each parameter
+        var param_defaults: std.ArrayListUnmanaged(u32) = .{};
+        defer param_defaults.deinit(self.allocator);
+
+        var extra_idx = extra_start.toInt() + 1;
+        for (0..param_count) |_| {
+            // Skip name, type, is_ref; just collect default
+            const default_expr_raw: u32 = self.store.extra_data.items[extra_idx + 3];
+            extra_idx += 4; // 4 values per param
+
+            param_defaults.append(self.allocator, default_expr_raw) catch return LowerError.OutOfMemory;
+        }
+
+        // Store param defaults for this function (for call-site defaulting)
+        if (param_count > 0) {
+            const defaults_slice = param_defaults.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory;
+            self.fn_param_defaults.put(name, defaults_slice) catch return LowerError.OutOfMemory;
+        }
+    }
+
     /// Check if a type implements a trait
     pub fn implementsTrait(self: *Self, type_name: []const u8, trait_name: []const u8) bool {
         const key = ImplKey{
@@ -697,16 +750,21 @@ pub const Lowerer = struct {
         for (0..param_count) |_| {
             const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
             const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
-            extra_idx += 2;
+            const param_direction_raw: u32 = self.store.extra_data.items[extra_idx + 2];
+            // default_expr at [extra_idx + 3] already collected in collectFnSignature
+            extra_idx += 4; // 4 values per param: name, type, is_ref, default_value
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
             const param_type = try self.lowerTypeIdx(param_type_idx);
 
+            // is_ref: 0 = by value, non-zero = by reference
+            const is_ref = param_direction_raw != 0;
+
             try params.append(self.allocator, .{
                 .name = param_name,
                 .ty = param_type,
-                .direction = .in,
+                .is_ref = is_ref,
             });
         }
 
@@ -1709,7 +1767,7 @@ pub const Lowerer = struct {
             .bool_literal => return self.lowerBoolLiteral(func, data),
             .null_literal => return self.lowerNullLiteral(func),
             .identifier => return self.lowerIdentifier(func, data),
-            .binary => return self.lowerBinary(func, data),
+            .binary => return self.lowerBinary(func, data, expr_idx),
             .unary => return self.lowerUnary(func, data, expr_idx),
             .grouping => return self.lowerExpression(@enumFromInt(data.a)),
             .call => return self.lowerCall(expr_idx),
@@ -1834,7 +1892,7 @@ pub const Lowerer = struct {
     }
 
     /// Lower a binary expression
-    fn lowerBinary(self: *Self, func: *ir.Function, data: NodeData) LowerError!ir.Value {
+    fn lowerBinary(self: *Self, func: *ir.Function, data: NodeData, expr_idx: ExprIdx) LowerError!ir.Value {
         const lhs_idx = data.getLhs();
         const rhs_idx = data.getRhs();
         const op = data.getBinaryOp();
@@ -1856,10 +1914,51 @@ pub const Lowerer = struct {
         const result = func.newValue(result_ty);
 
         const ir_op: ir.Instruction = switch (op) {
-            .add => if (lhs.ty == .string or lhs.ty == .string_fixed)
-                .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result } }
-            else
-                .{ .iadd = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .add => blk: {
+                const lhs_is_string = (lhs.ty == .string or lhs.ty == .string_fixed);
+                const rhs_is_string = (rhs.ty == .string or rhs.ty == .string_fixed);
+
+                debug.print(.ir, "binary add: lhs.ty={s} rhs.ty={s} lhs_is_string={} rhs_is_string={}", .{
+                    @tagName(lhs.ty),
+                    @tagName(rhs.ty),
+                    lhs_is_string,
+                    rhs_is_string,
+                });
+
+                if (lhs_is_string and !rhs_is_string) {
+                    // DBL: Cannot concatenate alpha with decimal/integer without cast
+                    const loc = self.store.exprLoc(expr_idx);
+                    self.setErrorContext(
+                        LowerError.TypeMismatch,
+                        "cannot concatenate string with non-string type (use %string() to convert)",
+                        .{},
+                        loc,
+                        "evaluating '+' expression",
+                        .{},
+                    );
+                    return LowerError.TypeMismatch;
+                }
+                if (!lhs_is_string and rhs_is_string) {
+                    const loc = self.store.exprLoc(expr_idx);
+                    self.setErrorContext(
+                        LowerError.TypeMismatch,
+                        "cannot add non-string to string type",
+                        .{},
+                        loc,
+                        "evaluating '+' expression",
+                        .{},
+                    );
+                    return LowerError.TypeMismatch;
+                }
+
+                const is_concat = lhs_is_string;
+                debug.print(.ir, "binary add decision: {s}", .{if (is_concat) "str_concat" else "iadd"});
+
+                break :blk if (is_concat)
+                    .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result } }
+                else
+                    .{ .iadd = .{ .lhs = lhs, .rhs = rhs, .result = result } };
+            },
             .sub => .{ .isub = .{ .lhs = lhs, .rhs = rhs, .result = result } },
             .mul => .{ .imul = .{ .lhs = lhs, .rhs = rhs, .result = result } },
             .div => .{ .sdiv = .{ .lhs = lhs, .rhs = rhs, .result = result } },
@@ -1990,6 +2089,37 @@ pub const Lowerer = struct {
             } else {
                 const arg_val = try self.lowerExpression(arg_idx);
                 try args.append(self.allocator, arg_val);
+            }
+        }
+
+        // Check if we need to fill in default values for missing arguments
+        if (self.fn_param_defaults.get(callee_name)) |defaults| {
+            const provided_args = args.items.len;
+            const total_params = defaults.len;
+
+            // If fewer args provided than params, fill in defaults
+            if (provided_args < total_params) {
+                for (provided_args..total_params) |i| {
+                    const default_expr_raw = defaults[i];
+                    if (default_expr_raw != 0) {
+                        // Lower the default expression
+                        const default_expr_idx: ExprIdx = @enumFromInt(default_expr_raw);
+                        const default_val = try self.lowerExpression(default_expr_idx);
+                        args.append(self.allocator, default_val) catch return LowerError.OutOfMemory;
+                    } else {
+                        // Required param missing - compile-time error
+                        const loc = self.store.exprLoc(expr_idx);
+                        self.setErrorContext(
+                            LowerError.MissingRequiredParam,
+                            "missing required parameter {d} in call to '{s}'",
+                            .{ i + 1, callee_name },
+                            loc,
+                            "checking function call arguments",
+                            .{},
+                        );
+                        return LowerError.MissingRequiredParam;
+                    }
+                }
             }
         }
 
@@ -2239,7 +2369,9 @@ pub const Lowerer = struct {
         for (0..param_count) |_| {
             const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
             const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
-            extra_idx += 2;
+            const param_direction_raw: u32 = self.store.extra_data.items[extra_idx + 2];
+            const default_expr_raw: u32 = self.store.extra_data.items[extra_idx + 3];
+            extra_idx += 4; // 4 values per param: name, type, is_ref, default_value
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
@@ -2250,10 +2382,16 @@ pub const Lowerer = struct {
             else
                 ir.Type.void;
 
+            // is_ref: 0 = by value, non-zero = by reference
+            const is_ref = param_direction_raw != 0;
+
+            // default_value: handled at call time
+            _ = default_expr_raw;
+
             params.append(self.allocator, .{
                 .name = param_name,
                 .ty = param_type,
-                .direction = .in,
+                .is_ref = is_ref,
             }) catch return LowerError.OutOfMemory;
         }
 
@@ -2576,6 +2714,57 @@ pub fn lowerWithOptions(
     return module;
 }
 
+/// Semantic diagnostic information for LSP
+pub const SemanticDiagnostic = struct {
+    line: u32,
+    column: u32,
+    message: []const u8,
+    severity: enum { @"error", warning },
+};
+
+/// Analyze source for semantic errors without completing lowering
+/// Returns a list of diagnostics (errors and warnings) that can be used by LSP
+pub fn analyzeSemantics(
+    allocator: Allocator,
+    store: *const NodeStore,
+    strings: *const StringInterner,
+    top_level: []const StmtIdx,
+) ![]SemanticDiagnostic {
+    var diagnostics: std.ArrayListUnmanaged(SemanticDiagnostic) = .empty;
+    errdefer diagnostics.deinit(allocator);
+
+    var lowerer = Lowerer.init(allocator, store, strings, "analysis") catch {
+        // Allocation error - return empty diagnostics
+        return diagnostics.toOwnedSlice(allocator);
+    };
+    defer lowerer.deinit();
+
+    // Try to lower - if it fails, capture the error
+    _ = lowerer.lowerProgram(top_level) catch {
+        // Capture the error context as a diagnostic
+        if (lowerer.getLastError()) |ctx| {
+            try diagnostics.append(allocator, .{
+                .line = ctx.line,
+                .column = ctx.column,
+                .message = try allocator.dupe(u8, ctx.message),
+                .severity = .@"error",
+            });
+        }
+    };
+
+    // Add any warnings
+    for (lowerer.getWarnings()) |warning| {
+        try diagnostics.append(allocator, .{
+            .line = warning.line,
+            .column = warning.column,
+            .message = try allocator.dupe(u8, warning.message),
+            .severity = .warning,
+        });
+    }
+
+    return diagnostics.toOwnedSlice(allocator);
+}
+
 // ============================================
 // Inline Tests (Ghostty pattern)
 // ============================================
@@ -2594,7 +2783,7 @@ test "lower: Lowerer initialization" {
 
     // Create lowerer
     var lowerer = Lowerer.init(allocator, &store, &interner, null) catch |err| {
-        std.debug.print("Lowerer init failed: {any}\n", .{err});
+        debug.print(.ir, "Lowerer init failed: {any}", .{err});
         return err;
     };
     defer lowerer.deinit();

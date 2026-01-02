@@ -21,6 +21,7 @@ pub const LowerError = error{
     UnsupportedFeature,
     UnknownFunction,
     VerificationFailed,
+    MissingRequiredParam,
 };
 
 /// Generic type definition - stores info needed to instantiate a generic type

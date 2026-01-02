@@ -555,6 +555,10 @@ pub const Lexer = struct {
         .{ "out", .kw_out },
         .{ "inout", .kw_inout },
 
+        // Parameter optionality modifiers
+        .{ "req", .kw_req },
+        .{ "opt", .kw_opt },
+
         // Subroutine/function
         .{ "xcall", .kw_xcall },
         .{ "xreturn", .kw_xreturn },

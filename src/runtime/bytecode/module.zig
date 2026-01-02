@@ -214,11 +214,10 @@ pub const RoutineFlags = packed struct(u16) {
     _reserved: u11 = 0,
 };
 
-/// Parameter pass mode
+/// Parameter pass mode: by value or by reference
 pub const ParamMode = enum(u8) {
-    in = 0,
-    out = 1,
-    inout = 2,
+    val = 0,  // by value (default for Cot, DBL class methods)
+    ref = 1,  // by reference (default for DBL subroutines/functions)
 };
 
 /// Parameter definition
@@ -424,7 +423,15 @@ pub const Module = struct {
             try writer.writeInt(u16, routine.param_count, .little);
             try writer.writeInt(u16, routine.local_count, .little);
             try writer.writeInt(u16, routine.max_stack, .little);
-            // Skip params for now (not used in current implementation)
+
+            // Write params (including mode for ref parameter handling)
+            try writer.writeInt(u16, @intCast(routine.params.len), .little);
+            for (routine.params) |param| {
+                try writer.writeInt(u16, param.name_index, .little);
+                try writer.writeByte(@intFromEnum(param.data_type));
+                try writer.writeByte(@intFromEnum(param.mode));
+                try writer.writeInt(u16, param.default_value orelse 0xFFFF, .little);
+            }
 
             // Write locals debug info
             try writer.writeInt(u16, @intCast(routine.locals.len), .little);
@@ -513,7 +520,21 @@ pub const Module = struct {
                 module.routines[i].param_count = try reader.readInt(u16, .little);
                 module.routines[i].local_count = try reader.readInt(u16, .little);
                 module.routines[i].max_stack = try reader.readInt(u16, .little);
-                module.routines[i].params = &[_]ParamDef{};
+
+                // Read params (including mode for ref parameter handling)
+                const params_count = try reader.readInt(u16, .little);
+                if (params_count > 0) {
+                    module.routines[i].params = try allocator.alloc(ParamDef, params_count);
+                    for (0..params_count) |j| {
+                        module.routines[i].params[j].name_index = try reader.readInt(u16, .little);
+                        module.routines[i].params[j].data_type = @enumFromInt(try reader.readByte());
+                        module.routines[i].params[j].mode = @enumFromInt(try reader.readByte());
+                        const default_val = try reader.readInt(u16, .little);
+                        module.routines[i].params[j].default_value = if (default_val == 0xFFFF) null else default_val;
+                    }
+                } else {
+                    module.routines[i].params = &[_]ParamDef{};
+                }
 
                 // Read locals debug info
                 const locals_count = try reader.readInt(u16, .little);

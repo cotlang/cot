@@ -391,9 +391,14 @@ pub const LoopStmtView = struct {
 };
 
 /// Parameter info stored in extra_data
+/// is_ref: false = by value (default for Cot, DBL class methods)
+///         true = by reference (default for DBL subroutines/functions)
+/// default_value: optional default value expression (null if required)
 pub const ParamInfo = struct {
     name: StringId,
     type_idx: TypeIdx,
+    is_ref: bool = false,
+    default_value: ExprIdx = ExprIdx.null,
 };
 
 /// View for function definition
@@ -409,8 +414,8 @@ pub const FnDefView = struct {
         const data = store.stmtData(idx);
         const params_start = ExtraIdx.fromInt(data.b);
         const param_count = store.extra_data.items[params_start.toInt()];
-        // return_type and body are after params
-        const after_params = params_start.toInt() + 1 + param_count * 2;
+        // return_type and body are after params (4 values per param: name, type, is_ref, default_value)
+        const after_params = params_start.toInt() + 1 + param_count * 4;
         return .{
             .name = data.getName(),
             .params_start = params_start,
@@ -421,12 +426,16 @@ pub const FnDefView = struct {
         };
     }
 
-    /// Get parameter at index
+    /// Get parameter at index (4 values per param: name, type, is_ref, default_value)
     pub fn getParam(self: FnDefView, store: *const NodeStore, param_idx: u32) ParamInfo {
-        const base_idx = self.params_start.toInt() + 1 + param_idx * 2;
+        const base_idx = self.params_start.toInt() + 1 + param_idx * 4;
+        const is_ref_raw = store.extra_data.items[base_idx + 2];
+        const default_raw = store.extra_data.items[base_idx + 3];
         return .{
             .name = @enumFromInt(store.extra_data.items[base_idx]),
             .type_idx = TypeIdx.fromInt(store.extra_data.items[base_idx + 1]),
+            .is_ref = is_ref_raw != 0,
+            .default_value = ExprIdx.fromInt(default_raw),
         };
     }
 
@@ -615,10 +624,10 @@ test "FnDefView" {
 
     const i32_type = try store.addPrimitiveType(.i32);
 
-    // Params: [name, type, name, type]
+    // Params: [name, type, is_ref, default_value, name, type, is_ref, default_value]
     const params = [_]u32{
-        @intFromEnum(param_a), i32_type.toInt(),
-        @intFromEnum(param_b), i32_type.toInt(),
+        @intFromEnum(param_a), i32_type.toInt(), 0, 0, // val, no default
+        @intFromEnum(param_b), i32_type.toInt(), 0, 0, // val, no default
     };
 
     const body_expr = try store.addIntLiteral(0, SourceLoc.zero);

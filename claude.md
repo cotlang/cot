@@ -30,3 +30,20 @@ Every issue must be analyzed to find the **root cause** and the **best fix** mus
 
 ### Why This Matters:
 Bugs that are bypassed rather than fixed accumulate as technical debt. They become harder to find later, cause cascading issues, and erode code quality. For this project to succeed, every bug must be addressed at its source.
+
+## Zig 0.15 API Notes
+
+This project uses Zig 0.15. Be aware of these API changes from older Zig versions:
+
+### ArrayList API Changes
+- **Don't use**: `std.ArrayList(T).init(allocator)` - this is the OLD API
+- **Use instead**: `std.ArrayListUnmanaged(T)` with `.empty` initialization:
+  ```zig
+  var list: std.ArrayListUnmanaged(T) = .empty;
+  errdefer list.deinit(allocator);
+
+  try list.append(allocator, item);
+  return list.toOwnedSlice(allocator);
+  ```
+- ArrayListUnmanaged methods require explicit allocator parameter: `append(allocator, item)`, `toOwnedSlice(allocator)`
+- Use `errdefer list.deinit(allocator)` for proper cleanup on error paths

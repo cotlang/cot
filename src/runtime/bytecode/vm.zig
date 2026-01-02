@@ -455,6 +455,7 @@ pub const VM = struct {
     }
 
     /// Print last error to stderr (convenience function)
+    /// Note: This is user-facing output, so it always prints (not debug-mode dependent)
     pub fn printLastError() void {
         if (last_error) |err| {
             std.debug.print(
@@ -1130,9 +1131,19 @@ pub const VM = struct {
 
     /// ret - return from subroutine
     fn op_ret(self: *Self, module: *const Module) VMError!DispatchResult {
-        _ = module;
         self.ip += 2;
         if (self.call_stack.pop()) |frame| {
+            // Copy back ref parameters to caller's registers
+            const routine = module.routines[frame.routine_index];
+            for (routine.params, 0..) |param, i| {
+                if (param.mode == .ref) {
+                    // Copy value from callee's stack slot back to caller's register
+                    const val = self.stack[self.fp + i];
+                    debug.print(.vm, "ret: copy ref param[{d}] '{s}' -> r{d}", .{ i, val.asString(), i });
+                    self.registers[i] = val;
+                }
+            }
+
             self.sp = frame.stack_pointer;
             self.fp = frame.base_pointer;
             self.ip = frame.return_ip;
@@ -1153,6 +1164,15 @@ pub const VM = struct {
         self.registers[15] = self.registers[rs];
 
         if (self.call_stack.pop()) |frame| {
+            // Copy back ref parameters to caller's registers
+            const routine = module.routines[frame.routine_index];
+            for (routine.params, 0..) |param, i| {
+                if (param.mode == .ref) {
+                    // Copy value from callee's stack slot back to caller's register
+                    self.registers[i] = self.stack[self.fp + i];
+                }
+            }
+
             self.sp = frame.stack_pointer;
             self.fp = frame.base_pointer;
             self.ip = frame.return_ip;
@@ -1242,10 +1262,14 @@ pub const VM = struct {
         const s1 = self.registers[rs1].asString();
         const s2 = self.registers[rs2].asString();
 
+        debug.print(.vm, "str_concat: r{d} = r{d}('{s}') + r{d}('{s}')", .{ rd, rs1, s1, rs2, s2 });
+
         // Concatenate strings
         const result = self.allocator.alloc(u8, s1.len + s2.len) catch return VMError.OutOfMemory;
         @memcpy(result[0..s1.len], s1);
         @memcpy(result[s1.len..], s2);
+
+        debug.print(.vm, "str_concat result: '{s}' (len={d})", .{ result, result.len });
 
         // Store result as string value
         self.registers[rd] = Value.initString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
@@ -2054,7 +2078,7 @@ pub const VM = struct {
 
         // Not found in module, try external native function registry
         const def = self.native_registry.lookup(routine_name) orelse {
-            std.debug.print("NATIVE {s} failed: function not found\n", .{routine_name});
+            debug.print(.vm, "NATIVE {s} failed: function not found", .{routine_name});
             return VMError.InvalidOpcode;
         };
 
@@ -2062,7 +2086,7 @@ pub const VM = struct {
             .bytecode => {
                 // Get the external bytecode module
                 const ext_module = self.native_registry.getLoadedModule(def.module_index.?) orelse {
-                    std.debug.print("NATIVE {s} failed: module not found\n", .{routine_name});
+                    debug.print(.vm, "NATIVE {s} failed: module not found", .{routine_name});
                     return VMError.InvalidOpcode;
                 };
 
@@ -2122,9 +2146,10 @@ pub const VM = struct {
                 };
 
                 // Handle native function return values:
-                // Store in shadow area for load_stack_offset to retrieve
+                // Store in r0 for bytecode to use (matches emitter expectation)
                 if (result) |res| {
-                    self.stack[self.sp] = res;
+                    self.registers[0] = res;
+                    debug.print(.vm, "NATIVE return: r0 = '{s}'", .{res.asString()});
                 }
             },
         }

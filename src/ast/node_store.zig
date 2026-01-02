@@ -691,10 +691,11 @@ pub const NodeStore = struct {
     }
 
     /// Add a function definition
+    /// params format: [name, type, is_ref, default_value, ...] (4 values per param)
     pub fn addFnDef(self: *Self, name: StringId, params: []const u32, return_type: TypeIdx, body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        // Store params as: [count, param1_name, param1_type, param2_name, param2_type, ...]
+        // Store params as: [count, param1_name, param1_type, param1_is_ref, param1_default, ...]
         const params_start: ExtraIdx = @enumFromInt(@as(u32, @intCast(self.extra_data.items.len)));
-        try self.extra_data.append(self.allocator, @intCast(params.len / 2)); // param count
+        try self.extra_data.append(self.allocator, @intCast(params.len / 4)); // param count (4 values per param)
         for (params) |p| {
             try self.extra_data.append(self.allocator, p);
         }

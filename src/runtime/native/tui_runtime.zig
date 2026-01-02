@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tui = @import("tui");
+const debug = @import("../debug.zig");
 
 // ============================================================================
 // Error Types - Proper error handling for debugging
@@ -179,7 +180,7 @@ pub fn init(allocator: std.mem.Allocator) void {
     // This prevents panics in the TUI library when running without a terminal
     const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
     if (!stdin_file.isTty()) {
-        std.debug.print("[TUI] No TTY detected, running in no-op mode\n", .{});
+        debug.print(.vm, "TUI: No TTY detected, running in no-op mode", .{});
         state.initialized = true;
         global_tui = state;
         return;
@@ -188,7 +189,7 @@ pub fn init(allocator: std.mem.Allocator) void {
     // Additional defensive check: verify stdout is also a TTY
     const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
     if (!stdout_file.isTty()) {
-        std.debug.print("[TUI] stdout is not a TTY, running in no-op mode\n", .{});
+        debug.print(.vm, "TUI: stdout is not a TTY, running in no-op mode", .{});
         state.initialized = true;
         global_tui = state;
         return;
@@ -206,7 +207,7 @@ pub fn init(allocator: std.mem.Allocator) void {
         .enable_paste = false,
         .enable_focus = false,
     }) catch |err| blk: {
-        std.debug.print("[TUI] Terminal init failed: {}, running in no-op mode\n", .{err});
+        debug.print(.vm, "TUI: Terminal init failed: {}, running in no-op mode", .{err});
         break :blk null;
     };
 

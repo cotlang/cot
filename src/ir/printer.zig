@@ -111,11 +111,9 @@ pub const Printer = struct {
         for (func.signature.params, 0..) |param, i| {
             if (i > 0) try self.writer.writeAll(", ");
 
-            // Direction
-            switch (param.direction) {
-                .in => {},
-                .out => try self.writer.writeAll("out "),
-                .inout => try self.writer.writeAll("inout "),
+            // Show ref modifier if by reference
+            if (param.is_ref) {
+                try self.writer.writeAll("ref ");
             }
 
             try self.writer.print("%{s}: ", .{param.name});

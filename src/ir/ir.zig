@@ -196,13 +196,8 @@ pub const FunctionType = struct {
     pub const Param = struct {
         name: []const u8,
         ty: Type,
-        direction: ParamDirection,
-    };
-
-    pub const ParamDirection = enum {
-        in, // Input only (read)
-        out, // Output only (write)
-        inout, // Both input and output
+        is_ref: bool, // by value (false) or by reference (true)
+        default_value: ?Value = null, // optional default value for optional params
     };
 };
 
