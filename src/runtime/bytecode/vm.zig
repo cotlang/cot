@@ -54,6 +54,9 @@ const ExtensionManager = extension_manager.ExtensionManager;
 const ExtensionContext = extension_manager.ExtensionContext;
 const Extension = extension_manager.Extension;
 
+// Extracted opcode handlers
+const vm_opcodes = @import("vm_opcodes.zig");
+
 /// Maximum stack size
 const STACK_SIZE = 4096;
 
@@ -224,6 +227,18 @@ pub const VM = struct {
         self.jit_profiler.report(std.io.getStdErr().writer()) catch {};
     }
 
+    /// Check if JIT profiling is enabled (for extracted opcode handlers)
+    pub fn jitProfilingEnabled(self: *Self) bool {
+        _ = self;
+        return jit_profiling_enabled;
+    }
+
+    /// Record a JIT call (for extracted opcode handlers)
+    pub fn recordJITCall(self: *Self, module_idx: u16, routine_idx: u16) ?CompilationTier {
+        if (!jit_profiling_enabled) return null;
+        return self.jit_profiler.recordCall(module_idx, routine_idx);
+    }
+
     /// Initialize the unified channel manager for text + ISAM I/O
     pub fn initChannels(self: *Self) !void {
         if (self.channel_manager != null) return; // Already initialized
@@ -325,12 +340,12 @@ pub const VM = struct {
 
     /// Create a rich error with full context and return the VMError
     /// This should be used instead of bare `return VMError.X` to capture context
-    fn fail(self: *Self, err: VMError, message: []const u8) VMError {
+    pub fn fail(self: *Self, err: VMError, message: []const u8) VMError {
         return self.failWithDetail(err, message, null);
     }
 
     /// Create a rich error with full context and additional detail
-    fn failWithDetail(self: *Self, err: VMError, message: []const u8, detail: ?[]const u8) VMError {
+    pub fn failWithDetail(self: *Self, err: VMError, message: []const u8, detail: ?[]const u8) VMError {
         const loc = self.getLocation();
         last_error = RuntimeError{
             .kind = err,
@@ -680,667 +695,12 @@ pub const VM = struct {
     }
 
     // ============================================
-    // Opcode Handler Functions (Computed Goto Dispatch)
+    // String Helper Functions
     // ============================================
-
-    /// Handler for invalid/unimplemented opcodes
-    fn op_invalid(self: *Self, module: *const Module) VMError!DispatchResult {
-        _ = module;
-        return self.fail(VMError.InvalidOpcode, "Invalid or unimplemented opcode");
-    }
-
-    /// nop - no operation
-    fn op_nop(self: *Self, module: *const Module) VMError!DispatchResult {
-        _ = self;
-        _ = module;
-        return .continue_dispatch;
-    }
-
-    /// halt - stop execution
-    fn op_halt(self: *Self, module: *const Module) VMError!DispatchResult {
-        _ = self;
-        _ = module;
-        return .halt;
-    }
-
-    /// mov rd, rs - register move
-    fn op_mov(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-        self.registers[rd] = self.registers[rs];
-        return .continue_dispatch;
-    }
-
-    /// movi rd, imm8 - move immediate
-    fn op_movi(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const imm: i8 = @bitCast(module.code[self.ip + 1]);
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.initInt(imm);
-        return .continue_dispatch;
-    }
-
-    /// movi16 rd, imm16 - move 16-bit immediate
-    fn op_movi16(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const imm: i16 = @bitCast(std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little));
-        self.ip += 3;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.initInt(imm);
-        return .continue_dispatch;
-    }
-
-    /// movi32 rd, imm32 - move 32-bit immediate
-    fn op_movi32(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const imm: i32 = @bitCast(std.mem.readInt(u32, module.code[self.ip + 1 ..][0..4], .little));
-        self.ip += 5;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.initInt(imm);
-        return .continue_dispatch;
-    }
-
-    /// load_const rd, idx - load constant
-    fn op_load_const(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const idx = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-        const rd: u4 = @truncate(ops >> 4);
-        if (idx >= module.constants.len) {
-            return self.fail(VMError.InvalidConstant, "Constant index out of bounds");
-        }
-        self.registers[rd] = self.constantToValue(module.constants[idx]);
-        return .continue_dispatch;
-    }
-
-    /// load_null rd - load null
-    fn op_load_null(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.null_val;
-        return .continue_dispatch;
-    }
-
-    /// load_true rd - load true
-    fn op_load_true(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.true_val;
-        return .continue_dispatch;
-    }
-
-    /// load_false rd - load false
-    fn op_load_false(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.false_val;
-        return .continue_dispatch;
-    }
-
-    /// load_local rd, slot - load from local variable
-    fn op_load_local(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const slot = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = self.stack[self.fp + slot];
-        return .continue_dispatch;
-    }
-
-    /// store_local rs, slot - store to local variable
-    fn op_store_local(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const slot = module.code[self.ip + 1];
-        self.ip += 2;
-        const rs: u4 = @truncate(ops >> 4);
-        self.stack[self.fp + slot] = self.registers[rs];
-        return .continue_dispatch;
-    }
-
-    /// load_local16 rd, slot16 - load from local (wide)
-    fn op_load_local16(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const slot = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = self.stack[self.fp + slot];
-        return .continue_dispatch;
-    }
-
-    /// store_local16 rs, slot16 - store to local (wide)
-    fn op_store_local16(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const slot = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-        const rs: u4 = @truncate(ops >> 4);
-        self.stack[self.fp + slot] = self.registers[rs];
-        return .continue_dispatch;
-    }
-
-    /// load_global rd, idx - load global variable
-    fn op_load_global(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const idx = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-        const rd: u4 = @truncate(ops >> 4);
-        if (idx >= self.globals.items.len) {
-            self.registers[rd] = Value.null_val;
-        } else {
-            self.registers[rd] = self.globals.items[idx];
-        }
-        return .continue_dispatch;
-    }
-
-    /// store_global rs, idx - store global variable
-    fn op_store_global(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const idx = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-        const rs: u4 = @truncate(ops >> 4);
-        while (self.globals.items.len <= idx) {
-            self.globals.append(self.allocator, Value.null_val) catch
-                return self.fail(VMError.OutOfMemory, "Failed to allocate global");
-        }
-        self.globals.items[idx] = self.registers[rs];
-        return .continue_dispatch;
-    }
-
-    /// add rd, rs1, rs2 - integer add
-    fn op_add(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rs1].toInt() + self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// sub rd, rs1, rs2 - integer subtract
-    fn op_sub(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rs1].toInt() - self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// mul rd, rs1, rs2 - integer multiply
-    fn op_mul(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rs1].toInt() * self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// div rd, rs1, rs2 - integer divide
-    fn op_div(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        const divisor = self.registers[rs2].toInt();
-        if (divisor == 0) {
-            @branchHint(.cold); // Division by zero is exceptional
-            return self.fail(VMError.DivisionByZero, "Division by zero");
-        }
-        self.registers[rd] = Value.initInt(@divTrunc(self.registers[rs1].toInt(), divisor));
-        return .continue_dispatch;
-    }
-
-    /// mod rd, rs1, rs2 - integer modulo
-    fn op_mod(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        const divisor = self.registers[rs2].toInt();
-        if (divisor == 0) {
-            @branchHint(.cold); // Division by zero is exceptional
-            return self.fail(VMError.DivisionByZero, "Modulo by zero");
-        }
-        self.registers[rd] = Value.initInt(@mod(self.registers[rs1].toInt(), divisor));
-        return .continue_dispatch;
-    }
-
-    /// neg rd, rs - negate
-    fn op_neg(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-        self.registers[rd] = Value.initInt(-self.registers[rs].toInt());
-        return .continue_dispatch;
-    }
-
-    /// addi rd, rs, imm8 - add immediate
-    fn op_addi(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const imm: i8 = @bitCast(module.code[self.ip + 1]);
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-        self.registers[rd] = Value.initInt(self.registers[rs].toInt() + imm);
-        return .continue_dispatch;
-    }
-
-    /// subi rd, rs, imm8 - subtract immediate
-    fn op_subi(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const imm: i8 = @bitCast(module.code[self.ip + 1]);
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-        self.registers[rd] = Value.initInt(self.registers[rs].toInt() - imm);
-        return .continue_dispatch;
-    }
-
-    /// muli rd, rs, imm8 - multiply immediate
-    fn op_muli(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const imm: i8 = @bitCast(module.code[self.ip + 1]);
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-        self.registers[rd] = Value.initInt(self.registers[rs].toInt() * imm);
-        return .continue_dispatch;
-    }
-
-    /// incr rd - increment
-    fn op_incr(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rd].toInt() + 1);
-        return .continue_dispatch;
-    }
-
-    /// decr rd - decrement
-    fn op_decr(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rd].toInt() - 1);
-        return .continue_dispatch;
-    }
-
-    /// cmp_eq rd, rs1, rs2 - compare equal
-    fn op_cmp_eq(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() == self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_ne rd, rs1, rs2 - compare not equal
-    fn op_cmp_ne(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() != self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_lt rd, rs1, rs2 - compare less than
-    fn op_cmp_lt(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() < self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_le rd, rs1, rs2 - compare less or equal
-    fn op_cmp_le(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() <= self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_gt rd, rs1, rs2 - compare greater than
-    fn op_cmp_gt(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() > self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_ge rd, rs1, rs2 - compare greater or equal
-    fn op_cmp_ge(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() >= self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// log_not rd, rs - logical not
-    fn op_log_not(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-        self.registers[rd] = Value.initBool(!self.registers[rs].toBool());
-        return .continue_dispatch;
-    }
-
-    /// jmp offset - unconditional jump
-    fn op_jmp(self: *Self, module: *const Module) VMError!DispatchResult {
-        const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little));
-        self.ip += 3;
-        const new_ip = @as(i64, @intCast(self.ip)) + offset;
-        if (new_ip < 0 or new_ip > module.code.len) {
-            @branchHint(.cold); // Invalid jumps shouldn't happen in correct bytecode
-            return self.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
-        }
-        // JIT Profiling: backward jump indicates loop iteration
-        if (jit_profiling_enabled and offset < 0) {
-            if (self.call_stack.top()) |frame| {
-                _ = self.jit_profiler.recordLoop(self.current_module_index orelse 0, frame.routine_index);
-            }
-        }
-        self.ip = @intCast(new_ip);
-        return .continue_dispatch;
-    }
-
-    /// jz rs, offset - jump if zero/false
-    fn op_jz(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little));
-        self.ip += 3;
-        const rs: u4 = @truncate(ops >> 4);
-        if (!self.registers[rs].toBool()) {
-            const new_ip = @as(i64, @intCast(self.ip)) + offset;
-            if (new_ip < 0 or new_ip > module.code.len) {
-                return self.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
-            }
-            // JIT Profiling: backward jump indicates loop iteration
-            if (jit_profiling_enabled and offset < 0) {
-                if (self.call_stack.top()) |frame| {
-                    _ = self.jit_profiler.recordLoop(self.current_module_index orelse 0, frame.routine_index);
-                }
-            }
-            self.ip = @intCast(new_ip);
-        }
-        return .continue_dispatch;
-    }
-
-    /// jnz rs, offset - jump if not zero/true
-    fn op_jnz(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little));
-        self.ip += 3;
-        const rs: u4 = @truncate(ops >> 4);
-        if (self.registers[rs].toBool()) {
-            const new_ip = @as(i64, @intCast(self.ip)) + offset;
-            if (new_ip < 0 or new_ip > module.code.len) {
-                return self.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
-            }
-            // JIT Profiling: backward jump indicates loop iteration
-            if (jit_profiling_enabled and offset < 0) {
-                if (self.call_stack.top()) |frame| {
-                    _ = self.jit_profiler.recordLoop(self.current_module_index orelse 0, frame.routine_index);
-                }
-            }
-            self.ip = @intCast(new_ip);
-        }
-        return .continue_dispatch;
-    }
-
-    /// No-op for loop markers
-    fn op_loop_nop(self: *Self, module: *const Module) VMError!DispatchResult {
-        _ = self;
-        _ = module;
-        return .continue_dispatch;
-    }
-
-    /// call routine_idx, argc - call subroutine
-    fn op_call(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const routine_idx = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-        const argc: u4 = @truncate(ops >> 4);
-
-        if (routine_idx >= module.routines.len) {
-            return self.fail(VMError.InvalidRoutine, "Routine index out of bounds");
-        }
-
-        // JIT Profiling: record function call
-        if (jit_profiling_enabled) {
-            const module_idx = self.current_module_index orelse 0;
-            _ = self.jit_profiler.recordCall(module_idx, routine_idx);
-        }
-
-        // Push call frame
-        self.call_stack.append(.{
-            .module = module,
-            .routine_index = routine_idx,
-            .return_ip = self.ip,
-            .base_pointer = self.fp,
-            .stack_pointer = self.sp,
-            .caller_module_index = self.current_module_index,
-        }) catch return self.fail(VMError.StackOverflow, "Call stack overflow");
-
-        // Copy args from r0..r(argc-1) to stack (as locals for callee)
-        const routine = module.routines[routine_idx];
-        self.fp = self.sp;
-        for (0..argc) |i| {
-            self.stack[self.sp] = self.registers[i];
-            self.sp += 1;
-        }
-        // Reserve space for remaining locals
-        for (argc..routine.local_count) |_| {
-            self.stack[self.sp] = Value.null_val;
-            self.sp += 1;
-        }
-
-        // Jump to routine
-        self.ip = routine.code_offset;
-        return .continue_dispatch;
-    }
-
-    /// call_dynamic name_idx, argc - call by name at runtime
-    fn op_call_dynamic(self: *Self, module: *const Module) VMError!DispatchResult {
-        // Format: [argc:4|0] [name_idx:16]
-        const argc: u8 = @truncate(module.code[self.ip] >> 4);
-        const name_idx = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-
-        debug.print(.vm, "call_dynamic: name_idx={d}, argc={d}, constants.len={d}", .{ name_idx, argc, module.constants.len });
-
-        try self.callNative(module, name_idx, argc);
-        return .continue_dispatch;
-    }
-
-    /// ret - return from subroutine
-    fn op_ret(self: *Self, module: *const Module) VMError!DispatchResult {
-        self.ip += 2;
-        if (self.call_stack.pop()) |frame| {
-            // Copy back ref parameters to caller's registers
-            const routine = module.routines[frame.routine_index];
-            for (routine.params, 0..) |param, i| {
-                if (param.mode == .ref) {
-                    // Copy value from callee's stack slot back to caller's register
-                    const val = self.stack[self.fp + i];
-                    debug.print(.vm, "ret: copy ref param[{d}] '{s}' -> r{d}", .{ i, val.asString(), i });
-                    self.registers[i] = val;
-                }
-            }
-
-            self.sp = frame.stack_pointer;
-            self.fp = frame.base_pointer;
-            self.ip = frame.return_ip;
-            self.current_module = frame.module;
-            self.current_module_index = frame.caller_module_index;
-            return .continue_dispatch;
-        } else {
-            return .return_from_main;
-        }
-    }
-
-    /// ret_val rs - return with value
-    fn op_ret_val(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rs: u4 = @truncate(ops >> 4);
-        // Return value goes in r15
-        self.registers[15] = self.registers[rs];
-
-        if (self.call_stack.pop()) |frame| {
-            // Copy back ref parameters to caller's registers
-            const routine = module.routines[frame.routine_index];
-            for (routine.params, 0..) |param, i| {
-                if (param.mode == .ref) {
-                    // Copy value from callee's stack slot back to caller's register
-                    self.registers[i] = self.stack[self.fp + i];
-                }
-            }
-
-            self.sp = frame.stack_pointer;
-            self.fp = frame.base_pointer;
-            self.ip = frame.return_ip;
-            self.current_module = frame.module;
-            self.current_module_index = frame.caller_module_index;
-            return .continue_dispatch;
-        } else {
-            return .return_from_main;
-        }
-    }
-
-    /// console_writeln rs - write value with newline
-    fn op_console_writeln(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rs: u4 = @truncate(ops >> 4);
-        const val = self.registers[rs];
-        // Format using Value's custom format function
-        var buf: [256]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        val.format("", .{}, fbs.writer()) catch {};
-        self.stdout.writeAll(fbs.getWritten()) catch {};
-        self.stdout.writeAll("\n") catch {};
-        return .continue_dispatch;
-    }
-
-    /// console_write rs - write value
-    fn op_console_write(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rs: u4 = @truncate(ops >> 4);
-        const val = self.registers[rs];
-        // Format using Value's custom format function
-        var buf: [256]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        val.format("", .{}, fbs.writer()) catch {};
-        self.stdout.writeAll(fbs.getWritten()) catch {};
-        return .continue_dispatch;
-    }
-
-    /// console_log rs, argc - log to dev pane
-    fn op_console_log(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const argc: u4 = @truncate(ops & 0xF);
-
-        // Pop arguments from stack (console_log uses stack-based args)
-        var i: usize = 0;
-        while (i < argc) : (i += 1) {
-            const val = self.pop() catch continue;
-            if (val.tag() == .string) {
-                // Log to stderr with [DEV] prefix for dev pane simulation
-                var stderr = std.fs.File.stderr();
-                var buf: [4096]u8 = undefined;
-                var writer = stderr.writer(&buf);
-                writer.interface.print("[DEV] {s}\n", .{val.asString()}) catch {};
-            } else {
-                var buf: [256]u8 = undefined;
-                const str = std.fmt.bufPrint(&buf, "{any}", .{val}) catch "";
-                var stderr = std.fs.File.stderr();
-                var buf2: [4096]u8 = undefined;
-                var writer = stderr.writer(&buf2);
-                writer.interface.print("[DEV] {s}\n", .{str}) catch {};
-            }
-        }
-        return .continue_dispatch;
-    }
-
-    // ============================================
-    // String Operations Handlers
-    // ============================================
-
-    /// str_concat rd, rs1, rs2 - rd = rs1 + rs2 (string concatenation)
-    /// Supports auto-coercion: integers and decimals are converted to their string representation
-    fn op_str_concat(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-
-        // Convert values to strings with auto-coercion
-        var buf1: [32]u8 = undefined;
-        var buf2: [32]u8 = undefined;
-        const s1 = self.valueToStringSlice(self.registers[rs1], &buf1);
-        const s2 = self.valueToStringSlice(self.registers[rs2], &buf2);
-
-        debug.print(.vm, "str_concat: r{d} = r{d}('{s}') + r{d}('{s}')", .{ rd, rs1, s1, rs2, s2 });
-
-        // Concatenate strings
-        const result = self.allocator.alloc(u8, s1.len + s2.len) catch return VMError.OutOfMemory;
-        @memcpy(result[0..s1.len], s1);
-        @memcpy(result[s1.len..], s2);
-
-        debug.print(.vm, "str_concat result: '{s}' (len={d})", .{ result, result.len });
-
-        // Store result as string value
-        self.registers[rd] = Value.initString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
-        return .continue_dispatch;
-    }
 
     /// Convert a Value to its string representation for auto-coercion
     /// Uses the provided buffer for numeric conversions, returns slice into buffer or string pointer
-    fn valueToStringSlice(self: *Self, val: Value, buf: *[32]u8) []const u8 {
+    pub fn valueToStringSlice(self: *Self, val: Value, buf: *[32]u8) []const u8 {
         _ = self;
         switch (val.tag()) {
             .string, .fixed_string => return val.asString(),
@@ -1373,920 +733,122 @@ pub const VM = struct {
     }
 
     // ============================================
-    // Type Conversion Handlers
-    // ============================================
-
-    /// format_decimal rd, rs, width - rd = zero-padded decimal string of rs
-    /// For DBL compatibility: formats integer to fixed-width zero-padded string
-    /// Right-aligned with leading zeros. Negative values get minus sign in front.
-    fn op_format_decimal(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const width_byte = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-        const width: usize = width_byte;
-
-        // Get the integer value from source register
-        const val = self.registers[rs];
-        const int_val: i64 = switch (val.tag()) {
-            .integer => val.asInt(),
-            .decimal => blk: {
-                if (val.asDecimal()) |dval| {
-                    // For decimals, use the whole part
-                    const divisor = std.math.pow(i64, 10, dval.precision);
-                    break :blk @divTrunc(dval.value, divisor);
-                }
-                break :blk 0;
-            },
-            else => 0,
-        };
-
-        // Format as zero-padded string
-        const abs_val: u64 = if (int_val < 0) @intCast(-int_val) else @intCast(int_val);
-        var buf: [32]u8 = undefined;
-        const digits_needed = if (width > 32) 32 else width;
-
-        // Format with leading zeros
-        const formatted = std.fmt.bufPrint(&buf, "{d:0>[1]}", .{ abs_val, digits_needed }) catch "";
-
-        // Allocate result string
-        const result_len = if (int_val < 0) formatted.len + 1 else formatted.len;
-        const result = self.allocator.alloc(u8, result_len) catch return VMError.OutOfMemory;
-
-        if (int_val < 0) {
-            result[0] = '-';
-            @memcpy(result[1..], formatted);
-        } else {
-            @memcpy(result, formatted);
-        }
-
-        debug.print(.vm, "format_decimal: r{d} = r{d}({d}) width={d} -> '{s}'", .{ rd, rs, int_val, width, result });
-
-        // Store result as string value
-        self.registers[rd] = Value.initString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
-        return .continue_dispatch;
-    }
-
-    /// parse_decimal rd, rs - rd = integer parsed from string rs
-    /// For DBL compatibility: validates string contains only digits (with optional leading minus)
-    /// Raises runtime error "bad digit" if string contains non-numeric characters
-    fn op_parse_decimal(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2; // Skip both operand bytes
-        const rd: u4 = @truncate(ops >> 4);
-        const rs: u4 = @truncate(ops & 0xF);
-
-        // Get the string value from source register
-        const val = self.registers[rs];
-        const str = switch (val.tag()) {
-            .string, .fixed_string => val.asString(),
-            .integer => {
-                // Already an integer - just copy it
-                self.registers[rd] = val;
-                return .continue_dispatch;
-            },
-            else => "",
-        };
-
-        // Trim leading/trailing whitespace
-        const trimmed = std.mem.trim(u8, str, " \t\n\r");
-
-        // Validate and parse the string
-        var is_negative = false;
-        var start: usize = 0;
-
-        // Check for leading minus sign
-        if (trimmed.len > 0 and trimmed[0] == '-') {
-            is_negative = true;
-            start = 1;
-        }
-
-        // Empty string after trimming (or just "-") -> 0
-        if (start >= trimmed.len) {
-            self.registers[rd] = Value.initInt(0);
-            return .continue_dispatch;
-        }
-
-        // Validate all remaining characters are digits
-        for (trimmed[start..]) |c| {
-            if (!std.ascii.isDigit(c)) {
-                // Bad digit error - in DBL this is a runtime error
-                debug.print(.vm, "parse_decimal: bad digit '{c}' in string '{s}'", .{ c, str });
-                // Return error - this will halt execution
-                return VMError.BadDigit;
-            }
-        }
-
-        // Parse the integer value
-        const abs_val = std.fmt.parseInt(i64, trimmed[start..], 10) catch {
-            // Overflow or other parse error
-            debug.print(.vm, "parse_decimal: overflow parsing '{s}'", .{str});
-            return VMError.BadDigit;
-        };
-
-        const result: i64 = if (is_negative) -abs_val else abs_val;
-
-        debug.print(.vm, "parse_decimal: r{d} = r{d}('{s}') -> {d}", .{ rd, rs, str, result });
-
-        self.registers[rd] = Value.initInt(result);
-        return .continue_dispatch;
-    }
-
-    // ============================================
-    // Logical Operations Handlers
-    // ============================================
-
-    /// log_and rd, rs1, rs2 - rd = rs1 && rs2
-    fn op_log_and(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toBool() and self.registers[rs2].toBool());
-        return .continue_dispatch;
-    }
-
-    /// log_or rd, rs1, rs2 - rd = rs1 || rs2
-    fn op_log_or(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toBool() or self.registers[rs2].toBool());
-        return .continue_dispatch;
-    }
-
-    // ============================================
-    // Debug Handlers
-    // ============================================
-
-    /// debug_break - debugger breakpoint
-    fn op_debug_break(self: *Self, module: *const Module) VMError!DispatchResult {
-        _ = module;
-        self.stop_reason = .breakpoint;
-        return .halt;
-    }
-
-    /// debug_line line - set current source line
-    fn op_debug_line(self: *Self, module: *const Module) VMError!DispatchResult {
-        const line = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        self.ip += 3;
-        self.debug_current_line = line;
-        return .continue_dispatch;
-    }
-
-    /// assert rs - assert that rs is true
-    fn op_assert(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rs: u4 = @truncate(ops >> 4);
-        if (!self.registers[rs].toBool()) {
-            return self.fail(VMError.InvalidType, "Assertion failed");
-        }
-        return .continue_dispatch;
-    }
-
-    // ============================================
-    // Quickened/Specialized Integer Handlers (0xE0-0xEB)
-    // These skip type checking for performance when types are known
-    // ============================================
-
-    /// add_int rd, rs1, rs2 - integer-specialized add (no type check)
-    fn op_add_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        // Direct integer operation - no type check
-        self.registers[rd] = Value.initInt(self.registers[rs1].toInt() + self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// sub_int rd, rs1, rs2 - integer-specialized subtract
-    fn op_sub_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rs1].toInt() - self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// mul_int rd, rs1, rs2 - integer-specialized multiply
-    fn op_mul_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rs1].toInt() * self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// div_int rd, rs1, rs2 - integer-specialized divide
-    fn op_div_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        const divisor = self.registers[rs2].toInt();
-        if (divisor == 0) {
-            return self.fail(VMError.DivisionByZero, "Division by zero");
-        }
-        self.registers[rd] = Value.initInt(@divTrunc(self.registers[rs1].toInt(), divisor));
-        return .continue_dispatch;
-    }
-
-    /// cmp_lt_int rd, rs1, rs2 - integer less-than
-    fn op_cmp_lt_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() < self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_le_int rd, rs1, rs2 - integer less-equal
-    fn op_cmp_le_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() <= self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_gt_int rd, rs1, rs2 - integer greater-than
-    fn op_cmp_gt_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() > self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_ge_int rd, rs1, rs2 - integer greater-equal
-    fn op_cmp_ge_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() >= self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_eq_int rd, rs1, rs2 - integer equality
-    fn op_cmp_eq_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() == self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// cmp_ne_int rd, rs1, rs2 - integer not-equal
-    fn op_cmp_ne_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        const byte2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const rs1: u4 = @truncate(ops & 0xF);
-        const rs2: u4 = @truncate(byte2 >> 4);
-        self.registers[rd] = Value.initBool(self.registers[rs1].toInt() != self.registers[rs2].toInt());
-        return .continue_dispatch;
-    }
-
-    /// incr_int rd - integer increment (no type check)
-    fn op_incr_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rd].toInt() + 1);
-        return .continue_dispatch;
-    }
-
-    /// decr_int rd - integer decrement (no type check)
-    fn op_decr_int(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        self.registers[rd] = Value.initInt(self.registers[rd].toInt() - 1);
-        return .continue_dispatch;
-    }
-
-    // ============================================
-    // Record Buffer Operations
-    // ============================================
-
-    /// load_record_buf rd, type_idx, local_base - serialize record fields to buffer
-    /// Format: [rd:4|0] [type_idx:16] [local_base:16]
-    /// Reads field values from locals starting at local_base, serializes them
-    /// according to the type definition, and stores the result buffer in rd.
-    fn op_load_record_buf(self: *Self, module: *const Module) VMError!DispatchResult {
-        // Read operands: rd, type_idx and local_base
-        const ops = module.code[self.ip];
-        const rd: u4 = @truncate(ops >> 4);
-        const type_idx = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
-        const local_base = std.mem.readInt(u16, module.code[self.ip + 3 ..][0..2], .little);
-        self.ip += 5;
-
-        debug.print(.vm, "load_record_buf: rd={d} type_idx={d} local_base={d}", .{ rd, type_idx, local_base });
-
-        // Get type definition
-        const type_def = module.getType(type_idx) orelse {
-            return self.fail(VMError.InvalidType, "Invalid type index in load_record_buf");
-        };
-
-        debug.print(.vm, "load_record_buf: type total_size={d} fields.len={d}", .{ type_def.total_size, type_def.fields.len });
-
-        // Allocate buffer for the serialized record
-        const buffer = self.allocator.alloc(u8, type_def.total_size) catch {
-            return self.fail(VMError.OutOfMemory, "Failed to allocate record buffer");
-        };
-        // Initialize to spaces (standard for ISAM records)
-        @memset(buffer, ' ');
-
-        // Serialize each field
-        for (type_def.fields, 0..) |field, i| {
-            const slot = self.fp + local_base + i;
-            if (slot >= self.stack.len) {
-                debug.print(.vm, "load_record_buf: slot {d} out of bounds (stack.len={d})", .{ slot, self.stack.len });
-                continue;
-            }
-            const val = self.stack[slot];
-
-            // Get the destination slice in the buffer
-            const offset = field.offset;
-            const size = field.size;
-            if (offset + size > buffer.len) {
-                debug.print(.vm, "load_record_buf: field offset/size out of bounds", .{});
-                continue;
-            }
-            const dest = buffer[offset .. offset + size];
-
-            // Serialize based on field type
-            switch (field.data_type) {
-                .decimal => {
-                    // For decimal fields, format as right-justified number
-                    const int_val = val.toInt();
-                    var num_buf: [32]u8 = undefined;
-                    const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{@abs(int_val)}) catch "0";
-
-                    // Right-justify the number, pad with zeros on left
-                    if (num_str.len >= size) {
-                        // Truncate from the left if too long
-                        @memcpy(dest, num_str[num_str.len - size ..]);
-                    } else {
-                        // Pad with zeros on the left
-                        const pad = size - num_str.len;
-                        @memset(dest[0..pad], '0');
-                        @memcpy(dest[pad..], num_str);
-                    }
-                    debug.print(.vm, "  field[{d}] decimal: val={d} -> '{s}'", .{ i, int_val, dest });
-                },
-                .string => {
-                    // For string fields, check if the value is an integer (DBL decimal in a string_fixed field)
-                    if (val.isInt()) {
-                        // Format as right-justified number with zero padding (DBL decimal style)
-                        const int_val = val.toInt();
-                        var num_buf: [32]u8 = undefined;
-                        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{@abs(int_val)}) catch "0";
-
-                        // Right-justify the number, pad with zeros on left
-                        if (num_str.len >= size) {
-                            @memcpy(dest, num_str[num_str.len - size ..]);
-                        } else {
-                            const pad = size - num_str.len;
-                            @memset(dest[0..pad], '0');
-                            @memcpy(dest[pad..], num_str);
-                        }
-                        debug.print(.vm, "  field[{d}] string(int): val={d} -> '{s}'", .{ i, int_val, dest });
-                    } else {
-                        // For actual strings, left-justify and pad with spaces
-                        const str = val.asString();
-                        const copy_len = @min(str.len, size);
-                        @memcpy(dest[0..copy_len], str[0..copy_len]);
-                        // Rest is already spaces from initialization
-                        debug.print(.vm, "  field[{d}] string: '{s}' -> '{s}'", .{ i, str, dest });
-                    }
-                },
-                else => {
-                    // For other types, try to convert to string
-                    const str = val.asString();
-                    const copy_len = @min(str.len, size);
-                    @memcpy(dest[0..copy_len], str[0..copy_len]);
-                    debug.print(.vm, "  field[{d}] other: -> '{s}'", .{ i, dest });
-                },
-            }
-        }
-
-        debug.print(.vm, "load_record_buf: serialized buffer len={d}, storing in r{d}", .{ buffer.len, rd });
-
-        // Create a fixed string value from the buffer and store in destination register
-        const result = Value.initFixedString(self.valueAllocator(), buffer) catch {
-            self.allocator.free(buffer);
-            return self.fail(VMError.OutOfMemory, "Failed to create record buffer value");
-        };
-        self.registers[rd] = result;
-
-        return .continue_dispatch;
-    }
-
-    /// store_record_buf type_idx, local_base - deserialize buffer to record fields
-    /// Format: [type_idx:16] [local_base:16]
-    /// Reads the buffer from the stack top, deserializes it according to the type definition,
-    /// and stores individual field values into locals starting at local_base.
-    fn op_store_record_buf(self: *Self, module: *const Module) VMError!DispatchResult {
-        // Read operands: type_idx and local_base
-        const type_idx = std.mem.readInt(u16, module.code[self.ip ..][0..2], .little);
-        const local_base = std.mem.readInt(u16, module.code[self.ip + 2 ..][0..2], .little);
-        self.ip += 4;
-
-        debug.print(.vm, "store_record_buf: type_idx={d} local_base={d} sp={d}", .{ type_idx, local_base, self.sp });
-
-        // Get the buffer from stack[sp] - this is where call_dynamic stores the return value
-        const buffer_val = self.stack[self.sp];
-        const buffer = buffer_val.toString();
-        if (buffer.len == 0) {
-            debug.print(.vm, "store_record_buf: buffer is empty", .{});
-            return .continue_dispatch;
-        }
-
-        debug.print(.vm, "store_record_buf: buffer len={d}", .{ buffer.len });
-
-        // Get type definition
-        const type_def = module.getType(type_idx) orelse {
-            return self.fail(VMError.InvalidType, "Invalid type index in store_record_buf");
-        };
-
-        debug.print(.vm, "store_record_buf: type total_size={d} fields.len={d}", .{ type_def.total_size, type_def.fields.len });
-
-        // Deserialize each field from the buffer into the local slots
-        for (type_def.fields, 0..) |field, i| {
-            const slot = self.fp + local_base + i;
-            if (slot >= self.stack.len) {
-                debug.print(.vm, "store_record_buf: slot {d} out of bounds (stack.len={d})", .{ slot, self.stack.len });
-                continue;
-            }
-
-            // Get the source slice from the buffer
-            const offset = field.offset;
-            const size = field.size;
-            if (offset + size > buffer.len) {
-                debug.print(.vm, "store_record_buf: field offset/size out of bounds", .{});
-                continue;
-            }
-            const src = buffer[offset .. offset + size];
-
-            // Deserialize based on field type
-            switch (field.data_type) {
-                .decimal => {
-                    // Parse as integer from the decimal field
-                    const trimmed = std.mem.trim(u8, src, " \t\x00");
-                    const int_val = std.fmt.parseInt(i64, trimmed, 10) catch 0;
-                    self.stack[slot] = Value.initInt(int_val);
-                    debug.print(.vm, "  field[{d}] decimal: '{s}' -> {d}", .{ i, src, int_val });
-                },
-                .string => {
-                    // Store as a fixed string value
-                    const str_copy = self.allocator.alloc(u8, size) catch {
-                        debug.print(.vm, "store_record_buf: failed to alloc string", .{});
-                        continue;
-                    };
-                    @memcpy(str_copy, src);
-                    const val = Value.initFixedString(self.valueAllocator(), str_copy) catch {
-                        self.allocator.free(str_copy);
-                        continue;
-                    };
-                    self.stack[slot] = val;
-                    debug.print(.vm, "  field[{d}] string: '{s}'", .{ i, src });
-                },
-                else => {
-                    debug.print(.vm, "  field[{d}] unknown type", .{i});
-                },
-            }
-        }
-
-        return .continue_dispatch;
-    }
-
-    // ============================================
-    // Map Operations (0xD5-0xDF)
-    // ============================================
-
-    /// map_new rd, flags - create a new map
-    fn op_map_new(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const flags: u4 = @truncate(ops & 0xF);
-
-        const map = self.allocator.create(OrderedMap) catch {
-            return self.fail(VMError.OutOfMemory, "Failed to allocate map");
-        };
-        map.* = OrderedMap.init(self.allocator, .{
-            .case_sensitive = (flags & 1) != 0,
-            .preserve_spaces = (flags & 2) != 0,
-        });
-
-        self.registers[rd] = Value.initMap(map);
-        return .continue_dispatch;
-    }
-
-    /// map_set map, key, val - store value in map
-    fn op_map_set(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops1 = module.code[self.ip];
-        const ops2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const map_reg: u4 = @truncate(ops1 >> 4);
-        const key_reg: u4 = @truncate(ops1 & 0xF);
-        const val_reg: u4 = @truncate(ops2 >> 4);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        var key_buf: [32]u8 = undefined;
-        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
-
-        _ = map.set(key, self.registers[val_reg]) catch {
-            return self.fail(VMError.OutOfMemory, "Failed to set map value");
-        };
-
-        return .continue_dispatch;
-    }
-
-    /// map_get rd, map, key - get value from map
-    fn op_map_get(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops1 = module.code[self.ip];
-        const ops2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops1 >> 4);
-        const map_reg: u4 = @truncate(ops1 & 0xF);
-        const key_reg: u4 = @truncate(ops2 >> 4);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        var key_buf: [32]u8 = undefined;
-        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
-
-        self.registers[rd] = map.get(key) orelse Value.null_val;
-        return .continue_dispatch;
-    }
-
-    /// map_delete map, key - delete key from map
-    fn op_map_delete(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops1 = module.code[self.ip];
-        const ops2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const map_reg: u4 = @truncate(ops1 >> 4);
-        const key_reg: u4 = @truncate(ops1 & 0xF);
-        _ = ops2;
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        var key_buf: [32]u8 = undefined;
-        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
-
-        _ = map.delete(key);
-        return .continue_dispatch;
-    }
-
-    /// map_has rd, map, key - check if key exists in map
-    fn op_map_has(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops1 = module.code[self.ip];
-        const ops2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops1 >> 4);
-        const map_reg: u4 = @truncate(ops1 & 0xF);
-        const key_reg: u4 = @truncate(ops2 >> 4);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        var key_buf: [32]u8 = undefined;
-        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
-
-        self.registers[rd] = if (map.has(key)) Value.true_val else Value.false_val;
-        return .continue_dispatch;
-    }
-
-    /// map_len rd, map - get number of entries in map
-    fn op_map_len(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const map_reg: u4 = @truncate(ops & 0xF);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        self.registers[rd] = Value.initInt(@intCast(map.len()));
-        return .continue_dispatch;
-    }
-
-    /// map_clear map - clear all entries from map
-    fn op_map_clear(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const map_reg: u4 = @truncate(ops >> 4);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        map.clear();
-        return .continue_dispatch;
-    }
-
-    /// map_keys rd, map - get keys as comma-separated string
-    fn op_map_keys(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const map_reg: u4 = @truncate(ops & 0xF);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        // Build comma-separated string of keys
-        var result: std.ArrayListUnmanaged(u8) = .empty;
-        defer result.deinit(self.allocator);
-
-        var iter = map.iterator();
-        var first = true;
-        while (iter.next()) |entry| {
-            if (!first) {
-                result.appendSlice(self.allocator, ",") catch return VMError.OutOfMemory;
-            }
-            result.appendSlice(self.allocator, entry.key) catch return VMError.OutOfMemory;
-            first = false;
-        }
-
-        const str = result.toOwnedSlice(self.allocator) catch return VMError.OutOfMemory;
-        self.registers[rd] = Value.initString(self.allocator, str) catch {
-            self.allocator.free(str);
-            return VMError.OutOfMemory;
-        };
-        self.allocator.free(str);
-        return .continue_dispatch;
-    }
-
-    /// map_values rd, map - get values as comma-separated string
-    fn op_map_values(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops = module.code[self.ip];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops >> 4);
-        const map_reg: u4 = @truncate(ops & 0xF);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        // Build comma-separated string of values
-        var result: std.ArrayListUnmanaged(u8) = .empty;
-        defer result.deinit(self.allocator);
-
-        var val_buf: [32]u8 = undefined;
-        var iter = map.iterator();
-        var first = true;
-        while (iter.next()) |entry| {
-            if (!first) {
-                result.appendSlice(self.allocator, ",") catch return VMError.OutOfMemory;
-            }
-            const val_str = self.valueToStringSlice(entry.value, &val_buf);
-            result.appendSlice(self.allocator, val_str) catch return VMError.OutOfMemory;
-            first = false;
-        }
-
-        const str = result.toOwnedSlice(self.allocator) catch return VMError.OutOfMemory;
-        self.registers[rd] = Value.initString(self.allocator, str) catch {
-            self.allocator.free(str);
-            return VMError.OutOfMemory;
-        };
-        self.allocator.free(str);
-        return .continue_dispatch;
-    }
-
-    /// map_get_at rd, map, access_code - get entry at access code position
-    fn op_map_get_at(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops1 = module.code[self.ip];
-        const ops2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const rd: u4 = @truncate(ops1 >> 4);
-        const map_reg: u4 = @truncate(ops1 & 0xF);
-        const idx_reg: u4 = @truncate(ops2 >> 4);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        const idx_val = self.registers[idx_reg];
-        if (idx_val.tag() != .integer) {
-            return self.fail(VMError.InvalidType, "Expected integer index");
-        }
-        const idx = idx_val.asInt();
-
-        if (idx <= 0) {
-            self.registers[rd] = Value.null_val;
-            return .continue_dispatch;
-        }
-
-        const entry = map.getAt(@intCast(idx - 1)); // 1-based to 0-based
-        if (entry) |e| {
-            self.registers[rd] = e.value;
-        } else {
-            self.registers[rd] = Value.null_val;
-        }
-        return .continue_dispatch;
-    }
-
-    /// map_set_at map, access_code, val - set entry at access code position
-    fn op_map_set_at(self: *Self, module: *const Module) VMError!DispatchResult {
-        const ops1 = module.code[self.ip];
-        const ops2 = module.code[self.ip + 1];
-        self.ip += 2;
-        const map_reg: u4 = @truncate(ops1 >> 4);
-        const idx_reg: u4 = @truncate(ops1 & 0xF);
-        const val_reg: u4 = @truncate(ops2 >> 4);
-
-        const map_val = self.registers[map_reg];
-        const map = map_val.asMap() orelse {
-            return self.fail(VMError.InvalidType, "Expected map value");
-        };
-
-        const idx_val = self.registers[idx_reg];
-        if (idx_val.tag() != .integer) {
-            return self.fail(VMError.InvalidType, "Expected integer index");
-        }
-        const idx = idx_val.asInt();
-
-        if (idx <= 0) {
-            return .continue_dispatch;
-        }
-
-        _ = map.putAt(@intCast(idx - 1), self.registers[val_reg]); // 1-based to 0-based
-        return .continue_dispatch;
-    }
-
-    // ============================================
     // Dispatch Table (Computed Goto)
     // ============================================
 
     /// Comptime-initialized dispatch table mapping opcode bytes to handlers
     const dispatch_table: [256]OpcodeHandler = init: {
-        var table: [256]OpcodeHandler = .{&op_invalid} ** 256;
+        var table: [256]OpcodeHandler = .{&vm_opcodes.op_invalid} ** 256;
 
-        // Core (0x00-0x0F)
-        table[@intFromEnum(Opcode.nop)] = &op_nop;
-        table[@intFromEnum(Opcode.halt)] = &op_halt;
+        // Core (0x00-0x0F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.nop)] = &vm_opcodes.op_nop;
+        table[@intFromEnum(Opcode.halt)] = &vm_opcodes.op_halt;
 
-        // Register Moves (0x10-0x1F)
-        table[@intFromEnum(Opcode.mov)] = &op_mov;
-        table[@intFromEnum(Opcode.movi)] = &op_movi;
-        table[@intFromEnum(Opcode.movi16)] = &op_movi16;
-        table[@intFromEnum(Opcode.movi32)] = &op_movi32;
-        table[@intFromEnum(Opcode.load_const)] = &op_load_const;
-        table[@intFromEnum(Opcode.load_null)] = &op_load_null;
-        table[@intFromEnum(Opcode.load_true)] = &op_load_true;
-        table[@intFromEnum(Opcode.load_false)] = &op_load_false;
+        // Register Moves (0x10-0x1F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.mov)] = &vm_opcodes.op_mov;
+        table[@intFromEnum(Opcode.movi)] = &vm_opcodes.op_movi;
+        table[@intFromEnum(Opcode.movi16)] = &vm_opcodes.op_movi16;
+        table[@intFromEnum(Opcode.movi32)] = &vm_opcodes.op_movi32;
+        table[@intFromEnum(Opcode.load_const)] = &vm_opcodes.op_load_const;
+        table[@intFromEnum(Opcode.load_null)] = &vm_opcodes.op_load_null;
+        table[@intFromEnum(Opcode.load_true)] = &vm_opcodes.op_load_true;
+        table[@intFromEnum(Opcode.load_false)] = &vm_opcodes.op_load_false;
 
-        // Local/Global (0x20-0x2F)
-        table[@intFromEnum(Opcode.load_local)] = &op_load_local;
-        table[@intFromEnum(Opcode.store_local)] = &op_store_local;
-        table[@intFromEnum(Opcode.load_local16)] = &op_load_local16;
-        table[@intFromEnum(Opcode.store_local16)] = &op_store_local16;
-        table[@intFromEnum(Opcode.load_global)] = &op_load_global;
-        table[@intFromEnum(Opcode.store_global)] = &op_store_global;
+        // Local/Global (0x20-0x2F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.load_local)] = &vm_opcodes.op_load_local;
+        table[@intFromEnum(Opcode.store_local)] = &vm_opcodes.op_store_local;
+        table[@intFromEnum(Opcode.load_local16)] = &vm_opcodes.op_load_local16;
+        table[@intFromEnum(Opcode.store_local16)] = &vm_opcodes.op_store_local16;
+        table[@intFromEnum(Opcode.load_global)] = &vm_opcodes.op_load_global;
+        table[@intFromEnum(Opcode.store_global)] = &vm_opcodes.op_store_global;
 
-        // Arithmetic (0x30-0x3F)
-        table[@intFromEnum(Opcode.add)] = &op_add;
-        table[@intFromEnum(Opcode.sub)] = &op_sub;
-        table[@intFromEnum(Opcode.mul)] = &op_mul;
-        table[@intFromEnum(Opcode.div)] = &op_div;
-        table[@intFromEnum(Opcode.mod)] = &op_mod;
-        table[@intFromEnum(Opcode.neg)] = &op_neg;
-        table[@intFromEnum(Opcode.addi)] = &op_addi;
-        table[@intFromEnum(Opcode.subi)] = &op_subi;
-        table[@intFromEnum(Opcode.muli)] = &op_muli;
-        table[@intFromEnum(Opcode.incr)] = &op_incr;
-        table[@intFromEnum(Opcode.decr)] = &op_decr;
+        // Arithmetic (0x30-0x3F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.add)] = &vm_opcodes.op_add;
+        table[@intFromEnum(Opcode.sub)] = &vm_opcodes.op_sub;
+        table[@intFromEnum(Opcode.mul)] = &vm_opcodes.op_mul;
+        table[@intFromEnum(Opcode.div)] = &vm_opcodes.op_div;
+        table[@intFromEnum(Opcode.mod)] = &vm_opcodes.op_mod;
+        table[@intFromEnum(Opcode.neg)] = &vm_opcodes.op_neg;
+        table[@intFromEnum(Opcode.addi)] = &vm_opcodes.op_addi;
+        table[@intFromEnum(Opcode.subi)] = &vm_opcodes.op_subi;
+        table[@intFromEnum(Opcode.muli)] = &vm_opcodes.op_muli;
+        table[@intFromEnum(Opcode.incr)] = &vm_opcodes.op_incr;
+        table[@intFromEnum(Opcode.decr)] = &vm_opcodes.op_decr;
 
-        // Comparison (0x40-0x4F)
-        table[@intFromEnum(Opcode.cmp_eq)] = &op_cmp_eq;
-        table[@intFromEnum(Opcode.cmp_ne)] = &op_cmp_ne;
-        table[@intFromEnum(Opcode.cmp_lt)] = &op_cmp_lt;
-        table[@intFromEnum(Opcode.cmp_le)] = &op_cmp_le;
-        table[@intFromEnum(Opcode.cmp_gt)] = &op_cmp_gt;
-        table[@intFromEnum(Opcode.cmp_ge)] = &op_cmp_ge;
+        // Comparison (0x40-0x4F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.cmp_eq)] = &vm_opcodes.op_cmp_eq;
+        table[@intFromEnum(Opcode.cmp_ne)] = &vm_opcodes.op_cmp_ne;
+        table[@intFromEnum(Opcode.cmp_lt)] = &vm_opcodes.op_cmp_lt;
+        table[@intFromEnum(Opcode.cmp_le)] = &vm_opcodes.op_cmp_le;
+        table[@intFromEnum(Opcode.cmp_gt)] = &vm_opcodes.op_cmp_gt;
+        table[@intFromEnum(Opcode.cmp_ge)] = &vm_opcodes.op_cmp_ge;
 
-        // Logical (0x50-0x5F)
-        table[@intFromEnum(Opcode.log_and)] = &op_log_and;
-        table[@intFromEnum(Opcode.log_or)] = &op_log_or;
-        table[@intFromEnum(Opcode.log_not)] = &op_log_not;
+        // Logical (0x50-0x5F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.log_and)] = &vm_opcodes.op_log_and;
+        table[@intFromEnum(Opcode.log_or)] = &vm_opcodes.op_log_or;
+        table[@intFromEnum(Opcode.log_not)] = &vm_opcodes.op_log_not;
 
-        // Control Flow (0x60-0x6F)
-        table[@intFromEnum(Opcode.jmp)] = &op_jmp;
-        table[@intFromEnum(Opcode.jz)] = &op_jz;
-        table[@intFromEnum(Opcode.jnz)] = &op_jnz;
-        table[@intFromEnum(Opcode.loop_start)] = &op_loop_nop;
-        table[@intFromEnum(Opcode.loop_end)] = &op_loop_nop;
-        table[@intFromEnum(Opcode.clear_error_handler)] = &op_loop_nop;
+        // Control Flow (0x60-0x6F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.jmp)] = &vm_opcodes.op_jmp;
+        table[@intFromEnum(Opcode.jz)] = &vm_opcodes.op_jz;
+        table[@intFromEnum(Opcode.jnz)] = &vm_opcodes.op_jnz;
+        table[@intFromEnum(Opcode.loop_start)] = &vm_opcodes.op_loop_nop;
+        table[@intFromEnum(Opcode.loop_end)] = &vm_opcodes.op_loop_nop;
+        table[@intFromEnum(Opcode.clear_error_handler)] = &vm_opcodes.op_loop_nop;
 
-        // Function Calls (0x70-0x7F)
-        table[@intFromEnum(Opcode.call)] = &op_call;
-        table[@intFromEnum(Opcode.call_dynamic)] = &op_call_dynamic;
-        table[@intFromEnum(Opcode.ret)] = &op_ret;
-        table[@intFromEnum(Opcode.ret_val)] = &op_ret_val;
+        // Function Calls (0x70-0x7F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.call)] = &vm_opcodes.op_call;
+        table[@intFromEnum(Opcode.call_dynamic)] = &vm_opcodes.op_call_dynamic;
+        table[@intFromEnum(Opcode.ret)] = &vm_opcodes.op_ret;
+        table[@intFromEnum(Opcode.ret_val)] = &vm_opcodes.op_ret_val;
 
-        // Record/Field Operations (0x80-0x8F)
-        table[@intFromEnum(Opcode.load_record_buf)] = &op_load_record_buf;
-        table[@intFromEnum(Opcode.store_record_buf)] = &op_store_record_buf;
+        // Record/Field Operations (0x80-0x8F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.load_record_buf)] = &vm_opcodes.op_load_record_buf;
+        table[@intFromEnum(Opcode.store_record_buf)] = &vm_opcodes.op_store_record_buf;
 
-        // String Operations (0x90-0x9F)
-        table[@intFromEnum(Opcode.str_concat)] = &op_str_concat;
+        // String Operations (0x90-0x9F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.str_concat)] = &vm_opcodes.op_str_concat;
 
-        // Type Conversion (0xA0-0xAF)
-        table[@intFromEnum(Opcode.format_decimal)] = &op_format_decimal;
-        table[@intFromEnum(Opcode.parse_decimal)] = &op_parse_decimal;
+        // Type Conversion (0xA0-0xAF) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.format_decimal)] = &vm_opcodes.op_format_decimal;
+        table[@intFromEnum(Opcode.parse_decimal)] = &vm_opcodes.op_parse_decimal;
 
-        // Console I/O (0xD0-0xD4)
-        table[@intFromEnum(Opcode.console_writeln)] = &op_console_writeln;
-        table[@intFromEnum(Opcode.console_write)] = &op_console_write;
-        table[@intFromEnum(Opcode.console_log)] = &op_console_log;
+        // Console I/O (0xD0-0xD4) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.console_writeln)] = &vm_opcodes.op_console_writeln;
+        table[@intFromEnum(Opcode.console_write)] = &vm_opcodes.op_console_write;
+        table[@intFromEnum(Opcode.console_log)] = &vm_opcodes.op_console_log;
 
-        // Map Operations (0xD5-0xDF)
-        table[@intFromEnum(Opcode.map_new)] = &op_map_new;
-        table[@intFromEnum(Opcode.map_set)] = &op_map_set;
-        table[@intFromEnum(Opcode.map_get)] = &op_map_get;
-        table[@intFromEnum(Opcode.map_delete)] = &op_map_delete;
-        table[@intFromEnum(Opcode.map_has)] = &op_map_has;
-        table[@intFromEnum(Opcode.map_len)] = &op_map_len;
-        table[@intFromEnum(Opcode.map_clear)] = &op_map_clear;
-        table[@intFromEnum(Opcode.map_keys)] = &op_map_keys;
-        table[@intFromEnum(Opcode.map_values)] = &op_map_values;
-        table[@intFromEnum(Opcode.map_get_at)] = &op_map_get_at;
-        table[@intFromEnum(Opcode.map_set_at)] = &op_map_set_at;
+        // Map Operations (0xD5-0xDF) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.map_new)] = &vm_opcodes.op_map_new;
+        table[@intFromEnum(Opcode.map_set)] = &vm_opcodes.op_map_set;
+        table[@intFromEnum(Opcode.map_get)] = &vm_opcodes.op_map_get;
+        table[@intFromEnum(Opcode.map_delete)] = &vm_opcodes.op_map_delete;
+        table[@intFromEnum(Opcode.map_has)] = &vm_opcodes.op_map_has;
+        table[@intFromEnum(Opcode.map_len)] = &vm_opcodes.op_map_len;
+        table[@intFromEnum(Opcode.map_clear)] = &vm_opcodes.op_map_clear;
+        table[@intFromEnum(Opcode.map_keys)] = &vm_opcodes.op_map_keys;
+        table[@intFromEnum(Opcode.map_values)] = &vm_opcodes.op_map_values;
+        table[@intFromEnum(Opcode.map_get_at)] = &vm_opcodes.op_map_get_at;
+        table[@intFromEnum(Opcode.map_set_at)] = &vm_opcodes.op_map_set_at;
 
-        // Debug (0xF0-0xFF)
-        table[@intFromEnum(Opcode.debug_break)] = &op_debug_break;
-        table[@intFromEnum(Opcode.debug_line)] = &op_debug_line;
-        table[@intFromEnum(Opcode.assert)] = &op_assert;
+        // Debug (0xF0-0xFF) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.debug_break)] = &vm_opcodes.op_debug_break;
+        table[@intFromEnum(Opcode.debug_line)] = &vm_opcodes.op_debug_line;
+        table[@intFromEnum(Opcode.assert)] = &vm_opcodes.op_assert;
 
-        // Quickened/Specialized Opcodes (0xE0-0xEB)
-        table[@intFromEnum(Opcode.add_int)] = &op_add_int;
-        table[@intFromEnum(Opcode.sub_int)] = &op_sub_int;
-        table[@intFromEnum(Opcode.mul_int)] = &op_mul_int;
-        table[@intFromEnum(Opcode.div_int)] = &op_div_int;
-        table[@intFromEnum(Opcode.cmp_lt_int)] = &op_cmp_lt_int;
-        table[@intFromEnum(Opcode.cmp_le_int)] = &op_cmp_le_int;
-        table[@intFromEnum(Opcode.cmp_gt_int)] = &op_cmp_gt_int;
-        table[@intFromEnum(Opcode.cmp_ge_int)] = &op_cmp_ge_int;
-        table[@intFromEnum(Opcode.cmp_eq_int)] = &op_cmp_eq_int;
-        table[@intFromEnum(Opcode.cmp_ne_int)] = &op_cmp_ne_int;
-        table[@intFromEnum(Opcode.incr_int)] = &op_incr_int;
-        table[@intFromEnum(Opcode.decr_int)] = &op_decr_int;
+        // Quickened/Specialized Opcodes (0xE0-0xEB) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.add_int)] = &vm_opcodes.op_add_int;
+        table[@intFromEnum(Opcode.sub_int)] = &vm_opcodes.op_sub_int;
+        table[@intFromEnum(Opcode.mul_int)] = &vm_opcodes.op_mul_int;
+        table[@intFromEnum(Opcode.div_int)] = &vm_opcodes.op_div_int;
+        table[@intFromEnum(Opcode.cmp_lt_int)] = &vm_opcodes.op_cmp_lt_int;
+        table[@intFromEnum(Opcode.cmp_le_int)] = &vm_opcodes.op_cmp_le_int;
+        table[@intFromEnum(Opcode.cmp_gt_int)] = &vm_opcodes.op_cmp_gt_int;
+        table[@intFromEnum(Opcode.cmp_ge_int)] = &vm_opcodes.op_cmp_ge_int;
+        table[@intFromEnum(Opcode.cmp_eq_int)] = &vm_opcodes.op_cmp_eq_int;
+        table[@intFromEnum(Opcode.cmp_ne_int)] = &vm_opcodes.op_cmp_ne_int;
+        table[@intFromEnum(Opcode.incr_int)] = &vm_opcodes.op_incr_int;
+        table[@intFromEnum(Opcode.decr_int)] = &vm_opcodes.op_decr_int;
 
         break :init table;
     };
@@ -2335,7 +897,7 @@ pub const VM = struct {
     }
 
     // Stack operations - with rich error context
-    fn push(self: *Self, value: Value) VMError!void {
+    pub fn push(self: *Self, value: Value) VMError!void {
         if (self.sp >= STACK_SIZE) {
             @branchHint(.cold); // Error path is rare
             return self.fail(VMError.StackOverflow, "Stack overflow: maximum stack depth exceeded");
@@ -2344,7 +906,7 @@ pub const VM = struct {
         self.sp += 1;
     }
 
-    fn pop(self: *Self) VMError!Value {
+    pub fn pop(self: *Self) VMError!Value {
         if (self.sp == 0) {
             @branchHint(.cold); // Error path is rare
             return self.fail(VMError.StackUnderflow, "Stack underflow: attempted to pop from empty stack");
@@ -2354,7 +916,7 @@ pub const VM = struct {
     }
 
     /// Convert a constant to a Value (for register-based instructions)
-    fn constantToValue(self: *Self, constant: Constant) Value {
+    pub fn constantToValue(self: *Self, constant: Constant) Value {
         return switch (constant) {
             .integer => |ival| Value.initInt(ival),
             .decimal => |dval| Value.initDecimal(self.valueAllocator(), dval.value, dval.precision) catch Value.null_val,
@@ -2554,7 +1116,7 @@ pub const VM = struct {
         }
     }
 
-    fn callNative(self: *Self, module: *const Module, name_idx: u16, arg_count: u8) VMError!void {
+    pub fn callNative(self: *Self, module: *const Module, name_idx: u16, arg_count: u8) VMError!void {
         // Get routine name from constants
         const name_const = module.getConstant(name_idx) orelse return VMError.InvalidConstant;
         const routine_name = switch (name_const) {

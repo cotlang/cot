@@ -10,69 +10,21 @@ const module = cot_runtime.bytecode.module;
 const opcodes = cot_runtime.bytecode.opcodes;
 const debug = cot_runtime.debug;
 
+// Builtin function definitions (extracted to reduce file size)
+const emit_builtins = @import("emit_builtins.zig");
+const BuiltinDef = emit_builtins.BuiltinDef;
+const opcode_builtins = emit_builtins.opcode_builtins;
+const io_functions = emit_builtins.io_functions;
+const native_functions = emit_builtins.native_functions;
+
+// Instruction emission handlers (extracted to reduce file size)
+const emit_inst = @import("emit_instruction.zig");
+
 // Scoped logging (Ghostty pattern) - enable with std_options or runtime filter
 const log = std.log.scoped(.@"bytecode-emit");
 
 const Allocator = std.mem.Allocator;
 const Opcode = opcodes.Opcode;
-
-/// Builtin function definition for performance-critical opcodes
-const BuiltinDef = struct {
-    opcode: Opcode,
-    min_args: u8,
-    max_args: u8,
-};
-
-/// Performance-critical functions that have dedicated opcodes
-/// Everything else routes through xcall to native functions
-const opcode_builtins = std.StaticStringMap(BuiltinDef).initComptime(.{
-    // Only keep opcodes for extremely high-volume operations
-    .{ "trim", BuiltinDef{ .opcode = .str_trim, .min_args = 1, .max_args = 1 } },
-    .{ "atrim", BuiltinDef{ .opcode = .str_trim, .min_args = 1, .max_args = 1 } },
-    .{ "len", BuiltinDef{ .opcode = .str_len, .min_args = 1, .max_args = 1 } },
-    .{ "size", BuiltinDef{ .opcode = .fn_size, .min_args = 1, .max_args = 1 } },
-});
-
-/// Core Cot I/O functions with dedicated opcodes (no return value)
-const io_functions = std.StaticStringMap(Opcode).initComptime(.{
-    .{ "println", .console_writeln },
-    .{ "print", .console_write },
-});
-
-/// Native functions - these are implemented in Zig and called via xcall
-/// All other "builtin" functions now route through this mechanism
-const native_functions = std.StaticStringMap(void).initComptime(.{
-    // Type conversion
-    .{ "string", {} },
-    .{ "integer", {} },
-    .{ "decimal", {} },
-    .{ "char", {} },
-    .{ "alpha", {} },
-    .{ "boolean", {} },
-    // String operations
-    .{ "instr", {} },
-    .{ "str_delete_last", {} },
-    .{ "upper", {} },
-    .{ "lower", {} },
-    .{ "ltrim", {} },
-    // Math functions
-    .{ "abs", {} },
-    .{ "sqrt", {} },
-    .{ "sin", {} },
-    .{ "cos", {} },
-    .{ "tan", {} },
-    .{ "log", {} },
-    .{ "log10", {} },
-    .{ "exp", {} },
-    .{ "round", {} },
-    .{ "trunc", {} },
-    // Date/time
-    .{ "date", {} },
-    .{ "time", {} },
-    // System
-    .{ "error", {} },
-    .{ "mem", {} },
-});
 
 /// Bytecode emitter errors
 pub const EmitError = error{
@@ -570,920 +522,88 @@ pub const BytecodeEmitter = struct {
     /// Emit a single IR instruction as bytecode
     fn emitInstruction(self: *Self, inst: *const ir.Instruction) EmitError!void {
         switch (inst.*) {
-            .alloca => |a| {
-                // Check if this is a record field (already registered as global)
-                if (self.globals.get(a.name)) |global_info| {
-                    // Use the existing global slot
-                    try self.value_slots.put(a.result.id, global_info.slot | 0x8000); // Set high bit to mark as global
-                } else if (self.locals.get(a.name)) |local_info| {
-                    // This is a parameter - use the existing parameter slot
-                    try self.value_slots.put(a.result.id, local_info.slot);
-                } else {
-                    // Check if this is a struct type - if so, allocate slots for all fields
-                    if (a.ty == .@"struct") {
-                        const struct_type = a.ty.@"struct";
-                        const base_slot = self.local_count;
-                        // Register the struct base slot
-                        try self.locals.put(a.name, .{
-                            .slot = base_slot,
-                            .is_global = false,
-                        });
-                        try self.value_slots.put(a.result.id, base_slot);
-                        // Allocate a slot for each field and register with qualified name
-                        for (struct_type.fields) |field| {
-                            const qualified_name = std.fmt.allocPrint(
-                                self.allocator,
-                                "{s}.{s}",
-                                .{ a.name, field.name },
-                            ) catch return EmitError.OutOfMemory;
-                            try self.locals.put(qualified_name, .{
-                                .slot = self.local_count,
-                                .is_global = false,
-                            });
-                            self.local_count += 1;
-                        }
-                    } else {
-                        // Allocate a new local variable slot (primitive type)
-                        try self.locals.put(a.name, .{
-                            .slot = self.local_count,
-                            .is_global = false,
-                        });
-                        try self.value_slots.put(a.result.id, self.local_count);
-                        self.local_count += 1;
-                    }
-                }
-            },
-
-            .load => |l| {
-                // Register-based: track slot mapping, load on demand
-                // Don't allocate a register now - will load when value is used
-                if (self.value_slots.get(l.ptr.id)) |slot_info| {
-                    // Forward the slot info to the result value
-                    try self.value_slots.put(l.result.id, slot_info);
-                } else if (self.value_consts.get(l.ptr.id)) |const_idx| {
-                    // Pointer is a constant - forward constant mapping
-                    try self.value_consts.put(l.result.id, const_idx);
-                } else if (self.last_result_value) |last_id| {
-                    if (last_id == l.ptr.id) {
-                        // Pointer is the last computed result - set result as last result too
-                        self.setLastResult(l.result.id, self.last_result_reg);
-                    } else {
-                        debug.print(.emit, "WARNING: .load ptr.id={d} not found, last_result={d}", .{ l.ptr.id, last_id });
-                    }
-                } else {
-                    debug.print(.emit, "WARNING: .load ptr.id={d} not found", .{l.ptr.id});
-                }
-            },
-
-            .store => |s| {
-                // Register-based: store from register to memory
-                const src_reg = try self.getValueInReg(s.value, 0);
-                if (self.value_slots.get(s.ptr.id)) |slot_info| {
-                    if (slot_info & 0x8000 != 0) {
-                        // Global variable
-                        const slot = slot_info & 0x7FFF;
-                        try self.emitRegStoreGlobal(src_reg, slot);
-                    } else {
-                        // Local variable
-                        if (slot_info < 256) {
-                            try self.emitRegStoreLocal(src_reg, @intCast(slot_info));
-                        } else {
-                            return EmitError.TooManyLocals;
-                        }
-                    }
-                }
-            },
-
-            .field_ptr => |fp| {
-                // field_ptr computes a pointer to a struct field
-                // We need to track the slot in value_slots for both register and stack modes
-                // because store/load use value_slots to find the target slot
-                if (self.value_slots.get(fp.struct_ptr.id)) |struct_slot| {
-                    // Compute the effective slot: struct_slot + field_index
-                    // This is a simplified approach - assumes fields are contiguous locals
-                    const field_slot = (struct_slot & 0x7FFF) + @as(u16, @intCast(fp.field_index));
-                    const is_global = (struct_slot & 0x8000) != 0;
-                    try self.value_slots.put(fp.result.id, field_slot | (if (is_global) @as(u16, 0x8000) else 0));
-                } else {
-                    debug.print(.emit, "WARNING: field_ptr struct_ptr.id={d} not in value_slots", .{fp.struct_ptr.id});
-                }
-            },
-
-            .iconst => |c| {
-                // Register-based: store in constant pool, load on demand
-                // Don't allocate a register now - will load when needed
-                const const_idx = try self.addConstant(.{ .integer = c.value });
-                try self.value_consts.put(c.result.id, const_idx);
-            },
-
-            .f32const => |c| {
-                // Store float as fixed-point constant
-                const int_val: i64 = @intFromFloat(@as(f64, c.value) * 100);
-                const const_idx = try self.addConstant(.{ .integer = int_val });
-                try self.value_consts.put(c.result.id, const_idx);
-            },
-
-            .f64const => |c| {
-                // Store float as fixed-point constant
-                const int_val: i64 = @intFromFloat(c.value * 100);
-                const const_idx = try self.addConstant(.{ .integer = int_val });
-                try self.value_consts.put(c.result.id, const_idx);
-            },
-
-            .const_string => |c| {
-                const const_idx = try self.addString(c.value);
-                // Register-based: store in constant pool, load on demand
-                try self.value_consts.put(c.result.id, const_idx);
-            },
-
-            .const_null => {
-                // Note: const_null doesn't have a result value, so we can't track it
-                // This is for legacy compatibility - should rarely be used
-            },
-
-            .iadd => |a| {
-                // Register-based emission - use temp registers for operands
-                const lhs_reg = try self.getValueInReg(a.lhs, 0); // r0 as temp
-                const rhs_reg = try self.getValueInReg(a.rhs, 1); // r1 as temp
-                const dest_reg: u4 = 2; // Result always goes to r2
-                try self.emitRegArith(.add, dest_reg, lhs_reg, rhs_reg);
-                // Track the result in r2 without permanent allocation
-                self.setLastResult(a.result.id, dest_reg);
-            },
-
-            .isub => |s| {
-                const lhs_reg = try self.getValueInReg(s.lhs, 0);
-                const rhs_reg = try self.getValueInReg(s.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.sub, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(s.result.id, dest_reg);
-            },
-
-            .imul => |m| {
-                const lhs_reg = try self.getValueInReg(m.lhs, 0);
-                const rhs_reg = try self.getValueInReg(m.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.mul, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(m.result.id, dest_reg);
-            },
-
-            .sdiv, .udiv => |d| {
-                const lhs_reg = try self.getValueInReg(d.lhs, 0);
-                const rhs_reg = try self.getValueInReg(d.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.div, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(d.result.id, dest_reg);
-            },
-
-            .srem, .urem => |m| {
-                const lhs_reg = try self.getValueInReg(m.lhs, 0);
-                const rhs_reg = try self.getValueInReg(m.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.mod, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(m.result.id, dest_reg);
-            },
-
-            .ineg => |n| {
-                const src_reg = try self.getValueInReg(n.operand, 0);
-                const dest_reg: u4 = 1;
-                try self.emitRegUnary(.neg, dest_reg, src_reg);
-                self.setLastResult(n.result.id, dest_reg);
-            },
-
-            .icmp => |c| {
-                const lhs_reg = try self.getValueInReg(c.lhs, 0);
-                const rhs_reg = try self.getValueInReg(c.rhs, 1);
-                const dest_reg: u4 = 2;
-                // Map IntCC condition to bytecode opcode
-                const opcode: Opcode = switch (c.cond) {
-                    .eq => if (c.lhs.ty == .string) .cmp_str_eq else .cmp_eq,
-                    .ne => .cmp_ne,
-                    .slt, .ult => .cmp_lt,
-                    .sle, .ule => .cmp_le,
-                    .sgt, .ugt => .cmp_gt,
-                    .sge, .uge => .cmp_ge,
-                };
-                try self.emitRegArith(opcode, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(c.result.id, dest_reg);
-            },
-
-            .log_and => |l| {
-                const lhs_reg = try self.getValueInReg(l.lhs, 0);
-                const rhs_reg = try self.getValueInReg(l.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.log_and, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(l.result.id, dest_reg);
-            },
-
-            .log_or => |l| {
-                const lhs_reg = try self.getValueInReg(l.lhs, 0);
-                const rhs_reg = try self.getValueInReg(l.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.log_or, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(l.result.id, dest_reg);
-            },
-
-            .log_not => |l| {
-                const src_reg = try self.getValueInReg(l.operand, 0);
-                const dest_reg: u4 = 1;
-                try self.emitRegUnary(.log_not, dest_reg, src_reg);
-                self.setLastResult(l.result.id, dest_reg);
-            },
-
-            .str_concat => |s| {
-                // Register-based: str_concat rd, rs1, rs2
-                // Format: [rd:4|rs1:4] [rs2:4|0]
-                //
-                // Important: If RHS is the last computed result in r0, we must move it
-                // to r1 before loading LHS into r0, otherwise LHS clobbers RHS.
-                debug.print(.emit, "str_concat: last_result_value={?d}, last_result_reg={d}, rhs.id={d}", .{
-                    self.last_result_value,
-                    self.last_result_reg,
-                    s.rhs.id,
-                });
-                var rs2: u4 = undefined;
-                if (self.last_result_value) |last_id| {
-                    if (last_id == s.rhs.id and self.last_result_reg == 0) {
-                        // RHS is in r0, move it to r1 before we load LHS into r0
-                        try self.emitOpcode(.mov);
-                        try self.emitU8((1 << 4) | 0); // mov r1, r0
-                        try self.emitU8(0);
-                        rs2 = 1;
-                        // Clear last_result since we moved it
-                        self.last_result_value = null;
-                    } else {
-                        rs2 = try self.getValueInReg(s.rhs, 1);
-                    }
-                } else {
-                    rs2 = try self.getValueInReg(s.rhs, 1);
-                }
-                const rs1 = try self.getValueInReg(s.lhs, 0);
-                const rd: u4 = 2;
-                try self.emitOpcode(.str_concat);
-                try self.emitU8((@as(u8, rd) << 4) | rs1);
-                try self.emitU8(@as(u8, rs2) << 4);
-                self.setLastResult(s.result.id, rd);
-            },
-
-            .str_slice => |s| {
-                // Emit: source string, start position, length/end
-                // Register-based: get values into registers
-                const src_reg = try self.getValueInReg(s.source, 0);
-                const start_reg = try self.getValueInReg(s.start, 1);
-                const len_reg = try self.getValueInReg(s.length_or_end, 2);
-                const dest_reg: u4 = 3;
-                try self.emitOpcode(.str_slice);
-                try self.emitU8((@as(u8, dest_reg) << 4) | src_reg);
-                try self.emitU8((@as(u8, start_reg) << 4) | len_reg);
-                try self.emitU8(if (s.is_length) 1 else 0);
-                self.setLastResult(s.result.id, dest_reg);
-            },
-
-            .str_slice_store => |s| {
-                // str_substr_store: variable(start:length) = value OR variable(start,end) = value
-                // Register-based: load target, compute slice, store back
-                const target_reg = try self.getValueInReg(s.target, 0);
-                const start_reg = try self.getValueInReg(s.start, 1);
-                const len_reg = try self.getValueInReg(s.length_or_end, 2);
-                const value_reg = try self.getValueInReg(s.value, 3);
-
-                // Emit str_slice_store opcode with register operands
-                try self.emitOpcode(.str_slice_store);
-                try self.emitU8((@as(u8, target_reg) << 4) | start_reg);
-                try self.emitU8((@as(u8, len_reg) << 4) | value_reg);
-                try self.emitU8(if (s.is_length) 1 else 0);
-
-                // Store the result back to the target variable
-                if (self.value_slots.get(s.target_ptr.id)) |slot_info| {
-                    const is_global = slot_info & 0x8000 != 0;
-                    const slot = slot_info & 0x7FFF;
-                    if (is_global) {
-                        try self.emitRegStoreGlobal(target_reg, slot);
-                    } else {
-                        if (slot < 256) {
-                            try self.emitRegStoreLocal(target_reg, @intCast(slot));
-                        }
-                    }
-                } else {
-                    debug.print(.emit, "WARNING: str_substr_store target_ptr id={d} not found in value_slots", .{s.target_ptr.id});
-                }
-            },
-
-            .str_compare, .str_copy => {
-                // These are handled by the builtin system
-                return EmitError.InvalidInstruction;
-            },
-
-            .jump => |b| {
-                try self.emitRegJmp(b.target);
-            },
-
-            .brif => |c| {
-                // Conditional branch - jump to else if condition is false (jz)
-                const cond_reg = try self.getValueInReg(c.condition, 0);
-                try self.emitRegCondJmp(.jz, cond_reg, c.else_block);
-
-                // Fall through to then block, or jump if not next
-                try self.emitRegJmp(c.then_block);
-            },
-
-            .return_ => |r| {
-                if (r) |val| {
-                    const src_reg = try self.getValueInReg(val, 0);
-                    try self.emitRegRet(src_reg);
-                } else {
-                    try self.emitRegRet(null);
-                }
-            },
-
-            .call => |c| {
-                // Check for built-in method calls (Console.WriteLine, console.log, etc.)
-                // Method calls now have qualified names like "Console.WriteLine" in callee
-                if (std.mem.eql(u8, c.callee, "Console.WriteLine")) {
-                    // Console.WriteLine - register-based: load args to registers
-                    for (c.args, 0..) |arg, i| {
-                        if (i < 8) {
-                            try self.emitValueToReg(arg, @intCast(i));
-                        }
-                    }
-                    try self.emitOpcode(.console_writeln);
-                    // Format: [rs:4|argc:4] [0] - 2 operand bytes
-                    const argc: u8 = @intCast(c.args.len);
-                    try self.emitU8((0 << 4) | (argc & 0xF)); // r0 in upper nibble, argc in lower
-                    try self.emitU8(0); // Second unused byte
-                    return; // No result value
-                } else if (std.mem.eql(u8, c.callee, "Console.Write")) {
-                    // Console.Write - register-based: load args to registers
-                    for (c.args, 0..) |arg, i| {
-                        if (i < 8) {
-                            try self.emitValueToReg(arg, @intCast(i));
-                        }
-                    }
-                    try self.emitOpcode(.console_write);
-                    // Format: [rs:4|argc:4] [0] - 2 operand bytes
-                    const argc: u8 = @intCast(c.args.len);
-                    try self.emitU8((0 << 4) | (argc & 0xF)); // r0 in upper nibble, argc in lower
-                    try self.emitU8(0); // Second unused byte
-                    return;
-                } else if (std.mem.eql(u8, c.callee, "console.log")) {
-                    // console.log - register-based: load args to registers (writes to dev pane)
-                    for (c.args, 0..) |arg, i| {
-                        if (i < 8) {
-                            try self.emitValueToReg(arg, @intCast(i));
-                        }
-                    }
-                    try self.emitOpcode(.console_log);
-                    // Format: [rs:4|argc:4] [0] - 2 operand bytes
-                    const argc: u8 = @intCast(c.args.len);
-                    try self.emitU8((0 << 4) | (argc & 0xF)); // r0 in upper nibble, argc in lower
-                    try self.emitU8(0); // Second unused byte
-                    return;
-                }
-
-                // Core Cot I/O functions: print(), println()
-                if (io_functions.get(c.callee)) |opcode| {
-                    // Register-based: ensure arguments are in registers and emit with register info
-                    // For println/print, we expect the value in r0
-                    if (c.args.len > 0) {
-                        const arg = c.args[0];
-                        // Check if we already have a register for this value
-                        if (self.reg_alloc.getRegister(arg.id)) |arg_reg| {
-                            // Move to r0 if not already there
-                            if (arg_reg != 0) {
-                                try self.emitRegMov(0, arg_reg);
-                            }
-                        } else {
-                            // Value wasn't in a register, emit it to r0
-                            try self.emitValueToReg(arg, 0);
-                        }
-                    }
-                    try self.emitOpcode(opcode);
-                    // Format: [rs:4|argc:4] [0] - 2 operand bytes
-                    const argc: u8 = @intCast(c.args.len);
-                    const reg_argc: u8 = (0 << 4) | (argc & 0xF); // r0 in upper nibble, argc in lower
-                    try self.emitU8(reg_argc);
-                    try self.emitU8(0); // Second unused byte
-                    return;
-                }
-
-                // Check for performance-critical functions with dedicated opcodes
-                if (opcode_builtins.get(c.callee)) |builtin| {
-                    // Register-based: emit arguments to registers
-                    for (c.args, 0..) |arg, i| {
-                        if (i < 8) {
-                            try self.emitValueToReg(arg, @intCast(i));
-                        }
-                    }
-                    // Emit the builtin opcode
-                    try self.emitOpcode(builtin.opcode);
-                    return;
-                }
-
-                // Check for native functions (implemented in Zig, called via xcall)
-                if (native_functions.has(c.callee)) {
-                    // Load arguments into registers r0, r1, r2, ... (VM reads from registers)
-                    // Two-pass approach: first emit last_result args (to prevent source clobbering),
-                    // then emit all other args
-                    if (self.last_result_value) |last_id| {
-                        for (c.args, 0..) |arg, i| {
-                            if (i < 8 and arg.id == last_id) {
-                                try self.emitValueToReg(arg, @intCast(i));
-                            }
-                        }
-                    }
-                    for (c.args, 0..) |arg, i| {
-                        if (i < 8) {
-                            // Skip if already emitted in first pass
-                            if (self.last_result_value) |last_id| {
-                                if (arg.id == last_id) continue;
-                            }
-                            try self.emitValueToReg(arg, @intCast(i));
-                        }
-                    }
-                    const name_idx = try self.addIdentifier(c.callee);
-                    // Format: [opcode] [argc:4|0] [name_idx:16]
-                    try self.emitOpcode(.call_dynamic);
-                    try self.emitU8(@intCast(c.args.len << 4));
-                    try self.emitU16(name_idx);
-                    // Native functions return a value in r0 - track it if call has a result
-                    if (c.result) |result| {
-                        self.setLastResult(result.id, 0);
-                    }
-                    return;
-                }
-
-                // Regular function call (user-defined functions)
-                // Look up the routine index from our function_indices map
-                if (self.function_indices.get(c.callee)) |routine_idx| {
-                    // Register-based: emit arguments to registers r0..r(n-1)
-                    // Two-pass approach: first emit last_result args to prevent clobbering
-                    if (self.last_result_value) |last_id| {
-                        for (c.args, 0..) |arg, i| {
-                            if (i < 8 and arg.id == last_id) {
-                                try self.emitValueToReg(arg, @intCast(i));
-                            }
-                        }
-                    }
-                    for (c.args, 0..) |arg, i| {
-                        if (i < 8) {
-                            if (self.last_result_value) |last_id| {
-                                if (arg.id == last_id) continue;
-                            }
-                            try self.emitValueToReg(arg, @intCast(i));
-                        }
-                    }
-                    // Format: [argc:4|0] [routine_idx:16]
-                    try self.emitOpcode(.call);
-                    const argc: u8 = @intCast(c.args.len);
-                    try self.emitU8(argc << 4); // argc in upper nibble
-                    try self.emitU16(routine_idx);
-
-                    // Emit store-back for ref parameters
-                    if (self.ir_module) |ir_mod| {
-                        if (routine_idx < ir_mod.functions.items.len) {
-                            const callee_func = ir_mod.functions.items[routine_idx];
-                            for (callee_func.signature.params, 0..) |param, i| {
-                                if (param.is_ref and i < c.args.len) {
-                                    // Check if this arg has a known stack slot
-                                    if (self.value_slots.get(c.args[i].id)) |slot| {
-                                        // Emit store from register i back to stack slot
-                                        if (slot <= 255) {
-                                            try self.emitOpcode(.store_local);
-                                            try self.emitU8(@intCast(i)); // Source register
-                                            try self.emitU8(@intCast(slot)); // Destination slot (8-bit)
-                                        } else {
-                                            try self.emitOpcode(.store_local16);
-                                            try self.emitU8(@intCast(i)); // Source register
-                                            try self.emitU16(slot); // Destination slot (16-bit)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Track result in r0 for SSA value chaining
-                    if (c.result) |result| {
-                        self.setLastResult(result.id, 0);
-                    }
-                } else {
-                    // Function not found - emit call_dynamic for runtime resolution
-                    // Load arguments into registers r0, r1, r2, ...
-                    // Two-pass approach: first emit last_result args to prevent clobbering
-                    if (self.last_result_value) |last_id| {
-                        for (c.args, 0..) |arg, i| {
-                            if (i < 8 and arg.id == last_id) {
-                                try self.emitValueToReg(arg, @intCast(i));
-                            }
-                        }
-                    }
-                    for (c.args, 0..) |arg, i| {
-                        if (i < 8) {
-                            if (self.last_result_value) |last_id| {
-                                if (arg.id == last_id) continue;
-                            }
-                            try self.emitValueToReg(arg, @intCast(i));
-                        }
-                    }
-                    const name_idx = try self.addIdentifier(c.callee);
-                    try self.emitOpcode(.call_dynamic);
-                    try self.emitU8(@intCast(c.args.len << 4));
-                    try self.emitU16(name_idx);
-                    // Track result in r0 for SSA value chaining
-                    if (c.result) |result| {
-                        self.setLastResult(result.id, 0);
-                    }
-                }
-            },
-
-            // Note: xcall is converted to regular .call in the IR lowerer
-
-            .io_open => |o| {
-                // OPEN - emit xcall to native "open" function
-                // Args: [cursor_id, filename] - mode is ignored (deprecated)
-                // Register-based: load args to r0, r1
-                try self.emitValueToReg(o.channel, 0);
-                try self.emitValueToReg(o.filename, 1);
-                const name_idx = try self.addIdentifier("open");
-                // Format: [opcode] [argc:4|0] [name_idx:16]
-                try self.emitOpcode(.call_dynamic);
-                try self.emitU8(2 << 4); // 2 args in upper nibble
-                try self.emitU16(name_idx);
-            },
-
-            .io_close => |c| {
-                // CLOSE - emit xcall to native "close" function
-                // Register-based: load channel to r0
-                try self.emitValueToReg(c.channel, 0);
-                const name_idx = try self.addIdentifier("close");
-                // Format: [opcode] [argc:4|0] [name_idx:16]
-                try self.emitOpcode(.call_dynamic);
-                try self.emitU8(1 << 4); // 1 arg in upper nibble
-                try self.emitU16(name_idx);
-            },
-
-            .io_read => |r| {
-                // READ - emit xcall to native "read" function
-                // For keyed reads: args = [cursor_id, key_num, key_value]
-                // For sequential reads (reads): args = [cursor_id]
-                // Register-based: load channel to r0
-                try self.emitValueToReg(r.channel, 0);
-                if (r.key) |key| {
-                    // Keyed read: read(cursor_id, key_num, key_value)
-                    // Load key_num as constant to r1
-                    const key_num_idx = try self.addConstant(.{ .integer = r.qualifiers.key_index });
-                    try self.emitOpcode(.load_const);
-                    try self.emitU8(1); // r1 as destination
-                    try self.emitU16(key_num_idx);
-                    // Load key value to r2
-                    try self.emitValueToReg(key, 2);
-                    const name_idx = try self.addIdentifier("read");
-                    // Format: [opcode] [argc:4|0] [name_idx:16]
-                    try self.emitOpcode(.call_dynamic);
-                    try self.emitU8(3 << 4); // 3 args in upper nibble
-                    try self.emitU16(name_idx);
-                    // Result is in r0
-                } else {
-                    // Sequential read: reads(cursor_id)
-                    const name_idx = try self.addIdentifier("reads");
-                    // Format: [opcode] [argc:4|0] [name_idx:16]
-                    try self.emitOpcode(.call_dynamic);
-                    try self.emitU8(1 << 4); // 1 arg in upper nibble
-                    try self.emitU16(name_idx);
-                    // Result is in r0
-                }
-                // If this is a structure read, emit store_record_buf to distribute to locals
-                if (r.struct_name) |struct_name| {
-                    try self.emitStoreRecordBuf(struct_name, r.base_name);
-                }
-            },
-
-            .io_write => |w| {
-                // WRITE - emit xcall to native "write" or "store" function
-                // Args: [cursor_id, record_buffer]
-                // Register-based: load args to r0, r1
-                try self.emitValueToReg(w.channel, 0);
-                try self.emitValueToReg(w.buffer, 1);
-                const name_idx = try self.addIdentifier(if (w.is_insert) "store" else "write");
-                // Format: [opcode] [argc:4|0] [name_idx:16]
-                try self.emitOpcode(.call_dynamic);
-                try self.emitU8(2 << 4); // 2 args in upper nibble
-                try self.emitU16(name_idx);
-            },
-
-            // Note: io_store is now part of io_write with is_insert flag
-
-            .load_struct_buf => |sb| {
-                // Find the type index and type definition for this structure
-                var type_idx: u16 = 0;
-                var found = false;
-                var type_def: ?*const module.TypeDef = null;
-                debug.print(.emit, "load_struct_buf: base='{s}' struct='{s}', types.len={d}", .{ sb.base_name, sb.struct_name, self.types.items.len });
-                for (self.types.items, 0..) |*t, i| {
-                    // Look up the type name from constants
-                    if (t.name_index < self.constants.items.len) {
-                        const name_const = self.constants.items[t.name_index];
-                        const type_name = switch (name_const) {
-                            .string => |s| s,
-                            .identifier => |s| s,
-                            else => continue,
-                        };
-                        debug.print(.emit, "  type[{d}] name='{s}'", .{ i, type_name });
-                        if (std.mem.eql(u8, type_name, sb.struct_name)) {
-                            type_idx = @intCast(i);
-                            type_def = t;
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found) {
-                    debug.print(.emit, "WARNING: struct '{s}' not found in types!", .{sb.struct_name});
-                }
-
-                // Find local_base by looking up the first field's name
-                var local_base: u16 = 0;
-                if (type_def) |td| {
-                    if (td.fields.len > 0) {
-                        const first_field = td.fields[0];
-                        // Get the field name from constants
-                        if (first_field.name_index < self.constants.items.len) {
-                            const field_name_const = self.constants.items[first_field.name_index];
-                            const field_name = switch (field_name_const) {
-                                .string => |s| s,
-                                .identifier => |s| s,
-                                else => "",
-                            };
-                            // Try plain field name first (for named records like "record customer")
-                            debug.print(.emit, "load_struct_buf: looking up first field '{s}'", .{field_name});
-                            if (self.locals.get(field_name)) |loc| {
-                                local_base = loc.slot;
-                                debug.print(.emit, "load_struct_buf: local_base={d} (plain name)", .{local_base});
-                            } else {
-                                // Try qualified name: base_name.field_name (for struct-typed fields)
-                                var qualified_buf: [256]u8 = undefined;
-                                const qualified_name = std.fmt.bufPrint(&qualified_buf, "{s}.{s}", .{ sb.base_name, field_name }) catch "";
-                                debug.print(.emit, "load_struct_buf: trying qualified name '{s}'", .{qualified_name});
-                                if (self.locals.get(qualified_name)) |loc| {
-                                    local_base = loc.slot;
-                                    debug.print(.emit, "load_struct_buf: local_base={d} (qualified)", .{local_base});
-                                } else {
-                                    debug.print(.emit, "WARNING: first field '{s}' not found in locals!", .{field_name});
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Allocate a register for the result and emit the opcode
-                // Format: [rd:4|0] [type_idx:16] [local_base:16]
-                const rd = try self.getOrAllocReg(sb.result);
-                debug.print(.emit, "load_struct_buf: allocated r{d} for result", .{rd});
-                try self.emitOpcode(.load_record_buf);
-                try self.emitU8(@as(u8, rd) << 4);
-                try self.emitU16(type_idx);
-                try self.emitU16(local_base);
-                // Track this register for the result value
-                self.last_result_value = sb.result.id;
-                self.last_result_reg = rd;
-            },
-
-            .store_struct_buf => |sb| {
-                // Register-based: load value (buffer from db_read) to r0
-                try self.emitValueToReg(sb.value, 0);
-                // Then emit store_record_buf to unpack it into struct fields
-                debug.print(.emit, "store_struct_buf: base='{s}' struct='{s}'", .{ sb.base_name, sb.struct_name });
-                try self.emitStoreRecordBuf(sb.struct_name, sb.base_name);
-            },
-
-            .debug_line => |d| {
-                // Emit debug line info for debugger
-                // Format: [0] [line:16]
-                try self.emitOpcode(.debug_line);
-                try self.emitU8(0); // Register field (unused for debug_line)
-                try self.emitU16(@intCast(d.line));
-            },
-
-            // Exception handling - using modern try/catch
-            .try_begin => |t| {
-                // Set up error handler to catch block
-                try self.emitOpcode(.set_error_handler);
-                try self.addPendingJump(t.catch_block, false);
-                try self.emitI16(0); // Placeholder - will be patched
-            },
-
-            .try_end => {
-                // Clear the error handler (normal exit from try block)
-                try self.emitOpcode(.clear_error_handler);
-            },
-
-            .catch_begin => {
-                // Start of catch block - error handler clears itself
-                try self.emitOpcode(.nop);
-            },
-
-            .throw => |t| {
-                // Throw exception - emit value and trigger error
-                // Note: Runtime doesn't have throw opcode yet, use error jump instead
-                // Register-based: load value to r0
-                try self.emitValueToReg(t.value, 0);
-                // For now, just emit nop (throw not implemented)
-                try self.emitOpcode(.nop);
-            },
-
-            .array_load => |al| {
-                // Array element access: array[index]
-                // Get the array slot
-                const array_slot = if (self.value_slots.get(al.array_ptr.id)) |slot_info|
-                    slot_info & 0x7FFF
-                else
-                    0;
-
-                // Register-based: load index to r0
-                try self.emitValueToReg(al.index, 0);
-
-                // Emit array_load opcode with the slot
-                try self.emitOpcode(.array_load);
-                try self.emitU8(0); // index is in r0, result goes to r0
-                try self.emitU16(array_slot);
-
-                // Result is in r0
-                self.setLastResult(al.result.id, 0);
-            },
-
-            .array_store => |as| {
-                // Array element assignment: array[index] = value
-                // Get the array slot
-                const array_slot = if (self.value_slots.get(as.array_ptr.id)) |slot_info|
-                    slot_info & 0x7FFF
-                else
-                    0;
-
-                // Register-based: load index to r0, value to r1
-                try self.emitValueToReg(as.index, 0);
-                try self.emitValueToReg(as.value, 1);
-
-                // Emit array_store opcode with the slot
-                try self.emitOpcode(.array_store);
-                try self.emitU8((0 << 4) | 1); // r0 = index, r1 = value
-                try self.emitU16(array_slot);
-            },
-
-            .br_table => |s| {
-                // Switch/jump table - emit as a series of comparisons for now
-                // Future: could emit as computed jump table for dense integer ranges
-                //
-                // For each case:
-                //   load case_value to r1
-                //   cmp_eq r0, r1 -> r2
-                //   jnz r2, case_target
-                // After all cases: jmp default
-
-                // Load the switch value to r0
-                const val_reg = try self.getValueInReg(s.value, 0);
-                _ = val_reg;
-
-                for (s.cases) |case| {
-                    // Load case constant to r1
-                    const case_idx = try self.addConstant(.{ .integer = case.value });
-                    try self.emitOpcode(.load_const);
-                    try self.emitU8(1); // r1
-                    try self.emitU16(case_idx);
-
-                    // Compare r0 == r1, result in r2
-                    try self.emitOpcode(.cmp_eq);
-                    try self.emitU8((0 << 4) | 1); // r0, r1
-                    try self.emitU8(2); // result in r2
-
-                    // Jump to case block if equal (jnz r2, target)
-                    try self.emitRegCondJmp(.jnz, 2, case.target);
-                }
-
-                // Fall through to default
-                try self.emitRegJmp(s.default);
-            },
-
-            .format_decimal => |fd| {
-                // format_decimal rd, rs, width - format integer as zero-padded string
-                // Format: [rd:4|rs:4] [width:8]
-                const src_reg = try self.getValueInReg(fd.value, 0);
-                const dest_reg: u4 = 1;
-                try self.emitOpcode(.format_decimal);
-                try self.emitU8((@as(u8, dest_reg) << 4) | src_reg);
-                try self.emitU8(@intCast(fd.width));
-                self.setLastResult(fd.result.id, dest_reg);
-            },
-
-            .parse_decimal => |pd| {
-                // parse_decimal rd, rs - parse string to integer with validation
-                // Format: [rd:4|rs:4] [0]
-                const src_reg = try self.getValueInReg(pd.value, 0);
-                const dest_reg: u4 = 1;
-                try self.emitOpcode(.parse_decimal);
-                try self.emitU8((@as(u8, dest_reg) << 4) | src_reg);
-                try self.emitU8(0);
-                self.setLastResult(pd.result.id, dest_reg);
-            },
-
-            // ============================================
-            // Map Operations
-            // ============================================
-
-            .map_new => |mn| {
-                // map_new rd, flags - create new map
-                // Format: [rd:4|flags:4] [0]
-                const dest_reg: u4 = 0;
-                try self.emitOpcode(.map_new);
-                try self.emitU8((@as(u8, dest_reg) << 4) | (mn.flags & 0x0F));
-                try self.emitU8(0);
-                self.setLastResult(mn.result.id, dest_reg);
-            },
-
-            .map_set => |ms| {
-                // map_set map, key, val - set key-value pair
-                // Format: [map:4|key:4] [val:4|0]
-                const map_reg = try self.getValueInReg(ms.map, 0);
-                const key_reg = try self.getValueInReg(ms.key, 1);
-                const val_reg = try self.getValueInReg(ms.value, 2);
-                try self.emitOpcode(.map_set);
-                try self.emitU8((@as(u8, map_reg) << 4) | key_reg);
-                try self.emitU8((@as(u8, val_reg) << 4) | 0);
-            },
-
-            .map_get => |mg| {
-                // map_get rd, map, key - get value by key
-                // Format: [rd:4|map:4] [key:4|0]
-                const map_reg = try self.getValueInReg(mg.map, 0);
-                const key_reg = try self.getValueInReg(mg.key, 1);
-                const dest_reg: u4 = 2;
-                try self.emitOpcode(.map_get);
-                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
-                try self.emitU8((@as(u8, key_reg) << 4) | 0);
-                self.setLastResult(mg.result.id, dest_reg);
-            },
-
-            .map_delete => |md| {
-                // map_delete map, key - delete key
-                // Format: [map:4|key:4] [0]
-                const map_reg = try self.getValueInReg(md.map, 0);
-                const key_reg = try self.getValueInReg(md.key, 1);
-                try self.emitOpcode(.map_delete);
-                try self.emitU8((@as(u8, map_reg) << 4) | key_reg);
-                try self.emitU8(0);
-            },
-
-            .map_has => |mh| {
-                // map_has rd, map, key - check if key exists
-                // Format: [rd:4|map:4] [key:4|0]
-                const map_reg = try self.getValueInReg(mh.map, 0);
-                const key_reg = try self.getValueInReg(mh.key, 1);
-                const dest_reg: u4 = 2;
-                try self.emitOpcode(.map_has);
-                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
-                try self.emitU8((@as(u8, key_reg) << 4) | 0);
-                self.setLastResult(mh.result.id, dest_reg);
-            },
-
-            .map_len => |ml| {
-                // map_len rd, map - get number of entries
-                // Format: [rd:4|map:4] [0]
-                const map_reg = try self.getValueInReg(ml.map, 0);
-                const dest_reg: u4 = 1;
-                try self.emitOpcode(.map_len);
-                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
-                try self.emitU8(0);
-                self.setLastResult(ml.result.id, dest_reg);
-            },
-
-            .map_clear => |mc| {
-                // map_clear map - remove all entries
-                // Format: [map:4|0] [0]
-                const map_reg = try self.getValueInReg(mc.map, 0);
-                try self.emitOpcode(.map_clear);
-                try self.emitU8((@as(u8, map_reg) << 4) | 0);
-                try self.emitU8(0);
-            },
-
-            .map_keys => |mk| {
-                // map_keys rd, map - get keys as string
-                // Format: [rd:4|map:4] [0]
-                const map_reg = try self.getValueInReg(mk.map, 0);
-                const dest_reg: u4 = 1;
-                try self.emitOpcode(.map_keys);
-                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
-                try self.emitU8(0);
-                self.setLastResult(mk.result.id, dest_reg);
-            },
-
-            .map_values => |mv| {
-                // map_values rd, map - get values as string
-                // Format: [rd:4|map:4] [0]
-                const map_reg = try self.getValueInReg(mv.map, 0);
-                const dest_reg: u4 = 1;
-                try self.emitOpcode(.map_values);
-                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
-                try self.emitU8(0);
-                self.setLastResult(mv.result.id, dest_reg);
-            },
+            // Memory operations
+            .alloca => |a| try emit_inst.emitAlloca(self, a),
+            .load => |l| try emit_inst.emitLoad(self, l),
+            .store => |s| try emit_inst.emitStore(self, s),
+            .field_ptr => |fp| try emit_inst.emitFieldPtr(self, fp),
+
+            // Constants
+            .iconst => |c| try emit_inst.emitIconst(self, c),
+            .f32const => |c| try emit_inst.emitF32const(self, c),
+            .f64const => |c| try emit_inst.emitF64const(self, c),
+            .const_string => |c| try emit_inst.emitConstString(self, c),
+            .const_null => {},
+
+            // Arithmetic
+            .iadd => |a| try emit_inst.emitBinaryArith(self, .add, a.lhs, a.rhs, a.result),
+            .isub => |s| try emit_inst.emitBinaryArith(self, .sub, s.lhs, s.rhs, s.result),
+            .imul => |m| try emit_inst.emitBinaryArith(self, .mul, m.lhs, m.rhs, m.result),
+            .sdiv, .udiv => |d| try emit_inst.emitBinaryArith(self, .div, d.lhs, d.rhs, d.result),
+            .srem, .urem => |m| try emit_inst.emitBinaryArith(self, .mod, m.lhs, m.rhs, m.result),
+            .ineg => |n| try emit_inst.emitIneg(self, n),
+            .icmp => |c| try emit_inst.emitIcmp(self, c),
+
+            // Logical
+            .log_and => |l| try emit_inst.emitBinaryArith(self, .log_and, l.lhs, l.rhs, l.result),
+            .log_or => |l| try emit_inst.emitBinaryArith(self, .log_or, l.lhs, l.rhs, l.result),
+            .log_not => |l| try emit_inst.emitLogNot(self, l),
+
+            // String operations
+            .str_concat => |s| try emit_inst.emitStrConcat(self, s),
+            .str_slice => |s| try emit_inst.emitStrSlice(self, s),
+            .str_slice_store => |s| try emit_inst.emitStrSliceStore(self, s),
+            .str_compare, .str_copy => return EmitError.InvalidInstruction,
+
+            // Control flow
+            .jump => |b| try emit_inst.emitJump(self, b),
+            .brif => |c| try emit_inst.emitBrif(self, c),
+            .return_ => |r| try emit_inst.emitReturn(self, r),
+
+            // Function calls
+            .call => |c| try emit_inst.emitCall(self, c),
+
+            // I/O operations
+            .io_open => |o| try emit_inst.emitIoOpen(self, o),
+            .io_close => |c| try emit_inst.emitIoClose(self, c),
+            .io_read => |r| try emit_inst.emitIoRead(self, r),
+            .io_write => |w| try emit_inst.emitIoWrite(self, w),
+            .io_delete => |d| try emit_inst.emitIoDelete(self, d),
+
+            // Struct buffer operations
+            .load_struct_buf => |sb| try emit_inst.emitLoadStructBuf(self, sb),
+            .store_struct_buf => |sb| try emit_inst.emitStoreStructBuf(self, sb),
+
+            // Debug
+            .debug_line => |d| try emit_inst.emitDebugLine(self, d),
+
+            // Exception handling
+            .try_begin => |t| try emit_inst.emitTryBegin(self, t),
+            .try_end => try emit_inst.emitTryEnd(self),
+            .catch_begin => try emit_inst.emitCatchBegin(self),
+            .throw => |t| try emit_inst.emitThrow(self, t),
+
+            // Array operations
+            .array_load => |al| try emit_inst.emitArrayLoad(self, al),
+            .array_store => |as| try emit_inst.emitArrayStore(self, as),
+
+            // Switch/branch table
+            .br_table => |s| try emit_inst.emitBrTable(self, s),
+
+            // Decimal formatting
+            .format_decimal => |fd| try emit_inst.emitFormatDecimal(self, fd),
+            .parse_decimal => |pd| try emit_inst.emitParseDecimal(self, pd),
+
+            // Map operations
+            .map_new => |mn| try emit_inst.emitMapNew(self, mn),
+            .map_set => |ms| try emit_inst.emitMapSet(self, ms),
+            .map_get => |mg| try emit_inst.emitMapGet(self, mg),
+            .map_delete => |md| try emit_inst.emitMapDelete(self, md),
+            .map_has => |mh| try emit_inst.emitMapHas(self, mh),
+            .map_len => |ml| try emit_inst.emitMapLen(self, ml),
+            .map_clear => |mc| try emit_inst.emitMapClear(self, mc),
+            .map_keys => |mk| try emit_inst.emitMapKeys(self, mk),
+            .map_values => |mv| try emit_inst.emitMapValues(self, mv),
 
             else => {
                 // Other instructions not yet implemented
@@ -1492,7 +612,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Emit store_record_buf with type_idx and local_base
-    fn emitStoreRecordBuf(self: *Self, struct_name: []const u8, base_name: ?[]const u8) EmitError!void {
+    pub fn emitStoreRecordBuf(self: *Self, struct_name: []const u8, base_name: ?[]const u8) EmitError!void {
         // Find the type index for this structure
         var type_idx: u16 = 0;
         var type_def: ?*const module.TypeDef = null;
@@ -1546,22 +666,22 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Emit opcode byte
-    fn emitOpcode(self: *Self, op: Opcode) EmitError!void {
+    pub fn emitOpcode(self: *Self, op: Opcode) EmitError!void {
         try self.code.append(self.allocator, @intFromEnum(op));
     }
 
     /// Emit unsigned 8-bit value
-    fn emitU8(self: *Self, val: u8) EmitError!void {
+    pub fn emitU8(self: *Self, val: u8) EmitError!void {
         try self.code.append(self.allocator, val);
     }
 
     /// Emit unsigned 16-bit value (little-endian)
-    fn emitU16(self: *Self, val: u16) EmitError!void {
+    pub fn emitU16(self: *Self, val: u16) EmitError!void {
         try self.code.appendSlice(self.allocator, &std.mem.toBytes(val));
     }
 
     /// Emit signed 16-bit value (little-endian)
-    fn emitI16(self: *Self, val: i16) EmitError!void {
+    pub fn emitI16(self: *Self, val: i16) EmitError!void {
         try self.code.appendSlice(self.allocator, &std.mem.toBytes(val));
     }
 
@@ -1622,98 +742,98 @@ pub const BytecodeEmitter = struct {
     // ============================================
 
     /// Emit register arithmetic: op dest, src1, src2
-    fn emitRegArith(self: *Self, op: Opcode, dest: u4, src1: u4, src2: u4) EmitError!void {
+    pub fn emitRegArith(self: *Self, op: Opcode, dest: u4, src1: u4, src2: u4) EmitError!void {
         try self.emitOpcode(op);
         try self.emitU8((@as(u8, dest) << 4) | @as(u8, src1));
         try self.emitU8(@as(u8, src2) << 4);
     }
 
     /// Emit register unary: op dest, src (neg, not, etc.)
-    fn emitRegUnary(self: *Self, op: Opcode, dest: u4, src: u4) EmitError!void {
+    pub fn emitRegUnary(self: *Self, op: Opcode, dest: u4, src: u4) EmitError!void {
         try self.emitOpcode(op);
         try self.emitU8((@as(u8, dest) << 4) | @as(u8, src));
         try self.emitU8(0);
     }
 
     /// Emit register immediate arithmetic: op dest, src, imm8
-    fn emitRegArithImm(self: *Self, op: Opcode, dest: u4, src: u4, imm: i8) EmitError!void {
+    pub fn emitRegArithImm(self: *Self, op: Opcode, dest: u4, src: u4, imm: i8) EmitError!void {
         try self.emitOpcode(op);
         try self.emitU8((@as(u8, dest) << 4) | @as(u8, src));
         try self.emitU8(@bitCast(imm));
     }
 
     /// Emit register move: mov dest, src
-    fn emitRegMov(self: *Self, dest: u4, src: u4) EmitError!void {
+    pub fn emitRegMov(self: *Self, dest: u4, src: u4) EmitError!void {
         try self.emitOpcode(.mov);
         try self.emitU8((@as(u8, dest) << 4) | @as(u8, src));
         try self.emitU8(0);
     }
 
     /// Emit register move immediate: movi dest, imm8
-    fn emitRegMovImm(self: *Self, dest: u4, imm: i8) EmitError!void {
+    pub fn emitRegMovImm(self: *Self, dest: u4, imm: i8) EmitError!void {
         try self.emitOpcode(.movi);
         try self.emitU8(@as(u8, dest) << 4);
         try self.emitU8(@bitCast(imm));
     }
 
     /// Emit register move immediate 16: movi16 dest, imm16
-    fn emitRegMovImm16(self: *Self, dest: u4, imm: i16) EmitError!void {
+    pub fn emitRegMovImm16(self: *Self, dest: u4, imm: i16) EmitError!void {
         try self.emitOpcode(.movi16);
         try self.emitU8(@as(u8, dest) << 4);
         try self.emitI16(imm);
     }
 
     /// Emit register load constant: load_const dest, const_idx
-    fn emitRegLoadConst(self: *Self, dest: u4, const_idx: u16) EmitError!void {
+    pub fn emitRegLoadConst(self: *Self, dest: u4, const_idx: u16) EmitError!void {
         try self.emitOpcode(.load_const);
         try self.emitU8(@as(u8, dest) << 4);
         try self.emitU16(const_idx);
     }
 
     /// Emit register load null/true/false
-    fn emitRegLoadLiteral(self: *Self, op: Opcode, dest: u4) EmitError!void {
+    pub fn emitRegLoadLiteral(self: *Self, op: Opcode, dest: u4) EmitError!void {
         try self.emitOpcode(op);
         try self.emitU8(@as(u8, dest) << 4);
         try self.emitU8(0);
     }
 
     /// Emit register load local: load_local dest, slot
-    fn emitRegLoadLocal(self: *Self, dest: u4, slot: u8) EmitError!void {
+    pub fn emitRegLoadLocal(self: *Self, dest: u4, slot: u8) EmitError!void {
         try self.emitOpcode(.load_local);
         try self.emitU8(@as(u8, dest) << 4);
         try self.emitU8(slot);
     }
 
     /// Emit register store local: store_local src, slot
-    fn emitRegStoreLocal(self: *Self, src: u4, slot: u8) EmitError!void {
+    pub fn emitRegStoreLocal(self: *Self, src: u4, slot: u8) EmitError!void {
         try self.emitOpcode(.store_local);
         try self.emitU8(@as(u8, src) << 4);
         try self.emitU8(slot);
     }
 
     /// Emit register load global: load_global dest, global_idx
-    fn emitRegLoadGlobal(self: *Self, dest: u4, idx: u16) EmitError!void {
+    pub fn emitRegLoadGlobal(self: *Self, dest: u4, idx: u16) EmitError!void {
         try self.emitOpcode(.load_global);
         try self.emitU8(@as(u8, dest) << 4);
         try self.emitU16(idx);
     }
 
     /// Emit register store global: store_global src, global_idx
-    fn emitRegStoreGlobal(self: *Self, src: u4, idx: u16) EmitError!void {
+    pub fn emitRegStoreGlobal(self: *Self, src: u4, idx: u16) EmitError!void {
         try self.emitOpcode(.store_global);
         try self.emitU8(@as(u8, src) << 4);
         try self.emitU16(idx);
     }
 
     /// Emit register comparison: cmp dest, src1, src2
-    fn emitRegCmp(self: *Self, op: Opcode, dest: u4, src1: u4, src2: u4) EmitError!void {
+    pub fn emitRegCmp(self: *Self, op: Opcode, dest: u4, src1: u4, src2: u4) EmitError!void {
         try self.emitOpcode(op);
         try self.emitU8((@as(u8, dest) << 4) | @as(u8, src1));
         try self.emitU8(@as(u8, src2) << 4);
     }
 
     /// Emit register jump: jmp offset
-    fn emitRegJmp(self: *Self, target: *const ir.Block) EmitError!void {
+    pub fn emitRegJmp(self: *Self, target: *const ir.Block) EmitError!void {
         try self.emitOpcode(.jmp);
         try self.emitU8(0); // Unused first byte
         try self.addPendingJump(target, false);
@@ -1721,7 +841,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Emit register conditional jump: jz/jnz cond, offset
-    fn emitRegCondJmp(self: *Self, op: Opcode, cond: u4, target: *const ir.Block) EmitError!void {
+    pub fn emitRegCondJmp(self: *Self, op: Opcode, cond: u4, target: *const ir.Block) EmitError!void {
         try self.emitOpcode(op);
         try self.emitU8(@as(u8, cond) << 4);
         try self.addPendingJump(target, false);
@@ -1729,14 +849,14 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Emit register call: call argc, routine_idx
-    fn emitRegCall(self: *Self, argc: u4, routine_idx: u16) EmitError!void {
+    pub fn emitRegCall(self: *Self, argc: u4, routine_idx: u16) EmitError!void {
         try self.emitOpcode(.call);
         try self.emitU8(@as(u8, argc) << 4);
         try self.emitU16(routine_idx);
     }
 
     /// Emit register return: ret or ret_val src
-    fn emitRegRet(self: *Self, src: ?u4) EmitError!void {
+    pub fn emitRegRet(self: *Self, src: ?u4) EmitError!void {
         if (src) |s| {
             try self.emitOpcode(.ret_val);
             try self.emitU8(@as(u8, s) << 4);
@@ -1748,7 +868,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Get or allocate a register for an IR value
-    fn getOrAllocReg(self: *Self, value: ir.Value) EmitError!u4 {
+    pub fn getOrAllocReg(self: *Self, value: ir.Value) EmitError!u4 {
         // Check if value already has a register
         if (self.reg_alloc.getRegister(value.id)) |reg| {
             return reg;
@@ -1765,7 +885,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Emit a value into a specific register (for register-based mode)
-    fn emitValueToReg(self: *Self, value: ir.Value, dest: u4) EmitError!void {
+    pub fn emitValueToReg(self: *Self, value: ir.Value, dest: u4) EmitError!void {
         // Check if this is the last computed result (SSA chaining)
         if (self.last_result_value) |last_id| {
             if (last_id == value.id) {
@@ -1809,7 +929,7 @@ pub const BytecodeEmitter = struct {
 
     /// Get or allocate a register for a value, or load it into a temp register if it's a constant/slot
     /// This version prefers using existing registers or loading on demand without permanent allocation
-    fn getValueInReg(self: *Self, value: ir.Value, temp_reg: u4) EmitError!u4 {
+    pub fn getValueInReg(self: *Self, value: ir.Value, temp_reg: u4) EmitError!u4 {
         // Check if this is the last computed result (SSA chaining)
         if (self.last_result_value) |last_id| {
             if (last_id == value.id) {
@@ -1851,7 +971,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Set the last computed result (for SSA value chains without permanent register allocation)
-    fn setLastResult(self: *Self, value_id: u32, reg: u4) void {
+    pub fn setLastResult(self: *Self, value_id: u32, reg: u4) void {
         self.last_result_value = value_id;
         self.last_result_reg = reg;
     }
@@ -1889,7 +1009,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Add pending jump for later patching
-    fn addPendingJump(self: *Self, target_block: *const ir.Block, is_wide: bool) EmitError!void {
+    pub fn addPendingJump(self: *Self, target_block: *const ir.Block, is_wide: bool) EmitError!void {
         try self.pending_jumps.append(self.allocator, .{
             .patch_offset = @intCast(self.code.items.len),
             .target_block = target_block,
@@ -1918,7 +1038,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Add constant to pool, returning index
-    fn addConstant(self: *Self, constant: module.Constant) EmitError!u16 {
+    pub fn addConstant(self: *Self, constant: module.Constant) EmitError!u16 {
         const idx = self.constants.items.len;
         if (idx > 65535) return EmitError.TooManyConstants;
         try self.constants.append(self.allocator, constant);
@@ -1926,7 +1046,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Add string constant with deduplication
-    fn addString(self: *Self, str: []const u8) EmitError!u16 {
+    pub fn addString(self: *Self, str: []const u8) EmitError!u16 {
         if (self.string_pool.get(str)) |idx| {
             return idx;
         }
@@ -1938,7 +1058,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Add identifier constant with deduplication
-    fn addIdentifier(self: *Self, name: []const u8) EmitError!u16 {
+    pub fn addIdentifier(self: *Self, name: []const u8) EmitError!u16 {
         if (self.string_pool.get(name)) |idx| {
             return idx;
         }
