@@ -1362,6 +1362,28 @@ pub const BytecodeEmitter = struct {
                 try self.emitRegJmp(s.default);
             },
 
+            .format_decimal => |fd| {
+                // format_decimal rd, rs, width - format integer as zero-padded string
+                // Format: [rd:4|rs:4] [width:8]
+                const src_reg = try self.getValueInReg(fd.value, 0);
+                const dest_reg: u4 = 1;
+                try self.emitOpcode(.format_decimal);
+                try self.emitU8((@as(u8, dest_reg) << 4) | src_reg);
+                try self.emitU8(@intCast(fd.width));
+                self.setLastResult(fd.result.id, dest_reg);
+            },
+
+            .parse_decimal => |pd| {
+                // parse_decimal rd, rs - parse string to integer with validation
+                // Format: [rd:4|rs:4] [0]
+                const src_reg = try self.getValueInReg(pd.value, 0);
+                const dest_reg: u4 = 1;
+                try self.emitOpcode(.parse_decimal);
+                try self.emitU8((@as(u8, dest_reg) << 4) | src_reg);
+                try self.emitU8(0);
+                self.setLastResult(pd.result.id, dest_reg);
+            },
+
             else => {
                 // Other instructions not yet implemented
             },
@@ -1851,6 +1873,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .array => .string, // Arrays treated as string for now
         .slice => .string, // Slices treated as string for now
         .@"struct" => .structure, // Structs are structures
+        .@"union" => .structure, // Unions are similar to structs
         .function => .int64, // Function pointers
     };
 }

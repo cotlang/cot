@@ -105,6 +105,24 @@ pub const Lexer = struct {
             return self.makeToken(.colon, self.source[start_pos..self.position]);
         }
 
+        // Caret: ^ or ^a (cast to alpha) or ^d (cast to decimal) or ^i (cast to integer)
+        if (c == '^') {
+            if (!self.isAtEnd()) {
+                const next = self.peek();
+                if (next == 'a' or next == 'A') {
+                    _ = self.advance();
+                    return self.makeToken(.cast_alpha, self.source[start_pos..self.position]);
+                } else if (next == 'd' or next == 'D') {
+                    _ = self.advance();
+                    return self.makeToken(.cast_decimal, self.source[start_pos..self.position]);
+                } else if (next == 'i' or next == 'I') {
+                    _ = self.advance();
+                    return self.makeToken(.cast_integer, self.source[start_pos..self.position]);
+                }
+            }
+            return self.makeToken(.caret, self.source[start_pos..self.position]);
+        }
+
         // Minus: - or -> (arrow)
         if (c == '-') {
             if (!self.isAtEnd() and self.peek() == '>') {

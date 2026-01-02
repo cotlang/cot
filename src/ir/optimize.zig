@@ -463,6 +463,12 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| {
             used.put(op.operand.id, {}) catch {};
         },
+        .format_decimal => |f| {
+            used.put(f.value.id, {}) catch {};
+        },
+        .parse_decimal => |p| {
+            used.put(p.value.id, {}) catch {};
+        },
         .sextend, .uextend => |e| {
             used.put(e.operand.id, {}) catch {};
         },

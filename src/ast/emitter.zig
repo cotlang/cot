@@ -127,7 +127,7 @@ pub const Emitter = struct {
             // Add blank line between top-level items
             if (!first and self.options.blank_lines) {
                 const tag = self.store.stmtTag(stmt_idx);
-                if (tag == .fn_def or tag == .struct_def or tag == .enum_def) {
+                if (tag == .fn_def or tag == .struct_def or tag == .union_def or tag == .enum_def) {
                     try self.writer.writeByte('\n');
                 }
             }
@@ -143,6 +143,8 @@ pub const Emitter = struct {
         switch (tag) {
             .fn_def => try self.emitFnDef(idx),
             .struct_def => try self.emitStructDef(idx),
+            .union_def => {}, // TODO: implement union_def emission
+            .field_view => {}, // TODO: implement field_view emission
             .enum_def => try self.emitEnumDef(idx),
             .trait_def => try self.emitTraitDef(idx),
             .impl_block => try self.emitImplBlock(idx),
@@ -292,6 +294,7 @@ pub const Emitter = struct {
                 }
                 try self.writer.writeByte('>');
             },
+            .@"union" => try self.writer.writeAll("union"),
             .function => try self.writer.writeAll("fn"),
             .tuple => try self.writer.writeAll("tuple"),
             .error_union => {

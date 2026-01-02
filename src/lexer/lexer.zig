@@ -373,6 +373,8 @@ pub const Lexer = struct {
         // Declarations
         .{ "fn", .kw_fn },
         .{ "struct", .kw_struct },
+        .{ "union", .kw_union },
+        .{ "view", .kw_view },
         .{ "enum", .kw_enum },
         .{ "const", .kw_const },
         .{ "let", .kw_let },

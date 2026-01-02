@@ -283,6 +283,12 @@ pub const Verifier = struct {
             .sextend, .uextend => |op| {
                 try self.checkValueDefined(op.operand);
             },
+            .format_decimal => |op| {
+                try self.checkValueDefined(op.value);
+            },
+            .parse_decimal => |op| {
+                try self.checkValueDefined(op.value);
+            },
             .wrap_optional, .unwrap_optional, .is_null => |op| {
                 try self.checkValueDefined(op.operand);
             },
@@ -332,6 +338,7 @@ pub const Verifier = struct {
             .array => "array",
             .slice => "slice",
             .@"struct" => "struct",
+            .@"union" => "union",
             .optional => "optional",
             .function => "function",
         };

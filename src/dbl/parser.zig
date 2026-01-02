@@ -839,12 +839,37 @@ pub const Parser = struct {
                     var_type = self.store.addPrimitiveType(.i64) catch return ParseError.OutOfMemory;
                 }
 
-                // Create variable declaration with proper type
-                // For structs, don't provide init value (let IR handle default construction)
-                // For primitives, initialize to 0
-                const init_val = if (is_struct_type) ExprIdx.null else self.store.addIntLiteral(0, loc) catch return ParseError.OutOfMemory;
-                const var_stmt = self.store.addLetDecl(var_name_id, var_type, init_val, true, loc) catch return ParseError.OutOfMemory;
-                stmts.append(self.allocator, var_stmt) catch return ParseError.OutOfMemory;
+                // Check for @position (field overlay) syntax
+                if (self.match(&[_]TokenType{.at})) {
+                    // Parse base field name
+                    const base_field_tok = try self.consume(.identifier, "Expected field name after '@'");
+                    const base_field_id = try self.intern(base_field_tok.lexeme);
+
+                    // Parse optional offset: + or - followed by number
+                    var offset: i32 = 0;
+                    if (self.match(&[_]TokenType{.plus})) {
+                        if (self.check(.integer_literal)) {
+                            const offset_tok = self.advance();
+                            offset = @intCast(std.fmt.parseInt(i32, offset_tok.lexeme, 10) catch 0);
+                        }
+                    } else if (self.match(&[_]TokenType{.minus})) {
+                        if (self.check(.integer_literal)) {
+                            const offset_tok = self.advance();
+                            offset = -@as(i32, @intCast(std.fmt.parseInt(i32, offset_tok.lexeme, 10) catch 0));
+                        }
+                    }
+
+                    // Create field_view instead of let_decl
+                    const view_stmt = self.store.addFieldView(var_name_id, var_type, base_field_id, offset, loc) catch return ParseError.OutOfMemory;
+                    stmts.append(self.allocator, view_stmt) catch return ParseError.OutOfMemory;
+                } else {
+                    // Create variable declaration with proper type
+                    // For structs, don't provide init value (let IR handle default construction)
+                    // For primitives, initialize to 0
+                    const init_val = if (is_struct_type) ExprIdx.null else self.store.addIntLiteral(0, loc) catch return ParseError.OutOfMemory;
+                    const var_stmt = self.store.addLetDecl(var_name_id, var_type, init_val, true, loc) catch return ParseError.OutOfMemory;
+                    stmts.append(self.allocator, var_stmt) catch return ParseError.OutOfMemory;
+                }
             } else {
                 _ = self.advance();
             }
@@ -933,13 +958,23 @@ pub const Parser = struct {
                 else
                     1; // Default size is 1
 
-                // For DBL, both alpha (a) and decimal (d) types are stored as fixed-length
-                // byte strings in records. The difference is interpretation, not storage.
-                // d6 = 6 bytes, a30 = 30 bytes, a1 = 1 byte
-                return .{
-                    .type_idx = self.store.addStringFixedType(size) catch TypeIdx.null,
-                    .is_struct = false,
-                };
+                // DBL type distinction:
+                // - 'a' (alpha): arbitrary characters, stored as string_fixed
+                // - 'd' (decimal): numeric only, stored as decimal type (zero-padded on store)
+                // - 'i' (integer): numeric only, stored as integer
+                if (lower[0] == 'd') {
+                    // Decimal type: numeric with precision (number of digits)
+                    return .{
+                        .type_idx = self.store.addDecimalType(size, 0) catch TypeIdx.null,
+                        .is_struct = false,
+                    };
+                } else {
+                    // Alpha (and fallback): fixed-length string
+                    return .{
+                        .type_idx = self.store.addStringFixedType(size) catch TypeIdx.null,
+                        .is_struct = false,
+                    };
+                }
             }
         }
 
@@ -1609,6 +1644,33 @@ pub const Parser = struct {
                 }
                 self.addError("Expected function name after '%'");
                 return ParseError.InvalidExpression;
+            },
+            .cast_alpha, .cast_decimal, .cast_integer => {
+                // DBL cast operators: ^a(), ^d(), ^i()
+                // These reinterpret bytes as a different type (NOT conversion)
+                const cast_tok = self.advance();
+                const cast_name = switch (cast_tok.type) {
+                    .cast_alpha => "cast_alpha",
+                    .cast_decimal => "cast_decimal",
+                    .cast_integer => "cast_integer",
+                    else => unreachable,
+                };
+                const func_id = try self.intern(cast_name);
+                var func_expr = self.store.addIdentifier(func_id, loc) catch return ParseError.OutOfMemory;
+
+                // Parse argument (required)
+                _ = try self.consume(.lparen, "Expected '(' after cast operator");
+                var args: std.ArrayListUnmanaged(ExprIdx) = .{};
+                errdefer args.deinit(self.allocator);
+
+                args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
+                while (self.match(&[_]TokenType{.comma})) {
+                    args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
+                }
+                _ = try self.consume(.rparen, "Expected ')'");
+                func_expr = self.store.addCall(func_expr, args.items, loc) catch return ParseError.OutOfMemory;
+                args.deinit(self.allocator);
+                return func_expr;
             },
             else => {
                 self.addError("Expected expression");

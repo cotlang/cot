@@ -516,6 +516,21 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}, r{}, size={}", .{ rd, rs, size });
             },
 
+            // format_decimal rd, rs, width - [rd:4|rs:4] [width:8]
+            .format_decimal => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                const width = operands[1];
+                try self.writer.print(" r{}, r{}, width={}", .{ rd, rs, width });
+            },
+
+            // parse_decimal rd, rs - [rd:4|rs:4] [0]
+            .parse_decimal => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}", .{ rd, rs });
+            },
+
             // ============================================
             // Array Operations (0xB0-0xBF)
             // ============================================

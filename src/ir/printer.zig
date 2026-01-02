@@ -307,6 +307,17 @@ pub const Printer = struct {
             .sextend => |op| try self.printIntExtend("sextend", op),
             .uextend => |op| try self.printIntExtend("uextend", op),
             .ireduce => |op| try self.printUnaryOp("ireduce", op),
+            .format_decimal => |op| {
+                try self.printValue(op.result);
+                try self.writer.print(" = format_decimal ", .{});
+                try self.printValue(op.value);
+                try self.writer.print(" width={d}", .{op.width});
+            },
+            .parse_decimal => |op| {
+                try self.printValue(op.result);
+                try self.writer.print(" = parse_decimal ", .{});
+                try self.printValue(op.value);
+            },
 
             // Constants (Cranelift names)
             .iconst => |c| {
@@ -509,6 +520,7 @@ pub const Printer = struct {
                 try self.printType(elem.*);
             },
             .@"struct" => |s| try self.writer.print("struct({s})", .{s.name}),
+            .@"union" => |u| try self.writer.print("union({s})", .{u.name}),
             .function => try self.writer.writeAll("fn"),
         }
     }

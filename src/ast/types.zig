@@ -83,6 +83,9 @@ pub const TypeTag = enum(u8) {
     /// Named type reference: MyStruct, MyEnum
     named,
 
+    /// Union type: fields share memory (like C union)
+    @"union",
+
     /// Function type: fn(A, B) -> C
     function,
 
@@ -160,7 +163,7 @@ pub const TypeTag = enum(u8) {
     /// Check if this is a compound/composite type
     pub fn isCompound(self: TypeTag) bool {
         return switch (self) {
-            .array, .slice, .optional, .pointer, .named, .function, .tuple, .error_union => true,
+            .array, .slice, .optional, .pointer, .named, .@"union", .function, .tuple, .error_union => true,
             else => false,
         };
     }

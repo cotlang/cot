@@ -12,12 +12,21 @@ const Value = native.Value;
 
 /// Register all conversion functions
 pub fn register(registry: anytype) !void {
+    // Conversion functions (transform values)
     try registry.registerNative("string", string);
     try registry.registerNative("integer", integer);
     try registry.registerNative("decimal", decimal);
     try registry.registerNative("char", char);
     try registry.registerNative("alpha", alpha);
     try registry.registerNative("boolean", boolean);
+
+    // Cast functions (reinterpret bytes - DBL ^a, ^d, ^i operators)
+    try registry.registerNative("cast_alpha", cast_alpha);
+    try registry.registerNative("cast_decimal", cast_decimal);
+    try registry.registerNative("cast_integer", cast_integer);
+
+    // ASCII conversion
+    try registry.registerNative("ascii", ascii);
 }
 
 /// STRING - Convert to string
@@ -118,4 +127,121 @@ pub fn boolean(ctx: *NativeContext) NativeError!?Value {
     const val = ctx.getArg(0) orelse return NativeError.InvalidArgument;
     const b = val.toBool();
     return Value.initInt(if (b) 1 else 0);
+}
+
+// ============================================================================
+// Cast Functions (DBL ^a, ^d, ^i operators)
+// These REINTERPRET bytes as a different type, unlike conversion functions
+// ============================================================================
+
+/// CAST_ALPHA (^A) - Pure type cast to alpha/string
+/// This is a type-level cast, NOT ASCII code conversion (use %ascii for that)
+/// Returns the string representation of the value (same output as %string)
+pub fn cast_alpha(ctx: *NativeContext) NativeError!?Value {
+    // Cast to alpha is semantically the same as string conversion
+    // The difference is type-system level (treating as alpha type)
+    return string(ctx);
+}
+
+/// CAST_DECIMAL (^D) - Reinterpret bytes as decimal
+/// For strings: parse the string as a decimal number
+/// For integers: treat as decimal with 0 precision
+/// For decimals: return as-is
+pub fn cast_decimal(ctx: *NativeContext) NativeError!?Value {
+    const val = ctx.getArg(0) orelse return NativeError.InvalidArgument;
+
+    switch (val.tag()) {
+        .fixed_string, .string => {
+            // Parse string as decimal - treat ASCII digits as numeric value
+            const str = std.mem.trimRight(u8, val.asString(), " ");
+            var value: i64 = 0;
+            var precision: u8 = 0;
+            var seen_dot = false;
+
+            for (str) |c| {
+                if (c >= '0' and c <= '9') {
+                    value = value * 10 + (c - '0');
+                    if (seen_dot) precision += 1;
+                } else if (c == '.') {
+                    seen_dot = true;
+                } else if (c == '-' and value == 0) {
+                    // Handle negative sign at start - we'll negate at end
+                    continue;
+                }
+            }
+            if (str.len > 0 and str[0] == '-') {
+                value = -value;
+            }
+            return Value.initDecimal(ctx.allocator, value, precision) catch return NativeError.OutOfMemory;
+        },
+        .integer => {
+            // Integer cast to decimal with 0 precision
+            const int_val = val.asInt();
+            return Value.initDecimal(ctx.allocator, int_val, 0) catch return NativeError.OutOfMemory;
+        },
+        .decimal => {
+            // Already decimal - return as-is
+            if (val.asDecimal()) |d| {
+                return Value.initDecimal(ctx.allocator, d.value, d.precision) catch return NativeError.OutOfMemory;
+            }
+            return Value.initDecimal(ctx.allocator, 0, 0) catch return NativeError.OutOfMemory;
+        },
+        else => {
+            return Value.initDecimal(ctx.allocator, 0, 0) catch return NativeError.OutOfMemory;
+        },
+    }
+}
+
+/// CAST_INTEGER (^I) - Reinterpret bytes as integer
+/// For strings: parse the string as an integer (ASCII digits to number)
+/// For decimals: truncate to integer
+/// For integers: return as-is
+pub fn cast_integer(ctx: *NativeContext) NativeError!?Value {
+    const val = ctx.getArg(0) orelse return NativeError.InvalidArgument;
+
+    switch (val.tag()) {
+        .fixed_string, .string => {
+            // Parse string as integer - treat ASCII digits as numeric value
+            const str = std.mem.trimRight(u8, val.asString(), " ");
+            var value: i64 = 0;
+            var negative = false;
+
+            for (str, 0..) |c, i| {
+                if (c >= '0' and c <= '9') {
+                    value = value * 10 + (c - '0');
+                } else if (c == '-' and i == 0) {
+                    negative = true;
+                } else if (c == '.') {
+                    break; // Stop at decimal point
+                }
+            }
+            if (negative) value = -value;
+            return Value.initInt(value);
+        },
+        .decimal => {
+            // Truncate decimal to integer
+            if (val.asDecimal()) |d| {
+                const scale: i64 = std.math.powi(i64, 10, d.precision) catch 1;
+                return Value.initInt(@divTrunc(d.value, scale));
+            }
+            return Value.initInt(0);
+        },
+        .integer => {
+            // Already integer - return as-is
+            return Value.initInt(val.asInt());
+        },
+        else => {
+            return Value.initInt(0);
+        },
+    }
+}
+
+/// ASCII - Convert integer to ASCII character (DBL %ASCII)
+/// Takes an integer and returns a single character string
+pub fn ascii(ctx: *NativeContext) NativeError!?Value {
+    const val = ctx.getArg(0) orelse return NativeError.InvalidArgument;
+    const code = val.toInt();
+    const result = ctx.allocator.alloc(u8, 1) catch return NativeError.OutOfMemory;
+    result[0] = @intCast(@mod(code, 256));
+    return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
 }

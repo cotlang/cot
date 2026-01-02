@@ -209,6 +209,16 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             else => .incompatible,
         },
 
+        .@"union" => |target_union| switch (value_deref) {
+            .@"union" => |value_union| blk: {
+                if (std.mem.eql(u8, target_union.name, value_union.name)) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            else => .incompatible,
+        },
+
         .function => .incompatible,
     };
 }
@@ -294,15 +304,24 @@ fn checkLogicalOp(_: Type, _: Type) BinaryOpResult {
 }
 
 fn checkStringConcat(lhs: Type, rhs: Type) BinaryOpResult {
-    if (!isString(lhs) or !isString(rhs)) {
+    // Auto-coercion: at least one operand must be a string
+    // The VM will auto-convert numeric types to their string representation
+    const lhs_is_string = isString(lhs);
+    const rhs_is_string = isString(rhs);
+
+    if (!lhs_is_string and !rhs_is_string) {
         return .{ .ok = false, .result_type = null };
     }
 
-    const lhs_len = getStringLen(lhs);
-    const rhs_len = getStringLen(rhs);
-    if (lhs_len > 0 or rhs_len > 0) {
-        return .{ .ok = true, .result_type = .{ .string_fixed = lhs_len + rhs_len } };
+    // If both are strings, calculate the result length
+    if (lhs_is_string and rhs_is_string) {
+        const lhs_len = getStringLen(lhs);
+        const rhs_len = getStringLen(rhs);
+        if (lhs_len > 0 or rhs_len > 0) {
+            return .{ .ok = true, .result_type = .{ .string_fixed = lhs_len + rhs_len } };
+        }
     }
+    // Mixed string + numeric: result is dynamic string
     return .{ .ok = true, .result_type = .{ .string = {} } };
 }
 
@@ -380,6 +399,7 @@ pub fn typeName(ty: Type) []const u8 {
         .array => "array",
         .slice => "slice",
         .@"struct" => "struct",
+        .@"union" => "union",
         .function => "function",
     };
 }
@@ -420,6 +440,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         .array => |a| writer.print("[{d}]{s}", .{ a.length, typeName(a.element.*) }) catch {},
         .slice => |s| writer.print("[]{s}", .{typeName(s.*)}) catch {},
         .@"struct" => |s| writer.print("struct({s})", .{s.name}) catch {},
+        .@"union" => |u| writer.print("union({s})", .{u.name}) catch {},
         .function => writer.writeAll("function") catch {},
     }
 

@@ -72,6 +72,9 @@ pub const Type = union(enum) {
     /// Struct type
     @"struct": *const StructType,
 
+    /// Union type (fields share memory - overlays)
+    @"union": *const UnionType,
+
     /// Function type
     function: *const FunctionType,
 
@@ -98,6 +101,7 @@ pub const Type = union(enum) {
             .array => |a| a.element.sizeInBytes() * a.length,
             .slice => 16, // Pointer + length
             .@"struct" => |s| s.size,
+            .@"union" => |u| u.size,
             .function => 8, // Function pointer
         };
     }
@@ -117,6 +121,7 @@ pub const Type = union(enum) {
             .ptr, .optional => 8,
             .array => |a| a.element.alignment(),
             .@"struct" => |s| s.alignment,
+            .@"union" => |u| u.alignment,
             .function => 8,
         };
     }
@@ -141,6 +146,7 @@ pub const Type = union(enum) {
             .ptr, .optional => "void*",
             .array, .slice => "void*",
             .@"struct" => "void*",
+            .@"union" => "void*",
             .function => "void*",
         };
     }
@@ -184,6 +190,19 @@ pub const StructType = struct {
         name: []const u8,
         ty: Type,
         offset: u32,
+    };
+};
+
+/// Union type definition (fields share memory - all at offset 0)
+pub const UnionType = struct {
+    name: []const u8,
+    variants: []const Variant,
+    size: u32, // max of all variant sizes
+    alignment: u32, // max of all variant alignments
+
+    pub const Variant = struct {
+        name: []const u8,
+        ty: Type,
     };
 };
 
@@ -375,6 +394,8 @@ pub const Instruction = union(enum) {
     sextend: IntExtend, // Sign extend (was: int_extend with signed=true)
     uextend: IntExtend, // Zero extend (was: int_extend with signed=false)
     ireduce: UnaryOp, // Reduce integer size (was: int_truncate)
+    format_decimal: FormatDecimal, // Format integer as zero-padded decimal string (DBL compatibility)
+    parse_decimal: ParseDecimal, // Parse string to decimal with validation (DBL compatibility)
 
     // ====== Constants (Cranelift names) ======
     iconst: struct { ty: Type, value: i64, result: Value }, // Integer constant
@@ -504,6 +525,20 @@ pub const Instruction = union(enum) {
         operand: Value,
         target_type: Type,
         result: Value,
+    };
+
+    // Format integer as zero-padded decimal string (DBL compatibility)
+    pub const FormatDecimal = struct {
+        value: Value, // Integer value to format
+        width: u32, // Target width (zero-pad to this many digits)
+        result: Value, // Result string
+    };
+
+    // Parse string to decimal with validation (DBL compatibility)
+    // Raises "bad digit" error if string contains non-numeric characters
+    pub const ParseDecimal = struct {
+        value: Value, // String value to parse
+        result: Value, // Result integer
     };
 
     // Integer sign/zero extend
@@ -723,6 +758,8 @@ pub const Instruction = union(enum) {
             .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| op.result,
             .sextend, .uextend => |e| e.result,
             .wrap_optional, .unwrap_optional, .is_null => |op| op.result,
+            .format_decimal => |f| f.result,
+            .parse_decimal => |p| p.result,
             // Instructions that don't produce values
             .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read,
             .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store,
@@ -934,6 +971,9 @@ pub const Module = struct {
     /// Struct type definitions
     structs: std.ArrayListUnmanaged(*StructType),
 
+    /// Union type definitions
+    unions: std.ArrayListUnmanaged(*UnionType),
+
     /// Global variables
     globals: std.ArrayListUnmanaged(Global),
 
@@ -958,6 +998,7 @@ pub const Module = struct {
             .name = name,
             .library_name = null,
             .structs = .{},
+            .unions = .{},
             .globals = .{},
             .functions = .{},
             .allocator = allocator,
@@ -976,6 +1017,13 @@ pub const Module = struct {
             self.allocator.destroy(struct_type);
         }
         self.structs.deinit(self.allocator);
+
+        // Free union types and their variants
+        for (self.unions.items) |union_type| {
+            self.allocator.free(union_type.variants);
+            self.allocator.destroy(union_type);
+        }
+        self.unions.deinit(self.allocator);
 
         self.globals.deinit(self.allocator);
 
@@ -1015,6 +1063,11 @@ pub const Module = struct {
     /// Add a struct type definition
     pub fn addStruct(self: *Module, struct_type: *StructType) !void {
         try self.structs.append(self.allocator, struct_type);
+    }
+
+    /// Add a union type definition
+    pub fn addUnion(self: *Module, union_type: *UnionType) !void {
+        try self.unions.append(self.allocator, union_type);
     }
 };
 

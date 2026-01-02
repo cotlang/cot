@@ -180,6 +180,7 @@ pub const Parser = struct {
         return switch (token.type) {
             .kw_fn => self.parseFnDef(),
             .kw_struct => self.parseStructDef(),
+            .kw_union => self.parseUnionDef(),
             .kw_enum => self.parseEnumDef(),
             .kw_trait => self.parseTraitDef(),
             .kw_impl => self.parseImplBlock(),
@@ -189,7 +190,7 @@ pub const Parser = struct {
             .kw_import => self.parseImport(),
             .kw_pub => self.parsePubDecl(),
             else => {
-                self.addError("Expected 'fn', 'struct', 'enum', 'trait', 'impl', 'const', 'let', 'type', or 'import' at top level");
+                self.addError("Expected 'fn', 'struct', 'union', 'enum', 'trait', 'impl', 'const', 'let', 'type', or 'import' at top level");
                 _ = self.advance();
                 return error.UnexpectedToken;
             },
@@ -340,6 +341,59 @@ pub const Parser = struct {
         self.store.stmt_data.append(self.allocator, .{
             .a = @intFromEnum(name),
             .b = @intCast(fields_start),
+        }) catch return error.OutOfMemory;
+
+        return idx;
+    }
+
+    /// Parse union definition: union Name { field: Type, ... }
+    /// All fields in a union share the same memory (like C union)
+    fn parseUnionDef(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = try self.consume(.kw_union, "Expected 'union'");
+        const name_token = try self.consume(.identifier, "Expected union name");
+        const name = self.internString(name_token.lexeme) catch return error.OutOfMemory;
+
+        _ = try self.consume(.lbrace, "Expected '{'");
+
+        // Parse variants into scratch buffer
+        try self.store.markScratch();
+        errdefer self.store.rollbackScratch();
+
+        while (!self.check(.rbrace) and !self.isAtEnd()) {
+            const variant_name_token = try self.consume(.identifier, "Expected variant name");
+            const variant_name = self.internString(variant_name_token.lexeme) catch return error.OutOfMemory;
+            _ = try self.consume(.colon, "Expected ':'");
+            const variant_type = try self.parseType();
+
+            // Store as [name, type] pairs
+            self.store.pushScratchU32(@intFromEnum(variant_name)) catch return error.OutOfMemory;
+            self.store.pushScratchU32(variant_type.toInt()) catch return error.OutOfMemory;
+
+            // Optional comma
+            _ = self.match(&[_]TokenType{.comma});
+        }
+
+        _ = try self.consume(.rbrace, "Expected '}'");
+
+        // Get variants from scratch
+        const variants = self.store.getScratchU32s();
+        self.store.commitScratch();
+
+        // Store union def in extra_data
+        const variants_start = self.store.extra_data.items.len;
+        self.store.extra_data.append(self.allocator, @intCast(variants.len / 2)) catch return error.OutOfMemory; // variant count
+        for (variants) |v| {
+            self.store.extra_data.append(self.allocator, v) catch return error.OutOfMemory;
+        }
+
+        // Add union_def statement
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));
+        self.store.stmt_tags.append(self.allocator, .union_def) catch return error.OutOfMemory;
+        self.store.stmt_locs.append(self.allocator, loc) catch return error.OutOfMemory;
+        self.store.stmt_data.append(self.allocator, .{
+            .a = @intFromEnum(name),
+            .b = @intCast(variants_start),
         }) catch return error.OutOfMemory;
 
         return idx;
@@ -597,6 +651,39 @@ pub const Parser = struct {
         return self.store.addLetDecl(name, type_idx, init_expr, is_mut, loc) catch return error.OutOfMemory;
     }
 
+    /// Parse view declaration: view name: Type = @base_field or view name: Type = @base_field + offset
+    /// Creates a memory alias to another variable
+    fn parseViewDecl(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = try self.consume(.kw_view, "Expected 'view'");
+
+        const name_token = try self.consume(.identifier, "Expected view name");
+        const name = self.internString(name_token.lexeme) catch return error.OutOfMemory;
+
+        // Type annotation is required for views
+        _ = try self.consume(.colon, "Expected ':'");
+        const type_idx = try self.parseType();
+
+        _ = try self.consume(.equals, "Expected '='");
+
+        // Expect @ followed by base field name
+        _ = try self.consume(.at, "Expected '@' before base field name");
+        const base_field_token = try self.consume(.identifier, "Expected base field name");
+        const base_field = self.internString(base_field_token.lexeme) catch return error.OutOfMemory;
+
+        // Parse optional offset: + or - followed by number
+        var offset: i32 = 0;
+        if (self.match(&[_]TokenType{.plus})) {
+            const offset_token = try self.consume(.integer_literal, "Expected offset value");
+            offset = @intCast(std.fmt.parseInt(i32, offset_token.lexeme, 10) catch 0);
+        } else if (self.match(&[_]TokenType{.minus})) {
+            const offset_token = try self.consume(.integer_literal, "Expected offset value");
+            offset = -@as(i32, @intCast(std.fmt.parseInt(i32, offset_token.lexeme, 10) catch 0));
+        }
+
+        return self.store.addFieldView(name, type_idx, base_field, offset, loc) catch return error.OutOfMemory;
+    }
+
     fn parseTypeAlias(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_type, "Expected 'type'");
@@ -653,6 +740,7 @@ pub const Parser = struct {
             .kw_return => self.parseReturn(),
             .kw_let => self.parseLetDecl(),
             .kw_const => self.parseConstDecl(),
+            .kw_view => self.parseViewDecl(),
             .kw_try => self.parseTry(),
             .kw_throw => self.parseThrow(),
             .kw_comptime => self.parseComptime(),
@@ -1045,6 +1133,12 @@ pub const Parser = struct {
                 continue;
             }
 
+            // Handle cast operator (as)
+            if (pratt.isCastOperator(self.peek().type)) {
+                left = try self.parseCastOp(left);
+                continue;
+            }
+
             // Handle binary operators
             if (pratt.isBinaryOperator(self.peek().type)) {
                 left = try self.parseBinaryOp(left, current_prec);
@@ -1091,6 +1185,39 @@ pub const Parser = struct {
         const right = try self.parseExpressionPrec(prec);
 
         return self.store.addBinary(left, op, right, loc) catch return error.OutOfMemory;
+    }
+
+    /// Parse a cast operator: expr as type
+    /// Converts to a call to cast_alpha, cast_decimal, or cast_integer
+    fn parseCastOp(self: *Self, left: ExprIdx) ParseError!ExprIdx {
+        _ = self.advance(); // consume 'as'
+        const loc = self.currentLoc();
+
+        // Parse the target type name
+        const type_token = try self.consume(.identifier, "Expected type name after 'as'");
+        const type_name = type_token.lexeme;
+
+        // Map type name to cast function
+        const cast_func: []const u8 = if (std.mem.eql(u8, type_name, "alpha") or std.mem.eql(u8, type_name, "string"))
+            "cast_alpha"
+        else if (std.mem.eql(u8, type_name, "decimal"))
+            "cast_decimal"
+        else if (std.mem.eql(u8, type_name, "integer") or std.mem.eql(u8, type_name, "int"))
+            "cast_integer"
+        else {
+            self.addError("Unknown cast type, expected: alpha, string, decimal, integer, or int");
+            return error.UnexpectedToken;
+        };
+
+        // Create call expression: cast_func(left)
+        const func_id = self.internString(cast_func) catch return error.OutOfMemory;
+        const func_expr = self.store.addIdentifier(func_id, loc) catch return error.OutOfMemory;
+
+        // Create single-element args array
+        var args_buf: [1]ExprIdx = .{left};
+        const args = self.allocator.dupe(ExprIdx, &args_buf) catch return error.OutOfMemory;
+
+        return self.store.addCall(func_expr, args, loc) catch return error.OutOfMemory;
     }
 
     /// Parse postfix operators (call, index, member access)

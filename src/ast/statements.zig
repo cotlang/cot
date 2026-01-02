@@ -17,6 +17,12 @@ pub const StatementTag = enum(u8) {
     /// Structure definition: struct Name { fields }
     struct_def,
 
+    /// Union definition: union { fields } - fields share memory (overlays)
+    union_def,
+
+    /// Field view definition: view name = start..end - spans multiple fields
+    field_view,
+
     /// Enumeration definition: enum Name { variants }
     enum_def,
 
@@ -128,7 +134,7 @@ pub const StatementTag = enum(u8) {
     /// Check if this is a declaration statement
     pub fn isDeclaration(self: StatementTag) bool {
         return switch (self) {
-            .fn_def, .struct_def, .enum_def, .const_decl, .let_decl, .type_alias => true,
+            .fn_def, .struct_def, .union_def, .field_view, .enum_def, .const_decl, .let_decl, .type_alias => true,
             else => false,
         };
     }

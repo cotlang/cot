@@ -1250,6 +1250,7 @@ pub const VM = struct {
     // ============================================
 
     /// str_concat rd, rs1, rs2 - rd = rs1 + rs2 (string concatenation)
+    /// Supports auto-coercion: integers and decimals are converted to their string representation
     fn op_str_concat(self: *Self, module: *const Module) VMError!DispatchResult {
         const ops = module.code[self.ip];
         const byte2 = module.code[self.ip + 1];
@@ -1258,9 +1259,11 @@ pub const VM = struct {
         const rs1: u4 = @truncate(ops & 0xF);
         const rs2: u4 = @truncate(byte2 >> 4);
 
-        // Get string values
-        const s1 = self.registers[rs1].asString();
-        const s2 = self.registers[rs2].asString();
+        // Convert values to strings with auto-coercion
+        var buf1: [32]u8 = undefined;
+        var buf2: [32]u8 = undefined;
+        const s1 = self.valueToStringSlice(self.registers[rs1], &buf1);
+        const s2 = self.valueToStringSlice(self.registers[rs2], &buf2);
 
         debug.print(.vm, "str_concat: r{d} = r{d}('{s}') + r{d}('{s}')", .{ rd, rs1, s1, rs2, s2 });
 
@@ -1273,6 +1276,160 @@ pub const VM = struct {
 
         // Store result as string value
         self.registers[rd] = Value.initString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
+        return .continue_dispatch;
+    }
+
+    /// Convert a Value to its string representation for auto-coercion
+    /// Uses the provided buffer for numeric conversions, returns slice into buffer or string pointer
+    fn valueToStringSlice(self: *Self, val: Value, buf: *[32]u8) []const u8 {
+        _ = self;
+        switch (val.tag()) {
+            .string, .fixed_string => return val.asString(),
+            .integer => {
+                const int_val = val.asInt();
+                return std.fmt.bufPrint(buf, "{d}", .{int_val}) catch "";
+            },
+            .decimal => {
+                if (val.asDecimal()) |dval| {
+                    const divisor = std.math.pow(i64, 10, dval.precision);
+                    const whole = @divTrunc(dval.value, divisor);
+                    const frac = @abs(@rem(dval.value, divisor));
+                    if (dval.precision > 0) {
+                        return std.fmt.bufPrint(buf, "{d}.{d}", .{ whole, frac }) catch "";
+                    } else {
+                        return std.fmt.bufPrint(buf, "{d}", .{whole}) catch "";
+                    }
+                }
+                return "";
+            },
+            .boolean => {
+                const bool_val = val.asBool();
+                return if (bool_val) "1" else "0";
+            },
+            .null_val => return "",
+            .record_ref => return "<record>",
+            .handle => return "<handle>",
+        }
+    }
+
+    // ============================================
+    // Type Conversion Handlers
+    // ============================================
+
+    /// format_decimal rd, rs, width - rd = zero-padded decimal string of rs
+    /// For DBL compatibility: formats integer to fixed-width zero-padded string
+    /// Right-aligned with leading zeros. Negative values get minus sign in front.
+    fn op_format_decimal(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops = module.code[self.ip];
+        const width_byte = module.code[self.ip + 1];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops >> 4);
+        const rs: u4 = @truncate(ops & 0xF);
+        const width: usize = width_byte;
+
+        // Get the integer value from source register
+        const val = self.registers[rs];
+        const int_val: i64 = switch (val.tag()) {
+            .integer => val.asInt(),
+            .decimal => blk: {
+                if (val.asDecimal()) |dval| {
+                    // For decimals, use the whole part
+                    const divisor = std.math.pow(i64, 10, dval.precision);
+                    break :blk @divTrunc(dval.value, divisor);
+                }
+                break :blk 0;
+            },
+            else => 0,
+        };
+
+        // Format as zero-padded string
+        const abs_val: u64 = if (int_val < 0) @intCast(-int_val) else @intCast(int_val);
+        var buf: [32]u8 = undefined;
+        const digits_needed = if (width > 32) 32 else width;
+
+        // Format with leading zeros
+        const formatted = std.fmt.bufPrint(&buf, "{d:0>[1]}", .{ abs_val, digits_needed }) catch "";
+
+        // Allocate result string
+        const result_len = if (int_val < 0) formatted.len + 1 else formatted.len;
+        const result = self.allocator.alloc(u8, result_len) catch return VMError.OutOfMemory;
+
+        if (int_val < 0) {
+            result[0] = '-';
+            @memcpy(result[1..], formatted);
+        } else {
+            @memcpy(result, formatted);
+        }
+
+        debug.print(.vm, "format_decimal: r{d} = r{d}({d}) width={d} -> '{s}'", .{ rd, rs, int_val, width, result });
+
+        // Store result as string value
+        self.registers[rd] = Value.initString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
+        return .continue_dispatch;
+    }
+
+    /// parse_decimal rd, rs - rd = integer parsed from string rs
+    /// For DBL compatibility: validates string contains only digits (with optional leading minus)
+    /// Raises runtime error "bad digit" if string contains non-numeric characters
+    fn op_parse_decimal(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops = module.code[self.ip];
+        self.ip += 2; // Skip both operand bytes
+        const rd: u4 = @truncate(ops >> 4);
+        const rs: u4 = @truncate(ops & 0xF);
+
+        // Get the string value from source register
+        const val = self.registers[rs];
+        const str = switch (val.tag()) {
+            .string, .fixed_string => val.asString(),
+            .integer => {
+                // Already an integer - just copy it
+                self.registers[rd] = val;
+                return .continue_dispatch;
+            },
+            else => "",
+        };
+
+        // Trim leading/trailing whitespace
+        const trimmed = std.mem.trim(u8, str, " \t\n\r");
+
+        // Validate and parse the string
+        var is_negative = false;
+        var start: usize = 0;
+
+        // Check for leading minus sign
+        if (trimmed.len > 0 and trimmed[0] == '-') {
+            is_negative = true;
+            start = 1;
+        }
+
+        // Empty string after trimming (or just "-") -> 0
+        if (start >= trimmed.len) {
+            self.registers[rd] = Value.initInt(0);
+            return .continue_dispatch;
+        }
+
+        // Validate all remaining characters are digits
+        for (trimmed[start..]) |c| {
+            if (!std.ascii.isDigit(c)) {
+                // Bad digit error - in DBL this is a runtime error
+                debug.print(.vm, "parse_decimal: bad digit '{c}' in string '{s}'", .{ c, str });
+                // Return error - this will halt execution
+                return VMError.BadDigit;
+            }
+        }
+
+        // Parse the integer value
+        const abs_val = std.fmt.parseInt(i64, trimmed[start..], 10) catch {
+            // Overflow or other parse error
+            debug.print(.vm, "parse_decimal: overflow parsing '{s}'", .{str});
+            return VMError.BadDigit;
+        };
+
+        const result: i64 = if (is_negative) -abs_val else abs_val;
+
+        debug.print(.vm, "parse_decimal: r{d} = r{d}('{s}') -> {d}", .{ rd, rs, str, result });
+
+        self.registers[rd] = Value.initInt(result);
         return .continue_dispatch;
     }
 
@@ -1754,6 +1911,10 @@ pub const VM = struct {
 
         // String Operations (0x90-0x9F)
         table[@intFromEnum(Opcode.str_concat)] = &op_str_concat;
+
+        // Type Conversion (0xA0-0xAF)
+        table[@intFromEnum(Opcode.format_decimal)] = &op_format_decimal;
+        table[@intFromEnum(Opcode.parse_decimal)] = &op_parse_decimal;
 
         // Console I/O (0xD0-0xDF)
         table[@intFromEnum(Opcode.console_writeln)] = &op_console_writeln;

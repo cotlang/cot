@@ -33,8 +33,9 @@ pub const Precedence = enum(u8) {
     term = 10, // + - #
     factor = 11, // * / %
     unary = 12, // ! - ~ & *
-    call = 13, // () . []
-    primary = 14,
+    cast = 13, // as (type cast)
+    call = 14, // () . []
+    primary = 15,
 
     /// Get the next higher precedence level
     pub fn next(self: Precedence) Precedence {
@@ -119,6 +120,9 @@ pub const rules: [TOKEN_COUNT]ParseRule = init: {
 
     // Binary operators - bitwise
     r[@intFromEnum(TokenType.caret)] = .{ .infix = null, .precedence = .bit_xor };
+
+    // Cast operator
+    r[@intFromEnum(TokenType.kw_as)] = .{ .infix = null, .precedence = .cast }; // expr as type
 
     // Postfix operators
     r[@intFromEnum(TokenType.period)] = .{ .infix = null, .precedence = .call }; // member access
@@ -245,6 +249,11 @@ pub fn isPostfixOperator(token_type: TokenType) bool {
         => true,
         else => false,
     };
+}
+
+/// Check if token is a cast operator (as)
+pub fn isCastOperator(token_type: TokenType) bool {
+    return token_type == .kw_as;
 }
 
 // ============================================================

@@ -141,11 +141,12 @@ const Handlers = struct {
         switch (language) {
             .cot => {
                 const cot_keywords = [_][]const u8{
-                    "fn",       "struct",   "enum",     "trait",    "impl",
-                    "const",    "let",      "type",     "import",   "if",
-                    "else",     "match",    "for",      "while",    "loop",
-                    "return",   "break",    "continue", "try",      "catch",
-                    "throw",    "comptime", "pub",      "mut",
+                    "fn",       "struct",   "union",    "view",     "enum",
+                    "trait",    "impl",     "const",    "let",      "type",
+                    "import",   "if",       "else",     "match",    "for",
+                    "while",    "loop",     "return",   "break",    "continue",
+                    "try",      "catch",    "throw",    "comptime", "pub",
+                    "mut",
                 };
 
                 for (cot_keywords) |kw| {
@@ -349,6 +350,8 @@ fn getKeywordDoc(word: []const u8, language: server_mod.Language) ?[]const u8 {
         // Declarations
         .{ "fn", "**fn** name(params) -> Type { body }\n\nFunction definition." },
         .{ "struct", "**struct** Name { fields }\n\nStructure definition." },
+        .{ "union", "**union** Name { variants }\n\nUnion definition. All variants share the same memory (overlay)." },
+        .{ "view", "**view** name: Type = @base [+ offset]\n\nMemory view/alias. Creates an alias to another field's memory." },
         .{ "enum", "**enum** Name { variants }\n\nEnumeration definition." },
         .{ "const", "**const** name = value\n\nConstant declaration." },
         .{ "let", "**let** [mut] name = value\n\nVariable declaration." },
@@ -565,7 +568,8 @@ fn getCotSemanticTokenType(token: anytype, prev_token: anytype, next_token: anyt
         }
 
         // Type declaration keywords
-        if (token.type == TokenType.kw_struct or token.type == TokenType.kw_enum or
+        if (token.type == TokenType.kw_struct or token.type == TokenType.kw_union or
+            token.type == TokenType.kw_view or token.type == TokenType.kw_enum or
             token.type == TokenType.kw_trait or token.type == TokenType.kw_impl)
         {
             return STI.Class;

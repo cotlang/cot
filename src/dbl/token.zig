@@ -56,6 +56,12 @@ pub const TokenType = enum {
     equals, // =
     at, // @
     percent, // %
+    caret, // ^
+
+    // Cast operators (DBL legacy)
+    cast_alpha, // ^a or ^A
+    cast_decimal, // ^d or ^D
+    cast_integer, // ^i or ^I
 
     // Multi-character tokens
     arrow, // ->

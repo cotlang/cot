@@ -83,6 +83,7 @@ pub const VMError = error{
     BytecodeOutOfBounds,
     NullPointerAccess,
     InvalidMemoryAccess,
+    BadDigit, // DBL: non-numeric character in decimal field
 };
 
 /// Rich runtime error with full context - this is what gets reported to the user

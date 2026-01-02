@@ -31,6 +31,11 @@ Every issue must be analyzed to find the **root cause** and the **best fix** mus
 ### Why This Matters:
 Bugs that are bypassed rather than fixed accumulate as technical debt. They become harder to find later, cause cascading issues, and erode code quality. For this project to succeed, every bug must be addressed at its source.
 
+## Reference Documentation
+
+### DBL Language Manual
+The legacy DBL reference manual is located at `~/cotlang/dbl-manual/`.
+
 ## Zig 0.15 API Notes
 
 This project uses Zig 0.15. Be aware of these API changes from older Zig versions:

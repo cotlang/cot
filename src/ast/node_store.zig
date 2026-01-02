@@ -719,6 +719,24 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a field view (overlay) statement
+    /// Used in records for fields that share memory with other fields
+    /// base_field is the field name to overlay, offset is the byte offset from that field
+    pub fn addFieldView(self: *Self, name: StringId, type_idx: TypeIdx, base_field: StringId, offset: i32, loc: SourceLoc) !StmtIdx {
+        // Store base_field and offset in extra_data
+        const extra_start = try self.addExtra(@intFromEnum(base_field));
+        _ = try self.addExtra(@bitCast(offset));
+
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
+        try self.stmt_tags.append(self.allocator, .field_view);
+        try self.stmt_locs.append(self.allocator, loc);
+        try self.stmt_data.append(self.allocator, .{
+            .a = @intFromEnum(name),
+            .b = (type_idx.toInt() << 16) | extra_start.toInt(),
+        });
+        return idx;
+    }
+
     // ========================================
     // Type Builders
     // ========================================

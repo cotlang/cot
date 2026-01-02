@@ -396,6 +396,18 @@ pub const Opcode = enum(u8) {
     /// Format: [rd:4|rs:4] [size:16]
     to_fixed_string = 0xA5,
 
+    /// format_decimal rd, rs, width - rd = zero-padded decimal string of rs
+    /// For DBL compatibility: formats integer to fixed-width zero-padded string
+    /// Negative values use overpunch encoding (last digit becomes letter)
+    /// Format: [rd:4|rs:4] [width:8]
+    format_decimal = 0xA6,
+
+    /// parse_decimal rd, rs - rd = integer parsed from string rs
+    /// For DBL compatibility: validates string contains only digits (with optional leading minus)
+    /// Raises runtime error "bad digit" if string contains non-numeric characters
+    /// Format: [rd:4|rs:4] [0]
+    parse_decimal = 0xA7,
+
     // ============================================
     // Array Operations (0xB0-0xBF)
     // ============================================
@@ -583,7 +595,7 @@ pub const Opcode = enum(u8) {
             .str_concat, .str_len, .str_index, .str_slice => 2,
             .str_slice_store, .str_trim, .str_upper, .str_lower => 2,
             .str_find, .str_replace, .str_setchar => 2,
-            .to_int, .to_str, .to_bool, .to_dec, .to_char => 2,
+            .to_int, .to_str, .to_bool, .to_dec, .to_char, .format_decimal, .parse_decimal => 2,
             .array_load, .array_store, .array_len => 2,
             .fn_abs, .fn_sqrt, .fn_sin, .fn_cos, .fn_tan => 2,
             .fn_log, .fn_log10, .fn_exp, .fn_round, .fn_trunc => 2,

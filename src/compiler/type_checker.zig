@@ -105,7 +105,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         // These don't need type checking (Cranelift names)
         .alloca, .field_ptr, .jump, .brif, .br_table, .return_, .trap => {},
         .iconst, .f32const, .f64const, .const_string, .const_null => {},
-        .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce, .bitcast => {},
+        .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce, .bitcast, .format_decimal, .parse_decimal => {},
         .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => {},
         .load_struct_buf, .store_struct_buf, .str_compare, .str_copy, .str_len, .ineg => {},
         .try_begin, .try_end, .catch_begin, .throw => {},

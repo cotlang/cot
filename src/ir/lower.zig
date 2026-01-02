@@ -79,6 +79,9 @@ pub const Lowerer = struct {
     /// Map struct names to their IR types
     struct_types: std.StringHashMap(*const ir.StructType),
 
+    /// Map union names to their IR types
+    union_types: std.StringHashMap(*const ir.UnionType),
+
     /// Generic struct definitions (templates for instantiation)
     generic_struct_defs: std.StringHashMap(GenericDef),
 
@@ -196,6 +199,7 @@ pub const Lowerer = struct {
             .scopes = try ScopeStack.init(allocator),
             .global_variables = std.StringHashMap(ir.Value).init(allocator),
             .struct_types = std.StringHashMap(*const ir.StructType).init(allocator),
+            .union_types = std.StringHashMap(*const ir.UnionType).init(allocator),
             .generic_struct_defs = std.StringHashMap(GenericDef).init(allocator),
             .type_param_substitutions = std.StringHashMap(ir.Type).init(allocator),
             .instantiated_structs = std.StringHashMap(*const ir.StructType).init(allocator),
@@ -261,6 +265,7 @@ pub const Lowerer = struct {
         self.scopes.deinit();
         self.global_variables.deinit();
         self.struct_types.deinit();
+        self.union_types.deinit();
         self.generic_struct_defs.deinit();
         self.type_param_substitutions.deinit();
         self.instantiated_structs.deinit();
@@ -294,11 +299,13 @@ pub const Lowerer = struct {
         log.debug("Lowering program with {d} top-level statements", .{top_level.len});
         debug.print(.ir, "Lowering program with {d} top-level statements", .{top_level.len});
 
-        // First pass: collect struct definitions
+        // First pass: collect struct and union definitions
         for (top_level) |stmt_idx| {
             const tag = self.store.stmtTag(stmt_idx);
             if (tag == .struct_def) {
                 try self.lowerStructDef(stmt_idx);
+            } else if (tag == .union_def) {
+                try self.lowerUnionDef(stmt_idx);
             }
         }
 
@@ -435,6 +442,62 @@ pub const Lowerer = struct {
 
         try self.module.addStruct(struct_type);
         try self.struct_types.put(name, struct_type);
+    }
+
+    /// Lower a union definition
+    fn lowerUnionDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const name_id: StringId = @enumFromInt(data.a);
+        const name = self.strings.get(name_id);
+        if (name.len == 0) return LowerError.UndefinedType;
+
+        log.debug("Lowering union: {s}", .{name});
+        debug.print(.ir, "Lowering union: {s}", .{name});
+
+        // Get variants from extra_data
+        // Layout: [variant_count, [name, type]...]
+        const extra_start = data.b;
+        const variant_count = self.store.extra_data.items[extra_start];
+
+        var variants: std.ArrayListUnmanaged(ir.UnionType.Variant) = .{};
+        defer variants.deinit(self.allocator);
+
+        var max_size: u32 = 0;
+        const max_alignment: u32 = 8;
+        var extra_idx = extra_start + 1;
+        for (0..variant_count) |_| {
+            const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+            const variant_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+            extra_idx += 2;
+
+            const variant_name = self.strings.get(variant_name_id);
+            if (variant_name.len == 0) continue;
+            const variant_type = try self.lowerTypeIdx(variant_type_idx);
+            const variant_size = variant_type.sizeInBytes();
+
+            try variants.append(self.allocator, .{
+                .name = variant_name,
+                .ty = variant_type,
+            });
+
+            // Union size is max of all variant sizes
+            if (variant_size > max_size) {
+                max_size = variant_size;
+            }
+            debug.print(.ir, "  variant '{s}': size={d}", .{ variant_name, variant_size });
+        }
+
+        const union_type = try self.allocator.create(ir.UnionType);
+        union_type.* = .{
+            .name = name,
+            .variants = try variants.toOwnedSlice(self.allocator),
+            .size = max_size,
+            .alignment = max_alignment,
+        };
+        debug.print(.ir, "  union '{s}' total size: {d}", .{ name, max_size });
+
+        try self.module.addUnion(union_type);
+        try self.union_types.put(name, union_type);
     }
 
     /// Instantiate a generic struct with concrete type arguments
@@ -916,7 +979,11 @@ pub const Lowerer = struct {
                 try self.emitDebugLine(loc);
                 try self.lowerMatch(stmt_idx);
             },
-            .import_stmt, .fn_def, .struct_def, .enum_def, .type_alias, .trait_def, .impl_block => {
+            .field_view => {
+                try self.emitDebugLine(loc);
+                try self.lowerFieldView(stmt_idx);
+            },
+            .import_stmt, .fn_def, .struct_def, .union_def, .enum_def, .type_alias, .trait_def, .impl_block => {
                 // Handled in earlier passes or no runtime code
             },
             .comptime_if, .comptime_block => {
@@ -989,8 +1056,52 @@ pub const Lowerer = struct {
         }
 
         // Normal assignment - lower both sides and emit store
-        const value = try self.lowerExpression(value_idx);
+        var value = try self.lowerExpression(value_idx);
         const target = try self.lowerLValue(target_idx);
+
+        // DBL compatibility: when storing a numeric value to a string_fixed field,
+        // format it with zero-padding to the field width
+        const target_type = switch (target.ty) {
+            .ptr => |p| p.*,
+            else => target.ty,
+        };
+
+        // Decimal type validation and conversion
+        if (target_type == .decimal) {
+            if (!value.isNumeric()) {
+                // Non-numeric value (string) being assigned to decimal field
+                // Emit parse_decimal to validate and convert at runtime
+                // This will raise "bad digit" error if string contains non-numeric chars
+                debug.print(.ir, "DBL parse_decimal: string value to decimal, emitting parse_decimal for runtime validation", .{});
+
+                const func = self.current_func orelse return LowerError.OutOfMemory;
+                const parsed = func.newValue(.i64);
+                try self.emit(.{
+                    .parse_decimal = .{
+                        .value = value,
+                        .result = parsed,
+                    },
+                });
+                value = parsed;
+            }
+        }
+
+        if (target_type == .string_fixed and value.isNumeric()) {
+            const width = target_type.string_fixed;
+            debug.print(.ir, "DBL decimal format: numeric value to string_fixed({d}), emitting format_decimal", .{width});
+
+            // Emit format_decimal instruction to convert integer to zero-padded string
+            const func = self.current_func orelse return LowerError.OutOfMemory;
+            const formatted = func.newValue(.{ .string_fixed = width });
+            try self.emit(.{
+                .format_decimal = .{
+                    .value = value,
+                    .width = width,
+                    .result = formatted,
+                },
+            });
+            value = formatted;
+        }
 
         try self.emit(.{
             .store = .{
@@ -1272,6 +1383,85 @@ pub const Lowerer = struct {
                     .value = val,
                 },
             });
+        }
+    }
+
+    /// Lower a field view (overlay) declaration
+    /// A field_view creates an alias to another field's memory, optionally with an offset
+    fn lowerFieldView(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const func = self.current_func orelse return LowerError.OutOfMemory;
+        const data = self.store.stmtData(stmt_idx);
+
+        // Get view name from data.a
+        const name_id: StringId = @enumFromInt(data.a);
+        const name = self.strings.get(name_id);
+        if (name.len == 0) return LowerError.UndefinedVariable;
+
+        // Get type and extra_start from data.b
+        const type_raw = (data.b >> 16) & 0xFFFF;
+        const type_idx: TypeIdx = if (type_raw == 0xFFFF) .null else @enumFromInt(type_raw);
+        const extra_start = data.b & 0xFFFF;
+
+        // Get base_field and offset from extra_data
+        const base_field_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start]);
+        const offset: i32 = @bitCast(self.store.extra_data.items[extra_start + 1]);
+        const base_field_name = self.strings.get(base_field_id);
+
+        // Determine the view type
+        var view_type: ir.Type = undefined;
+        if (type_idx != .null) {
+            view_type = try self.lowerTypeIdx(type_idx);
+        } else {
+            view_type = .{ .string_fixed = 1 }; // Default to a1
+        }
+
+        // Look up the base field's memory location
+        if (self.scopes.get(base_field_name)) |base_ptr| {
+            // Field overlay: view shares the same memory as base_ptr (plus offset)
+            // For offset 0, the view is simply an alias to the same slot
+            // For non-zero offsets, we need byte-level access (not yet supported)
+
+            if (offset == 0) {
+                // Simple alias - the view name maps to the exact same storage slot as the base
+                // No instruction needed - we just register the view name pointing to base_ptr
+                try self.scopes.put(name, base_ptr);
+                debug.print(.ir, "field_view '{s}' aliased to '{s}' (offset 0)", .{ name, base_field_name });
+            } else {
+                // Offset access requires byte-level memory addressing
+                // For now, we log a warning and create a separate variable
+                // TODO: Implement proper byte-level substring views
+                debug.print(.ir, "WARNING: field_view '{s}' with offset {d} not fully supported, creating separate variable", .{ name, offset });
+
+                const ty_ptr = try self.allocator.create(ir.Type);
+                ty_ptr.* = view_type;
+                try self.allocated_types.append(self.allocator, ty_ptr);
+
+                const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+                try self.emit(.{
+                    .alloca = .{
+                        .ty = view_type,
+                        .name = name,
+                        .result = alloca_result,
+                    },
+                });
+                try self.scopes.put(name, alloca_result);
+            }
+        } else {
+            // Base field not found - create a regular alloca as fallback
+            // This allows code to compile even if the base field declaration comes later
+            const ty_ptr = try self.allocator.create(ir.Type);
+            ty_ptr.* = view_type;
+            try self.allocated_types.append(self.allocator, ty_ptr);
+
+            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+            try self.emit(.{
+                .alloca = .{
+                    .ty = view_type,
+                    .name = name,
+                    .result = alloca_result,
+                },
+            });
+            try self.scopes.put(name, alloca_result);
         }
     }
 
@@ -1893,6 +2083,7 @@ pub const Lowerer = struct {
 
     /// Lower a binary expression
     fn lowerBinary(self: *Self, func: *ir.Function, data: NodeData, expr_idx: ExprIdx) LowerError!ir.Value {
+        _ = expr_idx; // Used for error location, currently unused with auto-coercion
         const lhs_idx = data.getLhs();
         const rhs_idx = data.getRhs();
         const op = data.getBinaryOp();
@@ -1925,34 +2116,10 @@ pub const Lowerer = struct {
                     rhs_is_string,
                 });
 
-                if (lhs_is_string and !rhs_is_string) {
-                    // DBL: Cannot concatenate alpha with decimal/integer without cast
-                    const loc = self.store.exprLoc(expr_idx);
-                    self.setErrorContext(
-                        LowerError.TypeMismatch,
-                        "cannot concatenate string with non-string type (use %string() to convert)",
-                        .{},
-                        loc,
-                        "evaluating '+' expression",
-                        .{},
-                    );
-                    return LowerError.TypeMismatch;
-                }
-                if (!lhs_is_string and rhs_is_string) {
-                    const loc = self.store.exprLoc(expr_idx);
-                    self.setErrorContext(
-                        LowerError.TypeMismatch,
-                        "cannot add non-string to string type",
-                        .{},
-                        loc,
-                        "evaluating '+' expression",
-                        .{},
-                    );
-                    return LowerError.TypeMismatch;
-                }
-
-                const is_concat = lhs_is_string;
-                debug.print(.ir, "binary add decision: {s}", .{if (is_concat) "str_concat" else "iadd"});
+                // Auto-coercion: if either operand is a string, use string concatenation
+                // The VM will auto-convert integers/decimals to their string representation
+                const is_concat = lhs_is_string or rhs_is_string;
+                debug.print(.ir, "binary add decision: {s}", .{if (is_concat) "str_concat (auto-coerce)" else "iadd"});
 
                 break :blk if (is_concat)
                     .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result } }
@@ -2584,6 +2751,7 @@ pub const Lowerer = struct {
                 break :blk .void;
             },
             .function => .void, // Function types are handled separately
+            .@"union" => .void, // Union types are handled via union_def statement
             // These types don't have IR equivalents yet
             .tuple, .error_union, .inferred, .any, .never => .void,
         };

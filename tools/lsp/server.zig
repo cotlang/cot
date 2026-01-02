@@ -402,6 +402,23 @@ fn getCotSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
                     },
                 };
             },
+            .union_def => blk: {
+                const name_id: cot.base.StringId = @enumFromInt(data.a);
+                const name = strings.get(name_id);
+                const name_len: u32 = @intCast(name.len);
+                break :blk .{
+                    .name = name,
+                    .kind = .Struct, // Union shown as struct in symbol outline
+                    .range = .{
+                        .start = .{ .line = loc.line, .character = loc.column },
+                        .end = .{ .line = loc.line, .character = loc.column + name_len },
+                    },
+                    .selection_range = .{
+                        .start = .{ .line = loc.line, .character = loc.column },
+                        .end = .{ .line = loc.line, .character = loc.column + name_len },
+                    },
+                };
+            },
             .enum_def => blk: {
                 const name_id: cot.base.StringId = @enumFromInt(data.a);
                 const name = strings.get(name_id);

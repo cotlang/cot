@@ -150,6 +150,8 @@ pub const TokenType = enum {
     // Keywords - declarations
     kw_fn,
     kw_struct,
+    kw_union,
+    kw_view,
     kw_enum,
     kw_const,
     kw_let,
@@ -206,6 +208,8 @@ pub const TokenType = enum {
         return switch (self) {
             .kw_fn,
             .kw_struct,
+            .kw_union,
+            .kw_view,
             .kw_enum,
             .kw_const,
             .kw_let,
