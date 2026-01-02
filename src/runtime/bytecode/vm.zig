@@ -12,10 +12,13 @@ const debug = @import("../debug.zig");
 const Debugger = @import("../debugger.zig").Debugger;
 const value_mod = @import("value.zig");
 const Profiler = @import("profiler.zig").Profiler;
+const JITProfiler = @import("profiler.zig").JITProfiler;
+const CompilationTier = @import("profiler.zig").CompilationTier;
 
 // Get profiling setting from build options (if available)
 const build_options = @import("build_options");
 const profiling_enabled = if (@hasDecl(build_options, "enable_profiling")) build_options.enable_profiling else false;
+const jit_profiling_enabled = if (@hasDecl(build_options, "enable_jit_profiling")) build_options.enable_jit_profiling else true;
 
 // NaN-boxed Value type and related types
 pub const Value = value_mod.Value;
@@ -253,6 +256,12 @@ pub const CallStack = struct {
     pub fn slice(self: *CallStack) []CallFrame {
         return self.buffer[0..self.len];
     }
+
+    /// Get the top call frame without popping (peek at current frame)
+    pub fn top(self: *CallStack) ?CallFrame {
+        if (self.len == 0) return null;
+        return self.buffer[self.len - 1];
+    }
 };
 
 /// Reason why the VM stopped execution
@@ -312,6 +321,9 @@ pub const VM = struct {
     // Profiler (only present when profiling is enabled)
     profiler: if (profiling_enabled) Profiler else void,
 
+    // JIT Profiler for function call/loop tracking (for future JIT compilation)
+    jit_profiler: if (jit_profiling_enabled) JITProfiler else void,
+
     // Register file for register-based bytecode execution
     // 16 virtual registers: r0-r7 (caller-saved), r8-r13 (callee-saved), r14 (fp), r15 (return)
     registers: [16]Value,
@@ -346,6 +358,7 @@ pub const VM = struct {
             .stop_reason = null,
             .debug_current_line = 0,
             .profiler = if (profiling_enabled) Profiler.init(allocator) else {},
+            .jit_profiler = if (jit_profiling_enabled) JITProfiler.init(allocator) else {},
             .registers = [_]Value{Value.null_val} ** 16,
             .inline_caches = std.AutoHashMap(u32, InlineCache).init(allocator),
         };
@@ -376,6 +389,23 @@ pub const VM = struct {
         return .{ .total = total, .hits = hits, .misses = misses };
     }
 
+    /// Get JIT profiler statistics (if JIT profiling is enabled)
+    pub fn getJITStats(self: *Self) ?struct { functions: u32, baseline_queue: usize, optimized_queue: usize, deopts: u32 } {
+        if (!jit_profiling_enabled) return null;
+        return .{
+            .functions = self.jit_profiler.total_functions,
+            .baseline_queue = self.jit_profiler.baseline_queue.items.len,
+            .optimized_queue = self.jit_profiler.optimized_queue.items.len,
+            .deopts = self.jit_profiler.total_deopts,
+        };
+    }
+
+    /// Print JIT profiler report to stderr (if JIT profiling is enabled)
+    pub fn printJITReport(self: *Self) void {
+        if (!jit_profiling_enabled) return;
+        self.jit_profiler.report(std.io.getStdErr().writer()) catch {};
+    }
+
     /// Initialize the unified channel manager for text + ISAM I/O
     pub fn initChannels(self: *Self) !void {
         if (self.channel_manager != null) return; // Already initialized
@@ -402,6 +432,9 @@ pub const VM = struct {
         self.debugger.deinit();
         if (profiling_enabled) {
             self.profiler.deinit();
+        }
+        if (jit_profiling_enabled) {
+            self.jit_profiler.deinit();
         }
         self.inline_caches.deinit();
     }
@@ -1173,6 +1206,12 @@ pub const VM = struct {
         if (new_ip < 0 or new_ip > module.code.len) {
             return self.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
         }
+        // JIT Profiling: backward jump indicates loop iteration
+        if (jit_profiling_enabled and offset < 0) {
+            if (self.call_stack.top()) |frame| {
+                _ = self.jit_profiler.recordLoop(self.current_module_index orelse 0, frame.routine_index);
+            }
+        }
         self.ip = @intCast(new_ip);
         return .continue_dispatch;
     }
@@ -1187,6 +1226,12 @@ pub const VM = struct {
             const new_ip = @as(i64, @intCast(self.ip)) + offset;
             if (new_ip < 0 or new_ip > module.code.len) {
                 return self.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
+            }
+            // JIT Profiling: backward jump indicates loop iteration
+            if (jit_profiling_enabled and offset < 0) {
+                if (self.call_stack.top()) |frame| {
+                    _ = self.jit_profiler.recordLoop(self.current_module_index orelse 0, frame.routine_index);
+                }
             }
             self.ip = @intCast(new_ip);
         }
@@ -1203,6 +1248,12 @@ pub const VM = struct {
             const new_ip = @as(i64, @intCast(self.ip)) + offset;
             if (new_ip < 0 or new_ip > module.code.len) {
                 return self.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
+            }
+            // JIT Profiling: backward jump indicates loop iteration
+            if (jit_profiling_enabled and offset < 0) {
+                if (self.call_stack.top()) |frame| {
+                    _ = self.jit_profiler.recordLoop(self.current_module_index orelse 0, frame.routine_index);
+                }
             }
             self.ip = @intCast(new_ip);
         }
@@ -1225,6 +1276,12 @@ pub const VM = struct {
 
         if (routine_idx >= module.routines.len) {
             return self.fail(VMError.InvalidRoutine, "Routine index out of bounds");
+        }
+
+        // JIT Profiling: record function call
+        if (jit_profiling_enabled) {
+            const module_idx = self.current_module_index orelse 0;
+            _ = self.jit_profiler.recordCall(module_idx, routine_idx);
         }
 
         // Push call frame

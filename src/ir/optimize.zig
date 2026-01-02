@@ -24,11 +24,13 @@ pub const OptStats = struct {
     dead_blocks_removed: u32 = 0,
     tail_calls_optimized: u32 = 0,
     switches_created: u32 = 0,
+    functions_inlined: u32 = 0,
+    call_sites_inlined: u32 = 0,
 
     pub fn total(self: OptStats) u32 {
         return self.constants_folded + self.dead_instructions_removed +
             self.dead_blocks_removed + self.tail_calls_optimized +
-            self.switches_created;
+            self.switches_created + self.call_sites_inlined;
     }
 };
 
@@ -42,6 +44,8 @@ pub const OptOptions = struct {
     tail_call_optimization: bool = true,
     /// Enable switch optimization (convert comparison chains to switch_br)
     switch_optimization: bool = true,
+    /// Enable function inlining
+    inlining: bool = true,
     /// Enable debug output
     debug: bool = false,
 };
@@ -49,6 +53,13 @@ pub const OptOptions = struct {
 /// Run all enabled optimization passes on a module
 pub fn optimize(module: *ir.Module, options: OptOptions) OptStats {
     var stats = OptStats{};
+
+    // Run inlining first (module-level pass)
+    if (options.inlining) {
+        const inline_stats = inlineFunctions(module, .{});
+        stats.functions_inlined = inline_stats.functions_inlined;
+        stats.call_sites_inlined = inline_stats.call_sites_inlined;
+    }
 
     // Run passes on each function
     for (module.functions.items) |func| {
@@ -861,6 +872,263 @@ pub fn tailCallOptimize(func: *ir.Function) TCOStats {
     }
 
     return stats;
+}
+
+// ============================================================================
+// Function Inlining
+// ============================================================================
+
+/// Inlining statistics
+pub const InlineStats = struct {
+    functions_inlined: u32 = 0,
+    call_sites_inlined: u32 = 0,
+};
+
+/// Inlining options
+pub const InlineOptions = struct {
+    /// Maximum instruction count for a function to be inlined
+    max_instructions: u32 = 20,
+    /// Maximum number of times to inline a single function
+    max_inline_count: u32 = 5,
+};
+
+/// Perform function inlining on a module.
+///
+/// Inlines small, non-recursive functions at their call sites.
+/// This eliminates call overhead and enables further optimizations.
+pub fn inlineFunctions(module: *ir.Module, options: InlineOptions) InlineStats {
+    var stats = InlineStats{};
+
+    // Build a map of inlineable functions
+    var inlineable = std.StringHashMap(InlineCandidate).init(module.allocator);
+    defer inlineable.deinit();
+
+    for (module.functions.items) |func| {
+        if (isInlineable(func, options)) {
+            inlineable.put(func.name, .{
+                .func = func,
+                .inline_count = 0,
+            }) catch continue;
+        }
+    }
+
+    if (inlineable.count() == 0) return stats;
+
+    // For each function, look for call sites to inline
+    for (module.functions.items) |caller| {
+        const result = inlineCallsInFunction(caller, &inlineable, options);
+        stats.call_sites_inlined += result.inlined;
+    }
+
+    // Count unique functions that were inlined
+    var iter = inlineable.iterator();
+    while (iter.next()) |entry| {
+        if (entry.value_ptr.inline_count > 0) {
+            stats.functions_inlined += 1;
+        }
+    }
+
+    return stats;
+}
+
+const InlineCandidate = struct {
+    func: *ir.Function,
+    inline_count: u32,
+};
+
+/// Check if a function is suitable for inlining
+fn isInlineable(func: *ir.Function, options: InlineOptions) bool {
+    // Don't inline external or exported functions
+    if (func.linkage != .internal) return false;
+
+    // Count instructions across all blocks
+    var total_instructions: u32 = 0;
+    for (func.blocks.items) |block| {
+        total_instructions += @intCast(block.instructions.items.len);
+    }
+
+    // Too large to inline
+    if (total_instructions > options.max_instructions) return false;
+
+    // Check for recursion (self-calls)
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst == .call) {
+                if (std.mem.eql(u8, inst.call.callee, func.name)) {
+                    return false; // Recursive function
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+const InlineResult = struct {
+    inlined: u32,
+};
+
+/// Inline eligible calls within a function
+fn inlineCallsInFunction(
+    caller: *ir.Function,
+    inlineable: *std.StringHashMap(InlineCandidate),
+    options: InlineOptions,
+) InlineResult {
+    var result = InlineResult{ .inlined = 0 };
+
+    // For simplicity, we only inline calls that are in simple positions:
+    // - The call result is used once (or not at all)
+    // - The call is not in a complex control flow situation
+    //
+    // Full inlining would require:
+    // 1. Copying all blocks from callee
+    // 2. Remapping all SSA values
+    // 3. Replacing parameters with arguments
+    // 4. Connecting control flow
+
+    for (caller.blocks.items) |block| {
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            const inst = block.instructions.items[i];
+
+            if (inst == .call) {
+                const call = inst.call;
+
+                // Check if this is an inlineable function
+                if (inlineable.getPtr(call.callee)) |candidate| {
+                    if (candidate.inline_count >= options.max_inline_count) {
+                        i += 1;
+                        continue;
+                    }
+
+                    // For now, only inline very simple functions:
+                    // Single block with just a return
+                    const callee = candidate.func;
+                    if (callee.blocks.items.len == 1) {
+                        const callee_block = callee.blocks.items[0];
+
+                        // Check for simple pattern: allocas + computation + return
+                        if (tryInlineSimpleFunction(caller, block, i, call, callee, callee_block)) {
+                            candidate.inline_count += 1;
+                            result.inlined += 1;
+                            // Don't increment i - we replaced the instruction
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            i += 1;
+        }
+    }
+
+    return result;
+}
+
+/// Try to inline a simple single-block function
+fn tryInlineSimpleFunction(
+    caller: *ir.Function,
+    block: *ir.Block,
+    call_idx: usize,
+    call: ir.Instruction.Call,
+    _: *ir.Function, // callee - not used currently
+    callee_block: *ir.Block,
+) bool {
+    // Find the return instruction and its value
+    var return_value: ?ir.Value = null;
+    var return_idx: ?usize = null;
+
+    for (callee_block.instructions.items, 0..) |inst, idx| {
+        if (inst == .ret) {
+            return_value = inst.ret;
+            return_idx = idx;
+            break;
+        }
+    }
+
+    if (return_idx == null) return false;
+
+    // Build parameter -> argument mapping
+    var param_map = std.AutoHashMap(u32, ir.Value).init(caller.allocator);
+    defer param_map.deinit();
+
+    // Map parameter allocas to argument values
+    var param_idx: usize = 0;
+    for (callee_block.instructions.items) |inst| {
+        if (inst == .alloca) {
+            if (param_idx < call.args.len) {
+                // Map this alloca's result ID to the argument value
+                param_map.put(inst.alloca.result.id, call.args[param_idx]) catch return false;
+                param_idx += 1;
+            }
+        }
+    }
+
+    // For very simple functions (just return a constant or parameter),
+    // we can inline by replacing the call with the returned value
+
+    if (return_value) |ret_val| {
+        // Check if return value is a constant
+        for (callee_block.instructions.items) |inst| {
+            const result_id = inst.getResult() orelse continue;
+            if (result_id.id != ret_val.id) continue;
+
+            switch (inst) {
+                .const_int => |c| {
+                    // Replace call with constant
+                    if (call.result) |call_result| {
+                        block.instructions.items[call_idx] = .{
+                            .const_int = .{
+                                .ty = c.ty,
+                                .value = c.value,
+                                .result = call_result,
+                            },
+                        };
+                        return true;
+                    }
+                },
+                .const_bool => |c| {
+                    if (call.result) |call_result| {
+                        block.instructions.items[call_idx] = .{
+                            .const_bool = .{
+                                .value = c.value,
+                                .result = call_result,
+                            },
+                        };
+                        return true;
+                    }
+                },
+                .const_string => |c| {
+                    if (call.result) |call_result| {
+                        block.instructions.items[call_idx] = .{
+                            .const_string = .{
+                                .value = c.value,
+                                .result = call_result,
+                            },
+                        };
+                        return true;
+                    }
+                },
+                .load => |l| {
+                    // If loading from a parameter, substitute the argument
+                    if (param_map.get(l.ptr.id)) |arg_val| {
+                        if (call.result) |call_result| {
+                            // The function just returns one of its parameters
+                            // Replace call with a copy/move of the argument
+                            // For now, emit a load from where the arg came from
+                            // This is a simplification - full inlining would be more complex
+                            _ = call_result;
+                            _ = arg_val;
+                            // Skip for now - needs more complex handling
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    return false;
 }
 
 // ============================================================================
