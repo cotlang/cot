@@ -6,11 +6,17 @@ pub fn build(b: *std.Build) void {
 
     // Build options
     const enable_tui = b.option(bool, "tui", "Enable TUI support (default: true)") orelse true;
+    const enable_jit = b.option(bool, "jit", "Enable Cranelift JIT compilation (default: false)") orelse false;
 
     // Build options module for compile-time checks
     const options = b.addOptions();
     options.addOption(bool, "enable_tui", enable_tui);
+    options.addOption(bool, "enable_jit", enable_jit);
     const build_options_mod = options.createModule();
+
+    // JIT: When enabled, link the Cranelift Rust bridge library
+    // The library must be built separately: cd src/jit/cranelift-bridge && cargo build --release
+    const jit_lib_path = if (enable_jit) b.path("src/jit/cranelift-bridge/target/release") else null;
 
     // ========================================================================
     // External dependency: tui.zig (terminal library)
@@ -99,6 +105,13 @@ pub fn build(b: *std.Build) void {
     }
     exe.linkSystemLibrary("sqlite3");
     exe.linkSystemLibrary("c");
+
+    // Link Cranelift JIT library when enabled
+    if (jit_lib_path) |lib_path| {
+        exe.addLibraryPath(lib_path);
+        exe.linkSystemLibrary("cot_cranelift");
+    }
+
     b.installArtifact(exe);
 
     // macOS: Generate dSYM for better crash stack traces
@@ -143,6 +156,13 @@ pub fn build(b: *std.Build) void {
     }
     dbl_exe.linkSystemLibrary("sqlite3");
     dbl_exe.linkSystemLibrary("c");
+
+    // Link Cranelift JIT library when enabled
+    if (jit_lib_path) |lib_path| {
+        dbl_exe.addLibraryPath(lib_path);
+        dbl_exe.linkSystemLibrary("cot_cranelift");
+    }
+
     b.installArtifact(dbl_exe);
 
     // ========================================================================
