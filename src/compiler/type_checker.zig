@@ -76,20 +76,15 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .store => |s| self.checkStore(s),
         .load => {}, // Loads are type-safe by construction
 
-        // Arithmetic operations
-        .add => |op| self.checkBinaryOp(op, .arithmetic, "+"),
-        .sub => |op| self.checkBinaryOp(op, .arithmetic, "-"),
-        .mul => |op| self.checkBinaryOp(op, .arithmetic, "*"),
-        .div => |op| self.checkBinaryOp(op, .arithmetic, "/"),
-        .mod => |op| self.checkBinaryOp(op, .arithmetic, "%"),
+        // Arithmetic operations (Cranelift names)
+        .iadd => |op| self.checkBinaryOp(op, .arithmetic, "+"),
+        .isub => |op| self.checkBinaryOp(op, .arithmetic, "-"),
+        .imul => |op| self.checkBinaryOp(op, .arithmetic, "*"),
+        .sdiv, .udiv => |op| self.checkBinaryOp(op, .arithmetic, "/"),
+        .srem, .urem => |op| self.checkBinaryOp(op, .arithmetic, "%"),
 
-        // Comparison operations
-        .cmp_eq => |op| self.checkBinaryOp(op, .comparison, "=="),
-        .cmp_ne => |op| self.checkBinaryOp(op, .comparison, "!="),
-        .cmp_lt => |op| self.checkBinaryOp(op, .comparison, "<"),
-        .cmp_le => |op| self.checkBinaryOp(op, .comparison, "<="),
-        .cmp_gt => |op| self.checkBinaryOp(op, .comparison, ">"),
-        .cmp_ge => |op| self.checkBinaryOp(op, .comparison, ">="),
+        // Comparison operations (Cranelift style - icmp with condition)
+        .icmp => |op| self.checkIcmpOp(op),
 
         // Logical operations (always valid)
         .log_and, .log_or, .log_not => {},
@@ -101,20 +96,21 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
 
         // Function calls
         .call => |c| self.checkCall(c),
+        .call_indirect => {},  // Indirect calls checked at runtime
 
         // Array operations
         .array_load => |a| self.checkArrayLoad(a),
         .array_store => |a| self.checkArrayStore(a),
 
-        // These don't need type checking
-        .alloca, .field_ptr, .br, .cond_br, .switch_br, .ret => {},
-        .const_int, .const_float, .const_string, .const_bool, .const_null => {},
-        .int_to_float, .float_to_int, .int_extend, .int_truncate, .cast => {},
+        // These don't need type checking (Cranelift names)
+        .alloca, .field_ptr, .jump, .brif, .br_table, .return_, .trap => {},
+        .iconst, .f32const, .f64const, .const_string, .const_null => {},
+        .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce, .bitcast => {},
         .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => {},
-        .load_struct_buf, .store_struct_buf, .str_compare, .str_copy, .str_len, .neg => {},
+        .load_struct_buf, .store_struct_buf, .str_compare, .str_copy, .str_len, .ineg => {},
         .try_begin, .try_end, .catch_begin, .throw => {},
         .wrap_optional, .unwrap_optional, .is_null => {},
-        .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => {},
+        .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => {},
         .array_len, .debug_line => {},
     }
 }
@@ -179,6 +175,27 @@ fn checkBinaryOp(self: *Self, op: ir.Instruction.BinaryOp, op_type: type_rules.B
             "operator '{s}' cannot be applied to '{s}' and '{s}'",
             .{
                 op_name,
+                type_rules.formatType(op.lhs.ty, &lhs_buf),
+                type_rules.formatType(op.rhs.ty, &rhs_buf),
+            },
+        );
+    }
+}
+
+/// Check icmp (integer comparison) instruction
+fn checkIcmpOp(self: *Self, op: ir.Instruction.IcmpOp) void {
+    const result = type_rules.checkBinaryOp(.comparison, op.lhs.ty, op.rhs.ty);
+    const loc = locToRange(op.loc);
+
+    if (!result.ok) {
+        var lhs_buf: [64]u8 = undefined;
+        var rhs_buf: [64]u8 = undefined;
+        self.collector.addError(
+            .E206_incompatible_operands,
+            self.file_path,
+            loc,
+            "comparison cannot be applied to '{s}' and '{s}'",
+            .{
                 type_rules.formatType(op.lhs.ty, &lhs_buf),
                 type_rules.formatType(op.rhs.ty, &rhs_buf),
             },

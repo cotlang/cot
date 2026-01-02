@@ -200,16 +200,19 @@ pub const Verifier = struct {
                 try self.checkValueDefined(op.ptr);
                 try self.checkValueDefined(op.value);
             },
-            .add, .sub, .mul, .div, .mod => |op| {
+            // Arithmetic (Cranelift names)
+            .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem => |op| {
                 try self.checkValueDefined(op.lhs);
                 try self.checkValueDefined(op.rhs);
                 try self.checkArithmeticTypes(op.lhs, op.rhs, "arithmetic");
             },
-            .bit_and, .bit_or, .bit_xor, .shl, .shr => |op| {
+            // Bitwise (Cranelift names)
+            .band, .bor, .bxor, .ishl, .sshr, .ushr => |op| {
                 try self.checkValueDefined(op.lhs);
                 try self.checkValueDefined(op.rhs);
             },
-            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge => |op| {
+            // Comparison (Cranelift icmp)
+            .icmp => |op| {
                 try self.checkValueDefined(op.lhs);
                 try self.checkValueDefined(op.rhs);
                 try self.checkComparisonTypes(op.lhs, op.rhs, "comparison");
@@ -218,17 +221,17 @@ pub const Verifier = struct {
                 try self.checkValueDefined(op.lhs);
                 try self.checkValueDefined(op.rhs);
             },
-            .neg, .log_not, .bit_not => |op| {
+            .ineg, .log_not, .bnot => |op| {
                 try self.checkValueDefined(op.operand);
             },
             .str_concat, .str_compare => |op| {
                 try self.checkValueDefined(op.lhs);
                 try self.checkValueDefined(op.rhs);
             },
-            .cond_br => |br| {
+            .brif => |br| {
                 try self.checkValueDefined(br.condition);
             },
-            .ret => |maybe_val| {
+            .return_ => |maybe_val| {
                 if (maybe_val) |val| {
                     try self.checkValueDefined(val);
                 }
@@ -270,10 +273,14 @@ pub const Verifier = struct {
                 try self.checkValueDefined(op.index);
                 try self.checkValueDefined(op.value);
             },
-            .cast => |op| {
+            .bitcast => |op| {
                 try self.checkValueDefined(op.operand);
             },
-            .int_to_float, .float_to_int, .int_truncate => |op| {
+            // Type conversions (Cranelift names)
+            .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| {
+                try self.checkValueDefined(op.operand);
+            },
+            .sextend, .uextend => |op| {
                 try self.checkValueDefined(op.operand);
             },
             .wrap_optional, .unwrap_optional, .is_null => |op| {
@@ -285,8 +292,8 @@ pub const Verifier = struct {
             .throw => |op| {
                 try self.checkValueDefined(op.value);
             },
-            // Instructions that don't use values or only define them
-            .alloca, .br, .switch_br, .const_int, .const_float, .const_string, .const_bool, .const_null, .debug_line, .try_begin, .try_end, .catch_begin, .field_ptr, .load_struct_buf, .str_slice, .str_slice_store, .str_copy, .int_extend => {},
+            // Instructions that don't use values or only define them (Cranelift names)
+            .alloca, .jump, .br_table, .trap, .iconst, .f32const, .f64const, .const_string, .const_null, .debug_line, .try_begin, .try_end, .catch_begin, .field_ptr, .load_struct_buf, .str_slice, .str_slice_store, .str_copy, .call_indirect => {},
         }
     }
 
@@ -444,7 +451,7 @@ test "verifier passes valid IR" {
     try module.addFunction(func);
 
     // Add a return terminator
-    try func.entry.append(.{ .ret = null });
+    try func.entry.append(.{ .return_ = null });
 
     var verifier = Verifier.init(allocator, &module);
     defer verifier.deinit();

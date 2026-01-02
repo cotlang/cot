@@ -838,7 +838,7 @@ pub const Lowerer = struct {
 
         // Add implicit return if not terminated
         if (!self.current_block.?.isTerminated()) {
-            try self.emit(.{ .ret = null });
+            try self.emit(.{ .return_ = null });
         }
 
         try self.module.addFunction(func);
@@ -968,7 +968,7 @@ pub const Lowerer = struct {
     /// Lower a break statement
     fn lowerBreak(self: *Self) LowerError!void {
         if (self.loop_exit_block) |exit_block| {
-            try self.emit(.{ .br = .{ .target = exit_block } });
+            try self.emit(.{ .jump = .{ .target = exit_block } });
         } else {
             return LowerError.UnsupportedFeature;
         }
@@ -977,7 +977,7 @@ pub const Lowerer = struct {
     /// Lower a continue statement
     fn lowerContinue(self: *Self) LowerError!void {
         if (self.loop_continue_block) |continue_block| {
-            try self.emit(.{ .br = .{ .target = continue_block } });
+            try self.emit(.{ .jump = .{ .target = continue_block } });
         } else {
             return LowerError.UnsupportedFeature;
         }
@@ -992,7 +992,7 @@ pub const Lowerer = struct {
     /// Lower a throw statement
     fn lowerThrow(self: *Self) LowerError!void {
         // Throw generates a return for now (proper exceptions TBD)
-        try self.emit(.{ .ret = null });
+        try self.emit(.{ .return_ = null });
     }
 
     /// Lower an assignment statement
@@ -1050,7 +1050,7 @@ pub const Lowerer = struct {
 
         // Branch based on condition
         try self.emit(.{
-            .cond_br = .{
+            .brif = .{
                 .condition = cond_val,
                 .then_block = then_block,
                 .else_block = else_block,
@@ -1061,7 +1061,7 @@ pub const Lowerer = struct {
         self.current_block = then_block;
         try self.lowerStatement(then_body);
         if (!self.current_block.?.isTerminated()) {
-            try self.emit(.{ .br = .{ .target = merge_block } });
+            try self.emit(.{ .jump = .{ .target = merge_block } });
         }
 
         // Else block
@@ -1070,7 +1070,7 @@ pub const Lowerer = struct {
             try self.lowerStatement(else_body);
         }
         if (!self.current_block.?.isTerminated()) {
-            try self.emit(.{ .br = .{ .target = merge_block } });
+            try self.emit(.{ .jump = .{ .target = merge_block } });
         }
 
         // Continue at merge block
@@ -1083,9 +1083,9 @@ pub const Lowerer = struct {
 
         if (value_idx != .null) {
             const value = try self.lowerExpression(value_idx);
-            try self.emit(.{ .ret = value });
+            try self.emit(.{ .return_ = value });
         } else {
-            try self.emit(.{ .ret = null });
+            try self.emit(.{ .return_ = null });
         }
     }
 
@@ -1108,13 +1108,13 @@ pub const Lowerer = struct {
         self.loop_continue_block = cond_block;
 
         // Jump to condition
-        try self.emit(.{ .br = .{ .target = cond_block } });
+        try self.emit(.{ .jump = .{ .target = cond_block } });
 
         // Condition block
         self.current_block = cond_block;
         const cond_val = try self.lowerExpression(cond_idx);
         try self.emit(.{
-            .cond_br = .{
+            .brif = .{
                 .condition = cond_val,
                 .then_block = body_block,
                 .else_block = exit_block,
@@ -1125,7 +1125,7 @@ pub const Lowerer = struct {
         self.current_block = body_block;
         try self.lowerStatement(body_idx);
         if (!self.current_block.?.isTerminated()) {
-            try self.emit(.{ .br = .{ .target = cond_block } });
+            try self.emit(.{ .jump = .{ .target = cond_block } });
         }
 
         // Restore loop context
@@ -1182,22 +1182,22 @@ pub const Lowerer = struct {
         self.loop_continue_block = incr_block;
 
         // TODO: Initialize from range start and check against range end
-        try self.emit(.{ .br = .{ .target = cond_block } });
+        try self.emit(.{ .jump = .{ .target = cond_block } });
 
         // Condition block - always true for now (infinite loop protection needed)
         self.current_block = cond_block;
-        try self.emit(.{ .br = .{ .target = body_block } });
+        try self.emit(.{ .jump = .{ .target = body_block } });
 
         // Body block
         self.current_block = body_block;
         try self.lowerStatement(body_idx);
         if (!self.current_block.?.isTerminated()) {
-            try self.emit(.{ .br = .{ .target = incr_block } });
+            try self.emit(.{ .jump = .{ .target = incr_block } });
         }
 
         // Increment block
         self.current_block = incr_block;
-        try self.emit(.{ .br = .{ .target = cond_block } });
+        try self.emit(.{ .jump = .{ .target = cond_block } });
 
         // Restore loop context
         self.loop_exit_block = prev_exit;
@@ -1224,13 +1224,13 @@ pub const Lowerer = struct {
         self.loop_continue_block = body_block;
 
         // Jump to body
-        try self.emit(.{ .br = .{ .target = body_block } });
+        try self.emit(.{ .jump = .{ .target = body_block } });
 
         // Body block
         self.current_block = body_block;
         try self.lowerStatement(body_idx);
         if (!self.current_block.?.isTerminated()) {
-            try self.emit(.{ .br = .{ .target = body_block } });
+            try self.emit(.{ .jump = .{ .target = body_block } });
         }
 
         // Restore loop context
@@ -1587,7 +1587,8 @@ pub const Lowerer = struct {
             // Compare scrutinee with pattern
             const cmp_result = func.newValue(.bool);
             try self.emit(.{
-                .cmp_eq = .{
+                .icmp = .{
+                    .cond = .eq,
                     .lhs = scrutinee_val,
                     .rhs = pattern_val,
                     .result = cmp_result,
@@ -1602,7 +1603,7 @@ pub const Lowerer = struct {
                 exit_block; // Last arm falls through to exit if no match
 
             try self.emit(.{
-                .cond_br = .{
+                .brif = .{
                     .condition = cmp_result,
                     .then_block = arm_block,
                     .else_block = else_block,
@@ -1615,7 +1616,7 @@ pub const Lowerer = struct {
 
             // Jump to exit after arm body
             if (!self.current_block.?.isTerminated()) {
-                try self.emit(.{ .br = .{ .target = exit_block } });
+                try self.emit(.{ .jump = .{ .target = exit_block } });
             }
 
             // Move to next check block if there is one
@@ -1831,7 +1832,7 @@ pub const Lowerer = struct {
         const value = data.getIntValue();
         const result = func.newValue(.i64);
         try self.emit(.{
-            .const_int = .{
+            .iconst = .{
                 .ty = .i64,
                 .value = value,
                 .result = result,
@@ -1846,8 +1847,7 @@ pub const Lowerer = struct {
         const value: f64 = @bitCast(bits);
         const result = func.newValue(.f64);
         try self.emit(.{
-            .const_float = .{
-                .ty = .f64,
+            .f64const = .{
                 .value = value,
                 .result = result,
             },
@@ -1869,12 +1869,13 @@ pub const Lowerer = struct {
         return result;
     }
 
-    /// Lower a boolean literal
+    /// Lower a boolean literal (represented as iconst 0 or 1 to match Cranelift)
     fn lowerBoolLiteral(self: *Self, func: *ir.Function, data: NodeData) LowerError!ir.Value {
-        const value = data.a != 0;
+        const value: i64 = if (data.a != 0) 1 else 0;
         const result = func.newValue(.bool);
         try self.emit(.{
-            .const_bool = .{
+            .iconst = .{
+                .ty = .bool,
                 .value = value,
                 .result = result,
             },
@@ -1944,24 +1945,24 @@ pub const Lowerer = struct {
             .add => if (lhs.ty == .string or lhs.ty == .string_fixed)
                 .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result } }
             else
-                .{ .add = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .sub => .{ .sub = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .mul => .{ .mul = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .div => .{ .div = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .mod => .{ .mod = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .eq => .{ .cmp_eq = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .ne => .{ .cmp_ne = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .lt => .{ .cmp_lt = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .le => .{ .cmp_le = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .gt => .{ .cmp_gt = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .ge => .{ .cmp_ge = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+                .{ .iadd = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .sub => .{ .isub = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .mul => .{ .imul = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .div => .{ .sdiv = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .mod => .{ .srem = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .eq => .{ .icmp = .{ .cond = .eq, .lhs = lhs, .rhs = rhs, .result = result } },
+            .ne => .{ .icmp = .{ .cond = .ne, .lhs = lhs, .rhs = rhs, .result = result } },
+            .lt => .{ .icmp = .{ .cond = .slt, .lhs = lhs, .rhs = rhs, .result = result } },
+            .le => .{ .icmp = .{ .cond = .sle, .lhs = lhs, .rhs = rhs, .result = result } },
+            .gt => .{ .icmp = .{ .cond = .sgt, .lhs = lhs, .rhs = rhs, .result = result } },
+            .ge => .{ .icmp = .{ .cond = .sge, .lhs = lhs, .rhs = rhs, .result = result } },
             .@"and" => .{ .log_and = .{ .lhs = lhs, .rhs = rhs, .result = result } },
             .@"or" => .{ .log_or = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .bit_and => .{ .bit_and = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .bit_or => .{ .bit_or = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .bit_xor => .{ .bit_xor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .shl => .{ .shl = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-            .shr => .{ .shr = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .bit_and => .{ .band = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .bit_or => .{ .bor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .bit_xor => .{ .bxor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .shl => .{ .ishl = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+            .shr => .{ .sshr = .{ .lhs = lhs, .rhs = rhs, .result = result } },
             .range, .range_inclusive => return LowerError.UnsupportedFeature,
         };
 
@@ -1980,7 +1981,7 @@ pub const Lowerer = struct {
         switch (op) {
             .neg => {
                 const result = func.newValue(operand.ty);
-                try self.emit(.{ .neg = .{ .operand = operand, .result = result } });
+                try self.emit(.{ .ineg = .{ .operand = operand, .result = result } });
                 return result;
             },
             .not => {
@@ -1991,7 +1992,7 @@ pub const Lowerer = struct {
             },
             .bit_not => {
                 const result = func.newValue(operand.ty);
-                try self.emit(.{ .bit_not = .{ .operand = operand, .result = result } });
+                try self.emit(.{ .bnot = .{ .operand = operand, .result = result } });
                 return result;
             },
             .addr_of => {
@@ -2196,7 +2197,7 @@ pub const Lowerer = struct {
             // Create index constant
             const idx_val = func.newValue(.i64);
             try self.emit(.{
-                .const_int = .{ .ty = .i64, .value = @intCast(idx), .result = idx_val },
+                .iconst = .{ .ty = .i64, .value = @intCast(idx), .result = idx_val },
             });
 
             // Store element at index
@@ -2389,7 +2390,7 @@ pub const Lowerer = struct {
 
         // Add implicit return if not terminated
         if (!self.current_block.?.isTerminated()) {
-            try self.emit(.{ .ret = null });
+            try self.emit(.{ .return_ = null });
         }
 
         // Add lambda function to module

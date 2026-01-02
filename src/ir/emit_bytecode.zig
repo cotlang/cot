@@ -645,14 +645,21 @@ pub const BytecodeEmitter = struct {
                 }
             },
 
-            .const_int => |c| {
+            .iconst => |c| {
                 // Register-based: store in constant pool, load on demand
                 // Don't allocate a register now - will load when needed
                 const const_idx = try self.addConstant(.{ .integer = c.value });
                 try self.value_consts.put(c.result.id, const_idx);
             },
 
-            .const_float => |c| {
+            .f32const => |c| {
+                // Store float as fixed-point constant
+                const int_val: i64 = @intFromFloat(@as(f64, c.value) * 100);
+                const const_idx = try self.addConstant(.{ .integer = int_val });
+                try self.value_consts.put(c.result.id, const_idx);
+            },
+
+            .f64const => |c| {
                 // Store float as fixed-point constant
                 const int_val: i64 = @intFromFloat(c.value * 100);
                 const const_idx = try self.addConstant(.{ .integer = int_val });
@@ -665,17 +672,12 @@ pub const BytecodeEmitter = struct {
                 try self.value_consts.put(c.result.id, const_idx);
             },
 
-            .const_bool => |c| {
-                const const_idx = try self.addConstant(.{ .integer = if (c.value) 1 else 0 });
-                try self.value_consts.put(c.result.id, const_idx);
-            },
-
             .const_null => {
                 // Note: const_null doesn't have a result value, so we can't track it
                 // This is for legacy compatibility - should rarely be used
             },
 
-            .add => |a| {
+            .iadd => |a| {
                 // Register-based emission - use temp registers for operands
                 const lhs_reg = try self.getValueInReg(a.lhs, 0); // r0 as temp
                 const rhs_reg = try self.getValueInReg(a.rhs, 1); // r1 as temp
@@ -685,7 +687,7 @@ pub const BytecodeEmitter = struct {
                 self.setLastResult(a.result.id, dest_reg);
             },
 
-            .sub => |s| {
+            .isub => |s| {
                 const lhs_reg = try self.getValueInReg(s.lhs, 0);
                 const rhs_reg = try self.getValueInReg(s.rhs, 1);
                 const dest_reg: u4 = 2;
@@ -693,7 +695,7 @@ pub const BytecodeEmitter = struct {
                 self.setLastResult(s.result.id, dest_reg);
             },
 
-            .mul => |m| {
+            .imul => |m| {
                 const lhs_reg = try self.getValueInReg(m.lhs, 0);
                 const rhs_reg = try self.getValueInReg(m.rhs, 1);
                 const dest_reg: u4 = 2;
@@ -701,7 +703,7 @@ pub const BytecodeEmitter = struct {
                 self.setLastResult(m.result.id, dest_reg);
             },
 
-            .div => |d| {
+            .sdiv, .udiv => |d| {
                 const lhs_reg = try self.getValueInReg(d.lhs, 0);
                 const rhs_reg = try self.getValueInReg(d.rhs, 1);
                 const dest_reg: u4 = 2;
@@ -709,7 +711,7 @@ pub const BytecodeEmitter = struct {
                 self.setLastResult(d.result.id, dest_reg);
             },
 
-            .mod => |m| {
+            .srem, .urem => |m| {
                 const lhs_reg = try self.getValueInReg(m.lhs, 0);
                 const rhs_reg = try self.getValueInReg(m.rhs, 1);
                 const dest_reg: u4 = 2;
@@ -717,62 +719,27 @@ pub const BytecodeEmitter = struct {
                 self.setLastResult(m.result.id, dest_reg);
             },
 
-            .neg => |n| {
+            .ineg => |n| {
                 const src_reg = try self.getValueInReg(n.operand, 0);
                 const dest_reg: u4 = 1;
                 try self.emitRegUnary(.neg, dest_reg, src_reg);
                 self.setLastResult(n.result.id, dest_reg);
             },
 
-            .cmp_eq => |c| {
+            .icmp => |c| {
                 const lhs_reg = try self.getValueInReg(c.lhs, 0);
                 const rhs_reg = try self.getValueInReg(c.rhs, 1);
                 const dest_reg: u4 = 2;
-                if (c.lhs.ty == .string) {
-                    try self.emitRegArith(.cmp_str_eq, dest_reg, lhs_reg, rhs_reg);
-                } else {
-                    try self.emitRegArith(.cmp_eq, dest_reg, lhs_reg, rhs_reg);
-                }
-                self.setLastResult(c.result.id, dest_reg);
-            },
-
-            .cmp_ne => |c| {
-                const lhs_reg = try self.getValueInReg(c.lhs, 0);
-                const rhs_reg = try self.getValueInReg(c.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.cmp_ne, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(c.result.id, dest_reg);
-            },
-
-            .cmp_lt => |c| {
-                const lhs_reg = try self.getValueInReg(c.lhs, 0);
-                const rhs_reg = try self.getValueInReg(c.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.cmp_lt, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(c.result.id, dest_reg);
-            },
-
-            .cmp_le => |c| {
-                const lhs_reg = try self.getValueInReg(c.lhs, 0);
-                const rhs_reg = try self.getValueInReg(c.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.cmp_le, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(c.result.id, dest_reg);
-            },
-
-            .cmp_gt => |c| {
-                const lhs_reg = try self.getValueInReg(c.lhs, 0);
-                const rhs_reg = try self.getValueInReg(c.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.cmp_gt, dest_reg, lhs_reg, rhs_reg);
-                self.setLastResult(c.result.id, dest_reg);
-            },
-
-            .cmp_ge => |c| {
-                const lhs_reg = try self.getValueInReg(c.lhs, 0);
-                const rhs_reg = try self.getValueInReg(c.rhs, 1);
-                const dest_reg: u4 = 2;
-                try self.emitRegArith(.cmp_ge, dest_reg, lhs_reg, rhs_reg);
+                // Map IntCC condition to bytecode opcode
+                const opcode: Opcode = switch (c.cond) {
+                    .eq => if (c.lhs.ty == .string) .cmp_str_eq else .cmp_eq,
+                    .ne => .cmp_ne,
+                    .slt, .ult => .cmp_lt,
+                    .sle, .ule => .cmp_le,
+                    .sgt, .ugt => .cmp_gt,
+                    .sge, .uge => .cmp_ge,
+                };
+                try self.emitRegArith(opcode, dest_reg, lhs_reg, rhs_reg);
                 self.setLastResult(c.result.id, dest_reg);
             },
 
@@ -860,11 +827,11 @@ pub const BytecodeEmitter = struct {
                 return EmitError.InvalidInstruction;
             },
 
-            .br => |b| {
+            .jump => |b| {
                 try self.emitRegJmp(b.target);
             },
 
-            .cond_br => |c| {
+            .brif => |c| {
                 // Conditional branch - jump to else if condition is false (jz)
                 const cond_reg = try self.getValueInReg(c.condition, 0);
                 try self.emitRegCondJmp(.jz, cond_reg, c.else_block);
@@ -873,7 +840,7 @@ pub const BytecodeEmitter = struct {
                 try self.emitRegJmp(c.then_block);
             },
 
-            .ret => |r| {
+            .return_ => |r| {
                 if (r) |val| {
                     const src_reg = try self.getValueInReg(val, 0);
                     try self.emitRegRet(src_reg);
@@ -1279,7 +1246,7 @@ pub const BytecodeEmitter = struct {
                 try self.emitU16(array_slot);
             },
 
-            .switch_br => |s| {
+            .br_table => |s| {
                 // Switch/jump table - emit as a series of comparisons for now
                 // Future: could emit as computed jump table for dense integer ranges
                 //

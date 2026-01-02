@@ -177,34 +177,32 @@ pub const Printer = struct {
                 try self.writer.print(", {d}", .{f.field_index});
             },
 
-            // Arithmetic
-            .add => |op| try self.printBinaryOp("add", op),
-            .sub => |op| try self.printBinaryOp("sub", op),
-            .mul => |op| try self.printBinaryOp("mul", op),
-            .div => |op| try self.printBinaryOp("div", op),
-            .mod => |op| try self.printBinaryOp("mod", op),
-            .neg => |op| try self.printUnaryOp("neg", op),
+            // Arithmetic (Cranelift names)
+            .iadd => |op| try self.printBinaryOp("iadd", op),
+            .isub => |op| try self.printBinaryOp("isub", op),
+            .imul => |op| try self.printBinaryOp("imul", op),
+            .sdiv => |op| try self.printBinaryOp("sdiv", op),
+            .udiv => |op| try self.printBinaryOp("udiv", op),
+            .srem => |op| try self.printBinaryOp("srem", op),
+            .urem => |op| try self.printBinaryOp("urem", op),
+            .ineg => |op| try self.printUnaryOp("ineg", op),
 
-            // Comparison
-            .cmp_eq => |op| try self.printBinaryOp("cmp_eq", op),
-            .cmp_ne => |op| try self.printBinaryOp("cmp_ne", op),
-            .cmp_lt => |op| try self.printBinaryOp("cmp_lt", op),
-            .cmp_le => |op| try self.printBinaryOp("cmp_le", op),
-            .cmp_gt => |op| try self.printBinaryOp("cmp_gt", op),
-            .cmp_ge => |op| try self.printBinaryOp("cmp_ge", op),
+            // Comparison (Cranelift icmp with condition code)
+            .icmp => |op| try self.printIcmpOp(op),
 
             // Logical
-            .log_and => |op| try self.printBinaryOp("and", op),
-            .log_or => |op| try self.printBinaryOp("or", op),
-            .log_not => |op| try self.printUnaryOp("not", op),
+            .log_and => |op| try self.printBinaryOp("log_and", op),
+            .log_or => |op| try self.printBinaryOp("log_or", op),
+            .log_not => |op| try self.printUnaryOp("log_not", op),
 
-            // Bitwise
-            .bit_and => |op| try self.printBinaryOp("bit_and", op),
-            .bit_or => |op| try self.printBinaryOp("bit_or", op),
-            .bit_xor => |op| try self.printBinaryOp("bit_xor", op),
-            .bit_not => |op| try self.printUnaryOp("bit_not", op),
-            .shl => |op| try self.printBinaryOp("shl", op),
-            .shr => |op| try self.printBinaryOp("shr", op),
+            // Bitwise (Cranelift names)
+            .band => |op| try self.printBinaryOp("band", op),
+            .bor => |op| try self.printBinaryOp("bor", op),
+            .bxor => |op| try self.printBinaryOp("bxor", op),
+            .bnot => |op| try self.printUnaryOp("bnot", op),
+            .ishl => |op| try self.printBinaryOp("ishl", op),
+            .sshr => |op| try self.printBinaryOp("sshr", op),
+            .ushr => |op| try self.printBinaryOp("ushr", op),
 
             // String
             .str_concat => |op| try self.printBinaryOp("str_concat", op),
@@ -239,17 +237,17 @@ pub const Printer = struct {
                 try self.printValue(s.value);
             },
 
-            // Control flow
-            .br => |b| {
-                try self.writer.print("br {s}", .{b.target.label});
+            // Control flow (Cranelift names)
+            .jump => |b| {
+                try self.writer.print("jump {s}", .{b.target.label});
             },
-            .cond_br => |c| {
-                try self.writer.writeAll("cond_br ");
+            .brif => |c| {
+                try self.writer.writeAll("brif ");
                 try self.printValue(c.condition);
                 try self.writer.print(", {s}, {s}", .{ c.then_block.label, c.else_block.label });
             },
-            .switch_br => |s| {
-                try self.writer.writeAll("switch ");
+            .br_table => |s| {
+                try self.writer.writeAll("br_table ");
                 try self.printValue(s.value);
                 try self.writer.print(" [default: {s}", .{s.default.label});
                 for (s.cases) |case| {
@@ -257,12 +255,15 @@ pub const Printer = struct {
                 }
                 try self.writer.writeByte(']');
             },
-            .ret => |v| {
-                try self.writer.writeAll("ret");
+            .return_ => |v| {
+                try self.writer.writeAll("return");
                 if (v) |val| {
                     try self.writer.writeByte(' ');
                     try self.printValue(val);
                 }
+            },
+            .trap => |t| {
+                try self.writer.print("trap {s}", .{@tagName(t)});
             },
 
             // Calls
@@ -278,45 +279,55 @@ pub const Printer = struct {
                 }
                 try self.writer.writeByte(')');
             },
-            // Note: xcall is converted to regular .call in the IR lowerer
+            .call_indirect => |c| {
+                if (c.result) |r| {
+                    try self.printValue(r);
+                    try self.writer.writeAll(" = ");
+                }
+                try self.writer.writeAll("call_indirect ");
+                try self.printValue(c.callee);
+                try self.writer.writeByte('(');
+                for (c.args, 0..) |arg, i| {
+                    if (i > 0) try self.writer.writeAll(", ");
+                    try self.printValue(arg);
+                }
+                try self.writer.writeByte(')');
+            },
 
-            // Type conversions
-            .cast => |c| {
+            // Type conversions (Cranelift names)
+            .bitcast => |c| {
                 try self.printValue(c.result);
-                try self.writer.writeAll(" = cast ");
+                try self.writer.writeAll(" = bitcast ");
                 try self.printValue(c.operand);
                 try self.writer.writeAll(" to ");
                 try self.printType(c.target_type);
             },
-            .int_to_float => |op| try self.printUnaryOp("int_to_float", op),
-            .float_to_int => |op| try self.printUnaryOp("float_to_int", op),
-            .int_extend => |e| {
-                try self.printValue(e.result);
-                try self.writer.print(" = int_extend{s} ", .{if (e.signed) ".signed" else ".unsigned"});
-                try self.printValue(e.operand);
-            },
-            .int_truncate => |op| try self.printUnaryOp("int_truncate", op),
+            .fcvt_from_sint => |op| try self.printUnaryOp("fcvt_from_sint", op),
+            .fcvt_from_uint => |op| try self.printUnaryOp("fcvt_from_uint", op),
+            .fcvt_to_sint => |op| try self.printUnaryOp("fcvt_to_sint", op),
+            .fcvt_to_uint => |op| try self.printUnaryOp("fcvt_to_uint", op),
+            .sextend => |op| try self.printIntExtend("sextend", op),
+            .uextend => |op| try self.printIntExtend("uextend", op),
+            .ireduce => |op| try self.printUnaryOp("ireduce", op),
 
-            // Constants
-            .const_int => |c| {
+            // Constants (Cranelift names)
+            .iconst => |c| {
                 try self.printValue(c.result);
-                try self.writer.writeAll(" = const_int ");
+                try self.writer.writeAll(" = iconst ");
                 try self.printType(c.ty);
                 try self.writer.print(" {d}", .{c.value});
             },
-            .const_float => |c| {
+            .f32const => |c| {
                 try self.printValue(c.result);
-                try self.writer.writeAll(" = const_float ");
-                try self.printType(c.ty);
-                try self.writer.print(" {d}", .{c.value});
+                try self.writer.print(" = f32const {d}", .{c.value});
+            },
+            .f64const => |c| {
+                try self.printValue(c.result);
+                try self.writer.print(" = f64const {d}", .{c.value});
             },
             .const_string => |c| {
                 try self.printValue(c.result);
                 try self.writer.print(" = const_string \"{s}\"", .{c.value});
-            },
-            .const_bool => |c| {
-                try self.printValue(c.result);
-                try self.writer.print(" = const_bool {}", .{c.value});
             },
             .const_null => |c| {
                 try self.printValue(c.result);
@@ -434,6 +445,20 @@ pub const Printer = struct {
         try self.printValue(op.rhs);
     }
 
+    fn printIcmpOp(self: *Self, op: ir.Instruction.IcmpOp) !void {
+        try self.printValue(op.result);
+        try self.writer.print(" = icmp {s} ", .{@tagName(op.cond)});
+        try self.printValue(op.lhs);
+        try self.writer.writeAll(", ");
+        try self.printValue(op.rhs);
+    }
+
+    fn printIntExtend(self: *Self, name: []const u8, op: ir.Instruction.IntExtend) !void {
+        try self.printValue(op.result);
+        try self.writer.print(" = {s} ", .{name});
+        try self.printValue(op.operand);
+    }
+
     fn printUnaryOp(self: *Self, name: []const u8, op: ir.Instruction.UnaryOp) !void {
         try self.printValue(op.result);
         try self.writer.print(" = {s} ", .{name});
@@ -533,8 +558,8 @@ test "print simple function" {
     const y = ir.Value{ .id = 1, .ty = .{ .decimal = .{ .length = 8, .decimal_places = 2 } } };
     const result = func.newValue(.{ .decimal = .{ .length = 10, .decimal_places = 2 } });
 
-    try func.entry.append(.{ .add = .{ .lhs = x, .rhs = y, .result = result } });
-    try func.entry.append(.{ .ret = result });
+    try func.entry.append(.{ .iadd = .{ .lhs = x, .rhs = y, .result = result } });
+    try func.entry.append(.{ .return_ = result });
 
     // Create module and add function
     var module = ir.Module.init(allocator, "test_module");
@@ -559,6 +584,6 @@ test "print simple function" {
     try std.testing.expect(std.mem.indexOf(u8, output, "export") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "cot_add_values") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "d8.2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "add") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "ret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "iadd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "return") != null);
 }

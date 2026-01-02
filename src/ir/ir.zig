@@ -2,10 +2,17 @@
 //!
 //! This module defines the IR used between the AST and code generation backends.
 //! The IR is designed to:
-//! - Support multiple backends (bytecode VM, native via LLVM, Zig transpiler)
+//! - Support multiple backends (bytecode VM, native via Cranelift, Zig transpiler)
 //! - Enable Cot functions to be exported with C ABI for .NET interop
 //! - Preserve type information for accurate code generation
 //! - Be inspectable for debugging and optimization
+//!
+//! Instruction names are aligned with Cranelift IR for easy JIT translation:
+//! - Arithmetic: iadd, isub, imul, sdiv, udiv, srem, urem, ineg
+//! - Bitwise: band, bor, bxor, bnot, ishl, sshr, ushr
+//! - Comparison: icmp with IntCC condition codes
+//! - Control: jump, brif, br_table, return_
+//! - Constants: iconst, f32const, f64const
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -290,86 +297,103 @@ pub const SourceLoc = struct {
     column: u32,
 };
 
-/// IR Instructions
+/// Integer comparison condition codes (matches Cranelift IntCC)
+pub const IntCC = enum {
+    eq, // Equal
+    ne, // Not equal
+    slt, // Signed less than
+    sge, // Signed greater or equal
+    sgt, // Signed greater than
+    sle, // Signed less or equal
+    ult, // Unsigned less than
+    uge, // Unsigned greater or equal
+    ugt, // Unsigned greater than
+    ule, // Unsigned less or equal
+};
+
+/// IR Instructions (names aligned with Cranelift IR)
 pub const Instruction = union(enum) {
-    // Memory operations
+    // ====== Memory operations ======
     alloca: Alloca,
     load: Load,
     store: Store,
     field_ptr: FieldPtr,
 
-    // Arithmetic
-    add: BinaryOp,
-    sub: BinaryOp,
-    mul: BinaryOp,
-    div: BinaryOp,
-    mod: BinaryOp,
-    neg: UnaryOp,
+    // ====== Arithmetic (Cranelift names) ======
+    iadd: BinaryOp, // Integer add
+    isub: BinaryOp, // Integer subtract
+    imul: BinaryOp, // Integer multiply
+    sdiv: BinaryOp, // Signed divide
+    udiv: BinaryOp, // Unsigned divide
+    srem: BinaryOp, // Signed remainder
+    urem: BinaryOp, // Unsigned remainder
+    ineg: UnaryOp, // Integer negate
 
-    // Bitwise operations
-    bit_and: BinaryOp,
-    bit_or: BinaryOp,
-    bit_xor: BinaryOp,
-    bit_not: UnaryOp,
-    shl: BinaryOp, // Shift left
-    shr: BinaryOp, // Shift right (arithmetic for signed, logical for unsigned)
+    // ====== Bitwise operations (Cranelift names) ======
+    band: BinaryOp, // Bitwise AND
+    bor: BinaryOp, // Bitwise OR
+    bxor: BinaryOp, // Bitwise XOR
+    bnot: UnaryOp, // Bitwise NOT
+    ishl: BinaryOp, // Integer shift left
+    sshr: BinaryOp, // Signed shift right (arithmetic)
+    ushr: BinaryOp, // Unsigned shift right (logical)
 
-    // Comparison
-    cmp_eq: BinaryOp,
-    cmp_ne: BinaryOp,
-    cmp_lt: BinaryOp,
-    cmp_le: BinaryOp,
-    cmp_gt: BinaryOp,
-    cmp_ge: BinaryOp,
+    // ====== Comparison (Cranelift style) ======
+    icmp: IcmpOp, // Integer compare with condition code
 
-    // Logical
+    // ====== Logical (short-circuit) ======
     log_and: BinaryOp,
     log_or: BinaryOp,
     log_not: UnaryOp,
 
-    // String operations
+    // ====== String operations (Cot-specific) ======
     str_concat: BinaryOp,
     str_compare: BinaryOp,
     str_copy: struct { dest: Value, src: Value },
     str_slice: StrSlice,
     str_slice_store: StrSliceStore,
-    str_len: UnaryOp, // Get string length
+    str_len: UnaryOp,
 
-    // Control flow
-    br: Branch,
-    cond_br: CondBranch,
-    switch_br: Switch,
-    ret: ?Value,
+    // ====== Control flow (Cranelift names) ======
+    jump: Branch, // Unconditional jump (was: br)
+    brif: CondBranch, // Branch if (was: cond_br)
+    br_table: Switch, // Branch table (was: switch_br)
+    return_: ?Value, // Return (was: ret)
 
-    // Function calls
+    // ====== Function calls ======
     call: Call,
+    call_indirect: CallIndirect, // Indirect call through function pointer
 
-    // Exception handling
-    try_begin: TryBegin, // Start of try block
-    try_end: void, // End of try block (normal exit)
-    catch_begin: CatchBegin, // Start of catch block
-    throw: Throw, // Throw exception
+    // ====== Exception handling (Cot-specific) ======
+    trap: TrapCode, // Trap/abort (Cranelift name)
+    try_begin: TryBegin,
+    try_end: void,
+    catch_begin: CatchBegin,
+    throw: Throw,
 
-    // Type conversions
-    cast: Cast,
-    int_to_float: UnaryOp,
-    float_to_int: UnaryOp,
-    int_extend: IntExtend, // Sign/zero extend
-    int_truncate: UnaryOp, // Truncate to smaller int
+    // ====== Type conversions (Cranelift names) ======
+    bitcast: Cast, // Reinterpret bits (was: cast)
+    fcvt_from_sint: UnaryOp, // Convert signed int to float (was: int_to_float)
+    fcvt_from_uint: UnaryOp, // Convert unsigned int to float
+    fcvt_to_sint: UnaryOp, // Convert float to signed int (was: float_to_int)
+    fcvt_to_uint: UnaryOp, // Convert float to unsigned int
+    sextend: IntExtend, // Sign extend (was: int_extend with signed=true)
+    uextend: IntExtend, // Zero extend (was: int_extend with signed=false)
+    ireduce: UnaryOp, // Reduce integer size (was: int_truncate)
 
-    // Constants
-    const_int: struct { ty: Type, value: i64, result: Value },
-    const_float: struct { ty: Type, value: f64, result: Value },
-    const_string: struct { value: []const u8, result: Value },
-    const_bool: struct { value: bool, result: Value },
-    const_null: struct { ty: Type, result: Value },
+    // ====== Constants (Cranelift names) ======
+    iconst: struct { ty: Type, value: i64, result: Value }, // Integer constant
+    f32const: struct { value: f32, result: Value }, // 32-bit float constant
+    f64const: struct { value: f64, result: Value }, // 64-bit float constant
+    const_string: struct { value: []const u8, result: Value }, // Cot-specific
+    const_null: struct { ty: Type, result: Value }, // Null constant
 
-    // Optional operations
-    wrap_optional: UnaryOp, // Wrap value in optional
-    unwrap_optional: UnaryOp, // Unwrap optional (panic if null)
-    is_null: UnaryOp, // Check if optional is null
+    // ====== Optional operations (Cot-specific) ======
+    wrap_optional: UnaryOp,
+    unwrap_optional: UnaryOp,
+    is_null: UnaryOp,
 
-    // I/O operations (ISAM file access)
+    // ====== I/O operations (Cot-specific, ISAM file access) ======
     io_open: IoOpen,
     io_close: struct { channel: Value },
     io_read: IoRead,
@@ -377,16 +401,16 @@ pub const Instruction = union(enum) {
     io_delete: struct { channel: Value },
     io_unlock: struct { channel: Value },
 
-    // Struct buffer operations - serialize struct fields into a buffer
+    // ====== Struct buffer operations (Cot-specific) ======
     load_struct_buf: struct { base_name: []const u8, struct_name: []const u8, result: Value },
     store_struct_buf: struct { base_name: []const u8, struct_name: []const u8, value: Value },
 
-    // Array operations
+    // ====== Array operations ======
     array_load: ArrayOp,
     array_store: ArrayStore,
     array_len: UnaryOp,
 
-    // Debug information
+    // ====== Debug information ======
     debug_line: struct { line: u32, column: u32 },
 
     // Allocate instruction
@@ -495,6 +519,34 @@ pub const Instruction = union(enum) {
         result: Value,
     };
 
+    // Integer comparison (Cranelift style with condition code)
+    pub const IcmpOp = struct {
+        cond: IntCC,
+        lhs: Value,
+        rhs: Value,
+        result: Value,
+        loc: ?SourceLoc = null,
+    };
+
+    // Indirect call through function pointer (Cranelift style)
+    pub const CallIndirect = struct {
+        sig: *const FunctionType,
+        callee: Value, // Function pointer value
+        args: []const Value,
+        result: ?Value,
+        loc: ?SourceLoc = null,
+    };
+
+    // Trap codes for runtime errors (Cranelift style)
+    pub const TrapCode = enum {
+        stack_overflow,
+        heap_out_of_bounds,
+        integer_overflow,
+        integer_division_by_zero,
+        bad_conversion_to_integer,
+        unreachable_code,
+    };
+
     /// Array load - load element from array (0-indexed)
     pub const ArrayOp = struct {
         array_ptr: Value, // Pointer to array base
@@ -576,15 +628,15 @@ pub const Instruction = union(enum) {
     /// Categories of IR instructions for analysis and optimization
     pub const Category = enum {
         memory, // alloca, load, store, field_ptr, load_struct_buf, store_struct_buf
-        arithmetic, // add, sub, mul, div, mod, neg
-        bitwise, // bit_and, bit_or, bit_xor, bit_not, shl, shr
-        comparison, // cmp_eq, cmp_ne, cmp_lt, cmp_le, cmp_gt, cmp_ge
+        arithmetic, // iadd, isub, imul, sdiv, udiv, srem, urem, ineg
+        bitwise, // band, bor, bxor, bnot, ishl, sshr, ushr
+        comparison, // icmp with IntCC condition codes
         logical, // log_and, log_or, log_not
         string, // str_concat, str_compare, str_copy, str_slice, str_slice_store, str_len
-        control, // br, cond_br, switch_br, ret, call
+        control, // jump, brif, br_table, return_, call, call_indirect, trap
         exception, // try_begin, try_end, catch_begin, throw
-        conversion, // cast, int_to_float, float_to_int, int_extend, int_truncate
-        constant, // const_int, const_float, const_string, const_bool, const_null
+        conversion, // bitcast, fcvt_from_sint, fcvt_from_uint, fcvt_to_sint, fcvt_to_uint, sextend, uextend, ireduce
+        constant, // iconst, f32const, f64const, const_string, const_null
         optional, // wrap_optional, unwrap_optional, is_null
         io, // io_open, io_close, io_read, io_write, io_delete, io_unlock
         array, // array_load, array_store, array_len
@@ -595,15 +647,15 @@ pub const Instruction = union(enum) {
     pub fn category(self: Instruction) Category {
         return switch (self) {
             .alloca, .load, .store, .field_ptr, .load_struct_buf, .store_struct_buf => .memory,
-            .add, .sub, .mul, .div, .mod, .neg => .arithmetic,
-            .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => .bitwise,
-            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge => .comparison,
+            .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem, .ineg => .arithmetic,
+            .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => .bitwise,
+            .icmp => .comparison,
             .log_and, .log_or, .log_not => .logical,
             .str_concat, .str_compare, .str_copy, .str_slice, .str_slice_store, .str_len => .string,
-            .br, .cond_br, .switch_br, .ret, .call => .control,
+            .jump, .brif, .br_table, .return_, .call, .call_indirect, .trap => .control,
             .try_begin, .try_end, .catch_begin, .throw => .exception,
-            .cast, .int_to_float, .float_to_int, .int_extend, .int_truncate => .conversion,
-            .const_int, .const_float, .const_string, .const_bool, .const_null => .constant,
+            .bitcast, .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce => .conversion,
+            .iconst, .f32const, .f64const, .const_string, .const_null => .constant,
             .wrap_optional, .unwrap_optional, .is_null => .optional,
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
             .array_load, .array_store, .array_len => .array,
@@ -639,7 +691,7 @@ pub const Instruction = union(enum) {
     /// Check if this instruction is a terminator (ends a basic block)
     pub fn isTerminator(self: Instruction) bool {
         return switch (self) {
-            .br, .cond_br, .switch_br, .ret, .throw => true,
+            .jump, .brif, .br_table, .return_, .throw, .trap => true,
             else => false,
         };
     }
@@ -655,28 +707,29 @@ pub const Instruction = union(enum) {
             .alloca => |a| a.result,
             .load => |l| l.result,
             .field_ptr => |f| f.result,
-            .add, .sub, .mul, .div, .mod => |op| op.result,
-            .bit_and, .bit_or, .bit_xor, .shl, .shr => |op| op.result,
-            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge => |op| op.result,
+            .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem => |op| op.result,
+            .band, .bor, .bxor, .ishl, .sshr, .ushr => |op| op.result,
+            .icmp => |op| op.result,
             .log_and, .log_or => |op| op.result,
-            .neg, .log_not, .bit_not => |op| op.result,
+            .ineg, .log_not, .bnot => |op| op.result,
             .str_concat, .str_compare => |op| op.result,
             .str_len, .array_len => |op| op.result,
             .str_slice => |s| s.result,
-            .const_int => |c| c.result,
-            .const_float => |c| c.result,
+            .iconst => |c| c.result,
+            .f32const => |c| c.result,
+            .f64const => |c| c.result,
             .const_string => |c| c.result,
-            .const_bool => |c| c.result,
             .const_null => |c| c.result,
             .call => |c| c.result,
+            .call_indirect => |c| c.result,
             .load_struct_buf => |l| l.result,
             .array_load => |a| a.result,
-            .cast => |c| c.result,
-            .int_to_float, .float_to_int, .int_truncate => |op| op.result,
-            .int_extend => |e| e.result,
+            .bitcast => |c| c.result,
+            .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| op.result,
+            .sextend, .uextend => |e| e.result,
             .wrap_optional, .unwrap_optional, .is_null => |op| op.result,
             // Instructions that don't produce values
-            .store, .br, .cond_br, .switch_br, .ret, .io_open, .io_close, .io_read,
+            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read,
             .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store,
             .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy => null,
         };
@@ -686,7 +739,7 @@ pub const Instruction = union(enum) {
     pub fn hasSideEffects(self: Instruction) bool {
         return switch (self) {
             .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock,
-            .store_struct_buf, .array_store, .throw, .call, .str_copy, .str_slice_store => true,
+            .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store => true,
             else => false,
         };
     }
@@ -736,7 +789,12 @@ pub const Block = struct {
                         self.allocator.free(c.args);
                     }
                 },
-                .switch_br => |s| {
+                .call_indirect => |c| {
+                    if (c.args.len > 0) {
+                        self.allocator.free(c.args);
+                    }
+                },
+                .br_table => |s| {
                     if (s.cases.len > 0) {
                         self.allocator.free(s.cases);
                     }

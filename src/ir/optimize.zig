@@ -121,28 +121,23 @@ fn constantFoldBlock(block: *ir.Block) u32 {
 /// Try to fold a single instruction. Returns true if folding occurred.
 fn tryFoldInstruction(block: *ir.Block, idx: usize, inst: *ir.Instruction) bool {
     switch (inst.*) {
-        // Arithmetic operations
-        .add => |op| return tryFoldBinaryArith(block, idx, op, .add),
-        .sub => |op| return tryFoldBinaryArith(block, idx, op, .sub),
-        .mul => |op| return tryFoldBinaryArith(block, idx, op, .mul),
-        .div => |op| return tryFoldBinaryArith(block, idx, op, .div),
-        .mod => |op| return tryFoldBinaryArith(block, idx, op, .mod),
+        // Arithmetic operations (Cranelift names)
+        .iadd => |op| return tryFoldBinaryArith(block, idx, op, .add),
+        .isub => |op| return tryFoldBinaryArith(block, idx, op, .sub),
+        .imul => |op| return tryFoldBinaryArith(block, idx, op, .mul),
+        .sdiv, .udiv => |op| return tryFoldBinaryArith(block, idx, op, .div),
+        .srem, .urem => |op| return tryFoldBinaryArith(block, idx, op, .mod),
 
-        // Comparison operations
-        .cmp_eq => |op| return tryFoldComparison(block, idx, op, .eq),
-        .cmp_ne => |op| return tryFoldComparison(block, idx, op, .ne),
-        .cmp_lt => |op| return tryFoldComparison(block, idx, op, .lt),
-        .cmp_le => |op| return tryFoldComparison(block, idx, op, .le),
-        .cmp_gt => |op| return tryFoldComparison(block, idx, op, .gt),
-        .cmp_ge => |op| return tryFoldComparison(block, idx, op, .ge),
+        // Comparison operations (Cranelift style - icmp with condition)
+        .icmp => |op| return tryFoldIcmp(block, idx, op),
 
         // Logical operations
         .log_and => |op| return tryFoldLogical(block, idx, op, .@"and"),
         .log_or => |op| return tryFoldLogical(block, idx, op, .@"or"),
         .log_not => |op| return tryFoldLogicalNot(block, idx, op),
 
-        // Unary negation
-        .neg => |op| return tryFoldNegation(block, idx, op),
+        // Unary negation (Cranelift name)
+        .ineg => |op| return tryFoldNegation(block, idx, op),
 
         else => return false,
     }
@@ -174,8 +169,8 @@ fn tryFoldBinaryArith(block: *ir.Block, idx: usize, op: ir.Instruction.BinaryOp,
             .mod => if (rhs_val.int != 0) @mod(lhs_val.int, rhs_val.int) else return false,
         };
 
-        // Replace with const_int
-        block.instructions.items[idx] = .{ .const_int = .{
+        // Replace with iconst (Cranelift name)
+        block.instructions.items[idx] = .{ .iconst = .{
             .ty = op.result.ty,
             .value = result,
             .result = op.result,
@@ -192,9 +187,8 @@ fn tryFoldBinaryArith(block: *ir.Block, idx: usize, op: ir.Instruction.BinaryOp,
             .mod => return false, // mod not supported for floats in simple folding
         };
 
-        // Replace with const_float
-        block.instructions.items[idx] = .{ .const_float = .{
-            .ty = op.result.ty,
+        // Replace with f64const (Cranelift name)
+        block.instructions.items[idx] = .{ .f64const = .{
             .value = result,
             .result = op.result,
         } };
@@ -204,8 +198,8 @@ fn tryFoldBinaryArith(block: *ir.Block, idx: usize, op: ir.Instruction.BinaryOp,
     return false;
 }
 
-/// Try to fold a comparison operation with constant operands
-fn tryFoldComparison(block: *ir.Block, idx: usize, op: ir.Instruction.BinaryOp, kind: CmpOp) bool {
+/// Try to fold an icmp comparison operation with constant operands (Cranelift style)
+fn tryFoldIcmp(block: *ir.Block, idx: usize, op: ir.Instruction.IcmpOp) bool {
     const lhs_const = findConstantValue(block, op.lhs);
     const rhs_const = findConstantValue(block, op.rhs);
 
@@ -217,25 +211,25 @@ fn tryFoldComparison(block: *ir.Block, idx: usize, op: ir.Instruction.BinaryOp, 
     var result: bool = false;
 
     if (lhs_val == .int and rhs_val == .int) {
-        result = switch (kind) {
+        result = switch (op.cond) {
             .eq => lhs_val.int == rhs_val.int,
             .ne => lhs_val.int != rhs_val.int,
-            .lt => lhs_val.int < rhs_val.int,
-            .le => lhs_val.int <= rhs_val.int,
-            .gt => lhs_val.int > rhs_val.int,
-            .ge => lhs_val.int >= rhs_val.int,
+            .slt, .ult => lhs_val.int < rhs_val.int,
+            .sle, .ule => lhs_val.int <= rhs_val.int,
+            .sgt, .ugt => lhs_val.int > rhs_val.int,
+            .sge, .uge => lhs_val.int >= rhs_val.int,
         };
     } else if (lhs_val == .float and rhs_val == .float) {
-        result = switch (kind) {
+        result = switch (op.cond) {
             .eq => lhs_val.float == rhs_val.float,
             .ne => lhs_val.float != rhs_val.float,
-            .lt => lhs_val.float < rhs_val.float,
-            .le => lhs_val.float <= rhs_val.float,
-            .gt => lhs_val.float > rhs_val.float,
-            .ge => lhs_val.float >= rhs_val.float,
+            .slt, .ult => lhs_val.float < rhs_val.float,
+            .sle, .ule => lhs_val.float <= rhs_val.float,
+            .sgt, .ugt => lhs_val.float > rhs_val.float,
+            .sge, .uge => lhs_val.float >= rhs_val.float,
         };
     } else if (lhs_val == .bool and rhs_val == .bool) {
-        result = switch (kind) {
+        result = switch (op.cond) {
             .eq => lhs_val.bool == rhs_val.bool,
             .ne => lhs_val.bool != rhs_val.bool,
             else => return false, // Can't do < > <= >= on bools
@@ -244,9 +238,10 @@ fn tryFoldComparison(block: *ir.Block, idx: usize, op: ir.Instruction.BinaryOp, 
         return false;
     }
 
-    // Replace with const_bool
-    block.instructions.items[idx] = .{ .const_bool = .{
-        .value = result,
+    // Replace with iconst (booleans represented as 0 or 1)
+    block.instructions.items[idx] = .{ .iconst = .{
+        .ty = .bool,
+        .value = if (result) 1 else 0,
         .result = op.result,
     } };
     return true;
@@ -269,8 +264,10 @@ fn tryFoldLogical(block: *ir.Block, idx: usize, op: ir.Instruction.BinaryOp, kin
         .@"or" => lhs_val.bool or rhs_val.bool,
     };
 
-    block.instructions.items[idx] = .{ .const_bool = .{
-        .value = result,
+    // Use iconst with 0 or 1 for boolean result (Cranelift style)
+    block.instructions.items[idx] = .{ .iconst = .{
+        .ty = .bool,
+        .value = if (result) 1 else 0,
         .result = op.result,
     } };
     return true;
@@ -284,8 +281,10 @@ fn tryFoldLogicalNot(block: *ir.Block, idx: usize, op: ir.Instruction.UnaryOp) b
     const val = operand_const.?;
     if (val != .bool) return false;
 
-    block.instructions.items[idx] = .{ .const_bool = .{
-        .value = !val.bool,
+    // Use iconst with 0 or 1 for boolean result (Cranelift style)
+    block.instructions.items[idx] = .{ .iconst = .{
+        .ty = .bool,
+        .value = if (!val.bool) 1 else 0,
         .result = op.result,
     } };
     return true;
@@ -299,7 +298,7 @@ fn tryFoldNegation(block: *ir.Block, idx: usize, op: ir.Instruction.UnaryOp) boo
     const val = operand_const.?;
 
     if (val == .int) {
-        block.instructions.items[idx] = .{ .const_int = .{
+        block.instructions.items[idx] = .{ .iconst = .{
             .ty = op.result.ty,
             .value = -%val.int,
             .result = op.result,
@@ -308,8 +307,7 @@ fn tryFoldNegation(block: *ir.Block, idx: usize, op: ir.Instruction.UnaryOp) boo
     }
 
     if (val == .float) {
-        block.instructions.items[idx] = .{ .const_float = .{
-            .ty = op.result.ty,
+        block.instructions.items[idx] = .{ .f64const = .{
             .value = -val.float,
             .result = op.result,
         } };
@@ -331,19 +329,23 @@ fn findConstantValue(block: *ir.Block, value: ir.Value) ?ConstValue {
     // Search backwards in the current block for the defining instruction
     for (block.instructions.items) |inst| {
         switch (inst) {
-            .const_int => |c| {
+            .iconst => |c| {
                 if (c.result.id == value.id) {
+                    // iconst can represent both integers and booleans
+                    if (c.ty == .bool) {
+                        return .{ .bool = c.value != 0 };
+                    }
                     return .{ .int = c.value };
                 }
             },
-            .const_float => |c| {
+            .f32const => |c| {
                 if (c.result.id == value.id) {
-                    return .{ .float = c.value };
+                    return .{ .float = @floatCast(c.value) };
                 }
             },
-            .const_bool => |c| {
+            .f64const => |c| {
                 if (c.result.id == value.id) {
-                    return .{ .bool = c.value };
+                    return .{ .float = c.value };
                 }
             },
             else => {
@@ -403,11 +405,13 @@ fn markUsedValues(block: *ir.Block, used: *std.AutoHashMap(u32, void)) void {
 /// Mark values used by a single instruction
 fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) void {
     switch (inst) {
-        .add, .sub, .mul, .div, .mod => |op| {
+        // Arithmetic (Cranelift names)
+        .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem => |op| {
             used.put(op.lhs.id, {}) catch {};
             used.put(op.rhs.id, {}) catch {};
         },
-        .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge => |op| {
+        // Comparison (Cranelift style)
+        .icmp => |op| {
             used.put(op.lhs.id, {}) catch {};
             used.put(op.rhs.id, {}) catch {};
         },
@@ -415,7 +419,8 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
             used.put(op.lhs.id, {}) catch {};
             used.put(op.rhs.id, {}) catch {};
         },
-        .neg, .log_not, .bit_not => |op| {
+        // Unary (Cranelift names)
+        .ineg, .log_not, .bnot => |op| {
             used.put(op.operand.id, {}) catch {};
         },
         .store => |s| {
@@ -425,10 +430,11 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .load => |l| {
             used.put(l.ptr.id, {}) catch {};
         },
-        .cond_br => |cb| {
+        // Control flow (Cranelift names)
+        .brif => |cb| {
             used.put(cb.condition.id, {}) catch {};
         },
-        .ret => |r| {
+        .return_ => |r| {
             if (r) |val| {
                 used.put(val.id, {}) catch {};
             }
@@ -441,16 +447,23 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
                 used.put(recv.id, {}) catch {};
             }
         },
-        .switch_br => |s| {
+        .call_indirect => |c| {
+            used.put(c.callee.id, {}) catch {};
+            for (c.args) |arg| {
+                used.put(arg.id, {}) catch {};
+            }
+        },
+        .br_table => |s| {
             used.put(s.value.id, {}) catch {};
         },
-        .cast => |c| {
+        // Type conversions (Cranelift names)
+        .bitcast => |c| {
             used.put(c.operand.id, {}) catch {};
         },
-        .int_to_float, .float_to_int, .int_truncate => |op| {
+        .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| {
             used.put(op.operand.id, {}) catch {};
         },
-        .int_extend => |e| {
+        .sextend, .uextend => |e| {
             used.put(e.operand.id, {}) catch {};
         },
         .wrap_optional, .unwrap_optional, .is_null => |op| {
@@ -516,13 +529,16 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .io_unlock => |io| {
             used.put(io.channel.id, {}) catch {};
         },
-        .bit_and, .bit_or, .bit_xor, .shl, .shr => |op| {
+        // Bitwise (Cranelift names)
+        .band, .bor, .bxor, .ishl, .sshr, .ushr => |op| {
             used.put(op.lhs.id, {}) catch {};
             used.put(op.rhs.id, {}) catch {};
         },
+        // Trap (Cranelift name)
+        .trap => {},
         // These don't use values or are handled specially
-        .alloca, .const_int, .const_float, .const_string, .const_bool, .const_null,
-        .br, .debug_line, .try_begin, .try_end, .catch_begin,
+        .alloca, .iconst, .f32const, .f64const, .const_string, .const_null,
+        .jump, .debug_line, .try_begin, .try_end, .catch_begin,
         .load_struct_buf, .store_struct_buf => {},
     }
 }
@@ -581,7 +597,7 @@ pub const SwitchStats = struct {
 pub fn optimizeSwitches(func: *ir.Function) SwitchStats {
     var stats = SwitchStats{};
 
-    // Look for chains of cmp_eq + cond_br on the same scrutinee value
+    // Look for chains of icmp eq + brif on the same scrutinee value
     // This is a simplified version - full decision tree compilation would
     // happen during IR lowering, not as an optimization pass
 
@@ -594,13 +610,13 @@ pub fn optimizeSwitches(func: *ir.Function) SwitchStats {
         const result = detectSwitchPattern(func, block);
         if (result.cases.len >= 2) {
             // Found a switch pattern with at least 2 cases
-            // Convert to switch_br
+            // Convert to br_table
 
-            // Clear the block and emit switch_br
+            // Clear the block and emit br_table
             // Keep instructions before the comparison
             var keep_count: usize = 0;
             for (block.instructions.items, 0..) |inst, i| {
-                if (inst == .cmp_eq) {
+                if (inst == .icmp and inst.icmp.cond == .eq) {
                     keep_count = i;
                     break;
                 }
@@ -618,8 +634,8 @@ pub fn optimizeSwitches(func: *ir.Function) SwitchStats {
                 };
             }
 
-            // Emit switch_br
-            block.append(.{ .switch_br = .{
+            // Emit br_table (Cranelift name for switch_br)
+            block.append(.{ .br_table = .{
                 .value = result.scrutinee,
                 .cases = cases,
                 .default = result.default,
@@ -660,27 +676,27 @@ fn detectSwitchPattern(func: *ir.Function, start_block: *ir.Block) SwitchPattern
         const insts = current_block.instructions.items;
         if (insts.len < 2) break;
 
-        // Look for cmp_eq + cond_br pattern at the end
+        // Look for icmp eq + brif pattern at the end (Cranelift names)
         var cmp_idx: ?usize = null;
-        var cond_br_idx: ?usize = null;
+        var brif_idx: ?usize = null;
 
         for (insts, 0..) |inst, i| {
-            if (inst == .cmp_eq) {
+            if (inst == .icmp and inst.icmp.cond == .eq) {
                 cmp_idx = i;
-            } else if (inst == .cond_br) {
-                cond_br_idx = i;
+            } else if (inst == .brif) {
+                brif_idx = i;
             }
         }
 
-        if (cmp_idx == null or cond_br_idx == null) break;
-        if (cond_br_idx.? != insts.len - 1) break; // cond_br must be last
-        if (cond_br_idx.? <= cmp_idx.?) break; // cond_br must be after cmp
+        if (cmp_idx == null or brif_idx == null) break;
+        if (brif_idx.? != insts.len - 1) break; // brif must be last
+        if (brif_idx.? <= cmp_idx.?) break; // brif must be after cmp
 
-        const cmp = insts[cmp_idx.?].cmp_eq;
-        const cond_br = insts[cond_br_idx.?].cond_br;
+        const cmp = insts[cmp_idx.?].icmp;
+        const brif = insts[brif_idx.?].brif;
 
-        // Check that cond_br uses the comparison result
-        if (cmp.result.id != cond_br.condition.id) break;
+        // Check that brif uses the comparison result
+        if (cmp.result.id != brif.condition.id) break;
 
         // Get the scrutinee (the value being compared)
         const this_scrutinee = cmp.lhs;
@@ -700,19 +716,19 @@ fn detectSwitchPattern(func: *ir.Function, start_block: *ir.Block) SwitchPattern
         // Record this case
         cases_buf[case_count] = .{
             .value = const_val.int,
-            .target = cond_br.then_block,
+            .target = brif.then_block,
         };
         case_count += 1;
 
         // Move to the else block (next comparison in chain)
-        const next_block = cond_br.else_block;
+        const next_block = brif.else_block;
 
         // Check if next block is a continuation of the chain or the default
         // A continuation has same pattern: compare same scrutinee
         var is_continuation = false;
         for (next_block.instructions.items) |inst| {
-            if (inst == .cmp_eq) {
-                const next_cmp = inst.cmp_eq;
+            if (inst == .icmp and inst.icmp.cond == .eq) {
+                const next_cmp = inst.icmp;
                 if (next_cmp.lhs.id == scrutinee.?.id) {
                     is_continuation = true;
                     break;
@@ -749,14 +765,20 @@ fn detectSwitchPattern(func: *ir.Function, start_block: *ir.Block) SwitchPattern
 fn findConstantValueById(block: *ir.Block, id: u32) ?ConstValue {
     for (block.instructions.items) |inst| {
         switch (inst) {
-            .const_int => |c| {
-                if (c.result.id == id) return .{ .int = c.value };
+            .iconst => |c| {
+                if (c.result.id == id) {
+                    // iconst can represent both integers and booleans
+                    if (c.ty == .bool) {
+                        return .{ .bool = c.value != 0 };
+                    }
+                    return .{ .int = c.value };
+                }
             },
-            .const_float => |c| {
+            .f32const => |c| {
+                if (c.result.id == id) return .{ .float = @floatCast(c.value) };
+            },
+            .f64const => |c| {
                 if (c.result.id == id) return .{ .float = c.value };
-            },
-            .const_bool => |c| {
-                if (c.result.id == id) return .{ .bool = c.value };
             },
             else => {},
         }
@@ -825,11 +847,11 @@ pub fn tailCallOptimize(func: *ir.Function) TCOStats {
         const last = block.instructions.items[len - 1];
         const second_last = block.instructions.items[len - 2];
 
-        // Pattern: call followed by ret of the call result
-        if (last != .ret or second_last != .call) continue;
+        // Pattern: call followed by return_ of the call result (Cranelift name)
+        if (last != .return_ or second_last != .call) continue;
 
         const call = second_last.call;
-        const ret_val = last.ret;
+        const ret_val = last.return_;
 
         // Check if this is a self-recursive call
         if (!std.mem.eql(u8, call.callee, func.name)) continue;
@@ -866,7 +888,7 @@ pub fn tailCallOptimize(func: *ir.Function) TCOStats {
 
         // Add branch back to loop entry (or entry block if no separate loop block)
         const target = loop_entry orelse func.entry;
-        block.append(.{ .br = .{ .target = target } }) catch continue;
+        block.append(.{ .jump = .{ .target = target } }) catch continue;
 
         stats.tail_calls_converted += 1;
     }
@@ -1039,8 +1061,8 @@ fn tryInlineSimpleFunction(
     var return_idx: ?usize = null;
 
     for (callee_block.instructions.items, 0..) |inst, idx| {
-        if (inst == .ret) {
-            return_value = inst.ret;
+        if (inst == .return_) {
+            return_value = inst.return_;
             return_idx = idx;
             break;
         }
@@ -1074,11 +1096,11 @@ fn tryInlineSimpleFunction(
             if (result_id.id != ret_val.id) continue;
 
             switch (inst) {
-                .const_int => |c| {
-                    // Replace call with constant
+                .iconst => |c| {
+                    // Replace call with constant (Cranelift name)
                     if (call.result) |call_result| {
                         block.instructions.items[call_idx] = .{
-                            .const_int = .{
+                            .iconst = .{
                                 .ty = c.ty,
                                 .value = c.value,
                                 .result = call_result,
@@ -1087,10 +1109,21 @@ fn tryInlineSimpleFunction(
                         return true;
                     }
                 },
-                .const_bool => |c| {
+                .f32const => |c| {
                     if (call.result) |call_result| {
                         block.instructions.items[call_idx] = .{
-                            .const_bool = .{
+                            .f32const = .{
+                                .value = c.value,
+                                .result = call_result,
+                            },
+                        };
+                        return true;
+                    }
+                },
+                .f64const => |c| {
+                    if (call.result) |call_result| {
+                        block.instructions.items[call_idx] = .{
+                            .f64const = .{
                                 .value = c.value,
                                 .result = call_result,
                             },
@@ -1150,17 +1183,17 @@ test "constant folding - integer arithmetic" {
     const func = try ir.Function.init(allocator, "test_fn", sig);
     try module.addFunction(func);
 
-    // Create: %0 = const_int 10
-    //         %1 = const_int 5
-    //         %2 = add %0, %1  <- should fold to const_int 15
+    // Create: %0 = iconst 10
+    //         %1 = iconst 5
+    //         %2 = iadd %0, %1  <- should fold to iconst 15
     const v0 = func.newValue(.{ .i64 = {} });
     const v1 = func.newValue(.{ .i64 = {} });
     const v2 = func.newValue(.{ .i64 = {} });
 
-    try func.entry.append(.{ .const_int = .{ .ty = .{ .i64 = {} }, .value = 10, .result = v0 } });
-    try func.entry.append(.{ .const_int = .{ .ty = .{ .i64 = {} }, .value = 5, .result = v1 } });
-    try func.entry.append(.{ .add = .{ .lhs = v0, .rhs = v1, .result = v2 } });
-    try func.entry.append(.{ .ret = v2 });
+    try func.entry.append(.{ .iconst = .{ .ty = .{ .i64 = {} }, .value = 10, .result = v0 } });
+    try func.entry.append(.{ .iconst = .{ .ty = .{ .i64 = {} }, .value = 5, .result = v1 } });
+    try func.entry.append(.{ .iadd = .{ .lhs = v0, .rhs = v1, .result = v2 } });
+    try func.entry.append(.{ .return_ = v2 });
 
     // Run optimization
     const stats = optimize(&module, .{});
@@ -1168,10 +1201,10 @@ test "constant folding - integer arithmetic" {
     // Check that one constant was folded
     try std.testing.expectEqual(@as(u32, 1), stats.constants_folded);
 
-    // Check that the add was replaced with const_int
+    // Check that the iadd was replaced with iconst
     const third_inst = func.entry.instructions.items[2];
-    try std.testing.expect(third_inst == .const_int);
-    try std.testing.expectEqual(@as(i64, 15), third_inst.const_int.value);
+    try std.testing.expect(third_inst == .iconst);
+    try std.testing.expectEqual(@as(i64, 15), third_inst.iconst.value);
 }
 
 test "constant folding - comparison" {
@@ -1189,25 +1222,26 @@ test "constant folding - comparison" {
     const func = try ir.Function.init(allocator, "test_fn", sig);
     try module.addFunction(func);
 
-    // Create: %0 = const_int 10
-    //         %1 = const_int 5
-    //         %2 = cmp_gt %0, %1  <- should fold to const_bool true
+    // Create: %0 = iconst 10
+    //         %1 = iconst 5
+    //         %2 = icmp sgt %0, %1  <- should fold to iconst 1 (true)
     const v0 = func.newValue(.{ .i64 = {} });
     const v1 = func.newValue(.{ .i64 = {} });
     const v2 = func.newValue(.{ .bool = {} });
 
-    try func.entry.append(.{ .const_int = .{ .ty = .{ .i64 = {} }, .value = 10, .result = v0 } });
-    try func.entry.append(.{ .const_int = .{ .ty = .{ .i64 = {} }, .value = 5, .result = v1 } });
-    try func.entry.append(.{ .cmp_gt = .{ .lhs = v0, .rhs = v1, .result = v2 } });
-    try func.entry.append(.{ .ret = v2 });
+    try func.entry.append(.{ .iconst = .{ .ty = .{ .i64 = {} }, .value = 10, .result = v0 } });
+    try func.entry.append(.{ .iconst = .{ .ty = .{ .i64 = {} }, .value = 5, .result = v1 } });
+    try func.entry.append(.{ .icmp = .{ .cond = .sgt, .lhs = v0, .rhs = v1, .result = v2 } });
+    try func.entry.append(.{ .return_ = v2 });
 
     const stats = optimize(&module, .{});
 
     try std.testing.expectEqual(@as(u32, 1), stats.constants_folded);
 
+    // Folded comparison produces iconst with value 1 (true)
     const third_inst = func.entry.instructions.items[2];
-    try std.testing.expect(third_inst == .const_bool);
-    try std.testing.expectEqual(true, third_inst.const_bool.value);
+    try std.testing.expect(third_inst == .iconst);
+    try std.testing.expectEqual(@as(i64, 1), third_inst.iconst.value);
 }
 
 test "dead code elimination" {
@@ -1225,15 +1259,15 @@ test "dead code elimination" {
     const func = try ir.Function.init(allocator, "test_fn", sig);
     try module.addFunction(func);
 
-    // Create: %0 = const_int 10   <- used
-    //         %1 = const_int 5    <- dead (not used)
-    //         ret %0
+    // Create: %0 = iconst 10   <- used
+    //         %1 = iconst 5    <- dead (not used)
+    //         return_ %0
     const v0 = func.newValue(.{ .i64 = {} });
     const v1 = func.newValue(.{ .i64 = {} });
 
-    try func.entry.append(.{ .const_int = .{ .ty = .{ .i64 = {} }, .value = 10, .result = v0 } });
-    try func.entry.append(.{ .const_int = .{ .ty = .{ .i64 = {} }, .value = 5, .result = v1 } });
-    try func.entry.append(.{ .ret = v0 });
+    try func.entry.append(.{ .iconst = .{ .ty = .{ .i64 = {} }, .value = 10, .result = v0 } });
+    try func.entry.append(.{ .iconst = .{ .ty = .{ .i64 = {} }, .value = 5, .result = v1 } });
+    try func.entry.append(.{ .return_ = v0 });
 
     const initial_count = func.entry.instructions.items.len;
     const stats = optimize(&module, .{});
