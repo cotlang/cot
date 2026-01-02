@@ -23,10 +23,12 @@ pub const OptStats = struct {
     dead_instructions_removed: u32 = 0,
     dead_blocks_removed: u32 = 0,
     tail_calls_optimized: u32 = 0,
+    switches_created: u32 = 0,
 
     pub fn total(self: OptStats) u32 {
         return self.constants_folded + self.dead_instructions_removed +
-            self.dead_blocks_removed + self.tail_calls_optimized;
+            self.dead_blocks_removed + self.tail_calls_optimized +
+            self.switches_created;
     }
 };
 
@@ -38,6 +40,8 @@ pub const OptOptions = struct {
     dead_code_elimination: bool = true,
     /// Enable tail call optimization
     tail_call_optimization: bool = true,
+    /// Enable switch optimization (convert comparison chains to switch_br)
+    switch_optimization: bool = true,
     /// Enable debug output
     debug: bool = false,
 };
@@ -50,6 +54,10 @@ pub fn optimize(module: *ir.Module, options: OptOptions) OptStats {
     for (module.functions.items) |func| {
         if (options.constant_folding) {
             stats.constants_folded += constantFoldFunction(func);
+        }
+        if (options.switch_optimization) {
+            const switch_stats = optimizeSwitches(func);
+            stats.switches_created += switch_stats.switches_created;
         }
         if (options.dead_code_elimination) {
             const dce_stats = deadCodeEliminateFunction(func);
@@ -534,6 +542,215 @@ fn removeDeadInstructions(block: *ir.Block, used: *std.AutoHashMap(u32, void)) u
     }
 
     return removed;
+}
+
+// ============================================================================
+// Switch Optimization (Decision Trees)
+// ============================================================================
+
+/// Switch optimization statistics
+pub const SwitchStats = struct {
+    switches_created: u32 = 0,
+    comparisons_eliminated: u32 = 0,
+};
+
+/// Optimize sequential match comparisons into switch_br instructions.
+///
+/// Detects patterns like:
+///   %cmp1 = cmp_eq %scrutinee, const1
+///   cond_br %cmp1, arm1, check2
+///   check2:
+///   %cmp2 = cmp_eq %scrutinee, const2
+///   cond_br %cmp2, arm2, check3
+///   ...
+///
+/// And converts to:
+///   switch_br %scrutinee, [const1 -> arm1, const2 -> arm2, ...], default
+///
+pub fn optimizeSwitches(func: *ir.Function) SwitchStats {
+    var stats = SwitchStats{};
+
+    // Look for chains of cmp_eq + cond_br on the same scrutinee value
+    // This is a simplified version - full decision tree compilation would
+    // happen during IR lowering, not as an optimization pass
+
+    // For each block, check if it starts a comparison chain
+    var block_idx: usize = 0;
+    while (block_idx < func.blocks.items.len) : (block_idx += 1) {
+        const block = func.blocks.items[block_idx];
+
+        // Try to detect a switch pattern starting from this block
+        const result = detectSwitchPattern(func, block);
+        if (result.cases.len >= 2) {
+            // Found a switch pattern with at least 2 cases
+            // Convert to switch_br
+
+            // Clear the block and emit switch_br
+            // Keep instructions before the comparison
+            var keep_count: usize = 0;
+            for (block.instructions.items, 0..) |inst, i| {
+                if (inst == .cmp_eq) {
+                    keep_count = i;
+                    break;
+                }
+            }
+
+            // Truncate to keep only pre-comparison instructions
+            block.instructions.items.len = keep_count;
+
+            // Create cases slice
+            var cases = func.allocator.alloc(ir.Instruction.Switch.Case, result.cases.len) catch continue;
+            for (result.cases, 0..) |c, i| {
+                cases[i] = .{
+                    .value = c.value,
+                    .target = c.target,
+                };
+            }
+
+            // Emit switch_br
+            block.append(.{ .switch_br = .{
+                .value = result.scrutinee,
+                .cases = cases,
+                .default = result.default,
+            } }) catch continue;
+
+            stats.switches_created += 1;
+            stats.comparisons_eliminated += @intCast(result.cases.len);
+
+            // Skip blocks that were part of this switch chain
+            // (they're now dead code and will be cleaned up by DCE)
+        }
+    }
+
+    return stats;
+}
+
+const SwitchCase = struct {
+    value: i64,
+    target: *ir.Block,
+};
+
+const SwitchPattern = struct {
+    scrutinee: ir.Value,
+    cases: []const SwitchCase,
+    default: *ir.Block,
+};
+
+/// Detect if a block starts a chain of comparisons that can be converted to a switch
+fn detectSwitchPattern(func: *ir.Function, start_block: *ir.Block) SwitchPattern {
+    var cases_buf: [64]SwitchCase = undefined;
+    var case_count: usize = 0;
+    var scrutinee: ?ir.Value = null;
+    var current_block = start_block;
+    var default_block: ?*ir.Block = null;
+
+    // Walk the comparison chain
+    while (case_count < 64) {
+        const insts = current_block.instructions.items;
+        if (insts.len < 2) break;
+
+        // Look for cmp_eq + cond_br pattern at the end
+        var cmp_idx: ?usize = null;
+        var cond_br_idx: ?usize = null;
+
+        for (insts, 0..) |inst, i| {
+            if (inst == .cmp_eq) {
+                cmp_idx = i;
+            } else if (inst == .cond_br) {
+                cond_br_idx = i;
+            }
+        }
+
+        if (cmp_idx == null or cond_br_idx == null) break;
+        if (cond_br_idx.? != insts.len - 1) break; // cond_br must be last
+        if (cond_br_idx.? <= cmp_idx.?) break; // cond_br must be after cmp
+
+        const cmp = insts[cmp_idx.?].cmp_eq;
+        const cond_br = insts[cond_br_idx.?].cond_br;
+
+        // Check that cond_br uses the comparison result
+        if (cmp.result.id != cond_br.condition.id) break;
+
+        // Get the scrutinee (the value being compared)
+        const this_scrutinee = cmp.lhs;
+
+        // First iteration: record the scrutinee
+        if (scrutinee == null) {
+            scrutinee = this_scrutinee;
+        } else {
+            // Subsequent iterations: verify same scrutinee
+            if (scrutinee.?.id != this_scrutinee.id) break;
+        }
+
+        // Get the constant value being compared against
+        const const_val = findConstantValueById(current_block, cmp.rhs.id) orelse break;
+        if (const_val != .int) break;
+
+        // Record this case
+        cases_buf[case_count] = .{
+            .value = const_val.int,
+            .target = cond_br.then_block,
+        };
+        case_count += 1;
+
+        // Move to the else block (next comparison in chain)
+        const next_block = cond_br.else_block;
+
+        // Check if next block is a continuation of the chain or the default
+        // A continuation has same pattern: compare same scrutinee
+        var is_continuation = false;
+        for (next_block.instructions.items) |inst| {
+            if (inst == .cmp_eq) {
+                const next_cmp = inst.cmp_eq;
+                if (next_cmp.lhs.id == scrutinee.?.id) {
+                    is_continuation = true;
+                    break;
+                }
+            }
+        }
+
+        if (is_continuation) {
+            current_block = next_block;
+        } else {
+            // This is the default block
+            default_block = next_block;
+            break;
+        }
+    }
+
+    // Return empty if not enough cases
+    if (case_count < 2 or scrutinee == null or default_block == null) {
+        return .{
+            .scrutinee = ir.Value{ .id = 0, .ty = .void },
+            .cases = &[_]SwitchCase{},
+            .default = func.entry,
+        };
+    }
+
+    return .{
+        .scrutinee = scrutinee.?,
+        .cases = cases_buf[0..case_count],
+        .default = default_block.?,
+    };
+}
+
+/// Find a constant value by its SSA id in a block
+fn findConstantValueById(block: *ir.Block, id: u32) ?ConstValue {
+    for (block.instructions.items) |inst| {
+        switch (inst) {
+            .const_int => |c| {
+                if (c.result.id == id) return .{ .int = c.value };
+            },
+            .const_float => |c| {
+                if (c.result.id == id) return .{ .float = c.value };
+            },
+            .const_bool => |c| {
+                if (c.result.id == id) return .{ .bool = c.value };
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 // ============================================================================

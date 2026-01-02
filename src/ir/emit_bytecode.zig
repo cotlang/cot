@@ -1279,6 +1279,40 @@ pub const BytecodeEmitter = struct {
                 try self.emitU16(array_slot);
             },
 
+            .switch_br => |s| {
+                // Switch/jump table - emit as a series of comparisons for now
+                // Future: could emit as computed jump table for dense integer ranges
+                //
+                // For each case:
+                //   load case_value to r1
+                //   cmp_eq r0, r1 -> r2
+                //   jnz r2, case_target
+                // After all cases: jmp default
+
+                // Load the switch value to r0
+                const val_reg = try self.getValueInReg(s.value, 0);
+                _ = val_reg;
+
+                for (s.cases) |case| {
+                    // Load case constant to r1
+                    const case_idx = try self.addConstant(.{ .integer = case.value });
+                    try self.emitOpcode(.load_const);
+                    try self.emitU8(1); // r1
+                    try self.emitU16(case_idx);
+
+                    // Compare r0 == r1, result in r2
+                    try self.emitOpcode(.cmp_eq);
+                    try self.emitU8((0 << 4) | 1); // r0, r1
+                    try self.emitU8(2); // result in r2
+
+                    // Jump to case block if equal (jnz r2, target)
+                    try self.emitRegCondJmp(.jnz, 2, case.target);
+                }
+
+                // Fall through to default
+                try self.emitRegJmp(s.default);
+            },
+
             else => {
                 // Other instructions not yet implemented
             },
