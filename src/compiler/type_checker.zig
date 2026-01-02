@@ -112,6 +112,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .wrap_optional, .unwrap_optional, .is_null => {},
         .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => {},
         .array_len, .debug_line => {},
+        .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values => {},
     }
 }
 

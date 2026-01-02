@@ -81,6 +81,18 @@ pub fn display(ctx: *NativeContext) NativeError!?Value {
             .fixed_string, .string => stdout.print("{s}", .{std.mem.trimRight(u8, val.asString(), " ")}) catch {},
             .record_ref => stdout.writeAll("<record>") catch {},
             .handle => stdout.print("<handle:{d}>", .{val.asHandle() orelse 0}) catch {},
+            .object => {
+                // Handle extension objects (Map is type_id 16)
+                if (val.isMap()) {
+                    if (val.asMap()) |m| {
+                        stdout.print("<map:{d}>", .{m.len()}) catch {};
+                    } else {
+                        stdout.writeAll("<map:null>") catch {};
+                    }
+                } else {
+                    stdout.print("<object:type={d}>", .{val.objectTypeId() orelse 0}) catch {};
+                }
+            },
         }
     }
     stdout.writeByte('\n') catch {};

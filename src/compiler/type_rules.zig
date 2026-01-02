@@ -220,6 +220,7 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
         },
 
         .function => .incompatible,
+        .map => .incompatible, // Maps require explicit operations
     };
 }
 
@@ -401,6 +402,7 @@ pub fn typeName(ty: Type) []const u8 {
         .@"struct" => "struct",
         .@"union" => "union",
         .function => "function",
+        .map => "Map",
     };
 }
 
@@ -442,6 +444,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         .@"struct" => |s| writer.print("struct({s})", .{s.name}) catch {},
         .@"union" => |u| writer.print("union({s})", .{u.name}) catch {},
         .function => writer.writeAll("function") catch {},
+        .map => writer.writeAll("Map") catch {},
     }
 
     return fbs.getWritten();

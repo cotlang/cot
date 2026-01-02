@@ -177,6 +177,15 @@ pub const Lowerer = struct {
 
     const Self = @This();
 
+    /// Check if a type is a map type (directly or through a pointer)
+    fn isMapType(ty: ir.Type) bool {
+        return switch (ty) {
+            .map => true,
+            .ptr => |p| p.* == .map,
+            else => false,
+        };
+    }
+
     /// Convert AST SourceLoc to IR SourceLoc
     fn astLocToIrLoc(loc: SourceLoc) ?ir.SourceLoc {
         if (loc.line == 0 and loc.column == 0) {
@@ -1040,6 +1049,31 @@ pub const Lowerer = struct {
     fn lowerAssignment(self: *Self, data: NodeData) LowerError!void {
         const target_idx = data.getTarget();
         const value_idx = data.getValue();
+
+        // Check if target is a map index expression: m["key"] = value
+        const target_tag = self.store.exprTag(target_idx);
+        if (target_tag == .index) {
+            const target_data = self.store.exprData(target_idx);
+            const object_idx = target_data.getObject();
+
+            // Try to lower the object to see if it's a map
+            const object_val = try self.lowerExpression(object_idx);
+            if (isMapType(object_val.ty)) {
+                // This is a map index assignment: m["key"] = value
+                const key_idx = target_data.getIndex();
+                const key_val = try self.lowerExpression(key_idx);
+                const value = try self.lowerExpression(value_idx);
+                try self.emit(.{
+                    .map_set = .{
+                        .map = object_val,
+                        .key = key_val,
+                        .value = value,
+                        .loc = null,
+                    },
+                });
+                return;
+            }
+        }
 
         // Check if target is a struct-typed variable (for db_read buffer unpacking)
         // Uses StructHelper for centralized struct detection
@@ -2210,6 +2244,29 @@ pub const Lowerer = struct {
 
     /// Lower an index expression
     fn lowerIndex(self: *Self, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+        const data = self.store.exprData(expr_idx);
+        const object_idx = data.getObject();
+        const index_idx = data.getIndex();
+
+        // First, try to determine if the object is a map
+        const object_val = try self.lowerExpression(object_idx);
+
+        // Check if object is a map type - emit map_get instruction
+        if (isMapType(object_val.ty)) {
+            const key_val = try self.lowerExpression(index_idx);
+            const result = func.newValue(.string); // Map values are strings by default
+            try self.emit(.{
+                .map_get = .{
+                    .map = object_val,
+                    .key = key_val,
+                    .result = result,
+                    .loc = null,
+                },
+            });
+            return result;
+        }
+
+        // Fallback to array/slice indexing via pointer
         const ptr = try self.lowerIndexPtr(expr_idx);
         const result = func.newValue(ptr.ty);
         try self.emit(.{
@@ -2232,6 +2289,134 @@ pub const Lowerer = struct {
 
         // Get callee name
         const callee_tag = self.store.exprTag(callee_idx);
+
+        // Check for Map.new() static method call OR map instance method calls
+        if (callee_tag == .member) {
+            const callee_data = self.store.exprData(callee_idx);
+            const object_idx = callee_data.getObject();
+            const field_id = callee_data.getField();
+            const field_name = self.strings.get(field_id);
+
+            // Check if object is "Map" identifier (static method)
+            const object_tag = self.store.exprTag(object_idx);
+            if (object_tag == .identifier) {
+                const object_data = self.store.exprData(object_idx);
+                const object_name_id = object_data.getName();
+                const object_name = self.strings.get(object_name_id);
+
+                if (std.mem.eql(u8, object_name, "Map") and std.mem.eql(u8, field_name, "new")) {
+                    // Map.new() - emit map_new instruction
+                    // Default flags: case_sensitive=true, preserve_spaces=true
+                    const flags: u8 = 0x03; // bit 0 = case_sensitive, bit 1 = preserve_spaces
+
+                    const result = func.newValue(.{ .map = undefined });
+                    try self.emit(.{
+                        .map_new = .{
+                            .flags = flags,
+                            .result = result,
+                            .loc = null,
+                        },
+                    });
+                    return result;
+                }
+            }
+
+            // Check if this is a method call on a map instance: m.set(), m.get(), etc.
+            const object_val = try self.lowerExpression(object_idx);
+            if (isMapType(object_val.ty)) {
+                // Lower arguments
+                var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                defer method_args.deinit(self.allocator);
+                for (0..args_count) |i| {
+                    const arg_idx: ExprIdx = @enumFromInt(self.store.extra_data.items[args_start + i]);
+                    const arg_val = try self.lowerExpression(arg_idx);
+                    try method_args.append(self.allocator, arg_val);
+                }
+
+                // Dispatch to appropriate map operation
+                if (std.mem.eql(u8, field_name, "set") and method_args.items.len >= 2) {
+                    try self.emit(.{
+                        .map_set = .{
+                            .map = object_val,
+                            .key = method_args.items[0],
+                            .value = method_args.items[1],
+                            .loc = null,
+                        },
+                    });
+                    return func.newValue(.void);
+                } else if (std.mem.eql(u8, field_name, "get") and method_args.items.len >= 1) {
+                    const result = func.newValue(.string);
+                    try self.emit(.{
+                        .map_get = .{
+                            .map = object_val,
+                            .key = method_args.items[0],
+                            .result = result,
+                            .loc = null,
+                        },
+                    });
+                    return result;
+                } else if (std.mem.eql(u8, field_name, "has") and method_args.items.len >= 1) {
+                    const result = func.newValue(.bool);
+                    try self.emit(.{
+                        .map_has = .{
+                            .map = object_val,
+                            .key = method_args.items[0],
+                            .result = result,
+                            .loc = null,
+                        },
+                    });
+                    return result;
+                } else if (std.mem.eql(u8, field_name, "delete") and method_args.items.len >= 1) {
+                    try self.emit(.{
+                        .map_delete = .{
+                            .map = object_val,
+                            .key = method_args.items[0],
+                            .loc = null,
+                        },
+                    });
+                    return func.newValue(.void);
+                } else if (std.mem.eql(u8, field_name, "len")) {
+                    const result = func.newValue(.i64);
+                    try self.emit(.{
+                        .map_len = .{
+                            .map = object_val,
+                            .result = result,
+                            .loc = null,
+                        },
+                    });
+                    return result;
+                } else if (std.mem.eql(u8, field_name, "clear")) {
+                    try self.emit(.{
+                        .map_clear = .{
+                            .map = object_val,
+                            .loc = null,
+                        },
+                    });
+                    return func.newValue(.void);
+                } else if (std.mem.eql(u8, field_name, "keys")) {
+                    const result = func.newValue(.string);
+                    try self.emit(.{
+                        .map_keys = .{
+                            .map = object_val,
+                            .result = result,
+                            .loc = null,
+                        },
+                    });
+                    return result;
+                } else if (std.mem.eql(u8, field_name, "values")) {
+                    const result = func.newValue(.string);
+                    try self.emit(.{
+                        .map_values = .{
+                            .map = object_val,
+                            .result = result,
+                            .loc = null,
+                        },
+                    });
+                    return result;
+                }
+            }
+        }
+
         const callee_name = if (callee_tag == .identifier) blk: {
             const callee_data = self.store.exprData(callee_idx);
             const name_id = callee_data.getName();
@@ -2322,10 +2507,104 @@ pub const Lowerer = struct {
 
         const method_name = self.strings.get(method_id);
 
-        // Get object type name for qualified method name
+        // Get object value
         const object_val = try self.lowerExpression(object_idx);
 
-        // Lower arguments (including object as first arg)
+        // Check if object is a map type - emit map instructions
+        if (isMapType(object_val.ty)) {
+            // Lower arguments
+            var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+            defer method_args.deinit(self.allocator);
+            for (0..args_count) |i| {
+                const arg_idx: ExprIdx = @enumFromInt(self.store.extra_data.items[extra_start + 2 + i]);
+                const arg_val = try self.lowerExpression(arg_idx);
+                try method_args.append(self.allocator, arg_val);
+            }
+
+            // Dispatch to appropriate map operation
+            if (std.mem.eql(u8, method_name, "set") and method_args.items.len >= 2) {
+                try self.emit(.{
+                    .map_set = .{
+                        .map = object_val,
+                        .key = method_args.items[0],
+                        .value = method_args.items[1],
+                        .loc = null,
+                    },
+                });
+                return func.newValue(.void);
+            } else if (std.mem.eql(u8, method_name, "get") and method_args.items.len >= 1) {
+                const result = func.newValue(.string); // Map values are strings by default
+                try self.emit(.{
+                    .map_get = .{
+                        .map = object_val,
+                        .key = method_args.items[0],
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            } else if (std.mem.eql(u8, method_name, "has") and method_args.items.len >= 1) {
+                const result = func.newValue(.bool);
+                try self.emit(.{
+                    .map_has = .{
+                        .map = object_val,
+                        .key = method_args.items[0],
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            } else if (std.mem.eql(u8, method_name, "delete") and method_args.items.len >= 1) {
+                try self.emit(.{
+                    .map_delete = .{
+                        .map = object_val,
+                        .key = method_args.items[0],
+                        .loc = null,
+                    },
+                });
+                return func.newValue(.void);
+            } else if (std.mem.eql(u8, method_name, "len")) {
+                const result = func.newValue(.i64);
+                try self.emit(.{
+                    .map_len = .{
+                        .map = object_val,
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            } else if (std.mem.eql(u8, method_name, "clear")) {
+                try self.emit(.{
+                    .map_clear = .{
+                        .map = object_val,
+                        .loc = null,
+                    },
+                });
+                return func.newValue(.void);
+            } else if (std.mem.eql(u8, method_name, "keys")) {
+                const result = func.newValue(.string); // Returns comma-separated keys
+                try self.emit(.{
+                    .map_keys = .{
+                        .map = object_val,
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            } else if (std.mem.eql(u8, method_name, "values")) {
+                const result = func.newValue(.string); // Returns comma-separated values
+                try self.emit(.{
+                    .map_values = .{
+                        .map = object_val,
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            }
+        }
+
+        // Fallback to regular method call
         var args: std.ArrayListUnmanaged(ir.Value) = .{};
         defer args.deinit(self.allocator);
         try args.append(self.allocator, object_val);
@@ -2749,6 +3028,29 @@ pub const Lowerer = struct {
                 }
 
                 break :blk .void;
+            },
+            .map => blk: {
+                // Map<K, V> type - key type in data.a, value type in data.b
+                const key_type_idx: TypeIdx = @enumFromInt(data.a);
+                const value_type_idx: TypeIdx = @enumFromInt(data.b);
+                const key_type = try self.lowerTypeIdx(key_type_idx);
+                const value_type = try self.lowerTypeIdx(value_type_idx);
+
+                // Allocate MapType struct
+                const map_type = try self.allocator.create(ir.MapType);
+                const key_ptr = try self.allocator.create(ir.Type);
+                const value_ptr = try self.allocator.create(ir.Type);
+                key_ptr.* = key_type;
+                value_ptr.* = value_type;
+                try self.allocated_types.append(self.allocator, key_ptr);
+                try self.allocated_types.append(self.allocator, value_ptr);
+
+                map_type.* = .{
+                    .key_type = key_ptr,
+                    .value_type = value_ptr,
+                };
+
+                break :blk .{ .map = map_type };
             },
             .function => .void, // Function types are handled separately
             .@"union" => .void, // Union types are handled via union_def statement

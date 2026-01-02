@@ -300,6 +300,37 @@ pub const Verifier = struct {
             },
             // Instructions that don't use values or only define them (Cranelift names)
             .alloca, .jump, .br_table, .trap, .iconst, .f32const, .f64const, .const_string, .const_null, .debug_line, .try_begin, .try_end, .catch_begin, .field_ptr, .load_struct_buf, .str_slice, .str_slice_store, .str_copy, .call_indirect => {},
+            // Map operations
+            .map_new => {}, // No input values
+            .map_set => |op| {
+                try self.checkValueDefined(op.map);
+                try self.checkValueDefined(op.key);
+                try self.checkValueDefined(op.value);
+            },
+            .map_get => |op| {
+                try self.checkValueDefined(op.map);
+                try self.checkValueDefined(op.key);
+            },
+            .map_delete => |op| {
+                try self.checkValueDefined(op.map);
+                try self.checkValueDefined(op.key);
+            },
+            .map_has => |op| {
+                try self.checkValueDefined(op.map);
+                try self.checkValueDefined(op.key);
+            },
+            .map_len => |op| {
+                try self.checkValueDefined(op.map);
+            },
+            .map_clear => |op| {
+                try self.checkValueDefined(op.map);
+            },
+            .map_keys => |op| {
+                try self.checkValueDefined(op.map);
+            },
+            .map_values => |op| {
+                try self.checkValueDefined(op.map);
+            },
         }
     }
 
@@ -341,6 +372,7 @@ pub const Verifier = struct {
             .@"union" => "union",
             .optional => "optional",
             .function => "function",
+            .map => "Map",
         };
     }
 

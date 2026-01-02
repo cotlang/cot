@@ -807,6 +807,14 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a map type: Map<K, V>
+    pub fn addMapType(self: *Self, key_type: TypeIdx, value_type: TypeIdx) !TypeIdx {
+        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
+        try self.type_tags.append(self.allocator, .map);
+        try self.type_data.append(self.allocator, .{ .a = key_type.toInt(), .b = value_type.toInt() });
+        return idx;
+    }
+
     /// Add a pointer type
     pub fn addPointerType(self: *Self, pointee: TypeIdx, mutability: Mutability) !TypeIdx {
         const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));

@@ -31,6 +31,7 @@ pub const Tag = enum {
     string,
     record_ref,
     handle,
+    object, // Extension-defined types (Map, Set, etc.)
 
     /// Get type name for debugging
     pub fn name(self: Tag) []const u8 {
@@ -43,6 +44,7 @@ pub const Tag = enum {
             .string => "string",
             .record_ref => "record",
             .handle => "handle",
+            .object => "object",
         };
     }
 };
@@ -80,6 +82,9 @@ pub const FixedStringRef = struct {
     len: usize,
 };
 
+/// Forward declare OrderedMap (actual type imported when needed)
+pub const OrderedMap = @import("ordered_map.zig").OrderedMap;
+
 // ============================================================================
 // NaN-boxed Value
 // ============================================================================
@@ -100,13 +105,13 @@ pub const Value = extern struct {
     /// Mask for the payload (low 48 bits)
     const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-    // Tag patterns (bits 48-51 encode type, bits 0-47 encode payload)
+    // Tag patterns (bits 46+ encode type, bits 0-45 encode payload for pointers)
     const TAG_NULL: u64 = 0x7FFC_0000_0000_0000;
     const TAG_FALSE: u64 = 0x7FFC_0000_0000_0001;
     const TAG_TRUE: u64 = 0x7FFC_0000_0000_0002;
     // Small integers: 0x7FFD + sign-extended 47-bit value
     const TAG_SMALL_INT: u64 = 0x7FFD_0000_0000_0000;
-    // Pointers: 0x7FFE/F + 48-bit pointer
+    // Pointers: 0x7FFE/F + 46-bit pointer (bits 46+ for type, bits 0-45 for pointer)
     const TAG_STRING: u64 = 0x7FFE_0000_0000_0000;
     const TAG_FIXED_STR: u64 = 0x7FFE_8000_0000_0000;
     const TAG_RECORD: u64 = 0x7FFF_0000_0000_0000;
@@ -114,7 +119,15 @@ pub const Value = extern struct {
     const TAG_DECIMAL: u64 = 0x7FFF_8000_0000_0000;
     const TAG_BOXED_INT: u64 = 0x7FFF_C000_0000_0000;
 
-    /// Pointer payload mask (low 46 bits for pointers)
+    // Extension objects: 0x7FFE_4 prefix + type_id in bits 40-45 + pointer in bits 0-39
+    // This allows 64 extension types (6 bits) with 1TB address space (40 bits)
+    const TAG_OBJECT: u64 = 0x7FFE_4000_0000_0000;
+    const TAG_OBJECT_MASK: u64 = 0xFFFF_C000_0000_0000; // Bits 46-63 for tag check
+    const OBJ_TYPE_SHIFT: u6 = 40;
+    const OBJ_TYPE_MASK: u64 = 0x0000_3F00_0000_0000; // Bits 40-45 for type_id (6 bits)
+    const OBJ_PTR_MASK: u64 = 0x0000_00FF_FFFF_FFFF; // Bits 0-39 for pointer (40 bits)
+
+    /// Pointer payload mask (low 46 bits for pointers) - used by non-object types
     const PTR_MASK: u64 = 0x0000_3FFF_FFFF_FFFF;
 
     /// Small integer max/min (47-bit signed)
@@ -208,6 +221,23 @@ pub const Value = extern struct {
         return .{ .bits = TAG_HANDLE | @as(u64, @intCast(h)) };
     }
 
+    /// Create an extension object value with type_id
+    /// type_id: Extension-assigned type ID (16-63, 0-15 reserved)
+    /// ptr: Pointer to heap-allocated object
+    pub fn initObject(type_id: u16, ptr: *anyopaque) Self {
+        std.debug.assert(type_id < 64); // 6 bits max
+        const addr = @intFromPtr(ptr);
+        std.debug.assert(addr <= OBJ_PTR_MASK); // Must fit in 40 bits
+        const type_bits = @as(u64, type_id) << OBJ_TYPE_SHIFT;
+        return .{ .bits = TAG_OBJECT | type_bits | addr };
+    }
+
+    /// Create a map value (convenience wrapper for OrderedMap)
+    /// Uses type_id 16 (first extension type) for backward compatibility
+    pub fn initMap(m: *OrderedMap) Self {
+        return initObject(16, m);
+    }
+
     // ========================================================================
     // Type checking and tagging
     // ========================================================================
@@ -219,10 +249,13 @@ pub const Value = extern struct {
 
         const upper = self.bits & 0xFFFF_C000_0000_0000;
         if (upper == TAG_SMALL_INT or upper == TAG_BOXED_INT) return .integer;
+        // Check OBJECT before STRING since OBJECT uses more specific mask
+        // and TAG_OBJECT (0x7FFE_4000) would otherwise match TAG_STRING's mask
+        if ((self.bits & TAG_OBJECT_MASK) == TAG_OBJECT) return .object;
         if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_STRING) return .string;
         if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR) return .fixed_string;
         if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_RECORD) return .record_ref;
-        if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_HANDLE) return .handle;
+        if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_HANDLE) return .handle;
         if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_DECIMAL) return .decimal;
 
         return .null_val; // Fallback
@@ -258,7 +291,32 @@ pub const Value = extern struct {
     }
 
     pub fn isHandle(self: Self) bool {
-        return (self.bits & 0xFFFF_C000_0000_0000) == TAG_HANDLE;
+        return (self.bits & 0xFFFF_F000_0000_0000) == TAG_HANDLE;
+    }
+
+    /// Check if this is an extension object
+    pub fn isObject(self: Self) bool {
+        return (self.bits & TAG_OBJECT_MASK) == TAG_OBJECT;
+    }
+
+    /// Check if this is a map (object with type_id 16)
+    /// Kept for backward compatibility
+    pub fn isMap(self: Self) bool {
+        if (!self.isObject()) return false;
+        return self.objectTypeId() == 16;
+    }
+
+    /// Get the type_id of an object value
+    pub fn objectTypeId(self: Self) ?u16 {
+        if (!self.isObject()) return null;
+        return @truncate((self.bits & OBJ_TYPE_MASK) >> OBJ_TYPE_SHIFT);
+    }
+
+    /// Get the pointer from an object value
+    pub fn objectPtr(self: Self, comptime T: type) ?*T {
+        if (!self.isObject()) return null;
+        const addr = self.bits & OBJ_PTR_MASK;
+        return @ptrFromInt(addr);
     }
 
     // ========================================================================
@@ -320,6 +378,12 @@ pub const Value = extern struct {
     pub fn asHandle(self: Self) ?usize {
         if (!self.isHandle()) return null;
         return @intCast(self.bits & PTR_MASK);
+    }
+
+    /// Get map pointer (for backward compatibility)
+    pub fn asMap(self: Self) ?*OrderedMap {
+        if (!self.isMap()) return null;
+        return self.objectPtr(OrderedMap);
     }
 
     // ========================================================================
@@ -389,6 +453,20 @@ pub const Value = extern struct {
             .fixed_string, .string => try writer.print("{s}", .{self.asString()}),
             .record_ref => try writer.writeAll("<record>"),
             .handle => try writer.print("<handle:{d}>", .{self.asHandle() orelse 0}),
+            .object => {
+                const type_id = self.objectTypeId() orelse 0;
+                // For now, special-case Map (type_id 16) for backward compatibility
+                // In the future, use type registry for formatting
+                if (type_id == 16) {
+                    if (self.asMap()) |m| {
+                        try writer.print("<map:{d}>", .{m.len()});
+                    } else {
+                        try writer.writeAll("<map:null>");
+                    }
+                } else {
+                    try writer.print("<object:type={d}>", .{type_id});
+                }
+            },
         }
     }
 
@@ -450,6 +528,21 @@ pub const Value = extern struct {
             return;
         }
 
+        // Check for extension objects
+        if ((self.bits & TAG_OBJECT_MASK) == TAG_OBJECT) {
+            const type_id = self.objectTypeId() orelse return;
+            // For now, special-case Map (type_id 16)
+            // In the future, use type registry for cleanup
+            if (type_id == 16) {
+                if (self.objectPtr(OrderedMap)) |map| {
+                    map.deinit();
+                    allocator.destroy(map);
+                }
+            }
+            // Other object types would be handled via type registry
+            return;
+        }
+
         // Record refs point to shared data, don't free here
         // Handles are just numeric IDs, no memory to free
         // Small ints, bools, null are inline - no memory to free
@@ -459,6 +552,7 @@ pub const Value = extern struct {
     pub fn needsCleanup(self: Self) bool {
         const upper = self.bits & 0xFFFF_C000_0000_0000;
         if (upper == TAG_BOXED_INT or upper == TAG_DECIMAL) return true;
+        if ((self.bits & TAG_OBJECT_MASK) == TAG_OBJECT) return true;
         if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_STRING) return true;
         if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR) return true;
         return false;

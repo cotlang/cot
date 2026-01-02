@@ -44,6 +44,10 @@
 
 const std = @import("std");
 const cot = @import("cot");
+const cot_runtime = @import("cot_runtime");
+
+// DBL runtime extension (Map type, NSPC_* functions)
+const dbl_ext = cot_runtime.dbl_ext;
 
 // DBL-specific modules - complete frontend
 pub const Lexer = @import("lexer.zig").Lexer;
@@ -91,6 +95,10 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
     // Execute in VM
     var vm = cot.bytecode.VM.init(allocator);
     defer vm.deinit();
+
+    // Load DBL extension (Map type, NSPC_* functions)
+    try vm.loadExtension(dbl_ext.dbl_extension);
+
     try vm.initChannels();
     try vm.execute(&module);
 }
@@ -110,6 +118,10 @@ pub fn runWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8, 
     // Execute in VM
     var vm = cot.bytecode.VM.init(allocator);
     defer vm.deinit();
+
+    // Load DBL extension (Map type, NSPC_* functions)
+    try vm.loadExtension(dbl_ext.dbl_extension);
+
     try vm.initChannels();
     try vm.execute(&module);
 }

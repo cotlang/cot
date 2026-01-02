@@ -63,6 +63,7 @@ pub fn build(b: *std.Build) void {
         .target = config.target,
         .imports = &.{
             .{ .name = "cot", .module = cot_mod },
+            .{ .name = "cot_runtime", .module = deps.cot_runtime },
         },
     });
 

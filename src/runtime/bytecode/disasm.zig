@@ -618,6 +618,91 @@ pub const Disassembler = struct {
             },
 
             // ============================================
+            // Map Operations (0xD5-0xDF)
+            // ============================================
+
+            // map_new rd, flags - [rd:4|flags:4] [0]
+            .map_new => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const flags: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, flags=0x{X}", .{ rd, flags });
+            },
+
+            // map_set map, key, val - [map:4|key:4] [val:4|0]
+            .map_set => {
+                const map_reg: u4 = @truncate(operands[0] >> 4);
+                const key_reg: u4 = @truncate(operands[0] & 0xF);
+                const val_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}[r{}] = r{}", .{ map_reg, key_reg, val_reg });
+            },
+
+            // map_get rd, map, key - [rd:4|map:4] [key:4|0]
+            .map_get => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const map_reg: u4 = @truncate(operands[0] & 0xF);
+                const key_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}, r{}[r{}]", .{ rd, map_reg, key_reg });
+            },
+
+            // map_delete map, key - [map:4|key:4] [0]
+            .map_delete => {
+                const map_reg: u4 = @truncate(operands[0] >> 4);
+                const key_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}[r{}]", .{ map_reg, key_reg });
+            },
+
+            // map_has rd, map, key - [rd:4|map:4] [key:4|0]
+            .map_has => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const map_reg: u4 = @truncate(operands[0] & 0xF);
+                const key_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}, r{}.has(r{})", .{ rd, map_reg, key_reg });
+            },
+
+            // map_len rd, map - [rd:4|map:4] [0]
+            .map_len => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const map_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}.len()", .{ rd, map_reg });
+            },
+
+            // map_clear map - [map:4|0] [0]
+            .map_clear => {
+                const map_reg: u4 = @truncate(operands[0] >> 4);
+                try self.writer.print(" r{}.clear()", .{map_reg});
+            },
+
+            // map_keys rd, map - [rd:4|map:4] [0]
+            .map_keys => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const map_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}.keys()", .{ rd, map_reg });
+            },
+
+            // map_values rd, map - [rd:4|map:4] [0]
+            .map_values => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const map_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}.values()", .{ rd, map_reg });
+            },
+
+            // map_get_at rd, map, idx - [rd:4|map:4] [idx:4|0]
+            .map_get_at => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const map_reg: u4 = @truncate(operands[0] & 0xF);
+                const idx_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}, r{}[@r{}]", .{ rd, map_reg, idx_reg });
+            },
+
+            // map_set_at map, idx, val - [map:4|idx:4] [val:4|0]
+            .map_set_at => {
+                const map_reg: u4 = @truncate(operands[0] >> 4);
+                const idx_reg: u4 = @truncate(operands[0] & 0xF);
+                const val_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}[@r{}] = r{}", .{ map_reg, idx_reg, val_reg });
+            },
+
+            // ============================================
             // Debug & Meta (0xF0-0xFF)
             // ============================================
 

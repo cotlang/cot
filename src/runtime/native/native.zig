@@ -28,6 +28,7 @@ pub const string = @import("string.zig");
 pub const io = @import("io.zig");
 pub const system = @import("system.zig");
 pub const db = @import("db.zig");
+// Note: symtable has moved to extensions/dbl/symtable.zig
 
 pub const Linker = linker.Linker;
 pub const Stdlib = stdlib.Stdlib;
@@ -158,6 +159,7 @@ pub const NativeRegistry = struct {
         try io.register(self);
         try system.register(self);
         try db.register(self);
+        // Note: NSPC_* functions are registered by the DBL extension
     }
 
     /// Register a native function

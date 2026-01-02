@@ -1384,6 +1384,107 @@ pub const BytecodeEmitter = struct {
                 self.setLastResult(pd.result.id, dest_reg);
             },
 
+            // ============================================
+            // Map Operations
+            // ============================================
+
+            .map_new => |mn| {
+                // map_new rd, flags - create new map
+                // Format: [rd:4|flags:4] [0]
+                const dest_reg: u4 = 0;
+                try self.emitOpcode(.map_new);
+                try self.emitU8((@as(u8, dest_reg) << 4) | (mn.flags & 0x0F));
+                try self.emitU8(0);
+                self.setLastResult(mn.result.id, dest_reg);
+            },
+
+            .map_set => |ms| {
+                // map_set map, key, val - set key-value pair
+                // Format: [map:4|key:4] [val:4|0]
+                const map_reg = try self.getValueInReg(ms.map, 0);
+                const key_reg = try self.getValueInReg(ms.key, 1);
+                const val_reg = try self.getValueInReg(ms.value, 2);
+                try self.emitOpcode(.map_set);
+                try self.emitU8((@as(u8, map_reg) << 4) | key_reg);
+                try self.emitU8((@as(u8, val_reg) << 4) | 0);
+            },
+
+            .map_get => |mg| {
+                // map_get rd, map, key - get value by key
+                // Format: [rd:4|map:4] [key:4|0]
+                const map_reg = try self.getValueInReg(mg.map, 0);
+                const key_reg = try self.getValueInReg(mg.key, 1);
+                const dest_reg: u4 = 2;
+                try self.emitOpcode(.map_get);
+                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
+                try self.emitU8((@as(u8, key_reg) << 4) | 0);
+                self.setLastResult(mg.result.id, dest_reg);
+            },
+
+            .map_delete => |md| {
+                // map_delete map, key - delete key
+                // Format: [map:4|key:4] [0]
+                const map_reg = try self.getValueInReg(md.map, 0);
+                const key_reg = try self.getValueInReg(md.key, 1);
+                try self.emitOpcode(.map_delete);
+                try self.emitU8((@as(u8, map_reg) << 4) | key_reg);
+                try self.emitU8(0);
+            },
+
+            .map_has => |mh| {
+                // map_has rd, map, key - check if key exists
+                // Format: [rd:4|map:4] [key:4|0]
+                const map_reg = try self.getValueInReg(mh.map, 0);
+                const key_reg = try self.getValueInReg(mh.key, 1);
+                const dest_reg: u4 = 2;
+                try self.emitOpcode(.map_has);
+                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
+                try self.emitU8((@as(u8, key_reg) << 4) | 0);
+                self.setLastResult(mh.result.id, dest_reg);
+            },
+
+            .map_len => |ml| {
+                // map_len rd, map - get number of entries
+                // Format: [rd:4|map:4] [0]
+                const map_reg = try self.getValueInReg(ml.map, 0);
+                const dest_reg: u4 = 1;
+                try self.emitOpcode(.map_len);
+                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
+                try self.emitU8(0);
+                self.setLastResult(ml.result.id, dest_reg);
+            },
+
+            .map_clear => |mc| {
+                // map_clear map - remove all entries
+                // Format: [map:4|0] [0]
+                const map_reg = try self.getValueInReg(mc.map, 0);
+                try self.emitOpcode(.map_clear);
+                try self.emitU8((@as(u8, map_reg) << 4) | 0);
+                try self.emitU8(0);
+            },
+
+            .map_keys => |mk| {
+                // map_keys rd, map - get keys as string
+                // Format: [rd:4|map:4] [0]
+                const map_reg = try self.getValueInReg(mk.map, 0);
+                const dest_reg: u4 = 1;
+                try self.emitOpcode(.map_keys);
+                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
+                try self.emitU8(0);
+                self.setLastResult(mk.result.id, dest_reg);
+            },
+
+            .map_values => |mv| {
+                // map_values rd, map - get values as string
+                // Format: [rd:4|map:4] [0]
+                const map_reg = try self.getValueInReg(mv.map, 0);
+                const dest_reg: u4 = 1;
+                try self.emitOpcode(.map_values);
+                try self.emitU8((@as(u8, dest_reg) << 4) | map_reg);
+                try self.emitU8(0);
+                self.setLastResult(mv.result.id, dest_reg);
+            },
+
             else => {
                 // Other instructions not yet implemented
             },
@@ -1875,6 +1976,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .@"struct" => .structure, // Structs are structures
         .@"union" => .structure, // Unions are similar to structs
         .function => .int64, // Function pointers
+        .map => .int64, // Map handles are pointer-sized
     };
 }
 

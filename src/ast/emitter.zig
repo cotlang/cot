@@ -308,6 +308,17 @@ pub const Emitter = struct {
                 try self.emitType(error_type);
                 try self.writer.writeByte('>');
             },
+            .map => {
+                // Emit as Map<KeyType, ValueType>
+                const data = self.store.typeData(idx);
+                const key_type = TypeIdx.fromInt(data.a);
+                const value_type = TypeIdx.fromInt(data.b);
+                try self.writer.writeAll("Map<");
+                try self.emitType(key_type);
+                try self.writer.writeAll(", ");
+                try self.emitType(value_type);
+                try self.writer.writeByte('>');
+            },
             .inferred => try self.writer.writeAll("_"),
             .any => try self.writer.writeAll("any"),
             .never => try self.writer.writeAll("never"),

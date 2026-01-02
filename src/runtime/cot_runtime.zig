@@ -49,6 +49,12 @@ pub const debug = @import("debug.zig");
 
 // Extension system
 pub const extension = @import("extension.zig");
+pub const extension_manager = @import("extension_manager.zig");
+pub const type_registry = @import("type_registry.zig");
+pub const opcode_registry = @import("opcode_registry.zig");
+
+// DBL extension (Map type, NSPC_* functions)
+pub const dbl_ext = @import("extensions/dbl/dbl.zig");
 
 // Debugger support (breakpoints, stepping, inspection)
 pub const debugger = @import("debugger.zig");

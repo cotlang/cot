@@ -443,6 +443,62 @@ pub const Printer = struct {
             .debug_line => |d| {
                 try self.writer.print("; line {d}:{d}", .{ d.line, d.column });
             },
+
+            // Map operations
+            .map_new => |m| {
+                try self.printValue(m.result);
+                try self.writer.print(" = map_new flags={d}", .{m.flags});
+            },
+            .map_set => |m| {
+                try self.writer.writeAll("map_set ");
+                try self.printValue(m.map);
+                try self.writer.writeAll("[");
+                try self.printValue(m.key);
+                try self.writer.writeAll("] = ");
+                try self.printValue(m.value);
+            },
+            .map_get => |m| {
+                try self.printValue(m.result);
+                try self.writer.writeAll(" = map_get ");
+                try self.printValue(m.map);
+                try self.writer.writeAll("[");
+                try self.printValue(m.key);
+                try self.writer.writeAll("]");
+            },
+            .map_delete => |m| {
+                try self.writer.writeAll("map_delete ");
+                try self.printValue(m.map);
+                try self.writer.writeAll("[");
+                try self.printValue(m.key);
+                try self.writer.writeAll("]");
+            },
+            .map_has => |m| {
+                try self.printValue(m.result);
+                try self.writer.writeAll(" = map_has ");
+                try self.printValue(m.map);
+                try self.writer.writeAll("[");
+                try self.printValue(m.key);
+                try self.writer.writeAll("]");
+            },
+            .map_len => |m| {
+                try self.printValue(m.result);
+                try self.writer.writeAll(" = map_len ");
+                try self.printValue(m.map);
+            },
+            .map_clear => |m| {
+                try self.writer.writeAll("map_clear ");
+                try self.printValue(m.map);
+            },
+            .map_keys => |m| {
+                try self.printValue(m.result);
+                try self.writer.writeAll(" = map_keys ");
+                try self.printValue(m.map);
+            },
+            .map_values => |m| {
+                try self.printValue(m.result);
+                try self.writer.writeAll(" = map_values ");
+                try self.printValue(m.map);
+            },
         }
     }
 
@@ -522,6 +578,7 @@ pub const Printer = struct {
             .@"struct" => |s| try self.writer.print("struct({s})", .{s.name}),
             .@"union" => |u| try self.writer.print("union({s})", .{u.name}),
             .function => try self.writer.writeAll("fn"),
+            .map => try self.writer.writeAll("Map"),
         }
     }
 

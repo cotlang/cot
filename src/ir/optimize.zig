@@ -546,6 +546,37 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .alloca, .iconst, .f32const, .f64const, .const_string, .const_null,
         .jump, .debug_line, .try_begin, .try_end, .catch_begin,
         .load_struct_buf, .store_struct_buf => {},
+        // Map operations
+        .map_new => {}, // No input values to mark
+        .map_set => |m| {
+            used.put(m.map.id, {}) catch {};
+            used.put(m.key.id, {}) catch {};
+            used.put(m.value.id, {}) catch {};
+        },
+        .map_get => |m| {
+            used.put(m.map.id, {}) catch {};
+            used.put(m.key.id, {}) catch {};
+        },
+        .map_delete => |m| {
+            used.put(m.map.id, {}) catch {};
+            used.put(m.key.id, {}) catch {};
+        },
+        .map_has => |m| {
+            used.put(m.map.id, {}) catch {};
+            used.put(m.key.id, {}) catch {};
+        },
+        .map_len => |m| {
+            used.put(m.map.id, {}) catch {};
+        },
+        .map_clear => |m| {
+            used.put(m.map.id, {}) catch {};
+        },
+        .map_keys => |m| {
+            used.put(m.map.id, {}) catch {};
+        },
+        .map_values => |m| {
+            used.put(m.map.id, {}) catch {};
+        },
     }
 }
 

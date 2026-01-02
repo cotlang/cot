@@ -502,6 +502,55 @@ pub const Opcode = enum(u8) {
     console_log = 0xD4,
 
     // ============================================
+    // Map Operations (0xD5-0xDF)
+    // ============================================
+
+    /// map_new rd, flags - rd = new map with flags
+    /// flags: bit 0 = case_sensitive, bit 1 = preserve_spaces
+    /// Format: [rd:4|flags:4] [0]
+    map_new = 0xD5,
+
+    /// map_set map_reg, key_reg, val_reg - map[key] = val
+    /// Format: [map:4|key:4] [val:4|0]
+    map_set = 0xD6,
+
+    /// map_get rd, map_reg, key_reg - rd = map[key]
+    /// Format: [rd:4|map:4] [key:4|0]
+    map_get = 0xD7,
+
+    /// map_delete map_reg, key_reg - delete map[key]
+    /// Format: [map:4|key:4] [0]
+    map_delete = 0xD8,
+
+    /// map_has rd, map_reg, key_reg - rd = map.has(key)
+    /// Format: [rd:4|map:4] [key:4|0]
+    map_has = 0xD9,
+
+    /// map_len rd, map_reg - rd = map.len()
+    /// Format: [rd:4|map:4] [0]
+    map_len = 0xDA,
+
+    /// map_clear map_reg - map.clear()
+    /// Format: [map:4|0] [0]
+    map_clear = 0xDB,
+
+    /// map_keys rd, map_reg - rd = array of keys
+    /// Format: [rd:4|map:4] [0]
+    map_keys = 0xDC,
+
+    /// map_values rd, map_reg - rd = array of values
+    /// Format: [rd:4|map:4] [0]
+    map_values = 0xDD,
+
+    /// map_get_at rd, map_reg, idx_reg - rd = map entry at position (1-based)
+    /// Format: [rd:4|map:4] [idx:4|0]
+    map_get_at = 0xDE,
+
+    /// map_set_at map_reg, idx_reg, val_reg - map[pos] = val (by position)
+    /// Format: [map:4|idx:4] [val:4|0]
+    map_set_at = 0xDF,
+
+    // ============================================
     // Debug & Meta (0xF0-0xFF)
     // ============================================
 
@@ -605,6 +654,11 @@ pub const Opcode = enum(u8) {
             .call_indirect => 2,
             .assert => 2,
             .extended => 1, // sub_opcode byte, then variable
+            // Map operations
+            .map_new, .map_set, .map_get, .map_delete => 2,
+            .map_has, .map_len, .map_clear => 2,
+            .map_keys, .map_values => 2,
+            .map_get_at, .map_set_at => 2,
 
             // 3-byte operands: [reg:4|0] [u16]
             .movi16, .load_const => 3,

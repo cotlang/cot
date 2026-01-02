@@ -39,10 +39,20 @@ pub const Value = value_mod.Value;
 pub const Record = value_mod.Record;
 pub const Tag = value_mod.Tag;
 pub const Decimal = value_mod.Decimal;
+pub const OrderedMap = value_mod.OrderedMap;
 
 // Native dependencies (WASM support removed)
 const cotdb = @import("cotdb");
 const native = @import("../native/native.zig");
+// Note: symtable moved to extensions/dbl/
+
+// Extension system
+const TypeRegistry = @import("../type_registry.zig").TypeRegistry;
+const OpcodeRegistry = @import("../opcode_registry.zig").OpcodeRegistry;
+const extension_manager = @import("../extension_manager.zig");
+const ExtensionManager = extension_manager.ExtensionManager;
+const ExtensionContext = extension_manager.ExtensionContext;
+const Extension = extension_manager.Extension;
 
 /// Maximum stack size
 const STACK_SIZE = 4096;
@@ -104,6 +114,11 @@ pub const VM = struct {
     cursor_manager: native.CursorManager, // CotDB cursor management for I/O
     channel_manager: ?native.ChannelManager, // Unified text + ISAM channels
 
+    // Extension system
+    type_registry: TypeRegistry,
+    opcode_registry: OpcodeRegistry,
+    extension_manager: ExtensionManager,
+
     // Modules
     current_module: ?*const Module,
     current_module_index: ?u16, // Index into native_registry.module_globals (null = main module)
@@ -149,6 +164,9 @@ pub const VM = struct {
             .native_registry = native.NativeRegistry.init(allocator),
             .cursor_manager = native.CursorManager.init(allocator),
             .channel_manager = null, // Initialized via initChannels()
+            .type_registry = TypeRegistry.init(allocator),
+            .opcode_registry = OpcodeRegistry.init(),
+            .extension_manager = ExtensionManager.init(allocator),
             .current_module = null,
             .current_module_index = null,
             .modules = .{},
@@ -212,6 +230,38 @@ pub const VM = struct {
         self.channel_manager = try native.ChannelManager.init(self.allocator, &self.cursor_manager);
     }
 
+    // ========================================================================
+    // Extension System
+    // ========================================================================
+
+    /// Get an extension context for loading extensions or registering types/opcodes
+    pub fn extensionContext(self: *Self) ExtensionContext {
+        return .{
+            .vm = self,
+            .allocator = self.allocator,
+            .extension_name = "",
+            .type_registry = &self.type_registry,
+            .opcode_registry = &self.opcode_registry,
+            .native_registry = &self.native_registry,
+        };
+    }
+
+    /// Load an extension into the VM
+    pub fn loadExtension(self: *Self, ext: Extension) !void {
+        var ctx = self.extensionContext();
+        try self.extension_manager.load(ext, &ctx);
+    }
+
+    /// Check if an extension is loaded
+    pub fn isExtensionLoaded(self: *Self, name: []const u8) bool {
+        return self.extension_manager.isLoaded(name);
+    }
+
+    /// Look up a type by ID (for extension objects)
+    pub fn lookupType(self: *Self, type_id: u16) ?*const TypeRegistry.TypeDef {
+        return self.type_registry.lookup(type_id);
+    }
+
     pub fn deinit(self: *Self) void {
         // Free global buffers (the actual string data that FixedStringRef points to)
         for (self.global_buffers.items) |buf| {
@@ -227,6 +277,19 @@ pub const VM = struct {
         self.heap.deinit();
         self.modules.deinit(self.allocator);
         self.native_registry.deinit();
+
+        // Clean up extension system (reverse order of init)
+        // Note: symtable cleanup is handled by DBL extension deinit
+        var ext_ctx = ExtensionContext{
+            .vm = self,
+            .allocator = self.allocator,
+            .extension_name = "",
+            .type_registry = &self.type_registry,
+            .opcode_registry = &self.opcode_registry,
+            .native_registry = &self.native_registry,
+        };
+        self.extension_manager.deinit(&ext_ctx);
+        self.type_registry.deinit();
         if (self.channel_manager) |*cm| cm.deinit();
         self.cursor_manager.deinit();
         self.debugger.deinit();
@@ -1190,13 +1253,11 @@ pub const VM = struct {
         self.ip += 2;
         const rs: u4 = @truncate(ops >> 4);
         const val = self.registers[rs];
-        if (val.tag() == .string) {
-            self.stdout.writeAll(val.asString()) catch {};
-        } else {
-            var buf: [256]u8 = undefined;
-            const str = std.fmt.bufPrint(&buf, "{any}", .{val}) catch "";
-            self.stdout.writeAll(str) catch {};
-        }
+        // Format using Value's custom format function
+        var buf: [256]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        val.format("", .{}, fbs.writer()) catch {};
+        self.stdout.writeAll(fbs.getWritten()) catch {};
         self.stdout.writeAll("\n") catch {};
         return .continue_dispatch;
     }
@@ -1207,13 +1268,11 @@ pub const VM = struct {
         self.ip += 2;
         const rs: u4 = @truncate(ops >> 4);
         const val = self.registers[rs];
-        if (val.tag() == .string) {
-            self.stdout.writeAll(val.asString()) catch {};
-        } else {
-            var buf: [256]u8 = undefined;
-            const str = std.fmt.bufPrint(&buf, "{any}", .{val}) catch "";
-            self.stdout.writeAll(str) catch {};
-        }
+        // Format using Value's custom format function
+        var buf: [256]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        val.format("", .{}, fbs.writer()) catch {};
+        self.stdout.writeAll(fbs.getWritten()) catch {};
         return .continue_dispatch;
     }
 
@@ -1309,6 +1368,7 @@ pub const VM = struct {
             .null_val => return "",
             .record_ref => return "<record>",
             .handle => return "<handle>",
+            .object => return "<object>",
         }
     }
 
@@ -1836,6 +1896,281 @@ pub const VM = struct {
     }
 
     // ============================================
+    // Map Operations (0xD5-0xDF)
+    // ============================================
+
+    /// map_new rd, flags - create a new map
+    fn op_map_new(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops = module.code[self.ip];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops >> 4);
+        const flags: u4 = @truncate(ops & 0xF);
+
+        const map = self.allocator.create(OrderedMap) catch {
+            return self.fail(VMError.OutOfMemory, "Failed to allocate map");
+        };
+        map.* = OrderedMap.init(self.allocator, .{
+            .case_sensitive = (flags & 1) != 0,
+            .preserve_spaces = (flags & 2) != 0,
+        });
+
+        self.registers[rd] = Value.initMap(map);
+        return .continue_dispatch;
+    }
+
+    /// map_set map, key, val - store value in map
+    fn op_map_set(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops1 = module.code[self.ip];
+        const ops2 = module.code[self.ip + 1];
+        self.ip += 2;
+        const map_reg: u4 = @truncate(ops1 >> 4);
+        const key_reg: u4 = @truncate(ops1 & 0xF);
+        const val_reg: u4 = @truncate(ops2 >> 4);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        var key_buf: [32]u8 = undefined;
+        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
+
+        _ = map.set(key, self.registers[val_reg]) catch {
+            return self.fail(VMError.OutOfMemory, "Failed to set map value");
+        };
+
+        return .continue_dispatch;
+    }
+
+    /// map_get rd, map, key - get value from map
+    fn op_map_get(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops1 = module.code[self.ip];
+        const ops2 = module.code[self.ip + 1];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops1 >> 4);
+        const map_reg: u4 = @truncate(ops1 & 0xF);
+        const key_reg: u4 = @truncate(ops2 >> 4);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        var key_buf: [32]u8 = undefined;
+        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
+
+        self.registers[rd] = map.get(key) orelse Value.null_val;
+        return .continue_dispatch;
+    }
+
+    /// map_delete map, key - delete key from map
+    fn op_map_delete(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops1 = module.code[self.ip];
+        const ops2 = module.code[self.ip + 1];
+        self.ip += 2;
+        const map_reg: u4 = @truncate(ops1 >> 4);
+        const key_reg: u4 = @truncate(ops1 & 0xF);
+        _ = ops2;
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        var key_buf: [32]u8 = undefined;
+        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
+
+        _ = map.delete(key);
+        return .continue_dispatch;
+    }
+
+    /// map_has rd, map, key - check if key exists in map
+    fn op_map_has(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops1 = module.code[self.ip];
+        const ops2 = module.code[self.ip + 1];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops1 >> 4);
+        const map_reg: u4 = @truncate(ops1 & 0xF);
+        const key_reg: u4 = @truncate(ops2 >> 4);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        var key_buf: [32]u8 = undefined;
+        const key = self.valueToStringSlice(self.registers[key_reg], &key_buf);
+
+        self.registers[rd] = if (map.has(key)) Value.true_val else Value.false_val;
+        return .continue_dispatch;
+    }
+
+    /// map_len rd, map - get number of entries in map
+    fn op_map_len(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops = module.code[self.ip];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops >> 4);
+        const map_reg: u4 = @truncate(ops & 0xF);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        self.registers[rd] = Value.initInt(@intCast(map.len()));
+        return .continue_dispatch;
+    }
+
+    /// map_clear map - clear all entries from map
+    fn op_map_clear(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops = module.code[self.ip];
+        self.ip += 2;
+        const map_reg: u4 = @truncate(ops >> 4);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        map.clear();
+        return .continue_dispatch;
+    }
+
+    /// map_keys rd, map - get keys as comma-separated string
+    fn op_map_keys(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops = module.code[self.ip];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops >> 4);
+        const map_reg: u4 = @truncate(ops & 0xF);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        // Build comma-separated string of keys
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        defer result.deinit(self.allocator);
+
+        var iter = map.iterator();
+        var first = true;
+        while (iter.next()) |entry| {
+            if (!first) {
+                result.appendSlice(self.allocator, ",") catch return VMError.OutOfMemory;
+            }
+            result.appendSlice(self.allocator, entry.key) catch return VMError.OutOfMemory;
+            first = false;
+        }
+
+        const str = result.toOwnedSlice(self.allocator) catch return VMError.OutOfMemory;
+        self.registers[rd] = Value.initString(self.allocator, str) catch {
+            self.allocator.free(str);
+            return VMError.OutOfMemory;
+        };
+        self.allocator.free(str);
+        return .continue_dispatch;
+    }
+
+    /// map_values rd, map - get values as comma-separated string
+    fn op_map_values(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops = module.code[self.ip];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops >> 4);
+        const map_reg: u4 = @truncate(ops & 0xF);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        // Build comma-separated string of values
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        defer result.deinit(self.allocator);
+
+        var val_buf: [32]u8 = undefined;
+        var iter = map.iterator();
+        var first = true;
+        while (iter.next()) |entry| {
+            if (!first) {
+                result.appendSlice(self.allocator, ",") catch return VMError.OutOfMemory;
+            }
+            const val_str = self.valueToStringSlice(entry.value, &val_buf);
+            result.appendSlice(self.allocator, val_str) catch return VMError.OutOfMemory;
+            first = false;
+        }
+
+        const str = result.toOwnedSlice(self.allocator) catch return VMError.OutOfMemory;
+        self.registers[rd] = Value.initString(self.allocator, str) catch {
+            self.allocator.free(str);
+            return VMError.OutOfMemory;
+        };
+        self.allocator.free(str);
+        return .continue_dispatch;
+    }
+
+    /// map_get_at rd, map, access_code - get entry at access code position
+    fn op_map_get_at(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops1 = module.code[self.ip];
+        const ops2 = module.code[self.ip + 1];
+        self.ip += 2;
+        const rd: u4 = @truncate(ops1 >> 4);
+        const map_reg: u4 = @truncate(ops1 & 0xF);
+        const idx_reg: u4 = @truncate(ops2 >> 4);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        const idx_val = self.registers[idx_reg];
+        if (idx_val.tag() != .integer) {
+            return self.fail(VMError.InvalidType, "Expected integer index");
+        }
+        const idx = idx_val.asInt();
+
+        if (idx <= 0) {
+            self.registers[rd] = Value.null_val;
+            return .continue_dispatch;
+        }
+
+        const entry = map.getAt(@intCast(idx - 1)); // 1-based to 0-based
+        if (entry) |e| {
+            self.registers[rd] = e.value;
+        } else {
+            self.registers[rd] = Value.null_val;
+        }
+        return .continue_dispatch;
+    }
+
+    /// map_set_at map, access_code, val - set entry at access code position
+    fn op_map_set_at(self: *Self, module: *const Module) VMError!DispatchResult {
+        const ops1 = module.code[self.ip];
+        const ops2 = module.code[self.ip + 1];
+        self.ip += 2;
+        const map_reg: u4 = @truncate(ops1 >> 4);
+        const idx_reg: u4 = @truncate(ops1 & 0xF);
+        const val_reg: u4 = @truncate(ops2 >> 4);
+
+        const map_val = self.registers[map_reg];
+        const map = map_val.asMap() orelse {
+            return self.fail(VMError.InvalidType, "Expected map value");
+        };
+
+        const idx_val = self.registers[idx_reg];
+        if (idx_val.tag() != .integer) {
+            return self.fail(VMError.InvalidType, "Expected integer index");
+        }
+        const idx = idx_val.asInt();
+
+        if (idx <= 0) {
+            return .continue_dispatch;
+        }
+
+        _ = map.putAt(@intCast(idx - 1), self.registers[val_reg]); // 1-based to 0-based
+        return .continue_dispatch;
+    }
+
+    // ============================================
     // Dispatch Table (Computed Goto)
     // ============================================
 
@@ -1916,10 +2251,23 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.format_decimal)] = &op_format_decimal;
         table[@intFromEnum(Opcode.parse_decimal)] = &op_parse_decimal;
 
-        // Console I/O (0xD0-0xDF)
+        // Console I/O (0xD0-0xD4)
         table[@intFromEnum(Opcode.console_writeln)] = &op_console_writeln;
         table[@intFromEnum(Opcode.console_write)] = &op_console_write;
         table[@intFromEnum(Opcode.console_log)] = &op_console_log;
+
+        // Map Operations (0xD5-0xDF)
+        table[@intFromEnum(Opcode.map_new)] = &op_map_new;
+        table[@intFromEnum(Opcode.map_set)] = &op_map_set;
+        table[@intFromEnum(Opcode.map_get)] = &op_map_get;
+        table[@intFromEnum(Opcode.map_delete)] = &op_map_delete;
+        table[@intFromEnum(Opcode.map_has)] = &op_map_has;
+        table[@intFromEnum(Opcode.map_len)] = &op_map_len;
+        table[@intFromEnum(Opcode.map_clear)] = &op_map_clear;
+        table[@intFromEnum(Opcode.map_keys)] = &op_map_keys;
+        table[@intFromEnum(Opcode.map_values)] = &op_map_values;
+        table[@intFromEnum(Opcode.map_get_at)] = &op_map_get_at;
+        table[@intFromEnum(Opcode.map_set_at)] = &op_map_set_at;
 
         // Debug (0xF0-0xFF)
         table[@intFromEnum(Opcode.debug_break)] = &op_debug_break;

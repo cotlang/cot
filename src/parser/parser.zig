@@ -1665,12 +1665,15 @@ pub const Parser = struct {
         if (std.mem.eql(u8, name, "void")) return self.store.addPrimitiveType(.void) catch return error.OutOfMemory;
         if (std.mem.eql(u8, name, "string")) return self.store.addPrimitiveType(.string) catch return error.OutOfMemory;
 
-        // Built-in generic types: Result<T, E> and Option<T>
+        // Built-in generic types: Result<T, E>, Option<T>, and Map<K, V>
         if (std.mem.eql(u8, name, "Result")) {
             return try self.parseResultType();
         }
         if (std.mem.eql(u8, name, "Option")) {
             return try self.parseOptionType();
+        }
+        if (std.mem.eql(u8, name, "Map")) {
+            return try self.parseMapType();
         }
 
         const name_id = self.internString(name) catch return error.OutOfMemory;
@@ -1746,6 +1749,16 @@ pub const Parser = struct {
         const inner_type = try self.parseType();
         _ = try self.consume(.gt, "Expected '>' after Option type argument");
         return self.store.addOptionalType(inner_type) catch return error.OutOfMemory;
+    }
+
+    /// Parse Map<K, V> built-in type
+    fn parseMapType(self: *Self) ParseError!TypeIdx {
+        _ = try self.consume(.lt, "Expected '<' after Map");
+        const key_type = try self.parseType();
+        _ = try self.consume(.comma, "Expected ',' in Map<K, V>");
+        const value_type = try self.parseType();
+        _ = try self.consume(.gt, "Expected '>' after Map type arguments");
+        return self.store.addMapType(key_type, value_type) catch return error.OutOfMemory;
     }
 
     // ============================================================

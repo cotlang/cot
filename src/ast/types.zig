@@ -95,6 +95,9 @@ pub const TypeTag = enum(u8) {
     /// Error union type: T!E
     error_union,
 
+    /// Map type: Map<K, V>
+    map,
+
     // ============================================
     // Generic Types
     // ============================================
@@ -163,7 +166,7 @@ pub const TypeTag = enum(u8) {
     /// Check if this is a compound/composite type
     pub fn isCompound(self: TypeTag) bool {
         return switch (self) {
-            .array, .slice, .optional, .pointer, .named, .@"union", .function, .tuple, .error_union => true,
+            .array, .slice, .optional, .pointer, .named, .@"union", .function, .tuple, .error_union, .map => true,
             else => false,
         };
     }

@@ -78,6 +78,9 @@ pub const Type = union(enum) {
     /// Function type
     function: *const FunctionType,
 
+    /// Map type (ordered key-value store)
+    map: *const MapType,
+
     pub const DecimalType = struct {
         /// Total precision in digits
         precision: u32,
@@ -103,6 +106,7 @@ pub const Type = union(enum) {
             .@"struct" => |s| s.size,
             .@"union" => |u| u.size,
             .function => 8, // Function pointer
+            .map => 8, // Map pointer
         };
     }
 
@@ -123,6 +127,7 @@ pub const Type = union(enum) {
             .@"struct" => |s| s.alignment,
             .@"union" => |u| u.alignment,
             .function => 8,
+            .map => 8,
         };
     }
 
@@ -148,6 +153,7 @@ pub const Type = union(enum) {
             .@"struct" => "void*",
             .@"union" => "void*",
             .function => "void*",
+            .map => "void*",
         };
     }
 
@@ -218,6 +224,12 @@ pub const FunctionType = struct {
         is_ref: bool, // by value (false) or by reference (true)
         default_value: ?Value = null, // optional default value for optional params
     };
+};
+
+/// Map type definition (ordered key-value store)
+pub const MapType = struct {
+    key_type: *const Type,
+    value_type: *const Type,
 };
 
 // ============================================================================
@@ -426,6 +438,17 @@ pub const Instruction = union(enum) {
     array_store: ArrayStore,
     array_len: UnaryOp,
 
+    // ====== Map operations ======
+    map_new: MapNew,
+    map_set: MapSet,
+    map_get: MapGet,
+    map_delete: MapDelete,
+    map_has: MapHas,
+    map_len: MapLen,
+    map_clear: MapClear,
+    map_keys: MapKeys,
+    map_values: MapValues,
+
     // ====== Debug information ======
     debug_line: struct { line: u32, column: u32 },
 
@@ -593,6 +616,71 @@ pub const Instruction = union(enum) {
         loc: ?SourceLoc = null,
     };
 
+    /// Map new - create a new map
+    pub const MapNew = struct {
+        flags: u8, // bit 0 = case_sensitive, bit 1 = preserve_spaces
+        result: Value, // Result map value
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map set - set key-value pair
+    pub const MapSet = struct {
+        map: Value, // Map to modify
+        key: Value, // Key value
+        value: Value, // Value to store
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map get - get value by key
+    pub const MapGet = struct {
+        map: Value, // Map to read
+        key: Value, // Key to look up
+        result: Value, // Result value
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map delete - delete by key
+    pub const MapDelete = struct {
+        map: Value, // Map to modify
+        key: Value, // Key to delete
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map has - check if key exists
+    pub const MapHas = struct {
+        map: Value, // Map to check
+        key: Value, // Key to look up
+        result: Value, // Boolean result
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map len - get number of entries
+    pub const MapLen = struct {
+        map: Value, // Map to query
+        result: Value, // Integer result
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map clear - remove all entries
+    pub const MapClear = struct {
+        map: Value, // Map to clear
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map keys - get array of keys
+    pub const MapKeys = struct {
+        map: Value, // Map to query
+        result: Value, // Array of keys
+        loc: ?SourceLoc = null,
+    };
+
+    /// Map values - get array of values
+    pub const MapValues = struct {
+        map: Value, // Map to query
+        result: Value, // Array of values
+        loc: ?SourceLoc = null,
+    };
+
     /// String slice - extract portion of string (0-indexed)
     pub const StrSlice = struct {
         source: Value, // Source string
@@ -670,6 +758,7 @@ pub const Instruction = union(enum) {
         optional, // wrap_optional, unwrap_optional, is_null
         io, // io_open, io_close, io_read, io_write, io_delete, io_unlock
         array, // array_load, array_store, array_len
+        map, // map_new, map_set, map_get, map_delete, map_has, map_len, map_clear, map_keys, map_values
         debug, // debug_line
     };
 
@@ -689,6 +778,7 @@ pub const Instruction = union(enum) {
             .wrap_optional, .unwrap_optional, .is_null => .optional,
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
             .array_load, .array_store, .array_len => .array,
+            .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values => .map,
             .debug_line => .debug,
         };
     }
@@ -760,10 +850,18 @@ pub const Instruction = union(enum) {
             .wrap_optional, .unwrap_optional, .is_null => |op| op.result,
             .format_decimal => |f| f.result,
             .parse_decimal => |p| p.result,
+            // Map operations with results
+            .map_new => |m| m.result,
+            .map_get => |m| m.result,
+            .map_has => |m| m.result,
+            .map_len => |m| m.result,
+            .map_keys => |m| m.result,
+            .map_values => |m| m.result,
             // Instructions that don't produce values
             .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read,
             .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store,
-            .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy => null,
+            .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy,
+            .map_set, .map_delete, .map_clear => null,
         };
     }
 
@@ -771,9 +869,15 @@ pub const Instruction = union(enum) {
     pub fn hasSideEffects(self: Instruction) bool {
         return switch (self) {
             .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock,
-            .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store => true,
+            .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store,
+            .map_set, .map_delete, .map_clear => true,
             else => false,
         };
+    }
+
+    /// Check if this instruction is a map operation
+    pub fn isMap(self: Instruction) bool {
+        return self.category() == .map;
     }
 };
 
