@@ -18,8 +18,19 @@ const verify = @import("verify.zig");
 const cot_runtime = @import("cot_runtime");
 const debug = cot_runtime.debug;
 
-// Import log module - must be from current package to avoid module conflicts
-const log = @import("../log.zig");
+// Scoped logging (Ghostty pattern) - enable with std_options or runtime filter
+const log = std.log.scoped(.@"ir-lower");
+
+// Import extracted types (following Ghostty pattern)
+const lower_types = @import("lower_types.zig");
+pub const LowerError = lower_types.LowerError;
+pub const GenericDef = lower_types.GenericDef;
+pub const InstantiationKey = lower_types.InstantiationKey;
+pub const TraitMethodSig = lower_types.TraitMethodSig;
+pub const TraitDef = lower_types.TraitDef;
+pub const ImplKey = lower_types.ImplKey;
+pub const MethodImpl = lower_types.MethodImpl;
+const ImplKeyContext = lower_types.ImplKeyContext;
 
 // Scope management
 const ScopeStack = scope_stack.ScopeStack;
@@ -44,90 +55,6 @@ const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
 
 const Allocator = std.mem.Allocator;
-
-pub const LowerError = error{
-    OutOfMemory,
-    UndefinedVariable,
-    UndefinedType,
-    TypeMismatch,
-    InvalidExpression,
-    UnsupportedFeature,
-    UnknownFunction,
-    VerificationFailed,
-};
-
-/// Generic type definition - stores info needed to instantiate a generic type
-pub const GenericDef = struct {
-    /// The original statement index (for re-lowering with substitutions)
-    stmt_idx: StmtIdx,
-    /// Number of type parameters
-    type_param_count: u16,
-    /// Type parameter names (stored as StringIds)
-    type_param_names: []const StringId,
-};
-
-/// Key for caching instantiated generics
-pub const InstantiationKey = struct {
-    base_name: []const u8,
-    type_args: []const ir.Type,
-
-    pub fn hash(self: InstantiationKey) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(self.base_name);
-        for (self.type_args) |arg| {
-            // Hash the type tag
-            h.update(std.mem.asBytes(&arg));
-        }
-        return h.final();
-    }
-
-    pub fn eql(a: InstantiationKey, b: InstantiationKey) bool {
-        if (!std.mem.eql(u8, a.base_name, b.base_name)) return false;
-        if (a.type_args.len != b.type_args.len) return false;
-        for (a.type_args, b.type_args) |ta, tb| {
-            if (!std.meta.eql(ta, tb)) return false;
-        }
-        return true;
-    }
-};
-
-/// Trait method signature
-pub const TraitMethodSig = struct {
-    name: []const u8,
-    param_count: u32,
-    return_type: ir.Type,
-};
-
-/// Trait definition - stores method signatures for a trait
-pub const TraitDef = struct {
-    name: []const u8,
-    type_param_count: u16,
-    methods: []const TraitMethodSig,
-};
-
-/// Key for looking up trait implementations
-pub const ImplKey = struct {
-    trait_name: []const u8,
-    type_name: []const u8,
-
-    pub fn hash(self: ImplKey) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(self.trait_name);
-        h.update(self.type_name);
-        return h.final();
-    }
-
-    pub fn eql(a: ImplKey, b: ImplKey) bool {
-        return std.mem.eql(u8, a.trait_name, b.trait_name) and
-            std.mem.eql(u8, a.type_name, b.type_name);
-    }
-};
-
-/// Method implementation entry
-pub const MethodImpl = struct {
-    method_name: []const u8,
-    fn_stmt_idx: StmtIdx,
-};
 
 /// Lowering context that tracks state during AST to IR conversion
 pub const Lowerer = struct {
@@ -186,14 +113,6 @@ pub const Lowerer = struct {
     impl_methods: ImplMethodsMap,
 
     const ImplMethodsMap = std.HashMap(ImplKey, []const MethodImpl, ImplKeyContext, std.hash_map.default_max_load_percentage);
-    const ImplKeyContext = struct {
-        pub fn hash(_: @This(), key: ImplKey) u64 {
-            return key.hash();
-        }
-        pub fn eql(_: @This(), a: ImplKey, b: ImplKey) bool {
-            return a.eql(b);
-        }
-    };
 
     /// Known builtin function names (lowercase)
     const known_builtins = std.StaticStringMap(void).initComptime(.{
@@ -360,8 +279,7 @@ pub const Lowerer = struct {
 
     /// Lower a program (list of top-level statements)
     pub fn lowerProgram(self: *Self, top_level: []const StmtIdx) LowerError!*ir.Module {
-        const logger = log.getLogger();
-        logger.debug("Lowering program with {d} top-level statements", .{top_level.len});
+        log.debug("Lowering program with {d} top-level statements", .{top_level.len});
         debug.print(.ir, "Lowering program with {d} top-level statements", .{top_level.len});
 
         // First pass: collect struct definitions
@@ -421,13 +339,12 @@ pub const Lowerer = struct {
 
     /// Lower a struct definition
     fn lowerStructDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
-        const logger = log.getLogger();
         const data = self.store.stmtData(stmt_idx);
         const name_id = data.getName();
         const name = self.strings.get(name_id);
         if (name.len == 0) return LowerError.UndefinedType;
 
-        logger.debug("Lowering struct: {s}", .{name});
+        log.debug("Lowering struct: {s}", .{name});
         debug.print(.ir, "Lowering struct: {s}", .{name});
 
         // Get fields and type params from extra_data
@@ -853,12 +770,11 @@ pub const Lowerer = struct {
 
     /// Lower a single statement to IR
     fn lowerStatement(self: *Self, stmt_idx: StmtIdx) LowerError!void {
-        const logger = log.getLogger();
         const tag = self.store.stmtTag(stmt_idx);
         const loc = self.store.stmtLoc(stmt_idx);
         const data = self.store.stmtData(stmt_idx);
 
-        logger.trace("lowerStatement: {s} at line {d}", .{ @tagName(tag), loc.line });
+        log.debug("lowerStatement: {s} at line {d}", .{ @tagName(tag), loc.line });
 
         switch (tag) {
             .assignment => {
@@ -997,7 +913,6 @@ pub const Lowerer = struct {
 
     /// Lower an assignment statement
     fn lowerAssignment(self: *Self, data: NodeData) LowerError!void {
-        const logger = log.getLogger();
         const target_idx = data.getTarget();
         const value_idx = data.getValue();
 
@@ -1006,7 +921,7 @@ pub const Lowerer = struct {
         if (StructHelper.detectStructTypeFromExpr(&self.scopes, self.store, self.strings, target_idx)) |info| {
             // This is an assignment to a struct variable (e.g., cust = db_read(...))
             // Lower the value (call expression), then emit store_struct_buf
-            logger.trace("lowerAssignment: struct target '{s}' type '{s}'", .{ info.base_name, info.structName() });
+            log.debug("lowerAssignment: struct target '{s}' type '{s}'", .{ info.base_name, info.structName() });
             debug.print(.ir, "lowerAssignment: target '{s}' is struct type '{s}', emitting store_struct_buf", .{ info.base_name, info.structName() });
 
             const value = try self.lowerExpression(value_idx);
@@ -1346,12 +1261,11 @@ pub const Lowerer = struct {
     /// Uses StructHelper for centralized struct detection.
     fn lowerStructBufferOrExpression(self: *Self, buffer_idx: ExprIdx) LowerError!ir.Value {
         const func = self.current_func orelse return LowerError.OutOfMemory;
-        const logger = log.getLogger();
 
         // Check if buffer expression is a struct type using centralized detection
         if (StructHelper.detectStructTypeFromExpr(&self.scopes, self.store, self.strings, buffer_idx)) |info| {
             // Emit load_struct_buf to serialize the struct
-            logger.trace("lowerStructBufferOrExpression: serializing '{s}' type '{s}'", .{ info.base_name, info.structName() });
+            log.debug("lowerStructBufferOrExpression: serializing '{s}' type '{s}'", .{ info.base_name, info.structName() });
             debug.print(.ir, "lowerStructBufferOrExpression: emitting load_struct_buf for '{s}' type '{s}'", .{ info.base_name, info.structName() });
 
             const result = StructHelper.makeResultValue(func, info);
@@ -2652,13 +2566,90 @@ pub fn lowerWithOptions(
 
         verifier.verify() catch {
             // Log verification errors
-            const logger = log.getLogger();
-            for (verifier.getErrors()) |err| {
-                logger.err("IR verification: {any}", .{err});
+            for (verifier.getErrors()) |e| {
+                log.err("IR verification: {any}", .{e});
             }
             return LowerError.VerificationFailed;
         };
     }
 
     return module;
+}
+
+// ============================================
+// Inline Tests (Ghostty pattern)
+// ============================================
+
+const testing = std.testing;
+
+test "lower: Lowerer initialization" {
+    const allocator = testing.allocator;
+
+    // Create minimal NodeStore for testing
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    var store = ast.NodeStore.init(allocator, &interner);
+    defer store.deinit();
+
+    // Create lowerer
+    var lowerer = Lowerer.init(allocator, &store, &interner, null) catch |err| {
+        std.debug.print("Lowerer init failed: {any}\n", .{err});
+        return err;
+    };
+    defer lowerer.deinit();
+
+    // Verify initial state
+    try testing.expect(lowerer.module != null);
+    try testing.expectEqual(@as(usize, 0), lowerer.scopes.depth());
+}
+
+test "lower: type name resolution" {
+    const allocator = testing.allocator;
+
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    var store = ast.NodeStore.init(allocator, &interner);
+    defer store.deinit();
+
+    var lowerer = try Lowerer.init(allocator, &store, &interner, null);
+    defer lowerer.deinit();
+
+    // Test primitive type resolution
+    const i32_name = try interner.intern("i32");
+    const i32_type = lowerer.resolveTypeName(i32_name);
+    try testing.expectEqual(ir.Type.i32, i32_type);
+
+    const bool_name = try interner.intern("bool");
+    const bool_type = lowerer.resolveTypeName(bool_name);
+    try testing.expectEqual(ir.Type.bool, bool_type);
+
+    const str_name = try interner.intern("str");
+    const str_type = lowerer.resolveTypeName(str_name);
+    try testing.expectEqual(ir.Type.str, str_type);
+}
+
+test "lower: scope stack push/pop" {
+    const allocator = testing.allocator;
+
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    var store = ast.NodeStore.init(allocator, &interner);
+    defer store.deinit();
+
+    var lowerer = try Lowerer.init(allocator, &store, &interner, null);
+    defer lowerer.deinit();
+
+    // Initial depth should be 0
+    try testing.expectEqual(@as(usize, 0), lowerer.scopes.depth());
+
+    // Push a scope
+    lowerer.scopes.push();
+    try testing.expectEqual(@as(usize, 1), lowerer.scopes.depth());
+
+    // Pop the scope
+    lowerer.scopes.pop();
+    try testing.expectEqual(@as(usize, 0), lowerer.scopes.depth());
 }

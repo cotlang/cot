@@ -10,6 +10,9 @@ const module = cot_runtime.bytecode.module;
 const opcodes = cot_runtime.bytecode.opcodes;
 const debug = cot_runtime.debug;
 
+// Scoped logging (Ghostty pattern) - enable with std_options or runtime filter
+const log = std.log.scoped(.@"bytecode-emit");
+
 const Allocator = std.mem.Allocator;
 const Opcode = opcodes.Opcode;
 

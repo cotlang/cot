@@ -1,6 +1,6 @@
 //! Cot Virtual Machine
 //!
-//! Stack-based bytecode interpreter for compiled Cot programs.
+//! Register-based bytecode interpreter for compiled Cot programs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,6 +14,20 @@ const value_mod = @import("value.zig");
 const Profiler = @import("profiler.zig").Profiler;
 const JITProfiler = @import("profiler.zig").JITProfiler;
 const CompilationTier = @import("profiler.zig").CompilationTier;
+
+// Scoped logging (Ghostty pattern) - enable with std_options or runtime filter
+const log = std.log.scoped(.@"vm-exec");
+
+// Import extracted types (following Ghostty pattern)
+const vm_types = @import("vm_types.zig");
+pub const DispatchResult = vm_types.DispatchResult;
+pub const InlineCache = vm_types.InlineCache;
+pub const VMError = vm_types.VMError;
+pub const RuntimeError = vm_types.RuntimeError;
+pub const CrashContext = vm_types.CrashContext;
+pub const CallFrame = vm_types.CallFrame;
+pub const CallStack = vm_types.CallStack;
+pub const StopReason = vm_types.StopReason;
 
 // Get profiling setting from build options (if available)
 const build_options = @import("build_options");
@@ -33,135 +47,13 @@ const native = @import("../native/native.zig");
 /// Maximum stack size
 const STACK_SIZE = 4096;
 
-/// Maximum call depth
-const MAX_CALL_DEPTH = 256;
-
-// ============================================
-// Dispatch Table Types (Computed Goto)
-// ============================================
-
-/// Result of executing an opcode handler
-pub const DispatchResult = enum {
-    /// Continue to next instruction
-    continue_dispatch,
-    /// VM should halt (normal termination)
-    halt,
-    /// Return from main routine (normal completion)
-    return_from_main,
-};
+/// Maximum call depth (imported from vm_types)
+const MAX_CALL_DEPTH = vm_types.MAX_CALL_DEPTH;
 
 /// Opcode handler function type for dispatch table
+/// Note: This must stay in vm.zig because it references VM
 pub const OpcodeHandler = *const fn (*VM, *const Module) VMError!DispatchResult;
 
-// ============================================
-// Inline Cache for field access optimization
-// ============================================
-
-/// Inline cache entry for field access
-/// Caches the type ID and field offset to avoid repeated lookups
-pub const InlineCache = struct {
-    /// Cached record type ID (0xFFFF = invalid/empty)
-    cached_type_id: u16 = 0xFFFF,
-    /// Cached field byte offset within record
-    cached_offset: u16 = 0,
-    /// Cached field size in bytes
-    cached_size: u8 = 0,
-    /// Cache hit count (for profiling)
-    hit_count: u32 = 0,
-    /// Cache miss count (for profiling)
-    miss_count: u32 = 0,
-
-    /// Check if cache is valid for a given type ID
-    pub fn isValidFor(self: InlineCache, type_id: u16) bool {
-        return self.cached_type_id != 0xFFFF and self.cached_type_id == type_id;
-    }
-
-    /// Update cache with new type/offset
-    pub fn update(self: *InlineCache, type_id: u16, offset: u16, size: u8) void {
-        self.cached_type_id = type_id;
-        self.cached_offset = offset;
-        self.cached_size = size;
-    }
-
-    /// Record a cache hit
-    pub fn recordHit(self: *InlineCache) void {
-        self.hit_count +|= 1; // Saturating add
-    }
-
-    /// Record a cache miss
-    pub fn recordMiss(self: *InlineCache) void {
-        self.miss_count +|= 1;
-    }
-
-    /// Get hit ratio (0.0 to 1.0)
-    pub fn hitRatio(self: InlineCache) f64 {
-        const total = self.hit_count + self.miss_count;
-        if (total == 0) return 0.0;
-        return @as(f64, @floatFromInt(self.hit_count)) / @as(f64, @floatFromInt(total));
-    }
-};
-
-/// VM error types - these are the actual Zig errors returned
-pub const VMError = error{
-    StackOverflow,
-    StackUnderflow,
-    InvalidOpcode,
-    InvalidConstant,
-    InvalidType,
-    InvalidRoutine,
-    DivisionByZero,
-    OutOfMemory,
-    FileError,
-    IsamError,
-    UnresolvedImport,
-    CallStackOverflow,
-    Halted,
-    ReloadRequested,
-    BytecodeOutOfBounds,
-    NullPointerAccess,
-    InvalidMemoryAccess,
-};
-
-/// Rich runtime error with full context - this is what gets reported to the user
-pub const RuntimeError = struct {
-    kind: VMError,
-    message: []const u8,
-    ip: u32,
-    opcode: ?Opcode,
-    source_line: u32,
-    routine_name: []const u8,
-    stack_depth: u32,
-    // Additional context for specific errors
-    detail: ?[]const u8 = null,
-
-    pub fn format(
-        self: RuntimeError,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print(
-            \\Runtime Error: {s}
-            \\  Message: {s}
-            \\  Location: {s} line {d} (IP: 0x{X:0>4})
-            \\  Opcode: {s}
-            \\  Stack depth: {d}
-        , .{
-            @errorName(self.kind),
-            self.message,
-            self.routine_name,
-            self.source_line,
-            self.ip,
-            if (self.opcode) |op| @tagName(op) else "<unknown>",
-            self.stack_depth,
-        });
-        if (self.detail) |d| {
-            try writer.print("\n  Detail: {s}", .{d});
-        }
-    }
-};
 
 /// Global last error - set whenever a VMError is raised
 /// This provides rich context even when only VMError is returned
@@ -170,46 +62,6 @@ pub var last_error: ?RuntimeError = null;
 /// Static buffer for dynamically formatted error messages
 /// This ensures the message slice remains valid after the function returns
 var error_message_buf: [128]u8 = undefined;
-
-/// Global crash context for signal handler - stores last execution state
-pub const CrashContext = struct {
-    ip: u32 = 0,
-    last_opcode: ?Opcode = null,
-    source_line: u32 = 0,
-    routine_name: ?[]const u8 = null,
-    active: bool = false,
-
-    // Native code tracking - for crashes in native calls or external libraries
-    native_context: ?[]const u8 = null, // e.g., "Terminal.init" or "t_print"
-    native_file: ?[]const u8 = null, // Source file where native call started
-    native_line: u32 = 0, // Line where native call started
-
-    // Pre-captured stack addresses for crash reporting
-    stack_addrs: [32]usize = [_]usize{0} ** 32,
-    stack_count: usize = 0,
-
-    /// Enter native code context - call before risky operations
-    pub fn enterNative(self: *CrashContext, context: []const u8, file: []const u8, line: u32) void {
-        self.native_context = context;
-        self.native_file = file;
-        self.native_line = line;
-        // Capture stack trace at this point - before the crash
-        var trace: std.builtin.StackTrace = .{
-            .index = 0,
-            .instruction_addresses = &self.stack_addrs,
-        };
-        std.debug.captureStackTrace(@returnAddress(), &trace);
-        self.stack_count = trace.index;
-    }
-
-    /// Exit native code context - call after risky operation completes safely
-    pub fn exitNative(self: *CrashContext) void {
-        self.native_context = null;
-        self.native_file = null;
-        self.native_line = 0;
-        self.stack_count = 0;
-    }
-};
 
 /// Global crash context accessible from signal handlers
 pub var crash_context: CrashContext = .{};
@@ -225,58 +77,6 @@ pub fn exitNativeContext() void {
 }
 
 // Value and Record are now imported from value.zig (NaN-boxed implementation)
-
-/// Call frame
-pub const CallFrame = struct {
-    module: *const Module,
-    routine_index: u16,
-    return_ip: usize,
-    base_pointer: usize,
-    stack_pointer: usize, // Caller's sp before pushing args
-    caller_module_index: ?u16, // Caller's module index (to restore on return)
-};
-
-/// Simple bounded call stack (replacement for removed BoundedArray)
-pub const CallStack = struct {
-    buffer: [MAX_CALL_DEPTH]CallFrame = undefined,
-    len: usize = 0,
-
-    pub fn append(self: *CallStack, item: CallFrame) !void {
-        if (self.len >= MAX_CALL_DEPTH) return error.CallStackOverflow;
-        self.buffer[self.len] = item;
-        self.len += 1;
-    }
-
-    pub fn pop(self: *CallStack) ?CallFrame {
-        if (self.len == 0) return null;
-        self.len -= 1;
-        return self.buffer[self.len];
-    }
-
-    pub fn slice(self: *CallStack) []CallFrame {
-        return self.buffer[0..self.len];
-    }
-
-    /// Get the top call frame without popping (peek at current frame)
-    pub fn top(self: *CallStack) ?CallFrame {
-        if (self.len == 0) return null;
-        return self.buffer[self.len - 1];
-    }
-};
-
-/// Reason why the VM stopped execution
-pub const StopReason = enum {
-    /// Program completed normally
-    completed,
-    /// Hit a breakpoint
-    breakpoint,
-    /// Stopped after a step operation
-    step,
-    /// Execution paused by user
-    paused,
-    /// An error occurred
-    err,
-};
 
 /// Virtual Machine
 pub const VM = struct {
@@ -1033,6 +833,7 @@ pub const VM = struct {
         const rs2: u4 = @truncate(byte2 >> 4);
         const divisor = self.registers[rs2].toInt();
         if (divisor == 0) {
+            @branchHint(.cold); // Division by zero is exceptional
             return self.fail(VMError.DivisionByZero, "Division by zero");
         }
         self.registers[rd] = Value.initInt(@divTrunc(self.registers[rs1].toInt(), divisor));
@@ -1049,6 +850,7 @@ pub const VM = struct {
         const rs2: u4 = @truncate(byte2 >> 4);
         const divisor = self.registers[rs2].toInt();
         if (divisor == 0) {
+            @branchHint(.cold); // Division by zero is exceptional
             return self.fail(VMError.DivisionByZero, "Modulo by zero");
         }
         self.registers[rd] = Value.initInt(@mod(self.registers[rs1].toInt(), divisor));
@@ -1204,6 +1006,7 @@ pub const VM = struct {
         self.ip += 3;
         const new_ip = @as(i64, @intCast(self.ip)) + offset;
         if (new_ip < 0 or new_ip > module.code.len) {
+            @branchHint(.cold); // Invalid jumps shouldn't happen in correct bytecode
             return self.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
         }
         // JIT Profiling: backward jump indicates loop iteration
@@ -2001,6 +1804,7 @@ pub const VM = struct {
     // Stack operations - with rich error context
     fn push(self: *Self, value: Value) VMError!void {
         if (self.sp >= STACK_SIZE) {
+            @branchHint(.cold); // Error path is rare
             return self.fail(VMError.StackOverflow, "Stack overflow: maximum stack depth exceeded");
         }
         self.stack[self.sp] = value;
@@ -2009,6 +1813,7 @@ pub const VM = struct {
 
     fn pop(self: *Self) VMError!Value {
         if (self.sp == 0) {
+            @branchHint(.cold); // Error path is rare
             return self.fail(VMError.StackUnderflow, "Stack underflow: attempted to pop from empty stack");
         }
         self.sp -= 1;
@@ -2825,7 +2630,11 @@ pub const VM = struct {
     }
 };
 
-test "vm basic operations" {
+// ============================================
+// Inline Tests (Ghostty pattern)
+// ============================================
+
+test "vm: stack push/pop" {
     const allocator = std.testing.allocator;
     var vm = VM.init(allocator);
     defer vm.deinit();
@@ -2839,4 +2648,75 @@ test "vm basic operations" {
 
     try std.testing.expectEqual(@as(i64, 42), a.toInt());
     try std.testing.expectEqual(@as(i64, 10), b.toInt());
+}
+
+test "vm: stack underflow error" {
+    const allocator = std.testing.allocator;
+    var vm = VM.init(allocator);
+    defer vm.deinit();
+
+    // Empty stack should error on pop
+    const result = vm.pop();
+    try std.testing.expectError(VMError.StackUnderflow, result);
+}
+
+test "vm: register operations" {
+    const allocator = std.testing.allocator;
+    var vm = VM.init(allocator);
+    defer vm.deinit();
+
+    // Test register read/write
+    vm.registers[0] = Value.initInt(100);
+    vm.registers[1] = Value.initInt(200);
+
+    try std.testing.expectEqual(@as(i64, 100), vm.registers[0].toInt());
+    try std.testing.expectEqual(@as(i64, 200), vm.registers[1].toInt());
+}
+
+test "vm: call stack operations" {
+    const allocator = std.testing.allocator;
+    var vm = VM.init(allocator);
+    defer vm.deinit();
+
+    // Initial call stack should be empty
+    try std.testing.expectEqual(@as(usize, 0), vm.call_stack.len);
+
+    // Top of empty stack should be null
+    try std.testing.expect(vm.call_stack.top() == null);
+}
+
+test "vm: value types" {
+    // Test integer values
+    const int_val = Value.initInt(42);
+    try std.testing.expectEqual(@as(i64, 42), int_val.toInt());
+
+    // Test boolean values
+    const true_val = Value.initBool(true);
+    const false_val = Value.initBool(false);
+    try std.testing.expect(true_val.toBool());
+    try std.testing.expect(!false_val.toBool());
+}
+
+test "vm: inline cache" {
+    var cache = InlineCache{};
+
+    // Initially invalid
+    try std.testing.expect(!cache.isValidFor(1));
+
+    // Update cache
+    cache.update(1, 8, 4);
+    try std.testing.expect(cache.isValidFor(1));
+    try std.testing.expect(!cache.isValidFor(2));
+
+    // Record hits/misses
+    cache.recordHit();
+    cache.recordHit();
+    cache.recordMiss();
+
+    try std.testing.expectEqual(@as(u32, 2), cache.hit_count);
+    try std.testing.expectEqual(@as(u32, 1), cache.miss_count);
+
+    // Check hit ratio (2/3 ≈ 0.666)
+    const ratio = cache.hitRatio();
+    try std.testing.expect(ratio > 0.6 and ratio < 0.7);
 }

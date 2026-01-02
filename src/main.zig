@@ -14,8 +14,77 @@
 //!   cot --version               Show version
 //!
 //! For DBL syntax files (.dbl), use the cot-dbl frontend instead.
+//!
+//! Logging (Ghostty pattern):
+//!   Set COT_LOG environment variable to control log output.
+//!   Examples:
+//!     COT_LOG=debug         Show all debug messages
+//!     COT_LOG=info          Show info and above (default)
+//!     COT_LOG=warn          Show warnings and errors only
+//!
+//!   Scoped logs available: ir-lower, vm-exec, bytecode-emit, parser
 
 const std = @import("std");
+
+// Configure std.log for scoped logging (Ghostty pattern)
+// Control via COT_LOG environment variable at runtime
+pub const std_options: std.Options = .{
+    // Allow all log levels at compile time, filter at runtime
+    .log_level = .debug,
+
+    // Custom log function that respects scopes and COT_LOG env var
+    .logFn = cotLogFn,
+};
+
+/// Cached log level from environment (initialized on first log call)
+var cached_log_level: ?std.log.Level = null;
+
+fn getRuntimeLogLevel() std.log.Level {
+    if (cached_log_level) |level| return level;
+
+    const env_val = std.posix.getenv("COT_LOG") orelse {
+        cached_log_level = .info;
+        return .info;
+    };
+
+    const level: std.log.Level = if (std.mem.eql(u8, env_val, "debug"))
+        .debug
+    else if (std.mem.eql(u8, env_val, "info"))
+        .info
+    else if (std.mem.eql(u8, env_val, "warn"))
+        .warn
+    else if (std.mem.eql(u8, env_val, "err"))
+        .err
+    else
+        .info;
+
+    cached_log_level = level;
+    return level;
+}
+
+fn cotLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // Runtime log level filtering
+    const runtime_level = getRuntimeLogLevel();
+    if (@intFromEnum(level) > @intFromEnum(runtime_level)) return;
+
+    // Format: [scope] message
+    const scope_name = @tagName(scope);
+    const prefix = comptime if (scope == .default) "" else "[" ++ scope_name ++ "] ";
+
+    const level_txt = comptime switch (level) {
+        .err => "\x1b[31merror\x1b[0m: ",
+        .warn => "\x1b[33mwarn\x1b[0m: ",
+        .info => "",
+        .debug => "\x1b[36mdebug\x1b[0m: ",
+    };
+
+    std.debug.print(level_txt ++ prefix ++ format ++ "\n", args);
+}
 const cot = @import("cot");
 const build_options = @import("build_options");
 const frontends = @import("frontends.zig");

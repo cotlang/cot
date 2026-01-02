@@ -1,86 +1,18 @@
 const std = @import("std");
+const build_config = @import("src/build/config.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Initialize configuration from command-line options
+    const config = build_config.Config.init(b);
 
-    // Build options
-    const enable_tui = b.option(bool, "tui", "Enable TUI support (default: true)") orelse true;
-    const enable_jit = b.option(bool, "jit", "Enable Cranelift JIT compilation (default: false)") orelse false;
+    // Initialize shared dependencies
+    const deps = build_config.SharedDeps.init(b, &config);
 
-    // Build options module for compile-time checks
-    const options = b.addOptions();
-    options.addOption(bool, "enable_tui", enable_tui);
-    options.addOption(bool, "enable_jit", enable_jit);
-    const build_options_mod = options.createModule();
+    // Create main cot module
+    const cot_mod = deps.createCotModule(b, &config);
 
-    // JIT: When enabled, link the Cranelift Rust bridge library
-    // The library must be built separately: cd src/jit/cranelift-bridge && cargo build --release
-    const jit_lib_path = if (enable_jit) b.path("src/jit/cranelift-bridge/target/release") else null;
-
-    // ========================================================================
-    // External dependency: tui.zig (terminal library)
-    // ========================================================================
-    const tui_dep = b.dependency("tui", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // ========================================================================
-    // Internal modules (all in this repo now)
-    // ========================================================================
-
-    // CotDB module (src/cotdb/)
-    const cotdb_mod = b.addModule("cotdb", .{
-        .root_source_file = b.path("src/cotdb/cotdb.zig"),
-        .target = target,
-    });
-    cotdb_mod.linkSystemLibrary("sqlite3", .{});
-    cotdb_mod.linkSystemLibrary("c", .{});
-
-    // Cot Runtime module (src/runtime/)
-    const cot_runtime_mod = b.addModule("cot_runtime", .{
-        .root_source_file = b.path("src/runtime/cot_runtime.zig"),
-        .target = target,
-        .imports = &.{
-            .{ .name = "tui", .module = tui_dep.module("tui") },
-            .{ .name = "cotdb", .module = cotdb_mod },
-            .{ .name = "build_options", .module = build_options_mod },
-        },
-    });
-    cot_runtime_mod.linkSystemLibrary("sqlite3", .{});
-    cot_runtime_mod.linkSystemLibrary("c", .{});
-
-    // TUI Extension module (src/tui_ext/) - only when TUI enabled
-    var cot_tui_mod: ?*std.Build.Module = null;
-    if (enable_tui) {
-        cot_tui_mod = b.addModule("cot_tui", .{
-            .root_source_file = b.path("src/tui_ext/cot_tui.zig"),
-            .target = target,
-            .imports = &.{
-                .{ .name = "tui", .module = tui_dep.module("tui") },
-                .{ .name = "cot_runtime", .module = cot_runtime_mod },
-                .{ .name = "build_options", .module = build_options_mod },
-            },
-        });
-    }
-
-    // Main cot module (compiler + framework)
-    const cot_mod = b.addModule("cot", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .imports = &.{
-            .{ .name = "tui", .module = tui_dep.module("tui") },
-            .{ .name = "cotdb", .module = cotdb_mod },
-            .{ .name = "cot_runtime", .module = cot_runtime_mod },
-            .{ .name = "build_options", .module = build_options_mod },
-        },
-    });
-    if (cot_tui_mod) |tm| {
-        cot_mod.addImport("cot_tui", tm);
-    }
-    cot_mod.linkSystemLibrary("sqlite3", .{});
-    cot_mod.linkSystemLibrary("c", .{});
+    // JIT library path (if enabled)
+    const jit_lib_path = config.getJitLibPath(b);
 
     // ========================================================================
     // Main executable: cot
@@ -89,18 +21,18 @@ pub fn build(b: *std.Build) void {
         .name = "cot",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
+            .target = config.target,
+            .optimize = config.optimize,
             .imports = &.{
                 .{ .name = "cot", .module = cot_mod },
-                .{ .name = "tui", .module = tui_dep.module("tui") },
-                .{ .name = "cotdb", .module = cotdb_mod },
-                .{ .name = "cot_runtime", .module = cot_runtime_mod },
-                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "tui", .module = deps.tui },
+                .{ .name = "cotdb", .module = deps.cotdb },
+                .{ .name = "cot_runtime", .module = deps.cot_runtime },
+                .{ .name = "build_options", .module = deps.build_options },
             },
         }),
     });
-    if (cot_tui_mod) |tm| {
+    if (deps.cot_tui) |tm| {
         exe.root_module.addImport("cot_tui", tm);
     }
     exe.linkSystemLibrary("sqlite3");
@@ -115,7 +47,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // macOS: Generate dSYM for better crash stack traces
-    if (target.result.os.tag == .macos) {
+    if (config.target.result.os.tag == .macos) {
         const dsymutil = b.addSystemCommand(&.{"dsymutil"});
         dsymutil.addArtifactArg(exe);
         dsymutil.addArg("-o");
@@ -128,7 +60,7 @@ pub fn build(b: *std.Build) void {
     // ========================================================================
     const dbl_mod = b.addModule("dbl", .{
         .root_source_file = b.path("src/dbl/root.zig"),
-        .target = target,
+        .target = config.target,
         .imports = &.{
             .{ .name = "cot", .module = cot_mod },
         },
@@ -141,17 +73,17 @@ pub fn build(b: *std.Build) void {
         .name = "cot-dbl",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/dbl/main.zig"),
-            .target = target,
-            .optimize = optimize,
+            .target = config.target,
+            .optimize = config.optimize,
             .imports = &.{
                 .{ .name = "cot", .module = cot_mod },
                 .{ .name = "dbl", .module = dbl_mod },
-                .{ .name = "cot_runtime", .module = cot_runtime_mod },
-                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "cot_runtime", .module = deps.cot_runtime },
+                .{ .name = "build_options", .module = deps.build_options },
             },
         }),
     });
-    if (cot_tui_mod) |tm| {
+    if (deps.cot_tui) |tm| {
         dbl_exe.root_module.addImport("cot_tui", tm);
     }
     dbl_exe.linkSystemLibrary("sqlite3");
@@ -172,13 +104,13 @@ pub fn build(b: *std.Build) void {
         .name = "cot-lsp",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/lsp/main.zig"),
-            .target = target,
-            .optimize = optimize,
+            .target = config.target,
+            .optimize = config.optimize,
             .imports = &.{
                 .{ .name = "cot", .module = cot_mod },
                 .{ .name = "dbl", .module = dbl_mod },
-                .{ .name = "cot_runtime", .module = cot_runtime_mod },
-                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "cot_runtime", .module = deps.cot_runtime },
+                .{ .name = "build_options", .module = deps.build_options },
             },
         }),
     });
