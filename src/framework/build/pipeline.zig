@@ -662,6 +662,9 @@ pub const Pipeline = struct {
             return result;
         }
 
+        // Run optimization passes
+        _ = cot.ir_optimize.optimize(ir_module, .{});
+
         // Emit bytecode
         var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(self.allocator);
         defer emitter.deinit();

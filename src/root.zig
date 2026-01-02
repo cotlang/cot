@@ -54,6 +54,7 @@ pub const comptime_builtins = @import("comptime/builtins.zig");
 // Intermediate Representation
 pub const ir = @import("ir/ir.zig");
 pub const ir_lower = @import("ir/lower.zig");
+pub const ir_optimize = @import("ir/optimize.zig");
 pub const ir_printer = @import("ir/printer.zig");
 pub const ir_emit_bytecode = @import("ir/emit_bytecode.zig");
 

@@ -522,6 +522,9 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
         return;
     }
 
+    // Run optimization passes
+    _ = cot.ir_optimize.optimize(ir_module, .{});
+
     // Emit bytecode from IR
     var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
     defer emitter.deinit();
@@ -721,6 +724,9 @@ fn disasmFile(allocator: std.mem.Allocator, filename: []const u8) !void {
             return;
         };
         defer ir_module.deinit();
+
+        // Run optimization passes
+        _ = cot.ir_optimize.optimize(ir_module, .{});
 
         // Emit bytecode
         var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
