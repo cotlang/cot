@@ -122,6 +122,30 @@ pub fn build(b: *std.Build) void {
     });
 
     // ========================================================================
+    // DBL executable: cot-dbl
+    // ========================================================================
+    const dbl_exe = b.addExecutable(.{
+        .name = "cot-dbl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dbl/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "cot", .module = cot_mod },
+                .{ .name = "dbl", .module = dbl_mod },
+                .{ .name = "cot_runtime", .module = cot_runtime_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            },
+        }),
+    });
+    if (cot_tui_mod) |tm| {
+        dbl_exe.root_module.addImport("cot_tui", tm);
+    }
+    dbl_exe.linkSystemLibrary("sqlite3");
+    dbl_exe.linkSystemLibrary("c");
+    b.installArtifact(dbl_exe);
+
+    // ========================================================================
     // LSP executable: cot-lsp
     // ========================================================================
     const lsp_exe = b.addExecutable(.{
@@ -141,6 +165,10 @@ pub fn build(b: *std.Build) void {
     lsp_exe.linkSystemLibrary("sqlite3");
     lsp_exe.linkSystemLibrary("c");
     b.installArtifact(lsp_exe);
+
+    // LSP-only build step
+    const lsp_step = b.step("lsp", "Build only the LSP server");
+    lsp_step.dependOn(&b.addInstallArtifact(lsp_exe, .{}).step);
 
     // ========================================================================
     // Run step

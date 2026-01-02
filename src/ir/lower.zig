@@ -164,9 +164,6 @@ pub const Lowerer = struct {
     /// Allocated Type pointers that need to be freed on deinit
     allocated_types: std.ArrayList(*ir.Type),
 
-    /// Allocated Value slices that need to be freed on deinit
-    allocated_value_slices: std.ArrayList([]const ir.Value),
-
     /// Current loop's exit block (for break statements)
     loop_exit_block: ?*ir.Block,
 
@@ -280,7 +277,6 @@ pub const Lowerer = struct {
             .type_param_substitutions = std.StringHashMap(ir.Type).init(allocator),
             .instantiated_structs = std.StringHashMap(*const ir.StructType).init(allocator),
             .allocated_types = .{},
-            .allocated_value_slices = .{},
             .loop_exit_block = null,
             .loop_continue_block = null,
             .warnings = .{},
@@ -347,11 +343,8 @@ pub const Lowerer = struct {
         self.trait_defs.deinit();
         self.impl_methods.deinit();
 
-        // NOTE: Do NOT free allocated_types and allocated_value_slices here!
-        // These are now owned by the IR module and will be freed when the module is freed.
-        // Just clean up the tracking arrays themselves.
-        self.allocated_types.deinit(self.allocator);
-        self.allocated_value_slices.deinit(self.allocator);
+        // NOTE: allocated_types ownership was transferred to the Module in lowerProgram.
+        // No cleanup needed here.
 
         for (self.warnings.items) |w| {
             self.allocator.free(w.message);
@@ -412,6 +405,16 @@ pub const Lowerer = struct {
                 try self.lowerFnDef(stmt_idx);
             }
         }
+
+        // Transfer ownership of allocated types to the module
+        // The module will free them in its deinit
+        // Convert managed ArrayList to unmanaged by taking the internal slice
+        self.module.allocated_types = .{
+            .items = self.allocated_types.items,
+            .capacity = self.allocated_types.capacity,
+        };
+        // Clear the Lowerer's list to prevent double-free
+        self.allocated_types = .{};
 
         return self.module;
     }
@@ -795,16 +798,15 @@ pub const Lowerer = struct {
 
         const return_type = try self.lowerTypeIdx(return_type_idx);
 
-        // Create function type
-        const func_type = try self.allocator.create(ir.FunctionType);
-        func_type.* = .{
+        // Create function type (stack variable - copied into Function.signature)
+        const func_type = ir.FunctionType{
             .params = try params.toOwnedSlice(self.allocator),
             .return_type = return_type,
             .is_variadic = false,
         };
 
         // Create function
-        const func = try ir.Function.init(self.allocator, name, func_type.*);
+        const func = try ir.Function.init(self.allocator, name, func_type);
 
         self.current_func = func;
 
@@ -2077,7 +2079,7 @@ pub const Lowerer = struct {
         }
 
         const args_slice = try args.toOwnedSlice(self.allocator);
-        try self.allocated_value_slices.append(self.allocator, args_slice);
+        // NOTE: args_slice is freed by Block.deinit when the call instruction is cleaned up
 
         // Determine result type based on builtin function
         const result_type = getBuiltinReturnType(callee_name, args_slice);
@@ -2123,7 +2125,7 @@ pub const Lowerer = struct {
         }
 
         const args_slice = try args.toOwnedSlice(self.allocator);
-        try self.allocated_value_slices.append(self.allocator, args_slice);
+        // NOTE: args_slice is freed by Block.deinit when the call instruction is cleaned up
 
         const result_type = getBuiltinReturnType(method_name, args_slice);
         const result = func.newValue(result_type);

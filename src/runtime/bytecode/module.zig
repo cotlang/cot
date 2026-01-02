@@ -366,7 +366,14 @@ pub const Module = struct {
             }
             self.allocator.free(self.types);
         }
-        if (self.routines.len > 0) self.allocator.free(self.routines);
+        if (self.routines.len > 0) {
+            // Free locals and params slices inside each routine
+            for (self.routines) |routine| {
+                if (routine.locals.len > 0) self.allocator.free(routine.locals);
+                if (routine.params.len > 0) self.allocator.free(routine.params);
+            }
+            self.allocator.free(self.routines);
+        }
         if (self.code.len > 0) self.allocator.free(self.code);
         if (self.exports.len > 0) self.allocator.free(self.exports);
         if (self.imports.len > 0) self.allocator.free(self.imports);

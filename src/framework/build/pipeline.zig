@@ -3,13 +3,13 @@
 //! Orchestrates building of workspace projects.
 //!
 //! Build modes:
-//! - Development: Individual .cotc files in .cot-cache/ for fast incremental builds
+//! - Development: Individual .cotc files in .cot-out/.cache/ for fast incremental builds
 //! - Release: Bundled executables (no extension) or library packages (.cotpkg)
 //!
-//! Output conventions:
-//! - Apps (release): bin/<name> (no extension, like Go/Rust)
-//! - Libraries (release): bin/<name>.cotpkg (package file)
-//! - Development cache: .cot-cache/<name>.cotc (compiled modules)
+//! Output conventions (all under workspace root .cot-out/):
+//! - Apps (release): .cot-out/apps/<name>/<name> (no extension, like Go/Rust)
+//! - Libraries (release): .cot-out/packages/<name>/<name>.cotpkg (package file)
+//! - Development cache: .cot-out/.cache/<name>/<name>.cotc (compiled modules)
 
 const std = @import("std");
 const config = @import("../config.zig");
@@ -205,14 +205,17 @@ pub const Pipeline = struct {
             std.debug.print("Cleaning all caches...\n", .{});
         }
 
-        // Clean caches for all apps
-        for (ws.apps.items) |project| {
-            try self.cleanProjectCaches(project.path);
-        }
+        // Delete entire .cot-out directory at workspace root
+        const cot_out_dir = try std.fs.path.join(self.allocator, &.{ ws.root_path, ".cot-out" });
+        defer self.allocator.free(cot_out_dir);
+        std.fs.cwd().deleteTree(cot_out_dir) catch {};
 
-        // Clean caches for all packages
+        // Also clean legacy locations (bin/, .cot-cache/) for migration
+        for (ws.apps.items) |project| {
+            try self.cleanLegacyProjectCaches(project.path);
+        }
         for (ws.packages.items) |project| {
-            try self.cleanProjectCaches(project.path);
+            try self.cleanLegacyProjectCaches(project.path);
         }
 
         if (self.options.verbose) {
@@ -220,14 +223,14 @@ pub const Pipeline = struct {
         }
     }
 
-    /// Clean caches for a single project
-    fn cleanProjectCaches(self: *Self, project_path: []const u8) !void {
-        // Delete .cot-cache directory
+    /// Clean legacy cache locations from a project (for migration from old structure)
+    fn cleanLegacyProjectCaches(self: *Self, project_path: []const u8) !void {
+        // Delete old .cot-cache directory
         const cache_dir = try std.fs.path.join(self.allocator, &.{ project_path, ".cot-cache" });
         defer self.allocator.free(cache_dir);
         std.fs.cwd().deleteTree(cache_dir) catch {};
 
-        // Delete bin directory
+        // Delete old bin directory
         const bin_dir = try std.fs.path.join(self.allocator, &.{ project_path, "bin" });
         defer self.allocator.free(bin_dir);
         std.fs.cwd().deleteTree(bin_dir) catch {};
@@ -298,8 +301,8 @@ pub const Pipeline = struct {
             // Find the project
             const project = ws.findProject(project_name) orelse continue;
 
-            // Build the project
-            const project_result = try self.buildProject(project, &discoverer);
+            // Build the project (pass workspace root for output directory)
+            const project_result = try self.buildProject(project, &discoverer, ws.root_path);
             result.total_projects += 1;
 
             if (project_result.success) {
@@ -315,7 +318,7 @@ pub const Pipeline = struct {
     }
 
     /// Build a single project
-    pub fn buildProject(self: *Self, project: *const workspace.Project, discoverer: *discovery.Discoverer) !ProjectResult {
+    pub fn buildProject(self: *Self, project: *const workspace.Project, discoverer: *discovery.Discoverer, workspace_root: []const u8) !ProjectResult {
         var result = try ProjectResult.init(self.allocator, project.name, project.path);
         errdefer result.deinit(self.allocator);
 
@@ -327,15 +330,18 @@ pub const Pipeline = struct {
         // - Development mode: individual files for fast incremental builds
         const should_bundle = self.options.release or project.config.bundle;
 
-        // Determine output directory:
-        // - Release: bin/ (or configured output_dir)
-        // - Development: .cot-cache/ (hidden cache directory)
+        // Determine project type subdirectory
+        const type_subdir = if (project.config.project_type == .library) "packages" else "apps";
+
+        // Determine output directory (all under workspace root .cot-out/):
+        // - Release: .cot-out/apps/<name>/ or .cot-out/packages/<name>/
+        // - Development: .cot-out/.cache/<name>/
         const output_base = if (self.options.output_dir) |dir|
             try std.fs.path.join(self.allocator, &.{ dir, project.name })
         else if (should_bundle)
-            try std.fs.path.join(self.allocator, &.{ project.path, project.config.output_dir })
+            try std.fs.path.join(self.allocator, &.{ workspace_root, ".cot-out", type_subdir, project.name })
         else
-            try std.fs.path.join(self.allocator, &.{ project.path, ".cot-cache" });
+            try std.fs.path.join(self.allocator, &.{ workspace_root, ".cot-out", ".cache", project.name });
         defer self.allocator.free(output_base);
 
         // Clean if requested

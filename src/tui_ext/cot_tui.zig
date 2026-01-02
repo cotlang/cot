@@ -31,7 +31,7 @@ pub const tui_runtime = cot_runtime.native.tui_runtime;
 /// The TUI extension definition
 pub const extension = Extension{
     .name = "tui",
-    .version = "0.2.0",
+    .version = "0.1.0",
     .natives = &natives,
     .init = extensionInit,
     .deinit = extensionDeinit,

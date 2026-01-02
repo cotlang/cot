@@ -416,6 +416,53 @@ pub const Value = extern struct {
     pub fn typeName(self: Self) []const u8 {
         return self.tag().name();
     }
+
+    /// Free heap-allocated memory for this value
+    /// Call this when a value is being discarded and its memory should be freed
+    pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+        const upper = self.bits & 0xFFFF_C000_0000_0000;
+
+        // Check for boxed integer
+        if (upper == TAG_BOXED_INT) {
+            const boxed = payloadToPtr(*BoxedInt, self.bits);
+            allocator.destroy(boxed);
+            return;
+        }
+
+        // Check for decimal
+        if (upper == TAG_DECIMAL) {
+            const dec = payloadToPtr(*Decimal, self.bits);
+            allocator.destroy(dec);
+            return;
+        }
+
+        // Check for string (immutable)
+        if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_STRING) {
+            const ref = payloadToPtr(*StringRef, self.bits);
+            allocator.destroy(ref);
+            return;
+        }
+
+        // Check for fixed string (mutable)
+        if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR) {
+            const ref = payloadToPtr(*FixedStringRef, self.bits);
+            allocator.destroy(ref);
+            return;
+        }
+
+        // Record refs point to shared data, don't free here
+        // Handles are just numeric IDs, no memory to free
+        // Small ints, bools, null are inline - no memory to free
+    }
+
+    /// Check if this value has heap-allocated memory that needs cleanup
+    pub fn needsCleanup(self: Self) bool {
+        const upper = self.bits & 0xFFFF_C000_0000_0000;
+        if (upper == TAG_BOXED_INT or upper == TAG_DECIMAL) return true;
+        if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_STRING) return true;
+        if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR) return true;
+        return false;
+    }
 };
 
 // ============================================================================

@@ -1,6 +1,6 @@
 .{
     .name = .cot,
-    .version = "0.1.11",
+    .version = "0.1.0",
     .fingerprint = 0xdd6e26d5f00514,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{

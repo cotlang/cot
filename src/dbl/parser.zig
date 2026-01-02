@@ -263,6 +263,9 @@ pub const Parser = struct {
         _ = try self.consume(.kw_endmain, "Expected 'endmain'");
 
         const block_idx = self.store.addBlock(body.items, loc) catch return ParseError.OutOfMemory;
+        body.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+        var_decls.deinit(self.allocator); // Free var_decls ArrayList
+
         const name_id = try self.intern("main");
         const return_type = self.store.addPrimitiveType(.i32) catch return ParseError.OutOfMemory;
 
@@ -333,6 +336,9 @@ pub const Parser = struct {
         _ = try self.consume(.kw_endfunction, "Expected 'endfunction'");
 
         const block_idx = self.store.addBlock(body.items, loc) catch return ParseError.OutOfMemory;
+        body.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+        param_decls.deinit(self.allocator); // Free param_decls ArrayList
+
         const return_type = self.store.addPrimitiveType(.i32) catch return ParseError.OutOfMemory;
 
         return self.store.addFnDef(name_id, &[_]u32{}, return_type, block_idx, loc) catch return ParseError.OutOfMemory;
@@ -404,9 +410,14 @@ pub const Parser = struct {
         _ = try self.consume(.kw_endsubroutine, "Expected 'endsubroutine'");
 
         const block_idx = self.store.addBlock(body.items, loc) catch return ParseError.OutOfMemory;
+        body.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+        local_record_decls.deinit(self.allocator); // Free local_record_decls ArrayList
+
         const return_type = self.store.addPrimitiveType(.void) catch return ParseError.OutOfMemory;
 
-        return self.store.addFnDef(name_id, params.items, return_type, block_idx, loc) catch return ParseError.OutOfMemory;
+        const result = self.store.addFnDef(name_id, params.items, return_type, block_idx, loc) catch return ParseError.OutOfMemory;
+        params.deinit(self.allocator); // Free params ArrayList
+        return result;
     }
 
     // ============================================================
@@ -466,7 +477,9 @@ pub const Parser = struct {
 
             _ = try self.consume(.kw_endwhile, "Expected 'endwhile'");
 
-            break :blk self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+            const result = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+            stmts.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+            break :blk result;
         };
 
         return self.store.addWhileStmt(condition, body, loc) catch return ParseError.OutOfMemory;
@@ -533,7 +546,9 @@ pub const Parser = struct {
 
         _ = try self.consume(.kw_end, "Expected 'end'");
 
-        return self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        const result = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        stmts.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+        return result;
     }
 
     fn parseBreak(self: *Self) ParseError!StmtIdx {
@@ -771,7 +786,9 @@ pub const Parser = struct {
         _ = try self.consume(.kw_endrecord, "Expected 'endrecord'");
 
         // Return as a block containing all the variable declarations
-        return self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        const result = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        stmts.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+        return result;
     }
 
     /// Result of parsing a DBL type specifier
@@ -938,6 +955,7 @@ pub const Parser = struct {
                 }
 
                 const case_body = self.store.addBlock(case_stmts.items, loc) catch return ParseError.OutOfMemory;
+                case_stmts.deinit(self.allocator); // Free ArrayList backing memory after data is copied
                 cases.append(self.allocator, .{
                     .value = case_value,
                     .body = case_body,
@@ -1060,6 +1078,7 @@ pub const Parser = struct {
         }
 
         const call_expr = self.store.addCall(callee, args.items, loc) catch return ParseError.OutOfMemory;
+        args.deinit(self.allocator); // Free ArrayList backing memory after data is copied
         return self.store.addExprStmt(call_expr, loc) catch return ParseError.OutOfMemory;
     }
 
@@ -1163,6 +1182,7 @@ pub const Parser = struct {
         const func_name = self.intern("console.log") catch return ParseError.OutOfMemory;
         const func_expr = self.store.addIdentifier(func_name, loc) catch return ParseError.OutOfMemory;
         const call_expr = self.store.addCall(func_expr, args.items, loc) catch return ParseError.OutOfMemory;
+        args.deinit(self.allocator); // Free ArrayList backing memory after data is copied
         return self.store.addExprStmt(call_expr, loc) catch return ParseError.OutOfMemory;
     }
 
@@ -1475,6 +1495,7 @@ pub const Parser = struct {
                         }
                         _ = try self.consume(.rparen, "Expected ')'");
                         expr = self.store.addCall(expr, args.items, loc) catch return ParseError.OutOfMemory;
+                        args.deinit(self.allocator); // Free ArrayList backing memory after data is copied
                     } else if (self.check(.lbracket)) {
                         _ = self.advance();
                         const index = try self.parseExpression();
@@ -1515,6 +1536,7 @@ pub const Parser = struct {
                         }
                         _ = try self.consume(.rparen, "Expected ')'");
                         func_expr = self.store.addCall(func_expr, args.items, loc) catch return ParseError.OutOfMemory;
+                        args.deinit(self.allocator); // Free ArrayList backing memory after data is copied
                     }
                     return func_expr;
                 }
@@ -1550,6 +1572,26 @@ pub const Parser = struct {
         if (self.current < self.tokens.len) {
             const tok = self.tokens[self.current];
             self.current += 1;
+
+            // Check for invalid tokens (like unterminated strings)
+            if (tok.type == .invalid) {
+                // Report error at the invalid token's location
+                if (self.errors.items.len < MAX_ERRORS) {
+                    // Check if it looks like an unterminated string
+                    if (tok.lexeme.len > 0 and (tok.lexeme[0] == '"' or tok.lexeme[0] == '\'')) {
+                        self.errors.append(self.allocator, .{
+                            .message = "Unterminated string literal",
+                            .token = tok,
+                        }) catch {};
+                    } else {
+                        self.errors.append(self.allocator, .{
+                            .message = "Invalid token",
+                            .token = tok,
+                        }) catch {};
+                    }
+                }
+            }
+
             return tok;
         }
         return Token{ .type = .eof, .lexeme = "", .line = 0, .column = 0 };

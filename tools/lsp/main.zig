@@ -373,7 +373,83 @@ fn getKeywordDoc(word: []const u8, language: server_mod.Language) ?[]const u8 {
     return null;
 }
 
-/// Build semantic tokens for Cot syntax
+/// Semantic token for sorting
+const SemanticToken = struct {
+    line: usize,
+    column: usize,
+    length: usize,
+    token_type: usize,
+};
+
+/// Find comments in source code and add them as semantic tokens
+fn findComments(allocator: Allocator, source: []const u8, tokens_list: *std.ArrayListUnmanaged(SemanticToken), comment_prefix: []const u8) void {
+    const STI = protocol.SemanticTokenIndex;
+    var line: usize = 0;
+    var line_start: usize = 0;
+    var i: usize = 0;
+
+    while (i < source.len) {
+        if (source[i] == '\n') {
+            line += 1;
+            line_start = i + 1;
+            i += 1;
+            continue;
+        }
+
+        // Check for line comment (// or ;)
+        if (i + comment_prefix.len <= source.len and std.mem.eql(u8, source[i .. i + comment_prefix.len], comment_prefix)) {
+            const comment_start = i;
+            const column = i - line_start;
+
+            // Find end of line
+            while (i < source.len and source[i] != '\n') : (i += 1) {}
+
+            const comment_len = i - comment_start;
+            tokens_list.append(allocator, .{
+                .line = line,
+                .column = column,
+                .length = comment_len,
+                .token_type = STI.Comment,
+            }) catch {};
+            continue;
+        }
+
+        // Check for block comment /* */
+        if (i + 2 <= source.len and source[i] == '/' and source[i + 1] == '*') {
+            const comment_start_line = line;
+            const comment_start_col = i - line_start;
+            var comment_len: usize = 2;
+            i += 2;
+
+            // Find end of block comment
+            while (i + 1 < source.len) {
+                if (source[i] == '\n') {
+                    line += 1;
+                    line_start = i + 1;
+                } else if (source[i] == '*' and source[i + 1] == '/') {
+                    comment_len = i + 2 - (comment_start_col + (line_start - comment_start_col));
+                    i += 2;
+                    break;
+                }
+                i += 1;
+                comment_len += 1;
+            }
+
+            // For multiline comments, just emit the first line for now
+            tokens_list.append(allocator, .{
+                .line = comment_start_line,
+                .column = comment_start_col,
+                .length = comment_len,
+                .token_type = STI.Comment,
+            }) catch {};
+            continue;
+        }
+
+        i += 1;
+    }
+}
+
+/// Build semantic tokens for Cot syntax (modern syntax with // comments)
 fn buildCotSemanticTokens(allocator: Allocator, source: []const u8, data: *JsonArray) !void {
     const cot = @import("cot");
 
@@ -381,52 +457,147 @@ fn buildCotSemanticTokens(allocator: Allocator, source: []const u8, data: *JsonA
     const tokens = lexer.tokenize(allocator) catch return;
     defer allocator.free(tokens);
 
-    var prev_line: usize = 0;
-    var prev_char: usize = 0;
+    // Collect all semantic tokens (including comments)
+    var tokens_list = std.ArrayListUnmanaged(SemanticToken).empty;
+    defer tokens_list.deinit(allocator);
 
-    for (tokens) |token| {
-        // Simple token type mapping based on lexeme patterns
-        const token_type: ?usize = blk: {
-            const TokenType = cot.token.TokenType;
-            break :blk switch (token.type) {
-                // Identifiers -> 7
-                TokenType.identifier => 7,
-                // Strings -> 14
-                TokenType.string_literal => 14,
-                // Numbers -> 15
-                TokenType.integer_literal, TokenType.decimal_literal => 15,
-                // Operators -> 16
-                TokenType.plus, TokenType.minus, TokenType.star, TokenType.slash, TokenType.equals => 16,
-                else => blk2: {
-                    // Check if it's a keyword (starts with kw_)
-                    const name = @tagName(token.type);
-                    if (name.len > 3 and name[0] == 'k' and name[1] == 'w' and name[2] == '_') {
-                        break :blk2 @as(?usize, 11); // keyword
-                    }
-                    break :blk2 null;
-                },
-            };
-        };
+    // First pass: find comments (lexer skips them)
+    findComments(allocator, source, &tokens_list, "//");
+
+    // Second pass: process lexer tokens with context awareness
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        const prev_token: ?cot.token.Token = if (i > 0) tokens[i - 1] else null;
+        const next_token: ?cot.token.Token = if (i + 1 < tokens.len) tokens[i + 1] else null;
+
+        const token_type: ?usize = getCotSemanticTokenType(token, prev_token, next_token);
 
         if (token_type) |tt| {
             const line = if (token.line > 0) token.line - 1 else 0;
             const char = if (token.column > 0) token.column - 1 else 0;
-            const delta_line = line -| prev_line;
-            const delta_char = if (delta_line == 0) char -| prev_char else char;
 
-            try data.append(JsonValue{ .integer = @intCast(delta_line) });
-            try data.append(JsonValue{ .integer = @intCast(delta_char) });
-            try data.append(JsonValue{ .integer = @intCast(token.lexeme.len) });
-            try data.append(JsonValue{ .integer = @intCast(tt) });
-            try data.append(JsonValue{ .integer = 0 }); // No modifiers
-
-            prev_line = line;
-            prev_char = char;
+            try tokens_list.append(allocator, .{
+                .line = line,
+                .column = char,
+                .length = token.lexeme.len,
+                .token_type = tt,
+            });
         }
+    }
+
+    // Sort tokens by position
+    std.mem.sort(SemanticToken, tokens_list.items, {}, struct {
+        fn lessThan(_: void, a: SemanticToken, b: SemanticToken) bool {
+            if (a.line != b.line) return a.line < b.line;
+            return a.column < b.column;
+        }
+    }.lessThan);
+
+    // Emit delta-encoded tokens
+    var prev_line: usize = 0;
+    var prev_char: usize = 0;
+
+    for (tokens_list.items) |st| {
+        const delta_line = st.line -| prev_line;
+        const delta_char = if (delta_line == 0) st.column -| prev_char else st.column;
+
+        try data.append(JsonValue{ .integer = @intCast(delta_line) });
+        try data.append(JsonValue{ .integer = @intCast(delta_char) });
+        try data.append(JsonValue{ .integer = @intCast(st.length) });
+        try data.append(JsonValue{ .integer = @intCast(st.token_type) });
+        try data.append(JsonValue{ .integer = 0 }); // No modifiers
+
+        prev_line = st.line;
+        prev_char = st.column;
     }
 }
 
-/// Build semantic tokens for DBL syntax
+/// Get semantic token type for Cot token with context awareness
+fn getCotSemanticTokenType(token: anytype, prev_token: anytype, next_token: anytype) ?usize {
+    const cot = @import("cot");
+    const TokenType = cot.token.TokenType;
+    const STI = protocol.SemanticTokenIndex;
+
+    // Handle identifiers with context
+    if (token.type == TokenType.identifier) {
+        // Check context from previous token
+        if (prev_token) |prev| {
+            // After dot = property access
+            if (prev.type == TokenType.period) {
+                return STI.Property;
+            }
+        }
+
+        // Check context from next token
+        if (next_token) |next| {
+            // Before lparen = function call
+            if (next.type == TokenType.lparen) {
+                return STI.Function;
+            }
+        }
+
+        // Default: regular variable
+        return STI.Variable;
+    }
+
+    // Strings
+    if (token.type == TokenType.string_literal) return STI.String;
+
+    // Numbers
+    if (token.type == TokenType.integer_literal or token.type == TokenType.decimal_literal) return STI.Number;
+
+    // Operators
+    switch (token.type) {
+        TokenType.plus, TokenType.minus, TokenType.star, TokenType.slash, TokenType.equals,
+        TokenType.eq, TokenType.ne, TokenType.lt, TokenType.le, TokenType.gt, TokenType.ge,
+        TokenType.amp_amp, TokenType.pipe_pipe, TokenType.bang,
+        => return STI.Operator,
+        else => {},
+    }
+
+    // Keyword categorization
+    const name = @tagName(token.type);
+    if (name.len > 3 and name[0] == 'k' and name[1] == 'w' and name[2] == '_') {
+        // Function/procedure keywords
+        if (token.type == TokenType.kw_fn or token.type == TokenType.kw_pub) {
+            return STI.Function;
+        }
+
+        // Type declaration keywords
+        if (token.type == TokenType.kw_struct or token.type == TokenType.kw_enum or
+            token.type == TokenType.kw_trait or token.type == TokenType.kw_impl)
+        {
+            return STI.Class;
+        }
+
+        // Namespace/module keywords
+        if (token.type == TokenType.kw_import or token.type == TokenType.kw_type) {
+            return STI.Namespace;
+        }
+
+        // Error handling keywords
+        if (token.type == TokenType.kw_try or token.type == TokenType.kw_catch or
+            token.type == TokenType.kw_throw)
+        {
+            return STI.Exception;
+        }
+
+        // Access modifiers
+        if (token.type == TokenType.kw_pub or token.type == TokenType.kw_mut or
+            token.type == TokenType.kw_const or token.type == TokenType.kw_comptime)
+        {
+            return STI.Modifier;
+        }
+
+        // Default: control flow keyword
+        return STI.Keyword;
+    }
+
+    return null;
+}
+
+/// Build semantic tokens for DBL syntax (legacy syntax with ; comments)
 fn buildDblSemanticTokens(allocator: Allocator, source: []const u8, data: *JsonArray) !void {
     const dbl = @import("dbl");
 
@@ -434,49 +605,220 @@ fn buildDblSemanticTokens(allocator: Allocator, source: []const u8, data: *JsonA
     const tokens = lexer.tokenize(allocator) catch return;
     defer allocator.free(tokens);
 
-    var prev_line: usize = 0;
-    var prev_char: usize = 0;
+    // Collect all semantic tokens (including comments)
+    var tokens_list = std.ArrayListUnmanaged(SemanticToken).empty;
+    defer tokens_list.deinit(allocator);
 
-    for (tokens) |token| {
-        // Simple token type mapping based on lexeme patterns
-        const token_type: ?usize = blk: {
-            const TokenType = dbl.TokenType;
-            break :blk switch (token.type) {
-                // Identifiers -> 7
-                TokenType.identifier => 7,
-                // Strings -> 14
-                TokenType.string_literal => 14,
-                // Numbers -> 15
-                TokenType.integer_literal, TokenType.decimal_literal => 15,
-                // Operators -> 16
-                TokenType.plus, TokenType.minus, TokenType.star, TokenType.slash, TokenType.equals => 16,
-                else => blk2: {
-                    // Check if it's a keyword (starts with kw_)
-                    const name = @tagName(token.type);
-                    if (name.len > 3 and name[0] == 'k' and name[1] == 'w' and name[2] == '_') {
-                        break :blk2 @as(?usize, 11); // keyword
-                    }
-                    break :blk2 null;
-                },
-            };
-        };
+    // First pass: find comments (lexer skips them)
+    // DBL uses ; for line comments, but also supports // and /* */
+    findComments(allocator, source, &tokens_list, ";");
+    findComments(allocator, source, &tokens_list, "//");
+
+    // Second pass: process lexer tokens with context awareness
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        const prev_token: ?dbl.Token = if (i > 0) tokens[i - 1] else null;
+        const next_token: ?dbl.Token = if (i + 1 < tokens.len) tokens[i + 1] else null;
+        const next_next_token: ?dbl.Token = if (i + 2 < tokens.len) tokens[i + 2] else null;
+
+        const token_type: ?usize = getDblSemanticTokenType(token, prev_token, next_token, next_next_token);
 
         if (token_type) |tt| {
             const line = if (token.line > 0) token.line - 1 else 0;
             const char = if (token.column > 0) token.column - 1 else 0;
-            const delta_line = line -| prev_line;
-            const delta_char = if (delta_line == 0) char -| prev_char else char;
 
-            try data.append(JsonValue{ .integer = @intCast(delta_line) });
-            try data.append(JsonValue{ .integer = @intCast(delta_char) });
-            try data.append(JsonValue{ .integer = @intCast(token.lexeme.len) });
-            try data.append(JsonValue{ .integer = @intCast(tt) });
-            try data.append(JsonValue{ .integer = 0 }); // No modifiers
-
-            prev_line = line;
-            prev_char = char;
+            try tokens_list.append(allocator, .{
+                .line = line,
+                .column = char,
+                .length = token.lexeme.len,
+                .token_type = tt,
+            });
         }
     }
+
+    // Sort tokens by position
+    std.mem.sort(SemanticToken, tokens_list.items, {}, struct {
+        fn lessThan(_: void, a: SemanticToken, b: SemanticToken) bool {
+            if (a.line != b.line) return a.line < b.line;
+            return a.column < b.column;
+        }
+    }.lessThan);
+
+    // Emit delta-encoded tokens
+    var prev_line: usize = 0;
+    var prev_char: usize = 0;
+
+    for (tokens_list.items) |st| {
+        const delta_line = st.line -| prev_line;
+        const delta_char = if (delta_line == 0) st.column -| prev_char else st.column;
+
+        try data.append(JsonValue{ .integer = @intCast(delta_line) });
+        try data.append(JsonValue{ .integer = @intCast(delta_char) });
+        try data.append(JsonValue{ .integer = @intCast(st.length) });
+        try data.append(JsonValue{ .integer = @intCast(st.token_type) });
+        try data.append(JsonValue{ .integer = 0 }); // No modifiers
+
+        prev_line = st.line;
+        prev_char = st.column;
+    }
+}
+
+/// Get semantic token type for DBL token with context awareness
+fn getDblSemanticTokenType(token: anytype, prev_token: anytype, next_token: anytype, next_next_token: anytype) ?usize {
+    const dbl = @import("dbl");
+    const TokenType = dbl.TokenType;
+    const STI = protocol.SemanticTokenIndex;
+
+    // Handle identifiers with context
+    if (token.type == TokenType.identifier) {
+        // Check if it's a label reference after onerror or goto
+        if (prev_token) |prev| {
+            if (prev.type == TokenType.kw_onerror or prev.type == TokenType.kw_goto) {
+                return STI.Label;
+            }
+            // Check if it's a type reference after comma (e.g., ",customer")
+            if (prev.type == TokenType.comma) {
+                return STI.Type;
+            }
+            // Check if it's a property after dot (e.g., "app.ch_cust")
+            if (prev.type == TokenType.period) {
+                return STI.Property;
+            }
+        }
+
+        // Check if it's a label definition (identifier followed by comma, where comma is NOT followed by a type)
+        if (next_token) |next| {
+            if (next.type == TokenType.comma) {
+                // Check what comes after the comma
+                if (next_next_token) |after_comma| {
+                    // If comma is followed by type specifier or identifier, it's a field declaration
+                    // If comma is followed by keyword/newline/etc, it's a label definition
+                    switch (after_comma.type) {
+                        TokenType.identifier, TokenType.at => {}, // Field declaration like "cust ,customer" or ",@type"
+                        else => return STI.Label, // Label definition like "eof_reached,"
+                    }
+                } else {
+                    // Comma at end of tokens = label definition
+                    return STI.Label;
+                }
+            }
+            // Check if it's a function call (identifier followed by lparen)
+            if (next.type == TokenType.lparen) {
+                // Special case: console
+                if (std.mem.eql(u8, token.lexeme, "console")) {
+                    return STI.Class;
+                }
+                return STI.Function;
+            }
+        }
+
+        // Check for "console" specifically (even without following paren)
+        if (std.mem.eql(u8, token.lexeme, "console")) {
+            return STI.Class;
+        }
+
+        // Default: regular variable
+        return STI.Variable;
+    }
+
+    // Handle percent (builtin function prefix like %trim)
+    if (token.type == TokenType.percent) {
+        return STI.Macro;
+    }
+
+    // Strings
+    if (token.type == TokenType.string_literal) return STI.String;
+
+    // Numbers
+    if (token.type == TokenType.integer_literal or token.type == TokenType.decimal_literal) return STI.Number;
+
+    // Operators
+    switch (token.type) {
+        TokenType.plus, TokenType.minus, TokenType.star, TokenType.slash, TokenType.hash, TokenType.equals,
+        TokenType.op_eq, TokenType.op_ne, TokenType.op_lt, TokenType.op_le, TokenType.op_gt, TokenType.op_ge,
+        TokenType.op_and, TokenType.op_or, TokenType.op_not, TokenType.op_xor,
+        => return STI.Operator,
+        else => {},
+    }
+
+    // Detailed keyword categorization (matching the old working LSP)
+    switch (token.type) {
+        // Function/subroutine declarations -> function
+        TokenType.kw_main, TokenType.kw_endmain, TokenType.kw_subroutine, TokenType.kw_endsubroutine,
+        TokenType.kw_function, TokenType.kw_endfunction, TokenType.kw_method, TokenType.kw_endmethod,
+        => return STI.Function,
+
+        // Type declarations -> class
+        TokenType.kw_record, TokenType.kw_endrecord, TokenType.kw_structure, TokenType.kw_endstructure,
+        TokenType.kw_class, TokenType.kw_endclass, TokenType.kw_interface, TokenType.kw_endinterface,
+        TokenType.kw_group, TokenType.kw_endgroup,
+        => return STI.Class,
+
+        // Namespace keywords -> namespace
+        TokenType.kw_namespace, TokenType.kw_endnamespace, TokenType.kw_import,
+        TokenType.kw_common, TokenType.kw_endcommon, TokenType.kw_literal, TokenType.kw_endliteral,
+        => return STI.Namespace,
+
+        // I/O keywords -> IO (regexp)
+        TokenType.kw_find, TokenType.kw_unlock, TokenType.kw_flush, TokenType.kw_accept,
+        => return STI.IO,
+
+        // Data manipulation -> Data (decorator)
+        TokenType.kw_clear, TokenType.kw_init, TokenType.kw_incr, TokenType.kw_decr,
+        TokenType.kw_locase, TokenType.kw_upcase,
+        => return STI.Data,
+
+        // Exception handling -> Exception (event)
+        TokenType.kw_try, TokenType.kw_catch, TokenType.kw_finally, TokenType.kw_endtry,
+        TokenType.kw_throw, TokenType.kw_onerror, TokenType.kw_offerror,
+        => return STI.Exception,
+
+        // Access modifiers -> modifier
+        TokenType.kw_public, TokenType.kw_private, TokenType.kw_protected,
+        TokenType.kw_static, TokenType.kw_virtual, TokenType.kw_override,
+        => return STI.Modifier,
+
+        // OOP keywords -> class
+        TokenType.kw_new, TokenType.kw_extends, TokenType.kw_implements,
+        TokenType.kw_property, TokenType.kw_endproperty,
+        => return STI.Class,
+
+        // Control flow keywords -> keyword
+        TokenType.kw_if, TokenType.kw_then, TokenType.kw_else, TokenType.kw_begin,
+        TokenType.kw_case, TokenType.kw_endcase, TokenType.kw_select,
+        TokenType.kw_do, TokenType.kw_while, TokenType.kw_endwhile, TokenType.kw_for,
+        TokenType.kw_from, TokenType.kw_thru, TokenType.kw_until, TokenType.kw_foreach,
+        TokenType.kw_in, TokenType.kw_forever, TokenType.kw_repeat,
+        TokenType.kw_exitloop, TokenType.kw_nextloop, TokenType.kw_loop,
+        TokenType.kw_break, TokenType.kw_continue, TokenType.kw_step,
+        TokenType.kw_return, TokenType.kw_freturn, TokenType.kw_mreturn, TokenType.kw_xreturn,
+        TokenType.kw_xcall, TokenType.kw_call, TokenType.kw_goto, TokenType.kw_stop, TokenType.kw_exit,
+        TokenType.kw_proc, TokenType.kw_end, TokenType.kw_data, TokenType.kw_using, TokenType.kw_endusing,
+        => return STI.Keyword,
+
+        // Boolean/null constants
+        TokenType.kw_true, TokenType.kw_false,
+        => return STI.Number, // Treat as constants
+
+        // Compile-time keywords -> modifier
+        TokenType.kw_comptime, TokenType.kw_const, TokenType.kw_inline,
+        => return STI.Modifier,
+
+        // Parameter modifiers -> parameter
+        TokenType.kw_out, TokenType.kw_inout,
+        => return STI.Parameter,
+
+        else => {},
+    }
+
+    // Fallback: check if it's any keyword we missed
+    const name = @tagName(token.type);
+    if (name.len > 3 and name[0] == 'k' and name[1] == 'w' and name[2] == '_') {
+        return STI.Keyword;
+    }
+
+    return null;
 }
 
 // ============================================================

@@ -351,6 +351,12 @@ pub const VM = struct {
         };
     }
 
+    /// Get allocator for Value heap allocations (StringRef, Decimal, etc.)
+    /// Uses arena allocator so all values are freed together at VM.deinit
+    pub fn valueAllocator(self: *Self) std.mem.Allocator {
+        return self.heap.allocator();
+    }
+
     /// Clear inline caches (call when module is reloaded)
     pub fn clearInlineCaches(self: *Self) void {
         self.inline_caches.clearRetainingCapacity();
@@ -377,13 +383,17 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Free global buffers
+        // Free global buffers (the actual string data that FixedStringRef points to)
         for (self.global_buffers.items) |buf| {
             self.allocator.free(buf);
         }
         self.global_buffers.deinit(self.allocator);
 
         self.globals.deinit(self.allocator);
+
+        // Free all Value heap allocations (StringRef, Decimal, etc.) at once
+        // Values use valueAllocator() which returns heap.allocator()
+        // This avoids tracking individual allocations or dealing with shared pointers
         self.heap.deinit();
         self.modules.deinit(self.allocator);
         self.native_registry.deinit();
@@ -1378,7 +1388,7 @@ pub const VM = struct {
         @memcpy(result[s1.len..], s2);
 
         // Store result as string value
-        self.registers[rd] = Value.initString(self.allocator, result) catch return VMError.OutOfMemory;
+        self.registers[rd] = Value.initString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
         return .continue_dispatch;
     }
 
@@ -1697,7 +1707,7 @@ pub const VM = struct {
         debug.print(.vm, "load_record_buf: serialized buffer len={d}, storing in r{d}", .{ buffer.len, rd });
 
         // Create a fixed string value from the buffer and store in destination register
-        const result = Value.initFixedString(self.allocator, buffer) catch {
+        const result = Value.initFixedString(self.valueAllocator(), buffer) catch {
             self.allocator.free(buffer);
             return self.fail(VMError.OutOfMemory, "Failed to create record buffer value");
         };
@@ -1768,7 +1778,7 @@ pub const VM = struct {
                         continue;
                     };
                     @memcpy(str_copy, src);
-                    const val = Value.initFixedString(self.allocator, str_copy) catch {
+                    const val = Value.initFixedString(self.valueAllocator(), str_copy) catch {
                         self.allocator.free(str_copy);
                         continue;
                     };
@@ -1952,10 +1962,10 @@ pub const VM = struct {
     fn constantToValue(self: *Self, constant: Constant) Value {
         return switch (constant) {
             .integer => |ival| Value.initInt(ival),
-            .decimal => |dval| Value.initDecimal(self.allocator, dval.value, dval.precision) catch Value.null_val,
-            .string => |sval| Value.initString(self.allocator, sval) catch Value.null_val,
-            .fixed_string => |aval| Value.initFixedString(self.allocator, @constCast(aval.data)) catch Value.null_val,
-            .identifier => |idval| Value.initString(self.allocator, idval) catch Value.null_val,
+            .decimal => |dval| Value.initDecimal(self.valueAllocator(), dval.value, dval.precision) catch Value.null_val,
+            .string => |sval| Value.initString(self.valueAllocator(), sval) catch Value.null_val,
+            .fixed_string => |aval| Value.initFixedString(self.valueAllocator(), @constCast(aval.data)) catch Value.null_val,
+            .identifier => |idval| Value.initString(self.valueAllocator(), idval) catch Value.null_val,
             else => Value.null_val,
         };
     }
@@ -2093,7 +2103,7 @@ pub const VM = struct {
         }
 
         debug.print(.vm, "LOAD_RECORD_BUF: result='{s}'", .{buf[0..@min(30, buf.len)]});
-        const fixed_str = Value.initFixedString(self.allocator, buf) catch
+        const fixed_str = Value.initFixedString(self.valueAllocator(), buf) catch
             return VMError.OutOfMemory;
         try self.push(fixed_str);
     }
@@ -2141,7 +2151,7 @@ pub const VM = struct {
                 try self.global_buffers.append(self.allocator, field_copy);
 
                 // Store the field value into local slot
-                const fixed_str = Value.initFixedString(self.allocator, field_copy) catch
+                const fixed_str = Value.initFixedString(self.valueAllocator(), field_copy) catch
                     return VMError.OutOfMemory;
                 self.stack[stack_index] = fixed_str;
                 debug.print(.vm, "STORE_RECORD_BUF: stored '{s}'", .{field_copy[0..@min(20, field_copy.len)]});
@@ -2329,8 +2339,8 @@ pub const VM = struct {
         return switch (gval) {
             .null_val => Value.null_val,
             .integer => |i| Value.initInt(i),
-            .decimal => |d| Value.initDecimal(self.allocator, d.value, d.precision) catch Value.null_val,
-            .fixed_string => |a| Value.initFixedString(self.allocator, a) catch Value.null_val,
+            .decimal => |d| Value.initDecimal(self.valueAllocator(), d.value, d.precision) catch Value.null_val,
+            .fixed_string => |a| Value.initFixedString(self.valueAllocator(), a) catch Value.null_val,
             .boolean => |b| Value.initBool(b),
         };
     }
@@ -2386,7 +2396,7 @@ pub const VM = struct {
         @memcpy(result[a_str.len..], b_str);
         try self.global_buffers.append(self.allocator, result);
 
-        return Value.initFixedString(self.allocator, result) catch return VMError.OutOfMemory;
+        return Value.initFixedString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
     }
 
     /// Convert a value to its string representation
@@ -2429,13 +2439,13 @@ pub const VM = struct {
                 const str = val.asString();
                 const copy = self.allocator.dupe(u8, str) catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, copy);
-                break :blk Value.initFixedString(self.allocator, copy) catch return VMError.OutOfMemory;
+                break :blk Value.initFixedString(self.valueAllocator(), copy) catch return VMError.OutOfMemory;
             },
             .integer => blk: {
                 const buf = self.allocator.alloc(u8, 32) catch return VMError.OutOfMemory;
                 const len = std.fmt.bufPrint(buf, "{d}", .{val.asInt()}) catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, buf);
-                break :blk Value.initFixedString(self.allocator, buf[0..len.len]) catch return VMError.OutOfMemory;
+                break :blk Value.initFixedString(self.valueAllocator(), buf[0..len.len]) catch return VMError.OutOfMemory;
             },
             .decimal => blk: {
                 const buf = self.allocator.alloc(u8, 32) catch return VMError.OutOfMemory;
@@ -2444,23 +2454,23 @@ pub const VM = struct {
                 const d = val.asDecimal() orelse break :blk Value.null_val;
                 const len = std.fmt.bufPrint(buf, "{d}", .{d.value}) catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, buf);
-                break :blk Value.initFixedString(self.allocator, buf[0..len.len]) catch return VMError.OutOfMemory;
+                break :blk Value.initFixedString(self.valueAllocator(), buf[0..len.len]) catch return VMError.OutOfMemory;
             },
             .boolean => blk: {
                 const str = if (val.asBool()) "true" else "false";
                 const copy = self.allocator.dupe(u8, str) catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, copy);
-                break :blk Value.initFixedString(self.allocator, copy) catch return VMError.OutOfMemory;
+                break :blk Value.initFixedString(self.valueAllocator(), copy) catch return VMError.OutOfMemory;
             },
             .null_val => blk: {
                 const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, empty);
-                break :blk Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+                break :blk Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
             },
             else => blk: {
                 const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, empty);
-                break :blk Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+                break :blk Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
             },
         };
     }
@@ -2487,14 +2497,14 @@ pub const VM = struct {
             else => {
                 const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, empty);
-                return Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+                return Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
             },
         };
         const trimmed = std.mem.trim(u8, str, " \t\r\n");
         const result = self.allocator.alloc(u8, trimmed.len) catch return VMError.OutOfMemory;
         @memcpy(result, trimmed);
         try self.global_buffers.append(self.allocator, result);
-        return Value.initFixedString(self.allocator, result) catch return VMError.OutOfMemory;
+        return Value.initFixedString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
     }
 
     /// Get string length
@@ -2514,7 +2524,7 @@ pub const VM = struct {
             else => {
                 const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, empty);
-                return Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+                return Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
             },
         };
 
@@ -2527,13 +2537,13 @@ pub const VM = struct {
             const result = self.allocator.alloc(u8, new_len) catch return VMError.OutOfMemory;
             @memcpy(result, trimmed[0..new_len]);
             try self.global_buffers.append(self.allocator, result);
-            return Value.initFixedString(self.allocator, result) catch return VMError.OutOfMemory;
+            return Value.initFixedString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
         }
 
         // Empty string
         const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
         try self.global_buffers.append(self.allocator, empty);
-        return Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+        return Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
     }
 
     /// Set character at position in string
@@ -2544,7 +2554,7 @@ pub const VM = struct {
             else => {
                 const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, empty);
-                return Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+                return Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
             },
         };
 
@@ -2584,7 +2594,7 @@ pub const VM = struct {
         result[pos] = ch;
 
         try self.global_buffers.append(self.allocator, result);
-        return Value.initFixedString(self.allocator, result) catch return VMError.OutOfMemory;
+        return Value.initFixedString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
     }
 
     /// Extract substring from string
@@ -2597,7 +2607,7 @@ pub const VM = struct {
             else => {
                 const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
                 try self.global_buffers.append(self.allocator, empty);
-                return Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+                return Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
             },
         };
 
@@ -2635,7 +2645,7 @@ pub const VM = struct {
         if (start_0based >= source.len or length == 0) {
             const empty = self.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
             try self.global_buffers.append(self.allocator, empty);
-            return Value.initFixedString(self.allocator, empty) catch return VMError.OutOfMemory;
+            return Value.initFixedString(self.valueAllocator(), empty) catch return VMError.OutOfMemory;
         }
 
         const actual_length = @min(length, source.len - start_0based);
@@ -2643,7 +2653,7 @@ pub const VM = struct {
         @memcpy(result, source[start_0based..][0..actual_length]);
 
         try self.global_buffers.append(self.allocator, result);
-        return Value.initFixedString(self.allocator, result) catch return VMError.OutOfMemory;
+        return Value.initFixedString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
     }
 
     /// Store value into substring of target string
@@ -2725,7 +2735,7 @@ pub const VM = struct {
         }
 
         try self.global_buffers.append(self.allocator, result);
-        return Value.initFixedString(self.allocator, result) catch return VMError.OutOfMemory;
+        return Value.initFixedString(self.valueAllocator(), result) catch return VMError.OutOfMemory;
     }
 
     /// Absolute value
@@ -2734,7 +2744,7 @@ pub const VM = struct {
             .integer => Value.initInt(@intCast(@abs(val.asInt()))),
             .decimal => blk: {
                 if (val.asDecimal()) |d| {
-                    break :blk Value.initDecimal(self.allocator, @intCast(@abs(d.value)), d.precision) catch return VMError.OutOfMemory;
+                    break :blk Value.initDecimal(self.valueAllocator(), @intCast(@abs(d.value)), d.precision) catch return VMError.OutOfMemory;
                 }
                 break :blk val;
             },

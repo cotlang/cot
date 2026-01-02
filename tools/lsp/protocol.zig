@@ -323,25 +323,57 @@ pub const CompletionItem = struct {
 // Semantic Token Types
 // ============================================================
 
+/// Semantic token types - order matters, indices used in encoding
+/// These match the LSP specification and provide rich syntax highlighting
 pub const SemanticTokenTypes = [_][]const u8{
-    "namespace",  // 0
-    "type",       // 1
-    "class",      // 2
+    "namespace",  // 0 - namespace declarations
+    "type",       // 1 - type references (,customer)
+    "class",      // 2 - class/structure declarations
     "enum",       // 3
     "interface",  // 4
-    "struct",     // 5
+    "struct",     // 5 - structure keyword
     "parameter",  // 6
-    "variable",   // 7
-    "property",   // 8
-    "function",   // 9
-    "method",     // 10
-    "keyword",    // 11
-    "modifier",   // 12
+    "variable",   // 7 - identifiers
+    "property",   // 8 - member access (after .)
+    "function",   // 9 - function/subroutine declarations
+    "method",     // 10 - method calls
+    "keyword",    // 11 - control flow (if, while, for)
+    "modifier",   // 12 - access modifiers (public, private)
     "comment",    // 13
     "string",     // 14
     "number",     // 15
     "operator",   // 16
-    "macro",      // 17
+    "macro",      // 17 - builtins like %trim
+    "regexp",     // 18 - I/O keywords (read, write, open)
+    "decorator",  // 19 - data keywords (clear, init)
+    "event",      // 20 - exception keywords (try, catch)
+    "label",      // 21 - labels (error handlers, goto targets)
+};
+
+/// Semantic token type indices for convenience
+pub const SemanticTokenIndex = struct {
+    pub const Namespace: usize = 0;
+    pub const Type: usize = 1;
+    pub const Class: usize = 2;
+    pub const Enum: usize = 3;
+    pub const Interface: usize = 4;
+    pub const Struct: usize = 5;
+    pub const Parameter: usize = 6;
+    pub const Variable: usize = 7;
+    pub const Property: usize = 8;
+    pub const Function: usize = 9;
+    pub const Method: usize = 10;
+    pub const Keyword: usize = 11;
+    pub const Modifier: usize = 12;
+    pub const Comment: usize = 13;
+    pub const String: usize = 14;
+    pub const Number: usize = 15;
+    pub const Operator: usize = 16;
+    pub const Macro: usize = 17;
+    pub const IO: usize = 18;       // regexp - used for I/O keywords
+    pub const Data: usize = 19;      // decorator - used for data keywords
+    pub const Exception: usize = 20; // event - used for exception keywords
+    pub const Label: usize = 21;
 };
 
 // ============================================================

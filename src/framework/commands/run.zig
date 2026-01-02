@@ -74,6 +74,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
         else
             std.fs.path.join(allocator, &.{ cwd, parsed.project }) catch |err| {
                 try stdout.print("Error: Could not resolve path: {}\n", .{err});
+                try stdout.flush();
                 return error.InvalidPath;
             };
         defer allocator.free(target_path);
@@ -89,6 +90,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
             workspace_root = try config_loader.findWorkspaceRoot(abs_target) orelse {
                 try stdout.print("Error: Not inside a Cot workspace.\n", .{});
                 try stdout.print("Run 'cot init' first to create a workspace.\n", .{});
+                try stdout.flush();
                 return error.NoWorkspace;
             };
             debug.print(.general, "Workspace root found: {s}", .{workspace_root});
@@ -98,6 +100,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
             workspace_root = try config_loader.findWorkspaceRoot(cwd) orelse {
                 try stdout.print("Error: Not inside a Cot workspace.\n", .{});
                 try stdout.print("Run 'cot init' first to create a workspace.\n", .{});
+                try stdout.flush();
                 return error.NoWorkspace;
             };
         }
@@ -106,6 +109,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
         workspace_root = try config_loader.findWorkspaceRoot(cwd) orelse {
             try stdout.print("Error: Not inside a Cot workspace.\n", .{});
             try stdout.print("Run 'cot init' first to create a workspace.\n", .{});
+            try stdout.flush();
             return error.NoWorkspace;
         };
     }
@@ -127,6 +131,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
         if (ws.apps.items.len == 0) {
             try stdout.print("Error: No apps found in workspace.\n", .{});
             try stdout.print("Create an app with 'cot new <name>'\n", .{});
+            try stdout.flush();
             return error.NoApps;
         }
 
@@ -145,6 +150,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
     const project = ws.findProject(target.project) orelse {
         debug.print(.general, "Project not found!", .{});
         try stdout.print("Error: Project '{s}' not found.\n", .{target.project});
+        try stdout.flush();
         return error.ProjectNotFound;
     };
 
@@ -195,64 +201,88 @@ fn parseTarget(spec: []const u8) !RunTarget {
 /// Run the main entry point of a project with its dependencies
 fn runProjectMain(allocator: Allocator, project: *const workspace.Project, ws: *const workspace.Workspace, writer: anytype, dev_mode: bool) !void {
     debug.print(.general, "runProjectMain for: {s}", .{project.name});
-    // Find compiled main bytecode - try dev cache first, then release output
-    // Dev mode: .cot-cache/*.cotc
-    // Release mode: {output_dir}/*.cbo
+    // Find compiled main bytecode - try workspace .cot-out/ directory
+    // Dev mode: .cot-out/.cache/<name>/<name>.cotc
+    // Release mode: .cot-out/apps/<name>/<name> (no extension)
     var bytecode_path: []const u8 = undefined;
     var found = false;
 
-    // Try dev cache first (.cot-cache/*.cotc)
-    const dev_path = try std.fs.path.join(allocator, &.{
-        project.path,
-        ".cot-cache",
+    // Determine project type subdirectory
+    const type_subdir = if (project.config.project_type == .library) "packages" else "apps";
+
+    // Try dev cache first (.cot-out/.cache/<name>/<name>.cotc)
+    const dev_bytecode = try std.fs.path.join(allocator, &.{
+        ws.root_path,
+        ".cot-out",
+        ".cache",
+        project.name,
         project.name,
     });
-    defer allocator.free(dev_path);
+    const dev_bytecode_ext = try std.fmt.allocPrint(allocator, "{s}.cotc", .{dev_bytecode});
+    allocator.free(dev_bytecode);
 
-    const dev_bytecode = try std.fmt.allocPrint(allocator, "{s}.cotc", .{dev_path});
-    if (std.fs.cwd().access(dev_bytecode, .{})) |_| {
-        bytecode_path = dev_bytecode;
+    if (std.fs.cwd().access(dev_bytecode_ext, .{})) |_| {
+        bytecode_path = dev_bytecode_ext;
         found = true;
     } else |_| {
-        allocator.free(dev_bytecode);
+        allocator.free(dev_bytecode_ext);
     }
 
-    // Try release output ({output_dir}/*.cbo)
+    // Try release output (.cot-out/apps/<name>/<name> - no extension)
     if (!found) {
         const release_path = try std.fs.path.join(allocator, &.{
-            project.path,
-            project.config.output_dir,
+            ws.root_path,
+            ".cot-out",
+            type_subdir,
+            project.name,
             project.name,
         });
-        defer allocator.free(release_path);
-
-        const release_bytecode = try std.fmt.allocPrint(allocator, "{s}.cbo", .{release_path});
-        if (std.fs.cwd().access(release_bytecode, .{})) |_| {
-            bytecode_path = release_bytecode;
+        if (std.fs.cwd().access(release_path, .{})) |_| {
+            bytecode_path = release_path;
             found = true;
         } else |_| {
-            allocator.free(release_bytecode);
+            allocator.free(release_path);
         }
     }
 
-    // Try bundle format ({output_dir}/{name} - no extension)
+    // Try legacy locations for backwards compatibility
     if (!found) {
-        const bundle_path = try std.fs.path.join(allocator, &.{
+        // Legacy: {project.path}/bin/{name}
+        const legacy_bundle = try std.fs.path.join(allocator, &.{
             project.path,
-            project.config.output_dir,
+            "bin",
             project.name,
         });
-        if (std.fs.cwd().access(bundle_path, .{})) |_| {
-            bytecode_path = bundle_path;
+        if (std.fs.cwd().access(legacy_bundle, .{})) |_| {
+            bytecode_path = legacy_bundle;
             found = true;
         } else |_| {
-            allocator.free(bundle_path);
+            allocator.free(legacy_bundle);
+        }
+    }
+
+    if (!found) {
+        // Legacy: {project.path}/.cot-cache/{name}.cotc
+        const legacy_cache = try std.fs.path.join(allocator, &.{
+            project.path,
+            ".cot-cache",
+            project.name,
+        });
+        const legacy_cache_ext = try std.fmt.allocPrint(allocator, "{s}.cotc", .{legacy_cache});
+        allocator.free(legacy_cache);
+
+        if (std.fs.cwd().access(legacy_cache_ext, .{})) |_| {
+            bytecode_path = legacy_cache_ext;
+            found = true;
+        } else |_| {
+            allocator.free(legacy_cache_ext);
         }
     }
 
     if (!found) {
         try writer.print("Error: Compiled bytecode not found.\n", .{});
         try writer.print("Run 'cot build' first to compile the project.\n", .{});
+        try writer.flush();
         return error.NotCompiled;
     }
     defer allocator.free(bytecode_path);
@@ -306,6 +336,7 @@ fn runComponent(
 
     const name = comp_name orelse {
         try writer.print("Error: Component name required for {s}\n", .{@tagName(comp_type)});
+        try writer.flush();
         return error.MissingComponentName;
     };
 
@@ -329,6 +360,7 @@ fn runComponent(
     std.fs.cwd().access(bytecode_path, .{}) catch {
         try writer.print("Error: Compiled bytecode not found: {s}\n", .{bytecode_path});
         try writer.print("Run 'cot build' first to compile the project.\n", .{});
+        try writer.flush();
         return error.NotCompiled;
     };
 
@@ -454,20 +486,26 @@ fn runBytecodeFileWithDeps(
             if (ws.findProject(dep_name)) |dep_project| {
                 debug.print(.general, "    Found project: {s} at {s}", .{ dep_project.name, dep_project.path });
 
-                // Try dev cache first (.cot-cache/*.cotc), then release output ({output_dir}/*.cbo)
-                const dirs_to_try = [_]struct { path: []const u8, ext: []const u8 }{
-                    .{ .path = ".cot-cache", .ext = ".cotc" },
-                    .{ .path = dep_project.config.output_dir, .ext = ".cbo" },
-                };
+                const dep_type_subdir = if (dep_project.config.project_type == .library) "packages" else "apps";
 
-                for (dirs_to_try) |dir_info| {
-                    const dep_output = try std.fs.path.join(allocator, &.{
-                        dep_project.path,
-                        dir_info.path,
-                    });
-                    defer allocator.free(dep_output);
+                // Try .cot-out/ locations first, then legacy locations
+                // 1. .cot-out/.cache/<name>/ (dev cache)
+                // 2. .cot-out/packages/<name>/ or .cot-out/apps/<name>/ (release)
+                // 3. Legacy: {project.path}/.cot-cache/
+                // 4. Legacy: {project.path}/{output_dir}/
+                const cache_path = try std.fs.path.join(allocator, &.{ ws.root_path, ".cot-out", ".cache", dep_name });
+                defer allocator.free(cache_path);
+                const release_path = try std.fs.path.join(allocator, &.{ ws.root_path, ".cot-out", dep_type_subdir, dep_name });
+                defer allocator.free(release_path);
+                const legacy_cache = try std.fs.path.join(allocator, &.{ dep_project.path, ".cot-cache" });
+                defer allocator.free(legacy_cache);
+                const legacy_output = try std.fs.path.join(allocator, &.{ dep_project.path, dep_project.config.output_dir });
+                defer allocator.free(legacy_output);
 
-                    debug.print(.general, "    Looking in: {s} for {s} files", .{ dep_output, dir_info.ext });
+                const dirs_to_try = [_][]const u8{ cache_path, release_path, legacy_cache, legacy_output };
+
+                for (dirs_to_try) |dep_output| {
+                    debug.print(.general, "    Looking in: {s}", .{dep_output});
 
                     var dir = std.fs.cwd().openDir(dep_output, .{ .iterate = true }) catch |err| {
                         debug.print(.general, "    Could not open dir: {}", .{err});
@@ -478,10 +516,16 @@ fn runBytecodeFileWithDeps(
                     var loaded_any = false;
                     var iter = dir.iterate();
                     while (iter.next() catch null) |file_entry| {
-                        if (file_entry.kind == .file and std.mem.endsWith(u8, file_entry.name, dir_info.ext)) {
-                            const module_path = try std.fs.path.join(allocator, &.{ dep_output, file_entry.name });
-                            try dep_modules.append(allocator, module_path);
-                            loaded_any = true;
+                        // Look for .cotc or .cbo files, or extensionless bundles
+                        if (file_entry.kind == .file) {
+                            const is_module = std.mem.endsWith(u8, file_entry.name, ".cotc") or
+                                std.mem.endsWith(u8, file_entry.name, ".cbo") or
+                                std.mem.eql(u8, file_entry.name, dep_name);
+                            if (is_module) {
+                                const module_path = try std.fs.path.join(allocator, &.{ dep_output, file_entry.name });
+                                try dep_modules.append(allocator, module_path);
+                                loaded_any = true;
+                            }
                         }
                     }
 

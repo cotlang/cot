@@ -133,14 +133,16 @@ pub const Bundler = struct {
     allocator: Allocator,
     modules: std.ArrayList(BundledModule),
     errors: std.ArrayList([]const u8),
+    cache_dir: ?[]const u8,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator) Self {
+    pub fn init(allocator: Allocator, cache_dir: ?[]const u8) Self {
         return .{
             .allocator = allocator,
             .modules = .{},
             .errors = .{},
+            .cache_dir = cache_dir,
         };
     }
 
@@ -278,9 +280,18 @@ pub const Bundler = struct {
 
     /// Compile a DBL file by spawning cot-dbl as an external process
     fn compileDblFile(self: *Self, source_path: []const u8) ![]const u8 {
-        // Create output path for bytecode (same as source with .cbo extension)
-        const output_path = try std.fmt.allocPrint(self.allocator, "{s}.cbo", .{source_path});
+        // Create output path for bytecode - use cache_dir if available, otherwise fallback to source location
+        const output_path = if (self.cache_dir) |cache_dir| blk: {
+            // Use cache directory: cache_dir/<basename>.cbo
+            const basename = std.fs.path.basename(source_path);
+            break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}.cbo", .{ cache_dir, basename });
+        } else try std.fmt.allocPrint(self.allocator, "{s}.cbo", .{source_path});
         defer self.allocator.free(output_path);
+
+        // Ensure cache directory exists
+        if (self.cache_dir) |cache_dir| {
+            std.fs.cwd().makePath(cache_dir) catch {};
+        }
 
         // Spawn cot-dbl to compile the file
         // cot-dbl <input.dbl> --output <output.cbo>
@@ -432,7 +443,8 @@ pub fn buildBundledProject(
     disc_result: *const discovery.DiscoveryResult,
     output_dir: []const u8,
 ) !struct { manifest: Manifest, success: bool, errors: []const []const u8 } {
-    var bund = Bundler.init(allocator);
+    // Use output_dir as cache directory for intermediate compilation artifacts
+    var bund = Bundler.init(allocator, output_dir);
     defer bund.deinit();
 
     // Helper to add a module, preferring pre-compiled bytecode from cache

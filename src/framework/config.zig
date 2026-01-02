@@ -569,7 +569,7 @@ pub fn writeWorkspaceConfig(file: std.fs.File, name: []const u8) !void {
         \\  "type": "workspace",
         \\  "workspaces": ["apps/*", "packages/*"],
         \\  "cot": {{
-        \\    "version": "0.2.0"
+        \\    "version": "0.1.0"
         \\  }}
         \\}}
         \\

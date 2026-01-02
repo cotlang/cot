@@ -75,7 +75,7 @@ pub const MAX_CURSORS = connections.MAX_CURSORS;
 pub const Error = @import("errors.zig").Error;
 
 // Version info
-pub const version = "0.3.0";
+pub const version = "0.1.0";
 pub const format_version: u32 = 3;
 
 test {

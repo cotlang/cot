@@ -543,12 +543,30 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
     const out_name = if (output_file) |of|
         of
     else blk: {
-        // Replace .cot with .cbo
-        if (std.mem.endsWith(u8, filename, ".cot") or std.mem.endsWith(u8, filename, ".COT")) {
-            const base = filename[0 .. filename.len - 4];
-            break :blk try std.fmt.allocPrint(allocator, "{s}.cbo", .{base});
+        // Get the base filename without extension
+        const basename = std.fs.path.basename(filename);
+        const base_no_ext = if (std.mem.lastIndexOf(u8, basename, ".")) |dot_idx|
+            basename[0..dot_idx]
+        else
+            basename;
+
+        // Try to find workspace root for output directory
+        const config = @import("framework/config.zig");
+        var config_loader = config.ConfigLoader.init(allocator);
+
+        const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch {
+            // Fallback to .cot-out in current directory
+            break :blk try std.fmt.allocPrint(allocator, ".cot-out/{s}.cbo", .{base_no_ext});
+        };
+        defer allocator.free(cwd);
+
+        if (config_loader.findWorkspaceRoot(cwd) catch null) |workspace_root| {
+            defer allocator.free(workspace_root);
+            // Output to workspace's .cot-out/.standalone/
+            break :blk try std.fmt.allocPrint(allocator, "{s}/.cot-out/.standalone/{s}.cbo", .{ workspace_root, base_no_ext });
         } else {
-            break :blk try std.fmt.allocPrint(allocator, "{s}.cbo", .{filename});
+            // No workspace, output to .cot-out/ in current directory
+            break :blk try std.fmt.allocPrint(allocator, ".cot-out/{s}.cbo", .{base_no_ext});
         }
     };
     defer if (output_file == null) allocator.free(out_name);

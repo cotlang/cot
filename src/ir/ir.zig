@@ -728,6 +728,22 @@ pub const Block = struct {
     }
 
     pub fn deinit(self: *Block) void {
+        // Free heap-allocated slices inside instructions
+        for (self.instructions.items) |inst| {
+            switch (inst) {
+                .call => |c| {
+                    if (c.args.len > 0) {
+                        self.allocator.free(c.args);
+                    }
+                },
+                .switch_br => |s| {
+                    if (s.cases.len > 0) {
+                        self.allocator.free(s.cases);
+                    }
+                },
+                else => {},
+            }
+        }
         self.instructions.deinit(self.allocator);
         self.predecessors.deinit(self.allocator);
         self.successors.deinit(self.allocator);
@@ -821,6 +837,10 @@ pub const Function = struct {
         }
         self.blocks.deinit(self.allocator);
         self.locals.deinit(self.allocator);
+        // Free the params slice from the function signature
+        if (self.signature.params.len > 0) {
+            self.allocator.free(self.signature.params);
+        }
         self.allocator.destroy(self);
     }
 
@@ -870,6 +890,9 @@ pub const Module = struct {
     /// Allocator
     allocator: Allocator,
 
+    /// Type pointers allocated during lowering (owned by Module)
+    allocated_types: std.ArrayListUnmanaged(*Type) = .{},
+
     pub const Global = struct {
         name: []const u8,
         ty: Type,
@@ -902,6 +925,12 @@ pub const Module = struct {
         self.structs.deinit(self.allocator);
 
         self.globals.deinit(self.allocator);
+
+        // Free type pointers allocated during lowering
+        for (self.allocated_types.items) |ty_ptr| {
+            self.allocator.destroy(ty_ptr);
+        }
+        self.allocated_types.deinit(self.allocator);
     }
 
     /// Get all exported functions

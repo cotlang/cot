@@ -180,7 +180,7 @@ pub const Lexer = struct {
 
         // String literals
         if (c == '"' or c == '\'') {
-            return self.scanString(c, start_pos, start_col);
+            return self.scanString(c, start_pos, start_col, self.line);
         }
 
         // Numbers
@@ -229,7 +229,7 @@ pub const Lexer = struct {
         return self.makeToken(.invalid, self.source[start_pos..self.position]);
     }
 
-    fn scanString(self: *Self, quote: u8, start_pos: usize, start_col: usize) Token {
+    fn scanString(self: *Self, quote: u8, start_pos: usize, start_col: usize, start_line: usize) Token {
         while (!self.isAtEnd() and self.peek() != quote) {
             if (self.peek() == '\n') {
                 self.line += 1;
@@ -239,10 +239,11 @@ pub const Lexer = struct {
         }
 
         if (self.isAtEnd()) {
+            // Unterminated string - report error at the START of the string, not where we ended up
             return .{
                 .type = .invalid,
                 .lexeme = self.source[start_pos..self.position],
-                .line = self.line,
+                .line = start_line,
                 .column = start_col,
             };
         }
@@ -253,7 +254,7 @@ pub const Lexer = struct {
         return .{
             .type = .string_literal,
             .lexeme = self.source[start_pos..self.position],
-            .line = self.line,
+            .line = start_line,
             .column = start_col,
         };
     }
