@@ -6,7 +6,8 @@
 const std = @import("std");
 const lexer_ext = @import("lexer_ext.zig");
 
-/// DBL type specifier (e.g., a50, d10, d10.2, i4, p6)
+/// DBL type specifier (e.g., a50, d10, d10.2, i4)
+/// Note: Packed types (p) are not supported
 pub const DblTypeSpec = struct {
     kind: Kind,
     size: ?u32 = null,
@@ -16,24 +17,23 @@ pub const DblTypeSpec = struct {
         alpha, // a, a50 - string/alpha
         decimal, // d, d10 - decimal number
         integer, // i1, i2, i4, i8 - integer
-        packed_decimal, // p6 - packed decimal
         boolean, // boolean
         handle, // @handle - object reference
     };
 
     /// Parse a DBL type specifier from string
-    /// Examples: "a50", "d10", "d10.2", "i4", "p6"
+    /// Examples: "a50", "d10", "d10.2", "i4"
     pub fn parse(s: []const u8) ?DblTypeSpec {
         if (s.len == 0) return null;
 
         var spec = DblTypeSpec{ .kind = undefined };
 
         // Determine kind from first character
+        // Note: 'p' (packed) types are not supported
         switch (s[0]) {
             'a', 'A' => spec.kind = .alpha,
             'd', 'D' => spec.kind = .decimal,
             'i', 'I' => spec.kind = .integer,
-            'p', 'P' => spec.kind = .packed_decimal,
             else => return null,
         }
 
@@ -65,7 +65,6 @@ pub const DblTypeSpec = struct {
             .alpha => .{ .string = self.size },
             .decimal => .{ .decimal = .{ .size = self.size, .precision = self.precision } },
             .integer => .{ .integer = @as(u8, @intCast(self.size orelse 4)) },
-            .packed_decimal => .{ .packed_decimal = self.size },
             .boolean => .{ .boolean = {} },
             .handle => .{ .handle = {} },
         };
@@ -77,7 +76,6 @@ pub const CoreType = union(enum) {
     string: ?u32, // string or string(size)
     decimal: struct { size: ?u32, precision: ?u32 },
     integer: u8, // 1, 2, 4, or 8 bytes
-    packed_decimal: ?u32,
     boolean: void,
     handle: void,
 };

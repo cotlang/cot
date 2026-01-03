@@ -26,9 +26,8 @@ pub const FieldSpec = struct {
         if (rest.len == 0) return error.InvalidFieldSpec;
 
         const type_char = rest[0];
-        if (type_char != 'a' and type_char != 'd' and
-            type_char != 'i' and type_char != 'p')
-        {
+        // Note: 'p' (packed) types are not supported - removed as they're not used in legacy app
+        if (type_char != 'a' and type_char != 'd' and type_char != 'i') {
             return error.InvalidTypeChar;
         }
 
@@ -63,7 +62,6 @@ pub const FieldSpec = struct {
             'a' => 1, // Default alpha is 1 char
             'd' => 10, // Default decimal
             'i' => 4, // Default integer (i4)
-            'p' => 6, // Default packed
             else => 1,
         };
     }
@@ -74,7 +72,6 @@ pub const FieldSpec = struct {
             'a' => self.size, // Alpha: 1 byte per char
             'd' => self.size, // Decimal: 1 byte per digit
             'i' => self.size, // Integer: size is byte count
-            'p' => (self.size + 1) / 2, // Packed: 2 digits per byte
             else => self.size,
         };
     }
@@ -111,6 +108,6 @@ test "field byte size" {
     const alpha = FieldSpec{ .name = "x", .type_char = 'a', .size = 50 };
     try std.testing.expect(alpha.byteSize() == 50);
 
-    const packed_field = FieldSpec{ .name = "y", .type_char = 'p', .size = 6 };
-    try std.testing.expect(packed_field.byteSize() == 3); // 6 digits = 3 bytes
+    const decimal = FieldSpec{ .name = "y", .type_char = 'd', .size = 10 };
+    try std.testing.expect(decimal.byteSize() == 10);
 }

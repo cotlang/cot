@@ -134,7 +134,7 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
     var value = try l.lowerExpression(value_idx);
     const target = try l.lowerLValue(target_idx);
 
-    // DBL compatibility: when storing a numeric value to a string_fixed field,
+    // DBL compatibility: when storing a numeric value to a [N]u8 array field,
     // format it with zero-padding to the field width
     const target_type = switch (target.ty) {
         .ptr => |p| p.*,
@@ -161,21 +161,31 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
         }
     }
 
-    if (target_type == .string_fixed and value.isNumeric()) {
-        const width = target_type.string_fixed;
-        debug.print(.ir, "DBL decimal format: numeric value to string_fixed({d}), emitting format_decimal", .{width});
+    // Check if target is a [N]u8 array (fixed-length string)
+    if (target_type == .array) {
+        const arr = target_type.array;
+        if (arr.element.* == .u8 and value.isNumeric()) {
+            const width = arr.length;
+            debug.print(.ir, "DBL decimal format: numeric value to [{}]u8, emitting format_decimal", .{width});
 
-        // Emit format_decimal instruction to convert integer to zero-padded string
-        const func = l.current_func orelse return LowerError.OutOfMemory;
-        const formatted = func.newValue(.{ .string_fixed = width });
-        try l.emit(.{
-            .format_decimal = .{
-                .value = value,
-                .width = width,
-                .result = formatted,
-            },
-        });
-        value = formatted;
+            // Emit format_decimal instruction to convert integer to zero-padded string
+            const func = l.current_func orelse return LowerError.OutOfMemory;
+
+            // Create [N]u8 array type for result
+            const u8_type_ptr = try l.allocator.create(ir.Type);
+            u8_type_ptr.* = .u8;
+            try l.allocated_types.append(l.allocator, u8_type_ptr);
+            const formatted = func.newValue(.{ .array = .{ .element = u8_type_ptr, .length = width } });
+
+            try l.emit(.{
+                .format_decimal = .{
+                    .value = value,
+                    .width = width,
+                    .result = formatted,
+                },
+            });
+            value = formatted;
+        }
     }
 
     try l.emit(.{
@@ -495,7 +505,11 @@ pub fn lowerFieldView(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
     if (type_idx != .null) {
         view_type = try l.lowerTypeIdx(type_idx);
     } else {
-        view_type = .{ .string_fixed = 1 }; // Default to a1
+        // Default to [1]u8 (equivalent to DBL a1)
+        const u8_type_ptr = try l.allocator.create(ir.Type);
+        u8_type_ptr.* = .u8;
+        try l.allocated_types.append(l.allocator, u8_type_ptr);
+        view_type = .{ .array = .{ .element = u8_type_ptr, .length = 1 } };
     }
 
     // Look up the base field's memory location

@@ -1670,6 +1670,8 @@ pub const Parser = struct {
         if (std.mem.eql(u8, name, "u16")) return self.store.addPrimitiveType(.u16) catch return error.OutOfMemory;
         if (std.mem.eql(u8, name, "u32")) return self.store.addPrimitiveType(.u32) catch return error.OutOfMemory;
         if (std.mem.eql(u8, name, "u64")) return self.store.addPrimitiveType(.u64) catch return error.OutOfMemory;
+        if (std.mem.eql(u8, name, "isize")) return self.store.addPrimitiveType(.isize) catch return error.OutOfMemory;
+        if (std.mem.eql(u8, name, "usize")) return self.store.addPrimitiveType(.usize) catch return error.OutOfMemory;
         if (std.mem.eql(u8, name, "f32")) return self.store.addPrimitiveType(.f32) catch return error.OutOfMemory;
         if (std.mem.eql(u8, name, "f64")) return self.store.addPrimitiveType(.f64) catch return error.OutOfMemory;
         if (std.mem.eql(u8, name, "bool")) return self.store.addPrimitiveType(.bool) catch return error.OutOfMemory;

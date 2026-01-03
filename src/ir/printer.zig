@@ -548,10 +548,11 @@ pub const Printer = struct {
             .u16 => try self.writer.writeAll("u16"),
             .u32 => try self.writer.writeAll("u32"),
             .u64 => try self.writer.writeAll("u64"),
+            .isize => try self.writer.writeAll("isize"),
+            .usize => try self.writer.writeAll("usize"),
             .f32 => try self.writer.writeAll("f32"),
             .f64 => try self.writer.writeAll("f64"),
             .string => try self.writer.writeAll("string"),
-            .string_fixed => |len| try self.writer.print("string[{d}]", .{len}),
             .decimal => |d| {
                 if (d.scale > 0) {
                     try self.writer.print("decimal({d},{d})", .{ d.precision, d.scale });

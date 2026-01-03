@@ -108,8 +108,18 @@ pub const StructHelper = struct {
     }
 
     /// Create a result value for serialization (sized to struct)
-    pub fn makeResultValue(func: *ir.Function, info: StructTypeInfo) ir.Value {
-        return func.newValue(.{ .string_fixed = info.size });
+    /// Returns [N]u8 array type where N is the struct size
+    pub fn makeResultValue(
+        func: *ir.Function,
+        info: StructTypeInfo,
+        allocator: std.mem.Allocator,
+        allocated_types: *std.ArrayListUnmanaged(*ir.Type),
+    ) error{OutOfMemory}!ir.Value {
+        // Create [N]u8 array type for the result
+        const u8_type_ptr = try allocator.create(ir.Type);
+        u8_type_ptr.* = .u8;
+        try allocated_types.append(allocator, u8_type_ptr);
+        return func.newValue(.{ .array = .{ .element = u8_type_ptr, .length = info.size } });
     }
 };
 

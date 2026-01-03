@@ -1023,7 +1023,7 @@ pub const Lowerer = struct {
             log.debug("lowerStructBufferOrExpression: serializing '{s}' type '{s}'", .{ info.base_name, info.structName() });
             debug.print(.ir, "lowerStructBufferOrExpression: emitting load_struct_buf for '{s}' type '{s}'", .{ info.base_name, info.structName() });
 
-            const result = StructHelper.makeResultValue(func, info);
+            const result = try StructHelper.makeResultValue(func, info, self.allocator, &self.allocated_types);
             const inst = StructHelper.makeLoadStructBufInst(info, result);
             try self.emit(inst);
             return result;

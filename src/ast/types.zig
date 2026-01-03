@@ -35,6 +35,12 @@ pub const TypeTag = enum(u8) {
     /// 64-bit unsigned integer
     u64,
 
+    /// Pointer-sized signed integer (i32 on 32-bit, i64 on 64-bit)
+    isize,
+
+    /// Pointer-sized unsigned integer (u32 on 32-bit, u64 on 64-bit)
+    usize,
+
     // ============================================
     // Primitive Types - Floats
     // ============================================
@@ -57,9 +63,6 @@ pub const TypeTag = enum(u8) {
 
     /// Dynamic string (heap allocated)
     string,
-
-    /// Fixed-length string (for DBL alpha compatibility)
-    string_fixed,
 
     /// Decimal type (for financial calculations)
     decimal,
@@ -124,7 +127,7 @@ pub const TypeTag = enum(u8) {
     /// Check if this is a signed integer type
     pub fn isSignedInt(self: TypeTag) bool {
         return switch (self) {
-            .i8, .i16, .i32, .i64 => true,
+            .i8, .i16, .i32, .i64, .isize => true,
             else => false,
         };
     }
@@ -132,7 +135,7 @@ pub const TypeTag = enum(u8) {
     /// Check if this is an unsigned integer type
     pub fn isUnsignedInt(self: TypeTag) bool {
         return switch (self) {
-            .u8, .u16, .u32, .u64 => true,
+            .u8, .u16, .u32, .u64, .usize => true,
             else => false,
         };
     }
@@ -158,7 +161,7 @@ pub const TypeTag = enum(u8) {
     /// Check if this is a primitive type
     pub fn isPrimitive(self: TypeTag) bool {
         return switch (self) {
-            .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .bool, .void, .string, .string_fixed, .decimal => true,
+            .i8, .i16, .i32, .i64, .isize, .u8, .u16, .u32, .u64, .usize, .f32, .f64, .bool, .void, .string, .decimal => true,
             else => false,
         };
     }
@@ -186,6 +189,7 @@ pub const TypeTag = enum(u8) {
             .i16, .u16 => 16,
             .i32, .u32, .f32 => 32,
             .i64, .u64, .f64 => 64,
+            .isize, .usize => @bitSizeOf(usize),
             else => 0,
         };
     }

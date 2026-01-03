@@ -1062,9 +1062,11 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
         // Serialize based on field type
         switch (field.data_type) {
             .decimal => {
-                const int_val = val.toInt();
+                // For implied decimal semantics, get the raw value (not divided by precision)
+                // e.g., d10.2 value 123.45 is stored as 12345, should write "0000012345"
+                const raw_val: i64 = if (val.asDecimal()) |d| d.value else val.toInt();
                 var num_buf: [32]u8 = undefined;
-                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{@abs(int_val)}) catch "0";
+                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{@abs(raw_val)}) catch "0";
 
                 if (num_str.len >= size) {
                     @memcpy(dest, num_str[num_str.len - size ..]);
@@ -1143,7 +1145,16 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
             .decimal => {
                 const trimmed = std.mem.trim(u8, src, " \t\x00");
                 const int_val = std.fmt.parseInt(i64, trimmed, 10) catch 0;
-                vm.stack[slot] = Value.initInt(int_val);
+                // Use field.precision to preserve implied decimal semantics
+                // For d10.2, value 12345 with precision 2 represents 123.45
+                if (field.precision > 0) {
+                    vm.stack[slot] = Value.initDecimal(vm.valueAllocator(), int_val, field.precision) catch {
+                        vm.stack[slot] = Value.initInt(int_val);
+                        continue;
+                    };
+                } else {
+                    vm.stack[slot] = Value.initInt(int_val);
+                }
             },
             .string => {
                 const str_copy = vm.allocator.alloc(u8, size) catch continue;

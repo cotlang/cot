@@ -41,15 +41,16 @@ pub const Type = union(enum) {
     u32: void,
     u64: void,
 
+    /// Pointer-sized integers
+    isize: void,
+    usize: void,
+
     /// Floating point types
     f32: void,
     f64: void,
 
     /// String type (dynamic length)
     string: void,
-
-    /// Fixed-length string (for ISAM field compatibility)
-    string_fixed: u32,
 
     /// Decimal type (for precise financial calculations)
     decimal: DecimalType,
@@ -97,8 +98,8 @@ pub const Type = union(enum) {
             .i16, .u16 => 2,
             .i32, .u32, .f32 => 4,
             .i64, .u64, .f64 => 8,
+            .isize, .usize => @sizeOf(usize),
             .string => 16, // Pointer + length
-            .string_fixed => |len| len,
             .decimal => |d| @max(8, (d.precision + 1) / 2), // At least 8 bytes
             .ptr, .optional => 8, // 64-bit pointers
             .array => |a| a.element.sizeInBytes() * a.length,
@@ -119,8 +120,8 @@ pub const Type = union(enum) {
             .i16, .u16 => 2,
             .i32, .u32, .f32 => 4,
             .i64, .u64, .f64 => 8,
+            .isize, .usize => @alignOf(usize),
             .string, .slice => 8,
-            .string_fixed => 1,
             .decimal => 8,
             .ptr, .optional => 8,
             .array => |a| a.element.alignment(),
@@ -144,9 +145,11 @@ pub const Type = union(enum) {
             .u16 => "uint16_t",
             .u32 => "uint32_t",
             .u64 => "uint64_t",
+            .isize => "intptr_t",
+            .usize => "uintptr_t",
             .f32 => "float",
             .f64 => "double",
-            .string, .string_fixed => "cot_string_t*",
+            .string => "cot_string_t*",
             .decimal => "cot_decimal_t",
             .ptr, .optional => "void*",
             .array, .slice => "void*",
@@ -160,8 +163,8 @@ pub const Type = union(enum) {
     /// Check if this type is numeric
     pub fn isNumeric(self: Type) bool {
         return switch (self) {
-            .i8, .i16, .i32, .i64 => true,
-            .u8, .u16, .u32, .u64 => true,
+            .i8, .i16, .i32, .i64, .isize => true,
+            .u8, .u16, .u32, .u64, .usize => true,
             .f32, .f64, .decimal => true,
             else => false,
         };
@@ -170,8 +173,8 @@ pub const Type = union(enum) {
     /// Check if this type is an integer
     pub fn isInteger(self: Type) bool {
         return switch (self) {
-            .i8, .i16, .i32, .i64 => true,
-            .u8, .u16, .u32, .u64 => true,
+            .i8, .i16, .i32, .i64, .isize => true,
+            .u8, .u16, .u32, .u64, .usize => true,
             else => false,
         };
     }
@@ -179,7 +182,7 @@ pub const Type = union(enum) {
     /// Check if this type is signed
     pub fn isSigned(self: Type) bool {
         return switch (self) {
-            .i8, .i16, .i32, .i64, .f32, .f64, .decimal => true,
+            .i8, .i16, .i32, .i64, .isize, .f32, .f64, .decimal => true,
             else => false,
         };
     }
@@ -258,7 +261,9 @@ pub const Value = struct {
     /// Check if this value has a string type
     pub fn isString(self: Value) bool {
         return switch (self.ty) {
-            .string, .string_fixed => true,
+            .string => true,
+            // Check if it's a [N]u8 array (fixed-length string)
+            .array => |a| a.element.* == .u8,
             else => false,
         };
     }

@@ -222,15 +222,13 @@ pub const Emitter = struct {
             .u16 => try self.writer.writeAll("u16"),
             .u32 => try self.writer.writeAll("u32"),
             .u64 => try self.writer.writeAll("u64"),
+            .isize => try self.writer.writeAll("isize"),
+            .usize => try self.writer.writeAll("usize"),
             .f32 => try self.writer.writeAll("f32"),
             .f64 => try self.writer.writeAll("f64"),
             .bool => try self.writer.writeAll("bool"),
             .void => try self.writer.writeAll("void"),
             .string => try self.writer.writeAll("string"),
-            .string_fixed => {
-                const data = self.store.typeData(idx);
-                try self.writer.print("a{d}", .{data.b});
-            },
             .decimal => {
                 const data = self.store.typeData(idx);
                 const precision = data.a;

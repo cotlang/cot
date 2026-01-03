@@ -749,15 +749,6 @@ pub const NodeStore = struct {
         return idx;
     }
 
-    /// Add a fixed-length string type (DBL alpha type like a30)
-    /// The length is stored in data.a to match how lowerTypeIdx reads it
-    pub fn addStringFixedType(self: *Self, length: u32) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .string_fixed);
-        try self.type_data.append(self.allocator, .{ .a = length, .b = 0 });
-        return idx;
-    }
-
     /// Add a decimal type (DBL decimal type like d6)
     /// precision is the number of digits, scale is decimal places (0 for integers)
     pub fn addDecimalType(self: *Self, precision: u32, scale: u32) !TypeIdx {

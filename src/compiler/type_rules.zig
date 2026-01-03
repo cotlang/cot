@@ -48,20 +48,40 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
         // Dynamic string
         .string => switch (value_deref) {
             .string => .compatible,
-            .string_fixed => .implicit_conversion,
+            // [N]u8 arrays can be implicitly converted to dynamic string
+            .array => |a| if (a.element.* == .u8) .implicit_conversion else .incompatible,
             else => .incompatible,
         },
 
-        // Fixed-length string
-        .string_fixed => |target_len| switch (value_deref) {
-            .string => .implicit_conversion, // Dynamic to fixed may truncate
-            .string_fixed => |value_len| blk: {
-                if (value_len <= target_len) {
-                    break :blk .compatible;
-                }
-                break :blk .lossy_conversion;
-            },
-            else => .incompatible,
+        // Array assignment compatibility
+        .array => |target_arr| blk: {
+            // Handle [N]u8 (string-like) arrays specially
+            if (target_arr.element.* == .u8) {
+                break :blk switch (value_deref) {
+                    .string => .implicit_conversion, // Dynamic to fixed may truncate
+                    .array => |value_arr| inner: {
+                        if (value_arr.element.* != .u8) break :inner .incompatible;
+                        if (value_arr.length <= target_arr.length) {
+                            break :inner .compatible;
+                        }
+                        break :inner .lossy_conversion;
+                    },
+                    else => .incompatible,
+                };
+            }
+            // General array handling
+            break :blk switch (value_deref) {
+                .array => |value_arr| inner: {
+                    if (!std.meta.eql(target_arr.element.*, value_arr.element.*)) {
+                        break :inner .incompatible;
+                    }
+                    if (value_arr.length <= target_arr.length) {
+                        break :inner .compatible;
+                    }
+                    break :inner .incompatible;
+                },
+                else => .incompatible,
+            };
         },
 
         // Decimal (precision, scale)
@@ -127,6 +147,21 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             else => .incompatible,
         },
 
+        // Pointer-sized integers
+        .isize => switch (value_deref) {
+            .i8, .i16, .i32, .isize => .compatible,
+            .i64 => .lossy_conversion, // May lose on 32-bit
+            .u8, .u16, .u32 => .compatible,
+            .u64, .usize => .lossy_conversion,
+            else => .incompatible,
+        },
+        .usize => switch (value_deref) {
+            .u8, .u16, .u32, .usize => .compatible,
+            .u64 => .lossy_conversion, // May lose on 32-bit
+            .i8, .i16, .i32, .i64, .isize => .lossy_conversion,
+            else => .incompatible,
+        },
+
         // Floats
         .f32 => switch (value_deref) {
             .f32 => .compatible,
@@ -170,18 +205,7 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             },
         },
 
-        .array => |target_arr| switch (value_deref) {
-            .array => |value_arr| blk: {
-                if (!std.meta.eql(target_arr.element.*, value_arr.element.*)) {
-                    break :blk .incompatible;
-                }
-                if (value_arr.length <= target_arr.length) {
-                    break :blk .compatible;
-                }
-                break :blk .incompatible;
-            },
-            else => .incompatible,
-        },
+        // General array handling is done above with the [N]u8 string-like case
 
         .slice => |target_elem| switch (value_deref) {
             .slice => |value_elem| blk: {
@@ -263,13 +287,9 @@ pub fn checkBinaryOp(op: BinaryOpType, lhs: Type, rhs: Type) BinaryOpResult {
 }
 
 fn checkArithmeticOp(lhs: Type, rhs: Type) BinaryOpResult {
-    // String concatenation: string + string
+    // String concatenation: string + string -> dynamic string
     if (isString(lhs) and isString(rhs)) {
-        const lhs_len = getStringLen(lhs);
-        const rhs_len = getStringLen(rhs);
-        if (lhs_len > 0 or rhs_len > 0) {
-            return .{ .ok = true, .result_type = .{ .string_fixed = lhs_len + rhs_len } };
-        }
+        // Result is always dynamic string (allocation happens at runtime)
         return .{ .ok = true, .result_type = .{ .string = {} } };
     }
 
@@ -314,15 +334,7 @@ fn checkStringConcat(lhs: Type, rhs: Type) BinaryOpResult {
         return .{ .ok = false, .result_type = null };
     }
 
-    // If both are strings, calculate the result length
-    if (lhs_is_string and rhs_is_string) {
-        const lhs_len = getStringLen(lhs);
-        const rhs_len = getStringLen(rhs);
-        if (lhs_len > 0 or rhs_len > 0) {
-            return .{ .ok = true, .result_type = .{ .string_fixed = lhs_len + rhs_len } };
-        }
-    }
-    // Mixed string + numeric: result is dynamic string
+    // Result is always dynamic string (allocation happens at runtime)
     return .{ .ok = true, .result_type = .{ .string = {} } };
 }
 
@@ -330,7 +342,8 @@ fn checkStringConcat(lhs: Type, rhs: Type) BinaryOpResult {
 fn getStringLen(ty: Type) u32 {
     return switch (ty) {
         .string => 0,
-        .string_fixed => |len| len,
+        // [N]u8 arrays have a fixed length
+        .array => |a| if (a.element.* == .u8) a.length else 0,
         else => 0,
     };
 }
@@ -372,7 +385,9 @@ pub fn isNumeric(ty: Type) bool {
 /// Check if a type is a string type
 pub fn isString(ty: Type) bool {
     return switch (ty) {
-        .string, .string_fixed => true,
+        .string => true,
+        // [N]u8 arrays are treated as fixed-length strings
+        .array => |a| a.element.* == .u8,
         else => false,
     };
 }
@@ -390,10 +405,11 @@ pub fn typeName(ty: Type) []const u8 {
         .u16 => "u16",
         .u32 => "u32",
         .u64 => "u64",
+        .isize => "isize",
+        .usize => "usize",
         .f32 => "f32",
         .f64 => "f64",
         .string => "string",
-        .string_fixed => "string",
         .decimal => "decimal",
         .ptr => "pointer",
         .optional => "optional",
@@ -422,10 +438,11 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         .u16 => writer.writeAll("u16") catch {},
         .u32 => writer.writeAll("u32") catch {},
         .u64 => writer.writeAll("u64") catch {},
+        .isize => writer.writeAll("isize") catch {},
+        .usize => writer.writeAll("usize") catch {},
         .f32 => writer.writeAll("f32") catch {},
         .f64 => writer.writeAll("f64") catch {},
         .string => writer.writeAll("string") catch {},
-        .string_fixed => |len| writer.print("string[{d}]", .{len}) catch {},
         .decimal => |d| writer.print("decimal({d},{d})", .{ d.precision, d.scale }) catch {},
         .ptr => |p| {
             var inner_buf: [64]u8 = undefined;
@@ -460,8 +477,10 @@ test "numeric assignment compatibility" {
 }
 
 test "string assignment compatibility" {
-    const str10: Type = .{ .string_fixed = 10 };
-    const str20: Type = .{ .string_fixed = 20 };
+    // Use static u8 type for array element
+    const u8_elem: Type = .{ .u8 = {} };
+    const str10: Type = .{ .array = .{ .element = &u8_elem, .length = 10 } };
+    const str20: Type = .{ .array = .{ .element = &u8_elem, .length = 20 } };
     const dec: Type = .{ .decimal = .{ .precision = 4, .scale = 0 } };
 
     // Shorter string to longer is compatible
@@ -477,7 +496,9 @@ test "string assignment compatibility" {
 test "arithmetic operation types" {
     const dec: Type = .{ .decimal = .{ .precision = 4, .scale = 0 } };
     const int: Type = .{ .i32 = {} };
-    const str: Type = .{ .string_fixed = 10 };
+    // Use static u8 type for array element
+    const u8_elem: Type = .{ .u8 = {} };
+    const str: Type = .{ .array = .{ .element = &u8_elem, .length = 10 } };
 
     // Decimal + integer is valid
     const result = checkBinaryOp(.arithmetic, dec, int);

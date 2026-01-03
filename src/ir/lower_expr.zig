@@ -117,7 +117,14 @@ pub fn lowerFloatLiteral(l: *Lowerer, func: *ir.Function, data: NodeData) LowerE
 pub fn lowerStringLiteral(l: *Lowerer, func: *ir.Function, data: NodeData) LowerError!ir.Value {
     const str_id = data.getName();
     const str = l.strings.get(str_id);
-    const result = func.newValue(.{ .string_fixed = @intCast(str.len) });
+
+    // Create [N]u8 array type for fixed-length string
+    const u8_type_ptr = try l.allocator.create(ir.Type);
+    u8_type_ptr.* = .u8;
+    try l.allocated_types.append(l.allocator, u8_type_ptr);
+
+    const array_type: ir.Type = .{ .array = .{ .element = u8_type_ptr, .length = @intCast(str.len) } };
+    const result = func.newValue(array_type);
     try l.emit(.{
         .const_string = .{
             .value = str,
@@ -367,8 +374,8 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
 
     const ir_op: ir.Instruction = switch (op) {
         .add => blk: {
-            const lhs_is_string = (lhs.ty == .string or lhs.ty == .string_fixed);
-            const rhs_is_string = (rhs.ty == .string or rhs.ty == .string_fixed);
+            const lhs_is_string = lhs.isString();
+            const rhs_is_string = rhs.isString();
 
             debug.print(.ir, "binary add: lhs.ty={s} rhs.ty={s} lhs_is_string={} rhs_is_string={}", .{
                 @tagName(lhs.ty),
@@ -1179,10 +1186,11 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
         .u16 => .u16,
         .u32 => .u32,
         .u64 => .u64,
+        .isize => .isize,
+        .usize => .usize,
         .f32 => .f32,
         .f64 => .f64,
         .string => .string,
-        .string_fixed => .{ .string_fixed = data.a },
         .decimal => .{ .decimal = .{ .precision = @intCast(data.a), .scale = @intCast(data.b) } },
         .array => blk: {
             const elem_type_idx: TypeIdx = @enumFromInt(data.a);

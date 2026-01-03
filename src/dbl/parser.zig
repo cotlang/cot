@@ -903,6 +903,34 @@ pub const Parser = struct {
         const len = @min(type_str.len, lower_buf.len);
         const lower = std.ascii.lowerString(lower_buf[0..len], type_str[0..len]);
 
+        // Check for C#-style types (used in DBL with comma prefix, e.g., ,string, ,int, ,boolean)
+        if (std.mem.eql(u8, lower, "string")) {
+            return .{
+                .type_idx = self.store.addPrimitiveType(.string) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "int") or std.mem.eql(u8, lower, "integer")) {
+            // DBL int/integer maps to i4 (4 bytes = 32 bits)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.i32) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "boolean") or std.mem.eql(u8, lower, "bool")) {
+            return .{
+                .type_idx = self.store.addPrimitiveType(.bool) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "decimal") or std.mem.eql(u8, lower, "double")) {
+            // DBL decimal and double both map to d28.10
+            return .{
+                .type_idx = self.store.addDecimalType(28, 10) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+
         // Check for array types: <digits><type_char><digits> e.g., 10a20, 10d4
         // The pattern is: array_size (digits) + type char (a/d/i) + element_size (digits)
         if (std.ascii.isDigit(lower[0])) {
@@ -936,42 +964,91 @@ pub const Parser = struct {
 
         // Check if it's a primitive DBL type specifier
         // DBL primitives are: d, a, i alone OR d<digits>, a<digits>, i<digits> (e.g., d6, a30, i4)
+        // Also handles d<digits>.<digits> for decimal with scale (e.g., d10.2)
         // NOT struct names that happen to start with a/d/i (e.g., app_state_t, data_t)
         if (lower[0] == 'd' or lower[0] == 'a' or lower[0] == 'i') {
             // Single letter (d, a, i) is a valid DBL type
-            // Or letter followed by all digits (d6, a30, i4)
+            // Or letter followed by digits (and optional .digits for decimals)
             var is_primitive = (len == 1);
+            var dot_pos: ?usize = null;
             if (!is_primitive and len >= 2) {
-                var all_digits = true;
-                for (lower[1..len]) |c| {
-                    if (!std.ascii.isDigit(c)) {
-                        all_digits = false;
+                var valid = true;
+                for (lower[1..len], 1..) |c, idx| {
+                    if (c == '.' and lower[0] == 'd') {
+                        // Only decimals can have a dot
+                        if (dot_pos != null) {
+                            valid = false; // Multiple dots
+                            break;
+                        }
+                        dot_pos = idx;
+                    } else if (!std.ascii.isDigit(c)) {
+                        valid = false;
                         break;
                     }
                 }
-                is_primitive = all_digits;
+                is_primitive = valid;
             }
             if (is_primitive) {
-                // It's a DBL primitive type specifier - parse the size
-                const size: u32 = if (len > 1)
-                    std.fmt.parseInt(u32, lower[1..len], 10) catch 1
-                else
-                    1; // Default size is 1
+                // It's a DBL primitive type specifier
 
                 // DBL type distinction:
-                // - 'a' (alpha): arbitrary characters, stored as string_fixed
+                // - 'a' (alpha): arbitrary characters, stored as [N]u8 array
                 // - 'd' (decimal): numeric only, stored as decimal type (zero-padded on store)
                 // - 'i' (integer): numeric only, stored as integer
+                // DBL integer types use BYTE counts: i1=1byte, i2=2bytes, i4=4bytes, i8=8bytes
+                // Cot/Zig uses BIT counts: i8=8bits, i16=16bits, i32=32bits, i64=64bits
                 if (lower[0] == 'd') {
-                    // Decimal type: numeric with precision (number of digits)
+                    // Decimal type: numeric with precision and optional scale
+                    // d = default precision (18), scale 0
+                    // d10 = precision 10, scale 0
+                    // d10.2 = precision 10, scale 2
+                    var precision: u32 = 18; // Default precision for bare 'd'
+                    var scale: u32 = 0;
+
+                    if (len > 1) {
+                        if (dot_pos) |dp| {
+                            // Parse precision before dot, scale after
+                            precision = std.fmt.parseInt(u32, lower[1..dp], 10) catch 1;
+                            if (dp + 1 < len) {
+                                scale = std.fmt.parseInt(u32, lower[dp + 1 .. len], 10) catch 0;
+                            }
+                        } else {
+                            // Just precision, no scale
+                            precision = std.fmt.parseInt(u32, lower[1..len], 10) catch 1;
+                        }
+                    }
+
                     return .{
-                        .type_idx = self.store.addDecimalType(size, 0) catch TypeIdx.null,
+                        .type_idx = self.store.addDecimalType(precision, scale) catch TypeIdx.null,
+                        .is_struct = false,
+                    };
+                } else if (lower[0] == 'i') {
+                    // Parse the size for integer types
+                    const size: u32 = if (len > 1)
+                        std.fmt.parseInt(u32, lower[1..len], 10) catch 1
+                    else
+                        1;
+                    // Integer type: map DBL byte count to Zig bit count
+                    // i1 (1 byte) -> i8, i2 (2 bytes) -> i16, i4 (4 bytes) -> i32, i8 (8 bytes) -> i64
+                    const int_type: ast.types.TypeTag = switch (size) {
+                        1 => .i8,
+                        2 => .i16,
+                        4 => .i32,
+                        else => .i64, // i8 and any other size defaults to i64
+                    };
+                    return .{
+                        .type_idx = self.store.addPrimitiveType(int_type) catch TypeIdx.null,
                         .is_struct = false,
                     };
                 } else {
-                    // Alpha (and fallback): fixed-length string
+                    // Alpha: fixed-length string as [N]u8 array (Zig-standard)
+                    const alpha_size: u32 = if (len > 1)
+                        std.fmt.parseInt(u32, lower[1..len], 10) catch 1
+                    else
+                        1;
+                    const u8_type = self.store.addPrimitiveType(.u8) catch TypeIdx.null;
                     return .{
-                        .type_idx = self.store.addStringFixedType(size) catch TypeIdx.null,
+                        .type_idx = self.store.addArrayType(u8_type, alpha_size) catch TypeIdx.null,
                         .is_struct = false,
                     };
                 }

@@ -1084,10 +1084,11 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .u16 => .int16,
         .u32 => .int32,
         .u64 => .int64,
+        .isize => .int64, // Pointer-sized signed
+        .usize => .int64, // Pointer-sized unsigned
         .f32 => .fixed_point,
         .f64 => .fixed_point,
         .string => .string,
-        .string_fixed => .string,
         .decimal => .decimal,
         .ptr => .int64, // Pointers are 64-bit
         .optional => .int64, // Optionals are pointer-sized
