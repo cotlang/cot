@@ -337,7 +337,12 @@ pub fn op_decr(vm: *VM, module: *const Module) VMError!DispatchResult {
 // Comparison Operations
 // ============================================================================
 
-/// cmp_eq rd, ra, rb - equality comparison
+/// Helper to check if value is any string type
+fn isAnyString(val: Value) bool {
+    return val.isString() or val.isFixedString();
+}
+
+/// cmp_eq rd, ra, rb - equality comparison (auto-detects strings)
 pub fn op_cmp_eq(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -345,11 +350,17 @@ pub fn op_cmp_eq(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[ra].toInt() == vm.registers[rb].toInt());
+    const a = vm.registers[ra];
+    const b = vm.registers[rb];
+    if (isAnyString(a) or isAnyString(b)) {
+        vm.registers[rd] = Value.initBool(std.mem.eql(u8, a.asString(), b.asString()));
+    } else {
+        vm.registers[rd] = Value.initBool(a.toInt() == b.toInt());
+    }
     return .continue_dispatch;
 }
 
-/// cmp_ne rd, ra, rb - not equal comparison
+/// cmp_ne rd, ra, rb - not equal comparison (auto-detects strings)
 pub fn op_cmp_ne(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -357,11 +368,17 @@ pub fn op_cmp_ne(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[ra].toInt() != vm.registers[rb].toInt());
+    const a = vm.registers[ra];
+    const b = vm.registers[rb];
+    if (isAnyString(a) or isAnyString(b)) {
+        vm.registers[rd] = Value.initBool(!std.mem.eql(u8, a.asString(), b.asString()));
+    } else {
+        vm.registers[rd] = Value.initBool(a.toInt() != b.toInt());
+    }
     return .continue_dispatch;
 }
 
-/// cmp_lt rd, ra, rb - less than comparison
+/// cmp_lt rd, ra, rb - less than comparison (auto-detects strings)
 pub fn op_cmp_lt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -369,11 +386,17 @@ pub fn op_cmp_lt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[ra].toInt() < vm.registers[rb].toInt());
+    const a = vm.registers[ra];
+    const b = vm.registers[rb];
+    if (isAnyString(a) or isAnyString(b)) {
+        vm.registers[rd] = Value.initBool(std.mem.order(u8, a.asString(), b.asString()) == .lt);
+    } else {
+        vm.registers[rd] = Value.initBool(a.toInt() < b.toInt());
+    }
     return .continue_dispatch;
 }
 
-/// cmp_le rd, ra, rb - less than or equal comparison
+/// cmp_le rd, ra, rb - less than or equal comparison (auto-detects strings)
 pub fn op_cmp_le(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -381,11 +404,18 @@ pub fn op_cmp_le(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[ra].toInt() <= vm.registers[rb].toInt());
+    const a = vm.registers[ra];
+    const b = vm.registers[rb];
+    if (isAnyString(a) or isAnyString(b)) {
+        const ord = std.mem.order(u8, a.asString(), b.asString());
+        vm.registers[rd] = Value.initBool(ord == .lt or ord == .eq);
+    } else {
+        vm.registers[rd] = Value.initBool(a.toInt() <= b.toInt());
+    }
     return .continue_dispatch;
 }
 
-/// cmp_gt rd, ra, rb - greater than comparison
+/// cmp_gt rd, ra, rb - greater than comparison (auto-detects strings)
 pub fn op_cmp_gt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -393,11 +423,17 @@ pub fn op_cmp_gt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[ra].toInt() > vm.registers[rb].toInt());
+    const a = vm.registers[ra];
+    const b = vm.registers[rb];
+    if (isAnyString(a) or isAnyString(b)) {
+        vm.registers[rd] = Value.initBool(std.mem.order(u8, a.asString(), b.asString()) == .gt);
+    } else {
+        vm.registers[rd] = Value.initBool(a.toInt() > b.toInt());
+    }
     return .continue_dispatch;
 }
 
-/// cmp_ge rd, ra, rb - greater than or equal comparison
+/// cmp_ge rd, ra, rb - greater than or equal comparison (auto-detects strings)
 pub fn op_cmp_ge(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -405,7 +441,104 @@ pub fn op_cmp_ge(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[ra].toInt() >= vm.registers[rb].toInt());
+    const a = vm.registers[ra];
+    const b = vm.registers[rb];
+    if (isAnyString(a) or isAnyString(b)) {
+        const ord = std.mem.order(u8, a.asString(), b.asString());
+        vm.registers[rd] = Value.initBool(ord == .gt or ord == .eq);
+    } else {
+        vm.registers[rd] = Value.initBool(a.toInt() >= b.toInt());
+    }
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// String Comparison Operations
+// ============================================================================
+
+/// cmp_str_eq rd, ra, rb - string equal comparison
+pub fn op_cmp_str_eq(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const ra: u4 = @truncate(ops & 0xF);
+    const rb: u4 = @truncate(ops2 >> 4);
+    const a = vm.registers[ra].asString();
+    const b = vm.registers[rb].asString();
+    vm.registers[rd] = Value.initBool(std.mem.eql(u8, a, b));
+    return .continue_dispatch;
+}
+
+/// cmp_str_ne rd, ra, rb - string not equal comparison
+pub fn op_cmp_str_ne(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const ra: u4 = @truncate(ops & 0xF);
+    const rb: u4 = @truncate(ops2 >> 4);
+    const a = vm.registers[ra].asString();
+    const b = vm.registers[rb].asString();
+    vm.registers[rd] = Value.initBool(!std.mem.eql(u8, a, b));
+    return .continue_dispatch;
+}
+
+/// cmp_str_lt rd, ra, rb - string less than comparison
+pub fn op_cmp_str_lt(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const ra: u4 = @truncate(ops & 0xF);
+    const rb: u4 = @truncate(ops2 >> 4);
+    const a = vm.registers[ra].asString();
+    const b = vm.registers[rb].asString();
+    vm.registers[rd] = Value.initBool(std.mem.order(u8, a, b) == .lt);
+    return .continue_dispatch;
+}
+
+/// cmp_str_le rd, ra, rb - string less than or equal comparison
+pub fn op_cmp_str_le(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const ra: u4 = @truncate(ops & 0xF);
+    const rb: u4 = @truncate(ops2 >> 4);
+    const a = vm.registers[ra].asString();
+    const b = vm.registers[rb].asString();
+    const ord = std.mem.order(u8, a, b);
+    vm.registers[rd] = Value.initBool(ord == .lt or ord == .eq);
+    return .continue_dispatch;
+}
+
+/// cmp_str_gt rd, ra, rb - string greater than comparison
+pub fn op_cmp_str_gt(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const ra: u4 = @truncate(ops & 0xF);
+    const rb: u4 = @truncate(ops2 >> 4);
+    const a = vm.registers[ra].asString();
+    const b = vm.registers[rb].asString();
+    vm.registers[rd] = Value.initBool(std.mem.order(u8, a, b) == .gt);
+    return .continue_dispatch;
+}
+
+/// cmp_str_ge rd, ra, rb - string greater than or equal comparison
+pub fn op_cmp_str_ge(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const ra: u4 = @truncate(ops & 0xF);
+    const rb: u4 = @truncate(ops2 >> 4);
+    const a = vm.registers[ra].asString();
+    const b = vm.registers[rb].asString();
+    const ord = std.mem.order(u8, a, b);
+    vm.registers[rd] = Value.initBool(ord == .gt or ord == .eq);
     return .continue_dispatch;
 }
 

@@ -317,7 +317,9 @@ pub const Lexer = struct {
             return self.scanDotOperator(start_pos, start_col);
         }
 
-        // Ampersand: & (bitwise AND) or && (logical AND) or &=
+        // Ampersand: && (logical AND) or &= or & (bitwise AND / string concat)
+        // Note: & also serves as string concatenation in DBL, so we always return it as a token
+        // Line continuation is handled by skipping newlines after operators
         if (c == '&') {
             if (!self.isAtEnd()) {
                 if (self.peek() == '&') {
@@ -589,6 +591,10 @@ pub const Lexer = struct {
                     _ = self.advance();
                     self.line += 1;
                     self.column = 1;
+                    // Note: Legacy DBL line continuation with & at start of line
+                    // is handled naturally - since newlines are whitespace and skipped,
+                    // the & at the start of the next line is just tokenized normally
+                    // as op_band (which also serves as string concatenation operator).
                 },
                 ';' => {
                     // Semicolon comment - skip to end of line

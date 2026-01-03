@@ -297,17 +297,18 @@ pub const Bundler = struct {
         }
 
         // Spawn cot-dbl to compile the file
-        // cot-dbl <input.dbl> --output <output.cbo>
+        // cot-dbl <input.dbl> compile --output <output.cbo>
         const argv = [_][]const u8{
             "cot-dbl",
             source_path,
+            "compile",
             "--output",
             output_path,
         };
 
         var child = std.process.Child.init(&argv, self.allocator);
-        // Use Ignore to avoid pipe deadlock (cot-dbl can produce output in debug mode)
-        child.stderr_behavior = .Ignore;
+        // Capture stderr to get actual error messages from cot-dbl
+        child.stderr_behavior = .Pipe;
         child.stdout_behavior = .Ignore;
 
         _ = child.spawn() catch |err| {
@@ -322,6 +323,12 @@ pub const Bundler = struct {
             return error.CompilationFailed;
         };
 
+        // Read stderr output before waiting (to avoid pipe buffer deadlock)
+        var stderr_output: []const u8 = "";
+        if (child.stderr) |stderr_pipe| {
+            stderr_output = stderr_pipe.readToEndAlloc(self.allocator, 64 * 1024) catch "";
+        }
+
         const result = child.wait() catch return error.CompilationFailed;
 
         // Check if process exited successfully (exit code 0)
@@ -331,13 +338,26 @@ pub const Bundler = struct {
         };
 
         if (!success) {
-            try self.errors.append(self.allocator, try std.fmt.allocPrint(
-                self.allocator,
-                "{s}: cot-dbl compilation failed",
-                .{source_path},
-            ));
+            // Include actual error output from cot-dbl
+            if (stderr_output.len > 0) {
+                // Strip ANSI codes and trim for cleaner output
+                const error_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}:\n{s}",
+                    .{ source_path, std.mem.trim(u8, stderr_output, " \t\n\r") },
+                );
+                try self.errors.append(self.allocator, error_msg);
+                self.allocator.free(stderr_output);
+            } else {
+                try self.errors.append(self.allocator, try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}: cot-dbl compilation failed",
+                    .{source_path},
+                ));
+            }
             return error.CompilationFailed;
         }
+        if (stderr_output.len > 0) self.allocator.free(stderr_output);
 
         // Read the compiled bytecode
         const file = std.fs.cwd().openFile(output_path, .{}) catch return error.CompilationFailed;

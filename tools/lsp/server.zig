@@ -585,3 +585,265 @@ fn getDblSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
         }
     }
 }
+
+// ============================================================
+// Document Formatting
+// ============================================================
+
+/// Text edit for formatting
+pub const TextEdit = struct {
+    range: protocol.Range,
+    new_text: []const u8,
+};
+
+/// Format a document and return text edits
+pub fn formatDocument(allocator: Allocator, doc: *const Document, tab_size: u32, insert_spaces: bool) ![]TextEdit {
+    return switch (doc.language) {
+        .dbl => formatDbl(allocator, doc.content, tab_size, insert_spaces),
+        .cot => formatCot(allocator, doc.content, tab_size, insert_spaces),
+    };
+}
+
+/// Format DBL source code
+fn formatDbl(allocator: Allocator, source: []const u8, tab_size: u32, insert_spaces: bool) ![]TextEdit {
+    var edits: std.ArrayListUnmanaged(TextEdit) = .empty;
+    errdefer edits.deinit(allocator);
+
+    // Build the indent string
+    var indent_buf: [16]u8 = undefined;
+    const indent_str = if (insert_spaces) blk: {
+        const size = @min(tab_size, 16);
+        @memset(indent_buf[0..size], ' ');
+        break :blk indent_buf[0..size];
+    } else "\t";
+
+    // Keywords that increase indent level
+    // Note: begin/end work like braces - control flow keywords (if/while/for/etc.)
+    // don't increase indent; only begin does
+    const indent_keywords = [_][]const u8{
+        "record", "group", "structure", "common", "global", "literal",
+        "begin", "using",
+        "class", "method", "property", "namespace", "interface", "try",
+        "subroutine", "function", "main", "proc", "test",
+    };
+
+    // Keywords that decrease indent level
+    // Note: else/catch/finally stay at the same level as begin/end, not dedented
+    const dedent_keywords = [_][]const u8{
+        "endrecord", "endgroup", "endstructure", "endcommon", "endglobal", "endliteral",
+        "end", "endusing", "endclass", "endmethod", "endproperty",
+        "endnamespace", "endinterface", "endtry", "endsubroutine", "endfunction",
+        "endmain", "endproc", "endtest",
+    };
+
+    // Process line by line
+    var line_num: u32 = 0;
+    var line_start: usize = 0;
+    var indent_level: u32 = 0;
+
+    var i: usize = 0;
+    while (i <= source.len) : (i += 1) {
+        const at_end = i == source.len;
+        const at_newline = !at_end and source[i] == '\n';
+
+        if (at_newline or at_end) {
+            const line_end = i;
+            const line = source[line_start..line_end];
+
+            // Skip empty lines
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (trimmed.len > 0) {
+                // Check if line starts with dedent keyword
+                var should_dedent = false;
+                for (dedent_keywords) |kw| {
+                    if (startsWithKeyword(trimmed, kw)) {
+                        should_dedent = true;
+                        break;
+                    }
+                }
+
+                // Apply dedent before this line
+                if (should_dedent and indent_level > 0) {
+                    indent_level -= 1;
+                }
+
+                // Calculate expected indent
+                const expected_indent = indent_level * @as(u32, @intCast(indent_str.len));
+
+                // Find actual indent
+                var actual_indent: u32 = 0;
+                for (line) |c| {
+                    if (c == ' ') {
+                        actual_indent += 1;
+                    } else if (c == '\t') {
+                        actual_indent += tab_size;
+                    } else {
+                        break;
+                    }
+                }
+
+                // If indent doesn't match, create edit
+                if (actual_indent != expected_indent) {
+                    // Build new indent
+                    const new_indent = try allocator.alloc(u8, expected_indent);
+                    if (insert_spaces) {
+                        @memset(new_indent, ' ');
+                    } else {
+                        const tabs = expected_indent / tab_size;
+                        @memset(new_indent[0..tabs], '\t');
+                    }
+
+                    // Find where content starts
+                    var content_start: u32 = 0;
+                    for (line) |c| {
+                        if (c != ' ' and c != '\t') break;
+                        content_start += 1;
+                    }
+
+                    try edits.append(allocator, .{
+                        .range = .{
+                            .start = .{ .line = line_num, .character = 0 },
+                            .end = .{ .line = line_num, .character = content_start },
+                        },
+                        .new_text = new_indent,
+                    });
+                }
+
+                // Check if line starts with indent keyword
+                for (indent_keywords) |kw| {
+                    if (startsWithKeyword(trimmed, kw)) {
+                        indent_level += 1;
+                        break;
+                    }
+                }
+            }
+
+            line_num += 1;
+            line_start = i + 1;
+        }
+    }
+
+    return edits.toOwnedSlice(allocator);
+}
+
+/// Check if line starts with a keyword (case-insensitive, word boundary)
+fn startsWithKeyword(line: []const u8, keyword: []const u8) bool {
+    if (line.len < keyword.len) return false;
+
+    // Case-insensitive comparison
+    for (keyword, 0..) |kc, j| {
+        const lc = std.ascii.toLower(line[j]);
+        const kwc = std.ascii.toLower(kc);
+        if (lc != kwc) return false;
+    }
+
+    // Check word boundary
+    if (line.len == keyword.len) return true;
+    const next_char = line[keyword.len];
+    return !std.ascii.isAlphanumeric(next_char) and next_char != '_';
+}
+
+/// Format Cot source code
+fn formatCot(allocator: Allocator, source: []const u8, tab_size: u32, insert_spaces: bool) ![]TextEdit {
+    var edits: std.ArrayListUnmanaged(TextEdit) = .empty;
+    errdefer edits.deinit(allocator);
+
+    // Build the indent string
+    var indent_buf: [16]u8 = undefined;
+    const indent_str = if (insert_spaces) blk: {
+        const size = @min(tab_size, 16);
+        @memset(indent_buf[0..size], ' ');
+        break :blk indent_buf[0..size];
+    } else "\t";
+
+    // Track brace depth for indentation
+    var indent_level: u32 = 0;
+    var line_num: u32 = 0;
+    var line_start: usize = 0;
+
+    var i: usize = 0;
+    while (i <= source.len) : (i += 1) {
+        const at_end = i == source.len;
+        const at_newline = !at_end and source[i] == '\n';
+
+        if (at_newline or at_end) {
+            const line_end = i;
+            const line = source[line_start..line_end];
+
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (trimmed.len > 0) {
+                // Check if line starts with closing brace
+                const starts_with_close = trimmed[0] == '}';
+
+                // Apply dedent before this line if it starts with }
+                if (starts_with_close and indent_level > 0) {
+                    indent_level -= 1;
+                }
+
+                // Calculate expected indent
+                const expected_indent = indent_level * @as(u32, @intCast(indent_str.len));
+
+                // Find actual indent
+                var actual_indent: u32 = 0;
+                for (line) |c| {
+                    if (c == ' ') {
+                        actual_indent += 1;
+                    } else if (c == '\t') {
+                        actual_indent += tab_size;
+                    } else {
+                        break;
+                    }
+                }
+
+                // If indent doesn't match, create edit
+                if (actual_indent != expected_indent) {
+                    const new_indent = try allocator.alloc(u8, expected_indent);
+                    if (insert_spaces) {
+                        @memset(new_indent, ' ');
+                    } else {
+                        const tabs = expected_indent / tab_size;
+                        @memset(new_indent[0..tabs], '\t');
+                    }
+
+                    var content_start: u32 = 0;
+                    for (line) |c| {
+                        if (c != ' ' and c != '\t') break;
+                        content_start += 1;
+                    }
+
+                    try edits.append(allocator, .{
+                        .range = .{
+                            .start = .{ .line = line_num, .character = 0 },
+                            .end = .{ .line = line_num, .character = content_start },
+                        },
+                        .new_text = new_indent,
+                    });
+                }
+
+                // Count braces on this line to update indent for next line
+                var in_string = false;
+                var in_comment = false;
+                for (trimmed, 0..) |c, j| {
+                    if (in_comment) break;
+                    if (c == '"' and (j == 0 or trimmed[j - 1] != '\\')) {
+                        in_string = !in_string;
+                    } else if (!in_string) {
+                        if (c == '/' and j + 1 < trimmed.len and trimmed[j + 1] == '/') {
+                            in_comment = true;
+                        } else if (c == '{') {
+                            indent_level += 1;
+                        } else if (c == '}' and !starts_with_close) {
+                            // Only dedent for } not at start of line
+                            if (indent_level > 0) indent_level -= 1;
+                        }
+                    }
+                }
+            }
+
+            line_num += 1;
+            line_start = i + 1;
+        }
+    }
+
+    return edits.toOwnedSlice(allocator);
+}

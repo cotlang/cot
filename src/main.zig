@@ -236,6 +236,7 @@ pub fn main() !void {
             if (err != error.NoWorkspace and err != error.BuildFailed) {
                 try printStderr("Error: {}\n", .{err});
             }
+            std.process.exit(1);
         };
     } else if (std.mem.eql(u8, command, "convert")) {
         const options = convert_cmd.parseArgs(args[2..]);

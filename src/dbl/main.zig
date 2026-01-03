@@ -178,11 +178,13 @@ pub fn main() !void {
         .trace => {
             dbl.traceWithRegistryAndPath(allocator, source, source_dir, trace_level) catch |err| {
                 std.debug.print("Error: {}\n", .{err});
+                std.process.exit(1);
             };
         },
         .run => {
             dbl.runWithRegistryAndPath(allocator, source, source_dir) catch |err| {
                 std.debug.print("Error: {}\n", .{err});
+                std.process.exit(1);
             };
         },
         .@"test" => {

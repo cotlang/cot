@@ -395,8 +395,10 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
         .eq, .ne, .lt, .le, .gt, .ge => .bool,
         // Logical operations always produce bool
         .@"and", .@"or" => .bool,
-        // Arithmetic and bitwise operations inherit operand type
-        .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .shl, .shr => lhs.ty,
+        // String operations: if either operand is string, result is string
+        .add, .bit_and => if (lhs.isString() or rhs.isString()) .string else lhs.ty,
+        // Other arithmetic and bitwise operations inherit operand type
+        .sub, .mul, .div, .mod, .bit_or, .bit_xor, .shl, .shr => lhs.ty,
         // Rounding operations produce decimal (or inherit from lhs)
         .round, .trunc => lhs.ty,
         .range, .range_inclusive => lhs.ty,
@@ -440,7 +442,16 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
         .ge => .{ .icmp = .{ .cond = .sge, .lhs = lhs, .rhs = rhs, .result = result } },
         .@"and" => .{ .log_and = .{ .lhs = lhs, .rhs = rhs, .result = result } },
         .@"or" => .{ .log_or = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .bit_and => .{ .band = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+        .bit_and => blk: {
+            // In DBL, & is overloaded: bitwise AND for integers, concatenation for strings
+            const lhs_is_string = lhs.isString();
+            const rhs_is_string = rhs.isString();
+            const is_concat = lhs_is_string or rhs_is_string;
+            break :blk if (is_concat)
+                .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result } }
+            else
+                .{ .band = .{ .lhs = lhs, .rhs = rhs, .result = result } };
+        },
         .bit_or => .{ .bor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
         .bit_xor => .{ .bxor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
         .shl => .{ .ishl = .{ .lhs = lhs, .rhs = rhs, .result = result } },
@@ -1037,10 +1048,29 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // data.b = start index in extra_data
     const type_name_id: StringId = @enumFromInt(data.a);
     const type_name = l.strings.get(type_name_id);
-    if (type_name.len == 0) return LowerError.UndefinedType;
+    if (type_name.len == 0) {
+        std.debug.print("  Error: Empty type name in struct literal\n", .{});
+        return LowerError.UndefinedType;
+    }
 
     // Look up struct type
-    const struct_type = l.struct_types.get(type_name) orelse return LowerError.UndefinedType;
+    const struct_type = l.struct_types.get(type_name) orelse {
+        std.debug.print("  Error: Unknown struct type '{s}'\n", .{type_name});
+        std.debug.print("  Available types: ", .{});
+        var count: usize = 0;
+        var it = l.struct_types.keyIterator();
+        while (it.next()) |key| {
+            if (count > 0) std.debug.print(", ", .{});
+            std.debug.print("{s}", .{key.*});
+            count += 1;
+            if (count >= 10) {
+                std.debug.print("...", .{});
+                break;
+            }
+        }
+        std.debug.print("\n", .{});
+        return LowerError.UndefinedType;
+    };
 
     // Get field count and field data from extra
     const extra_start: ast.ExtraIdx = @enumFromInt(data.b);
@@ -1306,10 +1336,14 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
         .named => blk: {
             const name_id: StringId = @enumFromInt(data.a);
             const name = l.strings.get(name_id);
-            if (name.len == 0) return LowerError.UndefinedType;
+            if (name.len == 0) {
+                std.debug.print("  Error: Empty named type reference\n", .{});
+                return LowerError.UndefinedType;
+            }
             if (l.struct_types.get(name)) |struct_type| {
                 break :blk .{ .@"struct" = struct_type };
             }
+            std.debug.print("  Error: Unknown type '{s}' (not a defined struct)\n", .{name});
             return LowerError.UndefinedType;
         },
         // Generic type parameter - look up in substitution map

@@ -2013,12 +2013,13 @@ pub const Parser = struct {
         // Check for record overlay syntax: record ,x or record name ,x
         var is_overlay = false;
         var overlay_base: ?base.StringId = null;
+        var record_name: ?base.StringId = null; // Named record (e.g., "record john")
 
         // Check for optional record name followed by optional overlay specifier
         if (self.check(.identifier)) {
             // Could be a named record, or just fields - peek ahead
             const saved_pos = self.current;
-            _ = self.advance(); // tentatively consume identifier
+            const name_tok = self.advance(); // tentatively consume identifier
 
             if (self.match(&[_]TokenType{.comma})) {
                 // Check if next is 'x' or another identifier (overlay target)
@@ -2031,6 +2032,7 @@ pub const Parser = struct {
                         // record name ,x syntax - named overlay at previous record
                         is_overlay = true;
                         overlay_base = self.last_record_base_field;
+                        record_name = self.intern(name_tok.lexeme) catch null;
                         _ = self.advance(); // consume 'x'
                     } else {
                         // record name ,type - it's a type specifier, backtrack
@@ -2041,8 +2043,9 @@ pub const Parser = struct {
                     self.current = saved_pos;
                 }
             } else {
-                // No comma - it's a named record without overlay, backtrack
-                self.current = saved_pos;
+                // No comma - it's a named record without overlay
+                // Keep the name and DON'T backtrack - the name is consumed
+                record_name = self.intern(name_tok.lexeme) catch null;
             }
         } else if (self.match(&[_]TokenType{.comma})) {
             // record ,x syntax - unnamed overlay
@@ -2157,6 +2160,9 @@ pub const Parser = struct {
 
                     const var_stmt = self.store.addLetDecl(var_name_id, var_type, init_val, true, loc) catch return ParseError.OutOfMemory;
                     stmts.append(self.allocator, var_stmt) catch return ParseError.OutOfMemory;
+
+                    // Track total size for named record overlay
+                    current_offset += field_size;
                 }
             } else {
                 _ = self.advance();
@@ -2165,6 +2171,20 @@ pub const Parser = struct {
 
         // endrecord is optional - proc or next record implicitly ends current record
         _ = self.match(&[_]TokenType{.kw_endrecord});
+
+        // If this is a named record, add a field_view for the record name that overlays
+        // the first field with the total size of all fields
+        // In DBL, "record name" creates a variable that covers all fields as an alpha string
+        if (record_name != null and first_field_id != null and current_offset > 0) {
+            // Create an alpha type covering all fields
+            const total_size: u32 = @intCast(current_offset);
+            const u8_type = self.store.addPrimitiveType(.u8) catch return ParseError.OutOfMemory;
+            const alpha_type = self.store.addArrayType(u8_type, total_size) catch return ParseError.OutOfMemory;
+
+            // Add the record name as a field_view overlaying the first field at offset 0
+            const record_var = self.store.addFieldView(record_name.?, alpha_type, first_field_id.?, 0, loc) catch return ParseError.OutOfMemory;
+            stmts.append(self.allocator, record_var) catch return ParseError.OutOfMemory;
+        }
 
         // Update last_record_base_field for future overlays (only for non-overlay records)
         if (!is_overlay and first_field_id != null) {

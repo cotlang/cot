@@ -823,6 +823,13 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.cmp_le)] = &vm_opcodes.op_cmp_le;
         table[@intFromEnum(Opcode.cmp_gt)] = &vm_opcodes.op_cmp_gt;
         table[@intFromEnum(Opcode.cmp_ge)] = &vm_opcodes.op_cmp_ge;
+        // String comparison
+        table[@intFromEnum(Opcode.cmp_str_eq)] = &vm_opcodes.op_cmp_str_eq;
+        table[@intFromEnum(Opcode.cmp_str_lt)] = &vm_opcodes.op_cmp_str_lt;
+        table[@intFromEnum(Opcode.cmp_str_ne)] = &vm_opcodes.op_cmp_str_ne;
+        table[@intFromEnum(Opcode.cmp_str_le)] = &vm_opcodes.op_cmp_str_le;
+        table[@intFromEnum(Opcode.cmp_str_gt)] = &vm_opcodes.op_cmp_str_gt;
+        table[@intFromEnum(Opcode.cmp_str_ge)] = &vm_opcodes.op_cmp_str_ge;
 
         // Logical (0x50-0x5F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.log_and)] = &vm_opcodes.op_log_and;

@@ -183,6 +183,18 @@ pub const Opcode = enum(u8) {
     /// cmp_str_lt rd, rs1, rs2 - rd = (rs1 < rs2) string comparison
     cmp_str_lt = 0x47,
 
+    /// cmp_str_ne rd, rs1, rs2 - rd = (rs1 != rs2) string comparison
+    cmp_str_ne = 0x48,
+
+    /// cmp_str_le rd, rs1, rs2 - rd = (rs1 <= rs2) string comparison
+    cmp_str_le = 0x49,
+
+    /// cmp_str_gt rd, rs1, rs2 - rd = (rs1 > rs2) string comparison
+    cmp_str_gt = 0x4A,
+
+    /// cmp_str_ge rd, rs1, rs2 - rd = (rs1 >= rs2) string comparison
+    cmp_str_ge = 0x4B,
+
     // ============================================
     // Logical & Bitwise (0x50-0x5F)
     // ============================================
@@ -646,7 +658,7 @@ pub const Opcode = enum(u8) {
             .cmp_lt_int, .cmp_le_int, .cmp_gt_int, .cmp_ge_int => 2,
             .cmp_eq_int, .cmp_ne_int => 2,
             .incr_int, .decr_int => 2,
-            .cmp_str_eq, .cmp_str_lt => 2,
+            .cmp_str_eq, .cmp_str_lt, .cmp_str_ne, .cmp_str_le, .cmp_str_gt, .cmp_str_ge => 2,
             .log_and, .log_or, .log_not => 2,
             .bit_and, .bit_or, .bit_xor, .bit_not => 2,
             .is_null, .select => 2,

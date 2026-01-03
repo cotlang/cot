@@ -226,18 +226,30 @@ pub fn emitTrunc(e: *BytecodeEmitter, t: ir.Instruction.RoundOp) EmitError!void 
     e.setLastResult(t.result.id, dest_reg);
 }
 
+/// Check if a type is a string type (directly or via pointer/array)
+fn isStringType(ty: ir.Type) bool {
+    return switch (ty) {
+        .string => true,
+        .ptr => |pointee| pointee.* == .string,
+        .array => |arr| arr.element.* == .u8, // []u8 arrays are strings
+        else => false,
+    };
+}
+
 /// Emit icmp instruction
 pub fn emitIcmp(e: *BytecodeEmitter, c: ir.Instruction.IcmpOp) EmitError!void {
     const lhs_reg = try e.getValueInReg(c.lhs, 0);
     const rhs_reg = try e.getValueInReg(c.rhs, 1);
     const dest_reg: u4 = 2;
+    // Check if type is string, or a pointer to string (for record fields)
+    const is_string = isStringType(c.lhs.ty);
     const opcode: Opcode = switch (c.cond) {
-        .eq => if (c.lhs.ty == .string) .cmp_str_eq else .cmp_eq,
-        .ne => .cmp_ne,
-        .slt, .ult => .cmp_lt,
-        .sle, .ule => .cmp_le,
-        .sgt, .ugt => .cmp_gt,
-        .sge, .uge => .cmp_ge,
+        .eq => if (is_string) .cmp_str_eq else .cmp_eq,
+        .ne => if (is_string) .cmp_str_ne else .cmp_ne,
+        .slt, .ult => if (is_string) .cmp_str_lt else .cmp_lt,
+        .sle, .ule => if (is_string) .cmp_str_le else .cmp_le,
+        .sgt, .ugt => if (is_string) .cmp_str_gt else .cmp_gt,
+        .sge, .uge => if (is_string) .cmp_str_ge else .cmp_ge,
     };
     try e.emitRegArith(opcode, dest_reg, lhs_reg, rhs_reg);
     e.setLastResult(c.result.id, dest_reg);

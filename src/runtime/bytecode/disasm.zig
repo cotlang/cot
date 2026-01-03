@@ -261,7 +261,7 @@ pub const Disassembler = struct {
             // ============================================
 
             // cmp_* rd, rs1, rs2 - [rd:4|rs1:4] [rs2:4|0]
-            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge, .cmp_str_eq, .cmp_str_lt => {
+            .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge, .cmp_str_eq, .cmp_str_lt, .cmp_str_ne, .cmp_str_le, .cmp_str_gt, .cmp_str_ge => {
                 const rd: u4 = @truncate(operands[0] >> 4);
                 const rs1: u4 = @truncate(operands[0] & 0xF);
                 const rs2: u4 = @truncate(operands[1] >> 4);
