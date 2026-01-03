@@ -173,6 +173,7 @@ pub const Emitter = struct {
             .io_delete => try self.emitIoDelete(idx),
             .comptime_if => try self.emitComptimeIf(idx),
             .comptime_block => try self.emitComptimeBlock(idx),
+            .test_def => try self.emitTestDef(idx),
         }
     }
 
@@ -755,6 +756,29 @@ pub const Emitter = struct {
         try self.writer.writeAll("}\n");
     }
 
+    fn emitTestDef(self: *Self, idx: StmtIdx) anyerror!void {
+        const test_data = self.store.getTestDef(idx);
+        const name = self.strings.get(test_data.name);
+
+        try self.writeIndent();
+        try self.writer.writeAll("test \"");
+        try self.writer.writeAll(name);
+        try self.writer.writeAll("\" {\n");
+
+        self.indent_level += 1;
+        // Emit body
+        const body_span = self.store.stmtData(test_data.body).getSpan();
+        const stmts = self.store.getStmtSpan(body_span);
+        for (stmts) |stmt_u32| {
+            const stmt_idx = StmtIdx.fromInt(stmt_u32);
+            try self.emitStatement(stmt_idx);
+        }
+        self.indent_level -= 1;
+
+        try self.writeIndent();
+        try self.writer.writeAll("}\n");
+    }
+
     // ========================================
     // Expression Emitters
     // ========================================
@@ -860,6 +884,8 @@ pub const Emitter = struct {
                 .bit_xor => "^",
                 .shl => "<<",
                 .shr => ">>",
+                .round => "##", // True rounding
+                .trunc => "#", // Truncating round
                 .range => "..",
                 .range_inclusive => "..=",
             });
@@ -884,6 +910,8 @@ pub const Emitter = struct {
                 .bit_xor => ".BXOR.",
                 .shl => "<<",
                 .shr => ">>",
+                .round => "##", // True rounding
+                .trunc => "#", // Truncating round
                 .range => "..",
                 .range_inclusive => "..=",
             });

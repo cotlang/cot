@@ -719,6 +719,29 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a test definition
+    /// data.a = name StringId
+    /// data.b = body StmtIdx (block statement)
+    pub fn addTestDef(self: *Self, name: StringId, body: StmtIdx, loc: SourceLoc) !StmtIdx {
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
+        try self.stmt_tags.append(self.allocator, .test_def);
+        try self.stmt_locs.append(self.allocator, loc);
+        try self.stmt_data.append(self.allocator, .{
+            .a = @intFromEnum(name),
+            .b = body.toInt(),
+        });
+        return idx;
+    }
+
+    /// Get test definition data
+    pub fn getTestDef(self: *const Self, idx: StmtIdx) struct { name: StringId, body: StmtIdx } {
+        const data = self.stmtData(idx);
+        return .{
+            .name = @enumFromInt(data.a),
+            .body = StmtIdx.fromInt(data.b),
+        };
+    }
+
     /// Add a field view (overlay) statement
     /// Used in records for fields that share memory with other fields
     /// base_field is the field name to overlay, offset is the byte offset from that field

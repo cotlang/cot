@@ -360,6 +360,10 @@ pub const Instruction = union(enum) {
     urem: BinaryOp, // Unsigned remainder
     ineg: UnaryOp, // Integer negate
 
+    // ====== Rounding operations (DBL legacy: # and ##) ======
+    round: RoundOp, // True rounding: value ## places
+    trunc: RoundOp, // Truncating round: value # places
+
     // ====== Bitwise operations (Cranelift names) ======
     band: BinaryOp, // Bitwise AND
     bor: BinaryOp, // Bitwise OR
@@ -489,6 +493,14 @@ pub const Instruction = union(enum) {
         lhs: Value,
         rhs: Value,
         result: Value,
+        loc: ?SourceLoc = null,
+    };
+
+    // Rounding operation (DBL legacy: # and ##)
+    pub const RoundOp = struct {
+        value: Value, // Value to round
+        places: Value, // Number of decimal places
+        result: Value, // Rounded result
         loc: ?SourceLoc = null,
     };
 
@@ -771,7 +783,7 @@ pub const Instruction = union(enum) {
     pub fn category(self: Instruction) Category {
         return switch (self) {
             .alloca, .load, .store, .field_ptr, .load_struct_buf, .store_struct_buf => .memory,
-            .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem, .ineg => .arithmetic,
+            .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem, .ineg, .round, .trunc => .arithmetic,
             .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => .bitwise,
             .icmp => .comparison,
             .log_and, .log_or, .log_not => .logical,
@@ -833,6 +845,7 @@ pub const Instruction = union(enum) {
             .load => |l| l.result,
             .field_ptr => |f| f.result,
             .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem => |op| op.result,
+            .round, .trunc => |op| op.result,
             .band, .bor, .bxor, .ishl, .sshr, .ushr => |op| op.result,
             .icmp => |op| op.result,
             .log_and, .log_or => |op| op.result,
@@ -984,6 +997,12 @@ pub const Function = struct {
 
     /// Linkage/visibility
     linkage: Linkage,
+
+    /// Whether this function is a test
+    is_test: bool = false,
+
+    /// Human-readable test name (if is_test is true)
+    test_name: ?[]const u8 = null,
 
     /// Entry block
     entry: *Block,

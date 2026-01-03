@@ -162,11 +162,16 @@ pub const Linker = struct {
             return LinkerError.ModuleNotFound;
         };
 
-        // Open and read module file
+        // Open and read module file into memory
         const file = std.fs.cwd().openFile(path, .{}) catch {
             return LinkerError.IoError;
         };
         defer file.close();
+
+        const bytes = file.readToEndAlloc(self.allocator, 1024 * 1024 * 100) catch {
+            return LinkerError.IoError;
+        };
+        defer self.allocator.free(bytes);
 
         // Create module
         const mod = self.allocator.create(bytecode.Module) catch {
@@ -174,8 +179,9 @@ pub const Linker = struct {
         };
         errdefer self.allocator.destroy(mod);
 
-        // Deserialize
-        mod.* = bytecode.Module.deserialize(self.allocator, file.reader()) catch {
+        // Deserialize from memory buffer
+        var fbs = std.io.fixedBufferStream(bytes);
+        mod.* = bytecode.Module.deserialize(self.allocator, fbs.reader()) catch {
             return LinkerError.InvalidModule;
         };
         errdefer mod.deinit();
@@ -218,11 +224,16 @@ pub const Linker = struct {
             return existing;
         }
 
-        // Open and read module file
+        // Open and read module file into memory
         const file = std.fs.cwd().openFile(path, .{}) catch {
             return LinkerError.IoError;
         };
         defer file.close();
+
+        const bytes = file.readToEndAlloc(self.allocator, 1024 * 1024 * 100) catch {
+            return LinkerError.IoError;
+        };
+        defer self.allocator.free(bytes);
 
         // Create module
         const mod = self.allocator.create(bytecode.Module) catch {
@@ -230,8 +241,9 @@ pub const Linker = struct {
         };
         errdefer self.allocator.destroy(mod);
 
-        // Deserialize
-        mod.* = bytecode.Module.deserialize(self.allocator, file.reader()) catch {
+        // Deserialize from memory buffer
+        var fbs = std.io.fixedBufferStream(bytes);
+        mod.* = bytecode.Module.deserialize(self.allocator, fbs.reader()) catch {
             return LinkerError.InvalidModule;
         };
         errdefer mod.deinit();

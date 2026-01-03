@@ -92,19 +92,38 @@ pub const SyntaxTransform = struct {
     /// Transform DBL comparison operator to Core
     pub fn dblOpToCore(op: lexer_ext.DblOperator) []const u8 {
         return switch (op) {
+            // Comparison
             .eq => "==",
             .ne => "!=",
             .lt => "<",
             .le => "<=",
             .gt => ">",
             .ge => ">=",
+            // Logical
             .and_ => "&&",
             .or_ => "||",
             .not_ => "!",
-            .xor_ => "^",
+            .xor_ => "^^", // Boolean XOR
+            // Bitwise
             .band => "&",
             .bor => "|",
             .bnot => "~",
+            .bxor => "^",
+            .bnand => "~&", // NAND as NOT AND
+            .shl => "<<",
+            .shr => ">>",
+            // String comparison (same as regular, context determines behavior)
+            .eqs => "==",
+            .nes => "!=",
+            .gts => ">",
+            .lts => "<",
+            .ges => ">=",
+            .les => "<=",
+            // Modulo
+            .mod => "%",
+            // Rounding (these need special handling in parser)
+            .round => "#",
+            .round_true => "##",
         };
     }
 

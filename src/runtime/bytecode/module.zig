@@ -461,7 +461,8 @@ pub const Module = struct {
         var module = Self.init(allocator);
 
         // Read header
-        const header_bytes = try reader.readBytesNoEof(@sizeOf(ModuleHeader));
+        var header_bytes: [@sizeOf(ModuleHeader)]u8 = undefined;
+        reader.readNoEof(&header_bytes) catch return error.EndOfStream;
         module.header = std.mem.bytesToValue(ModuleHeader, &header_bytes);
 
         if (!module.header.isValid()) {
@@ -513,7 +514,8 @@ pub const Module = struct {
             module.routines = try allocator.alloc(RoutineDef, routine_count);
             for (0..routine_count) |i| {
                 module.routines[i].name_index = try reader.readInt(u16, .little);
-                const flags_bytes = try reader.readBytesNoEof(@sizeOf(RoutineFlags));
+                var flags_bytes: [@sizeOf(RoutineFlags)]u8 = undefined;
+                try reader.readNoEof(&flags_bytes);
                 module.routines[i].flags = std.mem.bytesToValue(RoutineFlags, &flags_bytes);
                 module.routines[i].code_offset = try reader.readInt(u32, .little);
                 module.routines[i].code_length = try reader.readInt(u32, .little);

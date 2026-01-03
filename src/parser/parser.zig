@@ -188,9 +188,10 @@ pub const Parser = struct {
             .kw_var => self.parseVarDecl(),
             .kw_type => self.parseTypeAlias(),
             .kw_import => self.parseImport(),
+            .kw_test => self.parseTestDef(),
             .kw_pub => self.parsePubDecl(),
             else => {
-                self.addError("Expected 'fn', 'struct', 'union', 'enum', 'trait', 'impl', 'const', 'var', 'type', or 'import' at top level");
+                self.addError("Expected 'fn', 'struct', 'union', 'enum', 'trait', 'impl', 'const', 'var', 'type', 'test', or 'import' at top level");
                 _ = self.advance();
                 return error.UnexpectedToken;
             },
@@ -626,7 +627,10 @@ pub const Parser = struct {
         _ = try self.consume(.equals, "Expected '='");
         const init_expr = try self.parseExpression();
 
-        return self.store.addConstDecl(name, type_idx, init_expr, loc) catch return error.OutOfMemory;
+        const stmt = self.store.addConstDecl(name, type_idx, init_expr, loc) catch return error.OutOfMemory;
+        // Optionally consume semicolon
+        _ = self.match(&[_]TokenType{.semicolon});
+        return stmt;
     }
 
     /// Parse var declaration (Zig-style mutable variable): var name: Type = expr
@@ -647,7 +651,10 @@ pub const Parser = struct {
         const init_expr = try self.parseExpression();
 
         // var is always mutable (is_mut = true)
-        return self.store.addLetDecl(name, type_idx, init_expr, true, loc) catch return error.OutOfMemory;
+        const stmt = self.store.addLetDecl(name, type_idx, init_expr, true, loc) catch return error.OutOfMemory;
+        // Optionally consume semicolon
+        _ = self.match(&[_]TokenType{.semicolon});
+        return stmt;
     }
 
     /// Parse view declaration: view name: Type = @base_field or view name: Type = @base_field + offset
@@ -719,6 +726,25 @@ pub const Parser = struct {
         }
 
         return self.store.addImport(module_name, loc) catch return error.OutOfMemory;
+    }
+
+    /// Parse a test definition: test "name" { body }
+    fn parseTestDef(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = try self.consume(.kw_test, "Expected 'test'");
+
+        // Expect test name as string literal
+        const name_token = try self.consume(.string_literal, "Expected test name as string literal");
+        const name_lexeme = name_token.lexeme;
+        // Strip quotes from string literal
+        const name_str = if (name_lexeme.len >= 2) name_lexeme[1 .. name_lexeme.len - 1] else name_lexeme;
+        const name = self.internString(name_str) catch return error.OutOfMemory;
+
+        // Expect block body
+        _ = try self.consume(.lbrace, "Expected '{' after test name");
+        const body = try self.parseBlock();
+
+        return self.store.addTestDef(name, body, loc) catch return error.OutOfMemory;
     }
 
     // ============================================================
@@ -933,12 +959,16 @@ pub const Parser = struct {
     fn parseBreak(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_break, "Expected 'break'");
+        // Optionally consume semicolon
+        _ = self.match(&[_]TokenType{.semicolon});
         return self.store.addBreak(loc) catch return error.OutOfMemory;
     }
 
     fn parseContinue(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_continue, "Expected 'continue'");
+        // Optionally consume semicolon
+        _ = self.match(&[_]TokenType{.semicolon});
         return self.store.addContinue(loc) catch return error.OutOfMemory;
     }
 
@@ -957,6 +987,9 @@ pub const Parser = struct {
                 value = try self.parseExpression();
             }
         }
+
+        // Optionally consume semicolon
+        _ = self.match(&[_]TokenType{.semicolon});
 
         return self.store.addReturn(value, loc) catch return error.OutOfMemory;
     }
@@ -1107,7 +1140,13 @@ pub const Parser = struct {
             return self.store.addAssignment(expr, binop, loc) catch return error.OutOfMemory;
         }
 
-        return self.store.addExprStmt(expr, loc) catch return error.OutOfMemory;
+        // Create expression statement
+        const stmt = self.store.addExprStmt(expr, loc) catch return error.OutOfMemory;
+
+        // Optionally consume semicolon (allows both `expr` and `expr;` syntax)
+        _ = self.match(&[_]TokenType{.semicolon});
+
+        return stmt;
     }
 
     // ============================================================

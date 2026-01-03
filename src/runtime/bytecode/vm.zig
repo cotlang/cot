@@ -10,6 +10,8 @@ const Module = @import("module.zig").Module;
 const Constant = @import("module.zig").Constant;
 const debug = @import("../debug.zig");
 const Debugger = @import("../debugger.zig").Debugger;
+const trace_mod = @import("../trace/trace.zig");
+pub const Tracer = trace_mod.Tracer;
 const value_mod = @import("value.zig");
 const Profiler = @import("profiler.zig").Profiler;
 const JITProfiler = @import("profiler.zig").JITProfiler;
@@ -136,6 +138,9 @@ pub const VM = struct {
     stop_reason: ?StopReason,
     debug_current_line: u32,
 
+    // Execution tracer (optional, for `cot trace` command)
+    tracer: ?*Tracer = null,
+
     // Profiler (only present when profiling is enabled)
     profiler: if (profiling_enabled) Profiler else void,
 
@@ -224,7 +229,9 @@ pub const VM = struct {
     /// Print JIT profiler report to stderr (if JIT profiling is enabled)
     pub fn printJITReport(self: *Self) void {
         if (!jit_profiling_enabled) return;
-        self.jit_profiler.report(std.io.getStdErr().writer()) catch {};
+        const stderr_file = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+        var buffer: [4096]u8 = undefined;
+        self.jit_profiler.report(stderr_file.writer(&buffer)) catch {};
     }
 
     /// Check if JIT profiling is enabled (for extracted opcode handlers)
@@ -275,6 +282,38 @@ pub const VM = struct {
     /// Look up a type by ID (for extension objects)
     pub fn lookupType(self: *Self, type_id: u16) ?*const TypeRegistry.TypeDef {
         return self.type_registry.lookup(type_id);
+    }
+
+    // =========================================================================
+    // Execution Tracing
+    // =========================================================================
+
+    /// Attach a tracer for execution tracing
+    pub fn setTracer(self: *Self, tracer: *Tracer) void {
+        self.tracer = tracer;
+        tracer.start();
+    }
+
+    /// Detach tracer and stop tracing
+    pub fn detachTracer(self: *Self) ?*Tracer {
+        const t = self.tracer;
+        if (t) |tracer| {
+            tracer.stop();
+        }
+        self.tracer = null;
+        return t;
+    }
+
+    /// Check if tracing is active
+    pub fn isTracing(self: *Self) bool {
+        return self.tracer != null;
+    }
+
+    /// Dump trace history to writer (for crash dumps)
+    pub fn dumpTraceHistory(self: *Self, writer: anytype) !void {
+        if (self.tracer) |tracer| {
+            try tracer.dumpHistory(writer);
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -586,7 +625,9 @@ pub const VM = struct {
     /// Write profiling report to stderr
     pub fn dumpProfilingReport(self: *Self) void {
         if (profiling_enabled) {
-            self.profiler.report(std.io.getStdErr().writer()) catch {};
+            const stderr_file = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+            var buffer: [4096]u8 = undefined;
+            self.profiler.report(stderr_file.writer(&buffer)) catch {};
         }
     }
 
@@ -813,6 +854,10 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.format_decimal)] = &vm_opcodes.op_format_decimal;
         table[@intFromEnum(Opcode.parse_decimal)] = &vm_opcodes.op_parse_decimal;
 
+        // Math Functions (0xC0-0xCF) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.fn_round)] = &vm_opcodes.op_fn_round;
+        table[@intFromEnum(Opcode.fn_trunc)] = &vm_opcodes.op_fn_trunc;
+
         // Console I/O (0xD0-0xD4) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.console_writeln)] = &vm_opcodes.op_console_writeln;
         table[@intFromEnum(Opcode.console_write)] = &vm_opcodes.op_console_write;
@@ -873,6 +918,16 @@ pub const VM = struct {
             crash_context.last_opcode = @enumFromInt(opcode_byte);
             crash_context.source_line = self.debug_current_line;
 
+            // Trace hook (before opcode execution)
+            if (self.tracer) |tracer| {
+                tracer.onOpcode(
+                    @intCast(self.ip),
+                    @enumFromInt(opcode_byte),
+                    self.debug_current_line,
+                    self.registers,
+                );
+            }
+
             // Record for profiling
             if (profiling_enabled) {
                 self.profiler.recordOpcode(@enumFromInt(opcode_byte));
@@ -881,7 +936,18 @@ pub const VM = struct {
             self.ip += 1;
 
             // Indexed dispatch - no switch, no enum conversion
-            const result = try dispatch_table[opcode_byte](self, module);
+            const result = dispatch_table[opcode_byte](self, module) catch |err| {
+                // Trace error if tracer is attached
+                if (self.tracer) |tracer| {
+                    tracer.onError(
+                        @intCast(self.ip),
+                        self.debug_current_line,
+                        err,
+                        @errorName(err),
+                    );
+                }
+                return err;
+            };
 
             switch (result) {
                 .continue_dispatch => continue,

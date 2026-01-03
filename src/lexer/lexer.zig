@@ -422,6 +422,9 @@ pub const Lexer = struct {
 
         // Comptime
         .{ "comptime", .kw_comptime },
+
+        // Testing
+        .{ "test", .kw_test },
     });
 };
 

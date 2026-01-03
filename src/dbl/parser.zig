@@ -20,6 +20,9 @@ const std = @import("std");
 const cot = @import("cot");
 const Token = @import("token.zig").Token;
 const TokenType = @import("token.zig").TokenType;
+const dbl_types = @import("types.zig");
+const AccessModifier = dbl_types.AccessModifier;
+const ClassModifiers = dbl_types.ClassModifiers;
 const ast = cot.ast;
 const base = cot.base;
 const NodeStore = ast.NodeStore;
@@ -50,6 +53,11 @@ pub const Parser = struct {
     store: *NodeStore,
     strings: *StringInterner,
     pending_common_globals: std.ArrayListUnmanaged(StmtIdx),
+    /// Pending impl_block statements from class definitions
+    pending_class_impl_blocks: std.ArrayListUnmanaged(StmtIdx),
+    /// Base field name for record overlays (,X syntax)
+    /// Stores the first field name of the last non-overlay record
+    last_record_base_field: ?base.StringId,
 
     const Self = @This();
     const MAX_NESTING_DEPTH: u8 = 128;
@@ -71,6 +79,8 @@ pub const Parser = struct {
             .store = store,
             .strings = strings,
             .pending_common_globals = .empty,
+            .pending_class_impl_blocks = .empty,
+            .last_record_base_field = null,
         };
     }
 
@@ -140,6 +150,7 @@ pub const Parser = struct {
     pub fn deinit(self: *Self) void {
         self.errors.deinit(self.allocator);
         self.pending_common_globals.deinit(self.allocator);
+        self.pending_class_impl_blocks.deinit(self.allocator);
     }
 
     /// Parse tokens into a list of top-level statements
@@ -154,6 +165,11 @@ pub const Parser = struct {
                 self.synchronize();
                 if (err == ParseError.OutOfMemory) return err;
             }
+        }
+
+        // Add pending class impl_blocks (these come after struct defs)
+        for (self.pending_class_impl_blocks.items) |impl_stmt| {
+            statements.append(self.allocator, impl_stmt) catch return ParseError.OutOfMemory;
         }
 
         // Add pending common block globals (these come after struct defs)
@@ -182,6 +198,16 @@ pub const Parser = struct {
             .kw_structure => self.parseStructure(),
             .kw_record => self.parseRecord(),
             .kw_common => self.parseCommon(),
+            .kw_literal => self.parseLiteral(),
+
+            // Testing
+            .kw_test => self.parseTestDef(),
+
+            // OOP definitions
+            .kw_class => self.parseClass(.private, .{}),
+            .kw_namespace => self.parseNamespace(),
+            .kw_public, .kw_private, .kw_protected => self.parseAccessModifiedDecl(),
+            .kw_abstract, .kw_sealed, .kw_partial => self.parseClassModifiedDecl(),
 
             // Control flow
             .kw_if => self.parseIf(),
@@ -207,7 +233,8 @@ pub const Parser = struct {
 
             // End keywords
             .kw_end, .kw_endrecord, .kw_endgroup, .kw_endcase, .kw_endusing,
-            .kw_endclass, .kw_endnamespace, .kw_endwhile, .dir_else, .dir_end, .kw_else,
+            .kw_endclass, .kw_endnamespace, .kw_endwhile, .kw_endliteral,
+            .dir_else, .dir_end, .kw_else,
             => ParseError.InvalidStatement,
 
             // Identifier could be assignment or function call
@@ -804,19 +831,633 @@ pub const Parser = struct {
         return struct_idx;
     }
 
+    /// Parse literal block (compile-time constants)
+    /// literal
+    ///     name, type, value
+    ///     ...
+    /// endliteral
+    ///
+    /// DBL literal blocks define compile-time constants.
+    /// a* means the size is derived from the initializer string length.
+    fn parseLiteral(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = self.advance(); // consume 'literal'
+
+        var stmts: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        // Parse constant declarations until endliteral
+        while (!self.check(.kw_endliteral) and !self.isAtEnd()) {
+            if (self.check(.identifier)) {
+                const const_name_tok = self.advance();
+                const const_name_id = try self.intern(const_name_tok.lexeme);
+
+                // Expect comma before type
+                _ = self.match(&[_]TokenType{.comma});
+
+                // Parse type specifier
+                var const_type = TypeIdx.null;
+                if (self.check(.identifier)) {
+                    const type_tok = self.advance();
+                    // Handle a* syntax (auto-size string) - a followed by star
+                    var lower_buf: [32]u8 = undefined;
+                    const type_len = @min(type_tok.lexeme.len, lower_buf.len);
+                    const lower_type = std.ascii.lowerString(lower_buf[0..type_len], type_tok.lexeme[0..type_len]);
+                    if (std.mem.eql(u8, lower_type, "a") and self.check(.star)) {
+                        // a* syntax - auto-sized string
+                        _ = self.advance(); // consume '*'
+                        const_type = self.store.addPrimitiveType(.string) catch return ParseError.OutOfMemory;
+                    } else if (std.mem.eql(u8, lower_type, "d") and self.check(.star)) {
+                        // d* syntax - auto-sized decimal
+                        _ = self.advance(); // consume '*'
+                        const_type = self.store.addDecimalType(28, 10) catch return ParseError.OutOfMemory;
+                    } else {
+                        const type_result = self.parseDblTypeSpecWithInfo(type_tok.lexeme);
+                        const_type = type_result.type_idx;
+                    }
+                } else {
+                    const_type = self.store.addPrimitiveType(.i64) catch return ParseError.OutOfMemory;
+                }
+
+                // Expect comma before value
+                _ = self.match(&[_]TokenType{.comma});
+
+                // Parse initial value expression
+                var init_val = ExprIdx.null;
+                if (!self.check(.kw_endliteral) and !self.check(.identifier)) {
+                    init_val = self.parseExpression() catch ExprIdx.null;
+                }
+
+                // Create const declaration
+                const const_stmt = self.store.addConstDecl(const_name_id, const_type, init_val, loc) catch return ParseError.OutOfMemory;
+                stmts.append(self.allocator, const_stmt) catch return ParseError.OutOfMemory;
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        _ = try self.consume(.kw_endliteral, "Expected 'endliteral'");
+
+        // Return as a block containing all the constant declarations
+        const result = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        stmts.deinit(self.allocator);
+        return result;
+    }
+
+    /// Parse a test definition: test "name" ... endtest
+    fn parseTestDef(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = self.advance(); // consume 'test'
+
+        // Expect test name as string literal
+        const name_token = try self.consume(.string_literal, "Expected test name as string literal");
+        const name_lexeme = name_token.lexeme;
+        // Strip quotes from string literal
+        const name_str = if (name_lexeme.len >= 2) name_lexeme[1 .. name_lexeme.len - 1] else name_lexeme;
+        const name = try self.intern(name_str);
+
+        // Parse body until endtest
+        var stmts: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        while (!self.check(.kw_endtest) and !self.isAtEnd()) {
+            const stmt = self.parseStatement() catch |err| {
+                if (err == ParseError.InvalidStatement) {
+                    continue;
+                }
+                return err;
+            };
+            stmts.append(self.allocator, stmt) catch return ParseError.OutOfMemory;
+        }
+
+        _ = try self.consume(.kw_endtest, "Expected 'endtest'");
+
+        // Wrap in block
+        const body = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        stmts.deinit(self.allocator);
+
+        return self.store.addTestDef(name, body, loc) catch return ParseError.OutOfMemory;
+    }
+
+    // ============================================================
+    // OOP Definitions (Classes, Methods, Namespaces)
+    // ============================================================
+
+    /// Parse a declaration preceded by an access modifier
+    /// Example: public class Foo ... or private method Bar ...
+    fn parseAccessModifiedDecl(self: *Self) ParseError!StmtIdx {
+        const access = AccessModifier.fromToken(self.peek().type);
+        _ = self.advance(); // consume access modifier
+
+        // Now parse the actual declaration
+        return switch (self.peek().type) {
+            .kw_class => self.parseClass(access, .{}),
+            .kw_abstract => blk: {
+                _ = self.advance();
+                if (self.check(.kw_class)) {
+                    break :blk self.parseClass(access, .{ .is_abstract = true });
+                }
+                self.addError("Expected 'class' after 'abstract'");
+                break :blk ParseError.UnexpectedToken;
+            },
+            .kw_sealed => blk: {
+                _ = self.advance();
+                if (self.check(.kw_class)) {
+                    break :blk self.parseClass(access, .{ .is_sealed = true });
+                }
+                self.addError("Expected 'class' after 'sealed'");
+                break :blk ParseError.UnexpectedToken;
+            },
+            .kw_partial => blk: {
+                _ = self.advance();
+                if (self.check(.kw_class)) {
+                    break :blk self.parseClass(access, .{ .is_partial = true });
+                }
+                self.addError("Expected 'class' after 'partial'");
+                break :blk ParseError.UnexpectedToken;
+            },
+            else => {
+                self.addError("Expected 'class' after access modifier");
+                return ParseError.UnexpectedToken;
+            },
+        };
+    }
+
+    /// Parse a declaration preceded by a class modifier (abstract, sealed, partial)
+    fn parseClassModifiedDecl(self: *Self) ParseError!StmtIdx {
+        var modifiers = ClassModifiers{};
+
+        // Collect all class modifiers
+        while (true) {
+            const tok = self.peek().type;
+            if (tok == .kw_abstract) {
+                modifiers.is_abstract = true;
+                _ = self.advance();
+            } else if (tok == .kw_sealed) {
+                modifiers.is_sealed = true;
+                _ = self.advance();
+            } else if (tok == .kw_partial) {
+                modifiers.is_partial = true;
+                _ = self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // Now expect class keyword
+        if (self.check(.kw_class)) {
+            return self.parseClass(.private, modifiers);
+        }
+
+        self.addError("Expected 'class' after class modifiers");
+        return ParseError.UnexpectedToken;
+    }
+
+    /// Parse a DBL class definition
+    /// Syntax: [access] [abstract|sealed|partial] class Name [extends Base] [implements I1, I2, ...]
+    ///             fields...
+    ///             methods...
+    ///         endclass
+    ///
+    /// Generates: struct_def for fields + impl_block for methods
+    fn parseClass(self: *Self, access: AccessModifier, modifiers: ClassModifiers) ParseError!StmtIdx {
+        _ = access; // TODO: Store access modifier in metadata
+        _ = modifiers; // TODO: Store class modifiers in metadata
+
+        const loc = self.currentLoc();
+        _ = self.advance(); // consume 'class'
+
+        const name_tok = try self.consume(.identifier, "Expected class name");
+        const class_name_id = try self.intern(name_tok.lexeme);
+        const class_name = name_tok.lexeme;
+
+        // Parse optional extends clause
+        // TODO: Generate base field in struct for inheritance
+        if (self.match(&[_]TokenType{.kw_extends})) {
+            _ = try self.consume(.identifier, "Expected base class name");
+        }
+
+        // Parse optional implements clause
+        while (self.match(&[_]TokenType{.kw_implements})) {
+            // Parse interface list
+            _ = try self.consume(.identifier, "Expected interface name");
+            while (self.match(&[_]TokenType{.comma})) {
+                _ = try self.consume(.identifier, "Expected interface name");
+            }
+        }
+
+        // Use scratch buffer for fields
+        self.store.markScratch() catch return ParseError.OutOfMemory;
+        errdefer self.store.rollbackScratch();
+
+        // Also collect methods
+        var methods: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer methods.deinit(self.allocator);
+
+        // Parse class body until endclass
+        while (!self.check(.kw_endclass) and !self.isAtEnd()) {
+            // Check for access modifiers on members
+            var member_access = AccessModifier.private;
+            if (self.match(&[_]TokenType{.kw_public})) {
+                member_access = .public;
+            } else if (self.match(&[_]TokenType{.kw_private})) {
+                member_access = .private;
+            } else if (self.match(&[_]TokenType{.kw_protected})) {
+                member_access = .protected;
+            }
+
+            // Check for static modifier (TODO: Handle static members)
+            _ = self.match(&[_]TokenType{.kw_static});
+
+            // Check for virtual/override modifiers (TODO: Handle virtual methods)
+            _ = self.match(&[_]TokenType{.kw_virtual}) or self.match(&[_]TokenType{.kw_override});
+
+            if (self.check(.kw_method)) {
+                // Parse method
+                const method_stmt = try self.parseClassMethod(class_name, member_access);
+                methods.append(self.allocator, method_stmt) catch return ParseError.OutOfMemory;
+            } else if (self.check(.kw_property)) {
+                // TODO: Parse property
+                self.addError("Properties not yet supported");
+                _ = self.advance();
+            } else if (self.check(.identifier)) {
+                // Field declaration: name, type
+                const field_name_tok = self.advance();
+                const field_name_id = try self.intern(field_name_tok.lexeme);
+
+                // Expect comma before type
+                _ = self.match(&[_]TokenType{.comma});
+
+                // Parse type specifier
+                var field_type = TypeIdx.null;
+                if (self.check(.identifier)) {
+                    const type_tok = self.advance();
+                    field_type = try self.parseDblTypeSpec(type_tok.lexeme);
+                } else {
+                    field_type = self.store.addPrimitiveType(.i64) catch return ParseError.OutOfMemory;
+                }
+
+                // Store as [name, type] pairs in scratch
+                // TODO: Store field access modifier (member_access) in metadata
+                self.store.pushScratchU32(@intFromEnum(field_name_id)) catch return ParseError.OutOfMemory;
+                self.store.pushScratchU32(field_type.toInt()) catch return ParseError.OutOfMemory;
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        _ = try self.consume(.kw_endclass, "Expected 'endclass'");
+
+        // Get fields from scratch
+        const fields = self.store.getScratchU32s();
+        self.store.commitScratch();
+
+        // Store struct def in extra_data
+        const fields_start = self.store.extra_data.items.len;
+        self.store.extra_data.append(self.allocator, @intCast(fields.len / 2)) catch return ParseError.OutOfMemory; // field count
+        self.store.extra_data.append(self.allocator, 0) catch return ParseError.OutOfMemory; // type param count
+        self.store.extra_data.append(self.allocator, 0) catch return ParseError.OutOfMemory; // type params start
+        for (fields) |f| {
+            self.store.extra_data.append(self.allocator, f) catch return ParseError.OutOfMemory;
+        }
+
+        // Create struct_def statement for the class
+        const struct_idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));
+        self.store.stmt_tags.append(self.allocator, .struct_def) catch return ParseError.OutOfMemory;
+        self.store.stmt_locs.append(self.allocator, loc) catch return ParseError.OutOfMemory;
+        self.store.stmt_data.append(self.allocator, .{
+            .a = @intFromEnum(class_name_id),
+            .b = @intCast(fields_start),
+        }) catch return ParseError.OutOfMemory;
+
+        // If there are methods, create impl_block
+        if (methods.items.len > 0) {
+            // Store methods in extra_data
+            // Format: [method_count, trait_type, target_type, method1, method2, ...]
+            const methods_start = self.store.extra_data.items.len;
+            const class_type = self.store.addNamedType(class_name_id) catch return ParseError.OutOfMemory;
+            self.store.extra_data.append(self.allocator, @intCast(methods.items.len)) catch return ParseError.OutOfMemory;
+            self.store.extra_data.append(self.allocator, class_type.toInt()) catch return ParseError.OutOfMemory; // trait type
+            self.store.extra_data.append(self.allocator, class_type.toInt()) catch return ParseError.OutOfMemory; // target type (same for inherent impl)
+            for (methods.items) |m| {
+                self.store.extra_data.append(self.allocator, m.toInt()) catch return ParseError.OutOfMemory;
+            }
+
+            // Create impl_block statement
+            const impl_idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));
+            self.store.stmt_tags.append(self.allocator, .impl_block) catch return ParseError.OutOfMemory;
+            self.store.stmt_locs.append(self.allocator, loc) catch return ParseError.OutOfMemory;
+            self.store.stmt_data.append(self.allocator, .{
+                .a = class_type.toInt(), // trait type (same as target for inherent impl)
+                .b = @intCast(methods_start),
+            }) catch return ParseError.OutOfMemory;
+
+            // Queue impl_block to be added to top-level statements
+            self.pending_class_impl_blocks.append(self.allocator, impl_idx) catch return ParseError.OutOfMemory;
+        }
+        methods.deinit(self.allocator);
+
+        return struct_idx;
+    }
+
+    /// Parse a class method
+    /// Syntax: [access] [static] [virtual|override] method Name[, ReturnType]
+    ///             params...
+    ///             [parent(...) | this(...)]
+    ///         proc
+    ///             body...
+    ///         endmethod
+    fn parseClassMethod(self: *Self, class_name: []const u8, access: AccessModifier) ParseError!StmtIdx {
+        _ = access; // TODO: Store access in method metadata
+        const loc = self.currentLoc();
+        _ = self.advance(); // consume 'method'
+
+        // Check for destructor syntax: method ~ClassName
+        var is_destructor = false;
+        if (self.check(.op_bnot)) {
+            _ = self.advance(); // consume '~'
+            is_destructor = true;
+        }
+
+        const method_name_tok = try self.consume(.identifier, "Expected method name");
+        const method_name = method_name_tok.lexeme;
+
+        // Check if this is a constructor (method name == class name)
+        var is_constructor = false;
+        {
+            var lower_method: [256]u8 = undefined;
+            var lower_class: [256]u8 = undefined;
+            const method_len = @min(method_name.len, lower_method.len);
+            const class_len = @min(class_name.len, lower_class.len);
+            const lower_m = std.ascii.lowerString(lower_method[0..method_len], method_name[0..method_len]);
+            const lower_c = std.ascii.lowerString(lower_class[0..class_len], class_name[0..class_len]);
+            if (std.mem.eql(u8, lower_m, lower_c)) {
+                is_constructor = true;
+            }
+        }
+
+        // For destructor, verify the name matches class name
+        if (is_destructor) {
+            var lower_method: [256]u8 = undefined;
+            var lower_class: [256]u8 = undefined;
+            const method_len = @min(method_name.len, lower_method.len);
+            const class_len = @min(class_name.len, lower_class.len);
+            const lower_m = std.ascii.lowerString(lower_method[0..method_len], method_name[0..method_len]);
+            const lower_c = std.ascii.lowerString(lower_class[0..class_len], class_name[0..class_len]);
+            if (!std.mem.eql(u8, lower_m, lower_c)) {
+                self.addError("Destructor name must match class name");
+            }
+        }
+
+        // Parse optional return type
+        var return_type = TypeIdx.null;
+        if (self.match(&[_]TokenType{.comma})) {
+            if (self.check(.identifier)) {
+                const type_tok = self.advance();
+                // Check for 'void'
+                var lower_buf: [32]u8 = undefined;
+                const type_len = @min(type_tok.lexeme.len, lower_buf.len);
+                const lower_type = std.ascii.lowerString(lower_buf[0..type_len], type_tok.lexeme[0..type_len]);
+                if (!std.mem.eql(u8, lower_type, "void")) {
+                    return_type = try self.parseDblTypeSpec(type_tok.lexeme);
+                }
+            }
+        }
+
+        // Parse parameters until proc or endmethod
+        var params: std.ArrayListUnmanaged(u32) = .{};
+        errdefer params.deinit(self.allocator);
+
+        while (!self.check(.kw_proc) and !self.check(.kw_endmethod) and
+            !self.check(.kw_parent) and !self.check(.kw_this) and !self.isAtEnd())
+        {
+            // Check for parameter direction modifiers
+            var is_ref: u32 = 1; // Default to ref for DBL methods
+            if (self.match(&[_]TokenType{.kw_inout})) {
+                is_ref = 1;
+            } else if (self.match(&[_]TokenType{.kw_out})) {
+                is_ref = 1;
+            } else if (self.match(&[_]TokenType{.kw_in})) {
+                is_ref = 0;
+            }
+
+            // Check for required/optional modifier (TODO: Handle optional params)
+            _ = self.match(&[_]TokenType{.kw_req}) or self.match(&[_]TokenType{.kw_opt});
+
+            if (self.check(.identifier)) {
+                const param_name_tok = self.advance();
+                const param_name_id = try self.intern(param_name_tok.lexeme);
+
+                // Expect comma before type
+                _ = self.match(&[_]TokenType{.comma});
+
+                // Parse type specifier
+                var param_type = TypeIdx.null;
+                if (self.check(.identifier)) {
+                    const type_tok = self.advance();
+                    param_type = try self.parseDblTypeSpec(type_tok.lexeme);
+                } else {
+                    param_type = self.store.addPrimitiveType(.i64) catch return ParseError.OutOfMemory;
+                }
+
+                // Store as [name, type, is_ref, default_value] quads
+                params.append(self.allocator, @intFromEnum(param_name_id)) catch return ParseError.OutOfMemory;
+                params.append(self.allocator, param_type.toInt()) catch return ParseError.OutOfMemory;
+                params.append(self.allocator, is_ref) catch return ParseError.OutOfMemory;
+                params.append(self.allocator, ExprIdx.null.toInt()) catch return ParseError.OutOfMemory; // no default
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        // Parse optional constructor initializer: parent(...) or this(...)
+        if (is_constructor) {
+            if (self.match(&[_]TokenType{.kw_parent})) {
+                // parent(...) - call parent constructor
+                if (self.match(&[_]TokenType{.lparen})) {
+                    // TODO: Parse parent constructor arguments
+                    while (!self.check(.rparen) and !self.isAtEnd()) {
+                        _ = self.advance();
+                    }
+                    _ = self.match(&[_]TokenType{.rparen});
+                }
+            } else if (self.match(&[_]TokenType{.kw_this})) {
+                // this(...) - call sibling constructor
+                if (self.match(&[_]TokenType{.lparen})) {
+                    // TODO: Parse sibling constructor arguments
+                    while (!self.check(.rparen) and !self.isAtEnd()) {
+                        _ = self.advance();
+                    }
+                    _ = self.match(&[_]TokenType{.rparen});
+                }
+            }
+        }
+
+        // Expect proc
+        _ = self.match(&[_]TokenType{.kw_proc});
+
+        // Parse method body until endmethod
+        var body: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer body.deinit(self.allocator);
+
+        while (!self.check(.kw_endmethod) and !self.isAtEnd()) {
+            const stmt = self.parseStatement() catch |err| {
+                self.synchronize();
+                if (err == ParseError.OutOfMemory) return err;
+                continue;
+            };
+            body.append(self.allocator, stmt) catch return ParseError.OutOfMemory;
+        }
+
+        _ = try self.consume(.kw_endmethod, "Expected 'endmethod'");
+
+        // Create block for body
+        const block_idx = self.store.addBlock(body.items, loc) catch return ParseError.OutOfMemory;
+        body.deinit(self.allocator);
+
+        // Generate method name - for constructor use __init__, for destructor use __deinit__
+        var method_name_id: base.StringId = undefined;
+        if (is_constructor) {
+            method_name_id = try self.intern("__init__");
+        } else if (is_destructor) {
+            method_name_id = try self.intern("__deinit__");
+        } else {
+            method_name_id = try self.intern(method_name);
+        }
+
+        // Set return type: constructors/destructors return void
+        if (is_constructor or is_destructor) {
+            return_type = TypeIdx.null;
+        }
+
+        // Create fn_def for the method
+        const fn_stmt = self.store.addFnDef(method_name_id, params.items, return_type, block_idx, loc) catch return ParseError.OutOfMemory;
+        params.deinit(self.allocator);
+
+        return fn_stmt;
+    }
+
+    /// Parse a namespace declaration
+    /// Syntax: namespace Name.SubName
+    ///             classes...
+    ///         endnamespace
+    fn parseNamespace(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = self.advance(); // consume 'namespace'
+
+        // Parse namespace name (can be dotted like MyApp.Models)
+        var namespace_parts: std.ArrayListUnmanaged([]const u8) = .{};
+        errdefer namespace_parts.deinit(self.allocator);
+
+        const first_part = try self.consume(.identifier, "Expected namespace name");
+        namespace_parts.append(self.allocator, first_part.lexeme) catch return ParseError.OutOfMemory;
+
+        while (self.match(&[_]TokenType{.period})) {
+            const part = try self.consume(.identifier, "Expected namespace component");
+            namespace_parts.append(self.allocator, part.lexeme) catch return ParseError.OutOfMemory;
+        }
+        namespace_parts.deinit(self.allocator); // TODO: Use namespace name
+
+        // Parse namespace body
+        var stmts: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        while (!self.check(.kw_endnamespace) and !self.isAtEnd()) {
+            const stmt = self.parseStatement() catch |err| {
+                self.synchronize();
+                if (err == ParseError.OutOfMemory) return err;
+                continue;
+            };
+            stmts.append(self.allocator, stmt) catch return ParseError.OutOfMemory;
+        }
+
+        _ = try self.consume(.kw_endnamespace, "Expected 'endnamespace'");
+
+        // Return namespace contents as a block
+        const result = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        stmts.deinit(self.allocator);
+        return result;
+    }
+
     /// Parse record block (local variable declarations)
-    /// record
+    /// record [name] [,x]
     ///     var ,type
     ///     ...
     /// endrecord
     ///
     /// DBL record blocks declare local variables with their proper types.
+    /// Record overlays (,X syntax) share memory with the previous record:
+    ///   record info         ; Named non-overlaid record
+    ///       time    ,d6
+    ///       date    ,d6
+    ///   record ,x           ; Unnamed overlay - shares memory with 'info'
+    ///       hr      ,d2
+    ///       min     ,d2
+    ///       sec     ,d2
     fn parseRecord(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = self.advance(); // consume 'record'
 
+        // Check for record overlay syntax: record ,x or record name ,x
+        var is_overlay = false;
+        var overlay_base: ?base.StringId = null;
+
+        // Check for optional record name followed by optional overlay specifier
+        if (self.check(.identifier)) {
+            // Could be a named record, or just fields - peek ahead
+            const saved_pos = self.current;
+            _ = self.advance(); // tentatively consume identifier
+
+            if (self.match(&[_]TokenType{.comma})) {
+                // Check if next is 'x' or another identifier (overlay target)
+                if (self.check(.identifier)) {
+                    const overlay_tok = self.peek();
+                    var lower_buf: [16]u8 = undefined;
+                    const lower_len = @min(overlay_tok.lexeme.len, lower_buf.len);
+                    const lower = std.ascii.lowerString(lower_buf[0..lower_len], overlay_tok.lexeme[0..lower_len]);
+                    if (std.mem.eql(u8, lower, "x")) {
+                        // record name ,x syntax - named overlay at previous record
+                        is_overlay = true;
+                        overlay_base = self.last_record_base_field;
+                        _ = self.advance(); // consume 'x'
+                    } else {
+                        // record name ,type - it's a type specifier, backtrack
+                        self.current = saved_pos;
+                    }
+                } else {
+                    // Just a comma after name with no identifier - backtrack
+                    self.current = saved_pos;
+                }
+            } else {
+                // No comma - it's a named record without overlay, backtrack
+                self.current = saved_pos;
+            }
+        } else if (self.match(&[_]TokenType{.comma})) {
+            // record ,x syntax - unnamed overlay
+            if (self.check(.identifier)) {
+                const overlay_tok = self.peek();
+                var lower_buf: [16]u8 = undefined;
+                const lower_len = @min(overlay_tok.lexeme.len, lower_buf.len);
+                const lower = std.ascii.lowerString(lower_buf[0..lower_len], overlay_tok.lexeme[0..lower_len]);
+                if (std.mem.eql(u8, lower, "x")) {
+                    is_overlay = true;
+                    overlay_base = self.last_record_base_field;
+                    _ = self.advance(); // consume 'x'
+                } else {
+                    // record ,name - overlay at named record
+                    is_overlay = true;
+                    overlay_base = self.intern(overlay_tok.lexeme) catch null;
+                    _ = self.advance(); // consume the overlay target name
+                }
+            }
+        }
+
         var stmts: std.ArrayListUnmanaged(StmtIdx) = .{};
         errdefer stmts.deinit(self.allocator);
+
+        // Track current byte offset for overlays
+        var current_offset: i32 = 0;
+        var first_field_id: ?base.StringId = null;
 
         // Parse variable declarations until endrecord
         while (!self.check(.kw_endrecord) and !self.isAtEnd()) {
@@ -824,19 +1465,27 @@ pub const Parser = struct {
                 const var_name_tok = self.advance();
                 const var_name_id = try self.intern(var_name_tok.lexeme);
 
+                // Track first field for future overlays
+                if (first_field_id == null) {
+                    first_field_id = var_name_id;
+                }
+
                 // Expect comma before type
                 _ = self.match(&[_]TokenType{.comma});
 
                 // Parse type specifier - could be primitive (d6, a30) or struct name
                 var var_type = TypeIdx.null;
                 var is_struct_type = false;
+                var field_size: i32 = 0;
                 if (self.check(.identifier)) {
                     const type_tok = self.advance();
                     const type_result = self.parseDblTypeSpecWithInfo(type_tok.lexeme);
                     var_type = type_result.type_idx;
                     is_struct_type = type_result.is_struct;
+                    field_size = self.getFieldSize(type_tok.lexeme);
                 } else {
                     var_type = self.store.addPrimitiveType(.i64) catch return ParseError.OutOfMemory;
+                    field_size = 8; // default i64 size
                 }
 
                 // Check for @position (field overlay) syntax
@@ -862,11 +1511,34 @@ pub const Parser = struct {
                     // Create field_view instead of let_decl
                     const view_stmt = self.store.addFieldView(var_name_id, var_type, base_field_id, offset, loc) catch return ParseError.OutOfMemory;
                     stmts.append(self.allocator, view_stmt) catch return ParseError.OutOfMemory;
+                } else if (is_overlay and overlay_base != null) {
+                    // This field overlays the base record at current_offset
+                    const view_stmt = self.store.addFieldView(var_name_id, var_type, overlay_base.?, current_offset, loc) catch return ParseError.OutOfMemory;
+                    stmts.append(self.allocator, view_stmt) catch return ParseError.OutOfMemory;
+                    current_offset += field_size;
                 } else {
-                    // Create variable declaration with proper type
-                    // For structs, don't provide init value (let IR handle default construction)
-                    // For primitives, initialize to 0
-                    const init_val = if (is_struct_type) ExprIdx.null else self.store.addIntLiteral(0, loc) catch return ParseError.OutOfMemory;
+                    // Check for optional initial value: , value
+                    // DBL syntax: name, type, initial_value
+                    var init_val = ExprIdx.null;
+                    if (self.match(&[_]TokenType{.comma})) {
+                        // Check if next token looks like a value (not a field name)
+                        // Values can be: string_literal, integer_literal, decimal_literal, true, false, or expr starting with - or (
+                        if (self.check(.string_literal) or self.check(.integer_literal) or
+                            self.check(.decimal_literal) or self.check(.kw_true) or
+                            self.check(.kw_false) or self.check(.minus) or self.check(.lparen))
+                        {
+                            init_val = self.parseExpression() catch ExprIdx.null;
+                        } else {
+                            // It's likely the next field name, backtrack
+                            self.current -= 1;
+                        }
+                    }
+
+                    // If no explicit init value, use defaults
+                    if (init_val == ExprIdx.null and !is_struct_type) {
+                        init_val = self.store.addIntLiteral(0, loc) catch return ParseError.OutOfMemory;
+                    }
+
                     const var_stmt = self.store.addLetDecl(var_name_id, var_type, init_val, true, loc) catch return ParseError.OutOfMemory;
                     stmts.append(self.allocator, var_stmt) catch return ParseError.OutOfMemory;
                 }
@@ -877,10 +1549,55 @@ pub const Parser = struct {
 
         _ = try self.consume(.kw_endrecord, "Expected 'endrecord'");
 
+        // Update last_record_base_field for future overlays (only for non-overlay records)
+        if (!is_overlay and first_field_id != null) {
+            self.last_record_base_field = first_field_id;
+        }
+
         // Return as a block containing all the variable declarations
         const result = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
         stmts.deinit(self.allocator); // Free ArrayList backing memory after data is copied
         return result;
+    }
+
+    /// Get the byte size of a DBL type for overlay offset calculations
+    fn getFieldSize(self: *Self, type_str: []const u8) i32 {
+        _ = self; // Not used but consistent with other methods
+        if (type_str.len == 0) return 8; // default
+
+        var lower_buf: [32]u8 = undefined;
+        const len = @min(type_str.len, lower_buf.len);
+        const lower = std.ascii.lowerString(lower_buf[0..len], type_str[0..len]);
+
+        // .NET types
+        if (std.mem.eql(u8, lower, "byte") or std.mem.eql(u8, lower, "sbyte")) return 1;
+        if (std.mem.eql(u8, lower, "short") or std.mem.eql(u8, lower, "ushort")) return 2;
+        if (std.mem.eql(u8, lower, "int") or std.mem.eql(u8, lower, "uint") or
+            std.mem.eql(u8, lower, "integer") or std.mem.eql(u8, lower, "float"))
+            return 4;
+        if (std.mem.eql(u8, lower, "long") or std.mem.eql(u8, lower, "ulong") or
+            std.mem.eql(u8, lower, "double"))
+            return 8;
+
+        // DBL types: a, d, i followed by size
+        if (lower[0] == 'a' or lower[0] == 'd') {
+            // Alpha and decimal sizes are in characters/digits
+            if (len > 1) {
+                const size = std.fmt.parseInt(i32, lower[1..len], 10) catch 1;
+                return size;
+            }
+            return 1;
+        }
+        if (lower[0] == 'i') {
+            // Integer size in bytes: i1=1, i2=2, i4=4, i8=8
+            if (len > 1) {
+                const size = std.fmt.parseInt(i32, lower[1..len], 10) catch 1;
+                return size;
+            }
+            return 1;
+        }
+
+        return 8; // default for unknown types
     }
 
     /// Result of parsing a DBL type specifier
@@ -903,7 +1620,8 @@ pub const Parser = struct {
         const len = @min(type_str.len, lower_buf.len);
         const lower = std.ascii.lowerString(lower_buf[0..len], type_str[0..len]);
 
-        // Check for C#-style types (used in DBL with comma prefix, e.g., ,string, ,int, ,boolean)
+        // Check for C#/.NET-style types (used in DBL with comma prefix, e.g., ,string, ,int, ,boolean)
+        // Reference: DBL LRM Chapter 2 - Data Types (.NET Type Aliases)
         if (std.mem.eql(u8, lower, "string")) {
             return .{
                 .type_idx = self.store.addPrimitiveType(.string) catch TypeIdx.null,
@@ -917,14 +1635,77 @@ pub const Parser = struct {
                 .is_struct = false,
             };
         }
+        if (std.mem.eql(u8, lower, "uint")) {
+            // DBL uint maps to u4 (4 bytes = 32 bits unsigned)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.u32) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "short")) {
+            // DBL short maps to i2 (2 bytes = 16 bits)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.i16) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "ushort")) {
+            // DBL ushort maps to u2 (2 bytes = 16 bits unsigned)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.u16) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "long")) {
+            // DBL long maps to i8 (8 bytes = 64 bits)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.i64) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "ulong")) {
+            // DBL ulong maps to u8 (8 bytes = 64 bits unsigned)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.u64) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "byte")) {
+            // DBL byte maps to u1 (1 byte = 8 bits unsigned)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.u8) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "sbyte")) {
+            // DBL sbyte maps to i1 (1 byte = 8 bits signed)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.i8) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
         if (std.mem.eql(u8, lower, "boolean") or std.mem.eql(u8, lower, "bool")) {
             return .{
                 .type_idx = self.store.addPrimitiveType(.bool) catch TypeIdx.null,
                 .is_struct = false,
             };
         }
-        if (std.mem.eql(u8, lower, "decimal") or std.mem.eql(u8, lower, "double")) {
-            // DBL decimal and double both map to d28.10
+        if (std.mem.eql(u8, lower, "float")) {
+            // DBL float maps to f32 (single precision)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.f32) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "double")) {
+            // DBL double maps to f64 (double precision)
+            return .{
+                .type_idx = self.store.addPrimitiveType(.f64) catch TypeIdx.null,
+                .is_struct = false,
+            };
+        }
+        if (std.mem.eql(u8, lower, "decimal")) {
+            // DBL decimal maps to d28.10 (high-precision decimal)
             return .{
                 .type_idx = self.store.addDecimalType(28, 10) catch TypeIdx.null,
                 .is_struct = false,
@@ -1511,59 +2292,144 @@ pub const Parser = struct {
     // ============================================================
 
     fn parseExpression(self: *Self) ParseError!ExprIdx {
-        return self.parseOr();
+        return self.parseNullCoalesce();
     }
 
-    fn parseOr(self: *Self) ParseError!ExprIdx {
-        var expr = try self.parseAnd();
+    // Null coalescing: ?? (lowest precedence binary operator)
+    fn parseNullCoalesce(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseOr();
 
-        while (self.match(&[_]TokenType{.op_or})) {
+        while (self.match(&[_]TokenType{.op_null_coalesce})) {
             const loc = self.currentLoc();
-            const right = try self.parseAnd();
+            const right = try self.parseOr();
+            // TODO: Add null_coalesce to BinaryOp, for now treat as logical or
             expr = self.store.addBinary(expr, .@"or", right, loc) catch return ParseError.OutOfMemory;
         }
 
         return expr;
     }
 
+    // Logical OR: .OR. or ||
+    fn parseOr(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseXor();
+
+        while (self.match(&[_]TokenType{.op_or})) {
+            const loc = self.currentLoc();
+            const right = try self.parseXor();
+            expr = self.store.addBinary(expr, .@"or", right, loc) catch return ParseError.OutOfMemory;
+        }
+
+        return expr;
+    }
+
+    // Logical XOR: .XOR.
+    fn parseXor(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseAnd();
+
+        while (self.match(&[_]TokenType{.op_xor})) {
+            const loc = self.currentLoc();
+            const right = try self.parseAnd();
+            // XOR is implemented as (a OR b) AND NOT (a AND b), map to bit_xor for now
+            expr = self.store.addBinary(expr, .bit_xor, right, loc) catch return ParseError.OutOfMemory;
+        }
+
+        return expr;
+    }
+
+    // Logical AND: .AND. or &&
     fn parseAnd(self: *Self) ParseError!ExprIdx {
-        var expr = try self.parseEquality();
+        var expr = try self.parseBitwiseOr();
 
         while (self.match(&[_]TokenType{.op_and})) {
             const loc = self.currentLoc();
-            const right = try self.parseEquality();
+            const right = try self.parseBitwiseOr();
             expr = self.store.addBinary(expr, .@"and", right, loc) catch return ParseError.OutOfMemory;
         }
 
         return expr;
     }
 
+    // Bitwise OR: .BOR. or |
+    fn parseBitwiseOr(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseBitwiseXor();
+
+        while (self.match(&[_]TokenType{.op_bor})) {
+            const loc = self.currentLoc();
+            const right = try self.parseBitwiseXor();
+            expr = self.store.addBinary(expr, .bit_or, right, loc) catch return ParseError.OutOfMemory;
+        }
+
+        return expr;
+    }
+
+    // Bitwise XOR: .BXOR. or ^
+    fn parseBitwiseXor(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseBitwiseAnd();
+
+        while (self.match(&[_]TokenType{.op_bxor})) {
+            const loc = self.currentLoc();
+            const right = try self.parseBitwiseAnd();
+            expr = self.store.addBinary(expr, .bit_xor, right, loc) catch return ParseError.OutOfMemory;
+        }
+
+        return expr;
+    }
+
+    // Bitwise AND: .BAND. or &, also .BNAND.
+    fn parseBitwiseAnd(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseEquality();
+
+        while (self.match(&[_]TokenType{ .op_band, .op_bnand })) {
+            const loc = self.currentLoc();
+            const op_tok = self.previous();
+            const right = try self.parseEquality();
+
+            if (op_tok.type == .op_bnand) {
+                // BNAND is NOT(a AND b) - create AND then wrap in NOT
+                const and_expr = self.store.addBinary(expr, .bit_and, right, loc) catch return ParseError.OutOfMemory;
+                expr = self.store.addUnary(.bit_not, and_expr, loc) catch return ParseError.OutOfMemory;
+            } else {
+                expr = self.store.addBinary(expr, .bit_and, right, loc) catch return ParseError.OutOfMemory;
+            }
+        }
+
+        return expr;
+    }
+
+    // Equality: .EQ./==, .NE./!=, .EQS., .NES.
     fn parseEquality(self: *Self) ParseError!ExprIdx {
         var expr = try self.parseComparison();
 
-        while (self.match(&[_]TokenType{ .op_eq, .op_ne })) {
+        while (self.match(&[_]TokenType{ .op_eq, .op_ne, .op_eqs, .op_nes })) {
             const loc = self.currentLoc();
             const op_tok = self.previous();
             const right = try self.parseComparison();
-            const op: BinaryOp = if (op_tok.type == .op_eq) .eq else .ne;
+            // .EQS./.NES. are full-length string comparison, same AST op - IR handles semantics
+            const op: BinaryOp = switch (op_tok.type) {
+                .op_eq, .op_eqs => .eq,
+                .op_ne, .op_nes => .ne,
+                else => .eq,
+            };
             expr = self.store.addBinary(expr, op, right, loc) catch return ParseError.OutOfMemory;
         }
 
         return expr;
     }
 
+    // Comparison: .LT./<, .LE./<=, .GT./>, .GE./>=, .GTS., .LTS., .GES., .LES.
     fn parseComparison(self: *Self) ParseError!ExprIdx {
-        var expr = try self.parseTerm();
+        var expr = try self.parseShift();
 
-        while (self.match(&[_]TokenType{ .op_lt, .op_le, .op_gt, .op_ge })) {
+        while (self.match(&[_]TokenType{ .op_lt, .op_le, .op_gt, .op_ge, .op_gts, .op_lts, .op_ges, .op_les })) {
             const loc = self.currentLoc();
             const op_tok = self.previous();
-            const right = try self.parseTerm();
+            const right = try self.parseShift();
+            // String comparison operators map to same AST ops - IR handles semantics
             const op: BinaryOp = switch (op_tok.type) {
-                .op_lt => .lt,
-                .op_le => .le,
-                .op_gt => .gt,
-                .op_ge => .ge,
+                .op_lt, .op_lts => .lt,
+                .op_le, .op_les => .le,
+                .op_gt, .op_gts => .gt,
+                .op_ge, .op_ges => .ge,
                 else => .lt,
             };
             expr = self.store.addBinary(expr, op, right, loc) catch return ParseError.OutOfMemory;
@@ -1572,18 +2438,49 @@ pub const Parser = struct {
         return expr;
     }
 
+    // Bit shift: << and >>
+    fn parseShift(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseTerm();
+
+        while (self.match(&[_]TokenType{ .op_shl, .op_shr })) {
+            const loc = self.currentLoc();
+            const op_tok = self.previous();
+            const right = try self.parseTerm();
+            const op: BinaryOp = if (op_tok.type == .op_shl) .shl else .shr;
+            expr = self.store.addBinary(expr, op, right, loc) catch return ParseError.OutOfMemory;
+        }
+
+        return expr;
+    }
+
+    // Addition/Subtraction: +, -
     fn parseTerm(self: *Self) ParseError!ExprIdx {
         var expr = try self.parseFactor();
 
-        // Note: hash (#) is DBL string concatenation - mapped to add, IR handles type dispatch
-        while (self.match(&[_]TokenType{ .plus, .minus, .hash })) {
+        while (self.match(&[_]TokenType{ .plus, .minus })) {
             const loc = self.currentLoc();
             const op_tok = self.previous();
             const right = try self.parseFactor();
+            const op: BinaryOp = if (op_tok.type == .plus) .add else .sub;
+            expr = self.store.addBinary(expr, op, right, loc) catch return ParseError.OutOfMemory;
+        }
+
+        return expr;
+    }
+
+    // Multiplication/Division/Modulo: *, /, .MOD./%
+    fn parseFactor(self: *Self) ParseError!ExprIdx {
+        var expr = try self.parseRounding();
+
+        while (self.match(&[_]TokenType{ .star, .slash, .op_mod })) {
+            const loc = self.currentLoc();
+            const op_tok = self.previous();
+            const right = try self.parseRounding();
             const op: BinaryOp = switch (op_tok.type) {
-                .plus, .hash => .add,
-                .minus => .sub,
-                else => .add,
+                .star => .mul,
+                .slash => .div,
+                .op_mod => .mod,
+                else => .mul,
             };
             expr = self.store.addBinary(expr, op, right, loc) catch return ParseError.OutOfMemory;
         }
@@ -1591,26 +2488,37 @@ pub const Parser = struct {
         return expr;
     }
 
-    fn parseFactor(self: *Self) ParseError!ExprIdx {
+    // Rounding operators: # (truncating), ## (true rounding)
+    // These are DBL-specific binary operators: value # places, value ## places
+    // # truncates to N decimal places, ## rounds to N decimal places
+    fn parseRounding(self: *Self) ParseError!ExprIdx {
         var expr = try self.parseUnary();
 
-        while (self.match(&[_]TokenType{ .star, .slash })) {
+        while (self.match(&[_]TokenType{ .op_round, .op_round_true })) {
             const loc = self.currentLoc();
             const op_tok = self.previous();
-            const right = try self.parseUnary();
-            const op: BinaryOp = if (op_tok.type == .star) .mul else .div;
-            expr = self.store.addBinary(expr, op, right, loc) catch return ParseError.OutOfMemory;
+            const places = try self.parseUnary();
+
+            // DBL: # is truncating round, ## is true round
+            const op: BinaryOp = if (op_tok.type == .op_round_true) .round else .trunc;
+            expr = self.store.addBinary(expr, op, places, loc) catch return ParseError.OutOfMemory;
         }
 
         return expr;
     }
 
+    // Unary operators: -, !, ~, .NOT., .BNOT.
     fn parseUnary(self: *Self) ParseError!ExprIdx {
-        if (self.match(&[_]TokenType{ .minus, .op_not, .kw_not })) {
+        if (self.match(&[_]TokenType{ .minus, .op_not, .kw_not, .op_bnot })) {
             const loc = self.currentLoc();
             const op_tok = self.previous();
             const operand = try self.parseUnary();
-            const op: UnaryOp = if (op_tok.type == .minus) .neg else .not;
+            const op: UnaryOp = switch (op_tok.type) {
+                .minus => .neg,
+                .op_not, .kw_not => .not,
+                .op_bnot => .bit_not,
+                else => .not,
+            };
             return self.store.addUnary(op, operand, loc) catch return ParseError.OutOfMemory;
         }
 

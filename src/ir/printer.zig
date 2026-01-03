@@ -185,6 +185,10 @@ pub const Printer = struct {
             .urem => |op| try self.printBinaryOp("urem", op),
             .ineg => |op| try self.printUnaryOp("ineg", op),
 
+            // Rounding (DBL legacy)
+            .round => |op| try self.printRoundOp("round", op),
+            .trunc => |op| try self.printRoundOp("trunc", op),
+
             // Comparison (Cranelift icmp with condition code)
             .icmp => |op| try self.printIcmpOp(op),
 
@@ -508,6 +512,14 @@ pub const Printer = struct {
         try self.printValue(op.lhs);
         try self.writer.writeAll(", ");
         try self.printValue(op.rhs);
+    }
+
+    fn printRoundOp(self: *Self, name: []const u8, op: ir.Instruction.RoundOp) !void {
+        try self.printValue(op.result);
+        try self.writer.print(" = {s} ", .{name});
+        try self.printValue(op.value);
+        try self.writer.writeAll(", ");
+        try self.printValue(op.places);
     }
 
     fn printIcmpOp(self: *Self, op: ir.Instruction.IcmpOp) !void {

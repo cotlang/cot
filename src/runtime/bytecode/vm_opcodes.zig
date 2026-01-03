@@ -516,9 +516,12 @@ pub fn op_debug_break(vm: *VM, module: *const Module) VMError!DispatchResult {
 }
 
 /// debug_line - set current line number
+/// Format: [opcode:1] [0:1] [line:u16]
+/// IP is at byte 1 (after opcode was consumed by dispatch loop)
 pub fn op_debug_line(vm: *VM, module: *const Module) VMError!DispatchResult {
-    const line = std.mem.readInt(u32, module.code[vm.ip + 1 ..][0..4], .little);
-    vm.ip += 5;
+    // Skip the 0 byte at vm.ip, read u16 line number at vm.ip+1
+    const line = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3; // Skip: 0 byte (1) + line u16 (2) = 3 bytes
     vm.debug_current_line = line;
     return .continue_dispatch;
 }
@@ -1444,5 +1447,97 @@ pub fn op_map_set_at(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 
     _ = map.putAt(@intCast(idx - 1), vm.registers[val_reg]); // 1-based to 0-based
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// Math Functions (0xC0-0xCF)
+// ============================================================================
+
+/// fn_round rd, rs, prec - rd = round(rs, precision)
+/// Performs true rounding (banker's rounding) to specified decimal places
+/// Format: [rd:4|rs:4] [prec:8]
+pub fn op_fn_round(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const prec = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+
+    const val = vm.registers[rs];
+
+    // Get numeric value
+    const num: f64 = switch (val.tag()) {
+        .integer => @floatFromInt(val.asInt()),
+        .decimal => blk: {
+            if (val.asDecimal()) |dval| {
+                const divisor: f64 = @floatFromInt(std.math.pow(i64, 10, dval.precision));
+                break :blk @as(f64, @floatFromInt(dval.value)) / divisor;
+            }
+            break :blk 0.0;
+        },
+        else => 0.0,
+    };
+
+    // Calculate rounding factor
+    const factor: f64 = @floatFromInt(std.math.pow(i64, 10, prec));
+
+    // True rounding: round to nearest, ties to even (banker's rounding)
+    const scaled = num * factor;
+    const rounded = @round(scaled);
+    const result = rounded / factor;
+
+    // Return as decimal if precision > 0, otherwise as integer
+    if (prec > 0) {
+        const int_val: i64 = @intFromFloat(rounded);
+        vm.registers[rd] = Value.initDecimal(vm.allocator, int_val, prec) catch return VMError.OutOfMemory;
+    } else {
+        vm.registers[rd] = Value.initInt(@intFromFloat(result));
+    }
+
+    return .continue_dispatch;
+}
+
+/// fn_trunc rd, rs, prec - rd = trunc(rs, precision)
+/// Truncates (towards zero) to specified decimal places
+/// Format: [rd:4|rs:4] [prec:8]
+pub fn op_fn_trunc(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const prec = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+
+    const val = vm.registers[rs];
+
+    // Get numeric value
+    const num: f64 = switch (val.tag()) {
+        .integer => @floatFromInt(val.asInt()),
+        .decimal => blk: {
+            if (val.asDecimal()) |dval| {
+                const divisor: f64 = @floatFromInt(std.math.pow(i64, 10, dval.precision));
+                break :blk @as(f64, @floatFromInt(dval.value)) / divisor;
+            }
+            break :blk 0.0;
+        },
+        else => 0.0,
+    };
+
+    // Calculate truncation factor
+    const factor: f64 = @floatFromInt(std.math.pow(i64, 10, prec));
+
+    // Truncate towards zero
+    const scaled = num * factor;
+    const truncated = @trunc(scaled);
+    const result = truncated / factor;
+
+    // Return as decimal if precision > 0, otherwise as integer
+    if (prec > 0) {
+        const int_val: i64 = @intFromFloat(truncated);
+        vm.registers[rd] = Value.initDecimal(vm.allocator, int_val, prec) catch return VMError.OutOfMemory;
+    } else {
+        vm.registers[rd] = Value.initInt(@intFromFloat(result));
+    }
+
     return .continue_dispatch;
 }

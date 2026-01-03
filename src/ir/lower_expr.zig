@@ -367,6 +367,8 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
         .@"and", .@"or" => .bool,
         // Arithmetic and bitwise operations inherit operand type
         .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .shl, .shr => lhs.ty,
+        // Rounding operations produce decimal (or inherit from lhs)
+        .round, .trunc => lhs.ty,
         .range, .range_inclusive => lhs.ty,
     };
 
@@ -411,6 +413,9 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
         .bit_xor => .{ .bxor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
         .shl => .{ .ishl = .{ .lhs = lhs, .rhs = rhs, .result = result } },
         .shr => .{ .sshr = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+        // Rounding operations: value # places (trunc) or value ## places (round)
+        .round => .{ .round = .{ .value = lhs, .places = rhs, .result = result } },
+        .trunc => .{ .trunc = .{ .value = lhs, .places = rhs, .result = result } },
         .range, .range_inclusive => return LowerError.UnsupportedFeature,
     };
 

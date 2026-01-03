@@ -62,6 +62,7 @@ pub const TokenType = enum {
     cast_alpha, // ^a or ^A
     cast_decimal, // ^d or ^D
     cast_integer, // ^i or ^I
+    cast_float, // ^f or ^F
 
     // Multi-character tokens
     arrow, // ->
@@ -84,6 +85,43 @@ pub const TokenType = enum {
     op_or, // || or .OR.
     op_not, // ! or .NOT.
     op_xor, // .XOR.
+
+    // Bitwise operators
+    op_band, // & or .BAND.
+    op_bor, // | or .BOR.
+    op_bnot, // ~ or .BNOT.
+    op_bxor, // ^ or .BXOR.
+    op_bnand, // .BNAND.
+    op_shl, // <<
+    op_shr, // >>
+
+    // String comparison operators (full-length comparison)
+    op_eqs, // .EQS.
+    op_nes, // .NES.
+    op_gts, // .GTS.
+    op_lts, // .LTS.
+    op_ges, // .GES.
+    op_les, // .LES.
+
+    // Modulo operator
+    op_mod, // % or .MOD.
+
+    // Rounding operators (DBL legacy)
+    op_round, // # (truncating round)
+    op_round_true, // ## (true round)
+
+    // Compound assignment operators
+    plus_equals, // +=
+    minus_equals, // -=
+    star_equals, // *=
+    slash_equals, // /=
+    band_equals, // &=
+    bor_equals, // |=
+
+    // Null-safety operators
+    op_null_coalesce, // ??
+    op_null_cond, // ?.
+    question, // ?
 
     // Compile-time directives
     dir_define, // .define
@@ -198,6 +236,11 @@ pub const TokenType = enum {
     kw_virtual,
     kw_override,
     kw_new,
+    kw_parent,
+    kw_this,
+    kw_abstract,
+    kw_sealed,
+    kw_partial,
 
     // Exception handling keywords
     kw_try,
@@ -227,6 +270,10 @@ pub const TokenType = enum {
     kw_match,
     kw_impl,
     kw_type,
+
+    // Testing keywords
+    kw_test,
+    kw_endtest,
 
     // Special
     eof,
@@ -324,6 +371,11 @@ pub const TokenType = enum {
             .kw_virtual,
             .kw_override,
             .kw_new,
+            .kw_parent,
+            .kw_this,
+            .kw_abstract,
+            .kw_sealed,
+            .kw_partial,
             .kw_try,
             .kw_catch,
             .kw_finally,
@@ -345,6 +397,8 @@ pub const TokenType = enum {
             .kw_match,
             .kw_impl,
             .kw_type,
+            .kw_test,
+            .kw_endtest,
             => true,
             else => false,
         };
@@ -353,22 +407,54 @@ pub const TokenType = enum {
     /// Check if this is an operator token
     pub fn isOperator(self: TokenType) bool {
         return switch (self) {
+            // Arithmetic
             .plus,
             .minus,
             .star,
             .slash,
             .hash,
             .equals,
+            // Comparison
             .op_eq,
             .op_ne,
             .op_lt,
             .op_le,
             .op_gt,
             .op_ge,
+            // Logical
             .op_and,
             .op_or,
             .op_not,
             .op_xor,
+            // Bitwise
+            .op_band,
+            .op_bor,
+            .op_bnot,
+            .op_bxor,
+            .op_bnand,
+            .op_shl,
+            .op_shr,
+            // String comparison
+            .op_eqs,
+            .op_nes,
+            .op_gts,
+            .op_lts,
+            .op_ges,
+            .op_les,
+            // Modulo and rounding
+            .op_mod,
+            .op_round,
+            .op_round_true,
+            // Compound assignment
+            .plus_equals,
+            .minus_equals,
+            .star_equals,
+            .slash_equals,
+            .band_equals,
+            .bor_equals,
+            // Null-safety
+            .op_null_coalesce,
+            .op_null_cond,
             => true,
             else => false,
         };

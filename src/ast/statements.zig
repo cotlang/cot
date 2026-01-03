@@ -131,12 +131,24 @@ pub const StatementTag = enum(u8) {
     /// Compile-time block: comptime { }
     comptime_block,
 
+    // ============================================
+    // Testing
+    // ============================================
+
+    /// Test definition: test "name" { body }
+    test_def,
+
     /// Check if this is a declaration statement
     pub fn isDeclaration(self: StatementTag) bool {
         return switch (self) {
-            .fn_def, .struct_def, .union_def, .field_view, .enum_def, .const_decl, .let_decl, .type_alias => true,
+            .fn_def, .struct_def, .union_def, .field_view, .enum_def, .const_decl, .let_decl, .type_alias, .test_def => true,
             else => false,
         };
+    }
+
+    /// Check if this is a test definition
+    pub fn isTest(self: StatementTag) bool {
+        return self == .test_def;
     }
 
     /// Check if this is a control flow statement

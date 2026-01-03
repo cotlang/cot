@@ -82,6 +82,9 @@ pub const Stdlib = struct {
         // Memory functions
         try self.registry.registerNative("mem_alloc", native_mem_alloc);
         try self.registry.registerNative("mem_free", native_mem_free);
+
+        // Testing functions
+        try self.registry.registerNative("assert", native_assert);
     }
 
     /// Load Cot stdlib modules from path
@@ -113,13 +116,14 @@ fn native_date(ctx: *NativeContext) NativeError!?Value {
     const ts = std.time.timestamp();
     const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
     const day = epoch.getEpochDay();
-    const ymd = day.calculateYearDay().calculateMonthDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
 
     const result = ctx.allocator.alloc(u8, 8) catch return NativeError.OutOfMemory;
     _ = std.fmt.bufPrint(result, "{d:0>4}{d:0>2}{d:0>2}", .{
-        ymd.year,
-        @intFromEnum(ymd.month),
-        ymd.day,
+        year_day.year,
+        @intFromEnum(month_day.month),
+        month_day.day_index + 1,
     }) catch return NativeError.OutOfMemory;
 
     return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
@@ -147,7 +151,8 @@ fn native_datetime(ctx: *NativeContext) NativeError!?Value {
     const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
 
     const day = epoch.getEpochDay();
-    const ymd = day.calculateYearDay().calculateMonthDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
     const day_secs = epoch.getDaySeconds();
 
     const hours = day_secs.getHoursIntoDay();
@@ -156,9 +161,9 @@ fn native_datetime(ctx: *NativeContext) NativeError!?Value {
 
     const result = ctx.allocator.alloc(u8, 14) catch return NativeError.OutOfMemory;
     _ = std.fmt.bufPrint(result, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}", .{
-        ymd.year,
-        @intFromEnum(ymd.month),
-        ymd.day,
+        year_day.year,
+        @intFromEnum(month_day.month),
+        month_day.day_index + 1,
         hours,
         mins,
         secs,
@@ -252,7 +257,7 @@ fn native_frac(ctx: *NativeContext) NativeError!?Value {
 fn native_sleep(ctx: *NativeContext) NativeError!?Value {
     const ms = ctx.getArgInt(0) catch return NativeError.InvalidArgument;
     if (ms > 0) {
-        std.time.sleep(@intCast(ms * 1_000_000));
+        std.Thread.sleep(@intCast(ms * 1_000_000));
     }
     return null;
 }
@@ -300,6 +305,38 @@ fn native_mem_free(ctx: *NativeContext) NativeError!?Value {
             _ = handle.asHandle();
         },
         else => return NativeError.InvalidArgument,
+    }
+
+    return null;
+}
+
+/// ASSERT - Test assertion
+/// assert(condition) - fails if condition is false
+/// assert(condition, message) - fails with message if condition is false
+fn native_assert(ctx: *NativeContext) NativeError!?Value {
+    const condition = ctx.getArg(0) orelse return NativeError.InvalidArgument;
+
+    // Get boolean value of condition
+    const is_true = switch (condition.tag()) {
+        .integer => condition.asInt() != 0,
+        .boolean => condition.asBool(),
+        .fixed_string => blk: {
+            const str = condition.asFixedString() orelse break :blk false;
+            break :blk str.len > 0;
+        },
+        .string => blk: {
+            const str = condition.asString();
+            break :blk str.len > 0;
+        },
+        else => false,
+    };
+
+    if (!is_true) {
+        // Assertion failed
+        const msg = if (ctx.getArg(1)) |msg_val| msg_val.toString() else "assertion failed";
+
+        std.debug.print("\x1b[31mAssertion failed\x1b[0m: {s}\n", .{msg});
+        return NativeError.AssertionFailed;
     }
 
     return null;

@@ -47,6 +47,9 @@ pub const ChannelManager = channels.ChannelManager;
 // Debug utilities
 pub const debug = @import("debug.zig");
 
+// Execution tracing
+pub const trace = @import("trace/trace.zig");
+
 // Extension system
 pub const extension = @import("extension.zig");
 pub const extension_manager = @import("extension_manager.zig");

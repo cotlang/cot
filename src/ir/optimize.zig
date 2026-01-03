@@ -410,6 +410,11 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
             used.put(op.lhs.id, {}) catch {};
             used.put(op.rhs.id, {}) catch {};
         },
+        // Rounding (DBL legacy)
+        .round, .trunc => |op| {
+            used.put(op.value.id, {}) catch {};
+            used.put(op.places.id, {}) catch {};
+        },
         // Comparison (Cranelift style)
         .icmp => |op| {
             used.put(op.lhs.id, {}) catch {};

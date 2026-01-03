@@ -111,3 +111,161 @@ test "field byte size" {
     const decimal = FieldSpec{ .name = "y", .type_char = 'd', .size = 10 };
     try std.testing.expect(decimal.byteSize() == 10);
 }
+
+// ============================================================================
+// OOP Type Definitions (DBL Classes, Methods, Properties)
+// ============================================================================
+
+/// Access modifier for class members
+pub const AccessModifier = enum {
+    public,
+    protected,
+    private,
+    internal, // .NET assembly-level visibility
+
+    pub fn fromToken(token_type: anytype) AccessModifier {
+        return switch (token_type) {
+            .kw_public => .public,
+            .kw_protected => .protected,
+            .kw_private => .private,
+            else => .private, // Default to private
+        };
+    }
+};
+
+/// Class-level modifiers (abstract, sealed, partial)
+pub const ClassModifiers = struct {
+    is_abstract: bool = false,
+    is_sealed: bool = false,
+    is_partial: bool = false,
+};
+
+/// Information about a class field
+pub const ClassFieldInfo = struct {
+    name: []const u8,
+    type_spec: FieldSpec,
+    access: AccessModifier = .private,
+    is_static: bool = false,
+    init_expr: ?usize = null, // Expression index for initializer
+};
+
+/// Information about a method parameter
+pub const MethodParamInfo = struct {
+    name: []const u8,
+    type_str: []const u8,
+    is_out: bool = false,
+    is_inout: bool = false,
+    is_optional: bool = false,
+};
+
+/// Information about a class method
+pub const MethodInfo = struct {
+    name: []const u8,
+    params: []MethodParamInfo,
+    return_type: ?[]const u8, // null for void
+    access: AccessModifier = .public,
+    is_static: bool = false,
+    is_virtual: bool = false,
+    is_abstract: bool = false,
+    is_override: bool = false,
+    body_stmt: ?usize = null, // Statement index for body (null for abstract)
+};
+
+/// Constructor initializer type
+pub const ConstructorInitializerKind = enum {
+    parent, // Call parent class constructor
+    this, // Call sibling constructor
+};
+
+/// Information about a constructor initializer (parent(...) or this(...))
+pub const ConstructorInitializer = struct {
+    kind: ConstructorInitializerKind,
+    args: []usize, // Expression indices for arguments
+};
+
+/// Information about a class constructor
+pub const ConstructorInfo = struct {
+    params: []MethodParamInfo,
+    access: AccessModifier = .public,
+    initializer: ?ConstructorInitializer = null, // parent(...) or this(...)
+    body_stmt: ?usize = null, // Statement index for body
+};
+
+/// Information about a class destructor
+pub const DestructorInfo = struct {
+    body_stmt: ?usize = null, // Statement index for body
+};
+
+/// Information about a property getter/setter
+pub const PropertyAccessorInfo = struct {
+    body_stmt: ?usize = null,
+};
+
+/// Information about a class property
+pub const PropertyInfo = struct {
+    name: []const u8,
+    type_str: []const u8,
+    access: AccessModifier = .public,
+    getter: ?PropertyAccessorInfo = null,
+    setter: ?PropertyAccessorInfo = null,
+    is_indexer: bool = false,
+    index_params: ?[]MethodParamInfo = null,
+};
+
+/// Complete information about a DBL class
+/// This is used during parsing to collect class elements,
+/// then transformed into cot core AST (struct_def + impl_block)
+pub const ClassInfo = struct {
+    name: []const u8,
+    namespace: ?[]const u8 = null,
+    base_class: ?[]const u8 = null, // extends
+    interfaces: []const []const u8 = &.{}, // implements
+    access: AccessModifier = .public,
+    is_abstract: bool = false,
+    is_sealed: bool = false,
+    is_partial: bool = false,
+
+    // Class members
+    fields: []ClassFieldInfo = &.{},
+    methods: []MethodInfo = &.{},
+    constructors: []ConstructorInfo = &.{},
+    destructor: ?DestructorInfo = null,
+    properties: []PropertyInfo = &.{},
+
+    /// Check if this class has a default (parameterless) constructor
+    pub fn hasDefaultConstructor(self: ClassInfo) bool {
+        for (self.constructors) |ctor| {
+            if (ctor.params.len == 0) return true;
+        }
+        return false;
+    }
+
+    /// Check if a method with the given name exists
+    pub fn hasMethod(self: ClassInfo, name: []const u8) bool {
+        for (self.methods) |method| {
+            if (std.mem.eql(u8, method.name, name)) return true;
+        }
+        return false;
+    }
+};
+
+/// Information about an interface method signature
+pub const InterfaceMethodInfo = struct {
+    name: []const u8,
+    params: []MethodParamInfo,
+    return_type: ?[]const u8,
+};
+
+/// Information about a DBL interface
+pub const InterfaceInfo = struct {
+    name: []const u8,
+    namespace: ?[]const u8 = null,
+    methods: []InterfaceMethodInfo = &.{},
+};
+
+/// Information about a namespace
+pub const NamespaceInfo = struct {
+    name: []const u8,
+    classes: []const []const u8 = &.{}, // Class names in this namespace
+    interfaces: []const []const u8 = &.{}, // Interface names
+};

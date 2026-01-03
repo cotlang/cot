@@ -210,21 +210,45 @@ const keyword_map = std.StaticStringMap(DblKeyword).initComptime(.{
     .{ "implements", .implements },
 });
 
-/// DBL comparison operators
+/// DBL operators (both dot-form and modern symbol form)
 pub const DblOperator = enum {
-    eq, // .EQ.
-    ne, // .NE.
-    lt, // .LT.
-    le, // .LE.
-    gt, // .GT.
-    ge, // .GE.
-    and_, // .AND.
-    or_, // .OR.
-    not_, // .NOT.
+    // Comparison operators
+    eq, // .EQ. or ==
+    ne, // .NE. or != or <>
+    lt, // .LT. or <
+    le, // .LE. or <=
+    gt, // .GT. or >
+    ge, // .GE. or >=
+
+    // Logical operators
+    and_, // .AND. or &&
+    or_, // .OR. or ||
+    not_, // .NOT. or !
     xor_, // .XOR.
-    band, // .BAND.
-    bor, // .BOR.
-    bnot, // .BNOT.
+
+    // Bitwise operators
+    band, // .BAND. or &
+    bor, // .BOR. or |
+    bnot, // .BNOT. or ~
+    bxor, // .BXOR. or ^
+    bnand, // .BNAND.
+    shl, // << (bit shift left)
+    shr, // >> (bit shift right)
+
+    // String comparison operators (full-length)
+    eqs, // .EQS. (string equal)
+    nes, // .NES. (string not equal)
+    gts, // .GTS. (string greater than)
+    lts, // .LTS. (string less than)
+    ges, // .GES. (string greater or equal)
+    les, // .LES. (string less or equal)
+
+    // Modulo
+    mod, // .MOD. or %
+
+    // Rounding (DBL legacy)
+    round, // # (truncating round)
+    round_true, // ## (true round)
 
     /// Parse a DBL operator from a string (e.g., ".EQ.")
     pub fn fromString(s: []const u8) ?DblOperator {
@@ -237,19 +261,33 @@ pub const DblOperator = enum {
 };
 
 const operator_map = std.StaticStringMap(DblOperator).initComptime(.{
+    // Comparison
     .{ "EQ", .eq },
     .{ "NE", .ne },
     .{ "LT", .lt },
     .{ "LE", .le },
     .{ "GT", .gt },
     .{ "GE", .ge },
+    // Logical
     .{ "AND", .and_ },
     .{ "OR", .or_ },
     .{ "NOT", .not_ },
     .{ "XOR", .xor_ },
+    // Bitwise
     .{ "BAND", .band },
     .{ "BOR", .bor },
     .{ "BNOT", .bnot },
+    .{ "BXOR", .bxor },
+    .{ "BNAND", .bnand },
+    // String comparison
+    .{ "EQS", .eqs },
+    .{ "NES", .nes },
+    .{ "GTS", .gts },
+    .{ "LTS", .lts },
+    .{ "GES", .ges },
+    .{ "LES", .les },
+    // Modulo
+    .{ "MOD", .mod },
 });
 
 /// Check if an identifier is a DBL keyword

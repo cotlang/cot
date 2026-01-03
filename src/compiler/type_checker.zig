@@ -83,6 +83,9 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .sdiv, .udiv => |op| self.checkBinaryOp(op, .arithmetic, "/"),
         .srem, .urem => |op| self.checkBinaryOp(op, .arithmetic, "%"),
 
+        // Rounding operations (DBL legacy)
+        .round, .trunc => {}, // Rounding is type-safe by construction
+
         // Comparison operations (Cranelift style - icmp with condition)
         .icmp => |op| self.checkIcmpOp(op),
 

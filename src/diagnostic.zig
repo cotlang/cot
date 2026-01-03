@@ -194,7 +194,9 @@ pub const DiagnosticList = struct {
 
     /// Print all diagnostics to stderr
     pub fn printAll(self: DiagnosticList) void {
-        const stderr = std.io.getStdErr().writer();
+        const stderr_file = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+        var buffer: [4096]u8 = undefined;
+        const stderr = stderr_file.writer(&buffer);
         for (self.list.items) |diag| {
             diag.format("", .{}, stderr) catch {};
         }

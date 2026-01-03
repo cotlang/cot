@@ -359,7 +359,9 @@ export fn cot_rt_io_write(
 
 /// Print debug message to stderr
 export fn cot_rt_debug_print(ptr: [*]const u8, len: u32) void {
-    const stderr = std.io.getStdErr().writer();
+    const stderr_file = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    var buffer: [4096]u8 = undefined;
+    const stderr = stderr_file.writer(&buffer);
     stderr.writeAll(ptr[0..len]) catch {};
     stderr.writeByte('\n') catch {};
 }

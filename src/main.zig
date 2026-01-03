@@ -4,6 +4,7 @@
 //! Usage:
 //!   cot <file.cot>              Run a Cot program (interpreter)
 //!   cot run <file.cot|.cbo>     Run a program (auto-detect mode)
+//!   cot trace <file.cot|.cbo>   Run with execution tracing enabled
 //!   cot compile <file.cot>      Compile to bytecode (.cbo) via IR
 //!   cot disasm <file.cot|.cbo>  Disassemble to readable output
 //!   cot dump-ir <file.cot>      Dump IR for debugging
@@ -88,6 +89,7 @@ fn cotLogFn(
 const cot = @import("cot");
 const build_options = @import("build_options");
 const frontends = @import("frontends.zig");
+const trace_mod = @import("cot_runtime").trace;
 
 // Framework commands
 const init_cmd = @import("framework/commands/init.zig");
@@ -180,6 +182,33 @@ pub fn main() !void {
                 try printStderr("Error: {}\n", .{err});
             }
         };
+    } else if (std.mem.eql(u8, command, "trace")) {
+        // Trace command - runs with execution tracing enabled
+        if (args.len < 3) {
+            try printErr("Error: trace requires a filename\n");
+            try printErr("Usage: cot trace <file.cot|file.cbo> [--level=opcodes|routines|verbose]\n");
+            return;
+        }
+        const target = args[2];
+        // Parse trace level option
+        var trace_level: trace_mod.TraceLevel = .opcodes; // default
+        for (args[3..]) |arg| {
+            if (std.mem.startsWith(u8, arg, "--level=")) {
+                const level_str = arg[8..];
+                if (std.mem.eql(u8, level_str, "none")) {
+                    trace_level = .none;
+                } else if (std.mem.eql(u8, level_str, "routines")) {
+                    trace_level = .routines;
+                } else if (std.mem.eql(u8, level_str, "opcodes")) {
+                    trace_level = .opcodes;
+                } else if (std.mem.eql(u8, level_str, "verbose")) {
+                    trace_level = .verbose;
+                } else if (std.mem.eql(u8, level_str, "full")) {
+                    trace_level = .full;
+                }
+            }
+        }
+        try traceFileAuto(allocator, target, trace_level);
     } else if (std.mem.eql(u8, command, "init")) {
         // Check for help flag
         if (args.len > 2 and std.mem.eql(u8, args[2], "--help")) {
@@ -254,6 +283,19 @@ pub fn main() !void {
                 try printStderr("Error: {}\n", .{err});
             }
         };
+    } else if (std.mem.eql(u8, command, "test")) {
+        if (args.len < 3) {
+            try printErr("Error: test requires a filename\n");
+            try printErr("Usage: cot test <file.cot>\n");
+            return;
+        }
+        runTests(allocator, args[2]) catch |err| {
+            if (err == error.TestsFailed) {
+                // Test failure already reported - exit with non-zero code
+                std.process.exit(1);
+            }
+            return err;
+        };
     } else {
         // Assume it's a filename - run with interpreter
         try runFile(allocator, command);
@@ -273,6 +315,7 @@ fn printUsage() !void {
         \\Usage:
         \\  cot <file.cot>              Run a Cot program (interpreter)
         \\  cot run <file|project>      Run a program or workspace project
+        \\  cot trace <file>            Run with execution tracing
         \\  cot compile <file.cot>      Compile to bytecode (.cbo)
         \\  cot disasm <file.cot|.cbo>  Disassemble to readable output
         \\  cot dump-ir <file.cot>      Dump IR for debugging
@@ -301,10 +344,16 @@ fn printUsage() !void {
         \\
         \\Note: For DBL syntax (.dbl files), use the cot-dbl frontend.
         \\
+        \\Trace Options:
+        \\  --level=routines            Trace routine calls only
+        \\  --level=opcodes             Trace each opcode (default)
+        \\  --level=verbose             Include register state
+        \\
         \\Examples:
         \\  cot hello.cot               Run hello.cot with interpreter
         \\  cot compile hello.cot       Compile to hello.cbo
         \\  cot run bin/hello.cbo       Run compiled bytecode
+        \\  cot trace hello.cot         Run with execution trace
         \\  cot init my-company         Create a workspace
         \\  cot new inventory           Create an app
         \\  cot build                   Build all projects
@@ -461,6 +510,256 @@ fn runBytecodeFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     vm.execute(&mod) catch |err| {
         try printStderr("VM error: {}\n", .{err});
     };
+}
+
+fn traceFileAuto(allocator: std.mem.Allocator, filename: []const u8, level: trace_mod.TraceLevel) !void {
+    // Check file extension for compiled bytecode formats
+    if (std.mem.endsWith(u8, filename, ".cbo") or
+        std.mem.endsWith(u8, filename, ".clb") or
+        std.mem.endsWith(u8, filename, ".cbr"))
+    {
+        try traceBytecodeFile(allocator, filename, level);
+    } else {
+        try traceSourceFile(allocator, filename, level);
+    }
+}
+
+fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: trace_mod.TraceLevel) !void {
+    // Try to dispatch to external frontend
+    if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{})) {
+        return;
+    }
+
+    const compiler = cot.compiler;
+    const DiagnosticCollector = compiler.DiagnosticCollector;
+    const formatter = compiler.formatter;
+    const diagnostics = compiler.diagnostics;
+
+    // Initialize diagnostic collector
+    var collector = DiagnosticCollector.init(allocator);
+    defer collector.deinit();
+
+    // Read source file
+    const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
+        try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
+        return;
+    };
+    defer file.close();
+
+    const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
+    defer allocator.free(source);
+
+    // Change to the source file's directory so relative paths work correctly
+    if (std.fs.path.dirname(filename)) |dir| {
+        std.posix.chdir(dir) catch {};
+    }
+
+    // Cache source for diagnostic context
+    collector.cacheSource(filename, source) catch {};
+
+    // Tokenize
+    var lex = cot.lexer.Lexer.init(source);
+    const tokens = lex.tokenize(allocator) catch |err| {
+        collector.addError(
+            .E001_invalid_character,
+            filename,
+            diagnostics.SourceRange.none,
+            "Lexer error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+    defer allocator.free(tokens);
+
+    // Create NodeStore and StringInterner
+    var strings = cot.base.StringInterner.init(allocator);
+    defer strings.deinit();
+
+    var store = cot.ast.NodeStore.init(allocator, &strings);
+    defer store.deinit();
+
+    // Parse
+    var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
+    defer parse.deinit();
+    const top_level = parse.parse() catch |err| {
+        for (parse.errors.items) |parse_err| {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.fromLoc(@intCast(parse_err.line), @intCast(parse_err.column)),
+                "{s}",
+                .{parse_err.message},
+            );
+        }
+        if (collector.error_count == 0) {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.none,
+                "Parser error: {}",
+                .{err},
+            );
+        }
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+
+    // Check for non-fatal parse errors
+    if (parse.errors.items.len > 0) {
+        for (parse.errors.items) |parse_err| {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.fromLoc(@intCast(parse_err.line), @intCast(parse_err.column)),
+                "{s}",
+                .{parse_err.message},
+            );
+        }
+    }
+
+    if (collector.hasErrors()) {
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    }
+
+    // Lower AST to IR
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+        collector.addError(
+            .E300_undefined_label,
+            filename,
+            diagnostics.SourceRange.none,
+            "IR lowering error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+    defer ir_module.deinit();
+
+    // Type check
+    const TypeChecker = compiler.TypeChecker;
+    var type_checker = TypeChecker.init(allocator, &collector, ir_module, filename);
+    type_checker.check();
+
+    if (collector.hasErrors()) {
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    }
+
+    // Optimize IR
+    _ = cot.ir_optimize.optimize(ir_module, .{});
+
+    // Emit bytecode
+    var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
+    defer emitter.deinit();
+
+    var mod = emitter.emit(ir_module) catch |err| {
+        collector.addError(
+            .E300_undefined_label,
+            filename,
+            diagnostics.SourceRange.none,
+            "Bytecode emission error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+    defer mod.deinit();
+
+    // Create tracer
+    var tracer = trace_mod.Tracer.init(allocator, .{
+        .level = level,
+        .output = .{ .format = .human, .target = .stderr, .color = true },
+        .history_size = 256,
+    });
+    defer tracer.deinit();
+
+    // Create VM and attach tracer
+    var vm = cot.bytecode.VM.init(allocator);
+    defer vm.deinit();
+
+    vm.setTracer(&tracer);
+
+    try printStderr("=== Execution Trace ===\n", .{});
+    vm.execute(&mod) catch |err| {
+        try printStderr("\nVM error: {}\n", .{err});
+        // Dump history on error
+        try printStderr("\n", .{});
+        const stderr_file: std.fs.File = .stderr();
+        var buf: [4096]u8 = undefined;
+        var stderr_writer = stderr_file.writer(&buf);
+        vm.dumpTraceHistory(&stderr_writer.interface) catch {};
+    };
+    try printStderr("\n=== Trace Statistics ===\n", .{});
+    try printStderr("Opcodes executed: {d}\n", .{tracer.stats.opcodes_executed});
+    try printStderr("Calls made: {d}\n", .{tracer.stats.calls_made});
+    try printStderr("Duration: {d}ms\n", .{tracer.stats.durationMs()});
+}
+
+fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: trace_mod.TraceLevel) !void {
+    const extension = cot.extension;
+
+    const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
+        try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
+        return;
+    };
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, 1024 * 1024 * 10); // 10MB max
+    defer allocator.free(bytes);
+
+    // Change to the source file's directory so relative paths work correctly
+    if (std.fs.path.dirname(filename)) |dir| {
+        std.posix.chdir(dir) catch {};
+    }
+
+    // Initialize extension registry
+    extension.initRegistry(allocator);
+    defer extension.deinitRegistry();
+
+    // Register TUI extension when available
+    if (comptime build_options.enable_tui) {
+        extension.registerExtension(cot.cot_tui.extension) catch {};
+    }
+
+    // Deserialize
+    var fbs = std.io.fixedBufferStream(bytes);
+    var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
+        try printStderr("Error: Invalid bytecode file '{s}': {}\n", .{ filename, err });
+        return;
+    };
+    defer mod.deinit();
+
+    // Create tracer
+    var tracer = trace_mod.Tracer.init(allocator, .{
+        .level = level,
+        .output = .{ .format = .human, .target = .stderr, .color = true },
+        .history_size = 256,
+    });
+    defer tracer.deinit();
+
+    // Create VM and attach tracer
+    var vm = cot.bytecode.VM.init(allocator);
+    defer vm.deinit();
+
+    vm.setTracer(&tracer);
+
+    try printStderr("=== Execution Trace ===\n", .{});
+    vm.execute(&mod) catch |err| {
+        try printStderr("\nVM error: {}\n", .{err});
+        // Dump history on error
+        try printStderr("\n", .{});
+        // Use stderr for trace dump - requires a buffer for Zig 0.15
+        const stderr_file: std.fs.File = .stderr();
+        var buf: [4096]u8 = undefined;
+        var stderr_writer = stderr_file.writer(&buf);
+        vm.dumpTraceHistory(&stderr_writer.interface) catch {};
+    };
+    try printStderr("\n=== Trace Statistics ===\n", .{});
+    try printStderr("Opcodes executed: {d}\n", .{tracer.stats.opcodes_executed});
+    try printStderr("Calls made: {d}\n", .{tracer.stats.calls_made});
+    try printStderr("Duration: {d}ms\n", .{tracer.stats.durationMs()});
 }
 
 fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: ?[]const u8) !void {
@@ -668,6 +967,173 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
     };
 
     try printStdout("Compiled: {s} -> {s}\n", .{ filename, out_name });
+}
+
+/// Run inline tests in a Cot source file
+fn runTests(allocator: std.mem.Allocator, filename: []const u8) !void {
+    // Try to dispatch to external frontend
+    if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{"test"})) {
+        return;
+    }
+
+    const compiler = cot.compiler;
+    const DiagnosticCollector = compiler.DiagnosticCollector;
+    const formatter = compiler.formatter;
+    const diagnostics = compiler.diagnostics;
+
+    // Initialize diagnostic collector
+    var collector = DiagnosticCollector.init(allocator);
+    defer collector.deinit();
+
+    // Read source file
+    const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
+        try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
+        return;
+    };
+    defer file.close();
+
+    const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
+    defer allocator.free(source);
+
+    // Cache source for diagnostic context
+    collector.cacheSource(filename, source) catch {};
+
+    // Tokenize
+    var lex = cot.lexer.Lexer.init(source);
+    const tokens = lex.tokenize(allocator) catch |err| {
+        collector.addError(
+            .E001_invalid_character,
+            filename,
+            diagnostics.SourceRange.none,
+            "Lexer error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+    defer allocator.free(tokens);
+
+    // Create NodeStore and StringInterner for new parser
+    var strings = cot.base.StringInterner.init(allocator);
+    defer strings.deinit();
+
+    var store = cot.ast.NodeStore.init(allocator, &strings);
+    defer store.deinit();
+
+    // Parse
+    var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
+    defer parse.deinit();
+    const top_level = parse.parse() catch |err| {
+        for (parse.errors.items) |parse_err| {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.fromLoc(@intCast(parse_err.line), @intCast(parse_err.column)),
+                "{s}",
+                .{parse_err.message},
+            );
+        }
+        if (collector.error_count == 0) {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.none,
+                "Parser error: {}",
+                .{err},
+            );
+        }
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+
+    // If we have errors after parsing, stop and report
+    if (collector.hasErrors()) {
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    }
+
+    // Lower AST to IR
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+        collector.addError(
+            .E300_undefined_label,
+            filename,
+            diagnostics.SourceRange.none,
+            "IR lowering error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+    defer ir_module.deinit();
+
+    // Discover test functions
+    var tests_found: usize = 0;
+    var tests_passed: usize = 0;
+    var tests_failed: usize = 0;
+
+    try printStdout("\nRunning tests in {s}:\n", .{filename});
+
+    for (ir_module.functions.items) |func| {
+        if (func.is_test) {
+            tests_found += 1;
+            const test_name = func.test_name orelse func.name;
+
+            // Emit bytecode for this test function
+            var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
+            defer emitter.deinit();
+
+            // Create a minimal module with just this test
+            var test_ir = cot.ir.Module.init(allocator, filename);
+            test_ir.addFunction(func) catch {
+                try printStdout("  \x1b[31m✗\x1b[0m {s}: failed to compile\n", .{test_name});
+                tests_failed += 1;
+                continue;
+            };
+
+            var mod = emitter.emit(&test_ir) catch {
+                try printStdout("  \x1b[31m✗\x1b[0m {s}: failed to emit bytecode\n", .{test_name});
+                tests_failed += 1;
+                continue;
+            };
+            defer mod.deinit();
+
+            // Run the test
+            var vm = cot.bytecode.VM.init(allocator);
+            defer vm.deinit();
+
+            // Register stdlib functions including assert
+            var stdlib = cot.native.Stdlib.init(allocator, &vm.native_registry);
+            defer stdlib.deinit();
+            stdlib.loadAll() catch {};
+
+            const start_time = std.time.nanoTimestamp();
+            vm.execute(&mod) catch |err| {
+                const duration_ns: u64 = @intCast(std.time.nanoTimestamp() - start_time);
+                const duration_ms = duration_ns / 1_000_000;
+                try printStdout("  \x1b[31m✗\x1b[0m {s} ({d}ms): {}\n", .{ test_name, duration_ms, err });
+                tests_failed += 1;
+                continue;
+            };
+
+            const duration_ns: u64 = @intCast(std.time.nanoTimestamp() - start_time);
+            const duration_ms = duration_ns / 1_000_000;
+            try printStdout("  \x1b[32m✓\x1b[0m {s} ({d}ms)\n", .{ test_name, duration_ms });
+            tests_passed += 1;
+        }
+    }
+
+    // Print summary
+    try printStdout("\n", .{});
+    if (tests_found == 0) {
+        try printStdout("No tests found.\n", .{});
+    } else {
+        try printStdout("{d} passed, {d} failed ({d} total)\n", .{ tests_passed, tests_failed, tests_found });
+    }
+
+    // Return error if any tests failed
+    if (tests_failed > 0) {
+        return error.TestsFailed;
+    }
 }
 
 fn dumpIR(allocator: std.mem.Allocator, filename: []const u8) !void {

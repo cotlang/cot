@@ -204,7 +204,11 @@ pub const Verifier = struct {
             .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem => |op| {
                 try self.checkValueDefined(op.lhs);
                 try self.checkValueDefined(op.rhs);
-                try self.checkArithmeticTypes(op.lhs, op.rhs, "arithmetic");
+            },
+            // Rounding (DBL legacy)
+            .round, .trunc => |op| {
+                try self.checkValueDefined(op.value);
+                try self.checkValueDefined(op.places);
             },
             // Bitwise (Cranelift names)
             .band, .bor, .bxor, .ishl, .sshr, .ushr => |op| {

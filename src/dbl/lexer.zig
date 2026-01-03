@@ -70,8 +70,8 @@ pub const Lexer = struct {
         const start_col = self.column;
         const c = self.advance();
 
-        // Single character tokens
-        const single_char_token: ?TokenType = switch (c) {
+        // Simple single character tokens (no multi-char variants)
+        const simple_single: ?TokenType = switch (c) {
             '(' => .lparen,
             ')' => .rparen,
             '[' => .lbracket,
@@ -79,16 +79,59 @@ pub const Lexer = struct {
             '{' => .lbrace,
             '}' => .rbrace,
             ',' => .comma,
-            '+' => .plus,
-            '*' => .star,
-            '#' => .hash,
             '@' => .at,
-            '%' => .percent,
+            '~' => .op_bnot,
             else => null,
         };
 
-        if (single_char_token) |tt| {
+        if (simple_single) |tt| {
             return self.makeToken(tt, self.source[start_pos..self.position]);
+        }
+
+        // Plus: + or +=
+        if (c == '+') {
+            if (!self.isAtEnd() and self.peek() == '=') {
+                _ = self.advance();
+                return self.makeToken(.plus_equals, self.source[start_pos..self.position]);
+            }
+            return self.makeToken(.plus, self.source[start_pos..self.position]);
+        }
+
+        // Star: * or *=
+        if (c == '*') {
+            if (!self.isAtEnd() and self.peek() == '=') {
+                _ = self.advance();
+                return self.makeToken(.star_equals, self.source[start_pos..self.position]);
+            }
+            return self.makeToken(.star, self.source[start_pos..self.position]);
+        }
+
+        // Hash: # or ## (rounding operators)
+        if (c == '#') {
+            if (!self.isAtEnd() and self.peek() == '#') {
+                _ = self.advance();
+                return self.makeToken(.op_round_true, self.source[start_pos..self.position]);
+            }
+            return self.makeToken(.op_round, self.source[start_pos..self.position]);
+        }
+
+        // Percent: % (modulo)
+        if (c == '%') {
+            return self.makeToken(.op_mod, self.source[start_pos..self.position]);
+        }
+
+        // Question mark: ? or ?? or ?.
+        if (c == '?') {
+            if (!self.isAtEnd()) {
+                if (self.peek() == '?') {
+                    _ = self.advance();
+                    return self.makeToken(.op_null_coalesce, self.source[start_pos..self.position]);
+                } else if (self.peek() == '.') {
+                    _ = self.advance();
+                    return self.makeToken(.op_null_cond, self.source[start_pos..self.position]);
+                }
+            }
+            return self.makeToken(.question, self.source[start_pos..self.position]);
         }
 
         // Colon: : or := (walrus) or :: (double colon)
@@ -105,7 +148,7 @@ pub const Lexer = struct {
             return self.makeToken(.colon, self.source[start_pos..self.position]);
         }
 
-        // Caret: ^ or ^a (cast to alpha) or ^d (cast to decimal) or ^i (cast to integer)
+        // Caret: ^ (bitwise XOR) or ^a (cast to alpha) or ^d (cast to decimal) or ^i (cast to integer) or ^f (cast to float)
         if (c == '^') {
             if (!self.isAtEnd()) {
                 const next = self.peek();
@@ -118,21 +161,30 @@ pub const Lexer = struct {
                 } else if (next == 'i' or next == 'I') {
                     _ = self.advance();
                     return self.makeToken(.cast_integer, self.source[start_pos..self.position]);
+                } else if (next == 'f' or next == 'F') {
+                    _ = self.advance();
+                    return self.makeToken(.cast_float, self.source[start_pos..self.position]);
                 }
             }
-            return self.makeToken(.caret, self.source[start_pos..self.position]);
+            // ^ alone is bitwise XOR
+            return self.makeToken(.op_bxor, self.source[start_pos..self.position]);
         }
 
-        // Minus: - or -> (arrow)
+        // Minus: - or -> (arrow) or -=
         if (c == '-') {
-            if (!self.isAtEnd() and self.peek() == '>') {
-                _ = self.advance();
-                return self.makeToken(.arrow, self.source[start_pos..self.position]);
+            if (!self.isAtEnd()) {
+                if (self.peek() == '>') {
+                    _ = self.advance();
+                    return self.makeToken(.arrow, self.source[start_pos..self.position]);
+                } else if (self.peek() == '=') {
+                    _ = self.advance();
+                    return self.makeToken(.minus_equals, self.source[start_pos..self.position]);
+                }
             }
             return self.makeToken(.minus, self.source[start_pos..self.position]);
         }
 
-        // Slash: / or // (line comment) or /* (block comment)
+        // Slash: / or // (line comment) or /* (block comment) or /=
         if (c == '/') {
             if (!self.isAtEnd()) {
                 if (self.peek() == '/') {
@@ -145,6 +197,9 @@ pub const Lexer = struct {
                     _ = self.advance();
                     self.skipBlockComment();
                     return self.nextToken();
+                } else if (self.peek() == '=') {
+                    _ = self.advance();
+                    return self.makeToken(.slash_equals, self.source[start_pos..self.position]);
                 }
             }
             return self.makeToken(.slash, self.source[start_pos..self.position]);
@@ -173,7 +228,7 @@ pub const Lexer = struct {
             return self.makeToken(.op_not, self.source[start_pos..self.position]);
         }
 
-        // Comparison operators: <, >, <=, >=, <>
+        // Comparison and shift operators: <, >, <=, >=, <>, <<, >>
         if (c == '<') {
             if (!self.isAtEnd()) {
                 const next = self.peek();
@@ -183,15 +238,24 @@ pub const Lexer = struct {
                 } else if (next == '>') {
                     _ = self.advance();
                     return self.makeToken(.op_ne, self.source[start_pos..self.position]);
+                } else if (next == '<') {
+                    _ = self.advance();
+                    return self.makeToken(.op_shl, self.source[start_pos..self.position]);
                 }
             }
             return self.makeToken(.op_lt, self.source[start_pos..self.position]);
         }
 
         if (c == '>') {
-            if (!self.isAtEnd() and self.peek() == '=') {
-                _ = self.advance();
-                return self.makeToken(.op_ge, self.source[start_pos..self.position]);
+            if (!self.isAtEnd()) {
+                const next = self.peek();
+                if (next == '=') {
+                    _ = self.advance();
+                    return self.makeToken(.op_ge, self.source[start_pos..self.position]);
+                } else if (next == '>') {
+                    _ = self.advance();
+                    return self.makeToken(.op_shr, self.source[start_pos..self.position]);
+                }
             }
             return self.makeToken(.op_gt, self.source[start_pos..self.position]);
         }
@@ -225,22 +289,32 @@ pub const Lexer = struct {
             return self.scanDotOperator(start_pos, start_col);
         }
 
-        // && for logical AND
+        // Ampersand: & (bitwise AND) or && (logical AND) or &=
         if (c == '&') {
-            if (!self.isAtEnd() and self.peek() == '&') {
-                _ = self.advance();
-                return self.makeToken(.op_and, self.source[start_pos..self.position]);
+            if (!self.isAtEnd()) {
+                if (self.peek() == '&') {
+                    _ = self.advance();
+                    return self.makeToken(.op_and, self.source[start_pos..self.position]);
+                } else if (self.peek() == '=') {
+                    _ = self.advance();
+                    return self.makeToken(.band_equals, self.source[start_pos..self.position]);
+                }
             }
-            return self.makeToken(.invalid, self.source[start_pos..self.position]);
+            return self.makeToken(.op_band, self.source[start_pos..self.position]);
         }
 
-        // || for logical OR
+        // Pipe: | (bitwise OR) or || (logical OR) or |=
         if (c == '|') {
-            if (!self.isAtEnd() and self.peek() == '|') {
-                _ = self.advance();
-                return self.makeToken(.op_or, self.source[start_pos..self.position]);
+            if (!self.isAtEnd()) {
+                if (self.peek() == '|') {
+                    _ = self.advance();
+                    return self.makeToken(.op_or, self.source[start_pos..self.position]);
+                } else if (self.peek() == '=') {
+                    _ = self.advance();
+                    return self.makeToken(.bor_equals, self.source[start_pos..self.position]);
+                }
             }
-            return self.makeToken(.invalid, self.source[start_pos..self.position]);
+            return self.makeToken(.op_bor, self.source[start_pos..self.position]);
         }
 
         // Unknown character
@@ -399,7 +473,9 @@ pub const Lexer = struct {
             if (!self.isAtEnd() and self.peek() == '.') {
                 _ = self.advance();
 
-                const op_type: ?TokenType = if (std.mem.eql(u8, lower_op, "eq"))
+                const op_type: ?TokenType =
+                    // Comparison operators
+                    if (std.mem.eql(u8, lower_op, "eq"))
                     .op_eq
                 else if (std.mem.eql(u8, lower_op, "ne"))
                     .op_ne
@@ -411,6 +487,7 @@ pub const Lexer = struct {
                     .op_gt
                 else if (std.mem.eql(u8, lower_op, "ge"))
                     .op_ge
+                    // Logical operators
                 else if (std.mem.eql(u8, lower_op, "and"))
                     .op_and
                 else if (std.mem.eql(u8, lower_op, "or"))
@@ -419,6 +496,33 @@ pub const Lexer = struct {
                     .op_not
                 else if (std.mem.eql(u8, lower_op, "xor"))
                     .op_xor
+                    // Bitwise operators
+                else if (std.mem.eql(u8, lower_op, "band"))
+                    .op_band
+                else if (std.mem.eql(u8, lower_op, "bor"))
+                    .op_bor
+                else if (std.mem.eql(u8, lower_op, "bnot"))
+                    .op_bnot
+                else if (std.mem.eql(u8, lower_op, "bxor"))
+                    .op_bxor
+                else if (std.mem.eql(u8, lower_op, "bnand"))
+                    .op_bnand
+                    // String comparison operators (full-length)
+                else if (std.mem.eql(u8, lower_op, "eqs"))
+                    .op_eqs
+                else if (std.mem.eql(u8, lower_op, "nes"))
+                    .op_nes
+                else if (std.mem.eql(u8, lower_op, "gts"))
+                    .op_gts
+                else if (std.mem.eql(u8, lower_op, "lts"))
+                    .op_lts
+                else if (std.mem.eql(u8, lower_op, "ges"))
+                    .op_ges
+                else if (std.mem.eql(u8, lower_op, "les"))
+                    .op_les
+                    // Modulo operator
+                else if (std.mem.eql(u8, lower_op, "mod"))
+                    .op_mod
                 else
                     null;
 
@@ -624,6 +728,11 @@ pub const Lexer = struct {
         .{ "virtual", .kw_virtual },
         .{ "override", .kw_override },
         .{ "new", .kw_new },
+        .{ "parent", .kw_parent },
+        .{ "this", .kw_this },
+        .{ "abstract", .kw_abstract },
+        .{ "sealed", .kw_sealed },
+        .{ "partial", .kw_partial },
 
         // Exception handling
         .{ "try", .kw_try },
@@ -653,6 +762,10 @@ pub const Lexer = struct {
         .{ "match", .kw_match },
         .{ "impl", .kw_impl },
         .{ "type", .kw_type },
+
+        // Testing
+        .{ "test", .kw_test },
+        .{ "endtest", .kw_endtest },
     });
 };
 
@@ -715,4 +828,125 @@ test "dbl lexer semicolon comments" {
     try std.testing.expectEqual(TokenType.equals, tokens[1].type);
     try std.testing.expectEqual(TokenType.integer_literal, tokens[2].type);
     try std.testing.expectEqual(TokenType.identifier, tokens[3].type); // y
+}
+
+test "dbl lexer bitwise operators" {
+    // Dot form
+    var lexer = Lexer.init("x .BAND. y .BOR. z .BXOR. w .BNOT. v");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.op_band, tokens[1].type);
+    try std.testing.expectEqual(TokenType.op_bor, tokens[3].type);
+    try std.testing.expectEqual(TokenType.op_bxor, tokens[5].type);
+    try std.testing.expectEqual(TokenType.op_bnot, tokens[7].type);
+}
+
+test "dbl lexer modern bitwise operators" {
+    // Symbol form
+    var lexer2 = Lexer.init("x & y | z ^ w ~ v");
+    const tokens2 = try lexer2.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens2);
+
+    try std.testing.expectEqual(TokenType.op_band, tokens2[1].type);
+    try std.testing.expectEqual(TokenType.op_bor, tokens2[3].type);
+    try std.testing.expectEqual(TokenType.op_bxor, tokens2[5].type);
+    try std.testing.expectEqual(TokenType.op_bnot, tokens2[7].type);
+}
+
+test "dbl lexer bit shift operators" {
+    var lexer = Lexer.init("x << 2 >> 1");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqual(TokenType.op_shl, tokens[1].type);
+    try std.testing.expectEqual(TokenType.integer_literal, tokens[2].type);
+    try std.testing.expectEqual(TokenType.op_shr, tokens[3].type);
+}
+
+test "dbl lexer string comparison operators" {
+    var lexer = Lexer.init("a .EQS. b .NES. c .GTS. d");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.op_eqs, tokens[1].type);
+    try std.testing.expectEqual(TokenType.op_nes, tokens[3].type);
+    try std.testing.expectEqual(TokenType.op_gts, tokens[5].type);
+}
+
+test "dbl lexer modulo operator" {
+    // Dot form
+    var lexer = Lexer.init("x .MOD. y");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.op_mod, tokens[1].type);
+
+    // Symbol form
+    var lexer2 = Lexer.init("x % y");
+    const tokens2 = try lexer2.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens2);
+
+    try std.testing.expectEqual(TokenType.op_mod, tokens2[1].type);
+}
+
+test "dbl lexer rounding operators" {
+    var lexer = Lexer.init("x # 2 ## 3");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqual(TokenType.op_round, tokens[1].type);
+    try std.testing.expectEqual(TokenType.integer_literal, tokens[2].type);
+    try std.testing.expectEqual(TokenType.op_round_true, tokens[3].type);
+}
+
+test "dbl lexer compound assignment" {
+    var lexer = Lexer.init("x += 1 -= 2 *= 3 /= 4 &= 5 |= 6");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.plus_equals, tokens[1].type);
+    try std.testing.expectEqual(TokenType.minus_equals, tokens[3].type);
+    try std.testing.expectEqual(TokenType.star_equals, tokens[5].type);
+    try std.testing.expectEqual(TokenType.slash_equals, tokens[7].type);
+    try std.testing.expectEqual(TokenType.band_equals, tokens[9].type);
+    try std.testing.expectEqual(TokenType.bor_equals, tokens[11].type);
+}
+
+test "dbl lexer null operators" {
+    var lexer = Lexer.init("x ?? y ?. z ?");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqual(TokenType.op_null_coalesce, tokens[1].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[2].type);
+    try std.testing.expectEqual(TokenType.op_null_cond, tokens[3].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[4].type);
+    try std.testing.expectEqual(TokenType.question, tokens[5].type);
+}
+
+test "dbl lexer modern comparison operators" {
+    // Test that modern operators work as aliases
+    var lexer = Lexer.init("x == y && z || !w");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.op_eq, tokens[1].type);
+    try std.testing.expectEqual(TokenType.op_and, tokens[3].type);
+    try std.testing.expectEqual(TokenType.op_or, tokens[5].type);
+    try std.testing.expectEqual(TokenType.op_not, tokens[6].type);
+}
+
+test "dbl lexer type casts" {
+    var lexer = Lexer.init("^A(x) ^D(y) ^I(z) ^F(w)");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.cast_alpha, tokens[0].type);
+    try std.testing.expectEqual(TokenType.cast_decimal, tokens[3].type);
+    try std.testing.expectEqual(TokenType.cast_integer, tokens[6].type);
+    try std.testing.expectEqual(TokenType.cast_float, tokens[9].type);
 }

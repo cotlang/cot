@@ -370,6 +370,14 @@ pub const Lowerer = struct {
             }
         }
 
+        // Seventh pass: lower test definitions
+        for (top_level) |stmt_idx| {
+            const tag = self.store.stmtTag(stmt_idx);
+            if (tag == .test_def) {
+                try self.lowerTestDef(stmt_idx);
+            }
+        }
+
         // Transfer ownership of allocated types to the module
         // The module will free them in its deinit
         // Convert managed ArrayList to unmanaged by taking the internal slice
@@ -900,6 +908,67 @@ pub const Lowerer = struct {
         try self.module.addFunction(func);
     }
 
+    /// Lower a test definition into a test function
+    fn lowerTestDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const test_data = self.store.getTestDef(stmt_idx);
+        const test_name = self.strings.get(test_data.name);
+
+        debug.print(.ir, "Lowering test: {s}", .{test_name});
+        log.debug("Lowering test: {s}", .{test_name});
+
+        // Generate mangled function name: __test_<mangled_name>
+        // Replace spaces and special chars with underscores
+        var mangled_buf: [256]u8 = undefined;
+        var mangled_len: usize = 0;
+
+        // Prefix
+        const prefix = "__test_";
+        @memcpy(mangled_buf[0..prefix.len], prefix);
+        mangled_len = prefix.len;
+
+        // Mangle the test name
+        for (test_name) |c| {
+            if (mangled_len >= mangled_buf.len - 1) break;
+            if (std.ascii.isAlphanumeric(c)) {
+                mangled_buf[mangled_len] = std.ascii.toLower(c);
+            } else {
+                mangled_buf[mangled_len] = '_';
+            }
+            mangled_len += 1;
+        }
+
+        // Allocate the mangled name
+        const fn_name = self.allocator.dupe(u8, mangled_buf[0..mangled_len]) catch return LowerError.OutOfMemory;
+
+        // Test functions have no params and return void
+        const func_type = ir.FunctionType{
+            .params = &.{},
+            .return_type = .void,
+            .is_variadic = false,
+        };
+
+        // Create function
+        const func = try ir.Function.init(self.allocator, fn_name, func_type);
+        func.is_test = true;
+        func.test_name = test_name;
+
+        self.current_func = func;
+        self.current_block = func.entry;
+
+        // Clear variables for new function scope
+        self.scopes.reset();
+
+        // Lower test body
+        try self.lowerStatement(test_data.body);
+
+        // Add implicit return if not terminated
+        if (!self.current_block.?.isTerminated()) {
+            try self.emit(.{ .return_ = null });
+        }
+
+        try self.module.addFunction(func);
+    }
+
     /// Emit a debug_line instruction if location is valid
     fn emitDebugLine(self: *Self, loc: SourceLoc) LowerError!void {
         if (loc.line > 0) {
@@ -1001,7 +1070,7 @@ pub const Lowerer = struct {
                 try self.emitDebugLine(loc);
                 try lower_stmt.lowerFieldView(self, stmt_idx);
             },
-            .import_stmt, .fn_def, .struct_def, .union_def, .enum_def, .type_alias, .trait_def, .impl_block => {
+            .import_stmt, .fn_def, .struct_def, .union_def, .enum_def, .type_alias, .trait_def, .impl_block, .test_def => {
                 // Handled in earlier passes or no runtime code
             },
             .comptime_if, .comptime_block => {

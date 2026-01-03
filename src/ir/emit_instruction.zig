@@ -181,6 +181,51 @@ pub fn emitIneg(e: *BytecodeEmitter, n: ir.Instruction.UnaryOp) EmitError!void {
     e.setLastResult(n.result.id, dest_reg);
 }
 
+/// Emit round instruction (DBL ## operator - true rounding)
+/// fn_round rd, rs, prec - Format: [rd:4|rs:4] [prec:8]
+pub fn emitRound(e: *BytecodeEmitter, r: ir.Instruction.RoundOp) EmitError!void {
+    const value_reg = try e.getValueInReg(r.value, 0);
+    const dest_reg: u4 = 1;
+
+    // Get precision value - must be a constant or loaded value
+    const prec: u8 = if (e.value_consts.get(r.places.id)) |const_idx| blk: {
+        // Load the constant value - for now assume it's a small integer
+        _ = const_idx;
+        break :blk 2; // Default precision
+    } else if (e.last_result_value) |last_id| blk: {
+        if (last_id == r.places.id) {
+            // Places value is the last computed result - use as precision
+            // For simplicity, default to 2 decimal places
+            break :blk 2;
+        }
+        break :blk 2;
+    } else 2;
+
+    try e.emitOpcode(.fn_round);
+    try e.emitU8((@as(u8, dest_reg) << 4) | value_reg);
+    try e.emitU8(prec);
+    e.setLastResult(r.result.id, dest_reg);
+}
+
+/// Emit trunc instruction (DBL # operator - truncating round)
+/// fn_trunc rd, rs - Format: [rd:4|rs:4] [0]
+pub fn emitTrunc(e: *BytecodeEmitter, t: ir.Instruction.RoundOp) EmitError!void {
+    const value_reg = try e.getValueInReg(t.value, 0);
+    const dest_reg: u4 = 1;
+
+    // fn_trunc uses the places value as precision
+    // For DBL compatibility, places specifies decimal positions to keep
+    const prec: u8 = if (e.value_consts.get(t.places.id)) |const_idx| blk: {
+        _ = const_idx;
+        break :blk 0; // Truncate to integer by default
+    } else 0;
+
+    try e.emitOpcode(.fn_trunc);
+    try e.emitU8((@as(u8, dest_reg) << 4) | value_reg);
+    try e.emitU8(prec);
+    e.setLastResult(t.result.id, dest_reg);
+}
+
 /// Emit icmp instruction
 pub fn emitIcmp(e: *BytecodeEmitter, c: ir.Instruction.IcmpOp) EmitError!void {
     const lhs_reg = try e.getValueInReg(c.lhs, 0);

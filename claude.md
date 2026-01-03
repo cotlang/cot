@@ -31,10 +31,68 @@ Every issue must be analyzed to find the **root cause** and the **best fix** mus
 ### Why This Matters:
 Bugs that are bypassed rather than fixed accumulate as technical debt. They become harder to find later, cause cascading issues, and erode code quality. For this project to succeed, every bug must be addressed at its source.
 
+## Codebase Architecture
+
+### Directory Structure
+```
+src/
+├── main.zig              # CLI entry point, command dispatch
+├── root.zig              # Main library exports (cot module)
+├── lexer/                # Tokenizer
+├── parser/               # Parser → AST (NodeStore)
+├── ast/                  # AST node types
+├── ir/                   # Intermediate representation
+│   ├── ir.zig            # IR types
+│   └── lower.zig         # AST → IR lowering
+├── compiler/             # Type checking, diagnostics
+├── runtime/
+│   ├── bytecode/
+│   │   ├── vm.zig        # Virtual machine
+│   │   ├── vm_opcodes.zig # Opcode handlers
+│   │   ├── module.zig    # Bytecode module format
+│   │   └── opcodes.zig   # Opcode definitions
+│   ├── trace/            # Execution tracing (cot trace)
+│   │   ├── trace.zig     # Tracer, TraceLevel, TraceEntry
+│   │   ├── history.zig   # Ring buffer for history
+│   │   └── output.zig    # Output formatting
+│   ├── native/           # Native function bindings
+│   └── cot_runtime.zig   # Runtime module exports
+├── framework/            # Workspace/project commands
+│   └── commands/         # init, new, build, run, etc.
+└── dbl/                  # DBL language frontend
+```
+
+### Key Patterns
+
+**Compilation Pipeline** (see `compileFile` in main.zig):
+```
+Source → Lexer → Parser → AST → IR Lower → Type Check → Optimize → Emit Bytecode → VM
+```
+
+**Adding VM opcodes**:
+1. Add to `opcodes.zig` enum
+2. Add handler in `vm_opcodes.zig`
+3. Add to dispatch table in `vm.zig`
+4. Add emitter in `ir/emit_bytecode.zig`
+
+**Module imports** (for main.zig):
+- `cot` = src/root.zig (compiler, lexer, parser, ir, bytecode)
+- `cot_runtime` = src/runtime/cot_runtime.zig (VM, native, trace)
+- `cot.ir_lower` = IR lowering
+- `cot.ir_emit_bytecode` = bytecode emission
+
+### Debugging
+
+**Execution tracing**: `cot trace <file.cbo> [--level=opcodes|routines|verbose]`
+
+**Environment variables**:
+- `COT_LOG=debug` - Enable debug logging
+- `COT_LOG=info` - Default log level
+
 ## Reference Documentation
 
 ### DBL Language Manual
-The legacy DBL reference manual is located at `~/cotlang/dbl-manual/`.
+The legacy DBL reference manual is located at `~/cotlang/dbllang/`.
 
 ## Zig 0.15 API Notes
 
@@ -52,3 +110,21 @@ This project uses Zig 0.15. Be aware of these API changes from older Zig version
   ```
 - ArrayListUnmanaged methods require explicit allocator parameter: `append(allocator, item)`, `toOwnedSlice(allocator)`
 - Use `errdefer list.deinit(allocator)` for proper cleanup on error paths
+- `ArrayList.writer()` now requires allocator: `list.writer(allocator)`
+
+### File I/O Changes
+- **Don't use**: `std.io.getStdOut()` or `std.io.getStdErr()` - these don't exist
+- **Use instead**: `std.fs.File.stdout()` and `std.fs.File.stderr()`
+  ```zig
+  const stderr_file: std.fs.File = .stderr();
+  var buf: [4096]u8 = undefined;
+  var writer = stderr_file.writer(&buf);
+  writer.interface.print("Hello\n", .{}) catch {};
+  ```
+- `File.writer()` returns a buffered writer that requires a buffer
+- Use `writer.interface.print()` to access print method
+
+### Writer API
+- `std.fs.File.Writer.print()` doesn't exist directly
+- Access via `writer.interface.print()` where `interface` is `std.Io.Writer`
+- `std.Io.Writer.print()` takes a mutable pointer `*Writer`, not const

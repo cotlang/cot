@@ -453,6 +453,26 @@ fn getCotSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
                     },
                 };
             },
+            .test_def => blk: {
+                const name_id: cot.base.StringId = @enumFromInt(data.a);
+                const name = strings.get(name_id);
+                const name_len: u32 = @intCast(name.len);
+                // Create display name with test prefix
+                var display_name_buf: [256]u8 = undefined;
+                const display_name = std.fmt.bufPrint(&display_name_buf, "test \"{s}\"", .{name}) catch name;
+                break :blk .{
+                    .name = display_name,
+                    .kind = .Function, // Tests are essentially functions
+                    .range = .{
+                        .start = .{ .line = loc.line, .character = loc.column },
+                        .end = .{ .line = loc.line, .character = loc.column + name_len + 7 }, // +7 for 'test ""'
+                    },
+                    .selection_range = .{
+                        .start = .{ .line = loc.line, .character = loc.column },
+                        .end = .{ .line = loc.line, .character = loc.column + name_len + 7 },
+                    },
+                };
+            },
             else => null,
         };
 
@@ -514,6 +534,31 @@ fn getDblSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
                     .selection_range = .{
                         .start = .{ .line = line, .character = col },
                         .end = .{ .line = line, .character = col + name_len },
+                    },
+                });
+            }
+        }
+
+        // Look for test declarations: test "name"
+        if (token.type == .kw_test) {
+            if (i + 1 < tokens.len and tokens[i + 1].type == .string_literal) {
+                const name_token = tokens[i + 1];
+                const line: u32 = @intCast(if (token.line > 0) token.line - 1 else 0);
+                const col: u32 = @intCast(if (token.column > 0) token.column - 1 else 0);
+                // Create display name including "test" prefix
+                var display_name_buf: [256]u8 = undefined;
+                const display_name = std.fmt.bufPrint(&display_name_buf, "test {s}", .{name_token.lexeme}) catch name_token.lexeme;
+                const display_len: u32 = @intCast(display_name.len);
+                try symbols.append(allocator, .{
+                    .name = display_name,
+                    .kind = .Function,
+                    .range = .{
+                        .start = .{ .line = line, .character = 0 },
+                        .end = .{ .line = line, .character = 80 },
+                    },
+                    .selection_range = .{
+                        .start = .{ .line = line, .character = col },
+                        .end = .{ .line = line, .character = col + display_len },
                     },
                 });
             }

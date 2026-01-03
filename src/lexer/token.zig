@@ -198,6 +198,9 @@ pub const TokenType = enum {
     // Keywords - comptime
     kw_comptime,
 
+    // Keywords - testing
+    kw_test,
+
     // Special
     eof,
     invalid,
@@ -244,6 +247,7 @@ pub const TokenType = enum {
             .kw_async,
             .kw_await,
             .kw_comptime,
+            .kw_test,
             => true,
             else => false,
         };

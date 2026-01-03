@@ -171,6 +171,10 @@ pub const BinaryOp = enum(u8) {
     shl, // <<
     shr, // >>
 
+    // Rounding (DBL legacy: # and ##)
+    round, // ## - true rounding to N decimal places
+    trunc, // # - truncating round to N decimal places
+
     // Range (for range expressions in data)
     range, // ..
     range_inclusive, // ..=
@@ -187,6 +191,7 @@ pub const BinaryOp = enum(u8) {
             .shl, .shr => 7,
             .add, .sub => 8,
             .mul, .div, .mod => 9,
+            .round, .trunc => 10, // Highest arithmetic precedence (before unary)
             .range, .range_inclusive => 0, // Lowest precedence
         };
     }
@@ -217,7 +222,7 @@ pub const BinaryOp = enum(u8) {
     /// Check if this is an arithmetic operator
     pub fn isArithmetic(self: BinaryOp) bool {
         return switch (self) {
-            .add, .sub, .mul, .div, .mod => true,
+            .add, .sub, .mul, .div, .mod, .round, .trunc => true,
             else => false,
         };
     }

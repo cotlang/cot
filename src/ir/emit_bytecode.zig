@@ -541,6 +541,8 @@ pub const BytecodeEmitter = struct {
             .imul => |m| try emit_inst.emitBinaryArith(self, .mul, m.lhs, m.rhs, m.result),
             .sdiv, .udiv => |d| try emit_inst.emitBinaryArith(self, .div, d.lhs, d.rhs, d.result),
             .srem, .urem => |m| try emit_inst.emitBinaryArith(self, .mod, m.lhs, m.rhs, m.result),
+            .round => |r| try emit_inst.emitRound(self, r),
+            .trunc => |t| try emit_inst.emitTrunc(self, t),
             .ineg => |n| try emit_inst.emitIneg(self, n),
             .icmp => |c| try emit_inst.emitIcmp(self, c),
 
