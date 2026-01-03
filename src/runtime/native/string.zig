@@ -88,17 +88,101 @@ pub fn str_delete_last(ctx: *NativeContext) NativeError!?Value {
 }
 
 /// S_BLD - Build a string with substitution
+/// Format string uses %s for strings, %d for integers, %f for floats
 pub fn s_bld(ctx: *NativeContext) NativeError!?Value {
-    _ = ctx;
-    // TODO: Implement string building
-    return NativeError.NotImplemented;
+    if (ctx.args.len < 1) return NativeError.InvalidArgument;
+
+    const format = ctx.getArgString(0) catch return NativeError.InvalidArgument;
+
+    // Estimate output size (format length + extra for substitutions)
+    var estimated_size: usize = format.len;
+    for (ctx.args[1..]) |arg| {
+        if (arg.isString() or arg.isFixedString()) {
+            estimated_size += arg.toString().len;
+        } else {
+            estimated_size += 32; // Reasonable estimate for numbers
+        }
+    }
+
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    defer result.deinit(ctx.allocator);
+    result.ensureTotalCapacity(ctx.allocator, estimated_size) catch return NativeError.OutOfMemory;
+
+    var arg_idx: usize = 1;
+    var i: usize = 0;
+    while (i < format.len) {
+        if (format[i] == '%' and i + 1 < format.len) {
+            const spec = format[i + 1];
+            if (spec == '%') {
+                // Escaped %
+                result.append(ctx.allocator, '%') catch return NativeError.OutOfMemory;
+                i += 2;
+                continue;
+            }
+            if (arg_idx < ctx.args.len) {
+                const arg = ctx.args[arg_idx];
+                switch (spec) {
+                    's' => {
+                        // String
+                        const str = arg.toString();
+                        result.appendSlice(ctx.allocator, str) catch return NativeError.OutOfMemory;
+                    },
+                    'd', 'i' => {
+                        // Integer
+                        const val = arg.toInt();
+                        var buf: [32]u8 = undefined;
+                        const printed = std.fmt.bufPrint(&buf, "{d}", .{val}) catch return NativeError.OutOfMemory;
+                        result.appendSlice(ctx.allocator, printed) catch return NativeError.OutOfMemory;
+                    },
+                    'f' => {
+                        // Float - treat as integer for now (proper decimal support would need Value.toDecimal)
+                        const val = arg.toInt();
+                        var buf: [32]u8 = undefined;
+                        const printed = std.fmt.bufPrint(&buf, "{d}.0", .{val}) catch return NativeError.OutOfMemory;
+                        result.appendSlice(ctx.allocator, printed) catch return NativeError.OutOfMemory;
+                    },
+                    else => {
+                        // Unknown specifier, output as-is
+                        result.append(ctx.allocator, '%') catch return NativeError.OutOfMemory;
+                        result.append(ctx.allocator, spec) catch return NativeError.OutOfMemory;
+                    },
+                }
+                arg_idx += 1;
+                i += 2;
+            } else {
+                // No more args, output literally
+                result.append(ctx.allocator, format[i]) catch return NativeError.OutOfMemory;
+                i += 1;
+            }
+        } else {
+            result.append(ctx.allocator, format[i]) catch return NativeError.OutOfMemory;
+            i += 1;
+        }
+    }
+
+    const str = result.toOwnedSlice(ctx.allocator) catch return NativeError.OutOfMemory;
+    return Value.initString(ctx.allocator, str) catch return NativeError.OutOfMemory;
 }
 
-/// S_PARSE - Parse a string
+/// S_PARSE - Parse a string into components
+/// Returns the position of the first delimiter found, or 0 if not found
+/// Result goes into second argument
 pub fn s_parse(ctx: *NativeContext) NativeError!?Value {
-    _ = ctx;
-    // TODO: Implement string parsing
-    return NativeError.NotImplemented;
+    if (ctx.args.len < 3) return NativeError.InvalidArgument;
+
+    const source = ctx.getArgString(0) catch return NativeError.InvalidArgument;
+    const delimiter = ctx.getArgString(2) catch return NativeError.InvalidArgument;
+
+    if (delimiter.len == 0) {
+        return Value.initInt(0);
+    }
+
+    // Find delimiter in source
+    if (std.mem.indexOf(u8, source, delimiter)) |pos| {
+        // Return 1-based position
+        return Value.initInt(@intCast(pos + 1));
+    }
+    return Value.initInt(0);
 }
 
 /// UPPER - Convert string to uppercase

@@ -887,3 +887,42 @@ pub fn emitMapValues(e: *BytecodeEmitter, mv: ir.Instruction.MapValues) EmitErro
     try e.emitU8(0);
     e.setLastResult(mv.result.id, dest_reg);
 }
+
+// ============================================================================
+// Null/Optional Operations
+// ============================================================================
+
+/// Emit is_null instruction: rd = (rs == null)
+pub fn emitIsNull(e: *BytecodeEmitter, n: ir.Instruction.UnaryOp) EmitError!void {
+    const src_reg = try e.getValueInReg(n.operand, 0);
+    const dest_reg: u4 = 1;
+    try e.emitOpcode(.is_null);
+    try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
+    try e.emitU8(0);
+    e.setLastResult(n.result.id, dest_reg);
+}
+
+/// Emit select instruction: rd = cond ? rtrue : rfalse
+pub fn emitSelect(e: *BytecodeEmitter, s: ir.Instruction.Select) EmitError!void {
+    const cond_reg = try e.getValueInReg(s.condition, 0);
+    const true_reg = try e.getValueInReg(s.true_val, 1);
+    const false_reg = try e.getValueInReg(s.false_val, 2);
+    const dest_reg: u4 = 3;
+    try e.emitOpcode(.select);
+    try e.emitU8((@as(u8, dest_reg) << 4) | cond_reg);
+    try e.emitU8((@as(u8, true_reg) << 4) | false_reg);
+    e.setLastResult(s.result.id, dest_reg);
+}
+
+/// Emit ptr_offset instruction: rd = base + offset (byte-level pointer arithmetic)
+pub fn emitPtrOffset(e: *BytecodeEmitter, p: ir.Instruction.PtrOffset) EmitError!void {
+    const base_reg = try e.getValueInReg(p.base_ptr, 0);
+    const dest_reg: u4 = 1;
+    try e.emitOpcode(.ptr_offset);
+    try e.emitU8((@as(u8, dest_reg) << 4) | base_reg);
+    // Emit offset as signed 16-bit
+    const offset_u16: u16 = @bitCast(@as(i16, @intCast(p.offset)));
+    try e.emitU8(@truncate(offset_u16));
+    try e.emitU8(@truncate(offset_u16 >> 8));
+    e.setLastResult(p.result.id, dest_reg);
+}

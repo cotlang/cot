@@ -96,9 +96,22 @@ pub fn runFrontend(allocator: std.mem.Allocator, frontend: Frontend, args: []con
     };
     const result = try child.wait();
 
-    // Propagate exit code
-    if (result.Exited != 0) {
-        std.process.exit(result.Exited);
+    // Propagate exit code or signal
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.process.exit(code);
+            }
+        },
+        .Signal => |sig| {
+            // Frontend was killed by signal - exit with error
+            std.debug.print("Frontend terminated by signal: {d}\n", .{sig});
+            std.process.exit(128 + @as(u8, @intCast(sig)));
+        },
+        .Stopped, .Unknown => {
+            // Unexpected state
+            std.process.exit(1);
+        },
     }
 }
 

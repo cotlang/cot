@@ -24,6 +24,13 @@ const std = @import("std");
 pub const TestContext = @import("context.zig").TestContext;
 pub const assertions = @import("assertions.zig");
 pub const fixtures = @import("fixtures.zig");
+pub const runner = @import("runner.zig");
+
+// Runner types
+pub const TestResult = runner.TestResult;
+pub const TestSuite = runner.TestSuite;
+pub const OutputCapture = runner.OutputCapture;
+pub const ExitCode = runner.ExitCode;
 
 // Convenience re-exports from assertions
 pub const expectCompileError = assertions.expectCompileError;

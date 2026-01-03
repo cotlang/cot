@@ -205,9 +205,105 @@ pub const Linker = struct {
             return LinkerError.OutOfMemory;
         };
 
-        // TODO: Process imports and load dependencies
+        // Process imports and load dependencies
+        try self.processImports(linked);
 
         return linked;
+    }
+
+    /// Process imports for a linked module, loading any required dependencies
+    fn processImports(self: *Self, linked: *LinkedModule) LinkerError!void {
+        const mod = linked.module;
+
+        // Process each import entry
+        for (mod.imports) |import_entry| {
+            // Get the import name from constants
+            const import_name = self.getConstantString(mod, import_entry.name_index) orelse continue;
+
+            // If module_index is non-zero, it specifies a particular module to import from
+            if (import_entry.module_index > 0) {
+                const module_name = self.getConstantString(mod, import_entry.module_index) orelse {
+                    if (import_entry.flags.required) {
+                        return LinkerError.UnresolvedImport;
+                    }
+                    continue;
+                };
+
+                // Load the required module if not already loaded
+                if (self.loaded_modules.get(module_name) == null) {
+                    _ = self.loadModule(module_name) catch |err| {
+                        if (import_entry.flags.required) {
+                            return err;
+                        }
+                        continue;
+                    };
+                }
+
+                // Verify the symbol exists in the target module
+                const target = self.loaded_modules.get(module_name) orelse {
+                    if (import_entry.flags.required) {
+                        return LinkerError.UnresolvedImport;
+                    }
+                    continue;
+                };
+
+                if (!self.hasExport(target.module, import_name, import_entry.kind)) {
+                    if (import_entry.flags.required) {
+                        return LinkerError.UnresolvedImport;
+                    }
+                }
+            } else {
+                // module_index == 0: search all loaded modules for the symbol
+                var found = false;
+                var iter = self.loaded_modules.iterator();
+                while (iter.next()) |entry| {
+                    if (self.hasExport(entry.value_ptr.*.module, import_name, import_entry.kind)) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found and import_entry.flags.required) {
+                    return LinkerError.UnresolvedImport;
+                }
+            }
+        }
+    }
+
+    /// Get a constant string from a module by index
+    fn getConstantString(self: *Self, mod: *bytecode.Module, index: u16) ?[]const u8 {
+        _ = self;
+        if (index >= mod.constants.len) return null;
+        const constant = mod.constants[index];
+        return switch (constant) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    /// Check if a module has an export matching the given name and kind
+    fn hasExport(self: *Self, mod: *bytecode.Module, name: []const u8, kind: bytecode.ImportEntry.ImportKind) bool {
+        _ = self;
+        for (mod.exports) |exp| {
+            // Get export name from constants
+            if (exp.name_index < mod.constants.len) {
+                const export_name = switch (mod.constants[exp.name_index]) {
+                    .string => |s| s,
+                    else => continue,
+                };
+
+                if (std.mem.eql(u8, export_name, name)) {
+                    // Check if the kind matches
+                    const kind_matches = switch (kind) {
+                        .routine => exp.kind == .routine,
+                        .record => exp.kind == .record,
+                        .global => exp.kind == .global,
+                    };
+                    if (kind_matches) return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// Load a module from a specific path

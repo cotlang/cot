@@ -828,6 +828,9 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.log_and)] = &vm_opcodes.op_log_and;
         table[@intFromEnum(Opcode.log_or)] = &vm_opcodes.op_log_or;
         table[@intFromEnum(Opcode.log_not)] = &vm_opcodes.op_log_not;
+        table[@intFromEnum(Opcode.is_null)] = &vm_opcodes.op_is_null;
+        table[@intFromEnum(Opcode.select)] = &vm_opcodes.op_select;
+        table[@intFromEnum(Opcode.ptr_offset)] = &vm_opcodes.op_ptr_offset;
 
         // Control Flow (0x60-0x6F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.jmp)] = &vm_opcodes.op_jmp;

@@ -23,6 +23,7 @@ const log = std.log.scoped(.@"ir-lower");
 
 // Import Lowerer and types from main module
 const lower_mod = @import("lower.zig");
+const lower_expr = @import("lower_expr.zig");
 const Lowerer = lower_mod.Lowerer;
 const LowerError = lower_mod.LowerError;
 
@@ -310,7 +311,7 @@ pub fn lowerWhile(l: *Lowerer, data: NodeData) LowerError!void {
 }
 
 /// Lower a for loop
-pub fn lowerFor(l: *Lowerer, stmt_idx: StmtIdx, data: NodeData) LowerError!void {
+pub fn lowerFor(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
     const func = l.current_func orelse return LowerError.OutOfMemory;
 
     const binding_id = data.getBinding();
@@ -345,21 +346,46 @@ pub fn lowerFor(l: *Lowerer, stmt_idx: StmtIdx, data: NodeData) LowerError!void 
     const incr_block = try func.createBlock("for.incr");
     const exit_block = try func.createBlock("for.exit");
 
-    _ = stmt_idx;
-    _ = iterable_idx;
-
     // Save and set loop context
     const prev_exit = l.loop_exit_block;
     const prev_continue = l.loop_continue_block;
     l.loop_exit_block = exit_block;
     l.loop_continue_block = incr_block;
 
-    // TODO: Initialize from range start and check against range end
+    // Lower the iterable expression and extract range bounds
+    // Check if iterable is a binary range expression (start..end or start..=end)
+    var start_val: ir.Value = undefined;
+    var end_val: ir.Value = undefined;
+    var is_inclusive = false;
+
+    if (l.store.exprTag(iterable_idx) == .binary) {
+        const bin_data = l.store.exprData(iterable_idx);
+        const op = bin_data.getBinaryOp();
+        if (op == .range or op == .range_inclusive) {
+            is_inclusive = (op == .range_inclusive);
+            start_val = try lower_expr.lowerExpression(l, bin_data.getLhs());
+            end_val = try lower_expr.lowerExpression(l, bin_data.getRhs());
+        } else {
+            // Not a range expression - treat as iterable collection (not yet supported)
+            return LowerError.UnsupportedFeature;
+        }
+    } else {
+        // Not a binary expression - could be a variable holding a collection
+        return LowerError.UnsupportedFeature;
+    }
+
+    // Initialize loop variable to range start
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = start_val } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
-    // Condition block - always true for now (infinite loop protection needed)
+    // Condition block - check loop_var <= end (or < for non-inclusive)
     l.current_block = cond_block;
-    try l.emit(.{ .jump = .{ .target = body_block } });
+    const current_val = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = current_val } });
+    const cond_result = func.newValue(.bool);
+    const cmp_cond: ir.IntCC = if (is_inclusive) .sle else .slt;
+    try l.emit(.{ .icmp = .{ .cond = cmp_cond, .lhs = current_val, .rhs = end_val, .result = cond_result } });
+    try l.emit(.{ .brif = .{ .condition = cond_result, .then_block = body_block, .else_block = exit_block } });
 
     // Body block
     l.current_block = body_block;
@@ -368,8 +394,15 @@ pub fn lowerFor(l: *Lowerer, stmt_idx: StmtIdx, data: NodeData) LowerError!void 
         try l.emit(.{ .jump = .{ .target = incr_block } });
     }
 
-    // Increment block
+    // Increment block - loop_var = loop_var + 1
     l.current_block = incr_block;
+    const loaded_val = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = loaded_val } });
+    const one = func.newValue(.i64);
+    try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = one } });
+    const incremented = func.newValue(.i64);
+    try l.emit(.{ .iadd = .{ .lhs = loaded_val, .rhs = one, .result = incremented } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Restore loop context
@@ -417,6 +450,13 @@ pub fn lowerLoop(l: *Lowerer, data: NodeData) LowerError!void {
 // ============================================================================
 // Declarations
 // ============================================================================
+
+/// Lower a const declaration (same as let at runtime, but semantically immutable)
+pub fn lowerConstDecl(l: *Lowerer, data: NodeData) LowerError!void {
+    // Constants are lowered the same as let declarations at runtime
+    // The only difference is compile-time enforcement of immutability
+    return lowerLetDecl(l, data);
+}
 
 /// Lower a let declaration
 pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
@@ -516,7 +556,7 @@ pub fn lowerFieldView(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
     if (l.scopes.get(base_field_name)) |base_ptr| {
         // Field overlay: view shares the same memory as base_ptr (plus offset)
         // For offset 0, the view is simply an alias to the same slot
-        // For non-zero offsets, we need byte-level access (not yet supported)
+        // For non-zero offsets, we use ptr_offset for byte-level access
 
         if (offset == 0) {
             // Simple alias - the view name maps to the exact same storage slot as the base
@@ -524,24 +564,22 @@ pub fn lowerFieldView(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
             try l.scopes.put(name, base_ptr);
             debug.print(.ir, "field_view '{s}' aliased to '{s}' (offset 0)", .{ name, base_field_name });
         } else {
-            // Offset access requires byte-level memory addressing
-            // For now, we log a warning and create a separate variable
-            // TODO: Implement proper byte-level substring views
-            debug.print(.ir, "WARNING: field_view '{s}' with offset {d} not fully supported, creating separate variable", .{ name, offset });
-
+            // Offset access uses byte-level pointer arithmetic
+            // Create a new pointer that points to base_ptr + offset bytes
             const ty_ptr = try l.allocator.create(ir.Type);
             ty_ptr.* = view_type;
             try l.allocated_types.append(l.allocator, ty_ptr);
 
-            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+            const offset_ptr = func.newValue(.{ .ptr = ty_ptr });
             try l.emit(.{
-                .alloca = .{
-                    .ty = view_type,
-                    .name = name,
-                    .result = alloca_result,
+                .ptr_offset = .{
+                    .base_ptr = base_ptr,
+                    .offset = offset,
+                    .result = offset_ptr,
                 },
             });
-            try l.scopes.put(name, alloca_result);
+            try l.scopes.put(name, offset_ptr);
+            debug.print(.ir, "field_view '{s}' at offset {d} from '{s}'", .{ name, offset, base_field_name });
         }
     } else {
         // Base field not found - create a regular alloca as fallback

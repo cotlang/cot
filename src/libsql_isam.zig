@@ -713,12 +713,106 @@ pub const LibSqlIsam = struct {
         return @intCast(c.libsql_stmt_column_int64(stmt, 0));
     }
 
-    fn getKeySegments(self: *Self, table: []const u8) IsamError![]const []const KeySegment {
-        _ = self;
-        _ = table;
-        // TODO: Load from _isam_segments table
-        // For now return empty - this is a stub
-        return &[_][]const KeySegment{};
+    fn getKeySegments(self: *Self, table: []const u8) IsamError![][]const KeySegment {
+        const conn = self.conn orelse return IsamError.NotOpen;
+
+        // First, get the number of keys for this table
+        var count_sql_buf: [128]u8 = undefined;
+        const count_sql = std.fmt.bufPrintZ(&count_sql_buf, "SELECT MAX(key_index) + 1 FROM _isam_keys WHERE table_name = ?", .{}) catch return IsamError.DatabaseError;
+
+        var count_stmt: c.libsql_stmt_t = null;
+        if (c.libsql_prepare(conn, count_sql, &count_stmt) != 0) {
+            return IsamError.DatabaseError;
+        }
+        defer _ = c.libsql_finalize(count_stmt);
+
+        if (c.libsql_bind_text(count_stmt, 1, table.ptr, @intCast(table.len)) != 0) {
+            return IsamError.DatabaseError;
+        }
+
+        var key_count: usize = 0;
+        if (c.libsql_step(count_stmt) == c.LIBSQL_ROW) {
+            const val = c.libsql_stmt_column_int64(count_stmt, 0);
+            if (val > 0) key_count = @intCast(val);
+        }
+
+        if (key_count == 0) {
+            return &[_][]const KeySegment{};
+        }
+
+        // Allocate array for all keys
+        var keys = self.allocator.alloc([]const KeySegment, key_count) catch return IsamError.OutOfMemory;
+        errdefer self.allocator.free(keys);
+
+        // Query segments for each key
+        var seg_sql_buf: [256]u8 = undefined;
+        const seg_sql = std.fmt.bufPrintZ(&seg_sql_buf,
+            \\SELECT start_pos, length, key_type, descending
+            \\FROM _isam_segments
+            \\WHERE table_name = ? AND key_index = ?
+            \\ORDER BY segment_index
+        , .{}) catch return IsamError.DatabaseError;
+
+        for (0..key_count) |key_idx| {
+            var seg_stmt: c.libsql_stmt_t = null;
+            if (c.libsql_prepare(conn, seg_sql, &seg_stmt) != 0) {
+                return IsamError.DatabaseError;
+            }
+            defer _ = c.libsql_finalize(seg_stmt);
+
+            if (c.libsql_bind_text(seg_stmt, 1, table.ptr, @intCast(table.len)) != 0) {
+                return IsamError.DatabaseError;
+            }
+            if (c.libsql_bind_int64(seg_stmt, 2, @intCast(key_idx)) != 0) {
+                return IsamError.DatabaseError;
+            }
+
+            // Count segments first
+            var seg_count: usize = 0;
+            while (c.libsql_step(seg_stmt) == c.LIBSQL_ROW) {
+                seg_count += 1;
+            }
+
+            // Reset and read segments
+            _ = c.libsql_reset(seg_stmt);
+            if (c.libsql_bind_text(seg_stmt, 1, table.ptr, @intCast(table.len)) != 0) {
+                return IsamError.DatabaseError;
+            }
+            if (c.libsql_bind_int64(seg_stmt, 2, @intCast(key_idx)) != 0) {
+                return IsamError.DatabaseError;
+            }
+
+            var segments = self.allocator.alloc(KeySegment, seg_count) catch return IsamError.OutOfMemory;
+            var seg_idx: usize = 0;
+
+            while (c.libsql_step(seg_stmt) == c.LIBSQL_ROW) {
+                const start_pos = c.libsql_stmt_column_int64(seg_stmt, 0);
+                const length = c.libsql_stmt_column_int64(seg_stmt, 1);
+                const key_type_ptr = c.libsql_stmt_column_text(seg_stmt, 2);
+                const descending = c.libsql_stmt_column_int64(seg_stmt, 3);
+
+                const key_type: KeyType = if (key_type_ptr) |ptr| blk: {
+                    const type_str = std.mem.span(ptr);
+                    if (std.mem.eql(u8, type_str, "alpha")) break :blk .alpha;
+                    if (std.mem.eql(u8, type_str, "decimal")) break :blk .decimal;
+                    if (std.mem.eql(u8, type_str, "integer")) break :blk .integer;
+                    if (std.mem.eql(u8, type_str, "descending")) break :blk .descending;
+                    break :blk .alpha;
+                } else .alpha;
+
+                segments[seg_idx] = .{
+                    .start = @intCast(start_pos),
+                    .length = @intCast(length),
+                    .key_type = key_type,
+                    .descending = descending != 0,
+                };
+                seg_idx += 1;
+            }
+
+            keys[key_idx] = segments;
+        }
+
+        return keys;
     }
 
     fn extractKey(self: *Self, record: []const u8, segments: []const KeySegment) IsamError![]u8 {

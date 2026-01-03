@@ -813,10 +813,105 @@ pub const PostgresIsam = struct {
     }
 
     fn getKeySegments(self: *Self, table: []const u8) IsamError![]const []const KeySegment {
-        _ = self;
-        _ = table;
-        // TODO: Load from _isam_segments table
-        return &[_][]const KeySegment{};
+        const conn = self.conn orelse return IsamError.NotOpen;
+
+        // First, get the number of keys for this table
+        var count_sql_buf: [128]u8 = undefined;
+        const count_sql = std.fmt.bufPrintZ(&count_sql_buf, "SELECT COALESCE(MAX(key_index) + 1, 0) FROM _isam_keys WHERE table_name = '{s}'", .{table}) catch return IsamError.DatabaseError;
+
+        const count_result = c.PQexec(conn, count_sql.ptr);
+        defer c.PQclear(count_result);
+
+        if (c.PQresultStatus(count_result) != c.PGRES_TUPLES_OK) {
+            return IsamError.DatabaseError;
+        }
+
+        var key_count: usize = 0;
+        if (c.PQntuples(count_result) > 0) {
+            const val_ptr = c.PQgetvalue(count_result, 0, 0);
+            if (val_ptr != null) {
+                const val_str: [*:0]const u8 = @ptrCast(val_ptr);
+                key_count = std.fmt.parseInt(usize, std.mem.span(val_str), 10) catch 0;
+            }
+        }
+
+        if (key_count == 0) {
+            return &[_][]const KeySegment{};
+        }
+
+        // Allocate array for all keys
+        var keys = self.allocator.alloc([]const KeySegment, key_count) catch return IsamError.OutOfMemory;
+        errdefer self.allocator.free(keys);
+
+        // Query segments for each key
+        for (0..key_count) |key_idx| {
+            var seg_sql_buf: [256]u8 = undefined;
+            const seg_sql = std.fmt.bufPrintZ(&seg_sql_buf,
+                \\SELECT start_pos, length, key_type, descending
+                \\FROM _isam_segments
+                \\WHERE table_name = '{s}' AND key_index = {d}
+                \\ORDER BY segment_index
+            , .{ table, key_idx }) catch return IsamError.DatabaseError;
+
+            const seg_result = c.PQexec(conn, seg_sql.ptr);
+            defer c.PQclear(seg_result);
+
+            if (c.PQresultStatus(seg_result) != c.PGRES_TUPLES_OK) {
+                return IsamError.DatabaseError;
+            }
+
+            const seg_count: usize = @intCast(c.PQntuples(seg_result));
+            var segments = self.allocator.alloc(KeySegment, seg_count) catch return IsamError.OutOfMemory;
+
+            for (0..seg_count) |seg_idx| {
+                const row: c_int = @intCast(seg_idx);
+
+                // Column 0: start_pos
+                const start_ptr = c.PQgetvalue(seg_result, row, 0);
+                const start_pos: usize = if (start_ptr != null) blk: {
+                    const str: [*:0]const u8 = @ptrCast(start_ptr);
+                    break :blk std.fmt.parseInt(usize, std.mem.span(str), 10) catch 0;
+                } else 0;
+
+                // Column 1: length
+                const len_ptr = c.PQgetvalue(seg_result, row, 1);
+                const length: usize = if (len_ptr != null) blk: {
+                    const str: [*:0]const u8 = @ptrCast(len_ptr);
+                    break :blk std.fmt.parseInt(usize, std.mem.span(str), 10) catch 0;
+                } else 0;
+
+                // Column 2: key_type
+                const type_ptr = c.PQgetvalue(seg_result, row, 2);
+                const key_type: KeyType = if (type_ptr != null) blk: {
+                    const str: [*:0]const u8 = @ptrCast(type_ptr);
+                    const type_str = std.mem.span(str);
+                    if (std.mem.eql(u8, type_str, "alpha")) break :blk .alpha;
+                    if (std.mem.eql(u8, type_str, "decimal")) break :blk .decimal;
+                    if (std.mem.eql(u8, type_str, "integer")) break :blk .integer;
+                    if (std.mem.eql(u8, type_str, "descending")) break :blk .descending;
+                    break :blk .alpha;
+                } else .alpha;
+
+                // Column 3: descending
+                const desc_ptr = c.PQgetvalue(seg_result, row, 3);
+                const descending: bool = if (desc_ptr != null) blk: {
+                    const str: [*:0]const u8 = @ptrCast(desc_ptr);
+                    const desc_str = std.mem.span(str);
+                    break :blk std.mem.eql(u8, desc_str, "t") or std.mem.eql(u8, desc_str, "true") or std.mem.eql(u8, desc_str, "1");
+                } else false;
+
+                segments[seg_idx] = .{
+                    .start = start_pos,
+                    .length = length,
+                    .key_type = key_type,
+                    .descending = descending,
+                };
+            }
+
+            keys[key_idx] = segments;
+        }
+
+        return keys;
     }
 
     fn extractKey(self: *Self, record: []const u8, segments: []const KeySegment) IsamError![]u8 {

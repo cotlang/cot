@@ -335,6 +335,14 @@ pub const Verifier = struct {
             .map_values => |op| {
                 try self.checkValueDefined(op.map);
             },
+            .select => |op| {
+                try self.checkValueDefined(op.condition);
+                try self.checkValueDefined(op.true_val);
+                try self.checkValueDefined(op.false_val);
+            },
+            .ptr_offset => |op| {
+                try self.checkValueDefined(op.base_ptr);
+            },
         }
     }
 

@@ -21,21 +21,23 @@ const UnaryOp = ast.UnaryOp;
 /// Operator precedence levels (higher = binds tighter)
 pub const Precedence = enum(u8) {
     none = 0,
-    assignment = 1, // = += -= *= /=
+    assignment = 1, // = += -= *= /= |= &=
     range = 2, // .. ..=
-    or_ = 3, // || or
-    and_ = 4, // && and
-    equality = 5, // == !=
-    comparison = 6, // < > <= >=
-    bit_or = 7, // |
-    bit_xor = 8, // ^
-    bit_and = 9, // &
-    term = 10, // + - #
-    factor = 11, // * / %
-    unary = 12, // ! - ~ & *
-    cast = 13, // as (type cast)
-    call = 14, // () . []
-    primary = 15,
+    null_coalesce = 3, // ??
+    or_ = 4, // || or
+    and_ = 5, // && and
+    equality = 6, // == !=
+    comparison = 7, // < > <= >=
+    is_test = 8, // is (type testing)
+    bit_or = 9, // |
+    bit_xor = 10, // ^
+    bit_and = 11, // &
+    term = 12, // + - #
+    factor = 13, // * / %
+    unary = 14, // ! - ~ & *
+    cast = 15, // as (type cast)
+    call = 16, // () . [] ?. ?[
+    primary = 17,
 
     /// Get the next higher precedence level
     pub fn next(self: Precedence) Precedence {
@@ -131,6 +133,14 @@ pub const rules: [TOKEN_COUNT]ParseRule = init: {
     r[@intFromEnum(TokenType.range)] = .{ .prefix = null, .infix = null, .precedence = .range }; // ..
     r[@intFromEnum(TokenType.range_inclusive)] = .{ .prefix = null, .infix = null, .precedence = .range }; // ..=
 
+    // Null-safety operators
+    r[@intFromEnum(TokenType.question_question)] = .{ .infix = null, .precedence = .null_coalesce }; // ??
+    r[@intFromEnum(TokenType.question_dot)] = .{ .infix = null, .precedence = .call }; // ?.
+    r[@intFromEnum(TokenType.question_lbracket)] = .{ .infix = null, .precedence = .call }; // ?[
+
+    // Type testing
+    r[@intFromEnum(TokenType.kw_is)] = .{ .infix = null, .precedence = .is_test }; // is
+
     break :init r;
 };
 
@@ -164,6 +174,9 @@ pub fn tokenToBinaryOp(token_type: TokenType) ?BinaryOp {
         // Range
         .range => .range,
         .range_inclusive => .range_inclusive,
+
+        // Null-safety
+        .question_question => .null_coalesce,
 
         else => null,
     };
@@ -235,6 +248,7 @@ pub fn isBinaryOperator(token_type: TokenType) bool {
         .caret,
         .range,
         .range_inclusive,
+        .question_question,
         => true,
         else => false,
     };
@@ -246,6 +260,8 @@ pub fn isPostfixOperator(token_type: TokenType) bool {
         .lparen, // call
         .lbracket, // index
         .period, // member access
+        .question_dot, // optional member access
+        .question_lbracket, // optional index
         => true,
         else => false,
     };
@@ -256,6 +272,11 @@ pub fn isCastOperator(token_type: TokenType) bool {
     return token_type == .kw_as;
 }
 
+/// Check if token is a type test operator (is)
+pub fn isTypeTestOperator(token_type: TokenType) bool {
+    return token_type == .kw_is;
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -264,13 +285,18 @@ test "precedence ordering" {
     const testing = std.testing;
 
     // Verify precedence hierarchy
+    try testing.expect(@intFromEnum(Precedence.null_coalesce) < @intFromEnum(Precedence.or_));
     try testing.expect(@intFromEnum(Precedence.or_) < @intFromEnum(Precedence.and_));
     try testing.expect(@intFromEnum(Precedence.and_) < @intFromEnum(Precedence.equality));
     try testing.expect(@intFromEnum(Precedence.equality) < @intFromEnum(Precedence.comparison));
-    try testing.expect(@intFromEnum(Precedence.comparison) < @intFromEnum(Precedence.bit_or));
+    try testing.expect(@intFromEnum(Precedence.comparison) < @intFromEnum(Precedence.is_test));
+    try testing.expect(@intFromEnum(Precedence.is_test) < @intFromEnum(Precedence.bit_or));
+    try testing.expect(@intFromEnum(Precedence.bit_or) < @intFromEnum(Precedence.bit_xor));
+    try testing.expect(@intFromEnum(Precedence.bit_xor) < @intFromEnum(Precedence.bit_and));
     try testing.expect(@intFromEnum(Precedence.term) < @intFromEnum(Precedence.factor));
     try testing.expect(@intFromEnum(Precedence.factor) < @intFromEnum(Precedence.unary));
-    try testing.expect(@intFromEnum(Precedence.unary) < @intFromEnum(Precedence.call));
+    try testing.expect(@intFromEnum(Precedence.unary) < @intFromEnum(Precedence.cast));
+    try testing.expect(@intFromEnum(Precedence.cast) < @intFromEnum(Precedence.call));
 }
 
 test "binary operator mapping" {
@@ -283,6 +309,7 @@ test "binary operator mapping" {
     try testing.expectEqual(BinaryOp.eq, tokenToBinaryOp(.eq).?);
     try testing.expectEqual(BinaryOp.@"and", tokenToBinaryOp(.amp_amp).?);
     try testing.expectEqual(BinaryOp.@"or", tokenToBinaryOp(.pipe_pipe).?);
+    try testing.expectEqual(BinaryOp.null_coalesce, tokenToBinaryOp(.question_question).?);
 }
 
 test "unary operator mapping" {
@@ -320,4 +347,32 @@ test "rule table lookup" {
 
     const eq_rule = getRule(.eq);
     try testing.expectEqual(Precedence.equality, eq_rule.precedence);
+
+    // Null-safety operators
+    const coalesce_rule = getRule(.question_question);
+    try testing.expectEqual(Precedence.null_coalesce, coalesce_rule.precedence);
+
+    const opt_dot_rule = getRule(.question_dot);
+    try testing.expectEqual(Precedence.call, opt_dot_rule.precedence);
+
+    const opt_bracket_rule = getRule(.question_lbracket);
+    try testing.expectEqual(Precedence.call, opt_bracket_rule.precedence);
+
+    // Type testing
+    const is_rule = getRule(.kw_is);
+    try testing.expectEqual(Precedence.is_test, is_rule.precedence);
+}
+
+test "null-safety operators" {
+    const testing = std.testing;
+
+    // ?? is a binary operator
+    try testing.expect(isBinaryOperator(.question_question));
+
+    // ?. and ?[ are postfix operators
+    try testing.expect(isPostfixOperator(.question_dot));
+    try testing.expect(isPostfixOperator(.question_lbracket));
+
+    // 'is' is a binary operator (for type testing)
+    try testing.expect(isBinaryOperator(.kw_is));
 }

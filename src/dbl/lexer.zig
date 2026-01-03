@@ -154,6 +154,7 @@ pub const Lexer = struct {
         }
 
         // Caret: ^ (bitwise XOR) or ^a (cast to alpha) or ^d (cast to decimal) or ^i (cast to integer) or ^f (cast to float)
+        //        or ^null (null check) or ^size (size check)
         if (c == '^') {
             if (!self.isAtEnd()) {
                 const next = self.peek();
@@ -169,6 +170,28 @@ pub const Lexer = struct {
                 } else if (next == 'f' or next == 'F') {
                     _ = self.advance();
                     return self.makeToken(.cast_float, self.source[start_pos..self.position]);
+                } else if (next == 'n' or next == 'N') {
+                    // Check for ^null
+                    const remaining = self.source[self.position..];
+                    if (remaining.len >= 4 and (std.ascii.eqlIgnoreCase(remaining[0..4], "null"))) {
+                        // Check it's not part of a longer identifier
+                        if (remaining.len == 4 or !std.ascii.isAlphanumeric(remaining[4])) {
+                            self.position += 4;
+                            self.column += 4;
+                            return self.makeToken(.builtin_null, self.source[start_pos..self.position]);
+                        }
+                    }
+                } else if (next == 's' or next == 'S') {
+                    // Check for ^size
+                    const remaining = self.source[self.position..];
+                    if (remaining.len >= 4 and (std.ascii.eqlIgnoreCase(remaining[0..4], "size"))) {
+                        // Check it's not part of a longer identifier
+                        if (remaining.len == 4 or !std.ascii.isAlphanumeric(remaining[4])) {
+                            self.position += 4;
+                            self.column += 4;
+                            return self.makeToken(.builtin_size, self.source[start_pos..self.position]);
+                        }
+                    }
                 }
             }
             // ^ alone is bitwise XOR

@@ -103,25 +103,25 @@ pub const ChangeType = enum {
 
 /// Compare two schema versions and produce a diff
 pub fn diff(allocator: std.mem.Allocator, old_schema: *const SchemaFile, new_schema: *const SchemaFile) !SchemaDiff {
-    var added_tables = std.ArrayList(TableSchema).init(allocator);
-    errdefer added_tables.deinit();
+    var added_tables: std.ArrayListUnmanaged(TableSchema) = .empty;
+    errdefer added_tables.deinit(allocator);
 
-    var removed_tables = std.ArrayList([]const u8).init(allocator);
-    errdefer removed_tables.deinit();
+    var removed_tables: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer removed_tables.deinit(allocator);
 
-    var modified_tables = std.ArrayList(TableDiff).init(allocator);
+    var modified_tables: std.ArrayListUnmanaged(TableDiff) = .empty;
     errdefer {
         for (modified_tables.items) |*td| {
             td.deinit(allocator);
         }
-        modified_tables.deinit();
+        modified_tables.deinit(allocator);
     }
 
-    var added_keys = std.ArrayList(KeyDefinition).init(allocator);
-    errdefer added_keys.deinit();
+    var added_keys: std.ArrayListUnmanaged(KeyDefinition) = .empty;
+    errdefer added_keys.deinit(allocator);
 
-    var removed_keys = std.ArrayList([]const u8).init(allocator);
-    errdefer removed_keys.deinit();
+    var removed_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer removed_keys.deinit(allocator);
 
     // Find added and modified tables
     for (new_schema.tables) |new_table| {
@@ -129,7 +129,7 @@ pub fn diff(allocator: std.mem.Allocator, old_schema: *const SchemaFile, new_sch
             // Table exists in both - check for modifications
             const table_diff = try diffTable(allocator, old_table, &new_table);
             if (table_diff.hasChanges()) {
-                try modified_tables.append(table_diff);
+                try modified_tables.append(allocator, table_diff);
             } else {
                 // No changes, free the empty diff
                 var td = table_diff;
@@ -137,21 +137,21 @@ pub fn diff(allocator: std.mem.Allocator, old_schema: *const SchemaFile, new_sch
             }
         } else {
             // Table is new
-            try added_tables.append(new_table);
+            try added_tables.append(allocator, new_table);
         }
     }
 
     // Find removed tables
     for (old_schema.tables) |old_table| {
         if (findTable(new_schema.tables, old_table.name) == null) {
-            try removed_tables.append(old_table.name);
+            try removed_tables.append(allocator, old_table.name);
         }
     }
 
     // Find added keys
     for (new_schema.keys) |new_key| {
         if (findKey(old_schema.keys, new_key.table_name, new_key.name) == null) {
-            try added_keys.append(new_key);
+            try added_keys.append(allocator, new_key);
         }
     }
 
@@ -160,7 +160,7 @@ pub fn diff(allocator: std.mem.Allocator, old_schema: *const SchemaFile, new_sch
         if (findKey(new_schema.keys, old_key.table_name, old_key.name) == null) {
             // Create table.keyname format
             const key_id = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ old_key.table_name, old_key.name });
-            try removed_keys.append(key_id);
+            try removed_keys.append(allocator, key_id);
         }
     }
 
@@ -171,11 +171,11 @@ pub fn diff(allocator: std.mem.Allocator, old_schema: *const SchemaFile, new_sch
         removed_keys.items.len > 0;
 
     return SchemaDiff{
-        .added_tables = try added_tables.toOwnedSlice(),
-        .removed_tables = try removed_tables.toOwnedSlice(),
-        .modified_tables = try modified_tables.toOwnedSlice(),
-        .added_keys = try added_keys.toOwnedSlice(),
-        .removed_keys = try removed_keys.toOwnedSlice(),
+        .added_tables = try added_tables.toOwnedSlice(allocator),
+        .removed_tables = try removed_tables.toOwnedSlice(allocator),
+        .modified_tables = try modified_tables.toOwnedSlice(allocator),
+        .added_keys = try added_keys.toOwnedSlice(allocator),
+        .removed_keys = try removed_keys.toOwnedSlice(allocator),
         .has_changes = has_changes,
         .allocator = allocator,
     };
@@ -183,40 +183,40 @@ pub fn diff(allocator: std.mem.Allocator, old_schema: *const SchemaFile, new_sch
 
 /// Compare two tables and produce a diff
 fn diffTable(allocator: std.mem.Allocator, old_table: *const TableSchema, new_table: *const TableSchema) !TableDiff {
-    var added_fields = std.ArrayList(FieldSchema).init(allocator);
-    errdefer added_fields.deinit();
+    var added_fields: std.ArrayListUnmanaged(FieldSchema) = .empty;
+    errdefer added_fields.deinit(allocator);
 
-    var removed_fields = std.ArrayList([]const u8).init(allocator);
-    errdefer removed_fields.deinit();
+    var removed_fields: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer removed_fields.deinit(allocator);
 
-    var modified_fields = std.ArrayList(FieldDiff).init(allocator);
-    errdefer modified_fields.deinit();
+    var modified_fields: std.ArrayListUnmanaged(FieldDiff) = .empty;
+    errdefer modified_fields.deinit(allocator);
 
     // Find added and modified fields
     for (new_table.fields) |new_field| {
         if (findField(old_table.fields, new_field.name)) |old_field| {
             // Field exists in both - check for modifications
             if (try diffField(old_field, &new_field)) |field_diff| {
-                try modified_fields.append(field_diff);
+                try modified_fields.append(allocator, field_diff);
             }
         } else {
             // Field is new
-            try added_fields.append(new_field);
+            try added_fields.append(allocator, new_field);
         }
     }
 
     // Find removed fields
     for (old_table.fields) |old_field| {
         if (findField(new_table.fields, old_field.name) == null) {
-            try removed_fields.append(old_field.name);
+            try removed_fields.append(allocator, old_field.name);
         }
     }
 
     return TableDiff{
         .name = new_table.name,
-        .added_fields = try added_fields.toOwnedSlice(),
-        .removed_fields = try removed_fields.toOwnedSlice(),
-        .modified_fields = try modified_fields.toOwnedSlice(),
+        .added_fields = try added_fields.toOwnedSlice(allocator),
+        .removed_fields = try removed_fields.toOwnedSlice(allocator),
+        .modified_fields = try modified_fields.toOwnedSlice(allocator),
     };
 }
 
@@ -258,33 +258,33 @@ fn diffField(old_field: *const FieldSchema, new_field: *const FieldSchema) !?Fie
 }
 
 /// Categorize the type of data type change
-fn categorizeTypeChange(old_type: anytype, new_type: anytype) ChangeType {
+fn categorizeTypeChange(old_type: types.SchemaDataType, new_type: types.SchemaDataType) ChangeType {
     // Compare sizes for same base type
     switch (old_type) {
-        .alpha => |old_a| {
-            if (new_type == .alpha) {
-                const new_a = new_type.alpha;
-                const old_size = old_a.size orelse 1;
-                const new_size = new_a.size orelse 1;
-                if (new_size > old_size) return .size_increased;
-                if (new_size < old_size) return .size_decreased;
+        .text => |old_t| {
+            if (new_type == .text) {
+                const new_t = new_type.text;
+                const old_len = old_t.max_length orelse 0;
+                const new_len = new_t.max_length orelse 0;
+                if (new_len > old_len) return .size_increased;
+                if (new_len < old_len and new_len > 0) return .size_decreased;
             }
         },
         .decimal => |old_d| {
             if (new_type == .decimal) {
                 const new_d = new_type.decimal;
-                const old_size = old_d.size orelse 1;
-                const new_size = new_d.size orelse 1;
-                if (new_size > old_size) return .size_increased;
-                if (new_size < old_size) return .size_decreased;
+                if (old_d.scale != new_d.scale) return .precision_changed;
+                if (new_d.precision > old_d.precision) return .size_increased;
+                if (new_d.precision < old_d.precision) return .size_decreased;
             }
         },
-        .implied_decimal => |old_id| {
-            if (new_type == .implied_decimal) {
-                const new_id = new_type.implied_decimal;
-                if (old_id.precision != new_id.precision) return .precision_changed;
-                if (new_id.total_digits > old_id.total_digits) return .size_increased;
-                if (new_id.total_digits < old_id.total_digits) return .size_decreased;
+        .blob => |old_b| {
+            if (new_type == .blob) {
+                const new_b = new_type.blob;
+                const old_size = old_b.max_size orelse 0;
+                const new_size = new_b.max_size orelse 0;
+                if (new_size > old_size) return .size_increased;
+                if (new_size < old_size and new_size > 0) return .size_decreased;
             }
         },
         else => {},
@@ -294,41 +294,31 @@ fn categorizeTypeChange(old_type: anytype, new_type: anytype) ChangeType {
 }
 
 /// Check if two data types are equal
-fn dataTypesEqual(a: anytype, b: anytype) bool {
-    const TagType = @typeInfo(@TypeOf(a)).@"union".tag_type.?;
+fn dataTypesEqual(a: types.SchemaDataType, b: types.SchemaDataType) bool {
+    const TagType = @typeInfo(types.SchemaDataType).@"union".tag_type.?;
     const a_tag = @as(TagType, a);
     const b_tag = @as(TagType, b);
 
     if (a_tag != b_tag) return false;
 
     return switch (a) {
-        .alpha => |aa| blk: {
-            const ba = b.alpha;
-            break :blk (aa.size orelse 1) == (ba.size orelse 1);
-        },
-        .decimal => |ad| blk: {
-            const bd = b.decimal;
-            break :blk (ad.size orelse 1) == (bd.size orelse 1);
-        },
-        .implied_decimal => |aid| blk: {
-            const bid = b.implied_decimal;
-            break :blk aid.total_digits == bid.total_digits and aid.precision == bid.precision;
+        .text => |at| blk: {
+            const bt = b.text;
+            break :blk (at.max_length orelse 0) == (bt.max_length orelse 0);
         },
         .integer => |ai| b.integer == ai,
-        .packed_decimal => |ap| blk: {
-            const bp = b.packed_decimal;
-            break :blk ap.size == bp.size and ap.precision == bp.precision;
+        .decimal => |ad| blk: {
+            const bd = b.decimal;
+            break :blk ad.precision == bd.precision and ad.scale == bd.scale;
         },
-        .string => true,
-        .handle => true,
-        .structure_ref => |as| blk: {
-            const bs = b.structure_ref;
-            break :blk std.mem.eql(u8, as.name, bs.name);
+        .boolean => true,
+        .blob => |ab| blk: {
+            const bb = b.blob;
+            break :blk (ab.max_size orelse 0) == (bb.max_size orelse 0);
         },
-        .class_ref => |ac| blk: {
-            const bc = b.class_ref;
-            break :blk std.mem.eql(u8, ac.name, bc.name);
-        },
+        .datetime => |adt| b.datetime == adt,
+        .ulid => true,
+        .reference => |ar| std.mem.eql(u8, ar, b.reference),
     };
 }
 

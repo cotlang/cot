@@ -423,18 +423,59 @@ pub fn op_log_not(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
+/// is_null rd, rs - check if value is null
+pub fn op_is_null(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+    vm.registers[rd] = Value.initBool(vm.registers[rs].isNull());
+    return .continue_dispatch;
+}
+
+/// select rd, cond, rtrue, rfalse - conditional select
+pub fn op_select(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops1 = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops1 >> 4);
+    const cond: u4 = @truncate(ops1 & 0xF);
+    const rtrue: u4 = @truncate(ops2 >> 4);
+    const rfalse: u4 = @truncate(ops2 & 0xF);
+    vm.registers[rd] = if (vm.registers[cond].toBool()) vm.registers[rtrue] else vm.registers[rfalse];
+    return .continue_dispatch;
+}
+
+/// ptr_offset rd, rs, offset - byte-level pointer arithmetic for field views
+/// Format: [rd:4|rs:4] [offset_lo] [offset_hi]
+/// For string/buffer values, this creates a view at the specified byte offset.
+/// The offset is stored in the high bits of the value for later use by load/store.
+pub fn op_ptr_offset(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little));
+    vm.ip += 3;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+    _ = offset; // Offset handling deferred until byte-level memory is implemented
+    // For now, just copy the value - byte-level addressing will be added later
+    vm.registers[rd] = vm.registers[rs];
+    return .continue_dispatch;
+}
+
 // ============================================================================
 // Control Flow
 // ============================================================================
 
 /// jmp offset16 - unconditional jump
+/// Format: [opcode][unused][offset_lo][offset_hi]
+/// Offset is relative to end of instruction (after all 4 bytes)
 pub fn op_jmp(vm: *VM, module: *const Module) VMError!DispatchResult {
-    // Read signed 16-bit offset
+    // Read signed 16-bit offset from bytes 2-3 (vm.ip points to byte 1 after main loop increment)
     const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little));
 
-    // Calculate new IP (relative to instruction start)
-    const base_ip: i32 = @intCast(vm.ip);
-    const new_ip = base_ip + offset;
+    // Calculate new IP (offset is relative to end of instruction = vm.ip + 3)
+    const end_of_instr: i32 = @intCast(vm.ip + 3);
+    const new_ip = end_of_instr + offset;
 
     if (new_ip < 0 or new_ip >= @as(i32, @intCast(module.code.len))) {
         return vm.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
@@ -445,6 +486,8 @@ pub fn op_jmp(vm: *VM, module: *const Module) VMError!DispatchResult {
 }
 
 /// jz rs, offset16 - jump if zero/false
+/// Format: [opcode][rs<<4][offset_lo][offset_hi]
+/// Offset is relative to end of instruction (after all 4 bytes)
 pub fn op_jz(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little));
@@ -454,9 +497,9 @@ pub fn op_jz(vm: *VM, module: *const Module) VMError!DispatchResult {
     const cond = vm.registers[rs].toBool();
 
     if (!cond) {
-        // Jump if false/zero
-        const base_ip: i32 = @intCast(vm.ip);
-        const new_ip = base_ip + offset;
+        // Jump if false/zero (offset relative to end of instruction)
+        const end_of_instr: i32 = @intCast(vm.ip + 3);
+        const new_ip = end_of_instr + offset;
 
         if (new_ip < 0 or new_ip >= @as(i32, @intCast(module.code.len))) {
             return vm.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
@@ -471,6 +514,8 @@ pub fn op_jz(vm: *VM, module: *const Module) VMError!DispatchResult {
 }
 
 /// jnz rs, offset16 - jump if not zero/true
+/// Format: [opcode][rs<<4][offset_lo][offset_hi]
+/// Offset is relative to end of instruction (after all 4 bytes)
 pub fn op_jnz(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little));
@@ -480,9 +525,9 @@ pub fn op_jnz(vm: *VM, module: *const Module) VMError!DispatchResult {
     const cond = vm.registers[rs].toBool();
 
     if (cond) {
-        // Jump if true/non-zero
-        const base_ip: i32 = @intCast(vm.ip);
-        const new_ip = base_ip + offset;
+        // Jump if true/non-zero (offset relative to end of instruction)
+        const end_of_instr: i32 = @intCast(vm.ip + 3);
+        const new_ip = end_of_instr + offset;
 
         if (new_ip < 0 or new_ip >= @as(i32, @intCast(module.code.len))) {
             return vm.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");

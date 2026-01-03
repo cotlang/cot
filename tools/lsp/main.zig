@@ -54,6 +54,9 @@ const Handlers = struct {
         // Document symbol support
         try capabilities.put("documentSymbolProvider", JsonValue{ .bool = true });
 
+        // CodeLens disabled - Test Explorer provides gutter icons instead
+        // try capabilities.put("codeLensProvider", JsonValue{ .bool = true });
+
         // Semantic tokens support
         var semantic_tokens_options = JsonObject.init(allocator);
         var token_types = JsonArray.init(allocator);
@@ -244,6 +247,127 @@ const Handlers = struct {
         var result = JsonArray.init(allocator);
         for (symbols) |sym| {
             try result.append(try sym.toJson(allocator));
+        }
+
+        return protocol.makeResponse(id, JsonValue{ .array = result }, allocator);
+    }
+
+    /// Handle textDocument/codeLens request - provides run buttons for tests
+    fn codeLens(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
+        const text_document = params.object.get("textDocument") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        const uri = text_document.object.get("uri") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        const doc = server.getDocument(uri.string) orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        var result = JsonArray.init(allocator);
+
+        // Find all test declarations in the document
+        const content = doc.content;
+        var line_num: usize = 0;
+        var line_start: usize = 0;
+        var i: usize = 0;
+
+        while (i < content.len) {
+            // Check for newline to track line numbers
+            if (content[i] == '\n') {
+                line_num += 1;
+                line_start = i + 1;
+                i += 1;
+                continue;
+            }
+
+            // Look for "test" keyword
+            if (i + 4 <= content.len and std.mem.eql(u8, content[i .. i + 4], "test")) {
+                // Check that it's at start of line or after whitespace
+                const at_start = (i == 0 or content[i - 1] == '\n' or content[i - 1] == ' ' or content[i - 1] == '\t' or content[i - 1] == '}');
+                if (at_start) {
+                    // Check what follows "test" - should be whitespace then "
+                    var j = i + 4;
+                    while (j < content.len and (content[j] == ' ' or content[j] == '\t')) : (j += 1) {}
+
+                    if (j < content.len and content[j] == '"') {
+                        // Found test declaration, extract name
+                        const quote_start = j + 1;
+                        var quote_end = quote_start;
+                        while (quote_end < content.len and content[quote_end] != '"') {
+                            if (content[quote_end] == '\\' and quote_end + 1 < content.len) {
+                                quote_end += 2; // Skip escaped char
+                            } else {
+                                quote_end += 1;
+                            }
+                        }
+
+                        if (quote_end < content.len) {
+                            const test_name = content[quote_start..quote_end];
+
+                            // Find end of line for range
+                            var line_end: usize = i;
+                            while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
+                            const char_end = line_end - line_start;
+
+                            // Create CodeLens for "Run Test"
+                            var range = JsonObject.init(allocator);
+                            var start_pos = JsonObject.init(allocator);
+                            try start_pos.put("line", JsonValue{ .integer = @intCast(line_num) });
+                            try start_pos.put("character", JsonValue{ .integer = 0 });
+                            var end_pos = JsonObject.init(allocator);
+                            try end_pos.put("line", JsonValue{ .integer = @intCast(line_num) });
+                            try end_pos.put("character", JsonValue{ .integer = @intCast(char_end) });
+                            try range.put("start", JsonValue{ .object = start_pos });
+                            try range.put("end", JsonValue{ .object = end_pos });
+
+                            // Command to run the test
+                            var command = JsonObject.init(allocator);
+                            try command.put("title", JsonValue{ .string = "▶ Run Test" });
+                            try command.put("command", JsonValue{ .string = "cot.runTest" });
+                            var args = JsonArray.init(allocator);
+                            try args.append(JsonValue{ .string = uri.string });
+                            try args.append(JsonValue{ .string = test_name });
+                            try command.put("arguments", JsonValue{ .array = args });
+
+                            var lens = JsonObject.init(allocator);
+                            try lens.put("range", JsonValue{ .object = range });
+                            try lens.put("command", JsonValue{ .object = command });
+
+                            try result.append(JsonValue{ .object = lens });
+
+                            i = quote_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            i += 1;
+        }
+
+        // If we found any tests, add "Run All Tests" at the top
+        if (result.items.len > 0) {
+            var range = JsonObject.init(allocator);
+            var start_pos = JsonObject.init(allocator);
+            try start_pos.put("line", JsonValue{ .integer = 0 });
+            try start_pos.put("character", JsonValue{ .integer = 0 });
+            var end_pos = JsonObject.init(allocator);
+            try end_pos.put("line", JsonValue{ .integer = 0 });
+            try end_pos.put("character", JsonValue{ .integer = 0 });
+            try range.put("start", JsonValue{ .object = start_pos });
+            try range.put("end", JsonValue{ .object = end_pos });
+
+            var command = JsonObject.init(allocator);
+            try command.put("title", JsonValue{ .string = "▶▶ Run All Tests" });
+            try command.put("command", JsonValue{ .string = "cot.runAllTests" });
+            var args = JsonArray.init(allocator);
+            try args.append(JsonValue{ .string = uri.string });
+            try command.put("arguments", JsonValue{ .array = args });
+
+            var lens = JsonObject.init(allocator);
+            try lens.put("range", JsonValue{ .object = range });
+            try lens.put("command", JsonValue{ .object = command });
+
+            try result.append(JsonValue{ .object = lens });
         }
 
         return protocol.makeResponse(id, JsonValue{ .array = result }, allocator);
@@ -870,6 +994,8 @@ pub fn main() !void {
                 break :blk try Handlers.hover(&server, id.?, params, allocator);
             } else if (std.mem.eql(u8, method.string, "textDocument/documentSymbol")) {
                 break :blk try Handlers.documentSymbol(&server, id.?, params, allocator);
+            } else if (std.mem.eql(u8, method.string, "textDocument/codeLens")) {
+                break :blk try Handlers.codeLens(&server, id.?, params, allocator);
             } else if (std.mem.eql(u8, method.string, "textDocument/semanticTokens/full")) {
                 break :blk try Handlers.semanticTokens(&server, id.?, params, allocator);
             } else {

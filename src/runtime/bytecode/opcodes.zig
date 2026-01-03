@@ -208,6 +208,18 @@ pub const Opcode = enum(u8) {
     /// bit_not rd, rs - rd = ~rs
     bit_not = 0x56,
 
+    /// is_null rd, rs - rd = (rs == null)
+    /// Format: [rd:4|rs:4] [0]
+    is_null = 0x57,
+
+    /// select rd, cond, rtrue, rfalse - rd = cond ? rtrue : rfalse
+    /// Format: [rd:4|cond:4] [rtrue:4|rfalse:4]
+    select = 0x58,
+
+    /// ptr_offset rd, rs, offset - rd = rs + offset (byte-level pointer arithmetic)
+    /// Format: [rd:4|rs:4] [offset:16]
+    ptr_offset = 0x59,
+
     // ============================================
     // Control Flow (0x60-0x6F)
     // ============================================
@@ -637,6 +649,7 @@ pub const Opcode = enum(u8) {
             .cmp_str_eq, .cmp_str_lt => 2,
             .log_and, .log_or, .log_not => 2,
             .bit_and, .bit_or, .bit_xor, .bit_not => 2,
+            .is_null, .select => 2,
             .load_null, .load_true, .load_false => 2,
             .ret, .ret_val => 2,
             .free_record, .clear_record => 2,
@@ -671,6 +684,7 @@ pub const Opcode = enum(u8) {
             .new_record, .load_field, .store_field => 3,
             .to_fixed_string => 3,
             .debug_line => 3,
+            .ptr_offset => 3, // [rd:4|rs:4] [offset:16]
 
             // 4-byte operands: [u16] [u16]
             .store_record_buf => 4,

@@ -78,6 +78,14 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             // These would require SSA phi nodes or temporary variables
             return LowerError.UnsupportedFeature;
         },
+        .optional_member, .optional_index => {
+            // Optional chaining (?. and ?[]) not yet supported
+            return LowerError.UnsupportedFeature;
+        },
+        .is_expr => {
+            // Type checking expressions not yet supported
+            return LowerError.UnsupportedFeature;
+        },
     }
 }
 
@@ -260,18 +268,41 @@ pub fn lowerLValueFromExpr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
 /// Lower a member access to get a pointer
 pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
+    const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
     const object_idx = data.getObject();
     const field_id = data.getField();
 
-    const object_ptr = try lowerLValue(l, object_idx);
+    var object_ptr = try lowerLValue(l, object_idx);
     const field_name = l.strings.get(field_id);
     if (field_name.len == 0) return LowerError.UndefinedVariable;
 
     // Look up field in struct type
+    // Handle both direct struct pointers (*Struct) and pointers to struct pointers (**Struct)
+    // The latter occurs with `self` parameter in methods: self is *Struct, so lowerLValue
+    // returns **Struct (pointer to the local variable holding the pointer)
     const struct_type = switch (object_ptr.ty) {
         .ptr => |p| switch (p.*) {
             .@"struct" => |s| s,
+            .ptr => |inner| blk: {
+                // Double pointer case: object is a pointer-to-pointer-to-struct
+                // Load the inner pointer first
+                switch (inner.*) {
+                    .@"struct" => |s| {
+                        // Load the struct pointer from the double-pointer
+                        const loaded_ptr = func.newValue(.{ .ptr = inner });
+                        try l.emit(.{
+                            .load = .{
+                                .ptr = object_ptr,
+                                .result = loaded_ptr,
+                            },
+                        });
+                        object_ptr = loaded_ptr;
+                        break :blk s;
+                    },
+                    else => return LowerError.TypeMismatch,
+                }
+            },
             else => return LowerError.TypeMismatch,
         },
         else => return LowerError.TypeMismatch,
@@ -286,7 +317,6 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     }
 
     if (field_idx) |idx| {
-        const func = l.current_func orelse return LowerError.OutOfMemory;
         const field = struct_type.fields[idx];
 
         const ty_ptr = try l.allocator.create(ir.Type);
@@ -370,6 +400,8 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
         // Rounding operations produce decimal (or inherit from lhs)
         .round, .trunc => lhs.ty,
         .range, .range_inclusive => lhs.ty,
+        // Null coalescing inherits type from lhs (the non-null value)
+        .null_coalesce => lhs.ty,
     };
 
     const result = func.newValue(result_ty);
@@ -417,6 +449,13 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
         .round => .{ .round = .{ .value = lhs, .places = rhs, .result = result } },
         .trunc => .{ .trunc = .{ .value = lhs, .places = rhs, .result = result } },
         .range, .range_inclusive => return LowerError.UnsupportedFeature,
+        .null_coalesce => blk: {
+            // null_coalesce: lhs ?? rhs = if (lhs is null) rhs else lhs
+            // Lower to: cond = is_null(lhs); result = select(cond, rhs, lhs)
+            const cond = func.newValue(.bool);
+            try l.emit(.{ .is_null = .{ .operand = lhs, .result = cond } });
+            break :blk .{ .select = .{ .condition = cond, .true_val = rhs, .false_val = lhs, .result = result } };
+        },
     };
 
     try l.emit(ir_op);
@@ -474,6 +513,40 @@ pub fn lowerUnary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Exp
 
 /// Lower a member access expression
 pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const data = l.store.exprData(expr_idx);
+    const object_idx = data.getObject();
+    const field_id = data.getField();
+    const field_name = l.strings.get(field_id);
+
+    // Check if this is an enum member access (EnumName.Variant)
+    const object_tag = l.store.exprTag(object_idx);
+    if (object_tag == .identifier) {
+        const object_data = l.store.exprData(object_idx);
+        const object_name_id = object_data.getName();
+        const object_name = l.strings.get(object_name_id);
+
+        // Check if object name is an enum
+        if (l.enum_types.get(object_name)) |variants| {
+            // Look up the variant value
+            if (variants.get(field_name)) |variant_value| {
+                // Return constant integer value
+                const result = func.newValue(.i64);
+                try l.emit(.{
+                    .iconst = .{
+                        .ty = .i64,
+                        .value = variant_value,
+                        .result = result,
+                    },
+                });
+                return result;
+            } else {
+                // Variant not found in this enum
+                return LowerError.UndefinedVariable;
+            }
+        }
+    }
+
+    // Not an enum access - proceed with regular member access
     const ptr = try lowerMemberPtr(l, expr_idx);
     const result = func.newValue(ptr.ty);
     try l.emit(.{

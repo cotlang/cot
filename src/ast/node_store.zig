@@ -100,6 +100,14 @@ pub const NodeData = packed struct {
         };
     }
 
+    /// Create data for is expression: expr, type
+    pub fn isExpr(expr: ExprIdx, type_idx: TypeIdx) NodeData {
+        return .{
+            .a = expr.toInt(),
+            .b = type_idx.toInt(),
+        };
+    }
+
     /// Create data for call: callee, args span start
     pub fn call(callee: ExprIdx, args_start: ExtraIdx) NodeData {
         return .{
@@ -528,6 +536,15 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a type test expression (expr is Type)
+    pub fn addIsExpr(self: *Self, expr: ExprIdx, type_idx: TypeIdx, loc: SourceLoc) !ExprIdx {
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
+        try self.expr_tags.append(self.allocator, .is_expr);
+        try self.expr_locs.append(self.allocator, loc);
+        try self.expr_data.append(self.allocator, NodeData.isExpr(expr, type_idx));
+        return idx;
+    }
+
     /// Add a call expression
     pub fn addCall(self: *Self, callee: ExprIdx, args: []const ExprIdx, loc: SourceLoc) !ExprIdx {
         // Store args in extra_data
@@ -629,6 +646,36 @@ pub const NodeStore = struct {
         try self.stmt_tags.append(self.allocator, .continue_stmt);
         try self.stmt_locs.append(self.allocator, loc);
         try self.stmt_data.append(self.allocator, NodeData.empty);
+        return idx;
+    }
+
+    /// Add a try-catch statement
+    /// try_body is the block to try, catch_body is the handler
+    /// For DBL: TRY body CATCH (var, type) handler FINALLY cleanup ENDTRY
+    pub fn addTryStmt(self: *Self, try_body: StmtIdx, catch_body: StmtIdx, finally_body: StmtIdx, loc: SourceLoc) !StmtIdx {
+        // Store catch_body and finally_body in extra_data
+        const catch_extra = try self.addExtra(catch_body.toInt());
+        _ = try self.addExtra(finally_body.toInt());
+
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
+        try self.stmt_tags.append(self.allocator, .try_stmt);
+        try self.stmt_locs.append(self.allocator, loc);
+        try self.stmt_data.append(self.allocator, .{
+            .a = try_body.toInt(),
+            .b = catch_extra.toInt(),
+        });
+        return idx;
+    }
+
+    /// Add a throw statement
+    pub fn addThrowStmt(self: *Self, value: ExprIdx, loc: SourceLoc) !StmtIdx {
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
+        try self.stmt_tags.append(self.allocator, .throw_stmt);
+        try self.stmt_locs.append(self.allocator, loc);
+        try self.stmt_data.append(self.allocator, .{
+            .a = value.toInt(),
+            .b = 0,
+        });
         return idx;
     }
 

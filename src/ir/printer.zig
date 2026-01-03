@@ -503,6 +503,25 @@ pub const Printer = struct {
                 try self.writer.writeAll(" = map_values ");
                 try self.printValue(m.map);
             },
+
+            // Conditional selection
+            .select => |s| {
+                try self.printValue(s.result);
+                try self.writer.writeAll(" = select ");
+                try self.printValue(s.condition);
+                try self.writer.writeAll(", ");
+                try self.printValue(s.true_val);
+                try self.writer.writeAll(", ");
+                try self.printValue(s.false_val);
+            },
+
+            // Pointer offset (for field views)
+            .ptr_offset => |p| {
+                try self.printValue(p.result);
+                try self.writer.writeAll(" = ptr_offset ");
+                try self.printValue(p.base_ptr);
+                try self.writer.print(", {d}", .{p.offset});
+            },
         }
     }
 

@@ -126,6 +126,90 @@ pub fn runWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8, 
     try vm.execute(&module);
 }
 
+/// Compile and run DBL source code with tracing enabled
+pub fn traceWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8, base_path: ?[]const u8, level: cot_runtime.trace.TraceLevel) !void {
+    // Compile to bytecode module with path for import resolution
+    var module = try compileToModuleWithPath(allocator, source, "main", base_path);
+    defer module.deinit();
+
+    // Create tracer
+    var tracer = cot_runtime.trace.Tracer.init(allocator, .{
+        .level = level,
+        .output = .{ .format = .human, .target = .stderr, .color = true },
+        .history_size = 256,
+    });
+    defer tracer.deinit();
+
+    // Execute in VM with tracer attached
+    var vm = cot.bytecode.VM.init(allocator);
+    defer vm.deinit();
+
+    vm.setTracer(&tracer);
+
+    // Load DBL extension (Map type, NSPC_* functions)
+    try vm.loadExtension(dbl_ext.dbl_extension);
+
+    try vm.initChannels();
+
+    std.debug.print("=== Execution Trace ===\n", .{});
+    vm.execute(&module) catch |err| {
+        std.debug.print("\nVM error: {}\n", .{err});
+        // Dump history on error
+        std.debug.print("\n", .{});
+        const stderr_file: std.fs.File = .stderr();
+        var buf: [4096]u8 = undefined;
+        var stderr_writer = stderr_file.writer(&buf);
+        vm.dumpTraceHistory(&stderr_writer.interface) catch {};
+    };
+    std.debug.print("\n=== Trace Statistics ===\n", .{});
+    std.debug.print("Opcodes executed: {d}\n", .{tracer.stats.opcodes_executed});
+    std.debug.print("Calls made: {d}\n", .{tracer.stats.calls_made});
+    std.debug.print("Duration: {d}ms\n", .{tracer.stats.durationMs()});
+}
+
+/// Compile DBL source to IR (for test discovery)
+pub fn compileToIR(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8) !*cot.ir.Module {
+    // Preprocess imports - combine all source files
+    const combined_source = try preprocessImports(allocator, source, null);
+    defer if (combined_source.ptr != source.ptr) allocator.free(combined_source);
+
+    // Tokenize with DBL lexer
+    var lex = Lexer.init(combined_source);
+    const tokens = try lex.tokenize(allocator);
+    defer allocator.free(tokens);
+
+    // Parse using NodeStore-based parser
+    var strings = base.StringInterner.init(allocator);
+    defer strings.deinit();
+
+    var store = ast.NodeStore.init(allocator, &strings);
+    defer store.deinit();
+
+    var parse = Parser.init(allocator, tokens, &store, &strings);
+    defer parse.deinit();
+
+    const top_level = parse.parse() catch |err| {
+        for (parse.errors.items) |e| {
+            std.debug.print("Parse error at line {d}: {s}\n", .{ e.token.line, e.message });
+        }
+        return err;
+    };
+    defer allocator.free(top_level);
+
+    if (parse.hasErrors()) {
+        for (parse.errors.items) |e| {
+            std.debug.print("Parse error at line {d}: {s}\n", .{ e.token.line, e.message });
+        }
+        return error.ParseError;
+    }
+
+    // Lower to IR - caller owns the returned module
+    return cot.ir_lower.lower(allocator, &store, &strings, top_level, module_name) catch |err| {
+        std.debug.print("IR lowering error: {}\n", .{err});
+        return error.LowerError;
+    };
+}
+
 /// Compile DBL source to bytecode
 /// Supports optional base_path for resolving imports relative to the source file
 pub fn compileToModule(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8) !cot.bytecode.Module {

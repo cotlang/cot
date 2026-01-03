@@ -91,6 +91,9 @@ pub const Lowerer = struct {
     /// Map union names to their IR types
     union_types: std.StringHashMap(*const ir.UnionType),
 
+    /// Map enum names to their variant values (enum name -> (variant name -> i64))
+    enum_types: std.StringHashMap(std.StringHashMap(i64)),
+
     /// Generic struct definitions (templates for instantiation)
     generic_struct_defs: std.StringHashMap(GenericDef),
 
@@ -218,6 +221,7 @@ pub const Lowerer = struct {
             .global_variables = std.StringHashMap(ir.Value).init(allocator),
             .struct_types = std.StringHashMap(*const ir.StructType).init(allocator),
             .union_types = std.StringHashMap(*const ir.UnionType).init(allocator),
+            .enum_types = std.StringHashMap(std.StringHashMap(i64)).init(allocator),
             .generic_struct_defs = std.StringHashMap(GenericDef).init(allocator),
             .type_param_substitutions = std.StringHashMap(ir.Type).init(allocator),
             .instantiated_structs = std.StringHashMap(*const ir.StructType).init(allocator),
@@ -284,6 +288,12 @@ pub const Lowerer = struct {
         self.global_variables.deinit();
         self.struct_types.deinit();
         self.union_types.deinit();
+        // Deinit inner maps first
+        var enum_iter = self.enum_types.valueIterator();
+        while (enum_iter.next()) |inner_map| {
+            inner_map.deinit();
+        }
+        self.enum_types.deinit();
         self.generic_struct_defs.deinit();
         self.type_param_substitutions.deinit();
         self.instantiated_structs.deinit();
@@ -312,70 +322,109 @@ pub const Lowerer = struct {
         block.instructions.append(self.allocator, inst) catch return LowerError.OutOfMemory;
     }
 
+    /// Process a statement for type/function definitions, recursively handling blocks.
+    /// This is used to find definitions inside namespaces (which are represented as blocks).
+    fn processStatementForDefinitions(self: *Self, stmt_idx: StmtIdx, pass: enum { structs, traits, impls, globals, fn_sigs, fn_bodies, tests }) LowerError!void {
+        const tag = self.store.stmtTag(stmt_idx);
+
+        // Handle blocks by recursively processing their contents
+        if (tag == .block) {
+            const data = self.store.stmtData(stmt_idx);
+            // Block data: a = start index in extra_data, b = count
+            const start = data.a;
+            const count = data.b;
+            for (0..count) |i| {
+                const child_idx: StmtIdx = @enumFromInt(self.store.extra_data.items[start + i]);
+                try self.processStatementForDefinitions(child_idx, pass);
+            }
+            return;
+        }
+
+        // Process based on the current pass
+        switch (pass) {
+            .structs => {
+                if (tag == .struct_def) {
+                    try self.lowerStructDef(stmt_idx);
+                } else if (tag == .union_def) {
+                    try self.lowerUnionDef(stmt_idx);
+                } else if (tag == .enum_def) {
+                    try self.lowerEnumDef(stmt_idx);
+                }
+            },
+            .traits => {
+                if (tag == .trait_def) {
+                    try self.lowerTraitDef(stmt_idx);
+                }
+            },
+            .impls => {
+                if (tag == .impl_block) {
+                    try self.lowerImplBlock(stmt_idx);
+                }
+            },
+            .globals => {
+                if (tag == .let_decl) {
+                    try lower_stmt.lowerGlobalLetDecl(self, stmt_idx);
+                }
+            },
+            .fn_sigs => {
+                if (tag == .fn_def) {
+                    try self.collectFnSignature(stmt_idx);
+                }
+            },
+            .fn_bodies => {
+                if (tag == .fn_def) {
+                    try self.lowerFnDef(stmt_idx);
+                }
+            },
+            .tests => {
+                if (tag == .test_def) {
+                    try self.lowerTestDef(stmt_idx);
+                }
+            },
+        }
+    }
+
     /// Lower a program (list of top-level statements)
     pub fn lowerProgram(self: *Self, top_level: []const StmtIdx) LowerError!*ir.Module {
         log.debug("Lowering program with {d} top-level statements", .{top_level.len});
         debug.print(.ir, "Lowering program with {d} top-level statements", .{top_level.len});
 
-        // First pass: collect struct and union definitions
+        // First pass: collect struct, union, and enum definitions (including from namespaces)
         for (top_level) |stmt_idx| {
-            const tag = self.store.stmtTag(stmt_idx);
-            if (tag == .struct_def) {
-                try self.lowerStructDef(stmt_idx);
-            } else if (tag == .union_def) {
-                try self.lowerUnionDef(stmt_idx);
-            }
+            try self.processStatementForDefinitions(stmt_idx, .structs);
         }
 
         // Second pass: collect trait definitions
         for (top_level) |stmt_idx| {
-            const tag = self.store.stmtTag(stmt_idx);
-            if (tag == .trait_def) {
-                try self.lowerTraitDef(stmt_idx);
-            }
+            try self.processStatementForDefinitions(stmt_idx, .traits);
         }
 
         // Third pass: collect impl blocks
         for (top_level) |stmt_idx| {
-            const tag = self.store.stmtTag(stmt_idx);
-            if (tag == .impl_block) {
-                try self.lowerImplBlock(stmt_idx);
-            }
+            try self.processStatementForDefinitions(stmt_idx, .impls);
         }
 
         // Fourth pass: register top-level let declarations as globals
         // (These come from DBL common blocks and need to be visible in all functions)
         // Must run BEFORE function lowering so functions can reference globals
         for (top_level) |stmt_idx| {
-            const tag = self.store.stmtTag(stmt_idx);
-            if (tag == .let_decl) {
-                try lower_stmt.lowerGlobalLetDecl(self, stmt_idx);
-            }
+            try self.processStatementForDefinitions(stmt_idx, .globals);
         }
 
         // Fifth pass: collect function SIGNATURES (params/defaults only, no body)
         // This must happen before body lowering so call sites can use defaults
         for (top_level) |stmt_idx| {
-            const tag = self.store.stmtTag(stmt_idx);
-            if (tag == .fn_def) {
-                try self.collectFnSignature(stmt_idx);
-            }
+            try self.processStatementForDefinitions(stmt_idx, .fn_sigs);
         }
 
         // Sixth pass: lower function BODIES
         for (top_level) |stmt_idx| {
-            const tag = self.store.stmtTag(stmt_idx);
-            if (tag == .fn_def) {
-                try self.lowerFnDef(stmt_idx);
-            }
+            try self.processStatementForDefinitions(stmt_idx, .fn_bodies);
         }
 
         // Seventh pass: lower test definitions
         for (top_level) |stmt_idx| {
-            const tag = self.store.stmtTag(stmt_idx);
-            if (tag == .test_def) {
-                try self.lowerTestDef(stmt_idx);
-            }
+            try self.processStatementForDefinitions(stmt_idx, .tests);
         }
 
         // Transfer ownership of allocated types to the module
@@ -524,6 +573,67 @@ pub const Lowerer = struct {
 
         try self.module.addUnion(union_type);
         try self.union_types.put(name, union_type);
+    }
+
+    /// Lower an enum definition - extract variant names and values
+    /// DBL format in extra_data: [count, name1, value1, name2, value2, ...]
+    /// Cot format in extra_data: [count, name1, name2, ...]
+    fn lowerEnumDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const name_id: StringId = @enumFromInt(data.a);
+        const name = self.strings.get(name_id);
+        if (name.len == 0) return LowerError.UndefinedType;
+
+        log.debug("Lowering enum: {s}", .{name});
+        debug.print(.ir, "Lowering enum: {s}", .{name});
+
+        // Get variants from extra_data
+        const extra_start = data.b;
+        const variant_count = self.store.extra_data.items[extra_start];
+
+        // Create inner map for this enum's variants
+        var variants = std.StringHashMap(i64).init(self.allocator);
+        errdefer variants.deinit();
+
+        var extra_idx = extra_start + 1;
+
+        // Check if this is DBL format (pairs) or Cot format (names only)
+        // DBL format has 2 * variant_count values after the count
+        // Cot format has variant_count values after the count
+        // We can detect by checking if we have enough values for pairs
+        const remaining = self.store.extra_data.items.len - extra_idx;
+        const is_dbl_format = remaining >= variant_count * 2;
+
+        if (is_dbl_format) {
+            // DBL format: [name, value] pairs
+            for (0..variant_count) |_| {
+                const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+                const variant_value: i32 = @bitCast(self.store.extra_data.items[extra_idx + 1]);
+                extra_idx += 2;
+
+                const variant_name = self.strings.get(variant_name_id);
+                if (variant_name.len == 0) continue;
+
+                try variants.put(variant_name, @intCast(variant_value));
+                debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, variant_value });
+            }
+        } else {
+            // Cot format: just names, auto-increment values from 0
+            var auto_value: i64 = 0;
+            for (0..variant_count) |_| {
+                const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+                extra_idx += 1;
+
+                const variant_name = self.strings.get(variant_name_id);
+                if (variant_name.len == 0) continue;
+
+                try variants.put(variant_name, auto_value);
+                debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, auto_value });
+                auto_value += 1;
+            }
+        }
+
+        try self.enum_types.put(name, variants);
     }
 
     /// Instantiate a generic struct with concrete type arguments
@@ -937,9 +1047,6 @@ pub const Lowerer = struct {
             mangled_len += 1;
         }
 
-        // Allocate the mangled name
-        const fn_name = self.allocator.dupe(u8, mangled_buf[0..mangled_len]) catch return LowerError.OutOfMemory;
-
         // Test functions have no params and return void
         const func_type = ir.FunctionType{
             .params = &.{},
@@ -947,8 +1054,8 @@ pub const Lowerer = struct {
             .is_variadic = false,
         };
 
-        // Create function
-        const func = try ir.Function.init(self.allocator, fn_name, func_type);
+        // Create function (Function.init dupes the name internally)
+        const func = try ir.Function.init(self.allocator, mangled_buf[0..mangled_len], func_type);
         func.is_test = true;
         func.test_name = test_name;
 
@@ -1027,8 +1134,8 @@ pub const Lowerer = struct {
                 try lower_stmt.lowerLetDecl(self, data);
             },
             .const_decl => {
-                // Compile-time constants are handled by the comptime evaluator.
-                // They don't generate runtime code.
+                try self.emitDebugLine(loc);
+                try lower_stmt.lowerConstDecl(self, data);
             },
             .io_open => {
                 try self.emitDebugLine(loc);

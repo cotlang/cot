@@ -135,6 +135,13 @@ pub const TokenType = enum {
     minus_equals, // -=
     star_equals, // *=
     slash_equals, // /=
+    pipe_equals, // |=
+    amp_equals, // &=
+
+    // Null-safety operators
+    question_dot, // ?.
+    question_question, // ??
+    question_lbracket, // ?[
 
     // Comparison operators
     eq, // ==
@@ -183,6 +190,7 @@ pub const TokenType = enum {
     // Keywords - other
     kw_import,
     kw_as,
+    kw_is, // type testing: obj is Type
     kw_self,
     kw_true,
     kw_false,
@@ -237,6 +245,7 @@ pub const TokenType = enum {
             .kw_finally,
             .kw_import,
             .kw_as,
+            .kw_is,
             .kw_self,
             .kw_true,
             .kw_false,
@@ -271,6 +280,11 @@ pub const TokenType = enum {
             .amp_amp,
             .pipe_pipe,
             .bang,
+            .question_dot,
+            .question_question,
+            .question_lbracket,
+            .pipe_equals,
+            .amp_equals,
             => true,
             else => false,
         };

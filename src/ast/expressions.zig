@@ -39,6 +39,12 @@ pub const ExpressionTag = enum(u8) {
     /// Array/slice indexing: expr[index]
     index,
 
+    /// Optional member access: expr?.field (null-safe)
+    optional_member,
+
+    /// Optional indexing: expr?[index] (null-safe)
+    optional_index,
+
     // ============================================
     // Operators
     // ============================================
@@ -94,6 +100,9 @@ pub const ExpressionTag = enum(u8) {
     /// Block expression: { statements; result }
     block_expr,
 
+    /// Type test expression: expr is Type
+    is_expr,
+
     /// Check if this is a literal expression
     pub fn isLiteral(self: ExpressionTag) bool {
         return switch (self) {
@@ -105,7 +114,7 @@ pub const ExpressionTag = enum(u8) {
     /// Check if this is an access expression
     pub fn isAccess(self: ExpressionTag) bool {
         return switch (self) {
-            .identifier, .member, .index => true,
+            .identifier, .member, .index, .optional_member, .optional_index => true,
             else => false,
         };
     }
@@ -179,28 +188,35 @@ pub const BinaryOp = enum(u8) {
     range, // ..
     range_inclusive, // ..=
 
+    // Null safety
+    null_coalesce, // ?? - returns left if non-null, else right
+
     /// Get the precedence of this operator (higher binds tighter)
+    /// Precedence follows C#/Kotlin conventions for null-safety operators
     pub fn precedence(self: BinaryOp) u8 {
         return switch (self) {
-            .@"or" => 1,
-            .@"and" => 2,
-            .eq, .ne, .lt, .le, .gt, .ge => 3,
-            .bit_or => 4,
-            .bit_xor => 5,
-            .bit_and => 6,
-            .shl, .shr => 7,
-            .add, .sub => 8,
-            .mul, .div, .mod => 9,
-            .round, .trunc => 10, // Highest arithmetic precedence (before unary)
+            .null_coalesce => 1, // Lowest (just above range)
+            .@"or" => 2,
+            .@"and" => 3,
+            .eq, .ne, .lt, .le, .gt, .ge => 4,
+            .bit_or => 5,
+            .bit_xor => 6,
+            .bit_and => 7,
+            .shl, .shr => 8,
+            .add, .sub => 9,
+            .mul, .div, .mod => 10,
+            .round, .trunc => 11, // Highest arithmetic precedence (before unary)
             .range, .range_inclusive => 0, // Lowest precedence
         };
     }
 
     /// Check if this operator is right-associative
     pub fn isRightAssociative(self: BinaryOp) bool {
-        _ = self;
-        // Currently no right-associative binary operators
-        return false;
+        return switch (self) {
+            // Null coalescing is right-associative: a ?? b ?? c = a ?? (b ?? c)
+            .null_coalesce => true,
+            else => false,
+        };
     }
 
     /// Check if this is a comparison operator
@@ -282,6 +298,12 @@ test "BinaryOp precedence" {
 
     // And binds tighter than or
     try std.testing.expect(BinaryOp.@"and".precedence() > BinaryOp.@"or".precedence());
+
+    // Null coalescing has lower precedence than or
+    try std.testing.expect(BinaryOp.@"or".precedence() > BinaryOp.null_coalesce.precedence());
+
+    // Null coalescing is right-associative
+    try std.testing.expect(BinaryOp.null_coalesce.isRightAssociative());
 }
 
 test "BinaryOp categories" {

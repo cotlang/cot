@@ -349,6 +349,7 @@ pub const Instruction = union(enum) {
     load: Load,
     store: Store,
     field_ptr: FieldPtr,
+    ptr_offset: PtrOffset, // Byte-level pointer offset (for substring views)
 
     // ====== Arithmetic (Cranelift names) ======
     iadd: BinaryOp, // Integer add
@@ -430,6 +431,9 @@ pub const Instruction = union(enum) {
     unwrap_optional: UnaryOp,
     is_null: UnaryOp,
 
+    // ====== Conditional selection (Cranelift-style) ======
+    select: Select, // result = cond ? true_val : false_val
+
     // ====== I/O operations (Cot-specific, ISAM file access) ======
     io_open: IoOpen,
     io_close: struct { channel: Value },
@@ -488,6 +492,13 @@ pub const Instruction = union(enum) {
         result: Value,
     };
 
+    // Byte-level pointer offset (for substring views)
+    pub const PtrOffset = struct {
+        base_ptr: Value, // Base pointer
+        offset: i32, // Byte offset (can be negative for backwards views)
+        result: Value, // Resulting pointer at base + offset
+    };
+
     // Binary operation
     pub const BinaryOp = struct {
         lhs: Value,
@@ -507,6 +518,14 @@ pub const Instruction = union(enum) {
     // Unary operation
     pub const UnaryOp = struct {
         operand: Value,
+        result: Value,
+    };
+
+    // Conditional selection (ternary): result = cond ? true_val : false_val
+    pub const Select = struct {
+        condition: Value, // Boolean condition
+        true_val: Value, // Value if condition is true
+        false_val: Value, // Value if condition is false
         result: Value,
     };
 
@@ -875,6 +894,8 @@ pub const Instruction = union(enum) {
             .map_len => |m| m.result,
             .map_keys => |m| m.result,
             .map_values => |m| m.result,
+            .select => |s| s.result,
+            .ptr_offset => |p| p.result,
             // Instructions that don't produce values
             .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read,
             .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store,
@@ -1027,8 +1048,10 @@ pub const Function = struct {
 
     pub fn init(allocator: Allocator, name: []const u8, signature: FunctionType) !*Function {
         const self = try allocator.create(Function);
+        // Function owns its name - make a copy
+        const owned_name = try allocator.dupe(u8, name);
         self.* = .{
-            .name = name,
+            .name = owned_name,
             .export_name = null,
             .signature = signature,
             .linkage = .internal,
@@ -1059,6 +1082,8 @@ pub const Function = struct {
         if (self.signature.params.len > 0) {
             self.allocator.free(self.signature.params);
         }
+        // Free the owned name
+        self.allocator.free(self.name);
         self.allocator.destroy(self);
     }
 
@@ -1160,6 +1185,7 @@ pub const Module = struct {
             self.allocator.destroy(ty_ptr);
         }
         self.allocated_types.deinit(self.allocator);
+        // Note: caller is responsible for destroying the Module pointer
     }
 
     /// Get all exported functions

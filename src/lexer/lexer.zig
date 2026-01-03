@@ -74,8 +74,19 @@ pub const Lexer = struct {
             '@' => return self.makeToken(.at, self.source[start_pos..self.position]),
             '%' => return self.makeToken(.percent, self.source[start_pos..self.position]),
             '~' => return self.makeToken(.tilde, self.source[start_pos..self.position]),
-            '?' => return self.makeToken(.question, self.source[start_pos..self.position]),
             else => {},
+        }
+
+        // Question mark variants: ? ?. ?? ?[
+        if (c == '?') {
+            if (self.match('.')) {
+                return self.makeToken(.question_dot, self.source[start_pos..self.position]);
+            } else if (self.match('?')) {
+                return self.makeToken(.question_question, self.source[start_pos..self.position]);
+            } else if (self.match('[')) {
+                return self.makeToken(.question_lbracket, self.source[start_pos..self.position]);
+            }
+            return self.makeToken(.question, self.source[start_pos..self.position]);
         }
 
         // Colon variants: : := ::
@@ -168,18 +179,22 @@ pub const Lexer = struct {
             return self.makeToken(.gt, self.source[start_pos..self.position]);
         }
 
-        // Ampersand: & &&
+        // Ampersand: & && &=
         if (c == '&') {
             if (self.match('&')) {
                 return self.makeToken(.amp_amp, self.source[start_pos..self.position]);
+            } else if (self.match('=')) {
+                return self.makeToken(.amp_equals, self.source[start_pos..self.position]);
             }
             return self.makeToken(.ampersand, self.source[start_pos..self.position]);
         }
 
-        // Pipe: | ||
+        // Pipe: | || |=
         if (c == '|') {
             if (self.match('|')) {
                 return self.makeToken(.pipe_pipe, self.source[start_pos..self.position]);
+            } else if (self.match('=')) {
+                return self.makeToken(.pipe_equals, self.source[start_pos..self.position]);
             }
             return self.makeToken(.pipe, self.source[start_pos..self.position]);
         }
@@ -408,6 +423,7 @@ pub const Lexer = struct {
         // Other
         .{ "import", .kw_import },
         .{ "as", .kw_as },
+        .{ "is", .kw_is },
         .{ "self", .kw_self },
         .{ "true", .kw_true },
         .{ "false", .kw_false },
@@ -497,6 +513,45 @@ test "lexer arrow and fat arrow" {
 
     try std.testing.expectEqual(TokenType.arrow, tokens[0].type);
     try std.testing.expectEqual(TokenType.fat_arrow, tokens[1].type);
+}
+
+test "lexer null safety operators" {
+    var lexer = Lexer.init("?. ?? ?[");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.question_dot, tokens[0].type);
+    try std.testing.expectEqual(TokenType.question_question, tokens[1].type);
+    try std.testing.expectEqual(TokenType.question_lbracket, tokens[2].type);
+}
+
+test "lexer bitwise compound assignment" {
+    var lexer = Lexer.init("|= &=");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.pipe_equals, tokens[0].type);
+    try std.testing.expectEqual(TokenType.amp_equals, tokens[1].type);
+}
+
+test "lexer is keyword" {
+    var lexer = Lexer.init("obj is Type");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqual(TokenType.kw_is, tokens[1].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[2].type);
+}
+
+test "lexer question mark alone" {
+    var lexer = Lexer.init("a ? b : c");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqual(TokenType.question, tokens[1].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[2].type);
 }
 
 test "lexer spans" {

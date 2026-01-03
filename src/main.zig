@@ -105,10 +105,7 @@ pub fn main() !void {
     // Install crash handlers FIRST - ensures crash reporting works for all commands
     cot.crash.installHandlers();
 
-    // Use page_allocator directly instead of GPA to avoid leak detection noise.
-    // The IR/AST has complex ownership that would require arena allocators to
-    // properly clean up. All memory is reclaimed on process exit anyway.
-    // TODO: Implement proper arena-based allocation for compilation passes
+    // Use page_allocator as the backing allocator - all memory is reclaimed on process exit
     const allocator = std.heap.page_allocator;
 
     const args = try std.process.argsAlloc(allocator);
@@ -286,10 +283,17 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "test")) {
         if (args.len < 3) {
             try printErr("Error: test requires a filename\n");
-            try printErr("Usage: cot test <file.cot>\n");
+            try printErr("Usage: cot test <file.cot> [--filter=<name>]\n");
             return;
         }
-        runTests(allocator, args[2]) catch |err| {
+        // Parse optional --filter argument
+        var filter: ?[]const u8 = null;
+        for (args[3..]) |arg| {
+            if (std.mem.startsWith(u8, arg, "--filter=")) {
+                filter = arg["--filter=".len..];
+            }
+        }
+        runTests(allocator, args[2], filter) catch |err| {
             if (err == error.TestsFailed) {
                 // Test failure already reported - exit with non-zero code
                 std.process.exit(1);
@@ -525,8 +529,15 @@ fn traceFileAuto(allocator: std.mem.Allocator, filename: []const u8, level: trac
 }
 
 fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: trace_mod.TraceLevel) !void {
-    // Try to dispatch to external frontend
-    if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{})) {
+    // Try to dispatch to external frontend with trace level argument
+    const level_str: []const u8 = switch (level) {
+        .none => "--level=none",
+        .routines => "--level=routines",
+        .opcodes => "--level=opcodes",
+        .verbose => "--level=verbose",
+        .full => "--level=full",
+    };
+    if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{ "trace", level_str })) {
         return;
     }
 
@@ -762,17 +773,23 @@ fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: 
     try printStderr("Duration: {d}ms\n", .{tracer.stats.durationMs()});
 }
 
-fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: ?[]const u8) !void {
+fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, output_file: ?[]const u8) !void {
     // Try to dispatch to external frontend
     if (output_file) |of| {
-        if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{ "compile", "-o", of })) {
+        if (try tryDispatchToFrontend(backing_allocator, filename, &[_][]const u8{ "compile", "-o", of })) {
             return;
         }
     } else {
-        if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{"compile"})) {
+        if (try tryDispatchToFrontend(backing_allocator, filename, &[_][]const u8{"compile"})) {
             return;
         }
     }
+
+    // Use arena allocator for all compilation phases - enables bulk deallocation,
+    // better cache locality, and faster allocation (bump pointer)
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const compiler = cot.compiler;
     const DiagnosticCollector = compiler.DiagnosticCollector;
@@ -781,7 +798,7 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
 
     // Initialize diagnostic collector
     var collector = DiagnosticCollector.init(allocator);
-    defer collector.deinit();
+    // No defer collector.deinit() needed - arena handles cleanup
 
     // Read source file
     const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
@@ -791,7 +808,7 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
     defer file.close();
 
     const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
-    defer allocator.free(source);
+    // No defer allocator.free(source) needed - arena handles cleanup
 
     // Cache source for diagnostic context
     collector.cacheSource(filename, source) catch {};
@@ -809,18 +826,18 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
         formatter.printToStderr(&collector, .{ .use_color = true });
         return;
     };
-    defer allocator.free(tokens);
+    // No defer allocator.free(tokens) needed - arena handles cleanup
 
     // Create NodeStore and StringInterner for new parser
     var strings = cot.base.StringInterner.init(allocator);
-    defer strings.deinit();
+    // No defer strings.deinit() needed - arena handles cleanup
 
     var store = cot.ast.NodeStore.init(allocator, &strings);
-    defer store.deinit();
+    // No defer store.deinit() needed - arena handles cleanup
 
     // Parse
     var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
-    defer parse.deinit();
+    // No defer parse.deinit() needed - arena handles cleanup
     const top_level = parse.parse() catch |err| {
         // Report parser's collected errors
         for (parse.errors.items) |parse_err| {
@@ -877,7 +894,7 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
         formatter.printToStderr(&collector, .{ .use_color = true });
         return;
     };
-    defer ir_module.deinit();
+    // No defer ir_module.deinit() needed - arena handles cleanup
 
     // Type check the IR
     const TypeChecker = compiler.TypeChecker;
@@ -895,7 +912,7 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
 
     // Emit bytecode from IR
     var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
-    defer emitter.deinit();
+    // No defer emitter.deinit() needed - arena handles cleanup
 
     var mod = emitter.emit(ir_module) catch |err| {
         collector.addError(
@@ -908,7 +925,7 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
         formatter.printToStderr(&collector, .{ .use_color = true });
         return;
     };
-    defer mod.deinit();
+    // No defer mod.deinit() needed - arena handles cleanup
 
     // Determine output filename
     const out_name = if (output_file) |of|
@@ -970,10 +987,21 @@ fn compileFile(allocator: std.mem.Allocator, filename: []const u8, output_file: 
 }
 
 /// Run inline tests in a Cot source file
-fn runTests(allocator: std.mem.Allocator, filename: []const u8) !void {
+fn runTests(allocator: std.mem.Allocator, filename: []const u8, filter: ?[]const u8) !void {
     // Try to dispatch to external frontend
-    if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{"test"})) {
-        return;
+    if (filter) |f| {
+        var filter_arg_buf: [256]u8 = undefined;
+        const filter_arg = std.fmt.bufPrint(&filter_arg_buf, "--filter={s}", .{f}) catch {
+            try printStderr("Error: filter name too long\n", .{});
+            return;
+        };
+        if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{ "test", filter_arg })) {
+            return;
+        }
+    } else {
+        if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{"test"})) {
+            return;
+        }
     }
 
     const compiler = cot.compiler;
@@ -1064,6 +1092,7 @@ fn runTests(allocator: std.mem.Allocator, filename: []const u8) !void {
         formatter.printToStderr(&collector, .{ .use_color = true });
         return;
     };
+    defer allocator.destroy(ir_module);
     defer ir_module.deinit();
 
     // Discover test functions
@@ -1075,15 +1104,27 @@ fn runTests(allocator: std.mem.Allocator, filename: []const u8) !void {
 
     for (ir_module.functions.items) |func| {
         if (func.is_test) {
-            tests_found += 1;
             const test_name = func.test_name orelse func.name;
+
+            // Apply filter if specified
+            if (filter) |f| {
+                if (!std.mem.eql(u8, test_name, f)) {
+                    continue;
+                }
+            }
+
+            tests_found += 1;
 
             // Emit bytecode for this test function
             var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
             defer emitter.deinit();
 
             // Create a minimal module with just this test
+            // Note: We only deinit the functions list, not the functions themselves
+            // (they're owned by ir_module)
             var test_ir = cot.ir.Module.init(allocator, filename);
+            defer test_ir.functions.deinit(allocator);
+
             test_ir.addFunction(func) catch {
                 try printStdout("  \x1b[31m✗\x1b[0m {s}: failed to compile\n", .{test_name});
                 tests_failed += 1;
@@ -1136,11 +1177,16 @@ fn runTests(allocator: std.mem.Allocator, filename: []const u8) !void {
     }
 }
 
-fn dumpIR(allocator: std.mem.Allocator, filename: []const u8) !void {
+fn dumpIR(backing_allocator: std.mem.Allocator, filename: []const u8) !void {
     // Try to dispatch to external frontend
-    if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{"dump-ir"})) {
+    if (try tryDispatchToFrontend(backing_allocator, filename, &[_][]const u8{"dump-ir"})) {
         return;
     }
+
+    // Use arena allocator for all compilation phases
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     // Read source file
     const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
@@ -1150,7 +1196,6 @@ fn dumpIR(allocator: std.mem.Allocator, filename: []const u8) !void {
     defer file.close();
 
     const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
-    defer allocator.free(source);
 
     // Tokenize
     var lex = cot.lexer.Lexer.init(source);
@@ -1158,32 +1203,26 @@ fn dumpIR(allocator: std.mem.Allocator, filename: []const u8) !void {
         try printStderr("Lexer error: {}\n", .{err});
         return;
     };
-    defer allocator.free(tokens);
 
     // Create StringInterner and NodeStore for new parser API
     var strings = cot.base.StringInterner.init(allocator);
-    defer strings.deinit();
     var store = cot.ast.NodeStore.init(allocator, &strings);
-    defer store.deinit();
 
     // Parse
     var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
-    defer parse.deinit();
     const top_level = parse.parse() catch |err| {
         try printStderr("Parser error: {}\n", .{err});
         return;
     };
 
     // Lower to IR using NodeStore directly
-    var ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
         try printStderr("IR lowering error: {}\n", .{err});
         return;
     };
-    defer ir_module.deinit();
 
     // Print IR
     var output: std.ArrayList(u8) = .{};
-    defer output.deinit(allocator);
 
     var printer = cot.ir_printer.Printer.init(output.writer(allocator).any());
     printer.printModule(ir_module) catch |err| {
@@ -1200,11 +1239,16 @@ fn dumpIR(allocator: std.mem.Allocator, filename: []const u8) !void {
     try stdout.flush();
 }
 
-fn disasmFile(allocator: std.mem.Allocator, filename: []const u8) !void {
+fn disasmFile(backing_allocator: std.mem.Allocator, filename: []const u8) !void {
     // Try to dispatch to external frontend
-    if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{"disasm"})) {
+    if (try tryDispatchToFrontend(backing_allocator, filename, &[_][]const u8{"disasm"})) {
         return;
     }
+
+    // Use arena allocator for all compilation phases
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     // Read source file
     const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
@@ -1214,10 +1258,8 @@ fn disasmFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     defer file.close();
 
     const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
-    defer allocator.free(source);
 
     var mod: cot.bytecode.Module = undefined;
-    var owns_module = false;
 
     // Check if it's a bytecode file or source file
     if (std.mem.endsWith(u8, filename, ".cbo") or
@@ -1230,7 +1272,6 @@ fn disasmFile(allocator: std.mem.Allocator, filename: []const u8) !void {
             try printStderr("Error: Invalid bytecode file: {}\n", .{err});
             return;
         };
-        owns_module = true;
     } else {
         // Compile source to bytecode first using IR pipeline
         var lex = cot.lexer.Lexer.init(source);
@@ -1238,16 +1279,12 @@ fn disasmFile(allocator: std.mem.Allocator, filename: []const u8) !void {
             try printStderr("Lexer error: {}\n", .{err});
             return;
         };
-        defer allocator.free(tokens);
 
         // Create StringInterner and NodeStore for new parser API
         var strings = cot.base.StringInterner.init(allocator);
-        defer strings.deinit();
         var store = cot.ast.NodeStore.init(allocator, &strings);
-        defer store.deinit();
 
         var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
-        defer parse.deinit();
         const top_level = parse.parse() catch |err| {
             try printStderr("Parser error: {}\n", .{err});
             return;
@@ -1258,26 +1295,22 @@ fn disasmFile(allocator: std.mem.Allocator, filename: []const u8) !void {
             try printStderr("IR lowering error: {}\n", .{err});
             return;
         };
-        defer ir_module.deinit();
 
         // Run optimization passes
         _ = cot.ir_optimize.optimize(ir_module, .{});
 
         // Emit bytecode
         var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
-        defer emitter.deinit();
 
         mod = emitter.emit(ir_module) catch |err| {
             try printStderr("Bytecode emission error: {}\n", .{err});
             return;
         };
-        owns_module = true;
     }
-    defer if (owns_module) mod.deinit();
+    // No defer mod.deinit() needed - arena handles cleanup
 
     // Disassemble
     var output: std.ArrayList(u8) = .{};
-    defer output.deinit(allocator);
 
     var disasm = cot.bytecode.Disassembler.init(&mod, output.writer(allocator));
     disasm.disassembleModule() catch |err| {

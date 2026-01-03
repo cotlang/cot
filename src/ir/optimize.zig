@@ -63,6 +63,9 @@ pub fn optimize(module: *ir.Module, options: OptOptions) OptStats {
 
     // Run passes on each function
     for (module.functions.items) |func| {
+        // Build CFG edges for predecessor/successor analysis
+        buildCFGEdges(func);
+
         if (options.constant_folding) {
             stats.constants_folded += constantFoldFunction(func);
         }
@@ -82,6 +85,48 @@ pub fn optimize(module: *ir.Module, options: OptOptions) OptStats {
     }
 
     return stats;
+}
+
+/// Build CFG edges (predecessor/successor lists) from terminators
+fn buildCFGEdges(func: *ir.Function) void {
+    // Clear existing edges
+    for (func.blocks.items) |block| {
+        block.predecessors.clearRetainingCapacity();
+        block.successors.clearRetainingCapacity();
+    }
+
+    // Build edges from terminators
+    for (func.blocks.items) |block| {
+        if (block.instructions.items.len == 0) continue;
+
+        const last = block.instructions.items[block.instructions.items.len - 1];
+        switch (last) {
+            .jump => |br| {
+                // Unconditional jump
+                block.successors.append(block.allocator, br.target) catch {};
+                br.target.predecessors.append(br.target.allocator, block) catch {};
+            },
+            .brif => |cond| {
+                // Conditional branch - two successors
+                block.successors.append(block.allocator, cond.then_block) catch {};
+                block.successors.append(block.allocator, cond.else_block) catch {};
+                cond.then_block.predecessors.append(cond.then_block.allocator, block) catch {};
+                cond.else_block.predecessors.append(cond.else_block.allocator, block) catch {};
+            },
+            .br_table => |sw| {
+                // Switch - default + all cases
+                block.successors.append(block.allocator, sw.default) catch {};
+                sw.default.predecessors.append(sw.default.allocator, block) catch {};
+                for (sw.cases) |case| {
+                    block.successors.append(block.allocator, case.target) catch {};
+                    case.target.predecessors.append(case.target.allocator, block) catch {};
+                }
+            },
+            else => {
+                // No control flow edges for return, trap, etc.
+            },
+        }
+    }
 }
 
 // ============================================================================
@@ -326,6 +371,11 @@ const ConstValue = union(enum) {
 
 /// Find the constant value that defines the given SSA value, if any
 fn findConstantValue(block: *ir.Block, value: ir.Value) ?ConstValue {
+    return findConstantValueWithVisited(block, value, null);
+}
+
+/// Find constant value with cycle detection for predecessor analysis
+fn findConstantValueWithVisited(block: *ir.Block, value: ir.Value, visited: ?*std.AutoHashMap(*ir.Block, void)) ?ConstValue {
     // Search backwards in the current block for the defining instruction
     for (block.instructions.items) |inst| {
         switch (inst) {
@@ -360,7 +410,39 @@ fn findConstantValue(block: *ir.Block, value: ir.Value) ?ConstValue {
         }
     }
 
-    // TODO: Look in predecessor blocks for more complete analysis
+    // Search predecessor blocks if CFG is available
+    if (block.predecessors.items.len > 0) {
+        // Create visited set for cycle detection if not provided
+        var local_visited = std.AutoHashMap(*ir.Block, void).init(block.allocator);
+        defer if (visited == null) local_visited.deinit();
+        var visit_set = visited orelse &local_visited;
+
+        // Mark current block as visited
+        visit_set.put(block, {}) catch return null;
+
+        // Search each predecessor
+        var found_value: ?ConstValue = null;
+        for (block.predecessors.items) |pred| {
+            // Skip already visited blocks to avoid infinite loops
+            if (visit_set.get(pred) != null) continue;
+
+            if (findConstantValueWithVisited(pred, value, visit_set)) |const_val| {
+                if (found_value) |existing| {
+                    // If we find different values from different paths, we can't fold
+                    const same = switch (existing) {
+                        .int => |a| const_val == .int and a == const_val.int,
+                        .float => |a| const_val == .float and a == const_val.float,
+                        .bool => |a| const_val == .bool and a == const_val.bool,
+                    };
+                    if (!same) return null;
+                } else {
+                    found_value = const_val;
+                }
+            }
+        }
+        return found_value;
+    }
+
     return null;
 }
 
@@ -581,6 +663,14 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         },
         .map_values => |m| {
             used.put(m.map.id, {}) catch {};
+        },
+        .select => |s| {
+            used.put(s.condition.id, {}) catch {};
+            used.put(s.true_val.id, {}) catch {};
+            used.put(s.false_val.id, {}) catch {};
+        },
+        .ptr_offset => |p| {
+            used.put(p.base_ptr.id, {}) catch {};
         },
     }
 }

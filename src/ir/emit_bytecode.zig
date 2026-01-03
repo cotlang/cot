@@ -551,6 +551,13 @@ pub const BytecodeEmitter = struct {
             .log_or => |l| try emit_inst.emitBinaryArith(self, .log_or, l.lhs, l.rhs, l.result),
             .log_not => |l| try emit_inst.emitLogNot(self, l),
 
+            // Null/optional operations
+            .is_null => |n| try emit_inst.emitIsNull(self, n),
+            .select => |s| try emit_inst.emitSelect(self, s),
+
+            // Pointer operations
+            .ptr_offset => |p| try emit_inst.emitPtrOffset(self, p),
+
             // String operations
             .str_concat => |s| try emit_inst.emitStrConcat(self, s),
             .str_slice => |s| try emit_inst.emitStrSlice(self, s),

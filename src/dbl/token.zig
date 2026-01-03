@@ -64,6 +64,10 @@ pub const TokenType = enum {
     cast_integer, // ^i or ^I
     cast_float, // ^f or ^F
 
+    // Builtin operators (DBL legacy)
+    builtin_null, // ^null - check if value is null
+    builtin_size, // ^size - get size/length of value
+
     // Multi-character tokens
     arrow, // ->
     fat_arrow, // =>

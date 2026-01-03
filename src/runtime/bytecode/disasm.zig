@@ -281,10 +281,27 @@ pub const Disassembler = struct {
             },
 
             // Unary logical/bitwise: [rd:4|rs:4] [0]
-            .log_not, .bit_not => {
+            .log_not, .bit_not, .is_null => {
                 const rd: u4 = @truncate(operands[0] >> 4);
                 const rs: u4 = @truncate(operands[0] & 0xF);
                 try self.writer.print(" r{}, r{}", .{ rd, rs });
+            },
+
+            // select rd, rcond, rtrue, rfalse - [rd:4|rcond:4] [rtrue:4|rfalse:4]
+            .select => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rcond: u4 = @truncate(operands[0] & 0xF);
+                const rtrue: u4 = @truncate(operands[1] >> 4);
+                const rfalse: u4 = @truncate(operands[1] & 0xF);
+                try self.writer.print(" r{}, r{}, r{}, r{}", .{ rd, rcond, rtrue, rfalse });
+            },
+
+            // ptr_offset rd, rs, offset - [rd:4|rs:4] [offset:16]
+            .ptr_offset => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                const offset: i16 = @bitCast(operands[1..3].*);
+                try self.writer.print(" r{}, r{}, {}", .{ rd, rs, offset });
             },
 
             // ============================================

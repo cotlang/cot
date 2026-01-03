@@ -143,8 +143,8 @@ pub const Emitter = struct {
         switch (tag) {
             .fn_def => try self.emitFnDef(idx),
             .struct_def => try self.emitStructDef(idx),
-            .union_def => {}, // TODO: implement union_def emission
-            .field_view => {}, // TODO: implement field_view emission
+            .union_def => try self.emitUnionDef(idx),
+            .field_view => try self.emitFieldView(idx),
             .enum_def => try self.emitEnumDef(idx),
             .trait_def => try self.emitTraitDef(idx),
             .impl_block => try self.emitImplBlock(idx),
@@ -205,6 +205,9 @@ pub const Emitter = struct {
             .if_expr => try self.emitIfExpr(idx),
             .match_expr => try self.emitMatchExpr(idx),
             .block_expr => try self.emitBlockExpr(idx),
+            .optional_member => try self.emitOptionalMember(idx),
+            .optional_index => try self.emitOptionalIndex(idx),
+            .is_expr => try self.emitIsExpr(idx),
         }
     }
 
@@ -384,6 +387,56 @@ pub const Emitter = struct {
         try self.writer.writeAll("endstructure\n");
     }
 
+    fn emitUnionDef(self: *Self, idx: StmtIdx) anyerror!void {
+        const data = self.store.stmtData(idx);
+        const name: StringId = @enumFromInt(data.a);
+        const variants_start = data.b;
+
+        try self.writeIndent();
+        try self.writer.writeAll("union ");
+        try self.writeStringId(name);
+        try self.writer.writeAll(" {\n");
+
+        // Emit variants from extra_data
+        const variant_count = self.store.extra_data.items[variants_start];
+        self.indent_level += 1;
+        var i: usize = 0;
+        while (i < variant_count) : (i += 1) {
+            const variant_name: StringId = @enumFromInt(self.store.extra_data.items[variants_start + 1 + i * 2]);
+            const variant_type = TypeIdx.fromInt(self.store.extra_data.items[variants_start + 2 + i * 2]);
+            try self.writeIndent();
+            try self.writeStringId(variant_name);
+            if (variant_type != .null) {
+                try self.writer.writeAll(": ");
+                try self.emitType(variant_type);
+            }
+            try self.writer.writeAll(",\n");
+        }
+        self.indent_level -= 1;
+
+        try self.writeIndent();
+        try self.writer.writeAll("}\n");
+    }
+
+    fn emitFieldView(self: *Self, idx: StmtIdx) anyerror!void {
+        const data = self.store.stmtData(idx);
+        const name: StringId = @enumFromInt(data.a);
+        const extra_start = data.b;
+
+        // Extra data contains: base_field_id, offset, type_idx (optional)
+        const base_field_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start]);
+        const offset: i32 = @bitCast(self.store.extra_data.items[extra_start + 1]);
+
+        try self.writeIndent();
+        try self.writeStringId(name);
+        try self.writer.writeAll(", ");
+        try self.writeStringId(base_field_id);
+        if (offset != 0) {
+            try self.writer.print(" + {d}", .{offset});
+        }
+        try self.writer.writeByte('\n');
+    }
+
     fn emitEnumDef(self: *Self, idx: StmtIdx) anyerror!void {
         const data = self.store.stmtData(idx);
         const name: StringId = @enumFromInt(data.a);
@@ -513,13 +566,38 @@ pub const Emitter = struct {
     fn emitMatchStmt(self: *Self, idx: StmtIdx) anyerror!void {
         const data = self.store.stmtData(idx);
         const value = ExprIdx.fromInt(data.a);
+        const arms_start = data.b;
 
         try self.writeIndent();
         try self.writer.writeAll("match ");
         try self.emitExpression(value);
         try self.writer.writeAll(" {\n");
 
-        // TODO: Emit match arms
+        // Emit match arms from extra_data
+        const arm_count = self.store.extra_data.items[arms_start];
+        self.indent_level += 1;
+        var i: usize = 0;
+        while (i < arm_count) : (i += 1) {
+            const pattern = ExprIdx.fromInt(self.store.extra_data.items[arms_start + 1 + i * 2]);
+            const body = StmtIdx.fromInt(self.store.extra_data.items[arms_start + 2 + i * 2]);
+            try self.writeIndent();
+            try self.emitExpression(pattern);
+            try self.writer.writeAll(" => ");
+            // Check if body is a block or single statement
+            const body_tag = self.store.stmtTag(body);
+            if (body_tag == .block) {
+                try self.writer.writeAll("{\n");
+                self.indent_level += 1;
+                try self.emitStatement(body);
+                self.indent_level -= 1;
+                try self.writeIndent();
+                try self.writer.writeAll("}");
+            } else {
+                try self.emitStatement(body);
+            }
+            try self.writer.writeAll(",\n");
+        }
+        self.indent_level -= 1;
 
         try self.writeIndent();
         try self.writer.writeAll("}\n");
@@ -734,23 +812,50 @@ pub const Emitter = struct {
     fn emitComptimeIf(self: *Self, idx: StmtIdx) anyerror!void {
         const data = self.store.stmtData(idx);
         const condition = ExprIdx.fromInt(data.a);
+        const then_body = StmtIdx.fromInt(data.b >> 16);
+        const extra_start = data.b & 0xFFFF;
+        const else_body = StmtIdx.fromInt(self.store.extra_data.items[extra_start]);
 
         try self.writeIndent();
         try self.writer.writeAll("comptime if ");
         try self.emitExpression(condition);
         try self.writer.writeAll(" {\n");
 
-        // TODO: Emit comptime body
+        self.indent_level += 1;
+        try self.emitStatement(then_body);
+        self.indent_level -= 1;
+
+        if (else_body != .null) {
+            try self.writeIndent();
+            try self.writer.writeAll("} else ");
+            // Check if else is another comptime_if (chained)
+            const else_tag = self.store.stmtTag(else_body);
+            if (else_tag == .comptime_if) {
+                // Inline the else-if
+                try self.emitComptimeIf(else_body);
+                return;
+            } else {
+                try self.writer.writeAll("{\n");
+                self.indent_level += 1;
+                try self.emitStatement(else_body);
+                self.indent_level -= 1;
+            }
+        }
 
         try self.writeIndent();
         try self.writer.writeAll("}\n");
     }
 
-    fn emitComptimeBlock(self: *Self, _: StmtIdx) anyerror!void {
+    fn emitComptimeBlock(self: *Self, idx: StmtIdx) anyerror!void {
+        const data = self.store.stmtData(idx);
+        const body = StmtIdx.fromInt(data.a);
+
         try self.writeIndent();
         try self.writer.writeAll("comptime {\n");
 
-        // TODO: Emit comptime block body
+        self.indent_level += 1;
+        try self.emitStatement(body);
+        self.indent_level -= 1;
 
         try self.writeIndent();
         try self.writer.writeAll("}\n");
@@ -888,6 +993,7 @@ pub const Emitter = struct {
                 .trunc => "#", // Truncating round
                 .range => "..",
                 .range_inclusive => "..=",
+                .null_coalesce => "??",
             });
         } else {
             // DBL-style operators
@@ -914,6 +1020,7 @@ pub const Emitter = struct {
                 .trunc => "#", // Truncating round
                 .range => "..",
                 .range_inclusive => "..=",
+                .null_coalesce => "??",
             });
         }
     }
@@ -1024,6 +1131,34 @@ pub const Emitter = struct {
     fn emitBlockExpr(self: *Self, idx: ExprIdx) anyerror!void {
         _ = idx;
         try self.writer.writeAll("{ ... }");
+    }
+
+    fn emitOptionalMember(self: *Self, idx: ExprIdx) anyerror!void {
+        const data = self.store.exprData(idx);
+        const object_idx: ExprIdx = @enumFromInt(data.a);
+        const member_id: StringId = @enumFromInt(data.b);
+        try self.emitExpression(object_idx);
+        try self.writer.writeAll("?.");
+        try self.writeStringId(member_id);
+    }
+
+    fn emitOptionalIndex(self: *Self, idx: ExprIdx) anyerror!void {
+        const data = self.store.exprData(idx);
+        const object_idx: ExprIdx = @enumFromInt(data.a);
+        const index_idx: ExprIdx = @enumFromInt(data.b);
+        try self.emitExpression(object_idx);
+        try self.writer.writeAll("?[");
+        try self.emitExpression(index_idx);
+        try self.writer.writeAll("]");
+    }
+
+    fn emitIsExpr(self: *Self, idx: ExprIdx) anyerror!void {
+        const data = self.store.exprData(idx);
+        const expr_idx: ExprIdx = @enumFromInt(data.a);
+        const type_idx: TypeIdx = @enumFromInt(data.b);
+        try self.emitExpression(expr_idx);
+        try self.writer.writeAll(" is ");
+        try self.emitType(type_idx);
     }
 
     // ========================================

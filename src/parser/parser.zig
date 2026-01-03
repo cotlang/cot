@@ -1126,12 +1126,14 @@ pub const Parser = struct {
         }
 
         // Check for compound assignment
-        if (self.match(&[_]TokenType{ .plus_equals, .minus_equals, .star_equals, .slash_equals })) {
+        if (self.match(&[_]TokenType{ .plus_equals, .minus_equals, .star_equals, .slash_equals, .pipe_equals, .amp_equals })) {
             const op: BinaryOp = switch (self.previous().type) {
                 .plus_equals => .add,
                 .minus_equals => .sub,
                 .star_equals => .mul,
                 .slash_equals => .div,
+                .pipe_equals => .bit_or,
+                .amp_equals => .bit_and,
                 else => unreachable,
             };
             const rhs = try self.parseExpression();
@@ -1186,6 +1188,12 @@ pub const Parser = struct {
             // Handle cast operator (as)
             if (pratt.isCastOperator(self.peek().type)) {
                 left = try self.parseCastOp(left);
+                continue;
+            }
+
+            // Handle type test operator (is)
+            if (pratt.isTypeTestOperator(self.peek().type)) {
+                left = try self.parseIsOp(left);
                 continue;
             }
 
@@ -1268,6 +1276,18 @@ pub const Parser = struct {
         const args = self.allocator.dupe(ExprIdx, &args_buf) catch return error.OutOfMemory;
 
         return self.store.addCall(func_expr, args, loc) catch return error.OutOfMemory;
+    }
+
+    /// Parse a type test operator: expr is Type
+    /// Returns a boolean expression that tests if expr is of type Type
+    fn parseIsOp(self: *Self, left: ExprIdx) ParseError!ExprIdx {
+        _ = self.advance(); // consume 'is'
+        const loc = self.currentLoc();
+
+        // Parse the target type
+        const type_idx = try self.parseType();
+
+        return self.store.addIsExpr(left, type_idx, loc) catch return error.OutOfMemory;
     }
 
     /// Parse postfix operators (call, index, member access)

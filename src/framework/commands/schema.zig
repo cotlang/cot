@@ -150,40 +150,158 @@ fn runDiff(allocator: Allocator, options: SchemaOptions) !void {
         return;
     };
 
+    const project_path = project_info.project_path orelse ".";
+
     const schema_path = try std.fs.path.join(allocator, &.{
-        project_info.project_path orelse ".",
+        project_path,
         schema_config.file,
     });
     defer allocator.free(schema_path);
 
-    var schema_file = schema.parseSchemaFile(allocator, schema_path) catch |err| {
+    var new_schema = schema.parseSchemaFile(allocator, schema_path) catch |err| {
         try stdout.print("Error loading schema file: {}\n", .{err});
         try stdout_writer.interface.flush();
         return error.SchemaLoadFailed;
     };
-    defer schema_file.deinit();
+    defer new_schema.deinit();
 
     try stdout.print("\n", .{});
     try stdout.print("  Schema Diff\n", .{});
     try stdout.print("  ===========\n", .{});
     try stdout.print("\n", .{});
 
-    // TODO: Compare with actual database schema
-    // For now, just show the schema file contents as "new"
-    try stdout.print("  Note: Database comparison not yet implemented.\n", .{});
-    try stdout.print("  Showing schema file contents as reference:\n", .{});
-    try stdout.print("\n", .{});
+    // Try to load previous schema version from migrations/applied directory
+    const applied_schema_path = try std.fs.path.join(allocator, &.{
+        project_path,
+        "migrations",
+        "applied.schema.cot",
+    });
+    defer allocator.free(applied_schema_path);
 
-    for (schema_file.tables) |table| {
-        try stdout.print("  + Table: {s}\n", .{table.name});
-        for (table.fields) |field| {
-            const type_str = dataTypeToString(field.data_type);
-            try stdout.print("    + {s: <20} {s}\n", .{ field.name, type_str });
+    var old_schema_result = schema.parseSchemaFile(allocator, applied_schema_path);
+    if (old_schema_result) |*old_schema| {
+        defer old_schema.deinit();
+
+        // Use the diff module to compare schemas
+        var schema_diff = schema.diff.diff(allocator, old_schema, &new_schema) catch |err| {
+            try stdout.print("  Error computing diff: {}\n", .{err});
+            try stdout_writer.interface.flush();
+            return;
+        };
+        defer schema_diff.deinit();
+
+        if (!schema_diff.has_changes) {
+            try stdout.print("  No changes detected.\n", .{});
+            try stdout.print("  Schema is up to date (version {d}).\n", .{new_schema.version});
+        } else {
+            try stdout.print("  Comparing version {d} → {d}\n\n", .{ old_schema.version, new_schema.version });
+            try printSchemaDiff(stdout, &schema_diff, options.verbose);
+        }
+    } else |_| {
+        // No previous schema found - show current as new
+        try stdout.print("  No previous schema snapshot found.\n", .{});
+        try stdout.print("  To enable schema comparison:\n", .{});
+        try stdout.print("    1. Run 'cot schema apply' to create initial migration\n", .{});
+        try stdout.print("    2. The applied schema will be saved for future comparisons\n", .{});
+        try stdout.print("\n", .{});
+        try stdout.print("  Current schema file (version {d}):\n\n", .{new_schema.version});
+
+        for (new_schema.tables) |table| {
+            try stdout.print("  + Table: {s}\n", .{table.name});
+            for (table.fields) |field| {
+                const type_str = dataTypeToString(field.data_type);
+                try stdout.print("    + {s: <20} {s}\n", .{ field.name, type_str });
+            }
         }
     }
 
     try stdout.print("\n", .{});
     try stdout_writer.interface.flush();
+}
+
+/// Print a schema diff in a human-readable format
+fn printSchemaDiff(stdout: anytype, schema_diff: *const schema.SchemaDiff, verbose: bool) !void {
+    // Added tables
+    if (schema_diff.added_tables.len > 0) {
+        try stdout.print("  Added Tables:\n", .{});
+        for (schema_diff.added_tables) |table| {
+            try stdout.print("    \x1b[32m+ {s}\x1b[0m\n", .{table.name});
+            if (verbose) {
+                for (table.fields) |field| {
+                    const type_str = dataTypeToString(field.data_type);
+                    try stdout.print("        {s: <20} {s}\n", .{ field.name, type_str });
+                }
+            }
+        }
+        try stdout.print("\n", .{});
+    }
+
+    // Removed tables
+    if (schema_diff.removed_tables.len > 0) {
+        try stdout.print("  Removed Tables:\n", .{});
+        for (schema_diff.removed_tables) |name| {
+            try stdout.print("    \x1b[31m- {s}\x1b[0m\n", .{name});
+        }
+        try stdout.print("\n", .{});
+    }
+
+    // Modified tables
+    if (schema_diff.modified_tables.len > 0) {
+        try stdout.print("  Modified Tables:\n", .{});
+        for (schema_diff.modified_tables) |table_diff| {
+            try stdout.print("    \x1b[33m~ {s}\x1b[0m\n", .{table_diff.name});
+
+            // Added fields
+            for (table_diff.added_fields) |field| {
+                const type_str = dataTypeToString(field.data_type);
+                try stdout.print("        \x1b[32m+ {s: <20} {s}\x1b[0m\n", .{ field.name, type_str });
+            }
+
+            // Removed fields
+            for (table_diff.removed_fields) |name| {
+                try stdout.print("        \x1b[31m- {s}\x1b[0m\n", .{name});
+            }
+
+            // Modified fields
+            for (table_diff.modified_fields) |field_diff| {
+                const old_type = dataTypeToString(field_diff.old_field.data_type);
+                const new_type = dataTypeToString(field_diff.new_field.data_type);
+                const change_desc = switch (field_diff.change_type) {
+                    .type_changed => "type changed",
+                    .size_increased => "size increased",
+                    .size_decreased => "size decreased",
+                    .precision_changed => "precision changed",
+                    .decorators_changed => "decorators changed",
+                    .multiple_changes => "multiple changes",
+                };
+                try stdout.print("        \x1b[33m~ {s}: {s} → {s} ({s})\x1b[0m\n", .{
+                    field_diff.name,
+                    old_type,
+                    new_type,
+                    change_desc,
+                });
+            }
+        }
+        try stdout.print("\n", .{});
+    }
+
+    // Added keys
+    if (schema_diff.added_keys.len > 0) {
+        try stdout.print("  Added Keys:\n", .{});
+        for (schema_diff.added_keys) |key| {
+            try stdout.print("    \x1b[32m+ {s}.{s}\x1b[0m\n", .{ key.table_name, key.name });
+        }
+        try stdout.print("\n", .{});
+    }
+
+    // Removed keys
+    if (schema_diff.removed_keys.len > 0) {
+        try stdout.print("  Removed Keys:\n", .{});
+        for (schema_diff.removed_keys) |key_id| {
+            try stdout.print("    \x1b[31m- {s}\x1b[0m\n", .{key_id});
+        }
+        try stdout.print("\n", .{});
+    }
 }
 
 /// Generate a migration file
