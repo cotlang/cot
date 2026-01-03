@@ -278,22 +278,40 @@ const Handlers = struct {
 
     /// Handle textDocument/formatting request
     fn formatting(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
-        const text_document = params.object.get("textDocument") orelse
-            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
-        const uri = text_document.object.get("uri") orelse
-            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        std.debug.print("LSP: formatting request received\n", .{});
 
-        const doc = server.getDocument(uri.string) orelse
+        const text_document = params.object.get("textDocument") orelse {
+            std.debug.print("LSP: no textDocument in params\n", .{});
             return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        };
+        const uri = text_document.object.get("uri") orelse {
+            std.debug.print("LSP: no uri in textDocument\n", .{});
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        };
+
+        std.debug.print("LSP: formatting uri={s}\n", .{uri.string});
+
+        const doc = server.getDocument(uri.string) orelse {
+            std.debug.print("LSP: document not found\n", .{});
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        };
+
+        std.debug.print("LSP: document found, language={s}, len={d}\n", .{@tagName(doc.language), doc.content.len});
 
         // Get formatting options
         const options = params.object.get("options") orelse JsonValue{ .object = JsonObject.init(allocator) };
         const tab_size: u32 = if (options.object.get("tabSize")) |ts| @intCast(ts.integer) else 4;
         const insert_spaces = if (options.object.get("insertSpaces")) |is| is.bool else true;
 
+        std.debug.print("LSP: tab_size={d}, insert_spaces={}\n", .{tab_size, insert_spaces});
+
         // Format the document
-        const edits = server_mod.formatDocument(allocator, doc, tab_size, insert_spaces) catch
+        const edits = server_mod.formatDocument(allocator, doc, tab_size, insert_spaces) catch |err| {
+            std.debug.print("LSP: formatDocument error: {}\n", .{err});
             return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        };
+
+        std.debug.print("LSP: formatDocument returned {d} edits\n", .{edits.len});
         defer allocator.free(edits);
 
         // Convert to JSON
