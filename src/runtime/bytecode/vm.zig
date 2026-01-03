@@ -1882,3 +1882,8 @@ test "vm: inline cache" {
     const ratio = cache.hitRatio();
     try std.testing.expect(ratio > 0.6 and ratio < 0.7);
 }
+
+// Pull in opcode handler tests
+test {
+    _ = @import("vm_opcodes_test.zig");
+}

@@ -199,6 +199,7 @@ pub const Parser = struct {
             .kw_record => self.parseRecord(),
             .kw_common => self.parseCommon(),
             .kw_literal => self.parseLiteral(),
+            .kw_enum => self.parseEnumDef(),
 
             // Testing
             .kw_test => self.parseTestDef(),
@@ -904,7 +905,65 @@ pub const Parser = struct {
         return result;
     }
 
-    /// Parse a test definition: test "name" ... endtest
+    /// Parse DBL enum definition: ENUM name / member = value / ... / ENDENUM
+    fn parseEnumDef(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = self.advance(); // consume 'enum'
+
+        // Parse enum name
+        const name_token = try self.consume(.identifier, "Expected enum name");
+        const name = try self.intern(name_token.lexeme);
+
+        // Parse variants into scratch buffer
+        self.store.markScratch() catch return ParseError.OutOfMemory;
+        errdefer self.store.rollbackScratch();
+
+        while (!self.check(.kw_endenum) and !self.isAtEnd()) {
+            // Parse variant: name = value or just name
+            if (self.check(.identifier)) {
+                const variant_token = self.advance();
+                const variant_name = try self.intern(variant_token.lexeme);
+
+                // Store variant name in scratch
+                self.store.pushScratchU32(@intFromEnum(variant_name)) catch return ParseError.OutOfMemory;
+
+                // Optional = value (DBL allows explicit values)
+                if (self.match(&[_]TokenType{.equals})) {
+                    // Skip the value expression (consumed for syntax but AST only stores names)
+                    _ = self.parseExpression() catch {};
+                }
+            } else {
+                // Skip unexpected tokens
+                _ = self.advance();
+            }
+        }
+
+        _ = try self.consume(.kw_endenum, "Expected 'endenum'");
+
+        // Get variants from scratch
+        const variants = self.store.getScratchU32s();
+        self.store.commitScratch();
+
+        // Store enum def: count followed by variant name StringIds
+        const variants_start = self.store.extra_data.items.len;
+        self.store.extra_data.append(self.allocator, @intCast(variants.len)) catch return ParseError.OutOfMemory;
+        for (variants) |v| {
+            self.store.extra_data.append(self.allocator, v) catch return ParseError.OutOfMemory;
+        }
+
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));
+        self.store.stmt_tags.append(self.allocator, .enum_def) catch return ParseError.OutOfMemory;
+        self.store.stmt_locs.append(self.allocator, loc) catch return ParseError.OutOfMemory;
+        self.store.stmt_data.append(self.allocator, .{
+            .a = @intFromEnum(name),
+            .b = @intCast(variants_start),
+        }) catch return ParseError.OutOfMemory;
+
+        return idx;
+    }
+
+    /// Parse a test definition: test "name" record ... proc ... endtest
+    /// Follows same pattern as main: record block(s) -> proc -> statements
     fn parseTestDef(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = self.advance(); // consume 'test'
@@ -916,10 +975,30 @@ pub const Parser = struct {
         const name_str = if (name_lexeme.len >= 2) name_lexeme[1 .. name_lexeme.len - 1] else name_lexeme;
         const name = try self.intern(name_str);
 
-        // Parse body until endtest
-        var stmts: std.ArrayListUnmanaged(StmtIdx) = .{};
-        errdefer stmts.deinit(self.allocator);
+        // Parse variable declarations until PROC (record block) - same as parseMain
+        var var_decls: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer var_decls.deinit(self.allocator);
 
+        while (!self.check(.kw_proc) and !self.check(.kw_endtest) and !self.isAtEnd()) {
+            if (self.check(.kw_record)) {
+                // Handle record block for local variables
+                const record_block = try self.parseRecord();
+                var_decls.append(self.allocator, record_block) catch return ParseError.OutOfMemory;
+            } else {
+                _ = self.advance();
+            }
+        }
+        _ = self.match(&[_]TokenType{.kw_proc});
+
+        var body: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer body.deinit(self.allocator);
+
+        // Add variable declarations to body first
+        for (var_decls.items) |decl| {
+            body.append(self.allocator, decl) catch return ParseError.OutOfMemory;
+        }
+
+        // Parse statements until endtest
         while (!self.check(.kw_endtest) and !self.isAtEnd()) {
             const stmt = self.parseStatement() catch |err| {
                 if (err == ParseError.InvalidStatement) {
@@ -927,16 +1006,17 @@ pub const Parser = struct {
                 }
                 return err;
             };
-            stmts.append(self.allocator, stmt) catch return ParseError.OutOfMemory;
+            body.append(self.allocator, stmt) catch return ParseError.OutOfMemory;
         }
 
         _ = try self.consume(.kw_endtest, "Expected 'endtest'");
 
         // Wrap in block
-        const body = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
-        stmts.deinit(self.allocator);
+        const block_idx = self.store.addBlock(body.items, loc) catch return ParseError.OutOfMemory;
+        body.deinit(self.allocator);
+        var_decls.deinit(self.allocator);
 
-        return self.store.addTestDef(name, body, loc) catch return ParseError.OutOfMemory;
+        return self.store.addTestDef(name, block_idx, loc) catch return ParseError.OutOfMemory;
     }
 
     // ============================================================
@@ -1459,8 +1539,8 @@ pub const Parser = struct {
         var current_offset: i32 = 0;
         var first_field_id: ?base.StringId = null;
 
-        // Parse variable declarations until endrecord
-        while (!self.check(.kw_endrecord) and !self.isAtEnd()) {
+        // Parse variable declarations until endrecord, proc, or next record (implicit end)
+        while (!self.check(.kw_endrecord) and !self.check(.kw_proc) and !self.check(.kw_record) and !self.isAtEnd()) {
             if (self.check(.identifier)) {
                 const var_name_tok = self.advance();
                 const var_name_id = try self.intern(var_name_tok.lexeme);
@@ -1547,7 +1627,8 @@ pub const Parser = struct {
             }
         }
 
-        _ = try self.consume(.kw_endrecord, "Expected 'endrecord'");
+        // endrecord is optional - proc or next record implicitly ends current record
+        _ = self.match(&[_]TokenType{.kw_endrecord});
 
         // Update last_record_base_field for future overlays (only for non-overlay records)
         if (!is_overlay and first_field_id != null) {
@@ -2754,6 +2835,7 @@ pub const Parser = struct {
                 .kw_begin, .kw_end, .kw_endmain, .kw_endfunction, .kw_endsubroutine,
                 .kw_return, .kw_xreturn, .kw_freturn, .kw_mreturn, .kw_proc,
                 .kw_structure, .kw_endstructure, .kw_record, .kw_endrecord,
+                .kw_enum, .kw_endenum,
                 .kw_using, .kw_endusing, .kw_onerror, .kw_offerror, .kw_clear,
                 .kw_endwhile,
                 => return,

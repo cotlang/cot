@@ -3,6 +3,11 @@
 //! Initializes a new Cot workspace in the current directory.
 
 const std = @import("std");
+
+// Pull in command tests
+test {
+    _ = @import("commands_test.zig");
+}
 const config = @import("../config.zig");
 const workspace = @import("../workspace.zig");
 const Allocator = std.mem.Allocator;

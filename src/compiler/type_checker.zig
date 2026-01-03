@@ -377,3 +377,8 @@ test "type checker initialization" {
     // Should have no errors on empty module
     try std.testing.expect(!checker.hasErrors());
 }
+
+// Pull in comprehensive type checker tests
+test {
+    _ = @import("type_checker_test.zig");
+}

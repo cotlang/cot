@@ -1,0 +1,35 @@
+// Function definitions and calls test fixture
+
+fn identity(x: i64) i64 {
+    return x
+}
+
+fn double(x: i64) i64 {
+    return x * 2
+}
+
+fn triple(x: i64) i64 {
+    return x * 3
+}
+
+fn recursive_sum(n: i64) i64 {
+    if n <= 0 {
+        return 0
+    }
+    return n + recursive_sum(n - 1)
+}
+
+fn fibonacci(n: i64) i64 {
+    if n <= 1 {
+        return n
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2)
+}
+
+fn main() {
+    var a = identity(42)
+    var b = double(21)
+    var c = triple(5)
+    var d = recursive_sum(10)
+    var e = fibonacci(10)
+}

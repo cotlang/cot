@@ -366,3 +366,8 @@ test "router param routes" {
         m.deinit();
     }
 }
+
+// Pull in comprehensive HTTP tests
+test {
+    _ = @import("http_test.zig");
+}

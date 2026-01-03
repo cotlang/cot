@@ -1,0 +1,36 @@
+# Valgrind Suppressions for Cot
+#
+# This file contains suppressions for known false positives
+# and platform-specific memory behavior.
+
+# Zig runtime allocator internals
+{
+   zig_gpa_init
+   Memcheck:Leak
+   ...
+   fun:*GeneralPurposeAllocator*
+}
+
+# macOS-specific suppressions (if running on Linux with cross-compiled artifacts)
+{
+   macos_dyld
+   Memcheck:Leak
+   ...
+   obj:/usr/lib/dyld
+}
+
+# SQLite internal allocations (managed by SQLite)
+{
+   sqlite_internal
+   Memcheck:Leak
+   ...
+   fun:sqlite3*
+}
+
+# TUI library internal state (if using terminal UI)
+{
+   tui_internal
+   Memcheck:Leak
+   ...
+   fun:*tui*
+}

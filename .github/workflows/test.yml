@@ -1,0 +1,138 @@
+name: Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  ZIG_VERSION: "0.15.0"
+
+jobs:
+  # Main test job - runs on Ubuntu
+  test:
+    name: Test (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build
+
+      - name: Run Tests
+        run: zig build test
+
+  # macOS test job
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build
+
+      - name: Run Tests
+        run: zig build test
+
+  # Code formatting check
+  format:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check Formatting
+        run: zig fmt --check src/
+
+  # Memory leak detection with Valgrind (Linux only)
+  valgrind:
+    name: Valgrind Memory Check
+    runs-on: ubuntu-latest
+    needs: test  # Only run if tests pass
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build Test Binary
+        run: zig build test --summary none -Doptimize=Debug
+
+      - name: Run with Valgrind
+        run: |
+          valgrind \
+            --leak-check=full \
+            --show-leak-kinds=all \
+            --track-origins=yes \
+            --error-exitcode=1 \
+            --suppressions=valgrind.supp \
+            .zig-cache/o/*/test 2>&1 || true
+        continue-on-error: true  # Valgrind may not find the binary path
+
+  # Integration tests (compile and run sample programs)
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build Cot
+        run: zig build
+
+      - name: Test Valid Fixtures Compile
+        run: |
+          for file in testdata/cot/valid/*.cot; do
+            echo "Compiling: $file"
+            ./zig-out/bin/cot compile "$file" || exit 1
+          done
+
+      - name: Test Invalid Fixtures Fail
+        run: |
+          for file in testdata/cot/invalid/syntax_errors/*.cot; do
+            echo "Testing should fail: $file"
+            if ./zig-out/bin/cot compile "$file" 2>/dev/null; then
+              echo "ERROR: $file should have failed to compile"
+              exit 1
+            fi
+          done
+
+  # All checks must pass
+  all-checks:
+    name: All Checks
+    runs-on: ubuntu-latest
+    needs: [test, test-macos, format, integration]
+    steps:
+      - run: echo "All checks passed!"

@@ -261,6 +261,10 @@ pub const TokenType = enum {
     kw_true,
     kw_false,
 
+    // Enumeration keywords
+    kw_enum,
+    kw_endenum,
+
     // Modern keywords (for compatibility/migration)
     kw_fn,
     kw_struct,
@@ -389,6 +393,8 @@ pub const TokenType = enum {
             .kw_not,
             .kw_true,
             .kw_false,
+            .kw_enum,
+            .kw_endenum,
             .kw_fn,
             .kw_struct,
             .kw_let,

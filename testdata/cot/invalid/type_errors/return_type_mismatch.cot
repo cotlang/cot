@@ -1,0 +1,9 @@
+// Return type mismatch - should fail type checking
+
+fn get_number() i64 {
+    return "not a number"
+}
+
+fn main() {
+    var x = get_number()
+}

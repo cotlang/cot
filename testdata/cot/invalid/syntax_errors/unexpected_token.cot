@@ -1,0 +1,5 @@
+// Unexpected token - should fail to parse
+
+fn main() {
+    var x = @@@
+}

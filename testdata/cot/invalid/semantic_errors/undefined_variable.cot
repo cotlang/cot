@@ -1,0 +1,5 @@
+// Undefined variable - should fail semantic analysis
+
+fn main() {
+    var x = undefined_variable + 1
+}

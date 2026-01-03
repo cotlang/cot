@@ -137,11 +137,33 @@ pub fn build(b: *std.Build) void {
     // ========================================================================
     // Test step
     // ========================================================================
+
+    // Test filtering option: zig build test -Dtest-filter="pattern"
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Filter tests by name pattern",
+    );
+
     const mod_tests = b.addTest(.{
         .root_module = cot_mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const test_step = b.step("test", "Run tests");
+    const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    // ========================================================================
+    // Integration test step
+    // ========================================================================
+    const integration_step = b.step("test-integration", "Run integration tests on fixture files");
+    integration_step.dependOn(b.getInstallStep());
+
+    // ========================================================================
+    // Test all step (unit + integration)
+    // ========================================================================
+    const test_all_step = b.step("test-all", "Run all tests (unit + integration)");
+    test_all_step.dependOn(&run_mod_tests.step);
+    test_all_step.dependOn(integration_step);
 }

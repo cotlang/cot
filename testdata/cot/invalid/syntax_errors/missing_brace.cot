@@ -1,0 +1,4 @@
+// Missing closing brace - should fail to parse
+
+fn main() {
+    var x = 1

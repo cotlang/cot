@@ -1486,3 +1486,8 @@ test "lower: scope stack push/pop" {
     lowerer.scopes.pop();
     try testing.expectEqual(@as(usize, 0), lowerer.scopes.depth());
 }
+
+// Pull in comprehensive IR lowering tests
+test {
+    _ = @import("lower_test.zig");
+}

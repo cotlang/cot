@@ -1,0 +1,24 @@
+// Arithmetic operations test fixture
+
+fn add(a: i64, b: i64) i64 {
+    return a + b
+}
+
+fn subtract(a: i64, b: i64) i64 {
+    return a - b
+}
+
+fn multiply(a: i64, b: i64) i64 {
+    return a * b
+}
+
+fn divide(a: i64, b: i64) i64 {
+    return a / b
+}
+
+fn main() {
+    var sum = add(10, 20)
+    var diff = subtract(30, 10)
+    var prod = multiply(5, 6)
+    var quot = divide(100, 4)
+}

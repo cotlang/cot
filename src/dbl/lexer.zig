@@ -115,8 +115,13 @@ pub const Lexer = struct {
             return self.makeToken(.op_round, self.source[start_pos..self.position]);
         }
 
-        // Percent: % (modulo)
+        // Percent: % (DBL built-in function prefix) or % (modulo operator)
         if (c == '%') {
+            // If followed by an identifier, it's a built-in function call like %string()
+            if (!self.isAtEnd() and std.ascii.isAlphabetic(self.peek())) {
+                return self.makeToken(.percent, self.source[start_pos..self.position]);
+            }
+            // Otherwise it's the modulo operator
             return self.makeToken(.op_mod, self.source[start_pos..self.position]);
         }
 
@@ -752,6 +757,10 @@ pub const Lexer = struct {
         // Booleans
         .{ "true", .kw_true },
         .{ "false", .kw_false },
+
+        // Enumerations
+        .{ "enum", .kw_enum },
+        .{ "endenum", .kw_endenum },
 
         // Modern keywords (also supported in DBL mode for compatibility)
         .{ "fn", .kw_fn },

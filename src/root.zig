@@ -81,6 +81,9 @@ pub const tui = cot_runtime.tui;
 // Debug utilities (from cot_runtime)
 pub const debug = cot_runtime.debug;
 
+// Testing utilities
+pub const testing_utils = @import("testing/mod.zig");
+
 // Crash handling (from cot_runtime)
 pub const crash = cot_runtime.crash;
 
