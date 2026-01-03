@@ -57,13 +57,13 @@ pub const TraceLevel = enum(u8) {
 
 /// Event type for trace entries
 pub const TraceEvent = enum(u8) {
-    opcode,         // Opcode execution
-    call,           // Routine call
-    return_,        // Routine return
-    native_call,    // Native function call
-    native_return,  // Native function return
-    error_,         // Error occurred
-    breakpoint,     // Hit breakpoint
+    opcode, // Opcode execution
+    call, // Routine call
+    return_, // Routine return
+    native_call, // Native function call
+    native_return, // Native function return
+    error_, // Error occurred
+    breakpoint, // Hit breakpoint
 };
 
 /// A single trace entry stored in history

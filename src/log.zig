@@ -22,11 +22,11 @@ const builtin = @import("builtin");
 
 /// Log verbosity levels
 pub const Level = enum(u8) {
-    silent = 0,  // Errors only
-    normal = 1,  // Progress + warnings + errors (default)
+    silent = 0, // Errors only
+    normal = 1, // Progress + warnings + errors (default)
     verbose = 2, // + stages, file counts, timing
-    debug = 3,   // + IR/bytecode details
-    trace = 4,   // + individual instructions
+    debug = 3, // + IR/bytecode details
+    trace = 4, // + individual instructions
 
     /// Get log level from environment variable
     pub fn fromEnv() Level {

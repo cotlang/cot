@@ -1077,7 +1077,6 @@ pub const BytecodeEmitter = struct {
         try self.string_pool.put(owned_name, idx);
         return idx;
     }
-
 };
 
 /// Convert IR type to bytecode data type code

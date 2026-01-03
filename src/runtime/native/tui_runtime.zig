@@ -258,7 +258,6 @@ pub fn getState() ?*TuiState {
 
 /// Clear the screen (only clears app pane in dev mode)
 pub fn clear() void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             if (state.dev_mode and state.app_width > 0) {
@@ -283,7 +282,6 @@ pub fn clear() void {
 
 /// Set the current drawing style
 pub fn setStyle(fg: u8, bg: u8, bold: bool, underline: bool) void {
-
     if (getState()) |state| {
         state.current_fg = fg;
         state.current_bg = bg;
@@ -322,7 +320,6 @@ fn applyStyle(term: anytype, fg: u8, bg: u8, bold: bool, underline: bool) !void 
 
 /// Reset style to default
 pub fn resetStyle() void {
-
     if (getState()) |state| {
         state.current_fg = 7;
         state.current_bg = 0;
@@ -337,7 +334,6 @@ pub fn resetStyle() void {
 
 /// Draw text at position (clips to app pane in dev mode)
 pub fn drawText(x: u16, y: u16, text: []const u8) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             // In dev mode, clip to app pane width
@@ -357,7 +353,6 @@ pub fn drawText(x: u16, y: u16, text: []const u8) void {
 
 /// Draw a box/border (clips to app pane in dev mode)
 pub fn drawBox(x: u16, y: u16, width: u16, height: u16, style_type: u8) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             // In dev mode, clip width to app pane
@@ -410,7 +405,6 @@ pub fn drawBox(x: u16, y: u16, width: u16, height: u16, style_type: u8) void {
 
 /// Draw a horizontal line (clips to app pane in dev mode)
 pub fn drawHLine(x: u16, y: u16, length: u16, style_type: u8) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             // In dev mode, clip to app pane
@@ -432,7 +426,6 @@ pub fn drawHLine(x: u16, y: u16, length: u16, style_type: u8) void {
 
 /// Draw a vertical line
 pub fn drawVLine(x: u16, y: u16, length: u16, style_type: u8) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             const ch: []const u8 = if (style_type == 1) "\xe2\x95\x91" else "\xe2\x94\x82"; // ║ or │
@@ -448,7 +441,6 @@ pub fn drawVLine(x: u16, y: u16, length: u16, style_type: u8) void {
 
 /// Fill an area with a character (clips to app pane in dev mode)
 pub fn fillArea(x: u16, y: u16, width: u16, height: u16, char: u8) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             // In dev mode, clip to app pane
@@ -608,7 +600,6 @@ pub fn waitKey() Key {
 
 /// Get screen dimensions
 pub fn getScreenSize() struct { width: u16, height: u16 } {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             const size = term.getSize() catch return .{ .width = 80, .height = 24 };
@@ -625,7 +616,6 @@ pub fn refresh() void {
 
 /// Draw a button widget (clips to app pane in dev mode)
 pub fn drawButton(x: u16, y: u16, label: []const u8, focused: bool) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             // In dev mode, skip if off screen
@@ -666,7 +656,6 @@ pub fn drawButton(x: u16, y: u16, label: []const u8, focused: bool) void {
 
 /// Draw a table header (clips to app pane in dev mode)
 pub fn drawTableHeader(x: u16, y: u16, columns: []const []const u8, widths: []const u16) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             // Get max x for clipping in dev mode
@@ -805,7 +794,6 @@ pub fn drawTableRow(x: u16, y: u16, cells: []const []const u8, widths: []const u
 
 /// Draw an input field (clips to app pane in dev mode)
 pub fn drawInput(x: u16, y: u16, width: u16, value: []const u8, cursor_pos: u16, focused: bool) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             // In dev mode, clip to app pane
@@ -860,7 +848,6 @@ pub fn drawInput(x: u16, y: u16, width: u16, value: []const u8, cursor_pos: u16,
 
 /// Draw a progress bar
 pub fn drawProgress(x: u16, y: u16, width: u16, percent: u8) void {
-
     if (getState()) |state| {
         if (state.terminal) |*term| {
             term.moveCursor(x, y) catch {};
@@ -909,7 +896,6 @@ pub fn drawCard(x: u16, y: u16, width: u16, height: u16, title: []const u8) void
 
 /// Show a modal dialog
 pub fn showModal(title: []const u8, message: []const u8) void {
-
     const size = getScreenSize();
     const modal_width: u16 = 50;
     const modal_height: u16 = 7;
@@ -1030,7 +1016,6 @@ pub fn devLog(message: []const u8) void {
 
 /// Draw the dev console pane
 pub fn drawDevPane() void {
-
     if (getState()) |state| {
         if (!state.dev_mode) return;
         if (state.terminal) |*term| {

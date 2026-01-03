@@ -1296,7 +1296,7 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
 
 /// store_record_buf type_idx, local_base - deserialize buffer to record fields
 pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult {
-    const type_idx = std.mem.readInt(u16, module.code[vm.ip ..][0..2], .little);
+    const type_idx = std.mem.readInt(u16, module.code[vm.ip..][0..2], .little);
     const local_base = std.mem.readInt(u16, module.code[vm.ip + 2 ..][0..2], .little);
     vm.ip += 4;
 

@@ -84,13 +84,13 @@ pub const MigrationRunner = struct {
     /// Get SQL to create the migrations tracking table
     pub fn getCreateMigrationsTableSql(self: *const Self) []const u8 {
         _ = self;
-        return
-            \\CREATE TABLE IF NOT EXISTS _cot_migrations (
-            \\    version INTEGER PRIMARY KEY,
-            \\    filename TEXT NOT NULL,
-            \\    applied_at INTEGER NOT NULL,
-            \\    checksum INTEGER NOT NULL
-            \\);
+        return 
+        \\CREATE TABLE IF NOT EXISTS _cot_migrations (
+        \\    version INTEGER PRIMARY KEY,
+        \\    filename TEXT NOT NULL,
+        \\    applied_at INTEGER NOT NULL,
+        \\    checksum INTEGER NOT NULL
+        \\);
         ;
     }
 

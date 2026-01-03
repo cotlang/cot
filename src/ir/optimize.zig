@@ -630,9 +630,7 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         // Trap (Cranelift name)
         .trap => {},
         // These don't use values or are handled specially
-        .alloca, .iconst, .f32const, .f64const, .const_string, .const_null,
-        .jump, .debug_line, .try_begin, .try_end, .catch_begin,
-        .load_struct_buf, .store_struct_buf => {},
+        .alloca, .iconst, .f32const, .f64const, .const_string, .const_null, .jump, .debug_line, .try_begin, .try_end, .catch_begin, .load_struct_buf, .store_struct_buf => {},
         // Map operations
         .map_new => {}, // No input values to mark
         .map_set => |m| {

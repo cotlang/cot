@@ -121,7 +121,6 @@ export fn cot_rt_str_slice(
 
 /// Decimal representation: value is stored as i64, scale determines decimal point
 /// Example: 12345 with scale=2 represents 123.45
-
 /// Add two decimals with scale alignment
 export fn cot_rt_dec_add(a: i64, b: i64, scale_a: u8, scale_b: u8, scale_out: u8) i64 {
     // Align scales

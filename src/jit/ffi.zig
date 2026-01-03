@@ -56,40 +56,38 @@ pub const CompileOptions = extern struct {
 // These are implemented by the Rust crate (cot-cranelift) and linked at build time.
 // When JIT is disabled, we provide stub implementations below.
 
-extern "C" {
-    /// Initialize the JIT context
-    /// Returns: Opaque pointer to JIT context, or null on failure
-    fn cot_jit_init() ?*JitContext;
+/// Initialize the JIT context
+/// Returns: Opaque pointer to JIT context, or null on failure
+extern fn cot_jit_init() ?*JitContext;
 
-    /// Destroy the JIT context and free all resources
-    fn cot_jit_destroy(ctx: *JitContext) void;
+/// Destroy the JIT context and free all resources
+extern fn cot_jit_destroy(ctx: *JitContext) void;
 
-    /// Register a runtime function that JIT code can call
-    /// name: null-terminated function name
-    /// ptr: function pointer with C calling convention
-    fn cot_jit_register_runtime_fn(ctx: *JitContext, name: [*:0]const u8, ptr: *const anyopaque) void;
+/// Register a runtime function that JIT code can call
+/// name: null-terminated function name
+/// ptr: function pointer with C calling convention
+extern fn cot_jit_register_runtime_fn(ctx: *JitContext, name: [*:0]const u8, ptr: *const anyopaque) void;
 
-    /// Compile IR to native code
-    /// ir_bytes: pointer to serialized IR
-    /// ir_len: length of serialized IR
-    /// options: compilation options
-    /// Returns: CompiledFunction with code pointer or error
-    fn cot_jit_compile(
-        ctx: *JitContext,
-        ir_bytes: [*]const u8,
-        ir_len: usize,
-        options: CompileOptions,
-    ) CompiledFunction;
+/// Compile IR to native code
+/// ir_bytes: pointer to serialized IR
+/// ir_len: length of serialized IR
+/// options: compilation options
+/// Returns: CompiledFunction with code pointer or error
+extern fn cot_jit_compile(
+    ctx: *JitContext,
+    ir_bytes: [*]const u8,
+    ir_len: usize,
+    options: CompileOptions,
+) CompiledFunction;
 
-    /// Free a compiled function's resources
-    fn cot_jit_free_compiled(ctx: *JitContext, func: *CompiledFunction) void;
+/// Free a compiled function's resources
+extern fn cot_jit_free_compiled(ctx: *JitContext, func: *CompiledFunction) void;
 
-    /// Get the last error message (for debugging)
-    fn cot_jit_get_last_error(ctx: *JitContext) ?[*:0]const u8;
+/// Get the last error message (for debugging)
+extern fn cot_jit_get_last_error(ctx: *JitContext) ?[*:0]const u8;
 
-    /// Get Cranelift version string
-    fn cot_jit_version() [*:0]const u8;
-}
+/// Get Cranelift version string
+extern fn cot_jit_version() [*:0]const u8;
 
 // =============================================================================
 // Zig Wrappers (safe interface)

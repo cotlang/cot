@@ -620,11 +620,12 @@ fn formatDbl(allocator: Allocator, source: []const u8, tab_size: u32, insert_spa
     // Keywords that increase indent level
     // Note: begin/end work like braces - control flow keywords (if/while/for/etc.)
     // don't increase indent; only begin does
+    // Note: 'main' is NOT an indent keyword - it's a section marker at the same level as 'proc'
     const indent_keywords = [_][]const u8{
         "record", "group", "structure", "common", "global", "literal",
         "begin", "using",
         "class", "method", "property", "namespace", "interface", "try",
-        "subroutine", "function", "main", "proc", "test",
+        "subroutine", "function", "proc", "test",
     };
 
     // Keywords that decrease indent level

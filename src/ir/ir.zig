@@ -897,19 +897,14 @@ pub const Instruction = union(enum) {
             .select => |s| s.result,
             .ptr_offset => |p| p.result,
             // Instructions that don't produce values
-            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read,
-            .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store,
-            .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy,
-            .map_set, .map_delete, .map_clear => null,
+            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear => null,
         };
     }
 
     /// Check if this instruction has side effects (I/O, memory stores, exceptions)
     pub fn hasSideEffects(self: Instruction) bool {
         return switch (self) {
-            .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock,
-            .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store,
-            .map_set, .map_delete, .map_clear => true,
+            .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store, .map_set, .map_delete, .map_clear => true,
             else => false,
         };
     }

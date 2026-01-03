@@ -99,7 +99,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
 
         // Function calls
         .call => |c| self.checkCall(c),
-        .call_indirect => {},  // Indirect calls checked at runtime
+        .call_indirect => {}, // Indirect calls checked at runtime
 
         // Array operations
         .array_load => |a| self.checkArrayLoad(a),

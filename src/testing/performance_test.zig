@@ -96,7 +96,7 @@ test "perf: interner handles many duplicate lookups" {
     // Intern a small set of strings
     const strings = [_][]const u8{
         "alpha", "beta", "gamma", "delta", "epsilon",
-        "zeta", "eta", "theta", "iota", "kappa",
+        "zeta",  "eta",  "theta", "iota",  "kappa",
     };
 
     for (strings) |s| {

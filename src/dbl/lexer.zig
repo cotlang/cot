@@ -506,55 +506,55 @@ pub const Lexer = struct {
                 const op_type: ?TokenType =
                     // Comparison operators
                     if (std.mem.eql(u8, lower_op, "eq"))
-                    .op_eq
-                else if (std.mem.eql(u8, lower_op, "ne"))
-                    .op_ne
-                else if (std.mem.eql(u8, lower_op, "lt"))
-                    .op_lt
-                else if (std.mem.eql(u8, lower_op, "le"))
-                    .op_le
-                else if (std.mem.eql(u8, lower_op, "gt"))
-                    .op_gt
-                else if (std.mem.eql(u8, lower_op, "ge"))
-                    .op_ge
-                    // Logical operators
-                else if (std.mem.eql(u8, lower_op, "and"))
-                    .op_and
-                else if (std.mem.eql(u8, lower_op, "or"))
-                    .op_or
-                else if (std.mem.eql(u8, lower_op, "not"))
-                    .op_not
-                else if (std.mem.eql(u8, lower_op, "xor"))
-                    .op_xor
-                    // Bitwise operators
-                else if (std.mem.eql(u8, lower_op, "band"))
-                    .op_band
-                else if (std.mem.eql(u8, lower_op, "bor"))
-                    .op_bor
-                else if (std.mem.eql(u8, lower_op, "bnot"))
-                    .op_bnot
-                else if (std.mem.eql(u8, lower_op, "bxor"))
-                    .op_bxor
-                else if (std.mem.eql(u8, lower_op, "bnand"))
-                    .op_bnand
-                    // String comparison operators (full-length)
-                else if (std.mem.eql(u8, lower_op, "eqs"))
-                    .op_eqs
-                else if (std.mem.eql(u8, lower_op, "nes"))
-                    .op_nes
-                else if (std.mem.eql(u8, lower_op, "gts"))
-                    .op_gts
-                else if (std.mem.eql(u8, lower_op, "lts"))
-                    .op_lts
-                else if (std.mem.eql(u8, lower_op, "ges"))
-                    .op_ges
-                else if (std.mem.eql(u8, lower_op, "les"))
-                    .op_les
-                    // Modulo operator
-                else if (std.mem.eql(u8, lower_op, "mod"))
-                    .op_mod
-                else
-                    null;
+                        .op_eq
+                    else if (std.mem.eql(u8, lower_op, "ne"))
+                        .op_ne
+                    else if (std.mem.eql(u8, lower_op, "lt"))
+                        .op_lt
+                    else if (std.mem.eql(u8, lower_op, "le"))
+                        .op_le
+                    else if (std.mem.eql(u8, lower_op, "gt"))
+                        .op_gt
+                    else if (std.mem.eql(u8, lower_op, "ge"))
+                        .op_ge
+                        // Logical operators
+                    else if (std.mem.eql(u8, lower_op, "and"))
+                        .op_and
+                    else if (std.mem.eql(u8, lower_op, "or"))
+                        .op_or
+                    else if (std.mem.eql(u8, lower_op, "not"))
+                        .op_not
+                    else if (std.mem.eql(u8, lower_op, "xor"))
+                        .op_xor
+                        // Bitwise operators
+                    else if (std.mem.eql(u8, lower_op, "band"))
+                        .op_band
+                    else if (std.mem.eql(u8, lower_op, "bor"))
+                        .op_bor
+                    else if (std.mem.eql(u8, lower_op, "bnot"))
+                        .op_bnot
+                    else if (std.mem.eql(u8, lower_op, "bxor"))
+                        .op_bxor
+                    else if (std.mem.eql(u8, lower_op, "bnand"))
+                        .op_bnand
+                        // String comparison operators (full-length)
+                    else if (std.mem.eql(u8, lower_op, "eqs"))
+                        .op_eqs
+                    else if (std.mem.eql(u8, lower_op, "nes"))
+                        .op_nes
+                    else if (std.mem.eql(u8, lower_op, "gts"))
+                        .op_gts
+                    else if (std.mem.eql(u8, lower_op, "lts"))
+                        .op_lts
+                    else if (std.mem.eql(u8, lower_op, "ges"))
+                        .op_ges
+                    else if (std.mem.eql(u8, lower_op, "les"))
+                        .op_les
+                        // Modulo operator
+                    else if (std.mem.eql(u8, lower_op, "mod"))
+                        .op_mod
+                    else
+                        null;
 
                 if (op_type) |tt| {
                     return .{

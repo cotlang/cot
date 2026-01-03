@@ -139,7 +139,13 @@ pub fn main() !void {
                 i += 1;
             }
         }
-        try compileFile(allocator, args[2], output_file);
+        compileFile(allocator, args[2], output_file) catch |err| {
+            if (err == error.CompilationFailed) {
+                // Error already printed, just exit with failure code
+                std.process.exit(1);
+            }
+            return err;
+        };
     } else if (std.mem.eql(u8, command, "disasm")) {
         if (args.len < 3) {
             try printErr("Error: disasm requires a filename\n");
@@ -675,7 +681,7 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
             .{err},
         );
         formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+        return error.CompilationFailed;
     };
     defer mod.deinit();
 
@@ -804,7 +810,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     // Read source file
     const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
         try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
-        return;
+        return error.CompilationFailed;
     };
     defer file.close();
 
@@ -825,7 +831,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
             .{err},
         );
         formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+        return error.CompilationFailed;
     };
     // No defer allocator.free(tokens) needed - arena handles cleanup
 
@@ -861,7 +867,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
             );
         }
         formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+        return error.CompilationFailed;
     };
 
     // Check if parser collected any non-fatal errors
@@ -880,7 +886,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     // If we have errors after parsing, stop and report
     if (collector.hasErrors()) {
         formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+        return error.CompilationFailed;
     }
 
     // Lower AST to IR using NodeStore directly
@@ -893,7 +899,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
             .{err},
         );
         formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+        return error.CompilationFailed;
     };
     // No defer ir_module.deinit() needed - arena handles cleanup
 
@@ -905,7 +911,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     // If type checking found errors, report them and stop
     if (collector.hasErrors()) {
         formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+        return error.CompilationFailed;
     }
 
     // Run optimization passes
@@ -924,7 +930,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
             .{err},
         );
         formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+        return error.CompilationFailed;
     };
     // No defer mod.deinit() needed - arena handles cleanup
 

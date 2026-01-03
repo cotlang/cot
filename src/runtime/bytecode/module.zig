@@ -216,8 +216,8 @@ pub const RoutineFlags = packed struct(u16) {
 
 /// Parameter pass mode: by value or by reference
 pub const ParamMode = enum(u8) {
-    val = 0,  // by value (default for Cot, DBL class methods)
-    ref = 1,  // by reference (default for DBL subroutines/functions)
+    val = 0, // by value (default for Cot, DBL class methods)
+    ref = 1, // by reference (default for DBL subroutines/functions)
 };
 
 /// Parameter definition

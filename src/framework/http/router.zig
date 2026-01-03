@@ -31,8 +31,8 @@ pub const RouteMatch = struct {
 
 /// Route segment type
 const SegmentType = enum {
-    static,   // Exact match: "products"
-    param,    // Dynamic match: ":id" or "[id]"
+    static, // Exact match: "products"
+    param, // Dynamic match: ":id" or "[id]"
     wildcard, // Matches anything: "*"
 };
 

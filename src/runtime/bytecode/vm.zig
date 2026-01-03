@@ -69,7 +69,6 @@ const MAX_CALL_DEPTH = vm_types.MAX_CALL_DEPTH;
 /// Note: This must stay in vm.zig because it references VM
 pub const OpcodeHandler = *const fn (*VM, *const Module) VMError!DispatchResult;
 
-
 /// Global last error - set whenever a VMError is raised
 /// This provides rich context even when only VMError is returned
 pub var last_error: ?RuntimeError = null;
@@ -517,9 +516,9 @@ pub const VM = struct {
         // Debug: print first 20 bytes of code
         if (module.code.len >= 20) {
             debug.print(.vm, "First 20 code bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
-                module.code[0], module.code[1], module.code[2], module.code[3],
-                module.code[4], module.code[5], module.code[6], module.code[7],
-                module.code[8], module.code[9], module.code[10], module.code[11],
+                module.code[0],  module.code[1],  module.code[2],  module.code[3],
+                module.code[4],  module.code[5],  module.code[6],  module.code[7],
+                module.code[8],  module.code[9],  module.code[10], module.code[11],
                 module.code[12], module.code[13], module.code[14], module.code[15],
                 module.code[16], module.code[17], module.code[18], module.code[19],
             });

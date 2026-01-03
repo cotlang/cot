@@ -91,8 +91,8 @@ pub const GlobalValue = union(enum) {
 pub const NativeContext = struct {
     allocator: std.mem.Allocator,
     args: []const Value,
-    cursors: ?*CursorManager,           // Legacy ISAM-only cursors
-    channels: ?*ChannelManager = null,  // Unified text + ISAM channels
+    cursors: ?*CursorManager, // Legacy ISAM-only cursors
+    channels: ?*ChannelManager = null, // Unified text + ISAM channels
 
     pub fn getArg(self: *const NativeContext, index: usize) ?Value {
         if (index >= self.args.len) return null;

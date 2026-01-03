@@ -24,10 +24,10 @@ pub const ChannelType = enum {
 
 /// Text file access mode
 pub const TextMode = enum {
-    read,       // I:SEQ - read existing
-    write,      // O:SEQ - create/overwrite
-    append,     // A:SEQ - append
-    update,     // U:SEQ - read/write
+    read, // I:SEQ - read existing
+    write, // O:SEQ - create/overwrite
+    append, // A:SEQ - append
+    update, // U:SEQ - read/write
 };
 
 /// A unified channel that can be text or ISAM
@@ -105,7 +105,7 @@ pub const Channel = struct {
 
         try writer.writeAll(data);
         try writer.writeByte('\n');
-        writer.flush() catch {};  // Flush to ensure data is written
+        writer.flush() catch {}; // Flush to ensure data is written
     }
 
     /// Flush any buffered writes (no-op with new unbuffered approach)
@@ -162,9 +162,7 @@ pub const ChannelManager = struct {
         // Parse mode to determine file type
         const file_type = detectFileType(mode, filename);
 
-        debug.print(.general, "ChannelManager.open: ch={d} mode='{s}' file='{s}' type={s}", .{
-            channel_id, mode, filename, @tagName(file_type)
-        });
+        debug.print(.general, "ChannelManager.open: ch={d} mode='{s}' file='{s}' type={s}", .{ channel_id, mode, filename, @tagName(file_type) });
 
         switch (file_type) {
             .text => {
@@ -267,13 +265,15 @@ fn detectFileType(mode: []const u8, filename: []const u8) ChannelType {
 
     // Explicit SEQ qualifier
     if (std.mem.indexOf(u8, mode_upper, ":SEQ") != null or
-        std.mem.indexOf(u8, mode_upper, "SEQ") != null) {
+        std.mem.indexOf(u8, mode_upper, "SEQ") != null)
+    {
         return .text;
     }
 
     // Explicit ISAM qualifier
     if (std.mem.indexOf(u8, mode_upper, ":ISAM") != null or
-        std.mem.indexOf(u8, mode_upper, "ISAM") != null) {
+        std.mem.indexOf(u8, mode_upper, "ISAM") != null)
+    {
         return .isam;
     }
 
@@ -281,7 +281,8 @@ fn detectFileType(mode: []const u8, filename: []const u8) ChannelType {
     if (std.mem.endsWith(u8, filename, ".ism") or
         std.mem.endsWith(u8, filename, ".ISM") or
         std.mem.endsWith(u8, filename, ".ddf") or
-        std.mem.endsWith(u8, filename, ".DDF")) {
+        std.mem.endsWith(u8, filename, ".DDF"))
+    {
         return .isam;
     }
 

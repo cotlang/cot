@@ -69,9 +69,9 @@ pub const ProjectConfig = struct {
     // Build settings
     output_dir: []const u8,
     target: []const u8,
-    bundle: bool,              // Bundle all modules into single executable
-    generate_manifest: bool,   // Generate manifest.json with build info
-    static_link: bool,         // Statically link dependencies
+    bundle: bool, // Bundle all modules into single executable
+    generate_manifest: bool, // Generate manifest.json with build info
+    static_link: bool, // Statically link dependencies
 
     allocator: Allocator,
 
