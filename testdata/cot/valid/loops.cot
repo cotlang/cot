@@ -2,14 +2,14 @@
 // Note: Simple loops without complex reassignment
 
 fn countdown(n: i64) i64 {
-    if n <= 0 {
+    if (n <= 0) {
         return 0
     }
     return countdown(n - 1)
 }
 
 fn sum_recursive(n: i64) i64 {
-    if n <= 0 {
+    if (n <= 0) {
         return 0
     }
     return n + sum_recursive(n - 1)

@@ -1,21 +1,21 @@
 // Control flow test fixture
 
 fn abs(x: i64) i64 {
-    if x < 0 {
+    if (x < 0) {
         return 0 - x
     }
     return x
 }
 
 fn is_positive(x: i64) i64 {
-    if x > 0 {
+    if (x > 0) {
         return 1
     }
     return 0
 }
 
 fn is_zero(x: i64) i64 {
-    if x == 0 {
+    if (x == 0) {
         return 1
     }
     return 0
