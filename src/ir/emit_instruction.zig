@@ -225,7 +225,10 @@ pub fn emitConstString(e: *BytecodeEmitter, c: ConstString) EmitError!void {
 pub fn emitBinaryArith(e: *BytecodeEmitter, op: Opcode, lhs: ir.Value, rhs: ir.Value, result: ir.Value) EmitError!void {
     const lhs_reg = try e.getValueInReg(lhs, 0);
     const rhs_reg = try e.getValueInReg(rhs, 1);
-    const dest_reg: u4 = 2;
+
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(result.id);
+
     try e.emitRegArith(op, dest_reg, lhs_reg, rhs_reg);
     e.setLastResult(result.id, dest_reg);
 }
@@ -297,7 +300,10 @@ fn isStringType(ty: ir.Type) bool {
 pub fn emitIcmp(e: *BytecodeEmitter, c: ir.Instruction.IcmpOp) EmitError!void {
     const lhs_reg = try e.getValueInReg(c.lhs, 0);
     const rhs_reg = try e.getValueInReg(c.rhs, 1);
-    const dest_reg: u4 = 2;
+
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(c.result.id);
+
     // Check if type is string, or a pointer to string (for record fields)
     const is_string = isStringType(c.lhs.ty);
     const opcode: Opcode = switch (c.cond) {

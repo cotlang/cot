@@ -230,6 +230,13 @@ pub const BytecodeEmitter = struct {
     last_result_value: ?u32 = null,
     last_result_reg: u4 = 0,
 
+    // Register spilling support
+    // When all registers are in use, we spill a register to a stack slot
+    spill_slot_base: u16 = 0, // First slot available for spilling
+    next_spill_slot: u16 = 0, // Next available spill slot
+    spilled_values: std.AutoHashMap(u32, u16), // value_id -> spill_slot
+    max_spill_slots_used: u16 = 0, // Track maximum for local_count
+
     const Self = @This();
 
     /// Initialize the bytecode emitter (register-based)
@@ -256,6 +263,7 @@ pub const BytecodeEmitter = struct {
             .current_func = null,
             .ir_module = null,
             .reg_alloc = RegisterAllocator.init(allocator),
+            .spilled_values = std.AutoHashMap(u32, u16).init(allocator),
         };
     }
 
@@ -275,6 +283,7 @@ pub const BytecodeEmitter = struct {
         self.value_consts.deinit();
         self.field_view_info.deinit();
         self.reg_alloc.deinit();
+        self.spilled_values.deinit();
     }
 
     /// Emit bytecode module from IR module
@@ -437,6 +446,7 @@ pub const BytecodeEmitter = struct {
         self.value_consts.clearRetainingCapacity();
         self.reg_alloc.reset(); // Reset register allocation for new function
         self.last_result_value = null; // Reset last result tracking
+        self.resetSpillState(); // Reset spill state for new function
 
         self.current_routine_start = @intCast(self.code.items.len);
 
@@ -467,6 +477,32 @@ pub const BytecodeEmitter = struct {
                 self.local_count += 1;
             }
         }
+
+        // Pre-pass: count all allocas in all blocks to know total local count
+        // This ensures spill slots don't overlap with regular locals
+        for (func.blocks.items) |block| {
+            for (block.instructions.items) |inst| {
+                if (inst == .alloca) {
+                    const a = inst.alloca;
+                    if (!self.globals.contains(a.name) and !self.locals.contains(a.name)) {
+                        if (a.ty == .@"struct") {
+                            // Struct type: count slots for each field
+                            self.local_count += @intCast(a.ty.@"struct".fields.len);
+                        } else {
+                            // Primitive type: one slot
+                            self.local_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Reset for actual emission (allocas will be processed again)
+        const total_declared_locals = self.local_count;
+        self.local_count = @intCast(func.signature.params.len);
+
+        // Setup spill slots after ALL declared locals are accounted for
+        self.spill_slot_base = total_declared_locals;
+        self.next_spill_slot = total_declared_locals;
 
         // First pass: record block offsets
         // We need to know where each block starts before emitting jumps
@@ -513,13 +549,16 @@ pub const BytecodeEmitter = struct {
             });
         }
 
+        // Calculate total locals including any spill slots used
+        const total_locals = self.local_count + self.max_spill_slots_used;
+
         try self.routines.append(self.allocator, .{
             .name_index = name_idx,
             .flags = if (func.linkage == .external) module.RoutineFlags{ .is_public = true } else module.RoutineFlags{},
             .code_offset = self.current_routine_start,
             .code_length = code_len,
             .param_count = @intCast(func.signature.params.len),
-            .local_count = self.local_count,
+            .local_count = total_locals,
             .max_stack = 0, // Register-based: stack not used
             .params = try params_list.toOwnedSlice(self.allocator),
             .locals = try locals_list.toOwnedSlice(self.allocator),
@@ -983,6 +1022,15 @@ pub const BytecodeEmitter = struct {
             return src;
         }
 
+        // Check if value was spilled - reload it into temp_reg
+        if (self.spilled_values.get(value.id)) |spill_slot| {
+            debug.print(.emit, "RELOAD: value_id={d} from slot {d} to r{d}", .{ value.id, spill_slot, temp_reg });
+            try self.emitSpillLoad(temp_reg, spill_slot);
+            // Note: we don't remove from spilled_values - the value might be needed again
+            // and we'd need to reload it. The spill slot is stable for this function.
+            return temp_reg;
+        }
+
         // Check if value is a constant - load into temp register
         if (self.value_consts.get(value.id)) |const_idx| {
             try self.emitRegLoadConst(temp_reg, const_idx);
@@ -1012,9 +1060,119 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Set the last computed result (for SSA value chains without permanent register allocation)
+    /// Also registers the value with the register allocator so it can be found later
     pub fn setLastResult(self: *Self, value_id: u32, reg: u4) void {
         self.last_result_value = value_id;
         self.last_result_reg = reg;
+        // Also track in register allocator so value can be retrieved later
+        // (even after last_result is overwritten by subsequent computations)
+        self.reg_alloc.assignRegister(value_id, reg) catch {};
+    }
+
+    // ============================================
+    // Register Spilling Support
+    // ============================================
+
+    /// Allocate a register for a value, spilling if necessary.
+    /// This is the main entry point for register allocation that handles spilling.
+    pub fn allocateWithSpill(self: *Self, value_id: u32) EmitError!u4 {
+        // First try normal allocation
+        if (self.reg_alloc.allocate(value_id)) |reg| {
+            return reg;
+        }
+
+        // No free registers - spill one
+        const spill_reg = self.selectSpillCandidate();
+        const spilled_value = self.reg_alloc.reg_to_value[spill_reg] orelse {
+            // No value in this register (shouldn't happen, but handle gracefully)
+            debug.print(.emit, "WARNING: spill candidate r{d} has no value", .{spill_reg});
+            return spill_reg;
+        };
+
+        // Allocate a spill slot and emit store_local to save the value
+        const spill_slot = self.allocateSpillSlot();
+        debug.print(.emit, "SPILL: value_id={d} from r{d} to slot {d}", .{ spilled_value, spill_reg, spill_slot });
+        try self.emitSpillStore(spill_reg, spill_slot);
+
+        // Track the spilled value
+        try self.spilled_values.put(spilled_value, spill_slot);
+
+        // Remove from register allocator
+        _ = self.reg_alloc.value_to_reg.remove(spilled_value);
+        self.reg_alloc.reg_to_value[spill_reg] = null;
+
+        // Now allocate the freed register for the new value
+        self.reg_alloc.reg_to_value[spill_reg] = value_id;
+        try self.reg_alloc.value_to_reg.put(value_id, spill_reg);
+
+        return spill_reg;
+    }
+
+    /// Select a register to spill.
+    /// Strategy: prefer caller-saved registers (r2-r7), skip r0-r1 (used for operand loading)
+    fn selectSpillCandidate(self: *Self) u4 {
+        // Start from r2 (r0, r1 are temp registers for operand loading)
+        var reg: u4 = 2;
+        while (reg < 14) : (reg += 1) {
+            if (self.reg_alloc.reg_to_value[reg] != null) {
+                return reg;
+            }
+        }
+        // Fallback to r2 if nothing found (shouldn't happen)
+        return 2;
+    }
+
+    /// Allocate a new spill slot
+    fn allocateSpillSlot(self: *Self) u16 {
+        const slot = self.next_spill_slot;
+        self.next_spill_slot += 1;
+        const slots_used = self.next_spill_slot - self.spill_slot_base;
+        if (slots_used > self.max_spill_slots_used) {
+            self.max_spill_slots_used = slots_used;
+        }
+        return slot;
+    }
+
+    /// Emit store_local for spilling a register to a slot
+    fn emitSpillStore(self: *Self, reg: u4, slot: u16) EmitError!void {
+        if (slot < 256) {
+            try self.emitOpcode(.store_local);
+            try self.emitU8(@as(u8, reg) << 4);
+            try self.emitU8(@intCast(slot));
+        } else {
+            try self.emitOpcode(.store_local16);
+            try self.emitU8(@as(u8, reg) << 4);
+            try self.emitU16(slot);
+        }
+    }
+
+    /// Emit load_local for reloading a spilled value
+    fn emitSpillLoad(self: *Self, reg: u4, slot: u16) EmitError!void {
+        if (slot < 256) {
+            try self.emitOpcode(.load_local);
+            try self.emitU8(@as(u8, reg) << 4);
+            try self.emitU8(@intCast(slot));
+        } else {
+            try self.emitOpcode(.load_local16);
+            try self.emitU8(@as(u8, reg) << 4);
+            try self.emitU16(slot);
+        }
+    }
+
+    /// Reset spill state for a new function
+    fn resetSpillState(self: *Self) void {
+        self.spilled_values.clearRetainingCapacity();
+        self.spill_slot_base = 0;
+        self.next_spill_slot = 0;
+        self.max_spill_slots_used = 0;
+    }
+
+    /// Setup spill slots for a function (call after counting locals)
+    fn setupSpillSlots(self: *Self) void {
+        // Reserve spill slots starting after declared locals
+        self.spill_slot_base = self.local_count;
+        self.next_spill_slot = self.local_count;
+        // Reserve 16 slots for spilling (will extend local_count later if needed)
     }
 
     /// Emit integer value to r0 (for stack-based compatibility)
