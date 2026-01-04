@@ -651,10 +651,12 @@ pub const NodeStore = struct {
 
     /// Add a try-catch statement
     /// try_body is the block to try, catch_body is the handler
-    /// For DBL: TRY body CATCH (var, type) handler FINALLY cleanup ENDTRY
-    pub fn addTryStmt(self: *Self, try_body: StmtIdx, catch_body: StmtIdx, finally_body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        // Store catch_body and finally_body in extra_data
-        const catch_extra = try self.addExtra(catch_body.toInt());
+    /// err_binding is optional error variable name (null_id if not bound)
+    /// finally_body is optional cleanup block (null if no finally)
+    pub fn addTryStmt(self: *Self, try_body: StmtIdx, err_binding: StringId, catch_body: StmtIdx, finally_body: StmtIdx, loc: SourceLoc) !StmtIdx {
+        // Store err_binding, catch_body and finally_body in extra_data
+        const extra_start = try self.addExtra(@intFromEnum(err_binding));
+        _ = try self.addExtra(catch_body.toInt());
         _ = try self.addExtra(finally_body.toInt());
 
         const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
@@ -662,7 +664,7 @@ pub const NodeStore = struct {
         try self.stmt_locs.append(self.allocator, loc);
         try self.stmt_data.append(self.allocator, .{
             .a = try_body.toInt(),
-            .b = catch_extra.toInt(),
+            .b = extra_start.toInt(),
         });
         return idx;
     }
@@ -674,6 +676,19 @@ pub const NodeStore = struct {
         try self.stmt_locs.append(self.allocator, loc);
         try self.stmt_data.append(self.allocator, .{
             .a = value.toInt(),
+            .b = 0,
+        });
+        return idx;
+    }
+
+    /// Add a defer statement
+    /// The body is a block or expression that executes at scope exit
+    pub fn addDeferStmt(self: *Self, body: StmtIdx, loc: SourceLoc) !StmtIdx {
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
+        try self.stmt_tags.append(self.allocator, .defer_stmt);
+        try self.stmt_locs.append(self.allocator, loc);
+        try self.stmt_data.append(self.allocator, .{
+            .a = body.toInt(),
             .b = 0,
         });
         return idx;
@@ -964,9 +979,16 @@ pub const NodeStore = struct {
     }
 
     /// Commit scratch and remove mark (success case)
+    /// Also shrinks scratch buffers back to mark position to prevent
+    /// nested block statements from leaking into parent blocks
     pub fn commitScratch(self: *Self) void {
         if (self.scratch_marks.items.len > 0) {
-            _ = self.scratch_marks.pop();
+            const mark = self.scratch_marks.pop().?;
+            // Shrink back to mark position - the caller has already copied
+            // the statements they need, so we can safely remove them
+            self.scratch_stmts.shrinkRetainingCapacity(mark.stmts);
+            self.scratch_exprs.shrinkRetainingCapacity(mark.exprs);
+            self.scratch_u32.shrinkRetainingCapacity(mark.u32s);
         }
     }
 

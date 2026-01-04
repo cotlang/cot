@@ -99,7 +99,6 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
     // Load DBL extension (Map type, NSPC_* functions)
     try vm.loadExtension(dbl_ext.dbl_extension);
 
-    try vm.initChannels();
     try vm.execute(&module);
 }
 
@@ -122,7 +121,6 @@ pub fn runWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8, 
     // Load DBL extension (Map type, NSPC_* functions)
     try vm.loadExtension(dbl_ext.dbl_extension);
 
-    try vm.initChannels();
     try vm.execute(&module);
 }
 
@@ -148,8 +146,6 @@ pub fn traceWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8
 
     // Load DBL extension (Map type, NSPC_* functions)
     try vm.loadExtension(dbl_ext.dbl_extension);
-
-    try vm.initChannels();
 
     std.debug.print("=== Execution Trace ===\n", .{});
     vm.execute(&module) catch |err| {

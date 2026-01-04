@@ -100,7 +100,7 @@ pub const Type = union(enum) {
             .i64, .u64, .f64 => 8,
             .isize, .usize => @sizeOf(usize),
             .string => 16, // Pointer + length
-            .decimal => |d| @max(8, (d.precision + 1) / 2), // At least 8 bytes
+            .decimal => |d| d.precision, // DBL decimals: 1 byte per digit character
             .ptr, .optional => 8, // 64-bit pointers
             .array => |a| a.element.sizeInBytes() * a.length,
             .slice => 16, // Pointer + length
@@ -1234,7 +1234,7 @@ test "ir type sizes" {
     try std.testing.expectEqual(@as(u32, 1), (Type{ .bool = {} }).sizeInBytes());
 
     const decimal_type = Type{ .decimal = .{ .precision = 18, .scale = 2 } };
-    try std.testing.expectEqual(@as(u32, 9), decimal_type.sizeInBytes());
+    try std.testing.expectEqual(@as(u32, 18), decimal_type.sizeInBytes()); // 1 byte per digit
 }
 
 test "ir function creation" {

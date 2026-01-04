@@ -419,6 +419,7 @@ pub const Lexer = struct {
         .{ "catch", .kw_catch },
         .{ "throw", .kw_throw },
         .{ "finally", .kw_finally },
+        .{ "defer", .kw_defer },
 
         // Other
         .{ "import", .kw_import },

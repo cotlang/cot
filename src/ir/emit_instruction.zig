@@ -6,6 +6,7 @@
 //! This module handles emission of all IR instruction types to bytecode.
 
 const std = @import("std");
+const log = std.log.scoped(.@"bytecode-emit");
 const ir = @import("ir.zig");
 const cot_runtime = @import("cot_runtime");
 const module = cot_runtime.bytecode.module;
@@ -103,7 +104,63 @@ pub fn emitLoad(e: *BytecodeEmitter, l: ir.Instruction.Load) EmitError!void {
 }
 
 /// Emit store instruction
+/// For DBL field views (overlays), uses str_slice_store to write through to the
+/// underlying buffer at the field's byte offset. This implements DBL RECORD
+/// semantics where field assignments modify the record buffer in place.
 pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
+    // Check if this is a field view (overlay) store that needs write-through
+    if (e.field_view_info.get(s.ptr.id)) |fv_info| {
+        // Field view store: use str_slice_store for write-through semantics
+        // Load value FIRST (into r3) to avoid clobbering other registers
+        // Then load buffer, offset, length into r0, r1, r2
+        // Finally emit str_slice_store and store the result back
+
+        debug.print(.emit, "store: field_view id={d} offset={d} len={d} -> str_slice_store", .{
+            s.ptr.id, fv_info.byte_offset, fv_info.length,
+        });
+
+        // Load value into r3 FIRST (emitValueToReg may use r0-r2 as temps)
+        try e.emitValueToReg(s.value, 3);
+
+        // Load the base buffer into r0
+        if (fv_info.is_global) {
+            try e.emitOpcode(.load_global);
+            try e.emitU8(0); // r0
+            try e.emitU16(fv_info.base_slot);
+        } else {
+            try e.emitOpcode(.load_local);
+            try e.emitU8(0 << 4); // r0
+            try e.emitU8(@intCast(fv_info.base_slot));
+        }
+
+        // Load offset constant into r1
+        const offset_idx = try e.addConstant(.{ .integer = fv_info.byte_offset });
+        try e.emitOpcode(.load_const);
+        try e.emitU8(1 << 4); // r1 in upper nibble
+        try e.emitU16(offset_idx);
+
+        // Load length constant into r2
+        const len_idx = try e.addConstant(.{ .integer = fv_info.length });
+        try e.emitOpcode(.load_const);
+        try e.emitU8(2 << 4); // r2 in upper nibble
+        try e.emitU16(len_idx);
+
+        // Emit str_slice_store r0, r1, r2, r3 (target, start, len, val)
+        try e.emitOpcode(.str_slice_store);
+        try e.emitU8((0 << 4) | 1); // r0 (target), r1 (start)
+        try e.emitU8((2 << 4) | 3); // r2 (len), r3 (val)
+        try e.emitU8(1); // is_length = true
+
+        // Store the modified buffer back to base slot
+        if (fv_info.is_global) {
+            try e.emitRegStoreGlobal(0, fv_info.base_slot);
+        } else {
+            try e.emitRegStoreLocal(0, @intCast(fv_info.base_slot));
+        }
+        return;
+    }
+
+    // Regular store
     const src_reg = try e.getValueInReg(s.value, 0);
     if (e.value_slots.get(s.ptr.id)) |slot_info| {
         if (slot_info & 0x8000 != 0) {
@@ -368,28 +425,22 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
 
 /// Emit call instruction - handles all call types
 pub fn emitCall(e: *BytecodeEmitter, c: ir.Instruction.Call) EmitError!void {
-    // Check for built-in method calls
-    if (std.mem.eql(u8, c.callee, "Console.WriteLine")) {
-        try emitConsoleCall(e, c, .console_writeln);
+    // Check for built-in method calls (Synergy.NET compatibility aliases)
+    // Note: DBL parser lowercases identifiers, so we check lowercase
+    if (std.mem.eql(u8, c.callee, "console.writeline")) {
+        try emitConsoleCall(e, c, .println);
         return;
-    } else if (std.mem.eql(u8, c.callee, "Console.Write")) {
-        try emitConsoleCall(e, c, .console_write);
-        return;
-    } else if (std.mem.eql(u8, c.callee, "console.log")) {
-        try emitConsoleCall(e, c, .console_log);
+    } else if (std.mem.eql(u8, c.callee, "console.write")) {
+        try emitConsoleCall(e, c, .print);
         return;
     }
 
     // Core Cot I/O functions: print(), println()
+    // Load ALL arguments to registers (r0, r1, r2, ...)
     if (io_functions.get(c.callee)) |opcode| {
-        if (c.args.len > 0) {
-            const arg = c.args[0];
-            if (e.reg_alloc.getRegister(arg.id)) |arg_reg| {
-                if (arg_reg != 0) {
-                    try e.emitRegMov(0, arg_reg);
-                }
-            } else {
-                try e.emitValueToReg(arg, 0);
+        for (c.args, 0..) |arg, i| {
+            if (i < 8) {
+                try e.emitValueToReg(arg, @intCast(i));
             }
         }
         try e.emitOpcode(opcode);
@@ -410,19 +461,21 @@ pub fn emitCall(e: *BytecodeEmitter, c: ir.Instruction.Call) EmitError!void {
         return;
     }
 
-    // Native functions (via xcall)
+    // User-defined functions take precedence over native functions
+    // This allows users to shadow builtin names like "log" with their own functions
+    if (e.function_indices.get(c.callee)) |routine_idx| {
+        try emitUserCall(e, c, routine_idx);
+        return;
+    }
+
+    // Native functions (via xcall) - only if no user function with same name
     if (native_functions.has(c.callee)) {
         try emitNativeCall(e, c);
         return;
     }
 
-    // Regular function call (user-defined)
-    if (e.function_indices.get(c.callee)) |routine_idx| {
-        try emitUserCall(e, c, routine_idx);
-    } else {
-        // Dynamic call (function not found at compile time)
-        try emitDynamicCall(e, c);
-    }
+    // Dynamic call (function not found at compile time)
+    try emitDynamicCall(e, c);
 }
 
 fn emitConsoleCall(e: *BytecodeEmitter, c: ir.Instruction.Call, opcode: Opcode) EmitError!void {
@@ -615,6 +668,8 @@ pub fn emitIoWrite(e: *BytecodeEmitter, w: ir.Instruction.IoWrite) EmitError!voi
 // ============================================================================
 
 /// Emit load_struct_buf instruction
+/// Format: [rd:4|flags:4] [type_idx:16] [base:16]
+/// flags: 0=locals, 1=globals
 pub fn emitLoadStructBuf(e: *BytecodeEmitter, sb: LoadStructBuf) EmitError!void {
     var type_idx: u16 = 0;
     var found = false;
@@ -642,7 +697,8 @@ pub fn emitLoadStructBuf(e: *BytecodeEmitter, sb: LoadStructBuf) EmitError!void 
         debug.print(.emit, "WARNING: struct '{s}' not found in types!", .{sb.struct_name});
     }
 
-    var local_base: u16 = 0;
+    var base: u16 = 0;
+    var is_global: bool = false;
     if (type_def) |td| {
         if (td.fields.len > 0) {
             const first_field = td.fields[0];
@@ -654,18 +710,31 @@ pub fn emitLoadStructBuf(e: *BytecodeEmitter, sb: LoadStructBuf) EmitError!void 
                     else => "",
                 };
                 debug.print(.emit, "load_struct_buf: looking up first field '{s}'", .{field_name});
+
+                // Try locals first
                 if (e.locals.get(field_name)) |loc| {
-                    local_base = loc.slot;
-                    debug.print(.emit, "load_struct_buf: local_base={d} (plain name)", .{local_base});
+                    base = loc.slot;
+                    is_global = false;
+                    debug.print(.emit, "load_struct_buf: base={d} (local)", .{base});
+                } else if (e.globals.get(field_name)) |glob| {
+                    base = glob.slot;
+                    is_global = true;
+                    debug.print(.emit, "load_struct_buf: base={d} (global)", .{base});
                 } else {
+                    // Try qualified names
                     var qualified_buf: [256]u8 = undefined;
                     const qualified_name = std.fmt.bufPrint(&qualified_buf, "{s}.{s}", .{ sb.base_name, field_name }) catch "";
                     debug.print(.emit, "load_struct_buf: trying qualified name '{s}'", .{qualified_name});
                     if (e.locals.get(qualified_name)) |loc| {
-                        local_base = loc.slot;
-                        debug.print(.emit, "load_struct_buf: local_base={d} (qualified)", .{local_base});
+                        base = loc.slot;
+                        is_global = false;
+                        debug.print(.emit, "load_struct_buf: base={d} (local qualified)", .{base});
+                    } else if (e.globals.get(qualified_name)) |glob| {
+                        base = glob.slot;
+                        is_global = true;
+                        debug.print(.emit, "load_struct_buf: base={d} (global qualified)", .{base});
                     } else {
-                        debug.print(.emit, "WARNING: first field '{s}' not found in locals!", .{field_name});
+                        debug.print(.emit, "WARNING: first field '{s}' not found!", .{field_name});
                     }
                 }
             }
@@ -673,11 +742,12 @@ pub fn emitLoadStructBuf(e: *BytecodeEmitter, sb: LoadStructBuf) EmitError!void 
     }
 
     const rd = try e.getOrAllocReg(sb.result);
-    debug.print(.emit, "load_struct_buf: allocated r{d} for result", .{rd});
+    const flags: u4 = if (is_global) 1 else 0;
+    debug.print(.emit, "load_struct_buf: rd=r{d} flags={d} (is_global={any})", .{ rd, flags, is_global });
     try e.emitOpcode(.load_record_buf);
-    try e.emitU8(@as(u8, rd) << 4);
+    try e.emitU8((@as(u8, rd) << 4) | flags);
     try e.emitU16(type_idx);
-    try e.emitU16(local_base);
+    try e.emitU16(base);
     e.last_result_value = sb.result.id;
     e.last_result_reg = rd;
 }
@@ -927,7 +997,50 @@ pub fn emitSelect(e: *BytecodeEmitter, s: ir.Instruction.Select) EmitError!void 
 }
 
 /// Emit ptr_offset instruction: rd = base + offset (byte-level pointer arithmetic)
+/// For DBL field views, this records FieldViewInfo for write-through semantics.
+/// When a field view is assigned, emitStore uses str_slice_store to write
+/// into the base buffer at the correct offset.
 pub fn emitPtrOffset(e: *BytecodeEmitter, p: ir.Instruction.PtrOffset) EmitError!void {
+    // Get base slot and global flag for field view tracking
+    const base_slot_info = e.value_slots.get(p.base_ptr.id);
+
+    // Determine the field length from the result type
+    // Field views have ptr type pointing to the field type (e.g., *[6]u8)
+    const field_length: u16 = blk: {
+        if (p.result.ty == .ptr) {
+            break :blk @intCast(p.result.ty.ptr.*.sizeInBytes());
+        } else {
+            break :blk @intCast(p.result.ty.sizeInBytes());
+        }
+    };
+
+    // Record field view info for ALL ptr_offset results (including offset 0)
+    // This enables write-through semantics for DBL record field overlays
+    if (base_slot_info) |slot_info| {
+        const base_slot = slot_info & 0x7FFF;
+        const is_global = (slot_info & 0x8000) != 0;
+
+        try e.field_view_info.put(p.result.id, .{
+            .base_slot = base_slot,
+            .byte_offset = @intCast(p.offset),
+            .length = field_length,
+            .is_global = is_global,
+        });
+
+        debug.print(.emit, "ptr_offset: id={d} -> base_slot={d} offset={d} len={d}", .{
+            p.result.id, base_slot, p.offset, field_length,
+        });
+    }
+
+    // For field views with offset 0, we just need to create an alias in value_slots
+    // The new pointer points to the same memory location as the base pointer
+    if (p.offset == 0) {
+        if (base_slot_info) |slot_info| {
+            try e.value_slots.put(p.result.id, slot_info);
+            return;
+        }
+    }
+
     const base_reg = try e.getValueInReg(p.base_ptr, 0);
     const dest_reg: u4 = 1;
     try e.emitOpcode(.ptr_offset);
@@ -937,4 +1050,9 @@ pub fn emitPtrOffset(e: *BytecodeEmitter, p: ir.Instruction.PtrOffset) EmitError
     try e.emitU8(@truncate(offset_u16));
     try e.emitU8(@truncate(offset_u16 >> 8));
     e.setLastResult(p.result.id, dest_reg);
+
+    // Also register in value_slots for subsequent loads
+    if (base_slot_info) |slot_info| {
+        try e.value_slots.put(p.result.id, slot_info);
+    }
 }

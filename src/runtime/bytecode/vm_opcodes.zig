@@ -849,37 +849,45 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
 // Console I/O
 // ============================================================================
 
-/// console_writeln rs - write value with newline
-pub fn op_console_writeln(vm: *VM, module: *const Module) VMError!DispatchResult {
+/// println argc - write all args to stdout with newline
+pub fn op_println(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
-    const rs: u4 = @truncate(ops >> 4);
-    const val = vm.registers[rs];
-    // Format using Value's custom format function
+    // argc is in low 4 bits (high 4 bits unused now)
+    const argc: u8 = @truncate(ops & 0x0F);
+
+    // Print all arguments from registers r0..r(argc-1)
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    val.format("", .{}, fbs.writer()) catch {};
-    vm.stdout.writeAll(fbs.getWritten()) catch {};
+    for (0..argc) |i| {
+        const val = vm.registers[i];
+        var fbs = std.io.fixedBufferStream(&buf);
+        val.format("", .{}, fbs.writer()) catch {};
+        vm.stdout.writeAll(fbs.getWritten()) catch {};
+    }
     vm.stdout.writeAll("\n") catch {};
     return .continue_dispatch;
 }
 
-/// console_write rs - write value
-pub fn op_console_write(vm: *VM, module: *const Module) VMError!DispatchResult {
+/// print argc - write all args to stdout
+pub fn op_print(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
-    const rs: u4 = @truncate(ops >> 4);
-    const val = vm.registers[rs];
-    // Format using Value's custom format function
+    // argc is in low 4 bits
+    const argc: u8 = @truncate(ops & 0x0F);
+
+    // Print all arguments from registers r0..r(argc-1)
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    val.format("", .{}, fbs.writer()) catch {};
-    vm.stdout.writeAll(fbs.getWritten()) catch {};
+    for (0..argc) |i| {
+        const val = vm.registers[i];
+        var fbs = std.io.fixedBufferStream(&buf);
+        val.format("", .{}, fbs.writer()) catch {};
+        vm.stdout.writeAll(fbs.getWritten()) catch {};
+    }
     return .continue_dispatch;
 }
 
-/// console_log rs, argc - log to dev pane
-pub fn op_console_log(vm: *VM, module: *const Module) VMError!DispatchResult {
+/// log argc - write all args to stderr
+pub fn op_log(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const argc: u4 = @truncate(ops & 0xF);
@@ -931,6 +939,63 @@ pub fn op_str_concat(vm: *VM, module: *const Module) VMError!DispatchResult {
     @memcpy(result[s1.len..], s2);
 
     // Store result as string value
+    vm.registers[rd] = Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory;
+    return .continue_dispatch;
+}
+
+/// str_slice_store rd, start_reg, len_reg, val_reg - rd[start:start+len] = val
+/// Writes val into the string buffer at position start for len bytes.
+/// This implements DBL field overlay write-through semantics for records.
+/// Format: [rd:4|start_reg:4] [len_reg:4|val_reg:4] [is_length:8]
+pub fn op_str_slice_store(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops1 = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    const is_length = module.code[vm.ip + 2];
+    vm.ip += 3;
+
+    const rd: u4 = @truncate(ops1 >> 4);
+    const start_reg: u4 = @truncate(ops1 & 0xF);
+    const len_reg: u4 = @truncate(ops2 >> 4);
+    const val_reg: u4 = @truncate(ops2 & 0xF);
+    _ = is_length; // Currently always treated as length
+
+    // Get parameters
+    const start: usize = @intCast(vm.registers[start_reg].asInt());
+    const length: usize = @intCast(vm.registers[len_reg].asInt());
+
+    // Get the target buffer
+    const target = vm.registers[rd];
+    const target_str = target.asString();
+
+    // Get the value to write (coerce to string if needed)
+    var val_buf: [32]u8 = undefined;
+    const val_str = vm.valueToStringSlice(vm.registers[val_reg], &val_buf);
+
+    // Ensure we have a mutable buffer of sufficient size
+    const total_len = @max(target_str.len, start + length);
+    const result = vm.allocator.alloc(u8, total_len) catch return VMError.OutOfMemory;
+
+    // Copy existing content
+    if (target_str.len > 0) {
+        const copy_len = @min(target_str.len, result.len);
+        @memcpy(result[0..copy_len], target_str[0..copy_len]);
+    }
+
+    // Fill with spaces if buffer is being extended
+    if (total_len > target_str.len) {
+        @memset(result[target_str.len..], ' ');
+    }
+
+    // Write the value at the specified position, padding or truncating as needed
+    const write_len = @min(length, val_str.len);
+    @memcpy(result[start .. start + write_len], val_str[0..write_len]);
+
+    // Pad remaining field space with spaces if value is shorter than field
+    if (write_len < length) {
+        @memset(result[start + write_len .. start + length], ' ');
+    }
+
+    // Store result back to rd
     vm.registers[rd] = Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory;
     return .continue_dispatch;
 }
@@ -1208,12 +1273,16 @@ pub fn op_decr_int(vm: *VM, module: *const Module) VMError!DispatchResult {
 // Record Buffer Operations
 // ============================================================================
 
-/// load_record_buf rd, type_idx, local_base - serialize record fields to buffer
+/// load_record_buf rd, type_idx, base, flags - serialize record fields to buffer
+/// Format: [rd:4|flags:4] [type_idx:16] [base:16]
+/// flags: 0=locals, 1=globals
 pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const rd: u4 = @truncate(ops >> 4);
+    const flags: u4 = @truncate(ops & 0xF);
+    const is_global = (flags & 1) != 0;
     const type_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
-    const local_base = std.mem.readInt(u16, module.code[vm.ip + 3 ..][0..2], .little);
+    const base = std.mem.readInt(u16, module.code[vm.ip + 3 ..][0..2], .little);
     vm.ip += 5;
 
     // Get type definition
@@ -1221,18 +1290,55 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
         return vm.fail(VMError.InvalidType, "Invalid type index in load_record_buf");
     };
 
-    // Allocate buffer for the serialized record
+    // DBL RECORD optimization: If the base slot already contains a properly-sized buffer
+    // (field overlay model), just use that directly instead of serializing from separate slots.
+    // This handles DBL records where all fields overlay a single buffer.
+    const base_val = if (is_global) blk: {
+        if (base >= vm.globals.items.len) break :blk Value.initNull();
+        break :blk vm.globals.items[base];
+    } else blk: {
+        const slot = vm.fp + base;
+        if (slot >= vm.stack.len) break :blk Value.initNull();
+        break :blk vm.stack[slot];
+    };
+
+    // Check if base slot is already a buffer of the right size
+    if (base_val.isString() or base_val.isFixedString()) {
+        const existing_buf = base_val.toString();
+        if (existing_buf.len == type_def.total_size) {
+            // DBL record case: buffer already contains serialized data
+            // Just copy it as a fixed string and return
+            const result_copy = vm.allocator.alloc(u8, existing_buf.len) catch {
+                return vm.fail(VMError.OutOfMemory, "Failed to copy record buffer");
+            };
+            @memcpy(result_copy, existing_buf);
+            const result = Value.initFixedString(vm.valueAllocator(), result_copy) catch {
+                vm.allocator.free(result_copy);
+                return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
+            };
+            vm.registers[rd] = result;
+            return .continue_dispatch;
+        }
+    }
+
+    // Cot struct case: Allocate buffer and serialize from separate field slots
     const buffer = vm.allocator.alloc(u8, type_def.total_size) catch {
         return vm.fail(VMError.OutOfMemory, "Failed to allocate record buffer");
     };
     // Initialize to spaces (standard for ISAM records)
     @memset(buffer, ' ');
 
-    // Serialize each field
+    // Serialize each field from the appropriate storage
     for (type_def.fields, 0..) |field, i| {
-        const slot = vm.fp + local_base + i;
-        if (slot >= vm.stack.len) continue;
-        const val = vm.stack[slot];
+        const val = if (is_global) blk: {
+            const slot = base + i;
+            if (slot >= vm.globals.items.len) break :blk Value.initNull();
+            break :blk vm.globals.items[slot];
+        } else blk: {
+            const slot = vm.fp + base + i;
+            if (slot >= vm.stack.len) break :blk Value.initNull();
+            break :blk vm.stack[slot];
+        };
 
         // Get the destination slice in the buffer
         const offset = field.offset;
@@ -1294,14 +1400,20 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
     return .continue_dispatch;
 }
 
-/// store_record_buf type_idx, local_base - deserialize buffer to record fields
+/// store_record_buf rs, type_idx, base, flags - deserialize buffer to record fields
+/// Format: [rs:4|flags:4] [type_idx:16] [base:16]
+/// flags: 0=locals, 1=globals
 pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult {
-    const type_idx = std.mem.readInt(u16, module.code[vm.ip..][0..2], .little);
-    const local_base = std.mem.readInt(u16, module.code[vm.ip + 2 ..][0..2], .little);
-    vm.ip += 4;
+    const ops = module.code[vm.ip];
+    const rs: u4 = @truncate(ops >> 4);
+    const flags: u4 = @truncate(ops & 0xF);
+    const is_global = (flags & 1) != 0;
+    const type_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    const base = std.mem.readInt(u16, module.code[vm.ip + 3 ..][0..2], .little);
+    vm.ip += 5;
 
-    // Get the buffer from stack[sp]
-    const buffer_val = vm.stack[vm.sp];
+    // Get the buffer from the source register
+    const buffer_val = vm.registers[rs];
     const buffer = buffer_val.toString();
     if (buffer.len == 0) {
         return .continue_dispatch;
@@ -1312,10 +1424,55 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
         return vm.fail(VMError.InvalidType, "Invalid type index in store_record_buf");
     };
 
-    // Deserialize each field from the buffer into the local slots
+    // DBL RECORD optimization: If the base slot contains a buffer of the right size
+    // (field overlay model), copy the incoming data directly to that buffer.
+    // This handles DBL records where all fields overlay a single buffer.
+    const base_slot_ptr: ?*Value = if (is_global) blk: {
+        if (base >= vm.globals.items.len) break :blk null;
+        break :blk &vm.globals.items[base];
+    } else blk: {
+        const slot = vm.fp + base;
+        if (slot >= vm.stack.len) break :blk null;
+        break :blk &vm.stack[slot];
+    };
+
+    if (base_slot_ptr) |slot_ptr| {
+        const base_val = slot_ptr.*;
+        if (base_val.isString() or base_val.isFixedString()) {
+            const existing_buf = base_val.toString();
+            if (existing_buf.len == type_def.total_size and buffer.len == type_def.total_size) {
+                // DBL record case: directly copy incoming buffer to the base slot
+                const new_buf = vm.allocator.alloc(u8, buffer.len) catch {
+                    return vm.fail(VMError.OutOfMemory, "Failed to allocate record buffer");
+                };
+                @memcpy(new_buf, buffer);
+                const new_val = Value.initFixedString(vm.valueAllocator(), new_buf) catch {
+                    vm.allocator.free(new_buf);
+                    return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
+                };
+                slot_ptr.* = new_val;
+                return .continue_dispatch;
+            }
+        }
+    }
+
+    // Cot struct case: Deserialize each field from the buffer into separate slots
     for (type_def.fields, 0..) |field, i| {
-        const slot = vm.fp + local_base + i;
-        if (slot >= vm.stack.len) continue;
+        // Determine target slot based on storage type
+        const slot_ptr: ?*Value = if (is_global) blk: {
+            const slot = base + i;
+            if (slot >= vm.globals.items.len) {
+                // Extend globals if needed
+                vm.globals.ensureTotalCapacity(vm.allocator, slot + 1) catch break :blk null;
+                vm.globals.items.len = slot + 1;
+            }
+            break :blk &vm.globals.items[slot];
+        } else blk: {
+            const slot = vm.fp + base + i;
+            if (slot >= vm.stack.len) break :blk null;
+            break :blk &vm.stack[slot];
+        };
+        if (slot_ptr == null) continue;
 
         const offset = field.offset;
         const size = field.size;
@@ -1329,12 +1486,12 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
                 // Use field.precision to preserve implied decimal semantics
                 // For d10.2, value 12345 with precision 2 represents 123.45
                 if (field.precision > 0) {
-                    vm.stack[slot] = Value.initDecimal(vm.valueAllocator(), int_val, field.precision) catch {
-                        vm.stack[slot] = Value.initInt(int_val);
+                    slot_ptr.?.* = Value.initDecimal(vm.valueAllocator(), int_val, field.precision) catch {
+                        slot_ptr.?.* = Value.initInt(int_val);
                         continue;
                     };
                 } else {
-                    vm.stack[slot] = Value.initInt(int_val);
+                    slot_ptr.?.* = Value.initInt(int_val);
                 }
             },
             .string => {
@@ -1344,7 +1501,7 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
                     vm.allocator.free(str_copy);
                     continue;
                 };
-                vm.stack[slot] = val;
+                slot_ptr.?.* = val;
             },
             else => {},
         }

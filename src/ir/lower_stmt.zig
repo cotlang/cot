@@ -46,16 +46,33 @@ const StructHelper = struct_serial.StructHelper;
 
 /// Lower a block statement (sequence of statements)
 pub fn lowerBlock(l: *Lowerer, data: NodeData) LowerError!void {
+    // Push a new defer scope for this block
+    try l.pushDeferScope();
+
     const span = data.getSpan();
     const stmt_indices = l.store.getStmtSpan(span);
     for (stmt_indices) |idx| {
         try l.lowerStatement(@enumFromInt(idx));
     }
+
+    // Pop defer scope and emit any defers in reverse order
+    try l.popDeferScopeAndEmit();
 }
 
 /// Lower a break statement
 pub fn lowerBreak(l: *Lowerer) LowerError!void {
     if (l.loop_exit_block) |exit_block| {
+        // Emit defers for the current scope before breaking
+        // Note: The block's popDeferScopeAndEmit won't run since we're jumping out
+        if (l.defer_scope_marks.items.len > 0) {
+            const mark = l.defer_scope_marks.items[l.defer_scope_marks.items.len - 1];
+            const defers_in_scope = l.defers.items[mark..];
+            var i: usize = defers_in_scope.len;
+            while (i > 0) {
+                i -= 1;
+                try l.lowerStatement(defers_in_scope[i]);
+            }
+        }
         try l.emit(.{ .jump = .{ .target = exit_block } });
     } else {
         return LowerError.UnsupportedFeature;
@@ -65,6 +82,17 @@ pub fn lowerBreak(l: *Lowerer) LowerError!void {
 /// Lower a continue statement
 pub fn lowerContinue(l: *Lowerer) LowerError!void {
     if (l.loop_continue_block) |continue_block| {
+        // Emit defers for the current scope before continuing
+        // Note: The block's popDeferScopeAndEmit won't run since we're jumping
+        if (l.defer_scope_marks.items.len > 0) {
+            const mark = l.defer_scope_marks.items[l.defer_scope_marks.items.len - 1];
+            const defers_in_scope = l.defers.items[mark..];
+            var i: usize = defers_in_scope.len;
+            while (i > 0) {
+                i -= 1;
+                try l.lowerStatement(defers_in_scope[i]);
+            }
+        }
         try l.emit(.{ .jump = .{ .target = continue_block } });
     } else {
         return LowerError.UnsupportedFeature;
@@ -255,12 +283,17 @@ pub fn lowerIf(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
 pub fn lowerReturn(l: *Lowerer, data: NodeData) LowerError!void {
     const value_idx = data.getReturnValue();
 
-    if (value_idx != .null) {
-        const value = try l.lowerExpression(value_idx);
-        try l.emit(.{ .return_ = value });
-    } else {
-        try l.emit(.{ .return_ = null });
-    }
+    // Evaluate return value first (before defers, in case they have side effects)
+    const return_value = if (value_idx != .null)
+        try l.lowerExpression(value_idx)
+    else
+        null;
+
+    // Emit all defers before returning (in reverse order, LIFO)
+    try l.emitAllDefers();
+
+    // Now emit the actual return
+    try l.emit(.{ .return_ = return_value });
 }
 
 /// Lower a while loop
@@ -555,14 +588,26 @@ pub fn lowerFieldView(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
     // Look up the base field's memory location
     if (l.scopes.get(base_field_name)) |base_ptr| {
         // Field overlay: view shares the same memory as base_ptr (plus offset)
-        // For offset 0, the view is simply an alias to the same slot
-        // For non-zero offsets, we use ptr_offset for byte-level access
+        // Create a new pointer with the correct view_type, even at offset 0
+        // This ensures the type information is preserved when accessing the view
 
         if (offset == 0) {
-            // Simple alias - the view name maps to the exact same storage slot as the base
-            // No instruction needed - we just register the view name pointing to base_ptr
-            try l.scopes.put(name, base_ptr);
-            debug.print(.ir, "field_view '{s}' aliased to '{s}' (offset 0)", .{ name, base_field_name });
+            // Same memory location but different type - create a bitcast-like view
+            // by using ptr_offset with offset 0 to get a new typed pointer
+            const ty_ptr = try l.allocator.create(ir.Type);
+            ty_ptr.* = view_type;
+            try l.allocated_types.append(l.allocator, ty_ptr);
+
+            const typed_ptr = func.newValue(.{ .ptr = ty_ptr });
+            try l.emit(.{
+                .ptr_offset = .{
+                    .base_ptr = base_ptr,
+                    .offset = 0,
+                    .result = typed_ptr,
+                },
+            });
+            try l.scopes.put(name, typed_ptr);
+            debug.print(.ir, "field_view '{s}' overlays '{s}' with type size", .{ name, base_field_name });
         } else {
             // Offset access uses byte-level pointer arithmetic
             // Create a new pointer that points to base_ptr + offset bytes

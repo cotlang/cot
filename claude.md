@@ -1,5 +1,27 @@
 # Claude Development Guidelines for Cot
 
+## Troubleshooting Priority: Use cot trace
+
+When debugging runtime issues, **always start with `cot trace --level=verbose`**:
+
+```bash
+cot compile myfile.cot -o myfile.cbo
+cot trace myfile.cbo --level=verbose
+```
+
+This shows:
+- Every opcode executed with IP and source line
+- Register values with type information (e.g., `r0=int:42 r1=str:"hello"`)
+- Call/return flow for routines and native functions
+
+**If verbose trace does not immediately reveal the cause:**
+1. Do NOT resort to trial-and-error debugging
+2. Instead, **enhance the trace infrastructure** to expose the missing information
+3. Add new trace output for the specific subsystem causing issues
+4. The goal is to mature `cot trace` so it can pinpoint any issue quickly
+
+This investment in tooling pays off across all future debugging sessions.
+
 ## Critical Rule: No Shortcuts, No Workarounds
 
 Every issue must be analyzed to find the **root cause** and the **best fix** must always be implemented.

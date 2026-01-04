@@ -161,6 +161,7 @@ pub const Emitter = struct {
             .continue_stmt => try self.emitContinueStmt(idx),
             .try_stmt => try self.emitTryStmt(idx),
             .throw_stmt => try self.emitThrowStmt(idx),
+            .defer_stmt => try self.emitDeferStmt(idx),
             .assignment => try self.emitAssignment(idx),
             .expression => try self.emitExprStmt(idx),
             .block => try self.emitBlock(idx),
@@ -678,16 +679,51 @@ pub const Emitter = struct {
     fn emitTryStmt(self: *Self, idx: StmtIdx) anyerror!void {
         const data = self.store.stmtData(idx);
         const try_body = StmtIdx.fromInt(data.a);
+        const extra_start = ast.ExtraIdx.fromInt(data.b);
 
+        // Extract from extra_data: err_binding, catch_body, finally_body
+        const extra_base = extra_start.toInt();
+        const err_binding: StringId = @enumFromInt(self.store.extra_data.items[extra_base]);
+        const catch_body = StmtIdx.fromInt(self.store.extra_data.items[extra_base + 1]);
+        const finally_body = StmtIdx.fromInt(self.store.extra_data.items[extra_base + 2]);
+
+        // Emit try block
         try self.writeIndent();
         try self.writer.writeAll("try {\n");
-
         self.indent_level += 1;
         try self.emitStatement(try_body);
         self.indent_level -= 1;
-
         try self.writeIndent();
-        try self.writer.writeAll("}\n");
+        try self.writer.writeAll("} catch");
+
+        // Emit error binding if present
+        if (err_binding != .null_id) {
+            try self.writer.writeAll(" (");
+            try self.writer.writeAll(self.store.strings.get(err_binding));
+            try self.writer.writeByte(')');
+        }
+
+        // Emit catch block
+        try self.writer.writeAll(" {\n");
+        self.indent_level += 1;
+        if (!catch_body.isNull()) {
+            try self.emitStatement(catch_body);
+        }
+        self.indent_level -= 1;
+        try self.writeIndent();
+        try self.writer.writeByte('}');
+
+        // Emit finally block if present
+        if (!finally_body.isNull()) {
+            try self.writer.writeAll(" finally {\n");
+            self.indent_level += 1;
+            try self.emitStatement(finally_body);
+            self.indent_level -= 1;
+            try self.writeIndent();
+            try self.writer.writeByte('}');
+        }
+
+        try self.writer.writeByte('\n');
     }
 
     fn emitThrowStmt(self: *Self, idx: StmtIdx) anyerror!void {
@@ -698,6 +734,34 @@ pub const Emitter = struct {
         try self.writer.writeAll("throw ");
         try self.emitExpression(value);
         try self.writer.writeByte('\n');
+    }
+
+    fn emitDeferStmt(self: *Self, idx: StmtIdx) anyerror!void {
+        const data = self.store.stmtData(idx);
+        const body = StmtIdx.fromInt(data.a);
+
+        try self.writeIndent();
+        try self.writer.writeAll("defer ");
+
+        // Check if body is a block or expression statement
+        const body_tag = self.store.stmtTag(body);
+        if (body_tag == .block) {
+            try self.emitBlock(body);
+        } else if (body_tag == .expression) {
+            // Single expression - emit without block braces
+            const expr_data = self.store.stmtData(body);
+            const expr = ExprIdx.fromInt(expr_data.a);
+            try self.emitExpression(expr);
+            try self.writer.writeByte('\n');
+        } else {
+            // Unexpected - emit as block for safety
+            try self.writer.writeAll("{\n");
+            self.indent_level += 1;
+            try self.emitStatement(body);
+            self.indent_level -= 1;
+            try self.writeIndent();
+            try self.writer.writeAll("}\n");
+        }
     }
 
     fn emitAssignment(self: *Self, idx: StmtIdx) anyerror!void {

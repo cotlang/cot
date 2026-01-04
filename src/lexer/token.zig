@@ -186,6 +186,7 @@ pub const TokenType = enum {
     kw_catch,
     kw_throw,
     kw_finally,
+    kw_defer,
 
     // Keywords - other
     kw_import,
@@ -243,6 +244,7 @@ pub const TokenType = enum {
             .kw_catch,
             .kw_throw,
             .kw_finally,
+            .kw_defer,
             .kw_import,
             .kw_as,
             .kw_is,

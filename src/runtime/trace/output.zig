@@ -6,6 +6,9 @@
 
 const std = @import("std");
 const Opcode = @import("../bytecode/opcodes.zig").Opcode;
+const Value = @import("../bytecode/value.zig").Value;
+const trace_mod = @import("trace.zig");
+const RegisterSnapshot = trace_mod.RegisterSnapshot;
 
 /// Output format
 pub const Format = enum {
@@ -293,6 +296,87 @@ pub const Output = struct {
         }
     }
 
+    /// Format a native function call with argument values
+    pub fn writeNativeCall(self: *Self, name: []const u8, args: []const Value, ip: u32) void {
+        switch (self.config.format) {
+            .human => {
+                self.indent();
+                self.color(Color.magenta);
+                self.write(">>> ", .{});
+                self.color(Color.reset);
+                self.write("native ", .{});
+                self.colored(Color.routine, name);
+                self.write("(", .{});
+                // Show each argument with its value
+                for (args, 0..) |arg, i| {
+                    if (i > 0) self.write(", ", .{});
+                    self.color(Color.value);
+                    var buf: [128]u8 = undefined;
+                    const repr = arg.debugRepr(&buf);
+                    self.write("{s}", .{repr});
+                    self.color(Color.reset);
+                }
+                self.write(") @ 0x{x:0>4}\n", .{ip});
+                self.current_call_depth += 1;
+            },
+            .json => {
+                self.write(
+                    \\{{"event":"native_call","name":"{s}","ip":{d},"args":[
+                , .{ name, ip });
+                for (args, 0..) |arg, i| {
+                    if (i > 0) self.write(",", .{});
+                    var buf: [128]u8 = undefined;
+                    const repr = arg.debugRepr(&buf);
+                    self.write("\"{s}\"", .{repr});
+                }
+                self.write("]}}\n", .{});
+            },
+            .compact => {
+                self.write("NATIVE:{s}:{d}\n", .{ name, args.len });
+            },
+        }
+    }
+
+    /// Format a native function return with result value
+    pub fn writeNativeReturn(self: *Self, name: []const u8, result: ?Value, ip: u32) void {
+        switch (self.config.format) {
+            .human => {
+                if (self.current_call_depth > 0) {
+                    self.current_call_depth -= 1;
+                }
+                self.indent();
+                self.color(Color.magenta);
+                self.write("<<< ", .{});
+                self.color(Color.reset);
+                self.write("native ", .{});
+                self.colored(Color.routine, name);
+                if (result) |res| {
+                    self.write(" -> ", .{});
+                    self.color(Color.value);
+                    var buf: [128]u8 = undefined;
+                    const repr = res.debugRepr(&buf);
+                    self.write("{s}", .{repr});
+                    self.color(Color.reset);
+                }
+                self.write(" @ 0x{x:0>4}\n", .{ip});
+            },
+            .json => {
+                self.write(
+                    \\{{"event":"native_return","name":"{s}","ip":{d}
+                , .{ name, ip });
+                if (result) |res| {
+                    var buf: [128]u8 = undefined;
+                    const repr = res.debugRepr(&buf);
+                    self.write(",\"result\":\"{s}\"", .{repr});
+                }
+                self.write("}}\n", .{});
+            },
+            .compact => {
+                self.write("NRET:{s}\n", .{name});
+            },
+        }
+    }
+
     /// Format a routine return event
     pub fn writeReturn(self: *Self, routine: []const u8, has_value: bool, ip: u32) void {
         switch (self.config.format) {
@@ -383,7 +467,7 @@ pub const Output = struct {
         }
     }
 
-    /// Write register state
+    /// Write register state (legacy - raw i64 values)
     pub fn writeRegisters(self: *Self, regs: []const i64) void {
         switch (self.config.format) {
             .human => {
@@ -404,6 +488,62 @@ pub const Output = struct {
             },
             .compact => {
                 // Not included
+            },
+        }
+    }
+
+    /// Write register state with type information (verbose mode)
+    /// Uses debugRepr to show values with their types
+    pub fn writeRegisterSnapshots(self: *Self, regs: []const RegisterSnapshot) void {
+        switch (self.config.format) {
+            .human => {
+                self.write("  | ", .{});
+                // Only show non-null registers to reduce noise
+                var first = true;
+                for (regs, 0..) |reg, i| {
+                    // Skip null values to reduce clutter
+                    if (reg.tag == .null_val) continue;
+
+                    if (!first) self.write(" ", .{});
+                    first = false;
+
+                    self.color(Color.register);
+                    self.write("r{d}", .{i});
+                    self.color(Color.reset);
+                    self.write("=", .{});
+                    self.color(Color.value);
+                    // Format with type info
+                    var buf: [64]u8 = undefined;
+                    const repr = reg.format(&buf);
+                    self.write("{s}", .{repr});
+                    self.color(Color.reset);
+                }
+                // If all registers were null, show that
+                if (first) {
+                    self.color(Color.dim);
+                    self.write("(all nil)", .{});
+                    self.color(Color.reset);
+                }
+            },
+            .json => {
+                // Include register types and values in JSON
+                self.write(",\"regs\":[", .{});
+                for (regs, 0..) |reg, i| {
+                    if (i > 0) self.write(",", .{});
+                    var buf: [64]u8 = undefined;
+                    const repr = reg.format(&buf);
+                    self.write("\"{s}\"", .{repr});
+                }
+                self.write("]", .{});
+            },
+            .compact => {
+                // Include compact register state
+                self.write("|", .{});
+                for (regs) |reg| {
+                    var buf: [32]u8 = undefined;
+                    const repr = reg.format(&buf);
+                    self.write("{s},", .{repr});
+                }
             },
         }
     }

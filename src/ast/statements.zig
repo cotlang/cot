@@ -83,6 +83,9 @@ pub const StatementTag = enum(u8) {
     /// Throw error: throw error_value
     throw_stmt,
 
+    /// Defer statement: defer expr (executed at scope exit)
+    defer_stmt,
+
     // ============================================
     // Expressions and Blocks
     // ============================================

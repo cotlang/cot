@@ -768,6 +768,7 @@ pub const Parser = struct {
             .kw_view => self.parseViewDecl(),
             .kw_try => self.parseTry(),
             .kw_throw => self.parseThrow(),
+            .kw_defer => self.parseDefer(),
             .kw_comptime => self.parseComptime(),
             .lbrace => self.parseBlockStmt(),
             else => self.parseExpressionStatement(),
@@ -813,7 +814,9 @@ pub const Parser = struct {
 
         const loc = self.currentLoc();
         _ = try self.consume(.kw_if, "Expected 'if'");
+        _ = try self.consume(.lparen, "Expected '(' after 'if'");
         const condition = try self.parseExpression();
+        _ = try self.consume(.rparen, "Expected ')' after condition");
 
         _ = try self.consume(.lbrace, "Expected '{'");
         const then_body = try self.parseBlock();
@@ -933,7 +936,9 @@ pub const Parser = struct {
 
         const loc = self.currentLoc();
         _ = try self.consume(.kw_while, "Expected 'while'");
+        _ = try self.consume(.lparen, "Expected '(' after 'while'");
         const condition = try self.parseExpression();
+        _ = try self.consume(.rparen, "Expected ')' after condition");
 
         _ = try self.consume(.lbrace, "Expected '{'");
         const body = try self.parseBlock();
@@ -1006,32 +1011,26 @@ pub const Parser = struct {
 
         _ = try self.consume(.kw_catch, "Expected 'catch'");
 
-        // Optional error binding: catch |err|
+        // Optional error binding: catch (err)
         var err_binding: StringId = .null_id;
-        if (self.match(&[_]TokenType{.pipe})) {
+        if (self.match(&[_]TokenType{.lparen})) {
             const err_token = try self.consume(.identifier, "Expected error variable");
             err_binding = self.internString(err_token.lexeme) catch return error.OutOfMemory;
-            _ = try self.consume(.pipe, "Expected '|'");
+            _ = try self.consume(.rparen, "Expected ')'");
         }
 
         _ = try self.consume(.lbrace, "Expected '{'");
         const catch_body = try self.parseBlock();
 
-        // Store try statement
-        const extra_start = self.store.extra_data.items.len;
-        self.store.extra_data.append(self.allocator, @intFromEnum(err_binding)) catch return error.OutOfMemory;
-        self.store.extra_data.append(self.allocator, catch_body.toInt()) catch return error.OutOfMemory;
-
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));
-        self.store.stmt_tags.append(self.allocator, .try_stmt) catch return error.OutOfMemory;
-        self.store.stmt_locs.append(self.allocator, loc) catch return error.OutOfMemory;
-        self.store.stmt_data.append(self.allocator, .{
-            .a = try_body.toInt(),
-            .b = @intCast(extra_start),
-        }) catch return error.OutOfMemory;
+        // Optional finally block
+        var finally_body: StmtIdx = .null;
+        if (self.match(&[_]TokenType{.kw_finally})) {
+            _ = try self.consume(.lbrace, "Expected '{'");
+            finally_body = try self.parseBlock();
+        }
 
         self.exitNesting();
-        return idx;
+        return self.store.addTryStmt(try_body, err_binding, catch_body, finally_body, loc) catch return error.OutOfMemory;
     }
 
     fn parseThrow(self: *Self) ParseError!StmtIdx {
@@ -1048,6 +1047,25 @@ pub const Parser = struct {
         }) catch return error.OutOfMemory;
 
         return idx;
+    }
+
+    /// Parse defer statement: defer expr or defer { block }
+    /// The deferred code runs at scope exit (in reverse order of declaration)
+    fn parseDefer(self: *Self) ParseError!StmtIdx {
+        const loc = self.currentLoc();
+        _ = try self.consume(.kw_defer, "Expected 'defer'");
+
+        // Check if it's a block or expression
+        const body = if (self.check(.lbrace)) blk: {
+            _ = try self.consume(.lbrace, "Expected '{'");
+            break :blk try self.parseBlock();
+        } else blk: {
+            // Single expression - wrap as expression statement
+            const expr = try self.parseExpression();
+            break :blk self.store.addExprStmt(expr, loc) catch return error.OutOfMemory;
+        };
+
+        return self.store.addDeferStmt(body, loc) catch return error.OutOfMemory;
     }
 
     fn parseComptime(self: *Self) ParseError!StmtIdx {
@@ -1863,6 +1881,13 @@ pub const Parser = struct {
 
     fn peek(self: *Self) Token {
         return self.tokens[self.current];
+    }
+
+    fn peekNext(self: *Self) Token {
+        if (self.current + 1 >= self.tokens.len) {
+            return self.tokens[self.tokens.len - 1]; // Return EOF
+        }
+        return self.tokens[self.current + 1];
     }
 
     fn previous(self: *Self) Token {

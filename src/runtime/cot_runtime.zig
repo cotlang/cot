@@ -34,15 +34,12 @@ pub const native = @import("native/native.zig");
 // TUI
 pub const tui = @import("tui/tui.zig");
 
-// I/O abstraction layer
-pub const io = @import("io/io.zig");
-
 // ISAM backends - re-export from cotdb
 pub const sqlite_isam = @import("cotdb").sqlite_isam;
 
-// Unified channel management (text + ISAM)
-pub const channels = @import("channels.zig");
-pub const ChannelManager = channels.ChannelManager;
+// Unified handle management
+pub const handles = @import("handles/handles.zig");
+pub const UnifiedHandleManager = handles.UnifiedHandleManager;
 
 // Debug utilities
 pub const debug = @import("debug.zig");

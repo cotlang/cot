@@ -48,11 +48,33 @@ const Handlers = struct {
         try completion_options.put("triggerCharacters", JsonValue{ .array = trigger_chars });
         try capabilities.put("completionProvider", JsonValue{ .object = completion_options });
 
+        // Signature help support (function parameter hints)
+        var sig_help_options = JsonObject.init(allocator);
+        var sig_trigger_chars = JsonArray.init(allocator);
+        try sig_trigger_chars.append(JsonValue{ .string = "(" });
+        try sig_trigger_chars.append(JsonValue{ .string = "," });
+        try sig_help_options.put("triggerCharacters", JsonValue{ .array = sig_trigger_chars });
+        try capabilities.put("signatureHelpProvider", JsonValue{ .object = sig_help_options });
+
         // Hover support
         try capabilities.put("hoverProvider", JsonValue{ .bool = true });
 
         // Document symbol support
         try capabilities.put("documentSymbolProvider", JsonValue{ .bool = true });
+
+        // Go to definition support
+        try capabilities.put("definitionProvider", JsonValue{ .bool = true });
+
+        // Find references support
+        try capabilities.put("referencesProvider", JsonValue{ .bool = true });
+
+        // Document highlight support (highlight all occurrences of symbol under cursor)
+        try capabilities.put("documentHighlightProvider", JsonValue{ .bool = true });
+
+        // Rename symbol support
+        var rename_options = JsonObject.init(allocator);
+        try rename_options.put("prepareProvider", JsonValue{ .bool = true });
+        try capabilities.put("renameProvider", JsonValue{ .object = rename_options });
 
         // Document formatting support
         try capabilities.put("documentFormattingProvider", JsonValue{ .bool = true });
@@ -99,6 +121,15 @@ const Handlers = struct {
 
         // Publish diagnostics for the new document
         try publishDiagnostics(server, uri.string);
+    }
+
+    /// Handle textDocument/didSave notification
+    fn didSave(server: *Server, params: JsonValue) void {
+        const text_document = params.object.get("textDocument") orelse return;
+        const uri = text_document.object.get("uri") orelse return;
+
+        // Re-index the document on save (safe because content is valid)
+        server.reindexDocument(uri.string);
     }
 
     /// Handle textDocument/didChange notification
@@ -199,6 +230,104 @@ const Handlers = struct {
         return protocol.makeResponse(id, JsonValue{ .array = items }, allocator);
     }
 
+    /// Handle textDocument/signatureHelp request
+    fn signatureHelp(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
+        const text_document = params.object.get("textDocument") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const uri = text_document.object.get("uri") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const position = params.object.get("position") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        const doc = server.getDocument(uri.string) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        const line_num: usize = @intCast(position.object.get("line").?.integer);
+        const char_num: usize = @intCast(position.object.get("character").?.integer);
+
+        // Find the function call context at the cursor position
+        const call_info = findFunctionCallContext(doc.content, line_num, char_num) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        // Look up the function definition
+        if (server.symbols.findDefinitions(call_info.function_name)) |definitions| {
+            for (definitions) |def| {
+                if (def.kind == .function) {
+                    // Build signature based on document language
+                    var sig_buf: [1024]u8 = undefined;
+                    var sig_stream = std.io.fixedBufferStream(&sig_buf);
+                    const writer = sig_stream.writer();
+
+                    const is_dbl = doc.language == .dbl;
+
+                    // Function keyword and name
+                    if (is_dbl) {
+                        writer.print("function {s}(", .{def.name}) catch return protocol.makeResponse(id, JsonValue.null, allocator);
+                    } else {
+                        writer.print("fn {s}(", .{def.name}) catch return protocol.makeResponse(id, JsonValue.null, allocator);
+                    }
+
+                    // Build parameters array for highlighting
+                    var params_array = JsonArray.init(allocator);
+
+                    if (def.params) |fn_params| {
+                        for (fn_params, 0..) |p, i| {
+                            if (i > 0) writer.writeAll(", ") catch {};
+
+                            // Record parameter start position for highlighting
+                            const param_start = sig_stream.pos;
+
+                            writer.print("{s}: {s}", .{ p.name, p.type_str }) catch {};
+
+                            const param_end = sig_stream.pos;
+
+                            // Create parameter info
+                            var param_info = JsonObject.init(allocator);
+                            var label_array = JsonArray.init(allocator);
+                            try label_array.append(JsonValue{ .integer = @intCast(param_start) });
+                            try label_array.append(JsonValue{ .integer = @intCast(param_end) });
+                            try param_info.put("label", JsonValue{ .array = label_array });
+                            try params_array.append(JsonValue{ .object = param_info });
+                        }
+                    }
+
+                    writer.writeByte(')') catch {};
+
+                    // Add return type for Cot only (DBL doesn't show return types)
+                    if (!is_dbl) {
+                        if (def.return_type) |rt| {
+                            if (!std.mem.eql(u8, rt, "void")) {
+                                writer.print(": {s}", .{rt}) catch {};
+                            }
+                        }
+                    }
+
+                    const signature_str = sig_buf[0..sig_stream.pos];
+                    const signature_copy = try allocator.dupe(u8, signature_str);
+
+                    // Build signature info
+                    var sig_info = JsonObject.init(allocator);
+                    try sig_info.put("label", JsonValue{ .string = signature_copy });
+                    try sig_info.put("parameters", JsonValue{ .array = params_array });
+
+                    // Build signatures array
+                    var signatures = JsonArray.init(allocator);
+                    try signatures.append(JsonValue{ .object = sig_info });
+
+                    // Build result
+                    var result = JsonObject.init(allocator);
+                    try result.put("signatures", JsonValue{ .array = signatures });
+                    try result.put("activeSignature", JsonValue{ .integer = 0 });
+                    try result.put("activeParameter", JsonValue{ .integer = @intCast(call_info.active_param) });
+
+                    return protocol.makeResponse(id, JsonValue{ .object = result }, allocator);
+                }
+            }
+        }
+
+        return protocol.makeResponse(id, JsonValue.null, allocator);
+    }
+
     /// Handle textDocument/hover request
     fn hover(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
         const text_document = params.object.get("textDocument") orelse
@@ -228,6 +357,305 @@ const Handlers = struct {
         try result.put("contents", JsonValue{ .object = contents });
 
         return protocol.makeResponse(id, JsonValue{ .object = result }, allocator);
+    }
+
+    /// Handle textDocument/definition request
+    fn definition(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
+        const text_document = params.object.get("textDocument") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const uri = text_document.object.get("uri") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const position = params.object.get("position") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        const doc = server.getDocument(uri.string) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        const line_num: usize = @intCast(position.object.get("line").?.integer);
+        const char_num: usize = @intCast(position.object.get("character").?.integer);
+
+        // Get the word at the cursor position
+        const word = getWordAtPosition(doc.content, line_num, char_num) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        // Look up the symbol definition
+        if (server.symbols.findDefinitions(word)) |definitions| {
+            if (definitions.len > 0) {
+                // Return the first definition (could return multiple for overloads)
+                const def = definitions[0];
+
+                var location = JsonObject.init(allocator);
+                try location.put("uri", JsonValue{ .string = def.uri });
+
+                var range = JsonObject.init(allocator);
+                var start_pos = JsonObject.init(allocator);
+                try start_pos.put("line", JsonValue{ .integer = @intCast(def.line) });
+                try start_pos.put("character", JsonValue{ .integer = @intCast(def.column) });
+                var end_pos = JsonObject.init(allocator);
+                try end_pos.put("line", JsonValue{ .integer = @intCast(def.end_line) });
+                try end_pos.put("character", JsonValue{ .integer = @intCast(def.end_column) });
+                try range.put("start", JsonValue{ .object = start_pos });
+                try range.put("end", JsonValue{ .object = end_pos });
+                try location.put("range", JsonValue{ .object = range });
+
+                return protocol.makeResponse(id, JsonValue{ .object = location }, allocator);
+            }
+        }
+
+        return protocol.makeResponse(id, JsonValue.null, allocator);
+    }
+
+    /// Handle textDocument/references request
+    fn references(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
+        const text_document = params.object.get("textDocument") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        const uri = text_document.object.get("uri") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        const position = params.object.get("position") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        const doc = server.getDocument(uri.string) orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        const line_num: usize = @intCast(position.object.get("line").?.integer);
+        const char_num: usize = @intCast(position.object.get("character").?.integer);
+
+        // Get the word at the cursor position
+        const word = getWordAtPosition(doc.content, line_num, char_num) orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        var locations = JsonArray.init(allocator);
+
+        // Check if user wants to include the declaration
+        const include_declaration = if (params.object.get("context")) |ctx|
+            if (ctx.object.get("includeDeclaration")) |incl| incl.bool else true
+        else
+            true;
+
+        // Note: We don't separately add definitions here because the reference extraction
+        // already captures all identifier tokens, including the function/struct name at
+        // the definition site. This gives us correct column positions (pointing to the
+        // name, not the keyword like "function" or "struct").
+        _ = include_declaration;
+
+        // Add all references (includes definition sites via token extraction)
+        if (server.symbols.findReferences(word)) |refs| {
+            for (refs) |ref| {
+                var location = JsonObject.init(allocator);
+                try location.put("uri", JsonValue{ .string = ref.uri });
+
+                var range = JsonObject.init(allocator);
+                var start_pos = JsonObject.init(allocator);
+                try start_pos.put("line", JsonValue{ .integer = @intCast(ref.line) });
+                try start_pos.put("character", JsonValue{ .integer = @intCast(ref.column) });
+                var end_pos = JsonObject.init(allocator);
+                try end_pos.put("line", JsonValue{ .integer = @intCast(ref.end_line) });
+                try end_pos.put("character", JsonValue{ .integer = @intCast(ref.end_column) });
+                try range.put("start", JsonValue{ .object = start_pos });
+                try range.put("end", JsonValue{ .object = end_pos });
+                try location.put("range", JsonValue{ .object = range });
+
+                try locations.append(JsonValue{ .object = location });
+            }
+        }
+
+        return protocol.makeResponse(id, JsonValue{ .array = locations }, allocator);
+    }
+
+    /// Handle textDocument/documentHighlight request
+    /// Returns all occurrences of the symbol under the cursor in the current document
+    fn documentHighlight(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
+        const text_document = params.object.get("textDocument") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        const uri = text_document.object.get("uri") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+        const position = params.object.get("position") orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        const doc = server.getDocument(uri.string) orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        const line_num: usize = @intCast(position.object.get("line").?.integer);
+        const char_num: usize = @intCast(position.object.get("character").?.integer);
+
+        // Get the word at the cursor position
+        const word = getWordAtPosition(doc.content, line_num, char_num) orelse
+            return protocol.makeResponse(id, JsonValue{ .array = JsonArray.init(allocator) }, allocator);
+
+        var highlights = JsonArray.init(allocator);
+
+        // Find all references to this symbol in the current document only
+        if (server.symbols.findReferences(word)) |refs| {
+            for (refs) |ref| {
+                // Only include references from the current document
+                if (!std.mem.eql(u8, ref.uri, uri.string)) continue;
+
+                var highlight = JsonObject.init(allocator);
+
+                var range = JsonObject.init(allocator);
+                var start_pos = JsonObject.init(allocator);
+                try start_pos.put("line", JsonValue{ .integer = @intCast(ref.line) });
+                try start_pos.put("character", JsonValue{ .integer = @intCast(ref.column) });
+                var end_pos = JsonObject.init(allocator);
+                try end_pos.put("line", JsonValue{ .integer = @intCast(ref.end_line) });
+                try end_pos.put("character", JsonValue{ .integer = @intCast(ref.end_column) });
+                try range.put("start", JsonValue{ .object = start_pos });
+                try range.put("end", JsonValue{ .object = end_pos });
+                try highlight.put("range", JsonValue{ .object = range });
+
+                // DocumentHighlightKind: 1 = Text, 2 = Read, 3 = Write
+                // For now, mark all as Text (1) - we could enhance to detect read vs write
+                try highlight.put("kind", JsonValue{ .integer = 1 });
+
+                try highlights.append(JsonValue{ .object = highlight });
+            }
+        }
+
+        return protocol.makeResponse(id, JsonValue{ .array = highlights }, allocator);
+    }
+
+    /// Handle textDocument/prepareRename request
+    /// Validates that rename is possible at the given position and returns the range to rename
+    fn prepareRename(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
+        const text_document = params.object.get("textDocument") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const uri = text_document.object.get("uri") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const position = params.object.get("position") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        const doc = server.getDocument(uri.string) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        const line_num: usize = @intCast(position.object.get("line").?.integer);
+        const char_num: usize = @intCast(position.object.get("character").?.integer);
+
+        // Get the word at the cursor position
+        const word_info = getWordRangeAtPosition(doc.content, line_num, char_num) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        // Check if this symbol exists in our references (is it a valid identifier?)
+        if (server.symbols.findReferences(word_info.word) == null) {
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        }
+
+        // Return the range that will be renamed
+        var range = JsonObject.init(allocator);
+        var start_pos = JsonObject.init(allocator);
+        try start_pos.put("line", JsonValue{ .integer = @intCast(line_num) });
+        try start_pos.put("character", JsonValue{ .integer = @intCast(word_info.start_col) });
+        var end_pos = JsonObject.init(allocator);
+        try end_pos.put("line", JsonValue{ .integer = @intCast(line_num) });
+        try end_pos.put("character", JsonValue{ .integer = @intCast(word_info.end_col) });
+        try range.put("start", JsonValue{ .object = start_pos });
+        try range.put("end", JsonValue{ .object = end_pos });
+
+        // Return PrepareRenameResult with range and placeholder
+        var result = JsonObject.init(allocator);
+        try result.put("range", JsonValue{ .object = range });
+        try result.put("placeholder", JsonValue{ .string = word_info.word });
+
+        return protocol.makeResponse(id, JsonValue{ .object = result }, allocator);
+    }
+
+    /// Handle textDocument/rename request
+    /// Returns WorkspaceEdit with all text edits to rename the symbol
+    fn rename(server: *Server, id: JsonValue, params: JsonValue, allocator: Allocator) !JsonValue {
+        const text_document = params.object.get("textDocument") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const uri = text_document.object.get("uri") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const position = params.object.get("position") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+        const new_name = params.object.get("newName") orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        // Validate new name is not a keyword
+        if (isKeyword(new_name.string)) {
+            return protocol.makeErrorResponse(id, -32602, "Cannot rename to a keyword", allocator);
+        }
+
+        // Validate new name is a valid identifier
+        if (!isValidIdentifier(new_name.string)) {
+            return protocol.makeErrorResponse(id, -32602, "Invalid identifier name", allocator);
+        }
+
+        const doc = server.getDocument(uri.string) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        const line_num: usize = @intCast(position.object.get("line").?.integer);
+        const char_num: usize = @intCast(position.object.get("character").?.integer);
+
+        // Get the word at the cursor position
+        const word = getWordAtPosition(doc.content, line_num, char_num) orelse
+            return protocol.makeResponse(id, JsonValue.null, allocator);
+
+        // Build WorkspaceEdit with changes grouped by document URI
+        var changes = JsonObject.init(allocator);
+
+        // Find all references and group by document, deduplicating by position
+        if (server.symbols.findReferences(word)) |refs| {
+            // Use a map to deduplicate references by URI and position
+            const PosKey = struct { line: u32, col: u32 };
+            var seen_positions = std.StringHashMap(std.AutoHashMap(PosKey, void)).init(allocator);
+            defer {
+                var it = seen_positions.valueIterator();
+                while (it.next()) |pos_map| {
+                    pos_map.deinit();
+                }
+                seen_positions.deinit();
+            }
+
+            var edits_by_uri = std.StringHashMap(JsonArray).init(allocator);
+            defer edits_by_uri.deinit();
+
+            for (refs) |ref| {
+                // Get or create position set for this URI
+                const seen_result = seen_positions.getOrPut(ref.uri) catch continue;
+                if (!seen_result.found_existing) {
+                    seen_result.value_ptr.* = std.AutoHashMap(PosKey, void).init(allocator);
+                }
+
+                // Check if we've seen this position already
+                const pos_key = PosKey{ .line = ref.line, .col = ref.column };
+                if (seen_result.value_ptr.contains(pos_key)) {
+                    continue; // Skip duplicate
+                }
+                seen_result.value_ptr.put(pos_key, {}) catch continue;
+
+                // Get or create edit array for this URI
+                const edit_result = edits_by_uri.getOrPut(ref.uri) catch continue;
+                if (!edit_result.found_existing) {
+                    edit_result.value_ptr.* = JsonArray.init(allocator);
+                }
+
+                var edit = JsonObject.init(allocator);
+                var range = JsonObject.init(allocator);
+                var start_pos = JsonObject.init(allocator);
+                try start_pos.put("line", JsonValue{ .integer = @intCast(ref.line) });
+                try start_pos.put("character", JsonValue{ .integer = @intCast(ref.column) });
+                var end_pos = JsonObject.init(allocator);
+                try end_pos.put("line", JsonValue{ .integer = @intCast(ref.end_line) });
+                try end_pos.put("character", JsonValue{ .integer = @intCast(ref.end_column) });
+                try range.put("start", JsonValue{ .object = start_pos });
+                try range.put("end", JsonValue{ .object = end_pos });
+                try edit.put("range", JsonValue{ .object = range });
+                try edit.put("newText", JsonValue{ .string = new_name.string });
+
+                try edit_result.value_ptr.append(JsonValue{ .object = edit });
+            }
+
+            // Add all edits to changes object
+            var it = edits_by_uri.iterator();
+            while (it.next()) |entry| {
+                try changes.put(entry.key_ptr.*, JsonValue{ .array = entry.value_ptr.* });
+            }
+        }
+
+        var workspace_edit = JsonObject.init(allocator);
+        try workspace_edit.put("changes", JsonValue{ .object = changes });
+
+        return protocol.makeResponse(id, JsonValue{ .object = workspace_edit }, allocator);
     }
 
     /// Handle textDocument/documentSymbol request
@@ -365,6 +793,86 @@ fn publishDiagnostics(server: *Server, uri: []const u8) !void {
     try protocol.writeMessage(notification, server.allocator);
 }
 
+/// Information about a function call context for signature help
+const FunctionCallContext = struct {
+    function_name: []const u8,
+    active_param: usize,
+};
+
+/// Find the function call context at a given position
+/// Returns the function name being called and which parameter is active
+fn findFunctionCallContext(content: []const u8, line: usize, char: usize) ?FunctionCallContext {
+    // Get position in content
+    var current_line: usize = 0;
+    var line_start: usize = 0;
+
+    for (content, 0..) |c, i| {
+        if (current_line == line) {
+            line_start = i;
+            break;
+        }
+        if (c == '\n') current_line += 1;
+    }
+
+    const cursor_pos = line_start + char;
+    if (cursor_pos >= content.len) return null;
+
+    // Search backwards from cursor to find the opening parenthesis
+    var paren_depth: i32 = 0;
+    var comma_count: usize = 0;
+    var i: usize = cursor_pos;
+
+    while (i > 0) {
+        i -= 1;
+        const c = content[i];
+
+        if (c == ')') {
+            paren_depth += 1;
+        } else if (c == '(') {
+            if (paren_depth == 0) {
+                // Found our opening paren, now find the function name
+                if (i > 0) {
+                    // Skip whitespace before the paren
+                    var j = i - 1;
+                    while (j > 0 and (content[j] == ' ' or content[j] == '\t')) {
+                        j -= 1;
+                    }
+
+                    // Find the end of the function name
+                    const name_end = j + 1;
+
+                    // Find the start of the function name
+                    while (j > 0 and isWordChar(content[j])) {
+                        j -= 1;
+                    }
+                    if (!isWordChar(content[j])) j += 1;
+
+                    if (name_end > j) {
+                        return .{
+                            .function_name = content[j..name_end],
+                            .active_param = comma_count,
+                        };
+                    }
+                }
+                return null;
+            } else {
+                paren_depth -= 1;
+            }
+        } else if (c == ',' and paren_depth == 0) {
+            comma_count += 1;
+        } else if (c == '\n') {
+            // Don't search across too many lines
+            if (current_line > 0) {
+                current_line -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    return null;
+}
+
 /// Get the word at a given position in the document
 fn getWordAtPosition(content: []const u8, line: usize, char: usize) ?[]const u8 {
     var current_line: usize = 0;
@@ -394,8 +902,93 @@ fn getWordAtPosition(content: []const u8, line: usize, char: usize) ?[]const u8 
     return line_content[word_start..word_end];
 }
 
+/// Get the word and its column range at a given position
+const WordRange = struct {
+    word: []const u8,
+    start_col: usize,
+    end_col: usize,
+};
+
+fn getWordRangeAtPosition(content: []const u8, line: usize, char: usize) ?WordRange {
+    var current_line: usize = 0;
+    var line_start: usize = 0;
+
+    for (content, 0..) |c, i| {
+        if (current_line == line) {
+            line_start = i;
+            break;
+        }
+        if (c == '\n') current_line += 1;
+    }
+
+    var line_end = line_start;
+    while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
+
+    const line_content = content[line_start..line_end];
+    if (char >= line_content.len) return null;
+
+    var word_start = char;
+    while (word_start > 0 and isWordChar(line_content[word_start - 1])) : (word_start -= 1) {}
+
+    var word_end = char;
+    while (word_end < line_content.len and isWordChar(line_content[word_end])) : (word_end += 1) {}
+
+    if (word_start == word_end) return null;
+    return .{
+        .word = line_content[word_start..word_end],
+        .start_col = word_start,
+        .end_col = word_end,
+    };
+}
+
 fn isWordChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '%';
+}
+
+/// Check if a name is a reserved keyword (both Cot and DBL)
+fn isKeyword(name: []const u8) bool {
+    const keywords = [_][]const u8{
+        // Cot keywords
+        "fn",       "struct",   "enum",     "union",    "const",
+        "var",      "let",      "if",       "else",     "for",
+        "while",    "loop",     "break",    "continue", "return",
+        "match",    "true",     "false",    "null",     "and",
+        "or",       "not",      "import",   "pub",      "test",
+        // DBL keywords
+        "main",     "endmain",  "proc",     "endproc",  "function",
+        "endfunction", "subroutine", "endsubroutine", "record",
+        "endrecord", "begin",   "end",      "if",       "else",
+        "then",     "using",    "case",     "endusing", "do",
+        "until",    "while",    "for",      "from",     "thru",
+        "by",       "exitloop", "nextloop", "goto",     "call",
+        "xcall",    "xreturn",  "freturn",  "return",   "stop",
+        "data",     "global",   "external", "common",   "literal",
+        "group",    "endgroup", "class",    "endclass", "method",
+        "endmethod", "property", "endproperty", "namespace",
+        "endnamespace", "enum", "endenum",  "structure", "endstructure",
+        "assert",   "test",     "endtest",
+    };
+
+    for (keywords) |kw| {
+        if (std.mem.eql(u8, name, kw)) return true;
+    }
+    return false;
+}
+
+/// Check if a name is a valid identifier
+fn isValidIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+
+    // First character must be letter or underscore
+    const first = name[0];
+    if (!std.ascii.isAlphabetic(first) and first != '_') return false;
+
+    // Rest must be alphanumeric or underscore
+    for (name[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    }
+
+    return true;
 }
 
 /// Get documentation for a keyword
@@ -912,42 +1505,102 @@ pub fn main() !void {
 
         const response: ?JsonValue = blk: {
             if (std.mem.eql(u8, method.string, "initialize")) {
-                break :blk try Handlers.initialize(&server, id.?, params, allocator);
+                break :blk Handlers.initialize(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("Initialize error: {}\n", .{err});
+                    break :blk null;
+                };
             } else if (std.mem.eql(u8, method.string, "initialized")) {
                 break :blk null;
             } else if (std.mem.eql(u8, method.string, "shutdown")) {
-                break :blk try Handlers.shutdown(&server, id.?, allocator);
+                break :blk Handlers.shutdown(&server, id.?, allocator) catch |err| {
+                    std.debug.print("Shutdown error: {}\n", .{err});
+                    break :blk null;
+                };
             } else if (std.mem.eql(u8, method.string, "exit")) {
                 break;
             } else if (std.mem.eql(u8, method.string, "textDocument/didOpen")) {
-                try Handlers.didOpen(&server, params);
+                Handlers.didOpen(&server, params) catch |err| {
+                    std.debug.print("didOpen error: {}\n", .{err});
+                };
                 break :blk null;
             } else if (std.mem.eql(u8, method.string, "textDocument/didChange")) {
-                try Handlers.didChange(&server, params);
+                Handlers.didChange(&server, params) catch |err| {
+                    std.debug.print("didChange error: {}\n", .{err});
+                };
+                break :blk null;
+            } else if (std.mem.eql(u8, method.string, "textDocument/didSave")) {
+                Handlers.didSave(&server, params);
                 break :blk null;
             } else if (std.mem.eql(u8, method.string, "textDocument/didClose")) {
                 Handlers.didClose(&server, params);
                 break :blk null;
             } else if (std.mem.eql(u8, method.string, "textDocument/completion")) {
-                break :blk try Handlers.completion(&server, id.?, params, allocator);
+                break :blk Handlers.completion(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("Completion error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
+            } else if (std.mem.eql(u8, method.string, "textDocument/signatureHelp")) {
+                break :blk Handlers.signatureHelp(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("SignatureHelp error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
             } else if (std.mem.eql(u8, method.string, "textDocument/hover")) {
-                break :blk try Handlers.hover(&server, id.?, params, allocator);
+                break :blk Handlers.hover(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("Hover error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
+            } else if (std.mem.eql(u8, method.string, "textDocument/definition")) {
+                break :blk Handlers.definition(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("Definition error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
+            } else if (std.mem.eql(u8, method.string, "textDocument/references")) {
+                break :blk Handlers.references(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("References error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
+            } else if (std.mem.eql(u8, method.string, "textDocument/documentHighlight")) {
+                break :blk Handlers.documentHighlight(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("DocumentHighlight error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
+            } else if (std.mem.eql(u8, method.string, "textDocument/prepareRename")) {
+                break :blk Handlers.prepareRename(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("PrepareRename error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
+            } else if (std.mem.eql(u8, method.string, "textDocument/rename")) {
+                break :blk Handlers.rename(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("Rename error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
             } else if (std.mem.eql(u8, method.string, "textDocument/documentSymbol")) {
-                break :blk try Handlers.documentSymbol(&server, id.?, params, allocator);
+                break :blk Handlers.documentSymbol(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("DocumentSymbol error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
             } else if (std.mem.eql(u8, method.string, "textDocument/semanticTokens/full")) {
-                break :blk try Handlers.semanticTokens(&server, id.?, params, allocator);
+                break :blk Handlers.semanticTokens(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("SemanticTokens error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
             } else if (std.mem.eql(u8, method.string, "textDocument/formatting")) {
-                break :blk try Handlers.formatting(&server, id.?, params, allocator);
+                break :blk Handlers.formatting(&server, id.?, params, allocator) catch |err| {
+                    std.debug.print("Formatting error: {}\n", .{err});
+                    break :blk protocol.makeErrorResponse(id.?, protocol.ErrorCode.InternalError, "Handler error", allocator) catch null;
+                };
             } else {
                 if (id) |req_id| {
-                    break :blk try protocol.makeErrorResponse(req_id, protocol.ErrorCode.MethodNotFound, "Method not found", allocator);
+                    break :blk protocol.makeErrorResponse(req_id, protocol.ErrorCode.MethodNotFound, "Method not found", allocator) catch null;
                 }
                 break :blk null;
             }
         };
 
         if (response) |resp| {
-            try protocol.writeMessage(resp, allocator);
+            protocol.writeMessage(resp, allocator) catch |err| {
+                std.debug.print("Write error: {}\n", .{err});
+            };
         }
     }
 }

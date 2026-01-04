@@ -1,5 +1,7 @@
 # Cot
 
+[![Test](https://github.com/cotlang/cot/actions/workflows/test.yml/badge.svg)](https://github.com/cotlang/cot/actions/workflows/test.yml)
+
 A compiler toolkit for business-oriented languages.
 
 ## Build
@@ -23,4 +25,4 @@ zig build
 - `src/tui_ext/` - TUI extension
 - `src/cotdb/` - ISAM database
 - `src/dbl/` - DBL syntax frontend
-- `tools/lsp/` - Language server (needs rewrite)
+- `tools/lsp/` - Language server 

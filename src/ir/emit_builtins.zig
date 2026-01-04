@@ -31,8 +31,8 @@ pub const opcode_builtins = std.StaticStringMap(BuiltinDef).initComptime(.{
 
 /// Core Cot I/O functions with dedicated opcodes (no return value)
 pub const io_functions = std.StaticStringMap(Opcode).initComptime(.{
-    .{ "println", .console_writeln },
-    .{ "print", .console_write },
+    .{ "println", .println },
+    .{ "print", .print },
 });
 
 /// Native functions - these are implemented in Zig and called via xcall
@@ -68,6 +68,15 @@ pub const native_functions = std.StaticStringMap(void).initComptime(.{
     // System
     .{ "error", {} },
     .{ "mem", {} },
+    // File I/O (modern Cot core API)
+    .{ "file.open", {} },
+    .{ "file.close", {} },
+    .{ "file.readline", {} },
+    .{ "file.readall", {} },
+    .{ "file.writeline", {} },
+    .{ "file.write", {} },
+    .{ "file.eof", {} },
+    .{ "file.flush", {} },
 });
 
 // ============================================================================

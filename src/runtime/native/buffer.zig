@@ -244,8 +244,7 @@ pub fn mem_proc(ctx: *NativeContext) NativeError!?Value {
             var new_ctx = NativeContext{
                 .allocator = ctx.allocator,
                 .args = &[_]Value{size_val},
-                .cursors = ctx.cursors,
-                .channels = ctx.channels,
+                .handles = ctx.handles,
             };
             return mem_alloc(&new_ctx);
         },
@@ -255,8 +254,7 @@ pub fn mem_proc(ctx: *NativeContext) NativeError!?Value {
             var new_ctx = NativeContext{
                 .allocator = ctx.allocator,
                 .args = &[_]Value{handle_val},
-                .cursors = ctx.cursors,
-                .channels = ctx.channels,
+                .handles = ctx.handles,
             };
             return mem_free(&new_ctx);
         },
@@ -267,8 +265,7 @@ pub fn mem_proc(ctx: *NativeContext) NativeError!?Value {
             var new_ctx = NativeContext{
                 .allocator = ctx.allocator,
                 .args = &[_]Value{ handle_val, size_val },
-                .cursors = ctx.cursors,
-                .channels = ctx.channels,
+                .handles = ctx.handles,
             };
             return mem_resize(&new_ctx);
         },
@@ -278,8 +275,7 @@ pub fn mem_proc(ctx: *NativeContext) NativeError!?Value {
             var new_ctx = NativeContext{
                 .allocator = ctx.allocator,
                 .args = &[_]Value{handle_val},
-                .cursors = ctx.cursors,
-                .channels = ctx.channels,
+                .handles = ctx.handles,
             };
             return mem_size(&new_ctx);
         },

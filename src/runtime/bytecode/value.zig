@@ -470,6 +470,50 @@ pub const Value = extern struct {
         }
     }
 
+    /// Debug representation showing type and value - use for tracing/debugging
+    pub fn debugRepr(self: Self, buf: []u8) []const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const writer = fbs.writer();
+
+        const tag_name = switch (self.tag()) {
+            .null_val => "null",
+            .boolean => "bool",
+            .integer => "int",
+            .decimal => "dec",
+            .fixed_string => "fstr",
+            .string => "str",
+            .record_ref => "rec",
+            .handle => "hnd",
+            .object => "obj",
+        };
+
+        writer.print("{s}:", .{tag_name}) catch {};
+
+        switch (self.tag()) {
+            .null_val => writer.writeAll("nil") catch {},
+            .boolean => writer.print("{}", .{self.asBool()}) catch {},
+            .integer => writer.print("{d}", .{self.asInt()}) catch {},
+            .decimal => {
+                if (self.asDecimal()) |d| {
+                    writer.print("{d}p{d}", .{ d.value, d.precision }) catch {};
+                }
+            },
+            .fixed_string, .string => {
+                const s = self.asString();
+                if (s.len > 20) {
+                    writer.print("\"{s}...\"({d})", .{ s[0..20], s.len }) catch {};
+                } else {
+                    writer.print("\"{s}\"", .{s}) catch {};
+                }
+            },
+            .record_ref => writer.writeAll("<record>") catch {},
+            .handle => writer.print("{d}", .{self.asHandle() orelse 0}) catch {},
+            .object => writer.print("type={d}", .{self.objectTypeId() orelse 0}) catch {},
+        }
+
+        return fbs.getWritten();
+    }
+
     // ========================================================================
     // Helpers
     // ========================================================================

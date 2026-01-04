@@ -54,6 +54,16 @@ const VarLocation = struct {
     is_global: bool,
 };
 
+/// Field view (overlay) information for DBL record field semantics
+/// When a store targets a field view, we need to use str_slice_store
+/// to write through to the underlying buffer at the correct offset
+const FieldViewInfo = struct {
+    base_slot: u16, // Slot of the underlying buffer
+    byte_offset: u16, // Byte offset into the buffer
+    length: u16, // Length of this field in bytes
+    is_global: bool, // Whether the base slot is a global
+};
+
 /// Register allocator for register-based bytecode emission
 /// Uses a linear scan approach with 16 virtual registers (r0-r15)
 pub const RegisterAllocator = struct {
@@ -198,6 +208,11 @@ pub const BytecodeEmitter = struct {
     // IR value to constant pool index (for constants that can be loaded on demand)
     value_consts: std.AutoHashMap(u32, u16), // value_id -> constant_pool_index
 
+    // Field view info for DBL record field overlays
+    // Maps IR value ID (from ptr_offset result) to field view info
+    // Used by emitStore to emit str_slice_store for field overlay write-through
+    field_view_info: std.AutoHashMap(u32, FieldViewInfo),
+
     // Current routine being emitted
     current_routine_start: u32,
 
@@ -236,6 +251,7 @@ pub const BytecodeEmitter = struct {
             .pending_jumps = .{},
             .value_slots = std.AutoHashMap(u32, u16).init(allocator),
             .value_consts = std.AutoHashMap(u32, u16).init(allocator),
+            .field_view_info = std.AutoHashMap(u32, FieldViewInfo).init(allocator),
             .current_routine_start = 0,
             .current_func = null,
             .ir_module = null,
@@ -257,6 +273,7 @@ pub const BytecodeEmitter = struct {
         self.pending_jumps.deinit(self.allocator);
         self.value_slots.deinit();
         self.value_consts.deinit();
+        self.field_view_info.deinit();
         self.reg_alloc.deinit();
     }
 
@@ -620,7 +637,7 @@ pub const BytecodeEmitter = struct {
         }
     }
 
-    /// Emit store_record_buf with type_idx and local_base
+    /// Emit store_record_buf with type_idx and base slot
     pub fn emitStoreRecordBuf(self: *Self, struct_name: []const u8, base_name: ?[]const u8) EmitError!void {
         // Find the type index for this structure
         var type_idx: u16 = 0;
@@ -641,8 +658,9 @@ pub const BytecodeEmitter = struct {
             }
         }
 
-        // Calculate local_base from base_name (same logic as load_struct_buf)
-        var local_base: u16 = 0;
+        // Calculate base slot from first field - check both locals and globals
+        var base: u16 = 0;
+        var is_global: bool = false;
         if (type_def) |td| {
             if (td.fields.len > 0) {
                 const first_field = td.fields[0];
@@ -654,24 +672,38 @@ pub const BytecodeEmitter = struct {
                         else => "",
                     };
                     // Try plain field name first (for named records like "record customer")
+                    // Check locals first
                     if (self.locals.get(field_name)) |loc| {
-                        local_base = loc.slot;
+                        base = loc.slot;
+                        is_global = false;
+                    } else if (self.globals.get(field_name)) |glob| {
+                        // Check globals
+                        base = glob.slot;
+                        is_global = true;
                     } else if (base_name) |bn| {
                         // Try qualified name: base_name.field_name (for struct-typed fields)
                         var qualified_buf: [256]u8 = undefined;
                         const qualified_name = std.fmt.bufPrint(&qualified_buf, "{s}.{s}", .{ bn, field_name }) catch "";
                         if (self.locals.get(qualified_name)) |loc| {
-                            local_base = loc.slot;
+                            base = loc.slot;
+                            is_global = false;
+                        } else if (self.globals.get(qualified_name)) |glob| {
+                            base = glob.slot;
+                            is_global = true;
                         }
                     }
                 }
             }
         }
 
-        // Register-based: store_record_buf reads from r0 (set by call_dynamic)
+        // Format: [rs:4|flags:4] [type_idx:16] [base:16]
+        // flags: bit 0 = is_global
+        // Source is in r0 (set by emitStoreStructBuf or call_dynamic)
+        const flags: u4 = if (is_global) 1 else 0;
         try self.emitOpcode(.store_record_buf);
+        try self.emitU8((@as(u8, 0) << 4) | flags); // r0 in upper nibble, flags in lower
         try self.emitU16(type_idx);
-        try self.emitU16(local_base);
+        try self.emitU16(base);
     }
 
     /// Emit opcode byte

@@ -10,10 +10,9 @@
 
 const std = @import("std");
 const bytecode = @import("../bytecode/bytecode.zig");
-const cotdb = @import("cotdb");
 const debug = @import("../debug.zig");
 const extension = @import("../extension.zig");
-const channels_mod = @import("../channels.zig");
+const handles_mod = @import("../handles/handles.zig");
 
 // Re-export submodules
 pub const linker = @import("linker.zig");
@@ -25,23 +24,20 @@ pub const math = @import("math.zig");
 pub const datetime = @import("datetime.zig");
 pub const conversion = @import("conversion.zig");
 pub const string = @import("string.zig");
-pub const io = @import("io.zig");
 pub const system = @import("system.zig");
-pub const db = @import("db.zig");
 pub const buffer = @import("buffer.zig");
+pub const io_console = @import("io_console.zig");
+pub const io_core = @import("io_core.zig");
+pub const io_isam = @import("io_isam.zig");
 // Note: symtable has moved to extensions/dbl/symtable.zig
 
 pub const Linker = linker.Linker;
 pub const Stdlib = stdlib.Stdlib;
 
-// Unified channel management (text + ISAM)
-pub const ChannelManager = channels_mod.ChannelManager;
-pub const Channel = channels_mod.Channel;
-pub const ChannelType = channels_mod.ChannelType;
-
-// Legacy cursor management from CotDB (still used internally)
-pub const CursorManager = cotdb.CursorManager;
-pub const Cursor = cotdb.Cursor;
+// Unified handle management
+pub const UnifiedHandleManager = handles_mod.UnifiedHandleManager;
+pub const Handle = handles_mod.Handle;
+pub const HandleType = handles_mod.HandleType;
 
 /// Value type from NaN-boxed implementation
 pub const Value = @import("../bytecode/value.zig").Value;
@@ -91,8 +87,7 @@ pub const GlobalValue = union(enum) {
 pub const NativeContext = struct {
     allocator: std.mem.Allocator,
     args: []const Value,
-    cursors: ?*CursorManager, // Legacy ISAM-only cursors
-    channels: ?*ChannelManager = null, // Unified text + ISAM channels
+    handles: ?*UnifiedHandleManager = null, // Unified handle manager for all I/O
 
     pub fn getArg(self: *const NativeContext, index: usize) ?Value {
         if (index >= self.args.len) return null;
@@ -158,11 +153,12 @@ pub const NativeRegistry = struct {
         try datetime.register(self);
         try conversion.register(self);
         try string.register(self);
-        try io.register(self);
         try system.register(self);
-        try db.register(self);
         try buffer.register(self);
-        // Note: NSPC_* functions are registered by the DBL extension
+        try io_console.register(self);
+        try io_core.register(self);
+        try io_isam.register(self);
+        // Note: DBL channel-based functions are registered by the DBL extension
     }
 
     /// Register a native function
@@ -178,12 +174,12 @@ pub const NativeRegistry = struct {
 
     /// Load a bytecode module
     pub fn loadModule(self: *Self, path: []const u8) !void {
-        const file = std.fs.cwd().openFile(path, .{}) catch {
+        const mod_file = std.fs.cwd().openFile(path, .{}) catch {
             return NativeError.FileError;
         };
-        defer file.close();
+        defer mod_file.close();
 
-        const bytes = file.readToEndAlloc(self.allocator, 1024 * 1024 * 100) catch {
+        const bytes = mod_file.readToEndAlloc(self.allocator, 1024 * 1024 * 100) catch {
             return NativeError.FileError;
         };
         defer self.allocator.free(bytes);
@@ -320,8 +316,8 @@ pub const NativeRegistry = struct {
     }
 };
 
-// Re-export parseKeySpec from db module for backwards compatibility
-pub const parseKeySpec = db.parseKeySpec;
+// Re-export parseKeySpec from io_isam module
+pub const parseKeySpec = io_isam.parseKeySpec;
 
 test "registry init" {
     const allocator = std.testing.allocator;

@@ -75,8 +75,8 @@ pub const Lowerer = struct {
     /// NodeStore-based AST (not owned)
     store: *const NodeStore,
 
-    /// String interner (not owned)
-    strings: *const StringInterner,
+    /// String interner (not owned, mutable for interning generated strings)
+    strings: *StringInterner,
 
     /// Scope stack for variable management
     /// Provides hierarchical scope lookup with push/pop for blocks
@@ -111,6 +111,12 @@ pub const Lowerer = struct {
 
     /// Current loop's continue block (for continue statements)
     loop_continue_block: ?*ir.Block,
+
+    /// Stack of deferred statement bodies (to execute at scope exit)
+    defers: std.ArrayListUnmanaged(StmtIdx),
+
+    /// Stack of scope marks for defer (each entry is the defer stack length when scope was entered)
+    defer_scope_marks: std.ArrayListUnmanaged(usize),
 
     /// Warnings collected during lowering
     warnings: std.ArrayList(Warning),
@@ -206,7 +212,7 @@ pub const Lowerer = struct {
         return .{ .line = loc.line, .column = loc.column };
     }
 
-    pub fn init(allocator: Allocator, store: *const NodeStore, strings: *const StringInterner, module_name: []const u8) !Self {
+    pub fn init(allocator: Allocator, store: *const NodeStore, strings: *StringInterner, module_name: []const u8) !Self {
         const module = try allocator.create(ir.Module);
         module.* = ir.Module.init(allocator, module_name);
 
@@ -228,6 +234,8 @@ pub const Lowerer = struct {
             .allocated_types = .{},
             .loop_exit_block = null,
             .loop_continue_block = null,
+            .defers = .{},
+            .defer_scope_marks = .{},
             .warnings = .{},
             .last_error = null,
             .lambda_counter = 0,
@@ -309,6 +317,10 @@ pub const Lowerer = struct {
 
         // NOTE: allocated_types ownership was transferred to the Module in lowerProgram.
         // No cleanup needed here.
+
+        // Clean up defer tracking
+        self.defers.deinit(self.allocator);
+        self.defer_scope_marks.deinit(self.allocator);
 
         for (self.warnings.items) |w| {
             self.allocator.free(w.message);
@@ -1169,6 +1181,12 @@ pub const Lowerer = struct {
                 try self.emitDebugLine(loc);
                 try lower_stmt.lowerThrow(self);
             },
+            .defer_stmt => {
+                // TODO: Proper defer implementation with scope-based execution
+                // For now, just record the defer - actual execution happens at scope exit
+                try self.emitDebugLine(loc);
+                try self.lowerDefer(stmt_idx);
+            },
             .match_stmt => {
                 try self.emitDebugLine(loc);
                 try self.lowerMatch(stmt_idx);
@@ -1177,8 +1195,19 @@ pub const Lowerer = struct {
                 try self.emitDebugLine(loc);
                 try lower_stmt.lowerFieldView(self, stmt_idx);
             },
-            .import_stmt, .fn_def, .struct_def, .union_def, .enum_def, .type_alias, .trait_def, .impl_block, .test_def => {
+            .import_stmt, .fn_def, .type_alias, .trait_def, .impl_block, .test_def => {
                 // Handled in earlier passes or no runtime code
+            },
+            .struct_def => {
+                // Process struct_def in blocks (e.g., DBL RECORD inside function)
+                // This creates the struct type for later use in the same block
+                try self.lowerStructDef(stmt_idx);
+            },
+            .union_def => {
+                try self.lowerUnionDef(stmt_idx);
+            },
+            .enum_def => {
+                try self.lowerEnumDef(stmt_idx);
             },
             .comptime_if, .comptime_block => {
                 // Should be resolved before IR lowering
@@ -1216,6 +1245,72 @@ pub const Lowerer = struct {
         const body_idx: StmtIdx = @enumFromInt(data.a);
 
         try self.lowerStatement(body_idx);
+    }
+
+    /// Lower defer statement - push deferred body onto the defer stack
+    fn lowerDefer(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const body: StmtIdx = @enumFromInt(data.a);
+
+        // Push the deferred body onto the stack (will be executed at scope exit)
+        self.defers.append(self.allocator, body) catch return LowerError.OutOfMemory;
+        log.debug("lowerDefer: pushed defer body, stack size={d}", .{self.defers.items.len});
+    }
+
+    /// Mark the start of a new scope for defer tracking
+    pub fn pushDeferScope(self: *Self) LowerError!void {
+        self.defer_scope_marks.append(self.allocator, self.defers.items.len) catch return LowerError.OutOfMemory;
+    }
+
+    /// Emit all defers in the current scope (in reverse order) and pop the scope mark
+    pub fn popDeferScopeAndEmit(self: *Self) LowerError!void {
+        if (self.defer_scope_marks.items.len == 0) return;
+
+        const mark = self.defer_scope_marks.pop().?;
+        const defers_in_scope = self.defers.items[mark..];
+
+        // Emit defers in reverse order (LIFO)
+        var i: usize = defers_in_scope.len;
+        while (i > 0) {
+            i -= 1;
+            const body = defers_in_scope[i];
+            log.debug("popDeferScopeAndEmit: emitting defer body at index {d}", .{mark + i});
+            try self.lowerStatement(body);
+        }
+
+        // Remove the defers we just emitted
+        self.defers.shrinkRetainingCapacity(mark);
+    }
+
+    /// Emit all defers up to a certain scope depth (for break/continue through multiple scopes)
+    /// Does NOT pop the scope marks - caller must handle that
+    pub fn emitDefersToScope(self: *Self, target_depth: usize) LowerError!void {
+        if (self.defer_scope_marks.items.len == 0) return;
+        if (target_depth >= self.defer_scope_marks.items.len) return;
+
+        const target_mark = self.defer_scope_marks.items[target_depth];
+        const defers_to_emit = self.defers.items[target_mark..];
+
+        // Emit defers in reverse order (LIFO)
+        var i: usize = defers_to_emit.len;
+        while (i > 0) {
+            i -= 1;
+            const body = defers_to_emit[i];
+            log.debug("emitDefersToScope: emitting defer body at index {d}", .{target_mark + i});
+            try self.lowerStatement(body);
+        }
+    }
+
+    /// Emit ALL defers (for return statements - must execute all defers before returning)
+    pub fn emitAllDefers(self: *Self) LowerError!void {
+        // Emit all defers in reverse order
+        var i: usize = self.defers.items.len;
+        while (i > 0) {
+            i -= 1;
+            const body = self.defers.items[i];
+            log.debug("emitAllDefers: emitting defer body at index {d}", .{i});
+            try self.lowerStatement(body);
+        }
     }
 
     /// Lower match statement
@@ -1427,7 +1522,7 @@ pub const LowerOptions = struct {
 pub fn lower(
     allocator: Allocator,
     store: *const NodeStore,
-    strings: *const StringInterner,
+    strings: *StringInterner,
     top_level: []const StmtIdx,
     module_name: []const u8,
 ) LowerError!*ir.Module {
@@ -1438,7 +1533,7 @@ pub fn lower(
 pub fn lowerWithOptions(
     allocator: Allocator,
     store: *const NodeStore,
-    strings: *const StringInterner,
+    strings: *StringInterner,
     top_level: []const StmtIdx,
     module_name: []const u8,
     options: LowerOptions,
@@ -1478,7 +1573,7 @@ pub const SemanticDiagnostic = struct {
 pub fn analyzeSemantics(
     allocator: Allocator,
     store: *const NodeStore,
-    strings: *const StringInterner,
+    strings: *StringInterner,
     top_level: []const StmtIdx,
 ) ![]SemanticDiagnostic {
     var diagnostics: std.ArrayListUnmanaged(SemanticDiagnostic) = .empty;

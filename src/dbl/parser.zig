@@ -425,8 +425,11 @@ pub const Parser = struct {
         const name_id = try self.getQualifiedName(name_tok.lexeme);
 
         // Parse parameters until PROC
-        var param_decls: std.ArrayListUnmanaged(StmtIdx) = .{};
-        errdefer param_decls.deinit(self.allocator);
+        // Parameters are stored as [name_id, type_idx, is_ref, default_value] quads
+        var params: std.ArrayListUnmanaged(u32) = .{};
+        errdefer params.deinit(self.allocator);
+        var local_record_decls: std.ArrayListUnmanaged(StmtIdx) = .{};
+        errdefer local_record_decls.deinit(self.allocator);
 
         while (!self.check(.kw_proc) and !self.check(.kw_endfunction) and !self.isAtEnd()) {
             if (self.check(.identifier)) {
@@ -438,23 +441,23 @@ pub const Parser = struct {
 
                 // Parse type specifier
                 var param_type = TypeIdx.null;
-                var is_struct_type = false;
                 if (self.check(.identifier)) {
                     const type_tok = self.advance();
                     const type_result = self.parseDblTypeSpecWithInfo(type_tok.lexeme);
                     param_type = type_result.type_idx;
-                    is_struct_type = type_result.is_struct;
                 } else {
                     param_type = self.store.addPrimitiveType(.i64) catch return ParseError.OutOfMemory;
                 }
 
-                // Create parameter declaration with proper type
-                const init_val = if (is_struct_type) ExprIdx.null else self.store.addIntLiteral(0, loc) catch return ParseError.OutOfMemory;
-                const param_decl = self.store.addLetDecl(param_name_id, param_type, init_val, true, loc) catch return ParseError.OutOfMemory;
-                param_decls.append(self.allocator, param_decl) catch return ParseError.OutOfMemory;
+                // Add parameter as [name_id, type_idx, is_ref, default_value] quad
+                // Functions pass by value by default (is_ref = 0)
+                params.append(self.allocator, @intFromEnum(param_name_id)) catch return ParseError.OutOfMemory;
+                params.append(self.allocator, param_type.toInt()) catch return ParseError.OutOfMemory;
+                params.append(self.allocator, 0) catch return ParseError.OutOfMemory; // is_ref = 0 (by value)
+                params.append(self.allocator, 0) catch return ParseError.OutOfMemory; // no default
             } else if (self.check(.kw_record)) {
                 const record_block = try self.parseRecord();
-                param_decls.append(self.allocator, record_block) catch return ParseError.OutOfMemory;
+                local_record_decls.append(self.allocator, record_block) catch return ParseError.OutOfMemory;
             } else {
                 _ = self.advance();
             }
@@ -464,8 +467,8 @@ pub const Parser = struct {
         var body: std.ArrayListUnmanaged(StmtIdx) = .{};
         errdefer body.deinit(self.allocator);
 
-        // Add parameter declarations to body first
-        for (param_decls.items) |decl| {
+        // Add local record declarations to body first
+        for (local_record_decls.items) |decl| {
             body.append(self.allocator, decl) catch return ParseError.OutOfMemory;
         }
 
@@ -482,11 +485,13 @@ pub const Parser = struct {
 
         const block_idx = self.store.addBlock(body.items, loc) catch return ParseError.OutOfMemory;
         body.deinit(self.allocator); // Free ArrayList backing memory after data is copied
-        param_decls.deinit(self.allocator); // Free param_decls ArrayList
+        local_record_decls.deinit(self.allocator); // Free local_record_decls ArrayList
 
         const return_type = self.store.addPrimitiveType(.i32) catch return ParseError.OutOfMemory;
 
-        return self.store.addFnDef(name_id, &[_]u32{}, return_type, block_idx, loc) catch return ParseError.OutOfMemory;
+        const result = self.store.addFnDef(name_id, params.items, return_type, block_idx, loc) catch return ParseError.OutOfMemory;
+        params.deinit(self.allocator); // Free params ArrayList
+        return result;
     }
 
     fn parseSubroutine(self: *Self) ParseError!StmtIdx {
@@ -2079,6 +2084,11 @@ pub const Parser = struct {
         var stmts: std.ArrayListUnmanaged(StmtIdx) = .{};
         errdefer stmts.deinit(self.allocator);
 
+        // For named records, collect field info to create overlays after allocating buffer
+        // Field info: [name_id, type_idx, offset]
+        var field_infos: std.ArrayListUnmanaged(struct { name_id: base.StringId, type_idx: TypeIdx, offset: i32 }) = .{};
+        defer field_infos.deinit(self.allocator);
+
         // Track current byte offset for overlays
         var current_offset: i32 = 0;
         var first_field_id: ?base.StringId = null;
@@ -2144,7 +2154,16 @@ pub const Parser = struct {
                     const view_stmt = self.store.addFieldView(var_name_id, var_type, overlay_base.?, current_offset, loc) catch return ParseError.OutOfMemory;
                     stmts.append(self.allocator, view_stmt) catch return ParseError.OutOfMemory;
                     current_offset += field_size;
+                } else if (record_name != null) {
+                    // Named record: collect field info to create as overlay after buffer allocation
+                    field_infos.append(self.allocator, .{
+                        .name_id = var_name_id,
+                        .type_idx = var_type,
+                        .offset = current_offset,
+                    }) catch return ParseError.OutOfMemory;
+                    current_offset += field_size;
                 } else {
+                    // Unnamed record: regular let_decl
                     // Check for optional initial value: , value
                     // DBL syntax: name, type, initial_value
                     var init_val = ExprIdx.null;
@@ -2170,7 +2189,7 @@ pub const Parser = struct {
                     const var_stmt = self.store.addLetDecl(var_name_id, var_type, init_val, true, loc) catch return ParseError.OutOfMemory;
                     stmts.append(self.allocator, var_stmt) catch return ParseError.OutOfMemory;
 
-                    // Track total size for named record overlay
+                    // Track total size for unnamed record
                     current_offset += field_size;
                 }
             } else {
@@ -2181,23 +2200,70 @@ pub const Parser = struct {
         // endrecord is optional - proc or next record implicitly ends current record
         _ = self.match(&[_]TokenType{.kw_endrecord});
 
-        // If this is a named record, add a field_view for the record name that overlays
-        // the first field with the total size of all fields
-        // In DBL, "record name" creates a variable that covers all fields as an alpha string
-        if (record_name != null and first_field_id != null and current_offset > 0) {
-            // Create an alpha type covering all fields
-            const total_size: u32 = @intCast(current_offset);
-            const u8_type = self.store.addPrimitiveType(.u8) catch return ParseError.OutOfMemory;
-            const alpha_type = self.store.addArrayType(u8_type, total_size) catch return ParseError.OutOfMemory;
+        // IMPORTANT: DBL RECORD vs STRUCTURE - they are fundamentally different!
+        //
+        // RECORD (what we're parsing here):
+        //   - Allocates memory (a buffer of bytes) with struct type
+        //   - Named record (e.g., "record customer") creates:
+        //     1. A struct_def for the record type (enables TypeDef for load/store_record_buf)
+        //     2. A variable "customer" with struct type (enables detectStructTypeFromExpr)
+        //     3. Field views that overlay positions within the buffer
+        //   - When you do store(1, customer), load_record_buf serializes fields to buffer
+        //   - When you do read(1, customer, key), store_record_buf distributes buffer to fields
+        //   - Example: record customer with cust_id a6, cust_name a30, cust_balance d10.2
+        //     creates struct "customer" with fields at offsets 0, 6, 36 (total 46 bytes)
+        //
+        // STRUCTURE (defined via structure-endstructure):
+        //   - Defines a REUSABLE TYPE (like Cot struct) - no instance
+        //   - Does NOT allocate memory by itself
+        //   - Can be used as a field type: "current_cust, customer_rec"
+        //   - Handled separately via parseStructure() -> struct_def only
+        //
+        // For named records:
+        //   1. Create struct_def for the record type (for TypeDef generation)
+        //   2. Create let_decl with struct type (for detectStructTypeFromExpr)
+        //   3. Create field_views for each field as overlays at their offsets
 
-            // Add the record name as a field_view overlaying the first field at offset 0
-            const record_var = self.store.addFieldView(record_name.?, alpha_type, first_field_id.?, 0, loc) catch return ParseError.OutOfMemory;
-            stmts.append(self.allocator, record_var) catch return ParseError.OutOfMemory;
+        if (record_name != null and current_offset > 0) {
+            // Step 1: Create a struct_def for the record type
+            // This creates a TypeDef that store_record_buf can use to distribute buffer to fields
+            const fields_start = self.store.extra_data.items.len;
+            self.store.extra_data.append(self.allocator, @intCast(field_infos.items.len)) catch return ParseError.OutOfMemory; // field count
+            self.store.extra_data.append(self.allocator, 0) catch return ParseError.OutOfMemory; // type param count
+            self.store.extra_data.append(self.allocator, 0) catch return ParseError.OutOfMemory; // type params start
+            for (field_infos.items) |field| {
+                self.store.extra_data.append(self.allocator, @intFromEnum(field.name_id)) catch return ParseError.OutOfMemory;
+                self.store.extra_data.append(self.allocator, field.type_idx.toInt()) catch return ParseError.OutOfMemory;
+            }
+
+            // Create struct_def statement
+            const struct_idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));
+            self.store.stmt_tags.append(self.allocator, .struct_def) catch return ParseError.OutOfMemory;
+            self.store.stmt_locs.append(self.allocator, loc) catch return ParseError.OutOfMemory;
+            self.store.stmt_data.append(self.allocator, .{
+                .a = @intFromEnum(record_name.?),
+                .b = @intCast(fields_start),
+            }) catch return ParseError.OutOfMemory;
+            stmts.append(self.allocator, struct_idx) catch return ParseError.OutOfMemory;
+
+            // Step 2: Create let_decl with STRUCT type (not array)
+            // This enables detectStructTypeFromExpr to work for store_struct_buf emission
+            const struct_type = self.store.addNamedType(record_name.?) catch return ParseError.OutOfMemory;
+            const buffer_stmt = self.store.addLetDecl(record_name.?, struct_type, ExprIdx.null, true, loc) catch return ParseError.OutOfMemory;
+            stmts.append(self.allocator, buffer_stmt) catch return ParseError.OutOfMemory;
+
+            // Step 3: Create field_views for each field, overlaying the record buffer
+            // Field views enable DBL overlay semantics: field assignments write into the buffer
+            for (field_infos.items) |field| {
+                const view_stmt = self.store.addFieldView(field.name_id, field.type_idx, record_name.?, field.offset, loc) catch return ParseError.OutOfMemory;
+                stmts.append(self.allocator, view_stmt) catch return ParseError.OutOfMemory;
+            }
         }
 
         // Update last_record_base_field for future overlays (only for non-overlay records)
-        if (!is_overlay and first_field_id != null) {
-            self.last_record_base_field = first_field_id;
+        // For named records, use the record name; for unnamed, use first field
+        if (!is_overlay) {
+            self.last_record_base_field = record_name orelse first_field_id;
         }
 
         // Return as a block containing all the variable declarations
@@ -2228,8 +2294,12 @@ pub const Parser = struct {
         // DBL types: a, d, i followed by size
         if (lower[0] == 'a' or lower[0] == 'd') {
             // Alpha and decimal sizes are in characters/digits
+            // For decimal types like d10.2, parse only the digits before the decimal point
             if (len > 1) {
-                const size = std.fmt.parseInt(i32, lower[1..len], 10) catch 1;
+                const size_str = lower[1..len];
+                // Find decimal point if present and parse only digits before it
+                const dot_pos = std.mem.indexOfScalar(u8, size_str, '.') orelse size_str.len;
+                const size = std.fmt.parseInt(i32, size_str[0..dot_pos], 10) catch 1;
                 return size;
             }
             return 1;
@@ -2718,7 +2788,8 @@ pub const Parser = struct {
         const finally_block = self.store.addBlock(finally_stmts.items, loc) catch return ParseError.OutOfMemory;
         finally_stmts.deinit(self.allocator);
 
-        return self.store.addTryStmt(try_block, catch_block, finally_block, loc) catch return ParseError.OutOfMemory;
+        // DBL doesn't support named error bindings, pass null_id
+        return self.store.addTryStmt(try_block, .null_id, catch_block, finally_block, loc) catch return ParseError.OutOfMemory;
     }
 
     /// Parse throw statement
@@ -2943,8 +3014,8 @@ pub const Parser = struct {
             return self.store.addExprStmt(zero, loc) catch return ParseError.OutOfMemory;
         }
 
-        // Check for console.log() - transform to t_print call
-        if (self.tryParseConsoleLog()) |stmt| {
+        // Check for Console.WriteLine/Write - Synergy.NET compatibility
+        if (self.tryParseConsoleMethod()) |stmt| {
             return stmt;
         } else |_| {
             // Fall through
@@ -2972,15 +3043,15 @@ pub const Parser = struct {
         return self.store.addExprStmt(expr, loc) catch return ParseError.OutOfMemory;
     }
 
-    /// Try to parse console.log() - transform to t_print call
-    fn tryParseConsoleLog(self: *Self) ParseError!StmtIdx {
-        // Check pattern: console.log(...)
+    /// Try to parse Console.WriteLine/Write - Synergy.NET compatibility
+    fn tryParseConsoleMethod(self: *Self) ParseError!StmtIdx {
+        // Check pattern: Console.WriteLine(...) or Console.Write(...)
         if (self.current + 3 >= self.tokens.len) return ParseError.InvalidStatement;
 
         const id_tok = self.tokens[self.current];
         if (id_tok.type != .identifier) return ParseError.InvalidStatement;
 
-        // Check for "console"
+        // Check for "Console" (case-insensitive)
         var lower_buf: [16]u8 = undefined;
         const id_len = @min(id_tok.lexeme.len, lower_buf.len);
         const id_lower = std.ascii.lowerString(lower_buf[0..id_len], id_tok.lexeme[0..id_len]);
@@ -2989,21 +3060,24 @@ pub const Parser = struct {
         // Check for "."
         if (self.tokens[self.current + 1].type != .period) return ParseError.InvalidStatement;
 
-        // Check for "log"
+        // Check for "WriteLine" or "Write"
         const member_tok = self.tokens[self.current + 2];
         if (member_tok.type != .identifier) return ParseError.InvalidStatement;
         const member_len = @min(member_tok.lexeme.len, lower_buf.len);
         const member_lower = std.ascii.lowerString(lower_buf[0..member_len], member_tok.lexeme[0..member_len]);
-        if (!std.mem.eql(u8, member_lower, "log")) return ParseError.InvalidStatement;
+
+        const is_writeline = std.mem.eql(u8, member_lower, "writeline");
+        const is_write = std.mem.eql(u8, member_lower, "write");
+        if (!is_writeline and !is_write) return ParseError.InvalidStatement;
 
         // Check for "("
         if (self.tokens[self.current + 3].type != .lparen) return ParseError.InvalidStatement;
 
-        // It's console.log(...) - parse as t_print call
+        // It's Console.WriteLine/Write(...) - parse it
         const loc = self.currentLoc();
-        _ = self.advance(); // consume 'console'
+        _ = self.advance(); // consume 'Console'
         _ = self.advance(); // consume '.'
-        _ = self.advance(); // consume 'log'
+        _ = self.advance(); // consume 'WriteLine' or 'Write'
         _ = self.advance(); // consume '('
 
         // Parse arguments
@@ -3016,14 +3090,17 @@ pub const Parser = struct {
                 args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
             }
         }
-        _ = try self.consume(.rparen, "Expected ')' after console.log arguments");
+        _ = try self.consume(.rparen, "Expected ')' after Console method arguments");
 
-        // Create console.log call - the bytecode emitter recognizes "console.log"
-        // and emits the console_log opcode (writes to dev pane in TUI)
-        const func_name = self.intern("console.log") catch return ParseError.OutOfMemory;
+        // Create call - emitter recognizes "console.writeline" and "console.write"
+        // (lowercase, matching DBL's case-insensitive convention)
+        const func_name = if (is_writeline)
+            self.intern("console.writeline") catch return ParseError.OutOfMemory
+        else
+            self.intern("console.write") catch return ParseError.OutOfMemory;
         const func_expr = self.store.addIdentifier(func_name, loc) catch return ParseError.OutOfMemory;
         const call_expr = self.store.addCall(func_expr, args.items, loc) catch return ParseError.OutOfMemory;
-        args.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+        args.deinit(self.allocator);
         return self.store.addExprStmt(call_expr, loc) catch return ParseError.OutOfMemory;
     }
 
@@ -3048,7 +3125,9 @@ pub const Parser = struct {
         } else if (std.mem.eql(u8, name, "close")) {
             return self.parseDblClose();
         } else if (std.mem.eql(u8, name, "store") or std.mem.eql(u8, name, "read") or
-            std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "find"))
+            std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "find") or
+            std.mem.eql(u8, name, "reads") or std.mem.eql(u8, name, "writes") or
+            std.mem.eql(u8, name, "puts"))
         {
             return self.parseDblIoOp(name);
         } else if (std.mem.eql(u8, name, "display")) {
@@ -3065,7 +3144,7 @@ pub const Parser = struct {
     }
 
     /// Parse: open(channel, mode, filename)
-    /// Mode is I, O, U, or A - converted to string literal
+    /// Mode can be: I, O, U, A or I:SEQ, O:SEQ, U:ISAM, etc.
     fn parseDblOpen(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = self.advance(); // consume 'open'
@@ -3075,12 +3154,31 @@ pub const Parser = struct {
         const channel = try self.parseExpression();
         _ = try self.consume(.comma, "Expected ','");
 
-        // Parse mode - could be I, O, U, A (as identifier) or as expression
+        // Parse mode - could be I, O, U, A with optional :SEQ/:ISAM suffix
         var mode_expr: ExprIdx = undefined;
         if (self.check(.identifier)) {
             const mode_tok = self.advance();
-            // Convert mode letter to string literal
-            const mode_id = try self.intern(mode_tok.lexeme);
+            var mode_buf: [32]u8 = undefined;
+            var mode_len: usize = @min(mode_tok.lexeme.len, 31);
+            @memcpy(mode_buf[0..mode_len], mode_tok.lexeme[0..mode_len]);
+
+            // Check for optional colon suffix (e.g., O:SEQ, I:SEQ, U:ISAM)
+            if (self.check(.colon)) {
+                _ = self.advance(); // consume ':'
+                mode_buf[mode_len] = ':';
+                mode_len += 1;
+
+                // Expect suffix identifier (SEQ, ISAM, etc.)
+                if (self.check(.identifier)) {
+                    const suffix_tok = self.advance();
+                    const suffix_len = @min(suffix_tok.lexeme.len, 31 - mode_len);
+                    @memcpy(mode_buf[mode_len .. mode_len + suffix_len], suffix_tok.lexeme[0..suffix_len]);
+                    mode_len += suffix_len;
+                }
+            }
+
+            // Convert mode string to string literal
+            const mode_id = try self.intern(mode_buf[0..mode_len]);
             mode_expr = self.store.addStringLiteral(mode_id, loc) catch return ParseError.OutOfMemory;
         } else {
             mode_expr = try self.parseExpression();
@@ -3167,6 +3265,18 @@ pub const Parser = struct {
             return self.store.addAssignment(record_target, call_expr, loc) catch return ParseError.OutOfMemory;
         }
 
+        // For writes/puts: emit as writes(channel, data) or puts(channel, data)
+        // These are direct function calls (already registered in native/db.zig)
+        const is_writes = std.mem.eql(u8, op_name, "writes");
+        const is_puts = std.mem.eql(u8, op_name, "puts");
+
+        if (is_writes or is_puts) {
+            const func_id = try self.intern(op_name);
+            const callee = self.store.addIdentifier(func_id, loc) catch return ParseError.OutOfMemory;
+            const call_expr = self.store.addCall(callee, args_list.items, loc) catch return ParseError.OutOfMemory;
+            return self.store.addExprStmt(call_expr, loc) catch return ParseError.OutOfMemory;
+        }
+
         // For other ops (store, write, find): emit as xcall db_<op>(args...)
         var func_name_buf: [32]u8 = undefined;
         const func_name = std.fmt.bufPrint(&func_name_buf, "db_{s}", .{op_name}) catch "db_io";
@@ -3176,20 +3286,32 @@ pub const Parser = struct {
         return self.store.addExprStmt(call_expr, loc) catch return ParseError.OutOfMemory;
     }
 
-    /// Parse: display(channel, expression, ...)
-    /// Ignores channel and emits as println(expressions...)
+    /// Parse: display(channel, expression, ...) or display(expression, ...)
+    /// If first arg is an integer literal, treat as channel and skip it.
+    /// Otherwise, treat all args as output values.
+    /// Emits as println(expressions...)
     fn parseDblDisplay(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = self.advance(); // consume 'display'
         _ = try self.consume(.lparen, "Expected '('");
 
-        // First argument is channel - skip it
-        _ = try self.parseExpression();
-
-        // Parse remaining arguments as output values
         var args: std.ArrayListUnmanaged(ExprIdx) = .{};
         defer args.deinit(self.allocator);
 
+        // Parse first argument
+        const first_arg = try self.parseExpression();
+
+        // Check if first arg is an integer literal (channel specifier)
+        const first_tag = self.store.exprTag(first_arg);
+        const is_channel = first_tag == .int_literal;
+
+        if (!is_channel) {
+            // First arg is output value, include it
+            args.append(self.allocator, first_arg) catch return ParseError.OutOfMemory;
+        }
+        // else: First arg is channel, skip it
+
+        // Parse remaining arguments as output values
         while (self.match(&[_]TokenType{.comma})) {
             args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
         }

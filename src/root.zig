@@ -196,6 +196,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
     // Execute in VM
     var vm = bytecode.VM.init(allocator);
     defer vm.deinit();
+
     try vm.execute(&module);
 }
 

@@ -44,7 +44,6 @@ pub const Decimal = value_mod.Decimal;
 pub const OrderedMap = value_mod.OrderedMap;
 
 // Native dependencies (WASM support removed)
-const cotdb = @import("cotdb");
 const native = @import("../native/native.zig");
 // Note: symtable moved to extensions/dbl/
 
@@ -115,8 +114,7 @@ pub const VM = struct {
 
     // Native function registry
     native_registry: native.NativeRegistry,
-    cursor_manager: native.CursorManager, // CotDB cursor management for I/O
-    channel_manager: ?native.ChannelManager, // Unified text + ISAM channels
+    handle_manager: native.UnifiedHandleManager, // Unified handle manager for all I/O
 
     // Extension system
     type_registry: TypeRegistry,
@@ -169,8 +167,7 @@ pub const VM = struct {
             .call_stack = .{},
             .stdout = std.fs.File.stdout(),
             .native_registry = native.NativeRegistry.init(allocator),
-            .cursor_manager = native.CursorManager.init(allocator),
-            .channel_manager = null, // Initialized via initChannels()
+            .handle_manager = native.UnifiedHandleManager.init(allocator),
             .type_registry = TypeRegistry.init(allocator),
             .opcode_registry = OpcodeRegistry.init(),
             .extension_manager = ExtensionManager.init(allocator),
@@ -243,12 +240,6 @@ pub const VM = struct {
     pub fn recordJITCall(self: *Self, module_idx: u16, routine_idx: u16) ?CompilationTier {
         if (!jit_profiling_enabled) return null;
         return self.jit_profiler.recordCall(module_idx, routine_idx);
-    }
-
-    /// Initialize the unified channel manager for text + ISAM I/O
-    pub fn initChannels(self: *Self) !void {
-        if (self.channel_manager != null) return; // Already initialized
-        self.channel_manager = try native.ChannelManager.init(self.allocator, &self.cursor_manager);
     }
 
     // ========================================================================
@@ -343,8 +334,7 @@ pub const VM = struct {
         };
         self.extension_manager.deinit(&ext_ctx);
         self.type_registry.deinit();
-        if (self.channel_manager) |*cm| cm.deinit();
-        self.cursor_manager.deinit();
+        self.handle_manager.deinit();
         self.debugger.deinit();
         if (profiling_enabled) {
             self.profiler.deinit();
@@ -858,6 +848,7 @@ pub const VM = struct {
 
         // String Operations (0x90-0x9F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.str_concat)] = &vm_opcodes.op_str_concat;
+        table[@intFromEnum(Opcode.str_slice_store)] = &vm_opcodes.op_str_slice_store;
 
         // Type Conversion (0xA0-0xAF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.format_decimal)] = &vm_opcodes.op_format_decimal;
@@ -867,10 +858,10 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.fn_round)] = &vm_opcodes.op_fn_round;
         table[@intFromEnum(Opcode.fn_trunc)] = &vm_opcodes.op_fn_trunc;
 
-        // Console I/O (0xD0-0xD4) - extracted to vm_opcodes.zig
-        table[@intFromEnum(Opcode.console_writeln)] = &vm_opcodes.op_console_writeln;
-        table[@intFromEnum(Opcode.console_write)] = &vm_opcodes.op_console_write;
-        table[@intFromEnum(Opcode.console_log)] = &vm_opcodes.op_console_log;
+        // Terminal I/O (0xD0-0xD4) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.println)] = &vm_opcodes.op_println;
+        table[@intFromEnum(Opcode.print)] = &vm_opcodes.op_print;
+        table[@intFromEnum(Opcode.log)] = &vm_opcodes.op_log;
 
         // Map Operations (0xD5-0xDF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.map_new)] = &vm_opcodes.op_map_new;
@@ -1249,16 +1240,24 @@ pub const VM = struct {
                     args[i] = self.registers[i];
                 }
 
+                // Trace native call entry with argument values
+                if (self.tracer) |tracer| {
+                    tracer.onNativeCallWithArgs(routine_name, args[0..arg_count], @intCast(self.ip));
+                }
+
                 // Create native function context
                 var ctx = native.NativeContext{
                     .allocator = self.allocator,
                     .args = args[0..arg_count],
-                    .cursors = &self.cursor_manager,
-                    .channels = if (self.channel_manager) |*cm| cm else null,
+                    .handles = &self.handle_manager,
                 };
 
                 // Call the native function
                 const result = def.native_fn.?(&ctx) catch |err| {
+                    // Trace native call error
+                    if (self.tracer) |tracer| {
+                        tracer.onNativeReturn(routine_name, null, @intCast(self.ip));
+                    }
                     // Check for hot-reload request (special case - not an error)
                     if (err == native.NativeError.ReloadRequested) {
                         return VMError.ReloadRequested;
@@ -1291,11 +1290,19 @@ pub const VM = struct {
                     return VMError.InvalidOpcode;
                 };
 
+                // Trace native call return with result
+                if (self.tracer) |tracer| {
+                    tracer.onNativeReturn(routine_name, result, @intCast(self.ip));
+                }
+
                 // Handle native function return values:
                 // Store in r0 for bytecode to use (matches emitter expectation)
                 if (result) |res| {
                     self.registers[0] = res;
-                    debug.print(.vm, "NATIVE return: r0 = '{s}'", .{res.asString()});
+                    var debug_buf: [64]u8 = undefined;
+                    debug.print(.vm, "NATIVE return: r0 = {s}", .{res.debugRepr(&debug_buf)});
+                } else {
+                    debug.print(.vm, "NATIVE return: void", .{});
                 }
             },
         }

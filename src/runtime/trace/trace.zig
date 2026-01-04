@@ -66,6 +66,30 @@ pub const TraceEvent = enum(u8) {
     breakpoint, // Hit breakpoint
 };
 
+/// Register snapshot with type information for verbose tracing
+pub const RegisterSnapshot = struct {
+    /// Raw value bits (interpreted based on type)
+    bits: u64,
+    /// Type tag for proper display
+    tag: value_mod.Tag,
+
+    const value_mod = @import("../bytecode/value.zig");
+
+    pub fn fromValue(v: Value) RegisterSnapshot {
+        return .{
+            .bits = v.bits,
+            .tag = v.tag(),
+        };
+    }
+
+    /// Format for display
+    pub fn format(self: RegisterSnapshot, buf: []u8) []const u8 {
+        // Reconstruct Value from raw bits for formatting
+        const v = Value{ .bits = self.bits };
+        return v.debugRepr(buf);
+    }
+};
+
 /// A single trace entry stored in history
 pub const TraceEntry = struct {
     /// Monotonic timestamp (nanoseconds)
@@ -86,9 +110,9 @@ pub const TraceEntry = struct {
     /// Call depth at this point
     call_depth: u16,
 
-    /// Register values snapshot (r0-r3 for verbose mode)
-    /// Stored as raw i64 for simplicity
-    registers: [4]i64,
+    /// Register snapshots (r0-r7 for verbose mode)
+    /// Stores type tags for proper display
+    registers: [8]RegisterSnapshot,
 
     /// Additional context depending on event type
     context: Context,
@@ -245,6 +269,12 @@ pub const Tracer = struct {
         // Check filter
         if (!self.config.filter.matches(ip, line, false)) return;
 
+        // Create register snapshots with type info
+        var reg_snapshots: [8]RegisterSnapshot = undefined;
+        for (0..8) |i| {
+            reg_snapshots[i] = RegisterSnapshot.fromValue(registers[i]);
+        }
+
         // Create entry
         const entry = TraceEntry{
             .timestamp = @truncate(std.time.nanoTimestamp()),
@@ -253,12 +283,7 @@ pub const Tracer = struct {
             .opcode = opcode,
             .line = line,
             .call_depth = self.call_depth,
-            .registers = .{
-                registers[0].asInt(),
-                registers[1].asInt(),
-                registers[2].asInt(),
-                registers[3].asInt(),
-            },
+            .registers = reg_snapshots,
             .context = .{ .opcode = {} },
         };
 
@@ -270,7 +295,7 @@ pub const Tracer = struct {
             self.output.writeOpcode(ip, opcode, line, self.current_routine, null);
 
             if (self.config.level.logsRegisters()) {
-                self.output.writeRegisters(&entry.registers);
+                self.output.writeRegisterSnapshots(&reg_snapshots);
                 self.output.newline();
             }
         }
@@ -293,7 +318,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = .{ 0, 0, 0, 0 },
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
             .context = .{ .call = .{
                 .target_len = @intCast(len),
                 .arg_count = arg_count,
@@ -323,7 +348,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = .{ 0, 0, 0, 0 },
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
             .context = .{ .return_ = .{ .has_value = has_value } },
         };
 
@@ -347,7 +372,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = .{ 0, 0, 0, 0 },
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
             .context = .{ .native_call = .{
                 .name_len = @intCast(@min(name.len, 255)),
                 .arg_count = arg_count,
@@ -358,6 +383,62 @@ pub const Tracer = struct {
 
         if (self.config.level.logsRoutines()) {
             self.output.writeCall(name, arg_count, ip);
+        }
+    }
+
+    /// Called when a native function is invoked with actual argument values
+    pub fn onNativeCallWithArgs(self: *Self, name: []const u8, args: []const Value, ip: u32) void {
+        self.stats.native_calls += 1;
+
+        if (self.config.filter.exclude_natives) return;
+
+        const arg_count: u8 = @intCast(@min(args.len, 255));
+
+        const entry = TraceEntry{
+            .timestamp = @truncate(std.time.nanoTimestamp()),
+            .event = .native_call,
+            .ip = ip,
+            .opcode = null,
+            .line = self.current_line,
+            .call_depth = self.call_depth,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .context = .{ .native_call = .{
+                .name_len = @intCast(@min(name.len, 255)),
+                .arg_count = arg_count,
+            } },
+        };
+
+        self.history.push(entry);
+        self.call_depth += 1;
+
+        if (self.config.level.logsRoutines()) {
+            self.output.writeNativeCall(name, args, ip);
+        }
+    }
+
+    /// Called when a native function returns
+    pub fn onNativeReturn(self: *Self, name: []const u8, result: ?Value, ip: u32) void {
+        if (self.config.filter.exclude_natives) return;
+
+        if (self.call_depth > 0) {
+            self.call_depth -= 1;
+        }
+
+        const entry = TraceEntry{
+            .timestamp = @truncate(std.time.nanoTimestamp()),
+            .event = .native_return,
+            .ip = ip,
+            .opcode = null,
+            .line = self.current_line,
+            .call_depth = self.call_depth,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .context = .{ .native_return = .{ .has_value = result != null } },
+        };
+
+        self.history.push(entry);
+
+        if (self.config.level.logsRoutines()) {
+            self.output.writeNativeReturn(name, result, ip);
         }
     }
 
@@ -372,7 +453,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = line,
             .call_depth = self.call_depth,
-            .registers = .{ 0, 0, 0, 0 },
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
             .context = .{ .error_ = .{ .err = 0 } },
         };
 

@@ -416,10 +416,26 @@ pub const Disassembler = struct {
             // ============================================
 
             // new_record rd, type_idx - [rd:4|0] [type_idx:16]
-            .new_record, .load_record_buf, .store_record_buf => {
+            .new_record => {
                 const rd: u4 = @truncate(operands[0] >> 4);
                 const type_idx: u16 = @bitCast(operands[1..3].*);
                 try self.writer.print(" r{}, type#{}", .{ rd, type_idx });
+            },
+
+            // load_record_buf rd, type_idx, local_base - [rd:4|0] [type_idx:16] [local_base:16]
+            .load_record_buf => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const type_idx: u16 = @bitCast(operands[1..3].*);
+                const local_base: u16 = @bitCast(operands[3..5].*);
+                try self.writer.print(" r{}, type#{}, local#{}", .{ rd, type_idx, local_base });
+            },
+
+            // store_record_buf rs, type_idx, local_base - [rs:4|0] [type_idx:16] [local_base:16]
+            .store_record_buf => {
+                const rs: u4 = @truncate(operands[0] >> 4);
+                const type_idx: u16 = @bitCast(operands[1..3].*);
+                const local_base: u16 = @bitCast(operands[3..5].*);
+                try self.writer.print(" r{}, type#{}, local#{}", .{ rs, type_idx, local_base });
             },
 
             // free_record rs - [rs:4|0] [0]
@@ -615,11 +631,11 @@ pub const Disassembler = struct {
             },
 
             // ============================================
-            // Console I/O (0xD0-0xDF)
+            // Terminal I/O (0xD0-0xD4)
             // ============================================
 
-            // console_write/writeln/log rs, argc - [rs:4|argc:4] [0]
-            .console_write, .console_writeln, .console_log => {
+            // print/println/log argc - [unused:4|argc:4] [0]
+            .print, .println, .log => {
                 const rs: u4 = @truncate(operands[0] >> 4);
                 const argc: u4 = @truncate(operands[0] & 0xF);
                 try self.writer.print(" r{}", .{rs});
@@ -628,8 +644,8 @@ pub const Disassembler = struct {
                 }
             },
 
-            // console_read rd - [rd:4|0] [0]
-            .console_read, .console_readkey => {
+            // readln/readkey rd - [rd:4|0] [0]
+            .readln, .readkey => {
                 const rd: u4 = @truncate(operands[0] >> 4);
                 try self.writer.print(" r{}", .{rd});
             },

@@ -339,13 +339,16 @@ pub const Opcode = enum(u8) {
     /// Format: [rd:4|rs:4] [offset:8]
     store_field_fast = 0x85,
 
-    /// load_record_buf rd, type_idx, local_base - serialize record fields to buffer
-    /// Format: [rd:4|0] [type_idx:16] [local_base:16]
-    /// Serializes fields from locals[local_base..] using type definition, result in rd
+    /// load_record_buf rd, type_idx, base, flags - serialize record fields to buffer
+    /// Format: [rd:4|flags:4] [type_idx:16] [base:16]
+    /// flags: 0=locals, 1=globals
+    /// Serializes fields from storage[base..] using type definition, result in rd
     load_record_buf = 0x86,
 
-    /// store_record_buf type_idx, local_base - deserialize buffer to record fields
-    /// Format: [type_idx:16] [local_base:16]
+    /// store_record_buf rs, type_idx, base, flags - deserialize buffer to record fields
+    /// Format: [rs:4|flags:4] [type_idx:16] [base:16]
+    /// flags: 0=locals, 1=globals
+    /// Distributes buffer from rs into storage[base..] using type definition
     store_record_buf = 0x87,
 
     /// clear_record rs - clear record fields
@@ -502,28 +505,28 @@ pub const Opcode = enum(u8) {
     fn_error = 0xCF,
 
     // ============================================
-    // Console I/O (0xD0-0xDF)
+    // Terminal I/O (0xD0-0xDF)
     // ============================================
 
-    /// console_write rs, argc - write rs (with argc format args following)
+    /// print rs, argc - write to stdout without newline
     /// Format: [rs:4|argc:4] [0]
-    console_write = 0xD0,
+    print = 0xD0,
 
-    /// console_writeln rs, argc - write rs with newline
+    /// println rs, argc - write to stdout with newline
     /// Format: [rs:4|argc:4] [0]
-    console_writeln = 0xD1,
+    println = 0xD1,
 
-    /// console_read rd - rd = read line from console
+    /// readln rd - rd = read line from stdin
     /// Format: [rd:4|0] [0]
-    console_read = 0xD2,
+    readln = 0xD2,
 
-    /// console_readkey rd - rd = read single key
+    /// readkey rd - rd = read single key
     /// Format: [rd:4|0] [0]
-    console_readkey = 0xD3,
+    readkey = 0xD3,
 
-    /// console_log rs, argc - log to dev pane
+    /// log rs, argc - write to stderr (debugging)
     /// Format: [rs:4|argc:4] [0]
-    console_log = 0xD4,
+    log = 0xD4,
 
     // ============================================
     // Map Operations (0xD5-0xDF)
@@ -674,8 +677,8 @@ pub const Opcode = enum(u8) {
             .fn_abs, .fn_sqrt, .fn_sin, .fn_cos, .fn_tan => 2,
             .fn_log, .fn_log10, .fn_exp, .fn_round, .fn_trunc => 2,
             .fn_date, .fn_time, .fn_size, .fn_instr, .fn_mem, .fn_error => 2,
-            .console_write, .console_writeln, .console_read => 2,
-            .console_readkey, .console_log => 2,
+            .print, .println, .readln => 2,
+            .readkey, .log => 2,
             .call_indirect => 2,
             .assert => 2,
             .extended => 1, // sub_opcode byte, then variable
@@ -698,12 +701,9 @@ pub const Opcode = enum(u8) {
             .debug_line => 3,
             .ptr_offset => 3, // [rd:4|rs:4] [offset:16]
 
-            // 4-byte operands: [u16] [u16]
-            .store_record_buf => 4,
-
             // 5-byte operands: [reg:4|0] [u32] or [reg:4|0] [u16] [u16]
             .movi32, .jmp32 => 5,
-            .load_record_buf => 5,
+            .load_record_buf, .store_record_buf => 5,
 
             // Unknown opcodes
             _ => 0,

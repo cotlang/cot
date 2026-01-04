@@ -650,6 +650,47 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 });
                 return result;
             }
+
+            // File.* static methods -> native function calls
+            if (std.mem.eql(u8, object_name, "File")) {
+                // Lower arguments for File.* call
+                var file_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                defer file_args.deinit(l.allocator);
+                for (0..args_count) |i| {
+                    const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                    const arg_val = try lowerExpression(l, arg_idx);
+                    try file_args.append(l.allocator, arg_val);
+                }
+
+                // Build native function name: "file.<method>" (lowercase for native lookup)
+                var native_name_buf: [64]u8 = undefined;
+                const native_name_len = std.fmt.bufPrint(&native_name_buf, "file.{s}", .{field_name}) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                // Convert to lowercase for consistent native lookup
+                for (native_name_len) |*ch| {
+                    ch.* = std.ascii.toLower(ch.*);
+                }
+
+                // Allocate the function name so it survives beyond this scope
+                const native_name = l.allocator.dupe(u8, native_name_len) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                const args_slice = try file_args.toOwnedSlice(l.allocator);
+                const result_type = getBuiltinReturnType(native_name, args_slice);
+                const result = func.newValue(result_type);
+
+                try l.emit(.{
+                    .call = .{
+                        .callee = native_name,
+                        .args = args_slice,
+                        .result = result,
+                    },
+                });
+                return result;
+            }
         }
 
         // Check if this is a method call on a map instance: m.set(), m.get(), etc.
@@ -1491,9 +1532,27 @@ pub fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
     if (std.mem.eql(u8, name, "file_exists") or
         std.mem.eql(u8, name, "dir_exists") or
         std.mem.eql(u8, name, "is_numeric") or
-        std.mem.eql(u8, name, "is_alpha"))
+        std.mem.eql(u8, name, "is_alpha") or
+        std.mem.eql(u8, name, "file.eof"))
     {
         return .bool;
+    }
+
+    // File.* API functions
+    if (std.mem.eql(u8, name, "file.open")) {
+        return .i64; // Returns handle
+    }
+    if (std.mem.eql(u8, name, "file.readline") or
+        std.mem.eql(u8, name, "file.readall"))
+    {
+        return .string;
+    }
+    if (std.mem.eql(u8, name, "file.close") or
+        std.mem.eql(u8, name, "file.writeline") or
+        std.mem.eql(u8, name, "file.write") or
+        std.mem.eql(u8, name, "file.flush"))
+    {
+        return .void;
     }
 
     // Void functions (side-effect only)

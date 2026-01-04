@@ -3,9 +3,10 @@
 //! Provides DBL-specific runtime features:
 //! - Map type (OrderedMap) for symbol tables
 //! - NSPC_* native functions for legacy compatibility
+//! - Channel-based I/O (open, close, reads, writes, etc.)
 //!
 //! This extension is loaded for DBL programs to provide
-//! backward-compatible symbol table functionality.
+//! backward-compatible symbol table and I/O functionality.
 
 const std = @import("std");
 const extension_manager = @import("../../extension_manager.zig");
@@ -19,6 +20,7 @@ const native = @import("../../native/native.zig");
 
 // Re-export symtable for access to constants
 pub const symtable = @import("symtable.zig");
+pub const native_io = @import("native_io.zig");
 
 /// Map type ID - reserved as first extension type
 pub const MAP_TYPE_ID: u16 = 16;
@@ -53,6 +55,9 @@ fn init(ctx: *ExtensionContext) anyerror!void {
     // We need to cast it to NativeRegistry
     const registry: *native.NativeRegistry = @ptrCast(@alignCast(ctx.native_registry));
     try symtable.register(registry);
+
+    // Register DBL channel-based I/O functions
+    try native_io.register(registry);
 }
 
 /// Cleanup the DBL extension

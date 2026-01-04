@@ -90,6 +90,7 @@ const cot = @import("cot");
 const build_options = @import("build_options");
 const frontends = @import("frontends.zig");
 const trace_mod = @import("cot_runtime").trace;
+const dbl_ext = @import("cot_runtime").dbl_ext;
 
 // Framework commands
 const init_cmd = @import("framework/commands/init.zig");
@@ -518,6 +519,10 @@ fn runBytecodeFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     var vm = cot.bytecode.VM.init(allocator);
     defer vm.deinit();
 
+    // Load DBL extension for channel-based I/O (db_open, db_store, etc.)
+    // This is needed for .cbo files compiled from DBL sources
+    try vm.loadExtension(dbl_ext.dbl_extension);
+
     vm.execute(&mod) catch |err| {
         try printStderr("VM error: {}\n", .{err});
     };
@@ -760,6 +765,9 @@ fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: 
     // Create VM and attach tracer
     var vm = cot.bytecode.VM.init(allocator);
     defer vm.deinit();
+
+    // Load DBL extension for channel-based I/O (db_open, db_store, etc.)
+    try vm.loadExtension(dbl_ext.dbl_extension);
 
     vm.setTracer(&tracer);
 
