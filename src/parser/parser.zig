@@ -1085,7 +1085,9 @@ pub const Parser = struct {
         errdefer self.exitNesting();
 
         _ = try self.consume(.kw_if, "Expected 'if'");
+        _ = try self.consume(.lparen, "Expected '(' after 'if'");
         const condition = try self.parseExpression();
+        _ = try self.consume(.rparen, "Expected ')' after condition");
 
         _ = try self.consume(.lbrace, "Expected '{'");
         const then_body = try self.parseBlock();
@@ -1443,8 +1445,50 @@ pub const Parser = struct {
             return self.parseRangeExpr(.null, end, inclusive, loc);
         }
 
+        // Comptime builtin: @name() or @name(args)
+        if (self.match(&[_]TokenType{.at})) {
+            return self.parseComptimeBuiltin(loc);
+        }
+
         self.addError("Expected expression");
         return error.ExpectedExpression;
+    }
+
+    /// Parse a comptime builtin expression: @name() or @name(args)
+    fn parseComptimeBuiltin(self: *Self, loc: SourceLoc) ParseError!ExprIdx {
+        // Expect an identifier after @
+        const name_token = try self.consume(.identifier, "Expected builtin name after '@'");
+        const name = self.internString(name_token.lexeme) catch return error.OutOfMemory;
+
+        // Expect opening parenthesis
+        _ = try self.consume(.lparen, "Expected '(' after builtin name");
+
+        // Parse arguments
+        try self.store.markScratch();
+        errdefer self.store.rollbackScratch();
+
+        if (!self.check(.rparen)) {
+            while (true) {
+                const arg = try self.parseExpression();
+                self.store.pushScratchExpr(arg) catch return error.OutOfMemory;
+                if (!self.match(&[_]TokenType{.comma})) break;
+            }
+        }
+
+        _ = try self.consume(.rparen, "Expected ')'");
+
+        const args = self.store.getScratchExprs();
+        self.store.commitScratch();
+
+        // Create array from scratch exprs
+        var args_array: std.ArrayListUnmanaged(ExprIdx) = .{};
+        errdefer args_array.deinit(self.allocator);
+
+        for (args) |arg_expr| {
+            args_array.append(self.allocator, arg_expr) catch return error.OutOfMemory;
+        }
+
+        return self.store.addComptimeBuiltin(name, args_array.items, loc) catch return error.OutOfMemory;
     }
 
     fn parseArrayLiteral(self: *Self, loc: SourceLoc) ParseError!ExprIdx {

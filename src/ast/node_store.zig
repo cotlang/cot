@@ -570,6 +570,22 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a comptime builtin expression: @name() or @name(args)
+    pub fn addComptimeBuiltin(self: *Self, name: StringId, args: []const ExprIdx, loc: SourceLoc) !ExprIdx {
+        // Store args in extra_data if present
+        const args_start: ExtraIdx = if (args.len > 0) try self.addExtraSlice(args) else ExtraIdx.fromInt(0);
+
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
+        try self.expr_tags.append(self.allocator, .comptime_builtin);
+        try self.expr_locs.append(self.allocator, loc);
+        // Pack: name in a, args count in b high bits, args start in b low bits
+        try self.expr_data.append(self.allocator, .{
+            .a = @intFromEnum(name),
+            .b = (@as(u32, @intCast(args.len)) << 16) | args_start.toInt(),
+        });
+        return idx;
+    }
+
     // ========================================
     // Statement Builders
     // ========================================

@@ -10,6 +10,7 @@ const cot_runtime = @import("cot_runtime");
 const dbl = @import("root.zig");
 
 const TraceLevel = cot_runtime.trace.TraceLevel;
+const PreprocessorConfig = dbl.PreprocessorConfig;
 
 // Configure std.log for scoped logging (same as main cot)
 // Control via COT_LOG environment variable at runtime
@@ -182,7 +183,10 @@ pub fn main() !void {
             };
         },
         .run => {
-            dbl.runWithRegistryAndPath(allocator, source, source_dir) catch |err| {
+            // Try to load cot.json for include paths
+            var pp_config = loadPreprocessorConfig(allocator, source_dir) catch .{};
+            defer freePreprocessorConfig(allocator, &pp_config);
+            dbl.runWithRegistryAndConfig(allocator, source, source_dir, pp_config) catch |err| {
                 std.debug.print("Error: {}\n", .{err});
                 std.process.exit(1);
             };
@@ -383,5 +387,120 @@ fn runTests(allocator: std.mem.Allocator, source: []const u8, filename: []const 
     // Return error if any tests failed
     if (tests_failed > 0) {
         return error.TestsFailed;
+    }
+}
+
+/// Load preprocessor configuration from cot.json
+/// Parses the includePaths section from cot.json
+fn loadPreprocessorConfig(allocator: std.mem.Allocator, source_dir: ?[]const u8) !PreprocessorConfig {
+    // Use the shared framework ConfigLoader to find and parse cot.json
+    const framework_config = cot.framework.config;
+
+    var loader = framework_config.ConfigLoader.init(allocator);
+
+    // Resolve to absolute path for reliable directory walking
+    const initial_path = source_dir orelse ".";
+    const abs_path = std.fs.cwd().realpathAlloc(allocator, initial_path) catch {
+        return .{};
+    };
+    var current: []const u8 = abs_path;
+
+    // Walk up directory tree looking for cot.json (any type, not just workspace)
+    while (true) {
+        const config_path = std.fs.path.join(allocator, &.{ current, "cot.json" }) catch {
+            allocator.free(abs_path);
+            return .{};
+        };
+
+        const config_exists = blk: {
+            const file = std.fs.cwd().openFile(config_path, .{}) catch {
+                allocator.free(config_path);
+                break :blk false;
+            };
+            file.close();
+            break :blk true;
+        };
+
+        if (config_exists) {
+            // Found a cot.json, try to load it
+            var project_config = loader.load(current) catch {
+                allocator.free(config_path);
+                // Not a valid config, continue up
+                const parent = std.fs.path.dirname(current) orelse {
+                    allocator.free(abs_path);
+                    return .{};
+                };
+                if (std.mem.eql(u8, parent, current)) {
+                    allocator.free(abs_path);
+                    return .{};
+                }
+                current = parent;
+                continue;
+            };
+            defer project_config.deinit();
+            allocator.free(config_path);
+
+            // Successfully loaded config - allocate project_root for return
+            const project_root = allocator.dupe(u8, current) catch {
+                allocator.free(abs_path);
+                return .{};
+            };
+            allocator.free(abs_path);
+
+            // Convert include_paths from ProjectConfig to PreprocessorConfig format
+            if (project_config.include_paths.count() > 0) {
+                var include_paths = std.StringHashMap([]const u8).init(allocator);
+
+                var it = project_config.include_paths.iterator();
+                while (it.next()) |entry| {
+                    const key = allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                    const val = allocator.dupe(u8, entry.value_ptr.*) catch {
+                        allocator.free(key);
+                        continue;
+                    };
+                    include_paths.put(key, val) catch {
+                        allocator.free(key);
+                        allocator.free(val);
+                    };
+                }
+
+                return PreprocessorConfig{
+                    .project_root = project_root,
+                    .include_paths = if (include_paths.count() > 0) include_paths else null,
+                };
+            }
+
+            return PreprocessorConfig{
+                .project_root = project_root,
+                .include_paths = null,
+            };
+        } else {
+            // No config here, move to parent
+            const parent = std.fs.path.dirname(current) orelse {
+                allocator.free(abs_path);
+                return .{};
+            };
+            if (std.mem.eql(u8, parent, current)) {
+                allocator.free(abs_path);
+                return .{};
+            }
+            current = parent;
+        }
+    }
+}
+
+/// Free preprocessor configuration resources
+fn freePreprocessorConfig(allocator: std.mem.Allocator, config: *PreprocessorConfig) void {
+    if (config.include_paths) |*paths| {
+        var it = paths.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        paths.deinit();
+    }
+    // Free project_root allocated by ConfigLoader.findWorkspaceRoot
+    if (config.project_root) |root| {
+        allocator.free(root);
     }
 }

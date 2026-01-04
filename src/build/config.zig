@@ -213,6 +213,9 @@ pub const SharedDeps = struct {
         if (self.cot_tui) |tm| {
             cot_mod.addImport("cot_tui", tm);
         }
+        // Self-import: allow framework files within cot to import("cot")
+        // This enables framework/commands/*.zig to access cot.* exports
+        cot_mod.addImport("cot", cot_mod);
         cot_mod.linkSystemLibrary("sqlite3", .{});
         cot_mod.linkSystemLibrary("c", .{});
         return cot_mod;

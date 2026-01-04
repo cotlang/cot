@@ -68,6 +68,9 @@ pub const log = @import("log.zig");
 // Schema repository
 pub const schema = @import("schema/schema.zig");
 
+// Framework (project configuration, commands, workspace management)
+pub const framework = @import("framework/mod.zig");
+
 // Native function registry (from cot_runtime)
 pub const native = cot_runtime.native;
 

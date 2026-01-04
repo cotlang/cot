@@ -371,30 +371,20 @@ pub const Parser = struct {
         const loc = self.currentLoc();
         _ = self.advance(); // consume 'main'
 
-        // Parse variable declarations until PROC (record block)
-        var var_decls: std.ArrayListUnmanaged(StmtIdx) = .{};
-        errdefer var_decls.deinit(self.allocator);
-
-        while (!self.check(.kw_proc) and !self.check(.kw_endmain) and !self.isAtEnd()) {
-            if (self.check(.kw_record)) {
-                // Handle record block for local variables
-                const record_block = try self.parseRecord();
-                var_decls.append(self.allocator, record_block) catch return ParseError.OutOfMemory;
-            } else {
-                _ = self.advance();
-            }
-        }
-        _ = self.match(&[_]TokenType{.kw_proc});
-
         var body: std.ArrayListUnmanaged(StmtIdx) = .{};
         errdefer body.deinit(self.allocator);
 
-        // Add variable declarations to body first
-        for (var_decls.items) |decl| {
-            body.append(self.allocator, decl) catch return ParseError.OutOfMemory;
+        // Parse optional RECORD blocks for local variable declarations
+        // These come before PROC (if present) or directly before statements
+        while (self.check(.kw_record)) {
+            const record_block = try self.parseRecord();
+            body.append(self.allocator, record_block) catch return ParseError.OutOfMemory;
         }
 
-        // Parse statements
+        // Skip optional PROC keyword (marks start of executable code in traditional DBL)
+        _ = self.match(&[_]TokenType{.kw_proc});
+
+        // Parse statements until endmain
         while (!self.check(.kw_endmain) and !self.isAtEnd()) {
             const stmt = self.parseStatement() catch |err| {
                 self.synchronize();
@@ -408,7 +398,6 @@ pub const Parser = struct {
 
         const block_idx = self.store.addBlock(body.items, loc) catch return ParseError.OutOfMemory;
         body.deinit(self.allocator); // Free ArrayList backing memory after data is copied
-        var_decls.deinit(self.allocator); // Free var_decls ArrayList
 
         const name_id = try self.intern("main");
         const return_type = self.store.addPrimitiveType(.i32) catch return ParseError.OutOfMemory;

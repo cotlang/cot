@@ -53,6 +53,7 @@ const dbl_ext = cot_runtime.dbl_ext;
 pub const Lexer = @import("lexer.zig").Lexer;
 pub const Parser = @import("parser.zig").Parser;
 pub const ParseError = @import("parser.zig").ParseError;
+pub const Preprocessor = @import("preprocessor.zig").Preprocessor;
 
 // DBL-specific token types (separate from cot core)
 pub const Token = @import("token.zig").Token;
@@ -70,6 +71,16 @@ pub const Extension = struct {
 
     /// File extensions handled by this frontend
     pub const file_extensions = [_][]const u8{ ".dbl", ".dbo" };
+};
+
+/// Configuration for the DBL preprocessor
+/// Used to pass project-level settings from cot.json
+pub const PreprocessorConfig = struct {
+    /// Project root directory (for resolving relative paths)
+    project_root: ?[]const u8 = null,
+    /// Logical include paths (from cot.json includePaths)
+    /// Maps logical name -> directory path (e.g., "comdef" -> "./defines")
+    include_paths: ?std.StringHashMap([]const u8) = null,
 };
 
 /// Check if a file should use DBL mode
@@ -124,6 +135,22 @@ pub fn runWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8, 
     try vm.execute(&module);
 }
 
+/// Compile and run DBL source code with full preprocessor config
+pub fn runWithRegistryAndConfig(allocator: std.mem.Allocator, source: []const u8, base_path: ?[]const u8, config: PreprocessorConfig) !void {
+    // Compile to bytecode module with full config
+    var module = try compileToModuleWithConfig(allocator, source, "main", base_path, config);
+    defer module.deinit();
+
+    // Execute in VM
+    var vm = cot.bytecode.VM.init(allocator);
+    defer vm.deinit();
+
+    // Load DBL extension (Map type, NSPC_* functions)
+    try vm.loadExtension(dbl_ext.dbl_extension);
+
+    try vm.execute(&module);
+}
+
 /// Compile and run DBL source code with tracing enabled
 pub fn traceWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8, base_path: ?[]const u8, level: cot_runtime.trace.TraceLevel) !void {
     // Compile to bytecode module with path for import resolution
@@ -165,11 +192,21 @@ pub fn traceWithRegistryAndPath(allocator: std.mem.Allocator, source: []const u8
 
 /// Compile DBL source to IR (for test discovery)
 pub fn compileToIR(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8) !*cot.ir.Module {
-    // Preprocess imports - combine all source files
-    const combined_source = try preprocessImports(allocator, source, null);
-    defer if (combined_source.ptr != source.ptr) allocator.free(combined_source);
+    // Step 1: Run DBL preprocessor (.define, .ifdef, .include directives)
+    var preprocessor = Preprocessor.init(allocator, source, module_name);
+    defer preprocessor.deinit();
+    try preprocessor.addBuiltinDefines();
 
-    // Tokenize with DBL lexer
+    const preprocessed = preprocessor.process() catch |err| {
+        std.debug.print("Preprocessor error: {}\n", .{err});
+        return error.PreprocessorError;
+    };
+
+    // Step 2: Preprocess imports - combine all source files
+    const combined_source = try preprocessImports(allocator, preprocessed, null);
+    defer if (combined_source.ptr != preprocessed.ptr) allocator.free(combined_source);
+
+    // Step 3: Tokenize with DBL lexer
     var lex = Lexer.init(combined_source);
     const tokens = try lex.tokenize(allocator);
     defer allocator.free(tokens);
@@ -214,11 +251,28 @@ pub fn compileToModule(allocator: std.mem.Allocator, source: []const u8, module_
 
 /// Compile DBL source to bytecode with a base path for resolving imports
 pub fn compileToModuleWithPath(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8, base_path: ?[]const u8) !cot.bytecode.Module {
-    // Preprocess imports - combine all source files
-    const combined_source = try preprocessImports(allocator, source, base_path);
-    defer if (combined_source.ptr != source.ptr) allocator.free(combined_source);
+    // Step 1: Run DBL preprocessor (.define, .ifdef, .include directives)
+    var preprocessor = Preprocessor.init(allocator, source, module_name);
+    defer preprocessor.deinit();
 
-    // Tokenize with DBL lexer
+    // Add built-in platform symbols
+    try preprocessor.addBuiltinDefines();
+
+    // Add base path for .include resolution
+    if (base_path) |bp| {
+        try preprocessor.addIncludePath(bp);
+    }
+
+    const preprocessed = preprocessor.process() catch |err| {
+        std.debug.print("Preprocessor error: {}\n", .{err});
+        return error.PreprocessorError;
+    };
+
+    // Step 2: Preprocess modern imports - combine all source files
+    const combined_source = try preprocessImports(allocator, preprocessed, base_path);
+    defer if (combined_source.ptr != preprocessed.ptr) allocator.free(combined_source);
+
+    // Step 3: Tokenize with DBL lexer
     var lex = Lexer.init(combined_source);
     const tokens = try lex.tokenize(allocator);
     defer allocator.free(tokens);
@@ -283,6 +337,95 @@ pub fn compileToModuleWithPath(allocator: std.mem.Allocator, source: []const u8,
             else => {},
         }
 
+        return error.LowerError;
+    };
+    defer allocator.destroy(ir_module);
+    defer ir_module.deinit();
+
+    // Emit bytecode using register mode (fully register-based VM)
+    var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
+    defer emitter.deinit();
+    return try emitter.emit(ir_module);
+}
+
+/// Compile DBL source to bytecode with full preprocessor configuration
+/// This is the most flexible variant, accepting project config from cot.json
+pub fn compileToModuleWithConfig(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    module_name: []const u8,
+    base_path: ?[]const u8,
+    config: PreprocessorConfig,
+) !cot.bytecode.Module {
+    // Step 1: Run DBL preprocessor (.define, .ifdef, .include directives)
+    var preprocessor = Preprocessor.init(allocator, source, module_name);
+    defer preprocessor.deinit();
+
+    // Add built-in platform symbols
+    try preprocessor.addBuiltinDefines();
+
+    // Add base path for .include resolution
+    if (base_path) |bp| {
+        try preprocessor.addIncludePath(bp);
+    }
+
+    // Set project root for resolving relative paths in logical includes
+    if (config.project_root) |root| {
+        preprocessor.setProjectRoot(root);
+    }
+
+    // Add logical include paths from cot.json
+    if (config.include_paths) |paths| {
+        var it = paths.iterator();
+        while (it.next()) |entry| {
+            try preprocessor.addLogicalPath(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+
+    const preprocessed = preprocessor.process() catch |err| {
+        std.debug.print("Preprocessor error: {}\n", .{err});
+        return error.PreprocessorError;
+    };
+
+    // Step 2: Preprocess modern imports - combine all source files
+    const combined_source = try preprocessImports(allocator, preprocessed, base_path);
+    defer if (combined_source.ptr != preprocessed.ptr) allocator.free(combined_source);
+
+    // Step 3: Tokenize with DBL lexer
+    var lex = Lexer.init(combined_source);
+    const tokens = try lex.tokenize(allocator);
+    defer allocator.free(tokens);
+
+    // Parse using NodeStore-based parser
+    var strings = base.StringInterner.init(allocator);
+    defer strings.deinit();
+
+    var store = ast.NodeStore.init(allocator, &strings);
+    defer store.deinit();
+
+    var parse = Parser.init(allocator, tokens, &store, &strings);
+    defer parse.deinit();
+
+    const top_level = parse.parse() catch |err| {
+        // Log parser errors if any
+        for (parse.errors.items) |e| {
+            std.debug.print("Parse error at line {d}: {s}\n", .{ e.token.line, e.message });
+        }
+        return err;
+    };
+    defer allocator.free(top_level);
+
+    // Check for parser errors
+    if (parse.hasErrors()) {
+        for (parse.errors.items) |e| {
+            std.debug.print("Parse error at line {d}: {s}\n", .{ e.token.line, e.message });
+        }
+        return error.ParseError;
+    }
+
+    // Lower to IR directly using NodeStore
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, module_name) catch |err| {
+        std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {}\n", .{err});
         return error.LowerError;
     };
     defer allocator.destroy(ir_module);

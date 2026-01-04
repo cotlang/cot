@@ -10,6 +10,7 @@
 //! 4. Lowers expressions to IR values
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("../ast/mod.zig");
 const ir = @import("ir.zig");
 const struct_serial = @import("struct_serialization.zig");
@@ -17,6 +18,7 @@ const scope_stack = @import("scope_stack.zig");
 const verify = @import("verify.zig");
 const cot_runtime = @import("cot_runtime");
 const debug = cot_runtime.debug;
+const comptime_eval = @import("../comptime/comptime.zig");
 
 // Scoped logging (Ghostty pattern) - enable with std_options or runtime filter
 const log = std.log.scoped(.@"ir-lower");
@@ -137,6 +139,9 @@ pub const Lowerer = struct {
     /// Trait implementations (ImplKey -> method implementations)
     impl_methods: ImplMethodsMap,
 
+    /// Comptime evaluator for evaluating comptime conditions during lowering
+    comptime_evaluator: comptime_eval.Evaluator,
+
     const ImplMethodsMap = std.HashMap(ImplKey, []const MethodImpl, ImplKeyContext, std.hash_map.default_max_load_percentage);
 
     /// Known builtin function names (lowercase)
@@ -242,6 +247,7 @@ pub const Lowerer = struct {
             .fn_param_defaults = std.StringHashMap([]const u32).init(allocator),
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
             .impl_methods = ImplMethodsMap.init(allocator),
+            .comptime_evaluator = comptime_eval.Evaluator.init(allocator, store, strings),
         };
     }
 
@@ -307,6 +313,7 @@ pub const Lowerer = struct {
         self.instantiated_structs.deinit();
         self.trait_defs.deinit();
         self.impl_methods.deinit();
+        self.comptime_evaluator.deinit();
 
         // Free function param defaults slices
         var defaults_iter = self.fn_param_defaults.valueIterator();
@@ -400,6 +407,23 @@ pub const Lowerer = struct {
     pub fn lowerProgram(self: *Self, top_level: []const StmtIdx) LowerError!*ir.Module {
         log.debug("Lowering program with {d} top-level statements", .{top_level.len});
         debug.print(.ir, "Lowering program with {d} top-level statements", .{top_level.len});
+
+        // Register top-level const declarations with the comptime evaluator
+        // This must happen first so comptime conditions can reference constants
+        for (top_level) |stmt_idx| {
+            const tag = self.store.stmtTag(stmt_idx);
+            if (tag == .const_decl) {
+                const view = ast.views.ConstDeclView.from(self.store, stmt_idx);
+                if (view.init != .null) {
+                    // Try to evaluate the init expression at comptime
+                    if (self.comptime_evaluator.evaluateExpression(view.init)) |value| {
+                        self.comptime_evaluator.constants.put(view.name, value) catch {};
+                    } else |_| {
+                        // Couldn't evaluate at comptime - that's okay, not all const inits are comptime
+                    }
+                }
+            }
+        }
 
         // First pass: collect struct, union, and enum definitions (including from namespaces)
         for (top_level) |stmt_idx| {
@@ -1209,11 +1233,54 @@ pub const Lowerer = struct {
             .enum_def => {
                 try self.lowerEnumDef(stmt_idx);
             },
-            .comptime_if, .comptime_block => {
-                // Should be resolved before IR lowering
-                return LowerError.UnsupportedFeature;
+            .comptime_if => {
+                // Handle comptime if inline during IR lowering
+                // Get comptime_if data:
+                // - data.a = condition expression
+                // - data.b >> 16 = then body statement
+                // - data.b & 0xFFFF = index into extra_data for else body
+                const comptime_data = self.store.stmtData(stmt_idx);
+                const condition_expr = ast.ExprIdx.fromInt(comptime_data.a);
+                const then_body = ast.StmtIdx.fromInt(comptime_data.b >> 16);
+                const extra_start = comptime_data.b & 0xFFFF;
+                const else_body = ast.StmtIdx.fromInt(self.store.extra_data.items[extra_start]);
+
+                // Evaluate the condition at compile time
+                if (self.evaluateComptimeCondition(condition_expr)) {
+                    // Include then branch
+                    if (then_body != .null) {
+                        try self.lowerStatement(then_body);
+                    }
+                } else {
+                    // Include else branch if present
+                    if (else_body != .null) {
+                        try self.lowerStatement(else_body);
+                    }
+                }
+            },
+            .comptime_block => {
+                // Handle comptime block inline - just lower the body
+                const block_data = self.store.stmtData(stmt_idx);
+                const body = ast.StmtIdx.fromInt(block_data.a);
+                if (body != .null) {
+                    try self.lowerStatement(body);
+                }
             },
         }
+    }
+
+    /// Evaluate a comptime condition expression
+    /// Returns true if the condition evaluates to a truthy value at compile time
+    fn evaluateComptimeCondition(self: *Self, condition_expr: ast.ExprIdx) bool {
+        // Use the stored comptime evaluator which has top-level constants registered
+        const result = self.comptime_evaluator.evaluateExpression(condition_expr) catch |err| {
+            log.debug("evaluateComptimeCondition: evaluation error: {}", .{err});
+            // On error, default to false (exclude the branch)
+            return false;
+        };
+
+        // Check if the result is truthy
+        return result.isTruthy();
     }
 
     /// Lower a buffer expression, handling struct types specially by emitting load_struct_buf

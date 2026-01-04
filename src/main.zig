@@ -92,15 +92,15 @@ const frontends = @import("frontends.zig");
 const trace_mod = @import("cot_runtime").trace;
 const dbl_ext = @import("cot_runtime").dbl_ext;
 
-// Framework commands
-const init_cmd = @import("framework/commands/init.zig");
-const new_cmd = @import("framework/commands/new.zig");
-const build_cmd = @import("framework/commands/build.zig");
-const run_cmd = @import("framework/commands/run.zig");
-const dev_cmd = @import("framework/commands/dev.zig");
-const schema_cmd = @import("framework/commands/schema.zig");
-const data_cmd = @import("framework/commands/data.zig");
-const convert_cmd = @import("framework/commands/convert.zig");
+// Framework commands (imported through cot module to avoid module conflicts)
+const init_cmd = cot.framework.commands.init;
+const new_cmd = cot.framework.commands.new;
+const build_cmd = cot.framework.commands.build;
+const run_cmd = cot.framework.commands.run;
+const dev_cmd = cot.framework.commands.dev;
+const schema_cmd = cot.framework.commands.schema;
+const data_cmd = cot.framework.commands.data;
+const convert_cmd = cot.framework.commands.convert;
 
 pub fn main() !void {
     // Install crash handlers FIRST - ensures crash reporting works for all commands
@@ -646,8 +646,26 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
         return;
     }
 
+    // Run compile-time evaluation (resolve comptime if, evaluate const)
+    var evaluator = cot.comptime_eval.Evaluator.init(allocator, &store, &strings);
+    defer evaluator.deinit();
+    evaluator.setSourceFile(filename);
+
+    const processed_stmts = evaluator.process(top_level) catch |err| {
+        collector.addError(
+            .E300_undefined_label,
+            filename,
+            diagnostics.SourceRange.none,
+            "Compile-time evaluation error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+    defer allocator.free(processed_stmts);
+
     // Lower AST to IR
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
         collector.addError(
             .E300_undefined_label,
             filename,
@@ -897,8 +915,26 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
         return error.CompilationFailed;
     }
 
+    // Run compile-time evaluation (resolve comptime if, evaluate const)
+    var evaluator = cot.comptime_eval.Evaluator.init(allocator, &store, &strings);
+    defer evaluator.deinit();
+    evaluator.setSourceFile(filename);
+
+    const processed_stmts = evaluator.process(top_level) catch |err| {
+        collector.addError(
+            .E300_undefined_label,
+            filename,
+            diagnostics.SourceRange.none,
+            "Compile-time evaluation error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return error.CompilationFailed;
+    };
+    defer allocator.free(processed_stmts);
+
     // Lower AST to IR using NodeStore directly
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
         collector.addError(
             .E300_undefined_label,
             filename,
@@ -954,8 +990,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
             basename;
 
         // Try to find workspace root for output directory
-        const config = @import("framework/config.zig");
-        var config_loader = config.ConfigLoader.init(allocator);
+        var config_loader = cot.framework.ConfigLoader.init(allocator);
 
         const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch {
             // Fallback to .cot-out in current directory
@@ -1095,8 +1130,26 @@ fn runTests(allocator: std.mem.Allocator, filename: []const u8, filter: ?[]const
         return;
     }
 
+    // Run compile-time evaluation (resolve comptime if, evaluate const)
+    var evaluator = cot.comptime_eval.Evaluator.init(allocator, &store, &strings);
+    defer evaluator.deinit();
+    evaluator.setSourceFile(filename);
+
+    const processed_stmts = evaluator.process(top_level) catch |err| {
+        collector.addError(
+            .E300_undefined_label,
+            filename,
+            diagnostics.SourceRange.none,
+            "Compile-time evaluation error: {}",
+            .{err},
+        );
+        formatter.printToStderr(&collector, .{ .use_color = true });
+        return;
+    };
+    defer allocator.free(processed_stmts);
+
     // Lower AST to IR
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
         collector.addError(
             .E300_undefined_label,
             filename,
@@ -1230,8 +1283,19 @@ fn dumpIR(backing_allocator: std.mem.Allocator, filename: []const u8) !void {
         return;
     };
 
+    // Run compile-time evaluation (resolve comptime if, evaluate const)
+    var evaluator = cot.comptime_eval.Evaluator.init(allocator, &store, &strings);
+    defer evaluator.deinit();
+    evaluator.setSourceFile(filename);
+
+    const processed_stmts = evaluator.process(top_level) catch |err| {
+        try printStderr("Compile-time evaluation error: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(processed_stmts);
+
     // Lower to IR using NodeStore directly
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
         try printStderr("IR lowering error: {}\n", .{err});
         return;
     };
@@ -1305,8 +1369,19 @@ fn disasmFile(backing_allocator: std.mem.Allocator, filename: []const u8) !void 
             return;
         };
 
+        // Run compile-time evaluation (resolve comptime if, evaluate const)
+        var evaluator = cot.comptime_eval.Evaluator.init(allocator, &store, &strings);
+        defer evaluator.deinit();
+        evaluator.setSourceFile(filename);
+
+        const processed_stmts = evaluator.process(top_level) catch |err| {
+            try printStderr("Compile-time evaluation error: {}\n", .{err});
+            return;
+        };
+        defer allocator.free(processed_stmts);
+
         // Lower to IR using NodeStore directly
-        const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
+        const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
             try printStderr("IR lowering error: {}\n", .{err});
             return;
         };

@@ -95,7 +95,7 @@ pub const Evaluator = struct {
     pub fn process(self: *Self, statements: []const StmtIdx) EvalError![]const StmtIdx {
         // First pass: collect all const declarations
         for (statements) |stmt_idx| {
-            const tag = self.store.getStatementTag(stmt_idx);
+            const tag = self.store.stmtTag(stmt_idx);
             if (tag == .const_decl) {
                 try self.registerConst(stmt_idx);
             }
@@ -138,15 +138,15 @@ pub const Evaluator = struct {
         defer _ = self.evaluating.remove(name_id);
 
         // Evaluate the value
-        if (view.value) |value_expr| {
-            const value = try self.evaluateExpression(value_expr);
+        if (view.init != .null) {
+            const value = try self.evaluateExpression(view.init);
             try self.constants.put(name_id, value);
         }
     }
 
     /// Process a statement, expanding comptime if as needed
     fn processStatement(self: *Self, stmt_idx: StmtIdx, output: *std.ArrayListUnmanaged(StmtIdx)) EvalError!void {
-        const tag = self.store.getStatementTag(stmt_idx);
+        const tag = self.store.stmtTag(stmt_idx);
 
         switch (tag) {
             .const_decl => {
@@ -154,35 +154,53 @@ pub const Evaluator = struct {
                 // They've already been registered, so skip them
             },
             .comptime_if => {
-                // Get comptime_if data from extra
-                const data = self.store.stmt_data.items[@intFromEnum(stmt_idx)];
-                const extra_idx = data.lhs;
-
-                // Read extra data: [condition_expr, then_count, then_stmts..., else_count, else_stmts...]
-                const condition_expr = ExprIdx.fromExtra(self.store.extra_data.items[extra_idx]);
-                const then_count = self.store.extra_data.items[extra_idx + 1];
-                const then_stmts_start = extra_idx + 2;
+                // Get comptime_if data:
+                // - data.a = condition expression
+                // - data.b >> 16 = then body statement
+                // - data.b & 0xFFFF = index into extra_data for else body
+                const data = self.store.stmtData(stmt_idx);
+                const condition_expr = ExprIdx.fromInt(data.a);
+                const then_body = StmtIdx.fromInt(data.b >> 16);
+                const extra_start = data.b & 0xFFFF;
+                const else_body = StmtIdx.fromInt(self.store.extra_data.items[extra_start]);
 
                 // Evaluate the condition
                 const condition = try self.evaluateExpression(condition_expr);
                 const is_true = condition.isTruthy();
 
                 if (is_true) {
-                    // Include then branch statements
-                    for (0..then_count) |i| {
-                        const then_stmt = StmtIdx.fromExtra(self.store.extra_data.items[then_stmts_start + i]);
-                        try self.processStatement(then_stmt, output);
+                    // Include then branch
+                    if (then_body != .null) {
+                        try self.processStatement(then_body, output);
                     }
                 } else {
-                    // Check for else branch
-                    const else_count_idx = then_stmts_start + then_count;
-                    const else_count = self.store.extra_data.items[else_count_idx];
-                    if (else_count > 0) {
-                        const else_stmts_start = else_count_idx + 1;
-                        for (0..else_count) |i| {
-                            const else_stmt = StmtIdx.fromExtra(self.store.extra_data.items[else_stmts_start + i]);
-                            try self.processStatement(else_stmt, output);
+                    // Include else branch if present
+                    if (else_body != .null) {
+                        try self.processStatement(else_body, output);
+                    }
+                }
+            },
+            .comptime_block => {
+                // Get comptime_block data:
+                // - data.a = body statement (a block)
+                // For now, just include the block's statements as runtime code
+                // In the future, we might actually execute code at compile time
+                const data = self.store.stmtData(stmt_idx);
+                const body = StmtIdx.fromInt(data.a);
+
+                // The body is a block - expand its statements into the output
+                if (body != .null) {
+                    const body_tag = self.store.stmtTag(body);
+                    if (body_tag == .block) {
+                        const view = ast.views.BlockView.from(self.store, body);
+                        const stmts = view.getStatements(self.store);
+                        for (stmts) |stmt_raw| {
+                            const inner_stmt = StmtIdx.fromInt(stmt_raw);
+                            try self.processStatement(inner_stmt, output);
                         }
+                    } else {
+                        // Single statement
+                        try self.processStatement(body, output);
                     }
                 }
             },
@@ -199,7 +217,7 @@ pub const Evaluator = struct {
             return Value{ .undefined = {} };
         }
 
-        const tag = self.store.getExpressionTag(expr_idx);
+        const tag = self.store.exprTag(expr_idx);
 
         return switch (tag) {
             .int_literal => blk: {
@@ -208,10 +226,9 @@ pub const Evaluator = struct {
             },
             .float_literal => blk: {
                 const view = ast.views.FloatLiteralView.from(self.store, expr_idx);
-                // Convert float bits back to float then to decimal representation
-                const float_val = @as(f64, @bitCast(view.bits));
+                // Convert float to decimal representation
                 break :blk Value{ .decimal = .{
-                    .value = @intFromFloat(float_val * 100),
+                    .value = @intFromFloat(view.value * 100),
                     .scale = 2,
                 } };
             },
@@ -245,7 +262,7 @@ pub const Evaluator = struct {
                 break :blk try self.evaluateBuiltin(expr_idx);
             },
             // These can't be evaluated at compile time
-            .call, .method_call, .index, .member, .range, .array_init, .struct_init, .lambda, .ternary, .try_expr, .orelse_expr, .catch_expr => EvalError.InvalidExpression,
+            .call, .method_call, .index, .member, .optional_member, .optional_index, .range, .array_init, .struct_init, .lambda, .if_expr, .match_expr, .block_expr, .is_expr => EvalError.InvalidExpression,
         };
     }
 
@@ -271,8 +288,8 @@ pub const Evaluator = struct {
 
     /// Evaluate a binary expression
     fn evaluateBinary(self: *Self, view: ast.views.BinaryExprView) EvalError!Value {
-        const left = try self.evaluateExpression(view.left);
-        const right = try self.evaluateExpression(view.right);
+        const left = try self.evaluateExpression(view.lhs);
+        const right = try self.evaluateExpression(view.rhs);
 
         return switch (view.op) {
             // Arithmetic
@@ -302,20 +319,18 @@ pub const Evaluator = struct {
             .@"and" => Value.fromBool(left.isTruthy() and right.isTruthy()),
             .@"or" => Value.fromBool(left.isTruthy() or right.isTruthy()),
 
-            // String concatenation (using add for now)
-            .concat => blk: {
-                const l_str = left.toString(self.allocator) catch return EvalError.OutOfMemory;
-                const r_str = right.toString(self.allocator) catch return EvalError.OutOfMemory;
-                const result = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ l_str, r_str }) catch return EvalError.OutOfMemory;
-                break :blk Value.fromString(result);
-            },
-
             // Bitwise operations
             .bit_and => Value.fromInt(left.toInt() & right.toInt()),
             .bit_or => Value.fromInt(left.toInt() | right.toInt()),
             .bit_xor => Value.fromInt(left.toInt() ^ right.toInt()),
             .shl => Value.fromInt(left.toInt() << @intCast(right.toInt())),
             .shr => Value.fromInt(left.toInt() >> @intCast(right.toInt())),
+
+            // Rounding operations - treat as division for now
+            .round, .trunc => Value.fromInt(@divTrunc(left.toInt(), right.toInt())),
+
+            // Null coalescing - for comptime, just use left if not undefined
+            .null_coalesce => if (left != .undefined) left else right,
 
             // Range - not evaluable at compile time
             .range, .range_inclusive => EvalError.InvalidExpression,
@@ -336,13 +351,27 @@ pub const Evaluator = struct {
 
     /// Evaluate a comptime builtin (@defined, @os, etc.)
     fn evaluateBuiltin(self: *Self, expr_idx: ExprIdx) EvalError!Value {
-        // Get the builtin data
-        const data = self.store.expr_data.items[@intFromEnum(expr_idx)];
-        const name_id = StringId.fromExtra(data.lhs);
+        // Get the builtin data:
+        // - data.a = StringId of the builtin name
+        // - data.b = (args_len << 16) | args_start
+        const data = self.store.exprData(expr_idx);
+        const name_id: StringId = @enumFromInt(data.a);
         const name = self.strings.get(name_id);
 
+        // Extract arguments
+        const args_len = data.b >> 16;
+        const args_start = data.b & 0xFFFF;
+
+        // Build args slice from extra_data
+        var args: []const ExprIdx = &.{};
+        if (args_len > 0) {
+            const raw_args = self.store.extra_data.items[args_start .. args_start + args_len];
+            // Cast to ExprIdx slice - the extra_data stores the raw u32 values
+            args = @as([*]const ExprIdx, @ptrCast(raw_args.ptr))[0..args_len];
+        }
+
         // Get location for @line()
-        const loc = self.store.expr_locs.items[@intFromEnum(expr_idx)];
+        const loc = self.store.exprLoc(expr_idx);
 
         const ctx = builtins.BuiltinContext{
             .constants = &self.constants,
@@ -351,20 +380,7 @@ pub const Evaluator = struct {
             .line = loc.line,
         };
 
-        // Get arguments from extra data if present
-        const args_extra = data.rhs;
-        var args: std.ArrayListUnmanaged(ExprIdx) = .{};
-        defer args.deinit(self.allocator);
-
-        if (args_extra > 0) {
-            const args_count = self.store.extra_data.items[args_extra];
-            for (0..args_count) |i| {
-                const arg_idx = ExprIdx.fromExtra(self.store.extra_data.items[args_extra + 1 + i]);
-                args.append(self.allocator, arg_idx) catch return EvalError.OutOfMemory;
-            }
-        }
-
-        return builtins.evaluate(name, args.items, &ctx, self) catch EvalError.BuiltinError;
+        return builtins.evaluate(name, args, &ctx, self) catch EvalError.BuiltinError;
     }
 
     /// Check if a constant is defined

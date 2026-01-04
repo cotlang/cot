@@ -7,7 +7,7 @@ const config = @import("../config.zig");
 const workspace = @import("../workspace.zig");
 const Allocator = std.mem.Allocator;
 
-// Import runtime
+// Import cot module for runtime/compiler components
 const cot = @import("cot");
 const debug = cot.debug;
 const build_options = @import("build_options");

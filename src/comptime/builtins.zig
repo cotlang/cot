@@ -41,7 +41,7 @@ pub fn evaluate(
         const arg = args[0];
 
         // The argument should be an identifier - we need to get its name
-        const expr_tag = evaluator.store.getExpressionTag(arg);
+        const expr_tag = evaluator.store.exprTag(arg);
         if (expr_tag != .identifier) return BuiltinError.InvalidArgument;
 
         const view = ast.views.IdentifierView.from(evaluator.store, arg);

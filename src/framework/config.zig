@@ -55,6 +55,10 @@ pub const ProjectConfig = struct {
     dependencies: std.StringHashMap([]const u8),
     exports: std.StringHashMap([]const u8), // Library exports: export name -> path
 
+    // Include paths for .include directive (logical name -> path)
+    // Paths are relative to cot.json and support ${ENV_VAR} expansion
+    include_paths: std.StringHashMap([]const u8),
+
     // Schema repository configuration
     schema: ?SchemaConfig = null,
 
@@ -92,6 +96,7 @@ pub const ProjectConfig = struct {
             .static_link = true,
             .dependencies = std.StringHashMap([]const u8).init(allocator),
             .exports = std.StringHashMap([]const u8).init(allocator),
+            .include_paths = std.StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
         };
     }
@@ -128,6 +133,13 @@ pub const ProjectConfig = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.exports.deinit();
+
+        var inc_it = self.include_paths.iterator();
+        while (inc_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.include_paths.deinit();
     }
 };
 
@@ -239,6 +251,21 @@ pub const ConfigLoader = struct {
                         const key = try self.allocator.dupe(u8, entry.key_ptr.*);
                         const val = try self.allocator.dupe(u8, entry.value_ptr.string);
                         try config.exports.put(key, val);
+                    }
+                }
+            }
+        }
+
+        // Optional: includePaths (for .include directive)
+        // Maps logical names to paths, e.g. "comdef": "./defines"
+        if (root.object.get("includePaths")) |include_val| {
+            if (include_val == .object) {
+                var it = include_val.object.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.* == .string) {
+                        const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                        const val = try self.allocator.dupe(u8, entry.value_ptr.string);
+                        try config.include_paths.put(key, val);
                     }
                 }
             }
