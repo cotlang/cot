@@ -97,6 +97,13 @@ pub const TokenType = enum {
     integer_literal,
     decimal_literal,
 
+    // Interpolated string tokens: "Hello ${name}!"
+    string_interp_start, // opening " of interpolated string
+    string_content, // literal text between interpolations
+    interp_expr_start, // ${
+    interp_expr_end, // }
+    string_interp_end, // closing "
+
     // Single-character tokens
     lparen, // (
     rparen, // )
@@ -300,6 +307,9 @@ pub const TokenType = enum {
             .string_literal,
             .integer_literal,
             .decimal_literal,
+            .string_interp_start,
+            .string_content,
+            .string_interp_end,
             => true,
             else => false,
         };

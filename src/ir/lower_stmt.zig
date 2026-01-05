@@ -668,6 +668,21 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
         var_type = .void;
     }
 
+    // Special case: if init_val is a pointer to a struct (from struct init),
+    // use it directly instead of creating a wrapper pointer. This ensures that
+    // field_ptr calculations work correctly in the slot-based VM.
+    if (init_val) |val| {
+        if (val.ty == .ptr) {
+            const pointee = val.ty.ptr.*;
+            if (pointee == .@"struct") {
+                // Register this variable name as an alias to the struct pointer
+                // The struct init already allocated slots for the fields
+                try l.scopes.put(name, val);
+                return;
+            }
+        }
+    }
+
     // Allocate variable
     const ty_ptr = try l.allocator.create(ir.Type);
     ty_ptr.* = var_type;

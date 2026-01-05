@@ -456,6 +456,15 @@ pub const BytecodeEmitter = struct {
             if (param.ty == .@"struct") {
                 // Structure parameter - allocate slots for each field with qualified names
                 const struct_type = param.ty.@"struct";
+                const base_slot = self.local_count;
+
+                // Also register the base parameter name pointing to the first field slot
+                // This allows the alloca for this parameter to find the existing registration
+                try self.locals.put(param.name, .{
+                    .slot = base_slot,
+                    .is_global = false,
+                });
+
                 for (struct_type.fields) |field| {
                     const qualified_name = std.fmt.allocPrint(
                         self.allocator,
@@ -498,7 +507,16 @@ pub const BytecodeEmitter = struct {
         }
         // Reset for actual emission (allocas will be processed again)
         const total_declared_locals = self.local_count;
-        self.local_count = @intCast(func.signature.params.len);
+        // Count actual parameter slots (struct params expand to multiple slots)
+        var param_slot_count: u16 = 0;
+        for (func.signature.params) |param| {
+            if (param.ty == .@"struct") {
+                param_slot_count += @intCast(param.ty.@"struct".fields.len);
+            } else {
+                param_slot_count += 1;
+            }
+        }
+        self.local_count = param_slot_count;
 
         // Setup spill slots after ALL declared locals are accounted for
         self.spill_slot_base = total_declared_locals;
@@ -1029,6 +1047,28 @@ pub const BytecodeEmitter = struct {
         // If value is already in a register, use that
         if (self.reg_alloc.getRegister(value.id)) |src| {
             return src;
+        }
+
+        // Before using temp_reg, check if it holds a value that needs to be preserved
+        // If so, spill it first
+        if (self.reg_alloc.reg_to_value[temp_reg]) |existing_value| {
+            // Spill the existing value if not already spilled
+            if (self.spilled_values.get(existing_value) == null) {
+                const spill_slot = self.allocateSpillSlot();
+                debug.print(.emit, "SPILL (pre-load): value_id={d} from r{d} to slot {d}", .{ existing_value, temp_reg, spill_slot });
+                try self.emitSpillStore(temp_reg, spill_slot);
+                try self.spilled_values.put(existing_value, spill_slot);
+            }
+            // If this was the last_result, invalidate it so subsequent lookups find it in spilled_values
+            if (self.last_result_value) |last_id| {
+                if (last_id == existing_value) {
+                    self.last_result_value = null;
+                }
+            }
+            // Remove from register allocator
+            _ = self.reg_alloc.value_to_reg.remove(existing_value);
+            self.reg_alloc.reg_to_value[temp_reg] = null;
+            self.reg_alloc.free_regs |= @as(u16, 1) << temp_reg;
         }
 
         // Check if value was spilled - reload it into temp_reg

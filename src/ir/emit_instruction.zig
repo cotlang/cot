@@ -43,7 +43,40 @@ const DebugLine = std.meta.TagPayload(ir.Instruction, .debug_line);
 
 /// Emit alloca instruction - allocate local variable
 pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void {
-    // Check if this is a record field (already registered as global)
+    // Struct types always get new local slots for each instance
+    // Don't use the type's global registration - that's just layout info
+    if (a.ty == .@"struct") {
+        // Check if this is a parameter (already registered as local)
+        if (e.locals.get(a.name)) |local_info| {
+            try e.value_slots.put(a.result.id, local_info.slot);
+            return;
+        }
+
+        const struct_type = a.ty.@"struct";
+        const base_slot = e.local_count;
+        // Register the struct base slot
+        try e.locals.put(a.name, .{
+            .slot = base_slot,
+            .is_global = false,
+        });
+        try e.value_slots.put(a.result.id, base_slot);
+        // Allocate a slot for each field and register with qualified name
+        for (struct_type.fields) |field| {
+            const qualified_name = std.fmt.allocPrint(
+                e.allocator,
+                "{s}.{s}",
+                .{ a.name, field.name },
+            ) catch return EmitError.OutOfMemory;
+            try e.locals.put(qualified_name, .{
+                .slot = e.local_count,
+                .is_global = false,
+            });
+            e.local_count += 1;
+        }
+        return;
+    }
+
+    // Non-struct types: check for existing registrations
     if (e.globals.get(a.name)) |global_info| {
         // Use the existing global slot
         try e.value_slots.put(a.result.id, global_info.slot | 0x8000);
@@ -51,38 +84,13 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
         // This is a parameter - use the existing parameter slot
         try e.value_slots.put(a.result.id, local_info.slot);
     } else {
-        // Check if this is a struct type - if so, allocate slots for all fields
-        if (a.ty == .@"struct") {
-            const struct_type = a.ty.@"struct";
-            const base_slot = e.local_count;
-            // Register the struct base slot
-            try e.locals.put(a.name, .{
-                .slot = base_slot,
-                .is_global = false,
-            });
-            try e.value_slots.put(a.result.id, base_slot);
-            // Allocate a slot for each field and register with qualified name
-            for (struct_type.fields) |field| {
-                const qualified_name = std.fmt.allocPrint(
-                    e.allocator,
-                    "{s}.{s}",
-                    .{ a.name, field.name },
-                ) catch return EmitError.OutOfMemory;
-                try e.locals.put(qualified_name, .{
-                    .slot = e.local_count,
-                    .is_global = false,
-                });
-                e.local_count += 1;
-            }
-        } else {
-            // Allocate a new local variable slot (primitive type)
-            try e.locals.put(a.name, .{
-                .slot = e.local_count,
-                .is_global = false,
-            });
-            try e.value_slots.put(a.result.id, e.local_count);
-            e.local_count += 1;
-        }
+        // Allocate a new local variable slot (primitive type)
+        try e.locals.put(a.name, .{
+            .slot = e.local_count,
+            .is_global = false,
+        });
+        try e.value_slots.put(a.result.id, e.local_count);
+        e.local_count += 1;
     }
 }
 
@@ -161,6 +169,29 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
     }
 
     // Regular store
+    // Special case: storing a struct value into a pointer slot
+    // Store the struct's base slot index as a "pointer reference"
+    if (s.value.ty == .@"struct" or
+        (s.value.ty == .ptr and s.value.ty.ptr.* == .@"struct"))
+    {
+        if (e.value_slots.get(s.value.id)) |value_slot| {
+            if (e.value_slots.get(s.ptr.id)) |ptr_slot| {
+                // Store the base slot index as the pointer value
+                const base_slot = value_slot & 0x7FFF;
+                const const_idx = try e.addConstant(.{ .integer = @intCast(base_slot) });
+                try e.emitOpcode(.load_const);
+                try e.emitU8(0 << 4);
+                try e.emitU16(const_idx);
+                if (ptr_slot < 256) {
+                    try e.emitRegStoreLocal(0, @intCast(ptr_slot));
+                } else {
+                    return EmitError.TooManyLocals;
+                }
+                return;
+            }
+        }
+    }
+
     const src_reg = try e.getValueInReg(s.value, 0);
     if (e.value_slots.get(s.ptr.id)) |slot_info| {
         if (slot_info & 0x8000 != 0) {
@@ -523,19 +554,9 @@ fn emitNativeCall(e: *BytecodeEmitter, c: ir.Instruction.Call) EmitError!void {
 }
 
 fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) EmitError!void {
-    // Two-pass argument loading
-    if (e.last_result_value) |last_id| {
-        for (c.args, 0..) |arg, i| {
-            if (i < 8 and arg.id == last_id) {
-                try e.emitValueToReg(arg, @intCast(i));
-            }
-        }
-    }
+    // Load arguments to registers
     for (c.args, 0..) |arg, i| {
         if (i < 8) {
-            if (e.last_result_value) |last_id| {
-                if (arg.id == last_id) continue;
-            }
             try e.emitValueToReg(arg, @intCast(i));
         }
     }
@@ -568,7 +589,8 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     }
 
     if (c.result) |result| {
-        e.setLastResult(result.id, 0);
+        // Return value from user-defined functions is in r15 (set by ret_val)
+        e.setLastResult(result.id, 15);
     }
 }
 

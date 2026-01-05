@@ -22,6 +22,7 @@ const expressions = @import("expressions.zig");
 pub const ExpressionTag = expressions.ExpressionTag;
 pub const BinaryOp = expressions.BinaryOp;
 pub const UnaryOp = expressions.UnaryOp;
+pub const InterpStringPartTag = expressions.InterpStringPartTag;
 
 const types = @import("types.zig");
 pub const TypeTag = types.TypeTag;
@@ -584,6 +585,44 @@ pub const NodeStore = struct {
             .b = (@as(u32, @intCast(args.len)) << 16) | args_start.toInt(),
         });
         return idx;
+    }
+
+    /// Add an interpolated string expression: "Hello ${name}!"
+    /// parts_data format: alternating [tag, data] pairs where:
+    ///   - tag 0 (string_content): data is StringId
+    ///   - tag 1 (expression): data is ExprIdx
+    pub fn addInterpString(self: *Self, parts_data: []const u32, loc: SourceLoc) !ExprIdx {
+        // Store parts in extra_data: [count, tag0, data0, tag1, data1, ...]
+        const parts_start: ExtraIdx = @enumFromInt(@as(u32, @intCast(self.extra_data.items.len)));
+        const part_count: u32 = @intCast(parts_data.len / 2);
+        try self.extra_data.append(self.allocator, part_count);
+        for (parts_data) |p| {
+            try self.extra_data.append(self.allocator, p);
+        }
+
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
+        try self.expr_tags.append(self.allocator, .interp_string);
+        try self.expr_locs.append(self.allocator, loc);
+        // Pack: parts_start in a, reserved in b
+        try self.expr_data.append(self.allocator, .{
+            .a = parts_start.toInt(),
+            .b = 0,
+        });
+        return idx;
+    }
+
+    /// Get interpolated string parts data
+    /// Returns: [count, tag0, data0, tag1, data1, ...] where count is number of parts
+    pub fn getInterpStringParts(self: *const Self, idx: ExprIdx) struct { count: u32, data: []const u32 } {
+        const data = self.exprData(idx);
+        const parts_start = data.a;
+        const count = self.extra_data.items[parts_start];
+        // Each part has 2 values (tag + data)
+        const total_values = count * 2;
+        return .{
+            .count = count,
+            .data = self.extra_data.items[parts_start + 1 .. parts_start + 1 + total_values],
+        };
     }
 
     // ========================================

@@ -1609,17 +1609,31 @@ fn runTests(allocator: std.mem.Allocator, filename: []const u8, filter: ?[]const
     };
     defer allocator.free(processed_stmts);
 
-    // Lower AST to IR
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
-        collector.addError(
-            .E300_undefined_label,
-            filename,
-            diagnostics.SourceRange.none,
-            "IR lowering error: {}",
-            .{err},
-        );
-        formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+    // Lower AST to IR with detailed error reporting
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                collector.addError(
+                    .E300_undefined_label,
+                    filename,
+                    diagnostics.SourceRange.none,
+                    "IR lowering error: {} - {s} ({s})",
+                    .{ e.kind, detail.message, detail.context },
+                );
+            } else {
+                collector.addError(
+                    .E300_undefined_label,
+                    filename,
+                    diagnostics.SourceRange.none,
+                    "IR lowering error: {}",
+                    .{e.kind},
+                );
+            }
+            formatter.printToStderr(&collector, .{ .use_color = true });
+            return;
+        },
     };
     defer allocator.destroy(ir_module);
     defer ir_module.deinit();

@@ -1,0 +1,30 @@
+// Test impl method dispatch
+// This test verifies that instance.method() calls work correctly
+
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+impl Point {
+    fn magnitude_squared(self: Point) i64 {
+        return self.x * self.x + self.y * self.y
+    }
+}
+
+fn main() {
+    // Create point directly (not using static method)
+    const p1 = Point { .x = 3, .y = 4 }
+
+    // Call instance method
+    const mag = p1.magnitude_squared()
+
+    // Print result - should be 3*3 + 4*4 = 9 + 16 = 25
+    println("mag = " + string(mag))
+
+    // Test with different values
+    const p2 = Point { .x = 5, .y = 12 }
+    const mag2 = p2.magnitude_squared()
+    // Should be 5*5 + 12*12 = 25 + 144 = 169
+    println("mag2 = " + string(mag2))
+}

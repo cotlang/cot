@@ -262,7 +262,7 @@ pub const Evaluator = struct {
                 break :blk try self.evaluateBuiltin(expr_idx);
             },
             // These can't be evaluated at compile time
-            .call, .method_call, .index, .member, .optional_member, .optional_index, .range, .array_init, .struct_init, .lambda, .if_expr, .match_expr, .block_expr, .is_expr => EvalError.InvalidExpression,
+            .call, .method_call, .index, .member, .optional_member, .optional_index, .range, .array_init, .struct_init, .lambda, .if_expr, .match_expr, .block_expr, .is_expr, .interp_string => EvalError.InvalidExpression,
         };
     }
 

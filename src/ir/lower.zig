@@ -1633,6 +1633,23 @@ pub fn lower(
     return lowerWithOptions(allocator, store, strings, top_level, module_name, .{});
 }
 
+/// Error detail structure for better error reporting
+pub const ErrorDetail = struct {
+    message: []const u8,
+    context: []const u8,
+    line: u32,
+    column: u32,
+};
+
+/// Result type for lowering with error details
+pub const LowerResult = union(enum) {
+    ok: *ir.Module,
+    err: struct {
+        kind: LowerError,
+        detail: ?ErrorDetail,
+    },
+};
+
 /// Main entry point for lowering with options
 pub fn lowerWithOptions(
     allocator: Allocator,
@@ -1642,10 +1659,38 @@ pub fn lowerWithOptions(
     module_name: []const u8,
     options: LowerOptions,
 ) LowerError!*ir.Module {
-    var lowerer = try Lowerer.init(allocator, store, strings, module_name, options);
-    defer lowerer.deinit();
+    const result = lowerWithDetails(allocator, store, strings, top_level, module_name, options);
+    switch (result) {
+        .ok => |module| return module,
+        .err => |e| return e.kind,
+    }
+}
 
-    const module = try lowerer.lowerProgram(top_level);
+/// Main entry point for lowering with detailed error reporting
+pub fn lowerWithDetails(
+    allocator: Allocator,
+    store: *const NodeStore,
+    strings: *StringInterner,
+    top_level: []const StmtIdx,
+    module_name: []const u8,
+    options: LowerOptions,
+) LowerResult {
+    var lowerer = Lowerer.init(allocator, store, strings, module_name, options) catch |err| {
+        return .{ .err = .{ .kind = err, .detail = null } };
+    };
+
+    const module = lowerer.lowerProgram(top_level) catch |err| {
+        // Extract error context BEFORE deinit
+        const detail: ?ErrorDetail = if (lowerer.getLastError()) |ctx| .{
+            .message = allocator.dupe(u8, ctx.message) catch ctx.message,
+            .context = allocator.dupe(u8, ctx.context) catch ctx.context,
+            .line = ctx.line,
+            .column = ctx.column,
+        } else null;
+
+        lowerer.deinit();
+        return .{ .err = .{ .kind = err, .detail = detail } };
+    };
 
     // Optional IR verification
     if (options.verify) {
@@ -1657,11 +1702,13 @@ pub fn lowerWithOptions(
             for (verifier.getErrors()) |e| {
                 log.err("IR verification: {any}", .{e});
             }
-            return LowerError.VerificationFailed;
+            lowerer.deinit();
+            return .{ .err = .{ .kind = LowerError.VerificationFailed, .detail = null } };
         };
     }
 
-    return module;
+    lowerer.deinit();
+    return .{ .ok = module };
 }
 
 /// Semantic diagnostic information for LSP

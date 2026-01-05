@@ -240,38 +240,80 @@ fn checkCall(self: *Self, call: ir.Instruction.Call) void {
     for (self.module.functions.items) |func| {
         if (std.mem.eql(u8, func.name, call.callee)) {
             const params = func.signature.params;
+
+            // Calculate expected argument count - struct params expand to field count
+            var expected_args: usize = 0;
+            for (params) |param| {
+                if (param.ty == .@"struct") {
+                    expected_args += param.ty.@"struct".fields.len;
+                } else {
+                    expected_args += 1;
+                }
+            }
+
             // Found the function - check argument count
-            if (call.args.len != params.len) {
+            if (call.args.len != expected_args) {
                 self.collector.addError(
                     .E204_argument_count_mismatch,
                     self.file_path,
                     loc,
                     "function '{s}' expects {d} arguments, got {d}",
-                    .{ call.callee, params.len, call.args.len },
+                    .{ call.callee, expected_args, call.args.len },
                 );
                 return;
             }
 
-            // Check argument types
-            for (call.args, 0..) |arg, i| {
-                const param = params[i];
-                const compat = type_rules.isAssignable(param.ty, arg.ty);
+            // Check argument types - account for struct expansion
+            var arg_idx: usize = 0;
+            for (params) |param| {
+                if (param.ty == .@"struct") {
+                    // Struct param expands to individual field args
+                    const struct_type = param.ty.@"struct";
+                    for (struct_type.fields) |field| {
+                        if (arg_idx >= call.args.len) break;
+                        const arg = call.args[arg_idx];
+                        const compat = type_rules.isAssignable(field.ty, arg.ty);
 
-                if (compat == .incompatible) {
-                    var expected_buf: [64]u8 = undefined;
-                    var actual_buf: [64]u8 = undefined;
-                    self.collector.addError(
-                        .E205_argument_type_mismatch,
-                        self.file_path,
-                        loc,
-                        "argument {d} to '{s}': expected '{s}', got '{s}'",
-                        .{
-                            i + 1,
-                            call.callee,
-                            type_rules.formatType(param.ty, &expected_buf),
-                            type_rules.formatType(arg.ty, &actual_buf),
-                        },
-                    );
+                        if (compat == .incompatible) {
+                            var expected_buf: [64]u8 = undefined;
+                            var actual_buf: [64]u8 = undefined;
+                            self.collector.addError(
+                                .E205_argument_type_mismatch,
+                                self.file_path,
+                                loc,
+                                "argument {d} to '{s}': expected '{s}', got '{s}'",
+                                .{
+                                    arg_idx + 1,
+                                    call.callee,
+                                    type_rules.formatType(field.ty, &expected_buf),
+                                    type_rules.formatType(arg.ty, &actual_buf),
+                                },
+                            );
+                        }
+                        arg_idx += 1;
+                    }
+                } else {
+                    if (arg_idx >= call.args.len) break;
+                    const arg = call.args[arg_idx];
+                    const compat = type_rules.isAssignable(param.ty, arg.ty);
+
+                    if (compat == .incompatible) {
+                        var expected_buf: [64]u8 = undefined;
+                        var actual_buf: [64]u8 = undefined;
+                        self.collector.addError(
+                            .E205_argument_type_mismatch,
+                            self.file_path,
+                            loc,
+                            "argument {d} to '{s}': expected '{s}', got '{s}'",
+                            .{
+                                arg_idx + 1,
+                                call.callee,
+                                type_rules.formatType(param.ty, &expected_buf),
+                                type_rules.formatType(arg.ty, &actual_buf),
+                            },
+                        );
+                    }
+                    arg_idx += 1;
                 }
             }
             return;

@@ -209,6 +209,7 @@ pub const Emitter = struct {
             .optional_member => try self.emitOptionalMember(idx),
             .optional_index => try self.emitOptionalIndex(idx),
             .is_expr => try self.emitIsExpr(idx),
+            .interp_string => {}, // TODO: implement interpolated string emission
         }
     }
 

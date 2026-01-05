@@ -1206,8 +1206,15 @@ pub const Parser = struct {
         while (!self.check(.kw_proc) and !self.check(.kw_endtest) and !self.isAtEnd()) {
             if (self.check(.kw_record)) {
                 // Handle record block for local variables
+                // parseRecord returns a block - unwrap it to avoid extra scope
                 const record_block = try self.parseRecord();
-                var_decls.append(self.allocator, record_block) catch return ParseError.OutOfMemory;
+                const block_data = self.store.stmtData(record_block);
+                const block_span = block_data.getSpan();
+                const block_stmts = self.store.getStmtSpan(block_span);
+                // Add each statement from the record block directly
+                for (block_stmts) |stmt_raw| {
+                    var_decls.append(self.allocator, @enumFromInt(stmt_raw)) catch return ParseError.OutOfMemory;
+                }
             } else {
                 _ = self.advance();
             }

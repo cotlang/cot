@@ -15,6 +15,11 @@ pub const Lexer = struct {
     line: usize,
     column: usize,
 
+    // Interpolated string state: "Hello ${name}!"
+    in_interp_string: bool,
+    interp_quote: u8,
+    interp_brace_depth: usize,
+
     const Self = @This();
 
     pub fn init(source: []const u8) Self {
@@ -23,6 +28,9 @@ pub const Lexer = struct {
             .position = 0,
             .line = 1,
             .column = 1,
+            .in_interp_string = false,
+            .interp_quote = 0,
+            .interp_brace_depth = 0,
         };
     }
 
@@ -50,6 +58,11 @@ pub const Lexer = struct {
     }
 
     pub fn nextToken(self: *Self) !Token {
+        // If we're inside an interpolated string, handle it specially
+        if (self.in_interp_string) {
+            return self.scanInterpStringContent();
+        }
+
         self.skipWhitespaceAndComments();
 
         if (self.isAtEnd()) {
@@ -215,8 +228,21 @@ pub const Lexer = struct {
             return self.makeToken(.period, self.source[start_pos..self.position]);
         }
 
-        // String literals
+        // String literals - check for interpolation with ${
         if (c == '"' or c == '\'') {
+            // Check if this string contains ${ for interpolation
+            if (self.stringContainsInterpolation(c)) {
+                self.in_interp_string = true;
+                self.interp_quote = c;
+                self.interp_brace_depth = 0;
+                return .{
+                    .type = .string_interp_start,
+                    .lexeme = self.source[start_pos..self.position],
+                    .line = self.line,
+                    .column = start_col,
+                    .span = Span.init(start_pos, self.position),
+                };
+            }
             return self.scanString(c, start_pos, start_col);
         }
 
@@ -260,6 +286,34 @@ pub const Lexer = struct {
             .column = start_col,
             .span = Span.init(start_pos, self.position),
         };
+    }
+
+    /// Check if a string (starting after the opening quote) contains ${ interpolation
+    fn stringContainsInterpolation(self: *const Self, quote: u8) bool {
+        var pos = self.position;
+        while (pos < self.source.len and self.source[pos] != quote) {
+            // Check for ${ (but not \${)
+            if (self.source[pos] == '$' and pos + 1 < self.source.len and self.source[pos + 1] == '{') {
+                // Make sure it's not escaped: check if preceded by odd number of backslashes
+                var backslash_count: usize = 0;
+                var check_pos = pos;
+                while (check_pos > self.position and self.source[check_pos - 1] == '\\') {
+                    backslash_count += 1;
+                    check_pos -= 1;
+                }
+                // If even number of backslashes (or zero), this is a real interpolation
+                if (backslash_count % 2 == 0) {
+                    return true;
+                }
+            }
+            // Skip escape sequences
+            if (self.source[pos] == '\\' and pos + 1 < self.source.len) {
+                pos += 2;
+                continue;
+            }
+            pos += 1;
+        }
+        return false;
     }
 
     fn scanNumber(self: *Self, start_pos: usize, start_col: usize) Token {
@@ -313,6 +367,143 @@ pub const Lexer = struct {
             .column = start_col,
             .span = Span.init(start_pos, self.position),
         };
+    }
+
+    /// Scan content inside an interpolated string: "Hello ${name}!"
+    fn scanInterpStringContent(self: *Self) !Token {
+        const start_pos = self.position;
+        const start_col = self.column;
+
+        // If we're inside an interpolation (brace_depth > 0), scan normal tokens
+        if (self.interp_brace_depth > 0) {
+            // Skip whitespace inside interpolation
+            self.skipWhitespaceAndComments();
+
+            if (self.isAtEnd()) {
+                self.in_interp_string = false;
+                return self.makeToken(.invalid, "");
+            }
+
+            const c = self.peek();
+
+            // Check for nested braces
+            if (c == '{') {
+                _ = self.advance();
+                self.interp_brace_depth += 1;
+                return self.makeToken(.lbrace, self.source[self.position - 1 .. self.position]);
+            }
+
+            // Check for closing brace - end of interpolation
+            if (c == '}') {
+                _ = self.advance();
+                self.interp_brace_depth -= 1;
+                if (self.interp_brace_depth == 0) {
+                    return .{
+                        .type = .interp_expr_end,
+                        .lexeme = self.source[self.position - 1 .. self.position],
+                        .line = self.line,
+                        .column = self.column - 1,
+                        .span = Span.init(self.position - 1, self.position),
+                    };
+                }
+                return self.makeToken(.rbrace, self.source[self.position - 1 .. self.position]);
+            }
+
+            // Otherwise, scan a normal token for the expression
+            const inner_start = self.position;
+            const inner_col = self.column;
+            const inner_c = self.advance();
+
+            // Handle the common cases for expressions inside interpolation
+            return switch (inner_c) {
+                '(' => self.makeToken(.lparen, self.source[inner_start..self.position]),
+                ')' => self.makeToken(.rparen, self.source[inner_start..self.position]),
+                '[' => self.makeToken(.lbracket, self.source[inner_start..self.position]),
+                ']' => self.makeToken(.rbracket, self.source[inner_start..self.position]),
+                ',' => self.makeToken(.comma, self.source[inner_start..self.position]),
+                '.' => self.makeToken(.period, self.source[inner_start..self.position]),
+                '+' => self.makeToken(.plus, self.source[inner_start..self.position]),
+                '-' => self.makeToken(.minus, self.source[inner_start..self.position]),
+                '*' => self.makeToken(.star, self.source[inner_start..self.position]),
+                '/' => self.makeToken(.slash, self.source[inner_start..self.position]),
+                '"', '\'' => self.scanString(inner_c, inner_start, inner_col),
+                '0'...'9' => self.scanNumber(inner_start, inner_col),
+                'a'...'z', 'A'...'Z', '_' => self.scanIdentifier(inner_start, inner_col),
+                else => self.makeToken(.invalid, self.source[inner_start..self.position]),
+            };
+        }
+
+        // We're in interpolated string content mode (not inside ${})
+        if (self.isAtEnd()) {
+            self.in_interp_string = false;
+            return self.makeToken(.invalid, "");
+        }
+
+        const c = self.peek();
+
+        // Check for closing quote - end of interpolated string
+        if (c == self.interp_quote) {
+            _ = self.advance();
+            self.in_interp_string = false;
+            return .{
+                .type = .string_interp_end,
+                .lexeme = self.source[start_pos..self.position],
+                .line = self.line,
+                .column = start_col,
+                .span = Span.init(start_pos, self.position),
+            };
+        }
+
+        // Check for interpolation start: ${
+        if (c == '$' and self.position + 1 < self.source.len and self.source[self.position + 1] == '{') {
+            // Check for escaped: \${
+            // We shouldn't get here if it was escaped, but just in case
+            _ = self.advance(); // $
+            _ = self.advance(); // {
+            self.interp_brace_depth = 1;
+            return .{
+                .type = .interp_expr_start,
+                .lexeme = self.source[start_pos..self.position],
+                .line = self.line,
+                .column = start_col,
+                .span = Span.init(start_pos, self.position),
+            };
+        }
+
+        // Scan string content until ${ or closing quote
+        while (!self.isAtEnd()) {
+            const next = self.peek();
+            if (next == self.interp_quote) {
+                break;
+            }
+            // Check for ${ interpolation start
+            if (next == '$' and self.position + 1 < self.source.len and self.source[self.position + 1] == '{') {
+                break;
+            }
+            // Handle escape sequences like in regular strings
+            if (next == '\\' and self.position + 1 < self.source.len) {
+                _ = self.advance();
+                _ = self.advance();
+                continue;
+            }
+            if (next == '\n') {
+                self.line += 1;
+                self.column = 0;
+            }
+            _ = self.advance();
+        }
+
+        if (self.position > start_pos) {
+            return .{
+                .type = .string_content,
+                .lexeme = self.source[start_pos..self.position],
+                .line = self.line,
+                .column = start_col,
+                .span = Span.init(start_pos, self.position),
+            };
+        }
+
+        return self.makeToken(.invalid, "");
     }
 
     fn skipWhitespaceAndComments(self: *Self) void {
@@ -583,4 +774,57 @@ test "lexer spans" {
     const source = "fn main() { }";
     try std.testing.expectEqualStrings("fn", tokens[0].span.slice(source));
     try std.testing.expectEqualStrings("main", tokens[1].span.slice(source));
+}
+
+test "lexer interpolated string simple" {
+    // Simple string without interpolation - should be regular string_literal
+    var lexer = Lexer.init("\"Hello\"");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.string_literal, tokens[0].type);
+}
+
+test "lexer interpolated string with interpolation" {
+    var lexer = Lexer.init("\"Hello ${name}!\"");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.string_interp_start, tokens[0].type);
+    try std.testing.expectEqual(TokenType.string_content, tokens[1].type);
+    try std.testing.expectEqualStrings("Hello ", tokens[1].lexeme);
+    try std.testing.expectEqual(TokenType.interp_expr_start, tokens[2].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[3].type);
+    try std.testing.expectEqualStrings("name", tokens[3].lexeme);
+    try std.testing.expectEqual(TokenType.interp_expr_end, tokens[4].type);
+    try std.testing.expectEqual(TokenType.string_content, tokens[5].type);
+    try std.testing.expectEqualStrings("!", tokens[5].lexeme);
+    try std.testing.expectEqual(TokenType.string_interp_end, tokens[6].type);
+}
+
+test "lexer interpolated string with expression" {
+    var lexer = Lexer.init("\"Sum: ${a + b}\"");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.string_interp_start, tokens[0].type);
+    try std.testing.expectEqual(TokenType.string_content, tokens[1].type);
+    try std.testing.expectEqual(TokenType.interp_expr_start, tokens[2].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[3].type);
+    try std.testing.expectEqualStrings("a", tokens[3].lexeme);
+    try std.testing.expectEqual(TokenType.plus, tokens[4].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[5].type);
+    try std.testing.expectEqualStrings("b", tokens[5].lexeme);
+    try std.testing.expectEqual(TokenType.interp_expr_end, tokens[6].type);
+    try std.testing.expectEqual(TokenType.string_interp_end, tokens[7].type);
+}
+
+test "lexer interpolated string escaped dollar" {
+    // \${ should be treated as literal ${, not interpolation
+    var lexer = Lexer.init("\"literal \\${not interp}\"");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    // Should be a regular string since \${ is escaped
+    try std.testing.expectEqual(TokenType.string_literal, tokens[0].type);
 }

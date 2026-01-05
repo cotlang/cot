@@ -34,6 +34,7 @@ const ExprIdx = ast.ExprIdx;
 const TypeIdx = ast.TypeIdx;
 const BinaryOp = ast.BinaryOp;
 const UnaryOp = ast.UnaryOp;
+const InterpStringPartTag = ast.InterpStringPartTag;
 const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
 
@@ -140,6 +141,7 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             // Type checking expressions not yet supported
             return LowerError.UnsupportedFeature;
         },
+        .interp_string => return lowerInterpString(l, func, expr_idx),
     }
 }
 
@@ -196,6 +198,88 @@ pub fn lowerStringLiteral(l: *Lowerer, func: *ir.Function, data: NodeData) Lower
     return result;
 }
 
+/// Lower an interpolated string: "Hello ${name}!"
+/// Desugars to a chain of str_concat operations:
+/// "Hello ${name}!" => "Hello " ++ to_string(name) ++ "!"
+pub fn lowerInterpString(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const parts_info = l.store.getInterpStringParts(expr_idx);
+    const count = parts_info.count;
+    const parts_data = parts_info.data;
+
+    // Helper to emit an empty string constant
+    const emitEmptyString = struct {
+        fn emit(lowerer: *Lowerer, f: *ir.Function) LowerError!ir.Value {
+            const u8_type_ptr = try lowerer.allocator.create(ir.Type);
+            u8_type_ptr.* = .u8;
+            try lowerer.allocated_types.append(lowerer.allocator, u8_type_ptr);
+            const array_type: ir.Type = .{ .array = .{ .element = u8_type_ptr, .length = 0 } };
+            const result = f.newValue(array_type);
+            try lowerer.emit(.{ .const_string = .{ .value = "", .result = result } });
+            return result;
+        }
+    }.emit;
+
+    // If no parts, return empty string
+    if (count == 0) {
+        return emitEmptyString(l, func);
+    }
+
+    // Lower each part
+    var values = std.ArrayListUnmanaged(ir.Value){};
+    defer values.deinit(l.allocator);
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const tag: InterpStringPartTag = @enumFromInt(parts_data[i * 2]);
+        const data_val = parts_data[i * 2 + 1];
+
+        const part_value: ir.Value = switch (tag) {
+            .string_content => blk: {
+                // String content - emit as const_string
+                const str_id: StringId = @enumFromInt(data_val);
+                const str = l.strings.get(str_id);
+
+                const u8_type_ptr = try l.allocator.create(ir.Type);
+                u8_type_ptr.* = .u8;
+                try l.allocated_types.append(l.allocator, u8_type_ptr);
+
+                const array_type: ir.Type = .{ .array = .{ .element = u8_type_ptr, .length = @intCast(str.len) } };
+                const result = func.newValue(array_type);
+                try l.emit(.{ .const_string = .{ .value = str, .result = result } });
+                break :blk result;
+            },
+            .expression => blk: {
+                // Expression - lower it, the VM handles auto-conversion to string in str_concat
+                const expr: ExprIdx = @enumFromInt(data_val);
+                break :blk try lowerExpression(l, expr);
+            },
+        };
+
+        try values.append(l.allocator, part_value);
+    }
+
+    // Interpolated strings always produce strings. If first part is not a string type,
+    // prepend an empty string to ensure the concat chain starts with a string.
+    // This guarantees type checker validation passes (str_concat requires at least one string).
+    var result = values.items[0];
+    if (!result.isString()) {
+        const empty = try emitEmptyString(l, func);
+        const concat_result = func.newValue(.string);
+        try l.emit(.{ .str_concat = .{ .lhs = empty, .rhs = result, .result = concat_result } });
+        result = concat_result;
+    }
+
+    // Concatenate remaining parts using str_concat chain
+    // str_concat auto-converts non-strings to string in the VM
+    for (values.items[1..]) |part| {
+        const concat_result = func.newValue(.string);
+        try l.emit(.{ .str_concat = .{ .lhs = result, .rhs = part, .result = concat_result } });
+        result = concat_result;
+    }
+
+    return result;
+}
+
 /// Lower a boolean literal (represented as iconst 0 or 1 to match Cranelift)
 pub fn lowerBoolLiteral(l: *Lowerer, func: *ir.Function, data: NodeData) LowerError!ir.Value {
     const value: i64 = if (data.a != 0) 1 else 0;
@@ -233,12 +317,31 @@ pub fn lowerNullLiteral(l: *Lowerer, func: *ir.Function) LowerError!ir.Value {
 pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerError!ir.Value {
     const name_id = data.getName();
     const name = l.strings.get(name_id);
-    if (name.len == 0) return LowerError.UndefinedVariable;
+    if (name.len == 0) {
+        l.setErrorContext(
+            LowerError.UndefinedVariable,
+            "Undefined variable: (empty name)",
+            .{},
+            .{ .line = 0, .column = 0 },
+            "lowering identifier expression",
+            .{},
+        );
+        return LowerError.UndefinedVariable;
+    }
 
     // Check local variables first (via scopes), then global variables
     const ptr = l.scopes.get(name) orelse
-        l.global_variables.get(name) orelse
-        return LowerError.UndefinedVariable;
+        l.global_variables.get(name) orelse blk: {
+            l.setErrorContext(
+                LowerError.UndefinedVariable,
+                "Undefined variable: '{s}'",
+                .{name},
+                .{ .line = 0, .column = 0 },
+                "lowering identifier expression",
+                .{},
+            );
+            break :blk null;
+        } orelse return LowerError.UndefinedVariable;
 
     // Get the underlying type (dereference pointer)
     const value_type = switch (ptr.ty) {
@@ -293,12 +396,23 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerErr
 pub fn lowerLValue(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const tag = l.store.exprTag(expr_idx);
     const data = l.store.exprData(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
 
     switch (tag) {
         .identifier => {
             const name_id = data.getName();
             const name = l.strings.get(name_id);
-            if (name.len == 0) return LowerError.UndefinedVariable;
+            if (name.len == 0) {
+                l.setErrorContext(
+                    LowerError.UndefinedVariable,
+                    "Undefined lvalue variable: (empty name)",
+                    .{},
+                    loc,
+                    "lowering lvalue identifier",
+                    .{},
+                );
+                return LowerError.UndefinedVariable;
+            }
 
             // Check local variables first (via scopes), then global variables
             if (l.scopes.get(name)) |ptr| {
@@ -336,6 +450,14 @@ pub fn lowerLValue(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
                 return result;
             }
+            l.setErrorContext(
+                LowerError.UndefinedVariable,
+                "Undefined lvalue variable: '{s}'",
+                .{name},
+                loc,
+                "lowering lvalue identifier",
+                .{},
+            );
             return LowerError.UndefinedVariable;
         },
         .member => {
@@ -359,12 +481,23 @@ pub fn lowerLValueFromExpr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
     const object_idx = data.getObject();
     const field_id = data.getField();
 
     var object_ptr = try lowerLValue(l, object_idx);
     const field_name = l.strings.get(field_id);
-    if (field_name.len == 0) return LowerError.UndefinedVariable;
+    if (field_name.len == 0) {
+        l.setErrorContext(
+            LowerError.UndefinedVariable,
+            "Undefined field: (empty name)",
+            .{},
+            loc,
+            "lowering member access",
+            .{},
+        );
+        return LowerError.UndefinedVariable;
+    }
 
     // Look up field in struct type
     // Handle both direct struct pointers (*Struct) and pointers to struct pointers (**Struct)
@@ -423,6 +556,14 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         return result;
     }
 
+    l.setErrorContext(
+        LowerError.UndefinedVariable,
+        "Field '{s}' not found in struct '{s}'",
+        .{ field_name, struct_type.name },
+        loc,
+        "lowering member access",
+        .{},
+    );
     return LowerError.UndefinedVariable;
 }
 
@@ -752,6 +893,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         const object_idx = callee_data.getObject();
         const field_id = callee_data.getField();
         const field_name = l.strings.get(field_id);
+        debug.print(.ir, "lowerCall: member access detected, field={s}", .{field_name});
 
         // Check if object is "Map" identifier (static method)
         const object_tag = l.store.exprTag(object_idx);
@@ -907,6 +1049,124 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                         .map = object_val,
                         .result = result,
                         .loc = null,
+                    },
+                });
+                return result;
+            }
+        }
+
+        // Check if this is a method call on a user-defined struct type
+        // This handles calls like: point.distance(other) where Point has an impl block
+        debug.print(.ir, "Checking for struct method: field={s}, object_ty={any}", .{ field_name, object_val.ty });
+
+        // Extract struct type from the value's type (may be direct struct or pointer to struct)
+        const maybe_struct_type: ?*const ir.StructType = blk: {
+            if (object_val.ty == .@"struct") {
+                break :blk object_val.ty.@"struct";
+            } else if (object_val.ty == .ptr) {
+                // Pointer to struct
+                const pointee = object_val.ty.ptr;
+                if (pointee.* == .@"struct") {
+                    break :blk pointee.@"struct";
+                } else if (pointee.* == .ptr) {
+                    // Pointer to pointer to struct (common pattern)
+                    const inner = pointee.ptr;
+                    if (inner.* == .@"struct") {
+                        break :blk inner.@"struct";
+                    }
+                }
+            }
+            break :blk null;
+        };
+
+        if (maybe_struct_type) |struct_type| {
+            const type_name = struct_type.name;
+
+            // Look up inherent impl (impl TypeName { ... })
+            // For inherent impls, trait_name == type_name
+            if (l.lookupTraitMethod(type_name, type_name, field_name)) |_| {
+                // Found the method! Lower arguments and emit call with object as first arg
+                var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                defer method_args.deinit(l.allocator);
+
+                // Get struct pointer using lowerLValue to avoid extra loads
+                // This gives us the direct pointer to the struct fields
+                const struct_lval = try lowerLValue(l, object_idx);
+
+                // Determine the struct pointer to use for field_ptr
+                // If lval is **struct (pointer to pointer to struct), load once to get *struct
+                var struct_ptr = struct_lval;
+                if (struct_lval.ty == .ptr) {
+                    const pointee = struct_lval.ty.ptr.*;
+                    if (pointee == .ptr) {
+                        const inner = pointee.ptr.*;
+                        if (inner == .@"struct") {
+                            // Load once to get *struct
+                            const loaded = func.newValue(.{ .ptr = struct_lval.ty.ptr });
+                            try l.emit(.{
+                                .load = .{
+                                    .ptr = struct_lval,
+                                    .result = loaded,
+                                },
+                            });
+                            struct_ptr = loaded;
+                        }
+                    }
+                }
+
+                // Emit field_ptr + load for each field to pass as individual arguments
+                for (struct_type.fields, 0..) |field, idx| {
+                    const field_ty_ptr = try l.allocator.create(ir.Type);
+                    field_ty_ptr.* = field.ty;
+                    try l.allocated_types.append(l.allocator, field_ty_ptr);
+
+                    const field_ptr_val = func.newValue(.{ .ptr = field_ty_ptr });
+                    try l.emit(.{
+                        .field_ptr = .{
+                            .struct_ptr = struct_ptr,
+                            .field_index = @intCast(idx),
+                            .result = field_ptr_val,
+                        },
+                    });
+
+                    const field_val = func.newValue(field.ty);
+                    try l.emit(.{
+                        .load = .{
+                            .ptr = field_ptr_val,
+                            .result = field_val,
+                        },
+                    });
+
+                    try method_args.append(l.allocator, field_val);
+                }
+
+                // Then the explicit arguments
+                for (0..args_count) |i| {
+                    const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                    const arg_val = try lowerExpression(l, arg_idx);
+                    try method_args.append(l.allocator, arg_val);
+                }
+
+                const args_slice = try method_args.toOwnedSlice(l.allocator);
+
+                // For now, use the method name directly (no mangling)
+                // TODO: Consider name mangling like "Point.distance" to avoid conflicts
+                const method_name = l.allocator.dupe(u8, field_name) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                // Determine return type from the method's signature
+                // For now, use a generic approach - could be improved with proper type inference
+                const result_type = getBuiltinReturnType(method_name, args_slice);
+                const result = func.newValue(result_type);
+
+                debug.print(.ir, "Dispatching method call: {s}.{s} with {d} args", .{ type_name, field_name, args_slice.len });
+
+                try l.emit(.{
+                    .call = .{
+                        .callee = method_name,
+                        .args = args_slice,
+                        .result = result,
                     },
                 });
                 return result;

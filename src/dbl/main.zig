@@ -300,10 +300,18 @@ fn runTests(allocator: std.mem.Allocator, source: []const u8, filename: []const 
         return error.ParseError;
     }
 
-    // Lower to IR
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, filename) catch |err| {
-        std.debug.print("IR lowering error: {}\n", .{err});
-        return error.LowerError;
+    // Lower to IR with detailed error reporting
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, filename, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                std.debug.print("IR lowering error: {} - {s} ({s})\n", .{ e.kind, detail.message, detail.context });
+            } else {
+                std.debug.print("IR lowering error: {}\n", .{e.kind});
+            }
+            return error.LowerError;
+        },
     };
     defer allocator.destroy(ir_module);
     defer ir_module.deinit();
@@ -332,12 +340,25 @@ fn runTests(allocator: std.mem.Allocator, source: []const u8, filename: []const 
             var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
             defer emitter.deinit();
 
-            // Create a minimal module with just this test
+            // Create a module with all non-test functions (including impl methods)
+            // plus this specific test function
             // Note: We only deinit the functions list, not the functions themselves
             // (they're owned by ir_module)
             var test_ir = ir.Module.init(allocator, filename);
             defer test_ir.functions.deinit(allocator);
 
+            // Add all non-test functions first (impl methods, regular functions)
+            for (ir_module.functions.items) |other_func| {
+                if (!other_func.is_test) {
+                    test_ir.addFunction(other_func) catch {
+                        std.debug.print("  \x1b[31m✗\x1b[0m {s}: failed to compile dependencies\n", .{test_name});
+                        tests_failed += 1;
+                        continue;
+                    };
+                }
+            }
+
+            // Add the test function
             test_ir.addFunction(func) catch {
                 std.debug.print("  \x1b[31m✗\x1b[0m {s}: failed to compile\n", .{test_name});
                 tests_failed += 1;

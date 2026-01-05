@@ -46,6 +46,7 @@ pub const expressions = @import("expressions.zig");
 pub const ExpressionTag = expressions.ExpressionTag;
 pub const BinaryOp = expressions.BinaryOp;
 pub const UnaryOp = expressions.UnaryOp;
+pub const InterpStringPartTag = expressions.InterpStringPartTag;
 
 pub const types = @import("types.zig");
 pub const TypeTag = types.TypeTag;

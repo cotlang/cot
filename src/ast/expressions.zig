@@ -103,6 +103,10 @@ pub const ExpressionTag = enum(u8) {
     /// Type test expression: expr is Type
     is_expr,
 
+    /// Interpolated string: "Hello ${name}!"
+    /// Desugared to str_concat calls during lowering
+    interp_string,
+
     /// Check if this is a literal expression
     pub fn isLiteral(self: ExpressionTag) bool {
         return switch (self) {
@@ -242,6 +246,14 @@ pub const BinaryOp = enum(u8) {
             else => false,
         };
     }
+};
+
+/// Interpolated string part tag - identifies what kind of part this is
+pub const InterpStringPartTag = enum(u8) {
+    /// Literal string content
+    string_content,
+    /// Expression to be evaluated and converted to string
+    expression,
 };
 
 /// Unary operator types
