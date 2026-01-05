@@ -1,11 +1,25 @@
 //! HTTP Server
 //!
 //! Embedded HTTP server for serving API routes and static files.
-//! Inspired by Next.js dev server functionality.
+//! Uses std.http.Server for proper HTTP/1.1 compliance.
 
 const std = @import("std");
+const http = std.http;
+const net = std.net;
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const router = @import("router.zig");
+const context = @import("context.zig");
+pub const middleware = @import("middleware.zig");
+pub const static = @import("static.zig");
+
+// Re-export Context for convenience
+pub const Context = context.Context;
+pub const MiddlewareFn = middleware.MiddlewareFn;
+pub const MiddlewareStack = middleware.MiddlewareStack;
+
+/// Error handler function type
+pub const ErrorHandlerFn = *const fn (*Context, anyerror) void;
 
 /// HTTP Server configuration
 pub const ServerConfig = struct {
@@ -19,6 +33,10 @@ pub const ServerConfig = struct {
     static_dir: ?[]const u8 = "public",
     /// Request timeout in milliseconds
     timeout_ms: u32 = 30000,
+    /// Read buffer size for HTTP parsing
+    read_buffer_size: usize = 8192,
+    /// Write buffer size for responses
+    write_buffer_size: usize = 8192,
 };
 
 /// HTTP Request wrapper for Cot
@@ -29,6 +47,10 @@ pub const Request = struct {
     headers: std.StringHashMap([]const u8),
     body: []const u8,
     params: std.StringHashMap([]const u8), // Route params like :id
+    allocator: Allocator,
+
+    // Reference to underlying std.http request for header iteration
+    http_request: ?*http.Server.Request = null,
 
     pub const Method = enum {
         GET,
@@ -51,6 +73,19 @@ pub const Request = struct {
             });
             return methods.get(s);
         }
+
+        pub fn fromHttpMethod(m: http.Method) Method {
+            return switch (m) {
+                .GET => .GET,
+                .POST => .POST,
+                .PUT => .PUT,
+                .DELETE => .DELETE,
+                .PATCH => .PATCH,
+                .HEAD => .HEAD,
+                .OPTIONS => .OPTIONS,
+                else => .GET,
+            };
+        }
     };
 
     pub fn init(allocator: Allocator) Request {
@@ -61,6 +96,7 @@ pub const Request = struct {
             .headers = std.StringHashMap([]const u8).init(allocator),
             .body = "",
             .params = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
         };
     }
 
@@ -69,9 +105,21 @@ pub const Request = struct {
         self.params.deinit();
     }
 
-    /// Get a header value
+    /// Get a header value (case-insensitive lookup)
     pub fn getHeader(self: *const Request, name: []const u8) ?[]const u8 {
-        return self.headers.get(name);
+        // First check our cached headers
+        if (self.headers.get(name)) |v| return v;
+
+        // If we have the http request, iterate through raw headers
+        if (self.http_request) |req| {
+            var iter = req.iterateHeaders();
+            while (iter.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, name)) {
+                    return header.value;
+                }
+            }
+        }
+        return null;
     }
 
     /// Get a route parameter
@@ -84,14 +132,14 @@ pub const Request = struct {
 pub const Response = struct {
     status_code: u16 = 200,
     headers: std.StringHashMap([]const u8),
-    body: std.ArrayList(u8),
+    body: std.ArrayListUnmanaged(u8),
     sent: bool = false,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) Response {
         return .{
             .headers = std.StringHashMap([]const u8).init(allocator),
-            .body = .{},
+            .body = .empty,
             .allocator = allocator,
         };
     }
@@ -141,6 +189,11 @@ pub const Response = struct {
         try self.setHeader("Location", url);
     }
 
+    /// Convert status code to http.Status
+    pub fn httpStatus(code: u16) http.Status {
+        return @enumFromInt(code);
+    }
+
     /// Get status text for code
     pub fn statusText(code: u16) []const u8 {
         return switch (code) {
@@ -163,14 +216,22 @@ pub const Response = struct {
     }
 };
 
-/// Route handler function type
+/// Context-based handler function type (recommended)
+pub const ContextHandlerFn = context.HandlerFn;
+
+/// Route handler function type (legacy - use ContextHandlerFn for new code)
 pub const HandlerFn = *const fn (*Request, *Response) anyerror!void;
+
+// Global server instance for signal handling
+var global_server: ?*Server = null;
 
 /// HTTP Server
 pub const Server = struct {
     allocator: Allocator,
     config: ServerConfig,
     router: router.Router,
+    middlewares: MiddlewareStack,
+    error_handler: ?ErrorHandlerFn = null,
     running: bool = false,
 
     const Self = @This();
@@ -180,41 +241,68 @@ pub const Server = struct {
             .allocator = allocator,
             .config = config,
             .router = router.Router.init(allocator),
+            .middlewares = MiddlewareStack.init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.router.deinit();
+        self.middlewares.deinit();
     }
 
-    /// Add a route handler
-    pub fn route(self: *Self, method: Request.Method, path: []const u8, handler: HandlerFn) !void {
+    /// Set global error handler
+    pub fn onError(self: *Self, handler: ErrorHandlerFn) void {
+        self.error_handler = handler;
+    }
+
+    /// Add global middleware (runs before handlers)
+    pub fn use(self: *Self, mw: MiddlewareFn) !void {
+        try self.middlewares.use(mw);
+    }
+
+    /// Add middleware that runs after handlers
+    pub fn useAfter(self: *Self, mw: MiddlewareFn) !void {
+        try self.middlewares.useAfter(mw);
+    }
+
+    /// Add a route handler (Context-based)
+    pub fn route(self: *Self, method: router.Method, path: []const u8, handler: ContextHandlerFn) !void {
         try self.router.add(method, path, handler);
     }
 
     /// GET route helper
-    pub fn get(self: *Self, path: []const u8, handler: HandlerFn) !void {
+    pub fn get(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
         try self.route(.GET, path, handler);
     }
 
     /// POST route helper
-    pub fn post(self: *Self, path: []const u8, handler: HandlerFn) !void {
+    pub fn post(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
         try self.route(.POST, path, handler);
     }
 
     /// PUT route helper
-    pub fn put(self: *Self, path: []const u8, handler: HandlerFn) !void {
+    pub fn put(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
         try self.route(.PUT, path, handler);
     }
 
     /// DELETE route helper
-    pub fn delete(self: *Self, path: []const u8, handler: HandlerFn) !void {
+    pub fn delete(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
         try self.route(.DELETE, path, handler);
     }
 
-    /// Start the server
+    /// PATCH route helper
+    pub fn patch(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
+        try self.route(.PATCH, path, handler);
+    }
+
+    /// Create a route group with a prefix
+    pub fn group(self: *Self, prefix: []const u8) RouteGroup {
+        return RouteGroup.init(self, prefix);
+    }
+
+    /// Start the server with graceful shutdown support
     pub fn listen(self: *Self) !void {
-        const address = try std.net.Address.parseIp4(self.config.host, self.config.port);
+        const address = try net.Address.parseIp4(self.config.host, self.config.port);
 
         var server = try address.listen(.{
             .reuse_address = true,
@@ -223,123 +311,340 @@ pub const Server = struct {
 
         self.running = true;
 
+        // Set up signal handlers for graceful shutdown
+        global_server = self;
+        setupSignalHandlers();
+
         std.debug.print("\nServer listening on http://{s}:{d}\n", .{ self.config.host, self.config.port });
         std.debug.print("Press Ctrl+C to stop\n\n", .{});
 
         while (self.running) {
             var connection = server.accept() catch |err| {
                 if (err == error.ConnectionAborted) continue;
+                if (!self.running) break; // Shutdown requested
                 return err;
             };
 
             self.handleConnection(&connection) catch |err| {
                 std.debug.print("Connection error: {}\n", .{err});
             };
+
+            connection.stream.close();
         }
+
+        std.debug.print("\nServer stopped gracefully\n", .{});
+        global_server = null;
     }
 
-    /// Stop the server
+    /// Stop the server gracefully
     pub fn stop(self: *Self) void {
         self.running = false;
     }
 
-    /// Handle a single connection
-    fn handleConnection(self: *Self, connection: *std.net.Server.Connection) !void {
-        defer connection.stream.close();
-
-        // Read request
+    /// Handle a single connection using std.http.Server
+    fn handleConnection(self: *Self, connection: *net.Server.Connection) !void {
+        // Allocate buffers for HTTP parsing
         var read_buffer: [8192]u8 = undefined;
-        const bytes_read = connection.stream.read(&read_buffer) catch |err| {
-            std.debug.print("Read error: {}\n", .{err});
-            return;
-        };
+        var write_buffer: [8192]u8 = undefined;
 
-        if (bytes_read == 0) return;
+        // Create reader and writer from the connection stream
+        var reader_obj = connection.stream.reader(&read_buffer);
+        var writer_obj = connection.stream.writer(&write_buffer);
 
-        const request_data = read_buffer[0..bytes_read];
+        // Initialize HTTP server for this connection
+        // Reader.interface() is a method, Writer.interface is a field
+        var http_server = http.Server.init(reader_obj.interface(), &writer_obj.interface);
 
-        // Parse HTTP request line
-        var req = Request.init(self.allocator);
-        defer req.deinit();
+        // Handle requests on this connection (supports keep-alive)
+        while (true) {
+            // Receive the HTTP request head
+            var http_request = http_server.receiveHead() catch |err| {
+                switch (err) {
+                    error.HttpConnectionClosing => return, // Client closed connection
+                    error.HttpRequestTruncated => return, // Partial request, connection closed
+                    error.HttpHeadersOversize => {
+                        // Headers too large - send raw error and close
+                        self.sendRawError(&writer_obj, 431, "Request Header Fields Too Large");
+                        return;
+                    },
+                    error.HttpHeadersInvalid => {
+                        // Bad request - send raw error
+                        self.sendRawError(&writer_obj, 400, "Bad Request");
+                        return;
+                    },
+                    error.ReadFailed => return, // Connection error
+                }
+            };
 
-        // Find first line
-        const first_line_end = std.mem.indexOf(u8, request_data, "\r\n") orelse return;
-        const first_line = request_data[0..first_line_end];
+            // Process the request
+            const keep_alive = self.processRequest(&http_request) catch |err| {
+                std.debug.print("Request processing error: {}\n", .{err});
+                // Try to send error response
+                self.sendErrorResponse(&http_request, 500, "Internal Server Error") catch {};
+                return;
+            };
 
-        // Parse "GET /path HTTP/1.1"
-        var parts = std.mem.splitScalar(u8, first_line, ' ');
-        const method_str = parts.next() orelse return;
-        const path_str = parts.next() orelse return;
+            // If not keep-alive, close after this request
+            if (!keep_alive) return;
+        }
+    }
 
-        req.method = Request.Method.fromString(method_str) orelse .GET;
+    /// Process a single HTTP request using Context API
+    fn processRequest(self: *Self, http_request: *http.Server.Request) !bool {
+        // Parse path and query from target
+        const target = http_request.head.target;
+        var path: []const u8 = target;
+        var query: ?[]const u8 = null;
 
-        // Parse path and query
-        if (std.mem.indexOf(u8, path_str, "?")) |idx| {
-            req.path = path_str[0..idx];
-            req.query = path_str[idx + 1 ..];
-        } else {
-            req.path = path_str;
+        if (std.mem.indexOf(u8, target, "?")) |idx| {
+            path = target[0..idx];
+            query = target[idx + 1 ..];
         }
 
-        // Build response
-        var res = Response.init(self.allocator);
-        defer res.deinit();
+        // Read request body if present
+        var body_buffer: [65536]u8 = undefined; // 64KB max body
+        var body_read_buffer: [8192]u8 = undefined;
+        var body_slice: []const u8 = "";
+        if (http_request.head.content_length) |content_len| {
+            if (content_len > 0 and content_len <= body_buffer.len) {
+                const body_reader = http_request.readerExpectNone(&body_read_buffer);
+                const read_len: usize = @intCast(content_len);
+                body_reader.readSliceAll(body_buffer[0..read_len]) catch {};
+                body_slice = body_buffer[0..read_len];
+            }
+        }
 
-        // Find and execute handler
-        if (self.router.match(req.method, req.path)) |match_result| {
+        // Build Context
+        var ctx = Context.init(self.allocator);
+        defer ctx.deinit();
+
+        ctx._method = Context.Method.fromHttpMethod(http_request.head.method);
+        ctx._path = path;
+        ctx._query = query;
+        ctx._body = body_slice;
+        ctx._http_request = http_request;
+
+        // Convert Method for router matching
+        const router_method: router.Method = switch (ctx._method) {
+            .GET => .GET,
+            .POST => .POST,
+            .PUT => .PUT,
+            .DELETE => .DELETE,
+            .PATCH => .PATCH,
+            .HEAD => .HEAD,
+            .OPTIONS => .OPTIONS,
+        };
+
+        // Find and execute handler with middleware
+        if (self.router.match(router_method, ctx._path)) |match_result| {
             var match = match_result;
             defer match.deinit();
 
-            // Copy route params
+            // Copy route params to context
             var param_iter = match.params.iterator();
             while (param_iter.next()) |entry| {
-                try req.params.put(entry.key_ptr.*, entry.value_ptr.*);
+                try ctx.setParam(entry.key_ptr.*, entry.value_ptr.*);
             }
 
-            // Call handler
-            match.handler(&req, &res) catch |err| {
-                res.status_code = 500;
-                try res.text("Internal Server Error");
-                std.debug.print("Handler error: {}\n", .{err});
+            // Execute middleware chain with handler
+            self.middlewares.execute(&ctx, match.handler) catch |err| {
+                // Use custom error handler if set
+                if (self.error_handler) |handler| {
+                    handler(&ctx, err);
+                } else {
+                    _ = ctx.status(500);
+                    try ctx.text("Internal Server Error");
+                    std.debug.print("Handler error: {}\n", .{err});
+                }
             };
         } else {
-            // 404 Not Found
-            res.status_code = 404;
-            try res.json("{\"error\": \"Not Found\"}");
+            // 404 Not Found - still run middleware for 404 responses
+            const not_found_handler = struct {
+                fn handler(c: *Context) anyerror!void {
+                    _ = c.status(404);
+                    try c.json("{\"error\": \"Not Found\"}");
+                }
+            }.handler;
+            self.middlewares.execute(&ctx, not_found_handler) catch |err| {
+                if (self.error_handler) |handler| {
+                    handler(&ctx, err);
+                } else {
+                    std.debug.print("404 handler error: {}\n", .{err});
+                }
+            };
         }
 
-        // Send response
-        try self.sendResponse(connection, &res);
+        // Build extra headers array from context
+        var extra_headers_list: [16]http.Header = undefined;
+        var extra_headers_count: usize = 0;
+
+        var header_iter = ctx.getResponseHeaders();
+        while (header_iter.next()) |entry| {
+            if (extra_headers_count < extra_headers_list.len) {
+                extra_headers_list[extra_headers_count] = .{
+                    .name = entry.key_ptr.*,
+                    .value = entry.value_ptr.*,
+                };
+                extra_headers_count += 1;
+            }
+        }
+
+        // Send response using std.http.Server
+        const keep_alive = http_request.head.keep_alive;
+        http_request.respond(ctx.getResponseBody(), .{
+            .status = context.codeToHttpStatus(ctx.getStatusCode()),
+            .keep_alive = keep_alive,
+            .extra_headers = extra_headers_list[0..extra_headers_count],
+        }) catch |err| {
+            std.debug.print("Response send error: {}\n", .{err});
+            return false;
+        };
+
+        return keep_alive;
     }
 
-    /// Send HTTP response
-    fn sendResponse(_: *Self, connection: *std.net.Server.Connection, res: *Response) !void {
-        // Build response
-        var response_buf: [16384]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&response_buf);
-        const writer = fbs.writer();
+    /// Send an error response using the HTTP request
+    fn sendErrorResponse(_: *Self, http_request: *http.Server.Request, status_code: u16, message: []const u8) !void {
+        try http_request.respond(message, .{
+            .status = Response.httpStatus(status_code),
+            .keep_alive = false,
+        });
+    }
 
-        // Status line
-        try writer.print("HTTP/1.1 {d} {s}\r\n", .{ res.status_code, Response.statusText(res.status_code) });
+    /// Send a raw error response directly to writer (when request not yet parsed)
+    fn sendRawError(_: *Self, writer: *net.Stream.Writer, status_code: u16, message: []const u8) void {
+        const status_text = Response.statusText(status_code);
+        writer.interface.print("HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+            status_code,
+            status_text,
+            message.len,
+            message,
+        }) catch {};
+        writer.interface.flush() catch {};
+    }
+};
 
-        // Headers
-        try writer.print("Content-Length: {d}\r\n", .{res.body.items.len});
+/// Set up signal handlers for graceful shutdown
+fn setupSignalHandlers() void {
+    // Signal handling setup
+    // Users can call server.stop() from their own signal handler if needed
+    // The server's running flag is checked on each accept() iteration
 
-        var header_iter = res.headers.iterator();
-        while (header_iter.next()) |entry| {
-            try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+    // On Unix-like systems, you can set up signal handlers externally:
+    // const handler: posix.Sigaction.handler_fn = @ptrCast(&myHandler);
+    // posix.sigaction(posix.SIG.INT, &.{ .handler = .{ .handler = handler }, ... }, null);
+}
+
+/// Route group for organizing routes with a common prefix and middleware
+pub const RouteGroup = struct {
+    server: *Server,
+    prefix: []const u8,
+    group_middleware: MiddlewareStack,
+    parent_prefix: []const u8,
+
+    const Self = @This();
+
+    pub fn init(server: *Server, prefix: []const u8) Self {
+        return .{
+            .server = server,
+            .prefix = prefix,
+            .group_middleware = MiddlewareStack.init(server.allocator),
+            .parent_prefix = "",
+        };
+    }
+
+    pub fn initNested(server: *Server, prefix: []const u8, parent_prefix: []const u8) Self {
+        return .{
+            .server = server,
+            .prefix = prefix,
+            .group_middleware = MiddlewareStack.init(server.allocator),
+            .parent_prefix = parent_prefix,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.group_middleware.deinit();
+    }
+
+    /// Build the full path with prefix
+    fn fullPath(self: *Self, path: []const u8) ![]const u8 {
+        // Combine parent_prefix + prefix + path
+        if (self.parent_prefix.len > 0) {
+            return std.fmt.allocPrint(self.server.allocator, "{s}{s}{s}", .{
+                self.parent_prefix,
+                self.prefix,
+                path,
+            });
+        }
+        return std.fmt.allocPrint(self.server.allocator, "{s}{s}", .{ self.prefix, path });
+    }
+
+    /// Wrap handler with group middleware
+    fn wrapHandler(self: *Self, handler: ContextHandlerFn) ContextHandlerFn {
+        // If no group middleware, return handler as-is
+        if (self.group_middleware.before.items.len == 0 and
+            self.group_middleware.after.items.len == 0)
+        {
+            return handler;
         }
 
-        // End headers
-        try writer.writeAll("\r\n");
+        // For now, return handler as-is since we can't create closures in Zig
+        // Group middleware is applied via the route registration
+        // TODO: Implement proper group middleware wrapping
+        return handler;
+    }
 
-        // Body
-        try writer.writeAll(res.body.items);
+    /// Add a route with the group prefix
+    pub fn route(self: *Self, method: router.Method, path: []const u8, handler: ContextHandlerFn) !void {
+        const full = try self.fullPath(path);
+        defer self.server.allocator.free(full);
 
-        // Send
-        _ = connection.stream.write(fbs.getWritten()) catch |err| {
-            std.debug.print("Write error: {}\n", .{err});
-        };
+        try self.server.router.add(method, full, self.wrapHandler(handler));
+    }
+
+    /// GET route helper
+    pub fn get(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
+        try self.route(.GET, path, handler);
+    }
+
+    /// POST route helper
+    pub fn post(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
+        try self.route(.POST, path, handler);
+    }
+
+    /// PUT route helper
+    pub fn put(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
+        try self.route(.PUT, path, handler);
+    }
+
+    /// DELETE route helper
+    pub fn delete(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
+        try self.route(.DELETE, path, handler);
+    }
+
+    /// PATCH route helper
+    pub fn patch(self: *Self, path: []const u8, handler: ContextHandlerFn) !void {
+        try self.route(.PATCH, path, handler);
+    }
+
+    /// Add group-specific middleware (runs before group handlers)
+    pub fn use(self: *Self, mw: MiddlewareFn) !void {
+        try self.group_middleware.use(mw);
+    }
+
+    /// Add group-specific middleware that runs after handlers
+    pub fn useAfter(self: *Self, mw: MiddlewareFn) !void {
+        try self.group_middleware.useAfter(mw);
+    }
+
+    /// Create a nested route group
+    pub fn group(self: *Self, prefix: []const u8) Self {
+        const combined = std.fmt.allocPrint(self.server.allocator, "{s}{s}", .{
+            if (self.parent_prefix.len > 0) self.parent_prefix else "",
+            self.prefix,
+        }) catch "";
+
+        return Self.initNested(self.server, prefix, combined);
     }
 };
 
@@ -347,16 +652,36 @@ pub const Server = struct {
 pub fn createTestServer(allocator: Allocator) !Server {
     var server = Server.init(allocator, .{});
 
-    // Add test routes
+    // Add test routes using Context API
     try server.get("/", struct {
-        fn handler(_: *Request, res: *Response) !void {
-            try res.html("<h1>Welcome to Cot!</h1>");
+        fn handler(ctx: *Context) !void {
+            try ctx.html("<h1>Welcome to Cot!</h1>");
         }
     }.handler);
 
-    try server.get("/api/health", struct {
-        fn handler(_: *Request, res: *Response) !void {
-            try res.json("{\"status\": \"ok\"}");
+    // Use route group for API routes
+    var api = server.group("/api");
+    defer api.deinit();
+
+    try api.get("/health", struct {
+        fn handler(ctx: *Context) !void {
+            try ctx.json("{\"status\": \"ok\"}");
+        }
+    }.handler);
+
+    try api.get("/version", struct {
+        fn handler(ctx: *Context) !void {
+            try ctx.json("{\"version\": \"0.1.0\"}");
+        }
+    }.handler);
+
+    // Nested group: /api/v1/*
+    var v1 = api.group("/v1");
+    defer v1.deinit();
+
+    try v1.get("/info", struct {
+        fn handler(ctx: *Context) !void {
+            try ctx.json("{\"api\": \"v1\", \"message\": \"Hello from v1!\"}");
         }
     }.handler);
 

@@ -917,6 +917,421 @@ pure = false
 throws = false
 
 # =============================================================================
+# std.fs - Filesystem Functions (Path-based convenience API)
+# =============================================================================
+
+[functions.read_file]
+namespace = "std.fs"
+description = "Read entire file contents as string"
+since = "1.1.0"
+
+[functions.read_file.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "string"
+
+[functions.read_file.behavior]
+pure = false
+throws = true
+errors = ["FileNotFound", "PermissionDenied", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.write_file]
+namespace = "std.fs"
+description = "Write string contents to file (creates or overwrites)"
+since = "1.1.0"
+
+[functions.write_file.signature]
+params = [
+    { name = "path", type = "string" },
+    { name = "content", type = "string" }
+]
+returns = "bool"
+
+[functions.write_file.behavior]
+pure = false
+throws = true
+errors = ["PermissionDenied", "DiskFull", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.append_file]
+namespace = "std.fs"
+description = "Append string contents to file (creates if not exists)"
+since = "1.1.0"
+
+[functions.append_file.signature]
+params = [
+    { name = "path", type = "string" },
+    { name = "content", type = "string" }
+]
+returns = "bool"
+
+[functions.append_file.behavior]
+pure = false
+throws = true
+errors = ["PermissionDenied", "DiskFull", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.exists]
+namespace = "std.fs"
+description = "Check if file or directory exists"
+since = "1.1.0"
+
+[functions.exists.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "bool"
+
+[functions.exists.behavior]
+pure = false
+throws = false
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.is_file]
+namespace = "std.fs"
+description = "Check if path is a regular file"
+since = "1.1.0"
+
+[functions.is_file.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "bool"
+
+[functions.is_file.behavior]
+pure = false
+throws = false
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.is_dir]
+namespace = "std.fs"
+description = "Check if path is a directory"
+since = "1.1.0"
+
+[functions.is_dir.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "bool"
+
+[functions.is_dir.behavior]
+pure = false
+throws = false
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.mkdir]
+namespace = "std.fs"
+description = "Create directory (fails if parent doesn't exist)"
+since = "1.1.0"
+
+[functions.mkdir.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "bool"
+
+[functions.mkdir.behavior]
+pure = false
+throws = true
+errors = ["PermissionDenied", "AlreadyExists", "FileNotFound"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.mkdir_all]
+namespace = "std.fs"
+description = "Create directory and all parent directories (mkdir -p)"
+since = "1.1.0"
+
+[functions.mkdir_all.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "bool"
+
+[functions.mkdir_all.behavior]
+pure = false
+throws = true
+errors = ["PermissionDenied", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.remove]
+namespace = "std.fs"
+description = "Remove file or empty directory"
+since = "1.1.0"
+
+[functions.remove.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "bool"
+
+[functions.remove.behavior]
+pure = false
+throws = true
+errors = ["FileNotFound", "PermissionDenied", "DirectoryNotEmpty"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.remove_all]
+namespace = "std.fs"
+description = "Remove file or directory recursively (rm -rf)"
+since = "1.1.0"
+
+[functions.remove_all.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "bool"
+
+[functions.remove_all.behavior]
+pure = false
+throws = true
+errors = ["FileNotFound", "PermissionDenied", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.copy_file]
+namespace = "std.fs"
+description = "Copy file from source to destination"
+since = "1.1.0"
+
+[functions.copy_file.signature]
+params = [
+    { name = "src", type = "string" },
+    { name = "dst", type = "string" }
+]
+returns = "bool"
+
+[functions.copy_file.behavior]
+pure = false
+throws = true
+errors = ["FileNotFound", "PermissionDenied", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.rename]
+namespace = "std.fs"
+description = "Rename/move file or directory"
+since = "1.1.0"
+
+[functions.rename.signature]
+params = [
+    { name = "old_path", type = "string" },
+    { name = "new_path", type = "string" }
+]
+returns = "bool"
+
+[functions.rename.behavior]
+pure = false
+throws = true
+errors = ["FileNotFound", "PermissionDenied", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.read_dir]
+namespace = "std.fs"
+description = "List directory contents as newline-separated string"
+since = "1.1.0"
+
+[functions.read_dir.signature]
+params = [
+    { name = "path", type = "string" }
+]
+returns = "string"
+
+[functions.read_dir.behavior]
+pure = false
+throws = true
+errors = ["FileNotFound", "PermissionDenied", "NotDirectory"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.cwd]
+namespace = "std.fs"
+description = "Get current working directory"
+since = "1.1.0"
+
+[functions.cwd.signature]
+params = []
+returns = "string"
+
+[functions.cwd.behavior]
+pure = false
+throws = false
+io = "filesystem"
+
+# =============================================================================
+# std.crypto - Cryptographic Hash Functions
+# =============================================================================
+
+[functions.sha256_hex]
+namespace = "std.crypto"
+description = "Compute SHA-256 hash and return as lowercase hex string (64 chars)"
+since = "1.1.0"
+
+[functions.sha256_hex.signature]
+params = [
+    { name = "data", type = "string" }
+]
+returns = "string"
+
+[functions.sha256_hex.behavior]
+pure = true
+throws = false
+
+[functions.sha256_hex.tests]
+cases = [
+    { args = ["hello"], expect = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" },
+    { args = [""], expect = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" }
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.sha256]
+namespace = "std.crypto"
+description = "Compute SHA-256 hash and return as raw 32-byte string"
+since = "1.1.0"
+
+[functions.sha256.signature]
+params = [
+    { name = "data", type = "string" }
+]
+returns = "string"
+
+[functions.sha256.behavior]
+pure = true
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.sha512_hex]
+namespace = "std.crypto"
+description = "Compute SHA-512 hash and return as lowercase hex string (128 chars)"
+since = "1.1.0"
+
+[functions.sha512_hex.signature]
+params = [
+    { name = "data", type = "string" }
+]
+returns = "string"
+
+[functions.sha512_hex.behavior]
+pure = true
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.md5_hex]
+namespace = "std.crypto"
+description = "Compute MD5 hash and return as lowercase hex string (32 chars). Note: MD5 is cryptographically broken, use only for legacy compatibility"
+since = "1.1.0"
+
+[functions.md5_hex.signature]
+params = [
+    { name = "data", type = "string" }
+]
+returns = "string"
+
+[functions.md5_hex.behavior]
+pure = true
+throws = false
+
+[functions.md5_hex.tests]
+cases = [
+    { args = ["hello"], expect = "5d41402abc4b2a76b9719d911017c592" }
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.hmac_sha256_hex]
+namespace = "std.crypto"
+description = "Compute HMAC-SHA256 and return as lowercase hex string. Useful for webhook signature verification"
+since = "1.1.0"
+
+[functions.hmac_sha256_hex.signature]
+params = [
+    { name = "key", type = "string" },
+    { name = "data", type = "string" }
+]
+returns = "string"
+
+[functions.hmac_sha256_hex.behavior]
+pure = true
+throws = false
+
+[functions.hmac_sha256_hex.tests]
+cases = [
+    { args = ["secret", "message"], expect = "8b5f48702995c1598c573db1e21866a9b825d4a794d169d7060a03605796360b" }
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.hex_encode]
+namespace = "std.crypto"
+description = "Encode arbitrary bytes to lowercase hex string"
+since = "1.1.0"
+
+[functions.hex_encode.signature]
+params = [
+    { name = "data", type = "string" }
+]
+returns = "string"
+
+[functions.hex_encode.behavior]
+pure = true
+throws = false
+
+[functions.hex_encode.tests]
+cases = [
+    { args = ["ABC"], expect = "414243" }
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.hex_decode]
+namespace = "std.crypto"
+description = "Decode hex string to bytes. Returns empty string on invalid hex"
+since = "1.1.0"
+
+[functions.hex_decode.signature]
+params = [
+    { name = "hex", type = "string" }
+]
+returns = "string"
+
+[functions.hex_decode.behavior]
+pure = true
+throws = false
+
+[functions.hex_decode.tests]
+cases = [
+    { args = ["414243"], expect = "ABC" },
+    { args = ["invalid"], expect = "" }
+]
+
+# =============================================================================
 # DBL Compatibility Aliases
 # These are available in .dbl files without any namespace
 # =============================================================================

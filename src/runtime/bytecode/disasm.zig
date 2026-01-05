@@ -361,6 +361,12 @@ pub const Disassembler = struct {
 
             .loop_start, .loop_end, .clear_error_handler => {},
 
+            // throw rs - throw exception with value in rs
+            .throw => {
+                const rs: u4 = @truncate(operands[0] >> 4);
+                try self.writer.print(" r{}", .{rs});
+            },
+
             // set_error_handler offset - [0] [offset:16]
             .set_error_handler => {
                 const offset_val: i16 = @bitCast(operands[1..3].*);

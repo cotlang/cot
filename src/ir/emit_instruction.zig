@@ -856,6 +856,7 @@ pub fn emitStoreStructBuf(e: *BytecodeEmitter, sb: StoreStructBuf) EmitError!voi
 // ============================================================================
 
 /// Emit debug_line instruction
+/// Format: [opcode][0][line_lo][line_hi] = 4 bytes
 pub fn emitDebugLine(e: *BytecodeEmitter, d: DebugLine) EmitError!void {
     try e.emitOpcode(.debug_line);
     try e.emitU8(0);
@@ -885,8 +886,12 @@ pub fn emitCatchBegin(e: *BytecodeEmitter) EmitError!void {
 
 /// Emit throw instruction
 pub fn emitThrow(e: *BytecodeEmitter, t: ir.Instruction.Throw) EmitError!void {
+    // Load exception value into r0
     try e.emitValueToReg(t.value, 0);
-    try e.emitOpcode(.nop);
+    // Emit throw opcode - VM will jump to current error handler
+    try e.emitOpcode(.throw);
+    try e.emitU8(0); // rs=0 (exception value in r0), unused nibble
+    try e.emitU8(0); // padding byte
 }
 
 // ============================================================================

@@ -19,9 +19,6 @@ pub fn build(b: *std.Build) void {
     // Create main cot module
     const cot_mod = deps.createCotModule(b, &config);
 
-    // JIT library path (if enabled)
-    const jit_lib_path = config.getJitLibPath(b);
-
     // ========================================================================
     // Main executable: cot
     // ========================================================================
@@ -46,12 +43,6 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("sqlite3");
     exe.linkSystemLibrary("c");
     exe.step.dependOn(&gen_natives.step); // Codegen runs before compile
-
-    // Link Cranelift JIT library when enabled
-    if (jit_lib_path) |lib_path| {
-        exe.addLibraryPath(lib_path);
-        exe.linkSystemLibrary("cot_cranelift");
-    }
 
     b.installArtifact(exe);
 
@@ -98,12 +89,6 @@ pub fn build(b: *std.Build) void {
     }
     dbl_exe.linkSystemLibrary("sqlite3");
     dbl_exe.linkSystemLibrary("c");
-
-    // Link Cranelift JIT library when enabled
-    if (jit_lib_path) |lib_path| {
-        dbl_exe.addLibraryPath(lib_path);
-        dbl_exe.linkSystemLibrary("cot_cranelift");
-    }
 
     b.installArtifact(dbl_exe);
 

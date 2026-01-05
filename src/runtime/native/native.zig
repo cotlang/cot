@@ -29,6 +29,11 @@ pub const buffer = @import("buffer.zig");
 pub const io_console = @import("io_console.zig");
 pub const io_core = @import("io_core.zig");
 pub const io_isam = @import("io_isam.zig");
+pub const json = @import("json.zig");
+pub const http_client = @import("http_client.zig");
+pub const http_server = @import("http_server.zig");
+pub const io_fs = @import("io_fs.zig");
+pub const io_crypto = @import("io_crypto.zig");
 // Note: symtable has moved to extensions/dbl/symtable.zig
 
 pub const Linker = linker.Linker;
@@ -54,6 +59,8 @@ pub const NativeError = error{
     RecordNotFound,
     TuiError,
     AssertionFailed,
+    ClosureCallFailed,
+    NoVMContext,
 };
 
 /// Native function signature
@@ -83,11 +90,25 @@ pub const GlobalValue = union(enum) {
     boolean: bool,
 };
 
+/// Closure invoker function type
+/// Called to execute a Cot closure from native code.
+/// vm_ptr: Opaque pointer to the VM instance
+/// closure: The closure Value to invoke
+/// call_args: Arguments to pass to the closure
+/// Returns: The closure's return value, or null on void return
+pub const ClosureInvoker = *const fn (
+    vm_ptr: *anyopaque,
+    closure: Value,
+    call_args: []const Value,
+) NativeError!?Value;
+
 /// Native function execution context
 pub const NativeContext = struct {
     allocator: std.mem.Allocator,
     args: []const Value,
     handles: ?*UnifiedHandleManager = null, // Unified handle manager for all I/O
+    vm: ?*anyopaque = null, // Opaque VM pointer for closure callbacks
+    closure_invoker: ?ClosureInvoker = null, // Function to invoke closures
 
     pub fn getArg(self: *const NativeContext, index: usize) ?Value {
         if (index >= self.args.len) return null;
@@ -102,6 +123,33 @@ pub const NativeContext = struct {
     pub fn getArgInt(self: *const NativeContext, index: usize) !i64 {
         const val = self.getArg(index) orelse return NativeError.InvalidArgument;
         return val.toInt();
+    }
+
+    /// Check if a closure value was passed at the given argument index
+    pub fn getArgClosure(self: *const NativeContext, index: usize) ?Value {
+        const val = self.getArg(index) orelse return null;
+        if (val.isClosure()) return val;
+        return null;
+    }
+
+    /// Call a Cot closure from native code.
+    /// This enables callback patterns where native functions invoke Cot handlers.
+    ///
+    /// Example:
+    ///   const handler = ctx.getArgClosure(1) orelse return error.InvalidArgument;
+    ///   const result = try ctx.callClosure(handler, &.{arg1, arg2});
+    ///
+    /// Returns: The closure's return value, or null if void
+    /// Error: NoVMContext if VM reference not available, ClosureCallFailed on execution error
+    pub fn callClosure(self: *const NativeContext, closure: Value, call_args: []const Value) NativeError!?Value {
+        const vm_ptr = self.vm orelse return NativeError.NoVMContext;
+        const invoker = self.closure_invoker orelse return NativeError.NoVMContext;
+        return invoker(vm_ptr, closure, call_args);
+    }
+
+    /// Check if closure invocation is supported
+    pub fn canCallClosures(self: *const NativeContext) bool {
+        return self.vm != null and self.closure_invoker != null;
     }
 };
 
@@ -158,6 +206,11 @@ pub const NativeRegistry = struct {
         try io_console.register(self);
         try io_core.register(self);
         try io_isam.register(self);
+        try json.register(self);
+        try http_client.register(self);
+        try http_server.register(self);
+        try io_fs.register(self);
+        try io_crypto.register(self);
         // Note: DBL channel-based functions are registered by the DBL extension
     }
 

@@ -1407,14 +1407,24 @@ pub const Parser = struct {
             return self.store.addStringLiteral(str_id, loc) catch return error.OutOfMemory;
         }
 
+        // Interpolated string: "Hello ${name}!"
+        if (self.match(&[_]TokenType{.string_interp_start})) {
+            return self.parseInterpString(loc);
+        }
+
         // Identifier
         if (self.match(&[_]TokenType{.identifier})) {
             const name = self.internString(self.previous().lexeme) catch return error.OutOfMemory;
 
-            // Check for struct initializer: Name { ... }
-            // Only if struct init is allowed in this context
-            if (self.allow_struct_init and self.check(.lbrace)) {
-                return self.parseStructInit(name, loc);
+            // Check for generic struct initializer: Name<T> { ... }
+            // or regular struct initializer: Name { ... }
+            if (self.allow_struct_init) {
+                if (self.check(.lt)) {
+                    // Could be a generic struct init: Box<i64> { ... }
+                    return self.parseGenericStructInit(name, loc);
+                } else if (self.check(.lbrace)) {
+                    return self.parseStructInit(name, loc);
+                }
             }
 
             return self.store.addIdentifier(name, loc) catch return error.OutOfMemory;
@@ -1583,6 +1593,117 @@ pub const Parser = struct {
         }) catch return error.OutOfMemory;
 
         self.exitNesting();
+        return idx;
+    }
+
+    /// Parse a generic struct initializer: Box<i64>{ .value = 42 }
+    fn parseGenericStructInit(self: *Self, type_name: StringId, loc: SourceLoc) ParseError!ExprIdx {
+        // Parse type arguments: <T, U, ...>
+        _ = try self.consume(.lt, "Expected '<'");
+
+        try self.store.markScratch();
+        errdefer self.store.rollbackScratch();
+
+        // Collect type arguments
+        var type_arg_count: u32 = 0;
+        while (!self.check(.gt) and !self.isAtEnd()) {
+            const type_arg = try self.parseType();
+            self.store.pushScratchU32(type_arg.toInt()) catch return error.OutOfMemory;
+            type_arg_count += 1;
+            if (!self.match(&[_]TokenType{.comma})) break;
+        }
+
+        _ = try self.consume(.gt, "Expected '>' after type arguments");
+
+        // Now parse the struct initializer body: { .field = value, ... }
+        _ = try self.consume(.lbrace, "Expected '{' after type arguments in struct initializer");
+
+        try self.enterNesting();
+        errdefer self.exitNesting();
+
+        // Parse field initializers
+        var field_count: u32 = 0;
+        while (!self.check(.rbrace) and !self.isAtEnd()) {
+            // Parse .field = value
+            _ = try self.consume(.period, "Expected '.'");
+            const field_token = try self.consume(.identifier, "Expected field name");
+            const field_name = self.internString(field_token.lexeme) catch return error.OutOfMemory;
+            _ = try self.consume(.equals, "Expected '='");
+            const value = try self.parseExpression();
+
+            self.store.pushScratchU32(@intFromEnum(field_name)) catch return error.OutOfMemory;
+            self.store.pushScratchU32(value.toInt()) catch return error.OutOfMemory;
+            field_count += 1;
+
+            // Optional comma
+            _ = self.match(&[_]TokenType{.comma});
+        }
+
+        _ = try self.consume(.rbrace, "Expected '}'");
+
+        const scratch_data = self.store.getScratchU32s();
+        self.store.commitScratch();
+
+        // Store generic_struct_init in extra_data:
+        // [type_arg_count, type_args..., field_count, field_name/value pairs...]
+        const extra_start = self.store.extra_data.items.len;
+        self.store.extra_data.append(self.allocator, type_arg_count) catch return error.OutOfMemory;
+        // Type args are at the beginning of scratch_data
+        for (scratch_data[0..type_arg_count]) |type_arg_raw| {
+            self.store.extra_data.append(self.allocator, type_arg_raw) catch return error.OutOfMemory;
+        }
+        self.store.extra_data.append(self.allocator, field_count) catch return error.OutOfMemory;
+        // Field data starts after type args (each field is 2 u32s: name, value)
+        for (scratch_data[type_arg_count .. type_arg_count + field_count * 2]) |f| {
+            self.store.extra_data.append(self.allocator, f) catch return error.OutOfMemory;
+        }
+
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.store.expr_tags.items.len)));
+        self.store.expr_tags.append(self.allocator, .generic_struct_init) catch return error.OutOfMemory;
+        self.store.expr_locs.append(self.allocator, loc) catch return error.OutOfMemory;
+        self.store.expr_data.append(self.allocator, .{
+            .a = @intFromEnum(type_name),
+            .b = @intCast(extra_start),
+        }) catch return error.OutOfMemory;
+
+        self.exitNesting();
+        return idx;
+    }
+
+    /// Parse an interpolated string: "Hello ${name}!"
+    /// Token stream: string_interp_start, (string_content | interp_expr_start expr interp_expr_end)*, string_interp_end
+    fn parseInterpString(self: *Self, loc: SourceLoc) ParseError!ExprIdx {
+        // Build parts array: alternating [tag, data] pairs
+        // tag 0 = string_content (data = StringId)
+        // tag 1 = expression (data = ExprIdx)
+        try self.store.markScratch();
+        errdefer self.store.rollbackScratch();
+
+        while (!self.check(.string_interp_end) and !self.isAtEnd()) {
+            if (self.match(&[_]TokenType{.string_content})) {
+                // Literal string part
+                const content = self.previous().lexeme;
+                const str_id = self.internString(content) catch return error.OutOfMemory;
+                self.store.pushScratchU32(0) catch return error.OutOfMemory; // tag = string_content
+                self.store.pushScratchU32(@intFromEnum(str_id)) catch return error.OutOfMemory;
+            } else if (self.match(&[_]TokenType{.interp_expr_start})) {
+                // Expression part: parse until interp_expr_end
+                const expr = try self.parseExpression();
+                _ = try self.consume(.interp_expr_end, "Expected '}' after interpolation expression");
+                self.store.pushScratchU32(1) catch return error.OutOfMemory; // tag = expression
+                self.store.pushScratchU32(@intFromEnum(expr)) catch return error.OutOfMemory;
+            } else {
+                self.addError("Expected string content or interpolation expression");
+                return error.InvalidSyntax;
+            }
+        }
+
+        _ = try self.consume(.string_interp_end, "Expected closing '\"' for interpolated string");
+
+        // Get parts data and create the interp_string node
+        const parts_data = self.store.getScratchU32s();
+        const idx = self.store.addInterpString(parts_data, loc) catch return error.OutOfMemory;
+        self.store.commitScratch();
         return idx;
     }
 

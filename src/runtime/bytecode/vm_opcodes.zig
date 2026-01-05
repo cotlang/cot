@@ -691,6 +691,61 @@ pub fn op_loop_nop(vm: *VM, module: *const Module) VMError!DispatchResult {
 }
 
 // ============================================================================
+// Exception Handling
+// ============================================================================
+
+/// set_error_handler offset16 - set error handler at relative offset
+/// Format: [opcode][offset_lo][offset_hi] = 3 bytes
+/// Note: IP is already at opcode+1 when handler is called (dispatch pre-increments)
+pub fn op_set_error_handler(vm: *VM, module: *const Module) VMError!DispatchResult {
+    // ip is at offset_lo (dispatch already skipped opcode), read 16-bit offset
+    const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip..][0..2], .little));
+
+    // Calculate absolute handler IP (offset is relative to end of instruction)
+    // End of instruction = vm.ip + 2 (current position + 2 bytes for offset)
+    const end_of_instr: i32 = @intCast(vm.ip + 2);
+    const handler_ip = end_of_instr + offset;
+
+    if (handler_ip < 0 or handler_ip >= @as(i32, @intCast(module.code.len))) {
+        return vm.fail(VMError.BytecodeOutOfBounds, "Error handler target out of bounds");
+    }
+
+    vm.error_handler_ip = @intCast(handler_ip);
+    vm.ip += 2; // offset (2) = 2 more bytes (3 total with opcode)
+    return .continue_dispatch;
+}
+
+/// clear_error_handler - remove current error handler
+pub fn op_clear_error_handler(vm: *VM, module: *const Module) VMError!DispatchResult {
+    _ = module;
+    vm.error_handler_ip = null;
+    vm.ip += 1;
+    return .continue_dispatch;
+}
+
+/// throw rs - throw exception with value in rs
+/// Format: [opcode][rs:4|0][0]
+pub fn op_throw(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip + 1];
+    const rs: u4 = @truncate(ops >> 4);
+    const error_value = vm.registers[rs];
+
+    // Check if there's an error handler set
+    if (vm.error_handler_ip) |handler_ip| {
+        // Store error value in r0 for catch block access
+        vm.registers[0] = error_value;
+        // Jump to handler
+        vm.ip = handler_ip;
+        // Clear the handler (it's consumed)
+        vm.error_handler_ip = null;
+        return .continue_dispatch;
+    } else {
+        // No handler - abort with unhandled exception
+        return vm.fail(VMError.UnhandledException, "Unhandled exception");
+    }
+}
+
+// ============================================================================
 // Debug Operations
 // ============================================================================
 
@@ -702,13 +757,13 @@ pub fn op_debug_break(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .halt;
 }
 
-/// debug_line - set current line number
-/// Format: [opcode:1] [0:1] [line:u16]
-/// IP is at byte 1 (after opcode was consumed by dispatch loop)
+/// debug_line - set current source line for debugging
+/// Format: [opcode][0][line_lo][line_hi] = 4 bytes
+/// Note: IP is already at opcode+1 when handler is called (dispatch pre-increments)
 pub fn op_debug_line(vm: *VM, module: *const Module) VMError!DispatchResult {
-    // Skip the 0 byte at vm.ip, read u16 line number at vm.ip+1
+    // ip is at padding byte (dispatch already skipped opcode), read line from ip+1
     const line = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
-    vm.ip += 3; // Skip: 0 byte (1) + line u16 (2) = 3 bytes
+    vm.ip += 3; // padding (1) + line u16 (2) = 3 more bytes (4 total with opcode)
     vm.debug_current_line = line;
 
     // Check if debugger wants to stop at this line

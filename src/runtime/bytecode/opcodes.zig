@@ -278,6 +278,10 @@ pub const Opcode = enum(u8) {
     /// clear_error_handler - clear error handler
     clear_error_handler = 0x6B,
 
+    /// throw rs - throw exception with value in rs
+    /// Format: [rs:4|0] [0]
+    throw = 0x6C,
+
     // ============================================
     // Function Calls (0x70-0x7F)
     // ============================================
@@ -741,7 +745,7 @@ pub const Opcode = enum(u8) {
             .bit_and, .bit_or, .bit_xor, .bit_not => 2,
             .is_null, .select => 2,
             .load_null, .load_true, .load_false => 2,
-            .ret, .ret_val => 2,
+            .ret, .ret_val, .throw => 2,
             .free_record, .clear_record => 2,
             .load_field_fast, .store_field_fast => 2,
             .str_concat, .str_len, .str_index, .str_slice => 2,
@@ -773,7 +777,7 @@ pub const Opcode = enum(u8) {
             .call, .call_external, .call_native, .call_dynamic => 3,
             .new_record, .load_field, .store_field => 3,
             .to_fixed_string => 3,
-            .debug_line => 3,
+            .debug_line => 4,
             .ptr_offset => 3, // [rd:4|rs:4] [offset:16]
 
             // 5-byte operands: [reg:4|0] [u32] or [reg:4|0] [u16] [u16]

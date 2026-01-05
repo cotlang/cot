@@ -447,6 +447,181 @@ pub const VM = struct {
     }
 
     // =========================================================================
+    // Closure Invocation (for native function callbacks)
+    // =========================================================================
+
+    /// Invoke a Cot closure synchronously and return its result.
+    ///
+    /// This enables native functions to call Cot callbacks (e.g., HTTP handlers).
+    /// The closure runs to completion before this function returns.
+    ///
+    /// Example usage from native code:
+    ///   const result = try vm.invokeClosure(handler_closure, &.{ctx_handle});
+    ///
+    /// Arguments:
+    ///   closure_val: A Value containing a closure (must be .isClosure() == true)
+    ///   args: Arguments to pass to the closure
+    ///
+    /// Returns: The closure's return value (from r15), or null if void return
+    /// Errors: VMError if closure execution fails
+    pub fn invokeClosure(self: *Self, closure_val: Value, args: []const Value) VMError!?Value {
+        const closure = closure_val.getClosure() orelse {
+            return self.fail(VMError.InvalidType, "Expected closure value");
+        };
+
+        // Get the module containing this closure
+        // For closures from the current module, module_idx is typically 0
+        // For closures from loaded modules, use the native registry
+        const target_module: *const Module = blk: {
+            if (closure.module_idx == 0) {
+                break :blk self.current_module orelse {
+                    return self.fail(VMError.InvalidRoutine, "No current module");
+                };
+            } else {
+                break :blk self.native_registry.getLoadedModule(closure.module_idx) orelse {
+                    return self.fail(VMError.InvalidRoutine, "Closure module not found");
+                };
+            }
+        };
+
+        // Validate routine index
+        if (closure.routine_idx >= target_module.routines.len) {
+            return self.fail(VMError.InvalidRoutine, "Closure routine index out of bounds");
+        }
+
+        const routine = target_module.routines[closure.routine_idx];
+
+        // Save current execution state
+        const saved_ip = self.ip;
+        const saved_sp = self.sp;
+        const saved_fp = self.fp;
+        const saved_module = self.current_module;
+        const saved_module_index = self.current_module_index;
+        const saved_call_depth = self.call_stack.len;
+
+        // Save registers (closure may modify them)
+        var saved_registers: [16]Value = undefined;
+        @memcpy(&saved_registers, &self.registers);
+
+        // Set up the new call
+        self.current_module = target_module;
+
+        // Push a sentinel call frame that will stop execution when popped
+        // This frame's return will bring us back to the saved state
+        self.call_stack.append(.{
+            .module = saved_module orelse target_module,
+            .routine_index = 0,
+            .return_ip = saved_ip,
+            .base_pointer = saved_fp,
+            .stack_pointer = saved_sp,
+            .caller_module_index = saved_module_index,
+        }) catch return self.fail(VMError.CallStackOverflow, "Call stack overflow in closure invocation");
+
+        // Set up stack frame for closure
+        self.fp = self.sp;
+
+        // If closure has captured environment, push it as first local
+        const has_env = closure.env != null;
+        if (has_env) {
+            self.stack[self.sp] = Value.initMap(closure.env.?);
+            self.sp += 1;
+        }
+
+        // Push arguments to stack
+        for (args) |arg| {
+            self.stack[self.sp] = arg;
+            self.sp += 1;
+        }
+
+        // Reserve space for remaining locals (beyond args + env)
+        const actual_argc: u32 = @intCast(args.len + @as(usize, if (has_env) 1 else 0));
+        if (actual_argc < routine.local_count) {
+            for (actual_argc..routine.local_count) |_| {
+                self.stack[self.sp] = Value.null_val;
+                self.sp += 1;
+            }
+        }
+
+        // Jump to closure routine
+        self.ip = routine.code_offset;
+
+        // Run until we return from this closure (call stack returns to saved depth)
+        while (self.call_stack.len > saved_call_depth) {
+            const module = self.current_module orelse return VMError.InvalidRoutine;
+
+            if (self.ip >= module.code.len) break;
+
+            const opcode_byte = module.code[self.ip];
+
+            // Update crash context
+            crash_context.ip = @intCast(self.ip);
+            crash_context.last_opcode = @enumFromInt(opcode_byte);
+            crash_context.source_line = self.debug_current_line;
+
+            // Trace hook (if tracing)
+            if (self.tracer) |tracer| {
+                tracer.onOpcode(
+                    @intCast(self.ip),
+                    @enumFromInt(opcode_byte),
+                    self.debug_current_line,
+                    self.registers,
+                );
+            }
+
+            self.ip += 1;
+
+            // Execute opcode
+            const result = dispatch_table[opcode_byte](self, module) catch |err| {
+                // Restore state on error
+                self.ip = saved_ip;
+                self.sp = saved_sp;
+                self.fp = saved_fp;
+                self.current_module = saved_module;
+                self.current_module_index = saved_module_index;
+                @memcpy(&self.registers, &saved_registers);
+                // Pop our sentinel frame if still there
+                while (self.call_stack.len > saved_call_depth) {
+                    _ = self.call_stack.pop();
+                }
+                return err;
+            };
+
+            switch (result) {
+                .continue_dispatch => continue,
+                .halt, .return_from_main => break,
+            }
+        }
+
+        // Get return value from r15 (ret_val stores result there)
+        const return_value = self.registers[15];
+
+        // Restore execution state
+        self.ip = saved_ip;
+        self.sp = saved_sp;
+        self.fp = saved_fp;
+        self.current_module = saved_module;
+        self.current_module_index = saved_module_index;
+        @memcpy(&self.registers, &saved_registers);
+
+        // Return the closure's result (null if it was a void return)
+        return if (return_value.isNull()) null else return_value;
+    }
+
+    /// Static invoker function that can be used as a ClosureInvoker
+    /// This is the bridge between NativeContext.callClosure and VM.invokeClosure
+    pub fn closureInvokerFn(
+        vm_ptr: *anyopaque,
+        closure: Value,
+        call_args: []const Value,
+    ) native.NativeError!?Value {
+        const vm: *Self = @ptrCast(@alignCast(vm_ptr));
+        return vm.invokeClosure(closure, call_args) catch |err| {
+            debug.print(.vm, "Closure invocation failed: {}", .{err});
+            return native.NativeError.ClosureCallFailed;
+        };
+    }
+
+    // =========================================================================
     // Execution Tracing
     // =========================================================================
 
@@ -1139,7 +1314,9 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.jnz)] = &vm_opcodes.op_jnz;
         table[@intFromEnum(Opcode.loop_start)] = &vm_opcodes.op_loop_nop;
         table[@intFromEnum(Opcode.loop_end)] = &vm_opcodes.op_loop_nop;
-        table[@intFromEnum(Opcode.clear_error_handler)] = &vm_opcodes.op_loop_nop;
+        table[@intFromEnum(Opcode.set_error_handler)] = &vm_opcodes.op_set_error_handler;
+        table[@intFromEnum(Opcode.clear_error_handler)] = &vm_opcodes.op_clear_error_handler;
+        table[@intFromEnum(Opcode.throw)] = &vm_opcodes.op_throw;
 
         // Function Calls (0x70-0x7F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.call)] = &vm_opcodes.op_call;
@@ -1573,11 +1750,13 @@ pub const VM = struct {
                     tracer.onNativeCallWithArgs(routine_name, args[0..arg_count], @intCast(self.ip));
                 }
 
-                // Create native function context
+                // Create native function context with VM reference for closure callbacks
                 var ctx = native.NativeContext{
                     .allocator = self.allocator,
                     .args = args[0..arg_count],
                     .handles = &self.handle_manager,
+                    .vm = self,
+                    .closure_invoker = Self.closureInvokerFn,
                 };
 
                 // Call the native function

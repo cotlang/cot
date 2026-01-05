@@ -132,9 +132,19 @@ pub fn lowerExpressionStmt(l: *Lowerer, data: NodeData) LowerError!void {
 }
 
 /// Lower a throw statement
-pub fn lowerThrow(l: *Lowerer) LowerError!void {
-    // Throw generates a return for now (proper exceptions TBD)
-    try l.emit(.{ .return_ = null });
+pub fn lowerThrow(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
+    const data = l.store.stmtData(stmt_idx);
+    // data.a = error_expr (ExprIdx)
+    const error_expr: ExprIdx = @enumFromInt(data.a);
+
+    // Lower the error expression
+    const error_value = try l.lowerExpression(error_expr);
+
+    // Emit throw instruction
+    try l.emit(.{ .throw = .{
+        .value = error_value,
+        .loc = null,
+    } });
 }
 
 // ============================================================================

@@ -176,22 +176,24 @@ fn parseReturnType(value: []const u8) []const u8 {
     // Handle complex types like { type = "decimal", ... }
     if (std.mem.startsWith(u8, value, "{")) {
         if (std.mem.indexOf(u8, value, "\"decimal\"") != null) return "f64";
-        if (std.mem.indexOf(u8, value, "\"optional\"") != null) {
-            if (std.mem.indexOf(u8, value, "\"string\"") != null) return "string";
-            return "any";
-        }
+        // Skip optional types - they need special handling in the lowerer
+        if (std.mem.indexOf(u8, value, "\"optional\"") != null) return "skip";
+        // Skip array types - runtime doesn't support arrays yet
+        if (std.mem.indexOf(u8, value, "\"array\"") != null) return "skip";
     }
 
-    return "any";
+    return "skip";
 }
 
-fn toIrType(returns: []const u8) []const u8 {
+fn toIrType(returns: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, returns, "void")) return ".void";
     if (std.mem.eql(u8, returns, "i64")) return ".i64";
     if (std.mem.eql(u8, returns, "f64")) return ".f64";
     if (std.mem.eql(u8, returns, "bool")) return ".bool";
     if (std.mem.eql(u8, returns, "string")) return ".string";
-    return ".any";
+    if (std.mem.eql(u8, returns, "skip")) return null;
+    // Unknown types not supported in static type map
+    return null;
 }
 
 fn generateZig(allocator: std.mem.Allocator, functions: []const Function, writer: anytype) !void {
@@ -217,7 +219,8 @@ fn generateZig(allocator: std.mem.Allocator, functions: []const Function, writer
         // Skip DBL-only functions
         if (std.mem.eql(u8, func.namespace, "dbl")) continue;
 
-        const ir_type = toIrType(func.returns);
+        // Skip functions with complex return types not representable in static map
+        const ir_type = toIrType(func.returns) orelse continue;
 
         // Build qualified name
         var qualified_buf: [256]u8 = undefined;
@@ -231,12 +234,16 @@ fn generateZig(allocator: std.mem.Allocator, functions: []const Function, writer
             .ir_type = ir_type,
         });
 
-        // Add short name for prelude functions
-        if (func.is_prelude) {
+        // Add short name for all namespaced functions (enables both qualified and short call syntax)
+        if (func.namespace.len > 0) {
             try entries.append(allocator, .{
                 .qualified_name = try allocator.dupe(u8, func.name),
                 .ir_type = ir_type,
             });
+        }
+
+        // Track prelude functions separately
+        if (func.is_prelude) {
             try prelude_funcs.append(allocator, try allocator.dupe(u8, func.name));
         }
     }

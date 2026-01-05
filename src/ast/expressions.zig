@@ -78,6 +78,9 @@ pub const ExpressionTag = enum(u8) {
     /// Struct initializer: Point{ .x = 1, .y = 2 }
     struct_init,
 
+    /// Generic struct initializer: Box<i64>{ .value = 42 }
+    generic_struct_init,
+
     /// Lambda/closure: |x| x + 1, |x, y| { return x + y; }
     lambda,
 
@@ -142,7 +145,7 @@ pub const ExpressionTag = enum(u8) {
     /// Check if this is a compound expression
     pub fn isCompound(self: ExpressionTag) bool {
         return switch (self) {
-            .range, .array_init, .struct_init, .lambda => true,
+            .range, .array_init, .struct_init, .generic_struct_init, .lambda => true,
             else => false,
         };
     }

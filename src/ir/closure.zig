@@ -222,11 +222,11 @@ pub const FreeVarCollector = struct {
                 // Scan callee and arguments
                 const callee: ExprIdx = @enumFromInt(data.a);
                 try self.scanExpression(callee);
-                // Arguments in extra_data
-                const args_start = data.b;
-                const args_count = self.store.extra_data.items[args_start];
+                // Arguments packed in data.b: (count << 16) | start
+                const args_count = data.b >> 16;
+                const args_start = data.b & 0xFFFF;
                 for (0..args_count) |i| {
-                    const arg: ExprIdx = @enumFromInt(self.store.extra_data.items[args_start + 1 + i]);
+                    const arg: ExprIdx = @enumFromInt(self.store.extra_data.items[args_start + i]);
                     try self.scanExpression(arg);
                 }
             },
@@ -267,6 +267,18 @@ pub const FreeVarCollector = struct {
                 for (0..field_count) |i| {
                     // Each field has name + value
                     const value: ExprIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1 + i * 2 + 1]);
+                    try self.scanExpression(value);
+                }
+            },
+            .generic_struct_init => {
+                // Generic struct init: [type_arg_count, type_args..., field_count, field_name/value pairs...]
+                const extra_start = data.b;
+                const type_arg_count = self.store.extra_data.items[extra_start];
+                const field_count_offset = extra_start + 1 + type_arg_count;
+                const field_count = self.store.extra_data.items[field_count_offset];
+                for (0..field_count) |i| {
+                    // Each field has name + value
+                    const value: ExprIdx = @enumFromInt(self.store.extra_data.items[field_count_offset + 1 + i * 2 + 1]);
                     try self.scanExpression(value);
                 }
             },

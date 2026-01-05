@@ -85,6 +85,7 @@ pub const VMError = error{
     InvalidMemoryAccess,
     BadDigit, // DBL: non-numeric character in decimal field
     ArrayOutOfBounds,
+    UnhandledException,
 };
 
 /// Rich runtime error with full context - this is what gets reported to the user

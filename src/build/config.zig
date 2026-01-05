@@ -21,7 +21,6 @@ pub const Config = struct {
 
     /// Feature flags
     enable_tui: bool,
-    enable_jit: bool,
     enable_profiling: bool,
     enable_jit_profiling: bool,
 
@@ -44,12 +43,6 @@ pub const Config = struct {
                 "tui",
                 "Enable TUI support (default: true)",
             ) orelse true,
-
-            .enable_jit = b.option(
-                bool,
-                "jit",
-                "Enable Cranelift JIT compilation (default: false)",
-            ) orelse false,
 
             .enable_profiling = b.option(
                 bool,
@@ -82,20 +75,11 @@ pub const Config = struct {
     pub fn createOptionsModule(self: Config, b: *std.Build) *std.Build.Module {
         const options = b.addOptions();
         options.addOption(bool, "enable_tui", self.enable_tui);
-        options.addOption(bool, "enable_jit", self.enable_jit);
         options.addOption(bool, "enable_profiling", self.enable_profiling);
         options.addOption(bool, "enable_jit_profiling", self.enable_jit_profiling);
         options.addOption(bool, "enable_debug_info", self.enable_debug_info);
         options.addOption(bool, "verbose_ir", self.verbose_ir);
         return options.createModule();
-    }
-
-    /// Get the JIT library path if JIT is enabled
-    pub fn getJitLibPath(self: Config, b: *std.Build) ?std.Build.LazyPath {
-        if (self.enable_jit) {
-            return b.path("src/jit/cranelift-bridge/target/release");
-        }
-        return null;
     }
 
     /// Check if this is a debug build
@@ -116,7 +100,6 @@ pub const Config = struct {
             \\Cot Build Configuration:
             \\  optimize:           {s}
             \\  enable_tui:         {}
-            \\  enable_jit:         {}
             \\  enable_profiling:   {}
             \\  enable_jit_profiling: {}
             \\  enable_debug_info:  {}
@@ -125,7 +108,6 @@ pub const Config = struct {
         , .{
             @tagName(self.optimize),
             self.enable_tui,
-            self.enable_jit,
             self.enable_profiling,
             self.enable_jit_profiling,
             self.enable_debug_info,

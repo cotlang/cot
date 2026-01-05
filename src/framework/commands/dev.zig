@@ -81,6 +81,21 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
     });
     defer server.deinit();
 
+    // Add middleware
+    try server.use(http_server.middleware.logger());
+    try server.use(http_server.middleware.cors());
+    try server.use(http_server.static.serve(.{})); // Static file serving
+    try server.useAfter(http_server.middleware.loggerAfter());
+
+    // Set up error handler
+    server.onError(struct {
+        fn handler(ctx: *http_server.Context, err: anyerror) void {
+            _ = ctx.status(500);
+            ctx.json("{\"error\": \"Internal Server Error\"}") catch {};
+            std.debug.print("Error: {}\n", .{err});
+        }
+    }.handler);
+
     // Register discovered API routes
     for (file_router.routes.items) |route| {
         // For now, register a placeholder handler
@@ -91,8 +106,8 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
 
     // Add built-in routes
     try server.get("/", struct {
-        fn handler(_: *http_server.Request, res: *http_server.Response) !void {
-            try res.html(
+        fn handler(ctx: *http_server.Context) !void {
+            try ctx.html(
                 \\<!DOCTYPE html>
                 \\<html>
                 \\<head>
@@ -118,9 +133,29 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
         }
     }.handler);
 
-    try server.get("/api/health", struct {
-        fn handler(_: *http_server.Request, res: *http_server.Response) !void {
-            try res.json("{\"status\": \"ok\", \"server\": \"cot\"}");
+    // Use route group for API routes
+    var api = server.group("/api");
+    defer api.deinit();
+
+    try api.get("/health", struct {
+        fn handler(ctx: *http_server.Context) !void {
+            try ctx.json("{\"status\": \"ok\", \"server\": \"cot\"}");
+        }
+    }.handler);
+
+    try api.get("/version", struct {
+        fn handler(ctx: *http_server.Context) !void {
+            try ctx.json("{\"version\": \"0.1.0\", \"framework\": \"cot\"}");
+        }
+    }.handler);
+
+    // Nested group for v1 API
+    var v1 = api.group("/v1");
+    defer v1.deinit();
+
+    try v1.get("/status", struct {
+        fn handler(ctx: *http_server.Context) !void {
+            try ctx.json("{\"api\": \"v1\", \"status\": \"operational\"}");
         }
     }.handler);
 
@@ -128,6 +163,8 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
     try stdout.print("\n  Routes:\n", .{});
     try stdout.print("    GET  /              Homepage\n", .{});
     try stdout.print("    GET  /api/health    Health check\n", .{});
+    try stdout.print("    GET  /api/version   Version info\n", .{});
+    try stdout.print("    GET  /api/v1/status API v1 status\n", .{});
     for (file_router.routes.items) |route| {
         try stdout.print("    *    {s}\n", .{route.route});
     }
@@ -139,7 +176,7 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
 }
 
 /// Create a handler for an API route file
-fn createApiHandler(allocator: Allocator, cot_path: []const u8) http_server.HandlerFn {
+fn createApiHandler(allocator: Allocator, cot_path: []const u8) http_server.ContextHandlerFn {
     _ = allocator;
     _ = cot_path;
     // For now, return a placeholder handler
@@ -148,8 +185,8 @@ fn createApiHandler(allocator: Allocator, cot_path: []const u8) http_server.Hand
     // 2. Execute the appropriate handler function based on HTTP method
     // 3. Return the response
     return struct {
-        fn handler(_: *http_server.Request, res: *http_server.Response) !void {
-            try res.json("{\"message\": \"API endpoint not yet implemented\"}");
+        fn handler(ctx: *http_server.Context) !void {
+            try ctx.json("{\"message\": \"API endpoint not yet implemented\"}");
         }
     }.handler;
 }

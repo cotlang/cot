@@ -8,15 +8,30 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const server = @import("server.zig");
+const context = @import("context.zig");
+
+// Re-export types used by server.zig
+pub const Context = context.Context;
+pub const ContextHandlerFn = context.HandlerFn;
+
+/// Method enum (duplicated to avoid circular dependency with server.zig)
+pub const Method = enum {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    PATCH,
+    HEAD,
+    OPTIONS,
+};
 
 /// Route match result
 pub const RouteMatch = struct {
-    handler: server.HandlerFn,
+    handler: ContextHandlerFn,
     params: std.StringHashMap([]const u8),
     allocator: Allocator,
 
-    pub fn init(allocator: Allocator, handler: server.HandlerFn) RouteMatch {
+    pub fn init(allocator: Allocator, handler: ContextHandlerFn) RouteMatch {
         return .{
             .handler = handler,
             .params = std.StringHashMap([]const u8).init(allocator),
@@ -44,10 +59,10 @@ const Segment = struct {
 
 /// A registered route
 const Route = struct {
-    method: server.Request.Method,
-    pattern: []const u8,
+    method: Method,
+    pattern: []const u8, // Owned by router, freed on deinit
     segments: []const Segment,
-    handler: server.HandlerFn,
+    handler: ContextHandlerFn,
 };
 
 /// HTTP Router
@@ -67,17 +82,22 @@ pub const Router = struct {
     pub fn deinit(self: *Self) void {
         for (self.routes.items) |route| {
             self.allocator.free(route.segments);
+            self.allocator.free(route.pattern);
         }
         self.routes.deinit(self.allocator);
     }
 
-    /// Add a route
-    pub fn add(self: *Self, method: server.Request.Method, pattern: []const u8, handler: server.HandlerFn) !void {
-        const segments = try self.parsePattern(pattern);
+    /// Add a route with Context-based handler
+    pub fn add(self: *Self, method: Method, pattern: []const u8, handler: ContextHandlerFn) !void {
+        // Duplicate the pattern string so we own it
+        const owned_pattern = try self.allocator.dupe(u8, pattern);
+        errdefer self.allocator.free(owned_pattern);
+
+        const segments = try self.parsePattern(owned_pattern);
 
         try self.routes.append(self.allocator, .{
             .method = method,
-            .pattern = pattern,
+            .pattern = owned_pattern,
             .segments = segments,
             .handler = handler,
         });
@@ -122,7 +142,7 @@ pub const Router = struct {
     }
 
     /// Match a path against registered routes
-    pub fn match(self: *Self, method: server.Request.Method, path: []const u8) ?RouteMatch {
+    pub fn match(self: *Self, method: Method, path: []const u8) ?RouteMatch {
         for (self.routes.items) |route| {
             if (route.method != method) continue;
 
@@ -214,7 +234,7 @@ pub const FileRouter = struct {
     const FileRoute = struct {
         path: []const u8,
         route: []const u8,
-        methods: []const server.Request.Method,
+        methods: []const Method,
     };
 
     pub fn init(allocator: Allocator) FileRouter {
@@ -287,7 +307,7 @@ pub const FileRouter = struct {
                 try self.routes.append(self.allocator, .{
                     .path = file_path,
                     .route = normalized_route,
-                    .methods = &[_]server.Request.Method{ .GET, .POST, .PUT, .DELETE },
+                    .methods = &[_]Method{ .GET, .POST, .PUT, .DELETE },
                 });
             }
         }
@@ -333,7 +353,7 @@ test "router static routes" {
     defer r.deinit();
 
     const handler = struct {
-        fn h(_: *server.Request, _: *server.Response) !void {}
+        fn h(_: *Context) !void {}
     }.h;
 
     try r.add(.GET, "/api/products", handler);
@@ -353,7 +373,7 @@ test "router param routes" {
     defer r.deinit();
 
     const handler = struct {
-        fn h(_: *server.Request, _: *server.Response) !void {}
+        fn h(_: *Context) !void {}
     }.h;
 
     try r.add(.GET, "/api/products/:id", handler);

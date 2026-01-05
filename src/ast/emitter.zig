@@ -200,6 +200,7 @@ pub const Emitter = struct {
             .range => try self.emitRange(idx),
             .array_init => try self.emitArrayInit(idx),
             .struct_init => try self.emitStructInit(idx),
+            .generic_struct_init => try self.emitGenericStructInit(idx),
             .lambda => try self.emitLambda(idx),
             .comptime_builtin => try self.emitComptimeBuiltin(idx),
             .grouping => try self.emitGrouping(idx),
@@ -1161,6 +1162,11 @@ pub const Emitter = struct {
     fn emitStructInit(self: *Self, idx: ExprIdx) anyerror!void {
         _ = idx;
         try self.writer.writeAll("{}"); // Simplified
+    }
+
+    fn emitGenericStructInit(self: *Self, idx: ExprIdx) anyerror!void {
+        _ = idx;
+        try self.writer.writeAll("<...>{}"); // Simplified
     }
 
     fn emitLambda(self: *Self, idx: ExprIdx) anyerror!void {

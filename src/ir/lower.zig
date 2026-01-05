@@ -1407,7 +1407,7 @@ pub const Lowerer = struct {
             },
             .throw_stmt => {
                 try self.emitDebugLine(loc);
-                try lower_stmt.lowerThrow(self);
+                try lower_stmt.lowerThrow(self, stmt_idx);
             },
             .defer_stmt => {
                 // TODO: Proper defer implementation with scope-based execution
@@ -1515,11 +1515,45 @@ pub const Lowerer = struct {
 
     /// Lower try/catch statement
     fn lowerTry(self: *Self, stmt_idx: StmtIdx) LowerError!void {
-        // For now, just lower the try body - proper exception handling TBD
+        const func = self.current_func orelse return LowerError.OutOfMemory;
         const data = self.store.stmtData(stmt_idx);
-        const body_idx: StmtIdx = @enumFromInt(data.a);
 
-        try self.lowerStatement(body_idx);
+        // data.a = try_body (StmtIdx)
+        // data.b = extra_start pointing to: [err_binding, catch_body, finally_body]
+        const try_body: StmtIdx = @enumFromInt(data.a);
+        const extra_start = data.b;
+        const catch_body: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1]);
+
+        // Create blocks for the catch handler and continuation
+        const catch_block = try func.createBlock("catch");
+        const end_block = try func.createBlock("try_end");
+
+        // Emit try_begin - sets up exception handler pointing to catch_block
+        try self.emit(.{ .try_begin = .{ .catch_block = catch_block } });
+
+        // Lower the try body
+        try self.lowerStatement(try_body);
+
+        // Emit try_end - clears the exception handler
+        try self.emit(.{ .try_end = {} });
+
+        // Jump past the catch block (normal flow)
+        try self.emit(.{ .jump = .{ .target = end_block } });
+
+        // Switch to catch block
+        self.current_block = catch_block;
+
+        // Emit catch_begin marker
+        try self.emit(.{ .catch_begin = .{ .error_type = null, .error_value = null } });
+
+        // Lower the catch body
+        try self.lowerStatement(catch_body);
+
+        // Jump to end
+        try self.emit(.{ .jump = .{ .target = end_block } });
+
+        // Switch to end block for continuation
+        self.current_block = end_block;
     }
 
     /// Lower defer statement - push deferred body onto the defer stack

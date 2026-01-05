@@ -126,6 +126,7 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .index => return lowerIndex(l, func, expr_idx),
         .array_init => return lowerArrayInit(l, expr_idx),
         .struct_init => return lowerStructInit(l, expr_idx),
+        .generic_struct_init => return lowerGenericStructInit(l, expr_idx),
         .lambda => return lowerLambda(l, expr_idx),
         .range => {
             // Range expressions are lowered by for loop handling, not as standalone values
@@ -1774,6 +1775,114 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             });
         }
         // Skip unknown fields silently (could add warning)
+    }
+
+    // Return pointer to struct
+    return struct_ptr;
+}
+
+/// Lower a generic struct initialization expression: Box<i64>{ .value = 42 }
+pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
+    const func = l.current_func orelse return LowerError.OutOfMemory;
+    const data = l.store.exprData(expr_idx);
+
+    // data.a = type_name (StringId)
+    // data.b = start index in extra_data
+    // extra_data layout: [type_arg_count, type_args..., field_count, field_name/value pairs...]
+    const type_name_id: StringId = @enumFromInt(data.a);
+    const type_name = l.strings.get(type_name_id);
+    if (type_name.len == 0) {
+        return LowerError.UndefinedType;
+    }
+
+    const extra_start: ast.ExtraIdx = @enumFromInt(data.b);
+    const type_arg_count = l.store.getExtra(extra_start);
+
+    // Build type arguments array
+    var type_args: std.ArrayListUnmanaged(ir.Type) = .{};
+    defer type_args.deinit(l.allocator);
+
+    for (0..type_arg_count) |i| {
+        const type_arg_idx = TypeIdx.fromInt(l.store.extra_data.items[@intFromEnum(extra_start) + 1 + i]);
+        const arg_type = try lowerTypeIdx(l, type_arg_idx);
+        try type_args.append(l.allocator, arg_type);
+    }
+
+    // Instantiate the generic struct
+    const struct_type = try l.instantiateGenericStruct(type_name, type_args.items) orelse {
+        std.debug.print("  Error: Failed to instantiate generic struct '{s}'\n", .{type_name});
+        return LowerError.UndefinedType;
+    };
+
+    // Get field data from extra_data
+    const field_count_offset = @intFromEnum(extra_start) + 1 + type_arg_count;
+    const field_count = l.store.extra_data.items[field_count_offset];
+
+    // Create struct type for allocation
+    const struct_ir_type = ir.Type{ .@"struct" = struct_type };
+    const struct_type_ptr = try l.allocator.create(ir.Type);
+    struct_type_ptr.* = struct_ir_type;
+    try l.allocated_types.append(l.allocator, struct_type_ptr);
+
+    // Allocate stack space for struct
+    const struct_ptr = func.newValue(.{ .ptr = struct_type_ptr });
+    try l.emit(.{
+        .alloca = .{
+            .ty = struct_ir_type,
+            .name = type_name,
+            .result = struct_ptr,
+        },
+    });
+
+    // Store each field
+    var field_i: u32 = 0;
+    while (field_i < field_count) : (field_i += 1) {
+        // Each field has: (field_name_id, expr_idx) in extra_data
+        const field_name_id_raw = l.store.extra_data.items[field_count_offset + 1 + field_i * 2];
+        const field_expr_raw = l.store.extra_data.items[field_count_offset + 2 + field_i * 2];
+
+        const field_name_id: StringId = @enumFromInt(field_name_id_raw);
+        const field_name = l.strings.get(field_name_id);
+        const field_expr_idx: ExprIdx = @enumFromInt(field_expr_raw);
+
+        // Find field index in struct type
+        var field_index: ?u32 = null;
+        for (struct_type.fields, 0..) |field, idx| {
+            if (std.mem.eql(u8, field.name, field_name)) {
+                field_index = @intCast(idx);
+                break;
+            }
+        }
+
+        if (field_index) |idx| {
+            // Lower the field value
+            const field_val = try lowerExpression(l, field_expr_idx);
+
+            // Get field type
+            const field_type = struct_type.fields[idx].ty;
+            const field_type_ptr = try l.allocator.create(ir.Type);
+            field_type_ptr.* = field_type;
+            try l.allocated_types.append(l.allocator, field_type_ptr);
+
+            // Get pointer to field
+            const field_ptr = func.newValue(.{ .ptr = field_type_ptr });
+            try l.emit(.{
+                .field_ptr = .{
+                    .struct_ptr = struct_ptr,
+                    .field_index = idx,
+                    .result = field_ptr,
+                },
+            });
+
+            // Store value to field
+            try l.emit(.{
+                .store = .{
+                    .ptr = field_ptr,
+                    .value = field_val,
+                },
+            });
+        }
+        // Skip unknown fields silently
     }
 
     // Return pointer to struct
