@@ -258,8 +258,7 @@ pub const Validator = struct {
         const entry = self.module.header.entry_point;
         if (entry != 0xFFFFFFFF) { // 0xFFFFFFFF means library/no entry
             if (entry >= self.module.code.len) {
-                try self.addIssue(.@"error", .invalid_entry_point, 0,
-                    try std.fmt.allocPrint(self.allocator, "Entry point 0x{x} beyond code end", .{entry}));
+                try self.addIssue(.@"error", .invalid_entry_point, 0, try std.fmt.allocPrint(self.allocator, "Entry point 0x{x} beyond code end", .{entry}));
             }
         }
     }
@@ -271,14 +270,12 @@ pub const Validator = struct {
 
             // Check bounds
             if (offset >= self.module.code.len) {
-                try self.addIssue(.@"error", .section_out_of_bounds, offset,
-                    try std.fmt.allocPrint(self.allocator, "Routine {d} offset beyond code end", .{i}));
+                try self.addIssue(.@"error", .section_out_of_bounds, offset, try std.fmt.allocPrint(self.allocator, "Routine {d} offset beyond code end", .{i}));
                 continue;
             }
 
             if (end > self.module.code.len) {
-                try self.addIssue(.@"error", .section_out_of_bounds, offset,
-                    try std.fmt.allocPrint(self.allocator, "Routine {d} extends beyond code end", .{i}));
+                try self.addIssue(.@"error", .section_out_of_bounds, offset, try std.fmt.allocPrint(self.allocator, "Routine {d} extends beyond code end", .{i}));
             }
 
             // Mark routine code as reachable
@@ -297,8 +294,7 @@ pub const Validator = struct {
 
             // Validate opcode
             if (!isValidOpcode(inst.opcode)) {
-                try self.addIssue(.@"error", .invalid_opcode, inst.offset,
-                    try std.fmt.allocPrint(self.allocator, "Invalid opcode 0x{x:0>2}", .{@intFromEnum(inst.opcode)}));
+                try self.addIssue(.@"error", .invalid_opcode, inst.offset, try std.fmt.allocPrint(self.allocator, "Invalid opcode 0x{x:0>2}", .{@intFromEnum(inst.opcode)}));
                 continue;
             }
 
@@ -308,8 +304,7 @@ pub const Validator = struct {
 
         // Check for truncation
         if (walker.pos < self.module.code.len) {
-            try self.addIssue(.warning, .truncated_data, @intCast(walker.pos),
-                "Incomplete instruction at end of code");
+            try self.addIssue(.warning, .truncated_data, @intCast(walker.pos), "Incomplete instruction at end of code");
         }
     }
 
@@ -321,12 +316,10 @@ pub const Validator = struct {
                     const dest = inst.operands[0] >> 4;
                     const src1 = inst.operands[0] & 0x0F;
                     if (dest > 15) {
-                        try self.addIssue(.@"error", .register_out_of_range, inst.offset,
-                            "Destination register out of range");
+                        try self.addIssue(.@"error", .register_out_of_range, inst.offset, "Destination register out of range");
                     }
                     if (src1 > 15) {
-                        try self.addIssue(.@"error", .register_out_of_range, inst.offset,
-                            "Source register 1 out of range");
+                        try self.addIssue(.@"error", .register_out_of_range, inst.offset, "Source register 1 out of range");
                     }
                 }
             },
@@ -336,11 +329,10 @@ pub const Validator = struct {
                 if (inst.operands.len >= 3) {
                     const const_idx = std.mem.readInt(u16, inst.operands[1..3], .little);
                     if (const_idx >= self.module.constants.len) {
-                        try self.addIssue(.@"error", .invalid_constant_index, inst.offset,
-                            try std.fmt.allocPrint(self.allocator, "Constant index {d} out of range (max {d})", .{
-                                const_idx,
-                                self.module.constants.len,
-                            }));
+                        try self.addIssue(.@"error", .invalid_constant_index, inst.offset, try std.fmt.allocPrint(self.allocator, "Constant index {d} out of range (max {d})", .{
+                            const_idx,
+                            self.module.constants.len,
+                        }));
                     }
                 }
             },
@@ -359,8 +351,7 @@ pub const Validator = struct {
                     };
 
                     if (target_offset < 0 or target_offset >= @as(i32, @intCast(self.module.code.len))) {
-                        try self.addIssue(.@"error", .jump_out_of_bounds, inst.offset,
-                            try std.fmt.allocPrint(self.allocator, "Jump target {d} out of bounds", .{target_offset}));
+                        try self.addIssue(.@"error", .jump_out_of_bounds, inst.offset, try std.fmt.allocPrint(self.allocator, "Jump target {d} out of bounds", .{target_offset}));
                     }
                 }
             },
@@ -397,8 +388,7 @@ pub const Validator = struct {
                     }
 
                     if (!found_terminator) {
-                        try self.addIssue(.warning, .missing_return, @intCast(last_ip),
-                            "Routine may not have proper return/halt");
+                        try self.addIssue(.warning, .missing_return, @intCast(last_ip), "Routine may not have proper return/halt");
                     }
                 },
             }
