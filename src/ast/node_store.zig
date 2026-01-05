@@ -955,6 +955,14 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a trait object type: dyn Trait
+    pub fn addTraitObjectType(self: *Self, trait_name: StringId) !TypeIdx {
+        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
+        try self.type_tags.append(self.allocator, .trait_object);
+        try self.type_data.append(self.allocator, .{ .a = @intFromEnum(trait_name), .b = 0 });
+        return idx;
+    }
+
     /// Add a pointer type
     pub fn addPointerType(self: *Self, pointee: TypeIdx, mutability: Mutability) !TypeIdx {
         const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));

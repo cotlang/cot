@@ -115,11 +115,15 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .wrap_optional, .unwrap_optional, .is_null => {},
         .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => {},
         .array_len, .debug_line, .select, .ptr_offset => {},
-        .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values => {},
+        .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => {},
+        // Closure operations
+        .make_closure => {},
         // Weak reference operations
         .weak_ref, .weak_load => {},
         // ARC operations
         .arc_retain, .arc_release, .arc_move => {},
+        // Trait object operations
+        .make_trait_object, .call_trait_method => {},
     }
 }
 

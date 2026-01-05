@@ -297,6 +297,19 @@ pub const LocalVarEntry = struct {
     data_type: DataTypeCode,
 };
 
+/// VTable method entry - maps method name to implementing function
+pub const VTableMethod = struct {
+    method_name: []const u8,
+    fn_name: []const u8,
+};
+
+/// VTable definition for trait object dispatch
+pub const VTableDef = struct {
+    trait_name: []const u8,
+    type_name: []const u8,
+    methods: []VTableMethod,
+};
+
 /// Complete module structure
 pub const Module = struct {
     allocator: std.mem.Allocator,
@@ -307,6 +320,7 @@ pub const Module = struct {
     code: []u8,
     exports: []ExportEntry,
     imports: []ImportEntry,
+    vtables: []VTableDef,
 
     // Debug info (optional)
     source_file: ?[]const u8,
@@ -329,6 +343,7 @@ pub const Module = struct {
             .code = &[_]u8{},
             .exports = &[_]ExportEntry{},
             .imports = &[_]ImportEntry{},
+            .vtables = &[_]VTableDef{},
             .source_file = null,
             .line_table = null,
             .local_vars = null,
@@ -376,6 +391,20 @@ pub const Module = struct {
         if (self.code.len > 0) self.allocator.free(self.code);
         if (self.exports.len > 0) self.allocator.free(self.exports);
         if (self.imports.len > 0) self.allocator.free(self.imports);
+        if (self.vtables.len > 0) {
+            for (self.vtables) |vt| {
+                // Free method strings
+                for (vt.methods) |method| {
+                    self.allocator.free(@constCast(method.method_name));
+                    self.allocator.free(@constCast(method.fn_name));
+                }
+                if (vt.methods.len > 0) self.allocator.free(vt.methods);
+                // Free vtable strings
+                self.allocator.free(@constCast(vt.trait_name));
+                self.allocator.free(@constCast(vt.type_name));
+            }
+            self.allocator.free(self.vtables);
+        }
         if (self.line_table) |lt| self.allocator.free(lt);
         if (self.local_vars) |lv| self.allocator.free(lv);
         if (self.source_file) |sf| self.allocator.free(sf);
@@ -453,6 +482,25 @@ pub const Module = struct {
             try writer.writeByte(@intFromEnum(exp.kind));
             try writer.writeByte(exp.flags);
             try writer.writeInt(u16, exp.index, .little);
+        }
+
+        // Write vtables section
+        try writer.writeInt(u32, @intCast(self.vtables.len), .little);
+        for (self.vtables) |vt| {
+            // Write trait_name (length-prefixed string)
+            try writer.writeInt(u16, @intCast(vt.trait_name.len), .little);
+            try writer.writeAll(vt.trait_name);
+            // Write type_name (length-prefixed string)
+            try writer.writeInt(u16, @intCast(vt.type_name.len), .little);
+            try writer.writeAll(vt.type_name);
+            // Write methods
+            try writer.writeInt(u16, @intCast(vt.methods.len), .little);
+            for (vt.methods) |method| {
+                try writer.writeInt(u16, @intCast(method.method_name.len), .little);
+                try writer.writeAll(method.method_name);
+                try writer.writeInt(u16, @intCast(method.fn_name.len), .little);
+                try writer.writeAll(method.fn_name);
+            }
         }
     }
 
@@ -569,6 +617,44 @@ pub const Module = struct {
                 module.exports[i].kind = @enumFromInt(try reader.readByte());
                 module.exports[i].flags = try reader.readByte();
                 module.exports[i].index = try reader.readInt(u16, .little);
+            }
+        }
+
+        // Read vtables section
+        const vtable_count = reader.readInt(u32, .little) catch 0; // Optional section for backward compat
+        if (vtable_count > 0) {
+            module.vtables = try allocator.alloc(VTableDef, vtable_count);
+            for (0..vtable_count) |i| {
+                // Read trait_name
+                const trait_name_len = try reader.readInt(u16, .little);
+                const trait_name = try allocator.alloc(u8, trait_name_len);
+                try reader.readNoEof(trait_name);
+                module.vtables[i].trait_name = trait_name;
+
+                // Read type_name
+                const type_name_len = try reader.readInt(u16, .little);
+                const type_name = try allocator.alloc(u8, type_name_len);
+                try reader.readNoEof(type_name);
+                module.vtables[i].type_name = type_name;
+
+                // Read methods
+                const method_count = try reader.readInt(u16, .little);
+                if (method_count > 0) {
+                    module.vtables[i].methods = try allocator.alloc(VTableMethod, method_count);
+                    for (0..method_count) |j| {
+                        const method_name_len = try reader.readInt(u16, .little);
+                        const method_name = try allocator.alloc(u8, method_name_len);
+                        try reader.readNoEof(method_name);
+                        module.vtables[i].methods[j].method_name = method_name;
+
+                        const fn_name_len = try reader.readInt(u16, .little);
+                        const fn_name = try allocator.alloc(u8, fn_name_len);
+                        try reader.readNoEof(fn_name);
+                        module.vtables[i].methods[j].fn_name = fn_name;
+                    }
+                } else {
+                    module.vtables[i].methods = &[_]VTableMethod{};
+                }
             }
         }
 

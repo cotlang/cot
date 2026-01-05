@@ -1159,6 +1159,11 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.format_decimal)] = &vm_opcodes.op_format_decimal;
         table[@intFromEnum(Opcode.parse_decimal)] = &vm_opcodes.op_parse_decimal;
 
+        // Array Operations (0xB0-0xBF) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.array_load)] = &vm_opcodes.op_array_load;
+        table[@intFromEnum(Opcode.array_store)] = &vm_opcodes.op_array_store;
+        table[@intFromEnum(Opcode.array_len)] = &vm_opcodes.op_array_len;
+
         // Math Functions (0xC0-0xCF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.fn_round)] = &vm_opcodes.op_fn_round;
         table[@intFromEnum(Opcode.fn_trunc)] = &vm_opcodes.op_fn_trunc;
@@ -1180,6 +1185,7 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.map_values)] = &vm_opcodes.op_map_values;
         table[@intFromEnum(Opcode.map_get_at)] = &vm_opcodes.op_map_get_at;
         table[@intFromEnum(Opcode.map_set_at)] = &vm_opcodes.op_map_set_at;
+        table[@intFromEnum(Opcode.map_key_at)] = &vm_opcodes.op_map_key_at;
 
         // Debug (0xF0-0xFF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.debug_break)] = &vm_opcodes.op_debug_break;
@@ -1194,6 +1200,14 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.arc_retain)] = &vm_opcodes.op_arc_retain;
         table[@intFromEnum(Opcode.arc_release)] = &vm_opcodes.op_arc_release;
         table[@intFromEnum(Opcode.arc_move)] = &vm_opcodes.op_arc_move;
+
+        // Closure opcodes (0xF8-0xF9)
+        table[@intFromEnum(Opcode.make_closure)] = &vm_opcodes.op_make_closure;
+        table[@intFromEnum(Opcode.call_closure)] = &vm_opcodes.op_call_closure;
+
+        // Trait object opcodes (0xFA-0xFB)
+        table[@intFromEnum(Opcode.make_trait_object)] = &vm_opcodes.op_make_trait_object;
+        table[@intFromEnum(Opcode.call_trait_method)] = &vm_opcodes.op_call_trait_method;
 
         // Quickened/Specialized Opcodes (0xE0-0xEB) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.add_int)] = &vm_opcodes.op_add_int;

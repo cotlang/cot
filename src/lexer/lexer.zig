@@ -590,6 +590,7 @@ pub const Lexer = struct {
         .{ "type", .kw_type },
         .{ "impl", .kw_impl },
         .{ "trait", .kw_trait },
+        .{ "dyn", .kw_dyn },
         .{ "pub", .kw_pub },
         .{ "static", .kw_static },
 

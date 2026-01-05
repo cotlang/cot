@@ -67,12 +67,30 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
                 "{s}.{s}",
                 .{ a.name, field.name },
             ) catch return EmitError.OutOfMemory;
+            // Track allocated string for cleanup
+            e.allocated_strings.append(e.allocator, qualified_name) catch return EmitError.OutOfMemory;
             try e.locals.put(qualified_name, .{
                 .slot = e.local_count,
                 .is_global = false,
             });
             e.local_count += 1;
         }
+        return;
+    }
+
+    // Array types need multiple consecutive slots for elements
+    if (a.ty == .array) {
+        const base_slot = e.local_count;
+        const array_len = a.ty.array.length;
+        // Register the array base slot
+        try e.locals.put(a.name, .{
+            .slot = base_slot,
+            .is_global = false,
+        });
+        try e.value_slots.put(a.result.id, base_slot);
+        // Reserve slots for all array elements
+        e.local_count += @intCast(array_len);
+        debug.print(.emit, "alloca array: {s} base_slot={d} length={d} next_slot={d}", .{ a.name, base_slot, array_len, e.local_count });
         return;
     }
 
@@ -96,6 +114,13 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
 
 /// Emit load instruction
 pub fn emitLoad(e: *BytecodeEmitter, l: ir.Instruction.Load) EmitError!void {
+    // Propagate array pointer target tracking through loads
+    // If l.ptr points to an array, the result should also point to that array
+    if (e.array_ptr_targets.get(l.ptr.id)) |array_slot| {
+        try e.array_ptr_targets.put(l.result.id, array_slot);
+        debug.print(.emit, "load: propagate array ptr id={d} -> result={d} array_slot={d}", .{ l.ptr.id, l.result.id, array_slot });
+    }
+
     if (e.value_slots.get(l.ptr.id)) |slot_info| {
         try e.value_slots.put(l.result.id, slot_info);
     } else if (e.value_consts.get(l.ptr.id)) |const_idx| {
@@ -189,6 +214,20 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
                 }
                 return;
             }
+        }
+    }
+
+    // Special case: storing an array value/pointer into a pointer slot
+    // Track the array slot so array_load can use it when accessing through the pointer
+    if (s.value.ty == .array or (s.value.ty == .ptr and s.value.ty.ptr.* == .array)) {
+        if (e.value_slots.get(s.value.id)) |value_slot| {
+            const array_slot = value_slot & 0x7FFF;
+            // Record that the target pointer (s.ptr.id) points to this array slot
+            try e.array_ptr_targets.put(s.ptr.id, array_slot);
+            debug.print(.emit, "store: array ptr tracking id={d} -> array_slot={d}", .{ s.ptr.id, array_slot });
+            // For array pointer stores, no actual bytecode needed - just tracking
+            // The array is accessed directly by slot in array_load
+            return;
         }
     }
 
@@ -620,6 +659,31 @@ fn emitDynamicCall(e: *BytecodeEmitter, c: ir.Instruction.Call) EmitError!void {
     }
 }
 
+/// Emit call_indirect instruction - call a closure/function pointer
+/// Format: [rd:4|closure_reg:4] [argc:8]
+pub fn emitCallIndirect(e: *BytecodeEmitter, c: ir.Instruction.CallIndirect) EmitError!void {
+    // Load the callee (closure) into register 8 (avoid arg registers 0-7)
+    const closure_reg: u4 = 8;
+    try e.emitValueToReg(c.callee, closure_reg);
+
+    // Load arguments to registers 0-7
+    for (c.args, 0..) |arg, i| {
+        if (i < 8) {
+            try e.emitValueToReg(arg, @intCast(i));
+        }
+    }
+
+    // Emit call_closure: [opcode] [rd:4|closure_reg:4] [argc:8]
+    try e.emitOpcode(.call_closure);
+    const rd: u4 = 15; // Return value register
+    try e.emitU8((@as(u8, rd) << 4) | closure_reg);
+    try e.emitU8(@intCast(c.args.len));
+
+    if (c.result) |result| {
+        e.setLastResult(result.id, rd);
+    }
+}
+
 // ============================================================================
 // I/O Operations
 // ============================================================================
@@ -831,10 +895,17 @@ pub fn emitThrow(e: *BytecodeEmitter, t: ir.Instruction.Throw) EmitError!void {
 
 /// Emit array_load instruction
 pub fn emitArrayLoad(e: *BytecodeEmitter, al: ir.Instruction.ArrayOp) EmitError!void {
-    const array_slot = if (e.value_slots.get(al.array_ptr.id)) |slot_info|
+    // First check array_ptr_targets for pointer indirection
+    // This handles cases like: arr = [1,2,3]; x = arr[i]
+    // where arr is a pointer to the actual array
+    const array_slot: u16 = if (e.array_ptr_targets.get(al.array_ptr.id)) |slot|
+        slot
+    else if (e.value_slots.get(al.array_ptr.id)) |slot_info|
         slot_info & 0x7FFF
     else
         0;
+
+    debug.print(.emit, "array_load: ptr.id={d} -> array_slot={d}", .{ al.array_ptr.id, array_slot });
 
     try e.emitValueToReg(al.index, 0);
     try e.emitOpcode(.array_load);
@@ -845,7 +916,10 @@ pub fn emitArrayLoad(e: *BytecodeEmitter, al: ir.Instruction.ArrayOp) EmitError!
 
 /// Emit array_store instruction
 pub fn emitArrayStore(e: *BytecodeEmitter, as: ir.Instruction.ArrayStore) EmitError!void {
-    const array_slot = if (e.value_slots.get(as.array_ptr.id)) |slot_info|
+    // First check array_ptr_targets for pointer indirection
+    const array_slot: u16 = if (e.array_ptr_targets.get(as.array_ptr.id)) |slot|
+        slot
+    else if (e.value_slots.get(as.array_ptr.id)) |slot_info|
         slot_info & 0x7FFF
     else
         0;
@@ -855,6 +929,30 @@ pub fn emitArrayStore(e: *BytecodeEmitter, as: ir.Instruction.ArrayStore) EmitEr
     try e.emitOpcode(.array_store);
     try e.emitU8((0 << 4) | 1);
     try e.emitU16(array_slot);
+}
+
+/// Emit array_len instruction
+/// For fixed-size arrays, the length is known at compile time from the type
+pub fn emitArrayLen(e: *BytecodeEmitter, al: ir.Instruction.UnaryOp) EmitError!void {
+    // Get the array type to extract the length
+    const operand_ty = al.operand.ty;
+
+    // Determine the array length from the type
+    const length: u32 = switch (operand_ty) {
+        .array => |arr| arr.length,
+        .ptr => |ptr_ty| switch (ptr_ty.*) {
+            .array => |arr| arr.length,
+            else => 0,
+        },
+        else => 0,
+    };
+
+    // Emit the length as a constant
+    const idx = try e.addConstant(.{ .integer = @intCast(length) });
+    try e.emitOpcode(.load_const);
+    try e.emitU8(0); // Load into r0
+    try e.emitU16(idx);
+    e.setLastResult(al.result.id, 0);
 }
 
 // ============================================================================
@@ -998,6 +1096,17 @@ pub fn emitMapValues(e: *BytecodeEmitter, mv: ir.Instruction.MapValues) EmitErro
     e.setLastResult(mv.result.id, dest_reg);
 }
 
+/// Emit map_key_at instruction - get key at index position
+pub fn emitMapKeyAt(e: *BytecodeEmitter, mk: ir.Instruction.MapKeyAt) EmitError!void {
+    const map_reg = try e.getValueInReg(mk.map, 0);
+    const idx_reg = try e.getValueInReg(mk.index, 1);
+    const dest_reg: u4 = 2;
+    try e.emitOpcode(.map_key_at);
+    try e.emitU8((@as(u8, dest_reg) << 4) | map_reg);
+    try e.emitU8(@as(u8, idx_reg) << 4);
+    e.setLastResult(mk.result.id, dest_reg);
+}
+
 // ============================================================================
 // Null/Optional Operations
 // ============================================================================
@@ -1136,4 +1245,118 @@ pub fn emitArcMove(e: *BytecodeEmitter, a: ir.Instruction.UnaryOp) EmitError!voi
     const dest_reg: u4 = 1;
     try e.emitRegUnary(.arc_move, dest_reg, src_reg);
     e.setLastResult(a.result.id, dest_reg);
+}
+
+// ============================================================================
+// Closure Operations
+// ============================================================================
+
+/// Emit make_closure instruction - create closure from function and environment
+/// make_closure rd, env_reg, fn_idx - Creates a closure value
+pub fn emitMakeClosure(e: *BytecodeEmitter, c: ir.Instruction.MakeClosure) EmitError!void {
+    const env_reg = try e.getValueInReg(c.env, 0);
+    const dest_reg: u4 = 1;
+
+    // Look up the function index by name
+    var fn_idx: u16 = 0;
+    for (e.routines.items, 0..) |r, i| {
+        // Match by routine name
+        if (r.name_index < e.constants.items.len) {
+            const constant = e.constants.items[r.name_index];
+            // Extract string from constant (identifier or string type)
+            const name = switch (constant) {
+                .identifier => |s| s,
+                .string => |s| s,
+                else => continue,
+            };
+            if (std.mem.eql(u8, name, c.func_name)) {
+                fn_idx = @intCast(i);
+                break;
+            }
+        }
+    }
+
+    // Emit: [opcode] [rd:4|env_reg:4] [fn_idx:16]
+    try e.emitOpcode(.make_closure);
+    try e.emitU8((@as(u8, dest_reg) << 4) | env_reg);
+    try e.emitU16(fn_idx);
+    e.setLastResult(c.result.id, dest_reg);
+}
+
+// ============================================================================
+// Trait Object Operations
+// ============================================================================
+
+/// Emit make_trait_object instruction - create trait object from value
+/// make_trait_object rd, src_reg, vtable_idx - Creates a trait object (fat pointer)
+pub fn emitMakeTraitObject(e: *BytecodeEmitter, m: ir.Instruction.MakeTraitObject) EmitError!void {
+    const src_reg = try e.getValueInReg(m.value, 0);
+    const dest_reg: u4 = 1;
+
+    // Look up the vtable index by trait_name and type_name
+    var vtable_idx: u16 = 0;
+    if (e.ir_module) |ir_mod| {
+        for (ir_mod.vtables.items, 0..) |vt, i| {
+            if (std.mem.eql(u8, vt.trait_name, m.trait_name) and
+                std.mem.eql(u8, vt.type_name, m.type_name))
+            {
+                vtable_idx = @intCast(i);
+                break;
+            }
+        }
+    }
+
+    // Emit: [opcode] [rd:4|src_reg:4] [vtable_idx:16]
+    try e.emitOpcode(.make_trait_object);
+    try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
+    try e.emitU16(vtable_idx);
+    e.setLastResult(m.result.id, dest_reg);
+}
+
+/// Emit call_trait_method instruction - call method on trait object via vtable
+/// call_trait_method trait_obj_reg, method_idx, argc - Calls method via dynamic dispatch
+pub fn emitCallTraitMethod(e: *BytecodeEmitter, c: ir.Instruction.CallTraitMethod) EmitError!void {
+    // Get trait object into a register
+    const trait_obj_reg = try e.getValueInReg(c.trait_object, 0);
+
+    // Get the trait name from the trait object's type
+    const trait_name = if (c.trait_object.ty == .trait_object)
+        c.trait_object.ty.trait_object.trait_name
+    else
+        return EmitError.InvalidInstruction;
+
+    // Look up method index in the trait definition
+    var method_idx: u8 = 0;
+    if (e.ir_module) |ir_mod| {
+        // Find the trait definition
+        for (ir_mod.traits.items) |trait_def| {
+            if (std.mem.eql(u8, trait_def.name, trait_name)) {
+                // Find the method index
+                for (trait_def.methods, 0..) |method, i| {
+                    if (std.mem.eql(u8, method.name, c.method_name)) {
+                        method_idx = @intCast(i);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Place arguments in registers (starting at r1, r2, etc.)
+    for (c.args, 0..) |arg, i| {
+        const arg_reg: u4 = @intCast(i + 1);
+        _ = try e.getValueInReg(arg, arg_reg);
+    }
+
+    const argc: u8 = @intCast(c.args.len);
+    const dest_reg: u4 = 0;
+
+    // Emit: [opcode] [trait_obj_reg:4|dest_reg:4] [method_idx:8] [argc:8]
+    try e.emitOpcode(.call_trait_method);
+    try e.emitU8((@as(u8, trait_obj_reg) << 4) | dest_reg);
+    try e.emitU8(method_idx);
+    try e.emitU8(argc);
+
+    e.setLastResult(c.result.id, dest_reg);
 }

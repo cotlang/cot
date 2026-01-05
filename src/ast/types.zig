@@ -115,6 +115,9 @@ pub const TypeTag = enum(u8) {
     /// Generic type instantiation: Foo<i32, string>
     generic_instance,
 
+    /// Trait object: dyn Trait (dynamic dispatch)
+    trait_object,
+
     // ============================================
     // Special Types
     // ============================================

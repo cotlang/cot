@@ -240,6 +240,7 @@ pub const Parser = struct {
         self.errors.deinit(self.allocator);
         self.pending_common_globals.deinit(self.allocator);
         self.pending_class_impl_blocks.deinit(self.allocator);
+        self.current_class_fields.deinit(self.allocator);
     }
 
     /// Parse tokens into a list of top-level statements

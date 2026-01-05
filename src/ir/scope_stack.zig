@@ -144,6 +144,11 @@ pub const ScopeStack = struct {
         try self.current.put(name, value);
     }
 
+    /// Remove a variable from the current scope (returns true if removed)
+    pub fn remove(self: *ScopeStack, name: []const u8) bool {
+        return self.current.variables.remove(name);
+    }
+
     /// Get the current scope depth (0 = root)
     pub fn depth(self: *const ScopeStack) usize {
         var d: usize = 0;

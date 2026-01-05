@@ -49,6 +49,8 @@ const BoxedInt = value_mod.BoxedInt;
 const StringRef = value_mod.StringRef;
 const FixedStringRef = value_mod.FixedStringRef;
 const Record = value_mod.Record;
+const Closure = value_mod.Closure;
+const CLOSURE_TYPE_ID = value_mod.CLOSURE_TYPE_ID;
 const OrderedMap = @import("ordered_map.zig").OrderedMap;
 
 // Scoped logging
@@ -361,9 +363,28 @@ fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void 
         },
 
         .object => {
-            // Check if it's a map (type_id 16)
-            if (value.asMap()) |map| {
-                // Release all values stored in the map
+            // Check object type_id to determine how to free
+            const type_id = value.objectTypeId() orelse 0;
+
+            if (type_id == CLOSURE_TYPE_ID) {
+                // Closure - release the env map if present
+                if (value.getClosure()) |closure| {
+                    if (closure.env) |env| {
+                        // Release all values in the env map
+                        for (env.entries.items) |entry| {
+                            if (!entry.deleted) {
+                                release(entry.value, allocator);
+                            }
+                        }
+                        // Deinit env map internals
+                        env.deinit();
+                        // Free the env map itself
+                        freeWithHeader(@ptrCast(env), @sizeOf(OrderedMap), allocator);
+                    }
+                }
+                freeWithHeader(ptr, @sizeOf(Closure), allocator);
+            } else if (value.asMap()) |map| {
+                // Map (type_id 16) - release all values stored in the map
                 for (map.entries.items) |entry| {
                     if (!entry.deleted) {
                         release(entry.value, allocator);
@@ -371,9 +392,11 @@ fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void 
                 }
                 // Deinit map internals (but not the map struct itself)
                 map.deinit();
+                freeWithHeader(ptr, @sizeOf(OrderedMap), allocator);
+            } else {
+                // Unknown object type - log warning and skip
+                log.warn("Unknown object type_id {} - cannot free", .{type_id});
             }
-
-            freeWithHeader(ptr, @sizeOf(OrderedMap), allocator);
         },
 
         // Inline types should never reach here
@@ -410,12 +433,27 @@ pub fn freeObjectForced(value: Value, ptr: *anyopaque, allocator: std.mem.Alloca
         },
 
         .object => {
-            // Free map structure without recursively releasing values
-            // (cycle collector already handled breaking the cycle)
-            if (value.asMap()) |map| {
+            // Check object type_id to determine how to free
+            const type_id = value.objectTypeId() orelse 0;
+
+            if (type_id == CLOSURE_TYPE_ID) {
+                // Closure - deinit env map if present (without recursive release)
+                // (cycle collector already handled breaking the cycle)
+                if (value.getClosure()) |closure| {
+                    if (closure.env) |env| {
+                        env.deinit();
+                        freeWithHeader(@ptrCast(env), @sizeOf(OrderedMap), allocator);
+                    }
+                }
+                freeWithHeader(ptr, @sizeOf(Closure), allocator);
+            } else if (value.asMap()) |map| {
+                // Map - free structure without recursively releasing values
                 map.deinit();
+                freeWithHeader(ptr, @sizeOf(OrderedMap), allocator);
+            } else {
+                // Unknown object type - log warning
+                log.warn("Unknown object type_id {} - cannot free (forced)", .{type_id});
             }
-            freeWithHeader(ptr, @sizeOf(OrderedMap), allocator);
         },
 
         .null_val, .boolean, .integer, .handle => unreachable,

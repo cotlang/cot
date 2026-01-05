@@ -181,4 +181,17 @@ pub fn build(b: *std.Build) void {
     const test_all_step = b.step("test-all", "Run all tests (unit + integration)");
     test_all_step.dependOn(&run_mod_tests.step);
     test_all_step.dependOn(integration_step);
+
+    // ========================================================================
+    // Format steps
+    // ========================================================================
+    // zig build fmt - Format all source files
+    const fmt_step = b.step("fmt", "Format source files");
+    const fmt_cmd = b.addSystemCommand(&.{ "zig", "fmt", "src/" });
+    fmt_step.dependOn(&fmt_cmd.step);
+
+    // zig build fmt-check - Check formatting (for CI)
+    const fmt_check_step = b.step("fmt-check", "Check source file formatting");
+    const fmt_check_cmd = b.addSystemCommand(&.{ "zig", "fmt", "--check", "src/" });
+    fmt_check_step.dependOn(&fmt_check_cmd.step);
 }

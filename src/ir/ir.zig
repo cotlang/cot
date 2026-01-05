@@ -85,6 +85,13 @@ pub const Type = union(enum) {
     /// Map type (ordered key-value store)
     map: *const MapType,
 
+    /// Trait object type (dynamic dispatch)
+    trait_object: TraitObjectType,
+
+    pub const TraitObjectType = struct {
+        trait_name: []const u8,
+    };
+
     pub const DecimalType = struct {
         /// Total precision in digits
         precision: u32,
@@ -111,6 +118,7 @@ pub const Type = union(enum) {
             .@"union" => |u| u.size,
             .function => 8, // Function pointer
             .map => 8, // Map pointer
+            .trait_object => 16, // Fat pointer: data + vtable
         };
     }
 
@@ -132,6 +140,7 @@ pub const Type = union(enum) {
             .@"union" => |u| u.alignment,
             .function => 8,
             .map => 8,
+            .trait_object => 8, // Fat pointer alignment
         };
     }
 
@@ -160,6 +169,7 @@ pub const Type = union(enum) {
             .@"union" => "void*",
             .function => "void*",
             .map => "void*",
+            .trait_object => "cot_trait_object_t*", // Fat pointer struct
         };
     }
 
@@ -362,6 +372,8 @@ fn typeNeedsArc(ty: Type) bool {
         .array => |a| typeNeedsArc(a.element.*),
         // Function pointers don't need ARC
         .function => false,
+        // Trait objects contain a pointer to the data, which may need ARC
+        .trait_object => true,
     };
 }
 
@@ -513,6 +525,14 @@ pub const Instruction = union(enum) {
     map_clear: MapClear,
     map_keys: MapKeys,
     map_values: MapValues,
+    map_key_at: MapKeyAt,
+
+    // ====== Closure operations ======
+    make_closure: MakeClosure,
+
+    // ====== Trait object operations ======
+    make_trait_object: MakeTraitObject,
+    call_trait_method: CallTraitMethod,
 
     // ====== Debug information ======
     debug_line: struct { line: u32, column: u32 },
@@ -774,6 +794,40 @@ pub const Instruction = union(enum) {
         loc: ?SourceLoc = null,
     };
 
+    /// Map key at - get key at index position (1-based)
+    pub const MapKeyAt = struct {
+        map: Value, // Map to query
+        index: Value, // Index (1-based)
+        result: Value, // Key string result
+        loc: ?SourceLoc = null,
+    };
+
+    /// Make closure - create a closure from a function and captured environment
+    pub const MakeClosure = struct {
+        func_name: []const u8, // Name of the lambda function
+        env: Value, // Map containing captured values
+        result: Value, // Result closure value
+        loc: ?SourceLoc = null,
+    };
+
+    /// Create trait object from concrete value (for dyn Trait)
+    pub const MakeTraitObject = struct {
+        value: Value, // The concrete value to box
+        trait_name: []const u8, // Name of the trait
+        type_name: []const u8, // Name of the concrete type
+        result: Value, // Result trait object value (fat pointer)
+        loc: ?SourceLoc = null,
+    };
+
+    /// Call method on trait object (dynamic dispatch via vtable)
+    pub const CallTraitMethod = struct {
+        trait_object: Value, // The trait object (fat pointer)
+        method_name: []const u8, // Method to call
+        args: []Value, // Arguments (first is self which is already trait_object)
+        result: Value, // Result value
+        loc: ?SourceLoc = null,
+    };
+
     /// String slice - extract portion of string (0-indexed)
     pub const StrSlice = struct {
         source: Value, // Source string
@@ -851,7 +905,7 @@ pub const Instruction = union(enum) {
         optional, // wrap_optional, unwrap_optional, is_null
         io, // io_open, io_close, io_read, io_write, io_delete, io_unlock
         array, // array_load, array_store, array_len
-        map, // map_new, map_set, map_get, map_delete, map_has, map_len, map_clear, map_keys, map_values
+        map, // map_new, map_set, map_get, map_delete, map_has, map_len, map_clear, map_keys, map_values, map_key_at
         debug, // debug_line
     };
 
@@ -871,7 +925,7 @@ pub const Instruction = union(enum) {
             .wrap_optional, .unwrap_optional, .is_null => .optional,
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
             .array_load, .array_store, .array_len => .array,
-            .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values => .map,
+            .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => .map,
             .debug_line => .debug,
         };
     }
@@ -951,12 +1005,18 @@ pub const Instruction = union(enum) {
             .map_len => |m| m.result,
             .map_keys => |m| m.result,
             .map_values => |m| m.result,
+            .map_key_at => |m| m.result,
+            // Closure operations
+            .make_closure => |c| c.result,
             .select => |s| s.result,
             .ptr_offset => |p| p.result,
             // Weak reference operations
             .weak_ref, .weak_load => |op| op.result,
             // ARC operations
             .arc_move => |op| op.result,
+            // Trait object operations
+            .make_trait_object => |m| m.result,
+            .call_trait_method => |c| c.result,
             // Instructions that don't produce values
             .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear, .arc_retain, .arc_release => null,
         };
@@ -1016,6 +1076,10 @@ pub const Block = struct {
         for (self.instructions.items) |inst| {
             switch (inst) {
                 .call => |c| {
+                    // Free the callee name (always owned/duped by lowerer)
+                    if (c.callee.len > 0) {
+                        self.allocator.free(c.callee);
+                    }
                     if (c.args.len > 0) {
                         self.allocator.free(c.args);
                     }
@@ -1166,6 +1230,36 @@ pub const Function = struct {
 };
 
 // ============================================================================
+// VTable (for trait objects)
+// ============================================================================
+
+/// VTable for trait object dynamic dispatch
+pub const VTable = struct {
+    trait_name: []const u8,
+    type_name: []const u8,
+    methods: []const VTableEntry,
+};
+
+/// Entry in a VTable mapping method name to function index
+pub const VTableEntry = struct {
+    method_name: []const u8,
+    fn_name: []const u8, // Name of the implementing function
+};
+
+/// Trait definition for method index lookup during dispatch
+pub const TraitDef = struct {
+    name: []const u8,
+    methods: []const TraitMethodSig,
+};
+
+/// Trait method signature
+pub const TraitMethodSig = struct {
+    name: []const u8,
+    param_count: u32,
+    return_type: Type,
+};
+
+// ============================================================================
 // Module
 // ============================================================================
 
@@ -1189,6 +1283,12 @@ pub const Module = struct {
     /// Functions
     functions: std.ArrayListUnmanaged(*Function),
 
+    /// VTables for trait object dispatch
+    vtables: std.ArrayListUnmanaged(VTable),
+
+    /// Trait definitions (for method index lookup)
+    traits: std.ArrayListUnmanaged(TraitDef),
+
     /// Allocator
     allocator: Allocator,
 
@@ -1210,6 +1310,8 @@ pub const Module = struct {
             .unions = .{},
             .globals = .{},
             .functions = .{},
+            .vtables = .{},
+            .traits = .{},
             .allocator = allocator,
         };
     }
@@ -1235,6 +1337,12 @@ pub const Module = struct {
         self.unions.deinit(self.allocator);
 
         self.globals.deinit(self.allocator);
+
+        // Free vtables and their method entries
+        for (self.vtables.items) |vtable| {
+            self.allocator.free(vtable.methods);
+        }
+        self.vtables.deinit(self.allocator);
 
         // Free type pointers allocated during lowering
         for (self.allocated_types.items) |ty_ptr| {

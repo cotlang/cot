@@ -568,27 +568,26 @@ pub const Disassembler = struct {
             // Array Operations (0xB0-0xBF)
             // ============================================
 
-            // array_load rd, arr_reg, idx_reg - [rd:4|arr_reg:4] [idx_reg:4|0]
+            // array_load idx_reg, slot - [idx_reg:8] [slot:16]
             .array_load => {
-                const rd: u4 = @truncate(operands[0] >> 4);
-                const arr_reg: u4 = @truncate(operands[0] & 0xF);
-                const idx_reg: u4 = @truncate(operands[1] >> 4);
-                try self.writer.print(" r{}, r{}[r{}]", .{ rd, arr_reg, idx_reg });
+                const idx_reg = operands[0];
+                const slot = std.mem.readInt(u16, operands[1..3], .little);
+                try self.writer.print(" r0, ${}[r{}]", .{ slot, idx_reg });
             },
 
-            // array_store arr_reg, idx_reg, val_reg - [arr_reg:4|idx_reg:4] [val_reg:4|0]
+            // array_store idx_reg, val_reg, slot - [idx_reg:4|val_reg:4] [slot:16]
             .array_store => {
-                const arr_reg: u4 = @truncate(operands[0] >> 4);
-                const idx_reg: u4 = @truncate(operands[0] & 0xF);
-                const val_reg: u4 = @truncate(operands[1] >> 4);
-                try self.writer.print(" r{}[r{}], r{}", .{ arr_reg, idx_reg, val_reg });
+                const idx_reg: u4 = @truncate(operands[0] >> 4);
+                const val_reg: u4 = @truncate(operands[0] & 0xF);
+                const slot = std.mem.readInt(u16, operands[1..3], .little);
+                try self.writer.print(" ${}[r{}], r{}", .{ slot, idx_reg, val_reg });
             },
 
-            // array_len rd, arr_reg - [rd:4|arr_reg:4] [0]
+            // array_len rd, slot - [rd:8] [slot:16]
             .array_len => {
-                const rd: u4 = @truncate(operands[0] >> 4);
-                const arr_reg: u4 = @truncate(operands[0] & 0xF);
-                try self.writer.print(" r{}, r{}", .{ rd, arr_reg });
+                const rd = operands[0];
+                const slot = std.mem.readInt(u16, operands[1..3], .little);
+                try self.writer.print(" r{}, len(${})", .{ rd, slot });
             },
 
             // ============================================
@@ -735,6 +734,14 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}[@r{}] = r{}", .{ map_reg, idx_reg, val_reg });
             },
 
+            // map_key_at rd, map, idx - [rd:4|map:4] [idx:4|0]
+            .map_key_at => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const map_reg: u4 = @truncate(operands[0] & 0xF);
+                const idx_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}, key_at(r{}, r{})", .{ rd, map_reg, idx_reg });
+            },
+
             // ============================================
             // Debug & Meta (0xF0-0xFF)
             // ============================================
@@ -782,6 +789,43 @@ pub const Disassembler = struct {
                 const rd: u4 = @truncate(operands[0] >> 4);
                 const rs: u4 = @truncate(operands[0] & 0xF);
                 try self.writer.print(" r{}, r{}", .{ rd, rs });
+            },
+
+            // ============================================
+            // Closure Operations
+            // ============================================
+
+            // make_closure rd, env_reg, fn_idx - [rd:4|env_reg:4] [fn_idx:16]
+            .make_closure => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const env_reg: u4 = @truncate(operands[0] & 0xF);
+                const fn_idx = std.mem.readInt(u16, operands[1..3], .little);
+                try self.writer.print(" r{}, r{}, fn[{}]", .{ rd, env_reg, fn_idx });
+            },
+
+            // call_closure rd, closure_reg, argc - [rd:4|closure_reg:4] [argc:8]
+            .call_closure => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const closure_reg: u4 = @truncate(operands[0] & 0xF);
+                const argc = operands[1];
+                try self.writer.print(" r{}, r{}, argc={}", .{ rd, closure_reg, argc });
+            },
+
+            // make_trait_object rd, src_reg, vtable_idx - [rd:4|src_reg:4] [vtable_idx:16]
+            .make_trait_object => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const src_reg: u4 = @truncate(operands[0] & 0xF);
+                const vtable_idx = std.mem.readInt(u16, operands[1..3], .little);
+                try self.writer.print(" r{}, r{}, vtable[{}]", .{ rd, src_reg, vtable_idx });
+            },
+
+            // call_trait_method rd, obj_reg, method_idx, argc - [rd:4|obj_reg:4] [method_idx:8] [argc:8]
+            .call_trait_method => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const obj_reg: u4 = @truncate(operands[0] & 0xF);
+                const method_idx = operands[1];
+                const argc = operands[2];
+                try self.writer.print(" r{}, r{}, method[{}], argc={}", .{ rd, obj_reg, method_idx, argc });
             },
 
             .extended => {

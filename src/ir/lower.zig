@@ -129,9 +129,21 @@ pub const Lowerer = struct {
     /// Counter for generating unique lambda names
     lambda_counter: u32,
 
+    /// Current lambda's captured variables (name -> outer scope value)
+    /// Set during lowerLambda, used by identifier lowering to detect captures
+    current_captures: ?std.StringHashMap(ir.Value),
+
+    /// The closure environment variable in the current lambda (if any)
+    /// Points to the map containing captured values
+    closure_env_value: ?ir.Value,
+
     /// Function parameter defaults (function name -> list of default ExprIdx per param)
     /// If ExprIdx is null (0), the param is required
     fn_param_defaults: std.StringHashMap([]const u32),
+
+    /// Function parameter types (function name -> list of param types)
+    /// Used for type coercion during call lowering (e.g., struct to trait object)
+    fn_param_types: std.StringHashMap([]const ir.Type),
 
     /// Trait definitions (trait name -> TraitDef)
     trait_defs: std.StringHashMap(TraitDef),
@@ -252,7 +264,10 @@ pub const Lowerer = struct {
             .warnings = .{},
             .last_error = null,
             .lambda_counter = 0,
+            .current_captures = null,
+            .closure_env_value = null,
             .fn_param_defaults = std.StringHashMap([]const u32).init(allocator),
+            .fn_param_types = std.StringHashMap([]const ir.Type).init(allocator),
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
             .impl_methods = ImplMethodsMap.init(allocator),
             .comptime_evaluator = comptime_eval.Evaluator.init(allocator, store, strings),
@@ -339,6 +354,11 @@ pub const Lowerer = struct {
         self.type_param_substitutions.deinit();
         self.instantiated_structs.deinit();
         self.trait_defs.deinit();
+        // Free impl method slices
+        var impl_iter = self.impl_methods.valueIterator();
+        while (impl_iter.next()) |methods| {
+            self.allocator.free(methods.*);
+        }
         self.impl_methods.deinit();
         self.comptime_evaluator.deinit();
         self.imported_namespaces.deinit();
@@ -490,6 +510,12 @@ pub const Lowerer = struct {
         for (top_level) |stmt_idx| {
             try self.processStatementForDefinitions(stmt_idx, .tests);
         }
+
+        // Build VTables from trait implementations
+        try self.buildVTables();
+
+        // Export trait definitions to module for method index lookup
+        try self.exportTraitDefs();
 
         // Transfer ownership of allocated types to the module
         // The module will free them in its deinit
@@ -901,15 +927,22 @@ pub const Lowerer = struct {
             const fn_name_id = fn_data.getName();
             const fn_name = self.strings.get(fn_name_id);
 
-            debug.print(.ir, "  Impl method: {s}", .{fn_name});
+            // Create qualified function name: TypeName.method_name
+            var qualified_name_buf: [256]u8 = undefined;
+            const qualified_name = std.fmt.bufPrint(&qualified_name_buf, "{s}.{s}", .{ target_name, fn_name }) catch {
+                return LowerError.OutOfMemory;
+            };
+            const qualified_name_owned = try self.allocator.dupe(u8, qualified_name);
+
+            debug.print(.ir, "  Impl method: {s} -> {s}", .{ fn_name, qualified_name_owned });
 
             try methods.append(self.allocator, .{
                 .method_name = fn_name,
                 .fn_stmt_idx = method_stmt_idx,
             });
 
-            // Also lower the method as a regular function (for now - later we may want mangled names)
-            try self.lowerFnDef(method_stmt_idx);
+            // Lower the method with the qualified name
+            try self.lowerImplMethod(method_stmt_idx, qualified_name_owned);
         }
 
         // Store the implementation mapping
@@ -952,8 +985,8 @@ pub const Lowerer = struct {
         return null;
     }
 
-    /// Collect function signature (params and defaults only, no body lowering)
-    /// This runs in an earlier pass so defaults are available at call sites
+    /// Collect function signature (params, types, and defaults)
+    /// This runs in an earlier pass so types and defaults are available at call sites
     fn collectFnSignature(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
         const name_id = data.getName();
@@ -964,23 +997,29 @@ pub const Lowerer = struct {
         const extra_start = data.getParamsStart();
         const param_count = self.store.getExtra(extra_start);
 
-        // Collect default expressions for each parameter
+        // Collect default expressions and types for each parameter
         var param_defaults: std.ArrayListUnmanaged(u32) = .{};
         defer param_defaults.deinit(self.allocator);
+        var param_types: std.ArrayListUnmanaged(ir.Type) = .{};
+        defer param_types.deinit(self.allocator);
 
         var extra_idx = extra_start.toInt() + 1;
         for (0..param_count) |_| {
-            // Skip name, type, is_ref; just collect default
+            const param_type_idx: ast.TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
             const default_expr_raw: u32 = self.store.extra_data.items[extra_idx + 3];
             extra_idx += 4; // 4 values per param
 
             param_defaults.append(self.allocator, default_expr_raw) catch return LowerError.OutOfMemory;
+            const param_type = self.lowerTypeIdx(param_type_idx) catch return LowerError.OutOfMemory;
+            param_types.append(self.allocator, param_type) catch return LowerError.OutOfMemory;
         }
 
-        // Store param defaults for this function (for call-site defaulting)
+        // Store param defaults and types for this function (for call-site handling)
         if (param_count > 0) {
             const defaults_slice = param_defaults.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory;
             self.fn_param_defaults.put(name, defaults_slice) catch return LowerError.OutOfMemory;
+            const types_slice = param_types.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory;
+            self.fn_param_types.put(name, types_slice) catch return LowerError.OutOfMemory;
         }
     }
 
@@ -991,6 +1030,65 @@ pub const Lowerer = struct {
             .type_name = type_name,
         };
         return self.impl_methods.contains(key);
+    }
+
+    /// Build VTables from all trait implementations
+    fn buildVTables(self: *Self) LowerError!void {
+        var iter = self.impl_methods.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const methods = entry.value_ptr.*;
+
+            // Build vtable entries
+            var vtable_entries: std.ArrayListUnmanaged(ir.VTableEntry) = .{};
+            errdefer vtable_entries.deinit(self.allocator);
+
+            for (methods) |method| {
+                // Create qualified function name: TypeName.method_name
+                var fn_name_buf: [256]u8 = undefined;
+                const qualified_fn_name = std.fmt.bufPrint(&fn_name_buf, "{s}.{s}", .{ key.type_name, method.method_name }) catch {
+                    return LowerError.OutOfMemory;
+                };
+                const fn_name = try self.allocator.dupe(u8, qualified_fn_name);
+
+                try vtable_entries.append(self.allocator, .{
+                    .method_name = method.method_name,
+                    .fn_name = fn_name,
+                });
+            }
+
+            // Create vtable
+            const vtable = ir.VTable{
+                .trait_name = key.trait_name,
+                .type_name = key.type_name,
+                .methods = try vtable_entries.toOwnedSlice(self.allocator),
+            };
+
+            try self.module.vtables.append(self.allocator, vtable);
+        }
+    }
+
+    /// Export trait definitions to the module for method index lookup during dispatch
+    fn exportTraitDefs(self: *Self) LowerError!void {
+        var iter = self.trait_defs.iterator();
+        while (iter.next()) |entry| {
+            const trait_def = entry.value_ptr.*;
+
+            // Convert lower_types.TraitMethodSig to ir.TraitMethodSig
+            var methods: std.ArrayListUnmanaged(ir.TraitMethodSig) = .{};
+            for (trait_def.methods) |method| {
+                try methods.append(self.allocator, .{
+                    .name = method.name,
+                    .param_count = method.param_count,
+                    .return_type = method.return_type,
+                });
+            }
+
+            try self.module.traits.append(self.allocator, .{
+                .name = trait_def.name,
+                .methods = try methods.toOwnedSlice(self.allocator),
+            });
+        }
     }
 
     /// Lower a function definition
@@ -1052,6 +1150,84 @@ pub const Lowerer = struct {
         self.current_block = func.entry;
 
         // Clear variables for new function scope
+        self.scopes.reset();
+
+        // Add parameters as local variables
+        for (func_type.params) |param| {
+            const ty_ptr = try self.allocator.create(ir.Type);
+            ty_ptr.* = param.ty;
+            try self.allocated_types.append(self.allocator, ty_ptr);
+
+            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+            try self.emit(.{
+                .alloca = .{
+                    .ty = param.ty,
+                    .name = param.name,
+                    .result = alloca_result,
+                },
+            });
+            try self.scopes.put(param.name, alloca_result);
+        }
+
+        // Lower function body
+        try self.lowerStatement(body_idx);
+
+        // Add implicit return if not terminated
+        if (!self.current_block.?.isTerminated()) {
+            try self.emit(.{ .return_ = null });
+        }
+
+        try self.module.addFunction(func);
+    }
+
+    /// Lower an impl method with a qualified name (TypeName.method_name)
+    fn lowerImplMethod(self: *Self, stmt_idx: StmtIdx, qualified_name: []const u8) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+
+        debug.print(.ir, "Lowering impl method: {s}", .{qualified_name});
+
+        // Parse extra data: [param_count, param1_name, param1_type, ..., return_type, body]
+        const extra_start = data.getParamsStart();
+        const param_count = self.store.getExtra(extra_start);
+
+        var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
+        defer params.deinit(self.allocator);
+
+        var extra_idx = extra_start.toInt() + 1;
+        for (0..param_count) |_| {
+            const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+            const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+            const param_direction_raw: u32 = self.store.extra_data.items[extra_idx + 2];
+            extra_idx += 4; // 4 values per param: name, type, is_ref, default_value
+
+            const param_name = self.strings.get(param_name_id);
+            if (param_name.len == 0) continue;
+            const param_type = try self.lowerTypeIdx(param_type_idx);
+            const is_ref = param_direction_raw != 0;
+
+            try params.append(self.allocator, .{
+                .name = param_name,
+                .ty = param_type,
+                .is_ref = is_ref,
+            });
+        }
+
+        const return_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx]);
+        const body_idx: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+
+        const return_type = try self.lowerTypeIdx(return_type_idx);
+
+        // Create function type with qualified name
+        const func_type = ir.FunctionType{
+            .params = try params.toOwnedSlice(self.allocator),
+            .return_type = return_type,
+            .is_variadic = false,
+        };
+
+        const func = try ir.Function.init(self.allocator, qualified_name, func_type);
+
+        self.current_func = func;
+        self.current_block = func.entry;
         self.scopes.reset();
 
         // Add parameters as local variables

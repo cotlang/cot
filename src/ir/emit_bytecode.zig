@@ -213,6 +213,11 @@ pub const BytecodeEmitter = struct {
     // Used by emitStore to emit str_slice_store for field overlay write-through
     field_view_info: std.AutoHashMap(u32, FieldViewInfo),
 
+    // Array pointer target tracking
+    // When we store an array value into a pointer variable, record the array slot
+    // so that array_load can use the correct slot when accessing through the pointer
+    array_ptr_targets: std.AutoHashMap(u32, u16), // value_id -> array_slot
+
     // Current routine being emitted
     current_routine_start: u32,
 
@@ -237,6 +242,9 @@ pub const BytecodeEmitter = struct {
     spilled_values: std.AutoHashMap(u32, u16), // value_id -> spill_slot
     max_spill_slots_used: u16 = 0, // Track maximum for local_count
 
+    // Track allocated strings that need to be freed (e.g., qualified field names)
+    allocated_strings: std.ArrayListUnmanaged([]const u8) = .{},
+
     const Self = @This();
 
     /// Initialize the bytecode emitter (register-based)
@@ -259,6 +267,7 @@ pub const BytecodeEmitter = struct {
             .value_slots = std.AutoHashMap(u32, u16).init(allocator),
             .value_consts = std.AutoHashMap(u32, u16).init(allocator),
             .field_view_info = std.AutoHashMap(u32, FieldViewInfo).init(allocator),
+            .array_ptr_targets = std.AutoHashMap(u32, u16).init(allocator),
             .current_routine_start = 0,
             .current_func = null,
             .ir_module = null,
@@ -282,8 +291,14 @@ pub const BytecodeEmitter = struct {
         self.value_slots.deinit();
         self.value_consts.deinit();
         self.field_view_info.deinit();
+        self.array_ptr_targets.deinit();
         self.reg_alloc.deinit();
         self.spilled_values.deinit();
+        // Free allocated strings (qualified field names, etc.)
+        for (self.allocated_strings.items) |s| {
+            self.allocator.free(s);
+        }
+        self.allocated_strings.deinit(self.allocator);
     }
 
     /// Emit bytecode module from IR module
@@ -317,6 +332,8 @@ pub const BytecodeEmitter = struct {
                     "{s}.{s}",
                     .{ record.name, field.name },
                 ) catch return EmitError.OutOfMemory;
+                // Track allocated string for cleanup
+                self.allocated_strings.append(self.allocator, qualified_name) catch return EmitError.OutOfMemory;
 
                 try self.globals.put(qualified_name, .{
                     .slot = self.global_count,
@@ -365,6 +382,25 @@ pub const BytecodeEmitter = struct {
             }
         }
 
+        // Build vtables from IR module (duplicate strings so module owns them)
+        var vtables_list: std.ArrayListUnmanaged(module.VTableDef) = .{};
+        if (self.ir_module) |ir_mod| {
+            for (ir_mod.vtables.items) |ir_vtable| {
+                var methods_list: std.ArrayListUnmanaged(module.VTableMethod) = .{};
+                for (ir_vtable.methods) |ir_method| {
+                    try methods_list.append(self.allocator, .{
+                        .method_name = try self.allocator.dupe(u8, ir_method.method_name),
+                        .fn_name = try self.allocator.dupe(u8, ir_method.fn_name),
+                    });
+                }
+                try vtables_list.append(self.allocator, .{
+                    .trait_name = try self.allocator.dupe(u8, ir_vtable.trait_name),
+                    .type_name = try self.allocator.dupe(u8, ir_vtable.type_name),
+                    .methods = try methods_list.toOwnedSlice(self.allocator),
+                });
+            }
+        }
+
         var result = module.Module{
             .allocator = self.allocator,
             .header = module.ModuleHeader.init(),
@@ -374,6 +410,7 @@ pub const BytecodeEmitter = struct {
             .code = try self.code.toOwnedSlice(self.allocator),
             .exports = try exports_list.toOwnedSlice(self.allocator),
             .imports = &[_]module.ImportEntry{},
+            .vtables = try vtables_list.toOwnedSlice(self.allocator),
             .source_file = null,
             .line_table = null,
             .local_vars = null,
@@ -471,6 +508,8 @@ pub const BytecodeEmitter = struct {
                         "{s}.{s}",
                         .{ param.name, field.name },
                     ) catch return EmitError.OutOfMemory;
+                    // Track allocated string for cleanup
+                    self.allocated_strings.append(self.allocator, qualified_name) catch return EmitError.OutOfMemory;
                     try self.locals.put(qualified_name, .{
                         .slot = self.local_count,
                         .is_global = false,
@@ -493,12 +532,23 @@ pub const BytecodeEmitter = struct {
             for (block.instructions.items) |inst| {
                 if (inst == .alloca) {
                     const a = inst.alloca;
-                    if (!self.globals.contains(a.name) and !self.locals.contains(a.name)) {
-                        if (a.ty == .@"struct") {
+                    // For struct allocas, don't check globals - globals contains TYPE names,
+                    // but struct instances should still get local slots
+                    const is_struct = a.ty == .@"struct";
+                    const skip_global_check = is_struct;
+                    const in_globals = if (skip_global_check) false else self.globals.contains(a.name);
+                    debug.print(.emit, "Pre-pass alloca: name='{s}' ty={any} global={} local={} skip_global={}", .{ a.name, a.ty, in_globals, self.locals.contains(a.name), skip_global_check });
+                    if (!in_globals and !self.locals.contains(a.name)) {
+                        if (is_struct) {
                             // Struct type: count slots for each field
+                            debug.print(.emit, "  -> counted as {d} slots for struct fields", .{a.ty.@"struct".fields.len});
                             self.local_count += @intCast(a.ty.@"struct".fields.len);
+                        } else if (a.ty == .array) {
+                            // Array type: count slots for each element
+                            self.local_count += @intCast(a.ty.array.length);
                         } else {
                             // Primitive type: one slot
+                            debug.print(.emit, "  -> counted as 1 slot, local_count now={d}", .{self.local_count + 1});
                             self.local_count += 1;
                         }
                     }
@@ -507,6 +557,7 @@ pub const BytecodeEmitter = struct {
         }
         // Reset for actual emission (allocas will be processed again)
         const total_declared_locals = self.local_count;
+        debug.print(.emit, "Pre-pass done: total_declared_locals={d}, spill_slot_base will be {d}", .{ total_declared_locals, total_declared_locals });
         // Count actual parameter slots (struct params expand to multiple slots)
         var param_slot_count: u16 = 0;
         for (func.signature.params) |param| {
@@ -645,6 +696,7 @@ pub const BytecodeEmitter = struct {
 
             // Function calls
             .call => |c| try emit_inst.emitCall(self, c),
+            .call_indirect => |c| try emit_inst.emitCallIndirect(self, c),
 
             // I/O operations
             .io_open => |o| try emit_inst.emitIoOpen(self, o),
@@ -669,6 +721,7 @@ pub const BytecodeEmitter = struct {
             // Array operations
             .array_load => |al| try emit_inst.emitArrayLoad(self, al),
             .array_store => |as| try emit_inst.emitArrayStore(self, as),
+            .array_len => |al| try emit_inst.emitArrayLen(self, al),
 
             // Switch/branch table
             .br_table => |s| try emit_inst.emitBrTable(self, s),
@@ -687,6 +740,7 @@ pub const BytecodeEmitter = struct {
             .map_clear => |mc| try emit_inst.emitMapClear(self, mc),
             .map_keys => |mk| try emit_inst.emitMapKeys(self, mk),
             .map_values => |mv| try emit_inst.emitMapValues(self, mv),
+            .map_key_at => |mk| try emit_inst.emitMapKeyAt(self, mk),
 
             // Weak reference operations
             .weak_ref => |w| try emit_inst.emitWeakRef(self, w),
@@ -696,6 +750,13 @@ pub const BytecodeEmitter = struct {
             .arc_retain => |a| try emit_inst.emitArcRetain(self, a),
             .arc_release => |a| try emit_inst.emitArcRelease(self, a),
             .arc_move => |a| try emit_inst.emitArcMove(self, a),
+
+            // Closure operations
+            .make_closure => |c| try emit_inst.emitMakeClosure(self, c),
+
+            // Trait object operations
+            .make_trait_object => |m| try emit_inst.emitMakeTraitObject(self, m),
+            .call_trait_method => |c| try emit_inst.emitCallTraitMethod(self, c),
 
             else => {
                 // Other instructions not yet implemented
@@ -906,6 +967,7 @@ pub const BytecodeEmitter = struct {
 
     /// Emit register load local: load_local dest, slot
     pub fn emitRegLoadLocal(self: *Self, dest: u4, slot: u8) EmitError!void {
+        debug.print(.emit, "emitRegLoadLocal: dest=r{d} slot={d} op_byte=0x{x:0>2}", .{ dest, slot, @as(u8, dest) << 4 });
         try self.emitOpcode(.load_local);
         try self.emitU8(@as(u8, dest) << 4);
         try self.emitU8(slot);
@@ -1037,15 +1099,19 @@ pub const BytecodeEmitter = struct {
     /// Get or allocate a register for a value, or load it into a temp register if it's a constant/slot
     /// This version prefers using existing registers or loading on demand without permanent allocation
     pub fn getValueInReg(self: *Self, value: ir.Value, temp_reg: u4) EmitError!u4 {
+        debug.print(.emit, "getValueInReg: value.id={d} temp_reg={d}", .{ value.id, temp_reg });
+
         // Check if this is the last computed result (SSA chaining)
         if (self.last_result_value) |last_id| {
             if (last_id == value.id) {
+                debug.print(.emit, "  -> last_result path: returning r{d}", .{self.last_result_reg});
                 return self.last_result_reg;
             }
         }
 
         // If value is already in a register, use that
         if (self.reg_alloc.getRegister(value.id)) |src| {
+            debug.print(.emit, "  -> reg_alloc path: returning r{d}", .{src});
             return src;
         }
 
@@ -1082,6 +1148,7 @@ pub const BytecodeEmitter = struct {
 
         // Check if value is a constant - load into temp register
         if (self.value_consts.get(value.id)) |const_idx| {
+            debug.print(.emit, "  -> const path: const_idx={d} -> r{d}", .{ const_idx, temp_reg });
             try self.emitRegLoadConst(temp_reg, const_idx);
             return temp_reg;
         }
@@ -1091,10 +1158,12 @@ pub const BytecodeEmitter = struct {
             if (slot_info & 0x8000 != 0) {
                 // Global variable
                 const slot = slot_info & 0x7FFF;
+                debug.print(.emit, "  -> slot path (global): slot={d} -> r{d}", .{ slot, temp_reg });
                 try self.emitRegLoadGlobal(temp_reg, slot);
             } else {
                 // Local variable
                 if (slot_info < 256) {
+                    debug.print(.emit, "  -> slot path (local): slot={d} -> r{d}", .{ slot_info, temp_reg });
                     try self.emitRegLoadLocal(temp_reg, @intCast(slot_info));
                 } else {
                     return EmitError.TooManyLocals;
@@ -1346,6 +1415,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .function => .int64, // Function pointers
         .map => .int64, // Map handles are pointer-sized
         .weak => .int64, // Weak references are pointer-sized
+        .trait_object => .int64, // Trait objects are pointer-sized (vtable + data)
     };
 }
 

@@ -11,3 +11,5 @@ zig-out/
 /cot
 /cot-lsp
 *.cbo
+/tests
+/examples

@@ -254,6 +254,19 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             },
             else => .incompatible, // Must explicitly create weak reference
         },
+        .trait_object => |target_trait| switch (value_deref) {
+            // Struct can be coerced to trait object if it implements the trait
+            // The actual trait implementation check is done during lowering
+            .@"struct" => .implicit_conversion,
+            // Same trait object is compatible
+            .trait_object => |value_trait| blk: {
+                if (std.mem.eql(u8, target_trait.trait_name, value_trait.trait_name)) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            else => .incompatible,
+        },
     };
 }
 
@@ -429,6 +442,7 @@ pub fn typeName(ty: Type) []const u8 {
         .function => "function",
         .map => "Map",
         .weak => "weak",
+        .trait_object => "trait_object",
     };
 }
 
@@ -478,6 +492,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
             writer.writeAll("weak ") catch {};
             writer.writeAll(inner) catch {};
         },
+        .trait_object => |t| writer.print("dyn {s}", .{t.trait_name}) catch {},
     }
 
     return fbs.getWritten();

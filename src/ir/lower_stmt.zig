@@ -36,6 +36,7 @@ const ExprIdx = ast.ExprIdx;
 const TypeIdx = ast.TypeIdx;
 const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
+const ForStmtView = ast.ForStmtView;
 
 // Struct serialization helpers
 const StructHelper = struct_serial.StructHelper;
@@ -486,21 +487,25 @@ pub fn lowerWhile(l: *Lowerer, data: NodeData) LowerError!void {
 }
 
 /// Lower a for loop
-pub fn lowerFor(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
+pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
+    log.debug("lowerFor: entering", .{});
+
     const func = l.current_func orelse return LowerError.OutOfMemory;
 
-    const binding_id = data.getBinding();
-    const iterable_idx = data.getIterable();
+    // Use ForStmtView to correctly extract packed data
+    const for_view = ForStmtView.from(l.store, idx);
+    const binding_id = for_view.binding;
+    const iterable_idx = for_view.iterable;
+    const body_idx = for_view.body;
 
-    // Get body from extra_data
-    const extra_idx_raw = data.b & 0xFFFF;
-    const body_idx: StmtIdx = @enumFromInt(l.store.extra_data.items[extra_idx_raw]);
+    log.debug("lowerFor: iterable_idx = {d}, body_idx = {d}", .{ @intFromEnum(iterable_idx), @intFromEnum(body_idx) });
 
     const binding_name = l.strings.get(binding_id);
     if (binding_name.len == 0) return LowerError.UndefinedVariable;
 
-    // For now, treat for loops as simple iteration over a range
-    // Create loop variable
+    // Create loop index variable with internal name
+    // For range iteration, we'll copy this to binding_name
+    // For collection iteration, binding_name will be the element
     const ty_ptr = try l.allocator.create(ir.Type);
     ty_ptr.* = .i64;
     try l.allocated_types.append(l.allocator, ty_ptr);
@@ -509,11 +514,11 @@ pub fn lowerFor(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
     try l.emit(.{
         .alloca = .{
             .ty = .i64,
-            .name = binding_name,
+            .name = "_iter_idx", // Internal name to avoid conflict with binding_name
             .result = loop_var,
         },
     });
-    try l.scopes.put(binding_name, loop_var);
+    // Don't bind to scope yet - for range iteration, we'll update the scope below
 
     // Create blocks
     const cond_block = try func.createBlock("for.cond");
@@ -541,13 +546,18 @@ pub fn lowerFor(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
             start_val = try lower_expr.lowerExpression(l, bin_data.getLhs());
             end_val = try lower_expr.lowerExpression(l, bin_data.getRhs());
         } else {
-            // Not a range expression - treat as iterable collection (not yet supported)
-            return LowerError.UnsupportedFeature;
+            // Not a range expression - try as iterable collection
+            const iterable_val = try lower_expr.lowerExpression(l, iterable_idx);
+            return lowerCollectionIteration(l, func, binding_name, iterable_val, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
         }
     } else {
         // Not a binary expression - could be a variable holding a collection
-        return LowerError.UnsupportedFeature;
+        const iterable_val = try lower_expr.lowerExpression(l, iterable_idx);
+        return lowerCollectionIteration(l, func, binding_name, iterable_val, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
     }
+
+    // For range iteration, the loop variable IS the user-visible binding
+    try l.scopes.put(binding_name, loop_var);
 
     // Initialize loop variable to range start
     try l.emit(.{ .store = .{ .ptr = loop_var, .value = start_val } });
@@ -577,6 +587,272 @@ pub fn lowerFor(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
     try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = one } });
     const incremented = func.newValue(.i64);
     try l.emit(.{ .iadd = .{ .lhs = loaded_val, .rhs = one, .result = incremented } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented } });
+    try l.emit(.{ .jump = .{ .target = cond_block } });
+
+    // Restore loop context
+    l.loop_exit_block = prev_exit;
+    l.loop_continue_block = prev_continue;
+
+    // Continue at exit block
+    l.current_block = exit_block;
+}
+
+/// Lower collection iteration (arrays, maps)
+/// Called when for-in iterable is not a range expression
+fn lowerCollectionIteration(
+    l: *Lowerer,
+    func: *ir.Function,
+    binding_name: []const u8,
+    iterable_val: ir.Value,
+    body_idx: StmtIdx,
+    cond_block: *ir.Block,
+    body_block: *ir.Block,
+    incr_block: *ir.Block,
+    exit_block: *ir.Block,
+    loop_var: ir.Value,
+    prev_exit: ?*ir.Block,
+    prev_continue: ?*ir.Block,
+) LowerError!void {
+    // Check the type of the iterable to determine how to iterate
+    const iterable_type = iterable_val.ty;
+
+    log.debug("lowerCollectionIteration: iterable_type tag = {s}", .{@tagName(iterable_type)});
+
+    // Handle pointer to array (common case from array literals)
+    var element_type: ir.Type = undefined;
+    var array_val = iterable_val;
+
+    switch (iterable_type) {
+        .ptr => |ptr_type| {
+            log.debug("lowerCollectionIteration: ptr_type.* tag = {s}", .{@tagName(ptr_type.*)});
+            switch (ptr_type.*) {
+                .array => |arr| {
+                    log.debug("lowerCollectionIteration: ptr to array, element type = {s}", .{@tagName(arr.element.*)});
+                    element_type = arr.element.*;
+                    array_val = iterable_val;
+                },
+                else => return LowerError.UnsupportedFeature,
+            }
+        },
+        .array => |arr| {
+            element_type = arr.element.*;
+            array_val = iterable_val;
+        },
+        .slice => |elem_ptr| {
+            element_type = elem_ptr.*;
+            array_val = iterable_val;
+        },
+        .map => {
+            // Map iteration - iterate over keys
+            return lowerMapIteration(l, func, binding_name, iterable_val, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
+        },
+        else => return LowerError.UnsupportedFeature,
+    }
+
+    // Array iteration: use array_len and array_load
+
+    // Get array length and store it in a variable so it persists across blocks
+    const ty_ptr = try l.allocator.create(ir.Type);
+    ty_ptr.* = .i64;
+    try l.allocated_types.append(l.allocator, ty_ptr);
+    const len_var = func.newValue(.{ .ptr = ty_ptr });
+    try l.emit(.{
+        .alloca = .{
+            .ty = .i64,
+            .name = "_array_len",
+            .result = len_var,
+        },
+    });
+    const len_val = func.newValue(.i64);
+    try l.emit(.{ .array_len = .{ .operand = array_val, .result = len_val } });
+    try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val } });
+
+    // Initialize index counter to 0
+    const zero = func.newValue(.i64);
+    try l.emit(.{ .iconst = .{ .ty = .i64, .value = 0, .result = zero } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = zero } });
+    try l.emit(.{ .jump = .{ .target = cond_block } });
+
+    // Condition block: check index < length
+    l.current_block = cond_block;
+    const current_idx = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = current_idx } });
+    const loaded_len = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = len_var, .result = loaded_len } });
+    const cond_result = func.newValue(.bool);
+    try l.emit(.{ .icmp = .{ .cond = .slt, .lhs = current_idx, .rhs = loaded_len, .result = cond_result } });
+    try l.emit(.{ .brif = .{ .condition = cond_result, .then_block = body_block, .else_block = exit_block } });
+
+    // Body block: load element at current index
+    l.current_block = body_block;
+
+    // Load current index for array access
+    const body_idx_val = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = body_idx_val } });
+
+    // Load element from array
+    const element_val = func.newValue(element_type);
+    try l.emit(.{ .array_load = .{ .array_ptr = array_val, .index = body_idx_val, .result = element_val } });
+
+    // Create element variable for loop body and bind the loaded value
+    // We need to create an alloca for the element and store into it
+    const elem_type_ptr = try l.allocator.create(ir.Type);
+    elem_type_ptr.* = element_type;
+    try l.allocated_types.append(l.allocator, elem_type_ptr);
+
+    const elem_var = func.newValue(.{ .ptr = elem_type_ptr });
+    try l.emit(.{
+        .alloca = .{
+            .ty = element_type,
+            .name = binding_name,
+            .result = elem_var,
+        },
+    });
+    try l.emit(.{ .store = .{ .ptr = elem_var, .value = element_val } });
+
+    // Temporarily shadow the loop counter variable with the element variable
+    // Save old binding and set new one
+    const old_binding = l.scopes.get(binding_name);
+    try l.scopes.put(binding_name, elem_var);
+
+    // Lower loop body
+    try l.lowerStatement(body_idx);
+
+    // Restore old binding if there was one
+    if (old_binding) |old_val| {
+        try l.scopes.put(binding_name, old_val);
+    } else {
+        _ = l.scopes.remove(binding_name);
+    }
+
+    if (!l.current_block.?.isTerminated()) {
+        try l.emit(.{ .jump = .{ .target = incr_block } });
+    }
+
+    // Increment block: index = index + 1
+    l.current_block = incr_block;
+    const loaded_idx = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = loaded_idx } });
+    const incr_one = func.newValue(.i64);
+    try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = incr_one } });
+    const incremented = func.newValue(.i64);
+    try l.emit(.{ .iadd = .{ .lhs = loaded_idx, .rhs = incr_one, .result = incremented } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented } });
+    try l.emit(.{ .jump = .{ .target = cond_block } });
+
+    // Restore loop context
+    l.loop_exit_block = prev_exit;
+    l.loop_continue_block = prev_continue;
+
+    // Continue at exit block
+    l.current_block = exit_block;
+}
+
+/// Lower map iteration (keys only for now)
+fn lowerMapIteration(
+    l: *Lowerer,
+    func: *ir.Function,
+    binding_name: []const u8,
+    map_val: ir.Value,
+    body_idx: StmtIdx,
+    cond_block: *ir.Block,
+    body_block: *ir.Block,
+    incr_block: *ir.Block,
+    exit_block: *ir.Block,
+    loop_var: ir.Value,
+    prev_exit: ?*ir.Block,
+    prev_continue: ?*ir.Block,
+) LowerError!void {
+    // Map keys are always strings in Cot
+    const key_type: ir.Type = .string;
+    const key_type_ptr = try l.allocator.create(ir.Type);
+    key_type_ptr.* = key_type;
+    try l.allocated_types.append(l.allocator, key_type_ptr);
+
+    // Allocate variable for map length so it persists across blocks
+    const len_ty_ptr = try l.allocator.create(ir.Type);
+    len_ty_ptr.* = .i64;
+    try l.allocated_types.append(l.allocator, len_ty_ptr);
+    const len_var = func.newValue(.{ .ptr = len_ty_ptr });
+    try l.emit(.{
+        .alloca = .{
+            .ty = .i64,
+            .name = "_map_len",
+            .result = len_var,
+        },
+    });
+
+    // Get map length directly using map_len and store it
+    const len_val = func.newValue(.i64);
+    try l.emit(.{ .map_len = .{ .map = map_val, .result = len_val } });
+    try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val } });
+
+    // Initialize index counter to 1 (map_key_at uses 1-based indexing)
+    const one = func.newValue(.i64);
+    try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = one } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = one } });
+    try l.emit(.{ .jump = .{ .target = cond_block } });
+
+    // Condition block: check index <= length (1-based)
+    l.current_block = cond_block;
+    const current_idx = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = current_idx } });
+    const loaded_len = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = len_var, .result = loaded_len } });
+    const cond_result = func.newValue(.bool);
+    // Use <= because 1-based: index 1..length inclusive
+    try l.emit(.{ .icmp = .{ .cond = .sle, .lhs = current_idx, .rhs = loaded_len, .result = cond_result } });
+    try l.emit(.{ .brif = .{ .condition = cond_result, .then_block = body_block, .else_block = exit_block } });
+
+    // Body block: get key at current index using map_key_at
+    l.current_block = body_block;
+
+    // Load current index for map_key_at access
+    const body_idx_val = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = body_idx_val } });
+
+    // Get key from map using map_key_at (1-based index)
+    const key_val = func.newValue(key_type);
+    try l.emit(.{ .map_key_at = .{ .map = map_val, .index = body_idx_val, .result = key_val } });
+
+    // Create key variable for loop body
+    const elem_var = func.newValue(.{ .ptr = key_type_ptr });
+    try l.emit(.{
+        .alloca = .{
+            .ty = key_type,
+            .name = binding_name,
+            .result = elem_var,
+        },
+    });
+    try l.emit(.{ .store = .{ .ptr = elem_var, .value = key_val } });
+
+    // Bind the key variable
+    const old_binding = l.scopes.get(binding_name);
+    try l.scopes.put(binding_name, elem_var);
+
+    // Lower loop body
+    try l.lowerStatement(body_idx);
+
+    // Restore old binding
+    if (old_binding) |old_val| {
+        try l.scopes.put(binding_name, old_val);
+    } else {
+        _ = l.scopes.remove(binding_name);
+    }
+
+    if (!l.current_block.?.isTerminated()) {
+        try l.emit(.{ .jump = .{ .target = incr_block } });
+    }
+
+    // Increment block: index = index + 1
+    l.current_block = incr_block;
+    const loaded_idx = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = loop_var, .result = loaded_idx } });
+    const incr_one = func.newValue(.i64);
+    try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = incr_one } });
+    const incremented = func.newValue(.i64);
+    try l.emit(.{ .iadd = .{ .lhs = loaded_idx, .rhs = incr_one, .result = incremented } });
     try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
@@ -700,13 +976,59 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
 
     // Store init value if present
     if (init_val) |val| {
-        try l.emit(.{
-            .store = .{
-                .ptr = alloca_result,
-                .value = val,
-            },
-        });
+        // Check if target type is a trait object - need to emit make_trait_object
+        if (var_type == .trait_object) {
+            const trait_name = var_type.trait_object.trait_name;
+
+            // Get the concrete type name from the value's type
+            const type_name = getTypeName(val.ty) orelse {
+                debug.print(.ir, "Error: cannot create trait object from non-struct type", .{});
+                return LowerError.TypeMismatch;
+            };
+
+            // Verify the type implements the trait
+            if (!l.implementsTrait(type_name, trait_name)) {
+                debug.print(.ir, "Error: type '{s}' does not implement trait '{s}'", .{ type_name, trait_name });
+                return LowerError.TypeMismatch;
+            }
+
+            // Emit make_trait_object instruction
+            const trait_obj_val = func.newValue(var_type);
+            try l.emit(.{
+                .make_trait_object = .{
+                    .value = val,
+                    .trait_name = trait_name,
+                    .type_name = type_name,
+                    .result = trait_obj_val,
+                    .loc = null,
+                },
+            });
+
+            // Store the trait object instead
+            try l.emit(.{
+                .store = .{
+                    .ptr = alloca_result,
+                    .value = trait_obj_val,
+                },
+            });
+        } else {
+            try l.emit(.{
+                .store = .{
+                    .ptr = alloca_result,
+                    .value = val,
+                },
+            });
+        }
     }
+}
+
+/// Get the type name from an IR type (for struct types)
+fn getTypeName(ty: ir.Type) ?[]const u8 {
+    return switch (ty) {
+        .@"struct" => |s| s.name,
+        .ptr => |p| getTypeName(p.*),
+        else => null,
+    };
 }
 
 /// Lower a field view (overlay) declaration

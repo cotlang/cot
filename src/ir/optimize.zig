@@ -672,6 +672,14 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .map_values => |m| {
             used.put(m.map.id, {}) catch {};
         },
+        .map_key_at => |m| {
+            used.put(m.map.id, {}) catch {};
+            used.put(m.index.id, {}) catch {};
+        },
+        // Closure operations
+        .make_closure => |c| {
+            used.put(c.env.id, {}) catch {};
+        },
         .select => |s| {
             used.put(s.condition.id, {}) catch {};
             used.put(s.true_val.id, {}) catch {};
@@ -690,6 +698,16 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         },
         .arc_move => |op| {
             used.put(op.operand.id, {}) catch {};
+        },
+        // Trait object operations
+        .make_trait_object => |m| {
+            used.put(m.value.id, {}) catch {};
+        },
+        .call_trait_method => |c| {
+            used.put(c.trait_object.id, {}) catch {};
+            for (c.args) |arg| {
+                used.put(arg.id, {}) catch {};
+            }
         },
     }
 }
@@ -1611,6 +1629,7 @@ fn instructionUsesValue(inst: ir.Instruction, value_id: u32) bool {
         .map_clear => |op| op.map.id == value_id,
         .map_keys => |op| op.map.id == value_id,
         .map_values => |op| op.map.id == value_id,
+        .map_key_at => |op| op.map.id == value_id or op.index.id == value_id,
         else => false,
     };
 }

@@ -439,16 +439,16 @@ pub const Opcode = enum(u8) {
     // Array Operations (0xB0-0xBF)
     // ============================================
 
-    /// array_load rd, arr_reg, idx_reg - rd = arr[idx]
-    /// Format: [rd:4|arr_reg:4] [idx_reg:4|0]
+    /// array_load idx_reg, slot - load arr[idx] into r0
+    /// Format: [idx_reg:8] [slot:16]
     array_load = 0xB0,
 
-    /// array_store arr_reg, idx_reg, val_reg - arr[idx] = val
-    /// Format: [arr_reg:4|idx_reg:4] [val_reg:4|0]
+    /// array_store idx_reg, val_reg, slot - arr[idx] = val
+    /// Format: [idx_reg:4|val_reg:4] [slot:16]
     array_store = 0xB1,
 
-    /// array_len rd, arr_reg - rd = len(arr)
-    /// Format: [rd:4|arr_reg:4] [0]
+    /// array_len rd, slot - rd = len(arr) (compile-time constant for fixed arrays)
+    /// Format: [rd:8] [slot:16]
     array_len = 0xB2,
 
     // ============================================
@@ -577,6 +577,10 @@ pub const Opcode = enum(u8) {
     /// Format: [map:4|idx:4] [val:4|0]
     map_set_at = 0xDF,
 
+    /// map_key_at rd, map_reg, idx_reg - rd = key at position (1-based)
+    /// Format: [rd:4|map:4] [idx:4|0]
+    map_key_at = 0xFC,
+
     // ============================================
     // Debug & Meta (0xF0-0xFF)
     // ============================================
@@ -624,6 +628,34 @@ pub const Opcode = enum(u8) {
     /// Used for last-use optimization.
     /// Format: [rd:4|rs:4] [0]
     arc_move = 0xF7,
+
+    // ============================================
+    // Closure Operations (0xF8-0xF9)
+    // ============================================
+
+    /// make_closure rd, env_reg, fn_idx - create closure from function and environment
+    /// Creates a closure value containing the function index and captured environment.
+    /// Format: [rd:4|env_reg:4] [fn_idx:16]
+    make_closure = 0xF8,
+
+    /// call_closure rd, closure_reg, argc - call a closure
+    /// Extracts function and env from closure, calls with env as first arg.
+    /// Format: [rd:4|closure_reg:4] [argc:8]
+    call_closure = 0xF9,
+
+    // ============================================
+    // Trait Object Operations (0xFA-0xFB)
+    // ============================================
+
+    /// make_trait_object rd, src_reg, vtable_idx - create trait object from value
+    /// Creates a fat pointer containing the value and vtable reference.
+    /// Format: [rd:4|src_reg:4] [vtable_idx:16]
+    make_trait_object = 0xFA,
+
+    /// call_trait_method rd, obj_reg, method_idx, argc - call method on trait object
+    /// Looks up method in vtable and calls with data as first arg.
+    /// Format: [rd:4|obj_reg:4] [method_idx:8] [argc:8]
+    call_trait_method = 0xFB,
 
     /// extended sub_opcode - extended opcode prefix
     /// Format: [sub_opcode:8] [...]
@@ -693,6 +725,12 @@ pub const Opcode = enum(u8) {
             // ARC operations
             .arc_retain, .arc_release => 2,
             .arc_move => 2,
+            // Closure operations
+            .make_closure => 4, // [rd:4|env_reg:4] [fn_idx:16]
+            .call_closure => 3, // [rd:4|closure_reg:4] [argc:8]
+            // Trait object operations
+            .make_trait_object => 4, // [rd:4|src_reg:4] [vtable_idx:16]
+            .call_trait_method => 4, // [rd:4|obj_reg:4] [method_idx:8] [argc:8]
             // Quickened integer-specialized opcodes
             .add_int, .sub_int, .mul_int, .div_int => 2,
             .cmp_lt_int, .cmp_le_int, .cmp_gt_int, .cmp_ge_int => 2,
@@ -710,7 +748,7 @@ pub const Opcode = enum(u8) {
             .str_slice_store, .str_trim, .str_upper, .str_lower => 2,
             .str_find, .str_replace, .str_setchar => 2,
             .to_int, .to_str, .to_bool, .to_dec, .to_char, .format_decimal, .parse_decimal => 2,
-            .array_load, .array_store, .array_len => 2,
+            .array_load, .array_store, .array_len => 3, // [idx_reg/regs:8] [slot:16]
             .fn_abs, .fn_sqrt, .fn_sin, .fn_cos, .fn_tan => 2,
             .fn_log, .fn_log10, .fn_exp, .fn_round, .fn_trunc => 2,
             .fn_date, .fn_time, .fn_size, .fn_instr, .fn_mem, .fn_error => 2,
@@ -723,7 +761,7 @@ pub const Opcode = enum(u8) {
             .map_new, .map_set, .map_get, .map_delete => 2,
             .map_has, .map_len, .map_clear => 2,
             .map_keys, .map_values => 2,
-            .map_get_at, .map_set_at => 2,
+            .map_get_at, .map_set_at, .map_key_at => 2,
 
             // 3-byte operands: [reg:4|0] [u16]
             .movi16, .load_const => 3,

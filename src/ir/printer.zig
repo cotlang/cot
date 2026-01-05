@@ -503,6 +503,20 @@ pub const Printer = struct {
                 try self.writer.writeAll(" = map_values ");
                 try self.printValue(m.map);
             },
+            .map_key_at => |m| {
+                try self.printValue(m.result);
+                try self.writer.writeAll(" = map_key_at ");
+                try self.printValue(m.map);
+                try self.writer.writeAll(", ");
+                try self.printValue(m.index);
+            },
+
+            // Closure operations
+            .make_closure => |c| {
+                try self.printValue(c.result);
+                try self.writer.print(" = make_closure \"{s}\", ", .{c.func_name});
+                try self.printValue(c.env);
+            },
 
             // Conditional selection
             .select => |s| {
@@ -537,6 +551,25 @@ pub const Printer = struct {
                 try self.printValue(op.value);
             },
             .arc_move => |op| try self.printUnaryOp("arc_move", op),
+
+            // Trait object operations
+            .make_trait_object => |m| {
+                try self.printValue(m.result);
+                try self.writer.print(" = make_trait_object \"{s}\" from ", .{m.trait_name});
+                try self.printValue(m.value);
+                try self.writer.print(" ({s})", .{m.type_name});
+            },
+            .call_trait_method => |c| {
+                try self.printValue(c.result);
+                try self.writer.print(" = call_trait_method \"{s}\" on ", .{c.method_name});
+                try self.printValue(c.trait_object);
+                try self.writer.writeAll(" (");
+                for (c.args, 0..) |arg, i| {
+                    if (i > 0) try self.writer.writeAll(", ");
+                    try self.printValue(arg);
+                }
+                try self.writer.writeAll(")");
+            },
         }
     }
 
@@ -630,6 +663,7 @@ pub const Printer = struct {
                 try self.writer.writeAll("weak ");
                 try self.printType(inner.*);
             },
+            .trait_object => |t| try self.writer.print("dyn {s}", .{t.trait_name}),
         }
     }
 

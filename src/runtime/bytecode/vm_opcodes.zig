@@ -13,6 +13,8 @@ const DispatchResult = vm_types.DispatchResult;
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const OrderedMap = value_mod.OrderedMap;
+const Closure = value_mod.Closure;
+const TraitObject = value_mod.TraitObject;
 const arc = @import("arc.zig");
 
 // Forward declaration - VM is imported at comptime to avoid circular import
@@ -136,7 +138,8 @@ pub fn op_load_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const slot = module.code[vm.ip + 1];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.writeRegister(rd, vm.stack[vm.fp + slot]);
+    const val = vm.stack[vm.fp + slot];
+    vm.writeRegister(rd, val);
     return .continue_dispatch;
 }
 
@@ -1306,6 +1309,232 @@ pub fn op_arc_move(vm: *VM, module: *const Module) VMError!DispatchResult {
 }
 
 // ============================================================================
+// Closure Operations (0xF8-0xF9)
+// ============================================================================
+
+/// make_closure rd, env_reg, fn_idx - create closure from function and environment
+/// Creates a Closure object containing the routine index and captured environment.
+pub fn op_make_closure(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const fn_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3; // 1 operand byte + 2 fn_idx bytes (opcode already consumed by dispatcher)
+
+    const rd: u4 = @truncate(ops >> 4);
+    const env_reg: u4 = @truncate(ops & 0xF);
+
+    // Get the environment map
+    const env_value = vm.registers[env_reg];
+    const env_map: ?*OrderedMap = if (env_value.isMap()) env_value.getMap() else null;
+
+    // Allocate and initialize closure with ARC header
+    const closure = arc.create(vm.allocator, Closure) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate closure");
+    };
+    closure.* = .{
+        .routine_idx = fn_idx,
+        .module_idx = vm.current_module_index orelse 0,
+        .env = env_map,
+    };
+
+    // Create closure value and retain the env map
+    const closure_val = Value.initClosure(closure);
+    if (env_map != null) {
+        arc.retain(env_value);
+    }
+
+    vm.writeRegister(rd, closure_val);
+    return .continue_dispatch;
+}
+
+/// call_closure rd, closure_reg, argc - call a closure
+/// Extracts function and env from closure, calls function with env as implicit first arg.
+pub fn op_call_closure(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const argc = module.code[vm.ip + 1];
+    vm.ip += 2; // 1 operand byte + 1 argc byte (opcode already consumed by dispatcher)
+
+    const rd: u4 = @truncate(ops >> 4);
+    const closure_reg: u4 = @truncate(ops & 0xF);
+    _ = rd; // Result register (for future use)
+
+    // Get the closure
+    const closure_val = vm.registers[closure_reg];
+    const closure = closure_val.getClosure() orelse {
+        return vm.fail(VMError.InvalidType, "Expected closure value");
+    };
+
+    // Get the routine from the closure
+    const routine_idx = closure.routine_idx;
+    if (routine_idx >= module.routines.len) {
+        return vm.fail(VMError.InvalidRoutine, "Closure routine index out of bounds");
+    }
+
+    // Push call frame
+    vm.call_stack.append(.{
+        .module = module,
+        .routine_index = routine_idx,
+        .return_ip = vm.ip,
+        .base_pointer = vm.fp,
+        .stack_pointer = vm.sp,
+        .caller_module_index = vm.current_module_index,
+    }) catch return vm.fail(VMError.StackOverflow, "Call stack overflow");
+
+    // Set up stack frame
+    const routine = module.routines[routine_idx];
+    vm.fp = vm.sp;
+
+    // Only push env if there is one
+    const has_env = closure.env != null;
+    if (has_env) {
+        // First local is the closure environment
+        vm.stack[vm.sp] = Value.initMap(closure.env.?);
+        vm.sp += 1;
+    }
+
+    // Copy regular arguments (r0..r(argc-1))
+    for (0..argc) |i| {
+        vm.stack[vm.sp] = vm.registers[i];
+        vm.sp += 1;
+    }
+
+    // Reserve space for remaining locals
+    const actual_argc = if (has_env) argc + 1 else argc;
+    if (actual_argc < routine.local_count) {
+        for (actual_argc..routine.local_count) |_| {
+            vm.stack[vm.sp] = Value.null_val;
+            vm.sp += 1;
+        }
+    }
+
+    // Jump to routine
+    vm.ip = routine.code_offset;
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// Trait Object Operations (0xFA-0xFB)
+// ============================================================================
+
+/// make_trait_object rd, src_reg, vtable_idx - create trait object from value
+/// Creates a TraitObject containing the value and vtable reference.
+pub fn op_make_trait_object(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const vtable_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3; // 1 operand byte + 2 vtable_idx bytes (opcode already consumed by dispatcher)
+
+    const rd: u4 = @truncate(ops >> 4);
+    const src_reg: u4 = @truncate(ops & 0xF);
+
+    // Get the source value
+    const src_value = vm.registers[src_reg];
+
+    // Allocate and initialize trait object with ARC header
+    const trait_obj = arc.create(vm.allocator, TraitObject) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate trait object");
+    };
+    trait_obj.* = .{
+        .data = src_value,
+        .vtable_idx = vtable_idx,
+    };
+
+    // Create trait object value and retain the source value
+    const trait_obj_val = Value.initTraitObject(trait_obj);
+    arc.retain(src_value);
+
+    vm.writeRegister(rd, trait_obj_val);
+    return .continue_dispatch;
+}
+
+/// call_trait_method rd, obj_reg, method_idx, argc - call method on trait object
+/// Looks up method in vtable and calls with the data as self.
+pub fn op_call_trait_method(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const method_idx = module.code[vm.ip + 1];
+    const argc = module.code[vm.ip + 2];
+    vm.ip += 3; // 1 operand byte + 1 method_idx + 1 argc byte
+
+    const obj_reg: u4 = @truncate(ops & 0xF);
+
+    // Get the trait object
+    const obj_val = vm.registers[obj_reg];
+    const trait_obj = obj_val.asTraitObject() orelse {
+        return vm.fail(VMError.InvalidType, "Expected trait object value");
+    };
+
+    // Get the vtable from the module
+    if (trait_obj.vtable_idx >= module.vtables.len) {
+        return vm.fail(VMError.InvalidRoutine, "VTable index out of bounds");
+    }
+    const vtable = module.vtables[trait_obj.vtable_idx];
+
+    // Get the method function name from the vtable
+    if (method_idx >= vtable.methods.len) {
+        return vm.fail(VMError.InvalidRoutine, "Method index out of bounds");
+    }
+    const method = vtable.methods[method_idx];
+
+    // Find the routine by name
+    var routine_idx: ?usize = null;
+    for (module.routines, 0..) |routine, i| {
+        if (routine.name_index < module.constants.len) {
+            const name = switch (module.constants[routine.name_index]) {
+                .identifier => |s| s,
+                .string => |s| s,
+                else => continue,
+            };
+            if (std.mem.eql(u8, name, method.fn_name)) {
+                routine_idx = i;
+                break;
+            }
+        }
+    }
+
+    const found_idx = routine_idx orelse {
+        return vm.fail(VMError.InvalidRoutine, "Method not found in module");
+    };
+    const routine = module.routines[found_idx];
+
+    // Push self (the concrete data) as first argument
+    vm.stack[vm.sp] = trait_obj.data;
+    vm.sp += 1;
+
+    // Copy regular arguments (r0..r(argc-1))
+    for (0..argc) |i| {
+        vm.stack[vm.sp] = vm.registers[i];
+        vm.sp += 1;
+    }
+
+    // Calculate total arg count (self + passed args)
+    const total_argc: u32 = argc + 1;
+    const caller_sp = vm.sp - total_argc;
+
+    // Save call frame using the VM's call stack append method
+    vm.call_stack.append(.{
+        .module = module,
+        .routine_index = @intCast(found_idx),
+        .return_ip = vm.ip,
+        .base_pointer = vm.fp,
+        .stack_pointer = caller_sp,
+        .caller_module_index = vm.current_module_index,
+    }) catch return vm.fail(VMError.InvalidRoutine, "Call stack overflow");
+
+    // Set up new frame - fp points to first argument (self)
+    vm.fp = caller_sp;
+    vm.ip = routine.code_offset;
+
+    // Reserve space for additional local variables beyond the parameters
+    if (routine.local_count > total_argc) {
+        const extra_locals = routine.local_count - total_argc;
+        for (0..extra_locals) |i| {
+            vm.stack[vm.sp + i] = Value.initInt(0);
+        }
+        vm.sp += extra_locals;
+    }
+
+    return .continue_dispatch;
+}
+
+// ============================================================================
 // Quickened/Specialized Integer Handlers (0xE0-0xEB)
 // These skip type checking for performance when types are known
 // ============================================================================
@@ -1974,6 +2203,49 @@ pub fn op_map_set_at(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
+/// map_key_at rd, map, idx - get key at access code position as string
+/// Format: [rd:4|map:4] [idx:4|0]
+pub fn op_map_key_at(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops1 = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops1 >> 4);
+    const map_reg: u4 = @truncate(ops1 & 0xF);
+    const idx_reg: u4 = @truncate(ops2 >> 4);
+
+    const map_val = vm.registers[map_reg];
+    const map = map_val.asMap() orelse {
+        return vm.fail(VMError.InvalidType, "Expected map value");
+    };
+
+    const idx_val = vm.registers[idx_reg];
+    if (idx_val.tag() != .integer) {
+        return vm.fail(VMError.InvalidType, "Expected integer index");
+    }
+    const idx = idx_val.asInt();
+
+    if (idx <= 0) {
+        vm.writeRegister(rd, Value.null_val);
+        return .continue_dispatch;
+    }
+
+    const entry = map.getAt(@intCast(idx)); // getAt already expects 1-based
+    if (entry) |e| {
+        // Duplicate the key string and create a Value
+        const key_copy = vm.allocator.dupe(u8, e.key) catch {
+            return vm.fail(VMError.OutOfMemory, "Failed to allocate key string");
+        };
+        const key_val = Value.initFixedString(vm.valueAllocator(), key_copy) catch {
+            vm.allocator.free(key_copy);
+            return vm.fail(VMError.OutOfMemory, "Failed to create string value");
+        };
+        vm.writeRegister(rd, key_val);
+    } else {
+        vm.writeRegister(rd, Value.null_val);
+    }
+    return .continue_dispatch;
+}
+
 // ============================================================================
 // Math Functions (0xC0-0xCF)
 // ============================================================================
@@ -2062,6 +2334,106 @@ pub fn op_fn_trunc(vm: *VM, module: *const Module) VMError!DispatchResult {
     } else {
         vm.writeRegister(rd, Value.initInt(@intFromFloat(result)));
     }
+
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// Array Operations (0xB0-0xBF)
+// ============================================================================
+
+/// array_load rd, idx_reg - load from array at stack slot
+/// Format: [idx_reg:8] [slot:16]
+/// Result stored in r0
+pub fn op_array_load(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const idx_reg: u4 = @truncate(module.code[vm.ip]);
+    const slot_lo = module.code[vm.ip + 1];
+    const slot_hi = module.code[vm.ip + 2];
+    vm.ip += 3;
+
+    const slot: u16 = (@as(u16, slot_hi) << 8) | slot_lo;
+
+    // Get the index value from register
+    const idx_val = vm.registers[idx_reg];
+    if (idx_val.tag() != .integer) {
+        return vm.fail(VMError.InvalidType, "Array index must be integer");
+    }
+    const idx = idx_val.asInt();
+
+    if (idx < 0) {
+        return vm.fail(VMError.ArrayOutOfBounds, "Array index cannot be negative");
+    }
+
+    // The array base is at stack[fp + slot], each element at consecutive slots
+    const base_index = vm.fp + slot;
+    const elem_index = base_index + @as(usize, @intCast(idx));
+
+    if (elem_index >= vm.stack.len) {
+        return vm.fail(VMError.ArrayOutOfBounds, "Array index out of bounds");
+    }
+
+    // Load the element into r0
+    vm.writeRegister(0, vm.stack[elem_index]);
+
+    return .continue_dispatch;
+}
+
+/// array_store idx_reg, val_reg - store to array at stack slot
+/// Format: [idx_reg:4|val_reg:4] [slot:16]
+pub fn op_array_store(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const slot_lo = module.code[vm.ip + 1];
+    const slot_hi = module.code[vm.ip + 2];
+    vm.ip += 3;
+
+    const idx_reg: u4 = @truncate(ops >> 4);
+    const val_reg: u4 = @truncate(ops & 0xF);
+    const slot: u16 = (@as(u16, slot_hi) << 8) | slot_lo;
+
+    // Get the index value
+    const idx_val = vm.registers[idx_reg];
+    if (idx_val.tag() != .integer) {
+        return vm.fail(VMError.InvalidType, "Array index must be integer");
+    }
+    const idx = idx_val.asInt();
+
+    if (idx < 0) {
+        return vm.fail(VMError.ArrayOutOfBounds, "Array index cannot be negative");
+    }
+
+    // Get the value to store
+    const value = vm.registers[val_reg];
+
+    // Calculate array element position
+    const base_index = vm.fp + slot;
+    const elem_index = base_index + @as(usize, @intCast(idx));
+
+    if (elem_index >= vm.stack.len) {
+        return vm.fail(VMError.ArrayOutOfBounds, "Array index out of bounds");
+    }
+
+    // Store the value
+    vm.stack[elem_index] = value;
+
+    return .continue_dispatch;
+}
+
+/// array_len rd, slot - get length of array (stored in metadata)
+/// Format: [rd:8] [slot:16]
+/// Note: For now, array length is not tracked dynamically - this is a stub
+pub fn op_array_len(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const rd: u4 = @truncate(module.code[vm.ip]);
+    const slot_lo = module.code[vm.ip + 1];
+    const slot_hi = module.code[vm.ip + 2];
+    vm.ip += 3;
+
+    _ = slot_lo;
+    _ = slot_hi;
+
+    // TODO: Array length needs to be stored somewhere - for now return 0
+    // In a proper implementation, we'd store the length in a metadata slot
+    // or use a different array representation
+    vm.writeRegister(rd, Value.initInt(0));
 
     return .continue_dispatch;
 }

@@ -335,6 +335,14 @@ pub const Verifier = struct {
             .map_values => |op| {
                 try self.checkValueDefined(op.map);
             },
+            .map_key_at => |op| {
+                try self.checkValueDefined(op.map);
+                try self.checkValueDefined(op.index);
+            },
+            // Closure operations
+            .make_closure => |op| {
+                try self.checkValueDefined(op.env);
+            },
             .select => |op| {
                 try self.checkValueDefined(op.condition);
                 try self.checkValueDefined(op.true_val);
@@ -353,6 +361,16 @@ pub const Verifier = struct {
             },
             .arc_move => |op| {
                 try self.checkValueDefined(op.operand);
+            },
+            // Trait object operations
+            .make_trait_object => |op| {
+                try self.checkValueDefined(op.value);
+            },
+            .call_trait_method => |op| {
+                try self.checkValueDefined(op.trait_object);
+                for (op.args) |arg| {
+                    try self.checkValueDefined(arg);
+                }
             },
         }
     }
@@ -399,6 +417,7 @@ pub const Verifier = struct {
             .function => "function",
             .map => "Map",
             .weak => "weak",
+            .trait_object => "trait_object",
         };
     }
 

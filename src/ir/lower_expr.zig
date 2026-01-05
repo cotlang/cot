@@ -20,10 +20,17 @@ const cot_runtime = @import("cot_runtime");
 const debug = cot_runtime.debug;
 const native_types = @import("generated/native_types.zig");
 
+// Scoped logging
+const log = std.log.scoped(.@"ir-lower-expr");
+
 // Import Lowerer and types from main module
 const lower_mod = @import("lower.zig");
 const Lowerer = lower_mod.Lowerer;
 const LowerError = lower_mod.LowerError;
+
+// Closure support
+const closure = @import("closure.zig");
+const FreeVarCollector = closure.FreeVarCollector;
 
 // NodeStore types
 const NodeStore = ast.NodeStore;
@@ -100,6 +107,8 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const func = l.current_func orelse return LowerError.UnsupportedFeature;
     const tag = l.store.exprTag(expr_idx);
     const data = l.store.exprData(expr_idx);
+
+    log.debug("lowerExpression: tag = {s}", .{@tagName(tag)});
 
     switch (tag) {
         .int_literal => return lowerIntLiteral(l, func, data),
@@ -329,19 +338,47 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerErr
         return LowerError.UndefinedVariable;
     }
 
+    // Check if this is a captured variable from a closure
+    if (l.current_captures) |captures| {
+        if (captures.get(name)) |captured_value| {
+            // This variable is captured - load from closure environment
+            if (l.closure_env_value) |env_value| {
+                // Create a string constant for the variable name (map key)
+                const key_value = func.newValue(.string);
+                try l.emit(.{
+                    .const_string = .{
+                        .value = name,
+                        .result = key_value,
+                    },
+                });
+
+                // Emit map_get to load from the closure environment
+                const result = func.newValue(captured_value.ty);
+                try l.emit(.{
+                    .map_get = .{
+                        .map = env_value,
+                        .key = key_value,
+                        .result = result,
+                    },
+                });
+                return result;
+            }
+        }
+    }
+
     // Check local variables first (via scopes), then global variables
     const ptr = l.scopes.get(name) orelse
         l.global_variables.get(name) orelse blk: {
-            l.setErrorContext(
-                LowerError.UndefinedVariable,
-                "Undefined variable: '{s}'",
-                .{name},
-                .{ .line = 0, .column = 0 },
-                "lowering identifier expression",
-                .{},
-            );
-            break :blk null;
-        } orelse return LowerError.UndefinedVariable;
+        l.setErrorContext(
+            LowerError.UndefinedVariable,
+            "Undefined variable: '{s}'",
+            .{name},
+            .{ .line = 0, .column = 0 },
+            "lowering identifier expression",
+            .{},
+        );
+        break :blk null;
+    } orelse return LowerError.UndefinedVariable;
 
     // Get the underlying type (dereference pointer)
     const value_type = switch (ptr.ty) {
@@ -378,7 +415,8 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerErr
         return result;
     }
 
-    const result = func.newValue(ptr.ty);
+    // Load the value from the pointer - result has the dereferenced type (value_type)
+    const result = func.newValue(value_type);
     try l.emit(.{
         .load = .{
             .ptr = ptr,
@@ -1055,6 +1093,50 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             }
         }
 
+        // Check if this is a method call on a trait object - emit call_trait_method
+        if (object_val.ty == .trait_object) {
+            const trait_obj_type = object_val.ty.trait_object;
+            const trait_name = trait_obj_type.trait_name;
+
+            debug.print(.ir, "Trait object method call: {s}.{s}", .{ trait_name, field_name });
+
+            // Get method return type from trait definition
+            var return_type: ir.Type = .void;
+            if (l.trait_defs.get(trait_name)) |trait_def| {
+                for (trait_def.methods) |method| {
+                    if (std.mem.eql(u8, method.name, field_name)) {
+                        return_type = method.return_type;
+                        break;
+                    }
+                }
+            }
+
+            // Lower arguments
+            var trait_args: std.ArrayListUnmanaged(ir.Value) = .{};
+            defer trait_args.deinit(l.allocator);
+
+            for (0..args_count) |i| {
+                const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                const arg_val = try lowerExpression(l, arg_idx);
+                try trait_args.append(l.allocator, arg_val);
+            }
+
+            const args_slice = try trait_args.toOwnedSlice(l.allocator);
+            const method_name = l.allocator.dupe(u8, field_name) catch return LowerError.OutOfMemory;
+            const result = func.newValue(return_type);
+
+            try l.emit(.{
+                .call_trait_method = .{
+                    .trait_object = object_val,
+                    .method_name = method_name,
+                    .args = args_slice,
+                    .result = result,
+                },
+            });
+
+            return result;
+        }
+
         // Check if this is a method call on a user-defined struct type
         // This handles calls like: point.distance(other) where Point has an impl block
         debug.print(.ir, "Checking for struct method: field={s}, object_ty={any}", .{ field_name, object_val.ty });
@@ -1149,9 +1231,12 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
                 const args_slice = try method_args.toOwnedSlice(l.allocator);
 
-                // For now, use the method name directly (no mangling)
-                // TODO: Consider name mangling like "Point.distance" to avoid conflicts
-                const method_name = l.allocator.dupe(u8, field_name) catch {
+                // Use qualified method name: TypeName.method_name
+                var method_name_buf: [256]u8 = undefined;
+                const qualified_method_name = std.fmt.bufPrint(&method_name_buf, "{s}.{s}", .{ type_name, field_name }) catch {
+                    return LowerError.OutOfMemory;
+                };
+                const method_name = l.allocator.dupe(u8, qualified_method_name) catch {
                     return LowerError.OutOfMemory;
                 };
 
@@ -1174,11 +1259,13 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         }
     }
 
+    // Dupe the callee name so Block.deinit can consistently free it
     const callee_name = if (callee_tag == .identifier) blk: {
         const callee_data = l.store.exprData(callee_idx);
         const name_id = callee_data.getName();
-        break :blk l.strings.get(name_id);
-    } else "";
+        const name = l.strings.get(name_id);
+        break :blk l.allocator.dupe(u8, name) catch return LowerError.OutOfMemory;
+    } else l.allocator.dupe(u8, "") catch return LowerError.OutOfMemory;
 
     // Check if this is a database I/O call that needs structure serialization
     const is_db_write = std.mem.eql(u8, callee_name, "db_store") or std.mem.eql(u8, callee_name, "db_write");
@@ -1186,6 +1273,9 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // Lower arguments
     var args: std.ArrayListUnmanaged(ir.Value) = .{};
     defer args.deinit(l.allocator);
+
+    // Get expected parameter types for this function (if known)
+    const param_types = l.fn_param_types.get(callee_name);
 
     for (0..args_count) |i| {
         const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
@@ -1196,7 +1286,47 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             const arg_val = try l.lowerStructBufferOrExpression(arg_idx);
             try args.append(l.allocator, arg_val);
         } else {
-            const arg_val = try lowerExpression(l, arg_idx);
+            var arg_val = try lowerExpression(l, arg_idx);
+
+            // Check if we need to coerce struct to trait object
+            if (param_types) |types| {
+                if (i < types.len) {
+                    const expected_type = types[i];
+                    if (expected_type == .trait_object and arg_val.ty == .@"struct") {
+                        // Emit make_trait_object to coerce struct to trait object
+                        const trait_name = expected_type.trait_object.trait_name;
+                        const struct_type = arg_val.ty.@"struct";
+                        const type_name = struct_type.name;
+
+                        // Verify the struct implements the trait
+                        if (!l.implementsTrait(type_name, trait_name)) {
+                            const loc = l.store.exprLoc(arg_idx);
+                            l.setErrorContext(
+                                LowerError.TypeMismatch,
+                                "type '{s}' does not implement trait '{s}'",
+                                .{ type_name, trait_name },
+                                loc,
+                                "checking trait implementation",
+                                .{},
+                            );
+                            return LowerError.TypeMismatch;
+                        }
+
+                        // Emit make_trait_object instruction
+                        const result = func.newValue(expected_type);
+                        try l.emit(.{
+                            .make_trait_object = .{
+                                .value = arg_val,
+                                .trait_name = trait_name,
+                                .type_name = type_name,
+                                .result = result,
+                            },
+                        });
+                        arg_val = result;
+                    }
+                }
+            }
+
             try args.append(l.allocator, arg_val);
         }
     }
@@ -1235,6 +1365,35 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const args_slice = try args.toOwnedSlice(l.allocator);
     // NOTE: args_slice is freed by Block.deinit when the call instruction is cleaned up
 
+    // Check if callee is a local variable (could be a closure)
+    // If so, we need to emit call_indirect instead of call
+    if (callee_tag == .identifier and l.scopes.get(callee_name) != null) {
+        // Callee is a variable - lower it to get the value and use call_indirect
+        const callee_value = try lowerExpression(l, callee_idx);
+
+        // Create a dummy function type for the call_indirect
+        // In a more complete implementation, we'd infer the actual type
+        const dummy_sig = l.allocator.create(ir.FunctionType) catch return LowerError.OutOfMemory;
+        dummy_sig.* = .{
+            .params = &[_]ir.FunctionType.Param{},
+            .return_type = .void,
+            .is_variadic = false,
+        };
+
+        const result = func.newValue(.void);
+
+        try l.emit(.{
+            .call_indirect = .{
+                .sig = dummy_sig,
+                .callee = callee_value,
+                .args = args_slice,
+                .result = result,
+            },
+        });
+
+        return result;
+    }
+
     // Determine result type based on builtin function
     const result_type = getBuiltinReturnType(callee_name, args_slice);
     const result = func.newValue(result_type);
@@ -1262,7 +1421,8 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const method_id: StringId = @enumFromInt(l.store.extra_data.items[extra_start]);
     const args_count = l.store.extra_data.items[extra_start + 1];
 
-    const method_name = l.strings.get(method_id);
+    // Get method name from string interner (not duped yet - may not need it for map methods)
+    const method_name_borrowed = l.strings.get(method_id);
 
     // Get object value
     const object_val = try lowerExpression(l, object_idx);
@@ -1279,7 +1439,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         }
 
         // Dispatch to appropriate map operation
-        if (std.mem.eql(u8, method_name, "set") and method_args.items.len >= 2) {
+        if (std.mem.eql(u8, method_name_borrowed, "set") and method_args.items.len >= 2) {
             try l.emit(.{
                 .map_set = .{
                     .map = object_val,
@@ -1289,7 +1449,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 },
             });
             return func.newValue(.void);
-        } else if (std.mem.eql(u8, method_name, "get") and method_args.items.len >= 1) {
+        } else if (std.mem.eql(u8, method_name_borrowed, "get") and method_args.items.len >= 1) {
             const result = func.newValue(.string); // Map values are strings by default
             try l.emit(.{
                 .map_get = .{
@@ -1300,7 +1460,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 },
             });
             return result;
-        } else if (std.mem.eql(u8, method_name, "has") and method_args.items.len >= 1) {
+        } else if (std.mem.eql(u8, method_name_borrowed, "has") and method_args.items.len >= 1) {
             const result = func.newValue(.bool);
             try l.emit(.{
                 .map_has = .{
@@ -1311,7 +1471,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 },
             });
             return result;
-        } else if (std.mem.eql(u8, method_name, "delete") and method_args.items.len >= 1) {
+        } else if (std.mem.eql(u8, method_name_borrowed, "delete") and method_args.items.len >= 1) {
             try l.emit(.{
                 .map_delete = .{
                     .map = object_val,
@@ -1320,7 +1480,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 },
             });
             return func.newValue(.void);
-        } else if (std.mem.eql(u8, method_name, "len")) {
+        } else if (std.mem.eql(u8, method_name_borrowed, "len")) {
             const result = func.newValue(.i64);
             try l.emit(.{
                 .map_len = .{
@@ -1330,7 +1490,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 },
             });
             return result;
-        } else if (std.mem.eql(u8, method_name, "clear")) {
+        } else if (std.mem.eql(u8, method_name_borrowed, "clear")) {
             try l.emit(.{
                 .map_clear = .{
                     .map = object_val,
@@ -1338,7 +1498,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 },
             });
             return func.newValue(.void);
-        } else if (std.mem.eql(u8, method_name, "keys")) {
+        } else if (std.mem.eql(u8, method_name_borrowed, "keys")) {
             const result = func.newValue(.string); // Returns comma-separated keys
             try l.emit(.{
                 .map_keys = .{
@@ -1348,7 +1508,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 },
             });
             return result;
-        } else if (std.mem.eql(u8, method_name, "values")) {
+        } else if (std.mem.eql(u8, method_name_borrowed, "values")) {
             const result = func.newValue(.string); // Returns comma-separated values
             try l.emit(.{
                 .map_values = .{
@@ -1359,6 +1519,49 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             });
             return result;
         }
+    }
+
+    // Check if object is a trait object - emit trait method call
+    log.debug("Method call on object type: {any}", .{object_val.ty});
+    if (object_val.ty == .trait_object) {
+        const trait_obj_type = object_val.ty.trait_object;
+        const trait_name = trait_obj_type.trait_name;
+
+        // Get method return type from trait definition
+        var return_type: ir.Type = .void;
+        if (l.trait_defs.get(trait_name)) |trait_def| {
+            for (trait_def.methods) |method| {
+                if (std.mem.eql(u8, method.name, method_name_borrowed)) {
+                    return_type = method.return_type;
+                    break;
+                }
+            }
+        }
+
+        // Lower arguments
+        var args: std.ArrayListUnmanaged(ir.Value) = .{};
+        defer args.deinit(l.allocator);
+
+        for (0..args_count) |i| {
+            const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[extra_start + 2 + i]);
+            const arg_val = try lowerExpression(l, arg_idx);
+            try args.append(l.allocator, arg_val);
+        }
+
+        const args_slice = try args.toOwnedSlice(l.allocator);
+        const method_name = l.allocator.dupe(u8, method_name_borrowed) catch return LowerError.OutOfMemory;
+        const result = func.newValue(return_type);
+
+        try l.emit(.{
+            .call_trait_method = .{
+                .trait_object = object_val,
+                .method_name = method_name,
+                .args = args_slice,
+                .result = result,
+            },
+        });
+
+        return result;
     }
 
     // Fallback to regular method call
@@ -1374,6 +1577,9 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
     const args_slice = try args.toOwnedSlice(l.allocator);
     // NOTE: args_slice is freed by Block.deinit when the call instruction is cleaned up
+
+    // Dupe the method name so Block.deinit can consistently free it
+    const method_name = l.allocator.dupe(u8, method_name_borrowed) catch return LowerError.OutOfMemory;
 
     const result_type = getBuiltinReturnType(method_name, args_slice);
     const result = func.newValue(result_type);
@@ -1395,6 +1601,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
 /// Lower an array initialization expression
 pub fn lowerArrayInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
+    log.debug("lowerArrayInit: entering", .{});
     const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
 
@@ -1578,6 +1785,7 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 // ============================================================================
 
 /// Lower a lambda expression
+/// Handles closures by detecting captured variables from outer scope
 pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const outer_func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
@@ -1591,20 +1799,25 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const lambda_name = std.fmt.allocPrint(l.allocator, "_lambda_{d}", .{l.lambda_counter}) catch return LowerError.OutOfMemory;
     l.lambda_counter += 1;
 
-    // Parse parameters
+    // Parse parameters first to know which names are lambda-local
     var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
     defer params.deinit(l.allocator);
+
+    var param_names = std.StringHashMap(void).init(l.allocator);
+    defer param_names.deinit();
 
     var extra_idx = @intFromEnum(params_start) + 1;
     for (0..param_count) |_| {
         const param_name_id: StringId = @enumFromInt(l.store.extra_data.items[extra_idx]);
         const param_type_idx: TypeIdx = @enumFromInt(l.store.extra_data.items[extra_idx + 1]);
         const param_direction_raw: u32 = l.store.extra_data.items[extra_idx + 2];
-        const default_expr_raw: u32 = l.store.extra_data.items[extra_idx + 3];
-        extra_idx += 4; // 4 values per param: name, type, is_ref, default_value
+        extra_idx += 3; // 3 values per param: name, type, direction (matches parser)
 
         const param_name = l.strings.get(param_name_id);
         if (param_name.len == 0) continue;
+
+        // Track parameter names for capture detection
+        param_names.put(param_name, {}) catch return LowerError.OutOfMemory;
 
         // Use type if specified, otherwise default to void (inferred later)
         const param_type = if (param_type_idx != .null)
@@ -1615,9 +1828,6 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         // is_ref: 0 = by value, non-zero = by reference
         const is_ref = param_direction_raw != 0;
 
-        // default_value: handled at call time
-        _ = default_expr_raw;
-
         params.append(l.allocator, .{
             .name = param_name,
             .ty = param_type,
@@ -1627,6 +1837,61 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
     // Get body statement index
     const body_idx: StmtIdx = @enumFromInt(l.store.extra_data.items[extra_idx]);
+
+    // ========================================================================
+    // Capture Detection - scan lambda body for free variables
+    // ========================================================================
+    var captures = std.StringHashMap(ir.Value).init(l.allocator);
+    defer captures.deinit();
+
+    // Use FreeVarCollector to find all referenced variables in the lambda body
+    var collector = FreeVarCollector.init(l.allocator, l.store, l.strings);
+    defer collector.deinit();
+
+    // Add lambda parameters as locals (these are NOT captures)
+    var param_iter = param_names.keyIterator();
+    while (param_iter.next()) |name| {
+        collector.addLocal(name.*) catch continue;
+    }
+
+    // Scan the body for variable references
+    collector.scanStatement(body_idx) catch {};
+
+    // Find which referenced variables exist in outer scope (these are captures)
+    const free_vars = collector.getFreeVariables();
+    defer l.allocator.free(free_vars);
+
+    for (free_vars) |var_name| {
+        // Check if this variable exists in outer scope
+        if (l.scopes.get(var_name)) |outer_value| {
+            captures.put(var_name, outer_value) catch continue;
+            debug.print(.ir, "Lambda {s}: capturing variable '{s}'", .{ lambda_name, var_name });
+        }
+    }
+
+    const has_captures = captures.count() > 0;
+
+    // ========================================================================
+    // If captures exist, add implicit _closure_env parameter
+    // ========================================================================
+    if (has_captures) {
+        // Insert _closure_env as first parameter
+        var new_params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
+        new_params.append(l.allocator, .{
+            .name = "_closure_env",
+            .ty = .{ .map = undefined }, // Map type
+            .is_ref = false,
+        }) catch return LowerError.OutOfMemory;
+
+        // Copy existing params
+        for (params.items) |param| {
+            new_params.append(l.allocator, param) catch return LowerError.OutOfMemory;
+        }
+
+        // Replace params list
+        params.deinit(l.allocator);
+        params = new_params;
+    }
 
     // Create function type (return type will be inferred as void for now)
     const func_type = l.allocator.create(ir.FunctionType) catch return LowerError.OutOfMemory;
@@ -1642,16 +1907,26 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // Save current context
     const saved_func = l.current_func;
     const saved_block = l.current_block;
+    const saved_captures = l.current_captures;
+    const saved_closure_env = l.closure_env_value;
 
     // Switch to lambda context
     l.current_func = lambda_func;
     l.current_block = lambda_func.entry;
 
+    // Set capture info for identifier lowering to use
+    if (has_captures) {
+        l.current_captures = captures;
+    } else {
+        l.current_captures = null;
+    }
+
     // Push new scope for lambda parameters/locals
     try l.scopes.push();
 
     // Add parameters as local variables
-    for (func_type.params) |param| {
+    var env_value: ?ir.Value = null;
+    for (func_type.params, 0..) |param, i| {
         const ty_ptr = l.allocator.create(ir.Type) catch return LowerError.OutOfMemory;
         ty_ptr.* = param.ty;
         l.allocated_types.append(l.allocator, ty_ptr) catch return LowerError.OutOfMemory;
@@ -1665,7 +1940,15 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             },
         });
         l.scopes.put(param.name, alloca_result) catch return LowerError.OutOfMemory;
+
+        // Track the closure environment parameter
+        if (has_captures and i == 0 and std.mem.eql(u8, param.name, "_closure_env")) {
+            env_value = alloca_result;
+        }
     }
+
+    // Set closure env value for identifier lowering
+    l.closure_env_value = env_value;
 
     // Lower lambda body
     try l.lowerStatement(body_idx);
@@ -1682,18 +1965,85 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     l.scopes.pop();
     l.current_func = saved_func;
     l.current_block = saved_block;
+    l.current_captures = saved_captures;
+    l.closure_env_value = saved_closure_env;
 
-    // Return function pointer value
-    const func_type_ptr = l.allocator.create(ir.FunctionType) catch return LowerError.OutOfMemory;
-    func_type_ptr.* = func_type.*;
-    const fn_ptr_type = ir.Type{ .function = func_type_ptr };
-    const fn_ptr_type_ptr = l.allocator.create(ir.Type) catch return LowerError.OutOfMemory;
-    fn_ptr_type_ptr.* = fn_ptr_type;
-    l.allocated_types.append(l.allocator, fn_ptr_type_ptr) catch return LowerError.OutOfMemory;
+    // ========================================================================
+    // Return value: closure with env if captures, function pointer otherwise
+    // ========================================================================
+    if (has_captures) {
+        // Create a map for captured values in the outer function
+        const env_map = outer_func.newValue(.{ .map = undefined });
+        try l.emit(.{
+            .map_new = .{
+                .flags = 0x03, // case_sensitive + preserve_spaces
+                .result = env_map,
+                .loc = null,
+            },
+        });
 
-    // Create a value representing the function pointer
-    const result = outer_func.newValue(fn_ptr_type);
-    return result;
+        // Store each captured variable in the map
+        var cap_iter = captures.iterator();
+        while (cap_iter.next()) |entry| {
+            const var_name = entry.key_ptr.*;
+            const outer_ptr = entry.value_ptr.*;
+
+            // Load the value from the outer scope pointer
+            const loaded_val = outer_func.newValue(.void);
+            try l.emit(.{
+                .load = .{
+                    .ptr = outer_ptr,
+                    .result = loaded_val,
+                },
+            });
+
+            // Create string constant for the key
+            const key_const = outer_func.newValue(.string);
+            try l.emit(.{
+                .const_string = .{
+                    .value = var_name,
+                    .result = key_const,
+                },
+            });
+
+            // Store in map
+            try l.emit(.{
+                .map_set = .{
+                    .map = env_map,
+                    .key = key_const,
+                    .value = loaded_val,
+                    .loc = null,
+                },
+            });
+        }
+
+        // Create closure value (struct with routine info and env)
+        // For now, we'll use a special "make_closure" instruction
+        const closure_result = outer_func.newValue(.void);
+        try l.emit(.{
+            .make_closure = .{
+                .func_name = lambda_name,
+                .env = env_map,
+                .result = closure_result,
+            },
+        });
+
+        return closure_result;
+    } else {
+        // No captures - still emit make_closure with null env for consistent calling convention
+        const null_env = outer_func.newValue(.void);
+
+        const closure_result = outer_func.newValue(.void);
+        try l.emit(.{
+            .make_closure = .{
+                .func_name = lambda_name,
+                .env = null_env,
+                .result = closure_result,
+            },
+        });
+
+        return closure_result;
+    }
 }
 
 // ============================================================================
@@ -1857,6 +2207,11 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
         .function => .void, // Function types are handled separately
         .@"union" => .void, // Union types are handled via union_def statement
         // These types don't have IR equivalents yet
+        .trait_object => blk: {
+            const trait_name_id: StringId = @enumFromInt(data.a);
+            const trait_name = l.strings.get(trait_name_id);
+            break :blk .{ .trait_object = .{ .trait_name = trait_name } };
+        },
         .tuple, .error_union, .inferred, .any, .never => .void,
     };
 }

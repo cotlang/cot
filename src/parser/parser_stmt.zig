@@ -190,7 +190,12 @@ pub fn parseFor(p: *Parser) ParseError!StmtIdx {
     const binding = p.internString(binding_token.lexeme) catch return error.OutOfMemory;
     _ = try p.consume(.kw_in, "Expected 'in'");
 
+    // Disable struct init parsing for iterable to avoid ambiguity with body block
+    // e.g., "for x in arr { ... }" should not parse "arr { ... }" as struct init
+    const prev_allow_struct_init = p.allow_struct_init;
+    p.allow_struct_init = false;
     const iterable = try p.parseExpression();
+    p.allow_struct_init = prev_allow_struct_init;
 
     _ = try p.consume(.lbrace, "Expected '{'");
     const body = try parseBlock(p);

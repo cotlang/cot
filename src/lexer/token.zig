@@ -173,6 +173,7 @@ pub const TokenType = enum {
     kw_type,
     kw_impl,
     kw_trait,
+    kw_dyn,
     kw_pub,
     kw_static,
 
@@ -236,6 +237,7 @@ pub const TokenType = enum {
             .kw_type,
             .kw_impl,
             .kw_trait,
+            .kw_dyn,
             .kw_pub,
             .kw_static,
             .kw_if,

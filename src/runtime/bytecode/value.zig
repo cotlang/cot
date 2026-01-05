@@ -86,6 +86,31 @@ pub const FixedStringRef = struct {
 /// Forward declare OrderedMap (actual type imported when needed)
 pub const OrderedMap = @import("ordered_map.zig").OrderedMap;
 
+/// Closure - a lambda with captured environment
+/// Contains the lambda's routine index and optional captured values map
+pub const Closure = struct {
+    /// Index of the lambda routine in the bytecode module
+    routine_idx: u16,
+    /// Module index where the lambda is defined
+    module_idx: u16,
+    /// Captured environment (null if no captures)
+    env: ?*OrderedMap,
+};
+
+/// Type ID for closures (after Map which is 16)
+pub const CLOSURE_TYPE_ID: u16 = 17;
+
+/// Type ID for trait objects
+pub const TRAIT_OBJECT_TYPE_ID: u16 = 18;
+
+/// Trait object - a value with a vtable for dynamic dispatch
+pub const TraitObject = struct {
+    /// The boxed concrete value
+    data: Value,
+    /// Index into the module's vtable array
+    vtable_idx: u16,
+};
+
 // ============================================================================
 // NaN-boxed Value
 // ============================================================================
@@ -240,6 +265,18 @@ pub const Value = extern struct {
         return initObject(16, m);
     }
 
+    /// Create a closure value
+    /// Uses type_id 17 (CLOSURE_TYPE_ID)
+    pub fn initClosure(c: *Closure) Self {
+        return initObject(CLOSURE_TYPE_ID, c);
+    }
+
+    /// Create a trait object value
+    /// Uses type_id 18 (TRAIT_OBJECT_TYPE_ID)
+    pub fn initTraitObject(t: *TraitObject) Self {
+        return initObject(TRAIT_OBJECT_TYPE_ID, t);
+    }
+
     // ========================================================================
     // Type checking and tagging
     // ========================================================================
@@ -308,6 +345,18 @@ pub const Value = extern struct {
         return self.objectTypeId() == 16;
     }
 
+    /// Check if this is a closure (object with CLOSURE_TYPE_ID)
+    pub fn isClosure(self: Self) bool {
+        if (!self.isObject()) return false;
+        return self.objectTypeId() == CLOSURE_TYPE_ID;
+    }
+
+    /// Check if this is a trait object (object with TRAIT_OBJECT_TYPE_ID)
+    pub fn isTraitObject(self: Self) bool {
+        if (!self.isObject()) return false;
+        return self.objectTypeId() == TRAIT_OBJECT_TYPE_ID;
+    }
+
     /// Get the type_id of an object value
     pub fn objectTypeId(self: Self) ?u16 {
         if (!self.isObject()) return null;
@@ -319,6 +368,18 @@ pub const Value = extern struct {
         if (!self.isObject()) return null;
         const addr = self.bits & OBJ_PTR_MASK;
         return @ptrFromInt(addr);
+    }
+
+    /// Get the closure pointer if this is a closure value
+    pub fn getClosure(self: Self) ?*Closure {
+        if (!self.isClosure()) return null;
+        return self.objectPtr(Closure);
+    }
+
+    /// Get the map pointer if this is a map value
+    pub fn getMap(self: Self) ?*OrderedMap {
+        if (!self.isMap()) return null;
+        return self.objectPtr(OrderedMap);
     }
 
     // ========================================================================
@@ -386,6 +447,12 @@ pub const Value = extern struct {
     pub fn asMap(self: Self) ?*OrderedMap {
         if (!self.isMap()) return null;
         return self.objectPtr(OrderedMap);
+    }
+
+    /// Get trait object pointer
+    pub fn asTraitObject(self: Self) ?*TraitObject {
+        if (!self.isTraitObject()) return null;
+        return self.objectPtr(TraitObject);
     }
 
     // ========================================================================

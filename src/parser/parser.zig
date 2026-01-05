@@ -77,6 +77,9 @@ pub const Parser = struct {
     // Type parameters currently in scope (for generic functions/structs)
     type_params: std.ArrayListUnmanaged(TypeParamInfo),
 
+    // Flag to disable struct initializer parsing (e.g., in for-loop iterable)
+    allow_struct_init: bool = true,
+
     const Self = @This();
     const MAX_NESTING_DEPTH: u8 = 128;
     const MAX_ERRORS: usize = 100;
@@ -921,7 +924,11 @@ pub const Parser = struct {
         const binding = self.internString(binding_token.lexeme) catch return error.OutOfMemory;
         _ = try self.consume(.kw_in, "Expected 'in'");
 
+        // Disable struct init parsing for iterable to avoid ambiguity with body block
+        const prev_allow_struct_init = self.allow_struct_init;
+        self.allow_struct_init = false;
         const iterable = try self.parseExpression();
+        self.allow_struct_init = prev_allow_struct_init;
 
         _ = try self.consume(.lbrace, "Expected '{'");
         const body = try self.parseBlock();
@@ -1405,7 +1412,8 @@ pub const Parser = struct {
             const name = self.internString(self.previous().lexeme) catch return error.OutOfMemory;
 
             // Check for struct initializer: Name { ... }
-            if (self.check(.lbrace)) {
+            // Only if struct init is allowed in this context
+            if (self.allow_struct_init and self.check(.lbrace)) {
                 return self.parseStructInit(name, loc);
             }
 
@@ -1625,7 +1633,8 @@ pub const Parser = struct {
 
         // Store lambda
         const params_start = self.store.extra_data.items.len;
-        self.store.extra_data.append(self.allocator, @intCast(params.len / 2)) catch return error.OutOfMemory;
+        // Each param has 3 values: name, type, direction
+        self.store.extra_data.append(self.allocator, @intCast(params.len / 3)) catch return error.OutOfMemory;
         for (params) |p| {
             self.store.extra_data.append(self.allocator, p) catch return error.OutOfMemory;
         }
@@ -1766,6 +1775,13 @@ pub const Parser = struct {
         if (self.match(&[_]TokenType{.kw_weak})) {
             const inner = try self.parseType();
             return self.store.addWeakType(inner) catch return error.OutOfMemory;
+        }
+
+        // Trait object type: dyn Trait
+        if (self.match(&[_]TokenType{.kw_dyn})) {
+            const trait_name_token = try self.consume(.identifier, "Expected trait name after 'dyn'");
+            const trait_name_id = self.strings.intern(trait_name_token.lexeme) catch return error.OutOfMemory;
+            return self.store.addTraitObjectType(trait_name_id) catch return error.OutOfMemory;
         }
 
         // Array type: [N]T or []T

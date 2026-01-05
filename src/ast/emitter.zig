@@ -333,6 +333,7 @@ pub const Emitter = struct {
             .inferred => try self.writer.writeAll("_"),
             .any => try self.writer.writeAll("any"),
             .never => try self.writer.writeAll("never"),
+            .trait_object => try self.writer.writeAll("dyn Trait"),
         }
     }
 
