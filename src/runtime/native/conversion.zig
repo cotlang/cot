@@ -1,6 +1,11 @@
 //! Type conversion native functions
 //!
-//! string, integer, decimal, char, alpha, boolean
+//! Namespace: std.convert
+//! Functions: string, integer, decimal, char, alpha, boolean, ascii
+//! Cast Functions: cast_alpha, cast_decimal, cast_integer (DBL ^a, ^d, ^i operators)
+//!
+//! In .cot files: requires `import std.convert` then call as `std.convert.string(x)`
+//! In .dbl files: available directly as `string(x)` (DBL compatibility)
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -10,23 +15,31 @@ const NativeError = native.NativeError;
 const NativeFn = native.NativeFn;
 const Value = native.Value;
 
-/// Register all conversion functions
+/// Register all conversion functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
-    // Conversion functions (transform values)
+    // Namespaced names (std.convert.*)
+    try registry.registerNative("std.convert.string", string);
+    try registry.registerNative("std.convert.integer", integer);
+    try registry.registerNative("std.convert.decimal", decimal);
+    try registry.registerNative("std.convert.char", char);
+    try registry.registerNative("std.convert.alpha", alpha);
+    try registry.registerNative("std.convert.boolean", boolean);
+    try registry.registerNative("std.convert.ascii", ascii);
+    try registry.registerNative("std.convert.cast_alpha", cast_alpha);
+    try registry.registerNative("std.convert.cast_decimal", cast_decimal);
+    try registry.registerNative("std.convert.cast_integer", cast_integer);
+
+    // Short names (DBL compatibility)
     try registry.registerNative("string", string);
     try registry.registerNative("integer", integer);
     try registry.registerNative("decimal", decimal);
     try registry.registerNative("char", char);
     try registry.registerNative("alpha", alpha);
     try registry.registerNative("boolean", boolean);
-
-    // Cast functions (reinterpret bytes - DBL ^a, ^d, ^i operators)
+    try registry.registerNative("ascii", ascii);
     try registry.registerNative("cast_alpha", cast_alpha);
     try registry.registerNative("cast_decimal", cast_decimal);
     try registry.registerNative("cast_integer", cast_integer);
-
-    // ASCII conversion
-    try registry.registerNative("ascii", ascii);
 }
 
 /// STRING - Convert to string

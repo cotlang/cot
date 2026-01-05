@@ -8,6 +8,9 @@
 
 const std = @import("std");
 const Module = @import("bytecode/module.zig").Module;
+const debug_tools = @import("debug/debug.zig");
+const BreakpointManager = debug_tools.BreakpointManager;
+const BreakpointState = debug_tools.BreakpointState;
 
 /// Debug event types sent to the debug adapter
 pub const DebugEvent = union(enum) {
@@ -120,11 +123,8 @@ pub const Debugger = struct {
     /// Call depth when step_out started
     step_out_depth: usize,
 
-    /// Breakpoints by line number
-    breakpoints: std.AutoHashMap(u32, Breakpoint),
-
-    /// Next breakpoint ID
-    next_breakpoint_id: u32,
+    /// Unified breakpoint manager (supports line, address, routine breakpoints)
+    bp_manager: BreakpointManager,
 
     /// Event callback (if set, called when debug events occur)
     event_callback: ?*const fn (DebugEvent) void,
@@ -142,15 +142,14 @@ pub const Debugger = struct {
             .current_line = 0,
             .previous_line = 0,
             .step_out_depth = 0,
-            .breakpoints = std.AutoHashMap(u32, Breakpoint).init(allocator),
-            .next_breakpoint_id = 1,
+            .bp_manager = BreakpointManager.init(allocator),
             .event_callback = null,
             .waiting_for_command = false,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.breakpoints.deinit();
+        self.bp_manager.deinit();
     }
 
     /// Enable debug mode
@@ -161,23 +160,30 @@ pub const Debugger = struct {
 
     /// Set a breakpoint at a line number
     pub fn setBreakpoint(self: *Self, line: u32) u32 {
-        const id = self.next_breakpoint_id;
-        self.next_breakpoint_id += 1;
+        return self.bp_manager.addAtLine(line, null) catch 0;
+    }
 
-        self.breakpoints.put(line, .{
-            .id = id,
-            .file = null,
-            .line = line,
-            .enabled = true,
-            .hit_count = 0,
-        }) catch return 0;
-
-        return id;
+    /// Set a breakpoint at a specific address
+    pub fn setBreakpointAtAddress(self: *Self, ip: u32) u32 {
+        return self.bp_manager.addAtAddress(ip) catch 0;
     }
 
     /// Remove a breakpoint at a line number
     pub fn removeBreakpoint(self: *Self, line: u32) bool {
-        return self.breakpoints.remove(line);
+        // Find breakpoint ID by line
+        var iter = self.bp_manager.breakpoints.iterator();
+        while (iter.next()) |entry| {
+            const bp = entry.value_ptr;
+            if (bp.kind == .line and bp.data.line.line == line) {
+                return self.bp_manager.remove(bp.id);
+            }
+        }
+        return false;
+    }
+
+    /// Remove a breakpoint by ID
+    pub fn removeBreakpointById(self: *Self, id: u32) bool {
+        return self.bp_manager.remove(id);
     }
 
     /// Check if we should stop at the current line
@@ -188,16 +194,14 @@ pub const Debugger = struct {
         self.previous_line = self.current_line;
         self.current_line = line;
 
-        // Check breakpoints
-        if (self.breakpoints.get(line)) |*bp| {
-            if (bp.enabled) {
-                // Update hit count (need to use getPtr for mutation)
-                if (self.breakpoints.getPtr(line)) |bp_ptr| {
-                    bp_ptr.hit_count += 1;
-                }
-                self.step_mode = .paused;
-                return true;
-            }
+        // Check breakpoints using the unified manager
+        const bp_result = self.bp_manager.check(.{
+            .line = line,
+            .call_depth = @intCast(call_depth),
+        });
+        if (bp_result.should_pause) {
+            self.step_mode = .paused;
+            return true;
         }
 
         // Check step mode

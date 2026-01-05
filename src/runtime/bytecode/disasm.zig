@@ -753,6 +753,37 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}", .{rs});
             },
 
+            // weak_ref rd, rs - [rd:4|rs:4] [0]
+            .weak_ref => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}", .{ rd, rs });
+            },
+
+            // weak_load rd, rs - [rd:4|rs:4] [0]
+            .weak_load => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}", .{ rd, rs });
+            },
+
+            // ============================================
+            // ARC Operations (0xF5-0xF7)
+            // ============================================
+
+            // arc_retain rs - [rs:4|0] [0]
+            .arc_retain, .arc_release => {
+                const rs: u4 = @truncate(operands[0] >> 4);
+                try self.writer.print(" r{}", .{rs});
+            },
+
+            // arc_move rd, rs - [rd:4|rs:4] [0]
+            .arc_move => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}", .{ rd, rs });
+            },
+
             .extended => {
                 const sub_opcode = operands[0];
                 try self.writer.print(" sub={X:0>2}", .{sub_opcode});

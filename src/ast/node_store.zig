@@ -891,6 +891,15 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a weak reference type: weak T
+    /// Weak references don't keep the referenced value alive (for breaking cycles)
+    pub fn addWeakType(self: *Self, inner_type: TypeIdx) !TypeIdx {
+        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
+        try self.type_tags.append(self.allocator, .weak);
+        try self.type_data.append(self.allocator, .{ .a = inner_type.toInt(), .b = 0 });
+        return idx;
+    }
+
     /// Add an error union type: T!E (value_type!error_type)
     pub fn addErrorUnionType(self: *Self, value_type: TypeIdx, error_type: TypeIdx) !TypeIdx {
         const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));

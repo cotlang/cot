@@ -1,13 +1,17 @@
 //! Cot Core ISAM Database API
 //!
-//! Handle-based ISAM database operations with method-style naming:
-//!   var db = Db.open("customers.ism")
-//!   var rec = Db.read(db, 0, "CUST001")
-//!   Db.store(db, record)
-//!   Db.close(db)
+//! Namespace: std.db
+//! Functions: open, close, read, readFirst, readNext, store, write, delete, find, eof
+//!
+//! Handle-based ISAM database operations:
+//!   import std.db
+//!   var db = std.db.open("customers.ism")
+//!   var rec = std.db.read(db, 0, "CUST001")
+//!   std.db.store(db, record)
+//!   std.db.close(db)
 //!
 //! This module uses the UnifiedHandleManager for all I/O operations.
-//! For DBL channel-based syntax, see src/dbl/native_dbl.zig.
+//! For DBL channel-based syntax, see src/runtime/extensions/dbl/native_io.zig.
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -22,9 +26,21 @@ const NativeError = native.NativeError;
 const Value = native.Value;
 const UnifiedHandleManager = handles.UnifiedHandleManager;
 
-/// Register all ISAM database functions
+/// Register all ISAM database functions with namespaced names
 pub fn register(registry: anytype) !void {
-    // Cot Core Db.* API (method-style naming)
+    // Namespaced names (std.db.*)
+    try registry.registerNative("std.db.open", db_open);
+    try registry.registerNative("std.db.close", db_close);
+    try registry.registerNative("std.db.read", db_read);
+    try registry.registerNative("std.db.readFirst", db_readfirst);
+    try registry.registerNative("std.db.readNext", db_readnext);
+    try registry.registerNative("std.db.store", db_store);
+    try registry.registerNative("std.db.write", db_write);
+    try registry.registerNative("std.db.delete", db_delete);
+    try registry.registerNative("std.db.find", db_find);
+    try registry.registerNative("std.db.eof", db_eof);
+
+    // Legacy lowercase names (for backward compatibility)
     try registry.registerNative("db.open", db_open);
     try registry.registerNative("db.close", db_close);
     try registry.registerNative("db.read", db_read);
@@ -36,7 +52,11 @@ pub fn register(registry: anytype) !void {
     try registry.registerNative("db.find", db_find);
     try registry.registerNative("db.eof", db_eof);
 
-    // ISAM utility functions (file creation)
+    // ISAM utility functions (file creation) - namespaced
+    try registry.registerNative("std.db.create", isamc);
+    try registry.registerNative("std.db.util", isutl);
+
+    // Legacy ISAM utility names (DBL compatibility)
     try registry.registerNative("isamc", isamc);
     try registry.registerNative("isutl", isutl);
 }

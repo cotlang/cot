@@ -89,8 +89,10 @@ fn cotLogFn(
 const cot = @import("cot");
 const build_options = @import("build_options");
 const frontends = @import("frontends.zig");
+const runtime_selector = @import("runtime_selector.zig");
 const trace_mod = @import("cot_runtime").trace;
 const dbl_ext = @import("cot_runtime").dbl_ext;
+const debug_tools = @import("cot_runtime").debug_tools;
 
 // Framework commands (imported through cot module to avoid module conflicts)
 const init_cmd = cot.framework.commands.init;
@@ -162,23 +164,82 @@ pub fn main() !void {
         }
         try dumpIR(allocator, args[2]);
     } else if (std.mem.eql(u8, command, "run")) {
+        // Parse runtime option (--runtime=zig|rs)
+        var selected_runtime: runtime_selector.Runtime = .zig;
+        var file_target: ?[]const u8 = null;
+
+        // Parse arguments
+        for (args[2..]) |arg| {
+            if (std.mem.startsWith(u8, arg, "--runtime=")) {
+                const runtime_name = arg[10..];
+                if (runtime_selector.Runtime.fromString(runtime_name)) |r| {
+                    selected_runtime = r;
+                } else {
+                    try printStderr("Error: Unknown runtime '{s}'. Use 'zig' or 'rs'.\n", .{runtime_name});
+                    return;
+                }
+            } else if (!std.mem.startsWith(u8, arg, "-")) {
+                // Non-option argument is the target file/project
+                file_target = arg;
+            }
+        }
+
         // Check if this looks like a file or a workspace target
-        if (args.len >= 3) {
-            const target = args[2];
+        if (file_target) |target| {
             // If it's a file path (has .cot or .cbo extension), use file runner
             if (std.mem.endsWith(u8, target, ".cot") or std.mem.endsWith(u8, target, ".cbo")) {
-                try runFileAuto(allocator, target);
+                // Use selected runtime
+                switch (selected_runtime) {
+                    .zig => try runFileAuto(allocator, target),
+                    .rs => {
+                        // For .cot files, compile first then run with Rust runtime
+                        var bytecode_path: []const u8 = undefined;
+                        if (std.mem.endsWith(u8, target, ".cot")) {
+                            // Compile to temp .cbo file
+                            const basename = std.fs.path.stem(target);
+                            bytecode_path = try std.fmt.allocPrint(allocator, "/tmp/{s}.cbo", .{basename});
+                            defer allocator.free(bytecode_path);
+                            compileFile(allocator, target, bytecode_path) catch |err| {
+                                if (err == error.CompilationFailed) {
+                                    std.process.exit(1);
+                                }
+                                return err;
+                            };
+                            runtime_selector.runWithRustRuntime(allocator, bytecode_path) catch |err| {
+                                if (err == error.RuntimeNotFound) {
+                                    try printErr("Error: Rust runtime (cot-rs) not found.\n");
+                                    try printErr("Install it or add to PATH.\n");
+                                }
+                                return;
+                            };
+                        } else {
+                            // Already .cbo, run directly
+                            runtime_selector.runWithRustRuntime(allocator, target) catch |err| {
+                                if (err == error.RuntimeNotFound) {
+                                    try printErr("Error: Rust runtime (cot-rs) not found.\n");
+                                    try printErr("Install it or add to PATH.\n");
+                                }
+                                return;
+                            };
+                        }
+                    },
+                }
                 return;
             }
         }
-        // Otherwise, try workspace runner
+
+        // Otherwise, try workspace runner (only supports zig runtime for now)
+        if (selected_runtime == .rs) {
+            try printErr("Error: --runtime=rs only works with file targets, not workspace projects.\n");
+            return;
+        }
         const options = run_cmd.parseArgs(args[2..]);
         run_cmd.run(allocator, options) catch |err| {
             if (err == error.NoWorkspace) {
                 // Fall back to file usage message
                 if (args.len < 3) {
                     try printErr("Error: run requires a filename or project target\n");
-                    try printErr("Usage: cot run <file.cot|file.cbo|project>\n");
+                    try printErr("Usage: cot run <file.cot|file.cbo|project> [--runtime=zig|rs]\n");
                 } else {
                     try printStderr("Error: {}\n", .{err});
                 }
@@ -213,6 +274,14 @@ pub fn main() !void {
             }
         }
         try traceFileAuto(allocator, target, trace_level);
+    } else if (std.mem.eql(u8, command, "debug")) {
+        // Interactive debugger command
+        if (args.len < 3) {
+            try printErr("Error: debug requires a filename\n");
+            try printErr("Usage: cot debug <file.cot|file.cbo>\n");
+            return;
+        }
+        try debugFile(allocator, args[2]);
     } else if (std.mem.eql(u8, command, "init")) {
         // Check for help flag
         if (args.len > 2 and std.mem.eql(u8, args[2], "--help")) {
@@ -308,6 +377,21 @@ pub fn main() !void {
             }
             return err;
         };
+    } else if (std.mem.eql(u8, command, "validate")) {
+        // Bytecode validation command
+        if (args.len < 3) {
+            try printErr("Error: validate requires a filename\n");
+            try printErr("Usage: cot validate <file.cbo> [--strict]\n");
+            return;
+        }
+        // Parse options
+        var strict = false;
+        for (args[3..]) |arg| {
+            if (std.mem.eql(u8, arg, "--strict")) {
+                strict = true;
+            }
+        }
+        try validateBytecode(allocator, args[2], strict);
     } else {
         // Assume it's a filename - run with interpreter
         try runFile(allocator, command);
@@ -328,6 +412,8 @@ fn printUsage() !void {
         \\  cot <file.cot>              Run a Cot program (interpreter)
         \\  cot run <file|project>      Run a program or workspace project
         \\  cot trace <file>            Run with execution tracing
+        \\  cot debug <file>            Interactive debugger
+        \\  cot validate <file.cbo>     Validate bytecode integrity
         \\  cot compile <file.cot>      Compile to bytecode (.cbo)
         \\  cot disasm <file.cot|.cbo>  Disassemble to readable output
         \\  cot dump-ir <file.cot>      Dump IR for debugging
@@ -361,10 +447,15 @@ fn printUsage() !void {
         \\  --level=opcodes             Trace each opcode (default)
         \\  --level=verbose             Include register state
         \\
+        \\Runtime Options:
+        \\  --runtime=zig               Use built-in Zig VM (default)
+        \\  --runtime=rs                Use Rust runtime (cot-rs)
+        \\
         \\Examples:
         \\  cot hello.cot               Run hello.cot with interpreter
         \\  cot compile hello.cot       Compile to hello.cbo
         \\  cot run bin/hello.cbo       Run compiled bytecode
+        \\  cot run hello.cbo --runtime=rs  Run with Rust runtime
         \\  cot trace hello.cot         Run with execution trace
         \\  cot init my-company         Create a workspace
         \\  cot new inventory           Create an app
@@ -413,6 +504,25 @@ fn printStderr(comptime fmt: []const u8, args: anytype) !void {
     const stderr = &stderr_writer.interface;
     try stderr.print(fmt, args);
     try stderr.flush();
+}
+
+/// Read a line from stdin into buffer, returning slice or null on EOF
+fn readLine(buf: []u8) ?[]u8 {
+    const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+    var len: usize = 0;
+    while (len < buf.len) {
+        var byte_buf: [1]u8 = undefined;
+        const n = stdin_file.read(&byte_buf) catch return null;
+        if (n == 0) {
+            // EOF
+            if (len == 0) return null;
+            break;
+        }
+        if (byte_buf[0] == '\n') break;
+        buf[len] = byte_buf[0];
+        len += 1;
+    }
+    return buf[0..len];
 }
 
 /// Check if a file needs an external frontend and dispatch if so
@@ -804,6 +914,357 @@ fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: 
     try printStderr("Opcodes executed: {d}\n", .{tracer.stats.opcodes_executed});
     try printStderr("Calls made: {d}\n", .{tracer.stats.calls_made});
     try printStderr("Duration: {d}ms\n", .{tracer.stats.durationMs()});
+}
+
+fn debugFile(allocator: std.mem.Allocator, filename: []const u8) !void {
+    const is_bytecode = std.mem.endsWith(u8, filename, ".cbo");
+
+    // For .cot files, compile first
+    var module: cot.bytecode.Module = undefined;
+    var temp_bytes: ?[]u8 = null;
+    defer if (temp_bytes) |b| allocator.free(b);
+
+    // Store source for list command (only available for .cot files)
+    var source_lines: ?[]const []const u8 = null;
+    var source_storage: ?[]u8 = null;
+    defer if (source_storage) |s| allocator.free(s);
+    defer if (source_lines) |lines| allocator.free(lines);
+
+    if (is_bytecode) {
+        // Load bytecode directly
+        const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
+            try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
+            return;
+        };
+        defer file.close();
+
+        temp_bytes = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
+        var fbs = std.io.fixedBufferStream(temp_bytes.?);
+        module = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
+            try printStderr("Error: Invalid bytecode file '{s}': {}\n", .{ filename, err });
+            return;
+        };
+    } else {
+        // Compile .cot file first
+        try printStdout("Compiling {s}...\n", .{filename});
+
+        // Read source and keep it for list command
+        source_storage = std.fs.cwd().readFileAlloc(allocator, filename, 1024 * 1024) catch |err| {
+            try printStderr("Error: Could not read file '{s}': {}\n", .{ filename, err });
+            return;
+        };
+
+        // Split into lines for list command
+        var line_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var iter = std.mem.splitScalar(u8, source_storage.?, '\n');
+        while (iter.next()) |line| {
+            line_list.append(allocator, line) catch break;
+        }
+        source_lines = line_list.toOwnedSlice(allocator) catch null;
+
+        // Compile to module (uses IR pipeline)
+        module = cot.compileToModule(allocator, source_storage.?, std.fs.path.stem(filename)) catch |err| {
+            try printStderr("Error: Compilation failed: {}\n", .{err});
+            return;
+        };
+    }
+    defer module.deinit();
+
+    // Initialize VM
+    var vm = cot.bytecode.VM.init(allocator);
+    defer vm.deinit();
+
+    // Enable debugger
+    vm.debugger.enable();
+
+    // Load module and initialize for execution
+    try vm.loadModule(&module);
+    vm.initForModule(&module) catch |err| {
+        try printStderr("Error initializing module: {}\n", .{err});
+        return;
+    };
+
+    // Print welcome message
+    try printStdout("\n=== Cot Interactive Debugger ===\n", .{});
+    try printStdout("File: {s}\n", .{filename});
+    try printStdout("Entry point: 0x{x:0>4}\n\n", .{module.header.entry_point});
+
+    try printStdout("Commands:\n", .{});
+    try printStdout("  r, run        - Run/continue execution\n", .{});
+    try printStdout("  s, step       - Step one instruction\n", .{});
+    try printStdout("  n, next       - Step over (to next line)\n", .{});
+    try printStdout("  o, out        - Step out of current function\n", .{});
+    try printStdout("  b <line>      - Set breakpoint at line\n", .{});
+    try printStdout("  d <line>      - Delete breakpoint at line\n", .{});
+    try printStdout("  i, info       - Show VM state\n", .{});
+    try printStdout("  reg           - Show registers\n", .{});
+    try printStdout("  locals        - Show local variables\n", .{});
+    try printStdout("  stack         - Show stack\n", .{});
+    try printStdout("  bt, backtrace - Show call stack\n", .{});
+    try printStdout("  l, list       - Show source around current line\n", .{});
+    try printStdout("  disasm        - Disassemble around current IP\n", .{});
+    try printStdout("  q, quit       - Exit debugger\n\n", .{});
+
+    // Interactive REPL
+    var line_buf: [256]u8 = undefined;
+
+    while (true) {
+        // Show current position
+        const inspector = vm.createInspector();
+        const snapshot = inspector.getSnapshot();
+
+        try printStdout("(debug) IP=0x{x:0>4} L{d} > ", .{ snapshot.ip, snapshot.line });
+
+        // Read command - simple byte-by-byte read
+        const line = readLine(&line_buf) orelse break;
+
+        const cmd = std.mem.trim(u8, line, " \t\r\n");
+        if (cmd.len == 0) continue;
+
+        // Parse and execute command
+        if (std.mem.eql(u8, cmd, "q") or std.mem.eql(u8, cmd, "quit")) {
+            try printStdout("Exiting debugger.\n", .{});
+            break;
+        } else if (std.mem.eql(u8, cmd, "r") or std.mem.eql(u8, cmd, "run")) {
+            vm.debugger.continue_();
+            _ = vm.runUntilStop() catch |err| {
+                try printStderr("Execution error: {}\n", .{err});
+            };
+            if (vm.stop_reason) |reason| {
+                switch (reason) {
+                    .completed => try printStdout("Program completed.\n", .{}),
+                    .breakpoint => try printStdout("Hit breakpoint.\n", .{}),
+                    .step => try printStdout("Step completed.\n", .{}),
+                    .err => try printStderr("Error occurred.\n", .{}),
+                    .paused => try printStdout("Execution paused.\n", .{}),
+                }
+            }
+        } else if (std.mem.eql(u8, cmd, "s") or std.mem.eql(u8, cmd, "step")) {
+            vm.debugger.stepInto();
+            _ = vm.runUntilStop() catch |err| {
+                try printStderr("Execution error: {}\n", .{err});
+            };
+        } else if (std.mem.eql(u8, cmd, "n") or std.mem.eql(u8, cmd, "next")) {
+            vm.debugger.stepOver(vm.call_stack.len);
+            _ = vm.runUntilStop() catch |err| {
+                try printStderr("Execution error: {}\n", .{err});
+            };
+        } else if (std.mem.eql(u8, cmd, "o") or std.mem.eql(u8, cmd, "out")) {
+            vm.debugger.stepOut(vm.call_stack.len);
+            _ = vm.runUntilStop() catch |err| {
+                try printStderr("Execution error: {}\n", .{err});
+            };
+        } else if (std.mem.startsWith(u8, cmd, "b ") or std.mem.startsWith(u8, cmd, "break ")) {
+            const arg = if (std.mem.startsWith(u8, cmd, "b ")) cmd[2..] else cmd[6..];
+            const line_num = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " "), 10) catch {
+                try printStderr("Invalid line number: {s}\n", .{arg});
+                continue;
+            };
+            const bp_id = vm.debugger.setBreakpoint(line_num);
+            try printStdout("Breakpoint {d} set at line {d}\n", .{ bp_id, line_num });
+        } else if (std.mem.startsWith(u8, cmd, "d ") or std.mem.startsWith(u8, cmd, "delete ")) {
+            const arg = if (std.mem.startsWith(u8, cmd, "d ")) cmd[2..] else cmd[7..];
+            const line_num = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " "), 10) catch {
+                try printStderr("Invalid line number: {s}\n", .{arg});
+                continue;
+            };
+            if (vm.debugger.removeBreakpoint(line_num)) {
+                try printStdout("Breakpoint at line {d} removed\n", .{line_num});
+            } else {
+                try printStderr("No breakpoint at line {d}\n", .{line_num});
+            }
+        } else if (std.mem.eql(u8, cmd, "i") or std.mem.eql(u8, cmd, "info")) {
+            try printStdout("IP: 0x{x:0>4}\n", .{snapshot.ip});
+            try printStdout("Line: {d}\n", .{snapshot.line});
+            try printStdout("SP: {d}\n", .{snapshot.sp});
+            try printStdout("FP: {d}\n", .{snapshot.fp});
+            try printStdout("Call depth: {d}\n", .{snapshot.call_depth});
+            if (snapshot.routine) |r| {
+                try printStdout("Routine: {s}\n", .{r});
+            }
+        } else if (std.mem.eql(u8, cmd, "reg") or std.mem.eql(u8, cmd, "registers")) {
+            var reg_buf: [512]u8 = undefined;
+            const reg_str = inspector.formatRegisters(&reg_buf);
+            try printStdout("Registers: {s}\n", .{reg_str});
+        } else if (std.mem.eql(u8, cmd, "stack")) {
+            try printStdout("Stack (top 8 entries, SP={d}):\n", .{snapshot.sp});
+            const top = inspector.getTopOfStack(8);
+            for (top, 0..) |val, i| {
+                var val_buf: [64]u8 = undefined;
+                const val_str = val.debugRepr(&val_buf);
+                try printStdout("  [{d}]: {s}\n", .{ snapshot.sp - top.len + i, val_str });
+            }
+        } else if (std.mem.eql(u8, cmd, "bt") or std.mem.eql(u8, cmd, "backtrace")) {
+            var bt_buf: [1024]u8 = undefined;
+            const bt_str = inspector.formatBacktrace(&bt_buf);
+            if (bt_str.len > 0) {
+                try printStdout("Call stack:\n{s}", .{bt_str});
+            } else {
+                try printStdout("(empty call stack)\n", .{});
+            }
+        } else if (std.mem.eql(u8, cmd, "locals")) {
+            // Show local variables
+            const locals = inspector.getLocals(allocator) catch |err| {
+                try printStderr("Error getting locals: {}\n", .{err});
+                continue;
+            };
+            defer allocator.free(locals);
+
+            if (locals.len == 0) {
+                try printStdout("(no local variables)\n", .{});
+            } else {
+                try printStdout("Local variables:\n", .{});
+                for (locals) |local| {
+                    var val_buf: [64]u8 = undefined;
+                    const val_str = local.format(&val_buf);
+                    const scope_str = switch (local.scope) {
+                        .parameter => "param",
+                        .local => "local",
+                        .global => "global",
+                    };
+                    try printStdout("  {s} {s}: {s} = {s}\n", .{
+                        scope_str,
+                        local.name,
+                        local.type_name,
+                        val_str,
+                    });
+                }
+            }
+        } else if (std.mem.eql(u8, cmd, "l") or std.mem.eql(u8, cmd, "list")) {
+            // Show source code around current line
+            if (source_lines) |lines| {
+                const current = snapshot.line;
+                const start = if (current > 5) current - 5 else 1;
+                const end = @min(current + 5, @as(u32, @intCast(lines.len)));
+
+                try printStdout("Source ({s}):\n", .{filename});
+                var line_num = start;
+                while (line_num <= end) : (line_num += 1) {
+                    const idx = line_num - 1;
+                    if (idx < lines.len) {
+                        const marker: []const u8 = if (line_num == current) " => " else "    ";
+                        try printStdout("{s}{d:4}: {s}\n", .{ marker, line_num, lines[idx] });
+                    }
+                }
+            } else {
+                try printStdout("(source not available for bytecode files)\n", .{});
+            }
+        } else if (std.mem.eql(u8, cmd, "disasm")) {
+            // Disassemble around current IP
+            const ip = snapshot.ip;
+            const code = module.code;
+
+            try printStdout("Disassembly around IP=0x{x:0>4}:\n", .{ip});
+
+            // Show 5 instructions before and after (approximately)
+            var disasm_ip: usize = if (ip > 20) ip - 20 else 0;
+            var count: usize = 0;
+            while (disasm_ip < code.len and count < 15) : (count += 1) {
+                const opcode: cot.bytecode.Opcode = @enumFromInt(code[disasm_ip]);
+                const size = 1 + opcode.operandSize();
+                const marker: []const u8 = if (disasm_ip == ip) " => " else "    ";
+                try printStdout("{s}0x{x:0>4}: {s}\n", .{ marker, disasm_ip, @tagName(opcode) });
+                disasm_ip += size;
+            }
+        } else if (std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "?")) {
+            try printStdout("Commands:\n", .{});
+            try printStdout("  r, run        - Run/continue execution\n", .{});
+            try printStdout("  s, step       - Step one instruction\n", .{});
+            try printStdout("  n, next       - Step over (to next line)\n", .{});
+            try printStdout("  o, out        - Step out of current function\n", .{});
+            try printStdout("  b <line>      - Set breakpoint at line\n", .{});
+            try printStdout("  d <line>      - Delete breakpoint at line\n", .{});
+            try printStdout("  i, info       - Show VM state\n", .{});
+            try printStdout("  reg           - Show registers\n", .{});
+            try printStdout("  locals        - Show local variables\n", .{});
+            try printStdout("  stack         - Show stack\n", .{});
+            try printStdout("  bt, backtrace - Show call stack\n", .{});
+            try printStdout("  l, list       - Show source around current line\n", .{});
+            try printStdout("  disasm        - Disassemble around current IP\n", .{});
+            try printStdout("  h, help, ?    - Show this help\n", .{});
+            try printStdout("  q, quit       - Exit debugger\n", .{});
+        } else {
+            try printStderr("Unknown command: {s}\n", .{cmd});
+        }
+    }
+}
+
+fn validateBytecode(allocator: std.mem.Allocator, filename: []const u8, strict: bool) !void {
+    // Open and read bytecode file
+    const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
+        try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
+        return;
+    };
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(allocator, 1024 * 1024 * 10); // 10MB max
+    defer allocator.free(bytes);
+
+    // Deserialize bytecode module
+    var fbs = std.io.fixedBufferStream(bytes);
+    var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
+        try printStderr("Error: Invalid bytecode file '{s}': {}\n", .{ filename, err });
+        try printStderr("  This may indicate a corrupted or incompatible bytecode version.\n", .{});
+        return;
+    };
+    defer mod.deinit();
+
+    // Run validator
+    var validator = debug_tools.Validator.init(allocator, &mod);
+    defer validator.deinit();
+
+    const result = validator.validate() catch |err| {
+        try printStderr("Error: Validation failed: {}\n", .{err});
+        return;
+    };
+
+    // Print results
+    try printStdout("\n=== Bytecode Validation Report ===\n\n", .{});
+    try printStdout("File: {s}\n", .{filename});
+    try printStdout("Code size: {d} bytes\n", .{result.stats.code_size});
+    try printStdout("Instructions: {d}\n", .{result.stats.instruction_count});
+    try printStdout("Routines: {d}\n", .{result.stats.routine_count});
+    try printStdout("Constants: {d}\n", .{result.stats.constant_count});
+    try printStdout("Types: {d}\n\n", .{result.stats.type_count});
+
+    // Print issues
+    if (result.issues.len == 0) {
+        try printStdout("No issues found.\n", .{});
+    } else {
+        try printStdout("Issues ({d}):\n", .{result.issues.len});
+        for (result.issues) |issue| {
+            const severity_str = switch (issue.severity) {
+                .@"error" => "\x1b[31mERROR\x1b[0m",
+                .warning => "\x1b[33mWARNING\x1b[0m",
+                .info => "\x1b[36mINFO\x1b[0m",
+            };
+            try printStdout("  [{s}] 0x{x:0>4}: {s}\n", .{
+                severity_str,
+                issue.offset,
+                issue.message,
+            });
+        }
+        try printStdout("\n", .{});
+    }
+
+    // Summary
+    try printStdout("Errors: {d}, Warnings: {d}\n", .{ result.stats.error_count, result.stats.warning_count });
+    try printStdout("Code coverage (reachable): {d:.1}%\n\n", .{result.stats.code_coverage});
+
+    if (result.is_valid) {
+        try printStdout("\x1b[32mValidation PASSED\x1b[0m\n", .{});
+    } else {
+        try printStdout("\x1b[31mValidation FAILED\x1b[0m\n", .{});
+        if (strict) {
+            std.process.exit(1);
+        }
+    }
+
+    // In strict mode, treat warnings as errors too
+    if (strict and result.stats.warning_count > 0) {
+        try printStdout("\n\x1b[33m--strict: Warnings treated as errors\x1b[0m\n", .{});
+        std.process.exit(1);
+    }
 }
 
 fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, output_file: ?[]const u8) !void {

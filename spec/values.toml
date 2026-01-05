@@ -1,0 +1,402 @@
+# Cot Value Representation Specification
+#
+# NaN-boxed values use the unused bits in IEEE 754 NaN patterns to encode
+# non-float values, reducing memory usage by 50% compared to tagged unions.
+
+[meta]
+version = "1.0.0"
+representation = "nan_boxing"
+size_bytes = 8
+description = "All Cot runtime values are exactly 8 bytes using NaN-boxing"
+
+[nan_boxing]
+description = """
+IEEE 754 doubles use 64 bits. NaN values have all exponent bits set (0x7FF)
+and at least one mantissa bit set. We use quiet NaN (qNaN) patterns with
+the quiet bit set to encode non-float values in the mantissa bits.
+"""
+qnan_base = "0x7FFC_0000_0000_0000"
+
+# =============================================================================
+# Tag Patterns
+# =============================================================================
+# Each tag uses specific bit patterns to identify value types.
+# Real doubles are detected by NOT matching any tag pattern.
+
+[tags.null]
+pattern = "0x7FFC_0000_0000_0000"
+payload_bits = 0
+description = "Null value - exactly matches qnan_base"
+
+[tags.false]
+pattern = "0x7FFC_0000_0000_0001"
+payload_bits = 0
+description = "Boolean false"
+
+[tags.true]
+pattern = "0x7FFC_0000_0000_0002"
+payload_bits = 0
+description = "Boolean true"
+
+[tags.small_int]
+pattern = "0x7FFD_0000_0000_0000"
+payload_bits = 47
+payload_type = "signed"
+signed = true
+description = "Inline signed integer (47-bit range)"
+
+[tags.string]
+pattern = "0x7FFE_0000_0000_0000"
+payload_bits = 46
+payload_type = "pointer"
+description = "Pointer to StringRef struct"
+
+[tags.fixed_string]
+pattern = "0x7FFE_8000_0000_0000"
+payload_bits = 46
+payload_type = "pointer"
+description = "Pointer to FixedStringRef struct (mutable)"
+
+[tags.record]
+pattern = "0x7FFF_0000_0000_0000"
+payload_bits = 46
+payload_type = "pointer"
+description = "Pointer to Record struct"
+
+[tags.handle]
+pattern = "0x7FFF_4000_0000_0000"
+payload_bits = 46
+payload_type = "handle_id"
+description = "Numeric handle ID (file handles, db handles, etc.)"
+
+[tags.decimal]
+pattern = "0x7FFF_8000_0000_0000"
+payload_bits = 46
+payload_type = "pointer"
+description = "Pointer to Decimal struct"
+
+[tags.boxed_int]
+pattern = "0x7FFF_C000_0000_0000"
+payload_bits = 46
+payload_type = "pointer"
+description = "Pointer to BoxedInt struct (for values outside small_int range)"
+
+[tags.object]
+pattern = "0x7FFE_4000_0000_0000"
+payload_bits = 46
+payload_type = "typed_pointer"
+description = """
+Extension-defined object types.
+Bits 40-45: type_id (6 bits, 64 types)
+Bits 0-39: pointer (40-bit address space = 1TB)
+"""
+
+[tags.object.encoding]
+type_id_bits = "45:40"
+type_id_mask = "0x0000_3F00_0000_0000"
+pointer_bits = "39:0"
+pointer_mask = "0x0000_00FF_FFFF_FFFF"
+
+[tags.object.reserved_types]
+0 = "reserved"
+16 = "ordered_map"
+
+# =============================================================================
+# Type Definitions
+# =============================================================================
+
+[types.small_int]
+description = "Inline signed integer using 47 bits"
+min = -70368744177664      # -2^46
+max = 70368744177663       # 2^46 - 1
+overflow_behavior = "box"  # Values outside range become boxed_int
+
+[types.boxed_int]
+description = "Heap-allocated integer for values outside small_int range"
+heap_layout = """
+struct BoxedInt {
+    value: i64,   // Full 64-bit signed integer
+}
+"""
+size_bytes = 8
+
+[types.decimal]
+description = "Fixed-point decimal with variable precision"
+heap_layout = """
+struct Decimal {
+    value: i64,       // Scaled integer value
+    precision: u8,    // Decimal places (0-18)
+}
+"""
+size_bytes = 9
+max_precision = 18
+
+[types.string]
+description = "Immutable UTF-8 string reference"
+heap_layout = """
+struct StringRef {
+    ptr: *const u8,   // Pointer to string data
+    len: usize,       // Length in bytes
+}
+"""
+size_bytes = 16  # 8 + 8 on 64-bit
+ownership = "arena_allocated"
+
+[types.fixed_string]
+description = "Mutable fixed-length string (alpha type)"
+heap_layout = """
+struct FixedStringRef {
+    ptr: *u8,         // Pointer to mutable buffer
+    len: usize,       // Buffer size
+}
+"""
+size_bytes = 16
+ownership = "arena_allocated"
+
+[types.record]
+description = "User-defined struct instance"
+heap_layout = """
+struct Record {
+    type_id: u16,     // Type definition index
+    data: []u8,       // Field data (layout defined by type)
+}
+"""
+ownership = "arena_allocated"
+
+[types.handle]
+description = "Numeric ID for external resources"
+encoding = "direct_value"
+max_value = "0x3FFF_FFFF_FFFF"  # 46 bits
+
+[types.ordered_map]
+description = "Hash map with preserved insertion order"
+object_type_id = 16
+heap_layout = """
+struct OrderedMap {
+    entries: ArrayListUnmanaged(Entry),
+    index: StringHashMap(usize),
+    case_sensitive: bool,
+    preserve_spaces: bool,
+}
+"""
+ownership = "arena_allocated"
+
+# =============================================================================
+# Type Detection Logic
+# =============================================================================
+
+[detection]
+description = "How to determine value type from bits"
+algorithm = """
+fn tag(bits: u64) -> Tag {
+    // Exact matches first
+    if bits == TAG_NULL: return null_val
+    if bits == TAG_TRUE or bits == TAG_FALSE: return boolean
+
+    // Mask-based checks
+    upper = bits & 0xFFFF_C000_0000_0000
+    if upper == TAG_SMALL_INT or upper == TAG_BOXED_INT: return integer
+
+    // Object check before string (more specific mask)
+    if (bits & 0xFFFF_C000_0000_0000) == TAG_OBJECT: return object
+
+    if (bits & 0xFFFF_8000_0000_0000) == TAG_STRING: return string
+    if (bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR: return fixed_string
+    if (bits & 0xFFFF_C000_0000_0000) == TAG_RECORD: return record_ref
+    if (bits & 0xFFFF_F000_0000_0000) == TAG_HANDLE: return handle
+    if (bits & 0xFFFF_C000_0000_0000) == TAG_DECIMAL: return decimal
+
+    // If no tag matches, it's a real double
+    return float
+}
+"""
+
+# =============================================================================
+# Conversion Rules
+# =============================================================================
+
+[conversions.to_int]
+description = "Convert any value to integer"
+rules = [
+    { from = "integer", to = "value as-is" },
+    { from = "decimal", to = "truncate to integer" },
+    { from = "boolean", to = "true=1, false=0" },
+    { from = "string", to = "parse as integer, 0 on failure" },
+    { from = "null", to = "0" },
+]
+
+[conversions.to_bool]
+description = "Convert any value to boolean"
+rules = [
+    { from = "null", to = "false" },
+    { from = "boolean", to = "value as-is" },
+    { from = "integer", to = "non-zero = true" },
+    { from = "decimal", to = "non-zero = true" },
+    { from = "string", to = "non-empty = true" },
+    { from = "fixed_string", to = "non-empty and not all spaces = true" },
+]
+
+[conversions.to_string]
+description = "Convert any value to string representation"
+rules = [
+    { from = "null", to = "\"null\"" },
+    { from = "boolean", to = "\"true\" or \"false\"" },
+    { from = "integer", to = "decimal representation" },
+    { from = "decimal", to = "formatted with decimal point" },
+    { from = "string", to = "value as-is" },
+    { from = "fixed_string", to = "trimmed trailing spaces" },
+    { from = "record", to = "\"<record>\"" },
+    { from = "handle", to = "\"<handle:N>\"" },
+    { from = "object", to = "\"<object:type=N>\" or type-specific" },
+]
+
+# =============================================================================
+# Memory Management: Automatic Reference Counting (ARC)
+# =============================================================================
+# Swift-inspired three-layer memory management:
+# 1. ARC (primary) - compiler-inserted retain/release, immediate deallocation
+# 2. Cycle Collector - background detection of reference cycles
+# 3. weak references - expert escape hatch for intentional cycles
+
+[memory]
+strategy = "arc"
+description = """
+Automatic Reference Counting provides deterministic memory management.
+Objects are freed immediately when their reference count reaches zero.
+Developers never write manual memory management code.
+"""
+
+[memory.arc]
+enabled = true
+description = """
+Every heap-allocated object has an 8-byte header prefix containing a
+reference count and flags. The compiler automatically inserts retain
+(increment refcount) and release (decrement refcount) operations.
+"""
+
+[memory.arc.header]
+size_bytes = 8
+layout = """
+struct ArcHeader {
+    refcount: u32,    // offset 0: reference count
+    flags: u32,       // offset 4: status flags
+}
+"""
+initial_refcount = 1
+
+[memory.arc.header.flags]
+description = "Bit flags for ARC object state"
+cycle_candidate = { bit = 0, description = "May be part of a reference cycle" }
+weak_target = { bit = 1, description = "Has weak references pointing to it" }
+poisoned = { bit = 2, description = "Being freed, do not access" }
+
+[memory.arc.operations]
+description = "When retain/release operations occur"
+
+[memory.arc.operations.retain]
+description = "Increment reference count"
+triggers = [
+    "Value assigned to variable",
+    "Value passed as function argument",
+    "Value stored in collection (map, array)",
+    "Value returned from function",
+]
+implementation = "header.refcount += 1"
+
+[memory.arc.operations.release]
+description = "Decrement reference count, free if zero"
+triggers = [
+    "Variable goes out of scope",
+    "Variable is reassigned (release old value)",
+    "Function returns (release locals)",
+    "Value removed from collection",
+]
+implementation = """
+header.refcount -= 1
+if header.refcount == 0:
+    free_object()
+"""
+
+[memory.arc.heap_types]
+description = "Types that require ARC (heap-allocated)"
+types = ["string", "fixed_string", "decimal", "boxed_int", "record", "object"]
+
+[memory.arc.inline_types]
+description = "Types that do NOT require ARC (inline in Value)"
+types = ["null", "boolean", "small_int", "float", "handle"]
+
+[memory.cycle_collector]
+enabled = true
+description = """
+Background cycle collector detects and breaks reference cycles.
+Runs periodically or when memory pressure is detected.
+Uses mark-sweep on objects flagged as cycle candidates.
+"""
+trigger_threshold = 10000  # Allocations before considering collection
+algorithm = "mark_sweep_on_candidates"
+
+[memory.cycle_collector.detection]
+description = """
+Objects that may form cycles (e.g., maps containing self-references)
+are flagged as cycle_candidates. The collector only scans these objects,
+not the entire heap.
+"""
+
+[memory.weak_references]
+enabled = true
+keyword = "weak"
+description = """
+Weak references do not increment the reference count.
+When the target is freed, weak references become null.
+Used for caches, parent back-references, and observer patterns.
+"""
+syntax = "weak parent: ?TreeNode"
+behavior = "auto_null_on_free"
+
+# =============================================================================
+# Memory Layout with ARC Header
+# =============================================================================
+# All heap-allocated objects now have this layout:
+#
+# ┌──────────────┬─────────────────────────────────────┐
+# │ ArcHeader    │ Object Data                         │
+# │ (8 bytes)    │ (type-specific)                     │
+# ├──────────────┼─────────────────────────────────────┤
+# │ refcount: u32│ StringRef / Decimal / Record / etc. │
+# │ flags: u32   │                                     │
+# └──────────────┴─────────────────────────────────────┘
+#       ^
+#       │
+#    NaN-boxed pointer points to Object Data (after header)
+#
+# To get header from pointer: header_ptr = object_ptr - 8
+
+[memory.layout]
+description = "Heap object memory layout with ARC header"
+header_offset = -8  # Header is 8 bytes before the object pointer
+pointer_target = "object_data"  # Pointer in Value points to data, not header
+
+[memory.layout.string]
+total_size = "8 + 16 = 24 bytes"
+layout = """
+[ArcHeader: 8 bytes] [StringRef: 16 bytes]
+                      ^
+                      └── Value pointer points here
+"""
+
+[memory.layout.decimal]
+total_size = "8 + 16 = 24 bytes (aligned)"
+layout = """
+[ArcHeader: 8 bytes] [Decimal: 9 bytes + 7 padding]
+                      ^
+                      └── Value pointer points here
+"""
+
+[memory.layout.ordered_map]
+total_size = "8 + sizeof(OrderedMap)"
+layout = """
+[ArcHeader: 8 bytes] [OrderedMap struct]
+                      ^
+                      └── Value pointer points here
+Note: Map values are also ARC-managed; releasing map releases contained values
+"""

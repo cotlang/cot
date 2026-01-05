@@ -343,6 +343,17 @@ pub const Verifier = struct {
             .ptr_offset => |op| {
                 try self.checkValueDefined(op.base_ptr);
             },
+            // Weak reference operations
+            .weak_ref, .weak_load => |op| {
+                try self.checkValueDefined(op.operand);
+            },
+            // ARC operations
+            .arc_retain, .arc_release => |op| {
+                try self.checkValueDefined(op.value);
+            },
+            .arc_move => |op| {
+                try self.checkValueDefined(op.operand);
+            },
         }
     }
 
@@ -387,6 +398,7 @@ pub const Verifier = struct {
             .optional => "optional",
             .function => "function",
             .map => "Map",
+            .weak => "weak",
         };
     }
 

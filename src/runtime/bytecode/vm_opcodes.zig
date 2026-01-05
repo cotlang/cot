@@ -13,6 +13,7 @@ const DispatchResult = vm_types.DispatchResult;
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const OrderedMap = value_mod.OrderedMap;
+const arc = @import("arc.zig");
 
 // Forward declaration - VM is imported at comptime to avoid circular import
 const VM = @import("vm.zig").VM;
@@ -51,7 +52,7 @@ pub fn op_mov(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    vm.registers[rd] = vm.registers[rs];
+    vm.writeRegister(rd, vm.registers[rs]);
     return .continue_dispatch;
 }
 
@@ -61,7 +62,7 @@ pub fn op_movi(vm: *VM, module: *const Module) VMError!DispatchResult {
     const imm: i8 = @bitCast(module.code[vm.ip + 1]);
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.initInt(imm);
+    vm.writeRegister(rd, Value.initInt(imm));
     return .continue_dispatch;
 }
 
@@ -71,7 +72,7 @@ pub fn op_movi16(vm: *VM, module: *const Module) VMError!DispatchResult {
     const imm: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little));
     vm.ip += 3;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.initInt(imm);
+    vm.writeRegister(rd, Value.initInt(imm));
     return .continue_dispatch;
 }
 
@@ -81,7 +82,7 @@ pub fn op_movi32(vm: *VM, module: *const Module) VMError!DispatchResult {
     const imm: i32 = @bitCast(std.mem.readInt(u32, module.code[vm.ip + 1 ..][0..4], .little));
     vm.ip += 5;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.initInt(imm);
+    vm.writeRegister(rd, Value.initInt(imm));
     return .continue_dispatch;
 }
 
@@ -94,7 +95,7 @@ pub fn op_load_const(vm: *VM, module: *const Module) VMError!DispatchResult {
     if (idx >= module.constants.len) {
         return vm.fail(VMError.InvalidConstant, "Constant index out of bounds");
     }
-    vm.registers[rd] = vm.constantToValue(module.constants[idx]);
+    vm.writeRegister(rd, vm.constantToValue(module.constants[idx]));
     return .continue_dispatch;
 }
 
@@ -103,7 +104,7 @@ pub fn op_load_null(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.null_val;
+    vm.writeRegister(rd, Value.null_val);
     return .continue_dispatch;
 }
 
@@ -112,7 +113,7 @@ pub fn op_load_true(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.true_val;
+    vm.writeRegister(rd, Value.true_val);
     return .continue_dispatch;
 }
 
@@ -121,7 +122,7 @@ pub fn op_load_false(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.false_val;
+    vm.writeRegister(rd, Value.false_val);
     return .continue_dispatch;
 }
 
@@ -135,7 +136,7 @@ pub fn op_load_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const slot = module.code[vm.ip + 1];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = vm.stack[vm.fp + slot];
+    vm.writeRegister(rd, vm.stack[vm.fp + slot]);
     return .continue_dispatch;
 }
 
@@ -145,7 +146,7 @@ pub fn op_store_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const slot = module.code[vm.ip + 1];
     vm.ip += 2;
     const rs: u4 = @truncate(ops >> 4);
-    vm.stack[vm.fp + slot] = vm.registers[rs];
+    vm.writeStack(vm.fp + slot, vm.registers[rs]);
     return .continue_dispatch;
 }
 
@@ -155,7 +156,7 @@ pub fn op_load_local16(vm: *VM, module: *const Module) VMError!DispatchResult {
     const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
     vm.ip += 3;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = vm.stack[vm.fp + slot];
+    vm.writeRegister(rd, vm.stack[vm.fp + slot]);
     return .continue_dispatch;
 }
 
@@ -165,7 +166,7 @@ pub fn op_store_local16(vm: *VM, module: *const Module) VMError!DispatchResult {
     const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
     vm.ip += 3;
     const rs: u4 = @truncate(ops >> 4);
-    vm.stack[vm.fp + slot] = vm.registers[rs];
+    vm.writeStack(vm.fp + slot, vm.registers[rs]);
     return .continue_dispatch;
 }
 
@@ -176,9 +177,9 @@ pub fn op_load_global(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 3;
     const rd: u4 = @truncate(ops >> 4);
     if (idx >= vm.globals.items.len) {
-        vm.registers[rd] = Value.null_val;
+        vm.writeRegister(rd, Value.null_val);
     } else {
-        vm.registers[rd] = vm.globals.items[idx];
+        vm.writeRegister(rd, vm.globals.items[idx]);
     }
     return .continue_dispatch;
 }
@@ -196,7 +197,12 @@ pub fn op_store_global(vm: *VM, module: *const Module) VMError!DispatchResult {
             return vm.fail(VMError.OutOfMemory, "Failed to extend globals");
         };
     }
-    vm.globals.items[idx] = vm.registers[rs];
+    // ARC: retain new value, release old
+    const new_val = vm.registers[rs];
+    const old_val = vm.globals.items[idx];
+    arc.retain(new_val);
+    arc.release(old_val, vm.allocator);
+    vm.globals.items[idx] = new_val;
     return .continue_dispatch;
 }
 
@@ -212,7 +218,7 @@ pub fn op_add(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[ra].toInt() + vm.registers[rb].toInt());
+    vm.writeRegister(rd, Value.initInt(vm.registers[ra].toInt() + vm.registers[rb].toInt()));
     return .continue_dispatch;
 }
 
@@ -224,7 +230,7 @@ pub fn op_sub(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[ra].toInt() - vm.registers[rb].toInt());
+    vm.writeRegister(rd, Value.initInt(vm.registers[ra].toInt() - vm.registers[rb].toInt()));
     return .continue_dispatch;
 }
 
@@ -236,7 +242,7 @@ pub fn op_mul(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[ra].toInt() * vm.registers[rb].toInt());
+    vm.writeRegister(rd, Value.initInt(vm.registers[ra].toInt() * vm.registers[rb].toInt()));
     return .continue_dispatch;
 }
 
@@ -252,7 +258,7 @@ pub fn op_div(vm: *VM, module: *const Module) VMError!DispatchResult {
     if (divisor == 0) {
         return vm.fail(VMError.DivisionByZero, "Division by zero");
     }
-    vm.registers[rd] = Value.initInt(@divTrunc(vm.registers[ra].toInt(), divisor));
+    vm.writeRegister(rd, Value.initInt(@divTrunc(vm.registers[ra].toInt(), divisor)));
     return .continue_dispatch;
 }
 
@@ -268,7 +274,7 @@ pub fn op_mod(vm: *VM, module: *const Module) VMError!DispatchResult {
     if (divisor == 0) {
         return vm.fail(VMError.DivisionByZero, "Modulo by zero");
     }
-    vm.registers[rd] = Value.initInt(@rem(vm.registers[ra].toInt(), divisor));
+    vm.writeRegister(rd, Value.initInt(@rem(vm.registers[ra].toInt(), divisor)));
     return .continue_dispatch;
 }
 
@@ -278,7 +284,7 @@ pub fn op_neg(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    vm.registers[rd] = Value.initInt(-vm.registers[rs].toInt());
+    vm.writeRegister(rd, Value.initInt(-vm.registers[rs].toInt()));
     return .continue_dispatch;
 }
 
@@ -289,7 +295,7 @@ pub fn op_addi(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    vm.registers[rd] = Value.initInt(vm.registers[rs].toInt() + imm);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs].toInt() + imm));
     return .continue_dispatch;
 }
 
@@ -300,7 +306,7 @@ pub fn op_subi(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    vm.registers[rd] = Value.initInt(vm.registers[rs].toInt() - imm);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs].toInt() - imm));
     return .continue_dispatch;
 }
 
@@ -311,7 +317,7 @@ pub fn op_muli(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    vm.registers[rd] = Value.initInt(vm.registers[rs].toInt() * imm);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs].toInt() * imm));
     return .continue_dispatch;
 }
 
@@ -320,7 +326,7 @@ pub fn op_incr(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[rd].toInt() + 1);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rd].toInt() + 1));
     return .continue_dispatch;
 }
 
@@ -329,7 +335,7 @@ pub fn op_decr(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[rd].toInt() - 1);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rd].toInt() - 1));
     return .continue_dispatch;
 }
 
@@ -353,9 +359,9 @@ pub fn op_cmp_eq(vm: *VM, module: *const Module) VMError!DispatchResult {
     const a = vm.registers[ra];
     const b = vm.registers[rb];
     if (isAnyString(a) or isAnyString(b)) {
-        vm.registers[rd] = Value.initBool(std.mem.eql(u8, a.asString(), b.asString()));
+        vm.writeRegister(rd, Value.initBool(std.mem.eql(u8, a.asString(), b.asString())));
     } else {
-        vm.registers[rd] = Value.initBool(a.toInt() == b.toInt());
+        vm.writeRegister(rd, Value.initBool(a.toInt() == b.toInt()));
     }
     return .continue_dispatch;
 }
@@ -371,9 +377,9 @@ pub fn op_cmp_ne(vm: *VM, module: *const Module) VMError!DispatchResult {
     const a = vm.registers[ra];
     const b = vm.registers[rb];
     if (isAnyString(a) or isAnyString(b)) {
-        vm.registers[rd] = Value.initBool(!std.mem.eql(u8, a.asString(), b.asString()));
+        vm.writeRegister(rd, Value.initBool(!std.mem.eql(u8, a.asString(), b.asString())));
     } else {
-        vm.registers[rd] = Value.initBool(a.toInt() != b.toInt());
+        vm.writeRegister(rd, Value.initBool(a.toInt() != b.toInt()));
     }
     return .continue_dispatch;
 }
@@ -389,9 +395,9 @@ pub fn op_cmp_lt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const a = vm.registers[ra];
     const b = vm.registers[rb];
     if (isAnyString(a) or isAnyString(b)) {
-        vm.registers[rd] = Value.initBool(std.mem.order(u8, a.asString(), b.asString()) == .lt);
+        vm.writeRegister(rd, Value.initBool(std.mem.order(u8, a.asString(), b.asString()) == .lt));
     } else {
-        vm.registers[rd] = Value.initBool(a.toInt() < b.toInt());
+        vm.writeRegister(rd, Value.initBool(a.toInt() < b.toInt()));
     }
     return .continue_dispatch;
 }
@@ -408,9 +414,9 @@ pub fn op_cmp_le(vm: *VM, module: *const Module) VMError!DispatchResult {
     const b = vm.registers[rb];
     if (isAnyString(a) or isAnyString(b)) {
         const ord = std.mem.order(u8, a.asString(), b.asString());
-        vm.registers[rd] = Value.initBool(ord == .lt or ord == .eq);
+        vm.writeRegister(rd, Value.initBool(ord == .lt or ord == .eq));
     } else {
-        vm.registers[rd] = Value.initBool(a.toInt() <= b.toInt());
+        vm.writeRegister(rd, Value.initBool(a.toInt() <= b.toInt()));
     }
     return .continue_dispatch;
 }
@@ -426,9 +432,9 @@ pub fn op_cmp_gt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const a = vm.registers[ra];
     const b = vm.registers[rb];
     if (isAnyString(a) or isAnyString(b)) {
-        vm.registers[rd] = Value.initBool(std.mem.order(u8, a.asString(), b.asString()) == .gt);
+        vm.writeRegister(rd, Value.initBool(std.mem.order(u8, a.asString(), b.asString()) == .gt));
     } else {
-        vm.registers[rd] = Value.initBool(a.toInt() > b.toInt());
+        vm.writeRegister(rd, Value.initBool(a.toInt() > b.toInt()));
     }
     return .continue_dispatch;
 }
@@ -445,9 +451,9 @@ pub fn op_cmp_ge(vm: *VM, module: *const Module) VMError!DispatchResult {
     const b = vm.registers[rb];
     if (isAnyString(a) or isAnyString(b)) {
         const ord = std.mem.order(u8, a.asString(), b.asString());
-        vm.registers[rd] = Value.initBool(ord == .gt or ord == .eq);
+        vm.writeRegister(rd, Value.initBool(ord == .gt or ord == .eq));
     } else {
-        vm.registers[rd] = Value.initBool(a.toInt() >= b.toInt());
+        vm.writeRegister(rd, Value.initBool(a.toInt() >= b.toInt()));
     }
     return .continue_dispatch;
 }
@@ -466,7 +472,7 @@ pub fn op_cmp_str_eq(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rb: u4 = @truncate(ops2 >> 4);
     const a = vm.registers[ra].asString();
     const b = vm.registers[rb].asString();
-    vm.registers[rd] = Value.initBool(std.mem.eql(u8, a, b));
+    vm.writeRegister(rd, Value.initBool(std.mem.eql(u8, a, b)));
     return .continue_dispatch;
 }
 
@@ -480,7 +486,7 @@ pub fn op_cmp_str_ne(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rb: u4 = @truncate(ops2 >> 4);
     const a = vm.registers[ra].asString();
     const b = vm.registers[rb].asString();
-    vm.registers[rd] = Value.initBool(!std.mem.eql(u8, a, b));
+    vm.writeRegister(rd, Value.initBool(!std.mem.eql(u8, a, b)));
     return .continue_dispatch;
 }
 
@@ -494,7 +500,7 @@ pub fn op_cmp_str_lt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rb: u4 = @truncate(ops2 >> 4);
     const a = vm.registers[ra].asString();
     const b = vm.registers[rb].asString();
-    vm.registers[rd] = Value.initBool(std.mem.order(u8, a, b) == .lt);
+    vm.writeRegister(rd, Value.initBool(std.mem.order(u8, a, b) == .lt));
     return .continue_dispatch;
 }
 
@@ -509,7 +515,7 @@ pub fn op_cmp_str_le(vm: *VM, module: *const Module) VMError!DispatchResult {
     const a = vm.registers[ra].asString();
     const b = vm.registers[rb].asString();
     const ord = std.mem.order(u8, a, b);
-    vm.registers[rd] = Value.initBool(ord == .lt or ord == .eq);
+    vm.writeRegister(rd, Value.initBool(ord == .lt or ord == .eq));
     return .continue_dispatch;
 }
 
@@ -523,7 +529,7 @@ pub fn op_cmp_str_gt(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rb: u4 = @truncate(ops2 >> 4);
     const a = vm.registers[ra].asString();
     const b = vm.registers[rb].asString();
-    vm.registers[rd] = Value.initBool(std.mem.order(u8, a, b) == .gt);
+    vm.writeRegister(rd, Value.initBool(std.mem.order(u8, a, b) == .gt));
     return .continue_dispatch;
 }
 
@@ -538,7 +544,7 @@ pub fn op_cmp_str_ge(vm: *VM, module: *const Module) VMError!DispatchResult {
     const a = vm.registers[ra].asString();
     const b = vm.registers[rb].asString();
     const ord = std.mem.order(u8, a, b);
-    vm.registers[rd] = Value.initBool(ord == .gt or ord == .eq);
+    vm.writeRegister(rd, Value.initBool(ord == .gt or ord == .eq));
     return .continue_dispatch;
 }
 
@@ -552,7 +558,7 @@ pub fn op_log_not(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    vm.registers[rd] = Value.initBool(!vm.registers[rs].toBool());
+    vm.writeRegister(rd, Value.initBool(!vm.registers[rs].toBool()));
     return .continue_dispatch;
 }
 
@@ -562,7 +568,7 @@ pub fn op_is_null(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    vm.registers[rd] = Value.initBool(vm.registers[rs].isNull());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs].isNull()));
     return .continue_dispatch;
 }
 
@@ -575,7 +581,7 @@ pub fn op_select(vm: *VM, module: *const Module) VMError!DispatchResult {
     const cond: u4 = @truncate(ops1 & 0xF);
     const rtrue: u4 = @truncate(ops2 >> 4);
     const rfalse: u4 = @truncate(ops2 & 0xF);
-    vm.registers[rd] = if (vm.registers[cond].toBool()) vm.registers[rtrue] else vm.registers[rfalse];
+    vm.writeRegister(rd, if (vm.registers[cond].toBool()) vm.registers[rtrue] else vm.registers[rfalse]);
     return .continue_dispatch;
 }
 
@@ -591,7 +597,7 @@ pub fn op_ptr_offset(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rs: u4 = @truncate(ops & 0xF);
     _ = offset; // Offset handling deferred until byte-level memory is implemented
     // For now, just copy the value - byte-level addressing will be added later
-    vm.registers[rd] = vm.registers[rs];
+    vm.writeRegister(rd, vm.registers[rs]);
     return .continue_dispatch;
 }
 
@@ -701,6 +707,13 @@ pub fn op_debug_line(vm: *VM, module: *const Module) VMError!DispatchResult {
     const line = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
     vm.ip += 3; // Skip: 0 byte (1) + line u16 (2) = 3 bytes
     vm.debug_current_line = line;
+
+    // Check if debugger wants to stop at this line
+    if (vm.debugger.shouldStop(line, vm.call_stack.len)) {
+        vm.stop_reason = .step;
+        return .halt;
+    }
+
     return .continue_dispatch;
 }
 
@@ -716,7 +729,7 @@ pub fn op_log_and(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toBool() and vm.registers[rs2].toBool());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toBool() and vm.registers[rs2].toBool()));
     return .continue_dispatch;
 }
 
@@ -728,7 +741,7 @@ pub fn op_log_or(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toBool() or vm.registers[rs2].toBool());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toBool() or vm.registers[rs2].toBool()));
     return .continue_dispatch;
 }
 
@@ -801,7 +814,7 @@ pub fn op_ret(vm: *VM, module: *const Module) VMError!DispatchResult {
         for (routine.params, 0..) |param, i| {
             if (param.mode == .ref) {
                 // Copy value from callee's stack slot back to caller's register
-                vm.registers[i] = vm.stack[vm.fp + i];
+                vm.writeRegister(@truncate(i), vm.stack[vm.fp + i]);
             }
         }
 
@@ -822,7 +835,7 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rs: u4 = @truncate(ops >> 4);
     // Return value goes in r15
-    vm.registers[15] = vm.registers[rs];
+    vm.writeRegister(15, vm.registers[rs]);
 
     if (vm.call_stack.pop()) |frame| {
         // Copy back ref parameters to caller's registers
@@ -830,7 +843,7 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
         for (routine.params, 0..) |param, i| {
             if (param.mode == .ref) {
                 // Copy value from callee's stack slot back to caller's register
-                vm.registers[i] = vm.stack[vm.fp + i];
+                vm.writeRegister(@truncate(i), vm.stack[vm.fp + i]);
             }
         }
 
@@ -856,15 +869,40 @@ pub fn op_println(vm: *VM, module: *const Module) VMError!DispatchResult {
     // argc is in low 4 bits (high 4 bits unused now)
     const argc: u8 = @truncate(ops & 0x0F);
 
+    // Build output string in buffer
+    var output_buf: [1024]u8 = undefined;
+    var output_pos: usize = 0;
+
     // Print all arguments from registers r0..r(argc-1)
     var buf: [256]u8 = undefined;
     for (0..argc) |i| {
         const val = vm.registers[i];
         var fbs = std.io.fixedBufferStream(&buf);
         val.format("", .{}, fbs.writer()) catch {};
-        vm.stdout.writeAll(fbs.getWritten()) catch {};
+        const written = fbs.getWritten();
+        vm.stdout.writeAll(written) catch {};
+
+        // Accumulate for callback
+        if (output_pos + written.len < output_buf.len) {
+            @memcpy(output_buf[output_pos..][0..written.len], written);
+            output_pos += written.len;
+        }
     }
     vm.stdout.writeAll("\n") catch {};
+
+    // Add newline to output buffer
+    if (output_pos < output_buf.len) {
+        output_buf[output_pos] = '\n';
+        output_pos += 1;
+    }
+
+    // Call output callback if registered (for DAP Debug Console)
+    if (vm.output_callback) |callback| {
+        if (vm.output_callback_context) |ctx| {
+            callback(output_buf[0..output_pos], ctx);
+        }
+    }
+
     return .continue_dispatch;
 }
 
@@ -875,14 +913,33 @@ pub fn op_print(vm: *VM, module: *const Module) VMError!DispatchResult {
     // argc is in low 4 bits
     const argc: u8 = @truncate(ops & 0x0F);
 
+    // Build output string in buffer
+    var output_buf: [1024]u8 = undefined;
+    var output_pos: usize = 0;
+
     // Print all arguments from registers r0..r(argc-1)
     var buf: [256]u8 = undefined;
     for (0..argc) |i| {
         const val = vm.registers[i];
         var fbs = std.io.fixedBufferStream(&buf);
         val.format("", .{}, fbs.writer()) catch {};
-        vm.stdout.writeAll(fbs.getWritten()) catch {};
+        const written = fbs.getWritten();
+        vm.stdout.writeAll(written) catch {};
+
+        // Accumulate for callback
+        if (output_pos + written.len < output_buf.len) {
+            @memcpy(output_buf[output_pos..][0..written.len], written);
+            output_pos += written.len;
+        }
     }
+
+    // Call output callback if registered (for DAP Debug Console)
+    if (vm.output_callback) |callback| {
+        if (vm.output_callback_context) |ctx| {
+            callback(output_buf[0..output_pos], ctx);
+        }
+    }
+
     return .continue_dispatch;
 }
 
@@ -939,7 +996,7 @@ pub fn op_str_concat(vm: *VM, module: *const Module) VMError!DispatchResult {
     @memcpy(result[s1.len..], s2);
 
     // Store result as string value
-    vm.registers[rd] = Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory;
+    vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
     return .continue_dispatch;
 }
 
@@ -996,7 +1053,7 @@ pub fn op_str_slice_store(vm: *VM, module: *const Module) VMError!DispatchResult
     }
 
     // Store result back to rd
-    vm.registers[rd] = Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory;
+    vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
     return .continue_dispatch;
 }
 
@@ -1047,7 +1104,7 @@ pub fn op_format_decimal(vm: *VM, module: *const Module) VMError!DispatchResult 
     }
 
     // Store result as string value
-    vm.registers[rd] = Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory;
+    vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
     return .continue_dispatch;
 }
 
@@ -1064,7 +1121,7 @@ pub fn op_parse_decimal(vm: *VM, module: *const Module) VMError!DispatchResult {
         .string, .fixed_string => val.asString(),
         .integer => {
             // Already an integer - just copy it
-            vm.registers[rd] = val;
+            vm.writeRegister(rd, val);
             return .continue_dispatch;
         },
         else => "",
@@ -1085,7 +1142,7 @@ pub fn op_parse_decimal(vm: *VM, module: *const Module) VMError!DispatchResult {
 
     // Empty string after trimming (or just "-") -> 0
     if (start >= trimmed.len) {
-        vm.registers[rd] = Value.initInt(0);
+        vm.writeRegister(rd, Value.initInt(0));
         return .continue_dispatch;
     }
 
@@ -1103,7 +1160,7 @@ pub fn op_parse_decimal(vm: *VM, module: *const Module) VMError!DispatchResult {
     };
 
     const result: i64 = if (is_negative) -abs_val else abs_val;
-    vm.registers[rd] = Value.initInt(result);
+    vm.writeRegister(rd, Value.initInt(result));
     return .continue_dispatch;
 }
 
@@ -1123,6 +1180,132 @@ pub fn op_assert(vm: *VM, module: *const Module) VMError!DispatchResult {
 }
 
 // ============================================================================
+// Weak Reference Operations (0xF3-0xF4)
+// ============================================================================
+
+/// weak_ref rd, rs - create weak reference: rd = weak(rs)
+/// Creates a weak reference to rs without incrementing refcount.
+/// When rs is freed, rd becomes null automatically.
+pub fn op_weak_ref(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops);
+
+    const source_value = vm.registers[rs];
+
+    // Store the value without retain (weak reference doesn't own the value)
+    // We need to clear any previous value in rd first (with release)
+    const old_value = vm.registers[rd];
+    if (arc.needsArc(old_value)) {
+        arc.release(old_value, vm.allocator);
+    }
+    vm.registers[rd] = source_value;
+
+    // Register this location in the weak registry
+    // When source_value is freed, rd will be set to null
+    vm.weak_registry.registerWeakRef(source_value, &vm.registers[rd]) catch {
+        return VMError.OutOfMemory;
+    };
+
+    return .continue_dispatch;
+}
+
+/// weak_load rd, rs - load from weak reference: rd = *rs (or null if freed)
+/// Returns null if the weak reference target has been freed.
+/// Returns the value (with retain) if still alive.
+pub fn op_weak_load(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops);
+
+    const weak_value = vm.registers[rs];
+
+    // Check if the target is still alive
+    if (weak_value.isNull()) {
+        // Weak ref already null (target was freed)
+        vm.writeRegister(rd, Value.null_val);
+    } else if (arc.getHeapPtr(weak_value)) |ptr| {
+        const header = arc.getHeader(ptr);
+        const flags = header.getFlags();
+
+        if (flags.poisoned or header.refcount == 0) {
+            // Target was freed - return null
+            vm.writeRegister(rd, Value.null_val);
+        } else {
+            // Target still alive - return it (writeRegister handles retain)
+            vm.writeRegister(rd, weak_value);
+        }
+    } else {
+        // Non-heap value (shouldn't have weak ref, but return it anyway)
+        vm.writeRegister(rd, weak_value);
+    }
+
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// ARC Operations (0xF5-0xF7)
+// Explicit reference counting for compiler integration
+// ============================================================================
+
+/// arc_retain rs - increment reference count of heap value
+/// No-op for inline values (ints, bools, null).
+pub fn op_arc_retain(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+
+    const rs: u4 = @truncate(ops >> 4);
+    const value = vm.registers[rs];
+
+    // Retain the value (no-op for inline values)
+    arc.retain(value);
+
+    return .continue_dispatch;
+}
+
+/// arc_release rs - decrement reference count (may free)
+/// No-op for inline values. Frees object when refcount reaches 0.
+pub fn op_arc_release(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+
+    const rs: u4 = @truncate(ops >> 4);
+    const value = vm.registers[rs];
+
+    // Release the value using weak-aware release
+    arc.releaseWithWeakSupport(value, vm.allocator, &vm.weak_registry);
+
+    return .continue_dispatch;
+}
+
+/// arc_move rd, rs - move value without ARC (transfer ownership)
+/// Copies rs to rd without retain, sets rs to null.
+/// Used for last-use optimization to avoid retain/release pair.
+pub fn op_arc_move(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops);
+
+    // Release old value in destination (if any)
+    const old_value = vm.registers[rd];
+    if (arc.needsArc(old_value)) {
+        arc.releaseWithWeakSupport(old_value, vm.allocator, &vm.weak_registry);
+    }
+
+    // Move value: copy to dest, null out source
+    vm.registers[rd] = vm.registers[rs];
+    vm.registers[rs] = Value.null_val;
+
+    return .continue_dispatch;
+}
+
+// ============================================================================
 // Quickened/Specialized Integer Handlers (0xE0-0xEB)
 // These skip type checking for performance when types are known
 // ============================================================================
@@ -1135,7 +1318,7 @@ pub fn op_add_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[rs1].toInt() + vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() + vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1147,7 +1330,7 @@ pub fn op_sub_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[rs1].toInt() - vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() - vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1159,7 +1342,7 @@ pub fn op_mul_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[rs1].toInt() * vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() * vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1175,7 +1358,7 @@ pub fn op_div_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     if (divisor == 0) {
         return vm.fail(VMError.DivisionByZero, "Division by zero");
     }
-    vm.registers[rd] = Value.initInt(@divTrunc(vm.registers[rs1].toInt(), divisor));
+    vm.writeRegister(rd, Value.initInt(@divTrunc(vm.registers[rs1].toInt(), divisor)));
     return .continue_dispatch;
 }
 
@@ -1187,7 +1370,7 @@ pub fn op_cmp_lt_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toInt() < vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toInt() < vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1199,7 +1382,7 @@ pub fn op_cmp_le_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toInt() <= vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toInt() <= vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1211,7 +1394,7 @@ pub fn op_cmp_gt_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toInt() > vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toInt() > vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1223,7 +1406,7 @@ pub fn op_cmp_ge_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toInt() >= vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toInt() >= vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1235,7 +1418,7 @@ pub fn op_cmp_eq_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toInt() == vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toInt() == vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1247,7 +1430,7 @@ pub fn op_cmp_ne_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const rs1: u4 = @truncate(ops & 0xF);
     const rs2: u4 = @truncate(byte2 >> 4);
-    vm.registers[rd] = Value.initBool(vm.registers[rs1].toInt() != vm.registers[rs2].toInt());
+    vm.writeRegister(rd, Value.initBool(vm.registers[rs1].toInt() != vm.registers[rs2].toInt()));
     return .continue_dispatch;
 }
 
@@ -1256,7 +1439,7 @@ pub fn op_incr_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[rd].toInt() + 1);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rd].toInt() + 1));
     return .continue_dispatch;
 }
 
@@ -1265,7 +1448,7 @@ pub fn op_decr_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
-    vm.registers[rd] = Value.initInt(vm.registers[rd].toInt() - 1);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rd].toInt() - 1));
     return .continue_dispatch;
 }
 
@@ -1316,7 +1499,7 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
                 vm.allocator.free(result_copy);
                 return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
             };
-            vm.registers[rd] = result;
+            vm.writeRegister(rd, result);
             return .continue_dispatch;
         }
     }
@@ -1395,7 +1578,7 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
         vm.allocator.free(buffer);
         return vm.fail(VMError.OutOfMemory, "Failed to create record buffer value");
     };
-    vm.registers[rd] = result;
+    vm.writeRegister(rd, result);
 
     return .continue_dispatch;
 }
@@ -1450,6 +1633,9 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
                     vm.allocator.free(new_buf);
                     return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
                 };
+                // Inline ARC for slot write
+                arc.retain(new_val);
+                arc.release(slot_ptr.*, vm.allocator);
                 slot_ptr.* = new_val;
                 return .continue_dispatch;
             }
@@ -1485,23 +1671,26 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
                 const int_val = std.fmt.parseInt(i64, trimmed, 10) catch 0;
                 // Use field.precision to preserve implied decimal semantics
                 // For d10.2, value 12345 with precision 2 represents 123.45
-                if (field.precision > 0) {
-                    slot_ptr.?.* = Value.initDecimal(vm.valueAllocator(), int_val, field.precision) catch {
-                        slot_ptr.?.* = Value.initInt(int_val);
-                        continue;
-                    };
-                } else {
-                    slot_ptr.?.* = Value.initInt(int_val);
-                }
+                const new_val = if (field.precision > 0)
+                    Value.initDecimal(vm.valueAllocator(), int_val, field.precision) catch Value.initInt(int_val)
+                else
+                    Value.initInt(int_val);
+                // Inline ARC for slot write
+                arc.retain(new_val);
+                arc.release(slot_ptr.?.*, vm.allocator);
+                slot_ptr.?.* = new_val;
             },
             .string => {
                 const str_copy = vm.allocator.alloc(u8, size) catch continue;
                 @memcpy(str_copy, src);
-                const val = Value.initFixedString(vm.valueAllocator(), str_copy) catch {
+                const new_val = Value.initFixedString(vm.valueAllocator(), str_copy) catch {
                     vm.allocator.free(str_copy);
                     continue;
                 };
-                slot_ptr.?.* = val;
+                // Inline ARC for slot write
+                arc.retain(new_val);
+                arc.release(slot_ptr.?.*, vm.allocator);
+                slot_ptr.?.* = new_val;
             },
             else => {},
         }
@@ -1521,7 +1710,7 @@ pub fn op_map_new(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const flags: u4 = @truncate(ops & 0xF);
 
-    const map = vm.allocator.create(OrderedMap) catch {
+    const map = arc.create(vm.allocator, OrderedMap) catch {
         return vm.fail(VMError.OutOfMemory, "Failed to allocate map");
     };
     map.* = OrderedMap.init(vm.allocator, .{
@@ -1529,7 +1718,7 @@ pub fn op_map_new(vm: *VM, module: *const Module) VMError!DispatchResult {
         .preserve_spaces = (flags & 2) != 0,
     });
 
-    vm.registers[rd] = Value.initMap(map);
+    vm.writeRegister(rd, Value.initMap(map));
     return .continue_dispatch;
 }
 
@@ -1574,7 +1763,7 @@ pub fn op_map_get(vm: *VM, module: *const Module) VMError!DispatchResult {
     var key_buf: [32]u8 = undefined;
     const key = vm.valueToStringSlice(vm.registers[key_reg], &key_buf);
 
-    vm.registers[rd] = map.get(key) orelse Value.null_val;
+    vm.writeRegister(rd, map.get(key) orelse Value.null_val);
     return .continue_dispatch;
 }
 
@@ -1616,7 +1805,7 @@ pub fn op_map_has(vm: *VM, module: *const Module) VMError!DispatchResult {
     var key_buf: [32]u8 = undefined;
     const key = vm.valueToStringSlice(vm.registers[key_reg], &key_buf);
 
-    vm.registers[rd] = if (map.has(key)) Value.true_val else Value.false_val;
+    vm.writeRegister(rd, if (map.has(key)) Value.true_val else Value.false_val);
     return .continue_dispatch;
 }
 
@@ -1632,7 +1821,7 @@ pub fn op_map_len(vm: *VM, module: *const Module) VMError!DispatchResult {
         return vm.fail(VMError.InvalidType, "Expected map value");
     };
 
-    vm.registers[rd] = Value.initInt(@intCast(map.len()));
+    vm.writeRegister(rd, Value.initInt(@intCast(map.len())));
     return .continue_dispatch;
 }
 
@@ -1678,10 +1867,10 @@ pub fn op_map_keys(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 
     const str = result.toOwnedSlice(vm.allocator) catch return VMError.OutOfMemory;
-    vm.registers[rd] = Value.initString(vm.allocator, str) catch {
+    vm.writeRegister(rd, Value.initString(vm.allocator, str) catch {
         vm.allocator.free(str);
         return VMError.OutOfMemory;
-    };
+    });
     vm.allocator.free(str);
     return .continue_dispatch;
 }
@@ -1715,10 +1904,10 @@ pub fn op_map_values(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 
     const str = result.toOwnedSlice(vm.allocator) catch return VMError.OutOfMemory;
-    vm.registers[rd] = Value.initString(vm.allocator, str) catch {
+    vm.writeRegister(rd, Value.initString(vm.allocator, str) catch {
         vm.allocator.free(str);
         return VMError.OutOfMemory;
-    };
+    });
     vm.allocator.free(str);
     return .continue_dispatch;
 }
@@ -1744,15 +1933,15 @@ pub fn op_map_get_at(vm: *VM, module: *const Module) VMError!DispatchResult {
     const idx = idx_val.asInt();
 
     if (idx <= 0) {
-        vm.registers[rd] = Value.null_val;
+        vm.writeRegister(rd, Value.null_val);
         return .continue_dispatch;
     }
 
     const entry = map.getAt(@intCast(idx - 1)); // 1-based to 0-based
     if (entry) |e| {
-        vm.registers[rd] = e.value;
+        vm.writeRegister(rd, e.value);
     } else {
-        vm.registers[rd] = Value.null_val;
+        vm.writeRegister(rd, Value.null_val);
     }
     return .continue_dispatch;
 }
@@ -1825,9 +2014,9 @@ pub fn op_fn_round(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Return as decimal if precision > 0, otherwise as integer
     if (prec > 0) {
         const int_val: i64 = @intFromFloat(rounded);
-        vm.registers[rd] = Value.initDecimal(vm.allocator, int_val, prec) catch return VMError.OutOfMemory;
+        vm.writeRegister(rd, Value.initDecimal(vm.allocator, int_val, prec) catch return VMError.OutOfMemory);
     } else {
-        vm.registers[rd] = Value.initInt(@intFromFloat(result));
+        vm.writeRegister(rd, Value.initInt(@intFromFloat(result)));
     }
 
     return .continue_dispatch;
@@ -1869,9 +2058,9 @@ pub fn op_fn_trunc(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Return as decimal if precision > 0, otherwise as integer
     if (prec > 0) {
         const int_val: i64 = @intFromFloat(truncated);
-        vm.registers[rd] = Value.initDecimal(vm.allocator, int_val, prec) catch return VMError.OutOfMemory;
+        vm.writeRegister(rd, Value.initDecimal(vm.allocator, int_val, prec) catch return VMError.OutOfMemory);
     } else {
-        vm.registers[rd] = Value.initInt(@intFromFloat(result));
+        vm.writeRegister(rd, Value.initInt(@intFromFloat(result)));
     }
 
     return .continue_dispatch;

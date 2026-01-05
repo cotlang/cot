@@ -1,6 +1,10 @@
 //! Math native functions
 //!
-//! abs, sqrt, sin, cos, tan, log, log10, exp, round, trunc
+//! Namespace: std.math
+//! Functions: abs, sqrt, sin, cos, tan, log, log10, exp, round, trunc
+//!
+//! In .cot files: requires `import std.math` then call as `std.math.abs(x)`
+//! In .dbl files: available directly as `abs(x)` (DBL compatibility)
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -9,8 +13,21 @@ const NativeError = native.NativeError;
 const NativeFn = native.NativeFn;
 const Value = native.Value;
 
-/// Register all math functions
+/// Register all math functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
+    // Namespaced names (std.math.*)
+    try registry.registerNative("std.math.abs", abs);
+    try registry.registerNative("std.math.sqrt", sqrt);
+    try registry.registerNative("std.math.sin", sin);
+    try registry.registerNative("std.math.cos", cos);
+    try registry.registerNative("std.math.tan", tan);
+    try registry.registerNative("std.math.log", log);
+    try registry.registerNative("std.math.log10", log10);
+    try registry.registerNative("std.math.exp", exp);
+    try registry.registerNative("std.math.round", round);
+    try registry.registerNative("std.math.trunc", trunc);
+
+    // Short names (DBL compatibility - available without import in .dbl files)
     try registry.registerNative("abs", abs);
     try registry.registerNative("sqrt", sqrt);
     try registry.registerNative("sin", sin);

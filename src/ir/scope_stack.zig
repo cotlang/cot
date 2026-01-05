@@ -177,10 +177,33 @@ pub const ScopeStack = struct {
         // They'll be freed on deinit()
     }
 
-    /// Iterator for all variables visible in current scope
+    /// Iterator for all variables visible in current scope (including parent scopes)
     pub fn visibleVariables(self: *const ScopeStack) VisibleIterator {
         return VisibleIterator{ .scope = self.current };
     }
+
+    /// Iterator for variables in only the current scope (not parent scopes)
+    /// Use this for scope-exit cleanup to release only variables declared in the exiting scope
+    pub fn currentScopeVariables(self: *const ScopeStack) CurrentScopeIterator {
+        return CurrentScopeIterator.init(self.current);
+    }
+
+    pub const CurrentScopeIterator = struct {
+        inner_iter: std.StringHashMap(ir.Value).Iterator,
+
+        pub fn init(scope: *const Scope) CurrentScopeIterator {
+            return .{
+                .inner_iter = scope.variables.iterator(),
+            };
+        }
+
+        pub fn next(self: *CurrentScopeIterator) ?struct { key: []const u8, value: ir.Value } {
+            if (self.inner_iter.next()) |entry| {
+                return .{ .key = entry.key_ptr.*, .value = entry.value_ptr.* };
+            }
+            return null;
+        }
+    };
 
     pub const VisibleIterator = struct {
         scope: ?*const Scope,

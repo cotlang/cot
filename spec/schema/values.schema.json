@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cotlang.org/spec/values.schema.json",
+  "title": "Cot Value Representation Specification",
+  "description": "Schema for NaN-boxed value encoding",
+  "type": "object",
+  "required": ["meta", "nan_boxing", "tags", "types"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["version", "representation", "size_bytes"],
+      "properties": {
+        "version": { "type": "string" },
+        "representation": { "type": "string", "enum": ["nan_boxing", "tagged_union"] },
+        "size_bytes": { "type": "integer" }
+      }
+    },
+    "nan_boxing": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "qnan_base": { "type": "string", "description": "Hex pattern for quiet NaN base" }
+      }
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/tag"
+      }
+    },
+    "types": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/type_def"
+      }
+    }
+  },
+  "definitions": {
+    "tag": {
+      "type": "object",
+      "required": ["pattern"],
+      "properties": {
+        "pattern": { "type": "string", "description": "Hex bit pattern" },
+        "payload_bits": { "type": "integer" },
+        "payload_type": { "type": "string", "enum": ["none", "signed", "pointer", "handle_id", "typed_pointer"] },
+        "signed": { "type": "boolean" }
+      }
+    },
+    "type_def": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "heap_layout": { "type": "string", "description": "Struct definition for heap types" },
+        "ownership": { "type": "string" },
+        "min": { "type": "integer" },
+        "max": { "type": "integer" },
+        "overflow_behavior": { "type": "string" }
+      }
+    }
+  }
+}

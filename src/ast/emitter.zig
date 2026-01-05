@@ -259,6 +259,13 @@ pub const Emitter = struct {
                 try self.writer.writeByte('?');
                 try self.emitType(view.inner_type);
             },
+            .weak => {
+                // Weak reference type - uses same layout as optional (inner type in data.a)
+                const data = self.store.typeData(idx);
+                const inner_type = TypeIdx.fromInt(data.a);
+                try self.writer.writeAll("weak ");
+                try self.emitType(inner_type);
+            },
             .pointer => {
                 const view = PointerTypeView.from(self.store, idx);
                 if (view.is_const) {

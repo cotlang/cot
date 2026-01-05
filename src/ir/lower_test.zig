@@ -663,3 +663,134 @@ test "lower: multiple comparisons" {
     }
     try testing.expect(cmp_count >= 2);
 }
+
+// ============================================================================
+// ARC Emission Tests
+// ============================================================================
+
+/// Parse source code and lower to IR with ARC emission enabled
+fn lowerSourceWithArc(allocator: std.mem.Allocator, source: []const u8) !*ir.Module {
+    // Tokenize
+    var lex = lexer.Lexer.init(source);
+    const tokens = try lex.tokenize(allocator);
+    defer allocator.free(tokens);
+
+    // Parse
+    var strings = base.StringInterner.init(allocator);
+    defer strings.deinit();
+
+    var store = ast.NodeStore.init(allocator, &strings);
+    defer store.deinit();
+
+    var parse = parser.Parser.init(allocator, tokens, &store, &strings);
+    defer parse.deinit();
+
+    const top_level = try parse.parse();
+    defer allocator.free(top_level);
+
+    // Lower to IR with ARC enabled
+    return lower.lowerWithOptions(allocator, &store, &strings, top_level, "test", .{ .emit_arc = true });
+}
+
+/// Count instructions of a specific type in a function
+fn countInstructionsByTag(func: *const ir.Function, comptime tag: std.meta.Tag(ir.Instruction)) usize {
+    var count: usize = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (std.meta.activeTag(inst) == tag) {
+                count += 1;
+            }
+        }
+    }
+    return count;
+}
+
+test "ARC: emit_arc flag emits arc_retain for string return" {
+    const allocator = testing.allocator;
+    const source =
+        \\fn get_name(): string {
+        \\    return "hello"
+        \\}
+        \\fn main() {}
+    ;
+
+    var module = try lowerSourceWithArc(allocator, source);
+    defer {
+        module.deinit();
+        allocator.destroy(module);
+    }
+
+    const get_name_fn = getFunction(module, "get_name").?;
+
+    // Should have arc_retain instruction for the return value
+    const retain_count = countInstructionsByTag(get_name_fn, .arc_retain);
+    try testing.expect(retain_count >= 1);
+}
+
+test "ARC: emit_arc flag emits arc_retain for string assignment" {
+    const allocator = testing.allocator;
+    const source =
+        \\fn test_assign() {
+        \\    let s: string = "hello"
+        \\}
+        \\fn main() {}
+    ;
+
+    var module = try lowerSourceWithArc(allocator, source);
+    defer {
+        module.deinit();
+        allocator.destroy(module);
+    }
+
+    const test_fn = getFunction(module, "test_assign").?;
+
+    // Should have arc_retain for the string assignment
+    const retain_count = countInstructionsByTag(test_fn, .arc_retain);
+    try testing.expect(retain_count >= 1);
+}
+
+test "ARC: emit_arc disabled does not emit arc_retain" {
+    const allocator = testing.allocator;
+    const source =
+        \\fn get_name(): string {
+        \\    return "hello"
+        \\}
+        \\fn main() {}
+    ;
+
+    // Use normal lowering (emit_arc = false)
+    var module = try lowerSource(allocator, source);
+    defer {
+        module.deinit();
+        allocator.destroy(module);
+    }
+
+    const get_name_fn = getFunction(module, "get_name").?;
+
+    // Should NOT have arc_retain instruction
+    const retain_count = countInstructionsByTag(get_name_fn, .arc_retain);
+    try testing.expectEqual(@as(usize, 0), retain_count);
+}
+
+test "ARC: emit_arc flag emits arc_release for function return scope cleanup" {
+    const allocator = testing.allocator;
+    const source =
+        \\fn test_scope(): i64 {
+        \\    let s: string = "hello"
+        \\    return 42
+        \\}
+        \\fn main() {}
+    ;
+
+    var module = try lowerSourceWithArc(allocator, source);
+    defer {
+        module.deinit();
+        allocator.destroy(module);
+    }
+
+    const test_fn = getFunction(module, "test_scope").?;
+
+    // Should have arc_release for the string local before return
+    const release_count = countInstructionsByTag(test_fn, .arc_release);
+    try testing.expect(release_count >= 1);
+}

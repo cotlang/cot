@@ -11,8 +11,12 @@ const Constant = @import("module.zig").Constant;
 const debug = @import("../debug.zig");
 const Debugger = @import("../debugger.zig").Debugger;
 const trace_mod = @import("../trace/trace.zig");
+const debug_tools = @import("../debug/debug.zig");
+const StateInspector = debug_tools.StateInspector;
 pub const Tracer = trace_mod.Tracer;
 const value_mod = @import("value.zig");
+const arc = @import("arc.zig");
+const CycleCollector = @import("cycle_collector.zig").CycleCollector;
 const Profiler = @import("profiler.zig").Profiler;
 const JITProfiler = @import("profiler.zig").JITProfiler;
 const CompilationTier = @import("profiler.zig").CompilationTier;
@@ -112,6 +116,11 @@ pub const VM = struct {
     // I/O
     stdout: std.fs.File,
 
+    // Output callback for debugger/DAP integration
+    // When set, print/println also call this callback with the output text
+    output_callback: ?*const fn ([]const u8, *anyopaque) void = null,
+    output_callback_context: ?*anyopaque = null,
+
     // Native function registry
     native_registry: native.NativeRegistry,
     handle_manager: native.UnifiedHandleManager, // Unified handle manager for all I/O
@@ -152,6 +161,17 @@ pub const VM = struct {
     // Key: instruction IP, Value: cached type/offset
     inline_caches: std.AutoHashMap(u32, InlineCache),
 
+    // Cycle collector for detecting and freeing reference cycles
+    cycle_collector: CycleCollector,
+
+    // Weak reference registry for zeroing weak refs when targets are freed
+    weak_registry: arc.WeakRegistry,
+
+    // ARC mode flag
+    // When true (default): VM performs retain/release on register/stack writes (hybrid mode)
+    // When false: All ARC is handled by compiler-emitted instructions (full compiler mode)
+    runtime_arc_enabled: bool = true,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -160,7 +180,7 @@ pub const VM = struct {
             .ip = 0,
             .sp = 0,
             .fp = 0,
-            .stack = undefined,
+            .stack = [_]Value{Value.null_val} ** STACK_SIZE,
             .globals = .{},
             .global_buffers = .{},
             .heap = std.heap.ArenaAllocator.init(allocator),
@@ -183,6 +203,45 @@ pub const VM = struct {
             .jit_profiler = if (jit_profiling_enabled) JITProfiler.init(allocator) else {},
             .registers = [_]Value{Value.null_val} ** 16,
             .inline_caches = std.AutoHashMap(u32, InlineCache).init(allocator),
+            .cycle_collector = CycleCollector.init(allocator),
+            .weak_registry = arc.WeakRegistry.init(allocator),
+        };
+    }
+
+    /// Simplified init for unit testing - uses testing allocator and minimal setup.
+    /// Does NOT use arena allocator - all allocations go directly to backing allocator
+    /// so memory leaks can be detected by std.testing.allocator.
+    pub fn initForTest(allocator: std.mem.Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .ip = 0,
+            .sp = 0,
+            .fp = 0,
+            .stack = [_]Value{Value.null_val} ** STACK_SIZE,
+            .globals = .{},
+            .global_buffers = .{},
+            .heap = std.heap.ArenaAllocator.init(allocator),
+            .call_stack = .{},
+            .stdout = std.fs.File.stdout(),
+            .native_registry = native.NativeRegistry.init(allocator),
+            .handle_manager = native.UnifiedHandleManager.init(allocator),
+            .type_registry = TypeRegistry.init(allocator),
+            .opcode_registry = OpcodeRegistry.init(),
+            .extension_manager = ExtensionManager.init(allocator),
+            .current_module = null,
+            .current_module_index = null,
+            .modules = .{},
+            .error_handler_ip = null,
+            .last_error = null,
+            .debugger = Debugger.init(allocator),
+            .stop_reason = null,
+            .debug_current_line = 0,
+            .profiler = if (profiling_enabled) Profiler.init(allocator) else {},
+            .jit_profiler = if (jit_profiling_enabled) JITProfiler.init(allocator) else {},
+            .registers = [_]Value{Value.null_val} ** 16,
+            .inline_caches = std.AutoHashMap(u32, InlineCache).init(allocator),
+            .cycle_collector = CycleCollector.init(allocator),
+            .weak_registry = arc.WeakRegistry.init(allocator),
         };
     }
 
@@ -209,6 +268,34 @@ pub const VM = struct {
             misses += cache.miss_count;
         }
         return .{ .total = total, .hits = hits, .misses = misses };
+    }
+
+    // ========================================================================
+    // Cycle Collection
+    // ========================================================================
+
+    /// Manually trigger cycle collection.
+    /// Returns number of objects freed.
+    /// Cycle collection also runs automatically during VM.deinit().
+    pub fn collectCycles(self: *Self) usize {
+        const stats = self.cycle_collector.collect();
+        return stats.objects_freed;
+    }
+
+    /// Add a value as a potential cycle candidate.
+    /// Called after arc.release when refcount didn't reach 0.
+    /// Only container types (maps, objects) can form cycles.
+    pub fn addCycleCandidate(self: *Self, value: Value) void {
+        self.cycle_collector.addCandidate(value);
+    }
+
+    /// Get cycle collector statistics
+    pub fn getCycleStats(self: *Self) struct { candidates: usize, total_freed: usize, total_collections: usize } {
+        return .{
+            .candidates = self.cycle_collector.candidateCount(),
+            .total_freed = self.cycle_collector.total_freed,
+            .total_collections = self.cycle_collector.total_collections,
+        };
     }
 
     /// Get JIT profiler statistics (if JIT profiling is enabled)
@@ -240,6 +327,91 @@ pub const VM = struct {
     pub fn recordJITCall(self: *Self, module_idx: u16, routine_idx: u16) ?CompilationTier {
         if (!jit_profiling_enabled) return null;
         return self.jit_profiler.recordCall(module_idx, routine_idx);
+    }
+
+    // ========================================================================
+    // ARC (Automatic Reference Counting)
+    // ========================================================================
+
+    /// Write a value to a register with ARC management.
+    /// Retains the new value and releases the old value.
+    /// When runtime_arc_enabled is false, skips ARC (compiler handles it).
+    pub inline fn writeRegister(self: *Self, reg: u4, value: Value) void {
+        if (self.runtime_arc_enabled) {
+            const old = self.registers[reg];
+
+            // Retain new value first (handles case where new == old)
+            arc.retain(value);
+
+            // Release old value
+            arc.release(old, self.allocator);
+        }
+
+        // Store new value
+        self.registers[reg] = value;
+    }
+
+    /// Write a value to the stack with ARC management.
+    /// Retains the new value and releases the old value.
+    /// When runtime_arc_enabled is false, skips ARC (compiler handles it).
+    pub inline fn writeStack(self: *Self, index: usize, value: Value) void {
+        if (self.runtime_arc_enabled) {
+            const old = self.stack[index];
+
+            // Retain new value first (handles case where new == old)
+            arc.retain(value);
+
+            // Release old value
+            arc.release(old, self.allocator);
+        }
+
+        // Store new value
+        self.stack[index] = value;
+    }
+
+    /// Push a value onto the stack with ARC management.
+    /// The pushed value is retained.
+    /// When runtime_arc_enabled is false, skips ARC (compiler handles it).
+    pub inline fn pushStack(self: *Self, value: Value) void {
+        if (self.runtime_arc_enabled) {
+            arc.retain(value);
+        }
+        self.stack[self.sp] = value;
+        self.sp += 1;
+    }
+
+    /// Pop a value from the stack with ARC management.
+    /// The popped value is NOT released - caller owns it.
+    /// Caller should release when done with the value.
+    pub inline fn popStack(self: *Self) Value {
+        self.sp -= 1;
+        const value = self.stack[self.sp];
+        self.stack[self.sp] = Value.null_val; // Clear slot
+        return value;
+    }
+
+    /// Release all values in a range of the stack (e.g., on function return).
+    /// Sets released slots to null.
+    /// When runtime_arc_enabled is false, just clears the slots (compiler handles releases).
+    pub fn releaseStackRange(self: *Self, start: usize, end: usize) void {
+        for (start..end) |i| {
+            if (self.runtime_arc_enabled) {
+                arc.release(self.stack[i], self.allocator);
+            }
+            self.stack[i] = Value.null_val;
+        }
+    }
+
+    /// Release all values in all registers.
+    /// Call this during VM cleanup.
+    /// When runtime_arc_enabled is false, just clears the registers (compiler handles releases).
+    pub fn releaseAllRegisters(self: *Self) void {
+        for (&self.registers) |*reg| {
+            if (self.runtime_arc_enabled) {
+                arc.release(reg.*, self.allocator);
+            }
+            reg.* = Value.null_val;
+        }
     }
 
     // ========================================================================
@@ -294,6 +466,27 @@ pub const VM = struct {
         return t;
     }
 
+    // =========================================================================
+    // Output Callback (for DAP Debug Console)
+    // =========================================================================
+
+    /// Set output callback for capturing print/println output
+    /// The callback receives the output text and a context pointer
+    pub fn setOutputCallback(
+        self: *Self,
+        callback: *const fn ([]const u8, *anyopaque) void,
+        context: *anyopaque,
+    ) void {
+        self.output_callback = callback;
+        self.output_callback_context = context;
+    }
+
+    /// Clear output callback
+    pub fn clearOutputCallback(self: *Self) void {
+        self.output_callback = null;
+        self.output_callback_context = null;
+    }
+
     /// Check if tracing is active
     pub fn isTracing(self: *Self) bool {
         return self.tracer != null;
@@ -306,6 +499,70 @@ pub const VM = struct {
         }
     }
 
+    // =========================================================================
+    // State Inspection (for debugging)
+    // =========================================================================
+
+    /// Create a StateInspector for the current VM state.
+    /// This provides read-only access to registers, stack, locals, and call frames.
+    /// The inspector is valid until the next VM operation.
+    pub fn createInspector(self: *Self) StateInspector {
+        // Build call frames from VM's call stack
+        const frames = self.call_stack.slice();
+        var call_frame_buf: [256]StateInspector.CallFrame = undefined;
+        var frame_count: usize = 0;
+
+        for (frames) |frame| {
+            if (frame_count >= 256) break;
+
+            // Get routine info from module for name/param/local info
+            var routine_name: []const u8 = "<unknown>";
+            var param_count: u8 = 0;
+            var local_count: u16 = 0;
+
+            if (frame.routine_index < frame.module.routines.len) {
+                const routine = frame.module.routines[frame.routine_index];
+                // Get routine name from constants
+                if (routine.name_index < frame.module.constants.len) {
+                    const c = frame.module.constants[routine.name_index];
+                    if (c == .identifier) {
+                        routine_name = c.identifier;
+                    }
+                }
+                param_count = @intCast(routine.param_count);
+                local_count = routine.local_count;
+            }
+
+            call_frame_buf[frame_count] = .{
+                .return_ip = @intCast(frame.return_ip),
+                .return_fp = @intCast(frame.base_pointer),
+                .routine_name = routine_name,
+                .param_count = param_count,
+                .local_count = local_count,
+            };
+            frame_count += 1;
+        }
+
+        return StateInspector{
+            .allocator = self.allocator,
+            .registers = &self.registers,
+            .stack = &self.stack,
+            .sp = @intCast(self.sp),
+            .fp = @intCast(self.fp),
+            .ip = @intCast(self.ip),
+            .line = self.debug_current_line,
+            .call_frames = call_frame_buf[0..frame_count],
+            .module = self.current_module,
+        };
+    }
+
+    /// Get a snapshot of the current VM state.
+    /// This is a lightweight struct for quick status checks.
+    pub fn getSnapshot(self: *Self) debug_tools.VMSnapshot {
+        const inspector = self.createInspector();
+        return inspector.getSnapshot();
+    }
+
     pub fn deinit(self: *Self) void {
         // Free global buffers (the actual string data that FixedStringRef points to)
         for (self.global_buffers.items) |buf| {
@@ -313,11 +570,21 @@ pub const VM = struct {
         }
         self.global_buffers.deinit(self.allocator);
 
+        // Release all ARC-managed values before freeing the heap
+        // This ensures proper reference counting cleanup
+        self.releaseAllRegisters();
+        self.releaseStackRange(0, self.sp);
+
+        // Release global values
+        for (self.globals.items) |val| {
+            arc.release(val, self.allocator);
+        }
         self.globals.deinit(self.allocator);
 
         // Free all Value heap allocations (StringRef, Decimal, etc.) at once
         // Values use valueAllocator() which returns heap.allocator()
-        // This avoids tracking individual allocations or dealing with shared pointers
+        // Note: With ARC, individual objects are freed when refcount hits 0,
+        // but the arena still needs to be deinited for cleanup
         self.heap.deinit();
         self.modules.deinit(self.allocator);
         self.native_registry.deinit();
@@ -343,6 +610,13 @@ pub const VM = struct {
             self.jit_profiler.deinit();
         }
         self.inline_caches.deinit();
+
+        // Run final cycle collection and cleanup
+        _ = self.cycle_collector.collect();
+        self.cycle_collector.deinit();
+
+        // Clean up weak reference registry
+        self.weak_registry.deinit();
     }
 
     /// Get current execution location for error reporting
@@ -489,6 +763,37 @@ pub const VM = struct {
     /// Load a module
     pub fn loadModule(self: *Self, module: *const Module) !void {
         try self.modules.append(self.allocator, module);
+    }
+
+    /// Initialize VM for a module without running (for debugger use)
+    pub fn initForModule(self: *Self, module: *const Module) VMError!void {
+        // Clear any previous error
+        last_error = null;
+
+        self.current_module = module;
+
+        // Find entry point
+        if (module.header.entry_point == 0xFFFFFFFF) {
+            return self.fail(VMError.InvalidRoutine, "No entry point - this is a library module");
+        }
+
+        self.ip = module.header.entry_point;
+
+        // Find the entry point routine and reserve space for local variables
+        for (module.routines) |routine| {
+            if (routine.code_offset == module.header.entry_point) {
+                // Bounds check on local_count to prevent stack overflow
+                if (routine.local_count > STACK_SIZE) {
+                    return self.fail(VMError.StackOverflow, "Entry routine requires more locals than stack can hold");
+                }
+                // Reserve space for local variables and initialize them to 0
+                for (0..routine.local_count) |i| {
+                    self.stack[i] = Value.initInt(0);
+                }
+                self.sp = routine.local_count;
+                break;
+            }
+        }
     }
 
     /// Execute a module
@@ -880,6 +1185,15 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.debug_break)] = &vm_opcodes.op_debug_break;
         table[@intFromEnum(Opcode.debug_line)] = &vm_opcodes.op_debug_line;
         table[@intFromEnum(Opcode.assert)] = &vm_opcodes.op_assert;
+
+        // Weak reference opcodes (0xF3-0xF4)
+        table[@intFromEnum(Opcode.weak_ref)] = &vm_opcodes.op_weak_ref;
+        table[@intFromEnum(Opcode.weak_load)] = &vm_opcodes.op_weak_load;
+
+        // ARC opcodes (0xF5-0xF7)
+        table[@intFromEnum(Opcode.arc_retain)] = &vm_opcodes.op_arc_retain;
+        table[@intFromEnum(Opcode.arc_release)] = &vm_opcodes.op_arc_release;
+        table[@intFromEnum(Opcode.arc_move)] = &vm_opcodes.op_arc_move;
 
         // Quickened/Specialized Opcodes (0xE0-0xEB) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.add_int)] = &vm_opcodes.op_add_int;

@@ -1,0 +1,140 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cotlang.org/spec/opcodes.schema.json",
+  "title": "Cot Bytecode Opcodes Specification",
+  "description": "Schema for defining VM opcode behavior and encoding",
+  "type": "object",
+  "required": ["meta", "opcodes"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["version"],
+      "properties": {
+        "version": { "type": "string" },
+        "total_opcodes": { "type": "integer", "default": 256 }
+      }
+    },
+    "opcodes": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/opcode"
+      }
+    }
+  },
+  "definitions": {
+    "opcode": {
+      "type": "object",
+      "required": ["code", "mnemonic", "description", "encoding"],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "mnemonic": { "type": "string" },
+        "description": { "type": "string" },
+        "since": { "type": "string" },
+        "encoding": {
+          "$ref": "#/definitions/encoding"
+        },
+        "semantics": {
+          "$ref": "#/definitions/semantics"
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/opcode_test"
+          }
+        }
+      }
+    },
+    "encoding": {
+      "type": "object",
+      "required": ["format", "size"],
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "none",
+            "reg",
+            "reg_reg",
+            "reg_imm8",
+            "reg_imm16",
+            "reg_imm32",
+            "reg_reg_reg",
+            "reg_reg_imm8",
+            "reg_reg_imm16",
+            "imm16",
+            "imm32"
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "operands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/operand"
+          }
+        }
+      }
+    },
+    "operand": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string" },
+        "bits": { "type": "string", "description": "Bit range, e.g., '7:4' for high nibble" },
+        "type": {
+          "type": "string",
+          "enum": ["register", "immediate", "offset", "index", "flags"]
+        },
+        "range": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "semantics": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "description": "Pseudocode for the operation"
+        },
+        "stack_effect": {
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "string", "enum": ["dynamic"] }
+          ]
+        },
+        "flags_affected": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "opcode_test": {
+      "type": "object",
+      "required": ["setup", "expect"],
+      "properties": {
+        "setup": {
+          "type": "object",
+          "description": "Initial register/memory state"
+        },
+        "args": {
+          "type": "object",
+          "description": "Opcode operand values"
+        },
+        "expect": {
+          "type": "object",
+          "description": "Expected register/memory state after execution"
+        }
+      }
+    }
+  }
+}

@@ -83,8 +83,9 @@ pub const Stdlib = struct {
         try self.registry.registerNative("mem_alloc", native_mem_alloc);
         try self.registry.registerNative("mem_free", native_mem_free);
 
-        // Testing functions
-        try self.registry.registerNative("assert", native_assert);
+        // Testing/Debug functions (std.debug namespace + prelude)
+        try self.registry.registerNative("std.debug.assert", native_assert);
+        try self.registry.registerNative("assert", native_assert); // Prelude
     }
 
     /// Load Cot stdlib modules from path

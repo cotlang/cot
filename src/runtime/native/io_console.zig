@@ -1,18 +1,19 @@
 //! Console I/O Native Functions
 //!
-//! Cot Core API (Zig-inspired):
+//! Namespace: std.io
+//! Prelude: print, println (available without import in .cot files)
+//!
+//! Functions:
 //!   print(args...)   - write to stdout, no newline
 //!   println(args...) - write to stdout with newline
 //!   readln()         - read line from stdin
 //!   log(args...)     - write to stderr (debugging)
 //!
 //! DBL/.NET compatibility aliases:
-//!   Console.WriteLine() - alias for println (Synergy.NET style)
-//!   Console.Write()     - alias for print
-//!   display(args...)    - transforms to println() at parse time (DBL style)
+//!   display(args...) - alias for println (DBL style)
 //!
-//! Performance note: print/println use register-based opcodes (console_write,
-//! console_writeln) for fast paths. Native functions are fallback for edge cases.
+//! Performance note: print/println use register-based opcodes for fast paths.
+//! Native functions are fallback for edge cases.
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -23,14 +24,22 @@ const Value = native.Value;
 
 /// Register console I/O functions
 pub fn register(registry: anytype) !void {
-    // Core I/O functions (Zig-inspired names)
+    // Namespaced names (std.io.*)
+    try registry.registerNative("std.io.print", io_print);
+    try registry.registerNative("std.io.println", io_println);
+    try registry.registerNative("std.io.readln", io_readln);
+    try registry.registerNative("std.io.log", io_log);
+
+    // Prelude names (available without import in .cot files)
+    // Also serves as DBL compatibility
     try registry.registerNative("print", io_print);
     try registry.registerNative("println", io_println);
+
+    // Non-prelude short names (require import in .cot, available in .dbl)
     try registry.registerNative("readln", io_readln);
     try registry.registerNative("log", io_log);
 
-    // DBL display (transformed to println at parse time, but register for xcall)
-    try registry.registerNative("display", io_println);
+    // Note: DBL `display` alias is registered by the DBL extension
 }
 
 /// print(args...) - Write args to stdout without newline
@@ -48,7 +57,8 @@ fn io_print(ctx: *NativeContext) NativeError!?Value {
 }
 
 /// println(args...) - Write args to stdout with newline
-fn io_println(ctx: *NativeContext) NativeError!?Value {
+/// Public so DBL extension can alias it as `display`
+pub fn io_println(ctx: *NativeContext) NativeError!?Value {
     const stdout_file: std.fs.File = .stdout();
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = stdout_file.writer(&stdout_buffer);

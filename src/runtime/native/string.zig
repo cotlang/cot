@@ -1,6 +1,10 @@
 //! String native functions
 //!
-//! instr, fill, copy, str_delete_last, upper, lower, ltrim, s_bld, s_parse
+//! Namespace: std.string
+//! Functions: instr, fill, copy, str_delete_last, upper, lower, ltrim, s_bld, s_parse
+//!
+//! In .cot files: requires `import std.string` then call as `std.string.upper(x)`
+//! In .dbl files: available directly as `upper(x)` (DBL compatibility)
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -9,8 +13,20 @@ const NativeError = native.NativeError;
 const NativeFn = native.NativeFn;
 const Value = native.Value;
 
-/// Register all string functions
+/// Register all string functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
+    // Namespaced names (std.string.*)
+    try registry.registerNative("std.string.instr", instr);
+    try registry.registerNative("std.string.fill", fill);
+    try registry.registerNative("std.string.copy", copy);
+    try registry.registerNative("std.string.delete_last", str_delete_last);
+    try registry.registerNative("std.string.upper", upper);
+    try registry.registerNative("std.string.lower", lower);
+    try registry.registerNative("std.string.ltrim", ltrim);
+    try registry.registerNative("std.string.format", s_bld);
+    try registry.registerNative("std.string.parse", s_parse);
+
+    // Short names (DBL compatibility)
     try registry.registerNative("instr", instr);
     try registry.registerNative("fill", fill);
     try registry.registerNative("copy", copy);

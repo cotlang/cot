@@ -6,6 +6,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const server_mod = @import("server.zig");
+const dap = @import("dap.zig");
 
 const json = std.json;
 const Allocator = std.mem.Allocator;
@@ -13,6 +14,7 @@ const JsonValue = protocol.JsonValue;
 const JsonObject = protocol.JsonObject;
 const JsonArray = protocol.JsonArray;
 const Server = server_mod.Server;
+const DebugAdapter = dap.DebugAdapter;
 
 // ============================================================
 // LSP Handlers
@@ -1487,16 +1489,82 @@ fn getDblSemanticTokenType(token: anytype, prev_token: anytype, next_token: anyt
 // ============================================================
 
 pub fn main() !void {
+    // Use absolute path for log file
+    const log_file = std.fs.createFileAbsolute("/tmp/cot-lsp.log", .{ .truncate = true }) catch null;
+    defer if (log_file) |f| f.close();
+
+    if (log_file) |f| _ = f.write("LSP: starting\n") catch {};
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    if (log_file) |f| _ = f.write("LSP: allocator ready\n") catch {};
+
     var server = Server.init(allocator);
     defer server.deinit();
 
+    // Debug adapter for DAP support
+    var debug_adapter = DebugAdapter.init(allocator);
+    defer debug_adapter.deinit();
+
+    if (log_file) |f| _ = f.write("LSP: initialized\n") catch {};
+
+    const log = struct {
+        fn write(file: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+            if (file) |f| {
+                var buf: [1024]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+                _ = f.write(msg) catch {};
+            }
+            // DO NOT write to stdout/stderr - it corrupts LSP protocol
+        }
+    };
+
+    log.write(log_file, "=== cot-lsp started ===\n", .{});
+
     // Main message loop
     while (!server.shutdown_requested) {
-        const msg = protocol.readMessage(allocator) catch continue orelse break;
+        log.write(log_file, "Waiting for message...\n", .{});
+        const msg = protocol.readMessage(allocator) catch |err| {
+            log.write(log_file, "readMessage error: {s}\n", .{@errorName(err)});
+            continue;
+        } orelse {
+            log.write(log_file, "readMessage returned null (EOF)\n", .{});
+            break;
+        };
+
+        // Log what we received for debugging
+        if (msg.object.get("type")) |t| {
+            if (t == .string) {
+                log.write(log_file, "LSP/DAP: Received message type='{s}'\n", .{t.string});
+            }
+        }
+        if (msg.object.get("command")) |c| {
+            if (c == .string) {
+                log.write(log_file, "LSP/DAP: Received command='{s}'\n", .{c.string});
+            }
+        }
+        if (msg.object.get("method")) |m| {
+            if (m == .string) {
+                log.write(log_file, "LSP/DAP: Received method='{s}'\n", .{m.string});
+            }
+        }
+
+        // Check if this is a DAP message (has "type" field) vs LSP (has "jsonrpc" or "method")
+        if (DebugAdapter.isDAPMessage(msg.object)) {
+            log.write(log_file, "LSP/DAP: Detected as DAP message\n", .{});
+            // Handle DAP message
+            const response = debug_adapter.handleRequest(msg.object, allocator) catch |err| {
+                std.debug.print("DAP error: {}\n", .{err});
+                continue;
+            };
+
+            protocol.writeMessage(response, allocator) catch |err| {
+                std.debug.print("DAP write error: {}\n", .{err});
+            };
+            continue;
+        }
 
         // Handle LSP message
         const method = msg.object.get("method") orelse continue;

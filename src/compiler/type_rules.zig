@@ -245,6 +245,15 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
 
         .function => .incompatible,
         .map => .incompatible, // Maps require explicit operations
+        .weak => |target_inner| switch (value_deref) {
+            .weak => |value_inner| blk: {
+                if (std.meta.eql(target_inner.*, value_inner.*)) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            else => .incompatible, // Must explicitly create weak reference
+        },
     };
 }
 
@@ -419,6 +428,7 @@ pub fn typeName(ty: Type) []const u8 {
         .@"union" => "union",
         .function => "function",
         .map => "Map",
+        .weak => "weak",
     };
 }
 
@@ -462,6 +472,12 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         .@"union" => |u| writer.print("union({s})", .{u.name}) catch {},
         .function => writer.writeAll("function") catch {},
         .map => writer.writeAll("Map") catch {},
+        .weak => |w| {
+            var inner_buf: [64]u8 = undefined;
+            const inner = formatType(w.*, &inner_buf);
+            writer.writeAll("weak ") catch {};
+            writer.writeAll(inner) catch {};
+        },
     }
 
     return fbs.getWritten();

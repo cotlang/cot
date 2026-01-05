@@ -142,6 +142,14 @@ pub const Lowerer = struct {
     /// Comptime evaluator for evaluating comptime conditions during lowering
     comptime_evaluator: comptime_eval.Evaluator,
 
+    /// Imported namespaces (e.g., "std.math" from `import std.math`)
+    /// Used to validate that non-prelude namespace functions have been imported
+    imported_namespaces: std.StringHashMap(void),
+
+    /// Whether to emit explicit ARC instructions (arc_retain/arc_release).
+    /// When false, the VM handles ARC at runtime.
+    emit_arc: bool,
+
     const ImplMethodsMap = std.HashMap(ImplKey, []const MethodImpl, ImplKeyContext, std.hash_map.default_max_load_percentage);
 
     /// Known builtin function names (lowercase)
@@ -217,7 +225,7 @@ pub const Lowerer = struct {
         return .{ .line = loc.line, .column = loc.column };
     }
 
-    pub fn init(allocator: Allocator, store: *const NodeStore, strings: *StringInterner, module_name: []const u8) !Self {
+    pub fn init(allocator: Allocator, store: *const NodeStore, strings: *StringInterner, module_name: []const u8, options: LowerOptions) !Self {
         const module = try allocator.create(ir.Module);
         module.* = ir.Module.init(allocator, module_name);
 
@@ -248,12 +256,31 @@ pub const Lowerer = struct {
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
             .impl_methods = ImplMethodsMap.init(allocator),
             .comptime_evaluator = comptime_eval.Evaluator.init(allocator, store, strings),
+            .imported_namespaces = std.StringHashMap(void).init(allocator),
+            .emit_arc = options.emit_arc,
         };
     }
 
     /// Check if a function name is a known builtin
     fn isKnownBuiltin(name: []const u8) bool {
         return known_builtins.has(name);
+    }
+
+    /// Track an import statement for namespace validation
+    fn trackImport(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const module_path_id = data.getName();
+        const module_path = self.strings.get(module_path_id);
+
+        // Store the imported namespace
+        self.imported_namespaces.put(module_path, {}) catch return LowerError.OutOfMemory;
+
+        log.debug("Tracked import: {s}", .{module_path});
+    }
+
+    /// Check if a namespace has been imported (or is in prelude)
+    pub fn isNamespaceImported(self: *const Self, namespace: []const u8) bool {
+        return self.imported_namespaces.contains(namespace);
     }
 
     /// Add a warning
@@ -314,6 +341,7 @@ pub const Lowerer = struct {
         self.trait_defs.deinit();
         self.impl_methods.deinit();
         self.comptime_evaluator.deinit();
+        self.imported_namespaces.deinit();
 
         // Free function param defaults slices
         var defaults_iter = self.fn_param_defaults.valueIterator();
@@ -1219,7 +1247,11 @@ pub const Lowerer = struct {
                 try self.emitDebugLine(loc);
                 try lower_stmt.lowerFieldView(self, stmt_idx);
             },
-            .import_stmt, .fn_def, .type_alias, .trait_def, .impl_block, .test_def => {
+            .import_stmt => {
+                // Track imported namespace for validation
+                try self.trackImport(stmt_idx);
+            },
+            .fn_def, .type_alias, .trait_def, .impl_block, .test_def => {
                 // Handled in earlier passes or no runtime code
             },
             .struct_def => {
@@ -1583,6 +1615,11 @@ fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
 pub const LowerOptions = struct {
     /// Run IR verification after lowering (catches bugs early)
     verify: bool = false,
+
+    /// Emit explicit ARC instructions (arc_retain/arc_release) during lowering.
+    /// When false (default), the VM handles ARC at runtime via writeRegister/writeStack.
+    /// When true, the compiler emits ARC instructions for assignments, returns, and scope exits.
+    emit_arc: bool = false,
 };
 
 /// Main entry point for lowering
@@ -1605,7 +1642,7 @@ pub fn lowerWithOptions(
     module_name: []const u8,
     options: LowerOptions,
 ) LowerError!*ir.Module {
-    var lowerer = try Lowerer.init(allocator, store, strings, module_name);
+    var lowerer = try Lowerer.init(allocator, store, strings, module_name, options);
     defer lowerer.deinit();
 
     const module = try lowerer.lowerProgram(top_level);
@@ -1646,7 +1683,7 @@ pub fn analyzeSemantics(
     var diagnostics: std.ArrayListUnmanaged(SemanticDiagnostic) = .empty;
     errdefer diagnostics.deinit(allocator);
 
-    var lowerer = Lowerer.init(allocator, store, strings, "analysis") catch {
+    var lowerer = Lowerer.init(allocator, store, strings, "analysis", .{}) catch {
         // Allocation error - return empty diagnostics
         return diagnostics.toOwnedSlice(allocator);
     };

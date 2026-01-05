@@ -1,0 +1,159 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cotlang.org/spec/natives.schema.json",
+  "title": "Cot Native Functions Specification",
+  "description": "Schema for defining native function signatures and behavior",
+  "type": "object",
+  "required": ["meta", "functions"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["version"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "description": { "type": "string" }
+      }
+    },
+    "functions": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/function"
+      }
+    }
+  },
+  "definitions": {
+    "function": {
+      "type": "object",
+      "required": ["namespace", "description", "signature"],
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "description": "Namespace path (e.g., std.math, std.io)"
+        },
+        "description": {
+          "type": "string"
+        },
+        "since": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "prelude": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, available without import in .cot files"
+        },
+        "dbl_implicit": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, available without namespace in .dbl files"
+        },
+        "signature": {
+          "$ref": "#/definitions/signature"
+        },
+        "behavior": {
+          "$ref": "#/definitions/behavior"
+        },
+        "tests": {
+          "$ref": "#/definitions/tests"
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "required": ["returns"],
+      "properties": {
+        "params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/param"
+          }
+        },
+        "returns": {
+          "oneOf": [
+            { "type": "string", "enum": ["void", "i64", "f64", "bool", "string", "alpha", "handle", "any"] },
+            { "$ref": "#/definitions/typed_return" }
+          ]
+        }
+      }
+    },
+    "param": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": {
+          "oneOf": [
+            { "type": "string", "enum": ["i64", "f64", "bool", "string", "alpha", "handle", "any", "variadic"] },
+            { "$ref": "#/definitions/typed_param" }
+          ]
+        },
+        "optional": { "type": "boolean", "default": false },
+        "default": { "type": ["string", "number", "boolean", "null"] }
+      }
+    },
+    "typed_param": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "element_type": { "type": "string" }
+      }
+    },
+    "typed_return": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "precision": { "type": "integer", "minimum": 0, "maximum": 18 }
+      }
+    },
+    "behavior": {
+      "type": "object",
+      "properties": {
+        "pure": {
+          "type": "boolean",
+          "description": "No side effects, same input always gives same output"
+        },
+        "throws": {
+          "type": "boolean",
+          "description": "Can raise runtime errors"
+        },
+        "errors": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Possible error types"
+        },
+        "io": {
+          "type": "string",
+          "enum": ["none", "stdout", "stderr", "stdin", "filesystem", "network"],
+          "description": "I/O side effects"
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "properties": {
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["args", "expect"],
+            "properties": {
+              "args": { "type": "array" },
+              "expect": {}
+            }
+          }
+        },
+        "error_cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["args", "error"],
+            "properties": {
+              "args": { "type": "array" },
+              "error": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

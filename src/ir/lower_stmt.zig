@@ -49,11 +49,22 @@ pub fn lowerBlock(l: *Lowerer, data: NodeData) LowerError!void {
     // Push a new defer scope for this block
     try l.pushDeferScope();
 
+    // Push a new variable scope for this block
+    try l.scopes.push();
+
     const span = data.getSpan();
     const stmt_indices = l.store.getStmtSpan(span);
     for (stmt_indices) |idx| {
         try l.lowerStatement(@enumFromInt(idx));
     }
+
+    // Emit ARC releases for block-local variables before exiting
+    if (l.emit_arc) {
+        try emitCurrentScopeReleases(l);
+    }
+
+    // Pop variable scope
+    l.scopes.pop();
 
     // Pop defer scope and emit any defers in reverse order
     try l.popDeferScopeAndEmit();
@@ -62,6 +73,13 @@ pub fn lowerBlock(l: *Lowerer, data: NodeData) LowerError!void {
 /// Lower a break statement
 pub fn lowerBreak(l: *Lowerer) LowerError!void {
     if (l.loop_exit_block) |exit_block| {
+        // Emit ARC releases for current scope before breaking
+        // Note: We only release the current scope; parent scopes will be released
+        // when their containing blocks exit normally
+        if (l.emit_arc) {
+            try emitCurrentScopeReleases(l);
+        }
+
         // Emit defers for the current scope before breaking
         // Note: The block's popDeferScopeAndEmit won't run since we're jumping out
         if (l.defer_scope_marks.items.len > 0) {
@@ -82,6 +100,13 @@ pub fn lowerBreak(l: *Lowerer) LowerError!void {
 /// Lower a continue statement
 pub fn lowerContinue(l: *Lowerer) LowerError!void {
     if (l.loop_continue_block) |continue_block| {
+        // Emit ARC releases for current scope before continuing
+        // Note: We only release the current scope; the loop will re-enter
+        // and create new values in subsequent iterations
+        if (l.emit_arc) {
+            try emitCurrentScopeReleases(l);
+        }
+
         // Emit defers for the current scope before continuing
         // Note: The block's popDeferScopeAndEmit won't run since we're jumping
         if (l.defer_scope_marks.items.len > 0) {
@@ -217,6 +242,62 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
         }
     }
 
+    // Check if target is a weak reference type
+    // If so, emit weak_ref to create a weak reference instead of a normal store
+    if (target_type == .weak) {
+        const func = l.current_func orelse return LowerError.OutOfMemory;
+
+        // Create weak reference from the value
+        const inner_type = target_type.weak.*;
+        const weak_value = func.newValue(.{ .weak = target_type.weak });
+        try l.emit(.{
+            .weak_ref = .{
+                .operand = value,
+                .result = weak_value,
+            },
+        });
+
+        // Store the weak reference
+        try l.emit(.{
+            .store = .{
+                .ptr = target,
+                .value = weak_value,
+            },
+        });
+        _ = inner_type;
+        return;
+    }
+
+    // Emit ARC operations if enabled
+    if (l.emit_arc) {
+        const arc_target_type = switch (target.ty) {
+            .ptr => |p| p.*,
+            else => target.ty,
+        };
+
+        // If target type needs ARC, release the old value before storing new
+        if (arc_target_type.needsArc()) {
+            const func = l.current_func orelse return LowerError.OutOfMemory;
+
+            // Load old value from target
+            const old_value = func.newValue(arc_target_type);
+            try l.emit(.{
+                .load = .{
+                    .ptr = target,
+                    .result = old_value,
+                },
+            });
+
+            // Release old value (no-op if null/inline)
+            try l.emit(.{ .arc_release = .{ .value = old_value } });
+        }
+
+        // Retain new value if it needs ARC
+        if (value.needsArc()) {
+            try l.emit(.{ .arc_retain = .{ .value = value } });
+        }
+    }
+
     try l.emit(.{
         .store = .{
             .ptr = target,
@@ -292,8 +373,69 @@ pub fn lowerReturn(l: *Lowerer, data: NodeData) LowerError!void {
     // Emit all defers before returning (in reverse order, LIFO)
     try l.emitAllDefers();
 
+    // Emit ARC operations for return
+    if (l.emit_arc) {
+        // Retain return value (caller will own it)
+        if (return_value) |rv| {
+            if (rv.needsArc()) {
+                try l.emit(.{ .arc_retain = .{ .value = rv } });
+            }
+        }
+
+        // Release all locals in current scope chain before returning
+        try emitScopeReleases(l);
+    }
+
     // Now emit the actual return
     try l.emit(.{ .return_ = return_value });
+}
+
+/// Emit arc_release for all locals that need ARC in the current scope chain.
+/// Called at function return to clean up all locals across all scopes.
+fn emitScopeReleases(l: *Lowerer) LowerError!void {
+    const func = l.current_func orelse return;
+
+    // Iterate all visible variables in scope chain
+    var iter = l.scopes.visibleVariables();
+    while (iter.next()) |entry| {
+        try emitReleaseForVariable(l, func, entry.value);
+    }
+}
+
+/// Emit arc_release for locals in only the current scope (not parent scopes).
+/// Called when exiting a block, break, or continue to release block-local variables.
+fn emitCurrentScopeReleases(l: *Lowerer) LowerError!void {
+    const func = l.current_func orelse return;
+
+    // Iterate only current scope's variables
+    var iter = l.scopes.currentScopeVariables();
+    while (iter.next()) |entry| {
+        try emitReleaseForVariable(l, func, entry.value);
+    }
+}
+
+/// Helper: Emit arc_release for a single variable if it needs ARC
+fn emitReleaseForVariable(l: *Lowerer, func: *ir.Function, local_ptr: ir.Value) LowerError!void {
+    // Get the pointed-to type
+    const value_type = switch (local_ptr.ty) {
+        .ptr => |p| p.*,
+        else => return, // Not a pointer, skip
+    };
+
+    // If the type needs ARC, load and release
+    if (value_type.needsArc()) {
+        // Load the value from the local
+        const loaded = func.newValue(value_type);
+        try l.emit(.{
+            .load = .{
+                .ptr = local_ptr,
+                .result = loaded,
+            },
+        });
+
+        // Release it
+        try l.emit(.{ .arc_release = .{ .value = loaded } });
+    }
 }
 
 /// Lower a while loop

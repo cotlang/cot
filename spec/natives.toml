@@ -1,0 +1,940 @@
+# Cot Native Functions Specification
+#
+# This file is the single source of truth for native function signatures.
+# Code generators use this to produce:
+#   - Zig native function stubs
+#   - Rust native function stubs
+#   - Conformance tests for both runtimes
+#   - API documentation
+#
+# Namespace Design:
+#   - Cot (.cot): Requires explicit import (e.g., `import std.math`)
+#   - Cot Prelude: Functions with `prelude = true` available without import
+#   - DBL (.dbl): All functions available implicitly (backward compatibility)
+
+[meta]
+version = "1.0.0"
+description = "Cot standard library native functions"
+
+# =============================================================================
+# PRELUDE FUNCTIONS
+# Available without import in .cot files
+# =============================================================================
+
+[functions.print]
+namespace = "std.io"
+description = "Write values to stdout without newline"
+since = "1.0.0"
+prelude = true
+
+[functions.print.signature]
+params = [
+    { name = "args", type = "variadic", element_type = "any" }
+]
+returns = "void"
+
+[functions.print.behavior]
+pure = false
+throws = false
+io = "stdout"
+
+# -----------------------------------------------------------------------------
+
+[functions.println]
+namespace = "std.io"
+description = "Write values to stdout with newline"
+since = "1.0.0"
+prelude = true
+
+[functions.println.signature]
+params = [
+    { name = "args", type = "variadic", element_type = "any" }
+]
+returns = "void"
+
+[functions.println.behavior]
+pure = false
+throws = false
+io = "stdout"
+
+# -----------------------------------------------------------------------------
+
+[functions.assert]
+namespace = "std.debug"
+description = "Assert condition is true, halt if false"
+since = "1.0.0"
+prelude = true
+
+[functions.assert.signature]
+params = [
+    { name = "condition", type = "bool" }
+]
+returns = "void"
+
+[functions.assert.behavior]
+pure = false
+throws = true
+errors = ["AssertionFailed"]
+
+# =============================================================================
+# std.math - Mathematical Functions
+# =============================================================================
+
+[functions.abs]
+namespace = "std.math"
+description = "Returns the absolute value of an integer"
+since = "1.0.0"
+
+[functions.abs.signature]
+params = [
+    { name = "x", type = "i64" }
+]
+returns = "i64"
+
+[functions.abs.behavior]
+pure = true
+throws = false
+
+[functions.abs.tests]
+cases = [
+    { args = [5], expect = 5 },
+    { args = [-5], expect = 5 },
+    { args = [0], expect = 0 },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.sqrt]
+namespace = "std.math"
+description = "Returns square root as decimal with 4 decimal places"
+since = "1.0.0"
+
+[functions.sqrt.signature]
+params = [
+    { name = "x", type = "i64" }
+]
+returns = { type = "decimal", precision = 4 }
+
+[functions.sqrt.behavior]
+pure = true
+throws = false
+
+[functions.sqrt.tests]
+cases = [
+    { args = [4], expect = { decimal = "2.0000" } },
+    { args = [9], expect = { decimal = "3.0000" } },
+    { args = [2], expect = { decimal = "1.4142" } },
+    { args = [0], expect = { decimal = "0.0000" } },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.sin]
+namespace = "std.math"
+description = "Sine of angle in degrees, returns decimal with 4 places"
+since = "1.0.0"
+
+[functions.sin.signature]
+params = [
+    { name = "degrees", type = "i64" }
+]
+returns = { type = "decimal", precision = 4 }
+
+[functions.sin.behavior]
+pure = true
+throws = false
+
+[functions.sin.tests]
+cases = [
+    { args = [0], expect = { decimal = "0.0000" } },
+    { args = [90], expect = { decimal = "1.0000" } },
+    { args = [180], expect = { decimal = "0.0000" } },
+    { args = [30], expect = { decimal = "0.5000" } },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.cos]
+namespace = "std.math"
+description = "Cosine of angle in degrees, returns decimal with 4 places"
+since = "1.0.0"
+
+[functions.cos.signature]
+params = [
+    { name = "degrees", type = "i64" }
+]
+returns = { type = "decimal", precision = 4 }
+
+[functions.cos.behavior]
+pure = true
+throws = false
+
+[functions.cos.tests]
+cases = [
+    { args = [0], expect = { decimal = "1.0000" } },
+    { args = [90], expect = { decimal = "0.0000" } },
+    { args = [180], expect = { decimal = "-1.0000" } },
+    { args = [60], expect = { decimal = "0.5000" } },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.tan]
+namespace = "std.math"
+description = "Tangent of angle in degrees, returns decimal with 4 places"
+since = "1.0.0"
+
+[functions.tan.signature]
+params = [
+    { name = "degrees", type = "i64" }
+]
+returns = { type = "decimal", precision = 4 }
+
+[functions.tan.behavior]
+pure = true
+throws = false
+
+[functions.tan.tests]
+cases = [
+    { args = [0], expect = { decimal = "0.0000" } },
+    { args = [45], expect = { decimal = "1.0000" } },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.log]
+namespace = "std.math"
+description = "Natural logarithm, returns decimal with 4 places"
+since = "1.0.0"
+
+[functions.log.signature]
+params = [
+    { name = "x", type = "i64" }
+]
+returns = { type = "decimal", precision = 4 }
+
+[functions.log.behavior]
+pure = true
+throws = false
+
+[functions.log.tests]
+cases = [
+    { args = [1], expect = { decimal = "0.0000" } },
+    { args = [0], expect = { decimal = "0.0000" } },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.log10]
+namespace = "std.math"
+description = "Base-10 logarithm, returns decimal with 4 places"
+since = "1.0.0"
+
+[functions.log10.signature]
+params = [
+    { name = "x", type = "i64" }
+]
+returns = { type = "decimal", precision = 4 }
+
+[functions.log10.behavior]
+pure = true
+throws = false
+
+[functions.log10.tests]
+cases = [
+    { args = [1], expect = { decimal = "0.0000" } },
+    { args = [10], expect = { decimal = "1.0000" } },
+    { args = [100], expect = { decimal = "2.0000" } },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.exp]
+namespace = "std.math"
+description = "Exponential function (e^x), returns decimal with 4 places"
+since = "1.0.0"
+
+[functions.exp.signature]
+params = [
+    { name = "x", type = "i64" }
+]
+returns = { type = "decimal", precision = 4 }
+
+[functions.exp.behavior]
+pure = true
+throws = false
+
+[functions.exp.tests]
+cases = [
+    { args = [0], expect = { decimal = "1.0000" } },
+    { args = [1], expect = { decimal = "2.7182" } },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.round]
+namespace = "std.math"
+description = "Round to specified decimal places"
+since = "1.0.0"
+
+[functions.round.signature]
+params = [
+    { name = "x", type = "any" },
+    { name = "precision", type = "i64", optional = true, default = 0 }
+]
+returns = { type = "decimal", precision = "dynamic" }
+
+[functions.round.behavior]
+pure = true
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.trunc]
+namespace = "std.math"
+description = "Truncate to integer (remove decimal part)"
+since = "1.0.0"
+
+[functions.trunc.signature]
+params = [
+    { name = "x", type = "any" }
+]
+returns = "i64"
+
+[functions.trunc.behavior]
+pure = true
+throws = false
+
+[functions.trunc.tests]
+cases = [
+    { args = [42], expect = 42 },
+]
+
+# =============================================================================
+# std.string - String Functions
+# =============================================================================
+
+[functions.instr]
+namespace = "std.string"
+description = "Find position of needle in haystack (1-based, 0 if not found)"
+since = "1.0.0"
+
+[functions.instr.signature]
+params = [
+    { name = "needle", type = "string" },
+    { name = "haystack", type = "string" },
+    { name = "start", type = "i64", optional = true, default = 1 }
+]
+returns = "i64"
+
+[functions.instr.behavior]
+pure = true
+throws = false
+
+[functions.instr.tests]
+cases = [
+    { args = ["lo", "hello"], expect = 4 },
+    { args = ["x", "hello"], expect = 0 },
+    { args = ["l", "hello", 4], expect = 4 },
+    { args = ["l", "hello", 5], expect = 0 },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.fill]
+namespace = "std.string"
+description = "Create string of repeated character"
+since = "1.0.0"
+
+[functions.fill.signature]
+params = [
+    { name = "char", type = "string" },
+    { name = "size", type = "i64" }
+]
+returns = "alpha"
+
+[functions.fill.behavior]
+pure = true
+throws = true
+errors = ["InvalidArgument"]
+
+[functions.fill.tests]
+cases = [
+    { args = ["*", 5], expect = "*****" },
+    { args = [" ", 3], expect = "   " },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.copy]
+namespace = "std.string"
+description = "Create a copy of a string"
+since = "1.0.0"
+
+[functions.copy.signature]
+params = [
+    { name = "src", type = "string" }
+]
+returns = "alpha"
+
+[functions.copy.behavior]
+pure = true
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.upper]
+namespace = "std.string"
+description = "Convert string to uppercase"
+since = "1.0.0"
+
+[functions.upper.signature]
+params = [
+    { name = "s", type = "string" }
+]
+returns = "alpha"
+
+[functions.upper.behavior]
+pure = true
+throws = false
+
+[functions.upper.tests]
+cases = [
+    { args = ["hello"], expect = "HELLO" },
+    { args = ["Hello World"], expect = "HELLO WORLD" },
+    { args = ["123"], expect = "123" },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.lower]
+namespace = "std.string"
+description = "Convert string to lowercase"
+since = "1.0.0"
+
+[functions.lower.signature]
+params = [
+    { name = "s", type = "string" }
+]
+returns = "alpha"
+
+[functions.lower.behavior]
+pure = true
+throws = false
+
+[functions.lower.tests]
+cases = [
+    { args = ["HELLO"], expect = "hello" },
+    { args = ["Hello World"], expect = "hello world" },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.ltrim]
+namespace = "std.string"
+description = "Remove leading whitespace"
+since = "1.0.0"
+
+[functions.ltrim.signature]
+params = [
+    { name = "s", type = "string" }
+]
+returns = "alpha"
+
+[functions.ltrim.behavior]
+pure = true
+throws = false
+
+[functions.ltrim.tests]
+cases = [
+    { args = ["  hello"], expect = "hello" },
+    { args = ["hello"], expect = "hello" },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.s_bld]
+namespace = "std.string"
+description = "Build string with format substitution (%s, %d, %f)"
+since = "1.0.0"
+
+[functions.s_bld.signature]
+params = [
+    { name = "format", type = "string" },
+    { name = "args", type = "variadic", element_type = "any" }
+]
+returns = "string"
+
+[functions.s_bld.behavior]
+pure = true
+throws = false
+
+[functions.s_bld.tests]
+cases = [
+    { args = ["Hello %s!", "World"], expect = "Hello World!" },
+    { args = ["Value: %d", 42], expect = "Value: 42" },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.s_parse]
+namespace = "std.string"
+description = "Find delimiter position in string (1-based, 0 if not found)"
+since = "1.0.0"
+
+[functions.s_parse.signature]
+params = [
+    { name = "source", type = "string" },
+    { name = "result", type = "any" },
+    { name = "delimiter", type = "string" }
+]
+returns = "i64"
+
+[functions.s_parse.behavior]
+pure = true
+throws = false
+
+# =============================================================================
+# std.io - Input/Output Functions
+# =============================================================================
+
+[functions.readln]
+namespace = "std.io"
+description = "Read a line from stdin"
+since = "1.0.0"
+
+[functions.readln.signature]
+params = []
+returns = "string"
+
+[functions.readln.behavior]
+pure = false
+throws = false
+io = "stdin"
+
+# -----------------------------------------------------------------------------
+
+[functions.io_log]
+namespace = "std.io"
+native_name = "log"
+description = "Write to stderr for debugging"
+since = "1.0.0"
+
+[functions.io_log.signature]
+params = [
+    { name = "args", type = "variadic", element_type = "any" }
+]
+returns = "void"
+
+[functions.io_log.behavior]
+pure = false
+throws = false
+io = "stderr"
+
+# =============================================================================
+# std.io.file - File I/O Functions
+# =============================================================================
+
+[functions.file_open]
+namespace = "std.io.file"
+native_name = "file.open"
+description = "Open a file and return a handle"
+since = "1.0.0"
+
+[functions.file_open.signature]
+params = [
+    { name = "path", type = "string" },
+    { name = "mode", type = "string" }
+]
+returns = "handle"
+
+[functions.file_open.behavior]
+pure = false
+throws = true
+errors = ["FileNotFound", "PermissionDenied", "InvalidMode"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.file_close]
+namespace = "std.io.file"
+native_name = "file.close"
+description = "Close a file handle"
+since = "1.0.0"
+
+[functions.file_close.signature]
+params = [
+    { name = "handle", type = "handle" }
+]
+returns = "void"
+
+[functions.file_close.behavior]
+pure = false
+throws = false
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.file_readline]
+namespace = "std.io.file"
+native_name = "file.readline"
+description = "Read a line from file (null at EOF)"
+since = "1.0.0"
+
+[functions.file_readline.signature]
+params = [
+    { name = "handle", type = "handle" }
+]
+returns = { type = "optional", inner = "string" }
+
+[functions.file_readline.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.file_readall]
+namespace = "std.io.file"
+native_name = "file.readall"
+description = "Read entire file contents"
+since = "1.0.0"
+
+[functions.file_readall.signature]
+params = [
+    { name = "handle", type = "handle" }
+]
+returns = { type = "optional", inner = "string" }
+
+[functions.file_readall.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.file_writeline]
+namespace = "std.io.file"
+native_name = "file.writeline"
+description = "Write a line to file with newline"
+since = "1.0.0"
+
+[functions.file_writeline.signature]
+params = [
+    { name = "handle", type = "handle" },
+    { name = "line", type = "string" }
+]
+returns = "void"
+
+[functions.file_writeline.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.file_write]
+namespace = "std.io.file"
+native_name = "file.write"
+description = "Write data to file without newline"
+since = "1.0.0"
+
+[functions.file_write.signature]
+params = [
+    { name = "handle", type = "handle" },
+    { name = "data", type = "string" }
+]
+returns = "void"
+
+[functions.file_write.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "IOError"]
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.file_eof]
+namespace = "std.io.file"
+native_name = "file.eof"
+description = "Check if file is at end"
+since = "1.0.0"
+
+[functions.file_eof.signature]
+params = [
+    { name = "handle", type = "handle" }
+]
+returns = "bool"
+
+[functions.file_eof.behavior]
+pure = false
+throws = false
+io = "filesystem"
+
+# -----------------------------------------------------------------------------
+
+[functions.file_flush]
+namespace = "std.io.file"
+native_name = "file.flush"
+description = "Flush file buffer to disk"
+since = "1.0.0"
+
+[functions.file_flush.signature]
+params = [
+    { name = "handle", type = "handle" }
+]
+returns = "void"
+
+[functions.file_flush.behavior]
+pure = false
+throws = false
+io = "filesystem"
+
+# =============================================================================
+# std.convert - Type Conversion Functions
+# =============================================================================
+
+[functions.string]
+namespace = "std.convert"
+description = "Convert any value to string representation"
+since = "1.0.0"
+
+[functions.string.signature]
+params = [
+    { name = "value", type = "any" }
+]
+returns = "string"
+
+[functions.string.behavior]
+pure = true
+throws = false
+
+[functions.string.tests]
+cases = [
+    { args = [42], expect = "42" },
+    { args = [true], expect = "true" },
+    { args = [false], expect = "false" },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.integer]
+namespace = "std.convert"
+description = "Convert value to integer"
+since = "1.0.0"
+
+[functions.integer.signature]
+params = [
+    { name = "value", type = "any" }
+]
+returns = "i64"
+
+[functions.integer.behavior]
+pure = true
+throws = false
+
+[functions.integer.tests]
+cases = [
+    { args = ["42"], expect = 42 },
+    { args = [true], expect = 1 },
+    { args = [false], expect = 0 },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.decimal]
+namespace = "std.convert"
+description = "Convert value to decimal with specified precision"
+since = "1.0.0"
+
+[functions.decimal.signature]
+params = [
+    { name = "value", type = "any" },
+    { name = "precision", type = "i64" }
+]
+returns = { type = "decimal", precision = "dynamic" }
+
+[functions.decimal.behavior]
+pure = true
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.boolean]
+namespace = "std.convert"
+description = "Convert value to boolean"
+since = "1.0.0"
+
+[functions.boolean.signature]
+params = [
+    { name = "value", type = "any" }
+]
+returns = "bool"
+
+[functions.boolean.behavior]
+pure = true
+throws = false
+
+[functions.boolean.tests]
+cases = [
+    { args = [0], expect = false },
+    { args = [1], expect = true },
+    { args = [""], expect = false },
+    { args = ["x"], expect = true },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.char]
+namespace = "std.convert"
+description = "Convert integer to single character string"
+since = "1.0.0"
+
+[functions.char.signature]
+params = [
+    { name = "code", type = "i64" }
+]
+returns = "string"
+
+[functions.char.behavior]
+pure = true
+throws = false
+
+[functions.char.tests]
+cases = [
+    { args = [65], expect = "A" },
+    { args = [97], expect = "a" },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.ascii]
+namespace = "std.convert"
+description = "Get ASCII code of first character"
+since = "1.0.0"
+
+[functions.ascii.signature]
+params = [
+    { name = "s", type = "string" }
+]
+returns = "i64"
+
+[functions.ascii.behavior]
+pure = true
+throws = false
+
+[functions.ascii.tests]
+cases = [
+    { args = ["A"], expect = 65 },
+    { args = ["abc"], expect = 97 },
+]
+
+# =============================================================================
+# std.time - Date and Time Functions
+# =============================================================================
+
+[functions.date]
+namespace = "std.time"
+description = "Get current date as YYYYMMDD integer"
+since = "1.0.0"
+
+[functions.date.signature]
+params = []
+returns = "i64"
+
+[functions.date.behavior]
+pure = false
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.time]
+namespace = "std.time"
+description = "Get current time as HHMMSS integer"
+since = "1.0.0"
+
+[functions.time.signature]
+params = []
+returns = "i64"
+
+[functions.time.behavior]
+pure = false
+throws = false
+
+# =============================================================================
+# std.sys - System Functions
+# =============================================================================
+
+[functions.getlog]
+namespace = "std.sys"
+description = "Get environment variable value"
+since = "1.0.0"
+
+[functions.getlog.signature]
+params = [
+    { name = "name", type = "string" }
+]
+returns = "string"
+
+[functions.getlog.behavior]
+pure = false
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.setlog]
+namespace = "std.sys"
+description = "Set environment variable"
+since = "1.0.0"
+
+[functions.setlog.signature]
+params = [
+    { name = "name", type = "string" },
+    { name = "value", type = "string" }
+]
+returns = "void"
+
+[functions.setlog.behavior]
+pure = false
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.error]
+namespace = "std.sys"
+description = "Get last error code"
+since = "1.0.0"
+
+[functions.error.signature]
+params = []
+returns = "i64"
+
+[functions.error.behavior]
+pure = false
+throws = false
+
+# =============================================================================
+# DBL Compatibility Aliases
+# These are available in .dbl files without any namespace
+# =============================================================================
+
+[functions.display]
+namespace = "dbl"
+description = "DBL display statement - alias for println"
+since = "1.0.0"
+alias_of = "println"
+dbl_implicit = true
+
+[functions.display.signature]
+params = [
+    { name = "args", type = "variadic", element_type = "any" }
+]
+returns = "void"
+
+[functions.display.behavior]
+pure = false
+throws = false
+io = "stdout"

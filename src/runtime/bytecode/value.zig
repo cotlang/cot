@@ -16,6 +16,7 @@
 //! ```
 
 const std = @import("std");
+const arc = @import("arc.zig");
 
 // ============================================================================
 // Value Tag Enum (for switch statements)
@@ -125,10 +126,11 @@ pub const Value = extern struct {
     const TAG_OBJECT_MASK: u64 = 0xFFFF_C000_0000_0000; // Bits 46-63 for tag check
     const OBJ_TYPE_SHIFT: u6 = 40;
     const OBJ_TYPE_MASK: u64 = 0x0000_3F00_0000_0000; // Bits 40-45 for type_id (6 bits)
-    const OBJ_PTR_MASK: u64 = 0x0000_00FF_FFFF_FFFF; // Bits 0-39 for pointer (40 bits)
+    /// Object pointer mask (40 bits) - public for ARC module
+    pub const OBJ_PTR_MASK: u64 = 0x0000_00FF_FFFF_FFFF; // Bits 0-39 for pointer (40 bits)
 
-    /// Pointer payload mask (low 46 bits for pointers) - used by non-object types
-    const PTR_MASK: u64 = 0x0000_3FFF_FFFF_FFFF;
+    /// Pointer payload mask (low 46 bits for pointers) - public for ARC module
+    pub const PTR_MASK: u64 = 0x0000_3FFF_FFFF_FFFF;
 
     /// Small integer max/min (47-bit signed)
     const SMALL_INT_MAX: i64 = 0x3FFF_FFFF_FFFF; // 2^46 - 1
@@ -177,16 +179,16 @@ pub const Value = extern struct {
         }
     }
 
-    /// Create a boxed integer (heap allocated)
+    /// Create a boxed integer (heap allocated with ARC header)
     pub fn initBoxedInt(allocator: std.mem.Allocator, i: i64) !Self {
-        const boxed = try allocator.create(BoxedInt);
+        const boxed = try arc.create(allocator, BoxedInt);
         boxed.* = .{ .value = i };
         return .{ .bits = TAG_BOXED_INT | ptrToPayload(boxed) };
     }
 
-    /// Create a decimal value (always boxed)
+    /// Create a decimal value (always boxed with ARC header)
     pub fn initDecimal(allocator: std.mem.Allocator, value: i64, precision: u8) !Self {
-        const boxed = try allocator.create(Decimal);
+        const boxed = try arc.create(allocator, Decimal);
         boxed.* = .{ .value = value, .precision = precision };
         return .{ .bits = TAG_DECIMAL | ptrToPayload(boxed) };
     }
@@ -196,16 +198,16 @@ pub const Value = extern struct {
         return initDecimal(allocator, d.value, d.precision);
     }
 
-    /// Create an immutable string reference
+    /// Create an immutable string reference (with ARC header)
     pub fn initString(allocator: std.mem.Allocator, s: []const u8) !Self {
-        const ref = try allocator.create(StringRef);
+        const ref = try arc.create(allocator, StringRef);
         ref.* = .{ .ptr = s.ptr, .len = s.len };
         return .{ .bits = TAG_STRING | ptrToPayload(ref) };
     }
 
-    /// Create a mutable fixed-length string reference
+    /// Create a mutable fixed-length string reference (with ARC header)
     pub fn initFixedString(allocator: std.mem.Allocator, s: []u8) !Self {
-        const ref = try allocator.create(FixedStringRef);
+        const ref = try arc.create(allocator, FixedStringRef);
         ref.* = .{ .ptr = s.ptr, .len = s.len };
         return .{ .bits = TAG_FIXED_STR | ptrToPayload(ref) };
     }
@@ -653,10 +655,7 @@ test "boxed integer" {
 
     const huge: i64 = 0x7FFF_FFFF_FFFF_FFFF;
     const v = try Value.initBoxedInt(allocator, huge);
-    defer {
-        const boxed = Value.payloadToPtr(*Value.BoxedInt, v.bits);
-        allocator.destroy(boxed);
-    }
+    defer arc.release(v, allocator);
 
     try std.testing.expectEqual(Tag.integer, v.tag());
     try std.testing.expectEqual(huge, v.asInt());

@@ -592,6 +592,39 @@ pub const Opcode = enum(u8) {
     /// Format: [rs:4|0] [0]
     assert = 0xF2,
 
+    /// weak_ref rd, rs - create weak reference: rd = weak(rs)
+    /// Creates a weak reference to rs without incrementing refcount.
+    /// When rs is freed, rd becomes null.
+    /// Format: [rd:4|rs:4] [0]
+    weak_ref = 0xF3,
+
+    /// weak_load rd, rs - load from weak reference: rd = *rs (or null if freed)
+    /// Returns null if the weak reference target has been freed.
+    /// Returns the value (with retain) if still alive.
+    /// Format: [rd:4|rs:4] [0]
+    weak_load = 0xF4,
+
+    // ============================================
+    // ARC Operations (0xF5-0xF7)
+    // Explicit reference counting operations for compiler integration
+    // ============================================
+
+    /// arc_retain rs - increment reference count of heap value
+    /// No-op for inline values (ints, bools, null).
+    /// Format: [rs:4|0] [0]
+    arc_retain = 0xF5,
+
+    /// arc_release rs - decrement reference count (may free)
+    /// No-op for inline values. Frees object when refcount reaches 0.
+    /// Format: [rs:4|0] [0]
+    arc_release = 0xF6,
+
+    /// arc_move rd, rs - move value without ARC (transfer ownership)
+    /// Copies rs to rd without retain, sets rs to null.
+    /// Used for last-use optimization.
+    /// Format: [rd:4|rs:4] [0]
+    arc_move = 0xF7,
+
     /// extended sub_opcode - extended opcode prefix
     /// Format: [sub_opcode:8] [...]
     extended = 0xFE,
@@ -656,6 +689,10 @@ pub const Opcode = enum(u8) {
             .incr, .decr => 2,
             .add_dec, .sub_dec, .mul_dec, .div_dec => 2,
             .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge => 2,
+            .weak_ref, .weak_load => 2,
+            // ARC operations
+            .arc_retain, .arc_release => 2,
+            .arc_move => 2,
             // Quickened integer-specialized opcodes
             .add_int, .sub_int, .mul_int, .div_int => 2,
             .cmp_lt_int, .cmp_le_int, .cmp_gt_int, .cmp_ge_int => 2,

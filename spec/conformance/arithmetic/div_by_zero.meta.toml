@@ -1,0 +1,3 @@
+[test]
+description = "Division by zero should produce runtime error 200"
+exit_code = 200

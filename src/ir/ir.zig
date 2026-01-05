@@ -61,6 +61,9 @@ pub const Type = union(enum) {
     /// Optional type (nullable)
     optional: *const Type,
 
+    /// Weak reference type (doesn't keep referenced value alive)
+    weak: *const Type,
+
     /// Array of a type
     array: struct {
         element: *const Type,
@@ -101,7 +104,7 @@ pub const Type = union(enum) {
             .isize, .usize => @sizeOf(usize),
             .string => 16, // Pointer + length
             .decimal => |d| d.precision, // DBL decimals: 1 byte per digit character
-            .ptr, .optional => 8, // 64-bit pointers
+            .ptr, .optional, .weak => 8, // 64-bit pointers
             .array => |a| a.element.sizeInBytes() * a.length,
             .slice => 16, // Pointer + length
             .@"struct" => |s| s.size,
@@ -123,7 +126,7 @@ pub const Type = union(enum) {
             .isize, .usize => @alignOf(usize),
             .string, .slice => 8,
             .decimal => 8,
-            .ptr, .optional => 8,
+            .ptr, .optional, .weak => 8,
             .array => |a| a.element.alignment(),
             .@"struct" => |s| s.alignment,
             .@"union" => |u| u.alignment,
@@ -151,7 +154,7 @@ pub const Type = union(enum) {
             .f64 => "double",
             .string => "cot_string_t*",
             .decimal => "cot_decimal_t",
-            .ptr, .optional => "void*",
+            .ptr, .optional, .weak => "void*",
             .array, .slice => "void*",
             .@"struct" => "void*",
             .@"union" => "void*",
@@ -185,6 +188,12 @@ pub const Type = union(enum) {
             .i8, .i16, .i32, .i64, .isize, .f32, .f64, .decimal => true,
             else => false,
         };
+    }
+
+    /// Check if values of this type require ARC (Automatic Reference Counting).
+    /// Returns true for heap-allocated types: string, decimal, map, struct, union, slice.
+    pub fn needsArc(self: Type) bool {
+        return typeNeedsArc(self);
     }
 };
 
@@ -320,7 +329,41 @@ pub const Value = struct {
             (self.isPointer() and other.isPointer()) or
             (self.isOptional() or other.isOptional());
     }
+
+    /// Check if this value's type requires ARC (Automatic Reference Counting).
+    /// Returns true for heap-allocated types: string, decimal, map, and struct/union
+    /// types that may contain heap fields.
+    pub fn needsArc(self: Value) bool {
+        return self.ty.needsArc();
+    }
 };
+
+/// Type helper to determine if values of this type need ARC
+fn typeNeedsArc(ty: Type) bool {
+    return switch (ty) {
+        // Heap-allocated types that need ARC
+        .string => true,
+        .decimal => true,
+        .map => true,
+        // Pointer to heap type needs ARC
+        .ptr => |p| typeNeedsArc(p.*),
+        // Optional of heap type needs ARC
+        .optional => |o| typeNeedsArc(o.*),
+        // Weak references don't increment refcount, but the referenced type might need ARC
+        .weak => false, // Weak refs explicitly don't participate in ARC
+        // Struct/union might contain heap fields - conservative: assume yes
+        .@"struct" => true,
+        .@"union" => true,
+        // Slices are heap-allocated
+        .slice => true,
+        // Inline types don't need ARC
+        .void, .bool, .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .isize, .usize => false,
+        // Arrays of inline types don't need ARC, but arrays of heap types do
+        .array => |a| typeNeedsArc(a.element.*),
+        // Function pointers don't need ARC
+        .function => false,
+    };
+}
 
 /// Source location for error reporting
 pub const SourceLoc = struct {
@@ -431,6 +474,15 @@ pub const Instruction = union(enum) {
     unwrap_optional: UnaryOp,
     is_null: UnaryOp,
 
+    // ====== Weak reference operations (Cot-specific) ======
+    weak_ref: UnaryOp, // Create weak reference: result = weak(operand)
+    weak_load: UnaryOp, // Load from weak ref: result = *weak_operand (or null if freed)
+
+    // ====== ARC operations (explicit reference counting) ======
+    arc_retain: ArcOp, // Increment refcount: retain(operand)
+    arc_release: ArcOp, // Decrement refcount: release(operand) - may free
+    arc_move: UnaryOp, // Move without ARC: result = move(operand), operand becomes null
+
     // ====== Conditional selection (Cranelift-style) ======
     select: Select, // result = cond ? true_val : false_val
 
@@ -519,6 +571,11 @@ pub const Instruction = union(enum) {
     pub const UnaryOp = struct {
         operand: Value,
         result: Value,
+    };
+
+    // ARC operation (no result - just modifies refcount)
+    pub const ArcOp = struct {
+        value: Value,
     };
 
     // Conditional selection (ternary): result = cond ? true_val : false_val
@@ -896,8 +953,12 @@ pub const Instruction = union(enum) {
             .map_values => |m| m.result,
             .select => |s| s.result,
             .ptr_offset => |p| p.result,
+            // Weak reference operations
+            .weak_ref, .weak_load => |op| op.result,
+            // ARC operations
+            .arc_move => |op| op.result,
             // Instructions that don't produce values
-            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear => null,
+            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear, .arc_retain, .arc_release => null,
         };
     }
 

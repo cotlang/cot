@@ -1,6 +1,10 @@
 //! System native functions
 //!
-//! flags, getlog, setlog, error, mem
+//! Namespace: std.system
+//! Functions: flags, getlog, setlog, error, mem
+//!
+//! In .cot files: requires `import std.system` then call as `std.system.getlog(x)`
+//! In .dbl files: available directly as `getlog(x)` (DBL compatibility)
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -9,8 +13,16 @@ const NativeError = native.NativeError;
 const NativeFn = native.NativeFn;
 const Value = native.Value;
 
-/// Register all system functions
+/// Register all system functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
+    // Namespaced names (std.system.*)
+    try registry.registerNative("std.system.flags", flags);
+    try registry.registerNative("std.system.getlog", getlog);
+    try registry.registerNative("std.system.setlog", setlog);
+    try registry.registerNative("std.system.error", getError);
+    try registry.registerNative("std.system.mem", mem);
+
+    // Short names (DBL compatibility)
     try registry.registerNative("flags", flags);
     try registry.registerNative("getlog", getlog);
     try registry.registerNative("setlog", setlog);

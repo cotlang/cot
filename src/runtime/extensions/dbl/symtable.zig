@@ -12,6 +12,7 @@ const NativeContext = native.NativeContext;
 const NativeError = native.NativeError;
 const Value = native.Value;
 const OrderedMap = @import("../../bytecode/ordered_map.zig").OrderedMap;
+const arc = @import("../../bytecode/arc.zig");
 
 /// DBL namespace flags (from namspc.def)
 pub const D_NSPC_NONE: i64 = 0;
@@ -41,7 +42,7 @@ pub fn deinit() void {
             const map = entry.value_ptr.*;
             map.deinit();
             if (registry_allocator) |alloc| {
-                alloc.destroy(map);
+                arc.destroy(alloc, OrderedMap, map);
             }
         }
         registry.deinit();
@@ -81,14 +82,14 @@ pub fn nspc_open(ctx: *NativeContext) NativeError!?Value {
         .preserve_spaces = (flags & D_NSPC_SPACE) != 0,
     };
 
-    const map = ctx.allocator.create(OrderedMap) catch return NativeError.OutOfMemory;
+    const map = arc.create(ctx.allocator, OrderedMap) catch return NativeError.OutOfMemory;
     map.* = OrderedMap.init(ctx.allocator, map_flags);
 
     const handle = next_handle;
     next_handle += 1;
     handle_registry.?.put(handle, map) catch {
         map.deinit();
-        ctx.allocator.destroy(map);
+        arc.destroy(ctx.allocator, OrderedMap, map);
         return NativeError.OutOfMemory;
     };
 
@@ -228,7 +229,7 @@ pub fn nspc_close(ctx: *NativeContext) NativeError!?Value {
     if (handle_registry.?.fetchRemove(id)) |kv| {
         const map = kv.value;
         map.deinit();
-        ctx.allocator.destroy(map);
+        arc.destroy(ctx.allocator, OrderedMap, map);
     }
     return null;
 }

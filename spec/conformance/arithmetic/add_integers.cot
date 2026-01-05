@@ -1,0 +1,13 @@
+; Test: Integer addition
+proc main
+    record
+        a, d10
+        b, d10
+        c, d10
+    endrecord
+
+    a = 42
+    b = 58
+    c = a + b
+    display(c)
+endproc

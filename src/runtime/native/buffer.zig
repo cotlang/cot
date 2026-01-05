@@ -1,7 +1,13 @@
 //! Buffer native functions
 //!
+//! Namespace: std.mem
+//! Functions: alloc, free, resize, size, get, set, clear
+//!
 //! Modern replacement for DBL's memory handles (^M, D_HANDLE, %MEM_PROC).
 //! Provides a safe, managed byte buffer with automatic memory management.
+//!
+//! In .cot files: requires `import std.mem` then call as `std.mem.alloc(size)`
+//! In .dbl files: available as `mem_alloc(size)` (DBL compatibility)
 //!
 //! DBL Legacy:
 //!   handle = %mem_proc(DM_ALLOC, size)
@@ -9,9 +15,9 @@
 //!   %mem_proc(DM_RESIZ, handle, new_size)
 //!
 //! Cot Modern:
-//!   handle = mem_alloc(size)
-//!   mem_free(handle)
-//!   mem_resize(handle, new_size)
+//!   handle = std.mem.alloc(size)
+//!   std.mem.free(handle)
+//!   std.mem.resize(handle, new_size)
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -79,8 +85,18 @@ fn ensureRegistry(allocator: std.mem.Allocator) void {
     }
 }
 
-/// Register all buffer functions
+/// Register all buffer functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
+    // Namespaced names (std.mem.*)
+    try registry.registerNative("std.mem.alloc", mem_alloc);
+    try registry.registerNative("std.mem.free", mem_free);
+    try registry.registerNative("std.mem.resize", mem_resize);
+    try registry.registerNative("std.mem.size", mem_size);
+    try registry.registerNative("std.mem.get", mem_get);
+    try registry.registerNative("std.mem.set", mem_set);
+    try registry.registerNative("std.mem.clear", mem_clear);
+
+    // Short names (DBL compatibility - mem_ prefix style)
     try registry.registerNative("mem_alloc", mem_alloc);
     try registry.registerNative("mem_free", mem_free);
     try registry.registerNative("mem_resize", mem_resize);
@@ -89,7 +105,7 @@ pub fn register(registry: anytype) !void {
     try registry.registerNative("mem_set", mem_set);
     try registry.registerNative("mem_clear", mem_clear);
 
-    // DBL compatibility aliases (maps to modern equivalents)
+    // DBL compatibility - %MEM_PROC wrapper
     try registry.registerNative("mem_proc", mem_proc);
 }
 

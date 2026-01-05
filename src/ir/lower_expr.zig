@@ -18,6 +18,7 @@ const ast = @import("../ast/mod.zig");
 const ir = @import("ir.zig");
 const cot_runtime = @import("cot_runtime");
 const debug = cot_runtime.debug;
+const native_types = @import("generated/native_types.zig");
 
 // Import Lowerer and types from main module
 const lower_mod = @import("lower.zig");
@@ -35,6 +36,59 @@ const BinaryOp = ast.BinaryOp;
 const UnaryOp = ast.UnaryOp;
 const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
+
+// ============================================================================
+// Qualified Name Extraction for Namespace Chains
+// ============================================================================
+
+/// Extract a fully qualified name from a member access chain.
+/// For example: `std.math.abs` -> "std.math.abs"
+/// Returns null if the expression is not a pure namespace chain (e.g., contains non-identifier base).
+fn extractQualifiedName(
+    store: *const NodeStore,
+    strings: *StringInterner,
+    expr_idx: ExprIdx,
+    buf: []u8,
+) ?[]const u8 {
+    const tag = store.exprTag(expr_idx);
+    const data = store.exprData(expr_idx);
+
+    switch (tag) {
+        .identifier => {
+            const name_id = data.getName();
+            const name = strings.get(name_id);
+            if (name.len > buf.len) return null;
+            @memcpy(buf[0..name.len], name);
+            return buf[0..name.len];
+        },
+        .member => {
+            // Get the object's qualified name first
+            const object_idx = data.getObject();
+            const field_id = data.getField();
+            const field_name = strings.get(field_id);
+
+            // Recursively get the object's qualified name
+            var temp_buf: [256]u8 = undefined;
+            const object_name = extractQualifiedName(store, strings, object_idx, &temp_buf) orelse return null;
+
+            // Build "object.field"
+            const total_len = object_name.len + 1 + field_name.len;
+            if (total_len > buf.len) return null;
+
+            @memcpy(buf[0..object_name.len], object_name);
+            buf[object_name.len] = '.';
+            @memcpy(buf[object_name.len + 1 ..][0..field_name.len], field_name);
+            return buf[0..total_len];
+        },
+        else => return null, // Not a valid namespace chain
+    }
+}
+
+/// Check if a qualified name represents a std namespace function
+fn isStdNamespaceFunction(name: []const u8) bool {
+    // Check for std.* prefix
+    return std.mem.startsWith(u8, name, "std.");
+}
 
 // ============================================================================
 // Main Expression Lowering
@@ -185,6 +239,41 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerErr
     const ptr = l.scopes.get(name) orelse
         l.global_variables.get(name) orelse
         return LowerError.UndefinedVariable;
+
+    // Get the underlying type (dereference pointer)
+    const value_type = switch (ptr.ty) {
+        .ptr => |p| p.*,
+        else => ptr.ty,
+    };
+
+    // Check if this is a weak reference type
+    // If so, emit weak_load which returns optional (may be null if target freed)
+    if (value_type == .weak) {
+        // First load the weak reference itself
+        const weak_value = func.newValue(value_type);
+        try l.emit(.{
+            .load = .{
+                .ptr = ptr,
+                .result = weak_value,
+            },
+        });
+
+        // Then emit weak_load to dereference it (may return null)
+        // Result type is optional of the inner type
+        const inner_type = value_type.weak.*;
+        const inner_ptr = l.allocator.create(ir.Type) catch return LowerError.OutOfMemory;
+        inner_ptr.* = inner_type;
+        try l.allocated_types.append(l.allocator, inner_ptr);
+
+        const result = func.newValue(.{ .optional = inner_ptr });
+        try l.emit(.{
+            .weak_load = .{
+                .operand = weak_value,
+                .result = result,
+            },
+        });
+        return result;
+    }
 
     const result = func.newValue(ptr.ty);
     try l.emit(.{
@@ -620,6 +709,42 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
     // Get callee name
     const callee_tag = l.store.exprTag(callee_idx);
+
+    // Check for namespace-qualified function calls (e.g., std.math.abs, std.io.println)
+    if (callee_tag == .member) {
+        var qualified_buf: [256]u8 = undefined;
+        if (extractQualifiedName(l.store, l.strings, callee_idx, &qualified_buf)) |qualified_name| {
+            // Check if this is a std.* namespace function
+            if (isStdNamespaceFunction(qualified_name)) {
+                // Lower arguments
+                var ns_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                defer ns_args.deinit(l.allocator);
+                for (0..args_count) |i| {
+                    const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                    const arg_val = try lowerExpression(l, arg_idx);
+                    try ns_args.append(l.allocator, arg_val);
+                }
+
+                // Allocate the function name so it survives beyond this scope
+                const native_name = l.allocator.dupe(u8, qualified_name) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                const args_slice = try ns_args.toOwnedSlice(l.allocator);
+                const result_type = getBuiltinReturnType(native_name, args_slice);
+                const result = func.newValue(result_type);
+
+                try l.emit(.{
+                    .call = .{
+                        .callee = native_name,
+                        .args = args_slice,
+                        .result = result,
+                    },
+                });
+                return result;
+            }
+        }
+    }
 
     // Check for Map.new() static method call OR map instance method calls
     if (callee_tag == .member) {
@@ -1366,6 +1491,14 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
             try l.allocated_types.append(l.allocator, inner_ptr);
             break :blk .{ .optional = inner_ptr };
         },
+        .weak => blk: {
+            const inner_type_idx: TypeIdx = @enumFromInt(data.a);
+            const inner_type = try lowerTypeIdx(l, inner_type_idx);
+            const inner_ptr = try l.allocator.create(ir.Type);
+            inner_ptr.* = inner_type;
+            try l.allocated_types.append(l.allocator, inner_ptr);
+            break :blk .{ .weak = inner_ptr };
+        },
         .pointer => blk: {
             const pointee_type_idx: TypeIdx = @enumFromInt(data.a);
             const pointee_type = try lowerTypeIdx(l, pointee_type_idx);
@@ -1481,90 +1614,16 @@ pub fn isMapType(ty: ir.Type) bool {
     };
 }
 
-/// Determine return type of builtin functions
+/// Determine return type of builtin functions using generated spec-based lookup.
+/// The FunctionReturnTypes map is auto-generated from spec/natives.toml.
 pub fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
-    // String functions that return strings
-    if (std.mem.eql(u8, name, "trim") or
-        std.mem.eql(u8, name, "upper") or
-        std.mem.eql(u8, name, "lower") or
-        std.mem.eql(u8, name, "atrim") or
-        std.mem.eql(u8, name, "chr") or
-        std.mem.eql(u8, name, "string") or
-        std.mem.eql(u8, name, "str_setchar") or
-        std.mem.eql(u8, name, "substr") or
-        std.mem.eql(u8, name, "replace") or
-        std.mem.eql(u8, name, "format") or
-        std.mem.eql(u8, name, "concat"))
-    {
-        return .string;
+    // O(1) lookup in the generated static map from spec/natives.toml
+    if (native_types.getReturnType(name)) |ty| {
+        return ty;
     }
 
-    // Numeric functions that return integers
-    if (std.mem.eql(u8, name, "len") or
-        std.mem.eql(u8, name, "size") or
-        std.mem.eql(u8, name, "asc") or
-        std.mem.eql(u8, name, "instr") or
-        std.mem.eql(u8, name, "integer") or
-        std.mem.eql(u8, name, "pos") or
-        std.mem.eql(u8, name, "index"))
-    {
-        return .i64;
-    }
-
-    // Math functions that return floats
-    if (std.mem.eql(u8, name, "sqrt") or
-        std.mem.eql(u8, name, "sin") or
-        std.mem.eql(u8, name, "cos") or
-        std.mem.eql(u8, name, "tan") or
-        std.mem.eql(u8, name, "log") or
-        std.mem.eql(u8, name, "log10") or
-        std.mem.eql(u8, name, "exp") or
-        std.mem.eql(u8, name, "abs") or
-        std.mem.eql(u8, name, "floor") or
-        std.mem.eql(u8, name, "ceil") or
-        std.mem.eql(u8, name, "round") or
-        std.mem.eql(u8, name, "pow"))
-    {
-        return .f64;
-    }
-
-    // Boolean functions
-    if (std.mem.eql(u8, name, "file_exists") or
-        std.mem.eql(u8, name, "dir_exists") or
-        std.mem.eql(u8, name, "is_numeric") or
-        std.mem.eql(u8, name, "is_alpha") or
-        std.mem.eql(u8, name, "file.eof"))
-    {
-        return .bool;
-    }
-
-    // File.* API functions
-    if (std.mem.eql(u8, name, "file.open")) {
-        return .i64; // Returns handle
-    }
-    if (std.mem.eql(u8, name, "file.readline") or
-        std.mem.eql(u8, name, "file.readall"))
-    {
-        return .string;
-    }
-    if (std.mem.eql(u8, name, "file.close") or
-        std.mem.eql(u8, name, "file.writeline") or
-        std.mem.eql(u8, name, "file.write") or
-        std.mem.eql(u8, name, "file.flush"))
-    {
-        return .void;
-    }
-
-    // Void functions (side-effect only)
-    if (std.mem.eql(u8, name, "print") or
-        std.mem.eql(u8, name, "println") or
-        std.mem.eql(u8, name, "display") or
-        std.mem.eql(u8, name, "clear") or
-        std.mem.eql(u8, name, "sleep") or
-        std.mem.eql(u8, name, "exit") or
-        std.mem.eql(u8, name, "close") or
-        std.mem.startsWith(u8, name, "t_")) // TUI functions
-    {
+    // Handle TUI functions (t_*) as void
+    if (std.mem.startsWith(u8, name, "t_")) {
         return .void;
     }
 

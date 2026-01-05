@@ -1,13 +1,17 @@
 //! Cot Core File I/O API
 //!
-//! Handle-based file operations with method-style naming:
-//!   var f = File.open("data.txt", "r")
-//!   var line = File.readLine(f)
-//!   File.writeLine(f, "Hello")
-//!   File.close(f)
+//! Namespace: std.file
+//! Functions: open, close, readLine, readAll, writeLine, write, eof, flush
+//!
+//! Handle-based file operations:
+//!   import std.file
+//!   var f = std.file.open("data.txt", "r")
+//!   var line = std.file.readLine(f)
+//!   std.file.writeLine(f, "Hello")
+//!   std.file.close(f)
 //!
 //! This module uses the UnifiedHandleManager for all I/O operations.
-//! For DBL channel-based syntax, see src/dbl/native_dbl.zig.
+//! For DBL channel-based syntax, see src/runtime/extensions/dbl/native_io.zig.
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -19,9 +23,19 @@ const Value = native.Value;
 const UnifiedHandleManager = handles.UnifiedHandleManager;
 const TextFileMode = handles.TextFileMode;
 
-/// Register all file functions
+/// Register all file functions with namespaced names
 pub fn register(registry: anytype) !void {
-    // Cot Core File.* API (method-style naming)
+    // Namespaced names (std.file.*)
+    try registry.registerNative("std.file.open", file_open);
+    try registry.registerNative("std.file.close", file_close);
+    try registry.registerNative("std.file.readLine", file_readline);
+    try registry.registerNative("std.file.readAll", file_readall);
+    try registry.registerNative("std.file.writeLine", file_writeline);
+    try registry.registerNative("std.file.write", file_write);
+    try registry.registerNative("std.file.eof", file_eof);
+    try registry.registerNative("std.file.flush", file_flush);
+
+    // Legacy lowercase names (for backward compatibility)
     try registry.registerNative("file.open", file_open);
     try registry.registerNative("file.close", file_close);
     try registry.registerNative("file.readline", file_readline);

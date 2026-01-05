@@ -13,6 +13,8 @@ pub const bytecode = struct {
     pub const opcodes = @import("bytecode/opcodes.zig");
     pub const disasm = @import("bytecode/disasm.zig");
     pub const profiler = @import("bytecode/profiler.zig");
+    pub const arc = @import("bytecode/arc.zig");
+    pub const cycle_collector = @import("bytecode/cycle_collector.zig");
 
     pub const VM = vm.VM;
     pub const Module = module.Module;
@@ -20,12 +22,19 @@ pub const bytecode = struct {
     pub const Disassembler = disasm.Disassembler;
     pub const StopReason = vm.StopReason;
     pub const Profiler = profiler.Profiler;
+    pub const CycleCollector = cycle_collector.CycleCollector;
 
     // Crash context for improved error reporting
     pub const CrashContext = vm.CrashContext;
     pub const crash_context = &vm.crash_context;
     pub const enterNativeContext = vm.enterNativeContext;
     pub const exitNativeContext = vm.exitNativeContext;
+
+    // Tests (only compiled during testing)
+    test {
+        _ = @import("bytecode/arc_conformance_test.zig");
+        _ = @import("bytecode/cycle_collector.zig");
+    }
 };
 
 // Native functions
@@ -41,11 +50,14 @@ pub const sqlite_isam = @import("cotdb").sqlite_isam;
 pub const handles = @import("handles/handles.zig");
 pub const UnifiedHandleManager = handles.UnifiedHandleManager;
 
-// Debug utilities
+// Debug utilities (environment-based debug logging)
 pub const debug = @import("debug.zig");
 
 // Execution tracing
 pub const trace = @import("trace/trace.zig");
+
+// Unified debug module (breakpoints, inspection, validation)
+pub const debug_tools = @import("debug/debug.zig");
 
 // Extension system
 pub const extension = @import("extension.zig");

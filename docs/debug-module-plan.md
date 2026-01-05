@@ -1,5 +1,30 @@
 # Cot Debug Module Design
 
+## Implementation Status (Updated 2026-01-05)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `cot trace` | ✅ Implemented | `src/runtime/trace/trace.zig` |
+| `cot debug` | ✅ Implemented | `src/main.zig:debugFile()` |
+| `cot validate` | ✅ Implemented | `src/main.zig:validateBytecode()` |
+| `trace.zig` | ✅ Implemented | `src/runtime/trace/trace.zig` |
+| `history.zig` | ✅ Implemented | `src/runtime/trace/history.zig` |
+| `output.zig` | ✅ Implemented | `src/runtime/trace/output.zig` |
+| `inspector.zig` | ✅ Implemented | `src/runtime/debug/inspector.zig` |
+| `validator.zig` | ✅ Implemented | `src/runtime/debug/validator.zig` |
+| `breakpoint.zig` | ✅ Implemented | `src/runtime/debug/breakpoint.zig` |
+| `debug.zig` (module root) | ✅ Implemented | `src/runtime/debug/debug.zig` |
+| VM StateInspector integration | ✅ Implemented | `vm.createInspector()` |
+| LSP/DAP Integration | 🔲 Not Started | - |
+
+### Key Changes from Original Plan:
+- Debug modules are in `src/runtime/debug/` (not `src/debug/`)
+- Trace modules remain in `src/runtime/trace/`
+- CLI commands are in `src/main.zig` (not separate command modules)
+- `BreakpointManager` provides unified breakpoint system for CLI/LSP sharing
+
+---
+
 ## Overview
 
 A comprehensive debugging infrastructure for the cot compiler and runtime, designed to:

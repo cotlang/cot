@@ -1,6 +1,10 @@
 //! Date/time native functions
 //!
-//! date, time
+//! Namespace: std.datetime
+//! Functions: date, time
+//!
+//! In .cot files: requires `import std.datetime` then call as `std.datetime.date()`
+//! In .dbl files: available directly as `date()` (DBL compatibility)
 
 const std = @import("std");
 const native = @import("native.zig");
@@ -9,8 +13,13 @@ const NativeError = native.NativeError;
 const NativeFn = native.NativeFn;
 const Value = native.Value;
 
-/// Register all datetime functions
+/// Register all datetime functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
+    // Namespaced names (std.datetime.*)
+    try registry.registerNative("std.datetime.date", date);
+    try registry.registerNative("std.datetime.time", time);
+
+    // Short names (DBL compatibility)
     try registry.registerNative("date", date);
     try registry.registerNative("time", time);
 }

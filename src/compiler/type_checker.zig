@@ -116,6 +116,10 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => {},
         .array_len, .debug_line, .select, .ptr_offset => {},
         .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values => {},
+        // Weak reference operations
+        .weak_ref, .weak_load => {},
+        // ARC operations
+        .arc_retain, .arc_release, .arc_move => {},
     }
 }
 

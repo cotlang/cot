@@ -5,6 +5,14 @@ pub fn build(b: *std.Build) void {
     // Initialize configuration from command-line options
     const config = build_config.Config.init(b);
 
+    // ========================================================================
+    // Codegen: generate native function types from spec
+    // ========================================================================
+    const gen_natives = b.addSystemCommand(&.{
+        "zig", "run", "tools/codegen/gen_natives.zig", "--",
+        "spec/natives.toml", "src/ir/generated/native_types.zig",
+    });
+
     // Initialize shared dependencies
     const deps = build_config.SharedDeps.init(b, &config);
 
@@ -37,6 +45,7 @@ pub fn build(b: *std.Build) void {
     }
     exe.linkSystemLibrary("sqlite3");
     exe.linkSystemLibrary("c");
+    exe.step.dependOn(&gen_natives.step); // Codegen runs before compile
 
     // Link Cranelift JIT library when enabled
     if (jit_lib_path) |lib_path| {
@@ -153,6 +162,12 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    // ========================================================================
+    // Manual codegen step (also runs automatically as part of build)
+    // ========================================================================
+    const gen_step = b.step("gen-natives", "Regenerate native function type mappings from spec/natives.toml");
+    gen_step.dependOn(&gen_natives.step);
 
     // ========================================================================
     // Integration test step

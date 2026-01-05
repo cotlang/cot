@@ -1,0 +1,13 @@
+; Test: String concatenation
+proc main
+    record
+        a, a10
+        b, a10
+        c, a20
+    endrecord
+
+    a = "Hello"
+    b = "World"
+    c = a + " " + b
+    display(c)
+endproc

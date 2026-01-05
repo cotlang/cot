@@ -27,6 +27,10 @@ const MatchMode = cotdb.MatchMode;
 
 /// Register all DBL I/O functions
 pub fn register(registry: anytype) !void {
+    // DBL console aliases
+    const io_console = @import("../../native/io_console.zig");
+    try registry.registerNative("display", io_console.io_println);
+
     // DBL channel-based I/O (short names)
     try registry.registerNative("open", dbl_open);
     try registry.registerNative("close", dbl_close);

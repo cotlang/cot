@@ -1062,3 +1062,56 @@ pub fn emitPtrOffset(e: *BytecodeEmitter, p: ir.Instruction.PtrOffset) EmitError
         try e.value_slots.put(p.result.id, slot_info);
     }
 }
+
+// ============================================================================
+// Weak Reference Operations
+// ============================================================================
+
+/// Emit weak_ref instruction - create a weak reference from a value
+/// weak_ref rd, rs - Creates weak reference without retaining
+pub fn emitWeakRef(e: *BytecodeEmitter, w: ir.Instruction.UnaryOp) EmitError!void {
+    const src_reg = try e.getValueInReg(w.operand, 0);
+    const dest_reg: u4 = 1;
+    try e.emitRegUnary(.weak_ref, dest_reg, src_reg);
+    e.setLastResult(w.result.id, dest_reg);
+}
+
+/// Emit weak_load instruction - load from a weak reference
+/// weak_load rd, rs - Returns the value or null if target was freed
+pub fn emitWeakLoad(e: *BytecodeEmitter, w: ir.Instruction.UnaryOp) EmitError!void {
+    const src_reg = try e.getValueInReg(w.operand, 0);
+    const dest_reg: u4 = 1;
+    try e.emitRegUnary(.weak_load, dest_reg, src_reg);
+    e.setLastResult(w.result.id, dest_reg);
+}
+
+// ============================================================================
+// ARC Operations
+// ============================================================================
+
+/// Emit arc_retain instruction - increment reference count
+/// arc_retain rs - No-op for inline values
+pub fn emitArcRetain(e: *BytecodeEmitter, a: ir.Instruction.ArcOp) EmitError!void {
+    const src_reg = try e.getValueInReg(a.value, 0);
+    try e.emitOpcode(.arc_retain);
+    try e.emitU8(@as(u8, src_reg) << 4); // [rs:4|0]
+    try e.emitU8(0);
+}
+
+/// Emit arc_release instruction - decrement reference count (may free)
+/// arc_release rs - No-op for inline values
+pub fn emitArcRelease(e: *BytecodeEmitter, a: ir.Instruction.ArcOp) EmitError!void {
+    const src_reg = try e.getValueInReg(a.value, 0);
+    try e.emitOpcode(.arc_release);
+    try e.emitU8(@as(u8, src_reg) << 4); // [rs:4|0]
+    try e.emitU8(0);
+}
+
+/// Emit arc_move instruction - move value without ARC
+/// arc_move rd, rs - Copies rs to rd, nulls rs
+pub fn emitArcMove(e: *BytecodeEmitter, a: ir.Instruction.UnaryOp) EmitError!void {
+    const src_reg = try e.getValueInReg(a.operand, 0);
+    const dest_reg: u4 = 1;
+    try e.emitRegUnary(.arc_move, dest_reg, src_reg);
+    e.setLastResult(a.result.id, dest_reg);
+}

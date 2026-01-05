@@ -432,6 +432,7 @@ pub const Lexer = struct {
         .{ "and", .kw_and },
         .{ "or", .kw_or },
         .{ "not", .kw_not },
+        .{ "weak", .kw_weak },
 
         // Async
         .{ "async", .kw_async },

@@ -1762,6 +1762,12 @@ pub const Parser = struct {
             return self.store.addOptionalType(inner) catch return error.OutOfMemory;
         }
 
+        // Weak reference type: weak T
+        if (self.match(&[_]TokenType{.kw_weak})) {
+            const inner = try self.parseType();
+            return self.store.addWeakType(inner) catch return error.OutOfMemory;
+        }
+
         // Array type: [N]T or []T
         if (self.match(&[_]TokenType{.lbracket})) {
             if (self.match(&[_]TokenType{.rbracket})) {

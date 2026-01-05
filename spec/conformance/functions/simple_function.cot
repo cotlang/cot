@@ -1,0 +1,13 @@
+; Test: Simple function call and return
+function add(a, d10, b, d10), d10
+    freturn a + b
+endfunction
+
+proc main
+    record
+        result, d10
+    endrecord
+
+    result = add(3, 7)
+    display(result)
+endproc

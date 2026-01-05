@@ -522,6 +522,21 @@ pub const Printer = struct {
                 try self.printValue(p.base_ptr);
                 try self.writer.print(", {d}", .{p.offset});
             },
+
+            // Weak reference operations
+            .weak_ref => |op| try self.printUnaryOp("weak_ref", op),
+            .weak_load => |op| try self.printUnaryOp("weak_load", op),
+
+            // ARC operations
+            .arc_retain => |op| {
+                try self.writer.writeAll("arc_retain ");
+                try self.printValue(op.value);
+            },
+            .arc_release => |op| {
+                try self.writer.writeAll("arc_release ");
+                try self.printValue(op.value);
+            },
+            .arc_move => |op| try self.printUnaryOp("arc_move", op),
         }
     }
 
@@ -611,6 +626,10 @@ pub const Printer = struct {
             .@"union" => |u| try self.writer.print("union({s})", .{u.name}),
             .function => try self.writer.writeAll("fn"),
             .map => try self.writer.writeAll("Map"),
+            .weak => |inner| {
+                try self.writer.writeAll("weak ");
+                try self.printType(inner.*);
+            },
         }
     }
 

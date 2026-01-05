@@ -1,0 +1,2567 @@
+# Cot Bytecode Opcodes Specification
+#
+# Register-based instruction set for the Cot virtual machine.
+# All operations use 16 virtual registers (r0-r15).
+#
+# Register Conventions:
+#   r0-r7:   General purpose, caller-saved, function arguments
+#   r8-r13:  General purpose, callee-saved
+#   r14:     Frame pointer (reserved)
+#   r15:     Return value
+
+[meta]
+version = "1.0.0"
+total_opcodes = 256
+description = "Cot VM bytecode instruction set"
+
+[registers]
+count = 16
+argument_registers = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
+caller_saved = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
+callee_saved = ["r8", "r9", "r10", "r11", "r12", "r13"]
+frame_pointer = "r14"
+return_value = "r15"
+
+# =============================================================================
+# Core Operations (0x00-0x0F)
+# =============================================================================
+
+[opcodes.nop]
+code = 0x00
+mnemonic = "nop"
+description = "No operation"
+since = "1.0.0"
+
+[opcodes.nop.encoding]
+format = "none"
+size = 1
+
+[opcodes.nop.semantics]
+operation = "// do nothing"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.halt]
+code = 0x01
+mnemonic = "halt"
+description = "Stop execution"
+since = "1.0.0"
+
+[opcodes.halt.encoding]
+format = "none"
+size = 1
+
+[opcodes.halt.semantics]
+operation = "return Halted"
+stack_effect = 0
+
+# =============================================================================
+# Register Moves & Immediates (0x10-0x1F)
+# =============================================================================
+
+[opcodes.mov]
+code = 0x10
+mnemonic = "mov"
+description = "Copy value from source register to destination register"
+since = "1.0.0"
+
+[opcodes.mov.encoding]
+format = "reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs", bits = "3:0", type = "register" },
+]
+
+[opcodes.mov.semantics]
+operation = "rd = rs"
+stack_effect = 0
+
+[opcodes.mov.tests]
+cases = [
+    { setup = { r0 = 42 }, args = { rd = 1, rs = 0 }, expect = { r1 = 42 } },
+    { setup = { r5 = -100 }, args = { rd = 0, rs = 5 }, expect = { r0 = -100 } },
+]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.movi]
+code = 0x11
+mnemonic = "movi"
+description = "Load 8-bit signed immediate into register"
+since = "1.0.0"
+
+[opcodes.movi.encoding]
+format = "reg_imm8"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "imm8", bits = "15:8", type = "immediate", range = [-128, 127] },
+]
+
+[opcodes.movi.semantics]
+operation = "rd = sign_extend(imm8)"
+stack_effect = 0
+
+[opcodes.movi.tests]
+cases = [
+    { args = { rd = 0, imm8 = 42 }, expect = { r0 = 42 } },
+    { args = { rd = 1, imm8 = -1 }, expect = { r1 = -1 } },
+]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.movi16]
+code = 0x12
+mnemonic = "movi16"
+description = "Load 16-bit signed immediate into register"
+since = "1.0.0"
+
+[opcodes.movi16.encoding]
+format = "reg_imm16"
+size = 3
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "imm16", bits = "23:8", type = "immediate", range = [-32768, 32767] },
+]
+
+[opcodes.movi16.semantics]
+operation = "rd = sign_extend(imm16)"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.movi32]
+code = 0x13
+mnemonic = "movi32"
+description = "Load 32-bit signed immediate into register"
+since = "1.0.0"
+
+[opcodes.movi32.encoding]
+format = "reg_imm32"
+size = 5
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "imm32", bits = "39:8", type = "immediate" },
+]
+
+[opcodes.movi32.semantics]
+operation = "rd = sign_extend(imm32)"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_const]
+code = 0x14
+mnemonic = "load_const"
+description = "Load constant from constant pool"
+since = "1.0.0"
+
+[opcodes.load_const.encoding]
+format = "reg_imm16"
+size = 3
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "idx", bits = "23:8", type = "index" },
+]
+
+[opcodes.load_const.semantics]
+operation = "rd = constants[idx]"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_null]
+code = 0x15
+mnemonic = "load_null"
+description = "Load null value into register"
+since = "1.0.0"
+
+[opcodes.load_null.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+]
+
+[opcodes.load_null.semantics]
+operation = "rd = null"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_true]
+code = 0x16
+mnemonic = "load_true"
+description = "Load boolean true into register"
+since = "1.0.0"
+
+[opcodes.load_true.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+]
+
+[opcodes.load_true.semantics]
+operation = "rd = true"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_false]
+code = 0x17
+mnemonic = "load_false"
+description = "Load boolean false into register"
+since = "1.0.0"
+
+[opcodes.load_false.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+]
+
+[opcodes.load_false.semantics]
+operation = "rd = false"
+stack_effect = 0
+
+# =============================================================================
+# Local & Global Variables (0x20-0x2F)
+# =============================================================================
+
+[opcodes.load_local]
+code = 0x20
+mnemonic = "load_local"
+description = "Load local variable into register"
+since = "1.0.0"
+
+[opcodes.load_local.encoding]
+format = "reg_imm8"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "slot", bits = "15:8", type = "index", range = [0, 255] },
+]
+
+[opcodes.load_local.semantics]
+operation = "rd = locals[slot]"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.store_local]
+code = 0x21
+mnemonic = "store_local"
+description = "Store register value to local variable"
+since = "1.0.0"
+
+[opcodes.store_local.encoding]
+format = "reg_imm8"
+size = 2
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+    { name = "slot", bits = "15:8", type = "index", range = [0, 255] },
+]
+
+[opcodes.store_local.semantics]
+operation = "locals[slot] = rs"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_local16]
+code = 0x22
+mnemonic = "load_local16"
+description = "Load local variable (16-bit slot)"
+since = "1.0.0"
+
+[opcodes.load_local16.encoding]
+format = "reg_imm16"
+size = 3
+
+[opcodes.load_local16.semantics]
+operation = "rd = locals[slot16]"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.store_local16]
+code = 0x23
+mnemonic = "store_local16"
+description = "Store local variable (16-bit slot)"
+since = "1.0.0"
+
+[opcodes.store_local16.encoding]
+format = "reg_imm16"
+size = 3
+
+[opcodes.store_local16.semantics]
+operation = "locals[slot16] = rs"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_global]
+code = 0x24
+mnemonic = "load_global"
+description = "Load global variable into register"
+since = "1.0.0"
+
+[opcodes.load_global.encoding]
+format = "reg_imm16"
+size = 3
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "idx", bits = "23:8", type = "index" },
+]
+
+[opcodes.load_global.semantics]
+operation = "rd = globals[idx]"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.store_global]
+code = 0x25
+mnemonic = "store_global"
+description = "Store register value to global variable"
+since = "1.0.0"
+
+[opcodes.store_global.encoding]
+format = "reg_imm16"
+size = 3
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+    { name = "idx", bits = "23:8", type = "index" },
+]
+
+[opcodes.store_global.semantics]
+operation = "globals[idx] = rs"
+stack_effect = 0
+
+# =============================================================================
+# Arithmetic (0x30-0x3F)
+# =============================================================================
+
+[opcodes.add]
+code = 0x30
+mnemonic = "add"
+description = "Add two registers"
+since = "1.0.0"
+
+[opcodes.add.encoding]
+format = "reg_reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs1", bits = "3:0", type = "register" },
+    { name = "rs2", bits = "15:12", type = "register" },
+]
+
+[opcodes.add.semantics]
+operation = "rd = rs1 + rs2"
+stack_effect = 0
+type_dispatch = true
+
+[opcodes.add.type_behavior]
+int_int = "integer addition, overflow wraps"
+dec_dec = "decimal addition with precision promotion"
+str_str = "string concatenation"
+
+[opcodes.add.tests]
+cases = [
+    { setup = { r0 = 10, r1 = 20 }, args = { rd = 2, rs1 = 0, rs2 = 1 }, expect = { r2 = 30 } },
+    { setup = { r0 = -5, r1 = 3 }, args = { rd = 0, rs1 = 0, rs2 = 1 }, expect = { r0 = -2 } },
+]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.sub]
+code = 0x31
+mnemonic = "sub"
+description = "Subtract rs2 from rs1"
+since = "1.0.0"
+
+[opcodes.sub.encoding]
+format = "reg_reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs1", bits = "3:0", type = "register" },
+    { name = "rs2", bits = "15:12", type = "register" },
+]
+
+[opcodes.sub.semantics]
+operation = "rd = rs1 - rs2"
+stack_effect = 0
+
+[opcodes.sub.tests]
+cases = [
+    { setup = { r0 = 20, r1 = 8 }, args = { rd = 2, rs1 = 0, rs2 = 1 }, expect = { r2 = 12 } },
+]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.mul]
+code = 0x32
+mnemonic = "mul"
+description = "Multiply two registers"
+since = "1.0.0"
+
+[opcodes.mul.encoding]
+format = "reg_reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs1", bits = "3:0", type = "register" },
+    { name = "rs2", bits = "15:12", type = "register" },
+]
+
+[opcodes.mul.semantics]
+operation = "rd = rs1 * rs2"
+stack_effect = 0
+
+[opcodes.mul.tests]
+cases = [
+    { setup = { r0 = 6, r1 = 7 }, args = { rd = 2, rs1 = 0, rs2 = 1 }, expect = { r2 = 42 } },
+]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.div]
+code = 0x33
+mnemonic = "div"
+description = "Integer division"
+since = "1.0.0"
+
+[opcodes.div.encoding]
+format = "reg_reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs1", bits = "3:0", type = "register" },
+    { name = "rs2", bits = "15:12", type = "register" },
+]
+
+[opcodes.div.semantics]
+operation = "rd = rs1 / rs2"
+stack_effect = 0
+throws = ["DivisionByZero"]
+
+[opcodes.div.tests]
+cases = [
+    { setup = { r0 = 20, r1 = 4 }, args = { rd = 2, rs1 = 0, rs2 = 1 }, expect = { r2 = 5 } },
+    { setup = { r0 = 7, r1 = 2 }, args = { rd = 2, rs1 = 0, rs2 = 1 }, expect = { r2 = 3 } },
+]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.mod]
+code = 0x34
+mnemonic = "mod"
+description = "Integer modulo"
+since = "1.0.0"
+
+[opcodes.mod.encoding]
+format = "reg_reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs1", bits = "3:0", type = "register" },
+    { name = "rs2", bits = "15:12", type = "register" },
+]
+
+[opcodes.mod.semantics]
+operation = "rd = rs1 % rs2"
+stack_effect = 0
+throws = ["DivisionByZero"]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.neg]
+code = 0x35
+mnemonic = "neg"
+description = "Negate value"
+since = "1.0.0"
+
+[opcodes.neg.encoding]
+format = "reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs", bits = "3:0", type = "register" },
+]
+
+[opcodes.neg.semantics]
+operation = "rd = -rs"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.addi]
+code = 0x36
+mnemonic = "addi"
+description = "Add immediate to register"
+since = "1.0.0"
+
+[opcodes.addi.encoding]
+format = "reg_reg_imm8"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs", bits = "3:0", type = "register" },
+    { name = "imm8", bits = "15:8", type = "immediate" },
+]
+
+[opcodes.addi.semantics]
+operation = "rd = rs + sign_extend(imm8)"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.subi]
+code = 0x37
+mnemonic = "subi"
+description = "Subtract immediate from register"
+since = "1.0.0"
+
+[opcodes.subi.encoding]
+format = "reg_reg_imm8"
+size = 2
+
+[opcodes.subi.semantics]
+operation = "rd = rs - sign_extend(imm8)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.muli]
+code = 0x38
+mnemonic = "muli"
+description = "Multiply register by immediate"
+since = "1.0.0"
+
+[opcodes.muli.encoding]
+format = "reg_reg_imm8"
+size = 2
+
+[opcodes.muli.semantics]
+operation = "rd = rs * sign_extend(imm8)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.incr]
+code = 0x39
+mnemonic = "incr"
+description = "Increment register by 1"
+since = "1.0.0"
+
+[opcodes.incr.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+]
+
+[opcodes.incr.semantics]
+operation = "rd = rd + 1"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.decr]
+code = 0x3A
+mnemonic = "decr"
+description = "Decrement register by 1"
+since = "1.0.0"
+
+[opcodes.decr.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+]
+
+[opcodes.decr.semantics]
+operation = "rd = rd - 1"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.add_dec]
+code = 0x3B
+mnemonic = "add_dec"
+description = "Add two decimals with precision"
+since = "1.0.0"
+
+[opcodes.add_dec.encoding]
+format = "reg_reg_reg_prec"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs1", bits = "3:0", type = "register" },
+    { name = "rs2", bits = "15:12", type = "register" },
+    { name = "prec", bits = "11:8", type = "immediate", range = [0, 18] },
+]
+
+[opcodes.add_dec.semantics]
+operation = "rd = decimal_add(rs1, rs2, precision)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.sub_dec]
+code = 0x3C
+mnemonic = "sub_dec"
+description = "Subtract two decimals with precision"
+since = "1.0.0"
+
+[opcodes.sub_dec.encoding]
+format = "reg_reg_reg_prec"
+size = 2
+
+[opcodes.sub_dec.semantics]
+operation = "rd = decimal_sub(rs1, rs2, precision)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.mul_dec]
+code = 0x3D
+mnemonic = "mul_dec"
+description = "Multiply two decimals with precision"
+since = "1.0.0"
+
+[opcodes.mul_dec.encoding]
+format = "reg_reg_reg_prec"
+size = 2
+
+[opcodes.mul_dec.semantics]
+operation = "rd = decimal_mul(rs1, rs2, precision)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.div_dec]
+code = 0x3E
+mnemonic = "div_dec"
+description = "Divide two decimals with precision"
+since = "1.0.0"
+
+[opcodes.div_dec.encoding]
+format = "reg_reg_reg_prec"
+size = 2
+
+[opcodes.div_dec.semantics]
+operation = "rd = decimal_div(rs1, rs2, precision)"
+throws = ["DivisionByZero"]
+
+# =============================================================================
+# Comparison (0x40-0x4F)
+# =============================================================================
+
+[opcodes.cmp_eq]
+code = 0x40
+mnemonic = "cmp_eq"
+description = "Compare equal"
+since = "1.0.0"
+
+[opcodes.cmp_eq.encoding]
+format = "reg_reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "rs1", bits = "3:0", type = "register" },
+    { name = "rs2", bits = "15:12", type = "register" },
+]
+
+[opcodes.cmp_eq.semantics]
+operation = "rd = (rs1 == rs2)"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_ne]
+code = 0x41
+mnemonic = "cmp_ne"
+description = "Compare not equal"
+since = "1.0.0"
+
+[opcodes.cmp_ne.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_ne.semantics]
+operation = "rd = (rs1 != rs2)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_lt]
+code = 0x42
+mnemonic = "cmp_lt"
+description = "Compare less than"
+since = "1.0.0"
+
+[opcodes.cmp_lt.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_lt.semantics]
+operation = "rd = (rs1 < rs2)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_le]
+code = 0x43
+mnemonic = "cmp_le"
+description = "Compare less than or equal"
+since = "1.0.0"
+
+[opcodes.cmp_le.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_le.semantics]
+operation = "rd = (rs1 <= rs2)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_gt]
+code = 0x44
+mnemonic = "cmp_gt"
+description = "Compare greater than"
+since = "1.0.0"
+
+[opcodes.cmp_gt.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_gt.semantics]
+operation = "rd = (rs1 > rs2)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_ge]
+code = 0x45
+mnemonic = "cmp_ge"
+description = "Compare greater than or equal"
+since = "1.0.0"
+
+[opcodes.cmp_ge.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_ge.semantics]
+operation = "rd = (rs1 >= rs2)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_str_eq]
+code = 0x46
+mnemonic = "cmp_str_eq"
+description = "String compare equal"
+since = "1.0.0"
+
+[opcodes.cmp_str_eq.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_str_eq.semantics]
+operation = "rd = (rs1 == rs2) // string comparison"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_str_lt]
+code = 0x47
+mnemonic = "cmp_str_lt"
+description = "String compare less than (lexicographic)"
+since = "1.0.0"
+
+[opcodes.cmp_str_lt.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_str_lt.semantics]
+operation = "rd = (rs1 < rs2) // string comparison"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_str_ne]
+code = 0x48
+mnemonic = "cmp_str_ne"
+description = "String compare not equal"
+since = "1.0.0"
+
+[opcodes.cmp_str_ne.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_str_ne.semantics]
+operation = "rd = (rs1 != rs2) // string comparison"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_str_le]
+code = 0x49
+mnemonic = "cmp_str_le"
+description = "String compare less than or equal"
+since = "1.0.0"
+
+[opcodes.cmp_str_le.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_str_le.semantics]
+operation = "rd = (rs1 <= rs2) // string comparison"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_str_gt]
+code = 0x4A
+mnemonic = "cmp_str_gt"
+description = "String compare greater than"
+since = "1.0.0"
+
+[opcodes.cmp_str_gt.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_str_gt.semantics]
+operation = "rd = (rs1 > rs2) // string comparison"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_str_ge]
+code = 0x4B
+mnemonic = "cmp_str_ge"
+description = "String compare greater than or equal"
+since = "1.0.0"
+
+[opcodes.cmp_str_ge.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_str_ge.semantics]
+operation = "rd = (rs1 >= rs2) // string comparison"
+
+# =============================================================================
+# Logical & Bitwise (0x50-0x5F)
+# =============================================================================
+
+[opcodes.log_and]
+code = 0x50
+mnemonic = "log_and"
+description = "Logical AND"
+since = "1.0.0"
+
+[opcodes.log_and.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.log_and.semantics]
+operation = "rd = rs1 && rs2"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.log_or]
+code = 0x51
+mnemonic = "log_or"
+description = "Logical OR"
+since = "1.0.0"
+
+[opcodes.log_or.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.log_or.semantics]
+operation = "rd = rs1 || rs2"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.log_not]
+code = 0x52
+mnemonic = "log_not"
+description = "Logical NOT"
+since = "1.0.0"
+
+[opcodes.log_not.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.log_not.semantics]
+operation = "rd = !rs"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.bit_and]
+code = 0x53
+mnemonic = "bit_and"
+description = "Bitwise AND"
+since = "1.0.0"
+
+[opcodes.bit_and.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.bit_and.semantics]
+operation = "rd = rs1 & rs2"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.bit_or]
+code = 0x54
+mnemonic = "bit_or"
+description = "Bitwise OR"
+since = "1.0.0"
+
+[opcodes.bit_or.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.bit_or.semantics]
+operation = "rd = rs1 | rs2"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.bit_xor]
+code = 0x55
+mnemonic = "bit_xor"
+description = "Bitwise XOR"
+since = "1.0.0"
+
+[opcodes.bit_xor.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.bit_xor.semantics]
+operation = "rd = rs1 ^ rs2"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.bit_not]
+code = 0x56
+mnemonic = "bit_not"
+description = "Bitwise NOT"
+since = "1.0.0"
+
+[opcodes.bit_not.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.bit_not.semantics]
+operation = "rd = ~rs"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.is_null]
+code = 0x57
+mnemonic = "is_null"
+description = "Check if value is null"
+since = "1.0.0"
+
+[opcodes.is_null.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.is_null.semantics]
+operation = "rd = (rs == null)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.select]
+code = 0x58
+mnemonic = "select"
+description = "Ternary select (conditional move)"
+since = "1.0.0"
+
+[opcodes.select.encoding]
+format = "reg_reg_reg_reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "cond", bits = "3:0", type = "register" },
+    { name = "rtrue", bits = "15:12", type = "register" },
+    { name = "rfalse", bits = "11:8", type = "register" },
+]
+
+[opcodes.select.semantics]
+operation = "rd = cond ? rtrue : rfalse"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.ptr_offset]
+code = 0x59
+mnemonic = "ptr_offset"
+description = "Pointer byte offset arithmetic"
+since = "1.0.0"
+
+[opcodes.ptr_offset.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.ptr_offset.semantics]
+operation = "rd = rs + offset (byte-level)"
+
+# =============================================================================
+# Control Flow (0x60-0x6F)
+# =============================================================================
+
+[opcodes.jmp]
+code = 0x60
+mnemonic = "jmp"
+description = "Unconditional jump (16-bit offset)"
+since = "1.0.0"
+
+[opcodes.jmp.encoding]
+format = "imm16"
+size = 3
+operands = [
+    { name = "offset", bits = "23:8", type = "offset" },
+]
+
+[opcodes.jmp.semantics]
+operation = "ip = ip + offset"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.jz]
+code = 0x62
+mnemonic = "jz"
+description = "Jump if zero/false/null"
+since = "1.0.0"
+
+[opcodes.jz.encoding]
+format = "reg_imm16"
+size = 3
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+    { name = "offset", bits = "23:8", type = "offset" },
+]
+
+[opcodes.jz.semantics]
+operation = "if (!rs.toBool()) ip = ip + offset"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.jnz]
+code = 0x63
+mnemonic = "jnz"
+description = "Jump if non-zero/true"
+since = "1.0.0"
+
+[opcodes.jnz.encoding]
+format = "reg_imm16"
+size = 3
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+    { name = "offset", bits = "23:8", type = "offset" },
+]
+
+[opcodes.jnz.semantics]
+operation = "if (rs.toBool()) ip = ip + offset"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.jmp32]
+code = 0x61
+mnemonic = "jmp32"
+description = "Unconditional jump (32-bit offset)"
+since = "1.0.0"
+
+[opcodes.jmp32.encoding]
+format = "imm32"
+size = 5
+
+[opcodes.jmp32.semantics]
+operation = "ip = ip + offset32"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.jeq]
+code = 0x64
+mnemonic = "jeq"
+description = "Jump if equal"
+since = "1.0.0"
+
+[opcodes.jeq.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.jeq.semantics]
+operation = "if (rs1 == rs2) ip = ip + offset"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.jne]
+code = 0x65
+mnemonic = "jne"
+description = "Jump if not equal"
+since = "1.0.0"
+
+[opcodes.jne.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.jne.semantics]
+operation = "if (rs1 != rs2) ip = ip + offset"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.jlt]
+code = 0x66
+mnemonic = "jlt"
+description = "Jump if less than"
+since = "1.0.0"
+
+[opcodes.jlt.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.jlt.semantics]
+operation = "if (rs1 < rs2) ip = ip + offset"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.jge]
+code = 0x67
+mnemonic = "jge"
+description = "Jump if greater than or equal"
+since = "1.0.0"
+
+[opcodes.jge.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.jge.semantics]
+operation = "if (rs1 >= rs2) ip = ip + offset"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.loop_start]
+code = 0x68
+mnemonic = "loop_start"
+description = "Mark start of loop (for profiling)"
+since = "1.0.0"
+
+[opcodes.loop_start.encoding]
+format = "none"
+size = 1
+
+[opcodes.loop_start.semantics]
+operation = "// loop profiling marker"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.loop_end]
+code = 0x69
+mnemonic = "loop_end"
+description = "Mark end of loop"
+since = "1.0.0"
+
+[opcodes.loop_end.encoding]
+format = "none"
+size = 1
+
+[opcodes.loop_end.semantics]
+operation = "// loop profiling marker"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.set_error_handler]
+code = 0x6A
+mnemonic = "set_error_handler"
+description = "Set error handler offset"
+since = "1.0.0"
+
+[opcodes.set_error_handler.encoding]
+format = "imm16"
+size = 3
+
+[opcodes.set_error_handler.semantics]
+operation = "error_handler = ip + offset"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.clear_error_handler]
+code = 0x6B
+mnemonic = "clear_error_handler"
+description = "Clear error handler"
+since = "1.0.0"
+
+[opcodes.clear_error_handler.encoding]
+format = "none"
+size = 1
+
+[opcodes.clear_error_handler.semantics]
+operation = "error_handler = null"
+
+# =============================================================================
+# Function Calls (0x70-0x7F)
+# =============================================================================
+
+[opcodes.call]
+code = 0x70
+mnemonic = "call"
+description = "Call routine by index"
+since = "1.0.0"
+
+[opcodes.call.encoding]
+format = "argc_idx16"
+size = 3
+operands = [
+    { name = "argc", bits = "7:4", type = "immediate", range = [0, 15] },
+    { name = "routine_idx", bits = "23:8", type = "index" },
+]
+
+[opcodes.call.semantics]
+operation = """
+push_frame(return_ip, fp, sp)
+fp = sp
+sp += routine.locals_count
+ip = routine.code_offset
+"""
+stack_effect = "dynamic"
+
+[opcodes.call.register_convention]
+args_in = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
+return_in = "r15"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.ret]
+code = 0x75
+mnemonic = "ret"
+description = "Return from routine (void)"
+since = "1.0.0"
+
+[opcodes.ret.encoding]
+format = "none"
+size = 2  # Has padding byte
+
+[opcodes.ret.semantics]
+operation = """
+frame = pop_frame()
+ip = frame.return_ip
+"""
+stack_effect = "dynamic"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.ret_val]
+code = 0x76
+mnemonic = "ret_val"
+description = "Return value from routine"
+since = "1.0.0"
+
+[opcodes.ret_val.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+]
+
+[opcodes.ret_val.semantics]
+operation = """
+r15 = rs
+frame = pop_frame()
+ip = frame.return_ip
+"""
+stack_effect = "dynamic"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.call_external]
+code = 0x71
+mnemonic = "call_external"
+description = "Call external function by import index"
+since = "1.0.0"
+
+[opcodes.call_external.encoding]
+format = "argc_idx16"
+size = 3
+
+[opcodes.call_external.semantics]
+operation = "call imports[idx] with argc args"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.call_native]
+code = 0x72
+mnemonic = "call_native"
+description = "Call native function by index"
+since = "1.0.0"
+
+[opcodes.call_native.encoding]
+format = "argc_idx16"
+size = 3
+
+[opcodes.call_native.semantics]
+operation = "call native[idx] with argc args"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.call_indirect]
+code = 0x73
+mnemonic = "call_indirect"
+description = "Call function pointer in register"
+since = "1.0.0"
+
+[opcodes.call_indirect.encoding]
+format = "argc_reg"
+size = 2
+
+[opcodes.call_indirect.semantics]
+operation = "call function at address in rs"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.call_dynamic]
+code = 0x74
+mnemonic = "call_dynamic"
+description = "Call by name at runtime"
+since = "1.0.0"
+
+[opcodes.call_dynamic.encoding]
+format = "argc_idx16"
+size = 3
+
+[opcodes.call_dynamic.semantics]
+operation = "call function by name constants[idx]"
+
+# =============================================================================
+# Record/Field Operations (0x80-0x8F)
+# =============================================================================
+
+[opcodes.new_record]
+code = 0x80
+mnemonic = "new_record"
+description = "Create new record of type"
+since = "1.0.0"
+
+[opcodes.new_record.encoding]
+format = "reg_imm16"
+size = 3
+
+[opcodes.new_record.semantics]
+operation = "rd = allocate_record(types[idx])"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.free_record]
+code = 0x81
+mnemonic = "free_record"
+description = "Free record"
+since = "1.0.0"
+
+[opcodes.free_record.encoding]
+format = "reg"
+size = 2
+
+[opcodes.free_record.semantics]
+operation = "deallocate(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_field]
+code = 0x82
+mnemonic = "load_field"
+description = "Load field from record"
+since = "1.0.0"
+
+[opcodes.load_field.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.load_field.semantics]
+operation = "rd = rs.fields[idx]"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.store_field]
+code = 0x83
+mnemonic = "store_field"
+description = "Store to record field"
+since = "1.0.0"
+
+[opcodes.store_field.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.store_field.semantics]
+operation = "rd.fields[idx] = rs"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_field_fast]
+code = 0x84
+mnemonic = "load_field_fast"
+description = "Load field at byte offset (fast path)"
+since = "1.0.0"
+
+[opcodes.load_field_fast.encoding]
+format = "reg_reg_imm8"
+size = 2
+
+[opcodes.load_field_fast.semantics]
+operation = "rd = *(rs + offset)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.store_field_fast]
+code = 0x85
+mnemonic = "store_field_fast"
+description = "Store field at byte offset (fast path)"
+since = "1.0.0"
+
+[opcodes.store_field_fast.encoding]
+format = "reg_reg_imm8"
+size = 2
+
+[opcodes.store_field_fast.semantics]
+operation = "*(rd + offset) = rs"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.load_record_buf]
+code = 0x86
+mnemonic = "load_record_buf"
+description = "Serialize record fields to buffer"
+since = "1.0.0"
+
+[opcodes.load_record_buf.encoding]
+format = "reg_flags_type_base"
+size = 5
+
+[opcodes.load_record_buf.semantics]
+operation = "rd = serialize fields from storage[base..] using type"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.store_record_buf]
+code = 0x87
+mnemonic = "store_record_buf"
+description = "Deserialize buffer to record fields"
+since = "1.0.0"
+
+[opcodes.store_record_buf.encoding]
+format = "reg_flags_type_base"
+size = 5
+
+[opcodes.store_record_buf.semantics]
+operation = "distribute rs buffer into storage[base..] using type"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.clear_record]
+code = 0x88
+mnemonic = "clear_record"
+description = "Clear record fields to defaults"
+since = "1.0.0"
+
+[opcodes.clear_record.encoding]
+format = "reg"
+size = 2
+
+[opcodes.clear_record.semantics]
+operation = "clear all fields in rs to defaults"
+
+# =============================================================================
+# String Operations (0x90-0x9F)
+# =============================================================================
+
+[opcodes.str_concat]
+code = 0x90
+mnemonic = "str_concat"
+description = "Concatenate two strings"
+since = "1.0.0"
+
+[opcodes.str_concat.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.str_concat.semantics]
+operation = "rd = rs1 + rs2"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_len]
+code = 0x91
+mnemonic = "str_len"
+description = "Get string length"
+since = "1.0.0"
+
+[opcodes.str_len.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.str_len.semantics]
+operation = "rd = len(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_index]
+code = 0x92
+mnemonic = "str_index"
+description = "Get character at index"
+since = "1.0.0"
+
+[opcodes.str_index.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.str_index.semantics]
+operation = "rd = rs[idx_reg]"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_slice]
+code = 0x93
+mnemonic = "str_slice"
+description = "Extract substring"
+since = "1.0.0"
+
+[opcodes.str_slice.encoding]
+format = "reg_reg_reg_reg"
+size = 2
+
+[opcodes.str_slice.semantics]
+operation = "rd = rs[start_reg:start_reg+len_reg]"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_slice_store]
+code = 0x94
+mnemonic = "str_slice_store"
+description = "Store substring"
+since = "1.0.0"
+
+[opcodes.str_slice_store.encoding]
+format = "reg_reg_reg_reg"
+size = 2
+
+[opcodes.str_slice_store.semantics]
+operation = "rd[start:len] = val"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_trim]
+code = 0x95
+mnemonic = "str_trim"
+description = "Trim whitespace from string"
+since = "1.0.0"
+
+[opcodes.str_trim.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.str_trim.semantics]
+operation = "rd = trim(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_upper]
+code = 0x96
+mnemonic = "str_upper"
+description = "Convert string to uppercase"
+since = "1.0.0"
+
+[opcodes.str_upper.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.str_upper.semantics]
+operation = "rd = upper(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_lower]
+code = 0x97
+mnemonic = "str_lower"
+description = "Convert string to lowercase"
+since = "1.0.0"
+
+[opcodes.str_lower.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.str_lower.semantics]
+operation = "rd = lower(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_find]
+code = 0x98
+mnemonic = "str_find"
+description = "Find substring position"
+since = "1.0.0"
+
+[opcodes.str_find.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.str_find.semantics]
+operation = "rd = position of rs2 in rs1"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_replace]
+code = 0x99
+mnemonic = "str_replace"
+description = "Replace substring"
+since = "1.0.0"
+
+[opcodes.str_replace.encoding]
+format = "reg_reg_reg_reg"
+size = 2
+
+[opcodes.str_replace.semantics]
+operation = "rd = replace old_reg with new_reg in rs"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.str_setchar]
+code = 0x9A
+mnemonic = "str_setchar"
+description = "Set character at index"
+since = "1.0.0"
+
+[opcodes.str_setchar.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.str_setchar.semantics]
+operation = "rd[idx_reg] = char_reg"
+
+# =============================================================================
+# Type Conversion (0xA0-0xAF)
+# =============================================================================
+
+[opcodes.to_int]
+code = 0xA0
+mnemonic = "to_int"
+description = "Convert to integer"
+since = "1.0.0"
+
+[opcodes.to_int.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.to_int.semantics]
+operation = "rd = int(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.to_str]
+code = 0xA1
+mnemonic = "to_str"
+description = "Convert to string"
+since = "1.0.0"
+
+[opcodes.to_str.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.to_str.semantics]
+operation = "rd = str(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.to_bool]
+code = 0xA2
+mnemonic = "to_bool"
+description = "Convert to boolean"
+since = "1.0.0"
+
+[opcodes.to_bool.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.to_bool.semantics]
+operation = "rd = bool(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.to_dec]
+code = 0xA3
+mnemonic = "to_dec"
+description = "Convert to decimal with precision"
+since = "1.0.0"
+
+[opcodes.to_dec.encoding]
+format = "reg_reg_imm8"
+size = 2
+
+[opcodes.to_dec.semantics]
+operation = "rd = decimal(rs, precision)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.to_char]
+code = 0xA4
+mnemonic = "to_char"
+description = "Convert integer to character"
+since = "1.0.0"
+
+[opcodes.to_char.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.to_char.semantics]
+operation = "rd = char(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.to_fixed_string]
+code = 0xA5
+mnemonic = "to_fixed_string"
+description = "Convert to fixed-length string"
+since = "1.0.0"
+
+[opcodes.to_fixed_string.encoding]
+format = "reg_reg_imm16"
+size = 3
+
+[opcodes.to_fixed_string.semantics]
+operation = "rd = fixed_string(rs, size)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.format_decimal]
+code = 0xA6
+mnemonic = "format_decimal"
+description = "Format integer as zero-padded decimal string"
+since = "1.0.0"
+
+[opcodes.format_decimal.encoding]
+format = "reg_reg_imm8"
+size = 2
+
+[opcodes.format_decimal.semantics]
+operation = "rd = zero_padded_string(rs, width)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.parse_decimal]
+code = 0xA7
+mnemonic = "parse_decimal"
+description = "Parse string as decimal integer"
+since = "1.0.0"
+
+[opcodes.parse_decimal.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.parse_decimal.semantics]
+operation = "rd = parse_int(rs)"
+throws = ["BadDigit"]
+
+# =============================================================================
+# Array Operations (0xB0-0xBF)
+# =============================================================================
+
+[opcodes.array_load]
+code = 0xB0
+mnemonic = "array_load"
+description = "Load array element"
+since = "1.0.0"
+
+[opcodes.array_load.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.array_load.semantics]
+operation = "rd = arr_reg[idx_reg]"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.array_store]
+code = 0xB1
+mnemonic = "array_store"
+description = "Store array element"
+since = "1.0.0"
+
+[opcodes.array_store.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.array_store.semantics]
+operation = "arr_reg[idx_reg] = val_reg"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.array_len]
+code = 0xB2
+mnemonic = "array_len"
+description = "Get array length"
+since = "1.0.0"
+
+[opcodes.array_len.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.array_len.semantics]
+operation = "rd = len(arr_reg)"
+
+# =============================================================================
+# Built-in Functions (0xC0-0xCF)
+# =============================================================================
+
+[opcodes.fn_abs]
+code = 0xC0
+mnemonic = "fn_abs"
+description = "Absolute value"
+since = "1.0.0"
+
+[opcodes.fn_abs.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_abs.semantics]
+operation = "rd = abs(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_sqrt]
+code = 0xC1
+mnemonic = "fn_sqrt"
+description = "Square root"
+since = "1.0.0"
+
+[opcodes.fn_sqrt.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_sqrt.semantics]
+operation = "rd = sqrt(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_sin]
+code = 0xC2
+mnemonic = "fn_sin"
+description = "Sine (degrees input)"
+since = "1.0.0"
+
+[opcodes.fn_sin.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_sin.semantics]
+operation = "rd = sin(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_cos]
+code = 0xC3
+mnemonic = "fn_cos"
+description = "Cosine (degrees input)"
+since = "1.0.0"
+
+[opcodes.fn_cos.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_cos.semantics]
+operation = "rd = cos(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_tan]
+code = 0xC4
+mnemonic = "fn_tan"
+description = "Tangent (degrees input)"
+since = "1.0.0"
+
+[opcodes.fn_tan.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_tan.semantics]
+operation = "rd = tan(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_log]
+code = 0xC5
+mnemonic = "fn_log"
+description = "Natural logarithm"
+since = "1.0.0"
+
+[opcodes.fn_log.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_log.semantics]
+operation = "rd = log(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_log10]
+code = 0xC6
+mnemonic = "fn_log10"
+description = "Base-10 logarithm"
+since = "1.0.0"
+
+[opcodes.fn_log10.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_log10.semantics]
+operation = "rd = log10(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_exp]
+code = 0xC7
+mnemonic = "fn_exp"
+description = "Exponential (e^x)"
+since = "1.0.0"
+
+[opcodes.fn_exp.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_exp.semantics]
+operation = "rd = exp(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_round]
+code = 0xC8
+mnemonic = "fn_round"
+description = "Round to precision"
+since = "1.0.0"
+
+[opcodes.fn_round.encoding]
+format = "reg_reg_imm8"
+size = 2
+
+[opcodes.fn_round.semantics]
+operation = "rd = round(rs, precision)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_trunc]
+code = 0xC9
+mnemonic = "fn_trunc"
+description = "Truncate to integer"
+since = "1.0.0"
+
+[opcodes.fn_trunc.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_trunc.semantics]
+operation = "rd = trunc(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_date]
+code = 0xCA
+mnemonic = "fn_date"
+description = "Get current date (YYYYMMDD)"
+since = "1.0.0"
+
+[opcodes.fn_date.encoding]
+format = "reg"
+size = 2
+
+[opcodes.fn_date.semantics]
+operation = "rd = current_date()"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_time]
+code = 0xCB
+mnemonic = "fn_time"
+description = "Get current time (HHMMSS)"
+since = "1.0.0"
+
+[opcodes.fn_time.encoding]
+format = "reg"
+size = 2
+
+[opcodes.fn_time.semantics]
+operation = "rd = current_time()"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_size]
+code = 0xCC
+mnemonic = "fn_size"
+description = "Get size of value"
+since = "1.0.0"
+
+[opcodes.fn_size.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.fn_size.semantics]
+operation = "rd = size(rs)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_instr]
+code = 0xCD
+mnemonic = "fn_instr"
+description = "Find substring (1-based position)"
+since = "1.0.0"
+
+[opcodes.fn_instr.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.fn_instr.semantics]
+operation = "rd = instr(rs1, rs2)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_mem]
+code = 0xCE
+mnemonic = "fn_mem"
+description = "Get available memory"
+since = "1.0.0"
+
+[opcodes.fn_mem.encoding]
+format = "reg"
+size = 2
+
+[opcodes.fn_mem.semantics]
+operation = "rd = available_memory()"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.fn_error]
+code = 0xCF
+mnemonic = "fn_error"
+description = "Get last error code"
+since = "1.0.0"
+
+[opcodes.fn_error.encoding]
+format = "reg"
+size = 2
+
+[opcodes.fn_error.semantics]
+operation = "rd = last_error()"
+
+# =============================================================================
+# I/O (0xD0-0xD4)
+# =============================================================================
+
+[opcodes.print]
+code = 0xD0
+mnemonic = "print"
+description = "Write to stdout without newline"
+since = "1.0.0"
+
+[opcodes.print.encoding]
+format = "reg_argc"
+size = 2
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+    { name = "argc", bits = "3:0", type = "immediate", range = [0, 15] },
+]
+
+[opcodes.print.semantics]
+operation = "print registers rs through rs+argc-1 to stdout"
+stack_effect = 0
+io = "stdout"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.println]
+code = 0xD1
+mnemonic = "println"
+description = "Write to stdout with newline"
+since = "1.0.0"
+
+[opcodes.println.encoding]
+format = "reg_argc"
+size = 2
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+    { name = "argc", bits = "3:0", type = "immediate", range = [0, 15] },
+]
+
+[opcodes.println.semantics]
+operation = "print registers rs through rs+argc-1 to stdout, then newline"
+stack_effect = 0
+io = "stdout"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.readln]
+code = 0xD2
+mnemonic = "readln"
+description = "Read line from stdin"
+since = "1.0.0"
+
+[opcodes.readln.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+]
+
+[opcodes.readln.semantics]
+operation = "rd = read_line(stdin)"
+stack_effect = 0
+io = "stdin"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.readkey]
+code = 0xD3
+mnemonic = "readkey"
+description = "Read single key from stdin"
+since = "1.0.0"
+
+[opcodes.readkey.encoding]
+format = "reg"
+size = 2
+
+[opcodes.readkey.semantics]
+operation = "rd = read_key(stdin)"
+io = "stdin"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.log]
+code = 0xD4
+mnemonic = "log"
+description = "Write to stderr for debugging"
+since = "1.0.0"
+
+[opcodes.log.encoding]
+format = "reg_argc"
+size = 2
+
+[opcodes.log.semantics]
+operation = "write registers to stderr"
+io = "stderr"
+
+# =============================================================================
+# Map Operations (0xD5-0xDF)
+# =============================================================================
+
+[opcodes.map_new]
+code = 0xD5
+mnemonic = "map_new"
+description = "Create new ordered map"
+since = "1.0.0"
+
+[opcodes.map_new.encoding]
+format = "reg_flags"
+size = 2
+operands = [
+    { name = "rd", bits = "7:4", type = "register" },
+    { name = "flags", bits = "3:0", type = "immediate", description = "bit0=case_sensitive, bit1=preserve_spaces" },
+]
+
+[opcodes.map_new.semantics]
+operation = "rd = new OrderedMap(flags)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_set]
+code = 0xD6
+mnemonic = "map_set"
+description = "Set map key-value pair"
+since = "1.0.0"
+
+[opcodes.map_set.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.map_set.semantics]
+operation = "map_reg[key_reg] = val_reg"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_get]
+code = 0xD7
+mnemonic = "map_get"
+description = "Get value by key"
+since = "1.0.0"
+
+[opcodes.map_get.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.map_get.semantics]
+operation = "rd = map_reg[key_reg]"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_delete]
+code = 0xD8
+mnemonic = "map_delete"
+description = "Delete key from map"
+since = "1.0.0"
+
+[opcodes.map_delete.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.map_delete.semantics]
+operation = "delete map_reg[key_reg]"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_has]
+code = 0xD9
+mnemonic = "map_has"
+description = "Check if key exists in map"
+since = "1.0.0"
+
+[opcodes.map_has.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.map_has.semantics]
+operation = "rd = map_reg.has(key_reg)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_len]
+code = 0xDA
+mnemonic = "map_len"
+description = "Get map length"
+since = "1.0.0"
+
+[opcodes.map_len.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.map_len.semantics]
+operation = "rd = map_reg.len()"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_clear]
+code = 0xDB
+mnemonic = "map_clear"
+description = "Clear all entries from map"
+since = "1.0.0"
+
+[opcodes.map_clear.encoding]
+format = "reg"
+size = 2
+
+[opcodes.map_clear.semantics]
+operation = "map_reg.clear()"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_keys]
+code = 0xDC
+mnemonic = "map_keys"
+description = "Get array of map keys"
+since = "1.0.0"
+
+[opcodes.map_keys.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.map_keys.semantics]
+operation = "rd = map_reg.keys()"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_values]
+code = 0xDD
+mnemonic = "map_values"
+description = "Get array of map values"
+since = "1.0.0"
+
+[opcodes.map_values.encoding]
+format = "reg_reg"
+size = 2
+
+[opcodes.map_values.semantics]
+operation = "rd = map_reg.values()"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_get_at]
+code = 0xDE
+mnemonic = "map_get_at"
+description = "Get map entry at index (1-based)"
+since = "1.0.0"
+
+[opcodes.map_get_at.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.map_get_at.semantics]
+operation = "rd = map_reg.entry_at(idx_reg)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.map_set_at]
+code = 0xDF
+mnemonic = "map_set_at"
+description = "Set map entry by index (1-based)"
+since = "1.0.0"
+
+[opcodes.map_set_at.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.map_set_at.semantics]
+operation = "map_reg.set_at(idx_reg, val_reg)"
+
+# =============================================================================
+# Quickened/Specialized Opcodes (0xE0-0xEF)
+# Runtime-specialized versions for performance
+# =============================================================================
+
+[opcodes.add_int]
+code = 0xE0
+mnemonic = "add_int"
+description = "Integer-specialized add (no type check)"
+since = "1.0.0"
+
+[opcodes.add_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.add_int.semantics]
+operation = "rd = rs1 + rs2 (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.sub_int]
+code = 0xE1
+mnemonic = "sub_int"
+description = "Integer-specialized subtract"
+since = "1.0.0"
+
+[opcodes.sub_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.sub_int.semantics]
+operation = "rd = rs1 - rs2 (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.mul_int]
+code = 0xE2
+mnemonic = "mul_int"
+description = "Integer-specialized multiply"
+since = "1.0.0"
+
+[opcodes.mul_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.mul_int.semantics]
+operation = "rd = rs1 * rs2 (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.div_int]
+code = 0xE3
+mnemonic = "div_int"
+description = "Integer-specialized divide"
+since = "1.0.0"
+
+[opcodes.div_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.div_int.semantics]
+operation = "rd = rs1 / rs2 (integer fast path)"
+throws = ["DivisionByZero"]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_lt_int]
+code = 0xE4
+mnemonic = "cmp_lt_int"
+description = "Integer less-than comparison"
+since = "1.0.0"
+
+[opcodes.cmp_lt_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_lt_int.semantics]
+operation = "rd = (rs1 < rs2) (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_le_int]
+code = 0xE5
+mnemonic = "cmp_le_int"
+description = "Integer less-equal comparison"
+since = "1.0.0"
+
+[opcodes.cmp_le_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_le_int.semantics]
+operation = "rd = (rs1 <= rs2) (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_gt_int]
+code = 0xE6
+mnemonic = "cmp_gt_int"
+description = "Integer greater-than comparison"
+since = "1.0.0"
+
+[opcodes.cmp_gt_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_gt_int.semantics]
+operation = "rd = (rs1 > rs2) (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_ge_int]
+code = 0xE7
+mnemonic = "cmp_ge_int"
+description = "Integer greater-equal comparison"
+since = "1.0.0"
+
+[opcodes.cmp_ge_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_ge_int.semantics]
+operation = "rd = (rs1 >= rs2) (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_eq_int]
+code = 0xE8
+mnemonic = "cmp_eq_int"
+description = "Integer equality comparison"
+since = "1.0.0"
+
+[opcodes.cmp_eq_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_eq_int.semantics]
+operation = "rd = (rs1 == rs2) (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.cmp_ne_int]
+code = 0xE9
+mnemonic = "cmp_ne_int"
+description = "Integer not-equal comparison"
+since = "1.0.0"
+
+[opcodes.cmp_ne_int.encoding]
+format = "reg_reg_reg"
+size = 2
+
+[opcodes.cmp_ne_int.semantics]
+operation = "rd = (rs1 != rs2) (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.incr_int]
+code = 0xEA
+mnemonic = "incr_int"
+description = "Integer increment (no type check)"
+since = "1.0.0"
+
+[opcodes.incr_int.encoding]
+format = "reg"
+size = 2
+
+[opcodes.incr_int.semantics]
+operation = "rd = rd + 1 (integer fast path)"
+
+# -----------------------------------------------------------------------------
+
+[opcodes.decr_int]
+code = 0xEB
+mnemonic = "decr_int"
+description = "Integer decrement (no type check)"
+since = "1.0.0"
+
+[opcodes.decr_int.encoding]
+format = "reg"
+size = 2
+
+[opcodes.decr_int.semantics]
+operation = "rd = rd - 1 (integer fast path)"
+
+# =============================================================================
+# Debug (0xF0-0xFF)
+# =============================================================================
+
+[opcodes.debug_break]
+code = 0xF0
+mnemonic = "debug_break"
+description = "Debugger breakpoint"
+since = "1.0.0"
+
+[opcodes.debug_break.encoding]
+format = "none"
+size = 1
+
+[opcodes.debug_break.semantics]
+operation = "pause execution for debugger"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.debug_line]
+code = 0xF1
+mnemonic = "debug_line"
+description = "Set current source line for debugging"
+since = "1.0.0"
+
+[opcodes.debug_line.encoding]
+format = "imm16"
+size = 3
+operands = [
+    { name = "line", bits = "23:8", type = "immediate" },
+]
+
+[opcodes.debug_line.semantics]
+operation = "current_line = line"
+stack_effect = 0
+
+# -----------------------------------------------------------------------------
+
+[opcodes.assert]
+code = 0xF2
+mnemonic = "assert"
+description = "Assert condition is true"
+since = "1.0.0"
+
+[opcodes.assert.encoding]
+format = "reg"
+size = 2
+operands = [
+    { name = "rs", bits = "7:4", type = "register" },
+]
+
+[opcodes.assert.semantics]
+operation = "if (!rs.toBool()) raise AssertionFailed"
+stack_effect = 0
+throws = ["AssertionFailed"]
+
+# -----------------------------------------------------------------------------
+
+[opcodes.extended]
+code = 0xFE
+mnemonic = "extended"
+description = "Extended opcode prefix for future expansion"
+since = "1.0.0"
+
+[opcodes.extended.encoding]
+format = "sub_opcode"
+size = 1  # Plus variable depending on sub-opcode
+
+[opcodes.extended.semantics]
+operation = "dispatch to extended opcode handler"

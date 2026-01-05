@@ -1,0 +1,259 @@
+# Cot Runtime Errors Specification
+#
+# Defines all runtime errors that can occur during VM execution.
+# Both Zig and Rust runtimes must implement identical error behavior.
+
+[meta]
+version = "1.0.0"
+description = "Cot VM runtime error definitions"
+
+# =============================================================================
+# Error Categories
+# =============================================================================
+
+[categories.type]
+code_range = [100, 199]
+description = "Type-related errors (coercion, mismatch)"
+
+[categories.arithmetic]
+code_range = [200, 299]
+description = "Arithmetic operation errors"
+
+[categories.memory]
+code_range = [300, 399]
+description = "Memory and allocation errors"
+
+[categories.io]
+code_range = [400, 499]
+description = "Input/output errors"
+
+[categories.runtime]
+code_range = [500, 599]
+description = "General runtime errors"
+
+[categories.assertion]
+code_range = [600, 699]
+description = "Assertion and validation errors"
+
+# =============================================================================
+# Type Errors
+# =============================================================================
+
+[errors.type_mismatch]
+code = 100
+name = "TypeMismatch"
+description = "Operation received incompatible types"
+category = "type"
+message_template = "Type mismatch: expected {expected}, got {actual}"
+recoverable = true
+since = "1.0.0"
+
+[errors.bad_digit]
+code = 101
+name = "BadDigit"
+description = "String contains non-numeric characters when parsing as number"
+category = "type"
+message_template = "Bad digit in numeric string: '{input}'"
+recoverable = true
+since = "1.0.0"
+causes = ["parse_decimal with non-numeric input"]
+
+[errors.null_value]
+code = 102
+name = "NullValue"
+description = "Null value used where a value was required"
+category = "type"
+message_template = "Unexpected null value"
+recoverable = true
+since = "1.0.0"
+
+# =============================================================================
+# Arithmetic Errors
+# =============================================================================
+
+[errors.division_by_zero]
+code = 200
+name = "DivisionByZero"
+description = "Division or modulo by zero"
+category = "arithmetic"
+message_template = "Division by zero"
+recoverable = true
+since = "1.0.0"
+
+[errors.overflow]
+code = 201
+name = "Overflow"
+description = "Integer overflow detected"
+category = "arithmetic"
+message_template = "Integer overflow"
+recoverable = true
+since = "1.0.0"
+
+[errors.underflow]
+code = 202
+name = "Underflow"
+description = "Integer underflow detected"
+category = "arithmetic"
+message_template = "Integer underflow"
+recoverable = true
+since = "1.0.0"
+
+# =============================================================================
+# Memory Errors
+# =============================================================================
+
+[errors.out_of_memory]
+code = 300
+name = "OutOfMemory"
+description = "Memory allocation failed"
+category = "memory"
+message_template = "Out of memory"
+recoverable = false
+since = "1.0.0"
+
+[errors.stack_overflow]
+code = 301
+name = "StackOverflow"
+description = "Call stack limit exceeded"
+category = "memory"
+message_template = "Stack overflow (max depth: {max_depth})"
+recoverable = false
+since = "1.0.0"
+
+[errors.index_out_of_bounds]
+code = 302
+name = "IndexOutOfBounds"
+description = "Array or string index out of valid range"
+category = "memory"
+message_template = "Index {index} out of bounds for length {length}"
+recoverable = true
+since = "1.0.0"
+
+# =============================================================================
+# I/O Errors
+# =============================================================================
+
+[errors.file_not_found]
+code = 400
+name = "FileNotFound"
+description = "File does not exist"
+category = "io"
+message_template = "File not found: {path}"
+recoverable = true
+since = "1.0.0"
+
+[errors.file_access_denied]
+code = 401
+name = "FileAccessDenied"
+description = "Permission denied accessing file"
+category = "io"
+message_template = "Access denied: {path}"
+recoverable = true
+since = "1.0.0"
+
+[errors.file_io_error]
+code = 402
+name = "FileIOError"
+description = "General file I/O error"
+category = "io"
+message_template = "I/O error: {message}"
+recoverable = true
+since = "1.0.0"
+
+[errors.channel_closed]
+code = 403
+name = "ChannelClosed"
+description = "I/O channel is closed"
+category = "io"
+message_template = "Channel {channel} is closed"
+recoverable = true
+since = "1.0.0"
+
+# =============================================================================
+# Runtime Errors
+# =============================================================================
+
+[errors.undefined_routine]
+code = 500
+name = "UndefinedRoutine"
+description = "Called routine does not exist"
+category = "runtime"
+message_template = "Undefined routine: {name}"
+recoverable = false
+since = "1.0.0"
+
+[errors.undefined_variable]
+code = 501
+name = "UndefinedVariable"
+description = "Variable not defined"
+category = "runtime"
+message_template = "Undefined variable: {name}"
+recoverable = false
+since = "1.0.0"
+
+[errors.invalid_opcode]
+code = 502
+name = "InvalidOpcode"
+description = "Unknown or invalid bytecode opcode"
+category = "runtime"
+message_template = "Invalid opcode: 0x{opcode:02X}"
+recoverable = false
+since = "1.0.0"
+
+[errors.invalid_constant]
+code = 503
+name = "InvalidConstant"
+description = "Constant pool index out of range"
+category = "runtime"
+message_template = "Invalid constant index: {index}"
+recoverable = false
+since = "1.0.0"
+
+[errors.module_not_found]
+code = 504
+name = "ModuleNotFound"
+description = "Required module not found"
+category = "runtime"
+message_template = "Module not found: {name}"
+recoverable = false
+since = "1.0.0"
+
+[errors.unhandled_error]
+code = 505
+name = "UnhandledError"
+description = "Error propagated without being handled"
+category = "runtime"
+message_template = "Unhandled error: {error}"
+recoverable = false
+since = "1.0.0"
+
+# =============================================================================
+# Assertion Errors
+# =============================================================================
+
+[errors.assertion_failed]
+code = 600
+name = "AssertionFailed"
+description = "Assertion condition was false"
+category = "assertion"
+message_template = "Assertion failed at line {line}"
+recoverable = true
+since = "1.0.0"
+
+[errors.precondition_failed]
+code = 601
+name = "PreconditionFailed"
+description = "Function precondition not met"
+category = "assertion"
+message_template = "Precondition failed: {condition}"
+recoverable = true
+since = "1.0.0"
+
+[errors.postcondition_failed]
+code = 602
+name = "PostconditionFailed"
+description = "Function postcondition not met"
+category = "assertion"
+message_template = "Postcondition failed: {condition}"
+recoverable = true
+since = "1.0.0"

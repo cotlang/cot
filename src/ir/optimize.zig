@@ -26,11 +26,14 @@ pub const OptStats = struct {
     switches_created: u32 = 0,
     functions_inlined: u32 = 0,
     call_sites_inlined: u32 = 0,
+    arc_pairs_elided: u32 = 0,
+    arc_moves_created: u32 = 0,
 
     pub fn total(self: OptStats) u32 {
         return self.constants_folded + self.dead_instructions_removed +
             self.dead_blocks_removed + self.tail_calls_optimized +
-            self.switches_created + self.call_sites_inlined;
+            self.switches_created + self.call_sites_inlined +
+            self.arc_pairs_elided + self.arc_moves_created;
     }
 };
 
@@ -46,6 +49,8 @@ pub const OptOptions = struct {
     switch_optimization: bool = true,
     /// Enable function inlining
     inlining: bool = true,
+    /// Enable ARC optimization (elide redundant retain/release pairs)
+    arc_optimization: bool = true,
     /// Enable debug output
     debug: bool = false,
 };
@@ -81,6 +86,11 @@ pub fn optimize(module: *ir.Module, options: OptOptions) OptStats {
         if (options.tail_call_optimization) {
             const tco_stats = tailCallOptimize(func);
             stats.tail_calls_optimized += tco_stats.tail_calls_converted;
+        }
+        if (options.arc_optimization) {
+            const arc_stats = optimizeArc(func);
+            stats.arc_pairs_elided += arc_stats.pairs_elided;
+            stats.arc_moves_created += arc_stats.moves_created;
         }
     }
 
@@ -669,6 +679,17 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         },
         .ptr_offset => |p| {
             used.put(p.base_ptr.id, {}) catch {};
+        },
+        // Weak reference operations
+        .weak_ref, .weak_load => |op| {
+            used.put(op.operand.id, {}) catch {};
+        },
+        // ARC operations
+        .arc_retain, .arc_release => |op| {
+            used.put(op.value.id, {}) catch {};
+        },
+        .arc_move => |op| {
+            used.put(op.operand.id, {}) catch {};
         },
     }
 }
@@ -1405,4 +1426,232 @@ test "dead code elimination" {
     // Check that one dead instruction was removed
     try std.testing.expectEqual(@as(u32, 1), stats.dead_instructions_removed);
     try std.testing.expectEqual(initial_count - 1, func.entry.instructions.items.len);
+}
+
+// ============================================================================
+// ARC Optimization
+// ============================================================================
+
+/// ARC optimization statistics
+pub const ArcOptStats = struct {
+    pairs_elided: u32 = 0,
+    moves_created: u32 = 0,
+};
+
+/// Optimize ARC instructions in a function.
+///
+/// This pass performs two optimizations:
+/// 1. Elide redundant retain/release pairs - When arc_retain(x) is immediately
+///    followed by arc_release(x) with no use of x in between, both can be removed.
+/// 2. Convert to arc_move - When a value is stored and the source is never used
+///    again (last use), convert retain+store to arc_move to avoid the retain/release.
+///
+pub fn optimizeArc(func: *ir.Function) ArcOptStats {
+    var stats = ArcOptStats{};
+
+    for (func.blocks.items) |block| {
+        // Pass 1: Elide redundant retain/release pairs
+        stats.pairs_elided += elideRetainReleasePairs(block);
+
+        // Pass 2: Convert last-use stores to arc_move
+        // This is more complex as it requires liveness analysis
+        // For now, we only do the simple case of retain immediately before store
+        // where the source is never used again in the same block
+        stats.moves_created += convertToArcMove(block);
+    }
+
+    return stats;
+}
+
+/// Elide redundant arc_retain/arc_release pairs.
+/// Pattern: arc_retain(x) followed by arc_release(x) with no intervening use of x.
+fn elideRetainReleasePairs(block: *ir.Block) u32 {
+    var elided: u32 = 0;
+    var i: usize = 0;
+
+    while (i < block.instructions.items.len) {
+        const inst = block.instructions.items[i];
+
+        // Look for arc_retain
+        if (inst == .arc_retain) {
+            const retain_value_id = inst.arc_retain.value.id;
+
+            // Look for matching arc_release in subsequent instructions
+            var j = i + 1;
+            var found_use = false;
+            var release_idx: ?usize = null;
+
+            while (j < block.instructions.items.len) {
+                const next_inst = block.instructions.items[j];
+
+                // Check if this instruction releases the same value
+                if (next_inst == .arc_release) {
+                    if (next_inst.arc_release.value.id == retain_value_id) {
+                        release_idx = j;
+                        break;
+                    }
+                }
+
+                // Check if this instruction uses the value (not just as ARC operand)
+                if (instructionUsesValue(next_inst, retain_value_id)) {
+                    found_use = true;
+                    break;
+                }
+
+                // Stop at terminators
+                if (next_inst.isTerminator()) break;
+
+                j += 1;
+            }
+
+            // If we found a release with no intervening use, elide both
+            if (release_idx != null and !found_use) {
+                // Remove release first (higher index)
+                _ = block.instructions.orderedRemove(release_idx.?);
+                // Remove retain
+                _ = block.instructions.orderedRemove(i);
+                elided += 1;
+                continue; // Don't increment i, we removed the current instruction
+            }
+        }
+
+        i += 1;
+    }
+
+    return elided;
+}
+
+/// Convert retain+store patterns to arc_move when the source is last-use.
+/// This avoids the retain/release overhead for values that are being moved.
+fn convertToArcMove(block: *ir.Block) u32 {
+    var converted: u32 = 0;
+    var i: usize = 0;
+
+    while (i + 1 < block.instructions.items.len) {
+        const inst = block.instructions.items[i];
+        const next_inst = block.instructions.items[i + 1];
+
+        // Look for pattern: arc_retain(x), store(ptr, x)
+        if (inst == .arc_retain and next_inst == .store) {
+            const retain_value = inst.arc_retain.value;
+            const store_value = next_inst.store.value;
+
+            // Check if the store uses the same value as the retain
+            if (retain_value.id == store_value.id) {
+                // Check if this is the last use of the value in this block
+                if (isLastUseInBlock(block, retain_value.id, i + 1)) {
+                    // Convert to arc_move:
+                    // 1. Remove the retain
+                    // 2. The store already handles the assignment
+                    // Note: We could convert to a dedicated arc_move instruction,
+                    // but for now just removing the redundant retain is sufficient
+                    // since the store will handle the value transfer.
+                    _ = block.instructions.orderedRemove(i);
+                    converted += 1;
+                    continue; // Don't increment i
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    return converted;
+}
+
+/// Check if an instruction uses a value (excluding ARC operations on it)
+fn instructionUsesValue(inst: ir.Instruction, value_id: u32) bool {
+    // ARC operations don't count as "use" for this optimization
+    switch (inst) {
+        .arc_retain, .arc_release => return false,
+        .arc_move => return false,
+        else => {},
+    }
+
+    // Check if any operand of this instruction uses the value
+    return switch (inst) {
+        // Binary operations
+        .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem => |op| op.lhs.id == value_id or op.rhs.id == value_id,
+        .band, .bor, .bxor, .ishl, .sshr, .ushr => |op| op.lhs.id == value_id or op.rhs.id == value_id,
+        .log_and, .log_or => |op| op.lhs.id == value_id or op.rhs.id == value_id,
+        .str_concat, .str_compare => |op| op.lhs.id == value_id or op.rhs.id == value_id,
+        // Unary operations
+        .ineg, .bnot, .log_not, .str_len => |op| op.operand.id == value_id,
+        .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| op.operand.id == value_id,
+        .wrap_optional, .unwrap_optional, .is_null => |op| op.operand.id == value_id,
+        .weak_ref, .weak_load => |op| op.operand.id == value_id,
+        .array_len => |op| op.operand.id == value_id,
+        // Comparison
+        .icmp => |op| op.lhs.id == value_id or op.rhs.id == value_id,
+        // Memory operations
+        .load => |op| op.ptr.id == value_id,
+        .store => |op| op.ptr.id == value_id or op.value.id == value_id,
+        .field_ptr => |op| op.struct_ptr.id == value_id,
+        .ptr_offset => |op| op.base_ptr.id == value_id,
+        // Control flow
+        .brif => |op| op.condition.id == value_id,
+        .return_ => |op| if (op) |v| v.id == value_id else false,
+        .select => |op| op.condition.id == value_id or op.true_val.id == value_id or op.false_val.id == value_id,
+        // Function calls
+        .call => |op| blk: {
+            for (op.args) |arg| {
+                if (arg.id == value_id) break :blk true;
+            }
+            break :blk false;
+        },
+        // Array operations
+        .array_load => |op| op.array_ptr.id == value_id or op.index.id == value_id,
+        .array_store => |op| op.array_ptr.id == value_id or op.index.id == value_id or op.value.id == value_id,
+        // Map operations
+        .map_set => |op| op.map.id == value_id or op.key.id == value_id or op.value.id == value_id,
+        .map_get => |op| op.map.id == value_id or op.key.id == value_id,
+        .map_delete => |op| op.map.id == value_id or op.key.id == value_id,
+        .map_has => |op| op.map.id == value_id or op.key.id == value_id,
+        .map_len => |op| op.map.id == value_id,
+        .map_clear => |op| op.map.id == value_id,
+        .map_keys => |op| op.map.id == value_id,
+        .map_values => |op| op.map.id == value_id,
+        else => false,
+    };
+}
+
+/// Check if a value's last use in the block is at the given index
+fn isLastUseInBlock(block: *ir.Block, value_id: u32, current_idx: usize) bool {
+    // Check remaining instructions in the block
+    for (block.instructions.items[current_idx + 1 ..]) |inst| {
+        if (instructionUsesValue(inst, value_id)) {
+            return false; // Value is used again
+        }
+    }
+    return true;
+}
+
+test "ARC optimization: elide retain/release pair" {
+    const allocator = std.testing.allocator;
+
+    var module = ir.Module.init(allocator, "test");
+    defer module.deinit();
+
+    const sig = ir.FunctionType{
+        .params = &[_]ir.FunctionType.Param{},
+        .return_type = .{ .void = {} },
+        .is_variadic = false,
+    };
+
+    const func = try ir.Function.init(allocator, "test_fn", sig);
+    try module.addFunction(func);
+
+    // Create pattern: arc_retain(x), arc_release(x) - should be elided
+    const v0 = func.newValue(.{ .string = {} });
+
+    try func.entry.append(.{ .arc_retain = .{ .value = v0 } });
+    try func.entry.append(.{ .arc_release = .{ .value = v0 } });
+    try func.entry.append(.{ .return_ = null });
+
+    const initial_count = func.entry.instructions.items.len;
+    const stats = optimize(&module, .{ .arc_optimization = true, .constant_folding = false, .dead_code_elimination = false, .tail_call_optimization = false, .switch_optimization = false, .inlining = false });
+
+    // Check that the retain/release pair was elided
+    try std.testing.expectEqual(@as(u32, 1), stats.arc_pairs_elided);
+    try std.testing.expectEqual(initial_count - 2, func.entry.instructions.items.len);
 }

@@ -670,6 +670,15 @@ pub const BytecodeEmitter = struct {
             .map_keys => |mk| try emit_inst.emitMapKeys(self, mk),
             .map_values => |mv| try emit_inst.emitMapValues(self, mv),
 
+            // Weak reference operations
+            .weak_ref => |w| try emit_inst.emitWeakRef(self, w),
+            .weak_load => |w| try emit_inst.emitWeakLoad(self, w),
+
+            // ARC operations
+            .arc_retain => |a| try emit_inst.emitArcRetain(self, a),
+            .arc_release => |a| try emit_inst.emitArcRelease(self, a),
+            .arc_move => |a| try emit_inst.emitArcMove(self, a),
+
             else => {
                 // Other instructions not yet implemented
             },
@@ -1296,6 +1305,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .@"union" => .structure, // Unions are similar to structs
         .function => .int64, // Function pointers
         .map => .int64, // Map handles are pointer-sized
+        .weak => .int64, // Weak references are pointer-sized
     };
 }
 

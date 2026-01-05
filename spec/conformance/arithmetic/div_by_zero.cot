@@ -1,0 +1,13 @@
+; Test: Division by zero error
+proc main
+    record
+        a, d10
+        b, d10
+        c, d10
+    endrecord
+
+    a = 10
+    b = 0
+    c = a / b
+    display(c)
+endproc

@@ -1,18 +1,67 @@
 # Claude Development Guidelines for Cot
 
-## Troubleshooting Priority: Use cot trace
+## CRITICAL: Plan Tracking
 
-When debugging runtime issues, **always start with `cot trace --level=verbose`**:
+**Before starting any work:**
+
+1. Check `~/cotlang/claude/` for authoritative plan documents (task lists, roadmaps)
+2. Read `.claude-plan` in the project root if it exists - it tracks current phase/task
+3. When switching tasks, update `.claude-plan` with current status
+
+**When the user asks "what's next":**
+- Look in `~/cotlang/claude/` for task documents - NOT `~/.claude/plans/` (those are stale)
+- Find the incomplete tasks and continue from there
+- Ask if unclear which plan is active
+
+**Never lose track of the plan.** Context loss causes repeated work and frustration.
+
+## Debugging Tools
+
+### cot trace - Execution Tracing
+
+For runtime issues, start with execution tracing:
 
 ```bash
 cot compile myfile.cot -o myfile.cbo
 cot trace myfile.cbo --level=verbose
 ```
 
-This shows:
+Trace levels: `none`, `routines`, `opcodes`, `verbose`, `full`
+
+Verbose trace shows:
 - Every opcode executed with IP and source line
 - Register values with type information (e.g., `r0=int:42 r1=str:"hello"`)
 - Call/return flow for routines and native functions
+
+### cot debug - Interactive Debugger
+
+For step-by-step debugging:
+
+```bash
+cot debug myfile.cbo
+```
+
+Commands:
+- `r/run` - Run/continue execution
+- `s/step` - Step one instruction
+- `n/next` - Step over (to next line)
+- `o/out` - Step out of current function
+- `b <line>` - Set breakpoint at line
+- `d <line>` - Delete breakpoint
+- `i/info` - Show VM state (IP, line, SP, FP)
+- `reg` - Show registers
+- `stack` - Show stack
+- `bt` - Show backtrace
+
+### cot validate - Bytecode Validation
+
+For verifying bytecode integrity:
+
+```bash
+cot validate myfile.cbo [--strict]
+```
+
+Reports: code size, instruction count, routine count, validation issues, reachability.
 
 **If verbose trace does not immediately reveal the cause:**
 1. Do NOT resort to trial-and-error debugging
@@ -77,6 +126,11 @@ src/
 │   │   ├── trace.zig     # Tracer, TraceLevel, TraceEntry
 │   │   ├── history.zig   # Ring buffer for history
 │   │   └── output.zig    # Output formatting
+│   ├── debug/            # Debugging infrastructure
+│   │   ├── debug.zig     # Module root, presets
+│   │   ├── breakpoint.zig # BreakpointManager (CLI/LSP shared)
+│   │   ├── inspector.zig # StateInspector for VM state
+│   │   └── validator.zig # Bytecode validation
 │   ├── native/           # Native function bindings
 │   └── cot_runtime.zig   # Runtime module exports
 ├── framework/            # Workspace/project commands

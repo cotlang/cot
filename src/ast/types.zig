@@ -80,6 +80,10 @@ pub const TypeTag = enum(u8) {
     /// Optional type: ?T
     optional,
 
+    /// Weak reference type: weak T
+    /// Does not keep the referenced value alive (for breaking cycles)
+    weak,
+
     /// Pointer type: *T, *const T
     pointer,
 
@@ -169,7 +173,7 @@ pub const TypeTag = enum(u8) {
     /// Check if this is a compound/composite type
     pub fn isCompound(self: TypeTag) bool {
         return switch (self) {
-            .array, .slice, .optional, .pointer, .named, .@"union", .function, .tuple, .error_union, .map => true,
+            .array, .slice, .optional, .weak, .pointer, .named, .@"union", .function, .tuple, .error_union, .map => true,
             else => false,
         };
     }

@@ -1,0 +1,402 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cotlang.org/spec/bytecode.schema.json",
+  "title": "Cot Bytecode Format Specification",
+  "description": "Schema for defining the binary format of Cot bytecode modules",
+  "type": "object",
+  "required": ["meta", "file_types", "header", "sections"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["version"],
+      "properties": {
+        "version": { "type": "string" },
+        "description": { "type": "string" },
+        "endianness": { "type": "string", "enum": ["little", "big"] }
+      }
+    },
+    "file_types": {
+      "$ref": "#/definitions/file_types"
+    },
+    "header": {
+      "$ref": "#/definitions/header"
+    },
+    "module_flags": {
+      "$ref": "#/definitions/module_flags"
+    },
+    "sections": {
+      "$ref": "#/definitions/sections"
+    },
+    "section_entry": {
+      "$ref": "#/definitions/section_entry"
+    },
+    "constants": {
+      "$ref": "#/definitions/constants"
+    },
+    "data_types": {
+      "$ref": "#/definitions/data_types"
+    },
+    "type_def": {
+      "$ref": "#/definitions/type_def"
+    },
+    "field_def": {
+      "$ref": "#/definitions/field_def"
+    },
+    "routine_def": {
+      "$ref": "#/definitions/routine_def"
+    },
+    "param_def": {
+      "$ref": "#/definitions/param_def"
+    },
+    "local_def": {
+      "$ref": "#/definitions/local_def"
+    },
+    "export_entry": {
+      "$ref": "#/definitions/export_entry"
+    },
+    "import_entry": {
+      "$ref": "#/definitions/import_entry"
+    },
+    "debug": {
+      "$ref": "#/definitions/debug"
+    },
+    "library": {
+      "$ref": "#/definitions/library"
+    },
+    "layout": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "structure": { "type": "string" }
+      }
+    }
+  },
+  "definitions": {
+    "file_types": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "object": { "$ref": "#/definitions/file_type" },
+        "library": { "$ref": "#/definitions/file_type" },
+        "executable": { "$ref": "#/definitions/file_type" }
+      }
+    },
+    "file_type": {
+      "type": "object",
+      "required": ["extension", "magic"],
+      "properties": {
+        "extension": { "type": "string" },
+        "magic": { "type": "string", "minLength": 4, "maxLength": 4 },
+        "magic_bytes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "description": { "type": "string" }
+      }
+    },
+    "header": {
+      "type": "object",
+      "required": ["size", "fields"],
+      "properties": {
+        "size": { "type": "integer" },
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/header_field" }
+        }
+      }
+    },
+    "header_field": {
+      "type": "object",
+      "required": ["offset", "size", "type"],
+      "properties": {
+        "offset": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 1 },
+        "type": { "type": "string" },
+        "description": { "type": "string" },
+        "current_value": { "type": "integer" },
+        "library_sentinel": { "type": "integer" }
+      }
+    },
+    "module_flags": {
+      "type": "object",
+      "properties": {
+        "size": { "type": "integer" },
+        "description": { "type": "string" },
+        "bits": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["bit"],
+            "properties": {
+              "bit": { "type": "integer", "minimum": 0, "maximum": 31 },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "sections": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "types": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["code"],
+            "properties": {
+              "code": { "type": "integer" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "section_entry": {
+      "type": "object",
+      "properties": {
+        "size": { "type": "integer" },
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/header_field" }
+        }
+      }
+    },
+    "constants": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "tags": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["code"],
+            "properties": {
+              "code": { "type": "integer" },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "formats": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/constant_format" }
+        }
+      }
+    },
+    "constant_format": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "layout": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/layout_field" }
+        }
+      }
+    },
+    "layout_field": {
+      "type": "object",
+      "required": ["field", "type"],
+      "properties": {
+        "field": { "type": "string" },
+        "size": { "oneOf": [{ "type": "integer" }, { "type": "string" }] },
+        "type": { "type": "string" },
+        "value": { "type": "integer" },
+        "description": { "type": "string" }
+      }
+    },
+    "data_types": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "codes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["code"],
+            "properties": {
+              "code": { "type": "integer" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "type_def": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/struct_field" }
+        },
+        "kinds": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "struct_field": {
+      "type": "object",
+      "properties": {
+        "size": { "type": "integer" },
+        "type": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    },
+    "field_def": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/struct_field" }
+        }
+      }
+    },
+    "routine_def": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/struct_field" }
+        },
+        "flags": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "bit": { "type": "integer" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "param_def": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/struct_field" }
+        },
+        "modes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "local_def": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/struct_field" }
+        }
+      }
+    },
+    "export_entry": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/struct_field" }
+        },
+        "kinds": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer" },
+              "description": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "import_entry": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/struct_field" }
+        },
+        "kinds": {
+          "type": "object"
+        },
+        "flags": {
+          "type": "object"
+        }
+      }
+    },
+    "debug": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "line_entry": {
+          "type": "object",
+          "properties": {
+            "description": { "type": "string" },
+            "fields": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/definitions/struct_field" }
+            }
+          }
+        },
+        "local_var_entry": {
+          "type": "object",
+          "properties": {
+            "description": { "type": "string" },
+            "fields": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/definitions/struct_field" }
+            }
+          }
+        }
+      }
+    },
+    "library": {
+      "type": "object",
+      "properties": {
+        "description": { "type": "string" },
+        "header": {
+          "type": "object",
+          "properties": {
+            "magic": { "type": "string" },
+            "description": { "type": "string" }
+          }
+        },
+        "master_export": {
+          "type": "object",
+          "properties": {
+            "description": { "type": "string" },
+            "fields": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/definitions/struct_field" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

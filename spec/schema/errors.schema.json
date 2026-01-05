@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cotlang.org/spec/errors.schema.json",
+  "title": "Cot Runtime Errors Specification",
+  "description": "Schema for defining runtime error types and codes",
+  "type": "object",
+  "required": ["meta", "categories", "errors"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["version"],
+      "properties": {
+        "version": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    },
+    "categories": {
+      "type": "object",
+      "description": "Error categories for grouping related errors",
+      "additionalProperties": {
+        "$ref": "#/definitions/category"
+      }
+    },
+    "errors": {
+      "type": "object",
+      "description": "All runtime error definitions",
+      "additionalProperties": {
+        "$ref": "#/definitions/error"
+      }
+    }
+  },
+  "definitions": {
+    "category": {
+      "type": "object",
+      "required": ["code_range", "description"],
+      "properties": {
+        "code_range": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "Start and end error codes for this category"
+        },
+        "description": { "type": "string" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "name", "description", "category"],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unique numeric error code"
+        },
+        "name": {
+          "type": "string",
+          "description": "Error name in PascalCase"
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description"
+        },
+        "category": {
+          "type": "string",
+          "description": "Error category reference"
+        },
+        "message_template": {
+          "type": "string",
+          "description": "Template for error message with {placeholders}"
+        },
+        "recoverable": {
+          "type": "boolean",
+          "description": "Whether the error can be caught and handled"
+        },
+        "since": {
+          "type": "string",
+          "description": "Version when error was introduced"
+        },
+        "causes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Common causes of this error"
+        },
+        "see_also": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Related errors or documentation"
+        }
+      }
+    }
+  }
+}

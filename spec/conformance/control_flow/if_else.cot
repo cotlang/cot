@@ -1,0 +1,13 @@
+; Test: If-else control flow
+proc main
+    record
+        x, d10
+    endrecord
+
+    x = 5
+
+    if (x > 3)
+        display("greater")
+    else
+        display("not greater")
+endproc
