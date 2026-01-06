@@ -632,12 +632,15 @@ pub const Printer = struct {
             .f32 => try self.writer.writeAll("f32"),
             .f64 => try self.writer.writeAll("f64"),
             .string => try self.writer.writeAll("string"),
-            .decimal => |d| {
+            .implied_decimal => |d| {
                 if (d.scale > 0) {
                     try self.writer.print("decimal({d},{d})", .{ d.precision, d.scale });
                 } else {
                     try self.writer.print("decimal({d})", .{d.precision});
                 }
+            },
+            .fixed_decimal => |d| {
+                try self.writer.print("fixed_decimal({d})", .{d.width});
             },
             .ptr => |inner| {
                 try self.writer.writeByte('*');
@@ -693,10 +696,10 @@ test "print simple function" {
 
     const sig = ir.FunctionType{
         .params = &[_]ir.FunctionType.Param{
-            .{ .name = "x", .ty = .{ .decimal = .{ .length = 8, .decimal_places = 2 } }, .direction = .in },
-            .{ .name = "y", .ty = .{ .decimal = .{ .length = 8, .decimal_places = 2 } }, .direction = .in },
+            .{ .name = "x", .ty = .{ .implied_decimal = .{ .precision = 8, .scale = 2 } }, .direction = .in },
+            .{ .name = "y", .ty = .{ .implied_decimal = .{ .precision = 8, .scale = 2 } }, .direction = .in },
         },
-        .return_type = .{ .decimal = .{ .length = 10, .decimal_places = 2 } },
+        .return_type = .{ .implied_decimal = .{ .precision = 10, .scale = 2 } },
         .is_variadic = false,
     };
 
@@ -706,9 +709,9 @@ test "print simple function" {
     func.setExport("cot_add_values");
 
     // Add some instructions to entry block
-    const x = ir.Value{ .id = 0, .ty = .{ .decimal = .{ .length = 8, .decimal_places = 2 } } };
-    const y = ir.Value{ .id = 1, .ty = .{ .decimal = .{ .length = 8, .decimal_places = 2 } } };
-    const result = func.newValue(.{ .decimal = .{ .length = 10, .decimal_places = 2 } });
+    const x = ir.Value{ .id = 0, .ty = .{ .implied_decimal = .{ .precision = 8, .scale = 2 } } };
+    const y = ir.Value{ .id = 1, .ty = .{ .implied_decimal = .{ .precision = 8, .scale = 2 } } };
+    const result = func.newValue(.{ .implied_decimal = .{ .precision = 10, .scale = 2 } });
 
     try func.entry.append(.{ .iadd = .{ .lhs = x, .rhs = y, .result = result } });
     try func.entry.append(.{ .return_ = result });

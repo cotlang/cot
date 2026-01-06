@@ -1218,8 +1218,8 @@ pub const VM = struct {
                 const int_val = val.asInt();
                 return std.fmt.bufPrint(buf, "{d}", .{int_val}) catch "";
             },
-            .decimal => {
-                if (val.asDecimal()) |dval| {
+            .implied_decimal => {
+                if (val.asImpliedDecimal()) |dval| {
                     const divisor = std.math.pow(i64, 10, dval.precision);
                     const whole = @divTrunc(dval.value, divisor);
                     const frac = @abs(@rem(dval.value, divisor));
@@ -1228,6 +1228,12 @@ pub const VM = struct {
                     } else {
                         return std.fmt.bufPrint(buf, "{d}", .{whole}) catch "";
                     }
+                }
+                return "";
+            },
+            .fixed_decimal => {
+                if (val.asFixedDecimal()) |dval| {
+                    return std.fmt.bufPrint(buf, "{d}", .{dval.value}) catch "";
                 }
                 return "";
             },
@@ -1327,10 +1333,14 @@ pub const VM = struct {
         // Record/Field Operations (0x80-0x8F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.load_record_buf)] = &vm_opcodes.op_load_record_buf;
         table[@intFromEnum(Opcode.store_record_buf)] = &vm_opcodes.op_store_record_buf;
+        table[@intFromEnum(Opcode.alloc_buffer)] = &vm_opcodes.op_alloc_buffer;
 
         // String Operations (0x90-0x9F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.str_concat)] = &vm_opcodes.op_str_concat;
+        table[@intFromEnum(Opcode.str_len)] = &vm_opcodes.op_str_len;
+        table[@intFromEnum(Opcode.str_trim)] = &vm_opcodes.op_str_trim;
         table[@intFromEnum(Opcode.str_slice_store)] = &vm_opcodes.op_str_slice_store;
+        table[@intFromEnum(Opcode.str_slice)] = &vm_opcodes.op_str_slice;
 
         // Type Conversion (0xA0-0xAF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.format_decimal)] = &vm_opcodes.op_format_decimal;
@@ -1344,6 +1354,12 @@ pub const VM = struct {
         // Math Functions (0xC0-0xCF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.fn_round)] = &vm_opcodes.op_fn_round;
         table[@intFromEnum(Opcode.fn_trunc)] = &vm_opcodes.op_fn_trunc;
+        table[@intFromEnum(Opcode.fn_size)] = &vm_opcodes.op_fn_size;
+
+        // Datetime Functions - high-performance opcodes
+        table[@intFromEnum(Opcode.fn_date)] = &vm_opcodes.op_fn_date;
+        table[@intFromEnum(Opcode.fn_time)] = &vm_opcodes.op_fn_time;
+        table[@intFromEnum(Opcode.fn_datetime)] = &vm_opcodes.op_fn_datetime;
 
         // Terminal I/O (0xD0-0xD4) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.println)] = &vm_opcodes.op_println;

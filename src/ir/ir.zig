@@ -52,8 +52,11 @@ pub const Type = union(enum) {
     /// String type (dynamic length)
     string: void,
 
-    /// Decimal type (for precise financial calculations)
-    decimal: DecimalType,
+    /// Implied decimal type (DBL d28.10 - has precision/scale)
+    implied_decimal: ImpliedDecimalType,
+
+    /// Fixed decimal type (DBL d28 - no decimal point)
+    fixed_decimal: FixedDecimalType,
 
     /// Pointer to another type
     ptr: *const Type,
@@ -92,12 +95,20 @@ pub const Type = union(enum) {
         trait_name: []const u8,
     };
 
-    pub const DecimalType = struct {
+    pub const ImpliedDecimalType = struct {
         /// Total precision in digits
         precision: u32,
         /// Number of decimal places (scale)
         scale: u8,
     };
+
+    pub const FixedDecimalType = struct {
+        /// Total width in digits
+        width: u32,
+    };
+
+    // Legacy alias for backward compatibility
+    pub const DecimalType = ImpliedDecimalType;
 
     /// Get the size of this type in bytes
     pub fn sizeInBytes(self: Type) u32 {
@@ -110,7 +121,8 @@ pub const Type = union(enum) {
             .i64, .u64, .f64 => 8,
             .isize, .usize => @sizeOf(usize),
             .string => 16, // Pointer + length
-            .decimal => |d| d.precision, // DBL decimals: 1 byte per digit character
+            .implied_decimal => |d| d.precision, // DBL decimals: 1 byte per digit character
+            .fixed_decimal => |d| d.width, // DBL fixed decimals: 1 byte per digit
             .ptr, .optional, .weak => 8, // 64-bit pointers
             .array => |a| a.element.sizeInBytes() * a.length,
             .slice => 16, // Pointer + length
@@ -133,7 +145,7 @@ pub const Type = union(enum) {
             .i64, .u64, .f64 => 8,
             .isize, .usize => @alignOf(usize),
             .string, .slice => 8,
-            .decimal => 8,
+            .implied_decimal, .fixed_decimal => 8,
             .ptr, .optional, .weak => 8,
             .array => |a| a.element.alignment(),
             .@"struct" => |s| s.alignment,
@@ -162,7 +174,8 @@ pub const Type = union(enum) {
             .f32 => "float",
             .f64 => "double",
             .string => "cot_string_t*",
-            .decimal => "cot_decimal_t",
+            .implied_decimal => "cot_implied_decimal_t",
+            .fixed_decimal => "cot_fixed_decimal_t",
             .ptr, .optional, .weak => "void*",
             .array, .slice => "void*",
             .@"struct" => "void*",
@@ -178,7 +191,7 @@ pub const Type = union(enum) {
         return switch (self) {
             .i8, .i16, .i32, .i64, .isize => true,
             .u8, .u16, .u32, .u64, .usize => true,
-            .f32, .f64, .decimal => true,
+            .f32, .f64, .implied_decimal, .fixed_decimal => true,
             else => false,
         };
     }
@@ -195,7 +208,7 @@ pub const Type = union(enum) {
     /// Check if this type is signed
     pub fn isSigned(self: Type) bool {
         return switch (self) {
-            .i8, .i16, .i32, .i64, .isize, .f32, .f64, .decimal => true,
+            .i8, .i16, .i32, .i64, .isize, .f32, .f64, .implied_decimal, .fixed_decimal => true,
             else => false,
         };
     }
@@ -272,7 +285,7 @@ pub const Value = struct {
     /// Check if this value has a numeric type (suitable for arithmetic)
     pub fn isNumeric(self: Value) bool {
         return switch (self.ty) {
-            .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .decimal => true,
+            .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .implied_decimal, .fixed_decimal => true,
             else => false,
         };
     }
@@ -353,7 +366,7 @@ fn typeNeedsArc(ty: Type) bool {
     return switch (ty) {
         // Heap-allocated types that need ARC
         .string => true,
-        .decimal => true,
+        .implied_decimal, .fixed_decimal => true,
         .map => true,
         // Pointer to heap type needs ARC
         .ptr => |p| typeNeedsArc(p.*),
@@ -1402,8 +1415,11 @@ test "ir type sizes" {
     try std.testing.expectEqual(@as(u32, 8), (Type{ .f64 = {} }).sizeInBytes());
     try std.testing.expectEqual(@as(u32, 1), (Type{ .bool = {} }).sizeInBytes());
 
-    const decimal_type = Type{ .decimal = .{ .precision = 18, .scale = 2 } };
-    try std.testing.expectEqual(@as(u32, 18), decimal_type.sizeInBytes()); // 1 byte per digit
+    const implied_decimal_type = Type{ .implied_decimal = .{ .precision = 18, .scale = 2 } };
+    try std.testing.expectEqual(@as(u32, 18), implied_decimal_type.sizeInBytes()); // 1 byte per digit
+
+    const fixed_decimal_type = Type{ .fixed_decimal = .{ .width = 10 } };
+    try std.testing.expectEqual(@as(u32, 10), fixed_decimal_type.sizeInBytes()); // 1 byte per digit
 }
 
 test "ir function creation" {

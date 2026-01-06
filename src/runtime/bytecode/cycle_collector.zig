@@ -294,7 +294,7 @@ fn getHeapPtr(value: Value) ?*anyopaque {
             const ptr = value.bits & Value.PTR_MASK;
             break :blk if (ptr != 0) @ptrFromInt(ptr) else null;
         },
-        .decimal => blk: {
+        .implied_decimal, .fixed_decimal => blk: {
             const ptr = value.bits & Value.PTR_MASK;
             break :blk if (ptr != 0) @ptrFromInt(ptr) else null;
         },

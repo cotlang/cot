@@ -6,6 +6,7 @@
 //!   cot run <file.cot|.cbo>     Run a program (auto-detect mode)
 //!   cot trace <file.cot|.cbo>   Run with execution tracing enabled
 //!   cot compile <file.cot>      Compile to bytecode (.cbo) via IR
+//!   cot fmt <files...>          Format source files
 //!   cot disasm <file.cot|.cbo>  Disassemble to readable output
 //!   cot dump-ir <file.cot>      Dump IR for debugging
 //!   cot repl                    Start interactive REPL
@@ -103,14 +104,70 @@ const dev_cmd = cot.framework.commands.dev;
 const schema_cmd = cot.framework.commands.schema;
 const data_cmd = cot.framework.commands.data;
 const convert_cmd = cot.framework.commands.convert;
+const gen_cmd = cot.framework.commands.gen;
+
+// ============================================================
+// Command Dispatch System
+// ============================================================
+
+/// Command handler function type
+const CommandFn = *const fn (std.mem.Allocator, []const []const u8) anyerror!void;
+
+/// Command definition
+const Command = struct {
+    name: []const u8,
+    aliases: []const []const u8 = &.{},
+    handler: CommandFn,
+    description: []const u8,
+    usage: []const u8 = "",
+    category: Category = .core,
+
+    const Category = enum { core, workspace, debug };
+};
+
+/// All available commands
+const commands = [_]Command{
+    // Core commands
+    .{ .name = "run", .handler = cmdRun, .description = "Run a program or workspace project", .usage = "<file|project> [--runtime=zig|rs]", .category = .core },
+    .{ .name = "compile", .handler = cmdCompile, .description = "Compile to bytecode (.cbo)", .usage = "<file.cot> [-o output.cbo]", .category = .core },
+    .{ .name = "fmt", .aliases = &.{"format"}, .handler = cmdFmt, .description = "Format source files", .usage = "<files...> [--check]", .category = .core },
+    .{ .name = "test", .handler = cmdTest, .description = "Run tests in a file", .usage = "<file.cot> [--filter=<name>]", .category = .core },
+    .{ .name = "repl", .handler = cmdRepl, .description = "Start interactive REPL", .category = .core },
+
+    // Debug commands
+    .{ .name = "trace", .handler = cmdTrace, .description = "Run with execution tracing", .usage = "<file> [--level=opcodes|verbose]", .category = .debug },
+    .{ .name = "debug", .handler = cmdDebug, .description = "Interactive debugger", .usage = "<file>", .category = .debug },
+    .{ .name = "validate", .handler = cmdValidate, .description = "Validate bytecode integrity", .usage = "<file.cbo> [--strict]", .category = .debug },
+    .{ .name = "disasm", .handler = cmdDisasm, .description = "Disassemble bytecode", .usage = "<file.cot|.cbo>", .category = .debug },
+    .{ .name = "dump-ir", .handler = cmdDumpIR, .description = "Dump IR for debugging", .usage = "<file.cot>", .category = .debug },
+
+    // Workspace commands
+    .{ .name = "init", .handler = cmdInit, .description = "Initialize a new workspace", .usage = "[name]", .category = .workspace },
+    .{ .name = "new", .handler = cmdNew, .description = "Create a new app or package", .usage = "<name>", .category = .workspace },
+    .{ .name = "build", .handler = cmdBuild, .description = "Build workspace projects", .usage = "[project]", .category = .workspace },
+    .{ .name = "dev", .handler = cmdDev, .description = "Start development server", .category = .workspace },
+    .{ .name = "schema", .handler = cmdSchema, .description = "Manage database schema", .usage = "<subcommand>", .category = .workspace },
+    .{ .name = "data", .handler = cmdData, .description = "Load/unload fixed-width data", .usage = "<subcommand>", .category = .workspace },
+    .{ .name = "convert", .handler = cmdConvert, .description = "Convert DBL to Cot syntax", .usage = "<file.dbl>", .category = .workspace },
+    .{ .name = "gen", .handler = cmdGen, .description = "Generate code (components, etc.)", .usage = "<generator> <name>", .category = .workspace },
+};
+
+/// Find a command by name or alias
+fn findCommand(name: []const u8) ?*const Command {
+    for (&commands) |*cmd| {
+        if (std.mem.eql(u8, cmd.name, name)) return cmd;
+        for (cmd.aliases) |alias| {
+            if (std.mem.eql(u8, alias, name)) return cmd;
+        }
+    }
+    return null;
+}
 
 pub fn main() !void {
-    // Install crash handlers FIRST - ensures crash reporting works for all commands
+    // Install crash handlers FIRST
     cot.crash.installHandlers();
 
-    // Use page_allocator as the backing allocator - all memory is reclaimed on process exit
     const allocator = std.heap.page_allocator;
-
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -119,352 +176,374 @@ pub fn main() !void {
         return;
     }
 
-    const command = args[1];
+    const cmd_name = args[1];
 
-    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
+    // Handle global flags
+    if (std.mem.eql(u8, cmd_name, "--help") or std.mem.eql(u8, cmd_name, "-h")) {
         try printUsage();
-    } else if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
+        return;
+    }
+    if (std.mem.eql(u8, cmd_name, "--version") or std.mem.eql(u8, cmd_name, "-v")) {
         try printVersion();
-    } else if (std.mem.eql(u8, command, "repl")) {
-        try runRepl(allocator);
-    } else if (std.mem.eql(u8, command, "compile")) {
-        if (args.len < 3) {
-            try printErr("Error: compile requires a filename\n");
-            try printErr("Usage: cot compile <file.cot> [-o output.cbo]\n");
-            return;
-        }
-        // Parse optional arguments
-        var output_file: ?[]const u8 = null;
-        var i: usize = 3;
-        while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "-o") and i + 1 < args.len) {
-                output_file = args[i + 1];
-                i += 1;
-            }
-        }
-        compileFile(allocator, args[2], output_file) catch |err| {
-            if (err == error.CompilationFailed) {
-                // Error already printed, just exit with failure code
-                std.process.exit(1);
-            }
-            return err;
-        };
-    } else if (std.mem.eql(u8, command, "disasm")) {
-        if (args.len < 3) {
-            try printErr("Error: disasm requires a filename\n");
-            try printErr("Usage: cot disasm <file.cot|file.cbo>\n");
-            return;
-        }
-        try disasmFile(allocator, args[2]);
-    } else if (std.mem.eql(u8, command, "dump-ir")) {
-        if (args.len < 3) {
-            try printErr("Error: dump-ir requires a filename\n");
-            try printErr("Usage: cot dump-ir <file.cot>\n");
-            return;
-        }
-        try dumpIR(allocator, args[2]);
-    } else if (std.mem.eql(u8, command, "run")) {
-        // Parse runtime option (--runtime=zig|rs)
-        var selected_runtime: runtime_selector.Runtime = .zig;
-        var file_target: ?[]const u8 = null;
+        return;
+    }
 
-        // Parse arguments
-        for (args[2..]) |arg| {
-            if (std.mem.startsWith(u8, arg, "--runtime=")) {
-                const runtime_name = arg[10..];
-                if (runtime_selector.Runtime.fromString(runtime_name)) |r| {
-                    selected_runtime = r;
-                } else {
-                    try printStderr("Error: Unknown runtime '{s}'. Use 'zig' or 'rs'.\n", .{runtime_name});
-                    return;
-                }
-            } else if (!std.mem.startsWith(u8, arg, "-")) {
-                // Non-option argument is the target file/project
-                file_target = arg;
-            }
-        }
-
-        // Check if this looks like a file or a workspace target
-        if (file_target) |target| {
-            // If it's a file path (has .cot or .cbo extension), use file runner
-            if (std.mem.endsWith(u8, target, ".cot") or std.mem.endsWith(u8, target, ".cbo")) {
-                // Use selected runtime
-                switch (selected_runtime) {
-                    .zig => try runFileAuto(allocator, target),
-                    .rs => {
-                        // For .cot files, compile first then run with Rust runtime
-                        var bytecode_path: []const u8 = undefined;
-                        if (std.mem.endsWith(u8, target, ".cot")) {
-                            // Compile to temp .cbo file
-                            const basename = std.fs.path.stem(target);
-                            bytecode_path = try std.fmt.allocPrint(allocator, "/tmp/{s}.cbo", .{basename});
-                            defer allocator.free(bytecode_path);
-                            compileFile(allocator, target, bytecode_path) catch |err| {
-                                if (err == error.CompilationFailed) {
-                                    std.process.exit(1);
-                                }
-                                return err;
-                            };
-                            runtime_selector.runWithRustRuntime(allocator, bytecode_path) catch |err| {
-                                if (err == error.RuntimeNotFound) {
-                                    try printErr("Error: Rust runtime (cot-rs) not found.\n");
-                                    try printErr("Install it or add to PATH.\n");
-                                }
-                                return;
-                            };
-                        } else {
-                            // Already .cbo, run directly
-                            runtime_selector.runWithRustRuntime(allocator, target) catch |err| {
-                                if (err == error.RuntimeNotFound) {
-                                    try printErr("Error: Rust runtime (cot-rs) not found.\n");
-                                    try printErr("Install it or add to PATH.\n");
-                                }
-                                return;
-                            };
-                        }
-                    },
-                }
-                return;
-            }
-        }
-
-        // Otherwise, try workspace runner (only supports zig runtime for now)
-        if (selected_runtime == .rs) {
-            try printErr("Error: --runtime=rs only works with file targets, not workspace projects.\n");
-            return;
-        }
-        const options = run_cmd.parseArgs(args[2..]);
-        run_cmd.run(allocator, options) catch |err| {
-            if (err == error.NoWorkspace) {
-                // Fall back to file usage message
-                if (args.len < 3) {
-                    try printErr("Error: run requires a filename or project target\n");
-                    try printErr("Usage: cot run <file.cot|file.cbo|project> [--runtime=zig|rs]\n");
-                } else {
-                    try printStderr("Error: {}\n", .{err});
-                }
-            } else if (err != error.NoApps and err != error.ProjectNotFound and err != error.NotCompiled) {
-                try printStderr("Error: {}\n", .{err});
-            }
-        };
-    } else if (std.mem.eql(u8, command, "trace")) {
-        // Trace command - runs with execution tracing enabled
-        if (args.len < 3) {
-            try printErr("Error: trace requires a filename\n");
-            try printErr("Usage: cot trace <file.cot|file.cbo> [--level=opcodes|routines|verbose]\n");
-            return;
-        }
-        const target = args[2];
-        // Parse trace level option
-        var trace_level: trace_mod.TraceLevel = .opcodes; // default
-        for (args[3..]) |arg| {
-            if (std.mem.startsWith(u8, arg, "--level=")) {
-                const level_str = arg[8..];
-                if (std.mem.eql(u8, level_str, "none")) {
-                    trace_level = .none;
-                } else if (std.mem.eql(u8, level_str, "routines")) {
-                    trace_level = .routines;
-                } else if (std.mem.eql(u8, level_str, "opcodes")) {
-                    trace_level = .opcodes;
-                } else if (std.mem.eql(u8, level_str, "verbose")) {
-                    trace_level = .verbose;
-                } else if (std.mem.eql(u8, level_str, "full")) {
-                    trace_level = .full;
-                }
-            }
-        }
-        try traceFileAuto(allocator, target, trace_level);
-    } else if (std.mem.eql(u8, command, "debug")) {
-        // Interactive debugger command
-        if (args.len < 3) {
-            try printErr("Error: debug requires a filename\n");
-            try printErr("Usage: cot debug <file.cot|file.cbo>\n");
-            return;
-        }
-        try debugFile(allocator, args[2]);
-    } else if (std.mem.eql(u8, command, "init")) {
-        // Check for help flag
-        if (args.len > 2 and std.mem.eql(u8, args[2], "--help")) {
-            try init_cmd.printHelp();
-            return;
-        }
-        const options = init_cmd.parseArgs(args[2..]);
-        init_cmd.run(allocator, options) catch |err| {
-            if (err != error.AlreadyExists) {
-                try printStderr("Error: {}\n", .{err});
-            }
-        };
-    } else if (std.mem.eql(u8, command, "new")) {
-        // Check for help flag
-        if (args.len > 2 and std.mem.eql(u8, args[2], "--help")) {
-            try new_cmd.printHelp();
-            return;
-        }
-        const options = new_cmd.parseArgs(args[2..]);
-        new_cmd.run(allocator, options) catch |err| {
-            if (err != error.MissingName and err != error.NoWorkspace) {
-                try printStderr("Error: {}\n", .{err});
-            }
-        };
-    } else if (std.mem.eql(u8, command, "build")) {
-        const options = build_cmd.parseArgs(args[2..]);
-        build_cmd.run(allocator, options) catch |err| {
-            if (err != error.NoWorkspace and err != error.BuildFailed) {
-                try printStderr("Error: {}\n", .{err});
-            }
-            std.process.exit(1);
-        };
-    } else if (std.mem.eql(u8, command, "convert")) {
-        const options = convert_cmd.parseArgs(args[2..]);
-        convert_cmd.run(allocator, options) catch |err| {
-            if (err != error.NoInputFile and err != error.NotDblFile) {
-                try printStderr("Error: {}\n", .{err});
-            }
-        };
-    } else if (std.mem.eql(u8, command, "dev")) {
-        // Check for help flag
-        if (args.len > 2 and std.mem.eql(u8, args[2], "--help")) {
-            try dev_cmd.printHelp();
-            return;
-        }
-        const options = dev_cmd.parseArgs(args[2..]);
-        dev_cmd.run(allocator, options) catch |err| {
-            if (err != error.NoWorkspace) {
-                try printStderr("Error: {}\n", .{err});
-            }
-        };
-    } else if (std.mem.eql(u8, command, "schema")) {
-        // Check for help flag
-        if (args.len > 2 and (std.mem.eql(u8, args[2], "--help") or std.mem.eql(u8, args[2], "-h"))) {
-            try schema_cmd.printHelp();
-            return;
-        }
-        const options = schema_cmd.parseArgs(args[2..]);
-        schema_cmd.run(allocator, options) catch |err| {
-            if (err != error.NoWorkspace and err != error.SchemaLoadFailed) {
-                try printStderr("Error: {}\n", .{err});
-            }
-        };
-    } else if (std.mem.eql(u8, command, "data")) {
-        // Check for help flag
-        if (args.len > 2 and (std.mem.eql(u8, args[2], "--help") or std.mem.eql(u8, args[2], "-h"))) {
-            try data_cmd.printHelp();
-            return;
-        }
-        const options = data_cmd.parseArgs(args[2..]);
-        data_cmd.run(allocator, options) catch |err| {
-            if (err != error.NoWorkspace) {
-                try printStderr("Error: {}\n", .{err});
-            }
-        };
-    } else if (std.mem.eql(u8, command, "test")) {
-        if (args.len < 3) {
-            try printErr("Error: test requires a filename\n");
-            try printErr("Usage: cot test <file.cot> [--filter=<name>]\n");
-            return;
-        }
-        // Parse optional --filter argument
-        var filter: ?[]const u8 = null;
-        for (args[3..]) |arg| {
-            if (std.mem.startsWith(u8, arg, "--filter=")) {
-                filter = arg["--filter=".len..];
-            }
-        }
-        runTests(allocator, args[2], filter) catch |err| {
-            if (err == error.TestsFailed) {
-                // Test failure already reported - exit with non-zero code
-                std.process.exit(1);
-            }
-            return err;
-        };
-    } else if (std.mem.eql(u8, command, "validate")) {
-        // Bytecode validation command
-        if (args.len < 3) {
-            try printErr("Error: validate requires a filename\n");
-            try printErr("Usage: cot validate <file.cbo> [--strict]\n");
-            return;
-        }
-        // Parse options
-        var strict = false;
-        for (args[3..]) |arg| {
-            if (std.mem.eql(u8, arg, "--strict")) {
-                strict = true;
-            }
-        }
-        try validateBytecode(allocator, args[2], strict);
+    // Find and execute command
+    if (findCommand(cmd_name)) |cmd| {
+        try cmd.handler(allocator, args[2..]);
     } else {
         // Assume it's a filename - run with interpreter
-        try runFile(allocator, command);
+        try runFile(allocator, cmd_name);
     }
 }
 
+// ============================================================
+// Command Handlers
+// ============================================================
+
+fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var selected_runtime: runtime_selector.Runtime = .zig;
+    var file_target: ?[]const u8 = null;
+
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--runtime=")) {
+            const runtime_name = arg[10..];
+            if (runtime_selector.Runtime.fromString(runtime_name)) |r| {
+                selected_runtime = r;
+            } else {
+                try printStderr("Error: Unknown runtime '{s}'. Use 'zig' or 'rs'.\n", .{runtime_name});
+                return;
+            }
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            file_target = arg;
+        }
+    }
+
+    if (file_target) |target| {
+        if (std.mem.endsWith(u8, target, ".cot") or std.mem.endsWith(u8, target, ".cbo")) {
+            switch (selected_runtime) {
+                .zig => try runFileAuto(allocator, target),
+                .rs => try runWithRustRuntime(allocator, target),
+            }
+            return;
+        }
+    }
+
+    if (selected_runtime == .rs) {
+        try printErr("Error: --runtime=rs only works with file targets, not workspace projects.\n");
+        return;
+    }
+
+    const options = run_cmd.parseArgs(args);
+    run_cmd.run(allocator, options) catch |err| {
+        if (err == error.NoWorkspace) {
+            if (args.len == 0) {
+                try printErr("Error: run requires a filename or project target\n");
+                try printErr("Usage: cot run <file.cot|file.cbo|project> [--runtime=zig|rs]\n");
+            } else {
+                try printStderr("Error: {}\n", .{err});
+            }
+        } else if (err != error.NoApps and err != error.ProjectNotFound and err != error.NotCompiled) {
+            try printStderr("Error: {}\n", .{err});
+        }
+    };
+}
+
+fn runWithRustRuntime(allocator: std.mem.Allocator, target: []const u8) !void {
+    var bytecode_path: []const u8 = target;
+    var allocated = false;
+
+    if (std.mem.endsWith(u8, target, ".cot")) {
+        const basename = std.fs.path.stem(target);
+        bytecode_path = try std.fmt.allocPrint(allocator, "/tmp/{s}.cbo", .{basename});
+        allocated = true;
+        compileFile(allocator, target, bytecode_path) catch |err| {
+            if (allocated) allocator.free(bytecode_path);
+            if (err == error.CompilationFailed) std.process.exit(1);
+            return err;
+        };
+    }
+    defer if (allocated) allocator.free(bytecode_path);
+
+    runtime_selector.runWithRustRuntime(allocator, bytecode_path) catch |err| {
+        if (err == error.RuntimeNotFound) {
+            try printErr("Error: Rust runtime (cot-rs) not found.\n");
+            try printErr("Install it or add to PATH.\n");
+        }
+    };
+}
+
+fn cmdCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try printErr("Error: compile requires a filename\n");
+        try printErr("Usage: cot compile <file.cot> [-o output.cbo]\n");
+        return;
+    }
+
+    var output_file: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-o") and i + 1 < args.len) {
+            output_file = args[i + 1];
+            i += 1;
+        }
+    }
+
+    compileFile(allocator, args[0], output_file) catch |err| {
+        if (err == error.CompilationFailed) std.process.exit(1);
+        return err;
+    };
+}
+
+fn cmdFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    try formatCommand(allocator, args);
+}
+
+fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try printErr("Error: test requires a filename\n");
+        try printErr("Usage: cot test <file.cot> [--filter=<name>]\n");
+        return;
+    }
+
+    var filter: ?[]const u8 = null;
+    for (args[1..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "--filter=")) {
+            filter = arg["--filter=".len..];
+        }
+    }
+
+    runTests(allocator, args[0], filter) catch |err| {
+        if (err == error.TestsFailed) std.process.exit(1);
+        return err;
+    };
+}
+
+fn cmdRepl(allocator: std.mem.Allocator, _: []const []const u8) !void {
+    try runRepl(allocator);
+}
+
+fn cmdTrace(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try printErr("Error: trace requires a filename\n");
+        try printErr("Usage: cot trace <file.cot|file.cbo> [--level=opcodes|routines|verbose]\n");
+        return;
+    }
+
+    var trace_level: trace_mod.TraceLevel = .opcodes;
+    for (args[1..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "--level=")) {
+            const level_str = arg[8..];
+            trace_level = if (std.mem.eql(u8, level_str, "none")) .none
+                else if (std.mem.eql(u8, level_str, "routines")) .routines
+                else if (std.mem.eql(u8, level_str, "opcodes")) .opcodes
+                else if (std.mem.eql(u8, level_str, "verbose")) .verbose
+                else if (std.mem.eql(u8, level_str, "full")) .full
+                else .opcodes;
+        }
+    }
+
+    try traceFileAuto(allocator, args[0], trace_level);
+}
+
+fn cmdDebug(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try printErr("Error: debug requires a filename\n");
+        try printErr("Usage: cot debug <file.cot|file.cbo>\n");
+        return;
+    }
+    try debugFile(allocator, args[0]);
+}
+
+fn cmdValidate(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try printErr("Error: validate requires a filename\n");
+        try printErr("Usage: cot validate <file.cbo> [--strict]\n");
+        return;
+    }
+
+    var strict = false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--strict")) strict = true;
+    }
+
+    try validateBytecode(allocator, args[0], strict);
+}
+
+fn cmdDisasm(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try printErr("Error: disasm requires a filename\n");
+        try printErr("Usage: cot disasm <file.cot|file.cbo>\n");
+        return;
+    }
+    try disasmFile(allocator, args[0]);
+}
+
+fn cmdDumpIR(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try printErr("Error: dump-ir requires a filename\n");
+        try printErr("Usage: cot dump-ir <file.cot>\n");
+        return;
+    }
+    try dumpIR(allocator, args[0]);
+}
+
+fn cmdInit(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--help")) {
+        try init_cmd.printHelp();
+        return;
+    }
+    const options = init_cmd.parseArgs(args);
+    init_cmd.run(allocator, options) catch |err| {
+        if (err != error.AlreadyExists) try printStderr("Error: {}\n", .{err});
+    };
+}
+
+fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--help")) {
+        try new_cmd.printHelp();
+        return;
+    }
+    const options = new_cmd.parseArgs(args);
+    new_cmd.run(allocator, options) catch |err| {
+        if (err != error.MissingName and err != error.NoWorkspace) try printStderr("Error: {}\n", .{err});
+    };
+}
+
+fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const options = build_cmd.parseArgs(args);
+    build_cmd.run(allocator, options) catch |err| {
+        if (err != error.NoWorkspace and err != error.BuildFailed) try printStderr("Error: {}\n", .{err});
+        std.process.exit(1);
+    };
+}
+
+fn cmdDev(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--help")) {
+        try dev_cmd.printHelp();
+        return;
+    }
+    const options = dev_cmd.parseArgs(args);
+    dev_cmd.run(allocator, options) catch |err| {
+        if (err != error.NoWorkspace) try printStderr("Error: {}\n", .{err});
+    };
+}
+
+fn cmdSchema(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and (std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h"))) {
+        try schema_cmd.printHelp();
+        return;
+    }
+    const options = schema_cmd.parseArgs(args);
+    schema_cmd.run(allocator, options) catch |err| {
+        if (err != error.NoWorkspace and err != error.SchemaLoadFailed) try printStderr("Error: {}\n", .{err});
+    };
+}
+
+fn cmdData(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and (std.mem.eql(u8, args[0], "--help") or std.mem.eql(u8, args[0], "-h"))) {
+        try data_cmd.printHelp();
+        return;
+    }
+    const options = data_cmd.parseArgs(args);
+    data_cmd.run(allocator, options) catch |err| {
+        if (err != error.NoWorkspace) try printStderr("Error: {}\n", .{err});
+    };
+}
+
+fn cmdConvert(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const options = convert_cmd.parseArgs(args);
+    convert_cmd.run(allocator, options) catch |err| {
+        if (err != error.NoInputFile and err != error.NotDblFile) try printStderr("Error: {}\n", .{err});
+    };
+}
+
+fn cmdGen(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--help")) {
+        try gen_cmd.printHelp();
+        return;
+    }
+    const options = gen_cmd.parseArgs(args);
+    gen_cmd.run(allocator, options) catch |err| {
+        if (err != error.MissingGenerator and err != error.MissingName and
+            err != error.InvalidName and err != error.FileExists and err != error.NameTooLong)
+        {
+            try printStderr("Error: {}\n", .{err});
+        }
+    };
+}
+
 fn printUsage() !void {
-    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_buffer: [8192]u8 = undefined;
     var stdout_file = std.fs.File.stdout();
     var stdout_writer = stdout_file.writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
+    // Header
     try stdout.writeAll(
         \\Cot - A modern systems language for business applications
         \\ISAM database, TUI interfaces, and full-stack development
         \\
         \\Usage:
-        \\  cot <file.cot>              Run a Cot program (interpreter)
-        \\  cot run <file|project>      Run a program or workspace project
-        \\  cot trace <file>            Run with execution tracing
-        \\  cot debug <file>            Interactive debugger
-        \\  cot validate <file.cbo>     Validate bytecode integrity
-        \\  cot compile <file.cot>      Compile to bytecode (.cbo)
-        \\  cot disasm <file.cot|.cbo>  Disassemble to readable output
-        \\  cot dump-ir <file.cot>      Dump IR for debugging
-        \\  cot repl                    Start interactive REPL
-        \\  cot --help                  Show this help message
-        \\  cot --version               Show version information
+        \\  cot <file.cot>              Run a Cot program directly
+        \\  cot <command> [args]        Run a command
+        \\  cot --help                  Show this help
+        \\  cot --version               Show version
         \\
-        \\Workspace Commands:
-        \\  cot init [name]             Initialize a new workspace
-        \\  cot new <name>              Create a new app or package
-        \\  cot build [project]         Build workspace projects
-        \\  cot run [project]           Run a workspace project
-        \\  cot dev                     Start development server
-        \\  cot schema <subcommand>     Manage database schema
-        \\  cot data <subcommand>       Load/unload fixed-width data
-        \\  cot convert <file.dbl>      Convert DBL to Cot syntax
         \\
-        \\Compile Options:
-        \\  -o <file>                   Output file (default: <input>.cbo)
+    );
+
+    // Generate command list by category
+    try stdout.writeAll("Commands:\n");
+    try printCommandCategory(stdout, .core);
+
+    try stdout.writeAll("\nWorkspace Commands:\n");
+    try printCommandCategory(stdout, .workspace);
+
+    try stdout.writeAll("\nDebug Commands:\n");
+    try printCommandCategory(stdout, .debug);
+
+    // Additional info
+    try stdout.writeAll(
         \\
-        \\File Extensions:
-        \\  .cot                        Cot source (modern syntax)
-        \\  .cbo                        Compiled bytecode object
-        \\  .clb                        Compiled library
-        \\  .cbr                        Compiled runnable (main entry)
-        \\
-        \\Note: For DBL syntax (.dbl files), use the cot-dbl frontend.
-        \\
-        \\Trace Options:
-        \\  --level=routines            Trace routine calls only
-        \\  --level=opcodes             Trace each opcode (default)
-        \\  --level=verbose             Include register state
-        \\
-        \\Runtime Options:
-        \\  --runtime=zig               Use built-in Zig VM (default)
-        \\  --runtime=rs                Use Rust runtime (cot-rs)
+        \\Options:
+        \\  compile -o <file>           Output file (default: <input>.cbo)
+        \\  trace --level=<level>       none, routines, opcodes, verbose, full
+        \\  run --runtime=<rt>          zig (default), rs (Rust runtime)
         \\
         \\Examples:
-        \\  cot hello.cot               Run hello.cot with interpreter
-        \\  cot compile hello.cot       Compile to hello.cbo
-        \\  cot run bin/hello.cbo       Run compiled bytecode
-        \\  cot run hello.cbo --runtime=rs  Run with Rust runtime
-        \\  cot trace hello.cot         Run with execution trace
-        \\  cot init my-company         Create a workspace
-        \\  cot new inventory           Create an app
-        \\  cot build                   Build all projects
-        \\  cot run inventory           Run an app
-        \\  cot dev                     Start dev server on :3000
+        \\  cot hello.cot               Run a program
+        \\  cot compile hello.cot       Compile to bytecode
+        \\  cot fmt src/*.cot           Format source files
+        \\  cot trace hello.cot         Run with tracing
+        \\  cot init my-project         Create a workspace
         \\
     );
     try stdout.flush();
+}
+
+fn printCommandCategory(stdout: anytype, category: Command.Category) !void {
+    for (commands) |cmd| {
+        if (cmd.category == category) {
+            // Format: "  cot name usage          description"
+            try stdout.print("  cot {s}", .{cmd.name});
+
+            // Add usage if present
+            if (cmd.usage.len > 0) {
+                try stdout.print(" {s}", .{cmd.usage});
+            }
+
+            // Calculate padding for alignment (target column 30)
+            const name_len = cmd.name.len + cmd.usage.len + (if (cmd.usage.len > 0) @as(usize, 1) else 0);
+            const padding = if (name_len < 24) 24 - name_len else 2;
+            var i: usize = 0;
+            while (i < padding) : (i += 1) {
+                try stdout.writeAll(" ");
+            }
+
+            try stdout.print("{s}\n", .{cmd.description});
+        }
+    }
 }
 
 fn printVersion() !void {
@@ -806,13 +885,26 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
     defer emitter.deinit();
 
     var mod = emitter.emit(ir_module) catch |err| {
-        collector.addError(
-            .E300_undefined_label,
-            filename,
-            diagnostics.SourceRange.none,
-            "Bytecode emission error: {}",
-            .{err},
-        );
+        if (emitter.getLastError()) |ctx| {
+            collector.addError(
+                .E300_undefined_label,
+                filename,
+                diagnostics.SourceRange.none,
+                "{s}",
+                .{ctx.message},
+            );
+            if (ctx.detail.len > 0) {
+                try printStderr("  Note: {s}\n", .{ctx.detail});
+            }
+        } else {
+            collector.addError(
+                .E300_undefined_label,
+                filename,
+                diagnostics.SourceRange.none,
+                "Bytecode emission error: {}",
+                .{err},
+            );
+        }
         formatter.printToStderr(&collector, .{ .use_color = true });
         return error.CompilationFailed;
     };
@@ -1189,6 +1281,146 @@ fn debugFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     }
 }
 
+/// Format source files (cot fmt)
+fn formatCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const formatter = cot.formatter;
+
+    // Parse options
+    var check_only = false;
+    var stdin_mode = false;
+    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer files.deinit(allocator);
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--check")) {
+            check_only = true;
+        } else if (std.mem.eql(u8, arg, "--stdin")) {
+            stdin_mode = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printFmtHelp();
+            return;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            try files.append(allocator, arg);
+        }
+    }
+
+    // Handle stdin mode
+    if (stdin_mode) {
+        const stdin = std.fs.File.stdin();
+        const source = try stdin.readToEndAlloc(allocator, 10 * 1024 * 1024); // 10MB max
+        defer allocator.free(source);
+
+        // Default to .cot for stdin
+        const result = try formatter.format(allocator, source, .cot, .{});
+        if (result) |formatted| {
+            defer allocator.free(formatted);
+            const stdout = std.fs.File.stdout();
+            _ = try stdout.write(formatted);
+        } else {
+            const stdout = std.fs.File.stdout();
+            _ = try stdout.write(source);
+        }
+        return;
+    }
+
+    // Need files to format
+    if (files.items.len == 0) {
+        try printErr("Error: No files specified\n");
+        try printErr("Usage: cot fmt <files...> [--check]\n");
+        return;
+    }
+
+    var any_changed = false;
+    var any_error = false;
+
+    for (files.items) |filepath| {
+        // Detect language from extension
+        const language = formatter.Language.fromPath(filepath) orelse {
+            try printStderr("Warning: Skipping '{s}' (unknown file type)\n", .{filepath});
+            continue;
+        };
+
+        // Read file
+        const file = std.fs.cwd().openFile(filepath, .{}) catch |err| {
+            try printStderr("Error: Could not open '{s}': {}\n", .{ filepath, err });
+            any_error = true;
+            continue;
+        };
+        defer file.close();
+
+        const source = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
+            try printStderr("Error: Could not read '{s}': {}\n", .{ filepath, err });
+            any_error = true;
+            continue;
+        };
+        defer allocator.free(source);
+
+        // Format
+        const result = formatter.format(allocator, source, language, .{}) catch |err| {
+            try printStderr("Error: Format failed for '{s}': {}\n", .{ filepath, err });
+            any_error = true;
+            continue;
+        };
+
+        if (result) |formatted| {
+            defer allocator.free(formatted);
+            any_changed = true;
+
+            if (check_only) {
+                try printStdout("{s}\n", .{filepath});
+            } else {
+                // Write formatted content back
+                const out_file = std.fs.cwd().createFile(filepath, .{}) catch |err| {
+                    try printStderr("Error: Could not write '{s}': {}\n", .{ filepath, err });
+                    any_error = true;
+                    continue;
+                };
+                defer out_file.close();
+                _ = out_file.write(formatted) catch |err| {
+                    try printStderr("Error: Write failed for '{s}': {}\n", .{ filepath, err });
+                    any_error = true;
+                    continue;
+                };
+            }
+        }
+    }
+
+    if (check_only and any_changed) {
+        std.process.exit(1);
+    }
+    if (any_error) {
+        std.process.exit(1);
+    }
+}
+
+fn printFmtHelp() !void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file = std.fs.File.stdout();
+    var stdout_writer = stdout_file.writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    try stdout.writeAll(
+        \\cot fmt - Format Cot and DBL source files
+        \\
+        \\Usage:
+        \\  cot fmt <files...>      Format files in place
+        \\  cot fmt --check <files> Check if files need formatting
+        \\  cot fmt --stdin         Format stdin to stdout
+        \\
+        \\Options:
+        \\  --check                 Check only, don't write (exit 1 if changes needed)
+        \\  --stdin                 Read from stdin, write to stdout
+        \\  --help, -h              Show this help
+        \\
+        \\Examples:
+        \\  cot fmt src/*.cot       Format all Cot files in src/
+        \\  cot fmt --check .       Check all files (for CI)
+        \\  cat file.cot | cot fmt --stdin > formatted.cot
+        \\
+    );
+    try stdout.flush();
+}
+
 fn validateBytecode(allocator: std.mem.Allocator, filename: []const u8, strict: bool) !void {
     // Open and read bytecode file
     const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
@@ -1394,17 +1626,31 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     };
     defer allocator.free(processed_stmts);
 
-    // Lower AST to IR using NodeStore directly
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
-        collector.addError(
-            .E300_undefined_label,
-            filename,
-            diagnostics.SourceRange.none,
-            "IR lowering error: {}",
-            .{err},
-        );
-        formatter.printToStderr(&collector, .{ .use_color = true });
-        return error.CompilationFailed;
+    // Lower AST to IR using NodeStore directly (with details for better error messages)
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                collector.addError(
+                    .E300_undefined_label,
+                    filename,
+                    diagnostics.SourceRange.fromLoc(detail.line, detail.column),
+                    "{s}",
+                    .{detail.message},
+                );
+            } else {
+                collector.addError(
+                    .E300_undefined_label,
+                    filename,
+                    diagnostics.SourceRange.none,
+                    "IR lowering error: {}",
+                    .{e.kind},
+                );
+            }
+            formatter.printToStderr(&collector, .{ .use_color = true });
+            return error.CompilationFailed;
+        },
     };
     // No defer ir_module.deinit() needed - arena handles cleanup
 
@@ -1427,13 +1673,26 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     // No defer emitter.deinit() needed - arena handles cleanup
 
     var mod = emitter.emit(ir_module) catch |err| {
-        collector.addError(
-            .E300_undefined_label,
-            filename,
-            diagnostics.SourceRange.none,
-            "Bytecode emission error: {}",
-            .{err},
-        );
+        if (emitter.getLastError()) |ctx| {
+            collector.addError(
+                .E300_undefined_label,
+                filename,
+                diagnostics.SourceRange.none,
+                "{s}",
+                .{ctx.message},
+            );
+            if (ctx.detail.len > 0) {
+                try printStderr("  Note: {s}\n", .{ctx.detail});
+            }
+        } else {
+            collector.addError(
+                .E300_undefined_label,
+                filename,
+                diagnostics.SourceRange.none,
+                "Bytecode emission error: {}",
+                .{err},
+            );
+        }
         formatter.printToStderr(&collector, .{ .use_color = true });
         return error.CompilationFailed;
     };
@@ -1868,7 +2127,14 @@ fn disasmFile(backing_allocator: std.mem.Allocator, filename: []const u8) !void 
         var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
 
         mod = emitter.emit(ir_module) catch |err| {
-            try printStderr("Bytecode emission error: {}\n", .{err});
+            if (emitter.getLastError()) |ctx| {
+                try printStderr("Error: {s}\n", .{ctx.message});
+                if (ctx.detail.len > 0) {
+                    try printStderr("  Note: {s}\n", .{ctx.detail});
+                }
+            } else {
+                try printStderr("Bytecode emission error: {}\n", .{err});
+            }
             return;
         };
     }

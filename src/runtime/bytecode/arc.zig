@@ -44,7 +44,8 @@ const std = @import("std");
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const Tag = value_mod.Tag;
-const Decimal = value_mod.Decimal;
+const ImpliedDecimal = value_mod.ImpliedDecimal;
+const FixedDecimal = value_mod.FixedDecimal;
 const BoxedInt = value_mod.BoxedInt;
 const StringRef = value_mod.StringRef;
 const FixedStringRef = value_mod.FixedStringRef;
@@ -302,7 +303,7 @@ pub fn getHeapPtr(value: Value) ?*anyopaque {
             const ptr = value.bits & Value.PTR_MASK;
             break :blk if (ptr != 0) @ptrFromInt(ptr) else null;
         },
-        .decimal => blk: {
+        .implied_decimal, .fixed_decimal => blk: {
             const ptr = value.bits & Value.PTR_MASK;
             break :blk if (ptr != 0) @ptrFromInt(ptr) else null;
         },
@@ -351,8 +352,12 @@ fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void 
             freeWithHeader(ptr, @sizeOf(FixedStringRef), allocator);
         },
 
-        .decimal => {
-            freeWithHeader(ptr, @sizeOf(Decimal), allocator);
+        .implied_decimal => {
+            freeWithHeader(ptr, @sizeOf(ImpliedDecimal), allocator);
+        },
+
+        .fixed_decimal => {
+            freeWithHeader(ptr, @sizeOf(FixedDecimal), allocator);
         },
 
         .record_ref => {
@@ -424,8 +429,12 @@ pub fn freeObjectForced(value: Value, ptr: *anyopaque, allocator: std.mem.Alloca
             freeWithHeader(ptr, @sizeOf(FixedStringRef), allocator);
         },
 
-        .decimal => {
-            freeWithHeader(ptr, @sizeOf(Decimal), allocator);
+        .implied_decimal => {
+            freeWithHeader(ptr, @sizeOf(ImpliedDecimal), allocator);
+        },
+
+        .fixed_decimal => {
+            freeWithHeader(ptr, @sizeOf(FixedDecimal), allocator);
         },
 
         .record_ref => {
@@ -705,7 +714,7 @@ test "retain increments refcount" {
     const allocator = std.testing.allocator;
 
     // Create a decimal value using ARC allocation
-    const dec_ptr = try create(allocator, Decimal);
+    const dec_ptr = try create(allocator, ImpliedDecimal);
     dec_ptr.* = .{ .value = 12345, .precision = 2 };
 
     // Manually construct value with decimal tag
@@ -732,7 +741,7 @@ test "release decrements refcount and frees at zero" {
     const allocator = std.testing.allocator;
 
     // Create a decimal value with ARC header
-    const dec_ptr = try create(allocator, Decimal);
+    const dec_ptr = try create(allocator, ImpliedDecimal);
     dec_ptr.* = .{ .value = 99999, .precision = 4 };
 
     // TAG_DECIMAL = 0x7FFF_8000_0000_0000
@@ -770,7 +779,7 @@ test "needsArc returns correct values" {
     try std.testing.expect(!needsArc(Value.initInt(42)));
 
     // Heap types need ARC
-    const dec_ptr = try create(allocator, Decimal);
+    const dec_ptr = try create(allocator, ImpliedDecimal);
     dec_ptr.* = .{ .value = 100, .precision = 2 };
     // TAG_DECIMAL = 0x7FFF_8000_0000_0000
     const dec_value = Value{ .bits = 0x7FFF_8000_0000_0000 | @intFromPtr(dec_ptr) };
@@ -788,7 +797,7 @@ test "WeakRegistry basic operations" {
     defer registry.deinit();
 
     // Create a target value
-    const dec_ptr = try create(allocator, Decimal);
+    const dec_ptr = try create(allocator, ImpliedDecimal);
     dec_ptr.* = .{ .value = 42, .precision = 2 };
     const target = Value{ .bits = 0x7FFF_8000_0000_0000 | @intFromPtr(dec_ptr) };
 
@@ -824,7 +833,7 @@ test "WeakRegistry multiple weak refs to same target" {
     defer registry.deinit();
 
     // Create a target value
-    const dec_ptr = try create(allocator, Decimal);
+    const dec_ptr = try create(allocator, ImpliedDecimal);
     dec_ptr.* = .{ .value = 100, .precision = 0 };
     const target = Value{ .bits = 0x7FFF_8000_0000_0000 | @intFromPtr(dec_ptr) };
 
@@ -865,7 +874,7 @@ test "WeakRegistry unregister" {
     defer registry.deinit();
 
     // Create a target value
-    const dec_ptr = try create(allocator, Decimal);
+    const dec_ptr = try create(allocator, ImpliedDecimal);
     dec_ptr.* = .{ .value = 50, .precision = 1 };
     const target = Value{ .bits = 0x7FFF_8000_0000_0000 | @intFromPtr(dec_ptr) };
 
@@ -893,7 +902,7 @@ test "releaseWithWeakSupport invalidates weak refs" {
     defer registry.deinit();
 
     // Create a target value
-    const dec_ptr = try create(allocator, Decimal);
+    const dec_ptr = try create(allocator, ImpliedDecimal);
     dec_ptr.* = .{ .value = 999, .precision = 3 };
     const target = Value{ .bits = 0x7FFF_8000_0000_0000 | @intFromPtr(dec_ptr) };
 

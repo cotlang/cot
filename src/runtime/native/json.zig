@@ -82,7 +82,7 @@ fn json_stringify_impl(allocator: std.mem.Allocator, val: Value) NativeError!?Va
             const dup = allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
             return Value.initString(allocator, dup) catch return NativeError.OutOfMemory;
         },
-        .decimal => {
+        .implied_decimal => {
             if (val.asDecimal()) |d| {
                 const scale: f64 = @floatFromInt(std.math.powi(u64, 10, @intCast(d.precision)) catch 1);
                 const f: f64 = @as(f64, @floatFromInt(d.value)) / scale;

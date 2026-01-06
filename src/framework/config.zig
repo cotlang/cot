@@ -46,6 +46,28 @@ pub const SchemaConfig = struct {
     }
 };
 
+/// Dex (real-time UI) configuration
+pub const DexConfig = struct {
+    /// Enable Dex for this app
+    enabled: bool = false,
+    /// Directory containing .dex component files
+    components_dir: []const u8 = "components",
+    /// Directory containing layout templates
+    layouts_dir: []const u8 = "layouts",
+    /// Directory for static assets (CSS, images, etc.)
+    assets_dir: []const u8 = "assets",
+    /// HTTP server port for development
+    port: u16 = 4000,
+    /// Enable hot reload in development
+    hot_reload: bool = true,
+
+    pub fn deinit(self: *DexConfig, allocator: Allocator) void {
+        allocator.free(self.components_dir);
+        allocator.free(self.layouts_dir);
+        allocator.free(self.assets_dir);
+    }
+};
+
 /// App or package configuration
 pub const ProjectConfig = struct {
     name: []const u8,
@@ -61,6 +83,9 @@ pub const ProjectConfig = struct {
 
     // Schema repository configuration
     schema: ?SchemaConfig = null,
+
+    // Dex (real-time UI) configuration
+    dex: ?DexConfig = null,
 
     // Convention directories
     screens_dir: []const u8,
@@ -118,6 +143,12 @@ pub const ProjectConfig = struct {
         if (self.schema) |*s| {
             var schema_cfg = s.*;
             schema_cfg.deinit(self.allocator);
+        }
+
+        // Clean up dex config if present
+        if (self.dex) |*d| {
+            var dex_cfg = d.*;
+            dex_cfg.deinit(self.allocator);
         }
 
         var it = self.dependencies.iterator();
@@ -415,6 +446,61 @@ pub const ConfigLoader = struct {
             }
         }
 
+        // Optional: dex (real-time UI) config
+        if (root.object.get("dex")) |dex_val| {
+            if (dex_val == .object) {
+                var dex_config = DexConfig{
+                    .enabled = true,
+                    .components_dir = try self.allocator.dupe(u8, "components"),
+                    .layouts_dir = try self.allocator.dupe(u8, "layouts"),
+                    .assets_dir = try self.allocator.dupe(u8, "assets"),
+                    .port = 4000,
+                    .hot_reload = true,
+                };
+
+                if (dex_val.object.get("enabled")) |enabled_val| {
+                    if (enabled_val == .bool) {
+                        dex_config.enabled = enabled_val.bool;
+                    }
+                }
+
+                if (dex_val.object.get("components")) |comp_val| {
+                    if (comp_val == .string) {
+                        self.allocator.free(dex_config.components_dir);
+                        dex_config.components_dir = try self.allocator.dupe(u8, comp_val.string);
+                    }
+                }
+
+                if (dex_val.object.get("layouts")) |layouts_val| {
+                    if (layouts_val == .string) {
+                        self.allocator.free(dex_config.layouts_dir);
+                        dex_config.layouts_dir = try self.allocator.dupe(u8, layouts_val.string);
+                    }
+                }
+
+                if (dex_val.object.get("assets")) |assets_val| {
+                    if (assets_val == .string) {
+                        self.allocator.free(dex_config.assets_dir);
+                        dex_config.assets_dir = try self.allocator.dupe(u8, assets_val.string);
+                    }
+                }
+
+                if (dex_val.object.get("port")) |port_val| {
+                    if (port_val == .integer) {
+                        dex_config.port = @intCast(port_val.integer);
+                    }
+                }
+
+                if (dex_val.object.get("hotReload")) |hr_val| {
+                    if (hr_val == .bool) {
+                        dex_config.hot_reload = hr_val.bool;
+                    }
+                }
+
+                config.dex = dex_config;
+            }
+        }
+
         return config;
     }
 
@@ -563,6 +649,37 @@ pub fn writeAppConfigWithMain(file: std.fs.File, name: []const u8, main_file: []
     try buffered.interface.flush();
 }
 
+/// Write a cot.json for a Dex-enabled app
+pub fn writeDexAppConfig(file: std.fs.File, name: []const u8) !void {
+    var write_buffer: [4096]u8 = undefined;
+    var buffered = file.writer(&write_buffer);
+    const writer = &buffered.interface;
+
+    try writer.print(
+        \\{{
+        \\  "name": "{s}",
+        \\  "version": "1.0.0",
+        \\  "type": "app",
+        \\  "main": "main.cot",
+        \\  "dependencies": {{}},
+        \\  "dex": {{
+        \\    "enabled": true,
+        \\    "components": "components",
+        \\    "layouts": "layouts",
+        \\    "assets": "assets",
+        \\    "port": 4000,
+        \\    "hotReload": true
+        \\  }},
+        \\  "build": {{
+        \\    "output": "bin",
+        \\    "target": "bytecode"
+        \\  }}
+        \\}}
+        \\
+    , .{name});
+    try buffered.interface.flush();
+}
+
 /// Write a default cot.json for a library to a file
 pub fn writeLibraryConfig(file: std.fs.File, name: []const u8) !void {
     var write_buffer: [4096]u8 = undefined;
@@ -686,4 +803,31 @@ test "parse schema config" {
     try std.testing.expectEqualStrings("db/schema.cot", config.schema.?.file);
     try std.testing.expect(config.schema.?.auto_migrate);
     try std.testing.expectEqualStrings("postgres", config.schema.?.backend);
+}
+
+test "parse dex config" {
+    const allocator = std.testing.allocator;
+    var loader = ConfigLoader.init(allocator);
+
+    const content =
+        \\{
+        \\  "name": "my-dashboard",
+        \\  "type": "app",
+        \\  "dex": {
+        \\    "enabled": true,
+        \\    "components": "live",
+        \\    "layouts": "templates",
+        \\    "port": 3000
+        \\  }
+        \\}
+    ;
+
+    var config = try loader.parse(content);
+    defer config.deinit();
+
+    try std.testing.expect(config.dex != null);
+    try std.testing.expect(config.dex.?.enabled);
+    try std.testing.expectEqualStrings("live", config.dex.?.components_dir);
+    try std.testing.expectEqualStrings("templates", config.dex.?.layouts_dir);
+    try std.testing.expectEqual(@as(u16, 3000), config.dex.?.port);
 }

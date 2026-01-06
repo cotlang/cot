@@ -430,6 +430,104 @@ cases = [
 
 # -----------------------------------------------------------------------------
 
+[functions.len]
+namespace = "std.string"
+description = "Get length of string or collection"
+since = "1.0.0"
+prelude = true
+opcode_builtin = true
+
+[functions.len.signature]
+params = [
+    { name = "value", type = "any" }
+]
+returns = "i64"
+
+[functions.len.behavior]
+pure = true
+throws = false
+
+[functions.len.tests]
+cases = [
+    { args = ["hello"], expect = 5 },
+    { args = [""], expect = 0 },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.size]
+namespace = "std.string"
+description = "Get size of value (alias for len)"
+since = "1.0.0"
+prelude = true
+opcode_builtin = true
+
+[functions.size.signature]
+params = [
+    { name = "value", type = "any" }
+]
+returns = "i64"
+
+[functions.size.behavior]
+pure = true
+throws = false
+
+[functions.size.tests]
+cases = [
+    { args = ["hello"], expect = 5 },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.trim]
+namespace = "std.string"
+description = "Remove leading and trailing whitespace"
+since = "1.0.0"
+prelude = true
+opcode_builtin = true
+
+[functions.trim.signature]
+params = [
+    { name = "s", type = "string" }
+]
+returns = "alpha"
+
+[functions.trim.behavior]
+pure = true
+throws = false
+
+[functions.trim.tests]
+cases = [
+    { args = ["  hello  "], expect = "hello" },
+    { args = ["hello"], expect = "hello" },
+]
+
+# -----------------------------------------------------------------------------
+
+[functions.atrim]
+namespace = "std.string"
+description = "Remove leading and trailing whitespace (alias for trim)"
+since = "1.0.0"
+prelude = true
+opcode_builtin = true
+
+[functions.atrim.signature]
+params = [
+    { name = "s", type = "string" }
+]
+returns = "alpha"
+
+[functions.atrim.behavior]
+pure = true
+throws = false
+
+[functions.atrim.tests]
+cases = [
+    { args = ["  hello  "], expect = "hello" },
+]
+
+# -----------------------------------------------------------------------------
+
 [functions.ltrim]
 namespace = "std.string"
 description = "Remove leading whitespace"
@@ -840,6 +938,8 @@ cases = [
 namespace = "std.time"
 description = "Get current date as YYYYMMDD integer"
 since = "1.0.0"
+prelude = true
+opcode_builtin = true
 
 [functions.date.signature]
 params = []
@@ -855,12 +955,31 @@ throws = false
 namespace = "std.time"
 description = "Get current time as HHMMSS integer"
 since = "1.0.0"
+prelude = true
+opcode_builtin = true
 
 [functions.time.signature]
 params = []
 returns = "i64"
 
 [functions.time.behavior]
+pure = false
+throws = false
+
+# -----------------------------------------------------------------------------
+
+[functions.datetime]
+namespace = "std.time"
+description = "Get current datetime as YYYYMMDDHHMMSSUUUUUU (20-digit string with microseconds)"
+since = "1.0.0"
+prelude = true
+opcode_builtin = true
+
+[functions.datetime.signature]
+params = []
+returns = "string"
+
+[functions.datetime.behavior]
 pure = false
 throws = false
 
@@ -1330,6 +1449,183 @@ cases = [
     { args = ["414243"], expect = "ABC" },
     { args = ["invalid"], expect = "" }
 ]
+
+# =============================================================================
+# std.sql - Database Functions
+# Unified SQL interface supporting SQLite, PostgreSQL, and other backends
+# =============================================================================
+
+[functions.sql_open]
+namespace = "std.sql"
+description = "Open database connection. URL format: sqlite:path, sqlite::memory:, postgres://user:pass@host/db"
+since = "1.1.0"
+
+[functions.sql_open.signature]
+params = [
+    { name = "url", type = "string" }
+]
+returns = "handle"
+
+[functions.sql_open.behavior]
+pure = false
+throws = true
+errors = ["ConnectionFailed", "InvalidUrl", "AuthFailed"]
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_close]
+namespace = "std.sql"
+description = "Close database connection or result set"
+since = "1.1.0"
+
+[functions.sql_close.signature]
+params = [
+    { name = "handle", type = "handle" }
+]
+returns = "void"
+
+[functions.sql_close.behavior]
+pure = false
+throws = false
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_exec]
+namespace = "std.sql"
+description = "Execute SQL statement (INSERT, UPDATE, DELETE, CREATE, etc.). Returns rows affected"
+since = "1.1.0"
+
+[functions.sql_exec.signature]
+params = [
+    { name = "db", type = "handle" },
+    { name = "sql", type = "string" },
+    { name = "params", type = "variadic", element_type = "any", optional = true }
+]
+returns = "i64"
+
+[functions.sql_exec.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "SqlError", "ConstraintViolation"]
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_query]
+namespace = "std.sql"
+description = "Execute SELECT query and return result set handle for iteration"
+since = "1.1.0"
+
+[functions.sql_query.signature]
+params = [
+    { name = "db", type = "handle" },
+    { name = "sql", type = "string" },
+    { name = "params", type = "variadic", element_type = "any", optional = true }
+]
+returns = "handle"
+
+[functions.sql_query.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "SqlError"]
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_fetch]
+namespace = "std.sql"
+description = "Fetch next row from result set as JSON object string. Returns empty string at end"
+since = "1.1.0"
+
+[functions.sql_fetch.signature]
+params = [
+    { name = "result", type = "handle" }
+]
+returns = "string"
+
+[functions.sql_fetch.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle"]
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_fetch_all]
+namespace = "std.sql"
+description = "Fetch all remaining rows as JSON array string"
+since = "1.1.0"
+
+[functions.sql_fetch_all.signature]
+params = [
+    { name = "result", type = "handle" }
+]
+returns = "string"
+
+[functions.sql_fetch_all.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle"]
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_begin]
+namespace = "std.sql"
+description = "Begin transaction"
+since = "1.1.0"
+
+[functions.sql_begin.signature]
+params = [
+    { name = "db", type = "handle" }
+]
+returns = "void"
+
+[functions.sql_begin.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "TransactionError"]
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_commit]
+namespace = "std.sql"
+description = "Commit transaction"
+since = "1.1.0"
+
+[functions.sql_commit.signature]
+params = [
+    { name = "db", type = "handle" }
+]
+returns = "void"
+
+[functions.sql_commit.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "TransactionError"]
+io = "database"
+
+# -----------------------------------------------------------------------------
+
+[functions.sql_rollback]
+namespace = "std.sql"
+description = "Rollback transaction"
+since = "1.1.0"
+
+[functions.sql_rollback.signature]
+params = [
+    { name = "db", type = "handle" }
+]
+returns = "void"
+
+[functions.sql_rollback.behavior]
+pure = false
+throws = true
+errors = ["InvalidHandle", "TransactionError"]
+io = "database"
 
 # =============================================================================
 # DBL Compatibility Aliases

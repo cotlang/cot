@@ -84,7 +84,7 @@ pub const rules: [TOKEN_COUNT]ParseRule = init: {
     r[@intFromEnum(TokenType.identifier)] = .{ .prefix = null, .precedence = .none };
     r[@intFromEnum(TokenType.kw_true)] = .{ .prefix = null, .precedence = .none };
     r[@intFromEnum(TokenType.kw_false)] = .{ .prefix = null, .precedence = .none };
-    r[@intFromEnum(TokenType.kw_nil)] = .{ .prefix = null, .precedence = .none };
+    r[@intFromEnum(TokenType.kw_null)] = .{ .prefix = null, .precedence = .none };
     r[@intFromEnum(TokenType.kw_self)] = .{ .prefix = null, .precedence = .none };
 
     // Grouping and collections
@@ -204,7 +204,7 @@ pub fn canStartExpression(token_type: TokenType) bool {
         .identifier,
         .kw_true,
         .kw_false,
-        .kw_nil,
+        .kw_null,
         .kw_self,
         => true,
 

@@ -1058,6 +1058,214 @@ pub fn op_str_concat(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
+/// str_len rd, rs - rd = len(rs)
+/// Returns the length of the string in rs
+/// Format: [rd:4|rs:4] [0]
+pub fn op_str_len(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+
+    // Get string from register, coerce to string if needed
+    var buf: [32]u8 = undefined;
+    const s = vm.valueToStringSlice(vm.registers[rs], &buf);
+
+    // Store length as integer
+    vm.writeRegister(rd, Value.initInt(@intCast(s.len)));
+    return .continue_dispatch;
+}
+
+/// str_trim rd, rs - rd = trim(rs)
+/// Trims whitespace from both ends of the string in rs
+/// Format: [rd:4|rs:4] [0]
+pub fn op_str_trim(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+
+    // Get string from register
+    var buf: [32]u8 = undefined;
+    const s = vm.valueToStringSlice(vm.registers[rs], &buf);
+
+    // Trim whitespace
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+
+    // Allocate and copy result
+    const result = vm.allocator.alloc(u8, trimmed.len) catch return VMError.OutOfMemory;
+    @memcpy(result, trimmed);
+
+    // Store result as string value
+    vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
+    return .continue_dispatch;
+}
+
+/// fn_size rd, rs - rd = size(rs)
+/// Returns the size/length of the value (string length, array length, etc.)
+/// Format: [rd:4|rs:4] [0]
+pub fn op_fn_size(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+
+    // Get string from register, coerce to string if needed
+    var buf: [32]u8 = undefined;
+    const s = vm.valueToStringSlice(vm.registers[rs], &buf);
+
+    // Store length as integer
+    vm.writeRegister(rd, Value.initInt(@intCast(s.len)));
+    return .continue_dispatch;
+}
+
+/// fn_date rd - rd = current date as YYYYMMDD integer
+/// High-performance opcode for date() builtin
+/// Format: [rd:4|0:4] [0]
+pub fn op_fn_date(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+
+    const now = std.time.timestamp();
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    const year: i64 = year_day.year;
+    const month: i64 = @intFromEnum(month_day.month);
+    const day_num: i64 = month_day.day_index + 1;
+
+    const result = year * 10000 + month * 100 + day_num;
+    vm.writeRegister(rd, Value.initInt(result));
+    return .continue_dispatch;
+}
+
+/// fn_time rd - rd = current time as HHMMSS integer
+/// High-performance opcode for time() builtin
+/// Format: [rd:4|0:4] [0]
+pub fn op_fn_time(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+
+    const now = std.time.timestamp();
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
+    const day_secs = epoch.getDaySeconds();
+
+    const hours: i64 = day_secs.getHoursIntoDay();
+    const mins: i64 = day_secs.getMinutesIntoHour();
+    const secs: i64 = day_secs.getSecondsIntoMinute();
+
+    const result = hours * 10000 + mins * 100 + secs;
+    vm.writeRegister(rd, Value.initInt(result));
+    return .continue_dispatch;
+}
+
+/// fn_datetime rd - rd = current datetime as YYYYMMDDHHMMSSUUUUUU (20-digit string)
+/// High-performance opcode for datetime() builtin
+/// Returns microsecond-precision timestamp as string for DBL compatibility
+/// (20 digits exceeds i64 max of ~9.2e18, so returned as string)
+/// Format: [rd:4|0:4] [0]
+pub fn op_fn_datetime(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+
+    // Get nanosecond-precision time (nanoTimestamp returns i128)
+    const nanos: i128 = std.time.nanoTimestamp();
+    const secs: i64 = @intCast(@divFloor(nanos, std.time.ns_per_s));
+    const nanos_rem: i64 = @intCast(@mod(nanos, std.time.ns_per_s));
+    const micros: u32 = @intCast(@divFloor(nanos_rem, 1000)); // Convert to microseconds
+
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch.getDaySeconds();
+
+    const year: u16 = @intCast(year_day.year);
+    const month: u8 = @intFromEnum(month_day.month);
+    const day_num: u8 = month_day.day_index + 1;
+    const hours: u8 = @intCast(day_secs.getHoursIntoDay());
+    const mins: u8 = @intCast(day_secs.getMinutesIntoHour());
+    const seconds: u8 = @intCast(day_secs.getSecondsIntoMinute());
+
+    // Build YYYYMMDDHHMMSSUUUUUU (20 digits) as string
+    var buf: [20]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>6}", .{
+        year, month, day_num, hours, mins, seconds, micros,
+    }) catch return VMError.OutOfMemory;
+
+    // Allocate string for result
+    const result_str = vm.allocator.alloc(u8, 20) catch return VMError.OutOfMemory;
+    @memcpy(result_str, &buf);
+
+    vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result_str) catch return VMError.OutOfMemory);
+    return .continue_dispatch;
+}
+
+/// str_slice rd, rs, start_reg, end_or_len_reg - rd = rs[start..end] or rs[start:len]
+/// Extracts a substring from the source string.
+/// Format: [dest_reg:4|src_reg:4] [start_reg:4|end_or_len_reg:4] [is_length:8]
+/// If is_length=0: end_or_len is end index (exclusive, 0-based) for modern Cot syntax s[start..end]
+/// If is_length=1: end_or_len is length for DBL syntax s(start:len) (1-based, converted internally)
+pub fn op_str_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops1 = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    const is_length = module.code[vm.ip + 2];
+    vm.ip += 3;
+
+    const dest_reg: u4 = @truncate(ops1 >> 4);
+    const src_reg: u4 = @truncate(ops1 & 0xF);
+    const start_reg: u4 = @truncate(ops2 >> 4);
+    const end_or_len_reg: u4 = @truncate(ops2 & 0xF);
+
+    // Get source string
+    const source_val = vm.registers[src_reg];
+    const source = switch (source_val.tag()) {
+        .fixed_string, .string => source_val.asString(),
+        else => "",
+    };
+
+    // Get start and end/length parameters
+    const start_val: i64 = vm.registers[start_reg].asInt();
+    const end_or_len_val: i64 = vm.registers[end_or_len_reg].asInt();
+
+    // Calculate actual start and length based on mode
+    var start: usize = undefined;
+    var length: usize = undefined;
+
+    if (is_length != 0) {
+        // DBL mode: 1-based indexing, (start:length) syntax
+        start = if (start_val > 0) @intCast(start_val - 1) else 0;
+        length = if (end_or_len_val > 0) @intCast(end_or_len_val) else 0;
+    } else {
+        // Modern Cot mode: 0-based indexing, [start..end] syntax (end is exclusive)
+        start = if (start_val >= 0) @intCast(start_val) else 0;
+        const end: usize = if (end_or_len_val >= 0) @intCast(end_or_len_val) else 0;
+        length = if (end > start) end - start else 0;
+    }
+
+    // Bounds checking
+    if (start >= source.len or length == 0) {
+        const empty = vm.allocator.dupe(u8, "") catch return VMError.OutOfMemory;
+        try vm.global_buffers.append(vm.allocator, empty);
+        vm.writeRegister(dest_reg, Value.initString(vm.valueAllocator(), empty) catch return VMError.OutOfMemory);
+        return .continue_dispatch;
+    }
+
+    // Calculate actual extraction length
+    const actual_length = @min(length, source.len - start);
+    const result = vm.allocator.alloc(u8, actual_length) catch return VMError.OutOfMemory;
+    @memcpy(result, source[start..][0..actual_length]);
+
+    try vm.global_buffers.append(vm.allocator, result);
+    vm.writeRegister(dest_reg, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
+    return .continue_dispatch;
+}
+
 /// str_slice_store rd, start_reg, len_reg, val_reg - rd[start:start+len] = val
 /// Writes val into the string buffer at position start for len bytes.
 /// This implements DBL field overlay write-through semantics for records.
@@ -1132,7 +1340,7 @@ pub fn op_format_decimal(vm: *VM, module: *const Module) VMError!DispatchResult 
     const val = vm.registers[rs];
     const int_val: i64 = switch (val.tag()) {
         .integer => val.asInt(),
-        .decimal => blk: {
+        .implied_decimal => blk: {
             if (val.asDecimal()) |dval| {
                 const divisor = std.math.pow(i64, 10, dval.precision);
                 break :blk @divTrunc(dval.value, divisor);
@@ -1983,6 +2191,40 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
     return .continue_dispatch;
 }
 
+/// alloc_buffer slot, size - allocate mutable buffer at local slot
+/// Format: [slot:8] [size:16]
+/// Creates a mutable FixedString filled with spaces
+pub fn op_alloc_buffer(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const slot = module.code[vm.ip];
+    const size = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3;
+
+    // Allocate buffer filled with spaces (standard DBL initialization)
+    const buffer = vm.allocator.alloc(u8, size) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate buffer");
+    };
+    @memset(buffer, ' ');
+
+    // Create mutable FixedString value
+    const val = Value.initFixedString(vm.valueAllocator(), buffer) catch {
+        vm.allocator.free(buffer);
+        return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
+    };
+
+    // Store in local slot
+    const target_slot = vm.fp + slot;
+    if (target_slot >= vm.stack.len) {
+        return vm.fail(VMError.StackOverflow, "Buffer slot out of bounds");
+    }
+
+    // ARC: release old value, store new value
+    arc.release(vm.stack[target_slot], vm.allocator);
+    vm.stack[target_slot] = val;
+    arc.retain(val);
+
+    return .continue_dispatch;
+}
+
 // ============================================================================
 // Map Operations (0xD5-0xDF)
 // ============================================================================
@@ -2320,7 +2562,7 @@ pub fn op_fn_round(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Get numeric value
     const num: f64 = switch (val.tag()) {
         .integer => @floatFromInt(val.asInt()),
-        .decimal => blk: {
+        .implied_decimal => blk: {
             if (val.asDecimal()) |dval| {
                 const divisor: f64 = @floatFromInt(std.math.pow(i64, 10, dval.precision));
                 break :blk @as(f64, @floatFromInt(dval.value)) / divisor;
@@ -2364,7 +2606,7 @@ pub fn op_fn_trunc(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Get numeric value
     const num: f64 = switch (val.tag()) {
         .integer => @floatFromInt(val.asInt()),
-        .decimal => blk: {
+        .implied_decimal => blk: {
             if (val.asDecimal()) |dval| {
                 const divisor: f64 = @floatFromInt(std.math.pow(i64, 10, dval.precision));
                 break :blk @as(f64, @floatFromInt(dval.value)) / divisor;

@@ -537,6 +537,31 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a slice expression: object[start..end]
+    pub fn addSliceExpr(self: *Self, object: ExprIdx, start_expr: ExprIdx, end_expr: ExprIdx, loc: SourceLoc) !ExprIdx {
+        // Store start and end in extra_data
+        const extra_start: ExtraIdx = @enumFromInt(@as(u32, @intCast(self.extra_data.items.len)));
+        try self.extra_data.append(self.allocator, start_expr.toInt());
+        try self.extra_data.append(self.allocator, end_expr.toInt());
+
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
+        try self.expr_tags.append(self.allocator, .slice_expr);
+        try self.expr_locs.append(self.allocator, loc);
+        // a = object, b = extra_data index for [start, end]
+        try self.expr_data.append(self.allocator, .{ .a = object.toInt(), .b = extra_start.toInt() });
+        return idx;
+    }
+
+    /// Get slice expression parts
+    pub fn getSliceExprParts(self: *const Self, expr_idx: ExprIdx) struct { object: ExprIdx, start: ExprIdx, end: ExprIdx } {
+        const data = self.exprData(expr_idx);
+        const object = ExprIdx.fromInt(data.a);
+        const extra_start = data.b;
+        const start = ExprIdx.fromInt(self.extra_data.items[extra_start]);
+        const end = ExprIdx.fromInt(self.extra_data.items[extra_start + 1]);
+        return .{ .object = object, .start = start, .end = end };
+    }
+
     /// Add a type test expression (expr is Type)
     pub fn addIsExpr(self: *Self, expr: ExprIdx, type_idx: TypeIdx, loc: SourceLoc) !ExprIdx {
         const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
@@ -759,6 +784,16 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add a record block (like block but doesn't introduce a new scope - for DBL records)
+    pub fn addRecordBlock(self: *Self, stmts: []const StmtIdx, loc: SourceLoc) !StmtIdx {
+        const span = try self.addStmtSpan(stmts);
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
+        try self.stmt_tags.append(self.allocator, .record_block);
+        try self.stmt_locs.append(self.allocator, loc);
+        try self.stmt_data.append(self.allocator, NodeData.block(span));
+        return idx;
+    }
+
     /// Add an if statement
     pub fn addIfStmt(self: *Self, cond: ExprIdx, then_body: StmtIdx, else_body: StmtIdx, loc: SourceLoc) !StmtIdx {
         // Store else_body in extra_data
@@ -904,6 +939,13 @@ pub const NodeStore = struct {
         try self.type_tags.append(self.allocator, .named);
         try self.type_data.append(self.allocator, NodeData.identifier(name));
         return idx;
+    }
+
+    /// Add a Self type (used for untyped 'self' parameter in methods)
+    /// This creates a named type "Self" which gets resolved during type checking
+    pub fn addSelfType(self: *Self) !TypeIdx {
+        const name = try self.strings.intern("Self");
+        return self.addNamedType(name);
     }
 
     /// Add an array type

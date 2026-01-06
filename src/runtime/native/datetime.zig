@@ -16,8 +16,8 @@ const Value = native.Value;
 /// Register all datetime functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
     // Namespaced names (std.datetime.*)
-    try registry.registerNative("std.datetime.date", date);
-    try registry.registerNative("std.datetime.time", time);
+    try registry.registerNative("std.time.date", date);
+    try registry.registerNative("std.time.time", time);
 
     // Short names (DBL compatibility)
     try registry.registerNative("date", date);

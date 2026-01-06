@@ -85,8 +85,8 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
         },
 
         // Decimal (precision, scale)
-        .decimal => |target_dec| switch (value_deref) {
-            .decimal => |value_dec| blk: {
+        .implied_decimal => |target_dec| switch (value_deref) {
+            .implied_decimal => |value_dec| blk: {
                 if (value_dec.precision <= target_dec.precision and
                     value_dec.scale <= target_dec.scale)
                 {
@@ -94,6 +94,20 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
                 }
                 break :blk .lossy_conversion;
             },
+            .fixed_decimal => .implicit_conversion, // Fixed to implied requires scaling
+            .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64 => .implicit_conversion,
+            else => .incompatible,
+        },
+
+        // Fixed decimal (no decimal point, just width)
+        .fixed_decimal => |target_fixed| switch (value_deref) {
+            .fixed_decimal => |value_fixed| blk: {
+                if (value_fixed.width <= target_fixed.width) {
+                    break :blk .compatible;
+                }
+                break :blk .lossy_conversion;
+            },
+            .implied_decimal => .lossy_conversion, // Implied to fixed loses scale
             .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64 => .implicit_conversion,
             else => .incompatible,
         },
@@ -114,14 +128,14 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             .i8, .i16, .i32 => .compatible,
             .u8, .u16 => .compatible,
             .u32 => .lossy_conversion,
-            .decimal => .lossy_conversion,
+            .implied_decimal, .fixed_decimal => .lossy_conversion,
             else => .incompatible,
         },
         .i64 => switch (value_deref) {
             .i8, .i16, .i32, .i64 => .compatible,
             .u8, .u16, .u32 => .compatible,
             .u64 => .lossy_conversion,
-            .decimal => .lossy_conversion,
+            .implied_decimal, .fixed_decimal => .lossy_conversion,
             else => .incompatible,
         },
 
@@ -172,7 +186,7 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
         .f64 => switch (value_deref) {
             .f32, .f64 => .compatible,
             .i8, .i16, .i32, .u8, .u16, .u32 => .implicit_conversion,
-            .i64, .u64, .decimal => .lossy_conversion,
+            .i64, .u64, .implied_decimal, .fixed_decimal => .lossy_conversion,
             else => .incompatible,
         },
 
@@ -372,9 +386,9 @@ fn getStringLen(ty: Type) u32 {
 
 /// Get the wider numeric type for arithmetic operations
 fn getWiderNumericType(lhs: Type, rhs: Type) Type {
-    // Decimal is widest
-    if (lhs == .decimal) return lhs;
-    if (rhs == .decimal) return rhs;
+    // Decimal is widest (implied_decimal has more precision info)
+    if (lhs == .implied_decimal or lhs == .fixed_decimal) return lhs;
+    if (rhs == .implied_decimal or rhs == .fixed_decimal) return rhs;
 
     // Floats next
     if (lhs == .f64 or rhs == .f64) return .{ .f64 = {} };
@@ -399,7 +413,7 @@ fn getWiderNumericType(lhs: Type, rhs: Type) Type {
 /// Check if a type is numeric
 pub fn isNumeric(ty: Type) bool {
     return switch (ty) {
-        .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .decimal => true,
+        .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .f32, .f64, .implied_decimal, .fixed_decimal => true,
         else => false,
     };
 }
@@ -432,7 +446,8 @@ pub fn typeName(ty: Type) []const u8 {
         .f32 => "f32",
         .f64 => "f64",
         .string => "string",
-        .decimal => "decimal",
+        .implied_decimal => "decimal",
+        .fixed_decimal => "fixed_decimal",
         .ptr => "pointer",
         .optional => "optional",
         .array => "array",
@@ -467,7 +482,8 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         .f32 => writer.writeAll("f32") catch {},
         .f64 => writer.writeAll("f64") catch {},
         .string => writer.writeAll("string") catch {},
-        .decimal => |d| writer.print("decimal({d},{d})", .{ d.precision, d.scale }) catch {},
+        .implied_decimal => |d| writer.print("decimal({d},{d})", .{ d.precision, d.scale }) catch {},
+        .fixed_decimal => |d| writer.print("fixed_decimal({d})", .{d.width}) catch {},
         .ptr => |p| {
             var inner_buf: [64]u8 = undefined;
             const inner = formatType(p.*, &inner_buf);
@@ -500,7 +516,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
 
 // Tests
 test "numeric assignment compatibility" {
-    const dec: Type = .{ .decimal = .{ .precision = 10, .scale = 2 } };
+    const dec: Type = .{ .implied_decimal = .{ .precision = 10, .scale = 2 } };
     const int: Type = .{ .i32 = {} };
 
     // Integer to decimal is implicit conversion
@@ -512,7 +528,7 @@ test "string assignment compatibility" {
     const u8_elem: Type = .{ .u8 = {} };
     const str10: Type = .{ .array = .{ .element = &u8_elem, .length = 10 } };
     const str20: Type = .{ .array = .{ .element = &u8_elem, .length = 20 } };
-    const dec: Type = .{ .decimal = .{ .precision = 4, .scale = 0 } };
+    const dec: Type = .{ .implied_decimal = .{ .precision = 4, .scale = 0 } };
 
     // Shorter string to longer is compatible
     try std.testing.expect(canAssign(str20, str10));
@@ -525,7 +541,7 @@ test "string assignment compatibility" {
 }
 
 test "arithmetic operation types" {
-    const dec: Type = .{ .decimal = .{ .precision = 4, .scale = 0 } };
+    const dec: Type = .{ .implied_decimal = .{ .precision = 4, .scale = 0 } };
     const int: Type = .{ .i32 = {} };
     // Use static u8 type for array element
     const u8_elem: Type = .{ .u8 = {} };

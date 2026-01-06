@@ -391,7 +391,7 @@ pub const Lowerer = struct {
 
     /// Process a statement for type/function definitions, recursively handling blocks.
     /// This is used to find definitions inside namespaces (which are represented as blocks).
-    fn processStatementForDefinitions(self: *Self, stmt_idx: StmtIdx, pass: enum { structs, traits, impls, globals, fn_sigs, fn_bodies, tests }) LowerError!void {
+    fn processStatementForDefinitions(self: *Self, stmt_idx: StmtIdx, pass: enum { struct_names, structs, traits, impls, globals, fn_sigs, fn_bodies, tests }) LowerError!void {
         const tag = self.store.stmtTag(stmt_idx);
 
         // Handle blocks by recursively processing their contents
@@ -409,7 +409,18 @@ pub const Lowerer = struct {
 
         // Process based on the current pass
         switch (pass) {
+            .struct_names => {
+                // First pass: register struct/union/enum names for forward references
+                if (tag == .struct_def) {
+                    try self.registerStructName(stmt_idx);
+                } else if (tag == .union_def) {
+                    try self.registerUnionName(stmt_idx);
+                } else if (tag == .enum_def) {
+                    try self.registerEnumName(stmt_idx);
+                }
+            },
             .structs => {
+                // Second pass: fill in struct/union/enum fields (all names now known)
                 if (tag == .struct_def) {
                     try self.lowerStructDef(stmt_idx);
                 } else if (tag == .union_def) {
@@ -473,7 +484,13 @@ pub const Lowerer = struct {
             }
         }
 
-        // First pass: collect struct, union, and enum definitions (including from namespaces)
+        // First pass: register struct/union/enum NAMES for forward references
+        // This enables self-referential types like: struct Node { next: ?*Node }
+        for (top_level) |stmt_idx| {
+            try self.processStatementForDefinitions(stmt_idx, .struct_names);
+        }
+
+        // Second pass: fill in struct/union/enum FIELDS (all type names now known)
         for (top_level) |stmt_idx| {
             try self.processStatementForDefinitions(stmt_idx, .structs);
         }
@@ -529,6 +546,88 @@ pub const Lowerer = struct {
 
         return self.module;
     }
+
+    // ========================================================================
+    // Forward Declaration Registration (Phase 1)
+    // These functions register type names before processing fields, enabling
+    // self-referential types like: struct Node { next: ?*Node }
+    // ========================================================================
+
+    /// Register a struct name with an empty (forward-declared) type
+    fn registerStructName(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const name_id = data.getName();
+        const name = self.strings.get(name_id);
+        if (name.len == 0) return LowerError.UndefinedType;
+
+        // Skip if already registered (shouldn't happen, but be safe)
+        if (self.struct_types.contains(name)) return;
+
+        // Check if this is a generic struct - skip registration, handle in lowerStructDef
+        const extra_start = data.getParamsStart();
+        const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
+        if (type_param_count > 0) return;
+
+        debug.print(.ir, "Registering struct name (forward): {s}", .{name});
+
+        // Create an empty struct type as a forward declaration
+        const struct_type = try self.allocator.create(ir.StructType);
+        struct_type.* = .{
+            .name = name,
+            .fields = &[_]ir.StructType.Field{}, // Empty for now, filled in lowerStructDef
+            .size = 0,
+            .alignment = 8,
+        };
+
+        try self.struct_types.put(name, struct_type);
+    }
+
+    /// Register a union name with an empty (forward-declared) type
+    fn registerUnionName(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const name_id: StringId = @enumFromInt(data.a);
+        const name = self.strings.get(name_id);
+        if (name.len == 0) return LowerError.UndefinedType;
+
+        // Skip if already registered
+        if (self.union_types.contains(name)) return;
+
+        debug.print(.ir, "Registering union name (forward): {s}", .{name});
+
+        // Create an empty union type as a forward declaration
+        const union_type = try self.allocator.create(ir.UnionType);
+        union_type.* = .{
+            .name = name,
+            .variants = &[_]ir.UnionType.Variant{},
+            .size = 0,
+            .alignment = 8,
+        };
+
+        try self.union_types.put(name, union_type);
+    }
+
+    /// Register an enum name with an empty (forward-declared) type
+    fn registerEnumName(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const name_id = data.getName();
+        const name = self.strings.get(name_id);
+        if (name.len == 0) return LowerError.UndefinedType;
+
+        // Skip if already registered
+        if (self.enum_types.contains(name)) return;
+
+        debug.print(.ir, "Registering enum name (forward): {s}", .{name});
+
+        // Create an empty variant map as a forward declaration
+        // Will be populated by lowerEnumDef
+        const empty_variants = std.StringHashMap(i64).init(self.allocator);
+        try self.enum_types.put(name, empty_variants);
+    }
+
+    // ========================================================================
+    // Type Definition Lowering (Phase 2)
+    // These functions fill in the fields of forward-declared types
+    // ========================================================================
 
     /// Lower a struct definition
     fn lowerStructDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
@@ -596,17 +695,32 @@ pub const Lowerer = struct {
             debug.print(.ir, "  field '{s}': offset={d} size={d}", .{ field_name, current_offset - field_size, field_size });
         }
 
-        const struct_type = try self.allocator.create(ir.StructType);
-        struct_type.* = .{
-            .name = name,
-            .fields = try fields.toOwnedSlice(self.allocator),
-            .size = current_offset, // Total size of all fields
-            .alignment = 8,
-        };
-        debug.print(.ir, "  struct '{s}' total size: {d}", .{ name, current_offset });
+        const owned_fields = try fields.toOwnedSlice(self.allocator);
 
-        try self.module.addStruct(struct_type);
-        try self.struct_types.put(name, struct_type);
+        // Check if we have a forward-declared struct to update in-place
+        // This is critical for self-referential types: fields like ?*Node already
+        // point to the forward-declared struct, so we must update it, not replace it
+        if (self.struct_types.get(name)) |existing_const| {
+            // Cast away const to update in-place (the memory was allocated mutable)
+            const existing: *ir.StructType = @constCast(existing_const);
+            existing.fields = owned_fields;
+            existing.size = current_offset;
+            debug.print(.ir, "  struct '{s}' updated in-place, total size: {d}", .{ name, current_offset });
+            try self.module.addStruct(existing);
+        } else {
+            // No forward declaration - create new struct type
+            const struct_type = try self.allocator.create(ir.StructType);
+            struct_type.* = .{
+                .name = name,
+                .fields = owned_fields,
+                .size = current_offset,
+                .alignment = 8,
+            };
+            debug.print(.ir, "  struct '{s}' total size: {d}", .{ name, current_offset });
+
+            try self.module.addStruct(struct_type);
+            try self.struct_types.put(name, struct_type);
+        }
     }
 
     /// Lower a union definition
@@ -652,17 +766,28 @@ pub const Lowerer = struct {
             debug.print(.ir, "  variant '{s}': size={d}", .{ variant_name, variant_size });
         }
 
-        const union_type = try self.allocator.create(ir.UnionType);
-        union_type.* = .{
-            .name = name,
-            .variants = try variants.toOwnedSlice(self.allocator),
-            .size = max_size,
-            .alignment = max_alignment,
-        };
-        debug.print(.ir, "  union '{s}' total size: {d}", .{ name, max_size });
+        const owned_variants = try variants.toOwnedSlice(self.allocator);
 
-        try self.module.addUnion(union_type);
-        try self.union_types.put(name, union_type);
+        // Check if we have a forward-declared union to update in-place
+        if (self.union_types.get(name)) |existing_const| {
+            const existing: *ir.UnionType = @constCast(existing_const);
+            existing.variants = owned_variants;
+            existing.size = max_size;
+            debug.print(.ir, "  union '{s}' updated in-place, total size: {d}", .{ name, max_size });
+            try self.module.addUnion(existing);
+        } else {
+            const union_type = try self.allocator.create(ir.UnionType);
+            union_type.* = .{
+                .name = name,
+                .variants = owned_variants,
+                .size = max_size,
+                .alignment = max_alignment,
+            };
+            debug.print(.ir, "  union '{s}' total size: {d}", .{ name, max_size });
+
+            try self.module.addUnion(union_type);
+            try self.union_types.put(name, union_type);
+        }
     }
 
     /// Lower an enum definition - extract variant names and values
@@ -687,40 +812,28 @@ pub const Lowerer = struct {
 
         var extra_idx = extra_start + 1;
 
-        // Check if this is DBL format (pairs) or Cot format (names only)
-        // DBL format has 2 * variant_count values after the count
-        // Cot format has variant_count values after the count
-        // We can detect by checking if we have enough values for pairs
-        const remaining = self.store.extra_data.items.len - extra_idx;
-        const is_dbl_format = remaining >= variant_count * 2;
+        // Cot format: just names, auto-increment values from 0
+        // Note: DBL enum format with explicit values would need a format indicator
+        // in the extra_data to distinguish from Cot format. For now, we only
+        // support the Cot format (auto-increment).
+        var auto_value: i64 = 0;
+        for (0..variant_count) |_| {
+            const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+            extra_idx += 1;
 
-        if (is_dbl_format) {
-            // DBL format: [name, value] pairs
-            for (0..variant_count) |_| {
-                const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
-                const variant_value: i32 = @bitCast(self.store.extra_data.items[extra_idx + 1]);
-                extra_idx += 2;
+            const variant_name = self.strings.get(variant_name_id);
+            if (variant_name.len == 0) continue;
 
-                const variant_name = self.strings.get(variant_name_id);
-                if (variant_name.len == 0) continue;
+            try variants.put(variant_name, auto_value);
+            debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, auto_value });
+            auto_value += 1;
+        }
 
-                try variants.put(variant_name, @intCast(variant_value));
-                debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, variant_value });
-            }
-        } else {
-            // Cot format: just names, auto-increment values from 0
-            var auto_value: i64 = 0;
-            for (0..variant_count) |_| {
-                const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
-                extra_idx += 1;
-
-                const variant_name = self.strings.get(variant_name_id);
-                if (variant_name.len == 0) continue;
-
-                try variants.put(variant_name, auto_value);
-                debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, auto_value });
-                auto_value += 1;
-            }
+        // Check if we have a forward-declared enum to clean up
+        if (self.enum_types.fetchRemove(name)) |kv| {
+            // Clean up the old empty map
+            var old_variants = kv.value;
+            old_variants.deinit();
         }
 
         try self.enum_types.put(name, variants);
@@ -1117,10 +1230,19 @@ pub const Lowerer = struct {
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
-            const param_type = try self.lowerTypeIdx(param_type_idx);
+            var param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // is_ref: 0 = by value, non-zero = by reference
-            const is_ref = param_direction_raw != 0;
+            // For pointer-to-struct parameters, convert to value type with is_ref=true
+            // This allows the bytecode VM to handle write-back correctly
+            var is_ref = param_direction_raw != 0;
+            if (param_type == .ptr) {
+                const pointee = param_type.ptr.*;
+                if (pointee == .@"struct") {
+                    // Convert *struct(T) to struct(T) with is_ref=true
+                    param_type = pointee;
+                    is_ref = true;
+                }
+            }
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -1202,8 +1324,19 @@ pub const Lowerer = struct {
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
-            const param_type = try self.lowerTypeIdx(param_type_idx);
-            const is_ref = param_direction_raw != 0;
+            var param_type = try self.lowerTypeIdx(param_type_idx);
+
+            // For pointer-to-struct parameters (mutable self), convert to value type with is_ref
+            // This allows the bytecode VM to handle write-back correctly
+            var is_ref = param_direction_raw != 0;
+            if (param_type == .ptr) {
+                const pointee = param_type.ptr.*;
+                if (pointee == .@"struct") {
+                    // Convert *struct(T) to struct(T) with is_ref=true
+                    param_type = pointee;
+                    is_ref = true;
+                }
+            }
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -1216,6 +1349,17 @@ pub const Lowerer = struct {
         const body_idx: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
 
         const return_type = try self.lowerTypeIdx(return_type_idx);
+
+        // Store param types for call-site type checking (before moving params to func_type)
+        if (params.items.len > 0) {
+            var param_types: std.ArrayListUnmanaged(ir.Type) = .{};
+            defer param_types.deinit(self.allocator);
+            for (params.items) |param| {
+                try param_types.append(self.allocator, param.ty);
+            }
+            const types_slice = try param_types.toOwnedSlice(self.allocator);
+            try self.fn_param_types.put(qualified_name, types_slice);
+        }
 
         // Create function type with qualified name
         const func_type = ir.FunctionType{
@@ -1345,6 +1489,7 @@ pub const Lowerer = struct {
                 try lower_stmt.lowerReturn(self, data);
             },
             .block => try lower_stmt.lowerBlock(self, data),
+            .record_block => try lower_stmt.lowerRecordBlock(self, data),
             .while_stmt => {
                 try self.emitDebugLine(loc);
                 try lower_stmt.lowerWhile(self, data);
@@ -1931,6 +2076,7 @@ pub const SemanticDiagnostic = struct {
 
 /// Analyze source for semantic errors without completing lowering
 /// Returns a list of diagnostics (errors and warnings) that can be used by LSP
+/// This version collects multiple errors by analyzing each function independently
 pub fn analyzeSemantics(
     allocator: Allocator,
     store: *const NodeStore,
@@ -1940,24 +2086,63 @@ pub fn analyzeSemantics(
     var diagnostics: std.ArrayListUnmanaged(SemanticDiagnostic) = .empty;
     errdefer diagnostics.deinit(allocator);
 
+    // First, try early passes that collect definitions (less likely to fail)
     var lowerer = Lowerer.init(allocator, store, strings, "analysis", .{}) catch {
-        // Allocation error - return empty diagnostics
         return diagnostics.toOwnedSlice(allocator);
     };
     defer lowerer.deinit();
 
-    // Try to lower - if it fails, capture the error
-    _ = lowerer.lowerProgram(top_level) catch {
-        // Capture the error context as a diagnostic
-        if (lowerer.getLastError()) |ctx| {
-            try diagnostics.append(allocator, .{
-                .line = ctx.line,
-                .column = ctx.column,
-                .message = try allocator.dupe(u8, ctx.message),
-                .severity = .@"error",
-            });
+    // Run definition collection passes - these rarely fail
+    for (top_level) |stmt_idx| {
+        lowerer.processStatementForDefinitions(stmt_idx, .structs) catch {};
+    }
+    for (top_level) |stmt_idx| {
+        lowerer.processStatementForDefinitions(stmt_idx, .traits) catch {};
+    }
+    for (top_level) |stmt_idx| {
+        lowerer.processStatementForDefinitions(stmt_idx, .impls) catch {};
+    }
+    for (top_level) |stmt_idx| {
+        lowerer.processStatementForDefinitions(stmt_idx, .globals) catch {};
+    }
+    for (top_level) |stmt_idx| {
+        lowerer.processStatementForDefinitions(stmt_idx, .fn_sigs) catch {};
+    }
+
+    // Now analyze each function body separately to collect multiple errors
+    for (top_level) |stmt_idx| {
+        const tag = store.stmtTag(stmt_idx);
+        if (tag == .fn_def) {
+            // Clear any previous error before analyzing this function
+            lowerer.last_error = null;
+
+            // Try to lower this function body
+            lowerer.lowerFnDef(stmt_idx) catch {
+                // Capture the error for this function
+                if (lowerer.getLastError()) |ctx| {
+                    try diagnostics.append(allocator, .{
+                        .line = ctx.line,
+                        .column = ctx.column,
+                        .message = try allocator.dupe(u8, ctx.message),
+                        .severity = .@"error",
+                    });
+                }
+                // Continue to next function
+            };
+        } else if (tag == .test_def) {
+            lowerer.last_error = null;
+            lowerer.lowerTestDef(stmt_idx) catch {
+                if (lowerer.getLastError()) |ctx| {
+                    try diagnostics.append(allocator, .{
+                        .line = ctx.line,
+                        .column = ctx.column,
+                        .message = try allocator.dupe(u8, ctx.message),
+                        .severity = .@"error",
+                    });
+                }
+            };
         }
-    };
+    }
 
     // Add any warnings
     for (lowerer.getWarnings()) |warning| {

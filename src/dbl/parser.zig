@@ -372,6 +372,9 @@ pub const Parser = struct {
         const loc = self.currentLoc();
         _ = self.advance(); // consume 'main'
 
+        // Optional name after 'main' (e.g., 'main string_format_demo')
+        _ = self.match(&[_]TokenType{.identifier});
+
         var body: std.ArrayListUnmanaged(StmtIdx) = .{};
         errdefer body.deinit(self.allocator);
 
@@ -2263,8 +2266,9 @@ pub const Parser = struct {
             self.last_record_base_field = record_name orelse first_field_id;
         }
 
-        // Return as a block containing all the variable declarations
-        const result = self.store.addBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
+        // Return as a record_block containing all the variable declarations
+        // record_block doesn't introduce a new scope - variables remain visible after the block
+        const result = self.store.addRecordBlock(stmts.items, loc) catch return ParseError.OutOfMemory;
         stmts.deinit(self.allocator); // Free ArrayList backing memory after data is copied
         return result;
     }

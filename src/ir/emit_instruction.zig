@@ -78,17 +78,32 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
         return;
     }
 
-    // Array types need multiple consecutive slots for elements
+    // Array types: u8 arrays (DBL buffers) use single slot, other arrays use multiple slots
     if (a.ty == .array) {
         const base_slot = e.local_count;
         const array_len = a.ty.array.length;
+
         // Register the array base slot
         try e.locals.put(a.name, .{
             .slot = base_slot,
             .is_global = false,
         });
         try e.value_slots.put(a.result.id, base_slot);
-        // Reserve slots for all array elements
+
+        // u8 arrays (DBL alpha/string buffers): single slot holding a buffer value
+        if (a.ty.array.element.* == .u8) {
+            e.local_count += 1;
+            debug.print(.emit, "alloca buffer: {s} slot={d} size={d}", .{ a.name, base_slot, array_len });
+
+            // Emit buffer initialization: alloc_buffer rd, size
+            // This creates a mutable FixedString at the slot
+            try e.emitOpcode(.alloc_buffer);
+            try e.emitU8(@intCast(base_slot)); // slot to store buffer
+            try e.emitU16(@intCast(array_len)); // buffer size
+            return;
+        }
+
+        // Other array types: one slot per element (legacy behavior)
         e.local_count += @intCast(array_len);
         debug.print(.emit, "alloca array: {s} base_slot={d} length={d} next_slot={d}", .{ a.name, base_slot, array_len, e.local_count });
         return;
@@ -210,6 +225,12 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
                 if (ptr_slot < 256) {
                     try e.emitRegStoreLocal(0, @intCast(ptr_slot));
                 } else {
+                    e.setError(
+                        "Local variable storage exceeds 256-slot limit (slot {d})",
+                        .{ptr_slot},
+                        "DBL record buffers with large alpha fields may exceed this limit. Consider using smaller field sizes or fewer variables.",
+                        .{},
+                    );
                     return EmitError.TooManyLocals;
                 }
                 return;
@@ -240,6 +261,12 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
             if (slot_info < 256) {
                 try e.emitRegStoreLocal(src_reg, @intCast(slot_info));
             } else {
+                e.setError(
+                    "Local variable storage exceeds 256-slot limit (slot {d})",
+                    .{slot_info},
+                    "DBL record buffers with large alpha fields may exceed this limit. Consider using smaller field sizes or fewer variables.",
+                    .{},
+                );
                 return EmitError.TooManyLocals;
             }
         }
@@ -534,6 +561,13 @@ pub fn emitCall(e: *BytecodeEmitter, c: ir.Instruction.Call) EmitError!void {
             }
         }
         try e.emitOpcode(builtin.opcode);
+        // Emit operands for string operations: [rd:4|rs:4] [0]
+        // Result goes to r0, source is in r0 (first argument)
+        try e.emitU8(0x00); // rd=0, rs=0
+        try e.emitU8(0x00); // padding
+        if (c.result) |result| {
+            e.setLastResult(result.id, 0);
+        }
         return;
     }
 

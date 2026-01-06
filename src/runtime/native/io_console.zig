@@ -118,8 +118,8 @@ fn writeValue(writer: anytype, val: Value) void {
         .null_val => writer.writeAll("null") catch {},
         .boolean => writer.print("{s}", .{if (val.asBool()) "true" else "false"}) catch {},
         .integer => writer.print("{d}", .{val.asInt()}) catch {},
-        .decimal => {
-            if (val.asDecimal()) |dval| {
+        .implied_decimal => {
+            if (val.asImpliedDecimal()) |dval| {
                 const divisor = std.math.pow(i64, 10, dval.precision);
                 const whole = @divTrunc(dval.value, divisor);
                 const frac = @abs(@rem(dval.value, divisor));
@@ -143,6 +143,11 @@ fn writeValue(writer: anytype, val: Value) void {
                 } else {
                     writer.print("{d}", .{whole}) catch {};
                 }
+            }
+        },
+        .fixed_decimal => {
+            if (val.asFixedDecimal()) |dval| {
+                writer.print("{d}", .{dval.value}) catch {};
             }
         },
         .fixed_string, .string => writer.print("{s}", .{std.mem.trimRight(u8, val.asString(), " \x00")}) catch {},

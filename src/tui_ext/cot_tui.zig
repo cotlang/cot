@@ -171,7 +171,7 @@ const natives = [_]NativeDef{
 fn getInt(val: Value) ?i64 {
     return switch (val.tag()) {
         .integer => val.asInt(),
-        .decimal => if (val.asDecimal()) |d| @divTrunc(d.value, std.math.pow(i64, 10, d.precision)) else null,
+        .implied_decimal => if (val.asDecimal()) |d| @divTrunc(d.value, std.math.pow(i64, 10, d.precision)) else null,
         else => null,
     };
 }

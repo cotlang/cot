@@ -38,6 +38,12 @@ pub const EmitError = error{
     StackOverflow,
 };
 
+/// Error context for better error reporting
+pub const ErrorContext = struct {
+    message: []const u8,
+    detail: []const u8,
+};
+
 /// Pending jump that needs to be patched
 const PendingJump = struct {
     /// Offset in code where the jump offset should be written
@@ -245,6 +251,9 @@ pub const BytecodeEmitter = struct {
     // Track allocated strings that need to be freed (e.g., qualified field names)
     allocated_strings: std.ArrayListUnmanaged([]const u8) = .{},
 
+    // Error context for better error reporting
+    last_error: ?ErrorContext = null,
+
     const Self = @This();
 
     /// Initialize the bytecode emitter (register-based)
@@ -299,6 +308,29 @@ pub const BytecodeEmitter = struct {
             self.allocator.free(s);
         }
         self.allocated_strings.deinit(self.allocator);
+        // Free error context strings
+        if (self.last_error) |err| {
+            self.allocator.free(err.message);
+            self.allocator.free(err.detail);
+        }
+    }
+
+    /// Set error context for better error reporting
+    pub fn setError(self: *Self, comptime message_fmt: []const u8, message_args: anytype, comptime detail_fmt: []const u8, detail_args: anytype) void {
+        // Free previous error if any
+        if (self.last_error) |err| {
+            self.allocator.free(err.message);
+            self.allocator.free(err.detail);
+        }
+        self.last_error = .{
+            .message = std.fmt.allocPrint(self.allocator, message_fmt, message_args) catch "allocation failed",
+            .detail = std.fmt.allocPrint(self.allocator, detail_fmt, detail_args) catch "",
+        };
+    }
+
+    /// Get the last error context
+    pub fn getLastError(self: *const Self) ?ErrorContext {
+        return self.last_error;
     }
 
     /// Emit bytecode module from IR module
@@ -448,7 +480,7 @@ pub const BytecodeEmitter = struct {
                 .flags = 0,
                 .offset = @intCast(field.offset),
                 .size = @intCast(field.ty.sizeInBytes()),
-                .precision = if (field.ty == .decimal) field.ty.decimal.scale else 0,
+                .precision = if (field.ty == .implied_decimal) field.ty.implied_decimal.scale else 0,
                 .array_dims = &[_]u16{},
             });
 
@@ -544,8 +576,14 @@ pub const BytecodeEmitter = struct {
                             debug.print(.emit, "  -> counted as {d} slots for struct fields", .{a.ty.@"struct".fields.len});
                             self.local_count += @intCast(a.ty.@"struct".fields.len);
                         } else if (a.ty == .array) {
-                            // Array type: count slots for each element
-                            self.local_count += @intCast(a.ty.array.length);
+                            // Array of u8 (DBL alpha/string buffer): single slot for the buffer value
+                            // Other arrays: one slot per element (legacy behavior)
+                            if (a.ty.array.element.* == .u8) {
+                                debug.print(.emit, "  -> u8 array (buffer), counted as 1 slot, local_count now={d}", .{self.local_count + 1});
+                                self.local_count += 1;
+                            } else {
+                                self.local_count += @intCast(a.ty.array.length);
+                            }
                         } else {
                             // Primitive type: one slot
                             debug.print(.emit, "  -> counted as 1 slot, local_count now={d}", .{self.local_count + 1});
@@ -1050,6 +1088,12 @@ pub const BytecodeEmitter = struct {
 
         // Out of registers - need to spill (fall back to stack-based for now)
         debug.print(.emit, "ERROR: Out of registers for value.id={d}, free_regs=0x{x:0>4}", .{ value.id, self.reg_alloc.free_regs });
+        self.setError(
+            "Ran out of CPU registers during code generation",
+            .{},
+            "The expression is too complex. Try breaking it into smaller statements.",
+            .{},
+        );
         return EmitError.TooManyLocals;
     }
 
@@ -1090,6 +1134,12 @@ pub const BytecodeEmitter = struct {
                 if (slot_info < 256) {
                     try self.emitRegLoadLocal(dest, @intCast(slot_info));
                 } else {
+                    self.setError(
+                        "Local variable storage exceeds 256-slot limit (slot {d})",
+                        .{slot_info},
+                        "DBL record buffers with large alpha fields may exceed this limit. Consider using smaller field sizes or fewer variables.",
+                        .{},
+                    );
                     return EmitError.TooManyLocals;
                 }
             }
@@ -1166,6 +1216,12 @@ pub const BytecodeEmitter = struct {
                     debug.print(.emit, "  -> slot path (local): slot={d} -> r{d}", .{ slot_info, temp_reg });
                     try self.emitRegLoadLocal(temp_reg, @intCast(slot_info));
                 } else {
+                    self.setError(
+                        "Local variable storage exceeds 256-slot limit (slot {d})",
+                        .{slot_info},
+                        "DBL record buffers with large alpha fields may exceed this limit. Consider using smaller field sizes or fewer variables.",
+                        .{},
+                    );
                     return EmitError.TooManyLocals;
                 }
             }
@@ -1405,7 +1461,8 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .f32 => .fixed_point,
         .f64 => .fixed_point,
         .string => .string,
-        .decimal => .decimal,
+        .implied_decimal => .decimal,
+        .fixed_decimal => .decimal, // Both decimal types map to bytecode decimal
         .ptr => .int64, // Pointers are 64-bit
         .optional => .int64, // Optionals are pointer-sized
         .array => .string, // Arrays treated as string for now

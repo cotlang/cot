@@ -8,6 +8,7 @@ const workspace = @import("../workspace.zig");
 const discovery = @import("../discovery.zig");
 const http_server = @import("../http/server.zig");
 const http_router = @import("../http/router.zig");
+const hotreload = @import("../http/hotreload.zig");
 const Allocator = std.mem.Allocator;
 
 // Import compiler for on-the-fly compilation
@@ -115,18 +116,29 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
                 \\  <style>
                 \\    body { font-family: system-ui; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
                 \\    h1 { color: #2563eb; }
+                \\    h2 { color: #1e40af; margin-top: 2rem; }
                 \\    code { background: #f1f5f9; padding: 0.2rem 0.4rem; border-radius: 0.25rem; }
+                \\    .status { color: #16a34a; font-weight: 500; }
+                \\    .dex-section { background: #eff6ff; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; }
                 \\  </style>
                 \\</head>
                 \\<body>
                 \\  <h1>Cot Development Server</h1>
-                \\  <p>Your Cot workspace is running!</p>
+                \\  <p>Your Cot workspace is running! <span class="status">Hot reload enabled.</span></p>
+                \\  <div class="dex-section">
+                \\    <h2>Dex Components</h2>
+                \\    <p>Create real-time UI components with <code>.dex</code> files:</p>
+                \\    <pre><code>cot gen dex Counter</code></pre>
+                \\    <p>Components in the <code>components/</code> directory will auto-reload on save.</p>
+                \\  </div>
                 \\  <h2>API Endpoints</h2>
                 \\  <p>Place <code>.cot</code> files in the <code>api/</code> directory to create endpoints.</p>
                 \\  <h2>Quick Links</h2>
                 \\  <ul>
                 \\    <li><a href="/api/health">Health Check</a></li>
+                \\    <li><a href="/api/version">Version Info</a></li>
                 \\  </ul>
+                ++ hotreload.client_script ++
                 \\</body>
                 \\</html>
             );

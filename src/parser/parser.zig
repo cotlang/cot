@@ -229,14 +229,22 @@ pub const Parser = struct {
         if (!self.check(.rparen)) {
             while (true) {
                 // Handle both regular identifiers and 'self' keyword
-                const param_name = if (self.match(&[_]TokenType{.kw_self}))
+                const is_self = self.match(&[_]TokenType{.kw_self});
+                const param_name = if (is_self)
                     self.internString("self") catch return error.OutOfMemory
                 else blk: {
                     const param_name_token = try self.consume(.identifier, "Expected parameter name");
                     break :blk self.internString(param_name_token.lexeme) catch return error.OutOfMemory;
                 };
-                _ = try self.consume(.colon, "Expected ':'");
-                const param_type = try self.parseType();
+
+                // For 'self' parameter, type annotation is optional (defaults to Self)
+                const param_type = if (is_self and !self.check(.colon)) blk: {
+                    // Use a special "Self" type that gets resolved during type checking
+                    break :blk self.store.addSelfType() catch return error.OutOfMemory;
+                } else blk: {
+                    _ = try self.consume(.colon, "Expected ':'");
+                    break :blk try self.parseType();
+                };
 
                 // Parse optional default value: param: Type = expr
                 var default_expr: u32 = 0; // 0 = ExprIdx.null (required param)
@@ -818,7 +826,14 @@ pub const Parser = struct {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_if, "Expected 'if'");
         _ = try self.consume(.lparen, "Expected '(' after 'if'");
+
+        // Disable struct init parsing for condition to avoid ambiguity with < operator
+        // e.g., "if (x < 10)" should not be parsed as "if (x<type>)"
+        const prev_allow_struct_init = self.allow_struct_init;
+        self.allow_struct_init = false;
         const condition = try self.parseExpression();
+        self.allow_struct_init = prev_allow_struct_init;
+
         _ = try self.consume(.rparen, "Expected ')' after condition");
 
         _ = try self.consume(.lbrace, "Expected '{'");
@@ -944,7 +959,14 @@ pub const Parser = struct {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_while, "Expected 'while'");
         _ = try self.consume(.lparen, "Expected '(' after 'while'");
+
+        // Disable struct init parsing for condition to avoid ambiguity with < operator
+        // e.g., "while (i < 10)" should not be parsed as "while (i<type>)"
+        const prev_allow_struct_init = self.allow_struct_init;
+        self.allow_struct_init = false;
         const condition = try self.parseExpression();
+        self.allow_struct_init = prev_allow_struct_init;
+
         _ = try self.consume(.rparen, "Expected ')' after condition");
 
         _ = try self.consume(.lbrace, "Expected '{'");
@@ -1238,6 +1260,7 @@ pub const Parser = struct {
     }
 
     /// Parse a prefix expression (unary operator or primary)
+    /// This includes parsing any postfix operators that follow the primary
     fn parsePrefixExpr(self: *Self) ParseError!ExprIdx {
         const token_type = self.peek().type;
 
@@ -1247,12 +1270,20 @@ pub const Parser = struct {
             // In prefix position, it's always unary
             _ = self.advance();
             const loc = self.currentLoc();
+            // Parse operand including any postfix operators like .method()
             const operand = try self.parsePrefixExpr();
             return self.store.addUnary(op, operand, loc) catch return error.OutOfMemory;
         }
 
-        // Primary expression
-        return self.parsePrimary();
+        // Primary expression followed by any postfix operators
+        var result = try self.parsePrimary();
+
+        // Parse postfix operators (call, index, member access)
+        while (pratt.isPostfixOperator(self.peek().type)) {
+            result = try self.parsePostfixOp(result);
+        }
+
+        return result;
     }
 
     /// Parse a binary operator and right-hand side
@@ -1331,10 +1362,23 @@ pub const Parser = struct {
             } else if (self.match(&[_]TokenType{.lbracket})) {
                 try self.enterNesting();
                 errdefer self.exitNesting();
-                const index_expr = try self.parseExpression();
-                _ = try self.consume(.rbracket, "Expected ']'");
-                self.exitNesting();
-                result = self.store.addIndex(result, index_expr, self.currentLoc()) catch return error.OutOfMemory;
+
+                // Parse at precedence above range to stop before '..' operator
+                const start_expr = try self.parseExpressionPrec(.range);
+
+                // Check for slice syntax: expr[start..end]
+                if (self.match(&[_]TokenType{.range})) {
+                    // Parse end expression (can be any expression)
+                    const end_expr = try self.parseExpression();
+                    _ = try self.consume(.rbracket, "Expected ']'");
+                    self.exitNesting();
+                    result = self.store.addSliceExpr(result, start_expr, end_expr, self.currentLoc()) catch return error.OutOfMemory;
+                } else {
+                    // Regular index expression: expr[index]
+                    _ = try self.consume(.rbracket, "Expected ']'");
+                    self.exitNesting();
+                    result = self.store.addIndex(result, start_expr, self.currentLoc()) catch return error.OutOfMemory;
+                }
             } else {
                 break;
             }
@@ -1383,7 +1427,7 @@ pub const Parser = struct {
         }
 
         // Null literal
-        if (self.match(&[_]TokenType{.kw_nil})) {
+        if (self.match(&[_]TokenType{.kw_null})) {
             return self.store.addNullLiteral(loc) catch return error.OutOfMemory;
         }
 

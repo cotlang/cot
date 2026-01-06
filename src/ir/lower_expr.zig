@@ -116,7 +116,7 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .string_literal => return lowerStringLiteral(l, func, data),
         .bool_literal => return lowerBoolLiteral(l, func, data),
         .null_literal => return lowerNullLiteral(l, func),
-        .identifier => return lowerIdentifier(l, func, data),
+        .identifier => return lowerIdentifier(l, func, data, expr_idx),
         .binary => return lowerBinary(l, func, data, expr_idx),
         .unary => return lowerUnary(l, func, data, expr_idx),
         .grouping => return lowerExpression(l, @enumFromInt(data.a)),
@@ -124,6 +124,7 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .method_call => return lowerMethodCall(l, expr_idx),
         .member => return lowerMember(l, func, expr_idx),
         .index => return lowerIndex(l, func, expr_idx),
+        .slice_expr => return lowerSliceExpr(l, func, expr_idx),
         .array_init => return lowerArrayInit(l, expr_idx),
         .struct_init => return lowerStructInit(l, expr_idx),
         .generic_struct_init => return lowerGenericStructInit(l, expr_idx),
@@ -324,7 +325,8 @@ pub fn lowerNullLiteral(l: *Lowerer, func: *ir.Function) LowerError!ir.Value {
 // ============================================================================
 
 /// Lower an identifier expression (variable load)
-pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerError!ir.Value {
+pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: ExprIdx) LowerError!ir.Value {
+    const loc = l.store.exprLoc(expr_idx);
     const name_id = data.getName();
     const name = l.strings.get(name_id);
     if (name.len == 0) {
@@ -332,7 +334,7 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerErr
             LowerError.UndefinedVariable,
             "Undefined variable: (empty name)",
             .{},
-            .{ .line = 0, .column = 0 },
+            loc,
             "lowering identifier expression",
             .{},
         );
@@ -374,7 +376,7 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData) LowerErr
             LowerError.UndefinedVariable,
             "Undefined variable: '{s}'",
             .{name},
-            .{ .line = 0, .column = 0 },
+            loc,
             "lowering identifier expression",
             .{},
         );
@@ -874,6 +876,35 @@ pub fn lowerIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError
     return result;
 }
 
+/// Lower a slice expression: expr[start..end]
+pub fn lowerSliceExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const parts = l.store.getSliceExprParts(expr_idx);
+
+    // Lower the source expression (should be a string)
+    const source_val = try lowerExpression(l, parts.object);
+
+    // Lower the start and end expressions
+    const start_val = try lowerExpression(l, parts.start);
+    const end_val = try lowerExpression(l, parts.end);
+
+    // Create result value (string slice returns a string)
+    const result = func.newValue(.string);
+
+    // Emit str_slice instruction with is_length=false (end is exclusive index)
+    try l.emit(.{
+        .str_slice = .{
+            .source = source_val,
+            .start = start_val,
+            .length_or_end = end_val,
+            .is_length = false, // Using end index, not length
+            .result = result,
+            .loc = null,
+        },
+    });
+
+    return result;
+}
+
 // ============================================================================
 // Function and Method Calls
 // ============================================================================
@@ -1172,12 +1203,20 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer method_args.deinit(l.allocator);
 
-                // Get struct pointer using lowerLValue to avoid extra loads
-                // This gives us the direct pointer to the struct fields
+                // Build qualified method name first to look up param types
+                var method_name_buf: [256]u8 = undefined;
+                const qualified_method_name = std.fmt.bufPrint(&method_name_buf, "{s}.{s}", .{ type_name, field_name }) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                // Check if the method's first parameter expects a pointer (self: *T)
+                const param_types = l.fn_param_types.get(qualified_method_name);
+                const first_param_is_ptr = if (param_types) |types| types.len > 0 and types[0] == .ptr else false;
+
+                // Get struct pointer using lowerLValue
                 const struct_lval = try lowerLValue(l, object_idx);
 
-                // Determine the struct pointer to use for field_ptr
-                // If lval is **struct (pointer to pointer to struct), load once to get *struct
+                // Handle **struct -> *struct case
                 var struct_ptr = struct_lval;
                 if (struct_lval.ty == .ptr) {
                     const pointee = struct_lval.ty.ptr.*;
@@ -1197,7 +1236,11 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     }
                 }
 
-                // Emit field_ptr + load for each field to pass as individual arguments
+                // Pass self argument by loading each struct field individually
+                // This is required because bytecode VM handles struct fields as separate slots
+                // Note: first_param_is_ptr check is now obsolete since lowerImplMethod converts
+                // pointer-to-struct params to value types with is_ref=true
+                _ = first_param_is_ptr;
                 for (struct_type.fields, 0..) |field, idx| {
                     const field_ty_ptr = try l.allocator.create(ir.Type);
                     field_ty_ptr.* = field.ty;
@@ -1232,11 +1275,6 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
                 const args_slice = try method_args.toOwnedSlice(l.allocator);
 
-                // Use qualified method name: TypeName.method_name
-                var method_name_buf: [256]u8 = undefined;
-                const qualified_method_name = std.fmt.bufPrint(&method_name_buf, "{s}.{s}", .{ type_name, field_name }) catch {
-                    return LowerError.OutOfMemory;
-                };
                 const method_name = l.allocator.dupe(u8, qualified_method_name) catch {
                     return LowerError.OutOfMemory;
                 };
@@ -1565,10 +1603,43 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         return result;
     }
 
-    // Fallback to regular method call
+    // Check if this is an impl method call on a struct
+    // For struct types, we need to use a qualified name like "Counter.get"
+    var callee_name: []const u8 = undefined;
+    const self_arg = object_val;
+
+    if (object_val.ty == .@"struct") {
+        const struct_type = object_val.ty.@"struct";
+        // Construct qualified method name: TypeName.method_name
+        callee_name = std.fmt.allocPrint(
+            l.allocator,
+            "{s}.{s}",
+            .{ struct_type.name, method_name_borrowed },
+        ) catch return LowerError.OutOfMemory;
+        debug.print(.ir, "lowerMethodCall: struct method {s}", .{callee_name});
+    } else if (object_val.ty == .ptr) {
+        // Pointer to struct - dereference to get struct type name
+        const pointee = object_val.ty.ptr.*;
+        if (pointee == .@"struct") {
+            const struct_type = pointee.@"struct";
+            callee_name = std.fmt.allocPrint(
+                l.allocator,
+                "{s}.{s}",
+                .{ struct_type.name, method_name_borrowed },
+            ) catch return LowerError.OutOfMemory;
+            debug.print(.ir, "lowerMethodCall: struct ptr method {s}", .{callee_name});
+        } else {
+            callee_name = l.allocator.dupe(u8, method_name_borrowed) catch return LowerError.OutOfMemory;
+        }
+    } else {
+        // Fallback to regular method name
+        callee_name = l.allocator.dupe(u8, method_name_borrowed) catch return LowerError.OutOfMemory;
+    }
+
+    // Build arguments: self first, then remaining args
     var args: std.ArrayListUnmanaged(ir.Value) = .{};
     defer args.deinit(l.allocator);
-    try args.append(l.allocator, object_val);
+    try args.append(l.allocator, self_arg);
 
     for (0..args_count) |i| {
         const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[extra_start + 2 + i]);
@@ -1579,15 +1650,12 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const args_slice = try args.toOwnedSlice(l.allocator);
     // NOTE: args_slice is freed by Block.deinit when the call instruction is cleaned up
 
-    // Dupe the method name so Block.deinit can consistently free it
-    const method_name = l.allocator.dupe(u8, method_name_borrowed) catch return LowerError.OutOfMemory;
-
-    const result_type = getBuiltinReturnType(method_name, args_slice);
+    const result_type = getBuiltinReturnType(callee_name, args_slice);
     const result = func.newValue(result_type);
 
     try l.emit(.{
         .call = .{
-            .callee = method_name,
+            .callee = callee_name,
             .args = args_slice,
             .result = result,
         },
@@ -1717,11 +1785,18 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     try l.allocated_types.append(l.allocator, struct_type_ptr);
 
     // Allocate stack space for struct
+    // Use a unique name combining type name and value ID to ensure each instance
+    // gets its own slots in the bytecode emitter
     const struct_ptr = func.newValue(.{ .ptr = struct_type_ptr });
+    const unique_name = std.fmt.allocPrint(
+        l.allocator,
+        "{s}${d}",
+        .{ type_name, struct_ptr.id },
+    ) catch return LowerError.OutOfMemory;
     try l.emit(.{
         .alloca = .{
             .ty = struct_ir_type,
-            .name = type_name,
+            .name = unique_name,
             .result = struct_ptr,
         },
     });
@@ -1825,11 +1900,18 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
     try l.allocated_types.append(l.allocator, struct_type_ptr);
 
     // Allocate stack space for struct
+    // Use a unique name combining type name and value ID to ensure each instance
+    // gets its own slots in the bytecode emitter
     const struct_ptr = func.newValue(.{ .ptr = struct_type_ptr });
+    const unique_name = std.fmt.allocPrint(
+        l.allocator,
+        "{s}${d}",
+        .{ type_name, struct_ptr.id },
+    ) catch return LowerError.OutOfMemory;
     try l.emit(.{
         .alloca = .{
             .ty = struct_ir_type,
-            .name = type_name,
+            .name = unique_name,
             .result = struct_ptr,
         },
     });
@@ -2184,7 +2266,7 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
         .f32 => .f32,
         .f64 => .f64,
         .string => .string,
-        .decimal => .{ .decimal = .{ .precision = @intCast(data.a), .scale = @intCast(data.b) } },
+        .decimal => .{ .implied_decimal = .{ .precision = @intCast(data.a), .scale = @intCast(data.b) } },
         .array => blk: {
             const elem_type_idx: TypeIdx = @enumFromInt(data.a);
             const length = data.b;
@@ -2236,7 +2318,11 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
             if (l.struct_types.get(name)) |struct_type| {
                 break :blk .{ .@"struct" = struct_type };
             }
-            std.debug.print("  Error: Unknown type '{s}' (not a defined struct)\n", .{name});
+            // Check if it's an enum type - enums are represented as i64 at runtime
+            if (l.enum_types.contains(name)) {
+                break :blk .i64;
+            }
+            std.debug.print("  Error: Unknown type '{s}' (not a defined struct or enum)\n", .{name});
             return LowerError.UndefinedType;
         },
         // Generic type parameter - look up in substitution map
@@ -2342,6 +2428,7 @@ pub fn isMapType(ty: ir.Type) bool {
 /// The FunctionReturnTypes map is auto-generated from spec/natives.toml.
 pub fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
     // O(1) lookup in the generated static map from spec/natives.toml
+    // This includes all native functions AND opcode builtins (len, size, trim, atrim)
     if (native_types.getReturnType(name)) |ty| {
         return ty;
     }

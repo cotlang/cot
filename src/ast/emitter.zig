@@ -164,7 +164,7 @@ pub const Emitter = struct {
             .defer_stmt => try self.emitDeferStmt(idx),
             .assignment => try self.emitAssignment(idx),
             .expression => try self.emitExprStmt(idx),
-            .block => try self.emitBlock(idx),
+            .block, .record_block => try self.emitBlock(idx),
             .import_stmt => try self.emitImportStmt(idx),
             .io_open => try self.emitIoOpen(idx),
             .io_close => try self.emitIoClose(idx),
@@ -193,6 +193,7 @@ pub const Emitter = struct {
             .identifier => try self.emitIdentifier(idx),
             .member => try self.emitMember(idx),
             .index => try self.emitIndex(idx),
+            .slice_expr => try self.emitSliceExpr(idx),
             .binary => try self.emitBinary(idx),
             .unary => try self.emitUnary(idx),
             .call => try self.emitCall(idx),
@@ -1016,6 +1017,16 @@ pub const Emitter = struct {
         try self.emitExpression(view.object);
         try self.writer.writeByte('[');
         try self.emitExpression(view.index);
+        try self.writer.writeByte(']');
+    }
+
+    fn emitSliceExpr(self: *Self, idx: ExprIdx) anyerror!void {
+        const parts = self.store.getSliceExprParts(idx);
+        try self.emitExpression(parts.object);
+        try self.writer.writeByte('[');
+        try self.emitExpression(parts.start);
+        try self.writer.writeAll("..");
+        try self.emitExpression(parts.end);
         try self.writer.writeByte(']');
     }
 

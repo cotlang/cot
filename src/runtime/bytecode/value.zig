@@ -27,7 +27,8 @@ pub const Tag = enum {
     null_val,
     boolean,
     integer,
-    decimal,
+    implied_decimal, // DBL d28.10 - fixed-length numeric with implied decimal point
+    fixed_decimal, // DBL d28 - fixed-length numeric without decimal point
     fixed_string,
     string,
     record_ref,
@@ -40,7 +41,8 @@ pub const Tag = enum {
             .null_val => "null",
             .boolean => "boolean",
             .integer => "integer",
-            .decimal => "decimal",
+            .implied_decimal => "implied_decimal",
+            .fixed_decimal => "fixed_decimal",
             .fixed_string => "alpha",
             .string => "string",
             .record_ref => "record",
@@ -54,11 +56,22 @@ pub const Tag = enum {
 // Boxed Types (heap allocated for values that don't fit inline)
 // ============================================================================
 
-/// Heap-allocated decimal (needs precision byte)
-pub const Decimal = struct {
+/// Heap-allocated implied decimal (DBL d28.10 - has precision/scale)
+/// Used for fixed-length numeric fields with implied decimal point
+pub const ImpliedDecimal = struct {
     value: i64,
     precision: u8,
 };
+
+/// Heap-allocated fixed decimal (DBL d28 - no decimal point)
+/// Used for fixed-length numeric fields without implied decimal
+pub const FixedDecimal = struct {
+    value: i64,
+    width: u8,
+};
+
+/// Legacy alias for backward compatibility
+pub const Decimal = ImpliedDecimal;
 
 /// Heap-allocated large integer
 pub const BoxedInt = struct {
@@ -142,7 +155,8 @@ pub const Value = extern struct {
     const TAG_FIXED_STR: u64 = 0x7FFE_8000_0000_0000;
     const TAG_RECORD: u64 = 0x7FFF_0000_0000_0000;
     const TAG_HANDLE: u64 = 0x7FFF_4000_0000_0000;
-    const TAG_DECIMAL: u64 = 0x7FFF_8000_0000_0000;
+    const TAG_IMPLIED_DECIMAL: u64 = 0x7FFF_8000_0000_0000;
+    const TAG_FIXED_DECIMAL: u64 = 0x7FFE_C000_0000_0000; // Uses 0x7FFE + bits 46-47=11
     const TAG_BOXED_INT: u64 = 0x7FFF_C000_0000_0000;
 
     // Extension objects: 0x7FFE_4 prefix + type_id in bits 40-45 + pointer in bits 0-39
@@ -211,17 +225,28 @@ pub const Value = extern struct {
         return .{ .bits = TAG_BOXED_INT | ptrToPayload(boxed) };
     }
 
-    /// Create a decimal value (always boxed with ARC header)
-    pub fn initDecimal(allocator: std.mem.Allocator, value: i64, precision: u8) !Self {
-        const boxed = try arc.create(allocator, Decimal);
+    /// Create an implied decimal value (DBL d28.10 - with precision)
+    pub fn initImpliedDecimal(allocator: std.mem.Allocator, value: i64, precision: u8) !Self {
+        const boxed = try arc.create(allocator, ImpliedDecimal);
         boxed.* = .{ .value = value, .precision = precision };
-        return .{ .bits = TAG_DECIMAL | ptrToPayload(boxed) };
+        return .{ .bits = TAG_IMPLIED_DECIMAL | ptrToPayload(boxed) };
     }
 
-    /// Create a decimal from inline struct (convenience for migration)
-    pub fn initDecimalInline(allocator: std.mem.Allocator, d: struct { value: i64, precision: u8 }) !Self {
-        return initDecimal(allocator, d.value, d.precision);
+    /// Create an implied decimal from inline struct (convenience for migration)
+    pub fn initImpliedDecimalInline(allocator: std.mem.Allocator, d: struct { value: i64, precision: u8 }) !Self {
+        return initImpliedDecimal(allocator, d.value, d.precision);
     }
+
+    /// Create a fixed decimal value (DBL d28 - without precision)
+    pub fn initFixedDecimal(allocator: std.mem.Allocator, value: i64, width: u8) !Self {
+        const boxed = try arc.create(allocator, FixedDecimal);
+        boxed.* = .{ .value = value, .width = width };
+        return .{ .bits = TAG_FIXED_DECIMAL | ptrToPayload(boxed) };
+    }
+
+    // Legacy aliases for backward compatibility during migration
+    pub const initDecimal = initImpliedDecimal;
+    pub const initDecimalInline = initImpliedDecimalInline;
 
     /// Create an immutable string reference (with ARC header)
     pub fn initString(allocator: std.mem.Allocator, s: []const u8) !Self {
@@ -295,7 +320,8 @@ pub const Value = extern struct {
         if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR) return .fixed_string;
         if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_RECORD) return .record_ref;
         if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_HANDLE) return .handle;
-        if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_DECIMAL) return .decimal;
+        if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_IMPLIED_DECIMAL) return .implied_decimal;
+        if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_FIXED_DECIMAL) return .fixed_decimal;
 
         return .null_val; // Fallback
     }
@@ -313,9 +339,16 @@ pub const Value = extern struct {
         return upper == TAG_SMALL_INT or upper == TAG_BOXED_INT;
     }
 
-    pub fn isDecimal(self: Self) bool {
-        return (self.bits & 0xFFFF_C000_0000_0000) == TAG_DECIMAL;
+    pub fn isImpliedDecimal(self: Self) bool {
+        return (self.bits & 0xFFFF_F000_0000_0000) == TAG_IMPLIED_DECIMAL;
     }
+
+    pub fn isFixedDecimal(self: Self) bool {
+        return (self.bits & 0xFFFF_C000_0000_0000) == TAG_FIXED_DECIMAL;
+    }
+
+    /// Legacy alias for backward compatibility
+    pub const isDecimal = isImpliedDecimal;
 
     pub fn isString(self: Self) bool {
         return (self.bits & 0xFFFF_8000_0000_0000) == TAG_STRING;
@@ -405,12 +438,22 @@ pub const Value = extern struct {
         return 0;
     }
 
-    /// Get decimal value
-    pub fn asDecimal(self: Self) ?Decimal {
-        if (!self.isDecimal()) return null;
-        const dec = payloadToPtr(*Decimal, self.bits);
+    /// Get implied decimal value
+    pub fn asImpliedDecimal(self: Self) ?ImpliedDecimal {
+        if (!self.isImpliedDecimal()) return null;
+        const dec = payloadToPtr(*ImpliedDecimal, self.bits);
         return dec.*;
     }
+
+    /// Get fixed decimal value
+    pub fn asFixedDecimal(self: Self) ?FixedDecimal {
+        if (!self.isFixedDecimal()) return null;
+        const dec = payloadToPtr(*FixedDecimal, self.bits);
+        return dec.*;
+    }
+
+    /// Legacy alias for backward compatibility
+    pub const asDecimal = asImpliedDecimal;
 
     /// Get immutable string slice
     pub fn asString(self: Self) []const u8 {
@@ -463,10 +506,11 @@ pub const Value = extern struct {
     pub fn toInt(self: Self) i64 {
         return switch (self.tag()) {
             .integer => self.asInt(),
-            .decimal => if (self.asDecimal()) |d|
+            .implied_decimal => if (self.asImpliedDecimal()) |d|
                 @divTrunc(d.value, std.math.pow(i64, 10, d.precision))
             else
                 0,
+            .fixed_decimal => if (self.asFixedDecimal()) |d| d.value else 0,
             .boolean => if (self.asBool()) @as(i64, 1) else 0,
             .fixed_string, .string => std.fmt.parseInt(i64, std.mem.trim(u8, self.asString(), " "), 10) catch 0,
             else => 0,
@@ -479,7 +523,8 @@ pub const Value = extern struct {
             .null_val => false,
             .boolean => self.asBool(),
             .integer => self.asInt() != 0,
-            .decimal => if (self.asDecimal()) |d| d.value != 0 else false,
+            .implied_decimal => if (self.asImpliedDecimal()) |d| d.value != 0 else false,
+            .fixed_decimal => if (self.asFixedDecimal()) |d| d.value != 0 else false,
             .fixed_string => blk: {
                 const s = self.asString();
                 break :blk s.len > 0 and !std.mem.allEqual(u8, s, ' ');
@@ -511,12 +556,17 @@ pub const Value = extern struct {
             .null_val => try writer.writeAll("null"),
             .boolean => try writer.print("{}", .{self.asBool()}),
             .integer => try writer.print("{d}", .{self.asInt()}),
-            .decimal => {
-                if (self.asDecimal()) |d| {
+            .implied_decimal => {
+                if (self.asImpliedDecimal()) |d| {
                     const divisor = std.math.pow(i64, 10, d.precision);
                     const whole = @divTrunc(d.value, divisor);
                     const frac = @abs(@rem(d.value, divisor));
                     try writer.print("{d}.{d}", .{ whole, frac });
+                }
+            },
+            .fixed_decimal => {
+                if (self.asFixedDecimal()) |d| {
+                    try writer.print("{d}", .{d.value});
                 }
             },
             .fixed_string, .string => try writer.print("{s}", .{self.asString()}),
@@ -548,7 +598,8 @@ pub const Value = extern struct {
             .null_val => "null",
             .boolean => "bool",
             .integer => "int",
-            .decimal => "dec",
+            .implied_decimal => "idec",
+            .fixed_decimal => "fdec",
             .fixed_string => "fstr",
             .string => "str",
             .record_ref => "rec",
@@ -562,9 +613,14 @@ pub const Value = extern struct {
             .null_val => writer.writeAll("nil") catch {},
             .boolean => writer.print("{}", .{self.asBool()}) catch {},
             .integer => writer.print("{d}", .{self.asInt()}) catch {},
-            .decimal => {
-                if (self.asDecimal()) |d| {
+            .implied_decimal => {
+                if (self.asImpliedDecimal()) |d| {
                     writer.print("{d}p{d}", .{ d.value, d.precision }) catch {};
+                }
+            },
+            .fixed_decimal => {
+                if (self.asFixedDecimal()) |d| {
+                    writer.print("{d}w{d}", .{ d.value, d.width }) catch {};
                 }
             },
             .fixed_string, .string => {
@@ -620,9 +676,16 @@ pub const Value = extern struct {
             return;
         }
 
-        // Check for decimal
-        if (upper == TAG_DECIMAL) {
-            const dec = payloadToPtr(*Decimal, self.bits);
+        // Check for implied decimal
+        if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_IMPLIED_DECIMAL) {
+            const dec = payloadToPtr(*ImpliedDecimal, self.bits);
+            allocator.destroy(dec);
+            return;
+        }
+
+        // Check for fixed decimal
+        if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_FIXED_DECIMAL) {
+            const dec = payloadToPtr(*FixedDecimal, self.bits);
             allocator.destroy(dec);
             return;
         }
@@ -664,7 +727,9 @@ pub const Value = extern struct {
     /// Check if this value has heap-allocated memory that needs cleanup
     pub fn needsCleanup(self: Self) bool {
         const upper = self.bits & 0xFFFF_C000_0000_0000;
-        if (upper == TAG_BOXED_INT or upper == TAG_DECIMAL) return true;
+        if (upper == TAG_BOXED_INT) return true;
+        if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_IMPLIED_DECIMAL) return true;
+        if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_FIXED_DECIMAL) return true;
         if ((self.bits & TAG_OBJECT_MASK) == TAG_OBJECT) return true;
         if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_STRING) return true;
         if ((self.bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR) return true;

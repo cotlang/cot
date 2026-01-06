@@ -4,15 +4,19 @@
 //! - Static routes: /api/products
 //! - Dynamic routes: /api/products/:id
 //! - Wildcard routes: /api/*
+//! - WebSocket routes: ws /live/:room_id
 //! - File-based routing from api/ directory
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const context = @import("context.zig");
+const websocket = @import("websocket.zig");
 
 // Re-export types used by server.zig
 pub const Context = context.Context;
 pub const ContextHandlerFn = context.HandlerFn;
+pub const WebSocket = websocket.WebSocket;
+pub const WebSocketHandler = websocket.WebSocketHandler;
 
 /// Method enum (duplicated to avoid circular dependency with server.zig)
 pub const Method = enum {
@@ -65,10 +69,37 @@ const Route = struct {
     handler: ContextHandlerFn,
 };
 
+/// A registered WebSocket route
+const WsRoute = struct {
+    pattern: []const u8, // Owned by router, freed on deinit
+    segments: []const Segment,
+    handler: WebSocketHandler,
+};
+
+/// WebSocket route match result
+pub const WsRouteMatch = struct {
+    handler: WebSocketHandler,
+    params: std.StringHashMap([]const u8),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, handler: WebSocketHandler) WsRouteMatch {
+        return .{
+            .handler = handler,
+            .params = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *WsRouteMatch) void {
+        self.params.deinit();
+    }
+};
+
 /// HTTP Router
 pub const Router = struct {
     allocator: Allocator,
     routes: std.ArrayList(Route),
+    ws_routes: std.ArrayList(WsRoute),
 
     const Self = @This();
 
@@ -76,6 +107,7 @@ pub const Router = struct {
         return .{
             .allocator = allocator,
             .routes = .{},
+            .ws_routes = .{},
         };
     }
 
@@ -85,6 +117,12 @@ pub const Router = struct {
             self.allocator.free(route.pattern);
         }
         self.routes.deinit(self.allocator);
+
+        for (self.ws_routes.items) |route| {
+            self.allocator.free(route.segments);
+            self.allocator.free(route.pattern);
+        }
+        self.ws_routes.deinit(self.allocator);
     }
 
     /// Add a route with Context-based handler
@@ -214,11 +252,95 @@ pub const Router = struct {
         return result;
     }
 
+    /// Add a WebSocket route
+    pub fn addWs(self: *Self, pattern: []const u8, handler: WebSocketHandler) !void {
+        const owned_pattern = try self.allocator.dupe(u8, pattern);
+        errdefer self.allocator.free(owned_pattern);
+
+        const segments = try self.parsePattern(owned_pattern);
+
+        try self.ws_routes.append(self.allocator, .{
+            .pattern = owned_pattern,
+            .segments = segments,
+            .handler = handler,
+        });
+    }
+
+    /// Match a path against registered WebSocket routes
+    pub fn matchWs(self: *Self, path: []const u8) ?WsRouteMatch {
+        for (self.ws_routes.items) |route| {
+            if (self.matchWsRoute(route, path)) |result| {
+                return result;
+            }
+        }
+        return null;
+    }
+
+    /// Match a single WebSocket route
+    fn matchWsRoute(self: *Self, route: WsRoute, path: []const u8) ?WsRouteMatch {
+        var result = WsRouteMatch.init(self.allocator, route.handler);
+
+        // Skip leading slash
+        var p = path;
+        if (p.len > 0 and p[0] == '/') {
+            p = p[1..];
+        }
+
+        // Split path into parts
+        var path_iter = std.mem.splitScalar(u8, p, '/');
+        var segment_idx: usize = 0;
+
+        while (path_iter.next()) |part| {
+            if (part.len == 0) continue;
+
+            if (segment_idx >= route.segments.len) {
+                result.deinit();
+                return null;
+            }
+
+            const segment = route.segments[segment_idx];
+            segment_idx += 1;
+
+            switch (segment.segment_type) {
+                .static => {
+                    if (!std.mem.eql(u8, segment.value, part)) {
+                        result.deinit();
+                        return null;
+                    }
+                },
+                .param => {
+                    result.params.put(segment.value, part) catch {
+                        result.deinit();
+                        return null;
+                    };
+                },
+                .wildcard => {
+                    return result;
+                },
+            }
+        }
+
+        if (segment_idx != route.segments.len) {
+            if (segment_idx == route.segments.len - 1) {
+                if (route.segments[segment_idx].segment_type == .wildcard) {
+                    return result;
+                }
+            }
+            result.deinit();
+            return null;
+        }
+
+        return result;
+    }
+
     /// Print all registered routes (for debugging)
     pub fn printRoutes(self: *const Self, writer: anytype) !void {
         try writer.writeAll("Registered Routes:\n");
         for (self.routes.items) |route| {
             try writer.print("  {s} {s}\n", .{ @tagName(route.method), route.pattern });
+        }
+        for (self.ws_routes.items) |route| {
+            try writer.print("  WS {s}\n", .{route.pattern});
         }
     }
 };

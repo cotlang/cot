@@ -450,6 +450,13 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}", .{rs});
             },
 
+            // alloc_buffer slot, size - [slot:8] [size:16]
+            .alloc_buffer => {
+                const slot = operands[0];
+                const size: u16 = @bitCast(operands[1..3].*);
+                try self.writer.print(" slot#{}, size={}", .{ slot, size });
+            },
+
             // load_field rd, rs, field_idx - [rd:4|rs:4] [field_idx:16]
             .load_field, .store_field => {
                 const rd: u4 = @truncate(operands[0] >> 4);
@@ -616,7 +623,7 @@ pub const Disassembler = struct {
             },
 
             // Nullary functions: [rd:4|0] [0]
-            .fn_date, .fn_time, .fn_mem, .fn_error => {
+            .fn_date, .fn_time, .fn_datetime, .fn_mem, .fn_error => {
                 const rd: u4 = @truncate(operands[0] >> 4);
                 try self.writer.print(" r{}", .{rd});
             },

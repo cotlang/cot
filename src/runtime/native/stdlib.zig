@@ -243,7 +243,7 @@ fn native_frac(ctx: *NativeContext) NativeError!?Value {
     const val = ctx.getArg(0) orelse return NativeError.InvalidArgument;
 
     switch (val.tag()) {
-        .decimal => {
+        .implied_decimal => {
             if (val.asDecimal()) |d| {
                 const divisor = std.math.pow(i64, 10, d.precision);
                 return Value.initDecimal(ctx.allocator, @rem(d.value, divisor), d.precision) catch return NativeError.OutOfMemory;

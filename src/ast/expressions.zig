@@ -39,6 +39,9 @@ pub const ExpressionTag = enum(u8) {
     /// Array/slice indexing: expr[index]
     index,
 
+    /// Slice expression: expr[start..end] (for substring)
+    slice_expr,
+
     /// Optional member access: expr?.field (null-safe)
     optional_member,
 
@@ -121,7 +124,7 @@ pub const ExpressionTag = enum(u8) {
     /// Check if this is an access expression
     pub fn isAccess(self: ExpressionTag) bool {
         return switch (self) {
-            .identifier, .member, .index, .optional_member, .optional_index => true,
+            .identifier, .member, .index, .slice_expr, .optional_member, .optional_index => true,
             else => false,
         };
     }

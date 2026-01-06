@@ -71,6 +71,18 @@ pub fn lowerBlock(l: *Lowerer, data: NodeData) LowerError!void {
     try l.popDeferScopeAndEmit();
 }
 
+/// Lower a record block (like block but doesn't introduce a new scope)
+/// Used for DBL record blocks where variables should remain visible after the block
+pub fn lowerRecordBlock(l: *Lowerer, data: NodeData) LowerError!void {
+    // No scope push - variables declared here remain visible in enclosing scope
+    const span = data.getSpan();
+    const stmt_indices = l.store.getStmtSpan(span);
+    for (stmt_indices) |idx| {
+        try l.lowerStatement(@enumFromInt(idx));
+    }
+    // No scope pop - variables stay in enclosing scope
+}
+
 /// Lower a break statement
 pub fn lowerBreak(l: *Lowerer) LowerError!void {
     if (l.loop_exit_block) |exit_block| {
@@ -207,7 +219,7 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
     };
 
     // Decimal type validation and conversion
-    if (target_type == .decimal) {
+    if (target_type == .implied_decimal) {
         if (!value.isNumeric()) {
             // Non-numeric value (string) being assigned to decimal field
             // Emit parse_decimal to validate and convert at runtime
@@ -954,15 +966,15 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
         var_type = .void;
     }
 
-    // Special case: if init_val is a pointer to a struct (from struct init),
+    // Special case: if init_val is a pointer to a struct or array (from struct/array init),
     // use it directly instead of creating a wrapper pointer. This ensures that
-    // field_ptr calculations work correctly in the slot-based VM.
+    // field_ptr and array indexing calculations work correctly in the slot-based VM.
     if (init_val) |val| {
         if (val.ty == .ptr) {
             const pointee = val.ty.ptr.*;
-            if (pointee == .@"struct") {
-                // Register this variable name as an alias to the struct pointer
-                // The struct init already allocated slots for the fields
+            if (pointee == .@"struct" or pointee == .array) {
+                // Register this variable name as an alias to the struct/array pointer
+                // The struct/array init already allocated slots for the fields/elements
                 try l.scopes.put(name, val);
                 return;
             }

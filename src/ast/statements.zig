@@ -99,6 +99,9 @@ pub const StatementTag = enum(u8) {
     /// Block of statements: { statements }
     block,
 
+    /// Record block: like block but doesn't introduce a new scope (DBL record)
+    record_block,
+
     /// Import statement: import "module"
     import_stmt,
 

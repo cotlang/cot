@@ -18,6 +18,7 @@ const JsonArray = protocol.JsonArray;
 pub const Language = enum {
     cot, // Modern .cot syntax
     dbl, // Legacy .dbl syntax
+    dex, // Dex component files
 
     pub fn fromUri(uri: []const u8) Language {
         // Check last few characters for extension
@@ -27,6 +28,9 @@ pub const Language = enum {
                 std.ascii.eqlIgnoreCase(ext, ".dbo"))
             {
                 return .dbl;
+            }
+            if (std.ascii.eqlIgnoreCase(ext, ".dex")) {
+                return .dex;
             }
         }
         return .cot;
@@ -112,8 +116,17 @@ pub const SymbolTable = struct {
     references: std.StringHashMap(std.ArrayListUnmanaged(Reference)),
     // Map from URI to list of references in that document (for cleanup)
     refs_by_document: std.StringHashMap(std.ArrayListUnmanaged(RefEntry)),
+    // Map from type name to list of impl methods for that type
+    impl_methods: std.StringHashMap(std.ArrayListUnmanaged(Symbol)),
+    // Map from URI to list of (type_name, method) pairs for cleanup
+    impl_by_document: std.StringHashMap(std.ArrayListUnmanaged(ImplEntry)),
 
     const Self = @This();
+
+    pub const ImplEntry = struct {
+        type_name: []const u8,
+        method: Symbol,
+    };
 
     pub fn init(allocator: Allocator) Self {
         return .{
@@ -122,6 +135,8 @@ pub const SymbolTable = struct {
             .by_document = std.StringHashMap(std.ArrayListUnmanaged(Symbol)).init(allocator),
             .references = std.StringHashMap(std.ArrayListUnmanaged(Reference)).init(allocator),
             .refs_by_document = std.StringHashMap(std.ArrayListUnmanaged(RefEntry)).init(allocator),
+            .impl_methods = std.StringHashMap(std.ArrayListUnmanaged(Symbol)).init(allocator),
+            .impl_by_document = std.StringHashMap(std.ArrayListUnmanaged(ImplEntry)).init(allocator),
         };
     }
 
@@ -153,6 +168,20 @@ pub const SymbolTable = struct {
             list.deinit(self.allocator);
         }
         self.refs_by_document.deinit();
+
+        // Free impl_methods lists
+        var impl_it = self.impl_methods.valueIterator();
+        while (impl_it.next()) |list| {
+            list.deinit(self.allocator);
+        }
+        self.impl_methods.deinit();
+
+        // Free impl_by_document lists
+        var ibd_it = self.impl_by_document.valueIterator();
+        while (ibd_it.next()) |list| {
+            list.deinit(self.allocator);
+        }
+        self.impl_by_document.deinit();
     }
 
     /// Add a symbol to the table
@@ -290,6 +319,93 @@ pub const SymbolTable = struct {
         return null;
     }
 
+    /// Add an impl method for a type
+    pub fn addImplMethod(self: *Self, type_name: []const u8, method: Symbol, uri: []const u8) !void {
+        // Duplicate type name
+        const type_name_copy = try self.allocator.dupe(u8, type_name);
+        errdefer self.allocator.free(type_name_copy);
+
+        // Duplicate method name
+        const method_name_copy = try self.allocator.dupe(u8, method.name);
+        errdefer self.allocator.free(method_name_copy);
+
+        // Duplicate params if present
+        var params_copy: ?[]const FunctionParam = null;
+        if (method.params) |params| {
+            var param_list = try self.allocator.alloc(FunctionParam, params.len);
+            for (params, 0..) |p, i| {
+                param_list[i] = .{
+                    .name = try self.allocator.dupe(u8, p.name),
+                    .type_str = try self.allocator.dupe(u8, p.type_str),
+                };
+            }
+            params_copy = param_list;
+        }
+
+        // Duplicate return type if present
+        const return_type_copy: ?[]const u8 = if (method.return_type) |rt|
+            try self.allocator.dupe(u8, rt)
+        else
+            null;
+
+        const owned_method = Symbol{
+            .name = method_name_copy,
+            .kind = method.kind,
+            .uri = method.uri,
+            .line = method.line,
+            .column = method.column,
+            .end_line = method.end_line,
+            .end_column = method.end_column,
+            .parent = type_name_copy,
+            .params = params_copy,
+            .return_type = return_type_copy,
+        };
+
+        // Add to impl_methods map
+        const impl_result = try self.impl_methods.getOrPut(type_name_copy);
+        if (!impl_result.found_existing) {
+            impl_result.value_ptr.* = .empty;
+        }
+        try impl_result.value_ptr.append(self.allocator, owned_method);
+
+        // Add to impl_by_document for cleanup
+        const uri_copy = try self.allocator.dupe(u8, uri);
+        const ibd_result = try self.impl_by_document.getOrPut(uri_copy);
+        if (!ibd_result.found_existing) {
+            ibd_result.value_ptr.* = .empty;
+        }
+        try ibd_result.value_ptr.append(self.allocator, ImplEntry{ .type_name = type_name_copy, .method = owned_method });
+    }
+
+    /// Get impl methods for a type
+    pub fn getImplMethods(self: *Self, type_name: []const u8) ?[]const Symbol {
+        if (self.impl_methods.get(type_name)) |list| {
+            return list.items;
+        }
+        return null;
+    }
+
+    /// Clear impl methods for a document
+    pub fn clearDocumentImplMethods(self: *Self, uri: []const u8) void {
+        if (self.impl_by_document.fetchRemove(uri)) |entry| {
+            // Remove these methods from the impl_methods map
+            for (entry.value.items) |item| {
+                if (self.impl_methods.getPtr(item.type_name)) |method_list| {
+                    var i: usize = 0;
+                    while (i < method_list.items.len) {
+                        if (std.mem.eql(u8, method_list.items[i].uri, uri)) {
+                            _ = method_list.swapRemove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            var list = entry.value;
+            list.deinit(self.allocator);
+        }
+    }
+
     /// Clear all references for a document
     pub fn clearDocumentReferences(self: *Self, uri: []const u8) void {
         if (self.refs_by_document.fetchRemove(uri)) |entry| {
@@ -393,15 +509,17 @@ pub const Server = struct {
         if (self.documents.getPtr(uri)) |doc| {
             self.symbols.clearDocument(uri);
             self.symbols.clearDocumentReferences(uri);
+            self.symbols.clearDocumentImplMethods(uri);
             self.indexDocument(doc) catch {};
         }
     }
 
     /// Close a document
     pub fn closeDocument(self: *Self, uri: []const u8) void {
-        // Clear symbols and references for this document
+        // Clear symbols, references, and impl methods for this document
         self.symbols.clearDocument(uri);
         self.symbols.clearDocumentReferences(uri);
+        self.symbols.clearDocumentImplMethods(uri);
 
         if (self.documents.fetchRemove(uri)) |entry| {
             var doc = entry.value;
@@ -419,6 +537,7 @@ pub const Server = struct {
         switch (doc.language) {
             .cot => try self.indexCotDocument(doc),
             .dbl => try self.indexDblDocument(doc),
+            .dex => {}, // DEX component files - no indexing yet
         }
     }
 
@@ -572,6 +691,90 @@ pub const Server = struct {
                 continue;
             }
 
+            // Handle impl blocks to extract methods
+            if (tag == .impl_block) {
+                // data.a = trait_type (TypeIdx) - for inherent impls, this is the type being implemented
+                // data.b = methods_start (index into extra_data)
+                // Layout: [method_count, trait_type, target_type, method_indices...]
+                const extra_data = store.extra_data.items;
+                const methods_start = data.b;
+                if (methods_start + 2 >= extra_data.len) continue;
+
+                const method_count = extra_data[methods_start];
+                const trait_type_int = extra_data[methods_start + 1];
+                const target_type_int = extra_data[methods_start + 2];
+
+                // Determine the type name - use target_type if present (trait impl), otherwise use trait_type (inherent impl)
+                // TypeIdx.null is maxInt(u32), so check against that instead of 0
+                const target_type: cot.ast.TypeIdx = @enumFromInt(target_type_int);
+                const trait_type: cot.ast.TypeIdx = @enumFromInt(trait_type_int);
+                const type_idx = if (!target_type.isNull()) target_type else trait_type;
+
+                // Get the type name
+                const type_name = blk: {
+                    if (type_idx.isNull()) break :blk null;
+                    const type_tag = store.typeTag(type_idx);
+                    if (type_tag == .named) {
+                        const type_data_item = store.type_data.items[type_idx.toInt()];
+                        const name_id: cot.base.StringId = @enumFromInt(type_data_item.a);
+                        break :blk strings.get(name_id);
+                    }
+                    break :blk null;
+                };
+
+                if (type_name) |tn| {
+                    // Extract each method
+                    var i: u32 = 0;
+                    while (i < method_count) : (i += 1) {
+                        const method_idx_int = extra_data[methods_start + 3 + i];
+                        const method_idx: cot.ast.StmtIdx = @enumFromInt(method_idx_int);
+
+                        // Get method details (it's a fn_def)
+                        if (store.stmtTag(method_idx) == .fn_def) {
+                            const method_view = cot.ast.FnDefView.from(store, method_idx);
+                            const method_data = store.stmtData(method_idx);
+                            const method_loc = store.stmtLoc(method_idx);
+                            const method_name_id: cot.base.StringId = @enumFromInt(method_data.a);
+                            const method_name = strings.get(method_name_id);
+
+                            // Extract parameters
+                            var method_params: std.ArrayListUnmanaged(FunctionParam) = .empty;
+                            defer method_params.deinit(self.allocator);
+
+                            var param_iter = method_view.paramIterator(store);
+                            while (param_iter.next()) |param| {
+                                const param_name = strings.get(param.name);
+                                const type_str = typeIdxToString(store, strings, param.type_idx);
+                                try method_params.append(self.allocator, .{
+                                    .name = param_name,
+                                    .type_str = type_str,
+                                });
+                            }
+
+                            // Get return type
+                            const return_type = typeIdxToString(store, strings, method_view.return_type);
+
+                            const method_name_len: u32 = @intCast(method_name.len);
+                            const method_line: u32 = if (method_loc.line > 0) method_loc.line - 1 else 0;
+                            const method_col: u32 = if (method_loc.column > 0) method_loc.column - 1 else 0;
+
+                            try self.symbols.addImplMethod(tn, .{
+                                .name = method_name,
+                                .kind = .function,
+                                .uri = uri,
+                                .line = method_line,
+                                .column = method_col,
+                                .end_line = method_line,
+                                .end_column = method_col + method_name_len,
+                                .params = method_params.items,
+                                .return_type = return_type,
+                            }, uri);
+                        }
+                    }
+                }
+                continue;
+            }
+
             const symbol_info: ?struct { name: []const u8, kind: SymbolKind } = switch (tag) {
                 .struct_def => blk: {
                     const name_id: cot.base.StringId = @enumFromInt(data.a);
@@ -678,6 +881,7 @@ pub fn analyzeDocument(allocator: Allocator, doc: *const Document) ![]protocol.D
     switch (doc.language) {
         .cot => try analyzeCot(allocator, doc.content, &diagnostics),
         .dbl => try analyzeDbl(allocator, doc.content, &diagnostics),
+        .dex => try analyzeDex(allocator, doc.content, &diagnostics),
     }
 
     return diagnostics.toOwnedSlice(allocator);
@@ -872,6 +1076,44 @@ fn analyzeDbl(allocator: Allocator, source: []const u8, diagnostics: *std.ArrayL
     }
 }
 
+fn analyzeDex(allocator: Allocator, source: []const u8, diagnostics: *std.ArrayListUnmanaged(protocol.Diagnostic)) !void {
+    // Use the Dex component parser through the framework
+    const dex = cot.framework.dex;
+
+    // Tokenize using ComponentLexer
+    var lexer = dex.component_parser.ComponentLexer.init(allocator, source);
+    const tokens = lexer.tokenize() catch |err| {
+        try diagnostics.append(allocator, .{
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = 0, .character = 1 },
+            },
+            .severity = .Error,
+            .message = @errorName(err),
+        });
+        return;
+    };
+    defer allocator.free(tokens);
+
+    // Parse tokens
+    var parser = dex.component_parser.ComponentParser.init(allocator, tokens);
+    defer parser.deinit();
+
+    _ = parser.parse() catch {
+        // For now, just report a generic parse error
+        // The component parser doesn't expose detailed errors yet
+        try diagnostics.append(allocator, .{
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = 0, .character = 1 },
+            },
+            .severity = .Error,
+            .message = "Dex component parse error",
+        });
+        return;
+    };
+}
+
 /// Get document symbols
 pub fn getDocumentSymbols(allocator: Allocator, doc: *const Document) ![]protocol.DocumentSymbol {
     var symbols: std.ArrayListUnmanaged(protocol.DocumentSymbol) = .empty;
@@ -880,9 +1122,155 @@ pub fn getDocumentSymbols(allocator: Allocator, doc: *const Document) ![]protoco
     switch (doc.language) {
         .cot => try getCotSymbols(allocator, doc.content, &symbols),
         .dbl => try getDblSymbols(allocator, doc.content, &symbols),
+        .dex => try getDexSymbols(allocator, doc.content, &symbols),
     }
 
     return symbols.toOwnedSlice(allocator);
+}
+
+/// Extract struct fields as DocumentSymbol children
+fn extractStructFieldChildren(
+    allocator: Allocator,
+    store: *const cot.ast.NodeStore,
+    strings: *const cot.base.StringInterner,
+    fields_start: u32,
+    parent_loc: cot.ast.SourceLoc,
+) !?[]protocol.DocumentSymbol {
+    const extra_data = store.extra_data.items;
+    if (fields_start >= extra_data.len) return null;
+
+    const field_count = extra_data[fields_start];
+    if (field_count == 0) return null;
+
+    var children: std.ArrayListUnmanaged(protocol.DocumentSymbol) = .empty;
+    errdefer children.deinit(allocator);
+
+    // Fields start at fields_start + 3 (after count, type_param_count, type_params_start)
+    // Each field is stored as [name_id, type_idx]
+    var i: u32 = 0;
+    while (i < field_count) : (i += 1) {
+        const field_offset = fields_start + 3 + (i * 2);
+        if (field_offset + 1 >= extra_data.len) break;
+
+        const field_name_id: cot.base.StringId = @enumFromInt(extra_data[field_offset]);
+        const field_type_idx: cot.ast.TypeIdx = @enumFromInt(extra_data[field_offset + 1]);
+
+        const field_name = strings.get(field_name_id);
+        const field_name_copy = try allocator.dupe(u8, field_name);
+        const field_name_len: u32 = @intCast(field_name.len);
+
+        // Get type string for detail
+        const type_str = getTypeStringForSymbol(store, strings, field_type_idx);
+
+        // Create child symbol for field - position on following lines from parent
+        const field_line = parent_loc.line + 1 + i;
+        try children.append(allocator, .{
+            .name = field_name_copy,
+            .detail = type_str,
+            .kind = .Field,
+            .range = .{
+                .start = .{ .line = field_line, .character = 4 }, // Indented
+                .end = .{ .line = field_line, .character = 4 + field_name_len },
+            },
+            .selection_range = .{
+                .start = .{ .line = field_line, .character = 4 },
+                .end = .{ .line = field_line, .character = 4 + field_name_len },
+            },
+        });
+    }
+
+    if (children.items.len == 0) return null;
+    const slice = try children.toOwnedSlice(allocator);
+    return slice;
+}
+
+/// Extract function parameters as DocumentSymbol children
+fn extractFunctionParamChildren(
+    allocator: Allocator,
+    store: *const cot.ast.NodeStore,
+    strings: *const cot.base.StringInterner,
+    params_start: u32,
+    parent_loc: cot.ast.SourceLoc,
+) !?[]protocol.DocumentSymbol {
+    const extra_data = store.extra_data.items;
+    if (params_start >= extra_data.len) return null;
+
+    const param_count = extra_data[params_start];
+    if (param_count == 0) return null;
+
+    var children: std.ArrayListUnmanaged(protocol.DocumentSymbol) = .empty;
+    errdefer children.deinit(allocator);
+
+    // Params are stored as [count, name1, type1, is_ref1, default1, name2, type2, ...]
+    // Each param is 4 values
+    var i: u32 = 0;
+    while (i < param_count) : (i += 1) {
+        const param_offset = params_start + 1 + (i * 4);
+        if (param_offset >= extra_data.len) break;
+
+        const param_name_id: cot.base.StringId = @enumFromInt(extra_data[param_offset]);
+        const param_type_idx: cot.ast.TypeIdx = @enumFromInt(extra_data[param_offset + 1]);
+
+        const param_name = strings.get(param_name_id);
+        const param_name_copy = try allocator.dupe(u8, param_name);
+        const param_name_len: u32 = @intCast(param_name.len);
+
+        // Get type string for detail
+        const type_str = getTypeStringForSymbol(store, strings, param_type_idx);
+
+        // Create child symbol for parameter - all on the same line as function
+        try children.append(allocator, .{
+            .name = param_name_copy,
+            .detail = type_str,
+            .kind = .Variable, // Parameters shown as variables
+            .range = .{
+                .start = .{ .line = parent_loc.line, .character = 0 },
+                .end = .{ .line = parent_loc.line, .character = param_name_len },
+            },
+            .selection_range = .{
+                .start = .{ .line = parent_loc.line, .character = 0 },
+                .end = .{ .line = parent_loc.line, .character = param_name_len },
+            },
+        });
+    }
+
+    if (children.items.len == 0) return null;
+    const slice = try children.toOwnedSlice(allocator);
+    return slice;
+}
+
+/// Get type string for document symbol detail
+fn getTypeStringForSymbol(
+    store: *const cot.ast.NodeStore,
+    strings: *const cot.base.StringInterner,
+    type_idx: cot.ast.TypeIdx,
+) ?[]const u8 {
+    const idx = type_idx.toInt();
+    // TypeIdx of max value typically means "no type" - check for valid range only
+    if (idx >= store.type_tags.items.len) return null;
+
+    const type_tag = store.type_tags.items[idx];
+    return switch (type_tag) {
+        .i8 => "i8",
+        .i16 => "i16",
+        .i32 => "i32",
+        .i64 => "i64",
+        .u8 => "u8",
+        .u16 => "u16",
+        .u32 => "u32",
+        .u64 => "u64",
+        .f32 => "f32",
+        .f64 => "f64",
+        .bool => "bool",
+        .string => "string",
+        .void => "void",
+        .named => blk: {
+            const type_data = store.type_data.items[idx];
+            const name_id: cot.base.StringId = @enumFromInt(type_data.a);
+            break :blk strings.get(name_id);
+        },
+        else => null,
+    };
 }
 
 fn getCotSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayListUnmanaged(protocol.DocumentSymbol)) !void {
@@ -917,6 +1305,8 @@ fn getCotSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
                 const name_len: u32 = @intCast(name.len);
                 // Duplicate name since StringInterner will be freed when this function exits
                 const name_copy = allocator.dupe(u8, name) catch break :blk null;
+                const params_start = data.b;
+                const param_children = extractFunctionParamChildren(allocator, &store, &strings, params_start, loc) catch null;
                 break :blk .{
                     .name = name_copy,
                     .kind = .Function,
@@ -928,6 +1318,7 @@ fn getCotSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
                         .start = .{ .line = loc.line, .character = loc.column },
                         .end = .{ .line = loc.line, .character = loc.column + name_len },
                     },
+                    .children = param_children,
                 };
             },
             .struct_def => blk: {
@@ -935,6 +1326,8 @@ fn getCotSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
                 const name = strings.get(name_id);
                 const name_len: u32 = @intCast(name.len);
                 const name_copy = allocator.dupe(u8, name) catch break :blk null;
+                const fields_start = data.b;
+                const field_children = extractStructFieldChildren(allocator, &store, &strings, fields_start, loc) catch null;
                 break :blk .{
                     .name = name_copy,
                     .kind = .Struct,
@@ -946,6 +1339,7 @@ fn getCotSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
                         .start = .{ .line = loc.line, .character = loc.column },
                         .end = .{ .line = loc.line, .character = loc.column + name_len },
                     },
+                    .children = field_children,
                 };
             },
             .union_def => blk: {
@@ -1135,347 +1529,109 @@ fn getDblSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
     }
 }
 
+fn getDexSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayListUnmanaged(protocol.DocumentSymbol)) !void {
+    // Parse Dex component to extract symbols
+    const dex = cot.framework.dex;
+
+    // Tokenize using ComponentLexer
+    var lexer = dex.component_parser.ComponentLexer.init(allocator, source);
+    const tokens = lexer.tokenize() catch return;
+    defer allocator.free(tokens);
+
+    // Parse tokens
+    var parser = dex.component_parser.ComponentParser.init(allocator, tokens);
+    defer parser.deinit();
+
+    const parsed = parser.parse() catch return;
+
+    // Add component name as class symbol
+    try symbols.append(allocator, .{
+        .name = try allocator.dupe(u8, parsed.name),
+        .kind = .Class,
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 100, .character = 0 },
+        },
+        .selection_range = .{
+            .start = .{ .line = 0, .character = 10 },
+            .end = .{ .line = 0, .character = 10 + @as(u32, @intCast(parsed.name.len)) },
+        },
+    });
+
+    // Add methods as function symbols
+    for (parsed.methods, 0..) |method, i| {
+        const line: u32 = @intCast(10 + i * 5); // Approximate line numbers
+        try symbols.append(allocator, .{
+            .name = try allocator.dupe(u8, method.name),
+            .kind = .Method,
+            .range = .{
+                .start = .{ .line = line, .character = 0 },
+                .end = .{ .line = line + 5, .character = 0 },
+            },
+            .selection_range = .{
+                .start = .{ .line = line, .character = 5 },
+                .end = .{ .line = line, .character = 5 + @as(u32, @intCast(method.name.len)) },
+            },
+        });
+    }
+}
+
 // ============================================================
 // Document Formatting
 // ============================================================
 
-/// Text edit for formatting
+/// Text edit for formatting (LSP format)
 pub const TextEdit = struct {
     range: protocol.Range,
     new_text: []const u8,
 };
 
 /// Format a document and return text edits
+/// Uses the shared formatter module and converts to LSP format
 pub fn formatDocument(allocator: Allocator, doc: *const Document, tab_size: u32, insert_spaces: bool) ![]TextEdit {
-    return switch (doc.language) {
-        .dbl => formatDbl(allocator, doc.content, tab_size, insert_spaces),
-        .cot => formatCot(allocator, doc.content, tab_size, insert_spaces),
-    };
-}
+    const formatter = cot.formatter;
 
-/// Format DBL source code
-fn formatDbl(allocator: Allocator, source: []const u8, tab_size: u32, insert_spaces: bool) ![]TextEdit {
-    var edits: std.ArrayListUnmanaged(TextEdit) = .empty;
-    errdefer edits.deinit(allocator);
-
-    // Build the indent string
-    var indent_buf: [16]u8 = undefined;
-    const indent_str = if (insert_spaces) blk: {
-        const size = @min(tab_size, 16);
-        @memset(indent_buf[0..size], ' ');
-        break :blk indent_buf[0..size];
-    } else "\t";
-
-    // Keywords that increase indent level
-    // Note: begin/end work like braces - control flow keywords (if/while/for/etc.)
-    // don't increase indent; only begin does
-    const indent_keywords = [_][]const u8{
-        "record", "group", "structure", "common", "global", "literal",
-        "begin", "using",
-        "class", "method", "property", "namespace", "interface", "try",
-        "subroutine", "function", "test",
+    // Map LSP language to formatter language
+    const lang: formatter.Language = switch (doc.language) {
+        .cot => .cot,
+        .dbl => .dbl,
+        .dex => return &.{}, // Dex files don't have formatting yet
     };
 
-    // Keywords that should be at indent 0 but set indent to 1 for following lines
-    // proc is special: it aligns with function/endfunction but its body is indented
-    const proc_like_keywords = [_][]const u8{
-        "proc",
-    };
+    // Get edits from shared formatter
+    const shared_edits = try formatter.formatToEdits(allocator, doc.content, lang, .{
+        .tab_size = tab_size,
+        .insert_spaces = insert_spaces,
+    });
+    defer allocator.free(shared_edits);
 
-    // Keywords that decrease indent level by 1
-    const dedent_keywords = [_][]const u8{
-        "endrecord", "endgroup", "endstructure", "endcommon", "endglobal", "endliteral",
-        "end", "endusing", "endclass", "endmethod", "endproperty",
-        "endnamespace", "endinterface", "endtry", "endproc",
-    };
-
-    // Keywords that reset indent to 0 (end of top-level blocks)
-    // These end blocks that can contain multiple nested indent levels
-    const reset_indent_keywords = [_][]const u8{
-        "endmain", "endfunction", "endsubroutine", "endtest",
-    };
-
-    // Control flow keywords that indent the next single statement (if no begin)
-    const control_flow_keywords = [_][]const u8{
-        "if", "else", "while", "for", "do", "using", "case",
-    };
-
-    // Process line by line
-    var line_num: u32 = 0;
-    var line_start: usize = 0;
-    var indent_level: u32 = 0;
-    var pending_single_indent: bool = false; // Next line gets +1 for single-statement body
-
-    var i: usize = 0;
-    while (i <= source.len) : (i += 1) {
-        const at_end = i == source.len;
-        const at_newline = !at_end and source[i] == '\n';
-
-        if (at_newline or at_end) {
-            const line_end = i;
-            const line = source[line_start..line_end];
-
-            // Skip empty lines
-            const trimmed = std.mem.trim(u8, line, " \t");
-            if (trimmed.len > 0) {
-                // Check if line starts with reset-indent keyword (top-level block enders)
-                var should_reset = false;
-                for (reset_indent_keywords) |kw| {
-                    if (startsWithKeyword(trimmed, kw)) {
-                        should_reset = true;
-                        break;
-                    }
-                }
-
-                // Check if line starts with proc-like keyword (indent 0, then set to 1)
-                var is_proc_like = false;
-                if (!should_reset) {
-                    for (proc_like_keywords) |kw| {
-                        if (startsWithKeyword(trimmed, kw)) {
-                            is_proc_like = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Check if line starts with dedent keyword
-                var should_dedent = false;
-                if (!should_reset and !is_proc_like) {
-                    for (dedent_keywords) |kw| {
-                        if (startsWithKeyword(trimmed, kw)) {
-                            should_dedent = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Apply indent changes before this line
-                if (should_reset) {
-                    indent_level = 0;
-                    pending_single_indent = false;
-                } else if (is_proc_like) {
-                    indent_level = 0; // proc itself at level 0
-                    pending_single_indent = false;
-                } else if (should_dedent and indent_level > 0) {
-                    indent_level -= 1;
-                    pending_single_indent = false;
-                }
-
-                // Calculate expected indent (add 1 if this is a single-statement body)
-                var effective_indent = indent_level;
-                if (pending_single_indent) {
-                    effective_indent += 1;
-                    pending_single_indent = false; // Only applies to one line
-                }
-                const expected_indent = effective_indent * @as(u32, @intCast(indent_str.len));
-
-                // Find actual indent
-                var actual_indent: u32 = 0;
-                for (line) |c| {
-                    if (c == ' ') {
-                        actual_indent += 1;
-                    } else if (c == '\t') {
-                        actual_indent += tab_size;
-                    } else {
-                        break;
-                    }
-                }
-
-                // If indent doesn't match, create edit
-                if (actual_indent != expected_indent) {
-                    // Build new indent
-                    const new_indent = try allocator.alloc(u8, expected_indent);
-                    if (insert_spaces) {
-                        @memset(new_indent, ' ');
-                    } else {
-                        const tabs = expected_indent / tab_size;
-                        @memset(new_indent[0..tabs], '\t');
-                    }
-
-                    // Find where content starts
-                    var content_start: u32 = 0;
-                    for (line) |c| {
-                        if (c != ' ' and c != '\t') break;
-                        content_start += 1;
-                    }
-
-                    try edits.append(allocator, .{
-                        .range = .{
-                            .start = .{ .line = line_num, .character = 0 },
-                            .end = .{ .line = line_num, .character = content_start },
-                        },
-                        .new_text = new_indent,
-                    });
-                }
-
-                // Update indent for next line
-                if (is_proc_like) {
-                    // proc sets indent to 1 for following lines
-                    indent_level = 1;
-                } else {
-                    // Check if line starts with indent keyword
-                    for (indent_keywords) |kw| {
-                        if (startsWithKeyword(trimmed, kw)) {
-                            indent_level += 1;
-                            break;
-                        }
-                    }
-
-                    // Check for control flow without begin (single-statement body)
-                    // e.g., "if (x)" without "begin" -> next line gets +1 indent
-                    for (control_flow_keywords) |kw| {
-                        if (startsWithKeyword(trimmed, kw)) {
-                            // Check if line contains or ends with "begin"
-                            const lower_trimmed = trimmed; // Already lowercase comparison in startsWithKeyword
-                            var has_begin = false;
-                            var j: usize = 0;
-                            while (j + 5 <= trimmed.len) : (j += 1) {
-                                if (std.ascii.eqlIgnoreCase(trimmed[j .. j + 5], "begin")) {
-                                    // Check word boundary
-                                    const before_ok = j == 0 or !std.ascii.isAlphanumeric(trimmed[j - 1]);
-                                    const after_ok = j + 5 >= trimmed.len or !std.ascii.isAlphanumeric(trimmed[j + 5]);
-                                    if (before_ok and after_ok) {
-                                        has_begin = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = lower_trimmed;
-                            if (!has_begin) {
-                                pending_single_indent = true;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-
-            line_num += 1;
-            line_start = i + 1;
+    // Convert to LSP TextEdit format
+    var lsp_edits: std.ArrayListUnmanaged(TextEdit) = .empty;
+    errdefer {
+        for (lsp_edits.items) |edit| {
+            allocator.free(edit.new_text);
         }
+        lsp_edits.deinit(allocator);
     }
 
-    return edits.toOwnedSlice(allocator);
-}
+    for (shared_edits) |edit| {
+        // Duplicate the new_text since shared_edits will be freed
+        const new_text = try allocator.dupe(u8, edit.new_text);
+        errdefer allocator.free(new_text);
 
-/// Check if line starts with a keyword (case-insensitive, word boundary)
-fn startsWithKeyword(line: []const u8, keyword: []const u8) bool {
-    if (line.len < keyword.len) return false;
-
-    // Case-insensitive comparison
-    for (keyword, 0..) |kc, j| {
-        const lc = std.ascii.toLower(line[j]);
-        const kwc = std.ascii.toLower(kc);
-        if (lc != kwc) return false;
+        try lsp_edits.append(allocator, .{
+            .range = .{
+                .start = .{ .line = edit.start_line, .character = edit.start_char },
+                .end = .{ .line = edit.end_line, .character = edit.end_char },
+            },
+            .new_text = new_text,
+        });
     }
 
-    // Check word boundary
-    if (line.len == keyword.len) return true;
-    const next_char = line[keyword.len];
-    return !std.ascii.isAlphanumeric(next_char) and next_char != '_';
-}
-
-/// Format Cot source code
-fn formatCot(allocator: Allocator, source: []const u8, tab_size: u32, insert_spaces: bool) ![]TextEdit {
-    var edits: std.ArrayListUnmanaged(TextEdit) = .empty;
-    errdefer edits.deinit(allocator);
-
-    // Build the indent string
-    var indent_buf: [16]u8 = undefined;
-    const indent_str = if (insert_spaces) blk: {
-        const size = @min(tab_size, 16);
-        @memset(indent_buf[0..size], ' ');
-        break :blk indent_buf[0..size];
-    } else "\t";
-
-    // Track brace depth for indentation
-    var indent_level: u32 = 0;
-    var line_num: u32 = 0;
-    var line_start: usize = 0;
-
-    var i: usize = 0;
-    while (i <= source.len) : (i += 1) {
-        const at_end = i == source.len;
-        const at_newline = !at_end and source[i] == '\n';
-
-        if (at_newline or at_end) {
-            const line_end = i;
-            const line = source[line_start..line_end];
-
-            const trimmed = std.mem.trim(u8, line, " \t");
-            if (trimmed.len > 0) {
-                // Check if line starts with closing brace
-                const starts_with_close = trimmed[0] == '}';
-
-                // Apply dedent before this line if it starts with }
-                if (starts_with_close and indent_level > 0) {
-                    indent_level -= 1;
-                }
-
-                // Calculate expected indent
-                const expected_indent = indent_level * @as(u32, @intCast(indent_str.len));
-
-                // Find actual indent
-                var actual_indent: u32 = 0;
-                for (line) |c| {
-                    if (c == ' ') {
-                        actual_indent += 1;
-                    } else if (c == '\t') {
-                        actual_indent += tab_size;
-                    } else {
-                        break;
-                    }
-                }
-
-                // If indent doesn't match, create edit
-                if (actual_indent != expected_indent) {
-                    const new_indent = try allocator.alloc(u8, expected_indent);
-                    if (insert_spaces) {
-                        @memset(new_indent, ' ');
-                    } else {
-                        const tabs = expected_indent / tab_size;
-                        @memset(new_indent[0..tabs], '\t');
-                    }
-
-                    var content_start: u32 = 0;
-                    for (line) |c| {
-                        if (c != ' ' and c != '\t') break;
-                        content_start += 1;
-                    }
-
-                    try edits.append(allocator, .{
-                        .range = .{
-                            .start = .{ .line = line_num, .character = 0 },
-                            .end = .{ .line = line_num, .character = content_start },
-                        },
-                        .new_text = new_indent,
-                    });
-                }
-
-                // Count braces on this line to update indent for next line
-                var in_string = false;
-                var in_comment = false;
-                for (trimmed, 0..) |c, j| {
-                    if (in_comment) break;
-                    if (c == '"' and (j == 0 or trimmed[j - 1] != '\\')) {
-                        in_string = !in_string;
-                    } else if (!in_string) {
-                        if (c == '/' and j + 1 < trimmed.len and trimmed[j + 1] == '/') {
-                            in_comment = true;
-                        } else if (c == '{') {
-                            indent_level += 1;
-                        } else if (c == '}' and !starts_with_close) {
-                            // Only dedent for } not at start of line
-                            if (indent_level > 0) indent_level -= 1;
-                        }
-                    }
-                }
-            }
-
-            line_num += 1;
-            line_start = i + 1;
-        }
+    // Free the original new_text from shared formatter
+    for (shared_edits) |edit| {
+        allocator.free(edit.new_text);
     }
 
-    return edits.toOwnedSlice(allocator);
+    return lsp_edits.toOwnedSlice(allocator);
 }

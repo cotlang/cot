@@ -23,6 +23,7 @@ pub const Config = struct {
     enable_tui: bool,
     enable_profiling: bool,
     enable_jit_profiling: bool,
+    enable_postgres: bool,
 
     /// Debug options
     enable_debug_info: bool,
@@ -56,6 +57,12 @@ pub const Config = struct {
                 "Enable JIT function call profiling (default: true)",
             ) orelse true,
 
+            .enable_postgres = b.option(
+                bool,
+                "postgres",
+                "Enable PostgreSQL support via libpq (default: false)",
+            ) orelse false,
+
             // Debug options - default to true in Debug mode
             .enable_debug_info = b.option(
                 bool,
@@ -77,6 +84,7 @@ pub const Config = struct {
         options.addOption(bool, "enable_tui", self.enable_tui);
         options.addOption(bool, "enable_profiling", self.enable_profiling);
         options.addOption(bool, "enable_jit_profiling", self.enable_jit_profiling);
+        options.addOption(bool, "enable_postgres", self.enable_postgres);
         options.addOption(bool, "enable_debug_info", self.enable_debug_info);
         options.addOption(bool, "verbose_ir", self.verbose_ir);
         return options.createModule();
@@ -102,6 +110,7 @@ pub const Config = struct {
             \\  enable_tui:         {}
             \\  enable_profiling:   {}
             \\  enable_jit_profiling: {}
+            \\  enable_postgres:    {}
             \\  enable_debug_info:  {}
             \\  verbose_ir:         {}
             \\
@@ -110,6 +119,7 @@ pub const Config = struct {
             self.enable_tui,
             self.enable_profiling,
             self.enable_jit_profiling,
+            self.enable_postgres,
             self.enable_debug_info,
             self.verbose_ir,
         });
@@ -156,6 +166,14 @@ pub const SharedDeps = struct {
         });
         cot_runtime.linkSystemLibrary("sqlite3", .{});
         cot_runtime.linkSystemLibrary("c", .{});
+
+        // PostgreSQL support (optional)
+        if (config.enable_postgres) {
+            // Add libpq include and library paths for macOS Homebrew
+            cot_runtime.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/include" });
+            cot_runtime.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/lib" });
+            cot_runtime.linkSystemLibrary("pq", .{});
+        }
 
         // TUI Extension module (optional)
         var cot_tui: ?*std.Build.Module = null;

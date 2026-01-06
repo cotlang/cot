@@ -359,6 +359,11 @@ pub const Opcode = enum(u8) {
     /// Format: [rs:4|0] [0]
     clear_record = 0x88,
 
+    /// alloc_buffer slot, size - allocate mutable buffer of given size
+    /// Format: [slot:8] [size:16]
+    /// Creates a mutable FixedString filled with spaces at the local slot
+    alloc_buffer = 0x89,
+
     // ============================================
     // String Operations (0x90-0x9F)
     // ============================================
@@ -707,6 +712,9 @@ pub const Opcode = enum(u8) {
     /// decr_int rd - integer decrement (no type check)
     decr_int = 0xEB,
 
+    /// fn_datetime rd - rd = current datetime as YYYYMMDDHHMMSSUUUUUU
+    fn_datetime = 0xEC,
+
     _,
 
     /// Get the size of operands for this opcode
@@ -755,7 +763,7 @@ pub const Opcode = enum(u8) {
             .array_load, .array_store, .array_len => 3, // [idx_reg/regs:8] [slot:16]
             .fn_abs, .fn_sqrt, .fn_sin, .fn_cos, .fn_tan => 2,
             .fn_log, .fn_log10, .fn_exp, .fn_round, .fn_trunc => 2,
-            .fn_date, .fn_time, .fn_size, .fn_instr, .fn_mem, .fn_error => 2,
+            .fn_date, .fn_time, .fn_datetime, .fn_size, .fn_instr, .fn_mem, .fn_error => 2,
             .print, .println, .readln => 2,
             .readkey, .log => 2,
             .call_indirect => 2,
@@ -783,6 +791,9 @@ pub const Opcode = enum(u8) {
             // 5-byte operands: [reg:4|0] [u32] or [reg:4|0] [u16] [u16]
             .movi32, .jmp32 => 5,
             .load_record_buf, .store_record_buf => 5,
+
+            // 3-byte operands: [u8] [u16]
+            .alloc_buffer => 3,
 
             // Unknown opcodes
             _ => 0,

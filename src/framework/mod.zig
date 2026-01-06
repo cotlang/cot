@@ -22,6 +22,7 @@ pub const commands = struct {
     pub const data = @import("commands/data.zig");
     pub const convert = @import("commands/convert.zig");
     pub const dev = @import("commands/dev.zig");
+    pub const gen = @import("commands/gen.zig");
 };
 
 // Build system
@@ -35,6 +36,9 @@ pub const http = struct {
     pub const server = @import("http/server.zig");
     pub const router = @import("http/router.zig");
 };
+
+// Dex - Real-time server-rendered UI framework
+pub const dex = @import("dex/dex.zig");
 
 // Re-export commonly used types for convenience
 pub const ConfigLoader = config.ConfigLoader;

@@ -620,7 +620,8 @@ pub const Lexer = struct {
         .{ "self", .kw_self },
         .{ "true", .kw_true },
         .{ "false", .kw_false },
-        .{ "nil", .kw_nil },
+        .{ "null", .kw_null },
+        .{ "nil", .kw_null }, // alias for backward compatibility
         .{ "and", .kw_and },
         .{ "or", .kw_or },
         .{ "not", .kw_not },

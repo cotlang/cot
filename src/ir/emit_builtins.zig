@@ -22,11 +22,15 @@ pub const BuiltinDef = struct {
 /// Performance-critical functions that have dedicated opcodes
 /// Everything else routes through xcall to native functions
 pub const opcode_builtins = std.StaticStringMap(BuiltinDef).initComptime(.{
-    // Only keep opcodes for extremely high-volume operations
+    // String operations - high volume
     .{ "trim", BuiltinDef{ .opcode = .str_trim, .min_args = 1, .max_args = 1 } },
     .{ "atrim", BuiltinDef{ .opcode = .str_trim, .min_args = 1, .max_args = 1 } },
     .{ "len", BuiltinDef{ .opcode = .str_len, .min_args = 1, .max_args = 1 } },
     .{ "size", BuiltinDef{ .opcode = .fn_size, .min_args = 1, .max_args = 1 } },
+    // Date/time - high volume, no arguments
+    .{ "date", BuiltinDef{ .opcode = .fn_date, .min_args = 0, .max_args = 0 } },
+    .{ "time", BuiltinDef{ .opcode = .fn_time, .min_args = 0, .max_args = 0 } },
+    .{ "datetime", BuiltinDef{ .opcode = .fn_datetime, .min_args = 0, .max_args = 0 } },
 });
 
 /// Core Cot I/O functions with dedicated opcodes (no return value)
@@ -62,9 +66,6 @@ pub const native_functions = std.StaticStringMap(void).initComptime(.{
     .{ "exp", {} },
     .{ "round", {} },
     .{ "trunc", {} },
-    // Date/time
-    .{ "date", {} },
-    .{ "time", {} },
     // System
     .{ "error", {} },
     .{ "mem", {} },

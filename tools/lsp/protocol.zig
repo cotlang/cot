@@ -247,6 +247,7 @@ pub const SymbolKind = enum(u8) {
 
 pub const DocumentSymbol = struct {
     name: []const u8,
+    detail: ?[]const u8 = null,
     kind: SymbolKind,
     range: Range,
     selection_range: Range,
@@ -258,6 +259,10 @@ pub const DocumentSymbol = struct {
         try obj.put("kind", JsonValue{ .integer = @intFromEnum(self.kind) });
         try obj.put("range", try self.range.toJson(allocator));
         try obj.put("selectionRange", try self.selection_range.toJson(allocator));
+
+        if (self.detail) |detail| {
+            try obj.put("detail", JsonValue{ .string = detail });
+        }
 
         if (self.children) |children| {
             var arr = JsonArray.init(allocator);

@@ -345,7 +345,17 @@ pub fn compileToModuleWithPath(allocator: std.mem.Allocator, source: []const u8,
     // Emit bytecode using register mode (fully register-based VM)
     var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
     defer emitter.deinit();
-    return try emitter.emit(ir_module);
+    return emitter.emit(ir_module) catch |err| {
+        if (emitter.getLastError()) |ctx| {
+            std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {s}\n", .{ctx.message});
+            if (ctx.detail.len > 0) {
+                std.debug.print("\x1b[33mNote:\x1b[0m {s}\n", .{ctx.detail});
+            }
+        } else {
+            std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {}\n", .{err});
+        }
+        return error.CompilationFailed;
+    };
 }
 
 /// Compile DBL source to bytecode with full preprocessor configuration
@@ -434,7 +444,17 @@ pub fn compileToModuleWithConfig(
     // Emit bytecode using register mode (fully register-based VM)
     var emitter = cot.ir_emit_bytecode.BytecodeEmitter.init(allocator);
     defer emitter.deinit();
-    return try emitter.emit(ir_module);
+    return emitter.emit(ir_module) catch |err| {
+        if (emitter.getLastError()) |ctx| {
+            std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {s}\n", .{ctx.message});
+            if (ctx.detail.len > 0) {
+                std.debug.print("\x1b[33mNote:\x1b[0m {s}\n", .{ctx.detail});
+            }
+        } else {
+            std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {}\n", .{err});
+        }
+        return error.CompilationFailed;
+    };
 }
 
 /// Preprocess DBL source to handle import statements

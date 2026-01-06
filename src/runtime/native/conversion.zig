@@ -58,7 +58,7 @@ pub fn string(ctx: *NativeContext) NativeError!?Value {
             const result = ctx.allocator.dupe(u8, str) catch return NativeError.OutOfMemory;
             return Value.initFixedString(ctx.allocator, result) catch return NativeError.OutOfMemory;
         },
-        .decimal => {
+        .implied_decimal => {
             // Format decimal as string
             if (val.asDecimal()) |d| {
                 var buf: [64]u8 = undefined;
@@ -192,7 +192,7 @@ pub fn cast_decimal(ctx: *NativeContext) NativeError!?Value {
             const int_val = val.asInt();
             return Value.initDecimal(ctx.allocator, int_val, 0) catch return NativeError.OutOfMemory;
         },
-        .decimal => {
+        .implied_decimal => {
             // Already decimal - return as-is
             if (val.asDecimal()) |d| {
                 return Value.initDecimal(ctx.allocator, d.value, d.precision) catch return NativeError.OutOfMemory;
@@ -231,7 +231,7 @@ pub fn cast_integer(ctx: *NativeContext) NativeError!?Value {
             if (negative) value = -value;
             return Value.initInt(value);
         },
-        .decimal => {
+        .implied_decimal => {
             // Truncate decimal to integer
             if (val.asDecimal()) |d| {
                 const scale: i64 = std.math.powi(i64, 10, d.precision) catch 1;

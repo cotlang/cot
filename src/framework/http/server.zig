@@ -12,11 +12,14 @@ const router = @import("router.zig");
 const context = @import("context.zig");
 pub const middleware = @import("middleware.zig");
 pub const static = @import("static.zig");
+pub const websocket = @import("websocket.zig");
 
 // Re-export Context for convenience
 pub const Context = context.Context;
 pub const MiddlewareFn = middleware.MiddlewareFn;
 pub const MiddlewareStack = middleware.MiddlewareStack;
+pub const WebSocket = websocket.WebSocket;
+pub const WebSocketHandler = websocket.WebSocketHandler;
 
 /// Error handler function type
 pub const ErrorHandlerFn = *const fn (*Context, anyerror) void;
@@ -295,6 +298,11 @@ pub const Server = struct {
         try self.route(.PATCH, path, handler);
     }
 
+    /// WebSocket route helper
+    pub fn ws(self: *Self, path: []const u8, handler: WebSocketHandler) !void {
+        try self.router.addWs(path, handler);
+    }
+
     /// Create a route group with a prefix
     pub fn group(self: *Self, prefix: []const u8) RouteGroup {
         return RouteGroup.init(self, prefix);
@@ -376,6 +384,14 @@ pub const Server = struct {
                 }
             };
 
+            // Check for WebSocket upgrade request
+            if (websocket.isUpgradeRequest(&http_request)) {
+                self.handleWebSocketUpgrade(&http_request, connection) catch |err| {
+                    std.debug.print("WebSocket upgrade error: {}\n", .{err});
+                };
+                return; // WebSocket takes over the connection
+            }
+
             // Process the request
             const keep_alive = self.processRequest(&http_request) catch |err| {
                 std.debug.print("Request processing error: {}\n", .{err});
@@ -386,6 +402,42 @@ pub const Server = struct {
 
             // If not keep-alive, close after this request
             if (!keep_alive) return;
+        }
+    }
+
+    /// Handle WebSocket upgrade request
+    fn handleWebSocketUpgrade(self: *Self, http_request: *http.Server.Request, connection: *net.Server.Connection) !void {
+        // Parse path from target
+        const target = http_request.head.target;
+        var path: []const u8 = target;
+        if (std.mem.indexOf(u8, target, "?")) |idx| {
+            path = target[0..idx];
+        }
+
+        // Find matching WebSocket route
+        if (self.router.matchWs(path)) |match_result| {
+            var match = match_result;
+            defer match.deinit();
+
+            // Create WebSocket and perform handshake
+            var websock = WebSocket.init(self.allocator, connection.stream);
+            errdefer websock.deinit();
+
+            try websock.acceptHandshake(http_request);
+
+            // Call the handler
+            match.handler(&websock) catch |err| {
+                std.debug.print("WebSocket handler error: {}\n", .{err});
+            };
+
+            // Clean up
+            websock.deinit();
+        } else {
+            // No matching WebSocket route - return 404
+            http_request.respond("WebSocket route not found", .{
+                .status = .not_found,
+                .keep_alive = false,
+            }) catch {};
         }
     }
 

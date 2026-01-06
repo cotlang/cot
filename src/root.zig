@@ -87,6 +87,9 @@ pub const debug = cot_runtime.debug;
 // Testing utilities
 pub const testing_utils = @import("testing/mod.zig");
 
+// Code formatter (shared between CLI and LSP)
+pub const formatter = @import("formatter/mod.zig");
+
 // Crash handling (from cot_runtime)
 pub const crash = cot_runtime.crash;
 
