@@ -694,7 +694,7 @@ pub const BytecodeEmitter = struct {
             .f32const => |c| try emit_inst.emitF32const(self, c),
             .f64const => |c| try emit_inst.emitF64const(self, c),
             .const_string => |c| try emit_inst.emitConstString(self, c),
-            .const_null => {},
+            .const_null => |c| try emit_inst.emitConstNull(self, c),
 
             // Arithmetic
             .iadd => |a| try emit_inst.emitBinaryArith(self, .add, a.lhs, a.rhs, a.result),
@@ -706,6 +706,14 @@ pub const BytecodeEmitter = struct {
             .trunc => |t| try emit_inst.emitTrunc(self, t),
             .ineg => |n| try emit_inst.emitIneg(self, n),
             .icmp => |c| try emit_inst.emitIcmp(self, c),
+
+            // Bitwise operations
+            .band => |b| try emit_inst.emitBinaryArith(self, .bit_and, b.lhs, b.rhs, b.result),
+            .bor => |b| try emit_inst.emitBinaryArith(self, .bit_or, b.lhs, b.rhs, b.result),
+            .bxor => |b| try emit_inst.emitBinaryArith(self, .bit_xor, b.lhs, b.rhs, b.result),
+            .bnot => |b| try emit_inst.emitBitNot(self, b),
+            .ishl => |s| try emit_inst.emitBinaryArith(self, .shl, s.lhs, s.rhs, s.result),
+            .sshr => |s| try emit_inst.emitBinaryArith(self, .shr, s.lhs, s.rhs, s.result),
 
             // Logical
             .log_and => |l| try emit_inst.emitBinaryArith(self, .log_and, l.lhs, l.rhs, l.result),
@@ -758,6 +766,7 @@ pub const BytecodeEmitter = struct {
             .array_load => |al| try emit_inst.emitArrayLoad(self, al),
             .array_store => |as| try emit_inst.emitArrayStore(self, as),
             .array_len => |al| try emit_inst.emitArrayLen(self, al),
+            .array_slice => |as| try emit_inst.emitArraySlice(self, as),
 
             // Switch/branch table
             .br_table => |s| try emit_inst.emitBrTable(self, s),

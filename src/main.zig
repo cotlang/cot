@@ -105,6 +105,7 @@ const schema_cmd = cot.framework.commands.schema;
 const data_cmd = cot.framework.commands.data;
 const convert_cmd = cot.framework.commands.convert;
 const gen_cmd = cot.framework.commands.gen;
+const deps_cmd = cot.framework.commands.deps;
 
 // ============================================================
 // Command Dispatch System
@@ -150,6 +151,7 @@ const commands = [_]Command{
     .{ .name = "data", .handler = cmdData, .description = "Load/unload fixed-width data", .usage = "<subcommand>", .category = .workspace },
     .{ .name = "convert", .handler = cmdConvert, .description = "Convert DBL to Cot syntax", .usage = "<file.dbl>", .category = .workspace },
     .{ .name = "gen", .handler = cmdGen, .description = "Generate code (components, etc.)", .usage = "<generator> <name>", .category = .workspace },
+    .{ .name = "deps", .handler = cmdDeps, .description = "Show package dependency graph", .usage = "[--json]", .category = .workspace },
 };
 
 /// Find a command by name or alias
@@ -276,23 +278,64 @@ fn runWithRustRuntime(allocator: std.mem.Allocator, target: []const u8) !void {
 fn cmdCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         try printErr("Error: compile requires a filename\n");
-        try printErr("Usage: cot compile <file.cot> [-o output.cbo]\n");
+        try printErr("Usage: cot compile <file.cot> [-o output.cbo] [--no-packages]\n");
         return;
     }
 
     var output_file: ?[]const u8 = null;
+    var no_packages: bool = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-o") and i + 1 < args.len) {
             output_file = args[i + 1];
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--no-packages")) {
+            no_packages = true;
         }
     }
 
+    // Try package-based compilation first (if cot.json exists)
+    if (!no_packages) {
+        if (hasWorkspaceConfig(allocator, args[0])) {
+            compileWithPackages(allocator, args[0], output_file) catch |err| {
+                if (err == error.CompilationFailed) std.process.exit(1);
+                return err;
+            };
+            return;
+        }
+    }
+
+    // Fall back to single-file compilation
     compileFile(allocator, args[0], output_file) catch |err| {
         if (err == error.CompilationFailed) std.process.exit(1);
         return err;
     };
+}
+
+/// Check if there's a cot.json in the file's directory or any parent
+fn hasWorkspaceConfig(allocator: std.mem.Allocator, filename: []const u8) bool {
+    const file_dir = std.fs.path.dirname(filename) orelse ".";
+    const abs_file_dir = std.fs.cwd().realpathAlloc(allocator, file_dir) catch return false;
+    defer allocator.free(abs_file_dir);
+
+    var search_dir: []const u8 = abs_file_dir;
+    while (true) {
+        const config_path = std.fs.path.join(allocator, &.{ search_dir, "cot.json" }) catch return false;
+        defer allocator.free(config_path);
+
+        if (std.fs.cwd().access(config_path, .{})) |_| {
+            return true;
+        } else |_| {}
+
+        // Try parent directory
+        if (std.fs.path.dirname(search_dir)) |parent| {
+            if (std.mem.eql(u8, parent, search_dir)) break;
+            search_dir = parent;
+        } else {
+            break;
+        }
+    }
+    return false;
 }
 
 fn cmdFmt(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -465,6 +508,22 @@ fn cmdGen(allocator: std.mem.Allocator, args: []const []const u8) !void {
         {
             try printStderr("Error: {}\n", .{err});
         }
+    };
+}
+
+fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var options = deps_cmd.DepsOptions{};
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            options.json = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            options.workspace_root = arg;
+        }
+    }
+
+    deps_cmd.run(allocator, options) catch |err| {
+        try printStderr("Error: {}\n", .{err});
     };
 }
 
@@ -1627,6 +1686,208 @@ fn resolveImportPath(
     const filename = try std.fmt.allocPrint(allocator, "{s}.cot", .{module_name});
     defer allocator.free(filename);
     return std.fs.path.join(allocator, &.{ base_dir, filename });
+}
+
+/// Compile using the package system
+/// Discovers packages from cot.json, compiles in dependency order, and links
+fn compileWithPackages(backing_allocator: std.mem.Allocator, filename: []const u8, output_file: ?[]const u8) !void {
+    const framework = cot.framework;
+    const pkg_module = framework.package;
+    const pkg_compiler = framework.package_compiler;
+
+    // Find workspace root by looking for cot.json
+    const file_dir = std.fs.path.dirname(filename) orelse ".";
+    const abs_file_dir = try std.fs.cwd().realpathAlloc(backing_allocator, file_dir);
+    defer backing_allocator.free(abs_file_dir);
+
+    // Look for cot.json in current dir or parent dirs
+    var workspace_root: ?[]const u8 = null;
+    var search_dir: []const u8 = abs_file_dir;
+
+    while (true) {
+        const config_path = try std.fs.path.join(backing_allocator, &.{ search_dir, "cot.json" });
+        defer backing_allocator.free(config_path);
+
+        if (std.fs.cwd().access(config_path, .{})) |_| {
+            workspace_root = try backing_allocator.dupe(u8, search_dir);
+            break;
+        } else |_| {}
+
+        // Try parent directory
+        if (std.fs.path.dirname(search_dir)) |parent| {
+            if (std.mem.eql(u8, parent, search_dir)) break; // Reached root
+            search_dir = parent;
+        } else {
+            break;
+        }
+    }
+
+    if (workspace_root == null) {
+        try printStderr("Error: No cot.json found. Create one or use compile without --packages.\n", .{});
+        return error.CompilationFailed;
+    }
+    defer backing_allocator.free(workspace_root.?);
+
+    try printStderr("Using package system with workspace: {s}\n", .{workspace_root.?});
+
+    // Initialize package manager
+    var pm = try pkg_module.PackageManager.init(backing_allocator, workspace_root.?);
+    defer pm.deinit();
+
+    // Discover packages
+    try pm.discoverPackages();
+
+    // Scan for dependencies
+    try scanPackageDependencies(backing_allocator, &pm);
+
+    // Compute build order
+    pm.computeBuildOrder() catch |err| {
+        if (err == error.CircularDependency) {
+            try printStderr("Error: Circular dependency detected\n", .{});
+            return error.CompilationFailed;
+        }
+        return err;
+    };
+
+    try printStderr("Build order: ", .{});
+    for (pm.build_order.items, 0..) |name, i| {
+        if (i > 0) try printStderr(" -> ", .{});
+        try printStderr("{s}", .{name});
+    }
+    try printStderr("\n\n", .{});
+
+    // Create workspace compiler
+    var wc = pkg_compiler.WorkspaceCompiler.init(backing_allocator, &pm);
+    defer wc.deinit();
+
+    // Set up build cache in workspace
+    var cache_path_buf: [512]u8 = undefined;
+    const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/.cot-cache", .{workspace_root.?}) catch workspace_root.?;
+    wc.setCacheDir(cache_path) catch {};
+
+    // Compile all packages
+    try printStderr("Compiling packages...\n", .{});
+    wc.compileAll() catch |err| {
+        try printStderr("Package compilation failed: {}\n", .{err});
+        return error.CompilationFailed;
+    };
+
+    // Report results
+    var it = wc.compiled.iterator();
+    while (it.next()) |entry| {
+        const compiled = entry.value_ptr.*;
+        try printStderr("  {s}: {} bytes, {} exports\n", .{
+            compiled.name,
+            compiled.bytecode.len,
+            compiled.exports.entries.count(),
+        });
+    }
+
+    // Determine entry package (from filename)
+    const basename = std.fs.path.basename(filename);
+    const entry_name = if (std.mem.endsWith(u8, basename, ".cot"))
+        basename[0 .. basename.len - 4]
+    else
+        basename;
+
+    // Find package containing the entry file
+    var entry_package: ?[]const u8 = null;
+    var pkg_it = pm.packages.iterator();
+    while (pkg_it.next()) |entry| {
+        const pkg = entry.value_ptr.*;
+        for (pkg.source_files.items) |src| {
+            if (std.mem.endsWith(u8, src, basename)) {
+                entry_package = pkg.name;
+                break;
+            }
+        }
+        if (entry_package != null) break;
+    }
+
+    if (entry_package == null) {
+        // Fallback: use filename without extension
+        entry_package = entry_name;
+    }
+
+    // Link and output
+    const out_path = output_file orelse blk: {
+        // Generate output path
+        const out = try std.fmt.allocPrint(backing_allocator, "{s}.cbo", .{entry_name});
+        break :blk out;
+    };
+    defer if (output_file == null) backing_allocator.free(out_path);
+
+    try printStderr("\nLinking to: {s}\n", .{out_path});
+    wc.link(entry_package.?, out_path) catch |err| {
+        try printStderr("Linking failed: {}\n", .{err});
+        return error.CompilationFailed;
+    };
+
+    try printStderr("Compiled: {s} -> {s}\n", .{ filename, out_path });
+}
+
+/// Scan package source files for import dependencies
+fn scanPackageDependencies(allocator: std.mem.Allocator, pm: *cot.framework.package.PackageManager) !void {
+    var it = pm.packages.iterator();
+    while (it.next()) |entry| {
+        const pkg = entry.value_ptr.*;
+
+        for (pkg.source_files.items) |source_file| {
+            try scanFileImports(allocator, pm, pkg, source_file);
+        }
+    }
+}
+
+/// Scan a single file for import statements
+fn scanFileImports(
+    allocator: std.mem.Allocator,
+    pm: *cot.framework.package.PackageManager,
+    pkg: *cot.framework.package.Package,
+    file_path: []const u8,
+) !void {
+    const file = std.fs.cwd().openFile(file_path, .{}) catch return;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return;
+    defer allocator.free(content);
+
+    // Simple import scanning - look for `import "..."` patterns
+    var i: usize = 0;
+    while (i < content.len) {
+        // Look for 'import' keyword
+        if (i + 6 < content.len and std.mem.eql(u8, content[i..][0..6], "import")) {
+            i += 6;
+
+            // Skip whitespace
+            while (i < content.len and (content[i] == ' ' or content[i] == '\t')) {
+                i += 1;
+            }
+
+            // Check for quote
+            if (i < content.len and content[i] == '"') {
+                i += 1;
+                const start = i;
+
+                // Find end quote
+                while (i < content.len and content[i] != '"') {
+                    i += 1;
+                }
+
+                if (i < content.len) {
+                    const import_path = content[start..i];
+
+                    // Resolve import to package name
+                    if (try pm.resolveImport(pkg.name, import_path)) |dep_name| {
+                        // Don't add self-dependency
+                        if (!std.mem.eql(u8, dep_name, pkg.name)) {
+                            try pkg.addDependency(dep_name);
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, output_file: ?[]const u8) !void {

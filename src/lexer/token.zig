@@ -150,6 +150,10 @@ pub const TokenType = enum {
     question_question, // ??
     question_lbracket, // ?[
 
+    // Shift operators
+    shl, // <<
+    shr, // >>
+
     // Comparison operators
     eq, // ==
     ne, // !=

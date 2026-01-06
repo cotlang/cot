@@ -528,6 +528,15 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add an optional member access expression (null-safe): expr?.field
+    pub fn addOptionalMember(self: *Self, object: ExprIdx, field: StringId, loc: SourceLoc) !ExprIdx {
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
+        try self.expr_tags.append(self.allocator, .optional_member);
+        try self.expr_locs.append(self.allocator, loc);
+        try self.expr_data.append(self.allocator, NodeData.member(object, field));
+        return idx;
+    }
+
     /// Add an index expression
     pub fn addIndex(self: *Self, object: ExprIdx, index_expr: ExprIdx, loc: SourceLoc) !ExprIdx {
         const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));

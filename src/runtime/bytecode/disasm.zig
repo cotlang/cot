@@ -273,7 +273,7 @@ pub const Disassembler = struct {
             // ============================================
 
             // Binary logical/bitwise: [rd:4|rs1:4] [rs2:4|0]
-            .log_and, .log_or, .bit_and, .bit_or, .bit_xor => {
+            .log_and, .log_or, .bit_and, .bit_or, .bit_xor, .shl, .shr => {
                 const rd: u4 = @truncate(operands[0] >> 4);
                 const rs1: u4 = @truncate(operands[0] & 0xF);
                 const rs2: u4 = @truncate(operands[1] >> 4);
@@ -601,6 +601,15 @@ pub const Disassembler = struct {
                 const rd = operands[0];
                 const slot = std.mem.readInt(u16, operands[1..3], .little);
                 try self.writer.print(" r{}, len(${})", .{ rd, slot });
+            },
+
+            // array_slice - [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+            .array_slice => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const start_reg: u4 = @truncate(operands[1] >> 4);
+                const end_reg: u4 = @truncate(operands[1] & 0xF);
+                const slot = std.mem.readInt(u16, operands[2..4], .little);
+                try self.writer.print(" r{}, ${}[r{}:r{}]", .{ rd, slot, start_reg, end_reg });
             },
 
             // ============================================

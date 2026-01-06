@@ -277,6 +277,11 @@ pub const Verifier = struct {
                 try self.checkValueDefined(op.index);
                 try self.checkValueDefined(op.value);
             },
+            .array_slice => |op| {
+                try self.checkValueDefined(op.source);
+                try self.checkValueDefined(op.start);
+                try self.checkValueDefined(op.end);
+            },
             .bitcast => |op| {
                 try self.checkValueDefined(op.operand);
             },

@@ -1326,6 +1326,12 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.is_null)] = &vm_opcodes.op_is_null;
         table[@intFromEnum(Opcode.select)] = &vm_opcodes.op_select;
         table[@intFromEnum(Opcode.ptr_offset)] = &vm_opcodes.op_ptr_offset;
+        table[@intFromEnum(Opcode.shl)] = &vm_opcodes.op_shl;
+        table[@intFromEnum(Opcode.shr)] = &vm_opcodes.op_shr;
+        table[@intFromEnum(Opcode.bit_and)] = &vm_opcodes.op_bit_and;
+        table[@intFromEnum(Opcode.bit_or)] = &vm_opcodes.op_bit_or;
+        table[@intFromEnum(Opcode.bit_xor)] = &vm_opcodes.op_bit_xor;
+        table[@intFromEnum(Opcode.bit_not)] = &vm_opcodes.op_bit_not;
 
         // Control Flow (0x60-0x6F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.jmp)] = &vm_opcodes.op_jmp;
@@ -1363,6 +1369,7 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.array_load)] = &vm_opcodes.op_array_load;
         table[@intFromEnum(Opcode.array_store)] = &vm_opcodes.op_array_store;
         table[@intFromEnum(Opcode.array_len)] = &vm_opcodes.op_array_len;
+        table[@intFromEnum(Opcode.array_slice)] = &vm_opcodes.op_array_slice;
 
         // Math Functions (0xC0-0xCF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.fn_round)] = &vm_opcodes.op_fn_round;

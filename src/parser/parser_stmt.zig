@@ -416,6 +416,8 @@ pub fn parseExpressionStatement(p: *Parser) ParseError!StmtIdx {
     // Check for assignment
     if (p.match(&[_]TokenType{.equals})) {
         const value = try p.parseExpression();
+        // Optionally consume semicolon
+        _ = p.match(&[_]TokenType{.semicolon});
         return p.store.addAssignment(expr, value, loc) catch return error.OutOfMemory;
     }
 
@@ -433,6 +435,8 @@ pub fn parseExpressionStatement(p: *Parser) ParseError!StmtIdx {
         const rhs = try p.parseExpression();
         // Desugar x += y to x = x + y
         const binop = p.store.addBinary(expr, op, rhs, loc) catch return error.OutOfMemory;
+        // Optionally consume semicolon
+        _ = p.match(&[_]TokenType{.semicolon});
         return p.store.addAssignment(expr, binop, loc) catch return error.OutOfMemory;
     }
 

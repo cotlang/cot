@@ -60,6 +60,7 @@ const Iconst = std.meta.TagPayload(ir.Instruction, .iconst);
 const F32const = std.meta.TagPayload(ir.Instruction, .f32const);
 const F64const = std.meta.TagPayload(ir.Instruction, .f64const);
 const ConstString = std.meta.TagPayload(ir.Instruction, .const_string);
+const ConstNull = std.meta.TagPayload(ir.Instruction, .const_null);
 const IoClose = std.meta.TagPayload(ir.Instruction, .io_close);
 const IoDelete = std.meta.TagPayload(ir.Instruction, .io_delete);
 const LoadStructBuf = std.meta.TagPayload(ir.Instruction, .load_struct_buf);
@@ -420,6 +421,13 @@ pub fn emitConstString(e: *BytecodeEmitter, c: ConstString) EmitError!void {
     try e.value_consts.put(c.result.id, const_idx);
 }
 
+/// Emit const_null instruction - load null into a register
+pub fn emitConstNull(e: *BytecodeEmitter, c: ConstNull) EmitError!void {
+    const dest_reg: u4 = 0;
+    try e.emitRegLoadLiteral(.load_null, dest_reg);
+    e.setLastResult(c.result.id, dest_reg);
+}
+
 // ============================================================================
 // Arithmetic Operations
 // ============================================================================
@@ -527,6 +535,14 @@ pub fn emitLogNot(e: *BytecodeEmitter, l: ir.Instruction.UnaryOp) EmitError!void
     const dest_reg: u4 = 1;
     try e.emitRegUnary(.log_not, dest_reg, src_reg);
     e.setLastResult(l.result.id, dest_reg);
+}
+
+/// Emit bitwise not instruction
+pub fn emitBitNot(e: *BytecodeEmitter, b: ir.Instruction.UnaryOp) EmitError!void {
+    const src_reg = try e.getValueInReg(b.operand, 0);
+    const dest_reg: u4 = 1;
+    try e.emitRegUnary(.bit_not, dest_reg, src_reg);
+    e.setLastResult(b.result.id, dest_reg);
 }
 
 // ============================================================================
@@ -1312,6 +1328,32 @@ pub fn emitArrayLen(e: *BytecodeEmitter, al: ir.Instruction.UnaryOp) EmitError!v
     try e.emitU8(0); // Load into r0
     try e.emitU16(idx);
     e.setLastResult(al.result.id, 0);
+}
+
+/// Emit array_slice instruction
+/// Format: [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+pub fn emitArraySlice(e: *BytecodeEmitter, as: ir.Instruction.ArraySlice) EmitError!void {
+    // Look up the source array's stack slot (same logic as array_load)
+    const array_slot: u16 = if (e.array_ptr_targets.get(as.source.id)) |slot|
+        slot
+    else if (e.value_slots.get(as.source.id)) |slot_info|
+        slot_info & 0x7FFF
+    else
+        0;
+
+    debug.print(.emit, "array_slice: source.id={d} -> array_slot={d}", .{ as.source.id, array_slot });
+
+    // Load start and end indices into registers
+    try e.emitValueToReg(as.start, 1);
+    try e.emitValueToReg(as.end, 2);
+
+    // Emit: array_slice rd=0, start_reg=1, end_reg=2, slot
+    try e.emitOpcode(.array_slice);
+    try e.emitU8(0 << 4); // rd=0, padding=0
+    try e.emitU8((1 << 4) | 2); // start_reg=1, end_reg=2
+    try e.emitU16(array_slot);
+
+    e.setLastResult(as.result.id, 0);
 }
 
 // ============================================================================

@@ -584,6 +584,11 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
             used.put(a.index.id, {}) catch {};
             used.put(a.value.id, {}) catch {};
         },
+        .array_slice => |a| {
+            used.put(a.source.id, {}) catch {};
+            used.put(a.start.id, {}) catch {};
+            used.put(a.end.id, {}) catch {};
+        },
         .str_concat, .str_compare => |op| {
             used.put(op.lhs.id, {}) catch {};
             used.put(op.rhs.id, {}) catch {};

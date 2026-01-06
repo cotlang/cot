@@ -114,6 +114,9 @@ pub const Lowerer = struct {
     /// Allocated Type pointers that need to be freed on deinit
     allocated_types: std.ArrayList(*ir.Type),
 
+    /// Allocated ListType pointers that need to be freed on deinit
+    allocated_list_types: std.ArrayList(*ir.ListType),
+
     /// Current loop's exit block (for break statements)
     loop_exit_block: ?*ir.Block,
 
@@ -254,7 +257,7 @@ pub const Lowerer = struct {
         const module = try allocator.create(ir.Module);
         module.* = ir.Module.init(allocator, module_name);
 
-        return .{
+        var self = Self{
             .allocator = allocator,
             .module = module,
             .current_func = null,
@@ -272,6 +275,7 @@ pub const Lowerer = struct {
             .type_param_substitutions = std.StringHashMap(ir.Type).init(allocator),
             .instantiated_structs = std.StringHashMap(*const ir.StructType).init(allocator),
             .allocated_types = .{},
+            .allocated_list_types = .{},
             .loop_exit_block = null,
             .loop_continue_block = null,
             .defers = .{},
@@ -291,6 +295,38 @@ pub const Lowerer = struct {
             .emit_arc = options.emit_arc,
             .current_loc = .{ .line = 0, .column = 0 },
         };
+
+        // Pre-populate type maps from dependency context (for cross-package compilation)
+        if (options.dependency_types) |dep_types| {
+            // Import struct types from dependencies
+            var struct_it = dep_types.struct_types.iterator();
+            while (struct_it.next()) |entry| {
+                self.struct_types.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+            // Import union types from dependencies
+            var union_it = dep_types.union_types.iterator();
+            while (union_it.next()) |entry| {
+                self.union_types.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+            // Import enum types from dependencies
+            var enum_it = dep_types.enum_types.iterator();
+            while (enum_it.next()) |entry| {
+                // Clone the variant map
+                var variants = std.StringHashMap(i64).init(allocator);
+                var var_it = entry.value_ptr.iterator();
+                while (var_it.next()) |var_entry| {
+                    variants.put(var_entry.key_ptr.*, var_entry.value_ptr.*) catch {};
+                }
+                self.enum_types.put(entry.key_ptr.*, variants) catch {};
+            }
+            // Import function return types from dependencies
+            var fn_it = dep_types.fn_return_types.iterator();
+            while (fn_it.next()) |entry| {
+                self.fn_return_types.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+        }
+
+        return self;
     }
 
     /// Check if a function name is a known builtin
@@ -573,6 +609,13 @@ pub const Lowerer = struct {
         };
         // Clear the Lowerer's list to prevent double-free
         self.allocated_types = .{};
+
+        // Transfer ownership of allocated list types to the module
+        self.module.allocated_list_types = .{
+            .items = self.allocated_list_types.items,
+            .capacity = self.allocated_list_types.capacity,
+        };
+        self.allocated_list_types = .{};
 
         return self.module;
     }
@@ -876,6 +919,18 @@ pub const Lowerer = struct {
         }
 
         try self.enum_types.put(name, variants);
+
+        // Also store in module for cross-package export
+        // Clone the variants map for the module (module owns its copy)
+        var module_variants = std.StringHashMap(i64).init(self.allocator);
+        var var_it = variants.iterator();
+        while (var_it.next()) |entry| {
+            module_variants.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+        }
+        self.module.enums.put(self.allocator, name, .{
+            .name = name,
+            .variants = module_variants,
+        }) catch {};
     }
 
     /// Instantiate a generic struct with concrete type arguments
@@ -1582,14 +1637,16 @@ pub const Lowerer = struct {
 
         debug.print(.ir, "Lowering impl method: {s}", .{qualified_name});
 
-        // Parse extra data: [param_count, param1_name, param1_type, ..., return_type, body]
+        // Parse extra data: [param_count, type_param_count, type_params..., param1_name, param1_type, ..., return_type, body]
         const extra_start = data.getParamsStart();
         const param_count = self.store.getExtra(extra_start);
+        const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
 
         var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
         defer params.deinit(self.allocator);
 
-        var extra_idx = extra_start.toInt() + 1;
+        // Skip past type params: extra_start + 1 (param_count) + 1 (type_param_count) + type_param_count
+        var extra_idx = extra_start.toInt() + 2 + type_param_count;
         for (0..param_count) |_| {
             const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
             const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
@@ -1781,11 +1838,11 @@ pub const Lowerer = struct {
             },
             .break_stmt => {
                 try self.emitDebugLine(loc);
-                try lower_stmt.lowerBreak(self);
+                try lower_stmt.lowerBreak(self, loc);
             },
             .continue_stmt => {
                 try self.emitDebugLine(loc);
-                try lower_stmt.lowerContinue(self);
+                try lower_stmt.lowerContinue(self, loc);
             },
             .expression => {
                 try self.emitDebugLine(loc);
@@ -1948,6 +2005,21 @@ pub const Lowerer = struct {
         const err_binding_raw = self.store.extra_data.items[extra_start];
         const err_binding: StringId = @enumFromInt(err_binding_raw);
         const catch_body: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1]);
+        const finally_body_raw = self.store.extra_data.items[extra_start + 2];
+        const finally_body: ?StmtIdx = if (finally_body_raw != 0) @enumFromInt(finally_body_raw) else null;
+
+        // Check if finally block is used - not yet implemented
+        if (finally_body != null) {
+            self.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "'finally' block not yet implemented",
+                .{},
+                loc,
+                "use 'defer' for cleanup code that must always run",
+                .{},
+            );
+            return LowerError.UnsupportedFeature;
+        }
 
         // Create blocks for the catch handler and continuation
         const catch_block = try func.createBlock("catch");
@@ -2124,34 +2196,41 @@ pub const Lowerer = struct {
             const pattern_idx: ExprIdx = @enumFromInt(pattern_raw);
             const body_idx: StmtIdx = @enumFromInt(body_raw);
 
-            // Lower pattern expression
-            const pattern_val = try self.lowerExpression(pattern_idx);
-
-            // Compare scrutinee with pattern
-            const cmp_result = func.newValue(.bool);
-            try self.emit(.{
-                .icmp = .{
-                    .cond = .eq,
-                    .lhs = scrutinee_val,
-                    .rhs = pattern_val,
-                    .result = cmp_result,
-                },
-            });
-
-            // Branch based on comparison
             const arm_block = arm_blocks.items[i];
-            const else_block = if (i < arm_count - 1)
-                check_blocks.items[i]
-            else
-                exit_block; // Last arm falls through to exit if no match
 
-            try self.emit(.{
-                .brif = .{
-                    .condition = cmp_result,
-                    .then_block = arm_block,
-                    .else_block = else_block,
-                },
-            });
+            // Check for default case (pattern_idx.isNull())
+            if (pattern_idx.isNull()) {
+                // Default case - unconditionally branch to arm
+                try self.emit(.{ .jump = .{ .target = arm_block } });
+            } else {
+                // Lower pattern expression
+                const pattern_val = try self.lowerExpression(pattern_idx);
+
+                // Compare scrutinee with pattern
+                const cmp_result = func.newValue(.bool);
+                try self.emit(.{
+                    .icmp = .{
+                        .cond = .eq,
+                        .lhs = scrutinee_val,
+                        .rhs = pattern_val,
+                        .result = cmp_result,
+                    },
+                });
+
+                // Branch based on comparison
+                const else_block = if (i < arm_count - 1)
+                    check_blocks.items[i]
+                else
+                    exit_block; // Last arm falls through to exit if no match
+
+                try self.emit(.{
+                    .brif = .{
+                        .condition = cmp_result,
+                        .then_block = arm_block,
+                        .else_block = else_block,
+                    },
+                });
+            }
 
             // Generate arm body
             self.current_block = arm_block;
@@ -2272,6 +2351,39 @@ fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
     return .void;
 }
 
+/// Context for types imported from dependencies (for cross-package compilation)
+pub const DependencyTypeContext = struct {
+    /// Map struct names to their IR struct types (from compiled dependencies)
+    struct_types: std.StringHashMap(*const ir.StructType),
+    /// Map union names to their IR union types
+    union_types: std.StringHashMap(*const ir.UnionType),
+    /// Map enum names to their variant values (enum name -> (variant name -> i64))
+    enum_types: std.StringHashMap(std.StringHashMap(i64)),
+    /// Map function names to their return types (for cross-package calls)
+    fn_return_types: std.StringHashMap(ir.Type),
+
+    pub fn init(allocator: Allocator) DependencyTypeContext {
+        return .{
+            .struct_types = std.StringHashMap(*const ir.StructType).init(allocator),
+            .union_types = std.StringHashMap(*const ir.UnionType).init(allocator),
+            .enum_types = std.StringHashMap(std.StringHashMap(i64)).init(allocator),
+            .fn_return_types = std.StringHashMap(ir.Type).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *DependencyTypeContext) void {
+        self.struct_types.deinit();
+        self.union_types.deinit();
+        // Free inner enum variant maps
+        var it = self.enum_types.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.enum_types.deinit();
+        self.fn_return_types.deinit();
+    }
+};
+
 /// Options for lowering
 pub const LowerOptions = struct {
     /// Run IR verification after lowering (catches bugs early)
@@ -2281,6 +2393,9 @@ pub const LowerOptions = struct {
     /// When false (default), the VM handles ARC at runtime via writeRegister/writeStack.
     /// When true, the compiler emits ARC instructions for assignments, returns, and scope exits.
     emit_arc: bool = false,
+
+    /// Types from compiled dependencies (for cross-package compilation)
+    dependency_types: ?*DependencyTypeContext = null,
 };
 
 /// Main entry point for lowering

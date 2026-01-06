@@ -11,6 +11,8 @@ pub const config = @import("config.zig");
 pub const workspace = @import("workspace.zig");
 pub const resolver = @import("resolver.zig");
 pub const discovery = @import("discovery.zig");
+pub const package = @import("package.zig");
+pub const package_compiler = @import("package_compiler.zig");
 
 // CLI commands
 pub const commands = struct {
@@ -23,6 +25,7 @@ pub const commands = struct {
     pub const convert = @import("commands/convert.zig");
     pub const dev = @import("commands/dev.zig");
     pub const gen = @import("commands/gen.zig");
+    pub const deps = @import("commands/deps.zig");
 };
 
 // Build system
@@ -44,3 +47,8 @@ pub const dex = @import("dex/dex.zig");
 pub const ConfigLoader = config.ConfigLoader;
 pub const ProjectConfig = config.ProjectConfig;
 pub const ProjectType = config.ProjectType;
+pub const Package = package.Package;
+pub const PackageManager = package.PackageManager;
+pub const ExportTable = package.ExportTable;
+pub const WorkspaceCompiler = package_compiler.WorkspaceCompiler;
+pub const CompiledPackage = package_compiler.CompiledPackage;

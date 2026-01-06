@@ -32,12 +32,13 @@ pub const Precedence = enum(u8) {
     bit_or = 9, // |
     bit_xor = 10, // ^
     bit_and = 11, // &
-    term = 12, // + - #
-    factor = 13, // * / %
-    unary = 14, // ! - ~ & *
-    cast = 15, // as (type cast)
-    call = 16, // () . [] ?. ?[
-    primary = 17,
+    shift = 12, // << >>
+    term = 13, // + - #
+    factor = 14, // * / %
+    unary = 15, // ! - ~ & *
+    cast = 16, // as (type cast)
+    call = 17, // () . [] ?. ?[
+    primary = 18,
 
     /// Get the next higher precedence level
     pub fn next(self: Precedence) Precedence {
@@ -90,7 +91,7 @@ pub const rules: [TOKEN_COUNT]ParseRule = init: {
     // Grouping and collections
     r[@intFromEnum(TokenType.lparen)] = .{ .prefix = null, .infix = null, .precedence = .call }; // () grouping or call
     r[@intFromEnum(TokenType.lbracket)] = .{ .prefix = null, .infix = null, .precedence = .call }; // [] array or index
-    r[@intFromEnum(TokenType.pipe)] = .{ .prefix = null, .precedence = .none }; // |x| lambda
+    r[@intFromEnum(TokenType.pipe)] = .{ .prefix = null, .infix = null, .precedence = .bit_or }; // |x| lambda or bit_or
 
     // Unary operators (prefix)
     r[@intFromEnum(TokenType.minus)] = .{ .prefix = null, .infix = null, .precedence = .term }; // negation or subtraction
@@ -122,6 +123,8 @@ pub const rules: [TOKEN_COUNT]ParseRule = init: {
 
     // Binary operators - bitwise
     r[@intFromEnum(TokenType.caret)] = .{ .infix = null, .precedence = .bit_xor };
+    r[@intFromEnum(TokenType.shl)] = .{ .infix = null, .precedence = .shift };
+    r[@intFromEnum(TokenType.shr)] = .{ .infix = null, .precedence = .shift };
 
     // Cast operator
     r[@intFromEnum(TokenType.kw_as)] = .{ .infix = null, .precedence = .cast }; // expr as type
@@ -170,6 +173,8 @@ pub fn tokenToBinaryOp(token_type: TokenType) ?BinaryOp {
         .ampersand => .bit_and,
         .pipe => .bit_or,
         .caret => .bit_xor,
+        .shl => .shl,
+        .shr => .shr,
 
         // Range
         .range => .range,
@@ -183,13 +188,13 @@ pub fn tokenToBinaryOp(token_type: TokenType) ?BinaryOp {
 }
 
 /// Map token type to unary operator
+/// Note: dereference is handled as postfix .* in parser.zig, not as prefix *
 pub fn tokenToUnaryOp(token_type: TokenType) ?UnaryOp {
     return switch (token_type) {
         .minus => .neg,
         .bang, .kw_not => .not,
         .tilde => .bit_not,
         .ampersand => .addr_of,
-        .star => .deref,
         else => null,
     };
 }
@@ -211,8 +216,8 @@ pub fn canStartExpression(token_type: TokenType) bool {
         // Grouping
         .lparen, .lbracket => true,
 
-        // Unary prefix
-        .minus, .bang, .kw_not, .tilde, .ampersand, .star => true,
+        // Unary prefix (note: .star removed - dereference is postfix .*)
+        .minus, .bang, .kw_not, .tilde, .ampersand => true,
 
         // Lambda
         .pipe => true,
@@ -246,6 +251,8 @@ pub fn isBinaryOperator(token_type: TokenType) bool {
         .ampersand,
         .pipe,
         .caret,
+        .shl,
+        .shr,
         .range,
         .range_inclusive,
         .question_question,
@@ -320,7 +327,8 @@ test "unary operator mapping" {
     try testing.expectEqual(UnaryOp.not, tokenToUnaryOp(.kw_not).?);
     try testing.expectEqual(UnaryOp.bit_not, tokenToUnaryOp(.tilde).?);
     try testing.expectEqual(UnaryOp.addr_of, tokenToUnaryOp(.ampersand).?);
-    try testing.expectEqual(UnaryOp.deref, tokenToUnaryOp(.star).?);
+    // Note: .star is not a unary prefix operator - dereference is postfix .*
+    try testing.expectEqual(@as(?UnaryOp, null), tokenToUnaryOp(.star));
 }
 
 test "expression starters" {

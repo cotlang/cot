@@ -888,8 +888,14 @@ pub const Parser = struct {
         errdefer self.store.rollbackScratch();
 
         while (!self.check(.rbrace) and !self.isAtEnd()) {
-            // Parse pattern (for now, just expressions or identifiers)
-            const pattern = try self.parseExpression();
+            // Parse pattern (expression, identifier, or 'else' for default)
+            var pattern: ExprIdx = undefined;
+            if (self.match(&[_]TokenType{.kw_else})) {
+                // Default case - use null as pattern (will be handled by lowerer)
+                pattern = .null;
+            } else {
+                pattern = try self.parseExpression();
+            }
 
             _ = try self.consume(.fat_arrow, "Expected '=>'");
 
@@ -1178,6 +1184,8 @@ pub const Parser = struct {
         // Check for assignment
         if (self.match(&[_]TokenType{.equals})) {
             const value = try self.parseExpression();
+            // Optionally consume semicolon
+            _ = self.match(&[_]TokenType{.semicolon});
             return self.store.addAssignment(expr, value, loc) catch return error.OutOfMemory;
         }
 
@@ -1195,6 +1203,8 @@ pub const Parser = struct {
             const rhs = try self.parseExpression();
             // Desugar x += y to x = x + y
             const binop = self.store.addBinary(expr, op, rhs, loc) catch return error.OutOfMemory;
+            // Optionally consume semicolon
+            _ = self.match(&[_]TokenType{.semicolon});
             return self.store.addAssignment(expr, binop, loc) catch return error.OutOfMemory;
         }
 
@@ -1363,9 +1373,14 @@ pub const Parser = struct {
             if (self.match(&[_]TokenType{.lparen})) {
                 result = try self.finishCall(result);
             } else if (self.match(&[_]TokenType{.period})) {
-                const field_token = try self.consume(.identifier, "Expected field name");
-                const field = self.internString(field_token.lexeme) catch return error.OutOfMemory;
-                result = self.store.addMember(result, field, self.currentLoc()) catch return error.OutOfMemory;
+                // Check for pointer dereference: expr.*
+                if (self.match(&[_]TokenType{.star})) {
+                    result = self.store.addUnary(.deref, result, self.currentLoc()) catch return error.OutOfMemory;
+                } else {
+                    const field_token = try self.consume(.identifier, "Expected field name");
+                    const field = self.internString(field_token.lexeme) catch return error.OutOfMemory;
+                    result = self.store.addMember(result, field, self.currentLoc()) catch return error.OutOfMemory;
+                }
             } else if (self.match(&[_]TokenType{.lbracket})) {
                 try self.enterNesting();
                 errdefer self.exitNesting();
@@ -1386,6 +1401,11 @@ pub const Parser = struct {
                     self.exitNesting();
                     result = self.store.addIndex(result, start_expr, self.currentLoc()) catch return error.OutOfMemory;
                 }
+            } else if (self.match(&[_]TokenType{.question_dot})) {
+                // Optional member access: expr?.field (null-safe)
+                const field_token = try self.consume(.identifier, "Expected field name");
+                const field = self.internString(field_token.lexeme) catch return error.OutOfMemory;
+                result = self.store.addOptionalMember(result, field, self.currentLoc()) catch return error.OutOfMemory;
             } else {
                 break;
             }

@@ -232,6 +232,14 @@ pub const Opcode = enum(u8) {
     /// Format: [rd:4|rs:4] [offset:16]
     ptr_offset = 0x59,
 
+    /// shl rd, rs1, rs2 - rd = rs1 << rs2 (shift left)
+    /// Format: [rd:4|rs1:4] [rs2:4|0]
+    shl = 0x5A,
+
+    /// shr rd, rs1, rs2 - rd = rs1 >> rs2 (shift right)
+    /// Format: [rd:4|rs1:4] [rs2:4|0]
+    shr = 0x5B,
+
     // ============================================
     // Control Flow (0x60-0x6F)
     // ============================================
@@ -491,6 +499,11 @@ pub const Opcode = enum(u8) {
     /// map_get_struct map_reg, key_reg, field_count, base_reg - get struct from map to high registers
     /// Format: [map:4|key:4] [field_count:8] [base_reg:8] [0]
     map_get_struct = 0xBA,
+
+    /// array_slice rd, start_reg, end_reg, slot - rd = arr[start..end]
+    /// Creates a new list containing elements from start to end (exclusive)
+    /// Format: [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+    array_slice = 0xBB,
 
     // ============================================
     // Built-in Functions (0xC0-0xCF)
@@ -806,7 +819,7 @@ pub const Opcode = enum(u8) {
             .incr_int, .decr_int => 2,
             .cmp_str_eq, .cmp_str_lt, .cmp_str_ne, .cmp_str_le, .cmp_str_gt, .cmp_str_ge => 2,
             .log_and, .log_or, .log_not => 2,
-            .bit_and, .bit_or, .bit_xor, .bit_not => 2,
+            .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => 2,
             .is_null, .select => 2,
             .load_null, .load_true, .load_false => 2,
             .ret, .ret_val, .throw => 2,
@@ -817,6 +830,7 @@ pub const Opcode = enum(u8) {
             .str_find, .str_replace, .str_setchar => 2,
             .to_int, .to_str, .to_bool, .to_dec, .to_char, .format_decimal, .parse_decimal => 2,
             .array_load, .array_store, .array_len => 3, // [idx_reg/regs:8] [slot:16]
+            .array_slice => 4, // [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
             .fn_abs, .fn_sqrt, .fn_sin, .fn_cos, .fn_tan => 2,
             .fn_log, .fn_log10, .fn_exp, .fn_round, .fn_trunc => 2,
             .fn_date, .fn_time, .fn_datetime, .fn_size, .fn_instr, .fn_mem, .fn_error => 2,

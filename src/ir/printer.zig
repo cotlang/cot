@@ -409,6 +409,16 @@ pub const Printer = struct {
                 try self.writer.writeAll("] = ");
                 try self.printValue(as.value);
             },
+            .array_slice => |as| {
+                try self.printValue(as.result);
+                try self.writer.writeAll(" = array_slice ");
+                try self.printValue(as.source);
+                try self.writer.writeAll("[");
+                try self.printValue(as.start);
+                try self.writer.writeAll(":");
+                try self.printValue(as.end);
+                try self.writer.writeAll("]");
+            },
 
             // Exception handling
             .try_begin => |t| {

@@ -606,6 +606,84 @@ pub fn op_ptr_offset(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
+/// shl rd, rs1, rs2 - shift left
+/// Format: [rd:4|rs1:4] [rs2:4|0]
+pub fn op_shl(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs1: u4 = @truncate(ops & 0xF);
+    const rs2: u4 = @truncate(ops2 >> 4);
+    const shift_amount: u6 = @intCast(@as(u64, @bitCast(vm.registers[rs2].toInt())) & 63);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() << shift_amount));
+    return .continue_dispatch;
+}
+
+/// shr rd, rs1, rs2 - shift right (arithmetic)
+/// Format: [rd:4|rs1:4] [rs2:4|0]
+pub fn op_shr(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs1: u4 = @truncate(ops & 0xF);
+    const rs2: u4 = @truncate(ops2 >> 4);
+    const shift_amount: u6 = @intCast(@as(u64, @bitCast(vm.registers[rs2].toInt())) & 63);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() >> shift_amount));
+    return .continue_dispatch;
+}
+
+/// bit_and rd, rs1, rs2 - bitwise AND
+/// Format: [rd:4|rs1:4] [rs2:4|0]
+pub fn op_bit_and(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs1: u4 = @truncate(ops & 0xF);
+    const rs2: u4 = @truncate(ops2 >> 4);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() & vm.registers[rs2].toInt()));
+    return .continue_dispatch;
+}
+
+/// bit_or rd, rs1, rs2 - bitwise OR
+/// Format: [rd:4|rs1:4] [rs2:4|0]
+pub fn op_bit_or(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs1: u4 = @truncate(ops & 0xF);
+    const rs2: u4 = @truncate(ops2 >> 4);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() | vm.registers[rs2].toInt()));
+    return .continue_dispatch;
+}
+
+/// bit_xor rd, rs1, rs2 - bitwise XOR
+/// Format: [rd:4|rs1:4] [rs2:4|0]
+pub fn op_bit_xor(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs1: u4 = @truncate(ops & 0xF);
+    const rs2: u4 = @truncate(ops2 >> 4);
+    vm.writeRegister(rd, Value.initInt(vm.registers[rs1].toInt() ^ vm.registers[rs2].toInt()));
+    return .continue_dispatch;
+}
+
+/// bit_not rd, rs - bitwise NOT
+/// Format: [rd:4|rs:4] [0]
+pub fn op_bit_not(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+    vm.writeRegister(rd, Value.initInt(~vm.registers[rs].toInt()));
+    return .continue_dispatch;
+}
+
 // ============================================================================
 // Control Flow
 // ============================================================================
@@ -3141,5 +3219,67 @@ pub fn op_array_len(vm: *VM, module: *const Module) VMError!DispatchResult {
     // or use a different array representation
     vm.writeRegister(rd, Value.initInt(0));
 
+    return .continue_dispatch;
+}
+
+/// array_slice rd, start_reg, end_reg, slot - rd = arr[start..end]
+/// Creates a new list containing elements from start to end (exclusive)
+/// Format: [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+pub fn op_array_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops1 = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    const slot_lo = module.code[vm.ip + 2];
+    const slot_hi = module.code[vm.ip + 3];
+    vm.ip += 4;
+
+    const rd: u4 = @truncate(ops1 >> 4);
+    const start_reg: u4 = @truncate(ops2 >> 4);
+    const end_reg: u4 = @truncate(ops2 & 0xF);
+    const slot: u16 = (@as(u16, slot_hi) << 8) | slot_lo;
+
+    // Get start and end indices
+    const start_val = vm.registers[start_reg];
+    const end_val = vm.registers[end_reg];
+
+    if (start_val.tag() != .integer or end_val.tag() != .integer) {
+        return vm.fail(VMError.InvalidType, "Array slice indices must be integers");
+    }
+
+    const start_idx = start_val.asInt();
+    const end_idx = end_val.asInt();
+
+    if (start_idx < 0 or end_idx < 0) {
+        return vm.fail(VMError.ArrayOutOfBounds, "Array slice indices cannot be negative");
+    }
+
+    if (start_idx > end_idx) {
+        return vm.fail(VMError.ArrayOutOfBounds, "Array slice start cannot be greater than end");
+    }
+
+    // Create a new list to hold the slice
+    const list = arc.create(vm.allocator, List) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate list for slice");
+    };
+    list.* = List.init(vm.allocator);
+
+    // Copy elements from source array (stack slots) to the list
+    const base_index = vm.fp + slot;
+    const start: usize = @intCast(start_idx);
+    const end: usize = @intCast(end_idx);
+
+    for (start..end) |i| {
+        const elem_index = base_index + i;
+        if (elem_index >= vm.stack.len) {
+            return vm.fail(VMError.ArrayOutOfBounds, "Array slice index out of bounds");
+        }
+        const elem = vm.stack[elem_index];
+        // Retain heap-allocated values since list takes ownership
+        arc.retain(elem);
+        list.push(elem) catch {
+            return vm.fail(VMError.OutOfMemory, "Failed to push element to slice list");
+        };
+    }
+
+    vm.writeRegister(rd, Value.initList(list));
     return .continue_dispatch;
 }

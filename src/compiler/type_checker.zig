@@ -114,7 +114,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .try_begin, .try_end, .catch_begin, .throw => {},
         .wrap_optional, .unwrap_optional, .is_null => {},
         .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => {},
-        .array_len, .debug_line, .select, .ptr_offset => {},
+        .array_len, .array_slice, .debug_line, .select, .ptr_offset => {},
         .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => {},
         .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => {},
         // Closure operations

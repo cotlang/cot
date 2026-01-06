@@ -176,18 +176,22 @@ pub const Lexer = struct {
             return self.makeToken(.bang, self.source[start_pos..self.position]);
         }
 
-        // Less than: < <=
+        // Less than: < <= <<
         if (c == '<') {
             if (self.match('=')) {
                 return self.makeToken(.le, self.source[start_pos..self.position]);
+            } else if (self.match('<')) {
+                return self.makeToken(.shl, self.source[start_pos..self.position]);
             }
             return self.makeToken(.lt, self.source[start_pos..self.position]);
         }
 
-        // Greater than: > >=
+        // Greater than: > >= >>
         if (c == '>') {
             if (self.match('=')) {
                 return self.makeToken(.ge, self.source[start_pos..self.position]);
+            } else if (self.match('>')) {
+                return self.makeToken(.shr, self.source[start_pos..self.position]);
             }
             return self.makeToken(.gt, self.source[start_pos..self.position]);
         }
@@ -587,6 +591,7 @@ pub const Lexer = struct {
         .{ "enum", .kw_enum },
         .{ "const", .kw_const },
         .{ "var", .kw_var },
+        .{ "let", .kw_var }, // alias for var (Rust/JS style)
         .{ "type", .kw_type },
         .{ "impl", .kw_impl },
         .{ "trait", .kw_trait },

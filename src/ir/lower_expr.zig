@@ -46,6 +46,18 @@ const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
 
 // ============================================================================
+// Source Location Conversion
+// ============================================================================
+
+/// Convert AST SourceLoc to IR SourceLoc for error reporting
+fn toIrLoc(loc: SourceLoc) ir.SourceLoc {
+    return .{
+        .line = loc.line,
+        .column = loc.column,
+    };
+}
+
+// ============================================================================
 // Qualified Name Extraction for Namespace Chains
 // ============================================================================
 
@@ -104,9 +116,20 @@ fn isStdNamespaceFunction(name: []const u8) bool {
 
 /// Lower an expression to an IR value
 pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
-    const func = l.current_func orelse return LowerError.UnsupportedFeature;
+    const func = l.current_func orelse {
+        l.setErrorContext(
+            LowerError.UnsupportedFeature,
+            "Expression outside of function context",
+            .{},
+            l.store.exprLoc(expr_idx),
+            "lowering expression at top level (no current function)",
+            .{},
+        );
+        return LowerError.UnsupportedFeature;
+    };
     const tag = l.store.exprTag(expr_idx);
     const data = l.store.exprData(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
 
     log.debug("lowerExpression: tag = {s}", .{@tagName(tag)});
 
@@ -132,24 +155,65 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .range => {
             // Range expressions are lowered by for loop handling, not as standalone values
             // If we get here, a range was used outside of a for loop context
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Range expression (a..b) cannot be used as a standalone value",
+                .{},
+                loc,
+                "range expressions are only valid in for loops (e.g., 'for i in 0..10')",
+                .{},
+            );
             return LowerError.UnsupportedFeature;
         },
         .comptime_builtin => {
             // Comptime builtins should be evaluated at compile time by the comptime evaluator
             // If we get here, a comptime builtin wasn't resolved during constant folding
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Compile-time builtin (@file, @line, etc.) not yet implemented",
+                .{},
+                loc,
+                "comptime builtins require compile-time evaluation which is not yet supported",
+                .{},
+            );
             return LowerError.UnsupportedFeature;
         },
         .if_expr, .match_expr, .block_expr => {
             // Expression forms (if/match/block as expressions) not yet supported
             // These would require SSA phi nodes or temporary variables
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Expression form of '{s}' not yet implemented",
+                .{@tagName(tag)},
+                loc,
+                "use statement form instead (e.g., if/else with assignments inside branches)",
+                .{},
+            );
             return LowerError.UnsupportedFeature;
         },
-        .optional_member, .optional_index => {
-            // Optional chaining (?. and ?[]) not yet supported
+        .optional_member => return lowerOptionalMember(l, func, expr_idx),
+        .optional_index => {
+            // Optional indexing (?[]) not yet supported
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Optional indexing operator '?[' not yet implemented",
+                .{},
+                loc,
+                "use explicit null check instead: if (x != null) {{ x[i] }}",
+                .{},
+            );
             return LowerError.UnsupportedFeature;
         },
         .is_expr => {
             // Type checking expressions not yet supported
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Type check operator 'is' not yet implemented",
+                .{},
+                loc,
+                "runtime type checking is not yet supported",
+                .{},
+            );
             return LowerError.UnsupportedFeature;
         },
         .interp_string => return lowerInterpString(l, func, expr_idx),
@@ -509,6 +573,25 @@ pub fn lowerLValue(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             // Index access as lvalue
             return lowerIndexPtr(l, expr_idx);
         },
+        .unary => {
+            // Dereference as lvalue: p.* = value
+            const op = data.getUnaryOp();
+            if (op == .deref) {
+                // The operand is the pointer - just return its value
+                const operand_idx = data.getOperand();
+                return lowerExpression(l, operand_idx);
+            }
+            // Other unary ops are not valid lvalues
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "Cannot use unary '{s}' expression as assignment target",
+                .{@tagName(op)},
+                .{ .line = loc.line, .column = loc.column },
+                "only dereference can be an lvalue",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        },
         else => {
             const expr_loc = l.store.exprLoc(expr_idx);
             l.setErrorContext(
@@ -714,10 +797,33 @@ pub fn lowerIndexPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
 /// Lower a binary expression
 pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: ExprIdx) LowerError!ir.Value {
-    _ = expr_idx; // Used for error location, currently unused with auto-coercion
+    const loc = l.store.exprLoc(expr_idx);
     const lhs_idx = data.getLhs();
     const rhs_idx = data.getRhs();
     const op = data.getBinaryOp();
+
+    // Check for null comparisons before lowering operands
+    // For x == null or x != null, we need to use is_null instead of icmp
+    const lhs_is_null = l.store.exprTag(lhs_idx) == .null_literal;
+    const rhs_is_null = l.store.exprTag(rhs_idx) == .null_literal;
+
+    if ((op == .eq or op == .ne) and (lhs_is_null or rhs_is_null)) {
+        // One operand is null - use is_null instruction
+        const non_null_idx = if (lhs_is_null) rhs_idx else lhs_idx;
+        const non_null_val = try lowerExpression(l, non_null_idx);
+        const result = func.newValue(.bool);
+
+        // is_null returns true if the value is null
+        try l.emit(.{ .is_null = .{ .operand = non_null_val, .result = result } });
+
+        if (op == .ne) {
+            // For != null, we need to negate the result
+            const negated = func.newValue(.bool);
+            try l.emit(.{ .log_not = .{ .operand = result, .result = negated } });
+            return negated;
+        }
+        return result;
+    }
 
     const lhs = try lowerExpression(l, lhs_idx);
     const rhs = try lowerExpression(l, rhs_idx);
@@ -759,40 +865,50 @@ pub fn lowerBinary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Ex
             debug.print(.ir, "binary add decision: {s}", .{if (is_concat) "str_concat (auto-coerce)" else "iadd"});
 
             break :blk if (is_concat)
-                .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result } }
+                .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } }
             else
-                .{ .iadd = .{ .lhs = lhs, .rhs = rhs, .result = result } };
+                .{ .iadd = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } };
         },
-        .sub => .{ .isub = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .mul => .{ .imul = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .div => .{ .sdiv = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .mod => .{ .srem = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .eq => .{ .icmp = .{ .cond = .eq, .lhs = lhs, .rhs = rhs, .result = result } },
-        .ne => .{ .icmp = .{ .cond = .ne, .lhs = lhs, .rhs = rhs, .result = result } },
-        .lt => .{ .icmp = .{ .cond = .slt, .lhs = lhs, .rhs = rhs, .result = result } },
-        .le => .{ .icmp = .{ .cond = .sle, .lhs = lhs, .rhs = rhs, .result = result } },
-        .gt => .{ .icmp = .{ .cond = .sgt, .lhs = lhs, .rhs = rhs, .result = result } },
-        .ge => .{ .icmp = .{ .cond = .sge, .lhs = lhs, .rhs = rhs, .result = result } },
-        .@"and" => .{ .log_and = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .@"or" => .{ .log_or = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+        .sub => .{ .isub = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .mul => .{ .imul = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .div => .{ .sdiv = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .mod => .{ .srem = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .eq => .{ .icmp = .{ .cond = .eq, .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .ne => .{ .icmp = .{ .cond = .ne, .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .lt => .{ .icmp = .{ .cond = .slt, .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .le => .{ .icmp = .{ .cond = .sle, .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .gt => .{ .icmp = .{ .cond = .sgt, .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .ge => .{ .icmp = .{ .cond = .sge, .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .@"and" => .{ .log_and = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .@"or" => .{ .log_or = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
         .bit_and => blk: {
             // In DBL, & is overloaded: bitwise AND for integers, concatenation for strings
             const lhs_is_string = lhs.isString();
             const rhs_is_string = rhs.isString();
             const is_concat = lhs_is_string or rhs_is_string;
             break :blk if (is_concat)
-                .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result } }
+                .{ .str_concat = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } }
             else
-                .{ .band = .{ .lhs = lhs, .rhs = rhs, .result = result } };
+                .{ .band = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } };
         },
-        .bit_or => .{ .bor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .bit_xor => .{ .bxor = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .shl => .{ .ishl = .{ .lhs = lhs, .rhs = rhs, .result = result } },
-        .shr => .{ .sshr = .{ .lhs = lhs, .rhs = rhs, .result = result } },
+        .bit_or => .{ .bor = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .bit_xor => .{ .bxor = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .shl => .{ .ishl = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .shr => .{ .sshr = .{ .lhs = lhs, .rhs = rhs, .result = result, .loc = toIrLoc(loc) } },
         // Rounding operations: value # places (trunc) or value ## places (round)
-        .round => .{ .round = .{ .value = lhs, .places = rhs, .result = result } },
-        .trunc => .{ .trunc = .{ .value = lhs, .places = rhs, .result = result } },
-        .range, .range_inclusive => return LowerError.UnsupportedFeature,
+        .round => .{ .round = .{ .value = lhs, .places = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .trunc => .{ .trunc = .{ .value = lhs, .places = rhs, .result = result, .loc = toIrLoc(loc) } },
+        .range, .range_inclusive => {
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Range operator '{s}' cannot be used in binary expression context",
+                .{if (op == .range) ".." else "..="},
+                loc,
+                "range expressions are only valid in for loops (e.g., 'for i in 0..10')",
+                .{},
+            );
+            return LowerError.UnsupportedFeature;
+        },
         .null_coalesce => blk: {
             // null_coalesce: lhs ?? rhs = if (lhs is null) rhs else lhs
             // Lower to: cond = is_null(lhs); result = select(cond, rhs, lhs)
@@ -838,7 +954,21 @@ pub fn lowerUnary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Exp
         },
         .deref => {
             // Dereference pointer - operand should be a pointer, result is pointee type
-            const pointee_ty = if (operand.ty == .ptr) operand.ty.ptr.* else operand.ty;
+            // Handle both *T and ?*T (optional pointer) cases
+            const pointee_ty: ir.Type = blk: {
+                if (operand.ty == .ptr) {
+                    break :blk operand.ty.ptr.*;
+                } else if (operand.ty == .optional) {
+                    // For ?*T, unwrap the optional to get *T, then get T
+                    const inner = operand.ty.optional.*;
+                    if (inner == .ptr) {
+                        break :blk inner.ptr.*;
+                    }
+                    break :blk inner;
+                } else {
+                    break :blk operand.ty;
+                }
+            };
             const deref_result = func.newValue(pointee_ty);
             try l.emit(.{
                 .load = .{
@@ -1007,7 +1137,12 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
 
     // Not an enum or call access - proceed with regular member access via lvalue
     const ptr = try lowerMemberPtr(l, expr_idx);
-    const result = func.newValue(ptr.ty);
+    // ptr is a pointer to the field, so the loaded value type is the pointee type
+    const pointee_ty: ir.Type = switch (ptr.ty) {
+        .ptr => |p| p.*,
+        else => ptr.ty, // Shouldn't happen, but be safe
+    };
+    const result = func.newValue(pointee_ty);
     try l.emit(.{
         .load = .{
             .ptr = ptr,
@@ -1043,9 +1178,30 @@ pub fn lowerIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError
         return result;
     }
 
+    // Check if object is a list type - emit list_get instruction
+    if (object_val.ty == .list) {
+        const index_val = try lowerExpression(l, index_idx);
+        const elem_type = object_val.ty.list.element_type.*;
+        const result = func.newValue(elem_type);
+        try l.emit(.{
+            .list_get = .{
+                .list = object_val,
+                .index = index_val,
+                .result = result,
+                .loc = null,
+            },
+        });
+        return result;
+    }
+
     // Fallback to array/slice indexing via pointer
     const ptr = try lowerIndexPtr(l, expr_idx);
-    const result = func.newValue(ptr.ty);
+    // ptr is a pointer to the element, so the loaded value type is the pointee type
+    const pointee_ty: ir.Type = switch (ptr.ty) {
+        .ptr => |p| p.*,
+        else => ptr.ty, // Shouldn't happen, but be safe
+    };
+    const result = func.newValue(pointee_ty);
     try l.emit(.{
         .load = .{
             .ptr = ptr,
@@ -1058,18 +1214,65 @@ pub fn lowerIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError
 /// Lower a slice expression: expr[start..end]
 pub fn lowerSliceExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
     const parts = l.store.getSliceExprParts(expr_idx);
+    const slice_loc = l.store.exprLoc(expr_idx);
 
-    // Lower the source expression (should be a string)
+    // Lower the source expression
     const source_val = try lowerExpression(l, parts.object);
 
     // Lower the start and end expressions
     const start_val = try lowerExpression(l, parts.start);
     const end_val = try lowerExpression(l, parts.end);
 
-    // Create result value (string slice returns a string)
-    const result = func.newValue(.string);
+    // Check if source is an array type
+    const is_array = switch (source_val.ty) {
+        .array => true,
+        .slice => true,
+        .list => true,
+        .ptr => |p| switch (p.*) {
+            .array => true,
+            .slice => true,
+            else => false,
+        },
+        else => false,
+    };
 
-    // Emit str_slice instruction with is_length=false (end is exclusive index)
+    if (is_array) {
+        // Array slicing - emit array_slice instruction
+        // Result is a list type since the VM creates a List
+        const elem_type_ptr = try l.allocator.create(ir.Type);
+        elem_type_ptr.* = switch (source_val.ty) {
+            .array => |a| a.element.*,
+            .slice => |s| s.*,
+            .list => |lt| lt.element_type.*,
+            .ptr => |p| switch (p.*) {
+                .array => |a| a.element.*,
+                .slice => |s| s.*,
+                else => .i64,
+            },
+            else => .i64,
+        };
+        try l.allocated_types.append(l.allocator, elem_type_ptr);
+
+        // Create a ListType for the result
+        const list_type_ptr = try l.allocator.create(ir.ListType);
+        list_type_ptr.* = .{ .element_type = elem_type_ptr };
+        try l.allocated_list_types.append(l.allocator, list_type_ptr);
+
+        const result = func.newValue(.{ .list = list_type_ptr });
+        try l.emit(.{
+            .array_slice = .{
+                .source = source_val,
+                .start = start_val,
+                .end = end_val,
+                .result = result,
+                .loc = toIrLoc(slice_loc),
+            },
+        });
+        return result;
+    }
+
+    // String slicing - emit str_slice instruction
+    const result = func.newValue(.string);
     try l.emit(.{
         .str_slice = .{
             .source = source_val,
@@ -1077,11 +1280,116 @@ pub fn lowerSliceExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerE
             .length_or_end = end_val,
             .is_length = false, // Using end index, not length
             .result = result,
-            .loc = null,
+            .loc = toIrLoc(slice_loc),
         },
     });
 
     return result;
+}
+
+/// Lower an optional member access expression: expr?.field
+/// Evaluates to null if expr is null, otherwise evaluates to expr.field
+pub fn lowerOptionalMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const data = l.store.exprData(expr_idx);
+    const object_idx = data.getObject();
+    const field_id = data.getField();
+    const field_name = l.strings.get(field_id);
+
+    // Lower the object expression
+    const object_val = try lowerExpression(l, object_idx);
+
+    // Check if object is null
+    const is_null_cond = func.newValue(.bool);
+    try l.emit(.{ .is_null = .{ .operand = object_val, .result = is_null_cond } });
+
+    // Get the struct type from the object value's type
+    // Handle optional types by unwrapping to get the inner type
+    const inner_type: ir.Type = switch (object_val.ty) {
+        .optional => |opt| opt.*,
+        .ptr => |p| p.*,
+        else => object_val.ty,
+    };
+
+    const struct_type: *const ir.StructType = switch (inner_type) {
+        .@"struct" => |s| s,
+        .ptr => |p| switch (p.*) {
+            .@"struct" => |s| s,
+            else => {
+                const loc = l.store.exprLoc(expr_idx);
+                l.setErrorContext(
+                    LowerError.UnsupportedFeature,
+                    "Optional member access requires a struct type, got pointer to non-struct",
+                    .{},
+                    loc,
+                    "the object type is not a struct",
+                    .{},
+                );
+                return LowerError.UnsupportedFeature;
+            },
+        },
+        else => {
+            const loc = l.store.exprLoc(expr_idx);
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Optional member access requires a struct type",
+                .{},
+                loc,
+                "the object type is not a struct",
+                .{},
+            );
+            return LowerError.UnsupportedFeature;
+        },
+    };
+
+    // Find the field in the struct
+    for (struct_type.fields, 0..) |fld, i| {
+        if (std.mem.eql(u8, fld.name, field_name)) {
+            // Found the field - create a pointer type for it
+            const ty_ptr = l.allocator.create(ir.Type) catch return LowerError.OutOfMemory;
+            ty_ptr.* = fld.ty;
+            try l.allocated_types.append(l.allocator, ty_ptr);
+
+            const field_ptr = func.newValue(.{ .ptr = ty_ptr });
+            try l.emit(.{
+                .field_ptr = .{
+                    .struct_ptr = object_val,
+                    .field_index = @intCast(i),
+                    .result = field_ptr,
+                },
+            });
+
+            // Load the field value
+            const field_val = func.newValue(fld.ty);
+            try l.emit(.{ .load = .{ .ptr = field_ptr, .result = field_val } });
+
+            // Create a null constant for the result type
+            const null_val = func.newValue(fld.ty);
+            try l.emit(.{ .const_null = .{ .ty = fld.ty, .result = null_val } });
+
+            // Select between null and field value based on is_null condition
+            const result = func.newValue(fld.ty);
+            try l.emit(.{ .select = .{
+                .condition = is_null_cond,
+                .true_val = null_val,
+                .false_val = field_val,
+                .result = result,
+            } });
+
+            return result;
+        }
+    }
+
+    // Field not found in struct
+    const loc = l.store.exprLoc(expr_idx);
+    l.setErrorContext(
+        LowerError.UndefinedVariable,
+        "struct '{s}' has no field '{s}'",
+        .{ struct_type.name, field_name },
+        .{ .line = loc.line, .column = loc.column },
+        "field not found in struct type for optional access",
+        .{},
+    );
+    return LowerError.UndefinedVariable;
 }
 
 // ============================================================================
@@ -1092,6 +1400,7 @@ pub fn lowerSliceExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerE
 pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
+    const call_loc = l.store.exprLoc(expr_idx);
 
     const callee_idx = data.getCallee();
     const args_count = data.b >> 16;
@@ -1129,6 +1438,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                         .callee = native_name,
                         .args = args_slice,
                         .result = result,
+                        .loc = toIrLoc(call_loc),
                     },
                 });
                 return result;
@@ -1237,6 +1547,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                         .callee = native_name,
                         .args = args_slice,
                         .result = result,
+                        .loc = null,
                     },
                 });
                 return result;
@@ -1560,6 +1871,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                         .callee = method_name,
                         .args = args_slice,
                         .result = result,
+                        .loc = toIrLoc(call_loc),
                     },
                 });
                 return result;
@@ -1673,6 +1985,42 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const args_slice = try args.toOwnedSlice(l.allocator);
     // NOTE: args_slice is freed by Block.deinit when the call instruction is cleaned up
 
+    // Special handling for len() - type-aware
+    if (std.mem.eql(u8, callee_name, "len") and args_slice.len == 1) {
+        const arg = args_slice[0];
+        const result = func.newValue(.i64);
+
+        if (arg.ty == .array) {
+            // Array length - emit array_len
+            try l.emit(.{ .array_len = .{ .operand = arg, .result = result } });
+            l.allocator.free(callee_name);
+            return result;
+        } else if (arg.ty == .list) {
+            // Dynamic list length - emit list_len
+            try l.emit(.{
+                .list_len = .{
+                    .list = arg,
+                    .result = result,
+                    .loc = null,
+                },
+            });
+            l.allocator.free(callee_name);
+            return result;
+        } else if (arg.ty == .map) {
+            // Map length - emit map_len
+            try l.emit(.{
+                .map_len = .{
+                    .map = arg,
+                    .result = result,
+                    .loc = null,
+                },
+            });
+            l.allocator.free(callee_name);
+            return result;
+        }
+        // Fall through to str_len for strings or other types
+    }
+
     // Check if callee is a local variable (could be a closure)
     // If so, we need to emit call_indirect instead of call
     if (callee_tag == .identifier and l.scopes.get(callee_name) != null) {
@@ -1739,6 +2087,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             .callee = actual_callee,
             .args = args_slice,
             .result = result,
+            .loc = toIrLoc(call_loc),
         },
     });
 
@@ -1749,6 +2098,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
+    const method_loc = l.store.exprLoc(expr_idx);
 
     // Method calls have object in a, method name + args in extra
     const object_idx: ExprIdx = @enumFromInt(data.a);
@@ -1956,6 +2306,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             .callee = callee_name,
             .args = args_slice,
             .result = result,
+            .loc = toIrLoc(method_loc),
         },
     });
 

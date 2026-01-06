@@ -84,7 +84,7 @@ pub fn lowerRecordBlock(l: *Lowerer, data: NodeData) LowerError!void {
 }
 
 /// Lower a break statement
-pub fn lowerBreak(l: *Lowerer) LowerError!void {
+pub fn lowerBreak(l: *Lowerer, loc: SourceLoc) LowerError!void {
     if (l.loop_exit_block) |exit_block| {
         // Emit ARC releases for current scope before breaking
         // Note: We only release the current scope; parent scopes will be released
@@ -106,12 +106,20 @@ pub fn lowerBreak(l: *Lowerer) LowerError!void {
         }
         try l.emit(.{ .jump = .{ .target = exit_block } });
     } else {
+        l.setErrorContext(
+            LowerError.UnsupportedFeature,
+            "'break' statement outside of loop",
+            .{},
+            loc,
+            "break can only be used inside while, for, or loop statements",
+            .{},
+        );
         return LowerError.UnsupportedFeature;
     }
 }
 
 /// Lower a continue statement
-pub fn lowerContinue(l: *Lowerer) LowerError!void {
+pub fn lowerContinue(l: *Lowerer, loc: SourceLoc) LowerError!void {
     if (l.loop_continue_block) |continue_block| {
         // Emit ARC releases for current scope before continuing
         // Note: We only release the current scope; the loop will re-enter
@@ -133,6 +141,14 @@ pub fn lowerContinue(l: *Lowerer) LowerError!void {
         }
         try l.emit(.{ .jump = .{ .target = continue_block } });
     } else {
+        l.setErrorContext(
+            LowerError.UnsupportedFeature,
+            "'continue' statement outside of loop",
+            .{},
+            loc,
+            "continue can only be used inside while, for, or loop statements",
+            .{},
+        );
         return LowerError.UnsupportedFeature;
     }
 }
@@ -570,12 +586,12 @@ pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
         } else {
             // Not a range expression - try as iterable collection
             const iterable_val = try lower_expr.lowerExpression(l, iterable_idx);
-            return lowerCollectionIteration(l, func, binding_name, iterable_val, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
+            return lowerCollectionIteration(l, func, binding_name, iterable_val, iterable_idx, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
         }
     } else {
         // Not a binary expression - could be a variable holding a collection
         const iterable_val = try lower_expr.lowerExpression(l, iterable_idx);
-        return lowerCollectionIteration(l, func, binding_name, iterable_val, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
+        return lowerCollectionIteration(l, func, binding_name, iterable_val, iterable_idx, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
     }
 
     // For range iteration, the loop variable IS the user-visible binding
@@ -627,6 +643,7 @@ fn lowerCollectionIteration(
     func: *ir.Function,
     binding_name: []const u8,
     iterable_val: ir.Value,
+    iterable_idx: ExprIdx,
     body_idx: StmtIdx,
     cond_block: *ir.Block,
     body_block: *ir.Block,
@@ -638,6 +655,7 @@ fn lowerCollectionIteration(
 ) LowerError!void {
     // Check the type of the iterable to determine how to iterate
     const iterable_type = iterable_val.ty;
+    const loc = l.store.exprLoc(iterable_idx);
 
     log.debug("lowerCollectionIteration: iterable_type tag = {s}", .{@tagName(iterable_type)});
 
@@ -654,7 +672,17 @@ fn lowerCollectionIteration(
                     element_type = arr.element.*;
                     array_val = iterable_val;
                 },
-                else => return LowerError.UnsupportedFeature,
+                else => {
+                    l.setErrorContext(
+                        LowerError.UnsupportedFeature,
+                        "Cannot iterate over pointer to '{s}'",
+                        .{@tagName(ptr_type.*)},
+                        loc,
+                        "for-in loops can iterate over arrays, slices, and maps",
+                        .{},
+                    );
+                    return LowerError.UnsupportedFeature;
+                },
             }
         },
         .array => |arr| {
@@ -669,7 +697,17 @@ fn lowerCollectionIteration(
             // Map iteration - iterate over keys
             return lowerMapIteration(l, func, binding_name, iterable_val, body_idx, cond_block, body_block, incr_block, exit_block, loop_var, prev_exit, prev_continue);
         },
-        else => return LowerError.UnsupportedFeature,
+        else => {
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Cannot iterate over type '{s}'",
+                .{@tagName(iterable_type)},
+                loc,
+                "for-in loops can iterate over arrays, slices, maps, and ranges (0..n)",
+                .{},
+            );
+            return LowerError.UnsupportedFeature;
+        },
     }
 
     // Array iteration: use array_len and array_load

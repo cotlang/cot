@@ -539,6 +539,7 @@ pub const Instruction = union(enum) {
     array_load: ArrayOp,
     array_store: ArrayStore,
     array_len: UnaryOp,
+    array_slice: ArraySlice,
 
     // ====== Map operations ======
     map_new: MapNew,
@@ -760,6 +761,15 @@ pub const Instruction = union(enum) {
         array_ptr: Value, // Pointer to array base
         index: Value, // Index expression (0-based)
         value: Value, // Value to store
+        loc: ?SourceLoc = null,
+    };
+
+    /// Array slice - extract portion of array (0-indexed)
+    pub const ArraySlice = struct {
+        source: Value, // Source array
+        start: Value, // Start index (0-based)
+        end: Value, // End index (exclusive)
+        result: Value, // Result slice value
         loc: ?SourceLoc = null,
     };
 
@@ -1009,7 +1019,7 @@ pub const Instruction = union(enum) {
             .iconst, .f32const, .f64const, .const_string, .const_null => .constant,
             .wrap_optional, .unwrap_optional, .is_null => .optional,
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
-            .array_load, .array_store, .array_len => .array,
+            .array_load, .array_store, .array_len, .array_slice => .array,
             .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => .map,
             .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => .list,
             .debug_line => .debug,
@@ -1078,6 +1088,7 @@ pub const Instruction = union(enum) {
             .call_indirect => |c| c.result,
             .load_struct_buf => |l| l.result,
             .array_load => |a| a.result,
+            .array_slice => |a| a.result,
             .bitcast => |c| c.result,
             .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| op.result,
             .sextend, .uextend => |e| e.result,
@@ -1368,6 +1379,9 @@ pub const Module = struct {
     /// Union type definitions
     unions: std.ArrayListUnmanaged(*UnionType),
 
+    /// Enum type definitions (for cross-package type sharing)
+    enums: std.StringHashMapUnmanaged(EnumDef),
+
     /// Global variables
     globals: std.ArrayListUnmanaged(Global),
 
@@ -1386,6 +1400,15 @@ pub const Module = struct {
     /// Type pointers allocated during lowering (owned by Module)
     allocated_types: std.ArrayListUnmanaged(*Type) = .{},
 
+    /// ListType pointers allocated during lowering (owned by Module)
+    allocated_list_types: std.ArrayListUnmanaged(*ListType) = .{},
+
+    /// Enum definition for cross-package export
+    pub const EnumDef = struct {
+        name: []const u8,
+        variants: std.StringHashMap(i64),
+    };
+
     pub const Global = struct {
         name: []const u8,
         ty: Type,
@@ -1399,6 +1422,7 @@ pub const Module = struct {
             .library_name = null,
             .structs = .{},
             .unions = .{},
+            .enums = .{},
             .globals = .{},
             .functions = .{},
             .vtables = .{},
@@ -1427,6 +1451,13 @@ pub const Module = struct {
         }
         self.unions.deinit(self.allocator);
 
+        // Free enum definitions and their variant maps
+        var enum_it = self.enums.iterator();
+        while (enum_it.next()) |entry| {
+            entry.value_ptr.variants.deinit();
+        }
+        self.enums.deinit(self.allocator);
+
         self.globals.deinit(self.allocator);
 
         // Free vtables and their method entries
@@ -1440,6 +1471,12 @@ pub const Module = struct {
             self.allocator.destroy(ty_ptr);
         }
         self.allocated_types.deinit(self.allocator);
+
+        // Free list type pointers allocated during lowering
+        for (self.allocated_list_types.items) |lt_ptr| {
+            self.allocator.destroy(lt_ptr);
+        }
+        self.allocated_list_types.deinit(self.allocator);
         // Note: caller is responsible for destroying the Module pointer
     }
 
