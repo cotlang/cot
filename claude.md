@@ -167,8 +167,8 @@ Source → Lexer → Parser → AST → IR Lower → Type Check → Optimize →
 
 ## Reference Documentation
 
-### DBL Language Manual
-The legacy DBL reference manual is located at `~/cotlang/dbllang/`.
+### Cot Language Syntax
+The Cot language syntax reference is at `~/cotlang/SYNTAX.md`. This is an example-first document showing all language features with runnable code snippets.
 
 ## Zig 0.15 API Notes
 

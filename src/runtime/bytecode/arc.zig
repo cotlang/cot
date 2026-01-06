@@ -52,6 +52,8 @@ const FixedStringRef = value_mod.FixedStringRef;
 const Record = value_mod.Record;
 const Closure = value_mod.Closure;
 const CLOSURE_TYPE_ID = value_mod.CLOSURE_TYPE_ID;
+const StructBox = value_mod.StructBox;
+const STRUCT_BOX_TYPE_ID = value_mod.STRUCT_BOX_TYPE_ID;
 const OrderedMap = @import("ordered_map.zig").OrderedMap;
 
 // Scoped logging
@@ -316,7 +318,7 @@ pub fn getHeapPtr(value: Value) ?*anyopaque {
             break :blk if (ptr != 0) @ptrFromInt(ptr) else null;
         },
         // Inline types - no heap allocation
-        .null_val, .boolean, .integer, .handle => null,
+        .null_val, .boolean, .integer, .float, .handle => null,
     };
 }
 
@@ -398,6 +400,13 @@ fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void 
                 // Deinit map internals (but not the map struct itself)
                 map.deinit();
                 freeWithHeader(ptr, @sizeOf(OrderedMap), allocator);
+            } else if (value.asStructBox()) |sbox| {
+                // StructBox (type_id 20) - release field values and free structure
+                for (sbox.fields) |field| {
+                    release(field, allocator);
+                }
+                sbox.deinitInternal();
+                freeWithHeader(ptr, @sizeOf(StructBox), allocator);
             } else {
                 // Unknown object type - log warning and skip
                 log.warn("Unknown object type_id {} - cannot free", .{type_id});
@@ -405,7 +414,7 @@ fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void 
         },
 
         // Inline types should never reach here
-        .null_val, .boolean, .integer, .handle => unreachable,
+        .null_val, .boolean, .integer, .float, .handle => unreachable,
     }
 }
 
@@ -459,13 +468,17 @@ pub fn freeObjectForced(value: Value, ptr: *anyopaque, allocator: std.mem.Alloca
                 // Map - free structure without recursively releasing values
                 map.deinit();
                 freeWithHeader(ptr, @sizeOf(OrderedMap), allocator);
+            } else if (value.asStructBox()) |sbox| {
+                // StructBox - free structure without recursively releasing values
+                sbox.deinitInternal();
+                freeWithHeader(ptr, @sizeOf(StructBox), allocator);
             } else {
                 // Unknown object type - log warning
                 log.warn("Unknown object type_id {} - cannot free (forced)", .{type_id});
             }
         },
 
-        .null_val, .boolean, .integer, .handle => unreachable,
+        .null_val, .boolean, .integer, .float, .handle => unreachable,
     }
 }
 

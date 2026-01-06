@@ -127,7 +127,7 @@ pub const PageRouter = struct {
         // Try exact match first
         const exact_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/{s}.dex",
+            "{s}/{s}.dx",
             .{ self.pages_dir, normalized },
         );
 
@@ -139,7 +139,7 @@ pub const PageRouter = struct {
         // Try index.dex in directory
         const index_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/{s}/index.dex",
+            "{s}/{s}/index.dx",
             .{ self.pages_dir, normalized },
         );
 

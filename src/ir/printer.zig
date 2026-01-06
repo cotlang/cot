@@ -511,6 +511,49 @@ pub const Printer = struct {
                 try self.printValue(m.index);
             },
 
+            // List operations
+            .list_new => |l| {
+                try self.printValue(l.result);
+                try self.writer.writeAll(" = list_new ");
+                try self.printType(l.element_type.*);
+            },
+            .list_push => |l| {
+                try self.writer.writeAll("list_push ");
+                try self.printValue(l.list);
+                try self.writer.writeAll(", ");
+                try self.printValue(l.value);
+            },
+            .list_pop => |l| {
+                try self.printValue(l.result);
+                try self.writer.writeAll(" = list_pop ");
+                try self.printValue(l.list);
+            },
+            .list_get => |l| {
+                try self.printValue(l.result);
+                try self.writer.writeAll(" = list_get ");
+                try self.printValue(l.list);
+                try self.writer.writeAll("[");
+                try self.printValue(l.index);
+                try self.writer.writeAll("]");
+            },
+            .list_set => |l| {
+                try self.writer.writeAll("list_set ");
+                try self.printValue(l.list);
+                try self.writer.writeAll("[");
+                try self.printValue(l.index);
+                try self.writer.writeAll("] = ");
+                try self.printValue(l.value);
+            },
+            .list_len => |l| {
+                try self.printValue(l.result);
+                try self.writer.writeAll(" = list_len ");
+                try self.printValue(l.list);
+            },
+            .list_clear => |l| {
+                try self.writer.writeAll("list_clear ");
+                try self.printValue(l.list);
+            },
+
             // Closure operations
             .make_closure => |c| {
                 try self.printValue(c.result);
@@ -662,6 +705,11 @@ pub const Printer = struct {
             .@"union" => |u| try self.writer.print("union({s})", .{u.name}),
             .function => try self.writer.writeAll("fn"),
             .map => try self.writer.writeAll("Map"),
+            .list => |l| {
+                try self.writer.writeAll("List<");
+                try self.printType(l.element_type.*);
+                try self.writer.writeAll(">");
+            },
             .weak => |inner| {
                 try self.writer.writeAll("weak ");
                 try self.printType(inner.*);

@@ -8,21 +8,21 @@ const Allocator = std.mem.Allocator;
 
 /// Patch operation types
 pub const PatchOp = enum {
-    replace,    // Replace element/content
-    insert,     // Insert new element
-    remove,     // Remove element
-    attr_set,   // Set attribute
-    attr_remove,// Remove attribute
-    text,       // Update text content
+    replace, // Replace element/content
+    insert, // Insert new element
+    remove, // Remove element
+    attr_set, // Set attribute
+    attr_remove, // Remove attribute
+    text, // Update text content
 };
 
 /// A single DOM patch
 pub const Patch = struct {
     op: PatchOp,
-    path: []const u8,      // CSS selector or path to target
-    html: ?[]const u8,     // HTML content (for replace/insert)
-    attr: ?[]const u8,     // Attribute name
-    value: ?[]const u8,    // Attribute value
+    path: []const u8, // CSS selector or path to target
+    html: ?[]const u8, // HTML content (for replace/insert)
+    attr: ?[]const u8, // Attribute name
+    value: ?[]const u8, // Attribute value
 };
 
 /// Patch set to send to client
@@ -114,7 +114,7 @@ pub const Differ = struct {
         if (!std.mem.eql(u8, old_html, new_html)) {
             try self.patches.append(self.allocator, Patch{
                 .op = .replace,
-                .path = "",  // Root of component
+                .path = "", // Root of component
                 .html = new_html,
                 .attr = null,
                 .value = null,

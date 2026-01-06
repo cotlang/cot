@@ -334,12 +334,7 @@ fn cmdTrace(allocator: std.mem.Allocator, args: []const []const u8) !void {
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--level=")) {
             const level_str = arg[8..];
-            trace_level = if (std.mem.eql(u8, level_str, "none")) .none
-                else if (std.mem.eql(u8, level_str, "routines")) .routines
-                else if (std.mem.eql(u8, level_str, "opcodes")) .opcodes
-                else if (std.mem.eql(u8, level_str, "verbose")) .verbose
-                else if (std.mem.eql(u8, level_str, "full")) .full
-                else .opcodes;
+            trace_level = if (std.mem.eql(u8, level_str, "none")) .none else if (std.mem.eql(u8, level_str, "routines")) .routines else if (std.mem.eql(u8, level_str, "opcodes")) .opcodes else if (std.mem.eql(u8, level_str, "verbose")) .verbose else if (std.mem.eql(u8, level_str, "full")) .full else .opcodes;
         }
     }
 
@@ -923,9 +918,15 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
     defer mod.deinit();
 
     // Create tracer
+    // At --level=full, show raw value bits for debugging NaN-boxing issues
     var tracer = trace_mod.Tracer.init(allocator, .{
         .level = level,
-        .output = .{ .format = .human, .target = .stderr, .color = true },
+        .output = .{
+            .format = .human,
+            .target = .stderr,
+            .color = true,
+            .show_raw_bits = level == .full,
+        },
         .history_size = 256,
     });
     defer tracer.deinit();
@@ -982,9 +983,15 @@ fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: 
     defer mod.deinit();
 
     // Create tracer
+    // At --level=full, show raw value bits for debugging NaN-boxing issues
     var tracer = trace_mod.Tracer.init(allocator, .{
         .level = level,
-        .output = .{ .format = .human, .target = .stderr, .color = true },
+        .output = .{
+            .format = .human,
+            .target = .stderr,
+            .color = true,
+            .show_raw_bits = level == .full,
+        },
         .history_size = 256,
     });
     defer tracer.deinit();
@@ -1506,6 +1513,122 @@ fn validateBytecode(allocator: std.mem.Allocator, filename: []const u8, strict: 
     }
 }
 
+/// Parse a single source file into an existing NodeStore
+/// Returns the top-level statements from this file
+fn parseFileIntoStore(
+    allocator: std.mem.Allocator,
+    filename: []const u8,
+    store: *cot.ast.NodeStore,
+    strings: *cot.base.StringInterner,
+    collector: *cot.compiler.DiagnosticCollector,
+) ![]const cot.ast.StmtIdx {
+    const diagnostics = cot.compiler.diagnostics;
+    const formatter = cot.compiler.formatter;
+
+    // Read source file
+    const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
+        try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
+        return error.CompilationFailed;
+    };
+    defer file.close();
+
+    const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
+    collector.cacheSource(filename, source) catch {};
+
+    // Tokenize
+    var lex = cot.lexer.Lexer.init(source);
+    const tokens = lex.tokenize(allocator) catch |err| {
+        collector.addError(
+            .E001_invalid_character,
+            filename,
+            diagnostics.SourceRange.none,
+            "Lexer error: {}",
+            .{err},
+        );
+        formatter.printToStderr(collector, .{ .use_color = true });
+        return error.CompilationFailed;
+    };
+
+    // Parse into the shared store
+    var parse = cot.parser.Parser.init(allocator, tokens, store, strings);
+    const top_level = parse.parse() catch |err| {
+        for (parse.errors.items) |parse_err| {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.fromLoc(@intCast(parse_err.line), @intCast(parse_err.column)),
+                "{s}",
+                .{parse_err.message},
+            );
+        }
+        if (collector.error_count == 0) {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.none,
+                "Parser error: {}",
+                .{err},
+            );
+        }
+        formatter.printToStderr(collector, .{ .use_color = true });
+        return error.CompilationFailed;
+    };
+
+    // Check for non-fatal parser errors
+    if (parse.errors.items.len > 0) {
+        for (parse.errors.items) |parse_err| {
+            collector.addError(
+                .E100_unexpected_token,
+                filename,
+                diagnostics.SourceRange.fromLoc(@intCast(parse_err.line), @intCast(parse_err.column)),
+                "{s}",
+                .{parse_err.message},
+            );
+        }
+    }
+
+    return top_level;
+}
+
+/// Extract import paths from parsed statements
+fn extractImports(
+    allocator: std.mem.Allocator,
+    store: *const cot.ast.NodeStore,
+    strings: *const cot.base.StringInterner,
+    stmts: []const cot.ast.StmtIdx,
+) ![][]const u8 {
+    var imports: std.ArrayListUnmanaged([]const u8) = .{};
+
+    for (stmts) |stmt_idx| {
+        const tag = store.stmtTag(stmt_idx);
+        if (tag == .import_stmt) {
+            const data = store.stmtData(stmt_idx);
+            const module_name = strings.get(data.getName());
+            // Duplicate the string since we need to return owned data
+            const duped = try allocator.dupe(u8, module_name);
+            try imports.append(allocator, duped);
+        }
+    }
+
+    return imports.toOwnedSlice(allocator);
+}
+
+/// Resolve an import module name to a file path
+fn resolveImportPath(
+    allocator: std.mem.Allocator,
+    base_dir: []const u8,
+    module_name: []const u8,
+) ![]const u8 {
+    // If module_name already has an extension, use it directly
+    if (std.mem.endsWith(u8, module_name, ".cot")) {
+        return std.fs.path.join(allocator, &.{ base_dir, module_name });
+    }
+    // Otherwise, add .cot extension
+    const filename = try std.fmt.allocPrint(allocator, "{s}.cot", .{module_name});
+    defer allocator.free(filename);
+    return std.fs.path.join(allocator, &.{ base_dir, filename });
+}
+
 fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, output_file: ?[]const u8) !void {
     // Try to dispatch to external frontend
     if (output_file) |of| {
@@ -1533,87 +1656,65 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     var collector = DiagnosticCollector.init(allocator);
     // No defer collector.deinit() needed - arena handles cleanup
 
-    // Read source file
-    const file = std.fs.cwd().openFile(filename, .{}) catch |err| {
-        try printStderr("Error: Could not open file '{s}': {}\n", .{ filename, err });
-        return error.CompilationFailed;
-    };
-    defer file.close();
-
-    const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
-    // No defer allocator.free(source) needed - arena handles cleanup
-
-    // Cache source for diagnostic context
-    collector.cacheSource(filename, source) catch {};
-
-    // Tokenize
-    var lex = cot.lexer.Lexer.init(source);
-    const tokens = lex.tokenize(allocator) catch |err| {
-        collector.addError(
-            .E001_invalid_character,
-            filename,
-            diagnostics.SourceRange.none,
-            "Lexer error: {}",
-            .{err},
-        );
-        formatter.printToStderr(&collector, .{ .use_color = true });
-        return error.CompilationFailed;
-    };
-    // No defer allocator.free(tokens) needed - arena handles cleanup
-
-    // Create NodeStore and StringInterner for new parser
+    // Create NodeStore and StringInterner for parsing all files
     var strings = cot.base.StringInterner.init(allocator);
     // No defer strings.deinit() needed - arena handles cleanup
 
     var store = cot.ast.NodeStore.init(allocator, &strings);
     // No defer store.deinit() needed - arena handles cleanup
 
-    // Parse
-    var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
-    // No defer parse.deinit() needed - arena handles cleanup
-    const top_level = parse.parse() catch |err| {
-        // Report parser's collected errors
-        for (parse.errors.items) |parse_err| {
-            collector.addError(
-                .E100_unexpected_token,
-                filename,
-                diagnostics.SourceRange.fromLoc(@intCast(parse_err.line), @intCast(parse_err.column)),
-                "{s}",
-                .{parse_err.message},
-            );
-        }
-        // Also report the fatal error if we have no collected errors
-        if (collector.error_count == 0) {
-            collector.addError(
-                .E100_unexpected_token,
-                filename,
-                diagnostics.SourceRange.none,
-                "Parser error: {}",
-                .{err},
-            );
-        }
-        formatter.printToStderr(&collector, .{ .use_color = true });
-        return error.CompilationFailed;
-    };
+    // Get base directory for resolving relative imports
+    const base_dir = std.fs.path.dirname(filename) orelse ".";
 
-    // Check if parser collected any non-fatal errors
-    if (parse.errors.items.len > 0) {
-        for (parse.errors.items) |parse_err| {
-            collector.addError(
-                .E100_unexpected_token,
-                filename,
-                diagnostics.SourceRange.fromLoc(@intCast(parse_err.line), @intCast(parse_err.column)),
-                "{s}",
-                .{parse_err.message},
-            );
-        }
-    }
+    // Track which files we've already parsed to avoid duplicates
+    var parsed_files = std.StringHashMap(void).init(allocator);
 
-    // If we have errors after parsing, stop and report
+    // Collect all statements from all files (imports first, then main file)
+    var all_stmts: std.ArrayListUnmanaged(cot.ast.StmtIdx) = .{};
+
+    // Parse main file first to discover imports
+    const main_stmts = try parseFileIntoStore(allocator, filename, &store, &strings, &collector);
+    try parsed_files.put(filename, {});
+
+    // If we have errors after parsing main file, stop
     if (collector.hasErrors()) {
         formatter.printToStderr(&collector, .{ .use_color = true });
         return error.CompilationFailed;
     }
+
+    // Extract imports from main file and parse them (recursively)
+    const imports = try extractImports(allocator, &store, &strings, main_stmts);
+
+    // Parse each imported file (in order, non-recursive for now)
+    for (imports) |module_name| {
+        const import_path = try resolveImportPath(allocator, base_dir, module_name);
+
+        // Skip if already parsed
+        if (parsed_files.contains(import_path)) continue;
+
+        // Check if file exists
+        std.fs.cwd().access(import_path, .{}) catch {
+            try printStderr("Error: Cannot find import '{s}' (looked for '{s}')\n", .{ module_name, import_path });
+            return error.CompilationFailed;
+        };
+
+        // Parse the imported file
+        const import_stmts = try parseFileIntoStore(allocator, import_path, &store, &strings, &collector);
+        try parsed_files.put(import_path, {});
+
+        // Add imported statements FIRST (so their types are defined before main file)
+        try all_stmts.appendSlice(allocator, import_stmts);
+
+        if (collector.hasErrors()) {
+            formatter.printToStderr(&collector, .{ .use_color = true });
+            return error.CompilationFailed;
+        }
+    }
+
+    // Add main file statements AFTER imports
+    try all_stmts.appendSlice(allocator, main_stmts);
+
+    const top_level = all_stmts.items;
 
     // Run compile-time evaluation (resolve comptime if, evaluate const)
     var evaluator = cot.comptime_eval.Evaluator.init(allocator, &store, &strings);

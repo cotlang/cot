@@ -335,10 +335,23 @@ pub const Tracer = struct {
 
     /// Called when returning from a routine
     pub fn onReturn(self: *Self, routine: []const u8, has_value: bool, ip: u32) void {
+        self.onReturnWithValue(routine, has_value, ip, null);
+    }
+
+    /// Called when returning from a routine with the actual return value
+    /// This enhanced version shows what value is being returned (from r15)
+    pub fn onReturnWithValue(self: *Self, routine: []const u8, has_value: bool, ip: u32, return_value: ?Value) void {
         self.stats.returns += 1;
 
         if (self.call_depth > 0) {
             self.call_depth -= 1;
+        }
+
+        // Capture return value in register snapshot if provided
+        var reg_snapshots = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8;
+        if (return_value) |val| {
+            // Put return value in the display (slot 7 represents r15)
+            reg_snapshots[7] = RegisterSnapshot.fromValue(val);
         }
 
         const entry = TraceEntry{
@@ -348,14 +361,14 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .registers = reg_snapshots,
             .context = .{ .return_ = .{ .has_value = has_value } },
         };
 
         self.history.push(entry);
 
         if (self.config.level.logsRoutines()) {
-            self.output.writeReturn(routine, has_value, ip);
+            self.output.writeReturnWithValue(routine, has_value, ip, return_value);
         }
     }
 

@@ -110,9 +110,11 @@ pub const Renderer = struct {
     }
 
     /// Render a template AST with the given context
+    /// Caller owns the returned memory and must free it.
     pub fn render(self: *Self, node: Node, ctx: *const Context) ![]const u8 {
         try self.renderNode(node, ctx);
-        return self.output.items;
+        // Return owned slice so caller owns the memory
+        return try self.output.toOwnedSlice(self.allocator);
     }
 
     fn renderNode(self: *Self, node: Node, ctx: *const Context) Allocator.Error!void {
@@ -180,7 +182,10 @@ pub const Renderer = struct {
         // Event bindings (generate data attributes for client-side handling)
         for (elem.events) |event| {
             try self.output.appendSlice(self.allocator, " data-dex-");
-            try self.output.appendSlice(self.allocator, event.event);
+            // Output event name in lowercase (e.g., "Click" -> "click")
+            for (event.event) |c| {
+                try self.output.append(self.allocator, std.ascii.toLower(c));
+            }
             try self.output.appendSlice(self.allocator, "=\"");
             try self.appendEscaped(event.handler);
             try self.output.append(self.allocator, '"');
@@ -234,7 +239,10 @@ pub const Renderer = struct {
         // Event bindings
         for (comp.events) |event| {
             try self.output.appendSlice(self.allocator, " data-dex-");
-            try self.output.appendSlice(self.allocator, event.event);
+            // Output event name in lowercase
+            for (event.event) |c| {
+                try self.output.append(self.allocator, std.ascii.toLower(c));
+            }
             try self.output.appendSlice(self.allocator, "=\"");
             try self.appendEscaped(event.handler);
             try self.output.append(self.allocator, '"');

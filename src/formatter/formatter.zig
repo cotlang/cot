@@ -259,9 +259,9 @@ fn formatDbl(allocator: Allocator, source: []const u8, tab_size: u32, insert_spa
 
     // Keywords that increase indent level
     const indent_keywords = [_][]const u8{
-        "record",    "group",     "structure",   "common",    "global",   "literal",
-        "begin",     "using",     "class",       "method",    "property", "namespace",
-        "interface", "try",       "subroutine",  "function",  "test",
+        "record",    "group", "structure",  "common",   "global",   "literal",
+        "begin",     "using", "class",      "method",   "property", "namespace",
+        "interface", "try",   "subroutine", "function", "test",
     };
 
     // Keywords that should be at indent 0 but set indent to 1 for following lines
@@ -269,10 +269,10 @@ fn formatDbl(allocator: Allocator, source: []const u8, tab_size: u32, insert_spa
 
     // Keywords that decrease indent level by 1
     const dedent_keywords = [_][]const u8{
-        "endrecord",    "endgroup",     "endstructure", "endcommon",
-        "endglobal",    "endliteral",   "end",          "endusing",
-        "endclass",     "endmethod",    "endproperty",  "endnamespace",
-        "endinterface", "endtry",       "endproc",
+        "endrecord",    "endgroup",   "endstructure", "endcommon",
+        "endglobal",    "endliteral", "end",          "endusing",
+        "endclass",     "endmethod",  "endproperty",  "endnamespace",
+        "endinterface", "endtry",     "endproc",
     };
 
     // Keywords that reset indent to 0 (end of top-level blocks)

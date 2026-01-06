@@ -137,6 +137,9 @@ pub const VM = struct {
 
     // Error handling
     error_handler_ip: ?u32, // Absolute IP of error handler (null = no handler)
+    error_handler_sp: usize, // Stack pointer when handler was set
+    error_handler_fp: usize, // Frame pointer when handler was set
+    error_handler_call_depth: usize, // Call stack depth when handler was set
     last_error: ?VMError, // Last error that occurred (for %ERROR function)
 
     // Debugger support
@@ -195,6 +198,9 @@ pub const VM = struct {
             .current_module_index = null,
             .modules = .{},
             .error_handler_ip = null,
+            .error_handler_sp = 0,
+            .error_handler_fp = 0,
+            .error_handler_call_depth = 0,
             .last_error = null,
             .debugger = Debugger.init(allocator),
             .stop_reason = null,
@@ -232,6 +238,9 @@ pub const VM = struct {
             .current_module_index = null,
             .modules = .{},
             .error_handler_ip = null,
+            .error_handler_sp = 0,
+            .error_handler_fp = 0,
+            .error_handler_call_depth = 0,
             .last_error = null,
             .debugger = Debugger.init(allocator),
             .stop_reason = null,
@@ -1218,6 +1227,10 @@ pub const VM = struct {
                 const int_val = val.asInt();
                 return std.fmt.bufPrint(buf, "{d}", .{int_val}) catch "";
             },
+            .float => {
+                const float_val = val.asFloat();
+                return std.fmt.bufPrint(buf, "{d}", .{float_val}) catch "";
+            },
             .implied_decimal => {
                 if (val.asImpliedDecimal()) |dval| {
                     const divisor = std.math.pow(i64, 10, dval.precision);
@@ -1380,6 +1393,25 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.map_set_at)] = &vm_opcodes.op_map_set_at;
         table[@intFromEnum(Opcode.map_key_at)] = &vm_opcodes.op_map_key_at;
 
+        // List Operations - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.list_new)] = &vm_opcodes.op_list_new;
+        table[@intFromEnum(Opcode.list_push)] = &vm_opcodes.op_list_push;
+        table[@intFromEnum(Opcode.list_pop)] = &vm_opcodes.op_list_pop;
+        table[@intFromEnum(Opcode.list_get)] = &vm_opcodes.op_list_get;
+        table[@intFromEnum(Opcode.list_set)] = &vm_opcodes.op_list_set;
+        table[@intFromEnum(Opcode.list_len)] = &vm_opcodes.op_list_len;
+        table[@intFromEnum(Opcode.list_clear)] = &vm_opcodes.op_list_clear;
+
+        // List struct operations (0xB5-0xB8) - for storing structs in lists
+        table[@intFromEnum(Opcode.list_push_struct)] = &vm_opcodes.op_list_push_struct;
+        table[@intFromEnum(Opcode.list_get_struct)] = &vm_opcodes.op_list_get_struct;
+        table[@intFromEnum(Opcode.list_pop_struct)] = &vm_opcodes.op_list_pop_struct;
+        table[@intFromEnum(Opcode.list_set_struct)] = &vm_opcodes.op_list_set_struct;
+
+        // Map struct operations (0xB9-0xBA)
+        table[@intFromEnum(Opcode.map_set_struct)] = &vm_opcodes.op_map_set_struct;
+        table[@intFromEnum(Opcode.map_get_struct)] = &vm_opcodes.op_map_get_struct;
+
         // Debug (0xF0-0xFF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.debug_break)] = &vm_opcodes.op_debug_break;
         table[@intFromEnum(Opcode.debug_line)] = &vm_opcodes.op_debug_line;
@@ -1510,6 +1542,7 @@ pub const VM = struct {
             .string => |sval| Value.initString(self.valueAllocator(), sval) catch Value.null_val,
             .fixed_string => |aval| Value.initFixedString(self.valueAllocator(), @constCast(aval.data)) catch Value.null_val,
             .identifier => |idval| Value.initString(self.valueAllocator(), idval) catch Value.null_val,
+            .float => |fval| Value{ .bits = @bitCast(fval) }, // NaN-boxed floats store bits directly
             else => Value.null_val,
         };
     }

@@ -15,37 +15,95 @@ const Allocator = std.mem.Allocator;
 // Import compiler for on-the-fly compilation
 const cot = @import("cot");
 
-// Dex page handler - renders pages/index.dex
+// Dex page handler - renders pages/index.dx
 const DexPageHandler = struct {
     fn handler(ctx: *http_server.Context) !void {
         const alloc = ctx.allocator;
         const dex = @import("../dex/dex.zig");
+        const page_path = "pages/index.dx";
 
-        // Try to read pages/index.dex
-        const source = readFile(alloc, "pages/index.dex") catch {
-            try ctx.html("<!DOCTYPE html><html><body><h1>Page not found</h1></body></html>");
+        // Try to read pages/index.dx
+        const source = readFile(alloc, page_path) catch {
+            try ctx.html("<!DOCTYPE html><html><body><h1>Page not found</h1><p>Could not read pages/index.dx</p></body></html>");
             return;
         };
         defer alloc.free(source);
 
-        // Compile the component
+        // Create error context for detailed error reporting
+        var error_context = dex.component_parser.ParseErrorContext.init(alloc);
+        error_context.setSource(source);
+        error_context.setFilePath(page_path);
+
+        // Compile the component with error context
         var compiler = dex.compiler.Compiler.init(alloc);
-        var component = compiler.compileSource(source) catch |err| {
-            const error_html = std.fmt.allocPrint(alloc,
+        var component = compiler.compileSourceWithContext(source, &error_context) catch |err| {
+            // Build detailed error message
+            var error_html_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer error_html_buf.deinit(alloc);
+
+            const writer = error_html_buf.writer(alloc);
+            try writer.print(
                 \\<!DOCTYPE html>
-                \\<html><body>
-                \\<h1>Error compiling page</h1>
-                \\<pre>{}</pre>
-                \\</body></html>
-            , .{err}) catch {
-                try ctx.html("<!DOCTYPE html><html><body><h1>Error compiling page</h1></body></html>");
-                return;
-            };
+                \\<html>
+                \\<head>
+                \\  <title>Parse Error</title>
+                \\  <style>
+                \\    body {{ font-family: system-ui; max-width: 800px; margin: 2rem auto; padding: 1rem; background: #1a1a2e; color: #eee; }}
+                \\    h1 {{ color: #ff6b6b; }}
+                \\    .error-box {{ background: #16213e; padding: 1rem; border-radius: 8px; border-left: 4px solid #ff6b6b; }}
+                \\    .location {{ color: #a8a8a8; margin-bottom: 0.5rem; }}
+                \\    .message {{ color: #ff6b6b; font-weight: bold; margin-bottom: 1rem; }}
+                \\    pre {{ background: #0f0f1a; padding: 1rem; border-radius: 4px; overflow-x: auto; }}
+                \\    .caret {{ color: #ff6b6b; font-weight: bold; }}
+                \\  </style>
+                \\</head>
+                \\<body>
+                \\  <h1>Parse Error</h1>
+                \\  <div class="error-box">
+                \\    <div class="location">File: {s}</div>
+            , .{page_path});
+
+            if (error_context.last_error) |parse_err| {
+                try writer.print(
+                    \\    <div class="location">Location: line {d}, column {d}</div>
+                    \\    <div class="message">{s}</div>
+                , .{ parse_err.line, parse_err.column, parse_err.message });
+
+                if (parse_err.source_line) |line| {
+                    try writer.print(
+                        \\    <pre>
+                    , .{});
+                    try writer.print("{d:>3} | {s}\n", .{ parse_err.line, line });
+                    try writer.print("    | ", .{});
+                    var i: u32 = 1;
+                    while (i < parse_err.column) : (i += 1) {
+                        try writer.writeByte(' ');
+                    }
+                    try writer.print("<span class=\"caret\">^</span>\n", .{});
+                    try writer.print("</pre>", .{});
+                }
+            } else {
+                try writer.print(
+                    \\    <div class="message">Error: {}</div>
+                , .{err});
+            }
+
+            try writer.print(
+                \\  </div>
+                \\</body>
+                \\</html>
+            , .{});
+
+            const error_html = try error_html_buf.toOwnedSlice(alloc);
             defer alloc.free(error_html);
             try ctx.html(error_html);
             return;
         };
         defer component.deinit();
+
+        // Duplicate the name since it points into source memory which we'll free later
+        const page_name = try alloc.dupe(u8, component.name);
+        defer alloc.free(page_name);
 
         // Create instance
         var instance = component.createInstance() catch {
@@ -62,10 +120,10 @@ const DexPageHandler = struct {
         defer alloc.free(content);
 
         // Wrap in document shell
+        // Note: hot_reload disabled for now - uses hardcoded port
         const html = dex.document.render(alloc, content, .{
-            .title = component.name,
-            .hot_reload = true,
-            .hot_reload_port = 3000,
+            .title = page_name,
+            .hot_reload = false,
         }) catch {
             try ctx.html("<!DOCTYPE html><html><body><h1>Error generating document</h1></body></html>");
             return;
@@ -94,6 +152,37 @@ pub const DevOptions = struct {
         return self.filter orelse self.project;
     }
 };
+
+/// WebSocket handler for Dex live events
+fn dexEventHandler(ws: *http_server.WebSocket) !void {
+    std.debug.print("Dex: WebSocket connected\n", .{});
+
+    // Keep connection alive and handle messages
+    while (ws.isOpen()) {
+        // Read next message
+        var msg = ws.readMessage() catch |err| {
+            std.debug.print("Dex: WebSocket read error: {}\n", .{err});
+            break;
+        } orelse break;
+        defer msg.deinit();
+
+        // Parse the message
+        const text = msg.text();
+        std.debug.print("Dex: Received event: {s}\n", .{text});
+
+        // For now, just acknowledge the event
+        // TODO: Parse JSON, dispatch to component, re-render, send patch
+        const response =
+            \\{"type":"ack","message":"Event received"}
+        ;
+        ws.sendText(response) catch |err| {
+            std.debug.print("Dex: WebSocket send error: {}\n", .{err});
+            break;
+        };
+    }
+
+    std.debug.print("Dex: WebSocket disconnected\n", .{});
+}
 
 /// Run the dev server
 pub fn run(allocator: Allocator, options: DevOptions) !void {
@@ -175,20 +264,25 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
 
     // Check if pages directory exists for Dex pages
     const pages_dir = blk: {
-        // Try each app's pages directory
-        for (ws.apps.items) |app| {
-            const pages_path = try std.fs.path.join(allocator, &.{ app.path, "pages" });
-            defer allocator.free(pages_path);
-            std.fs.cwd().access(pages_path, .{}) catch continue;
-            break :blk try allocator.dupe(u8, pages_path);
-        }
-        // Default to workspace root pages
+        // First, check if local pages/ exists (for running in app directory)
+        std.fs.cwd().access("pages", .{}) catch {
+            // Try each app's pages directory
+            for (ws.apps.items) |app| {
+                const pages_path = try std.fs.path.join(allocator, &.{ app.path, "pages" });
+                defer allocator.free(pages_path);
+                std.fs.cwd().access(pages_path, .{}) catch continue;
+                break :blk try allocator.dupe(u8, pages_path);
+            }
+            // Default to workspace root pages
+            break :blk try allocator.dupe(u8, "pages");
+        };
+        // Local pages/ exists - use it
         break :blk try allocator.dupe(u8, "pages");
     };
     defer allocator.free(pages_dir);
 
-    // Check if pages/index.dex exists
-    const index_dex_path = try std.fs.path.join(allocator, &.{ pages_dir, "index.dex" });
+    // Check if pages/index.dx exists
+    const index_dex_path = try std.fs.path.join(allocator, &.{ pages_dir, "index.dx" });
     defer allocator.free(index_dex_path);
     const has_index_page = blk: {
         std.fs.cwd().access(index_dex_path, .{}) catch break :blk false;
@@ -233,7 +327,7 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
                     \\    <li><a href="/api/health">Health Check</a></li>
                     \\    <li><a href="/api/version">Version Info</a></li>
                     \\  </ul>
-                    ++ hotreload.client_script ++
+                ++ hotreload.client_script ++
                     \\</body>
                     \\</html>
                 );
@@ -267,9 +361,13 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
         }
     }.handler);
 
+    // TODO: WebSocket blocks the single-threaded server, disabling for now
+    // try server.ws("/__dex_events", dexEventHandler);
+
     // Print routes
     try stdout.print("\n  Routes:\n", .{});
     try stdout.print("    GET  /              Homepage\n", .{});
+    try stdout.print("    WS   /__dex_events  Dex events\n", .{});
     try stdout.print("    GET  /api/health    Health check\n", .{});
     try stdout.print("    GET  /api/version   Version info\n", .{});
     try stdout.print("    GET  /api/v1/status API v1 status\n", .{});
@@ -310,7 +408,7 @@ fn createDexPageHandler(allocator: Allocator, pages_dir: []const u8, port: u16) 
             const alloc = ctx.allocator;
 
             // Try to read pages/index.dex
-            const source = readFile(alloc, "pages/index.dex") catch {
+            const source = readFile(alloc, "pages/index.dx") catch {
                 // Fallback to default page
                 try ctx.html("<!DOCTYPE html><html><body><h1>Page not found</h1></body></html>");
                 return;
@@ -341,8 +439,7 @@ fn createDexPageHandler(allocator: Allocator, pages_dir: []const u8, port: u16) 
             // Wrap in document
             const html = dex.document.render(alloc, content, .{
                 .title = component.name,
-                .hot_reload = true,
-                .hot_reload_port = 3000,
+                .hot_reload = false,
             }) catch {
                 try ctx.html("<!DOCTYPE html><html><body><h1>Error generating document</h1></body></html>");
                 return;

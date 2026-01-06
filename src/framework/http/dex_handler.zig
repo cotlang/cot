@@ -14,6 +14,7 @@ const dex_document = @import("../dex/document.zig");
 const dex_compiler = @import("../dex/compiler.zig");
 const dex_renderer = @import("../dex/template/renderer.zig");
 const dex_router = @import("../dex/router.zig");
+const component_parser = @import("../dex/component_parser.zig");
 
 /// Dex handler configuration
 pub const DexHandlerConfig = struct {
@@ -102,7 +103,7 @@ pub const DexHandler = struct {
         // Try custom 404 page
         const custom_404_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/404.dex",
+            "{s}/404.dx",
             .{self.config.pages_dir},
         );
         defer self.allocator.free(custom_404_path);
@@ -133,9 +134,18 @@ pub const DexHandler = struct {
         const source = try readFile(self.allocator, page_path);
         defer self.allocator.free(source);
 
-        // Compile the component
+        // Create error context for detailed error reporting
+        var error_context = component_parser.ParseErrorContext.init(self.allocator);
+        error_context.setSource(source);
+        error_context.setFilePath(page_path);
+
+        // Compile the component with error context
         var compiler = dex_compiler.Compiler.init(self.allocator);
-        var component = try compiler.compileSource(source);
+        var component = compiler.compileSourceWithContext(source, &error_context) catch |err| {
+            // Render detailed error if available
+            try self.renderDetailedError(ctx, err, page_path, &error_context);
+            return;
+        };
         defer component.deinit();
 
         // Create instance
@@ -173,9 +183,18 @@ pub const DexHandler = struct {
         const source = try readFile(self.allocator, page_path);
         defer self.allocator.free(source);
 
-        // Compile the component
+        // Create error context for detailed error reporting
+        var error_context = component_parser.ParseErrorContext.init(self.allocator);
+        error_context.setSource(source);
+        error_context.setFilePath(page_path);
+
+        // Compile the component with error context
         var compiler = dex_compiler.Compiler.init(self.allocator);
-        var component = try compiler.compileSource(source);
+        var component = compiler.compileSourceWithContext(source, &error_context) catch |err| {
+            // Render detailed error if available
+            try self.renderDetailedError(ctx, err, page_path, &error_context);
+            return;
+        };
         defer component.deinit();
 
         // Create instance
@@ -218,7 +237,7 @@ pub const DexHandler = struct {
         // Try custom error page
         const custom_error_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/_error.dex",
+            "{s}/_error.dx",
             .{self.config.pages_dir},
         );
         defer self.allocator.free(custom_error_path);
@@ -250,6 +269,70 @@ pub const DexHandler = struct {
             self.allocator,
             500,
             "Internal Server Error",
+            detail,
+            self.config.dev_mode,
+        );
+        defer self.allocator.free(html);
+
+        _ = ctx.status(500);
+        try ctx.html(html);
+    }
+
+    /// Render a detailed error page with parse error context
+    fn renderDetailedError(
+        self: *Self,
+        ctx: *Context,
+        err: anyerror,
+        page_path: []const u8,
+        error_context: *component_parser.ParseErrorContext,
+    ) !void {
+        if (!self.config.dev_mode) {
+            // In production, show generic error
+            try self.renderDefaultError(ctx, err, page_path);
+            return;
+        }
+
+        // Build detailed error message
+        var detail_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer detail_buf.deinit(self.allocator);
+
+        const writer = detail_buf.writer(self.allocator);
+
+        // Header with file path
+        try writer.print("Parse Error in: {s}\n\n", .{page_path});
+
+        // Add formatted error from error context
+        if (error_context.last_error) |parse_err| {
+            // Location
+            try writer.print("Location: line {d}, column {d}\n", .{ parse_err.line, parse_err.column });
+
+            // Error message
+            try writer.print("Error: {s}\n\n", .{parse_err.message});
+
+            // Source context with line numbers and caret
+            if (parse_err.source_line) |line| {
+                try writer.print("  |\n", .{});
+                try writer.print("{d:>3} | {s}\n", .{ parse_err.line, line });
+                try writer.print("    | ", .{});
+                // Print spaces then caret
+                var i: u32 = 1;
+                while (i < parse_err.column) : (i += 1) {
+                    try writer.writeByte(' ');
+                }
+                try writer.print("^\n", .{});
+            }
+        } else {
+            // Fallback to basic error info
+            try writer.print("Error: {}\n", .{err});
+        }
+
+        const detail = try detail_buf.toOwnedSlice(self.allocator);
+        defer self.allocator.free(detail);
+
+        const html = try dex_document.renderError(
+            self.allocator,
+            500,
+            "Parse Error",
             detail,
             self.config.dev_mode,
         );

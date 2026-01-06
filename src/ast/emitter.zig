@@ -332,6 +332,14 @@ pub const Emitter = struct {
                 try self.emitType(value_type);
                 try self.writer.writeByte('>');
             },
+            .list => {
+                // Emit as List<ElementType>
+                const data = self.store.typeData(idx);
+                const elem_type = TypeIdx.fromInt(data.a);
+                try self.writer.writeAll("List<");
+                try self.emitType(elem_type);
+                try self.writer.writeByte('>');
+            },
             .inferred => try self.writer.writeAll("_"),
             .any => try self.writer.writeAll("any"),
             .never => try self.writer.writeAll("never"),

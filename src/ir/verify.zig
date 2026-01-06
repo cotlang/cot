@@ -339,6 +339,30 @@ pub const Verifier = struct {
                 try self.checkValueDefined(op.map);
                 try self.checkValueDefined(op.index);
             },
+            // List operations
+            .list_new => {}, // No input values
+            .list_push => |op| {
+                try self.checkValueDefined(op.list);
+                try self.checkValueDefined(op.value);
+            },
+            .list_pop => |op| {
+                try self.checkValueDefined(op.list);
+            },
+            .list_get => |op| {
+                try self.checkValueDefined(op.list);
+                try self.checkValueDefined(op.index);
+            },
+            .list_set => |op| {
+                try self.checkValueDefined(op.list);
+                try self.checkValueDefined(op.index);
+                try self.checkValueDefined(op.value);
+            },
+            .list_len => |op| {
+                try self.checkValueDefined(op.list);
+            },
+            .list_clear => |op| {
+                try self.checkValueDefined(op.list);
+            },
             // Closure operations
             .make_closure => |op| {
                 try self.checkValueDefined(op.env);
@@ -417,6 +441,7 @@ pub const Verifier = struct {
             .optional => "optional",
             .function => "function",
             .map => "Map",
+            .list => "List",
             .weak => "weak",
             .trait_object => "trait_object",
         };

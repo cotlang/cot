@@ -64,7 +64,7 @@ fn generateDexComponent(allocator: Allocator, name_opt: ?[]const u8, stdout: any
 
     // Build filename: Counter.dex
     var filename_buf: [256]u8 = undefined;
-    const filename = std.fmt.bufPrint(&filename_buf, "components/{s}.dex", .{name}) catch {
+    const filename = std.fmt.bufPrint(&filename_buf, "components/{s}.dx", .{name}) catch {
         try stdout.print("Error: Component name too long.\n", .{});
         try stdout.flush();
         return error.NameTooLong;

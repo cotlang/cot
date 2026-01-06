@@ -118,6 +118,7 @@ fn writeValue(writer: anytype, val: Value) void {
         .null_val => writer.writeAll("null") catch {},
         .boolean => writer.print("{s}", .{if (val.asBool()) "true" else "false"}) catch {},
         .integer => writer.print("{d}", .{val.asInt()}) catch {},
+        .float => writer.print("{d}", .{val.asFloat()}) catch {},
         .implied_decimal => {
             if (val.asImpliedDecimal()) |dval| {
                 const divisor = std.math.pow(i64, 10, dval.precision);

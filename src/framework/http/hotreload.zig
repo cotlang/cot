@@ -14,7 +14,7 @@ pub const HotReloadConfig = struct {
     /// Directories to watch for changes
     watch_dirs: []const []const u8 = &.{},
     /// File extensions to watch
-    extensions: []const []const u8 = &.{ ".dex", ".cot" },
+    extensions: []const []const u8 = &.{ ".dx", ".cot" },
     /// Poll interval in milliseconds
     poll_interval_ms: u32 = 500,
 };

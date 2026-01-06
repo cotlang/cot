@@ -124,7 +124,7 @@ pub const LayoutResolver = struct {
         var depth: u32 = 0;
 
         // Root layout
-        const root_layout = try std.fs.path.join(self.allocator, &.{ self.pages_dir, "_layout.dex" });
+        const root_layout = try std.fs.path.join(self.allocator, &.{ self.pages_dir, "_layout.dx" });
         defer self.allocator.free(root_layout);
 
         if (fileExists(root_layout)) {
@@ -151,7 +151,7 @@ pub const LayoutResolver = struct {
                 defer layout_path_buf.deinit(self.allocator);
 
                 try layout_path_buf.appendSlice(self.allocator, current_path.items);
-                try layout_path_buf.appendSlice(self.allocator, "/_layout.dex");
+                try layout_path_buf.appendSlice(self.allocator, "/_layout.dx");
 
                 if (fileExists(layout_path_buf.items)) {
                     try chain.add(layout_path_buf.items, depth);
@@ -264,8 +264,8 @@ test "layout chain init and deinit" {
     var chain = LayoutChain.init(allocator);
     defer chain.deinit();
 
-    try chain.add("pages/_layout.dex", 0);
-    try chain.add("pages/docs/_layout.dex", 1);
+    try chain.add("pages/_layout.dx", 0);
+    try chain.add("pages/docs/_layout.dx", 1);
 
     try std.testing.expectEqual(@as(usize, 2), chain.layouts.items.len);
 }
@@ -277,8 +277,8 @@ test "layout chain render order" {
     defer chain.deinit();
 
     // Add in reverse order
-    try chain.add("pages/_layout.dex", 0);
-    try chain.add("pages/docs/_layout.dex", 1);
+    try chain.add("pages/_layout.dx", 0);
+    try chain.add("pages/docs/_layout.dx", 1);
 
     const order = chain.getRenderOrder();
 

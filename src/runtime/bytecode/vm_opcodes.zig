@@ -15,6 +15,8 @@ const Value = value_mod.Value;
 const OrderedMap = value_mod.OrderedMap;
 const Closure = value_mod.Closure;
 const TraitObject = value_mod.TraitObject;
+const List = value_mod.List;
+const StructBox = value_mod.StructBox;
 const arc = @import("arc.zig");
 
 // Forward declaration - VM is imported at comptime to avoid circular import
@@ -710,7 +712,12 @@ pub fn op_set_error_handler(vm: *VM, module: *const Module) VMError!DispatchResu
         return vm.fail(VMError.BytecodeOutOfBounds, "Error handler target out of bounds");
     }
 
+    // Save current stack state for unwinding on throw
     vm.error_handler_ip = @intCast(handler_ip);
+    vm.error_handler_sp = vm.sp;
+    vm.error_handler_fp = vm.fp;
+    vm.error_handler_call_depth = vm.call_stack.len;
+
     vm.ip += 2; // offset (2) = 2 more bytes (3 total with opcode)
     return .continue_dispatch;
 }
@@ -726,7 +733,8 @@ pub fn op_clear_error_handler(vm: *VM, module: *const Module) VMError!DispatchRe
 /// throw rs - throw exception with value in rs
 /// Format: [opcode][rs:4|0][0]
 pub fn op_throw(vm: *VM, module: *const Module) VMError!DispatchResult {
-    const ops = module.code[vm.ip + 1];
+    _ = module;
+    const ops = vm.current_module.?.code[vm.ip + 1];
     const rs: u4 = @truncate(ops >> 4);
     const error_value = vm.registers[rs];
 
@@ -734,6 +742,16 @@ pub fn op_throw(vm: *VM, module: *const Module) VMError!DispatchResult {
     if (vm.error_handler_ip) |handler_ip| {
         // Store error value in r0 for catch block access
         vm.registers[0] = error_value;
+
+        // Restore stack state to when the handler was set (unwind call stack)
+        vm.sp = vm.error_handler_sp;
+        vm.fp = vm.error_handler_fp;
+
+        // Pop call frames back to the saved depth
+        while (vm.call_stack.len > vm.error_handler_call_depth) {
+            _ = vm.call_stack.pop();
+        }
+
         // Jump to handler
         vm.ip = handler_ip;
         // Clear the handler (it's consumed)
@@ -893,7 +911,8 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rs: u4 = @truncate(ops >> 4);
     // Return value goes in r15
-    vm.writeRegister(15, vm.registers[rs]);
+    const return_value = vm.registers[rs];
+    vm.writeRegister(15, return_value);
 
     if (vm.call_stack.pop()) |frame| {
         // Copy back ref parameters to caller's registers
@@ -903,6 +922,19 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
                 // Copy value from callee's stack slot back to caller's register
                 vm.writeRegister(@truncate(i), vm.stack[vm.fp + i]);
             }
+        }
+
+        // Trace return with actual value (helps debug return value issues)
+        if (vm.tracer) |tracer| {
+            const routine_name = if (routine.name_index < module.constants.len)
+                switch (module.constants[routine.name_index]) {
+                    .identifier => |s| s,
+                    .string => |s| s,
+                    else => "?",
+                }
+            else
+                "?";
+            tracer.onReturnWithValue(routine_name, true, @intCast(vm.ip), return_value);
         }
 
         vm.sp = frame.stack_pointer;
@@ -2540,6 +2572,383 @@ pub fn op_map_key_at(vm: *VM, module: *const Module) VMError!DispatchResult {
     } else {
         vm.writeRegister(rd, Value.null_val);
     }
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// List Operations
+// ============================================================================
+
+/// list_new rd - create a new empty list
+pub fn op_list_new(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+
+    const list = arc.create(vm.allocator, List) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate list");
+    };
+    list.* = List.init(vm.allocator);
+
+    vm.writeRegister(rd, Value.initList(list));
+    return .continue_dispatch;
+}
+
+/// list_push list, val - push value onto list
+pub fn op_list_push(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const list_reg: u4 = @truncate(ops >> 4);
+    const val_reg: u4 = @truncate(ops & 0xF);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    list.push(vm.registers[val_reg]) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to push to list");
+    };
+
+    return .continue_dispatch;
+}
+
+/// list_pop rd, list - pop last value from list
+pub fn op_list_pop(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const list_reg: u4 = @truncate(ops & 0xF);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    vm.writeRegister(rd, list.pop() orelse Value.null_val);
+    return .continue_dispatch;
+}
+
+/// list_get rd, list, idx - get value at index
+pub fn op_list_get(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops1 = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops1 >> 4);
+    const list_reg: u4 = @truncate(ops1 & 0xF);
+    const idx_reg: u4 = @truncate(ops2 >> 4);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    const idx_val = vm.registers[idx_reg];
+    if (!idx_val.isInt()) {
+        return vm.fail(VMError.InvalidType, "Expected integer index");
+    }
+    const idx = idx_val.asInt();
+
+    if (idx < 0) {
+        vm.writeRegister(rd, Value.null_val);
+    } else {
+        vm.writeRegister(rd, list.get(@intCast(idx)) orelse Value.null_val);
+    }
+    return .continue_dispatch;
+}
+
+/// list_set list, idx, val - set value at index
+pub fn op_list_set(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops1 = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const list_reg: u4 = @truncate(ops1 >> 4);
+    const idx_reg: u4 = @truncate(ops1 & 0xF);
+    const val_reg: u4 = @truncate(ops2 >> 4);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    const idx_val = vm.registers[idx_reg];
+    if (!idx_val.isInt()) {
+        return vm.fail(VMError.InvalidType, "Expected integer index");
+    }
+    const idx = idx_val.asInt();
+
+    if (idx >= 0) {
+        _ = list.set(@intCast(idx), vm.registers[val_reg]);
+    }
+    return .continue_dispatch;
+}
+
+/// list_len rd, list - get list length
+pub fn op_list_len(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const list_reg: u4 = @truncate(ops & 0xF);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    vm.writeRegister(rd, Value.initInt(@intCast(list.len())));
+    return .continue_dispatch;
+}
+
+/// list_clear list - clear all items from list
+pub fn op_list_clear(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const list_reg: u4 = @truncate(ops >> 4);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    list.clear();
+    return .continue_dispatch;
+}
+
+/// list_push_struct - push struct from consecutive slots as a StructBox
+/// Format: [list:4|0] [field_count:8] [base_slot:16]
+pub fn op_list_push_struct(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const field_count = module.code[vm.ip + 1];
+    const base_slot: u16 = @as(u16, module.code[vm.ip + 2]) | (@as(u16, module.code[vm.ip + 3]) << 8);
+    vm.ip += 4;
+    const list_reg: u4 = @truncate(ops >> 4);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    // Create a StructBox to hold the struct fields
+    const box = StructBox.init(vm.allocator, field_count) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate StructBox");
+    };
+
+    // Copy field values from consecutive slots and retain heap-allocated values
+    for (0..field_count) |i| {
+        const val = vm.stack[vm.fp + base_slot + i];
+        arc.retain(val); // StructBox owns a reference to each field
+        box.fields[i] = val;
+    }
+
+    // Push the boxed struct to the list
+    list.push(Value.initStructBox(box)) catch {
+        arc.release(Value.initStructBox(box), vm.allocator);
+        return vm.fail(VMError.OutOfMemory, "Failed to push to list");
+    };
+
+    return .continue_dispatch;
+}
+
+/// list_get_struct - get struct from list and expand to consecutive HIGH registers
+/// Format: [list:4|idx:4] [field_count:8] [base_reg:8] [0]
+pub fn op_list_get_struct(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const field_count = module.code[vm.ip + 1];
+    const base_reg = module.code[vm.ip + 2];
+    vm.ip += 4;
+    const list_reg: u4 = @truncate(ops >> 4);
+    const idx_reg: u4 = @truncate(ops & 0xF);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    const idx = @as(usize, @intCast(vm.registers[idx_reg].asInt()));
+    const boxed_val = list.get(idx) orelse {
+        return vm.fail(VMError.ArrayOutOfBounds, "List index out of bounds");
+    };
+
+    const box = boxed_val.asStructBox() orelse {
+        return vm.fail(VMError.InvalidType, "Expected StructBox in list");
+    };
+
+    // Expand struct fields to consecutive high registers with retain
+    // (caller will store these to stack slots that get cleaned up)
+    const copy_count = @min(field_count, box.field_count);
+    for (0..copy_count) |i| {
+        const val = box.fields[i];
+        arc.retain(val); // Caller gets their own reference
+        vm.registers[base_reg + i] = val;
+    }
+
+    return .continue_dispatch;
+}
+
+/// list_pop_struct - pop struct from list and expand to consecutive slots
+/// Format: [list:4|0] [field_count:8] [dest_slot:16]
+pub fn op_list_pop_struct(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const field_count = module.code[vm.ip + 1];
+    const dest_slot: u16 = @as(u16, module.code[vm.ip + 2]) | (@as(u16, module.code[vm.ip + 3]) << 8);
+    vm.ip += 4;
+    const list_reg: u4 = @truncate(ops >> 4);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    const boxed_val = list.pop() orelse {
+        // Return null for all slots if list is empty
+        for (0..field_count) |i| {
+            vm.stack[vm.fp + dest_slot + i] = Value.null_val;
+        }
+        return .continue_dispatch;
+    };
+
+    const box = boxed_val.asStructBox() orelse {
+        return vm.fail(VMError.InvalidType, "Expected StructBox in list");
+    };
+
+    // Expand struct fields to consecutive slots with retain
+    // (transferring ownership from StructBox to stack slots)
+    const copy_count = @min(field_count, box.field_count);
+    for (0..copy_count) |i| {
+        const val = box.fields[i];
+        arc.retain(val); // Stack slot gets its own reference
+        vm.stack[vm.fp + dest_slot + i] = val;
+    }
+
+    // Release the StructBox after unpacking (this releases its references to fields)
+    arc.release(boxed_val, vm.allocator);
+
+    return .continue_dispatch;
+}
+
+/// list_set_struct - set struct at index from consecutive slots
+/// Format: [list:4|idx:4] [field_count:8] [base_slot:16]
+pub fn op_list_set_struct(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const field_count = module.code[vm.ip + 1];
+    const base_slot: u16 = @as(u16, module.code[vm.ip + 2]) | (@as(u16, module.code[vm.ip + 3]) << 8);
+    vm.ip += 4;
+    const list_reg: u4 = @truncate(ops >> 4);
+    const idx_reg: u4 = @truncate(ops & 0xF);
+
+    const list_val = vm.registers[list_reg];
+    const list = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    const idx = @as(usize, @intCast(vm.registers[idx_reg].asInt()));
+
+    // Get existing value and release it if it's a StructBox
+    if (list.get(idx)) |existing| {
+        if (existing.asStructBox() != null) {
+            arc.release(existing, vm.allocator);
+        }
+    }
+
+    // Create a new StructBox for the replacement value
+    const box = StructBox.init(vm.allocator, field_count) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate StructBox");
+    };
+
+    // Copy field values from consecutive slots with retain
+    for (0..field_count) |i| {
+        const val = vm.stack[vm.fp + base_slot + i];
+        arc.retain(val); // StructBox owns a reference to each field
+        box.fields[i] = val;
+    }
+
+    // Set the boxed struct in the list
+    if (!list.set(idx, Value.initStructBox(box))) {
+        arc.release(Value.initStructBox(box), vm.allocator);
+        return vm.fail(VMError.ArrayOutOfBounds, "List index out of bounds");
+    }
+
+    return .continue_dispatch;
+}
+
+/// map_set_struct - store struct from consecutive slots to map
+/// Format: [map:4|key:4] [field_count:8] [base_slot:16]
+pub fn op_map_set_struct(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const field_count = module.code[vm.ip + 1];
+    const base_slot: u16 = @as(u16, module.code[vm.ip + 2]) | (@as(u16, module.code[vm.ip + 3]) << 8);
+    vm.ip += 4;
+    const map_reg: u4 = @truncate(ops >> 4);
+    const key_reg: u4 = @truncate(ops & 0xF);
+
+    const map_val = vm.registers[map_reg];
+    const map = map_val.asMap() orelse {
+        return vm.fail(VMError.InvalidType, "Expected map value");
+    };
+
+    var key_buf: [32]u8 = undefined;
+    const key = vm.valueToStringSlice(vm.registers[key_reg], &key_buf);
+
+    // Create a StructBox to hold the struct fields
+    const box = StructBox.init(vm.allocator, field_count) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate StructBox");
+    };
+
+    // Copy field values from consecutive slots and retain heap-allocated values
+    for (0..field_count) |i| {
+        const val = vm.stack[vm.fp + base_slot + i];
+        arc.retain(val); // StructBox owns a reference to each field
+        box.fields[i] = val;
+    }
+
+    // Store the boxed struct in the map
+    _ = map.set(key, Value.initStructBox(box)) catch {
+        arc.release(Value.initStructBox(box), vm.allocator);
+        return vm.fail(VMError.OutOfMemory, "Failed to set map value");
+    };
+
+    return .continue_dispatch;
+}
+
+/// map_get_struct - get struct from map and expand to consecutive high registers
+/// Format: [map:4|key:4] [field_count:8] [base_reg:8] [0]
+pub fn op_map_get_struct(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const field_count = module.code[vm.ip + 1];
+    const base_reg = module.code[vm.ip + 2];
+    vm.ip += 4;
+    const map_reg: u4 = @truncate(ops >> 4);
+    const key_reg: u4 = @truncate(ops & 0xF);
+
+    const map_val = vm.registers[map_reg];
+    const map = map_val.asMap() orelse {
+        return vm.fail(VMError.InvalidType, "Expected map value");
+    };
+
+    var key_buf: [32]u8 = undefined;
+    const key = vm.valueToStringSlice(vm.registers[key_reg], &key_buf);
+
+    const boxed_val = map.get(key) orelse {
+        // Return null for all registers if key not found
+        for (0..field_count) |i| {
+            vm.registers[base_reg + i] = Value.null_val;
+        }
+        return .continue_dispatch;
+    };
+
+    const box = boxed_val.asStructBox() orelse {
+        return vm.fail(VMError.InvalidType, "Expected StructBox in map");
+    };
+
+    // Expand struct fields to consecutive high registers with retain
+    // (caller will store these to stack slots that get cleaned up)
+    const copy_count = @min(field_count, box.field_count);
+    for (0..copy_count) |i| {
+        const val = box.fields[i];
+        arc.retain(val); // Caller gets their own reference
+        vm.registers[base_reg + i] = val;
+    }
+
     return .continue_dispatch;
 }
 

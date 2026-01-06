@@ -27,6 +27,7 @@ pub const Tag = enum {
     null_val,
     boolean,
     integer,
+    float, // f64 floating point (stored directly via NaN-boxing)
     implied_decimal, // DBL d28.10 - fixed-length numeric with implied decimal point
     fixed_decimal, // DBL d28 - fixed-length numeric without decimal point
     fixed_string,
@@ -41,6 +42,7 @@ pub const Tag = enum {
             .null_val => "null",
             .boolean => "boolean",
             .integer => "integer",
+            .float => "float",
             .implied_decimal => "implied_decimal",
             .fixed_decimal => "fixed_decimal",
             .fixed_string => "alpha",
@@ -116,12 +118,92 @@ pub const CLOSURE_TYPE_ID: u16 = 17;
 /// Type ID for trait objects
 pub const TRAIT_OBJECT_TYPE_ID: u16 = 18;
 
+/// Type ID for lists
+pub const LIST_TYPE_ID: u16 = 19;
+
+/// Type ID for boxed structs (for storing structs in containers)
+pub const STRUCT_BOX_TYPE_ID: u16 = 20;
+
+/// Boxed struct - holds multiple Values for storing structs in containers like List
+/// When a struct is pushed to a List, its fields are copied into a StructBox.
+/// When retrieved, the fields are unpacked back to consecutive slots.
+/// NOTE: StructBox is ARC-managed - always allocate with arc.create
+pub const StructBox = struct {
+    field_count: u16,
+    fields: []Value,
+    allocator: std.mem.Allocator,
+
+    /// Create a new StructBox with ARC header for proper reference counting.
+    /// Use this function instead of direct allocation.
+    pub fn init(allocator: std.mem.Allocator, field_count: u16) !*StructBox {
+        const box = try arc.create(allocator, StructBox);
+        box.* = .{
+            .field_count = field_count,
+            .fields = try allocator.alloc(Value, field_count),
+            .allocator = allocator,
+        };
+        return box;
+    }
+
+    /// Free internal resources. Called by ARC when refcount reaches 0.
+    /// Do NOT call directly - use arc.release instead.
+    pub fn deinitInternal(self: *StructBox) void {
+        self.allocator.free(self.fields);
+        // Note: the StructBox itself is freed by arc.freeWithHeader
+    }
+};
+
 /// Trait object - a value with a vtable for dynamic dispatch
 pub const TraitObject = struct {
     /// The boxed concrete value
     data: Value,
     /// Index into the module's vtable array
     vtable_idx: u16,
+};
+
+/// Dynamic list - growable array of values
+pub const List = struct {
+    items: std.ArrayListUnmanaged(Value),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) List {
+        return .{
+            .items = .{},
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *List) void {
+        self.items.deinit(self.allocator);
+    }
+
+    pub fn push(self: *List, value: Value) !void {
+        try self.items.append(self.allocator, value);
+    }
+
+    pub fn pop(self: *List) ?Value {
+        if (self.items.items.len == 0) return null;
+        return self.items.pop();
+    }
+
+    pub fn get(self: *const List, index: usize) ?Value {
+        if (index >= self.items.items.len) return null;
+        return self.items.items[index];
+    }
+
+    pub fn set(self: *List, index: usize, value: Value) bool {
+        if (index >= self.items.items.len) return false;
+        self.items.items[index] = value;
+        return true;
+    }
+
+    pub fn len(self: *const List) usize {
+        return self.items.items.len;
+    }
+
+    pub fn clear(self: *List) void {
+        self.items.clearRetainingCapacity();
+    }
 };
 
 // ============================================================================
@@ -302,6 +384,18 @@ pub const Value = extern struct {
         return initObject(TRAIT_OBJECT_TYPE_ID, t);
     }
 
+    /// Create a list value
+    /// Uses type_id 19 (LIST_TYPE_ID)
+    pub fn initList(l: *List) Self {
+        return initObject(LIST_TYPE_ID, l);
+    }
+
+    /// Create a struct box value
+    /// Uses type_id 20 (STRUCT_BOX_TYPE_ID)
+    pub fn initStructBox(sb: *StructBox) Self {
+        return initObject(STRUCT_BOX_TYPE_ID, sb);
+    }
+
     // ========================================================================
     // Type checking and tagging
     // ========================================================================
@@ -311,8 +405,10 @@ pub const Value = extern struct {
         if (self.bits == TAG_NULL) return .null_val;
         if (self.bits == TAG_TRUE or self.bits == TAG_FALSE) return .boolean;
 
-        const upper = self.bits & 0xFFFF_C000_0000_0000;
-        if (upper == TAG_SMALL_INT or upper == TAG_BOXED_INT) return .integer;
+        // SMALL_INT uses 48-bit payload, check with 16-bit tag mask
+        if ((self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT) return .integer;
+        // BOXED_INT uses 46-bit pointer, check with 18-bit tag mask
+        if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_BOXED_INT) return .integer;
         // Check OBJECT before STRING since OBJECT uses more specific mask
         // and TAG_OBJECT (0x7FFE_4000) would otherwise match TAG_STRING's mask
         if ((self.bits & TAG_OBJECT_MASK) == TAG_OBJECT) return .object;
@@ -323,7 +419,8 @@ pub const Value = extern struct {
         if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_IMPLIED_DECIMAL) return .implied_decimal;
         if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_FIXED_DECIMAL) return .fixed_decimal;
 
-        return .null_val; // Fallback
+        // NaN-boxed floats: any bit pattern not matching a tag is a real f64
+        return .float;
     }
 
     pub fn isNull(self: Self) bool {
@@ -335,8 +432,11 @@ pub const Value = extern struct {
     }
 
     pub fn isInt(self: Self) bool {
-        const upper = self.bits & 0xFFFF_C000_0000_0000;
-        return upper == TAG_SMALL_INT or upper == TAG_BOXED_INT;
+        // SMALL_INT uses 48-bit payload (bits 0-47), tag in bits 48-63
+        // BOXED_INT uses 46-bit pointer (bits 0-45), tag in bits 46-63
+        const is_small = (self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT;
+        const is_boxed = (self.bits & 0xFFFF_C000_0000_0000) == TAG_BOXED_INT;
+        return is_small or is_boxed;
     }
 
     pub fn isImpliedDecimal(self: Self) bool {
@@ -356,6 +456,10 @@ pub const Value = extern struct {
 
     pub fn isFixedString(self: Self) bool {
         return (self.bits & 0xFFFF_8000_0000_0000) == TAG_FIXED_STR;
+    }
+
+    pub fn isFloat(self: Self) bool {
+        return self.tag() == .float;
     }
 
     pub fn isRecord(self: Self) bool {
@@ -388,6 +492,18 @@ pub const Value = extern struct {
     pub fn isTraitObject(self: Self) bool {
         if (!self.isObject()) return false;
         return self.objectTypeId() == TRAIT_OBJECT_TYPE_ID;
+    }
+
+    /// Check if this is a list (object with LIST_TYPE_ID)
+    pub fn isList(self: Self) bool {
+        if (!self.isObject()) return false;
+        return self.objectTypeId() == LIST_TYPE_ID;
+    }
+
+    /// Check if this is a struct box (object with STRUCT_BOX_TYPE_ID)
+    pub fn isStructBox(self: Self) bool {
+        if (!self.isObject()) return false;
+        return self.objectTypeId() == STRUCT_BOX_TYPE_ID;
     }
 
     /// Get the type_id of an object value
@@ -426,16 +542,23 @@ pub const Value = extern struct {
 
     /// Get integer value
     pub fn asInt(self: Self) i64 {
-        const upper = self.bits & 0xFFFF_C000_0000_0000;
-        if (upper == TAG_SMALL_INT) {
-            // Extract 46-bit signed integer and sign-extend
+        // SMALL_INT: 16-bit tag (0x7FFD) + 48-bit signed payload
+        if ((self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT) {
+            // Extract 48-bit signed integer and sign-extend
             const payload: u48 = @truncate(self.bits);
             return @as(i48, @bitCast(payload));
-        } else if (upper == TAG_BOXED_INT) {
+        }
+        // BOXED_INT: 18-bit tag + 46-bit pointer
+        if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_BOXED_INT) {
             const boxed = payloadToPtr(*BoxedInt, self.bits);
             return boxed.value;
         }
         return 0;
+    }
+
+    /// Get float value (NaN-boxed f64 stored directly in bits)
+    pub fn asFloat(self: Self) f64 {
+        return @bitCast(self.bits);
     }
 
     /// Get implied decimal value
@@ -498,6 +621,18 @@ pub const Value = extern struct {
         return self.objectPtr(TraitObject);
     }
 
+    /// Get list pointer
+    pub fn asList(self: Self) ?*List {
+        if (!self.isList()) return null;
+        return self.objectPtr(List);
+    }
+
+    /// Get struct box pointer
+    pub fn asStructBox(self: Self) ?*StructBox {
+        if (!self.isStructBox()) return null;
+        return self.objectPtr(StructBox);
+    }
+
     // ========================================================================
     // Conversion methods (compatibility with old API)
     // ========================================================================
@@ -556,6 +691,7 @@ pub const Value = extern struct {
             .null_val => try writer.writeAll("null"),
             .boolean => try writer.print("{}", .{self.asBool()}),
             .integer => try writer.print("{d}", .{self.asInt()}),
+            .float => try writer.print("{d}", .{self.asFloat()}),
             .implied_decimal => {
                 if (self.asImpliedDecimal()) |d| {
                     const divisor = std.math.pow(i64, 10, d.precision);
@@ -598,6 +734,7 @@ pub const Value = extern struct {
             .null_val => "null",
             .boolean => "bool",
             .integer => "int",
+            .float => "f64",
             .implied_decimal => "idec",
             .fixed_decimal => "fdec",
             .fixed_string => "fstr",
@@ -613,6 +750,7 @@ pub const Value = extern struct {
             .null_val => writer.writeAll("nil") catch {},
             .boolean => writer.print("{}", .{self.asBool()}) catch {},
             .integer => writer.print("{d}", .{self.asInt()}) catch {},
+            .float => writer.print("{d}", .{self.asFloat()}) catch {},
             .implied_decimal => {
                 if (self.asImpliedDecimal()) |d| {
                     writer.print("{d}p{d}", .{ d.value, d.precision }) catch {};

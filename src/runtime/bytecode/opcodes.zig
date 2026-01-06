@@ -460,6 +460,38 @@ pub const Opcode = enum(u8) {
     /// Format: [rd:8] [slot:16]
     array_len = 0xB2,
 
+    /// list_len rd, list_reg - rd = list.len()
+    /// Format: [rd:4|list:4] [0]
+    list_len = 0xB3,
+
+    /// list_clear list_reg - list.clear()
+    /// Format: [list:4|0] [0]
+    list_clear = 0xB4,
+
+    /// list_push_struct list_reg, base_slot, field_count - push struct from consecutive slots
+    /// Format: [list:4|0] [field_count:8] [base_slot:16]
+    list_push_struct = 0xB5,
+
+    /// list_get_struct list_reg, idx_reg, field_count, base_reg - get struct and expand to high registers
+    /// Format: [list:4|idx:4] [field_count:8] [base_reg:8] [0]
+    list_get_struct = 0xB6,
+
+    /// list_pop_struct dest_slot, list_reg, field_count - pop struct and expand to slots
+    /// Format: [list:4|0] [field_count:8] [dest_slot:16]
+    list_pop_struct = 0xB7,
+
+    /// list_set_struct list_reg, idx_reg, base_slot, field_count - set struct from consecutive slots
+    /// Format: [list:4|idx:4] [field_count:8] [base_slot:16]
+    list_set_struct = 0xB8,
+
+    /// map_set_struct map_reg, key_reg, base_slot, field_count - store struct to map
+    /// Format: [map:4|key:4] [field_count:8] [base_slot:16]
+    map_set_struct = 0xB9,
+
+    /// map_get_struct map_reg, key_reg, field_count, base_reg - get struct from map to high registers
+    /// Format: [map:4|key:4] [field_count:8] [base_reg:8] [0]
+    map_get_struct = 0xBA,
+
     // ============================================
     // Built-in Functions (0xC0-0xCF)
     // ============================================
@@ -589,6 +621,30 @@ pub const Opcode = enum(u8) {
     /// map_key_at rd, map_reg, idx_reg - rd = key at position (1-based)
     /// Format: [rd:4|map:4] [idx:4|0]
     map_key_at = 0xFC,
+
+    // ============================================
+    // List Operations (0xED-0xEF and extended)
+    // ============================================
+
+    /// list_new rd - rd = new empty list
+    /// Format: [rd:4|0] [0]
+    list_new = 0xED,
+
+    /// list_push list_reg, val_reg - list.push(val)
+    /// Format: [list:4|val:4] [0]
+    list_push = 0xEE,
+
+    /// list_pop rd, list_reg - rd = list.pop()
+    /// Format: [rd:4|list:4] [0]
+    list_pop = 0xEF,
+
+    /// list_get rd, list_reg, idx_reg - rd = list[idx]
+    /// Format: [rd:4|list:4] [idx:4|0]
+    list_get = 0xFD,
+
+    /// list_set list_reg, idx_reg, val_reg - list[idx] = val
+    /// Format: [list:4|idx:4] [val:4|0]
+    list_set = 0xFF,
 
     // ============================================
     // Debug & Meta (0xF0-0xFF)
@@ -774,6 +830,14 @@ pub const Opcode = enum(u8) {
             .map_has, .map_len, .map_clear => 2,
             .map_keys, .map_values => 2,
             .map_get_at, .map_set_at, .map_key_at => 2,
+            // List operations
+            .list_new, .list_push, .list_pop => 2,
+            .list_get, .list_set => 2,
+            .list_len, .list_clear => 2,
+            // List struct operations (4 bytes: opcode + field_count + slot16)
+            .list_push_struct, .list_get_struct, .list_pop_struct, .list_set_struct => 4,
+            // Map struct operations (4 bytes: opcode + field_count + slot16/base_reg)
+            .map_set_struct, .map_get_struct => 4,
 
             // 3-byte operands: [reg:4|0] [u16]
             .movi16, .load_const => 3,
@@ -785,7 +849,7 @@ pub const Opcode = enum(u8) {
             .call, .call_external, .call_native, .call_dynamic => 3,
             .new_record, .load_field, .store_field => 3,
             .to_fixed_string => 3,
-            .debug_line => 4,
+            .debug_line => 3, // [0] [line:16] = 3 operand bytes
             .ptr_offset => 3, // [rd:4|rs:4] [offset:16]
 
             // 5-byte operands: [reg:4|0] [u32] or [reg:4|0] [u16] [u16]

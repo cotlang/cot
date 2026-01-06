@@ -99,6 +99,12 @@ pub const Lowerer = struct {
     /// Generic struct definitions (templates for instantiation)
     generic_struct_defs: std.StringHashMap(GenericDef),
 
+    /// Generic function definitions (templates for instantiation)
+    generic_fn_defs: std.StringHashMap(GenericDef),
+
+    /// Cache of instantiated generic functions (mangled name -> already lowered)
+    instantiated_fns: std.StringHashMap(void),
+
     /// Current type parameter substitutions (for generic instantiation)
     type_param_substitutions: std.StringHashMap(ir.Type),
 
@@ -165,6 +171,9 @@ pub const Lowerer = struct {
     /// Whether to emit explicit ARC instructions (arc_retain/arc_release).
     /// When false, the VM handles ARC at runtime.
     emit_arc: bool,
+
+    /// Current source location being processed (for error messages)
+    current_loc: SourceLoc,
 
     const ImplMethodsMap = std.HashMap(ImplKey, []const MethodImpl, ImplKeyContext, std.hash_map.default_max_load_percentage);
 
@@ -258,6 +267,8 @@ pub const Lowerer = struct {
             .union_types = std.StringHashMap(*const ir.UnionType).init(allocator),
             .enum_types = std.StringHashMap(std.StringHashMap(i64)).init(allocator),
             .generic_struct_defs = std.StringHashMap(GenericDef).init(allocator),
+            .generic_fn_defs = std.StringHashMap(GenericDef).init(allocator),
+            .instantiated_fns = std.StringHashMap(void).init(allocator),
             .type_param_substitutions = std.StringHashMap(ir.Type).init(allocator),
             .instantiated_structs = std.StringHashMap(*const ir.StructType).init(allocator),
             .allocated_types = .{},
@@ -278,6 +289,7 @@ pub const Lowerer = struct {
             .comptime_evaluator = comptime_eval.Evaluator.init(allocator, store, strings),
             .imported_namespaces = std.StringHashMap(void).init(allocator),
             .emit_arc = options.emit_arc,
+            .current_loc = .{ .line = 0, .column = 0 },
         };
     }
 
@@ -355,7 +367,19 @@ pub const Lowerer = struct {
             inner_map.deinit();
         }
         self.enum_types.deinit();
+        // Free generic struct type_param_names slices
+        var gen_struct_iter = self.generic_struct_defs.valueIterator();
+        while (gen_struct_iter.next()) |def| {
+            self.allocator.free(def.type_param_names);
+        }
         self.generic_struct_defs.deinit();
+        // Free generic function type_param_names slices
+        var gen_fn_iter = self.generic_fn_defs.valueIterator();
+        while (gen_fn_iter.next()) |def| {
+            self.allocator.free(def.type_param_names);
+        }
+        self.generic_fn_defs.deinit();
+        self.instantiated_fns.deinit();
         self.type_param_substitutions.deinit();
         self.instantiated_structs.deinit();
         self.trait_defs.deinit();
@@ -638,6 +662,9 @@ pub const Lowerer = struct {
     /// Lower a struct definition
     fn lowerStructDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
+        const loc = self.store.stmtLoc(stmt_idx);
+        self.current_loc = loc; // Set location for error messages
+
         const name_id = data.getName();
         const name = self.strings.get(name_id);
         if (name.len == 0) return LowerError.UndefinedType;
@@ -732,6 +759,9 @@ pub const Lowerer = struct {
     /// Lower a union definition
     fn lowerUnionDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
+        const loc = self.store.stmtLoc(stmt_idx);
+        self.current_loc = loc; // Set location for error messages
+
         const name_id: StringId = @enumFromInt(data.a);
         const name = self.strings.get(name_id);
         if (name.len == 0) return LowerError.UndefinedType;
@@ -801,6 +831,9 @@ pub const Lowerer = struct {
     /// Cot format in extra_data: [count, name1, name2, ...]
     fn lowerEnumDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
+        const loc = self.store.stmtLoc(stmt_idx);
+        self.current_loc = loc; // Set location for error messages
+
         const name_id: StringId = @enumFromInt(data.a);
         const name = self.strings.get(name_id);
         if (name.len == 0) return LowerError.UndefinedType;
@@ -952,9 +985,203 @@ pub const Lowerer = struct {
         return struct_type;
     }
 
+    /// Instantiate a generic function with concrete type arguments
+    /// Returns the mangled function name to call, or null if not a generic function
+    pub fn instantiateGenericFn(self: *Self, base_name: []const u8, type_args: []const ir.Type) LowerError!?[]const u8 {
+        // Check if we have a generic definition for this name
+        const generic_def = self.generic_fn_defs.get(base_name) orelse return null;
+
+        // Verify argument count
+        if (type_args.len != generic_def.type_param_count) {
+            debug.print(.ir, "Generic fn {s}: expected {d} type args, got {d}", .{ base_name, generic_def.type_param_count, type_args.len });
+            return null;
+        }
+
+        // Generate a mangled name for this instantiation
+        var mangled_name_buf: [256]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&mangled_name_buf);
+        const writer = stream.writer();
+        writer.writeAll(base_name) catch return null;
+        writer.writeAll("<") catch return null;
+        for (type_args, 0..) |arg, i| {
+            if (i > 0) writer.writeAll(", ") catch return null;
+            switch (arg) {
+                .i8 => writer.writeAll("i8") catch return null,
+                .i16 => writer.writeAll("i16") catch return null,
+                .i32 => writer.writeAll("i32") catch return null,
+                .i64 => writer.writeAll("i64") catch return null,
+                .u8 => writer.writeAll("u8") catch return null,
+                .u16 => writer.writeAll("u16") catch return null,
+                .u32 => writer.writeAll("u32") catch return null,
+                .u64 => writer.writeAll("u64") catch return null,
+                .f32 => writer.writeAll("f32") catch return null,
+                .f64 => writer.writeAll("f64") catch return null,
+                .bool => writer.writeAll("bool") catch return null,
+                .string => writer.writeAll("string") catch return null,
+                .void => writer.writeAll("void") catch return null,
+                // Array of u8 is effectively a string type
+                .array => |arr| {
+                    if (arr.element.* == .u8) {
+                        writer.writeAll("string") catch return null;
+                    } else {
+                        writer.writeAll("array") catch return null;
+                    }
+                },
+                else => writer.writeAll("?") catch return null,
+            }
+        }
+        writer.writeAll(">") catch return null;
+
+        const mangled_name = stream.getWritten();
+
+        // Check if we already instantiated this
+        if (self.instantiated_fns.get(mangled_name)) |_| {
+            // Already instantiated, return a dupe of the name
+            return self.allocator.dupe(u8, mangled_name) catch return LowerError.OutOfMemory;
+        }
+
+        debug.print(.ir, "Instantiating generic function: {s}", .{mangled_name});
+
+        // Set up type parameter substitutions
+        self.type_param_substitutions.clearRetainingCapacity();
+        for (generic_def.type_param_names, type_args) |param_name_id, arg_type| {
+            const param_name = self.strings.get(param_name_id);
+            self.type_param_substitutions.put(param_name, arg_type) catch return LowerError.OutOfMemory;
+        }
+
+        // Re-lower the function with substitutions active
+        const stmt_idx = generic_def.stmt_idx;
+        const data = self.store.stmtData(stmt_idx);
+
+        // Allocate the mangled name
+        const name_copy = self.allocator.dupe(u8, mangled_name) catch return LowerError.OutOfMemory;
+
+        // Parse params from extra data: [param_count, type_param_count, type_params..., params..., return_type, body]
+        const extra_start = data.getParamsStart();
+        const param_count = self.store.getExtra(extra_start);
+        const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
+
+        var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
+        defer params.deinit(self.allocator);
+
+        // Skip past type params
+        var extra_idx = extra_start.toInt() + 2 + type_param_count;
+        for (0..param_count) |_| {
+            const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+            const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+            const param_direction_raw: u32 = self.store.extra_data.items[extra_idx + 2];
+            extra_idx += 4; // 4 values per param
+
+            const param_name = self.strings.get(param_name_id);
+            if (param_name.len == 0) continue;
+
+            // Lower type with substitutions active
+            var param_type = try self.lowerTypeIdx(param_type_idx);
+
+            var is_ref = param_direction_raw != 0;
+            if (param_type == .ptr) {
+                const pointee = param_type.ptr.*;
+                if (pointee == .@"struct") {
+                    param_type = pointee;
+                    is_ref = true;
+                }
+            }
+
+            try params.append(self.allocator, .{
+                .name = param_name,
+                .ty = param_type,
+                .is_ref = is_ref,
+            });
+        }
+
+        const return_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx]);
+        const body_idx: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+
+        // Lower return type with substitutions
+        const return_type = try self.lowerTypeIdx(return_type_idx);
+
+        // Clear substitutions before lowering body (we set them per-identifier lookup)
+        // Actually keep them for the body lowering
+        // self.type_param_substitutions.clearRetainingCapacity();
+
+        // Create function type
+        const func_type = ir.FunctionType{
+            .params = try params.toOwnedSlice(self.allocator),
+            .return_type = return_type,
+            .is_variadic = false,
+        };
+
+        // Create function
+        const func = try ir.Function.init(self.allocator, name_copy, func_type);
+
+        // Save current context
+        const saved_func = self.current_func;
+        const saved_block = self.current_block;
+
+        self.current_func = func;
+        self.current_block = func.entry;
+
+        // Clear scope for new function
+        self.scopes.reset();
+
+        // Add parameters as local variables (same as lowerFnDef)
+        for (func_type.params) |param| {
+            const ty_ptr = try self.allocator.create(ir.Type);
+            ty_ptr.* = param.ty;
+            try self.allocated_types.append(self.allocator, ty_ptr);
+
+            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+            try self.emit(.{
+                .alloca = .{
+                    .ty = param.ty,
+                    .name = param.name,
+                    .result = alloca_result,
+                },
+            });
+            self.scopes.put(param.name, alloca_result) catch return LowerError.OutOfMemory;
+        }
+
+        // Lower the body
+        const body_tag = self.store.stmtTag(body_idx);
+        if (body_tag == .block) {
+            const body_data = self.store.stmtData(body_idx);
+            try lower_stmt.lowerBlock(self, body_data);
+        } else {
+            try self.lowerStatement(body_idx);
+        }
+
+        // Clear substitutions
+        self.type_param_substitutions.clearRetainingCapacity();
+
+        // Restore context
+        self.current_func = saved_func;
+        self.current_block = saved_block;
+
+        // Add function to module
+        try self.module.addFunction(func);
+
+        // Store param types and return type for the instantiated function
+        const param_types_slice = self.allocator.alloc(ir.Type, func_type.params.len) catch return LowerError.OutOfMemory;
+        for (func_type.params, 0..) |p, i| {
+            param_types_slice[i] = p.ty;
+        }
+        self.fn_param_types.put(name_copy, param_types_slice) catch return LowerError.OutOfMemory;
+        self.fn_return_types.put(name_copy, return_type) catch return LowerError.OutOfMemory;
+
+        // Mark as instantiated
+        self.instantiated_fns.put(name_copy, {}) catch return LowerError.OutOfMemory;
+
+        debug.print(.ir, "Finished instantiating generic function: {s} -> {s}", .{ base_name, name_copy });
+
+        return name_copy;
+    }
+
     /// Lower a trait definition - stores trait method signatures for later lookup
     fn lowerTraitDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
+        const loc = self.store.stmtLoc(stmt_idx);
+        self.current_loc = loc; // Set location for error messages
+
         const name_id: StringId = @enumFromInt(data.a);
         const name = self.strings.get(name_id);
         const methods_start = data.b;
@@ -988,7 +1215,7 @@ pub const Lowerer = struct {
             offset += param_count * 2;
 
             const return_type = if (return_type_idx != .null)
-                self.lowerTypeIdx(return_type_idx) catch .void
+                try self.lowerTypeIdx(return_type_idx)
             else
                 .void;
 
@@ -1112,9 +1339,16 @@ pub const Lowerer = struct {
         const name = self.strings.get(name_id);
         if (name.len == 0) return LowerError.UndefinedVariable;
 
-        // Parse extra data: [param_count, param1_name, param1_type, param1_is_ref, param1_default, ..., return_type, body]
+        // Parse extra data: [param_count, type_param_count, type_params..., param1_name, param1_type, param1_is_ref, param1_default, ..., return_type, body]
         const extra_start = data.getParamsStart();
         const param_count = self.store.getExtra(extra_start);
+        const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
+
+        // Skip generic functions - they'll be instantiated at call sites
+        if (type_param_count > 0) {
+            debug.print(.ir, "Skipping generic function signature: {s} (has {d} type params)", .{ name, type_param_count });
+            return;
+        }
 
         // Collect default expressions and types for each parameter
         var param_defaults: std.ArrayListUnmanaged(u32) = .{};
@@ -1122,14 +1356,15 @@ pub const Lowerer = struct {
         var param_types: std.ArrayListUnmanaged(ir.Type) = .{};
         defer param_types.deinit(self.allocator);
 
-        var extra_idx = extra_start.toInt() + 1;
+        // Skip past type params: extra_start + 1 (param_count) + 1 (type_param_count) + type_param_count
+        var extra_idx = extra_start.toInt() + 2 + type_param_count;
         for (0..param_count) |_| {
             const param_type_idx: ast.TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
             const default_expr_raw: u32 = self.store.extra_data.items[extra_idx + 3];
             extra_idx += 4; // 4 values per param
 
             param_defaults.append(self.allocator, default_expr_raw) catch return LowerError.OutOfMemory;
-            const param_type = self.lowerTypeIdx(param_type_idx) catch return LowerError.OutOfMemory;
+            const param_type = try self.lowerTypeIdx(param_type_idx);
             param_types.append(self.allocator, param_type) catch return LowerError.OutOfMemory;
         }
 
@@ -1143,7 +1378,7 @@ pub const Lowerer = struct {
 
         // Extract and store return type
         const return_type_idx: ast.TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx]);
-        const return_type = self.lowerTypeIdx(return_type_idx) catch return LowerError.OutOfMemory;
+        const return_type = try self.lowerTypeIdx(return_type_idx);
         self.fn_return_types.put(name, return_type) catch return LowerError.OutOfMemory;
     }
 
@@ -1218,20 +1453,48 @@ pub const Lowerer = struct {
     /// Lower a function definition
     fn lowerFnDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
+        const loc = self.store.stmtLoc(stmt_idx);
+        self.current_loc = loc; // Set location for error messages
+
         const name_id = data.getName();
         const name = self.strings.get(name_id);
         if (name.len == 0) return LowerError.UndefinedVariable;
 
         debug.print(.ir, "Lowering function: {s}", .{name});
 
-        // Parse extra data: [param_count, param1_name, param1_type, ..., return_type, body]
+        // Parse extra data: [param_count, type_param_count, type_params..., param1_name, param1_type, ..., return_type, body]
         const extra_start = data.getParamsStart();
         const param_count = self.store.getExtra(extra_start);
+        const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
+
+        // If this is a generic function, store it as a template for later instantiation
+        if (type_param_count > 0) {
+            debug.print(.ir, "  -> Generic function with {d} type params, storing as template", .{type_param_count});
+
+            // Collect type param names
+            var type_param_names: std.ArrayListUnmanaged(StringId) = .{};
+            defer type_param_names.deinit(self.allocator);
+
+            for (0..type_param_count) |i| {
+                const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start.toInt() + 2 + i]);
+                try type_param_names.append(self.allocator, param_name_id);
+            }
+
+            const generic_def = GenericDef{
+                .stmt_idx = stmt_idx,
+                .type_param_count = @intCast(type_param_count),
+                .type_param_names = try type_param_names.toOwnedSlice(self.allocator),
+            };
+
+            try self.generic_fn_defs.put(name, generic_def);
+            return;
+        }
 
         var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
         defer params.deinit(self.allocator);
 
-        var extra_idx = extra_start.toInt() + 1;
+        // Skip past type params: extra_start + 1 (param_count) + 1 (type_param_count) + type_param_count
+        var extra_idx = extra_start.toInt() + 2 + type_param_count;
         for (0..param_count) |_| {
             const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
             const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
@@ -1484,6 +1747,9 @@ pub const Lowerer = struct {
         const loc = self.store.stmtLoc(stmt_idx);
         const data = self.store.stmtData(stmt_idx);
 
+        // Track current location for error messages in nested calls
+        self.current_loc = loc;
+
         log.debug("lowerStatement: {s} at line {d}", .{ @tagName(tag), loc.line });
 
         switch (tag) {
@@ -1673,11 +1939,14 @@ pub const Lowerer = struct {
     fn lowerTry(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const func = self.current_func orelse return LowerError.OutOfMemory;
         const data = self.store.stmtData(stmt_idx);
+        const loc = self.store.stmtLoc(stmt_idx);
 
         // data.a = try_body (StmtIdx)
         // data.b = extra_start pointing to: [err_binding, catch_body, finally_body]
         const try_body: StmtIdx = @enumFromInt(data.a);
         const extra_start = data.b;
+        const err_binding_raw = self.store.extra_data.items[extra_start];
+        const err_binding: StringId = @enumFromInt(err_binding_raw);
         const catch_body: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1]);
 
         // Create blocks for the catch handler and continuation
@@ -1699,8 +1968,35 @@ pub const Lowerer = struct {
         // Switch to catch block
         self.current_block = catch_block;
 
-        // Emit catch_begin marker
-        try self.emit(.{ .catch_begin = .{ .error_type = null, .error_value = null } });
+        // Handle error binding if present: catch (err) { ... }
+        var error_value: ?ir.Value = null;
+        if (!err_binding.isNull()) {
+            const err_name = self.strings.get(err_binding);
+
+            // Create alloca for the error variable (string type)
+            const string_type = ir.Type{ .string = {} };
+            const ty_ptr = try self.allocator.create(ir.Type);
+            ty_ptr.* = string_type;
+            try self.allocated_types.append(self.allocator, ty_ptr);
+
+            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+            try self.emit(.{
+                .alloca = .{
+                    .ty = string_type,
+                    .name = err_name,
+                    .result = alloca_result,
+                },
+            });
+
+            // Add to scope so the catch body can access it
+            try self.scopes.put(err_name, alloca_result);
+            error_value = alloca_result;
+
+            log.debug("lowerTry: created error binding '{s}' at {d}:{d}", .{ err_name, loc.line, loc.column });
+        }
+
+        // Emit catch_begin - will store r0 (error value) to error_value if provided
+        try self.emit(.{ .catch_begin = .{ .error_type = null, .error_value = error_value } });
 
         // Lower the catch body
         try self.lowerStatement(catch_body);

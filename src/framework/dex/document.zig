@@ -24,6 +24,15 @@ pub const DocumentConfig = struct {
 
     // Extra body attributes
     body_class: ?[]const u8 = null,
+
+    // Hydration data (generated from PageHydrationData.toScript())
+    hydration_script: ?[]const u8 = null,
+
+    // Include dex-runtime.js
+    include_runtime: bool = true,
+
+    // Custom runtime script URL (defaults to /assets/dex-runtime.js)
+    runtime_url: []const u8 = "/assets/dex-runtime.js",
 };
 
 /// Render a full HTML document with the given content
@@ -55,11 +64,15 @@ pub fn render(allocator: Allocator, content: []const u8, config: DocumentConfig)
         try writer.print("  <base href=\"{s}\">\n", .{base});
     }
 
-    // Default styles for dev mode
+    // Dex WebSocket URL for real-time events
+    try writer.writeAll("  <meta name=\"dex-ws-url\" content=\"/__dex_events\">\n");
+
+    // Tailwind CSS for styling
     try writer.writeAll(
+        \\  <script src="https://cdn.tailwindcss.com"></script>
         \\  <style>
         \\    * { box-sizing: border-box; }
-        \\    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; }
+        \\    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #09090b; color: #fafafa; }
         \\  </style>
         \\
     );
@@ -77,19 +90,30 @@ pub fn render(allocator: Allocator, content: []const u8, config: DocumentConfig)
         try writer.writeAll("<body>\n");
     }
 
-    // Main content wrapper
-    try writer.writeAll("  <div id=\"__dex\">\n");
+    // Main content wrapper (data-dex-id triggers runtime auto-init)
+    try writer.writeAll("  <div id=\"__dex\" data-dex-id=\"root\">\n");
     try writer.print("    {s}\n", .{content});
     try writer.writeAll("  </div>\n");
 
-    // Hydration script placeholder
-    try writer.writeAll(
-        \\  <script>
-        \\    // Dex hydration will be added in Phase 6
-        \\    window.__DEX_DATA__ = {};
-        \\  </script>
-        \\
-    );
+    // Include dex-runtime.js
+    if (config.include_runtime) {
+        try writer.writeAll("  <script src=\"https://unpkg.com/morphdom@2.7.0/dist/morphdom-umd.min.js\"></script>\n");
+        try writer.print("  <script src=\"{s}\"></script>\n", .{config.runtime_url});
+    }
+
+    // Hydration script (embeds component state)
+    if (config.hydration_script) |script| {
+        try writer.writeAll("  ");
+        try writer.writeAll(script);
+    } else {
+        // Fallback placeholder
+        try writer.writeAll(
+            \\  <script>
+            \\    window.__DEX_HYDRATION__ = { components: [] };
+            \\  </script>
+            \\
+        );
+    }
 
     // Hot reload script in dev mode
     if (config.hot_reload) {

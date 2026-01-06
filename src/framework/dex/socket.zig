@@ -12,11 +12,11 @@ const presence = @import("presence.zig");
 
 /// Message types from client
 pub const ClientMessageType = enum {
-    join,             // Join a component
-    event,            // User interaction event
-    ping,             // Heartbeat
-    leave,            // Leave a component
-    presence_track,   // Track presence in topic
+    join, // Join a component
+    event, // User interaction event
+    ping, // Heartbeat
+    leave, // Leave a component
+    presence_track, // Track presence in topic
     presence_untrack, // Untrack presence from topic
 };
 

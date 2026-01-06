@@ -70,12 +70,18 @@ pub const presence = struct {
     pub const Metadata = @import("presence.zig").Metadata;
 };
 
-// Component file parser (.dex files)
+// Component file parser (.dx files)
 pub const component_parser = struct {
     pub const ComponentLexer = @import("component_parser.zig").ComponentLexer;
     pub const ComponentParser = @import("component_parser.zig").ComponentParser;
+    pub const PageParser = @import("component_parser.zig").PageParser;
     pub const ParsedComponent = @import("component_parser.zig").ParsedComponent;
+    pub const ParseErrorContext = @import("component_parser.zig").ParseErrorContext;
+    pub const ParseError = @import("component_parser.zig").ParseError;
     pub const toComponentDef = @import("component_parser.zig").toComponentDef;
+    pub const parseSource = @import("component_parser.zig").parseSource;
+    pub const isPageFormat = @import("component_parser.zig").isPageFormat;
+    pub const isUiFormat = @import("component_parser.zig").isUiFormat;
 };
 
 // Live route handler
@@ -83,6 +89,15 @@ pub const live = struct {
     pub const LiveContext = @import("live_handler.zig").LiveContext;
     pub const LiveRoute = @import("live_handler.zig").LiveRoute;
     pub const PendingPatch = @import("live_handler.zig").PendingPatch;
+};
+
+// Hydration (server state → client)
+pub const hydration = struct {
+    pub const PageHydrationData = @import("hydration.zig").PageHydrationData;
+    pub const ComponentHydrationData = @import("hydration.zig").ComponentHydrationData;
+    pub const serializeValue = @import("hydration.zig").serializeValue;
+    pub const serializeContext = @import("hydration.zig").serializeContext;
+    pub const fromComponent = @import("hydration.zig").fromComponent;
 };
 
 // Component compiler (Dex AST → executable components)
@@ -205,6 +220,7 @@ test {
     _ = @import("presence.zig");
     _ = @import("component_parser.zig");
     _ = @import("live_handler.zig");
+    _ = @import("hydration.zig");
     _ = @import("compiler.zig");
     _ = @import("page.zig");
     _ = @import("document.zig");

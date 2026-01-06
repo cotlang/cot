@@ -68,18 +68,18 @@ pub const languages = struct {
     pub const zig = Language{
         .name = "zig",
         .keywords = &.{
-            "const",       "var",       "fn",       "pub",     "return",   "if",
-            "else",        "while",     "for",      "switch",  "break",    "continue",
-            "try",         "catch",     "errdefer", "defer",   "struct",   "enum",
-            "union",       "error",     "comptime", "inline",  "extern",   "export",
-            "test",        "and",       "or",       "orelse",  "undefined", "null",
-            "true",        "false",     "unreachable",
+            "const", "var",   "fn",          "pub",    "return",    "if",
+            "else",  "while", "for",         "switch", "break",     "continue",
+            "try",   "catch", "errdefer",    "defer",  "struct",    "enum",
+            "union", "error", "comptime",    "inline", "extern",    "export",
+            "test",  "and",   "or",          "orelse", "undefined", "null",
+            "true",  "false", "unreachable",
         },
         .types = &.{
-            "u8",    "u16",   "u32",   "u64",    "u128",  "usize",
-            "i8",    "i16",   "i32",   "i64",    "i128",  "isize",
-            "f16",   "f32",   "f64",   "f128",   "bool",  "void",
-            "type",  "anytype", "anyerror", "noreturn",
+            "u8",   "u16",     "u32",      "u64",      "u128", "usize",
+            "i8",   "i16",     "i32",      "i64",      "i128", "isize",
+            "f16",  "f32",     "f64",      "f128",     "bool", "void",
+            "type", "anytype", "anyerror", "noreturn",
         },
         .single_comment = "//",
         .multi_comment_start = null,
@@ -90,15 +90,15 @@ pub const languages = struct {
     pub const cot = Language{
         .name = "cot",
         .keywords = &.{
-            "fn",       "let",      "const",    "var",      "if",       "else",
-            "while",    "for",      "return",   "break",    "continue", "struct",
-            "enum",     "trait",    "impl",     "import",   "pub",      "match",
-            "true",     "false",    "null",     "self",     "dyn",
+            "fn",    "let",   "const",  "var",    "if",       "else",
+            "while", "for",   "return", "break",  "continue", "struct",
+            "enum",  "trait", "impl",   "import", "pub",      "match",
+            "true",  "false", "null",   "self",   "dyn",
         },
         .types = &.{
-            "int",      "float",    "string",   "bool",     "void",     "any",
-            "i8",       "i16",      "i32",      "i64",      "u8",       "u16",
-            "u32",      "u64",      "f32",      "f64",
+            "int", "float", "string", "bool", "void", "any",
+            "i8",  "i16",   "i32",    "i64",  "u8",   "u16",
+            "u32", "u64",   "f32",    "f64",
         },
         .single_comment = "//",
         .multi_comment_start = "/*",
@@ -109,12 +109,12 @@ pub const languages = struct {
     pub const dex = Language{
         .name = "dex",
         .keywords = &.{
-            "component", "state",    "props",    "handlers", "template", "fn",
-            "let",       "const",    "if",       "else",     "for",      "in",
-            "self",      "true",     "false",    "null",
+            "component", "state", "props", "handlers", "template", "fn",
+            "let",       "const", "if",    "else",     "for",      "in",
+            "self",      "true",  "false", "null",
         },
         .types = &.{
-            "int",      "float",    "string",   "bool",     "list",     "map",
+            "int", "float", "string", "bool", "list", "map",
         },
         .single_comment = "//",
         .multi_comment_start = null,
@@ -125,16 +125,16 @@ pub const languages = struct {
     pub const javascript = Language{
         .name = "javascript",
         .keywords = &.{
-            "const",     "let",       "var",       "function", "return",   "if",
-            "else",      "while",     "for",       "switch",   "case",     "break",
-            "continue",  "try",       "catch",     "finally",  "throw",    "new",
-            "class",     "extends",   "import",    "export",   "default",  "async",
-            "await",     "this",      "super",     "typeof",   "instanceof", "in",
-            "of",        "true",      "false",     "null",     "undefined",
+            "const",    "let",     "var",    "function", "return",     "if",
+            "else",     "while",   "for",    "switch",   "case",       "break",
+            "continue", "try",     "catch",  "finally",  "throw",      "new",
+            "class",    "extends", "import", "export",   "default",    "async",
+            "await",    "this",    "super",  "typeof",   "instanceof", "in",
+            "of",       "true",    "false",  "null",     "undefined",
         },
         .types = &.{
-            "Array",    "Object",   "String",   "Number",   "Boolean",  "Function",
-            "Promise",  "Map",      "Set",      "Date",     "RegExp",
+            "Array",   "Object", "String", "Number", "Boolean", "Function",
+            "Promise", "Map",    "Set",    "Date",   "RegExp",
         },
         .single_comment = "//",
         .multi_comment_start = "/*",
@@ -159,12 +159,12 @@ pub const languages = struct {
     pub const bash = Language{
         .name = "bash",
         .keywords = &.{
-            "if",       "then",     "else",     "elif",     "fi",       "for",
-            "while",    "do",       "done",     "case",     "esac",     "in",
-            "function", "return",   "exit",     "export",   "local",    "readonly",
-            "shift",    "echo",     "cd",       "pwd",      "ls",       "rm",
-            "mkdir",    "cp",       "mv",       "cat",      "grep",     "sed",
-            "awk",      "git",      "npm",      "yarn",     "cot",      "zig",
+            "if",       "then",   "else", "elif",   "fi",    "for",
+            "while",    "do",     "done", "case",   "esac",  "in",
+            "function", "return", "exit", "export", "local", "readonly",
+            "shift",    "echo",   "cd",   "pwd",    "ls",    "rm",
+            "mkdir",    "cp",     "mv",   "cat",    "grep",  "sed",
+            "awk",      "git",    "npm",  "yarn",   "cot",   "zig",
         },
         .types = &.{},
         .single_comment = "#",
@@ -189,7 +189,7 @@ pub const languages = struct {
     pub const css = Language{
         .name = "css",
         .keywords = &.{
-            "import",   "media",    "keyframes", "font-face", "supports",
+            "import", "media", "keyframes", "font-face", "supports",
         },
         .types = &.{},
         .single_comment = null,
@@ -393,34 +393,34 @@ fn appendEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, text: [
 /// Generate CSS for syntax highlighting (Tailwind-compatible)
 pub fn generateThemeCSS(dark_mode: bool) []const u8 {
     if (dark_mode) {
-        return
-            \\.hl-keyword { color: #c678dd; font-weight: 600; }
-            \\.hl-string { color: #98c379; }
-            \\.hl-number { color: #d19a66; }
-            \\.hl-comment { color: #5c6370; font-style: italic; }
-            \\.hl-function { color: #61afef; }
-            \\.hl-type { color: #e5c07b; }
-            \\.hl-operator { color: #56b6c2; }
-            \\.hl-punctuation { color: #abb2bf; }
-            \\.hl-variable { color: #e06c75; }
-            \\.hl-attribute { color: #d19a66; }
-            \\.hl-tag { color: #e06c75; }
-            \\.hl-plain { color: #abb2bf; }
+        return 
+        \\.hl-keyword { color: #c678dd; font-weight: 600; }
+        \\.hl-string { color: #98c379; }
+        \\.hl-number { color: #d19a66; }
+        \\.hl-comment { color: #5c6370; font-style: italic; }
+        \\.hl-function { color: #61afef; }
+        \\.hl-type { color: #e5c07b; }
+        \\.hl-operator { color: #56b6c2; }
+        \\.hl-punctuation { color: #abb2bf; }
+        \\.hl-variable { color: #e06c75; }
+        \\.hl-attribute { color: #d19a66; }
+        \\.hl-tag { color: #e06c75; }
+        \\.hl-plain { color: #abb2bf; }
         ;
     } else {
-        return
-            \\.hl-keyword { color: #8250df; font-weight: 600; }
-            \\.hl-string { color: #0a3069; }
-            \\.hl-number { color: #0550ae; }
-            \\.hl-comment { color: #6e7781; font-style: italic; }
-            \\.hl-function { color: #8250df; }
-            \\.hl-type { color: #953800; }
-            \\.hl-operator { color: #cf222e; }
-            \\.hl-punctuation { color: #24292f; }
-            \\.hl-variable { color: #953800; }
-            \\.hl-attribute { color: #0550ae; }
-            \\.hl-tag { color: #116329; }
-            \\.hl-plain { color: #24292f; }
+        return 
+        \\.hl-keyword { color: #8250df; font-weight: 600; }
+        \\.hl-string { color: #0a3069; }
+        \\.hl-number { color: #0550ae; }
+        \\.hl-comment { color: #6e7781; font-style: italic; }
+        \\.hl-function { color: #8250df; }
+        \\.hl-type { color: #953800; }
+        \\.hl-operator { color: #cf222e; }
+        \\.hl-punctuation { color: #24292f; }
+        \\.hl-variable { color: #953800; }
+        \\.hl-attribute { color: #0550ae; }
+        \\.hl-tag { color: #116329; }
+        \\.hl-plain { color: #24292f; }
         ;
     }
 }

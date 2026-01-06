@@ -277,9 +277,6 @@ pub const Parser = struct {
         // Parse body
         const body = try self.parseBlock();
 
-        // Clear type params from scope
-        self.clearTypeParams(type_param_count);
-
         // Get params from scratch and duplicate them
         const params = self.store.getScratchU32s();
         const params_copy = self.allocator.dupe(u32, params) catch return error.OutOfMemory;
@@ -287,12 +284,22 @@ pub const Parser = struct {
         // This prevents nested scratch usage from leaking data to parent callers
         self.store.rollbackScratch();
 
-        // For generic functions, we need to store type_params_start differently
-        // For now, we'll extend the fn_def to include type param info
-        // TODO: Add proper generic fn_def storage
-        _ = type_params_start; // Will be used when we extend fn_def
+        // Extract type param names for generic function storage
+        var type_param_names: [MAX_TYPE_PARAMS]u32 = undefined;
+        if (type_param_count > 0) {
+            // Type params are stored as [count, name1, bound1, name2, bound2, ...] at type_params_start
+            // We just need the names (StringIds)
+            const start_idx = self.type_params.items.len - type_param_count;
+            for (self.type_params.items[start_idx..], 0..) |param, i| {
+                type_param_names[i] = @intFromEnum(param.name);
+            }
+        }
+        _ = type_params_start; // Stored separately in extra_data, not needed for fn_def
 
-        return self.store.addFnDef(name, params_copy, return_type, body, loc) catch return error.OutOfMemory;
+        // Clear type params from scope
+        self.clearTypeParams(type_param_count);
+
+        return self.store.addGenericFnDef(name, type_param_names[0..type_param_count], params_copy, return_type, body, loc) catch return error.OutOfMemory;
     }
 
     fn parseStructDef(self: *Self) ParseError!StmtIdx {
@@ -1996,6 +2003,9 @@ pub const Parser = struct {
         if (std.mem.eql(u8, name, "Map")) {
             return try self.parseMapType();
         }
+        if (std.mem.eql(u8, name, "List")) {
+            return try self.parseListType();
+        }
 
         const name_id = self.internString(name) catch return error.OutOfMemory;
 
@@ -2080,6 +2090,14 @@ pub const Parser = struct {
         const value_type = try self.parseType();
         _ = try self.consume(.gt, "Expected '>' after Map type arguments");
         return self.store.addMapType(key_type, value_type) catch return error.OutOfMemory;
+    }
+
+    /// Parse List<T> built-in type
+    fn parseListType(self: *Self) ParseError!TypeIdx {
+        _ = try self.consume(.lt, "Expected '<' after List");
+        const element_type = try self.parseType();
+        _ = try self.consume(.gt, "Expected '>' after List type argument");
+        return self.store.addListType(element_type) catch return error.OutOfMemory;
     }
 
     // ============================================================

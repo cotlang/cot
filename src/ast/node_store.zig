@@ -844,10 +844,25 @@ pub const NodeStore = struct {
 
     /// Add a function definition
     /// params format: [name, type, is_ref, default_value, ...] (4 values per param)
+    /// type_params format: [type_param_name_id, ...] (StringIds for each type param like T, U)
     pub fn addFnDef(self: *Self, name: StringId, params: []const u32, return_type: TypeIdx, body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        // Store params as: [count, param1_name, param1_type, param1_is_ref, param1_default, ...]
+        // Non-generic function - delegate to generic version with empty type params
+        return self.addGenericFnDef(name, &.{}, params, return_type, body, loc);
+    }
+
+    /// Add a generic function definition
+    /// type_params: StringIds for type parameter names (e.g., T, U)
+    /// params format: [name, type, is_ref, default_value, ...] (4 values per param)
+    pub fn addGenericFnDef(self: *Self, name: StringId, type_params: []const u32, params: []const u32, return_type: TypeIdx, body: StmtIdx, loc: SourceLoc) !StmtIdx {
+        // Store as: [param_count, type_param_count, type_param1, type_param2, ..., param1_name, param1_type, param1_is_ref, param1_default, ..., return_type, body]
         const params_start: ExtraIdx = @enumFromInt(@as(u32, @intCast(self.extra_data.items.len)));
         try self.extra_data.append(self.allocator, @intCast(params.len / 4)); // param count (4 values per param)
+        try self.extra_data.append(self.allocator, @intCast(type_params.len)); // type param count
+        // Store type parameter names
+        for (type_params) |tp| {
+            try self.extra_data.append(self.allocator, tp);
+        }
+        // Store regular parameters
         for (params) |p| {
             try self.extra_data.append(self.allocator, p);
         }
@@ -994,6 +1009,14 @@ pub const NodeStore = struct {
         const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
         try self.type_tags.append(self.allocator, .map);
         try self.type_data.append(self.allocator, .{ .a = key_type.toInt(), .b = value_type.toInt() });
+        return idx;
+    }
+
+    /// Add a list type: List<T>
+    pub fn addListType(self: *Self, element_type: TypeIdx) !TypeIdx {
+        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
+        try self.type_tags.append(self.allocator, .list);
+        try self.type_data.append(self.allocator, .{ .a = element_type.toInt(), .b = 0 });
         return idx;
     }
 

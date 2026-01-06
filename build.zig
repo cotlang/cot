@@ -163,9 +163,12 @@ pub fn build(b: *std.Build) void {
     // ========================================================================
     // Format steps
     // ========================================================================
-    // zig build fmt - Format all source files
-    const fmt_step = b.step("fmt", "Format source files");
+    // Auto-format source files on every build
     const fmt_cmd = b.addSystemCommand(&.{ "zig", "fmt", "src/" });
+    b.getInstallStep().dependOn(&fmt_cmd.step);
+
+    // zig build fmt - Format all source files (explicit)
+    const fmt_step = b.step("fmt", "Format source files");
     fmt_step.dependOn(&fmt_cmd.step);
 
     // zig build fmt-check - Check formatting (for CI)

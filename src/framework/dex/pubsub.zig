@@ -21,7 +21,7 @@ const Allocator = std.mem.Allocator;
 pub const Message = struct {
     topic: []const u8,
     event: []const u8,
-    payload: []const u8,  // JSON-encoded payload
+    payload: []const u8, // JSON-encoded payload
 };
 
 /// Subscriber callback function type

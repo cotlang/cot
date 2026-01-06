@@ -251,7 +251,7 @@ pub const Router = struct {
                     try self.scanDirectory(entry_relative);
                 },
                 .file => {
-                    if (std.mem.endsWith(u8, entry.name, ".dex")) {
+                    if (std.mem.endsWith(u8, entry.name, ".dx")) {
                         try self.addRoute(entry_relative);
                     }
                 },

@@ -514,7 +514,7 @@
       }
     }
 
-    // Static factory
+    // Static factory - simple init without hydration data
     static init() {
       const dex = new Dex();
 
@@ -530,6 +530,97 @@
       }
 
       return dex;
+    }
+
+    /**
+     * Hydrate from server-rendered state
+     * Called with data from window.__DEX_HYDRATION__
+     */
+    static hydrate(hydrationData) {
+      const dex = new Dex();
+
+      if (!hydrationData) {
+        console.warn('Dex: No hydration data provided');
+        return dex;
+      }
+
+      // Store hydration data for reconnection
+      dex.hydrationData = hydrationData;
+
+      const doHydrate = () => {
+        // Connect using wsUrl from hydration data
+        const wsUrl = hydrationData.wsUrl;
+        if (wsUrl) {
+          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const fullUrl = `${protocol}//${window.location.host}${wsUrl}`;
+          dex.connect(fullUrl);
+        } else {
+          dex.connect();
+        }
+
+        // Mount all components from hydration data
+        if (hydrationData.components) {
+          for (const comp of hydrationData.components) {
+            // Find element with matching data-dex-id
+            const element = document.querySelector(`[data-dex-id="${comp.id}"]`);
+            if (element) {
+              const view = dex.mount(element);
+              if (view) {
+                // Store initial state for comparison
+                view.initialState = comp.state;
+                view.initialProps = comp.props;
+                view.componentName = comp.name;
+
+                // Subscribe to topics from hydration data
+                if (comp.subscriptions) {
+                  for (const topic of comp.subscriptions) {
+                    dex.presence.track(topic, {});
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Also mount any additional dex elements not in hydration data
+        const allDexElements = document.querySelectorAll('[data-dex-id]');
+        allDexElements.forEach(el => {
+          if (!dex.views.has(el)) {
+            dex.mount(el);
+          }
+        });
+      };
+
+      // Hydrate on DOM ready
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', doHydrate);
+      } else {
+        doHydrate();
+      }
+
+      return dex;
+    }
+
+    /**
+     * Rehydrate after reconnection
+     * Uses stored hydration data to restore state
+     */
+    rehydrate() {
+      if (!this.hydrationData) return;
+
+      // Rejoin all views
+      this.joinViews();
+
+      // Re-track presence
+      if (this.hydrationData.components) {
+        for (const comp of this.hydrationData.components) {
+          if (comp.subscriptions) {
+            for (const topic of comp.subscriptions) {
+              this.presence.track(topic, {});
+            }
+          }
+        }
+      }
     }
   }
 

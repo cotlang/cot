@@ -206,7 +206,7 @@ pub const BytecodeEmitter = struct {
 
     // Block management
     block_offsets: std.AutoHashMap(*const ir.Block, u32), // block -> code_offset
-    pending_jumps: std.ArrayList(PendingJump),
+    pending_jumps: std.ArrayListUnmanaged(PendingJump),
 
     // IR value to stack slot mapping
     value_slots: std.AutoHashMap(u32, u16), // value_id -> stack_slot
@@ -572,9 +572,10 @@ pub const BytecodeEmitter = struct {
                     debug.print(.emit, "Pre-pass alloca: name='{s}' ty={any} global={} local={} skip_global={}", .{ a.name, a.ty, in_globals, self.locals.contains(a.name), skip_global_check });
                     if (!in_globals and !self.locals.contains(a.name)) {
                         if (is_struct) {
-                            // Struct type: count slots for each field
-                            debug.print(.emit, "  -> counted as {d} slots for struct fields", .{a.ty.@"struct".fields.len});
-                            self.local_count += @intCast(a.ty.@"struct".fields.len);
+                            // Struct type: count FLATTENED slots for nested structs
+                            const slot_count = emit_inst.getSlotCount(a.ty);
+                            debug.print(.emit, "  -> counted as {d} slots for struct fields (flattened)", .{slot_count});
+                            self.local_count += @intCast(slot_count);
                         } else if (a.ty == .array) {
                             // Array of u8 (DBL alpha/string buffer): single slot for the buffer value
                             // Other arrays: one slot per element (legacy behavior)
@@ -599,11 +600,8 @@ pub const BytecodeEmitter = struct {
         // Count actual parameter slots (struct params expand to multiple slots)
         var param_slot_count: u16 = 0;
         for (func.signature.params) |param| {
-            if (param.ty == .@"struct") {
-                param_slot_count += @intCast(param.ty.@"struct".fields.len);
-            } else {
-                param_slot_count += 1;
-            }
+            // Use flattened slot count for nested structs
+            param_slot_count += @intCast(emit_inst.getSlotCount(param.ty));
         }
         self.local_count = param_slot_count;
 
@@ -753,7 +751,7 @@ pub const BytecodeEmitter = struct {
             // Exception handling
             .try_begin => |t| try emit_inst.emitTryBegin(self, t),
             .try_end => try emit_inst.emitTryEnd(self),
-            .catch_begin => try emit_inst.emitCatchBegin(self),
+            .catch_begin => |c| try emit_inst.emitCatchBegin(self, c),
             .throw => |t| try emit_inst.emitThrow(self, t),
 
             // Array operations
@@ -779,6 +777,15 @@ pub const BytecodeEmitter = struct {
             .map_keys => |mk| try emit_inst.emitMapKeys(self, mk),
             .map_values => |mv| try emit_inst.emitMapValues(self, mv),
             .map_key_at => |mk| try emit_inst.emitMapKeyAt(self, mk),
+
+            // List operations
+            .list_new => |ln| try emit_inst.emitListNew(self, ln),
+            .list_push => |lp| try emit_inst.emitListPush(self, lp),
+            .list_pop => |lp| try emit_inst.emitListPop(self, lp),
+            .list_get => |lg| try emit_inst.emitListGet(self, lg),
+            .list_set => |ls| try emit_inst.emitListSet(self, ls),
+            .list_len => |ll| try emit_inst.emitListLen(self, ll),
+            .list_clear => |lc| try emit_inst.emitListClear(self, lc),
 
             // Weak reference operations
             .weak_ref => |w| try emit_inst.emitWeakRef(self, w),
@@ -1471,6 +1478,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .@"union" => .structure, // Unions are similar to structs
         .function => .int64, // Function pointers
         .map => .int64, // Map handles are pointer-sized
+        .list => .int64, // List handles are pointer-sized
         .weak => .int64, // Weak references are pointer-sized
         .trait_object => .int64, // Trait objects are pointer-sized (vtable + data)
     };

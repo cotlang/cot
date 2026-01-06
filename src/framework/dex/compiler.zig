@@ -506,20 +506,29 @@ pub const Compiler = struct {
         };
     }
 
-    /// Compile a .dex file from source
+    /// Compile a .dx file from source
+    /// Automatically detects page format (YAML frontmatter) vs component format
     pub fn compileSource(self: *Self, source: []const u8) !CompiledComponent {
-        // Tokenize
-        var lexer = component_parser.ComponentLexer.init(self.allocator, source);
-        defer lexer.deinit();
-        const tokens = try lexer.tokenize();
+        var error_context = component_parser.ParseErrorContext.init(self.allocator);
+        return self.compileSourceWithContext(source, &error_context);
+    }
 
-        // Parse
-        var parser = component_parser.ComponentParser.init(self.allocator, tokens);
-        defer parser.deinit();
-        const parsed = try parser.parse();
+    /// Compile with explicit error context for detailed error reporting
+    pub fn compileSourceWithContext(
+        self: *Self,
+        source: []const u8,
+        error_context: *component_parser.ParseErrorContext,
+    ) !CompiledComponent {
+        // Use the unified parser that handles both formats
+        const parsed = try component_parser.parseSource(self.allocator, source, error_context);
 
         // Compile
         return self.compile(parsed);
+    }
+
+    /// Get the last parse error with full context (if any)
+    pub fn getLastError(error_context: *const component_parser.ParseErrorContext) ?component_parser.ParseError {
+        return error_context.last_error;
     }
 };
 

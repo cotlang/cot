@@ -676,6 +676,30 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
             used.put(m.map.id, {}) catch {};
             used.put(m.index.id, {}) catch {};
         },
+        // List operations
+        .list_new => {}, // No input values to mark
+        .list_push => |l| {
+            used.put(l.list.id, {}) catch {};
+            used.put(l.value.id, {}) catch {};
+        },
+        .list_pop => |l| {
+            used.put(l.list.id, {}) catch {};
+        },
+        .list_get => |l| {
+            used.put(l.list.id, {}) catch {};
+            used.put(l.index.id, {}) catch {};
+        },
+        .list_set => |l| {
+            used.put(l.list.id, {}) catch {};
+            used.put(l.index.id, {}) catch {};
+            used.put(l.value.id, {}) catch {};
+        },
+        .list_len => |l| {
+            used.put(l.list.id, {}) catch {};
+        },
+        .list_clear => |l| {
+            used.put(l.list.id, {}) catch {};
+        },
         // Closure operations
         .make_closure => |c| {
             used.put(c.env.id, {}) catch {};
@@ -776,8 +800,8 @@ pub fn optimizeSwitches(func: *ir.Function) SwitchStats {
         const block = func.blocks.items[block_idx];
 
         // Try to detect a switch pattern starting from this block
-        const result = detectSwitchPattern(func, block);
-        if (result.cases.len >= 2) {
+        const result = detectSwitchPattern(func.allocator, func, block);
+        if (result.valid) {
             // Found a switch pattern with at least 2 cases
             // Convert to br_table
 
@@ -794,14 +818,21 @@ pub fn optimizeSwitches(func: *ir.Function) SwitchStats {
             // Truncate to keep only pre-comparison instructions
             block.instructions.items.len = keep_count;
 
-            // Create cases slice
-            var cases = func.allocator.alloc(ir.Instruction.Switch.Case, result.cases.len) catch continue;
+            // Create cases slice for the br_table instruction
+            var cases = func.allocator.alloc(ir.Instruction.Switch.Case, result.cases.len) catch {
+                // Free the detected cases since we can't use them
+                func.allocator.free(result.cases);
+                continue;
+            };
             for (result.cases, 0..) |c, i| {
                 cases[i] = .{
                     .value = c.value,
                     .target = c.target,
                 };
             }
+
+            // Free the detected cases now that we've copied them
+            func.allocator.free(result.cases);
 
             // Emit br_table (Cranelift name for switch_br)
             block.append(.{ .br_table = .{
@@ -828,12 +859,14 @@ const SwitchCase = struct {
 
 const SwitchPattern = struct {
     scrutinee: ir.Value,
-    cases: []const SwitchCase,
+    cases: []SwitchCase, // Heap-allocated, caller must free
     default: *ir.Block,
+    valid: bool, // Whether this is a valid pattern (to avoid optional return)
 };
 
 /// Detect if a block starts a chain of comparisons that can be converted to a switch
-fn detectSwitchPattern(func: *ir.Function, start_block: *ir.Block) SwitchPattern {
+/// Returns a pattern with heap-allocated cases slice that the caller must free
+fn detectSwitchPattern(allocator: std.mem.Allocator, func: *ir.Function, start_block: *ir.Block) SwitchPattern {
     var cases_buf: [64]SwitchCase = undefined;
     var case_count: usize = 0;
     var scrutinee: ?ir.Value = null;
@@ -914,19 +947,32 @@ fn detectSwitchPattern(func: *ir.Function, start_block: *ir.Block) SwitchPattern
         }
     }
 
-    // Return empty if not enough cases
+    // Return invalid if not enough cases
     if (case_count < 2 or scrutinee == null or default_block == null) {
         return .{
             .scrutinee = ir.Value{ .id = 0, .ty = .void },
             .cases = &[_]SwitchCase{},
             .default = func.entry,
+            .valid = false,
         };
     }
 
+    // Allocate cases on heap so they survive after this function returns
+    const cases = allocator.alloc(SwitchCase, case_count) catch {
+        return .{
+            .scrutinee = ir.Value{ .id = 0, .ty = .void },
+            .cases = &[_]SwitchCase{},
+            .default = func.entry,
+            .valid = false,
+        };
+    };
+    @memcpy(cases, cases_buf[0..case_count]);
+
     return .{
         .scrutinee = scrutinee.?,
-        .cases = cases_buf[0..case_count],
+        .cases = cases,
         .default = default_block.?,
+        .valid = true,
     };
 }
 

@@ -14,40 +14,40 @@ const Allocator = std.mem.Allocator;
 /// Token types for template lexing
 pub const TokenType = enum {
     // HTML structure
-    text,              // Raw text content
-    tag_open,          // <
-    tag_close,         // >
-    tag_self_close,    // />
-    tag_end_open,      // </
-    tag_name,          // div, span, button, etc.
+    text, // Raw text content
+    tag_open, // <
+    tag_close, // >
+    tag_self_close, // />
+    tag_end_open, // </
+    tag_name, // div, span, button, etc.
 
     // Attributes
-    attr_name,         // class, id, value, etc.
-    attr_equals,       // =
-    attr_value,        // "string value"
+    attr_name, // class, id, value, etc.
+    attr_equals, // =
+    attr_value, // "string value"
 
     // Cot expressions
-    expr_open,         // {
-    expr_close,        // }
-    expr_content,      // The expression inside { }
+    expr_open, // {
+    expr_close, // }
+    expr_content, // The expression inside { }
 
     // Directives
-    directive_if,      // @if
-    directive_else,    // @else
-    directive_for,     // @for
-    directive_in,      // in (within @for)
-    directive_raw,     // @raw
+    directive_if, // @if
+    directive_else, // @else
+    directive_for, // @for
+    directive_in, // in (within @for)
+    directive_raw, // @raw
     directive_comment, // @//
 
     // Event bindings (special attributes)
-    event_name,        // @click, @input, @submit, etc.
+    event_name, // @click, @input, @submit, etc.
 
     // Control
-    block_open,        // {
-    block_close,       // }
+    block_open, // {
+    block_close, // }
 
     // Components
-    component_name,    // PascalCase component names
+    component_name, // PascalCase component names
 
     // Special
     eof,
@@ -130,8 +130,13 @@ pub const Lexer = struct {
 
         // Check for tag start
         if (c == '<') {
-            self.in_tag = true;
             self.advance();
+
+            // Check for HTML comment <!-- ... -->
+            if (self.peek() == '!' and self.peekAt(1) == '-' and self.peekAt(2) == '-') {
+                try self.scanHtmlComment();
+                return;
+            }
 
             if (self.peek() == '/') {
                 self.advance();
@@ -139,6 +144,8 @@ pub const Lexer = struct {
             } else {
                 try self.addToken(.tag_open, "<");
             }
+
+            self.in_tag = true;
 
             // Scan tag name
             try self.scanTagName();
@@ -224,7 +231,15 @@ pub const Lexer = struct {
         const name = self.source[start..self.pos];
         if (name.len == 0) return;
 
-        try self.addToken(.attr_name, name);
+        // Check for React-style event handlers (onClick, onSubmit, onChange, onInput, etc.)
+        if (name.len > 2 and std.mem.startsWith(u8, name, "on") and std.ascii.isUpper(name[2])) {
+            // Convert onClick to Click, onSubmit to Submit, etc.
+            // Store the event name part (e.g., "Click" from "onClick")
+            // The renderer will handle lowercasing
+            try self.addToken(.event_name, name[2..]);
+        } else {
+            try self.addToken(.attr_name, name);
+        }
 
         self.skipWhitespace();
 
@@ -380,6 +395,27 @@ pub const Lexer = struct {
         }
     }
 
+    /// Scan HTML comment <!-- ... -->
+    fn scanHtmlComment(self: *Self) !void {
+        // Skip the !--
+        self.advance(); // !
+        self.advance(); // -
+        self.advance(); // -
+
+        // Scan until we find -->
+        while (!self.isAtEnd()) {
+            if (self.peek() == '-' and self.peekAt(1) == '-' and self.peekAt(2) == '>') {
+                // Found end of comment
+                self.advance(); // -
+                self.advance(); // -
+                self.advance(); // >
+                return;
+            }
+            self.advance();
+        }
+        // If we reach end without closing, just consume everything
+    }
+
     // Helper methods
 
     fn peek(self: *const Self) u8 {
@@ -390,6 +426,11 @@ pub const Lexer = struct {
     fn peekNext(self: *const Self) u8 {
         if (self.pos + 1 >= self.source.len) return 0;
         return self.source[self.pos + 1];
+    }
+
+    fn peekAt(self: *const Self, offset: usize) u8 {
+        if (self.pos + offset >= self.source.len) return 0;
+        return self.source[self.pos + offset];
     }
 
     fn advance(self: *Self) void {

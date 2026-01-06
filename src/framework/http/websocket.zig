@@ -238,24 +238,35 @@ pub const WebSocket = struct {
         }
     }
 
+    /// Read exactly n bytes from the stream (using deprecated but functional Stream.read)
+    fn readExact(self: *Self, buf: []u8) !void {
+        var bytes_read: usize = 0;
+        while (bytes_read < buf.len) {
+            const n = self.stream.read(buf[bytes_read..]) catch |err| {
+                // Convert connection errors to incomplete frame
+                if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+                    return error.IncompleteFrame;
+                }
+                return err;
+            };
+            if (n == 0) return error.IncompleteFrame;
+            bytes_read += n;
+        }
+    }
+
     /// Read a single frame
     fn readFrame(self: *Self) !?Frame {
         if (self.state == .closed) return null;
 
         // Read first 2 bytes (minimum header)
         var header_buf: [2]u8 = undefined;
-        const header_read = self.stream.read(&header_buf) catch |err| {
-            if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+        self.readExact(&header_buf) catch |err| {
+            if (err == error.IncompleteFrame) {
                 self.state = .closed;
                 return null;
             }
             return err;
         };
-        if (header_read == 0) {
-            self.state = .closed;
-            return null;
-        }
-        if (header_read < 2) return error.IncompleteFrame;
 
         const fin = (header_buf[0] & 0x80) != 0;
         const opcode_raw = header_buf[0] & 0x0F;
@@ -266,18 +277,18 @@ pub const WebSocket = struct {
         // Extended payload length
         if (payload_len == 126) {
             var len_buf: [2]u8 = undefined;
-            _ = try self.stream.readAll(&len_buf);
+            try self.readExact(&len_buf);
             payload_len = std.mem.readInt(u16, &len_buf, .big);
         } else if (payload_len == 127) {
             var len_buf: [8]u8 = undefined;
-            _ = try self.stream.readAll(&len_buf);
+            try self.readExact(&len_buf);
             payload_len = std.mem.readInt(u64, &len_buf, .big);
         }
 
         // Read masking key if present
         var mask_key: [4]u8 = undefined;
         if (masked) {
-            _ = try self.stream.readAll(&mask_key);
+            try self.readExact(&mask_key);
         }
 
         // Read payload
@@ -287,7 +298,7 @@ pub const WebSocket = struct {
 
         const payload_slice = self.read_buffer[0..@intCast(payload_len)];
         if (payload_len > 0) {
-            _ = try self.stream.readAll(payload_slice);
+            try self.readExact(payload_slice);
         }
 
         // Unmask if needed

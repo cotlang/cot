@@ -88,6 +88,9 @@ pub const Type = union(enum) {
     /// Map type (ordered key-value store)
     map: *const MapType,
 
+    /// List type (dynamic array)
+    list: *const ListType,
+
     /// Trait object type (dynamic dispatch)
     trait_object: TraitObjectType,
 
@@ -130,6 +133,7 @@ pub const Type = union(enum) {
             .@"union" => |u| u.size,
             .function => 8, // Function pointer
             .map => 8, // Map pointer
+            .list => 8, // List pointer
             .trait_object => 16, // Fat pointer: data + vtable
         };
     }
@@ -152,6 +156,7 @@ pub const Type = union(enum) {
             .@"union" => |u| u.alignment,
             .function => 8,
             .map => 8,
+            .list => 8,
             .trait_object => 8, // Fat pointer alignment
         };
     }
@@ -182,6 +187,7 @@ pub const Type = union(enum) {
             .@"union" => "void*",
             .function => "void*",
             .map => "void*",
+            .list => "void*",
             .trait_object => "cot_trait_object_t*", // Fat pointer struct
         };
     }
@@ -265,6 +271,11 @@ pub const FunctionType = struct {
 pub const MapType = struct {
     key_type: *const Type,
     value_type: *const Type,
+};
+
+/// List type definition (dynamic array)
+pub const ListType = struct {
+    element_type: *const Type,
 };
 
 // ============================================================================
@@ -368,6 +379,7 @@ fn typeNeedsArc(ty: Type) bool {
         .string => true,
         .implied_decimal, .fixed_decimal => true,
         .map => true,
+        .list => true,
         // Pointer to heap type needs ARC
         .ptr => |p| typeNeedsArc(p.*),
         // Optional of heap type needs ARC
@@ -539,6 +551,15 @@ pub const Instruction = union(enum) {
     map_keys: MapKeys,
     map_values: MapValues,
     map_key_at: MapKeyAt,
+
+    // ====== List operations ======
+    list_new: ListNew,
+    list_push: ListPush,
+    list_pop: ListPop,
+    list_get: ListGet,
+    list_set: ListSet,
+    list_len: ListLen,
+    list_clear: ListClear,
 
     // ====== Closure operations ======
     make_closure: MakeClosure,
@@ -815,6 +836,56 @@ pub const Instruction = union(enum) {
         loc: ?SourceLoc = null,
     };
 
+    /// List new - create a new empty list
+    pub const ListNew = struct {
+        element_type: *const Type, // Element type for the list
+        result: Value, // Result list value
+        loc: ?SourceLoc = null,
+    };
+
+    /// List push - add item to end
+    pub const ListPush = struct {
+        list: Value, // List to modify
+        value: Value, // Value to push
+        loc: ?SourceLoc = null,
+    };
+
+    /// List pop - remove and return last item
+    pub const ListPop = struct {
+        list: Value, // List to modify
+        result: Value, // Popped value
+        loc: ?SourceLoc = null,
+    };
+
+    /// List get - get item at index
+    pub const ListGet = struct {
+        list: Value, // List to read
+        index: Value, // Index (0-based)
+        result: Value, // Result value
+        loc: ?SourceLoc = null,
+    };
+
+    /// List set - set item at index
+    pub const ListSet = struct {
+        list: Value, // List to modify
+        index: Value, // Index (0-based)
+        value: Value, // Value to store
+        loc: ?SourceLoc = null,
+    };
+
+    /// List len - get number of items
+    pub const ListLen = struct {
+        list: Value, // List to query
+        result: Value, // Integer result
+        loc: ?SourceLoc = null,
+    };
+
+    /// List clear - remove all items
+    pub const ListClear = struct {
+        list: Value, // List to clear
+        loc: ?SourceLoc = null,
+    };
+
     /// Make closure - create a closure from a function and captured environment
     pub const MakeClosure = struct {
         func_name: []const u8, // Name of the lambda function
@@ -919,6 +990,7 @@ pub const Instruction = union(enum) {
         io, // io_open, io_close, io_read, io_write, io_delete, io_unlock
         array, // array_load, array_store, array_len
         map, // map_new, map_set, map_get, map_delete, map_has, map_len, map_clear, map_keys, map_values, map_key_at
+        list, // list_new, list_push, list_pop, list_get, list_set, list_len, list_clear
         debug, // debug_line
     };
 
@@ -939,6 +1011,7 @@ pub const Instruction = union(enum) {
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
             .array_load, .array_store, .array_len => .array,
             .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => .map,
+            .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => .list,
             .debug_line => .debug,
         };
     }
@@ -1019,6 +1092,11 @@ pub const Instruction = union(enum) {
             .map_keys => |m| m.result,
             .map_values => |m| m.result,
             .map_key_at => |m| m.result,
+            // List operations with results
+            .list_new => |l| l.result,
+            .list_pop => |l| l.result,
+            .list_get => |l| l.result,
+            .list_len => |l| l.result,
             // Closure operations
             .make_closure => |c| c.result,
             .select => |s| s.result,
@@ -1031,14 +1109,14 @@ pub const Instruction = union(enum) {
             .make_trait_object => |m| m.result,
             .call_trait_method => |c| c.result,
             // Instructions that don't produce values
-            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear, .arc_retain, .arc_release => null,
+            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear, .list_push, .list_set, .list_clear, .arc_retain, .arc_release => null,
         };
     }
 
     /// Check if this instruction has side effects (I/O, memory stores, exceptions)
     pub fn hasSideEffects(self: Instruction) bool {
         return switch (self) {
-            .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store, .map_set, .map_delete, .map_clear => true,
+            .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store, .map_set, .map_delete, .map_clear, .list_push, .list_pop, .list_set, .list_clear => true,
             else => false,
         };
     }

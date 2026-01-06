@@ -29,7 +29,11 @@ pub const Language = enum {
             {
                 return .dbl;
             }
-            if (std.ascii.eqlIgnoreCase(ext, ".dex")) {
+        }
+        // Check for .dx (3 chars)
+        if (uri.len >= 3) {
+            const ext3 = uri[uri.len - 3 ..];
+            if (std.ascii.eqlIgnoreCase(ext3, ".dx")) {
                 return .dex;
             }
         }
@@ -1095,21 +1099,35 @@ fn analyzeDex(allocator: Allocator, source: []const u8, diagnostics: *std.ArrayL
     };
     defer allocator.free(tokens);
 
-    // Parse tokens
-    var parser = dex.component_parser.ComponentParser.init(allocator, tokens);
+    // Parse tokens with error context for detailed error reporting
+    var error_context = dex.component_parser.ParseErrorContext.init(allocator);
+    error_context.setSource(source);
+
+    var parser = dex.component_parser.ComponentParser.init(allocator, tokens, &error_context);
     defer parser.deinit();
 
     _ = parser.parse() catch {
-        // For now, just report a generic parse error
-        // The component parser doesn't expose detailed errors yet
-        try diagnostics.append(allocator, .{
-            .range = .{
-                .start = .{ .line = 0, .character = 0 },
-                .end = .{ .line = 0, .character = 1 },
-            },
-            .severity = .Error,
-            .message = "Dex component parse error",
-        });
+        // Use detailed error from error context if available
+        if (error_context.last_error) |parse_err| {
+            try diagnostics.append(allocator, .{
+                .range = .{
+                    .start = .{ .line = if (parse_err.line > 0) parse_err.line - 1 else 0, .character = if (parse_err.column > 0) parse_err.column - 1 else 0 },
+                    .end = .{ .line = if (parse_err.line > 0) parse_err.line - 1 else 0, .character = parse_err.column },
+                },
+                .severity = .Error,
+                .message = parse_err.message,
+            });
+        } else {
+            // Fallback to generic error
+            try diagnostics.append(allocator, .{
+                .range = .{
+                    .start = .{ .line = 0, .character = 0 },
+                    .end = .{ .line = 0, .character = 1 },
+                },
+                .severity = .Error,
+                .message = "Dex component parse error",
+            });
+        }
         return;
     };
 }
@@ -1530,19 +1548,14 @@ fn getDblSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
 }
 
 fn getDexSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayListUnmanaged(protocol.DocumentSymbol)) !void {
-    // Parse Dex component to extract symbols
+    // Parse Dex component to extract symbols using unified parser
     const dex = cot.framework.dex;
 
-    // Tokenize using ComponentLexer
-    var lexer = dex.component_parser.ComponentLexer.init(allocator, source);
-    const tokens = lexer.tokenize() catch return;
-    defer allocator.free(tokens);
+    // Use the unified parser that handles both page and component formats
+    var error_context = dex.component_parser.ParseErrorContext.init(allocator);
+    error_context.setSource(source);
 
-    // Parse tokens
-    var parser = dex.component_parser.ComponentParser.init(allocator, tokens);
-    defer parser.deinit();
-
-    const parsed = parser.parse() catch return;
+    const parsed = dex.component_parser.parseSource(allocator, source, &error_context) catch return;
 
     // Add component name as class symbol
     try symbols.append(allocator, .{

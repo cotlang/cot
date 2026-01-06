@@ -509,7 +509,18 @@ pub fn lowerLValue(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             // Index access as lvalue
             return lowerIndexPtr(l, expr_idx);
         },
-        else => return LowerError.InvalidExpression,
+        else => {
+            const expr_loc = l.store.exprLoc(expr_idx);
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "Cannot use '{s}' expression as assignment target",
+                .{@tagName(tag)},
+                .{ .line = expr_loc.line, .column = expr_loc.column },
+                "expression cannot be assigned to",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        },
     }
 }
 
@@ -563,12 +574,42 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                         object_ptr = loaded_ptr;
                         break :blk s;
                     },
-                    else => return LowerError.TypeMismatch,
+                    else => {
+                        l.setErrorContext(
+                            LowerError.TypeMismatch,
+                            "cannot access field '{s}' on non-struct pointer type",
+                            .{field_name},
+                            loc,
+                            "lowering member access (inner pointer is not a struct)",
+                            .{},
+                        );
+                        return LowerError.TypeMismatch;
+                    },
                 }
             },
-            else => return LowerError.TypeMismatch,
+            else => {
+                l.setErrorContext(
+                    LowerError.TypeMismatch,
+                    "cannot access field '{s}' on non-struct type",
+                    .{field_name},
+                    loc,
+                    "lowering member access (pointer target is not a struct)",
+                    .{},
+                );
+                return LowerError.TypeMismatch;
+            },
         },
-        else => return LowerError.TypeMismatch,
+        else => {
+            l.setErrorContext(
+                LowerError.TypeMismatch,
+                "cannot access field '{s}' - expected pointer type",
+                .{field_name},
+                loc,
+                "lowering member access (object is not a pointer)",
+                .{},
+            );
+            return LowerError.TypeMismatch;
+        },
     };
 
     var field_idx: ?u32 = null;
@@ -612,6 +653,7 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 pub fn lowerIndexPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
 
     const object_idx = data.getObject();
     const index_idx = data.getIndex();
@@ -624,9 +666,29 @@ pub fn lowerIndexPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .ptr => |p| switch (p.*) {
             .array => |a| a.element.*,
             .slice => |s| s.*,
-            else => return LowerError.TypeMismatch,
+            else => {
+                l.setErrorContext(
+                    LowerError.TypeMismatch,
+                    "cannot index into non-array/slice type",
+                    .{},
+                    loc,
+                    "lowering index expression (pointer target is not array or slice)",
+                    .{},
+                );
+                return LowerError.TypeMismatch;
+            },
         },
-        else => return LowerError.TypeMismatch,
+        else => {
+            l.setErrorContext(
+                LowerError.TypeMismatch,
+                "cannot index into non-pointer type",
+                .{},
+                loc,
+                "lowering index expression (object is not a pointer)",
+                .{},
+            );
+            return LowerError.TypeMismatch;
+        },
     };
 
     const ty_ptr = try l.allocator.create(ir.Type);
@@ -823,12 +885,127 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                 return result;
             } else {
                 // Variant not found in this enum
+                l.setErrorContext(
+                    LowerError.UndefinedVariable,
+                    "Unknown enum variant '{s}.{s}'",
+                    .{ object_name, field_name },
+                    .{ .line = 0, .column = 0 },
+                    "variant '{s}' does not exist in enum '{s}'",
+                    .{ field_name, object_name },
+                );
                 return LowerError.UndefinedVariable;
             }
         }
     }
 
-    // Not an enum access - proceed with regular member access
+    // Check if object is a call expression - can't get lvalue from call result
+    // Need to evaluate call first, store to temp, then access field
+    if (object_tag == .call or object_tag == .method_call) {
+        const object_val = try lowerExpression(l, object_idx);
+        // Object should be a struct - get its type
+        const struct_type = switch (object_val.ty) {
+            .@"struct" => |s| s,
+            .ptr => |p| switch (p.*) {
+                .@"struct" => |s| s,
+                else => {
+                    const loc = l.store.exprLoc(expr_idx);
+                    l.setErrorContext(
+                        LowerError.TypeMismatch,
+                        "cannot access field '{s}' on non-struct call result",
+                        .{field_name},
+                        .{ .line = loc.line, .column = loc.column },
+                        "call result is not a struct type",
+                        .{},
+                    );
+                    return LowerError.TypeMismatch;
+                },
+            },
+            else => {
+                const loc = l.store.exprLoc(expr_idx);
+                l.setErrorContext(
+                    LowerError.TypeMismatch,
+                    "cannot access field '{s}' on non-struct call result",
+                    .{field_name},
+                    .{ .line = loc.line, .column = loc.column },
+                    "call result is not a struct type",
+                    .{},
+                );
+                return LowerError.TypeMismatch;
+            },
+        };
+
+        // Find field in struct type
+        for (struct_type.fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, field_name)) {
+                // Create temp storage for the struct value
+                const struct_type_ptr = try l.allocator.create(ir.Type);
+                struct_type_ptr.* = .{ .@"struct" = struct_type };
+                try l.allocated_types.append(l.allocator, struct_type_ptr);
+
+                const temp_ptr = func.newValue(.{ .ptr = struct_type_ptr });
+                const temp_name = std.fmt.allocPrint(
+                    l.allocator,
+                    "__call_result${d}",
+                    .{temp_ptr.id},
+                ) catch return LowerError.OutOfMemory;
+
+                // Allocate temp storage
+                try l.emit(.{
+                    .alloca = .{
+                        .ty = .{ .@"struct" = struct_type },
+                        .name = temp_name,
+                        .result = temp_ptr,
+                    },
+                });
+
+                // Store call result to temp
+                try l.emit(.{
+                    .store = .{
+                        .ptr = temp_ptr,
+                        .value = object_val,
+                    },
+                });
+
+                // Get field pointer from temp
+                const field_type_ptr = try l.allocator.create(ir.Type);
+                field_type_ptr.* = field.ty;
+                try l.allocated_types.append(l.allocator, field_type_ptr);
+
+                const field_ptr = func.newValue(.{ .ptr = field_type_ptr });
+                try l.emit(.{
+                    .field_ptr = .{
+                        .struct_ptr = temp_ptr,
+                        .field_index = @intCast(i),
+                        .result = field_ptr,
+                    },
+                });
+
+                // Load field value
+                const result = func.newValue(field.ty);
+                try l.emit(.{
+                    .load = .{
+                        .ptr = field_ptr,
+                        .result = result,
+                    },
+                });
+                return result;
+            }
+        }
+
+        // Field not found
+        const loc = l.store.exprLoc(expr_idx);
+        l.setErrorContext(
+            LowerError.UndefinedVariable,
+            "struct '{s}' has no field '{s}'",
+            .{ struct_type.name, field_name },
+            .{ .line = loc.line, .column = loc.column },
+            "field not found in struct type",
+            .{},
+        );
+        return LowerError.UndefinedVariable;
+    }
+
+    // Not an enum or call access - proceed with regular member access via lvalue
     const ptr = try lowerMemberPtr(l, expr_idx);
     const result = func.newValue(ptr.ty);
     try l.emit(.{
@@ -852,7 +1029,9 @@ pub fn lowerIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError
     // Check if object is a map type - emit map_get instruction
     if (isMapType(object_val.ty)) {
         const key_val = try lowerExpression(l, index_idx);
-        const result = func.newValue(.string); // Map values are strings by default
+        // Get the value type from the map's type information
+        const value_type = getMapValueType(object_val.ty);
+        const result = func.newValue(value_type);
         try l.emit(.{
             .map_get = .{
                 .map = object_val,
@@ -977,10 +1156,44 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 // Default flags: case_sensitive=true, preserve_spaces=true
                 const flags: u8 = 0x03; // bit 0 = case_sensitive, bit 1 = preserve_spaces
 
-                const result = func.newValue(.{ .map = undefined });
+                // Create key/value types for the map (default to void, will be inferred at runtime)
+                const key_type_ptr = try l.allocator.create(ir.Type);
+                key_type_ptr.* = .void;
+                try l.allocated_types.append(l.allocator, key_type_ptr);
+
+                const value_type_ptr = try l.allocator.create(ir.Type);
+                value_type_ptr.* = .void;
+                try l.allocated_types.append(l.allocator, value_type_ptr);
+
+                const map_type = try l.allocator.create(ir.MapType);
+                map_type.* = .{ .key_type = key_type_ptr, .value_type = value_type_ptr };
+
+                const result = func.newValue(.{ .map = map_type });
                 try l.emit(.{
                     .map_new = .{
                         .flags = flags,
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            }
+
+            if (std.mem.eql(u8, object_name, "List") and std.mem.eql(u8, field_name, "new")) {
+                // List.new() - emit list_new instruction
+                // Need to get element type from context (type annotation) or default to void
+                // For now, we'll use a runtime-determined type (dynamic list)
+                const elem_type_ptr = try l.allocator.create(ir.Type);
+                elem_type_ptr.* = .void; // Will be determined at runtime or from annotation
+                try l.allocated_types.append(l.allocator, elem_type_ptr);
+
+                const list_type = try l.allocator.create(ir.ListType);
+                list_type.* = .{ .element_type = elem_type_ptr };
+
+                const result = func.newValue(.{ .list = list_type });
+                try l.emit(.{
+                    .list_new = .{
+                        .element_type = elem_type_ptr,
                         .result = result,
                         .loc = null,
                     },
@@ -1028,6 +1241,33 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 });
                 return result;
             }
+
+            // StructName.new() - create new struct instance
+            if (std.mem.eql(u8, field_name, "new")) {
+                if (l.struct_types.get(object_name)) |struct_type| {
+                    // Create a pointer to the struct type for the IR value
+                    const struct_type_ptr = try l.allocator.create(ir.Type);
+                    struct_type_ptr.* = .{ .@"struct" = struct_type };
+                    try l.allocated_types.append(l.allocator, struct_type_ptr);
+
+                    // Allocate stack space for struct
+                    const struct_ptr = func.newValue(.{ .ptr = struct_type_ptr });
+                    const unique_name = std.fmt.allocPrint(
+                        l.allocator,
+                        "{s}${d}",
+                        .{ object_name, struct_ptr.id },
+                    ) catch return LowerError.OutOfMemory;
+
+                    try l.emit(.{
+                        .alloca = .{
+                            .ty = .{ .@"struct" = struct_type },
+                            .name = unique_name,
+                            .result = struct_ptr,
+                        },
+                    });
+                    return struct_ptr;
+                }
+            }
         }
 
         // Check if this is a method call on a map instance: m.set(), m.get(), etc.
@@ -1054,7 +1294,8 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 });
                 return func.newValue(.void);
             } else if (std.mem.eql(u8, field_name, "get") and method_args.items.len >= 1) {
-                const result = func.newValue(.string);
+                const value_type = getMapValueType(object_val.ty);
+                const result = func.newValue(value_type);
                 try l.emit(.{
                     .map_get = .{
                         .map = object_val,
@@ -1122,6 +1363,87 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     },
                 });
                 return result;
+            }
+        }
+
+        // Check if this is a method call on a list instance: l.push(), l.get(), etc.
+        if (isListType(object_val.ty)) {
+            // Lower arguments
+            var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+            defer method_args.deinit(l.allocator);
+            for (0..args_count) |i| {
+                const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                const arg_val = try lowerExpression(l, arg_idx);
+                try method_args.append(l.allocator, arg_val);
+            }
+
+            // Get element type from list type for proper return types
+            const elem_type: ir.Type = if (object_val.ty == .list)
+                object_val.ty.list.element_type.*
+            else if (object_val.ty == .ptr and object_val.ty.ptr.* == .list)
+                object_val.ty.ptr.list.element_type.*
+            else
+                .void;
+
+            // Dispatch to appropriate list operation
+            if (std.mem.eql(u8, field_name, "push") and method_args.items.len >= 1) {
+                try l.emit(.{
+                    .list_push = .{
+                        .list = object_val,
+                        .value = method_args.items[0],
+                        .loc = null,
+                    },
+                });
+                return func.newValue(.void);
+            } else if (std.mem.eql(u8, field_name, "pop")) {
+                const result = func.newValue(elem_type);
+                try l.emit(.{
+                    .list_pop = .{
+                        .list = object_val,
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            } else if (std.mem.eql(u8, field_name, "get") and method_args.items.len >= 1) {
+                const result = func.newValue(elem_type);
+                try l.emit(.{
+                    .list_get = .{
+                        .list = object_val,
+                        .index = method_args.items[0],
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            } else if (std.mem.eql(u8, field_name, "set") and method_args.items.len >= 2) {
+                try l.emit(.{
+                    .list_set = .{
+                        .list = object_val,
+                        .index = method_args.items[0],
+                        .value = method_args.items[1],
+                        .loc = null,
+                    },
+                });
+                return func.newValue(.void);
+            } else if (std.mem.eql(u8, field_name, "len")) {
+                const result = func.newValue(.i64);
+                try l.emit(.{
+                    .list_len = .{
+                        .list = object_val,
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
+            } else if (std.mem.eql(u8, field_name, "clear")) {
+                try l.emit(.{
+                    .list_clear = .{
+                        .list = object_val,
+                        .loc = null,
+                    },
+                });
+                return func.newValue(.void);
             }
         }
 
@@ -1209,62 +1531,9 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     return LowerError.OutOfMemory;
                 };
 
-                // Check if the method's first parameter expects a pointer (self: *T)
-                const param_types = l.fn_param_types.get(qualified_method_name);
-                const first_param_is_ptr = if (param_types) |types| types.len > 0 and types[0] == .ptr else false;
-
-                // Get struct pointer using lowerLValue
-                const struct_lval = try lowerLValue(l, object_idx);
-
-                // Handle **struct -> *struct case
-                var struct_ptr = struct_lval;
-                if (struct_lval.ty == .ptr) {
-                    const pointee = struct_lval.ty.ptr.*;
-                    if (pointee == .ptr) {
-                        const inner = pointee.ptr.*;
-                        if (inner == .@"struct") {
-                            // Load once to get *struct
-                            const loaded = func.newValue(.{ .ptr = struct_lval.ty.ptr });
-                            try l.emit(.{
-                                .load = .{
-                                    .ptr = struct_lval,
-                                    .result = loaded,
-                                },
-                            });
-                            struct_ptr = loaded;
-                        }
-                    }
-                }
-
-                // Pass self argument by loading each struct field individually
-                // This is required because bytecode VM handles struct fields as separate slots
-                // Note: first_param_is_ptr check is now obsolete since lowerImplMethod converts
-                // pointer-to-struct params to value types with is_ref=true
-                _ = first_param_is_ptr;
-                for (struct_type.fields, 0..) |field, idx| {
-                    const field_ty_ptr = try l.allocator.create(ir.Type);
-                    field_ty_ptr.* = field.ty;
-                    try l.allocated_types.append(l.allocator, field_ty_ptr);
-
-                    const field_ptr_val = func.newValue(.{ .ptr = field_ty_ptr });
-                    try l.emit(.{
-                        .field_ptr = .{
-                            .struct_ptr = struct_ptr,
-                            .field_index = @intCast(idx),
-                            .result = field_ptr_val,
-                        },
-                    });
-
-                    const field_val = func.newValue(field.ty);
-                    try l.emit(.{
-                        .load = .{
-                            .ptr = field_ptr_val,
-                            .result = field_val,
-                        },
-                    });
-
-                    try method_args.append(l.allocator, field_val);
-                }
+                // Pass self as a single struct value (not expanded into fields)
+                // The function signature expects one parameter of struct type
+                try method_args.append(l.allocator, object_val);
 
                 // Then the explicit arguments
                 for (0..args_count) |i| {
@@ -1433,18 +1702,41 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         return result;
     }
 
+    // Check if this is a call to a generic function that needs instantiation
+    // We infer type arguments from the argument types
+    var actual_callee: []const u8 = callee_name;
+    if (l.generic_fn_defs.get(callee_name)) |generic_def| {
+        // Infer type arguments from argument types
+        // Simple 1:1 mapping: first N args determine first N type params
+        const type_param_count = generic_def.type_param_count;
+        if (args_slice.len >= type_param_count) {
+            var type_args: [16]ir.Type = undefined; // Max 16 type params
+            for (0..type_param_count) |i| {
+                type_args[i] = args_slice[i].ty;
+            }
+
+            // Instantiate the generic function
+            if (try l.instantiateGenericFn(callee_name, type_args[0..type_param_count])) |instantiated_name| {
+                // Free the original callee_name since we're using the instantiated one
+                l.allocator.free(callee_name);
+                actual_callee = instantiated_name;
+                debug.print(.ir, "Calling instantiated generic: {s}", .{actual_callee});
+            }
+        }
+    }
+
     // Determine result type:
     // 1. First check if this is a user-defined function with a known return type
     // 2. Otherwise fall back to builtin return type inference
-    const result_type: ir.Type = if (l.fn_return_types.get(callee_name)) |rt|
+    const result_type: ir.Type = if (l.fn_return_types.get(actual_callee)) |rt|
         rt
     else
-        getBuiltinReturnType(callee_name, args_slice);
+        getBuiltinReturnType(actual_callee, args_slice);
     const result = func.newValue(result_type);
 
     try l.emit(.{
         .call = .{
-            .callee = callee_name,
+            .callee = actual_callee,
             .args = args_slice,
             .result = result,
         },
@@ -1494,7 +1786,8 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             });
             return func.newValue(.void);
         } else if (std.mem.eql(u8, method_name_borrowed, "get") and method_args.items.len >= 1) {
-            const result = func.newValue(.string); // Map values are strings by default
+            const value_type = getMapValueType(object_val.ty);
+            const result = func.newValue(value_type);
             try l.emit(.{
                 .map_get = .{
                     .map = object_val,
@@ -1756,26 +2049,27 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const type_name_id: StringId = @enumFromInt(data.a);
     const type_name = l.strings.get(type_name_id);
     if (type_name.len == 0) {
-        std.debug.print("  Error: Empty type name in struct literal\n", .{});
+        l.setErrorContext(
+            LowerError.UndefinedType,
+            "Empty type name in struct literal",
+            .{},
+            .{ .line = 0, .column = 0 },
+            "struct literal must have a type name",
+            .{},
+        );
         return LowerError.UndefinedType;
     }
 
     // Look up struct type
     const struct_type = l.struct_types.get(type_name) orelse {
-        std.debug.print("  Error: Unknown struct type '{s}'\n", .{type_name});
-        std.debug.print("  Available types: ", .{});
-        var count: usize = 0;
-        var it = l.struct_types.keyIterator();
-        while (it.next()) |key| {
-            if (count > 0) std.debug.print(", ", .{});
-            std.debug.print("{s}", .{key.*});
-            count += 1;
-            if (count >= 10) {
-                std.debug.print("...", .{});
-                break;
-            }
-        }
-        std.debug.print("\n", .{});
+        l.setErrorContext(
+            LowerError.UndefinedType,
+            "Unknown struct type '{s}'",
+            .{type_name},
+            .{ .line = 0, .column = 0 },
+            "type '{s}' is not defined",
+            .{type_name},
+        );
         return LowerError.UndefinedType;
     };
 
@@ -1872,6 +2166,14 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
     const type_name_id: StringId = @enumFromInt(data.a);
     const type_name = l.strings.get(type_name_id);
     if (type_name.len == 0) {
+        l.setErrorContext(
+            LowerError.UndefinedType,
+            "Empty type name in generic struct literal",
+            .{},
+            .{ .line = 0, .column = 0 },
+            "generic struct literal must have a type name",
+            .{},
+        );
         return LowerError.UndefinedType;
     }
 
@@ -1890,7 +2192,14 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
 
     // Instantiate the generic struct
     const struct_type = try l.instantiateGenericStruct(type_name, type_args.items) orelse {
-        std.debug.print("  Error: Failed to instantiate generic struct '{s}'\n", .{type_name});
+        l.setErrorContext(
+            LowerError.UndefinedType,
+            "Failed to instantiate generic struct '{s}'",
+            .{type_name},
+            .{ .line = 0, .column = 0 },
+            "generic type '{s}' could not be instantiated with the given type arguments",
+            .{type_name},
+        );
         return LowerError.UndefinedType;
     };
 
@@ -2317,7 +2626,14 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
             const name_id: StringId = @enumFromInt(data.a);
             const name = l.strings.get(name_id);
             if (name.len == 0) {
-                std.debug.print("  Error: Empty named type reference\n", .{});
+                l.setErrorContext(
+                    LowerError.UndefinedType,
+                    "Empty type reference",
+                    .{},
+                    l.current_loc,
+                    "type reference has no name",
+                    .{},
+                );
                 return LowerError.UndefinedType;
             }
             if (l.struct_types.get(name)) |struct_type| {
@@ -2327,7 +2643,14 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
             if (l.enum_types.contains(name)) {
                 break :blk .i64;
             }
-            std.debug.print("  Error: Unknown type '{s}' (not a defined struct or enum)\n", .{name});
+            l.setErrorContext(
+                LowerError.UndefinedType,
+                "Unknown type '{s}'",
+                .{name},
+                l.current_loc,
+                "type '{s}' is not a defined struct or enum",
+                .{name},
+            );
             return LowerError.UndefinedType;
         },
         // Generic type parameter - look up in substitution map
@@ -2404,6 +2727,24 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
 
             break :blk .{ .map = map_type };
         },
+        // List type: List<T>
+        .list => blk: {
+            const elem_type_idx: TypeIdx = @enumFromInt(data.a);
+
+            const elem_type = try lowerTypeIdx(l, elem_type_idx);
+
+            const list_type = try l.allocator.create(ir.ListType);
+            const elem_ptr = try l.allocator.create(ir.Type);
+
+            elem_ptr.* = elem_type;
+            try l.allocated_types.append(l.allocator, elem_ptr);
+
+            list_type.* = .{
+                .element_type = elem_ptr,
+            };
+
+            break :blk .{ .list = list_type };
+        },
         .function => .void, // Function types are handled separately
         .@"union" => .void, // Union types are handled via union_def statement
         // These types don't have IR equivalents yet
@@ -2425,6 +2766,27 @@ pub fn isMapType(ty: ir.Type) bool {
     return switch (ty) {
         .map => true,
         .ptr => |p| p.* == .map,
+        else => false,
+    };
+}
+
+/// Get the value type from a map type (returns .string as fallback)
+pub fn getMapValueType(ty: ir.Type) ir.Type {
+    return switch (ty) {
+        .map => |m| m.value_type.*,
+        .ptr => |p| switch (p.*) {
+            .map => |m| m.value_type.*,
+            else => .string,
+        },
+        else => .string,
+    };
+}
+
+/// Check if a type is a list type (directly or through a pointer)
+pub fn isListType(ty: ir.Type) bool {
+    return switch (ty) {
+        .list => true,
+        .ptr => |p| p.* == .list,
         else => false,
     };
 }

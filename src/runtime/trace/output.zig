@@ -47,6 +47,10 @@ pub const Config = struct {
     /// Maximum line width for human format (0 = unlimited)
     max_width: u16 = 0,
 
+    /// Show raw value bits (useful for debugging NaN-boxing issues)
+    /// Enable this at --level=full to see raw 64-bit representations
+    show_raw_bits: bool = false,
+
     pub const Target = enum {
         stderr,
         stdout,
@@ -407,6 +411,47 @@ pub const Output = struct {
         }
     }
 
+    /// Format a return event with the actual return value (enhanced tracing)
+    pub fn writeReturnWithValue(self: *Self, routine: []const u8, has_value: bool, ip: u32, return_value: ?Value) void {
+        switch (self.config.format) {
+            .human => {
+                if (self.current_call_depth > 0) {
+                    self.current_call_depth -= 1;
+                }
+                self.indent();
+                self.color(Color.call);
+                self.write("<<< ", .{});
+                self.color(Color.reset);
+                self.write("return from ", .{});
+                self.colored(Color.routine, routine);
+                if (has_value) {
+                    if (return_value) |val| {
+                        self.write(" -> ", .{});
+                        self.color(Color.value);
+                        // Format return value using RegisterSnapshot
+                        const snapshot = RegisterSnapshot.fromValue(val);
+                        var buf: [64]u8 = undefined;
+                        const repr = snapshot.format(&buf);
+                        self.write("{s}", .{repr});
+                        self.color(Color.reset);
+                    } else {
+                        self.write(" (with value)", .{});
+                    }
+                }
+                self.write(" @ 0x{x:0>4}\n", .{ip});
+            },
+            .json => {
+                self.write(
+                    \\{{"event":"return","routine":"{s}","has_value":{s},"ip":{d}}}
+                , .{ routine, if (has_value) "true" else "false", ip });
+                self.newline();
+            },
+            .compact => {
+                self.write("RET:{s}\n", .{routine});
+            },
+        }
+    }
+
     /// Format an error event
     pub fn writeError(self: *Self, ip: u32, line: u32, err: anyerror, message: []const u8) void {
         switch (self.config.format) {
@@ -494,6 +539,8 @@ pub const Output = struct {
 
     /// Write register state with type information (verbose mode)
     /// Uses debugRepr to show values with their types
+    /// When show_raw_bits is enabled, also displays raw 64-bit representation
+    /// (useful for debugging NaN-boxing issues)
     pub fn writeRegisterSnapshots(self: *Self, regs: []const RegisterSnapshot) void {
         switch (self.config.format) {
             .human => {
@@ -516,6 +563,11 @@ pub const Output = struct {
                     var buf: [64]u8 = undefined;
                     const repr = reg.format(&buf);
                     self.write("{s}", .{repr});
+                    // Show raw bits for debugging NaN-boxing issues
+                    if (self.config.show_raw_bits) {
+                        self.color(Color.dim);
+                        self.write("[0x{x:0>16}]", .{reg.bits});
+                    }
                     self.color(Color.reset);
                 }
                 // If all registers were null, show that

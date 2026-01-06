@@ -1002,15 +1002,32 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
         if (var_type == .trait_object) {
             const trait_name = var_type.trait_object.trait_name;
 
+            // Get source location from init expression for error reporting
+            const init_loc = if (init_idx != .null) l.store.exprLoc(init_idx) else ast.SourceLoc{ .line = 0, .column = 0 };
+
             // Get the concrete type name from the value's type
             const type_name = getTypeName(val.ty) orelse {
-                debug.print(.ir, "Error: cannot create trait object from non-struct type", .{});
+                l.setErrorContext(
+                    LowerError.TypeMismatch,
+                    "cannot create trait object from non-struct type",
+                    .{},
+                    init_loc,
+                    "lowering variable declaration for '{s}'",
+                    .{name},
+                );
                 return LowerError.TypeMismatch;
             };
 
             // Verify the type implements the trait
             if (!l.implementsTrait(type_name, trait_name)) {
-                debug.print(.ir, "Error: type '{s}' does not implement trait '{s}'", .{ type_name, trait_name });
+                l.setErrorContext(
+                    LowerError.TypeMismatch,
+                    "type '{s}' does not implement trait '{s}'",
+                    .{ type_name, trait_name },
+                    init_loc,
+                    "lowering variable declaration for '{s}'",
+                    .{name},
+                );
                 return LowerError.TypeMismatch;
             }
 

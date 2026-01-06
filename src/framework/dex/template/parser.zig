@@ -11,14 +11,14 @@ const TokenType = lexer.TokenType;
 
 /// AST Node types
 pub const NodeType = enum {
-    element,      // HTML element: <div>...</div>
-    text,         // Plain text content
-    expression,   // Cot expression: {expr}
-    conditional,  // @if / @else
-    loop,         // @for item in items
-    component,    // <ComponentName ... />
-    raw,          // @raw {content} - unescaped HTML
-    fragment,     // Root container for multiple nodes
+    element, // HTML element: <div>...</div>
+    text, // Plain text content
+    expression, // Cot expression: {expr}
+    conditional, // @if / @else
+    loop, // @for item in items
+    component, // <ComponentName ... />
+    raw, // @raw {content} - unescaped HTML
+    fragment, // Root container for multiple nodes
 };
 
 /// Attribute on an element or component
@@ -35,7 +35,7 @@ pub const AttributeValue = union(enum) {
 
 /// Event binding (@click, @input, etc.)
 pub const EventBinding = struct {
-    event: []const u8,   // "click", "input", "submit"
+    event: []const u8, // "click", "input", "submit"
     handler: []const u8, // Handler name or expression
 };
 
@@ -324,8 +324,18 @@ pub const Parser = struct {
         if (self.peek().token_type == .attr_equals) {
             _ = self.advance(); // =
 
-            if (self.peek().token_type == .attr_value) {
+            const value_token = self.peek();
+            if (value_token.token_type == .attr_value) {
                 handler = self.advance().lexeme;
+            } else if (value_token.token_type == .expr_open) {
+                // Expression value: onClick={handler}
+                _ = self.advance(); // {
+                if (self.peek().token_type == .expr_content) {
+                    handler = self.advance().lexeme;
+                }
+                if (self.peek().token_type == .expr_close) {
+                    _ = self.advance(); // }
+                }
             }
         }
 

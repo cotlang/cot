@@ -756,6 +756,111 @@ pub const Disassembler = struct {
             },
 
             // ============================================
+            // List Operations
+            // ============================================
+
+            // list_new rd - [rd:4|0] [0]
+            .list_new => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                try self.writer.print(" r{}", .{rd});
+            },
+
+            // list_push list, val - [list:4|val:4] [0]
+            .list_push => {
+                const list_reg: u4 = @truncate(operands[0] >> 4);
+                const val_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}.push(r{})", .{ list_reg, val_reg });
+            },
+
+            // list_pop rd, list - [rd:4|list:4] [0]
+            .list_pop => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const list_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}.pop()", .{ rd, list_reg });
+            },
+
+            // list_get rd, list, idx - [rd:4|list:4] [idx:4|0]
+            .list_get => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const list_reg: u4 = @truncate(operands[0] & 0xF);
+                const idx_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}, r{}[r{}]", .{ rd, list_reg, idx_reg });
+            },
+
+            // list_set list, idx, val - [list:4|idx:4] [val:4|0]
+            .list_set => {
+                const list_reg: u4 = @truncate(operands[0] >> 4);
+                const idx_reg: u4 = @truncate(operands[0] & 0xF);
+                const val_reg: u4 = @truncate(operands[1] >> 4);
+                try self.writer.print(" r{}[r{}] = r{}", .{ list_reg, idx_reg, val_reg });
+            },
+
+            // list_len rd, list - [rd:4|list:4] [0]
+            .list_len => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const list_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}.len()", .{ rd, list_reg });
+            },
+
+            // list_clear list - [list:4|0] [0]
+            .list_clear => {
+                const list_reg: u4 = @truncate(operands[0] >> 4);
+                try self.writer.print(" r{}.clear()", .{list_reg});
+            },
+
+            // list_push_struct - [list:4|0] [field_count:8] [base_slot:16]
+            .list_push_struct => {
+                const list_reg: u4 = @truncate(operands[0] >> 4);
+                const field_count = operands[1];
+                const base_slot: u16 = @as(u16, operands[2]) | (@as(u16, operands[3]) << 8);
+                try self.writer.print(" r{}.push_struct(slot[{}..{}])", .{ list_reg, base_slot, base_slot + field_count });
+            },
+
+            // list_get_struct - [list:4|idx:4] [field_count:8] [base_reg:8] [0]
+            .list_get_struct => {
+                const list_reg: u4 = @truncate(operands[0] >> 4);
+                const idx_reg: u4 = @truncate(operands[0] & 0xF);
+                const field_count = operands[1];
+                const base_reg = operands[2];
+                try self.writer.print(" r{}..r{} = r{}[r{}]", .{ base_reg, base_reg + field_count - 1, list_reg, idx_reg });
+            },
+
+            // list_pop_struct - [list:4|0] [field_count:8] [dest_slot:16]
+            .list_pop_struct => {
+                const list_reg: u4 = @truncate(operands[0] >> 4);
+                const field_count = operands[1];
+                const dest_slot: u16 = @as(u16, operands[2]) | (@as(u16, operands[3]) << 8);
+                try self.writer.print(" slot[{}..{}] = r{}.pop_struct()", .{ dest_slot, dest_slot + field_count, list_reg });
+            },
+
+            // list_set_struct - [list:4|idx:4] [field_count:8] [base_slot:16]
+            .list_set_struct => {
+                const list_reg: u4 = @truncate(operands[0] >> 4);
+                const idx_reg: u4 = @truncate(operands[0] & 0xF);
+                const field_count = operands[1];
+                const base_slot: u16 = @as(u16, operands[2]) | (@as(u16, operands[3]) << 8);
+                try self.writer.print(" r{}[r{}] = slot[{}..{}]", .{ list_reg, idx_reg, base_slot, base_slot + field_count });
+            },
+
+            // map_set_struct - [map:4|key:4] [field_count:8] [base_slot:16]
+            .map_set_struct => {
+                const map_reg: u4 = @truncate(operands[0] >> 4);
+                const key_reg: u4 = @truncate(operands[0] & 0xF);
+                const field_count = operands[1];
+                const base_slot: u16 = @as(u16, operands[2]) | (@as(u16, operands[3]) << 8);
+                try self.writer.print(" r{}[r{}] = slot[{}..{}]", .{ map_reg, key_reg, base_slot, base_slot + field_count });
+            },
+
+            // map_get_struct - [map:4|key:4] [field_count:8] [base_reg:8] [0]
+            .map_get_struct => {
+                const map_reg: u4 = @truncate(operands[0] >> 4);
+                const key_reg: u4 = @truncate(operands[0] & 0xF);
+                const field_count = operands[1];
+                const base_reg = operands[2];
+                try self.writer.print(" r{}[r{}] -> r{}..r{}", .{ map_reg, key_reg, base_reg, base_reg + field_count - 1 });
+            },
+
+            // ============================================
             // Debug & Meta (0xF0-0xFF)
             // ============================================
 
@@ -886,6 +991,7 @@ pub const Disassembler = struct {
             .identifier => |s| try self.writer.print("id(\"{s}\")", .{s}),
             .record_ref => |r| try self.writer.print("record#{}", .{r}),
             .routine_ref => |r| try self.writer.print("routine#{}", .{r}),
+            .float => |v| try self.writer.print("float({})", .{v}),
         }
     }
 

@@ -49,8 +49,8 @@ const MimeTypes = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Static file serving options
 pub const StaticOptions = struct {
-    /// Root directory for static files
-    root: []const u8 = "public",
+    /// Root directory for static files (default: current directory)
+    root: []const u8 = ".",
     /// Index file name
     index: []const u8 = "index.html",
     /// Enable directory listing (default: false for security)
@@ -211,6 +211,17 @@ pub fn serve(options: StaticOptions) MiddlewareFn {
             // Remove leading slash
             if (path.len > 0 and path[0] == '/') {
                 path = path[1..];
+            }
+
+            // Skip empty paths (root) - let route handlers handle those
+            if (path.len == 0) {
+                return true;
+            }
+
+            // Skip paths without a file extension (likely routes, not static files)
+            // This prevents trying to serve directories as files
+            if (std.mem.indexOfScalar(u8, path, '.') == null) {
+                return true;
             }
 
             // Try to serve the file

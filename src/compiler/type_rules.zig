@@ -192,7 +192,7 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
 
         .ptr => |target_ptr| switch (value_deref) {
             .ptr => |value_ptr| blk: {
-                if (std.meta.eql(target_ptr.*, value_ptr.*)) {
+                if (typesEqual(target_ptr.*, value_ptr.*)) {
                     break :blk .compatible;
                 }
                 if (target_ptr.* == .void) {
@@ -205,14 +205,18 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
 
         .optional => |target_inner| switch (value_deref) {
             .optional => |value_inner| blk: {
-                if (std.meta.eql(target_inner.*, value_inner.*)) {
+                if (typesEqual(target_inner.*, value_inner.*)) {
                     break :blk .compatible;
+                }
+                // ?void (null literal) is coercible to any optional type
+                if (value_inner.* == .void) {
+                    break :blk .implicit_conversion;
                 }
                 break :blk .incompatible;
             },
             else => blk: {
                 // Non-optional can be assigned to optional
-                if (std.meta.eql(target_inner.*, value_deref)) {
+                if (typesEqual(target_inner.*, value_deref)) {
                     break :blk .implicit_conversion;
                 }
                 break :blk .incompatible;
@@ -223,17 +227,19 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
 
         .slice => |target_elem| switch (value_deref) {
             .slice => |value_elem| blk: {
-                if (std.meta.eql(target_elem.*, value_elem.*)) {
+                if (typesEqual(target_elem.*, value_elem.*)) {
                     break :blk .compatible;
                 }
                 break :blk .incompatible;
             },
             .array => |arr| blk: {
-                if (std.meta.eql(target_elem.*, arr.element.*)) {
+                if (typesEqual(target_elem.*, arr.element.*)) {
                     break :blk .implicit_conversion;
                 }
                 break :blk .incompatible;
             },
+            // void (empty array literal []) is coercible to any slice type
+            .void => .implicit_conversion,
             else => .incompatible,
         },
 
@@ -258,7 +264,37 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
         },
 
         .function => .incompatible,
-        .map => .incompatible, // Maps require explicit operations
+        .map => |target_map| switch (value_deref) {
+            .map => |value_map| blk: {
+                // Maps with same key and value types are compatible
+                if (typesEqual(target_map.key_type.*, value_map.key_type.*) and
+                    typesEqual(target_map.value_type.*, value_map.value_type.*))
+                {
+                    break :blk .compatible;
+                }
+                // Map<void, void> (from Map.new()) can be assigned to any map type
+                if (value_map.key_type.* == .void and value_map.value_type.* == .void) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            else => .incompatible,
+        },
+        .list => |target_list| switch (value_deref) {
+            .list => |value_list| blk: {
+                // Lists with same element types are compatible
+                if (typesEqual(target_list.element_type.*, value_list.element_type.*)) {
+                    break :blk .compatible;
+                }
+                // List<void> (from List.new()) can be assigned to any list type
+                // since it's an empty list that can be used for any element type
+                if (value_list.element_type.* == .void) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            else => .incompatible,
+        },
         .weak => |target_inner| switch (value_deref) {
             .weak => |value_inner| blk: {
                 if (std.meta.eql(target_inner.*, value_inner.*)) {
@@ -281,6 +317,39 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             },
             else => .incompatible,
         },
+    };
+}
+
+/// Check if two types are semantically equal (by name/structure, not pointer identity)
+pub fn typesEqual(a: Type, b: Type) bool {
+    const a_tag = @intFromEnum(std.meta.activeTag(a));
+    const b_tag = @intFromEnum(std.meta.activeTag(b));
+    if (a_tag != b_tag) return false;
+
+    return switch (a) {
+        .void, .bool, .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .isize, .usize, .f32, .f64, .string => true,
+        .implied_decimal => |ad| blk: {
+            const bd = b.implied_decimal;
+            break :blk ad.precision == bd.precision and ad.scale == bd.scale;
+        },
+        .fixed_decimal => |ad| blk: {
+            const bd = b.fixed_decimal;
+            break :blk ad.width == bd.width;
+        },
+        .ptr => |ap| typesEqual(ap.*, b.ptr.*),
+        .optional => |ao| typesEqual(ao.*, b.optional.*),
+        .array => |aa| blk: {
+            const ba = b.array;
+            break :blk aa.length == ba.length and typesEqual(aa.element.*, ba.element.*);
+        },
+        .slice => |as| typesEqual(as.*, b.slice.*),
+        .@"struct" => |as| std.mem.eql(u8, as.name, b.@"struct".name),
+        .@"union" => |au| std.mem.eql(u8, au.name, b.@"union".name),
+        .function => false, // Function types would need more complex comparison
+        .map => true, // Maps are structurally typed (compare key/value types if needed)
+        .list => |al| typesEqual(al.element_type.*, b.list.element_type.*),
+        .weak => |aw| typesEqual(aw.*, b.weak.*),
+        .trait_object => |at| std.mem.eql(u8, at.trait_name, b.trait_object.trait_name),
     };
 }
 
@@ -456,6 +525,7 @@ pub fn typeName(ty: Type) []const u8 {
         .@"union" => "union",
         .function => "function",
         .map => "Map",
+        .list => "List",
         .weak => "weak",
         .trait_object => "trait_object",
     };
@@ -502,6 +572,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         .@"union" => |u| writer.print("union({s})", .{u.name}) catch {},
         .function => writer.writeAll("function") catch {},
         .map => writer.writeAll("Map") catch {},
+        .list => |l| writer.print("List<{s}>", .{typeName(l.element_type.*)}) catch {},
         .weak => |w| {
             var inner_buf: [64]u8 = undefined;
             const inner = formatType(w.*, &inner_buf);

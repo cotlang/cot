@@ -86,6 +86,7 @@ pub const ConstantTag = enum(u8) {
     identifier = 0x05,
     record_ref = 0x06,
     routine_ref = 0x07,
+    float = 0x08, // f64 floating point
 };
 
 /// Constant pool value
@@ -97,6 +98,7 @@ pub const Constant = union(ConstantTag) {
     identifier: []const u8,
     record_ref: u16,
     routine_ref: u16,
+    float: f64,
 
     /// Serialize constant to writer
     pub fn serialize(self: Constant, writer: anytype) !void {
@@ -123,6 +125,10 @@ pub const Constant = union(ConstantTag) {
             },
             .record_ref => |r| try writer.writeInt(u16, r, .little),
             .routine_ref => |r| try writer.writeInt(u16, r, .little),
+            .float => |val| {
+                const bits: u64 = @bitCast(val);
+                try writer.writeInt(u64, bits, .little);
+            },
         }
     }
 
@@ -159,6 +165,10 @@ pub const Constant = union(ConstantTag) {
             },
             .record_ref => .{ .record_ref = try reader.readInt(u16, .little) },
             .routine_ref => .{ .routine_ref = try reader.readInt(u16, .little) },
+            .float => blk: {
+                const bits = try reader.readInt(u64, .little);
+                break :blk .{ .float = @bitCast(bits) };
+            },
         };
     }
 };
