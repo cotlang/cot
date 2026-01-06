@@ -62,6 +62,14 @@ pub const pubsub = struct {
     pub const Subscription = @import("pubsub.zig").Subscription;
 };
 
+// Presence tracking for real-time multi-user features
+pub const presence = struct {
+    pub const PresenceState = @import("presence.zig").PresenceState;
+    pub const Presence = @import("presence.zig").Presence;
+    pub const PresenceDiff = @import("presence.zig").PresenceDiff;
+    pub const Metadata = @import("presence.zig").Metadata;
+};
+
 // Component file parser (.dex files)
 pub const component_parser = struct {
     pub const ComponentLexer = @import("component_parser.zig").ComponentLexer;
@@ -166,6 +174,24 @@ pub const content = struct {
     pub const Highlighter = highlight.Highlighter;
     pub const TokenType = highlight.TokenType;
     pub const Language = highlight.Language;
+
+    // MDX parser (Markdown + Components)
+    pub const mdx = @import("content/mdx.zig");
+    pub const MdxParser = mdx.Parser;
+    pub const MdxOptions = mdx.Options;
+    pub const ComponentProps = mdx.ComponentProps;
+    pub const ComponentRegistry = mdx.ComponentRegistry;
+
+    // Content loader (file conventions and routing)
+    pub const loader = @import("content/loader.zig");
+    pub const ContentLoader = loader.Loader;
+    pub const ContentEntry = loader.ContentEntry;
+    pub const NavItem = loader.NavItem;
+
+    // Built-in documentation components
+    pub const doc_components = @import("content/components.zig");
+    pub const CalloutType = doc_components.CalloutType;
+    pub const createComponentRegistry = doc_components.createRegistry;
 };
 
 test {
@@ -176,6 +202,7 @@ test {
     _ = @import("diff.zig");
     _ = @import("socket.zig");
     _ = @import("pubsub.zig");
+    _ = @import("presence.zig");
     _ = @import("component_parser.zig");
     _ = @import("live_handler.zig");
     _ = @import("compiler.zig");
@@ -189,4 +216,7 @@ test {
     _ = @import("content/markdown.zig");
     _ = @import("content/frontmatter.zig");
     _ = @import("content/highlight.zig");
+    _ = @import("content/mdx.zig");
+    _ = @import("content/loader.zig");
+    _ = @import("content/components.zig");
 }

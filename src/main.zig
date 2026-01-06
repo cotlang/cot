@@ -1,5 +1,5 @@
 //! Cot - A modern programming language for business applications
-//! Business apps with ISAM database, TUI, and project framework
+//! Business apps with ISAM database and project framework
 //!
 //! Usage:
 //!   cot <file.cot>              Run a Cot program (interpreter)
@@ -482,7 +482,7 @@ fn printUsage() !void {
     // Header
     try stdout.writeAll(
         \\Cot - A modern systems language for business applications
-        \\ISAM database, TUI interfaces, and full-stack development
+        \\ISAM database and full-stack development
         \\
         \\Usage:
         \\  cot <file.cot>              Run a Cot program directly
@@ -848,17 +848,34 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
     };
     defer allocator.free(processed_stmts);
 
-    // Lower AST to IR
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
-        collector.addError(
-            .E300_undefined_label,
-            filename,
-            diagnostics.SourceRange.none,
-            "IR lowering error: {}",
-            .{err},
-        );
-        formatter.printToStderr(&collector, .{ .use_color = true });
-        return;
+    // Lower AST to IR using detailed error reporting
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                collector.addError(
+                    .E300_undefined_label,
+                    filename,
+                    diagnostics.SourceRange.fromLoc(detail.line, detail.column),
+                    "{s}",
+                    .{detail.message},
+                );
+                if (detail.context.len > 0) {
+                    try printStderr("  while {s}\n", .{detail.context});
+                }
+            } else {
+                collector.addError(
+                    .E300_undefined_label,
+                    filename,
+                    diagnostics.SourceRange.none,
+                    "IR lowering error: {}",
+                    .{e.kind},
+                );
+            }
+            formatter.printToStderr(&collector, .{ .use_color = true });
+            return;
+        },
     };
     defer ir_module.deinit();
 
@@ -2018,10 +2035,21 @@ fn dumpIR(backing_allocator: std.mem.Allocator, filename: []const u8) !void {
     };
     defer allocator.free(processed_stmts);
 
-    // Lower to IR using NodeStore directly
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
-        try printStderr("IR lowering error: {}\n", .{err});
-        return;
+    // Lower to IR using detailed error reporting
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                try printStderr("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                if (detail.context.len > 0) {
+                    try printStderr("  while {s}\n", .{detail.context});
+                }
+            } else {
+                try printStderr("IR lowering error: {}\n", .{e.kind});
+            }
+            return;
+        },
     };
 
     // Print IR
@@ -2104,10 +2132,21 @@ fn disasmFile(backing_allocator: std.mem.Allocator, filename: []const u8) !void 
         };
         defer allocator.free(processed_stmts);
 
-        // Lower to IR using NodeStore directly
-        const ir_module = cot.ir_lower.lower(allocator, &store, &strings, processed_stmts, filename) catch |err| {
-            try printStderr("IR lowering error: {}\n", .{err});
-            return;
+        // Lower to IR using detailed error reporting
+        const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+        const ir_module = switch (lower_result) {
+            .ok => |module| module,
+            .err => |e| {
+                if (e.detail) |detail| {
+                    try printStderr("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                    if (detail.context.len > 0) {
+                        try printStderr("  while {s}\n", .{detail.context});
+                    }
+                } else {
+                    try printStderr("IR lowering error: {}\n", .{e.kind});
+                }
+                return;
+            },
         };
 
         // Run optimization passes

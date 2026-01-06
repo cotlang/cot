@@ -637,10 +637,17 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
     }
 
     // Emit the actual return
-    // For struct returns, return_base_reg indicates first register of struct
-    // The caller knows how many registers based on the return type
+    // For struct returns with multiple fields, use 'ret' (no value) instead of 'ret_val'
+    // because ret_val copies rs -> r15 which would destroy the second field in r15.
+    // The struct fields are already in high registers and will survive the return.
     if (r != null) {
-        try e.emitRegRet(@intCast(return_base_reg));
+        if (return_field_count > 1) {
+            // Multi-field struct return: use ret (registers already set up)
+            try e.emitRegRet(null);
+        } else {
+            // Single value return: use ret_val
+            try e.emitRegRet(@intCast(return_base_reg));
+        }
     } else {
         try e.emitRegRet(null);
     }

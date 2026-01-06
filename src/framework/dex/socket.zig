@@ -8,13 +8,16 @@ const Allocator = std.mem.Allocator;
 const component = @import("component.zig");
 const diff = @import("diff.zig");
 const renderer = @import("template/renderer.zig");
+const presence = @import("presence.zig");
 
 /// Message types from client
 pub const ClientMessageType = enum {
-    join,      // Join a component
-    event,     // User interaction event
-    ping,      // Heartbeat
-    leave,     // Leave a component
+    join,             // Join a component
+    event,            // User interaction event
+    ping,             // Heartbeat
+    leave,            // Leave a component
+    presence_track,   // Track presence in topic
+    presence_untrack, // Untrack presence from topic
 };
 
 /// Parsed client message
@@ -27,12 +30,18 @@ pub const ClientMessage = struct {
     target_id: ?[]const u8,
     value: ?[]const u8,
     form_data: ?std.StringHashMapUnmanaged([]const u8),
+    // Presence fields
+    topic: ?[]const u8,
+    presence_key: ?[]const u8,
+    presence_meta: ?[]const u8, // JSON-encoded metadata
 };
 
 /// Socket session - represents a connected client
 pub const Session = struct {
     socket_id: u64,
     components: std.ArrayListUnmanaged(u64), // Component instance IDs
+    presence_topics: std.ArrayListUnmanaged([]const u8), // Topics this session tracks presence in
+    presence_key: ?[]const u8, // Unique key for this session's presence
     allocator: Allocator,
 
     const Self = @This();
@@ -41,16 +50,39 @@ pub const Session = struct {
         return .{
             .socket_id = socket_id,
             .components = .empty,
+            .presence_topics = .empty,
+            .presence_key = null,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.components.deinit(self.allocator);
+        self.presence_topics.deinit(self.allocator);
+        if (self.presence_key) |key| {
+            self.allocator.free(key);
+        }
     }
 
     pub fn addComponent(self: *Self, instance_id: u64) !void {
         try self.components.append(self.allocator, instance_id);
+    }
+
+    pub fn addPresenceTopic(self: *Self, topic: []const u8) !void {
+        // Check if already tracking
+        for (self.presence_topics.items) |t| {
+            if (std.mem.eql(u8, t, topic)) return;
+        }
+        try self.presence_topics.append(self.allocator, topic);
+    }
+
+    pub fn removePresenceTopic(self: *Self, topic: []const u8) void {
+        for (self.presence_topics.items, 0..) |t, i| {
+            if (std.mem.eql(u8, t, topic)) {
+                _ = self.presence_topics.swapRemove(i);
+                return;
+            }
+        }
     }
 };
 
@@ -58,6 +90,7 @@ pub const Session = struct {
 pub const Manager = struct {
     sessions: std.AutoHashMapUnmanaged(u64, Session),
     registry: *component.Registry,
+    presence_state: presence.PresenceState,
     allocator: Allocator,
     next_socket_id: u64,
 
@@ -67,6 +100,7 @@ pub const Manager = struct {
         return .{
             .sessions = .empty,
             .registry = registry,
+            .presence_state = presence.PresenceState.init(allocator),
             .allocator = allocator,
             .next_socket_id = 1,
         };
@@ -78,6 +112,7 @@ pub const Manager = struct {
             entry.value_ptr.deinit();
         }
         self.sessions.deinit(self.allocator);
+        self.presence_state.deinit();
     }
 
     /// Handle new WebSocket connection
@@ -95,8 +130,15 @@ pub const Manager = struct {
         // Clean up all components for this socket
         self.registry.cleanupSocket(socket_id);
 
-        // Remove session
+        // Clean up presence for this session
         if (self.sessions.getPtr(socket_id)) |session| {
+            if (session.presence_key) |key| {
+                // Untrack from all topics
+                for (session.presence_topics.items) |topic| {
+                    self.presence_state.untrack(topic, key);
+                }
+            }
+
             session.deinit();
             _ = self.sessions.remove(socket_id);
         }
@@ -111,6 +153,8 @@ pub const Manager = struct {
             .event => self.handleEvent(socket_id, msg),
             .ping => self.handlePing(msg),
             .leave => self.handleLeave(socket_id, msg),
+            .presence_track => self.handlePresenceTrack(socket_id, msg),
+            .presence_untrack => self.handlePresenceUntrack(socket_id, msg),
         };
     }
 
@@ -210,6 +254,69 @@ pub const Manager = struct {
 
         return try std.fmt.allocPrint(self.allocator, "{{\"ref\":{d},\"type\":\"left\"}}", .{msg.id});
     }
+
+    fn handlePresenceTrack(self: *Self, socket_id: u64, msg: ClientMessage) !?[]const u8 {
+        const topic = msg.topic orelse return null;
+        const key = msg.presence_key orelse {
+            // Generate key from socket_id if not provided
+            var buf: [32]u8 = undefined;
+            const generated = std.fmt.bufPrint(&buf, "socket_{d}", .{socket_id}) catch return null;
+
+            // Track presence
+            try self.presence_state.track(topic, generated, &.{});
+
+            // Update session
+            if (self.sessions.getPtr(socket_id)) |session| {
+                if (session.presence_key == null) {
+                    session.presence_key = try self.allocator.dupe(u8, generated);
+                }
+                try session.addPresenceTopic(topic);
+            }
+
+            return try std.fmt.allocPrint(self.allocator, "{{\"ref\":{d},\"type\":\"presence_tracked\",\"topic\":\"{s}\"}}", .{ msg.id, topic });
+        };
+
+        // Track presence with provided key
+        try self.presence_state.track(topic, key, &.{});
+
+        // Update session
+        if (self.sessions.getPtr(socket_id)) |session| {
+            if (session.presence_key == null) {
+                session.presence_key = try self.allocator.dupe(u8, key);
+            }
+            try session.addPresenceTopic(topic);
+        }
+
+        return try std.fmt.allocPrint(self.allocator, "{{\"ref\":{d},\"type\":\"presence_tracked\",\"topic\":\"{s}\"}}", .{ msg.id, topic });
+    }
+
+    fn handlePresenceUntrack(self: *Self, socket_id: u64, msg: ClientMessage) !?[]const u8 {
+        const topic = msg.topic orelse return null;
+
+        if (self.sessions.getPtr(socket_id)) |session| {
+            if (session.presence_key) |key| {
+                self.presence_state.untrack(topic, key);
+                session.removePresenceTopic(topic);
+            }
+        }
+
+        return try std.fmt.allocPrint(self.allocator, "{{\"ref\":{d},\"type\":\"presence_untracked\",\"topic\":\"{s}\"}}", .{ msg.id, topic });
+    }
+
+    /// Get pending presence diffs to broadcast
+    pub fn getPresenceDiffs(self: *Self) ![]presence.PresenceState.TopicDiff {
+        return self.presence_state.takeDiffs();
+    }
+
+    /// Check if there are pending presence diffs
+    pub fn hasPresenceDiffs(self: *const Self) bool {
+        return self.presence_state.hasPendingDiffs();
+    }
+
+    /// Get presence count for a topic
+    pub fn getPresenceCount(self: *const Self, topic: []const u8) usize {
+        return self.presence_state.count(topic);
+    }
 };
 
 /// Parse a client message from JSON
@@ -226,6 +333,9 @@ fn parseClientMessage(allocator: Allocator, raw: []const u8) !ClientMessage {
         .target_id = null,
         .value = null,
         .form_data = null,
+        .topic = null,
+        .presence_key = null,
+        .presence_meta = null,
     };
 
     // Extract message ID
@@ -251,6 +361,10 @@ fn parseClientMessage(allocator: Allocator, raw: []const u8) !ClientMessage {
                 msg.msg_type = .ping;
             } else if (std.mem.eql(u8, type_str, "leave")) {
                 msg.msg_type = .leave;
+            } else if (std.mem.eql(u8, type_str, "presence:track")) {
+                msg.msg_type = .presence_track;
+            } else if (std.mem.eql(u8, type_str, "presence:untrack")) {
+                msg.msg_type = .presence_untrack;
             }
         }
     }
@@ -276,6 +390,22 @@ fn parseClientMessage(allocator: Allocator, raw: []const u8) !ClientMessage {
         const start = pos + 9;
         if (std.mem.indexOfPos(u8, raw, start, "\"")) |end| {
             msg.value = raw[start..end];
+        }
+    }
+
+    // Extract topic (for presence)
+    if (std.mem.indexOf(u8, raw, "\"topic\":\"")) |pos| {
+        const start = pos + 9;
+        if (std.mem.indexOfPos(u8, raw, start, "\"")) |end| {
+            msg.topic = raw[start..end];
+        }
+    }
+
+    // Extract key (for presence)
+    if (std.mem.indexOf(u8, raw, "\"key\":\"")) |pos| {
+        const start = pos + 7;
+        if (std.mem.indexOfPos(u8, raw, start, "\"")) |end| {
+            msg.presence_key = raw[start..end];
         }
     }
 

@@ -123,19 +123,30 @@ pub const Parser = struct {
     allocator: Allocator,
     options: Options,
     output: std.ArrayListUnmanaged(u8),
+    /// Rendered components stored by index
+    component_outputs: std.ArrayListUnmanaged([]const u8),
 
     const Self = @This();
+
+    /// Placeholder marker for components (uses chars markdown won't escape)
+    const component_placeholder_prefix = "[[[MDXC:";
+    const component_placeholder_suffix = ":MDXC]]]";
 
     pub fn init(allocator: Allocator, options: Options) Self {
         return .{
             .allocator = allocator,
             .options = options,
             .output = .empty,
+            .component_outputs = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.output.deinit(self.allocator);
+        for (self.component_outputs.items) |html| {
+            self.allocator.free(html);
+        }
+        self.component_outputs.deinit(self.allocator);
     }
 
     /// Parse MDX source and return HTML
@@ -219,9 +230,13 @@ pub const Parser = struct {
         }
 
         // Parse the processed markdown
-        const html = try md_parser.parse(processed.items);
+        const html_with_placeholders = try md_parser.parse(processed.items);
 
-        // Copy TOC entries
+        // Replace placeholders with actual component HTML
+        const html = try self.replacePlaceholders(html_with_placeholders);
+        errdefer self.allocator.free(html);
+
+        // Copy TOC entries (note: these reference source strings, not owned)
         const toc = try self.allocator.alloc(markdown.TocEntry, md_parser.toc.items.len);
         @memcpy(toc, md_parser.toc.items);
 
@@ -231,6 +246,46 @@ pub const Parser = struct {
             .toc = toc,
             .code_blocks = &.{},
         };
+    }
+
+    /// Replace component placeholders with actual HTML
+    fn replacePlaceholders(self: *Self, html: []const u8) ![]const u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+
+        var pos: usize = 0;
+        while (pos < html.len) {
+            // Look for placeholder start
+            if (std.mem.indexOf(u8, html[pos..], component_placeholder_prefix)) |rel_start| {
+                const start = pos + rel_start;
+                // Copy everything before the placeholder
+                try result.appendSlice(self.allocator, html[pos..start]);
+
+                // Find placeholder end
+                const after_prefix = start + component_placeholder_prefix.len;
+                if (std.mem.indexOf(u8, html[after_prefix..], component_placeholder_suffix)) |rel_end| {
+                    const index_str = html[after_prefix .. after_prefix + rel_end];
+                    const index = std.fmt.parseInt(usize, index_str, 10) catch 0;
+
+                    // Insert component HTML
+                    if (index < self.component_outputs.items.len) {
+                        try result.appendSlice(self.allocator, self.component_outputs.items[index]);
+                    }
+
+                    pos = after_prefix + rel_end + component_placeholder_suffix.len;
+                } else {
+                    // Malformed placeholder, copy as-is
+                    try result.append(self.allocator, html[start]);
+                    pos = start + 1;
+                }
+            } else {
+                // No more placeholders, copy rest
+                try result.appendSlice(self.allocator, html[pos..]);
+                break;
+            }
+        }
+
+        return result.toOwnedSlice(self.allocator);
     }
 
     /// Check if line starts a component tag
@@ -265,56 +320,72 @@ pub const Parser = struct {
         return std.mem.startsWith(u8, trimmed, ">");
     }
 
-    /// Render a component to HTML
+    /// Render a component to HTML, storing it for later placeholder replacement
     fn renderComponent(self: *Self, output: *std.ArrayListUnmanaged(u8), component_src: []const u8) !void {
         // Parse the component
-        const props = try self.parseComponentTag(component_src);
+        var props = try self.parseComponentTag(component_src);
+        defer props.props.deinit();
+
+        // Build the component HTML
+        var component_html: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer component_html.deinit(self.allocator);
 
         // Check for custom renderer
         if (self.options.components) |registry| {
             if (registry.get(props.name)) |renderer| {
                 const html = try renderer(self.allocator, &props);
-                defer self.allocator.free(html);
-                try output.appendSlice(self.allocator, html);
-                return;
+                try component_html.appendSlice(self.allocator, html);
+                self.allocator.free(html);
             }
-        }
+        } else {
+            // Default: pass through as custom element (for client-side handling)
+            try component_html.appendSlice(self.allocator, "<div data-mdx-component=\"");
+            try component_html.appendSlice(self.allocator, props.name);
+            try component_html.appendSlice(self.allocator, "\"");
 
-        // Default: pass through as custom element (for client-side handling)
-        try output.appendSlice(self.allocator, "<div data-mdx-component=\"");
-        try output.appendSlice(self.allocator, props.name);
-        try output.appendSlice(self.allocator, "\"");
-
-        // Add props as data attributes
-        var it = props.props.iterator();
-        while (it.next()) |entry| {
-            try output.appendSlice(self.allocator, " data-");
-            try output.appendSlice(self.allocator, entry.key_ptr.*);
-            try output.appendSlice(self.allocator, "=\"");
-            switch (entry.value_ptr.*) {
-                .string => |s| try output.appendSlice(self.allocator, s),
-                .boolean => |b| try output.appendSlice(self.allocator, if (b) "true" else "false"),
-                .number => |n| {
-                    var buf: [32]u8 = undefined;
-                    const len = std.fmt.formatFloat(buf[0..], n, .{}) catch 0;
-                    try output.appendSlice(self.allocator, buf[0..len]);
-                },
-                else => {},
+            // Add props as data attributes
+            var it = props.props.iterator();
+            while (it.next()) |entry| {
+                try component_html.appendSlice(self.allocator, " data-");
+                try component_html.appendSlice(self.allocator, entry.key_ptr.*);
+                try component_html.appendSlice(self.allocator, "=\"");
+                switch (entry.value_ptr.*) {
+                    .string => |s| try component_html.appendSlice(self.allocator, s),
+                    .boolean => |b| try component_html.appendSlice(self.allocator, if (b) "true" else "false"),
+                    .number => |n| {
+                        var buf: [32]u8 = undefined;
+                        const fmt_result = std.fmt.bufPrint(&buf, "{d}", .{n}) catch "";
+                        try component_html.appendSlice(self.allocator, fmt_result);
+                    },
+                    else => {},
+                }
+                try component_html.appendSlice(self.allocator, "\"");
             }
-            try output.appendSlice(self.allocator, "\"");
+
+            try component_html.appendSlice(self.allocator, ">");
+
+            // Process children (may contain more markdown/mdx)
+            if (props.children.len > 0) {
+                var md_parser = markdown.Parser.init(self.allocator, self.options.markdown_options);
+                defer md_parser.deinit();
+                const children_html = try md_parser.parse(props.children);
+                try component_html.appendSlice(self.allocator, children_html);
+            }
+
+            try component_html.appendSlice(self.allocator, "</div>");
         }
 
-        try output.appendSlice(self.allocator, ">");
+        // Store the HTML and write a placeholder
+        const index = self.component_outputs.items.len;
+        try self.component_outputs.append(self.allocator, try component_html.toOwnedSlice(self.allocator));
 
-        // Process children (may contain more markdown/mdx)
-        if (props.children.len > 0) {
-            var md_parser = markdown.Parser.init(self.allocator, self.options.markdown_options);
-            defer md_parser.deinit();
-            const children_html = try md_parser.parse(props.children);
-            try output.appendSlice(self.allocator, children_html);
-        }
-
-        try output.appendSlice(self.allocator, "</div>\n");
+        // Write placeholder to output (will be replaced after markdown parsing)
+        try output.appendSlice(self.allocator, component_placeholder_prefix);
+        var idx_buf: [16]u8 = undefined;
+        const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{index}) catch "0";
+        try output.appendSlice(self.allocator, idx_str);
+        try output.appendSlice(self.allocator, component_placeholder_suffix);
+        try output.append(self.allocator, '\n');
     }
 
     /// Parse component tag into props
@@ -434,6 +505,7 @@ test "parse mdx with component" {
     var result = try parser.parse(source);
     defer result.frontmatter.deinit();
     defer allocator.free(result.toc);
+    defer allocator.free(result.html);
 
     try std.testing.expect(std.mem.indexOf(u8, result.html, "data-mdx-component=\"Callout\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.html, "data-type=\"warning\"") != null);
@@ -456,6 +528,7 @@ test "parse self-closing component" {
     var result = try parser.parse(source);
     defer result.frontmatter.deinit();
     defer allocator.free(result.toc);
+    defer allocator.free(result.html);
 
     try std.testing.expect(std.mem.indexOf(u8, result.html, "data-mdx-component=\"Divider\"") != null);
 }
@@ -466,7 +539,8 @@ test "parse component props" {
     var parser = Parser.init(allocator, .{});
     defer parser.deinit();
 
-    const props = try parser.parseComponentTag("<Button variant=\"primary\" disabled>\nClick me\n</Button>");
+    var props = try parser.parseComponentTag("<Button variant=\"primary\" disabled>\nClick me\n</Button>");
+    defer props.props.deinit();
 
     try std.testing.expectEqualStrings("Button", props.name);
     try std.testing.expectEqualStrings("primary", props.getString("variant").?);

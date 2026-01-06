@@ -138,7 +138,7 @@ pub const CrashContext = struct {
     active: bool = false,
 
     // Native code tracking - for crashes in native calls or external libraries
-    native_context: ?[]const u8 = null, // e.g., "Terminal.init" or "t_print"
+    native_context: ?[]const u8 = null, // e.g., "http_get" or "db_query"
     native_file: ?[]const u8 = null, // Source file where native call started
     native_line: u32 = 0, // Line where native call started
 

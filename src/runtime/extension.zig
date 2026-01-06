@@ -1,7 +1,7 @@
 //! Cot Extension Interface
 //!
 //! Extensions are optional modules that provide additional native functions to Cot programs.
-//! Examples: TUI (terminal UI), HTTP client, database drivers, etc.
+//! Examples: HTTP client, database drivers, etc.
 //!
 //! Extensions are linked at build time based on the "extensions" field in cot.json.
 //! This keeps the core runtime lean while allowing modular feature additions.
@@ -23,7 +23,7 @@ pub const NativeHandler = *const fn (*NativeContext) NativeError!?Value;
 
 /// Definition of a single native function provided by an extension
 pub const NativeDef = struct {
-    /// Name of the function (e.g., "t_init", "http_get")
+    /// Name of the function (e.g., "http_get", "db_connect")
     name: []const u8,
     /// Handler function
     handler: NativeHandler,
@@ -36,7 +36,7 @@ pub const NativeDef = struct {
 /// Extension definition
 /// Each extension package exports a const `extension` of this type.
 pub const Extension = struct {
-    /// Extension identifier (e.g., "tui", "http")
+    /// Extension identifier (e.g., "http", "postgres")
     name: []const u8,
     /// Semantic version string
     version: []const u8,

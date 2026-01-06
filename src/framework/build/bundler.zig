@@ -243,8 +243,22 @@ pub const Bundler = struct {
         defer parse.deinit();
         const top_level = try parse.parse();
 
-        // Lower to IR using NodeStore directly
-        const ir_module = try cot.ir_lower.lower(self.allocator, &store, &strings, top_level, source_path);
+        // Lower to IR using detailed error reporting
+        const lower_result = cot.ir_lower.lowerWithDetails(self.allocator, &store, &strings, top_level, source_path, .{});
+        const ir_module = switch (lower_result) {
+            .ok => |module| module,
+            .err => |e| {
+                if (e.detail) |detail| {
+                    std.debug.print("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                    if (detail.context.len > 0) {
+                        std.debug.print("  while {s}\n", .{detail.context});
+                    }
+                } else {
+                    std.debug.print("IR lowering error: {}\n", .{e.kind});
+                }
+                return e.kind;
+            },
+        };
         defer ir_module.deinit();
 
         // Type checking

@@ -224,10 +224,21 @@ pub fn compileToModule(allocator: std.mem.Allocator, source: []const u8, module_
         return error.ParseError;
     }
 
-    // Lower to IR directly using NodeStore
-    const ir_module = ir_lower.lower(allocator, &store, &strings, top_level, module_name) catch {
-        std.debug.print("IR lowering error\n", .{});
-        return error.LowerError;
+    // Lower to IR using detailed error reporting
+    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                std.debug.print("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                if (detail.context.len > 0) {
+                    std.debug.print("  while {s}\n", .{detail.context});
+                }
+            } else {
+                std.debug.print("IR lowering error: {}\n", .{e.kind});
+            }
+            return error.LowerError;
+        },
     };
     defer allocator.destroy(ir_module);
     defer ir_module.deinit();
@@ -272,8 +283,22 @@ pub fn lowerToIR(allocator: std.mem.Allocator, source: []const u8, module_name: 
         return error.ParseError;
     }
 
-    // Lower to IR directly using NodeStore
-    return ir_lower.lower(allocator, &store, &strings, top_level, module_name);
+    // Lower to IR using detailed error reporting
+    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{});
+    return switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                std.debug.print("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                if (detail.context.len > 0) {
+                    std.debug.print("  while {s}\n", .{detail.context});
+                }
+            } else {
+                std.debug.print("IR lowering error: {}\n", .{e.kind});
+            }
+            return e.kind;
+        },
+    };
 }
 
 test "library version" {

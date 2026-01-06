@@ -236,10 +236,21 @@ pub fn compileToIR(allocator: std.mem.Allocator, source: []const u8, module_name
         return error.ParseError;
     }
 
-    // Lower to IR - caller owns the returned module
-    return cot.ir_lower.lower(allocator, &store, &strings, top_level, module_name) catch |err| {
-        std.debug.print("IR lowering error: {}\n", .{err});
-        return error.LowerError;
+    // Lower to IR using detailed error reporting - caller owns the returned module
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{});
+    return switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                std.debug.print("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                if (detail.context.len > 0) {
+                    std.debug.print("  while {s}\n", .{detail.context});
+                }
+            } else {
+                std.debug.print("IR lowering error: {}\n", .{e.kind});
+            }
+            return error.LowerError;
+        },
     };
 }
 
@@ -304,40 +315,52 @@ pub fn compileToModuleWithPath(allocator: std.mem.Allocator, source: []const u8,
         return error.ParseError;
     }
 
-    // Lower to IR directly using NodeStore
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, module_name) catch |err| {
-        std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {}\n", .{err});
-        std.debug.print("\nDiagnostic info:\n", .{});
-
-        // Print context about what was being compiled
-        if (top_level.len > 0) {
-            std.debug.print("  Statements being compiled: {d}\n", .{top_level.len});
-            // Show first few statement types to help narrow down the issue
-            for (top_level[0..@min(5, top_level.len)], 0..) |stmt, i| {
-                const tag = store.stmt_tags.items[@intFromEnum(stmt)];
-                std.debug.print("    [{d}] {s}", .{ i, @tagName(tag) });
-                // Try to get statement name if it has one (fn_def, struct_def, etc)
-                if (tag == .fn_def or tag == .struct_def or tag == .enum_def or tag == .block) {
-                    const data = store.stmt_data.items[@intFromEnum(stmt)];
-                    const name_id: base.StringId = @enumFromInt(data.a);
-                    const name = strings.get(name_id);
-                    if (name.len > 0) {
-                        std.debug.print(" '{s}'", .{name});
-                    }
+    // Lower to IR using detailed error reporting
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            // Print the rich error details if available
+            if (e.detail) |detail| {
+                std.debug.print("\n\x1b[31m{d}:{d}: error:\x1b[0m {s}\n", .{ detail.line, detail.column, detail.message });
+                if (detail.context.len > 0) {
+                    std.debug.print("  while {s}\n", .{detail.context});
                 }
-                std.debug.print("\n", .{});
+            } else {
+                std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {}\n", .{e.kind});
             }
-        }
+            std.debug.print("\nDiagnostic info:\n", .{});
 
-        // Provide guidance based on error type
-        switch (err) {
-            error.UndefinedType => std.debug.print("\n\x1b[33mHint:\x1b[0m A type reference could not be resolved. Check struct/record names.\n", .{}),
-            error.UndefinedVariable => std.debug.print("\n\x1b[33mHint:\x1b[0m A variable is used before it's declared.\n", .{}),
-            error.TypeMismatch => std.debug.print("\n\x1b[33mHint:\x1b[0m Types don't match in an assignment or operation.\n", .{}),
-            else => {},
-        }
+            // Print context about what was being compiled
+            if (top_level.len > 0) {
+                std.debug.print("  Statements being compiled: {d}\n", .{top_level.len});
+                // Show first few statement types to help narrow down the issue
+                for (top_level[0..@min(5, top_level.len)], 0..) |stmt, i| {
+                    const tag = store.stmt_tags.items[@intFromEnum(stmt)];
+                    std.debug.print("    [{d}] {s}", .{ i, @tagName(tag) });
+                    // Try to get statement name if it has one (fn_def, struct_def, etc)
+                    if (tag == .fn_def or tag == .struct_def or tag == .enum_def or tag == .block) {
+                        const data = store.stmt_data.items[@intFromEnum(stmt)];
+                        const name_id: base.StringId = @enumFromInt(data.a);
+                        const name = strings.get(name_id);
+                        if (name.len > 0) {
+                            std.debug.print(" '{s}'", .{name});
+                        }
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
 
-        return error.LowerError;
+            // Provide guidance based on error type
+            switch (e.kind) {
+                error.UndefinedType => std.debug.print("\n\x1b[33mHint:\x1b[0m A type reference could not be resolved. Check struct/record names.\n", .{}),
+                error.UndefinedVariable => std.debug.print("\n\x1b[33mHint:\x1b[0m A variable is used before it's declared.\n", .{}),
+                error.TypeMismatch => std.debug.print("\n\x1b[33mHint:\x1b[0m Types don't match in an assignment or operation.\n", .{}),
+                else => {},
+            }
+
+            return error.LowerError;
+        },
     };
     defer allocator.destroy(ir_module);
     defer ir_module.deinit();
@@ -433,10 +456,21 @@ pub fn compileToModuleWithConfig(
         return error.ParseError;
     }
 
-    // Lower to IR directly using NodeStore
-    const ir_module = cot.ir_lower.lower(allocator, &store, &strings, top_level, module_name) catch |err| {
-        std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {}\n", .{err});
-        return error.LowerError;
+    // Lower to IR using detailed error reporting
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{});
+    const ir_module = switch (lower_result) {
+        .ok => |module| module,
+        .err => |e| {
+            if (e.detail) |detail| {
+                std.debug.print("\n\x1b[31m{d}:{d}: error:\x1b[0m {s}\n", .{ detail.line, detail.column, detail.message });
+                if (detail.context.len > 0) {
+                    std.debug.print("  while {s}\n", .{detail.context});
+                }
+            } else {
+                std.debug.print("\n\x1b[31mCompilation Error:\x1b[0m {}\n", .{e.kind});
+            }
+            return error.LowerError;
+        },
     };
     defer allocator.destroy(ir_module);
     defer ir_module.deinit();

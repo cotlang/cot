@@ -639,9 +639,17 @@ pub const Pipeline = struct {
         // Schema metadata is available via self.schema_metadata for table lookups
         _ = self.schema_metadata;
 
-        const ir_module = cot.ir_lower.lower(self.allocator, &store, &strings, top_level, source_path) catch |err| {
-            result.error_message = try std.fmt.allocPrint(self.allocator, "IR lowering error: {}", .{err});
-            return result;
+        const lower_result = cot.ir_lower.lowerWithDetails(self.allocator, &store, &strings, top_level, source_path, .{});
+        const ir_module = switch (lower_result) {
+            .ok => |module| module,
+            .err => |e| {
+                if (e.detail) |detail| {
+                    result.error_message = try std.fmt.allocPrint(self.allocator, "{d}:{d}: error: {s}", .{ detail.line, detail.column, detail.message });
+                } else {
+                    result.error_message = try std.fmt.allocPrint(self.allocator, "IR lowering error: {}", .{e.kind});
+                }
+                return result;
+            },
         };
         defer ir_module.deinit();
 

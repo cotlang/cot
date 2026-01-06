@@ -34,6 +34,7 @@ pub const http_server = @import("http_server.zig");
 pub const io_fs = @import("io_fs.zig");
 pub const io_crypto = @import("io_crypto.zig");
 pub const io_sql = @import("io_sql.zig");
+pub const io_terminal = @import("io_terminal.zig");
 // Note: symtable has moved to extensions/dbl/symtable.zig
 
 pub const Linker = linker.Linker;
@@ -211,6 +212,7 @@ pub const NativeRegistry = struct {
         try io_fs.register(self);
         try io_crypto.register(self);
         try io_sql.register(self);
+        try io_terminal.register(self);
         // Note: DBL channel-based functions are registered by the DBL extension
     }
 
