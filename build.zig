@@ -30,16 +30,12 @@ pub fn build(b: *std.Build) void {
             .optimize = config.optimize,
             .imports = &.{
                 .{ .name = "cot", .module = cot_mod },
-                .{ .name = "tui", .module = deps.tui },
                 .{ .name = "cotdb", .module = deps.cotdb },
                 .{ .name = "cot_runtime", .module = deps.cot_runtime },
                 .{ .name = "build_options", .module = deps.build_options },
             },
         }),
     });
-    if (deps.cot_tui) |tm| {
-        exe.root_module.addImport("cot_tui", tm);
-    }
     exe.linkSystemLibrary("sqlite3");
     exe.linkSystemLibrary("c");
     exe.step.dependOn(&gen_natives.step); // Codegen runs before compile
@@ -84,9 +80,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    if (deps.cot_tui) |tm| {
-        dbl_exe.root_module.addImport("cot_tui", tm);
-    }
     dbl_exe.linkSystemLibrary("sqlite3");
     dbl_exe.linkSystemLibrary("c");
 

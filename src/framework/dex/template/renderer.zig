@@ -115,7 +115,7 @@ pub const Renderer = struct {
         return self.output.items;
     }
 
-    fn renderNode(self: *Self, node: Node, ctx: *const Context) !void {
+    fn renderNode(self: *Self, node: Node, ctx: *const Context) Allocator.Error!void {
         switch (node.node_type) {
             .fragment => {
                 for (node.children) |child| {

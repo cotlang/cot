@@ -1433,8 +1433,13 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         return result;
     }
 
-    // Determine result type based on builtin function
-    const result_type = getBuiltinReturnType(callee_name, args_slice);
+    // Determine result type:
+    // 1. First check if this is a user-defined function with a known return type
+    // 2. Otherwise fall back to builtin return type inference
+    const result_type: ir.Type = if (l.fn_return_types.get(callee_name)) |rt|
+        rt
+    else
+        getBuiltinReturnType(callee_name, args_slice);
     const result = func.newValue(result_type);
 
     try l.emit(.{
@@ -2431,11 +2436,6 @@ pub fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
     // This includes all native functions AND opcode builtins (len, size, trim, atrim)
     if (native_types.getReturnType(name)) |ty| {
         return ty;
-    }
-
-    // Handle TUI functions (t_*) as void
-    if (std.mem.startsWith(u8, name, "t_")) {
-        return .void;
     }
 
     // Default: return type of first argument or void

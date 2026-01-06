@@ -17,7 +17,6 @@ const handles_mod = @import("../handles/handles.zig");
 // Re-export submodules
 pub const linker = @import("linker.zig");
 pub const stdlib = @import("stdlib.zig");
-pub const tui_runtime = @import("tui_runtime.zig");
 
 // Function category modules
 pub const math = @import("math.zig");
@@ -58,7 +57,6 @@ pub const NativeError = error{
     ReloadRequested,
     EndOfFile,
     RecordNotFound,
-    TuiError,
     AssertionFailed,
     ClosureCallFailed,
     NoVMContext,

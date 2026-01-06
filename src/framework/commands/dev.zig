@@ -9,10 +9,78 @@ const discovery = @import("../discovery.zig");
 const http_server = @import("../http/server.zig");
 const http_router = @import("../http/router.zig");
 const hotreload = @import("../http/hotreload.zig");
+const dex_handler = @import("../http/dex_handler.zig");
 const Allocator = std.mem.Allocator;
 
 // Import compiler for on-the-fly compilation
 const cot = @import("cot");
+
+// Dex page handler - renders pages/index.dex
+const DexPageHandler = struct {
+    fn handler(ctx: *http_server.Context) !void {
+        const alloc = ctx.allocator;
+        const dex = @import("../dex/dex.zig");
+
+        // Try to read pages/index.dex
+        const source = readFile(alloc, "pages/index.dex") catch {
+            try ctx.html("<!DOCTYPE html><html><body><h1>Page not found</h1></body></html>");
+            return;
+        };
+        defer alloc.free(source);
+
+        // Compile the component
+        var compiler = dex.compiler.Compiler.init(alloc);
+        var component = compiler.compileSource(source) catch |err| {
+            const error_html = std.fmt.allocPrint(alloc,
+                \\<!DOCTYPE html>
+                \\<html><body>
+                \\<h1>Error compiling page</h1>
+                \\<pre>{}</pre>
+                \\</body></html>
+            , .{err}) catch {
+                try ctx.html("<!DOCTYPE html><html><body><h1>Error compiling page</h1></body></html>");
+                return;
+            };
+            defer alloc.free(error_html);
+            try ctx.html(error_html);
+            return;
+        };
+        defer component.deinit();
+
+        // Create instance
+        var instance = component.createInstance() catch {
+            try ctx.html("<!DOCTYPE html><html><body><h1>Error creating component</h1></body></html>");
+            return;
+        };
+        defer instance.deinit();
+
+        // Render content
+        const content = instance.render() catch {
+            try ctx.html("<!DOCTYPE html><html><body><h1>Error rendering page</h1></body></html>");
+            return;
+        };
+        defer alloc.free(content);
+
+        // Wrap in document shell
+        const html = dex.document.render(alloc, content, .{
+            .title = component.name,
+            .hot_reload = true,
+            .hot_reload_port = 3000,
+        }) catch {
+            try ctx.html("<!DOCTYPE html><html><body><h1>Error generating document</h1></body></html>");
+            return;
+        };
+        defer alloc.free(html);
+
+        try ctx.html(html);
+    }
+
+    fn readFile(alloc: Allocator, path: []const u8) ![]const u8 {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+        return try file.readToEndAlloc(alloc, 1024 * 1024);
+    }
+};
 
 pub const DevOptions = struct {
     port: u16 = 3000,
@@ -105,45 +173,73 @@ pub fn run(allocator: Allocator, options: DevOptions) !void {
         try server.post(route.route, createApiHandler(allocator, route.path));
     }
 
-    // Add built-in routes
-    try server.get("/", struct {
-        fn handler(ctx: *http_server.Context) !void {
-            try ctx.html(
-                \\<!DOCTYPE html>
-                \\<html>
-                \\<head>
-                \\  <title>Cot Dev Server</title>
-                \\  <style>
-                \\    body { font-family: system-ui; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
-                \\    h1 { color: #2563eb; }
-                \\    h2 { color: #1e40af; margin-top: 2rem; }
-                \\    code { background: #f1f5f9; padding: 0.2rem 0.4rem; border-radius: 0.25rem; }
-                \\    .status { color: #16a34a; font-weight: 500; }
-                \\    .dex-section { background: #eff6ff; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; }
-                \\  </style>
-                \\</head>
-                \\<body>
-                \\  <h1>Cot Development Server</h1>
-                \\  <p>Your Cot workspace is running! <span class="status">Hot reload enabled.</span></p>
-                \\  <div class="dex-section">
-                \\    <h2>Dex Components</h2>
-                \\    <p>Create real-time UI components with <code>.dex</code> files:</p>
-                \\    <pre><code>cot gen dex Counter</code></pre>
-                \\    <p>Components in the <code>components/</code> directory will auto-reload on save.</p>
-                \\  </div>
-                \\  <h2>API Endpoints</h2>
-                \\  <p>Place <code>.cot</code> files in the <code>api/</code> directory to create endpoints.</p>
-                \\  <h2>Quick Links</h2>
-                \\  <ul>
-                \\    <li><a href="/api/health">Health Check</a></li>
-                \\    <li><a href="/api/version">Version Info</a></li>
-                \\  </ul>
-                ++ hotreload.client_script ++
-                \\</body>
-                \\</html>
-            );
+    // Check if pages directory exists for Dex pages
+    const pages_dir = blk: {
+        // Try each app's pages directory
+        for (ws.apps.items) |app| {
+            const pages_path = try std.fs.path.join(allocator, &.{ app.path, "pages" });
+            defer allocator.free(pages_path);
+            std.fs.cwd().access(pages_path, .{}) catch continue;
+            break :blk try allocator.dupe(u8, pages_path);
         }
-    }.handler);
+        // Default to workspace root pages
+        break :blk try allocator.dupe(u8, "pages");
+    };
+    defer allocator.free(pages_dir);
+
+    // Check if pages/index.dex exists
+    const index_dex_path = try std.fs.path.join(allocator, &.{ pages_dir, "index.dex" });
+    defer allocator.free(index_dex_path);
+    const has_index_page = blk: {
+        std.fs.cwd().access(index_dex_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (has_index_page) {
+        try stdout.print("  Pages: {s}\n", .{pages_dir});
+        // Use Dex page handler for homepage
+        try server.get("/", DexPageHandler.handler);
+    } else {
+        // Default welcome page when no pages/index.dex exists
+        try server.get("/", struct {
+            fn handler(ctx: *http_server.Context) !void {
+                try ctx.html(
+                    \\<!DOCTYPE html>
+                    \\<html>
+                    \\<head>
+                    \\  <title>Cot Dev Server</title>
+                    \\  <style>
+                    \\    body { font-family: system-ui; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+                    \\    h1 { color: #2563eb; }
+                    \\    h2 { color: #1e40af; margin-top: 2rem; }
+                    \\    code { background: #f1f5f9; padding: 0.2rem 0.4rem; border-radius: 0.25rem; }
+                    \\    .status { color: #16a34a; font-weight: 500; }
+                    \\    .dex-section { background: #eff6ff; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; }
+                    \\  </style>
+                    \\</head>
+                    \\<body>
+                    \\  <h1>Cot Development Server</h1>
+                    \\  <p>Your Cot workspace is running! <span class="status">Hot reload enabled.</span></p>
+                    \\  <div class="dex-section">
+                    \\    <h2>Dex Components</h2>
+                    \\    <p>Create real-time UI components with <code>.dex</code> files:</p>
+                    \\    <pre><code>cot gen dex Counter</code></pre>
+                    \\    <p>Create a page at <code>pages/index.dex</code> to replace this page.</p>
+                    \\  </div>
+                    \\  <h2>API Endpoints</h2>
+                    \\  <p>Place <code>.cot</code> files in the <code>api/</code> directory to create endpoints.</p>
+                    \\  <h2>Quick Links</h2>
+                    \\  <ul>
+                    \\    <li><a href="/api/health">Health Check</a></li>
+                    \\    <li><a href="/api/version">Version Info</a></li>
+                    \\  </ul>
+                    ++ hotreload.client_script ++
+                    \\</body>
+                    \\</html>
+                );
+            }
+        }.handler);
+    }
 
     // Use route group for API routes
     var api = server.group("/api");
@@ -199,6 +295,67 @@ fn createApiHandler(allocator: Allocator, cot_path: []const u8) http_server.Cont
     return struct {
         fn handler(ctx: *http_server.Context) !void {
             try ctx.json("{\"message\": \"API endpoint not yet implemented\"}");
+        }
+    }.handler;
+}
+
+/// Create a handler for Dex pages
+fn createDexPageHandler(allocator: Allocator, pages_dir: []const u8, port: u16) http_server.ContextHandlerFn {
+    _ = allocator;
+    _ = pages_dir;
+    _ = port;
+    // Simplified handler that loads and renders index.dex
+    return struct {
+        fn handler(ctx: *http_server.Context) !void {
+            const alloc = ctx.allocator;
+
+            // Try to read pages/index.dex
+            const source = readFile(alloc, "pages/index.dex") catch {
+                // Fallback to default page
+                try ctx.html("<!DOCTYPE html><html><body><h1>Page not found</h1></body></html>");
+                return;
+            };
+            defer alloc.free(source);
+
+            // Compile and render
+            const dex = @import("../dex/dex.zig");
+            var compiler = dex.compiler.Compiler.init(alloc);
+            var component = compiler.compileSource(source) catch {
+                try ctx.html("<!DOCTYPE html><html><body><h1>Error compiling page</h1></body></html>");
+                return;
+            };
+            defer component.deinit();
+
+            var instance = component.createInstance() catch {
+                try ctx.html("<!DOCTYPE html><html><body><h1>Error creating component</h1></body></html>");
+                return;
+            };
+            defer instance.deinit();
+
+            const content = instance.render() catch {
+                try ctx.html("<!DOCTYPE html><html><body><h1>Error rendering page</h1></body></html>");
+                return;
+            };
+            defer alloc.free(content);
+
+            // Wrap in document
+            const html = dex.document.render(alloc, content, .{
+                .title = component.name,
+                .hot_reload = true,
+                .hot_reload_port = 3000,
+            }) catch {
+                try ctx.html("<!DOCTYPE html><html><body><h1>Error generating document</h1></body></html>");
+                return;
+            };
+            defer alloc.free(html);
+
+            try ctx.html(html);
+        }
+
+        fn readFile(alloc: Allocator, path: []const u8) ![]const u8 {
+            const file = try std.fs.cwd().openFile(path, .{});
+            defer file.close();
+            return try file.readToEndAlloc(alloc, 1024 * 1024);
         }
     }.handler;
 }

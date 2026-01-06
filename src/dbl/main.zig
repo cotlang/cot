@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const cot = @import("cot");
-const cot_tui = @import("cot_tui");
 const cot_runtime = @import("cot_runtime");
 const dbl = @import("root.zig");
 
@@ -144,14 +143,9 @@ pub fn main() !void {
     const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
     defer allocator.free(source);
 
-    // Initialize extension registry and register TUI extension
+    // Initialize extension registry
     cot.extension.initRegistry(allocator);
     defer cot.extension.deinitRegistry();
-
-    // Register TUI extension for t_* native functions
-    cot.extension.registerExtension(cot_tui.extension) catch |err| {
-        std.debug.print("Warning: Could not register TUI extension: {}\n", .{err});
-    };
 
     const source_dir = std.fs.path.dirname(filename.?);
 

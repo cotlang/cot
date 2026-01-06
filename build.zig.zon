@@ -3,12 +3,7 @@
     .version = "0.1.0",
     .fingerprint = 0xdd6e26d5f00514,
     .minimum_zig_version = "0.15.2",
-    .dependencies = .{
-        .tui = .{
-            .url = "git+https://github.com/muhammad-fiaz/tui.zig.git#f3c2726b1245c9b849fb516d3198c492a7f9c583",
-            .hash = "tui-0.0.1-TMwxp-tWBgBwZqdkgqHn4c_YDJSUQhha2-OKOFBGYig3",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

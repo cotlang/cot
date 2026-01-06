@@ -60,6 +60,7 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
             .is_global = false,
         });
         try e.value_slots.put(a.result.id, base_slot);
+        debug.print(.emit, "alloca struct: name={s} result.id={d} base_slot={d}", .{ a.name, a.result.id, base_slot });
         // Allocate a slot for each field and register with qualified name
         for (struct_type.fields) |field| {
             const qualified_name = std.fmt.allocPrint(
@@ -209,31 +210,62 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
     }
 
     // Regular store
-    // Special case: storing a struct value into a pointer slot
-    // Store the struct's base slot index as a "pointer reference"
-    if (s.value.ty == .@"struct" or
-        (s.value.ty == .ptr and s.value.ty.ptr.* == .@"struct"))
-    {
+    // Check if this is a struct value being stored (either direct struct or pointer-to-struct)
+    const struct_type_opt: ?*const ir.StructType = if (s.value.ty == .@"struct")
+        s.value.ty.@"struct"
+    else if (s.value.ty == .ptr and s.value.ty.ptr.* == .@"struct")
+        s.value.ty.ptr.*.@"struct"
+    else
+        null;
+
+    if (struct_type_opt) |struct_type| {
+        const field_count = struct_type.fields.len;
+
+        // Check if source value has slots (from local struct)
         if (e.value_slots.get(s.value.id)) |value_slot| {
             if (e.value_slots.get(s.ptr.id)) |ptr_slot| {
-                // Store the base slot index as the pointer value
-                const base_slot = value_slot & 0x7FFF;
-                const const_idx = try e.addConstant(.{ .integer = @intCast(base_slot) });
-                try e.emitOpcode(.load_const);
-                try e.emitU8(0 << 4);
-                try e.emitU16(const_idx);
-                if (ptr_slot < 256) {
-                    try e.emitRegStoreLocal(0, @intCast(ptr_slot));
-                } else {
-                    e.setError(
-                        "Local variable storage exceeds 256-slot limit (slot {d})",
-                        .{ptr_slot},
-                        "DBL record buffers with large alpha fields may exceed this limit. Consider using smaller field sizes or fewer variables.",
-                        .{},
-                    );
-                    return EmitError.TooManyLocals;
+                // Struct-to-struct copy: copy all fields from source slots to dest slots
+                debug.print(.emit, "store struct: copying {d} fields from slot {d} to slot {d}", .{
+                    field_count, value_slot & 0x7FFF, ptr_slot & 0x7FFF,
+                });
+                const src_base = value_slot & 0x7FFF;
+                const dst_base = ptr_slot & 0x7FFF;
+                for (0..field_count) |field_idx| {
+                    const src_slot = src_base + field_idx;
+                    const dst_slot = dst_base + field_idx;
+                    // Load from source, store to dest
+                    try e.emitOpcode(.load_local);
+                    try e.emitU8(0 << 4); // r0
+                    try e.emitU8(@intCast(src_slot));
+                    try e.emitOpcode(.store_local);
+                    try e.emitU8(0 << 4); // r0
+                    try e.emitU8(@intCast(dst_slot));
                 }
                 return;
+            }
+        }
+
+        // Check if source is the last result from a call (struct returned in high registers)
+        if (e.last_result_value) |last_id| {
+            if (last_id == s.value.id) {
+                // This store is for a struct returned from a function call
+                // The struct fields are in consecutive high registers starting at last_result_reg
+                if (e.value_slots.get(s.ptr.id)) |ptr_slot| {
+                    const return_base_reg = e.last_result_reg;
+                    const dst_base = ptr_slot & 0x7FFF;
+                    debug.print(.emit, "store struct from call: {d} fields from r{d} to slot {d}", .{
+                        field_count, return_base_reg, dst_base,
+                    });
+                    for (0..field_count) |field_idx| {
+                        const src_reg: u8 = return_base_reg + @as(u8, @intCast(field_idx));
+                        const dst_slot = dst_base + field_idx;
+                        debug.print(.emit, "  store r{d} -> slot {d}", .{ src_reg, dst_slot });
+                        try e.emitOpcode(.store_local);
+                        try e.emitU8(src_reg << 4);
+                        try e.emitU8(@intCast(dst_slot));
+                    }
+                    return;
+                }
             }
         }
     }
@@ -513,10 +545,102 @@ pub fn emitBrif(e: *BytecodeEmitter, c: ir.Instruction.CondBranch) EmitError!voi
 }
 
 /// Emit return instruction
+/// For functions with is_ref parameters, we must copy modified values back to registers
+/// before returning, so the caller can write them back to the original slots.
+/// For struct returns, all fields are loaded into consecutive high registers (r14, r15 for 2-field, etc.)
 pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
+    // Determine how many registers the return value needs
+    // Struct returns use multiple high registers (e.g., r14, r15 for 2 fields)
+    var return_field_count: u8 = 0;
+    var return_base_reg: u8 = 15;
+
     if (r) |val| {
-        const src_reg = try e.getValueInReg(val, 0);
-        try e.emitRegRet(src_reg);
+        // Check for struct type OR pointer-to-struct type
+        // Struct literals have pointer-to-struct type (the address of the temporary struct)
+        const struct_type_opt: ?*const ir.StructType = if (val.ty == .@"struct")
+            val.ty.@"struct"
+        else if (val.ty == .ptr and val.ty.ptr.* == .@"struct")
+            val.ty.ptr.*.@"struct"
+        else
+            null;
+
+        debug.print(.emit, "emitReturn: val.id={d} val.ty={s} struct_type_opt={s} has_slot={}", .{
+            val.id,
+            @tagName(val.ty),
+            if (struct_type_opt != null) "yes" else "no",
+            e.value_slots.get(val.id) != null,
+        });
+
+        if (struct_type_opt) |struct_type| {
+            return_field_count = @intCast(struct_type.fields.len);
+            // Use high registers: for 2 fields use r14, r15; for 3 use r13, r14, r15, etc.
+            return_base_reg = 16 - return_field_count;
+
+            // Load ALL struct fields into consecutive high registers
+            if (e.value_slots.get(val.id)) |base_slot| {
+                debug.print(.emit, "emitReturn struct: field_count={d} base_slot={d} return_base_reg={d}", .{
+                    return_field_count, base_slot, return_base_reg,
+                });
+                for (0..return_field_count) |field_idx| {
+                    const slot = base_slot + field_idx;
+                    const reg: u8 = return_base_reg + @as(u8, @intCast(field_idx));
+                    debug.print(.emit, "  load slot {d} -> r{d}", .{ slot, reg });
+                    if (slot < 256) {
+                        try e.emitOpcode(.load_local);
+                        try e.emitU8(reg << 4);
+                        try e.emitU8(@intCast(slot));
+                    } else if (slot < 65536) {
+                        try e.emitOpcode(.load_local16);
+                        try e.emitU8(reg << 4);
+                        try e.emitU16(@intCast(slot));
+                    }
+                }
+            } else {
+                // Fallback: struct value not in slots, use single register
+                try e.emitValueToReg(val, 15);
+                return_field_count = 1;
+                return_base_reg = 15;
+            }
+        } else {
+            // Non-struct return: single value into r15
+            try e.emitValueToReg(val, 15);
+            return_field_count = 1;
+        }
+    }
+
+    // Now copy is_ref parameters back to registers for write-back
+    if (e.current_func) |func| {
+        var reg_offset: u8 = 0;
+        for (func.signature.params) |param| {
+            const slot_count: u8 = if (param.ty == .@"struct")
+                @intCast(param.ty.@"struct".fields.len)
+            else
+                1;
+
+            if (param.is_ref) {
+                // Get the local slot for this parameter
+                if (e.locals.get(param.name)) |local_info| {
+                    // Load all slots for this parameter back to registers
+                    for (0..slot_count) |field_idx| {
+                        const slot: u16 = @intCast(local_info.slot + field_idx);
+                        const reg: u8 = reg_offset + @as(u8, @intCast(field_idx));
+                        if (reg < 16) {
+                            try e.emitOpcode(.load_local);
+                            try e.emitU8(reg << 4);
+                            try e.emitU8(@intCast(slot));
+                        }
+                    }
+                }
+            }
+            reg_offset += slot_count;
+        }
+    }
+
+    // Emit the actual return
+    // For struct returns, return_base_reg indicates first register of struct
+    // The caller knows how many registers based on the return type
+    if (r != null) {
+        try e.emitRegRet(@intCast(return_base_reg));
     } else {
         try e.emitRegRet(null);
     }
@@ -628,41 +752,126 @@ fn emitNativeCall(e: *BytecodeEmitter, c: ir.Instruction.Call) EmitError!void {
 
 fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) EmitError!void {
     // Load arguments to registers
-    for (c.args, 0..) |arg, i| {
-        if (i < 8) {
-            try e.emitValueToReg(arg, @intCast(i));
-        }
-    }
+    // For struct arguments (including pointer-to-struct), we need to load ALL fields into consecutive registers
+    var reg_offset: u8 = 0;
+    for (c.args) |arg| {
+        // Check for struct type OR pointer-to-struct type
+        // When passing &obj, the argument type is *struct but we still need to expand the struct fields
+        const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
+            arg.ty.@"struct"
+        else if (arg.ty == .ptr and arg.ty.ptr.* == .@"struct")
+            arg.ty.ptr.*.@"struct"
+        else
+            null;
 
-    try e.emitOpcode(.call);
-    const argc: u8 = @intCast(c.args.len);
-    try e.emitU8(argc << 4);
-    try e.emitU16(routine_idx);
-
-    // Emit store-back for ref parameters
-    if (e.ir_module) |ir_mod| {
-        if (routine_idx < ir_mod.functions.items.len) {
-            const callee_func = ir_mod.functions.items[routine_idx];
-            for (callee_func.signature.params, 0..) |param, i| {
-                if (param.is_ref and i < c.args.len) {
-                    if (e.value_slots.get(c.args[i].id)) |slot| {
-                        if (slot <= 255) {
-                            try e.emitOpcode(.store_local);
-                            try e.emitU8(@intCast(i));
+        if (struct_type_opt) |struct_type| {
+            // Struct argument: load all fields from consecutive slots to consecutive registers
+            const field_count = struct_type.fields.len;
+            if (e.value_slots.get(arg.id)) |base_slot| {
+                for (0..field_count) |field_idx| {
+                    if (reg_offset < 16) {
+                        const slot = base_slot + field_idx;
+                        if (slot < 256) {
+                            try e.emitOpcode(.load_local);
+                            try e.emitU8(reg_offset << 4);
                             try e.emitU8(@intCast(slot));
-                        } else {
-                            try e.emitOpcode(.store_local16);
-                            try e.emitU8(@intCast(i));
-                            try e.emitU16(slot);
+                        } else if (slot < 65536) {
+                            try e.emitOpcode(.load_local16);
+                            try e.emitU8(reg_offset << 4);
+                            try e.emitU16(@intCast(slot));
                         }
+                        reg_offset += 1;
                     }
                 }
+            } else {
+                // No slot - maybe already in a register or constant, use fallback
+                if (reg_offset < 16) {
+                    try e.emitValueToReg(arg, @intCast(reg_offset));
+                }
+                reg_offset += @intCast(field_count);
+            }
+        } else {
+            // Non-struct argument: load single value to single register
+            if (reg_offset < 16) {
+                try e.emitValueToReg(arg, @intCast(reg_offset));
+                reg_offset += 1;
             }
         }
     }
 
+    try e.emitOpcode(.call);
+    // argc is the number of registers used, not the number of arguments
+    // (struct arguments expand to multiple registers)
+    try e.emitU8(reg_offset << 4);
+    try e.emitU16(routine_idx);
+
+    // Emit store-back for ref parameters
+    // For struct parameters, we need to write back ALL fields, not just the first slot
+    if (e.ir_module) |ir_mod| {
+        if (routine_idx < ir_mod.functions.items.len) {
+            const callee_func = ir_mod.functions.items[routine_idx];
+            var param_reg_offset: usize = 0; // Track which register each param starts at
+            for (callee_func.signature.params, 0..) |param, param_idx| {
+                // Determine how many slots/registers this parameter uses
+                const slot_count: usize = if (param.ty == .@"struct")
+                    param.ty.@"struct".fields.len
+                else
+                    1;
+
+                if (param.is_ref and param_idx < c.args.len) {
+                    if (e.value_slots.get(c.args[param_idx].id)) |base_slot| {
+                        // Write back all slots for this parameter
+                        for (0..slot_count) |field_idx| {
+                            const reg = param_reg_offset + field_idx;
+                            const slot = base_slot + field_idx;
+                            if (slot <= 255 and reg <= 255) {
+                                try e.emitOpcode(.store_local);
+                                // store_local format: [rs:4|0:4] slot - register in high nibble
+                                try e.emitU8(@as(u8, @intCast(reg)) << 4);
+                                try e.emitU8(@intCast(slot));
+                            } else if (slot <= 65535) {
+                                try e.emitOpcode(.store_local16);
+                                try e.emitU8(@as(u8, @intCast(reg)) << 4);
+                                try e.emitU16(@intCast(slot));
+                            }
+                        }
+                    }
+                }
+                param_reg_offset += slot_count;
+            }
+        }
+    }
+
+    // Handle return value
+    // For struct returns, the callee puts all fields into consecutive high registers
+    // (r14, r15 for 2-field struct, etc.) - we need to store them all to result slots
     if (c.result) |result| {
-        // Return value from user-defined functions is in r15 (set by ret_val)
+        if (e.ir_module) |ir_mod| {
+            if (routine_idx < ir_mod.functions.items.len) {
+                const callee_func = ir_mod.functions.items[routine_idx];
+                const return_type = callee_func.signature.return_type;
+
+                debug.print(.emit, "emitUserCall: callee={s} return_type={s} result.id={d} result_slot={?d}", .{
+                    c.callee,
+                    @tagName(return_type),
+                    result.id,
+                    e.value_slots.get(result.id),
+                });
+
+                if (return_type == .@"struct") {
+                    const field_count = return_type.@"struct".fields.len;
+                    const return_base_reg: u8 = 16 - @as(u8, @intCast(field_count));
+                    debug.print(.emit, "  struct return: field_count={d} return_base_reg={d}", .{ field_count, return_base_reg });
+
+                    // For struct returns, set last_result so the following store instruction
+                    // knows where to find the struct fields (in consecutive high registers)
+                    // The store instruction will handle copying all fields to the destination slots
+                    e.setLastResult(result.id, @intCast(return_base_reg));
+                    return;
+                }
+            }
+        }
+        // Non-struct return: value is in r15
         e.setLastResult(result.id, 15);
     }
 }

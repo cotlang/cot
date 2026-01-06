@@ -27,7 +27,7 @@
 
 const std = @import("std");
 
-// Cot Runtime - bytecode VM, native functions, TUI, ISAM backends
+// Cot Runtime - bytecode VM, native functions, ISAM backends
 const cot_runtime = @import("cot_runtime");
 
 // Base utilities
@@ -78,9 +78,6 @@ pub const native = cot_runtime.native;
 pub const cotdb = @import("cotdb");
 pub const isam = cotdb.isam;
 
-// TUI Framework (from cot_runtime)
-pub const tui = cot_runtime.tui;
-
 // Debug utilities (from cot_runtime)
 pub const debug = cot_runtime.debug;
 
@@ -95,14 +92,6 @@ pub const crash = cot_runtime.crash;
 
 // Extension system (from cot_runtime)
 pub const extension = cot_runtime.extension;
-
-// Build options for conditional compilation
-const build_options = @import("build_options");
-
-// TUI Extension (only when TUI is enabled)
-pub const cot_tui = if (build_options.enable_tui) @import("cot_tui") else struct {
-    pub const extension: ?cot_runtime.extension.Extension = null;
-};
 
 /// Library version
 pub const version = "0.1.0";
@@ -189,11 +178,6 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
     // Initialize extension registry
     extension.initRegistry(allocator);
     defer extension.deinitRegistry();
-
-    // Register TUI extension when available
-    if (comptime build_options.enable_tui) {
-        try extension.registerExtension(cot_tui.extension);
-    }
 
     // Compile to bytecode module
     var module = try compileToModule(allocator, source, "main");

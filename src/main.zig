@@ -692,11 +692,6 @@ fn runBytecodeFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     extension.initRegistry(allocator);
     defer extension.deinitRegistry();
 
-    // Register TUI extension when available
-    if (comptime build_options.enable_tui) {
-        extension.registerExtension(cot.cot_tui.extension) catch {};
-    }
-
     // Deserialize and run
     var fbs = std.io.fixedBufferStream(bytes);
     var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
@@ -960,11 +955,6 @@ fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: 
     // Initialize extension registry
     extension.initRegistry(allocator);
     defer extension.deinitRegistry();
-
-    // Register TUI extension when available
-    if (comptime build_options.enable_tui) {
-        extension.registerExtension(cot.cot_tui.extension) catch {};
-    }
 
     // Deserialize
     var fbs = std.io.fixedBufferStream(bytes);

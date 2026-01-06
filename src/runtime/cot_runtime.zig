@@ -40,9 +40,6 @@ pub const bytecode = struct {
 // Native functions
 pub const native = @import("native/native.zig");
 
-// TUI
-pub const tui = @import("tui/tui.zig");
-
 // ISAM backends - re-export from cotdb
 pub const sqlite_isam = @import("cotdb").sqlite_isam;
 

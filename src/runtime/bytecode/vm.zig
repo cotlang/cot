@@ -1795,20 +1795,6 @@ pub const VM = struct {
                             return;
                         }
                     }
-                    // TUI errors include rich context - display it
-                    if (err == native.NativeError.TuiError) {
-                        std.debug.print("[TUI ERROR] NATIVE {s} failed\n", .{routine_name});
-                        if (native.tui_runtime.getLastError()) |tui_err| {
-                            std.debug.print("  Operation: {s}\n", .{tui_err.operation});
-                            if (tui_err.file.len > 0) {
-                                std.debug.print("  Location: {s}:{d}\n", .{ tui_err.file, tui_err.line });
-                            }
-                            if (tui_err.detail.len > 0) {
-                                std.debug.print("  Detail: {s}\n", .{tui_err.detail});
-                            }
-                        }
-                        return VMError.InvalidOpcode;
-                    }
                     std.debug.print("NATIVE {s} failed: {}\n", .{ routine_name, err });
                     return VMError.InvalidOpcode;
                 };

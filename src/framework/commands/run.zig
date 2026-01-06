@@ -10,13 +10,11 @@ const Allocator = std.mem.Allocator;
 // Import cot module for runtime/compiler components
 const cot = @import("cot");
 const debug = cot.debug;
-const build_options = @import("build_options");
 
 pub const RunCommandOptions = struct {
     target: ?[]const u8 = null,
     filter: ?[]const u8 = null, // --filter=<project> like Turborepo
     show_help: bool = false,
-    dev_mode: bool = false, // --dev flag for split-pane dev tools
 
     /// Get effective target (filter takes precedence)
     pub fn getTarget(self: RunCommandOptions) ?[]const u8 {
@@ -137,7 +135,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
 
         // Run the first app's main
         const first_app = &ws.apps.items[0];
-        try runProjectMain(allocator, first_app, &ws, stdout, options.dev_mode);
+        try runProjectMain(allocator, first_app, &ws, stdout);
         return;
     }
 
@@ -161,7 +159,7 @@ pub fn run(allocator: Allocator, options: RunCommandOptions) !void {
         try runComponent(allocator, project, comp_type, target.component_name, stdout);
     } else {
         debug.print(.general, "Running project main...", .{});
-        try runProjectMain(allocator, project, &ws, stdout, options.dev_mode);
+        try runProjectMain(allocator, project, &ws, stdout);
     }
     debug.print(.general, "Run completed", .{});
 }
@@ -199,7 +197,7 @@ fn parseTarget(spec: []const u8) !RunTarget {
 }
 
 /// Run the main entry point of a project with its dependencies
-fn runProjectMain(allocator: Allocator, project: *const workspace.Project, ws: *const workspace.Workspace, writer: anytype, dev_mode: bool) !void {
+fn runProjectMain(allocator: Allocator, project: *const workspace.Project, ws: *const workspace.Workspace, writer: anytype) !void {
     debug.print(.general, "runProjectMain for: {s}", .{project.name});
     // Find compiled main bytecode - try workspace .cot-out/ directory
     // Dev mode: .cot-out/.cache/<name>/<name>.cotc
@@ -314,7 +312,7 @@ fn runProjectMain(allocator: Allocator, project: *const workspace.Project, ws: *
     try writer.print("─────────────────────\n", .{});
     try writer.flush();
 
-    try runBytecodeFileWithDeps(allocator, bytecode_path, ws, project, writer, dev_mode);
+    try runBytecodeFileWithDeps(allocator, bytecode_path, ws, project, writer);
 }
 
 /// Run a specific component
@@ -409,11 +407,6 @@ fn runRegularBytecode(allocator: Allocator, bytes: []const u8) !void {
     extension.initRegistry(allocator);
     defer extension.deinitRegistry();
 
-    // Register TUI extension when available
-    if (comptime build_options.enable_tui) {
-        extension.registerExtension(cot.cot_tui.extension) catch {};
-    }
-
     // Deserialize module
     var fbs = std.io.fixedBufferStream(bytes);
     var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
@@ -434,17 +427,15 @@ fn runRegularBytecode(allocator: Allocator, bytes: []const u8) !void {
 }
 
 /// Run bytecode with dependencies loaded
-/// In dev mode, supports hot-reloading when the bytecode file changes
 fn runBytecodeFileWithDeps(
     allocator: Allocator,
     main_path: []const u8,
     ws: *const workspace.Workspace,
     project: *const workspace.Project,
     writer: anytype,
-    dev_mode: bool,
 ) !void {
     _ = writer;
-    debug.print(.general, ">>> runBytecodeFileWithDeps: main_path={s} dev_mode={}", .{ main_path, dev_mode });
+    debug.print(.general, ">>> runBytecodeFileWithDeps: main_path={s}", .{main_path});
 
     // Convert paths to absolute BEFORE changing directory
     const abs_main_path = try std.fs.cwd().realpathAlloc(allocator, main_path);
@@ -453,19 +444,13 @@ fn runBytecodeFileWithDeps(
     const abs_project_path = try std.fs.cwd().realpathAlloc(allocator, project.path);
     defer allocator.free(abs_project_path);
 
-    const tui_runtime = cot.native.tui_runtime;
     const extension = cot.extension;
 
     // Initialize extension registry for this run
     extension.initRegistry(allocator);
     defer extension.deinitRegistry();
 
-    // Register TUI extension when available
-    if (comptime build_options.enable_tui) {
-        extension.registerExtension(cot.cot_tui.extension) catch {};
-    }
-
-    // Load dependency packages (we do this once, before the reload loop)
+    // Load dependency packages
     var dep_modules = std.ArrayListUnmanaged([]const u8){};
     defer {
         for (dep_modules.items) |path| allocator.free(path);
@@ -489,10 +474,6 @@ fn runBytecodeFileWithDeps(
                 const dep_type_subdir = if (dep_project.config.project_type == .library) "packages" else "apps";
 
                 // Try .cot-out/ locations first, then legacy locations
-                // 1. .cot-out/.cache/<name>/ (dev cache)
-                // 2. .cot-out/packages/<name>/ or .cot-out/apps/<name>/ (release)
-                // 3. Legacy: {project.path}/.cot-cache/
-                // 4. Legacy: {project.path}/{output_dir}/
                 const cache_path = try std.fs.path.join(allocator, &.{ ws.root_path, ".cot-out", ".cache", dep_name });
                 defer allocator.free(cache_path);
                 const release_path = try std.fs.path.join(allocator, &.{ ws.root_path, ".cot-out", dep_type_subdir, dep_name });
@@ -542,281 +523,123 @@ fn runBytecodeFileWithDeps(
     debug.print(.general, "Changing to project directory: {s}", .{abs_project_path});
     try std.posix.chdir(abs_project_path);
 
-    // Hot-reload loop - in dev mode, we restart the app when bytecode changes
-    var reload_count: u32 = 0;
-    while (true) {
-        // Create fresh VM for each run
-        var vm = cot.bytecode.VM.init(allocator);
-        defer vm.deinit();
+    // Create VM
+    var vm = cot.bytecode.VM.init(allocator);
+    defer vm.deinit();
 
-        // Load dependency modules into VM
-        for (dep_modules.items) |module_path| {
-            debug.print(.general, "Loading module: {s}", .{module_path});
-            vm.native_registry.loadModule(module_path) catch |err| {
-                debug.print(.general, "Warning: Could not load module {s}: {}", .{ module_path, err });
-            };
-        }
-
-        // Read and deserialize main module (use absolute path since we changed directory)
-        const file = std.fs.cwd().openFile(abs_main_path, .{}) catch |err| {
-            std.debug.print("Error: Could not open bytecode file: {}\n", .{err});
-            return error.FileNotFound;
+    // Load dependency modules into VM
+    for (dep_modules.items) |module_path| {
+        debug.print(.general, "Loading module: {s}", .{module_path});
+        vm.native_registry.loadModule(module_path) catch |err| {
+            debug.print(.general, "Warning: Could not load module {s}: {}", .{ module_path, err });
         };
+    }
 
-        const bytes = file.readToEndAlloc(allocator, 1024 * 1024 * 100) catch |err| {
-            file.close();
-            std.debug.print("Error reading bytecode: {}\n", .{err});
-            return error.FileNotFound;
-        };
+    // Read and deserialize main module (use absolute path since we changed directory)
+    const file = std.fs.cwd().openFile(abs_main_path, .{}) catch |err| {
+        std.debug.print("Error: Could not open bytecode file: {}\n", .{err});
+        return error.FileNotFound;
+    };
+
+    const bytes = file.readToEndAlloc(allocator, 1024 * 1024 * 100) catch |err| {
         file.close();
-        defer allocator.free(bytes);
+        std.debug.print("Error reading bytecode: {}\n", .{err});
+        return error.FileNotFound;
+    };
+    file.close();
+    defer allocator.free(bytes);
 
-        // Check for bundle format (CBUNDLE magic header)
-        const is_bundle = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "CBUNDLE\x00");
-        debug.print(.general, "is_bundle: {}", .{is_bundle});
+    // Check for bundle format (CBUNDLE magic header)
+    const is_bundle = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "CBUNDLE\x00");
+    debug.print(.general, "is_bundle: {}", .{is_bundle});
 
-        // In dev mode, set up file watching and dev mode for hot-reload
-        if (dev_mode) {
-            // Set pending dev mode (applied when TUI init is called)
-            // Must be set each iteration since t_init clears it
-            tui_runtime.setPendingDevMode(true);
-            // Set pending watch file (applied when TUI init is called)
-            tui_runtime.setPendingWatchFile(abs_main_path);
-            // Also set directly if TUI is already initialized (for reloads)
-            if (tui_runtime.isInitialized()) {
-                tui_runtime.setWatchFile(abs_main_path);
-                tui_runtime.setDevMode(true);
-            }
-            if (reload_count > 0) {
-                tui_runtime.devLog(">>> App reloaded!");
+    if (is_bundle) {
+        // Extract main module from bundle and run it
+        const module_count = std.mem.readInt(u32, bytes[9..13], .little);
+        debug.print(.general, "Bundle has {d} modules", .{module_count});
+
+        // Find main module (type 0) in entries
+        var main_offset: ?u32 = null;
+        var main_size: ?u32 = null;
+        for (0..module_count) |i| {
+            const entry_start = 13 + (i * 9);
+            const offset = std.mem.readInt(u32, bytes[entry_start..][0..4], .little);
+            const size = std.mem.readInt(u32, bytes[entry_start + 4 ..][0..4], .little);
+            const mod_type = bytes[entry_start + 8];
+            if (mod_type == 0) { // Main module
+                main_offset = offset;
+                main_size = size;
+                break;
             }
         }
 
-        var execution_error: ?anyerror = null;
-        var error_ip: u32 = 0;
-        var error_routine_buf: [128]u8 = undefined;
-        var error_routine: ?[]const u8 = null;
-        var error_callstack: [][]const u8 = &[_][]const u8{};
-        // Rich error info captured from VM.getLastError() before module freed
-        var error_source_line: u32 = 0;
-        var error_message_buf: [256]u8 = undefined;
-        var error_message: ?[]const u8 = null;
-        var error_opcode: ?cot.bytecode.Opcode = null;
+        if (main_offset == null) {
+            std.debug.print("Error: No main module in bundle\n", .{});
+            return error.InvalidBytecode;
+        }
 
-        if (is_bundle) {
-            // Extract main module from bundle and run it
-            // Bundle format: header(8) + version(1) + module_count(4) + entries(9 each) + modules
-            const module_count = std.mem.readInt(u32, bytes[9..13], .little);
-            debug.print(.general, "Bundle has {d} modules", .{module_count});
+        const main_bytes = bytes[main_offset.? .. main_offset.? + main_size.?];
+        var fbs = std.io.fixedBufferStream(main_bytes);
+        var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
+            std.debug.print("Error: Invalid bytecode format in bundle: {}\n", .{err});
+            return error.InvalidBytecode;
+        };
+        defer mod.deinit();
 
-            // Find main module (type 0) in entries
-            var main_offset: ?u32 = null;
-            var main_size: ?u32 = null;
-            for (0..module_count) |i| {
-                const entry_start = 13 + (i * 9);
-                const offset = std.mem.readInt(u32, bytes[entry_start..][0..4], .little);
-                const size = std.mem.readInt(u32, bytes[entry_start + 4 ..][0..4], .little);
-                const mod_type = bytes[entry_start + 8];
-                if (mod_type == 0) { // Main module
-                    main_offset = offset;
-                    main_size = size;
-                    break;
-                }
-            }
+        // Execute
+        vm.execute(&mod) catch |err| {
+            printRuntimeError(allocator, &vm, err);
+            return err;
+        };
+    } else {
+        var fbs = std.io.fixedBufferStream(bytes);
+        var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
+            debug.print(.general, "Invalid bytecode format: {}", .{err});
+            return error.InvalidBytecode;
+        };
+        defer mod.deinit();
 
-            if (main_offset == null) {
-                std.debug.print("Error: No main module in bundle\n", .{});
-                return error.InvalidBytecode;
-            }
+        // Execute
+        vm.execute(&mod) catch |err| {
+            printRuntimeError(allocator, &vm, err);
+            return err;
+        };
+    }
+}
 
-            const main_bytes = bytes[main_offset.? .. main_offset.? + main_size.?];
-            var fbs = std.io.fixedBufferStream(main_bytes);
-            var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
-                std.debug.print("Error: Invalid bytecode format in bundle: {}\n", .{err});
-                return error.InvalidBytecode;
-            };
-            defer mod.deinit();
+/// Print runtime error with location and callstack
+fn printRuntimeError(allocator: Allocator, vm: *cot.bytecode.VM, err: anyerror) void {
+    const loc = vm.getLocation();
+    const callstack = vm.getCallstack(allocator) catch &[_][]const u8{};
+    defer {
+        for (callstack) |entry_item| allocator.free(entry_item);
+        allocator.free(callstack);
+    }
 
-            // Execute
-            vm.execute(&mod) catch |err| {
-                execution_error = err;
-                // Capture location BEFORE mod is freed by defer
-                // Must copy routine name since it points into module memory
-                const loc = vm.getLocation();
-                error_ip = loc.ip;
-                if (loc.routine) |r| {
-                    const len = @min(r.len, error_routine_buf.len);
-                    @memcpy(error_routine_buf[0..len], r[0..len]);
-                    error_routine = error_routine_buf[0..len];
-                }
-                error_callstack = vm.getCallstack(allocator) catch &[_][]const u8{};
-                // Capture rich error info before module is freed
-                if (cot.bytecode.VM.getLastError()) |rich_err| {
-                    error_source_line = rich_err.source_line;
-                    error_opcode = rich_err.opcode;
-                    const msg_len = @min(rich_err.message.len, error_message_buf.len);
-                    @memcpy(error_message_buf[0..msg_len], rich_err.message[0..msg_len]);
-                    error_message = error_message_buf[0..msg_len];
-                }
-            };
+    std.debug.print("\n=== Runtime Error ===\n", .{});
+    std.debug.print("Error: {}\n", .{err});
+
+    if (cot.bytecode.VM.getLastError()) |rich_err| {
+        std.debug.print("Message: {s}\n", .{rich_err.message});
+        const routine_name = loc.routine orelse "unknown";
+        if (rich_err.source_line > 0) {
+            std.debug.print("At: {s} line {d} (IP: 0x{x:0>4})\n", .{ routine_name, rich_err.source_line, loc.ip });
         } else {
-            var fbs = std.io.fixedBufferStream(bytes);
-            var mod = cot.bytecode.Module.deserialize(allocator, fbs.reader()) catch |err| {
-                debug.print(.general, "Invalid bytecode format: {}", .{err});
-                return error.InvalidBytecode;
-            };
-            defer mod.deinit();
-
-            // Execute
-            vm.execute(&mod) catch |err| {
-                execution_error = err;
-                // Capture location BEFORE mod is freed by defer
-                // Must copy routine name since it points into module memory
-                const loc = vm.getLocation();
-                error_ip = loc.ip;
-                if (loc.routine) |r| {
-                    const len = @min(r.len, error_routine_buf.len);
-                    @memcpy(error_routine_buf[0..len], r[0..len]);
-                    error_routine = error_routine_buf[0..len];
-                }
-                error_callstack = vm.getCallstack(allocator) catch &[_][]const u8{};
-                // Capture rich error info before module is freed
-                if (cot.bytecode.VM.getLastError()) |rich_err| {
-                    error_source_line = rich_err.source_line;
-                    error_opcode = rich_err.opcode;
-                    const msg_len = @min(rich_err.message.len, error_message_buf.len);
-                    @memcpy(error_message_buf[0..msg_len], rich_err.message[0..msg_len]);
-                    error_message = error_message_buf[0..msg_len];
-                }
-            };
+            std.debug.print("At: {s} (IP: 0x{x:0>4})\n", .{ routine_name, loc.ip });
         }
-
-        // Handle execution error
-        if (execution_error) |err| {
-            // Check for hot-reload request (Ctrl+R in dev mode)
-            // This is not an error - it's a signal to reload the app
-            if (err == cot.bytecode.vm.VMError.ReloadRequested) {
-                if (dev_mode) {
-                    // Note: devLog was already called in pollKey when Ctrl+R was detected
-                    // Clean up TUI state before reloading (since we aborted mid-execution)
-                    tui_runtime.clearReloadPending();
-                    tui_runtime.clearWatchFile();
-                    tui_runtime.deinit();
-                    reload_count += 1;
-                    continue;
-                }
-            }
-
-            // Use pre-captured callstack (captured before mod was freed)
-            const callstack = error_callstack;
-            defer {
-                for (callstack) |entry_item| allocator.free(entry_item);
-                allocator.free(callstack);
-            }
-
-            // In dev mode, show error in dev console and wait for reload
-            if (dev_mode and tui_runtime.isInitialized()) {
-                // Use captured error info (captured before module freed)
-                var msg_buf: [256]u8 = undefined;
-                const routine_name = error_routine orelse "unknown";
-                if (error_source_line > 0) {
-                    const error_msg = std.fmt.bufPrint(&msg_buf, "Error: {} at {s} line {d}", .{ err, routine_name, error_source_line }) catch "Runtime error";
-                    tui_runtime.devLog(error_msg);
-                } else {
-                    const error_msg = std.fmt.bufPrint(&msg_buf, "Error: {} at {s}", .{ err, routine_name }) catch "Runtime error";
-                    tui_runtime.devLog(error_msg);
-                }
-                if (error_message) |msg| {
-                    var msg_buf2: [256]u8 = undefined;
-                    const detail_msg = std.fmt.bufPrint(&msg_buf2, "  {s}", .{msg}) catch "";
-                    tui_runtime.devLog(detail_msg);
-                }
-                tui_runtime.devLog("Fix the error and rebuild to reload...");
-                tui_runtime.devLog("Press Q or Ctrl+C to quit");
-
-                // Wait for reload or quit
-                while (!tui_runtime.isReloadPending()) {
-                    std.Thread.sleep(100 * std.time.ns_per_ms);
-                    // Check file periodically even without key presses
-                    tui_runtime.pollWatchedFile();
-                    // Also check for quit keys
-                    if (tui_runtime.pollKey()) |key| {
-                        // Q, q, Escape, or Ctrl+C to quit
-                        const should_quit = switch (key) {
-                            .char => |c| c == 'q' or c == 'Q' or c == 3, // q, Q, Ctrl+C
-                            .escape => true,
-                            else => false,
-                        };
-                        if (should_quit) {
-                            tui_runtime.deinit();
-                            return err;
-                        }
-                    }
-                }
-            } else if (tui_runtime.isInitialized()) {
-                // Display error with TUI - exit TUI first for clean output
-                tui_runtime.deinit();
-
-                // Now print to stderr cleanly
-                std.debug.print("\n\x1b[1;31m=== Runtime Error ===\x1b[0m\n", .{});
-                std.debug.print("Error: {}\n", .{err});
-                if (error_message) |msg| {
-                    std.debug.print("Message: {s}\n", .{msg});
-                }
-                const routine_name = error_routine orelse "unknown";
-                if (error_source_line > 0) {
-                    std.debug.print("At: {s} line {d} (IP: 0x{x:0>4})\n", .{ routine_name, error_source_line, error_ip });
-                } else {
-                    std.debug.print("At: {s} (IP: 0x{x:0>4})\n", .{ routine_name, error_ip });
-                }
-                if (error_opcode) |op| {
-                    std.debug.print("Opcode: {s}\n", .{@tagName(op)});
-                }
-                if (callstack.len > 0) {
-                    std.debug.print("\nCall Stack:\n", .{});
-                    for (callstack) |entry_item| {
-                        std.debug.print("  {s}\n", .{entry_item});
-                    }
-                }
-                return err;
-            } else {
-                // Fallback to stderr - use captured error info
-                std.debug.print("\n=== Runtime Error ===\n", .{});
-                std.debug.print("Error: {}\n", .{err});
-                if (error_message) |msg| {
-                    std.debug.print("Message: {s}\n", .{msg});
-                }
-                const routine_name = error_routine orelse "unknown";
-                if (error_source_line > 0) {
-                    std.debug.print("At: {s} line {d} (IP: 0x{x:0>4})\n", .{ routine_name, error_source_line, error_ip });
-                } else {
-                    std.debug.print("At: {s} (IP: 0x{x:0>4})\n", .{ routine_name, error_ip });
-                }
-                if (error_opcode) |op| {
-                    std.debug.print("Opcode: {s}\n", .{@tagName(op)});
-                }
-                if (callstack.len > 0) {
-                    std.debug.print("\nCall Stack:\n", .{});
-                    for (callstack) |entry_item| {
-                        std.debug.print("  {s}\n", .{entry_item});
-                    }
-                }
-                return err;
-            }
+        if (rich_err.opcode) |op| {
+            std.debug.print("Opcode: {s}\n", .{@tagName(op)});
         }
+    } else {
+        const routine_name = loc.routine orelse "unknown";
+        std.debug.print("At: {s} (IP: 0x{x:0>4})\n", .{ routine_name, loc.ip });
+    }
 
-        // Check if we should reload (dev mode only)
-        if (dev_mode and tui_runtime.isReloadPending()) {
-            tui_runtime.clearReloadPending();
-            tui_runtime.clearWatchFile();
-            reload_count += 1;
-            tui_runtime.devLog(">>> Reloading app...");
-            // Continue to next iteration of the reload loop
-            continue;
+    if (callstack.len > 0) {
+        std.debug.print("\nCall Stack:\n", .{});
+        for (callstack) |entry_item| {
+            std.debug.print("  {s}\n", .{entry_item});
         }
-
-        // Normal exit - break out of reload loop
-        break;
     }
 }
 
@@ -896,8 +719,6 @@ pub fn parseArgs(args: []const []const u8) RunCommandOptions {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             options.show_help = true;
-        } else if (std.mem.eql(u8, arg, "--dev") or std.mem.eql(u8, arg, "-d")) {
-            options.dev_mode = true;
         } else if (std.mem.startsWith(u8, arg, "--filter=")) {
             // Turborepo-style --filter=<project>
             options.filter = arg[9..];
@@ -940,14 +761,12 @@ pub fn printHelp() !void {
         \\  inventory:report:sales        Run a report
         \\
         \\Options:
-        \\  -d, --dev         Enable dev mode (split-pane with dev console)
         \\  -f, --filter=X    Run only project X (Turborepo-style)
         \\  -h, --help        Show this help
         \\
         \\Examples:
         \\  cot run                       Run default app
         \\  cot run inventory             Run inventory app main
-        \\  cot run --dev                 Run with dev tools pane
         \\  cot run --filter=inventory    Run with Turborepo-style filter
         \\
         \\Note: Projects must be compiled first with 'cot build'

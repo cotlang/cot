@@ -145,6 +145,10 @@ pub const Lowerer = struct {
     /// Used for type coercion during call lowering (e.g., struct to trait object)
     fn_param_types: std.StringHashMap([]const ir.Type),
 
+    /// Function return types (function name -> return type)
+    /// Used to determine call expression result types for user-defined functions
+    fn_return_types: std.StringHashMap(ir.Type),
+
     /// Trait definitions (trait name -> TraitDef)
     trait_defs: std.StringHashMap(TraitDef),
 
@@ -268,6 +272,7 @@ pub const Lowerer = struct {
             .closure_env_value = null,
             .fn_param_defaults = std.StringHashMap([]const u32).init(allocator),
             .fn_param_types = std.StringHashMap([]const ir.Type).init(allocator),
+            .fn_return_types = std.StringHashMap(ir.Type).init(allocator),
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
             .impl_methods = ImplMethodsMap.init(allocator),
             .comptime_evaluator = comptime_eval.Evaluator.init(allocator, store, strings),
@@ -369,6 +374,7 @@ pub const Lowerer = struct {
             self.allocator.free(defaults.*);
         }
         self.fn_param_defaults.deinit();
+        self.fn_return_types.deinit();
 
         // NOTE: allocated_types ownership was transferred to the Module in lowerProgram.
         // No cleanup needed here.
@@ -1134,6 +1140,11 @@ pub const Lowerer = struct {
             const types_slice = param_types.toOwnedSlice(self.allocator) catch return LowerError.OutOfMemory;
             self.fn_param_types.put(name, types_slice) catch return LowerError.OutOfMemory;
         }
+
+        // Extract and store return type
+        const return_type_idx: ast.TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx]);
+        const return_type = self.lowerTypeIdx(return_type_idx) catch return LowerError.OutOfMemory;
+        self.fn_return_types.put(name, return_type) catch return LowerError.OutOfMemory;
     }
 
     /// Check if a type implements a trait
@@ -1953,8 +1964,7 @@ fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
         std.mem.eql(u8, name, "clear") or
         std.mem.eql(u8, name, "sleep") or
         std.mem.eql(u8, name, "exit") or
-        std.mem.eql(u8, name, "close") or
-        std.mem.startsWith(u8, name, "t_")) // TUI functions
+        std.mem.eql(u8, name, "close"))
     {
         return .void;
     }

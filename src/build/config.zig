@@ -9,7 +9,7 @@
 //!
 //! Usage in source files (via build_options):
 //!   const build_options = @import("build_options");
-//!   if (build_options.enable_tui) { ... }
+//!   if (build_options.enable_profiling) { ... }
 
 const std = @import("std");
 
@@ -20,7 +20,6 @@ pub const Config = struct {
     optimize: std.builtin.OptimizeMode,
 
     /// Feature flags
-    enable_tui: bool,
     enable_profiling: bool,
     enable_jit_profiling: bool,
     enable_postgres: bool,
@@ -39,12 +38,6 @@ pub const Config = struct {
             .optimize = optimize,
 
             // Feature flags with defaults
-            .enable_tui = b.option(
-                bool,
-                "tui",
-                "Enable TUI support (default: true)",
-            ) orelse true,
-
             .enable_profiling = b.option(
                 bool,
                 "profiling",
@@ -81,7 +74,6 @@ pub const Config = struct {
     /// Create the build options module for compile-time access
     pub fn createOptionsModule(self: Config, b: *std.Build) *std.Build.Module {
         const options = b.addOptions();
-        options.addOption(bool, "enable_tui", self.enable_tui);
         options.addOption(bool, "enable_profiling", self.enable_profiling);
         options.addOption(bool, "enable_jit_profiling", self.enable_jit_profiling);
         options.addOption(bool, "enable_postgres", self.enable_postgres);
@@ -107,7 +99,6 @@ pub const Config = struct {
         std.debug.print(
             \\Cot Build Configuration:
             \\  optimize:           {s}
-            \\  enable_tui:         {}
             \\  enable_profiling:   {}
             \\  enable_jit_profiling: {}
             \\  enable_postgres:    {}
@@ -116,7 +107,6 @@ pub const Config = struct {
             \\
         , .{
             @tagName(self.optimize),
-            self.enable_tui,
             self.enable_profiling,
             self.enable_jit_profiling,
             self.enable_postgres,
@@ -128,21 +118,12 @@ pub const Config = struct {
 
 /// Shared dependencies used across all modules
 pub const SharedDeps = struct {
-    tui: *std.Build.Module,
     cotdb: *std.Build.Module,
     cot_runtime: *std.Build.Module,
     build_options: *std.Build.Module,
-    cot_tui: ?*std.Build.Module,
 
     /// Initialize all shared dependencies
     pub fn init(b: *std.Build, config: *const Config) SharedDeps {
-        // TUI dependency (external)
-        const tui_dep = b.dependency("tui", .{
-            .target = config.target,
-            .optimize = config.optimize,
-        });
-        const tui = tui_dep.module("tui");
-
         // Build options module
         const build_options = config.createOptionsModule(b);
 
@@ -159,7 +140,6 @@ pub const SharedDeps = struct {
             .root_source_file = b.path("src/runtime/cot_runtime.zig"),
             .target = config.target,
             .imports = &.{
-                .{ .name = "tui", .module = tui },
                 .{ .name = "cotdb", .module = cotdb },
                 .{ .name = "build_options", .module = build_options },
             },
@@ -175,26 +155,10 @@ pub const SharedDeps = struct {
             cot_runtime.linkSystemLibrary("pq", .{});
         }
 
-        // TUI Extension module (optional)
-        var cot_tui: ?*std.Build.Module = null;
-        if (config.enable_tui) {
-            cot_tui = b.addModule("cot_tui", .{
-                .root_source_file = b.path("src/tui_ext/cot_tui.zig"),
-                .target = config.target,
-                .imports = &.{
-                    .{ .name = "tui", .module = tui },
-                    .{ .name = "cot_runtime", .module = cot_runtime },
-                    .{ .name = "build_options", .module = build_options },
-                },
-            });
-        }
-
         return .{
-            .tui = tui,
             .cotdb = cotdb,
             .cot_runtime = cot_runtime,
             .build_options = build_options,
-            .cot_tui = cot_tui,
         };
     }
 
@@ -204,15 +168,11 @@ pub const SharedDeps = struct {
             .root_source_file = b.path("src/root.zig"),
             .target = config.target,
             .imports = &.{
-                .{ .name = "tui", .module = self.tui },
                 .{ .name = "cotdb", .module = self.cotdb },
                 .{ .name = "cot_runtime", .module = self.cot_runtime },
                 .{ .name = "build_options", .module = self.build_options },
             },
         });
-        if (self.cot_tui) |tm| {
-            cot_mod.addImport("cot_tui", tm);
-        }
         // Self-import: allow framework files within cot to import("cot")
         // This enables framework/commands/*.zig to access cot.* exports
         cot_mod.addImport("cot", cot_mod);
