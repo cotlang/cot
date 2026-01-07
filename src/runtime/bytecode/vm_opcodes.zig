@@ -18,6 +18,7 @@ const TraitObject = value_mod.TraitObject;
 const List = value_mod.List;
 const StructBox = value_mod.StructBox;
 const Record = value_mod.Record;
+const Variant = value_mod.Variant;
 const arc = @import("arc.zig");
 
 // Forward declaration - VM is imported at comptime to avoid circular import
@@ -995,24 +996,7 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
         _ = vm.recordJITCall(module_idx, routine_idx);
     }
 
-    // DEBUG: Print call info with routine name
     const routine = module.routines[routine_idx];
-    const routine_name = if (routine.name_index < module.constants.len)
-        switch (module.constants[routine.name_index]) {
-            .identifier => |s| s,
-            else => "<unknown>",
-        }
-    else
-        "<unknown>";
-    std.debug.print("[CALL] routine={s} idx={d} argc={d} stack_argc={d} fp={d} sp={d}\n", .{
-        routine_name, routine_idx, argc, stack_argc, vm.fp, vm.sp,
-    });
-
-    // DEBUG: Print register args
-    for (0..argc) |i| {
-        const val = vm.registers[i];
-        std.debug.print("  r{d} = {s}\n", .{ i, @tagName(val.tag()) });
-    }
 
     // Push call frame
     // stack_pointer saved is BEFORE overflow args, so they're cleaned up on return
@@ -1027,38 +1011,25 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     }) catch return vm.fail(VMError.StackOverflow, "Call stack overflow");
 
     // Copy args from r0..r(argc-1) to stack (as locals for callee)
+    // CRITICAL: Must retain heap values - callee will release them when storing
+    // new values to these slots, and we need caller's copy to remain valid.
     vm.fp = vm.sp; // New frame starts after overflow args (they're below fp now)
     for (0..argc) |i| {
-        vm.stack[vm.sp] = vm.registers[i];
+        const arg_value = vm.registers[i];
+        if (vm.runtime_arc_enabled) arc.retain(arg_value);
+        vm.stack[vm.sp] = arg_value;
         vm.sp += 1;
     }
 
     // Copy overflow args from caller's stack (below fp) to callee's locals
     // They were pushed at positions caller_sp - stack_argc to caller_sp - 1
     // and need to end up at slots argc..argc+stack_argc-1
+    // CRITICAL: Same retain requirement as register args above.
     for (0..stack_argc) |i| {
-        vm.stack[vm.sp] = vm.stack[caller_sp - @as(u32, stack_argc) + i];
+        const arg_value = vm.stack[caller_sp - @as(u32, stack_argc) + i];
+        if (vm.runtime_arc_enabled) arc.retain(arg_value);
+        vm.stack[vm.sp] = arg_value;
         vm.sp += 1;
-    }
-
-    // DEBUG: Print callee slots 0-22 (Parser struct size)
-    std.debug.print("  [After setup] fp={d} sp={d} local_count={d}\n", .{ vm.fp, vm.sp, routine.local_count });
-    const num_slots_to_show = @min(routine.local_count, 23);
-    for (0..num_slots_to_show) |slot| {
-        const val = vm.stack[vm.fp + slot];
-        switch (val.tag()) {
-            .integer => std.debug.print("    slot[{d}] = int:{d}\n", .{ slot, val.asInt() }),
-            .boolean => std.debug.print("    slot[{d}] = bool:{}\n", .{ slot, val.asBool() }),
-            .string => {
-                const s = val.asString();
-                if (s.len > 20) {
-                    std.debug.print("    slot[{d}] = str:\"{s}...\" (len={d})\n", .{ slot, s[0..20], s.len });
-                } else {
-                    std.debug.print("    slot[{d}] = str:\"{s}\"\n", .{ slot, s });
-                }
-            },
-            else => std.debug.print("    slot[{d}] = {s}\n", .{ slot, @tagName(val.tag()) }),
-        }
     }
 
     // Reserve space for remaining locals (after argc + stack_argc)
@@ -1094,6 +1065,20 @@ pub fn op_ret(vm: *VM, module: *const Module) VMError!DispatchResult {
             if (param.mode == .ref) {
                 // Copy value from callee's stack slot back to caller's register
                 vm.writeRegister(@truncate(i), vm.stack[vm.fp + i]);
+            }
+        }
+
+        // Release all callee's local slots.
+        // CRITICAL: This balances the retain done in op_call when copying args.
+        // For ref params, ownership is transferred to caller (copied to register above),
+        // but we still release here because op_call retained them. The net effect:
+        // - op_call: +1 refcount
+        // - op_ret: -1 refcount
+        // - Caller's store_local after call: +1 refcount (for the new slot owner)
+        // This ensures no double-free: callee's release is balanced by call's retain.
+        if (vm.runtime_arc_enabled) {
+            for (0..routine.local_count) |i| {
+                arc.release(vm.stack[vm.fp + i], vm.allocator);
             }
         }
 
@@ -1140,6 +1125,15 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
             tracer.onReturnWithValue(routine_name, true, @intCast(vm.ip), return_value);
         }
 
+        // Release all callee's local slots.
+        // CRITICAL: This balances the retain done in op_call when copying args.
+        // See op_ret for detailed explanation.
+        if (vm.runtime_arc_enabled) {
+            for (0..routine.local_count) |i| {
+                arc.release(vm.stack[vm.fp + i], vm.allocator);
+            }
+        }
+
         vm.sp = frame.stack_pointer;
         vm.fp = frame.base_pointer;
         vm.ip = frame.return_ip;
@@ -1167,15 +1161,33 @@ pub fn op_ret_large(vm: *VM, module: *const Module) VMError!DispatchResult {
             }
         }
 
+        // CRITICAL: Release local slots BEFORE copying return values.
+        // The return values will be copied to frame.stack_pointer, which may overlap
+        // with local slots (vm.fp to vm.fp + local_count). If we release after copying,
+        // we'd release the just-copied return values, corrupting them.
+        if (vm.runtime_arc_enabled) {
+            for (0..routine.local_count) |i| {
+                arc.release(vm.stack[vm.fp + i], vm.allocator);
+            }
+        }
+
         // Key difference from ret: we need to preserve `count` values that were
         // pushed to the stack for the large struct return.
         // The values are at vm.sp - count to vm.sp - 1 (already pushed by push_arg)
         // We copy them to the caller's stack space starting at frame.stack_pointer
 
-        // First, copy the return values to caller's stack (at stack_pointer)
+        // Copy the return values to caller's stack (at stack_pointer)
         const src_base = vm.sp - @as(u32, count);
         for (0..count) |i| {
             vm.stack[frame.stack_pointer + i] = vm.stack[src_base + i];
+        }
+
+        // Release pushed return values (transfer ownership to caller via the copy above)
+        // The values were retained when pushed via push_arg, now caller owns them.
+        if (vm.runtime_arc_enabled) {
+            for (0..count) |i| {
+                arc.release(vm.stack[src_base + i], vm.allocator);
+            }
         }
 
         // Restore frame, but sp points AFTER the return values
@@ -1196,8 +1208,11 @@ pub fn op_push_arg(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 3;
 
     // Push value from local slot to stack
+    // CRITICAL: Must retain because the pushed copy becomes an independent reference.
+    // ret_large will release this when transferring ownership to caller.
     const stack_addr = vm.fp + slot;
     const value = vm.stack[stack_addr];
+    if (vm.runtime_arc_enabled) arc.retain(value);
     vm.stack[vm.sp] = value;
     vm.sp += 1;
 
@@ -1211,7 +1226,10 @@ pub fn op_push_arg_reg(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rs: u4 = @truncate(ops >> 4);
 
     // Push register value to stack
-    vm.stack[vm.sp] = vm.registers[rs];
+    // CRITICAL: Must retain because the pushed copy becomes an independent reference.
+    const value = vm.registers[rs];
+    if (vm.runtime_arc_enabled) arc.retain(value);
+    vm.stack[vm.sp] = value;
     vm.sp += 1;
 
     return .continue_dispatch;
@@ -3657,5 +3675,81 @@ pub fn op_array_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 
     vm.writeRegister(rd, Value.initList(list));
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// Variant (Sum Type) Operations (0x8A-0x8C)
+// ============================================================================
+
+/// variant_construct rd, tag, argc - construct a variant with payload
+/// Creates a Variant value with the given tag and payload values from registers.
+/// Format: [rd:4|argc:4] [tag:16]
+/// Payload values are in r0..r(argc-1)
+pub fn op_variant_construct(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const tag = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3; // 1 operand byte + 2 tag bytes (opcode already consumed by dispatcher)
+
+    const rd: u4 = @truncate(ops >> 4);
+    const argc: u4 = @truncate(ops & 0xF);
+
+    // Create the variant with payload count
+    const variant = Variant.init(vm.allocator, tag, argc) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate variant");
+    };
+
+    // Copy payload values from registers r0..r(argc-1)
+    for (0..argc) |i| {
+        const payload_val = vm.registers[i];
+        // Retain heap-allocated values since variant takes ownership
+        arc.retain(payload_val);
+        variant.setPayload(i, payload_val);
+    }
+
+    vm.writeRegister(rd, Value.initVariant(variant));
+    return .continue_dispatch;
+}
+
+/// variant_get_tag rd, src_reg - get the tag from a variant
+/// Format: [rd:4|src_reg:4] [0]
+pub fn op_variant_get_tag(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2; // 1 operand byte + 1 padding byte (opcode already consumed by dispatcher)
+
+    const rd: u4 = @truncate(ops >> 4);
+    const src_reg: u4 = @truncate(ops & 0xF);
+
+    const src_val = vm.registers[src_reg];
+    const variant = src_val.asVariant() orelse {
+        return vm.fail(VMError.InvalidType, "Expected variant value");
+    };
+
+    vm.writeRegister(rd, Value.initInt(@intCast(variant.tag)));
+    return .continue_dispatch;
+}
+
+/// variant_get_payload rd, src_reg, field_idx - get payload field from variant
+/// Format: [rd:4|src_reg:4] [field_idx:16]
+pub fn op_variant_get_payload(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const field_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3; // 1 operand byte + 2 field_idx bytes (opcode already consumed by dispatcher)
+
+    const rd: u4 = @truncate(ops >> 4);
+    const src_reg: u4 = @truncate(ops & 0xF);
+
+    const src_val = vm.registers[src_reg];
+    const variant = src_val.asVariant() orelse {
+        return vm.fail(VMError.InvalidType, "Expected variant value");
+    };
+
+    const payload_val = variant.getPayload(field_idx) orelse {
+        return vm.fail(VMError.ArrayOutOfBounds, "Variant payload index out of bounds");
+    };
+
+    // Retain the value since we're extracting it from the variant
+    arc.retain(payload_val);
+    vm.writeRegister(rd, payload_val);
     return .continue_dispatch;
 }

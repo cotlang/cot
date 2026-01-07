@@ -1456,6 +1456,11 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.make_trait_object)] = &vm_opcodes.op_make_trait_object;
         table[@intFromEnum(Opcode.call_trait_method)] = &vm_opcodes.op_call_trait_method;
 
+        // Variant (sum type) opcodes (0x8A-0x8C)
+        table[@intFromEnum(Opcode.variant_construct)] = &vm_opcodes.op_variant_construct;
+        table[@intFromEnum(Opcode.variant_get_tag)] = &vm_opcodes.op_variant_get_tag;
+        table[@intFromEnum(Opcode.variant_get_payload)] = &vm_opcodes.op_variant_get_payload;
+
         // Quickened/Specialized Opcodes (0xE0-0xEB) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.add_int)] = &vm_opcodes.op_add_int;
         table[@intFromEnum(Opcode.sub_int)] = &vm_opcodes.op_sub_int;

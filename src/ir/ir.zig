@@ -98,6 +98,10 @@ pub const Type = union(enum) {
     /// Trait object type (dynamic dispatch)
     trait_object: TraitObjectType,
 
+    /// Variant type (sum type / enum with payload)
+    /// Used to tag values as variant instances that need variant_get_tag for matching
+    variant: void,
+
     pub const TraitObjectType = struct {
         trait_name: []const u8,
     };
@@ -140,6 +144,7 @@ pub const Type = union(enum) {
             .list => 8, // List pointer
             .heap_record => 8, // Heap record reference (NaN-boxed value)
             .trait_object => 16, // Fat pointer: data + vtable
+            .variant => 8, // Variant value (NaN-boxed)
         };
     }
 
@@ -164,6 +169,7 @@ pub const Type = union(enum) {
             .list => 8,
             .heap_record => 8,
             .trait_object => 8, // Fat pointer alignment
+            .variant => 8, // Variant value alignment
         };
     }
 
@@ -408,6 +414,8 @@ fn typeNeedsArc(ty: Type) bool {
         .trait_object => true,
         // Heap records are reference counted
         .heap_record => true,
+        // Variants are reference counted
+        .variant => true,
     };
 }
 
@@ -584,6 +592,10 @@ pub const Instruction = union(enum) {
     // ====== Trait object operations ======
     make_trait_object: MakeTraitObject,
     call_trait_method: CallTraitMethod,
+
+    // ====== Sum type (variant) operations ======
+    variant_construct: VariantConstruct, // Create a variant with payload
+    variant_get_tag: VariantGetTag, // Get the discriminant/tag from a variant
 
     // ====== Debug information ======
     debug_line: struct { line: u32, column: u32 },
@@ -978,6 +990,21 @@ pub const Instruction = union(enum) {
         loc: ?SourceLoc = null,
     };
 
+    /// Construct a variant (sum type) with payload
+    pub const VariantConstruct = struct {
+        tag: u16, // Discriminant/tag value for this variant
+        payload: []const Value, // Payload values (empty for variants without payload)
+        result: Value, // Result variant value
+        loc: ?SourceLoc = null,
+    };
+
+    /// Get the discriminant/tag from a variant value
+    pub const VariantGetTag = struct {
+        variant: Value, // Source variant value
+        result: Value, // Result i64 containing the tag
+        loc: ?SourceLoc = null,
+    };
+
     /// String slice - extract portion of string (0-indexed)
     pub const StrSlice = struct {
         source: Value, // Source string
@@ -1082,6 +1109,8 @@ pub const Instruction = union(enum) {
             .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => .map,
             .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => .list,
             .make_closure, .make_trait_object, .call_trait_method => .control, // Closure/trait ops are control
+            .variant_construct => .memory, // Variant construction allocates memory
+            .variant_get_tag => .memory, // Variant tag extraction
             .debug_line => .debug,
         };
     }
@@ -1183,6 +1212,9 @@ pub const Instruction = union(enum) {
             // Heap record operations
             .heap_alloc => |h| h.result,
             .load_field_heap => |l| l.result,
+            // Variant operations
+            .variant_construct => |v| v.result,
+            .variant_get_tag => |v| v.result,
             // Instructions that don't produce values
             .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear, .list_push, .list_set, .list_clear, .arc_retain, .arc_release, .store_field_heap => null,
         };
@@ -1469,10 +1501,36 @@ pub const Module = struct {
     /// ListType pointers allocated during lowering (owned by Module)
     allocated_list_types: std.ArrayListUnmanaged(*ListType) = .{},
 
-    /// Enum definition for cross-package export
+    /// Payload kind for sum type variants
+    pub const VariantPayloadKind = enum(u2) {
+        none = 0,
+        tuple = 1,
+        struct_like = 2,
+    };
+
+    /// A field in a variant's payload
+    pub const VariantPayloadField = struct {
+        name: ?[]const u8, // null for tuple-like (positional)
+        type_name: []const u8,
+    };
+
+    /// Information about a single enum variant (for sum types)
+    pub const EnumVariantDef = struct {
+        name: []const u8,
+        value: i64,
+        payload_kind: VariantPayloadKind,
+        payload_fields: []const VariantPayloadField,
+    };
+
+    /// Enum definition for cross-package export (supports sum types)
     pub const EnumDef = struct {
         name: []const u8,
+        /// Simple variant name -> value map (for backwards compatibility)
         variants: std.StringHashMap(i64),
+        /// Extended variant info with payloads (for sum types)
+        variant_defs: []const EnumVariantDef,
+        /// Whether this enum has any variants with payloads
+        is_sum_type: bool,
     };
 
     pub const Global = struct {

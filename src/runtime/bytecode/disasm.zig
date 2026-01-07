@@ -1005,6 +1005,33 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}, r{}, method[{}], argc={}", .{ rd, obj_reg, method_idx, argc });
             },
 
+            // ============================================
+            // Variant (Sum Type) Operations
+            // ============================================
+
+            // variant_construct rd, tag, argc - [rd:4|argc:4] [tag:16]
+            .variant_construct => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const argc: u4 = @truncate(operands[0] & 0xF);
+                const tag = std.mem.readInt(u16, operands[1..3], .little);
+                try self.writer.print(" r{}, tag={}, argc={}", .{ rd, tag, argc });
+            },
+
+            // variant_get_tag rd, src_reg - [rd:4|src_reg:4] [0]
+            .variant_get_tag => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const src_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{}, r{}", .{ rd, src_reg });
+            },
+
+            // variant_get_payload rd, src_reg, field_idx - [rd:4|src_reg:4] [field_idx:16]
+            .variant_get_payload => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const src_reg: u4 = @truncate(operands[0] & 0xF);
+                const field_idx = std.mem.readInt(u16, operands[1..3], .little);
+                try self.writer.print(" r{}, r{}, field[{}]", .{ rd, src_reg, field_idx });
+            },
+
             .extended => {
                 const sub_opcode = operands[0];
                 try self.writer.print(" sub={X:0>2}", .{sub_opcode});

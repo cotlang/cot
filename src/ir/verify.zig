@@ -413,6 +413,15 @@ pub const Verifier = struct {
             .load_field_heap => |op| {
                 try self.checkValueDefined(op.record);
             },
+            // Variant operations
+            .variant_construct => |op| {
+                for (op.payload) |val| {
+                    try self.checkValueDefined(val);
+                }
+            },
+            .variant_get_tag => |op| {
+                try self.checkValueDefined(op.variant);
+            },
         }
     }
 
@@ -462,6 +471,7 @@ pub const Verifier = struct {
             .heap_record => "heap_record",
             .weak => "weak",
             .trait_object => "trait_object",
+            .variant => "variant",
         };
     }
 

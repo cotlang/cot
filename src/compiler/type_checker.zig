@@ -127,6 +127,8 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .make_trait_object, .call_trait_method => {},
         // Heap record operations
         .heap_alloc, .store_field_heap, .load_field_heap => {},
+        // Variant operations (sum types)
+        .variant_construct, .variant_get_tag => {},
     }
 }
 

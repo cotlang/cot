@@ -37,6 +37,7 @@ pub const ParseError = error{
     InvalidSyntax,
     OutOfMemory,
     TooNested,
+    SyntaxError,
 };
 
 pub const Error = struct {
@@ -426,6 +427,20 @@ pub const Parser = struct {
         return idx;
     }
 
+    /// Temporary storage for variant payload fields during parsing
+    const VariantPayloadInfo = struct {
+        kind: ast.VariantPayloadKind,
+        field_count: u8,
+        /// Index into payload_fields array where this variant's fields start
+        fields_start: u32,
+    };
+
+    /// Temporary storage for a payload field
+    const PayloadField = struct {
+        name: StringId, // StringId.null for tuple-like (positional)
+        type_idx: TypeIdx,
+    };
+
     fn parseEnumDef(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_enum, "Expected 'enum'");
@@ -434,34 +449,145 @@ pub const Parser = struct {
 
         _ = try self.consume(.lbrace, "Expected '{'");
 
-        // Parse variants into scratch buffer
-        try self.store.markScratch();
-        errdefer self.store.rollbackScratch();
+        // Temporary storage for variants and their payloads
+        // We use fixed-size arrays to avoid allocation complexity
+        const MAX_VARIANTS = 256;
+        const MAX_TOTAL_FIELDS = 1024;
+
+        var variant_names: [MAX_VARIANTS]StringId = undefined;
+        var variant_payloads: [MAX_VARIANTS]VariantPayloadInfo = undefined;
+        var payload_fields: [MAX_TOTAL_FIELDS]PayloadField = undefined;
+        var variant_count: u32 = 0;
+        var total_field_count: u32 = 0;
 
         while (!self.check(.rbrace) and !self.isAtEnd()) {
+            if (variant_count >= MAX_VARIANTS) {
+                return error.SyntaxError; // Too many variants
+            }
+
             const variant_token = try self.consume(.identifier, "Expected variant name");
             const variant_name = self.internString(variant_token.lexeme) catch return error.OutOfMemory;
+            variant_names[variant_count] = variant_name;
 
-            self.store.pushScratchU32(@intFromEnum(variant_name)) catch return error.OutOfMemory;
+            // Check for payload: ( for tuple-like, { for struct-like
+            if (self.match(&[_]TokenType{.lparen})) {
+                // Tuple-like payload: Some(T) or Point(i64, i64)
+                const fields_start = total_field_count;
+                var field_count: u8 = 0;
 
-            // Optional comma
+                if (!self.check(.rparen)) {
+                    while (true) {
+                        if (total_field_count >= MAX_TOTAL_FIELDS) {
+                            return error.SyntaxError; // Too many fields
+                        }
+
+                        const field_type = try self.parseType();
+                        payload_fields[total_field_count] = .{
+                            .name = .null_id,
+                            .type_idx = field_type,
+                        };
+                        total_field_count += 1;
+                        field_count += 1;
+
+                        if (!self.match(&[_]TokenType{.comma})) break;
+                    }
+                }
+
+                _ = try self.consume(.rparen, "Expected ')' after variant payload");
+
+                variant_payloads[variant_count] = .{
+                    .kind = .tuple,
+                    .field_count = field_count,
+                    .fields_start = fields_start,
+                };
+            } else if (self.match(&[_]TokenType{.lbrace})) {
+                // Struct-like payload: Move { x: i64, y: i64 }
+                const fields_start = total_field_count;
+                var field_count: u8 = 0;
+
+                if (!self.check(.rbrace)) {
+                    while (true) {
+                        if (total_field_count >= MAX_TOTAL_FIELDS) {
+                            return error.SyntaxError; // Too many fields
+                        }
+
+                        const field_name_token = try self.consume(.identifier, "Expected field name");
+                        const field_name = self.internString(field_name_token.lexeme) catch return error.OutOfMemory;
+
+                        _ = try self.consume(.colon, "Expected ':' after field name");
+                        const field_type = try self.parseType();
+
+                        payload_fields[total_field_count] = .{
+                            .name = field_name,
+                            .type_idx = field_type,
+                        };
+                        total_field_count += 1;
+                        field_count += 1;
+
+                        if (!self.match(&[_]TokenType{.comma})) break;
+                    }
+                }
+
+                _ = try self.consume(.rbrace, "Expected '}' after variant fields");
+
+                variant_payloads[variant_count] = .{
+                    .kind = .struct_like,
+                    .field_count = field_count,
+                    .fields_start = fields_start,
+                };
+            } else {
+                // No payload
+                variant_payloads[variant_count] = .{
+                    .kind = .none,
+                    .field_count = 0,
+                    .fields_start = 0,
+                };
+            }
+
+            variant_count += 1;
+
+            // Optional comma between variants
             _ = self.match(&[_]TokenType{.comma});
         }
 
         _ = try self.consume(.rbrace, "Expected '}'");
 
-        // Get variants from scratch
-        const variants = self.store.getScratchU32s();
-        self.store.commitScratch();
+        // Store enum def in extra_data
+        // New format: [variant_count,
+        //   // For each variant (3 u32s):
+        //   variant_name: StringId,
+        //   variant_value: i32,
+        //   payload_info: u32,  // (kind: 2 bits) | (field_count: 8 bits) | (fields_start: 22 bits)
+        // ]
+        // Then payload fields at the end: [name: StringId, type: TypeIdx] pairs
 
-        // Store enum def
-        // Standard format: [count, name1, value1, name2, value2, ...]
-        // All frontends (Cot, DBL) output this format. Values are explicit.
         const variants_start = self.store.extra_data.items.len;
-        self.store.extra_data.append(self.allocator, @intCast(variants.len)) catch return error.OutOfMemory;
-        for (variants, 0..) |v, i| {
-            self.store.extra_data.append(self.allocator, v) catch return error.OutOfMemory; // name
-            self.store.extra_data.append(self.allocator, @intCast(i)) catch return error.OutOfMemory; // value (auto-numbered)
+        self.store.extra_data.append(self.allocator, variant_count) catch return error.OutOfMemory;
+
+        // First, reserve space for where payload fields will start
+        const payload_fields_start = variants_start + 1 + variant_count * 3;
+
+        // Write variant data
+        for (0..variant_count) |i| {
+            // Name
+            self.store.extra_data.append(self.allocator, @intFromEnum(variant_names[i])) catch return error.OutOfMemory;
+            // Value (auto-numbered)
+            self.store.extra_data.append(self.allocator, @intCast(i)) catch return error.OutOfMemory;
+
+            // Pack payload_info: (kind: 2 bits) | (field_count: 8 bits) | (fields_start: 22 bits)
+            const payload = variant_payloads[i];
+            const actual_fields_start = payload_fields_start + payload.fields_start * 2;
+            const payload_info: u32 = @as(u32, @intFromEnum(payload.kind)) |
+                (@as(u32, payload.field_count) << 2) |
+                (@as(u32, @truncate(actual_fields_start)) << 10);
+            self.store.extra_data.append(self.allocator, payload_info) catch return error.OutOfMemory;
+        }
+
+        // Write payload fields
+        for (0..total_field_count) |i| {
+            const field = payload_fields[i];
+            self.store.extra_data.append(self.allocator, @intFromEnum(field.name)) catch return error.OutOfMemory;
+            self.store.extra_data.append(self.allocator, field.type_idx.toInt()) catch return error.OutOfMemory;
         }
 
         const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));

@@ -661,6 +661,22 @@ pub const Printer = struct {
                 try self.printValue(l.record);
                 try self.writer.print("[{d}]", .{l.field_index});
             },
+
+            // Variant operations (sum types)
+            .variant_construct => |v| {
+                try self.printValue(v.result);
+                try self.writer.print(" = variant_construct tag={d} (", .{v.tag});
+                for (v.payload, 0..) |val, i| {
+                    if (i > 0) try self.writer.writeAll(", ");
+                    try self.printValue(val);
+                }
+                try self.writer.writeAll(")");
+            },
+            .variant_get_tag => |v| {
+                try self.printValue(v.result);
+                try self.writer.writeAll(" = variant_get_tag ");
+                try self.printValue(v.variant);
+            },
         }
     }
 
@@ -764,6 +780,7 @@ pub const Printer = struct {
                 try self.printType(inner.*);
             },
             .trait_object => |t| try self.writer.print("dyn {s}", .{t.trait_name}),
+            .variant => try self.writer.writeAll("variant"),
         }
     }
 

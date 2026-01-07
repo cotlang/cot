@@ -252,6 +252,17 @@ pub fn retain(value: Value) void {
 /// Safe to call on any Value - does nothing for inline types.
 pub fn release(value: Value, allocator: std.mem.Allocator) void {
     if (getHeapPtr(value)) |ptr| {
+        // Validate pointer alignment before accessing header
+        const ptr_addr = @intFromPtr(ptr);
+        if (ptr_addr < 4096) {
+            log.err("ARC release: invalid pointer address (too low): ptr_addr=0x{x} tag={s} bits=0x{x}", .{ ptr_addr, @tagName(value.tag()), value.bits });
+            @panic("ARC: release called with invalid pointer (address too low)");
+        }
+        if (ptr_addr % 8 != 0) {
+            log.err("ARC release: misaligned pointer: ptr_addr=0x{x} tag={s} bits=0x{x}", .{ ptr_addr, @tagName(value.tag()), value.bits });
+            @panic("ARC: release called with misaligned pointer");
+        }
+
         const header = getHeader(ptr);
 
         if (header.isPoisoned()) {
@@ -327,6 +338,13 @@ pub fn getHeapPtr(value: Value) ?*anyopaque {
 fn freeWithHeader(ptr: *anyopaque, comptime data_size: usize, allocator: std.mem.Allocator) void {
     const header: *ArcHeader = getHeader(ptr);
     const total_size = ArcHeader.SIZE + data_size;
+
+    // Validate header pointer alignment before attempting free
+    const header_addr = @intFromPtr(header);
+    if (header_addr % 8 != 0) {
+        log.err("ARC freeWithHeader: misaligned header: header_addr=0x{x} ptr_addr=0x{x} data_size={d}", .{ header_addr, @intFromPtr(ptr), data_size });
+        @panic("ARC: freeWithHeader called with misaligned header");
+    }
 
     // Get pointer to beginning of allocation (the header)
     const bytes_ptr: [*]align(8) u8 = @ptrCast(@alignCast(header));

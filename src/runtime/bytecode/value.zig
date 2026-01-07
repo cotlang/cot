@@ -153,6 +153,67 @@ pub const StructBox = struct {
     }
 };
 
+/// Type ID for sum type variants (enum with payloads)
+pub const VARIANT_TYPE_ID: u16 = 21;
+
+/// Sum type variant - holds a tag and optional payload (via StructBox)
+/// Used for enum variants with associated data (e.g., Option.Some(42), Message.Move { x, y })
+/// Reuses StructBox for payload storage to avoid code duplication.
+/// NOTE: Variant is ARC-managed - always allocate with arc.create
+pub const Variant = struct {
+    /// Discriminant/tag value for this variant
+    tag: u16,
+    /// Payload data (null for variants without payload like None)
+    /// Uses StructBox for actual storage - composition over duplication
+    payload: ?*StructBox,
+    allocator: std.mem.Allocator,
+
+    /// Create a new Variant with ARC header for proper reference counting.
+    /// payload_count of 0 means no payload (like Option.None)
+    pub fn init(allocator: std.mem.Allocator, tag: u16, payload_count: u16) !*Variant {
+        const variant = try arc.create(allocator, Variant);
+        const payload: ?*StructBox = if (payload_count > 0)
+            try StructBox.init(allocator, payload_count)
+        else
+            null;
+        variant.* = .{
+            .tag = tag,
+            .payload = payload,
+            .allocator = allocator,
+        };
+        return variant;
+    }
+
+    /// Free internal resources. Called by ARC when refcount reaches 0.
+    pub fn deinitInternal(self: *Variant) void {
+        if (self.payload) |box| {
+            // Release the StructBox (ARC will handle actual deallocation)
+            arc.release(self.allocator, box);
+        }
+    }
+
+    /// Get number of payload values
+    pub fn payloadCount(self: *const Variant) u16 {
+        if (self.payload) |box| return box.field_count;
+        return 0;
+    }
+
+    /// Get payload value at index
+    pub fn getPayload(self: *const Variant, index: usize) ?Value {
+        const box = self.payload orelse return null;
+        if (index >= box.field_count) return null;
+        return box.fields[index];
+    }
+
+    /// Set payload value at index
+    pub fn setPayload(self: *Variant, index: usize, value: Value) void {
+        const box = self.payload orelse return;
+        if (index < box.field_count) {
+            box.fields[index] = value;
+        }
+    }
+};
+
 /// Trait object - a value with a vtable for dynamic dispatch
 pub const TraitObject = struct {
     /// The boxed concrete value
@@ -396,6 +457,12 @@ pub const Value = extern struct {
         return initObject(STRUCT_BOX_TYPE_ID, sb);
     }
 
+    /// Create a variant value (for sum types)
+    /// Uses type_id 21 (VARIANT_TYPE_ID)
+    pub fn initVariant(v: *Variant) Self {
+        return initObject(VARIANT_TYPE_ID, v);
+    }
+
     // ========================================================================
     // Type checking and tagging
     // ========================================================================
@@ -504,6 +571,12 @@ pub const Value = extern struct {
     pub fn isStructBox(self: Self) bool {
         if (!self.isObject()) return false;
         return self.objectTypeId() == STRUCT_BOX_TYPE_ID;
+    }
+
+    /// Check if this is a variant (object with VARIANT_TYPE_ID)
+    pub fn isVariant(self: Self) bool {
+        if (!self.isObject()) return false;
+        return self.objectTypeId() == VARIANT_TYPE_ID;
     }
 
     /// Get the type_id of an object value
@@ -631,6 +704,12 @@ pub const Value = extern struct {
     pub fn asStructBox(self: Self) ?*StructBox {
         if (!self.isStructBox()) return null;
         return self.objectPtr(StructBox);
+    }
+
+    /// Get variant pointer (for sum types)
+    pub fn asVariant(self: Self) ?*Variant {
+        if (!self.isVariant()) return null;
+        return self.objectPtr(Variant);
     }
 
     // ========================================================================

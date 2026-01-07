@@ -235,8 +235,20 @@ pub fn compileToModuleWithFile(allocator: std.mem.Allocator, source: []const u8,
         return error.ParseError;
     }
 
+    // Run compile-time evaluation (resolve comptime if, evaluate const)
+    var evaluator = comptime_eval.Evaluator.init(allocator, &store, &strings);
+    defer evaluator.deinit();
+    if (source_file) |sf| {
+        evaluator.setSourceFile(sf);
+    }
+    const processed_stmts = evaluator.process(top_level) catch |err| {
+        std.debug.print("Compile-time evaluation error: {}\n", .{err});
+        return error.ComptimeError;
+    };
+    defer allocator.free(processed_stmts);
+
     // Lower to IR using detailed error reporting
-    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{ .source_file = source_file });
+    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, module_name, .{ .source_file = source_file });
     const ir_module = switch (lower_result) {
         .ok => |module| module,
         .err => |e| {
@@ -253,6 +265,9 @@ pub fn compileToModuleWithFile(allocator: std.mem.Allocator, source: []const u8,
     };
     defer allocator.destroy(ir_module);
     defer ir_module.deinit();
+
+    // Run optimization passes
+    _ = ir_optimize.optimize(ir_module, .{});
 
     // Emit bytecode from IR
     var emitter = ir_emit_bytecode.BytecodeEmitter.init(allocator);

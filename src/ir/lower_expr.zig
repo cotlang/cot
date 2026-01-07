@@ -1775,6 +1775,7 @@ fn getTypeName(ty: ir.Type) []const u8 {
         .map => "map",
         .list => "list",
         .heap_record => |hr| hr.name,
+        .variant => "variant",
     };
 }
 
@@ -2254,6 +2255,77 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 return result;
             }
 
+            // Check for enum variant constructor: EnumName.Variant(payload...)
+            if (l.enum_types.get(object_name)) |variants| {
+                // This is an enum - check if the variant exists
+                if (variants.get(field_name)) |variant_value| {
+                    // Get variant info from module.enums to check for payload
+                    if (l.module.enums.get(object_name)) |enum_def| {
+                        // Find the variant definition
+                        for (enum_def.variant_defs) |variant_def| {
+                            if (std.mem.eql(u8, variant_def.name, field_name)) {
+                                // Check if this variant has a payload
+                                if (variant_def.payload_kind != .none) {
+                                    // Lower arguments as payload values
+                                    var payload_values: std.ArrayListUnmanaged(ir.Value) = .{};
+                                    defer payload_values.deinit(l.allocator);
+
+                                    for (0..args_count) |i| {
+                                        const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                                        const arg_val = try lowerExpression(l, arg_idx);
+                                        try payload_values.append(l.allocator, arg_val);
+                                    }
+
+                                    const payload_slice = try payload_values.toOwnedSlice(l.allocator);
+
+                                    // Emit variant_construct instruction
+                                    const result = func.newValue(.variant);
+                                    try l.emit(.{
+                                        .variant_construct = .{
+                                            .tag = @intCast(variant_value),
+                                            .payload = payload_slice,
+                                            .result = result,
+                                            .loc = toIrLoc(call_loc),
+                                        },
+                                    });
+
+                                    debug.print(.ir, "Emitted variant_construct for {s}.{s} with {d} payload values", .{
+                                        object_name, field_name, payload_slice.len,
+                                    });
+
+                                    return result;
+                                } else {
+                                    // Variant has no payload but was called with () - error
+                                    l.setErrorContext(
+                                        LowerError.TypeMismatch,
+                                        "Variant '{s}.{s}' does not take arguments",
+                                        .{ object_name, field_name },
+                                        call_loc,
+                                        "use '{s}.{s}' without parentheses",
+                                        .{ object_name, field_name },
+                                    );
+                                    return LowerError.TypeMismatch;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: variant without payload info (old-style enum)
+                    // If called with args, that's an error
+                    if (args_count > 0) {
+                        l.setErrorContext(
+                            LowerError.TypeMismatch,
+                            "Enum variant '{s}.{s}' does not take arguments",
+                            .{ object_name, field_name },
+                            call_loc,
+                            "simple enum variants cannot have payloads",
+                            .{},
+                        );
+                        return LowerError.TypeMismatch;
+                    }
+                }
+            }
+
             // File.* static methods -> native function calls
             if (std.mem.eql(u8, object_name, "File")) {
                 // Lower arguments for File.* call
@@ -2305,12 +2377,19 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     .{ object_name, field_name },
                 ) catch return LowerError.OutOfMemory;
 
-                // Check if this method exists as a function (from impl block)
-                var method_exists = false;
-                for (l.module.functions.items) |fn_def| {
-                    if (std.mem.eql(u8, fn_def.name, qualified_name)) {
-                        method_exists = true;
-                        break;
+                // Check if this method exists - first check fn_return_types (populated in impl_sigs phase)
+                // This is critical: fn_return_types is populated before fn_bodies are lowered,
+                // while module.functions is only populated when impl_bodies are lowered.
+                // For static method calls like Type.init(), we need the check to work during fn_bodies.
+                var method_exists = l.fn_return_types.contains(qualified_name);
+
+                // Also check module.functions for backwards compatibility
+                if (!method_exists) {
+                    for (l.module.functions.items) |fn_def| {
+                        if (std.mem.eql(u8, fn_def.name, qualified_name)) {
+                            method_exists = true;
+                            break;
+                        }
                     }
                 }
 

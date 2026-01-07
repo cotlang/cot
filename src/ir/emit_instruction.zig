@@ -2441,3 +2441,42 @@ pub fn emitLoadFieldHeap(e: *BytecodeEmitter, l: ir.Instruction.LoadFieldHeap) E
 
     e.setLastResult(l.result.id, dest_reg);
 }
+
+// ============================================================================
+// Variant (Sum Type) Operations
+// ============================================================================
+
+/// Emit variant_construct instruction - construct a variant with payload
+/// Format: [opcode] [rd:4|argc:4] [tag:16]
+/// Payload values are expected to be in r0..r(argc-1)
+pub fn emitVariantConstruct(e: *BytecodeEmitter, v: ir.Instruction.VariantConstruct) EmitError!void {
+    const argc: u4 = @intCast(v.payload.len);
+
+    // Load payload values into registers r0..r(argc-1)
+    for (v.payload, 0..) |payload_val, i| {
+        _ = try e.getValueInReg(payload_val, @intCast(i));
+    }
+
+    // Result goes to r0 (or first register after payload setup)
+    const dest_reg: u4 = 0;
+
+    try e.emitOpcode(.variant_construct);
+    try e.emitU8((@as(u8, dest_reg) << 4) | argc);
+    try e.emitU16(v.tag);
+
+    e.setLastResult(v.result.id, dest_reg);
+}
+
+/// Emit variant_get_tag instruction - get the tag from a variant
+/// Format: [opcode] [rd:4|src_reg:4] [0]
+pub fn emitVariantGetTag(e: *BytecodeEmitter, v: ir.Instruction.VariantGetTag) EmitError!void {
+    const src_reg = try e.getValueInReg(v.variant, 0);
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(v.result.id);
+
+    try e.emitOpcode(.variant_get_tag);
+    try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
+    try e.emitU8(0); // padding
+
+    e.setLastResult(v.result.id, dest_reg);
+}

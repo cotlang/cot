@@ -66,6 +66,8 @@ const UnaryOp = ast.UnaryOp;
 const TypeTag = ast.TypeTag;
 const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
+const EnumDefView = ast.EnumDefView;
+const VariantPayloadKind = ast.VariantPayloadKind;
 
 const Allocator = std.mem.Allocator;
 
@@ -520,6 +522,7 @@ pub const Lowerer = struct {
             .struct_names => {
                 // First pass: register struct/union/enum names for forward references
                 if (tag == .struct_def) {
+                    debug.print(.ir, "Phase 1: found struct_def, calling registerStructName", .{});
                     try self.registerStructName(stmt_idx);
                 } else if (tag == .union_def) {
                     try self.registerUnionName(stmt_idx);
@@ -613,9 +616,11 @@ pub const Lowerer = struct {
 
         // First pass: register struct/union/enum NAMES for forward references
         // This enables self-referential types like: struct Node { next: ?*Node }
+        debug.print(.ir, "=== Starting struct_names pass (Phase 1) with {d} statements ===", .{top_level.len});
         for (top_level) |stmt_idx| {
             try self.processStatementForDefinitions(stmt_idx, .struct_names);
         }
+        debug.print(.ir, "=== Finished struct_names pass (Phase 1) ===", .{});
 
         // Second pass: fill in struct/union/enum FIELDS (all type names now known)
         for (top_level) |stmt_idx| {
@@ -702,15 +707,24 @@ pub const Lowerer = struct {
         const data = self.store.stmtData(stmt_idx);
         const name_id = data.getName();
         const name = self.strings.get(name_id);
-        if (name.len == 0) return LowerError.UndefinedType;
+        if (name.len == 0) {
+            debug.print(.ir, "registerStructName: empty name, skipping", .{});
+            return LowerError.UndefinedType;
+        }
 
         // Skip if already registered (shouldn't happen, but be safe)
-        if (self.struct_types.contains(name)) return;
+        if (self.struct_types.contains(name)) {
+            debug.print(.ir, "registerStructName: {s} already registered, skipping", .{name});
+            return;
+        }
 
         // Check if this is a generic struct - skip registration, handle in lowerStructDef
         const extra_start = data.getParamsStart();
         const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
-        if (type_param_count > 0) return;
+        if (type_param_count > 0) {
+            debug.print(.ir, "registerStructName: {s} has {d} type params, skipping (generic)", .{ name, type_param_count });
+            return;
+        }
 
         debug.print(.ir, "Registering struct name (forward): {s}", .{name});
 
@@ -949,44 +963,94 @@ pub const Lowerer = struct {
         }
     }
 
-    /// Lower an enum definition - extract variant names and values
-    /// Standard format in extra_data: [count, name1, value1, name2, value2, ...]
-    /// All frontends (Cot, DBL) output this unified format with explicit values.
+    /// Lower an enum definition - extract variant names, values, and payloads (for sum types)
+    /// New format in extra_data: [count, (name, value, payload_info)*]
+    /// Each variant has 3 u32s: name, value, payload_info
+    /// payload_info = (kind: 2 bits) | (field_count: 8 bits) | (fields_start: 22 bits)
     fn lowerEnumDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
-        const data = self.store.stmtData(stmt_idx);
         const loc = self.store.stmtLoc(stmt_idx);
         self.current_loc = loc; // Set location for error messages
 
-        const name_id: StringId = @enumFromInt(data.a);
-        const name = self.strings.get(name_id);
+        // Use the EnumDefView for structured access
+        const view = EnumDefView.from(self.store, stmt_idx);
+        const name = self.strings.get(view.name);
         if (name.len == 0) return LowerError.UndefinedType;
 
         log.debug("Lowering enum: {s}", .{name});
         debug.print(.ir, "Lowering enum: {s}", .{name});
 
-        // Get variants from extra_data
-        // Standard format: [count, name1, value1, name2, value2, ...]
-        const extra_start = data.b;
-        const variant_count = self.store.extra_data.items[extra_start];
-
-        // Create inner map for this enum's variants
+        // Create inner map for this enum's variants (for backwards compatibility)
         var variants = std.StringHashMap(i64).init(self.allocator);
         errdefer variants.deinit();
 
-        // Parse name/value pairs
-        var extra_idx = extra_start + 1; // skip count only
-        for (0..variant_count) |_| {
-            const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
-            extra_idx += 1;
-            const variant_value: i64 = @as(i32, @bitCast(self.store.extra_data.items[extra_idx]));
-            extra_idx += 1;
+        // Build extended variant definitions for sum type support
+        var variant_defs_list: std.ArrayListUnmanaged(ir.Module.EnumVariantDef) = .empty;
+        errdefer variant_defs_list.deinit(self.allocator);
 
-            const variant_name = self.strings.get(variant_name_id);
+        var is_sum_type = false;
+
+        // Iterate through variants using the view
+        var it = view.variantIterator(self.store);
+        while (it.next()) |variant| {
+            const variant_name = self.strings.get(variant.name);
             if (variant_name.len == 0) continue;
 
-            try variants.put(variant_name, variant_value);
-            debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, variant_value });
+            try variants.put(variant_name, variant.value);
+
+            // Convert AST payload kind to IR payload kind
+            const ir_payload_kind: ir.Module.VariantPayloadKind = switch (variant.payload_kind) {
+                .none => .none,
+                .tuple => .tuple,
+                .struct_like => .struct_like,
+            };
+
+            // Track if this is a sum type
+            if (variant.payload_kind != .none) {
+                is_sum_type = true;
+            }
+
+            // Build payload fields for this variant
+            var payload_fields_list: std.ArrayListUnmanaged(ir.Module.VariantPayloadField) = .empty;
+            errdefer payload_fields_list.deinit(self.allocator);
+
+            if (variant.payload_field_count > 0) {
+                var field_it = view.payloadFieldIterator(self.store, variant);
+                while (field_it.next()) |field| {
+                    const field_name: ?[]const u8 = if (field.name.isNull()) null else self.strings.get(field.name);
+                    const type_tag = self.store.typeTag(field.type_idx);
+
+                    // Get the type name from the type
+                    const type_name = self.typeTagToName(type_tag, field.type_idx);
+
+                    try payload_fields_list.append(self.allocator, .{
+                        .name = field_name,
+                        .type_name = type_name,
+                    });
+                }
+            }
+
+            const payload_fields = try payload_fields_list.toOwnedSlice(self.allocator);
+
+            try variant_defs_list.append(self.allocator, .{
+                .name = variant_name,
+                .value = variant.value,
+                .payload_kind = ir_payload_kind,
+                .payload_fields = payload_fields,
+            });
+
+            if (variant.payload_kind != .none) {
+                debug.print(.ir, "  variant '{s}' = {d} (payload: {s}, {d} fields)", .{
+                    variant_name,
+                    variant.value,
+                    @tagName(variant.payload_kind),
+                    variant.payload_field_count,
+                });
+            } else {
+                debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, variant.value });
+            }
         }
+
+        const variant_defs = try variant_defs_list.toOwnedSlice(self.allocator);
 
         // Check if we have a forward-declared enum to clean up
         if (self.enum_types.fetchRemove(name)) |kv| {
@@ -1007,7 +1071,36 @@ pub const Lowerer = struct {
         self.module.enums.put(self.allocator, name, .{
             .name = name,
             .variants = module_variants,
+            .variant_defs = variant_defs,
+            .is_sum_type = is_sum_type,
         }) catch {};
+    }
+
+    /// Convert a type tag to a type name string
+    fn typeTagToName(self: *Self, tag: TypeTag, type_idx: TypeIdx) []const u8 {
+        return switch (tag) {
+            .i8 => "i8",
+            .i16 => "i16",
+            .i32 => "i32",
+            .i64 => "i64",
+            .u8 => "u8",
+            .u16 => "u16",
+            .u32 => "u32",
+            .u64 => "u64",
+            .isize => "isize",
+            .usize => "usize",
+            .f32 => "f32",
+            .f64 => "f64",
+            .bool => "bool",
+            .void => "void",
+            .string => "string",
+            .named => blk: {
+                const data = self.store.typeData(type_idx);
+                const name_id: StringId = @enumFromInt(data.a);
+                break :blk self.strings.get(name_id);
+            },
+            else => "unknown",
+        };
     }
 
     /// Instantiate a generic struct with concrete type arguments
@@ -3006,6 +3099,18 @@ pub const Lowerer = struct {
 
         const scrutinee_val = try self.lowerExpression(scrutinee_idx);
 
+        // For variant types, extract the tag for comparison
+        const comparison_val = if (scrutinee_val.ty == .variant) blk: {
+            const tag_val = func.newValue(.i64);
+            try self.emit(.{
+                .variant_get_tag = .{
+                    .variant = scrutinee_val,
+                    .result = tag_val,
+                },
+            });
+            break :blk tag_val;
+        } else scrutinee_val;
+
         // Get arm count from extra_data
         const arm_count = self.store.getExtra(arms_start);
 
@@ -3055,12 +3160,12 @@ pub const Lowerer = struct {
                 // Lower pattern expression
                 const pattern_val = try self.lowerExpression(pattern_idx);
 
-                // Compare scrutinee with pattern
+                // Compare scrutinee (or its tag for variants) with pattern
                 const cmp_result = func.newValue(.bool);
                 try self.emit(.{
                     .icmp = .{
                         .cond = .eq,
-                        .lhs = scrutinee_val,
+                        .lhs = comparison_val,
                         .rhs = pattern_val,
                         .result = cmp_result,
                     },

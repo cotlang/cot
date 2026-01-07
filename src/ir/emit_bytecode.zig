@@ -854,6 +854,10 @@ pub const BytecodeEmitter = struct {
             .store_field_heap => |s| try emit_inst.emitStoreFieldHeap(self, s),
             .load_field_heap => |l| try emit_inst.emitLoadFieldHeap(self, l),
 
+            // Variant (sum type) operations
+            .variant_construct => |v| try emit_inst.emitVariantConstruct(self, v),
+            .variant_get_tag => |v| try emit_inst.emitVariantGetTag(self, v),
+
             else => {
                 // Other instructions not yet implemented
             },
@@ -1571,6 +1575,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .heap_record => .int64, // Heap record references are pointer-sized
         .weak => .int64, // Weak references are pointer-sized
         .trait_object => .int64, // Trait objects are pointer-sized (vtable + data)
+        .variant => .int64, // Variant values are pointer-sized (NaN-boxed)
     };
 }
 

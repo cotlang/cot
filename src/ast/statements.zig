@@ -191,6 +191,25 @@ pub const StatementTag = enum(u8) {
 };
 
 // ============================================================
+// Sum Types Support (Tagged Unions)
+// ============================================================
+
+/// Kind of enum variant payload for sum types
+/// Used to distinguish between simple enums and enums with associated data
+pub const VariantPayloadKind = enum(u2) {
+    /// No payload: `Quit` or `None`
+    none = 0,
+
+    /// Tuple-like payload: `Some(T)` or `Write(string)`
+    /// Fields are positional (no names)
+    tuple = 1,
+
+    /// Struct-like payload: `Move { x: i64, y: i64 }`
+    /// Fields have names
+    struct_like = 2,
+};
+
+// ============================================================
 // Tests
 // ============================================================
 

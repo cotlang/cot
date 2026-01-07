@@ -31,6 +31,7 @@ pub fn register(registry: anytype) !void {
 
     // Short names (DBL compatibility)
     try registry.registerNative("string", string);
+    try registry.registerNative("str", string); // Common alias for string()
     try registry.registerNative("integer", integer);
     try registry.registerNative("decimal", decimal);
     try registry.registerNative("char", char);

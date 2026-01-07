@@ -41,6 +41,7 @@ pub const ExtraSpan = indices.ExtraSpan;
 // Re-export tag enums
 pub const statements = @import("statements.zig");
 pub const StatementTag = statements.StatementTag;
+pub const VariantPayloadKind = statements.VariantPayloadKind;
 
 pub const expressions = @import("expressions.zig");
 pub const ExpressionTag = expressions.ExpressionTag;
@@ -88,6 +89,11 @@ pub const LoopStmtView = views.LoopStmtView;
 pub const FnDefView = views.FnDefView;
 pub const ParamInfo = views.ParamInfo;
 pub const ImportView = views.ImportView;
+
+// Enum/Sum type views
+pub const EnumDefView = views.EnumDefView;
+pub const EnumVariantInfo = views.EnumVariantInfo;
+pub const VariantPayloadField = views.VariantPayloadField;
 
 // Type views
 pub const ArrayTypeView = views.ArrayTypeView;

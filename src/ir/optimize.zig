@@ -750,6 +750,15 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .load_field_heap => |l| {
             used.put(l.record.id, {}) catch {};
         },
+        // Variant operations (sum types)
+        .variant_construct => |v| {
+            for (v.payload) |val| {
+                used.put(val.id, {}) catch {};
+            }
+        },
+        .variant_get_tag => |v| {
+            used.put(v.variant.id, {}) catch {};
+        },
     }
 }
 

@@ -397,6 +397,24 @@ pub const Opcode = enum(u8) {
     alloc_buffer = 0x89,
 
     // ============================================
+    // Sum Type (Variant) Operations (0x8A-0x8F)
+    // ============================================
+
+    /// variant_construct rd, tag, argc - construct a variant with payload
+    /// Creates a Variant value with the given tag and payload values from registers.
+    /// Format: [rd:4|argc:4] [tag:16]
+    /// Payload values are in r0..r(argc-1)
+    variant_construct = 0x8A,
+
+    /// variant_get_tag rd, src_reg - get the tag from a variant
+    /// Format: [rd:4|src_reg:4] [0]
+    variant_get_tag = 0x8B,
+
+    /// variant_get_payload rd, src_reg, field_idx - get payload field from variant
+    /// Format: [rd:4|src_reg:4] [field_idx:16]
+    variant_get_payload = 0x8C,
+
+    // ============================================
     // String Operations (0x90-0x9F)
     // ============================================
 
@@ -815,7 +833,25 @@ pub const Opcode = enum(u8) {
 
     _,
 
-    /// Get the size of operands for this opcode
+    /// Get the size of operands for this opcode (NOT including the opcode byte itself).
+    ///
+    /// ## Operand Size Calculation Rules
+    /// - `[reg:4|reg:4]` = 1 byte (two 4-bit nibbles packed into one byte)
+    /// - `[byte]` or `[u8]` = 1 byte
+    /// - `[u16]` = 2 bytes (little endian)
+    /// - `[u32]` = 4 bytes (little endian)
+    ///
+    /// ## Common Mistakes to Avoid
+    /// - DON'T count each 4-bit field as a full byte: `[rd:4|src:4]` is 1 byte, not 2
+    /// - DON'T include the opcode in the count - this returns OPERAND size only
+    /// - DO count each distinct byte field: `[a:8] [b:8]` is 2 bytes
+    /// - DO add up all u16 as 2 bytes: `[reg:8] [offset:16]` is 3 bytes
+    ///
+    /// ## Examples
+    /// - Format `[rd:4|src:4]` = 1 byte (nibbles packed)
+    /// - Format `[rd:4|src:4] [u16]` = 1 + 2 = 3 bytes
+    /// - Format `[rd:4|src:4] [u8] [u8]` = 1 + 1 + 1 = 3 bytes
+    /// - Format `[u8] [u16] [u16]` = 1 + 2 + 2 = 5 bytes
     pub fn operandSize(self: Opcode) usize {
         return switch (self) {
             // No operands
@@ -836,11 +872,15 @@ pub const Opcode = enum(u8) {
             .arc_retain, .arc_release => 2,
             .arc_move => 2,
             // Closure operations
-            .make_closure => 4, // [rd:4|env_reg:4] [fn_idx:16]
-            .call_closure => 3, // [rd:4|closure_reg:4] [argc:8]
+            .make_closure => 3, // [rd:4|env_reg:4] [fn_idx:16] = 1 + 2 = 3
+            .call_closure => 2, // [rd:4|closure_reg:4] [argc:8] = 1 + 1 = 2
             // Trait object operations
-            .make_trait_object => 4, // [rd:4|src_reg:4] [vtable_idx:16]
-            .call_trait_method => 4, // [rd:4|obj_reg:4] [method_idx:8] [argc:8]
+            .make_trait_object => 3, // [rd:4|src_reg:4] [vtable_idx:16] = 1 + 2 = 3
+            .call_trait_method => 3, // [rd:4|obj_reg:4] [method_idx:8] [argc:8] = 1 + 1 + 1 = 3
+            // Variant (sum type) operations
+            .variant_construct => 3, // [rd:4|argc:4] [tag:16]
+            .variant_get_tag => 2, // [rd:4|src_reg:4] [0]
+            .variant_get_payload => 3, // [rd:4|src_reg:4] [field_idx:16]
             // Quickened integer-specialized opcodes
             .add_int, .sub_int, .mul_int, .div_int => 2,
             .cmp_lt_int, .cmp_le_int, .cmp_gt_int, .cmp_ge_int => 2,

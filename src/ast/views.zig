@@ -23,6 +23,9 @@ const NodeStore = node_store.NodeStore;
 const NodeData = node_store.NodeData;
 const SourceLoc = node_store.SourceLoc;
 
+const statements = @import("statements.zig");
+const VariantPayloadKind = statements.VariantPayloadKind;
+
 // ============================================
 // Expression Views
 // ============================================
@@ -474,6 +477,150 @@ pub const ImportView = struct {
             .loc = store.stmtLoc(idx),
         };
     }
+};
+
+// ============================================
+// Enum/Sum Type Views
+// ============================================
+
+/// A single payload field in an enum variant
+pub const VariantPayloadField = struct {
+    /// Field name (StringId.null for tuple-like positional fields)
+    name: StringId,
+    /// Type of the field
+    type_idx: TypeIdx,
+};
+
+/// Information about a single enum variant (for sum types)
+pub const EnumVariantInfo = struct {
+    /// Variant name
+    name: StringId,
+    /// Discriminant value
+    value: i64,
+    /// Kind of payload
+    payload_kind: VariantPayloadKind,
+    /// Number of payload fields (0 for no payload)
+    payload_field_count: u8,
+    /// Index into extra_data where payload fields start
+    payload_fields_start: ExtraIdx,
+};
+
+/// View for enum definition (supports both simple enums and sum types)
+///
+/// Extra data format for enum with sum type support:
+/// [variant_count,
+///   // For each variant:
+///   variant_name: StringId,
+///   variant_value: i32,
+///   payload_info: u32,  // (payload_kind: 2 bits) | (field_count: 8 bits) | (fields_start: 22 bits)
+///   // Payload fields are stored separately after all variants
+/// ]
+///
+/// Payload field format (2 u32s per field):
+/// [field_name: StringId, field_type: TypeIdx]
+pub const EnumDefView = struct {
+    name: StringId,
+    variant_count: u32,
+    extra_start: ExtraIdx,
+    loc: SourceLoc,
+
+    pub fn from(store: *const NodeStore, idx: StmtIdx) EnumDefView {
+        const data = store.stmtData(idx);
+        const extra_start = ExtraIdx.fromInt(data.b);
+        return .{
+            .name = data.getName(),
+            .variant_count = store.extra_data.items[extra_start.toInt()],
+            .extra_start = extra_start,
+            .loc = store.stmtLoc(idx),
+        };
+    }
+
+    /// Check if this enum has any variants with payloads (is a sum type)
+    pub fn isSumType(self: EnumDefView, store: *const NodeStore) bool {
+        var it = self.variantIterator(store);
+        while (it.next()) |variant| {
+            if (variant.payload_kind != .none) return true;
+        }
+        return false;
+    }
+
+    /// Get variant at specific index
+    pub fn getVariant(self: EnumDefView, store: *const NodeStore, variant_idx: u32) EnumVariantInfo {
+        // Each variant uses 3 u32s: name, value, payload_info
+        const base_idx = self.extra_start.toInt() + 1 + variant_idx * 3;
+        const name: StringId = @enumFromInt(store.extra_data.items[base_idx]);
+        const value: i64 = @as(i32, @bitCast(store.extra_data.items[base_idx + 1]));
+        const payload_info = store.extra_data.items[base_idx + 2];
+
+        // Unpack payload_info: (kind: 2 bits) | (field_count: 8 bits) | (fields_start: 22 bits)
+        const payload_kind: VariantPayloadKind = @enumFromInt(@as(u2, @truncate(payload_info)));
+        const payload_field_count: u8 = @truncate(payload_info >> 2);
+        const payload_fields_start: u22 = @truncate(payload_info >> 10);
+
+        return .{
+            .name = name,
+            .value = value,
+            .payload_kind = payload_kind,
+            .payload_field_count = payload_field_count,
+            .payload_fields_start = ExtraIdx.fromInt(payload_fields_start),
+        };
+    }
+
+    /// Get payload field at specific index for a variant
+    pub fn getPayloadField(self: EnumDefView, store: *const NodeStore, variant: EnumVariantInfo, field_idx: u8) VariantPayloadField {
+        _ = self;
+        const base_idx = variant.payload_fields_start.toInt() + @as(u32, field_idx) * 2;
+        return .{
+            .name = @enumFromInt(store.extra_data.items[base_idx]),
+            .type_idx = TypeIdx.fromInt(store.extra_data.items[base_idx + 1]),
+        };
+    }
+
+    /// Iterator over variants
+    pub fn variantIterator(self: EnumDefView, store: *const NodeStore) VariantIterator {
+        return .{
+            .store = store,
+            .view = self,
+            .current = 0,
+        };
+    }
+
+    pub const VariantIterator = struct {
+        store: *const NodeStore,
+        view: EnumDefView,
+        current: u32,
+
+        pub fn next(self: *VariantIterator) ?EnumVariantInfo {
+            if (self.current >= self.view.variant_count) return null;
+            const variant = self.view.getVariant(self.store, self.current);
+            self.current += 1;
+            return variant;
+        }
+    };
+
+    /// Iterator over payload fields of a variant
+    pub fn payloadFieldIterator(self: EnumDefView, store: *const NodeStore, variant: EnumVariantInfo) PayloadFieldIterator {
+        return .{
+            .store = store,
+            .view = self,
+            .variant = variant,
+            .current = 0,
+        };
+    }
+
+    pub const PayloadFieldIterator = struct {
+        store: *const NodeStore,
+        view: EnumDefView,
+        variant: EnumVariantInfo,
+        current: u8,
+
+        pub fn next(self: *PayloadFieldIterator) ?VariantPayloadField {
+            if (self.current >= self.variant.payload_field_count) return null;
+            const field = self.view.getPayloadField(self.store, self.variant, self.current);
+            self.current += 1;
+            return field;
+        }
+    };
 };
 
 // ============================================

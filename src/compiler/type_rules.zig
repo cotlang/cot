@@ -333,6 +333,11 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             },
             else => .incompatible,
         },
+        // Variant types - variants are compatible only with same variant type
+        .variant => switch (value_deref) {
+            .variant => .compatible,
+            else => .incompatible,
+        },
     };
 }
 
@@ -367,6 +372,7 @@ pub fn typesEqual(a: Type, b: Type) bool {
         .heap_record => |ah| std.mem.eql(u8, ah.name, b.heap_record.name),
         .weak => |aw| typesEqual(aw.*, b.weak.*),
         .trait_object => |at| std.mem.eql(u8, at.trait_name, b.trait_object.trait_name),
+        .variant => true, // Variant types are equal if tags match (already checked above)
     };
 }
 
@@ -546,6 +552,7 @@ pub fn typeName(ty: Type) []const u8 {
         .heap_record => "heap_record",
         .weak => "weak",
         .trait_object => "trait_object",
+        .variant => "variant",
     };
 }
 
@@ -599,6 +606,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
             writer.writeAll(inner) catch {};
         },
         .trait_object => |t| writer.print("dyn {s}", .{t.trait_name}) catch {},
+        .variant => writer.writeAll("variant") catch {},
     }
 
     return fbs.getWritten();
