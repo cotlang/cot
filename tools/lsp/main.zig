@@ -290,9 +290,6 @@ const Handlers = struct {
                     }).toJson(allocator));
                 }
             },
-            .dex => {
-                // DEX component files - no keyword completions yet
-            },
         }
 
         return protocol.makeResponse(id, JsonValue{ .array = items }, allocator);
@@ -1520,7 +1517,6 @@ const Handlers = struct {
         switch (doc.language) {
             .cot => try buildCotSemanticTokens(allocator, doc.content, &data),
             .dbl => try buildDblSemanticTokens(allocator, doc.content, &data),
-            .dex => {}, // DEX semantic tokens not yet implemented
         }
 
         var result = JsonObject.init(allocator);

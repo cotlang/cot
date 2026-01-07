@@ -1252,8 +1252,33 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Set the last computed result (for SSA value chains without permanent register allocation)
-    /// Also registers the value with the register allocator so it can be found later
+    /// Also registers the value with the register allocator so it can be found later.
+    /// IMPORTANT: Before overwriting last_result, spill the previous value so it can be
+    /// recovered later. This is critical for expressions like `f() + g()` where both calls
+    /// return in the same register (r15) - we need to preserve f()'s result before calling g().
     pub fn setLastResult(self: *Self, value_id: u32, reg: u4) void {
+        log.debug("setLastResult: value_id={d} reg={d} (prev_value={?d} prev_reg={d})", .{
+            value_id,
+            reg,
+            self.last_result_value,
+            self.last_result_reg,
+        });
+
+        // Before overwriting, spill the previous last_result if it exists and uses the same register
+        // This ensures intermediate values aren't lost when making multiple calls
+        if (self.last_result_value) |prev_value_id| {
+            if (self.last_result_reg == reg and prev_value_id != value_id) {
+                // Previous value is in the same register we're about to overwrite
+                // Spill it if not already spilled
+                if (self.spilled_values.get(prev_value_id) == null) {
+                    const spill_slot = self.allocateSpillSlot();
+                    log.debug("SPILL (last_result): value_id={d} from r{d} to slot {d}", .{ prev_value_id, reg, spill_slot });
+                    self.emitSpillStore(reg, spill_slot) catch {};
+                    self.spilled_values.put(prev_value_id, spill_slot) catch {};
+                }
+            }
+        }
+
         self.last_result_value = value_id;
         self.last_result_reg = reg;
         // Also track in register allocator so value can be retrieved later
@@ -1315,7 +1340,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Allocate a new spill slot
-    fn allocateSpillSlot(self: *Self) u16 {
+    pub fn allocateSpillSlot(self: *Self) u16 {
         const slot = self.next_spill_slot;
         self.next_spill_slot += 1;
         const slots_used = self.next_spill_slot - self.spill_slot_base;
@@ -1326,7 +1351,7 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Emit store_local for spilling a register to a slot
-    fn emitSpillStore(self: *Self, reg: u4, slot: u16) EmitError!void {
+    pub fn emitSpillStore(self: *Self, reg: u4, slot: u16) EmitError!void {
         if (slot < 256) {
             try self.emitOpcode(.store_local);
             try self.emitU8(@as(u8, reg) << 4);

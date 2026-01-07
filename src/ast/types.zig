@@ -134,6 +134,10 @@ pub const TypeTag = enum(u8) {
     /// Never type (for functions that don't return)
     never,
 
+    /// Associated type reference: Self.Item or T.Item
+    /// Data: extra_data index -> [base_type_idx, assoc_name_id]
+    associated_type,
+
     /// Check if this is a signed integer type
     pub fn isSignedInt(self: TypeTag) bool {
         return switch (self) {

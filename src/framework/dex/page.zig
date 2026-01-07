@@ -1,27 +1,20 @@
-//! Dex Page Component System
+//! Dex Page System
 //!
-//! Handles page conventions and routing for Dex components.
-//!
-//! Convention:
-//!   pages/index.dex  → /
-//!   pages/about.dex  → /about
-//!   pages/blog/index.dex → /blog
-//!   pages/blog/[slug].dex → /blog/:slug (dynamic routes)
+//! Handles page routing and request context for Dex.
+//! Page rendering is handled by the frontend framework (React/Vue/Svelte).
+//! This module provides server-side data loading and context.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const compiler = @import("compiler.zig");
-const component_parser = @import("component_parser.zig");
-
-/// Page metadata extracted from component
+/// Page metadata
 pub const PageMeta = struct {
     title: ?[]const u8 = null,
     description: ?[]const u8 = null,
     layout: ?[]const u8 = null,
 };
 
-/// Request context passed to getServerProps
+/// Request context passed to page loaders
 pub const RequestContext = struct {
     path: []const u8,
     query: std.StringHashMap([]const u8),
@@ -63,7 +56,7 @@ pub const RequestContext = struct {
     }
 };
 
-/// Server-side props returned by getServerProps
+/// Server-side props returned by page loaders
 pub const ServerProps = struct {
     props: std.StringHashMap([]const u8),
     redirect: ?[]const u8 = null,
@@ -90,28 +83,16 @@ pub const ServerProps = struct {
 pub const PageRouter = struct {
     allocator: Allocator,
     pages_dir: []const u8,
-    cache: std.StringHashMap(CachedPage),
-
-    const CachedPage = struct {
-        component: compiler.CompiledComponent,
-        mtime: i128,
-    };
 
     pub fn init(allocator: Allocator, pages_dir: []const u8) PageRouter {
         return .{
             .allocator = allocator,
             .pages_dir = pages_dir,
-            .cache = std.StringHashMap(CachedPage).init(allocator),
         };
     }
 
     pub fn deinit(self: *PageRouter) void {
-        var iter = self.cache.iterator();
-        while (iter.next()) |entry| {
-            var comp = entry.value_ptr.component;
-            comp.deinit();
-        }
-        self.cache.deinit();
+        _ = self;
     }
 
     /// Resolve a URL path to a page file path
@@ -124,10 +105,10 @@ pub const PageRouter = struct {
         else
             url_path;
 
-        // Try exact match first
+        // Try exact match first (for .cot loader files)
         const exact_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/{s}.dx",
+            "{s}/{s}.cot",
             .{ self.pages_dir, normalized },
         );
 
@@ -136,10 +117,10 @@ pub const PageRouter = struct {
         }
         self.allocator.free(exact_path);
 
-        // Try index.dex in directory
+        // Try index.cot in directory
         const index_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/{s}/index.dx",
+            "{s}/{s}/index.cot",
             .{ self.pages_dir, normalized },
         );
 
@@ -150,60 +131,12 @@ pub const PageRouter = struct {
 
         return null;
     }
-
-    /// Load and compile a page, using cache if available
-    /// Returns a fresh CompiledComponent (caller owns it)
-    pub fn loadPage(self: *PageRouter, path: []const u8) !compiler.CompiledComponent {
-        // Check cache
-        if (self.cache.getPtr(path)) |cached| {
-            // Check if file was modified
-            const current_mtime = getFileMtime(path) catch 0;
-            if (current_mtime <= cached.mtime) {
-                // Return a copy - caller manages their own lifecycle
-                return cached.component;
-            }
-            // File changed, invalidate cache
-            cached.component.deinit();
-            _ = self.cache.remove(path);
-        }
-
-        // Load and compile
-        const source = try readFile(self.allocator, path);
-        defer self.allocator.free(source);
-
-        var comp = compiler.Compiler.init(self.allocator);
-        const component = try comp.compileSource(source);
-
-        // Cache it
-        const mtime = getFileMtime(path) catch 0;
-        try self.cache.put(path, .{
-            .component = component,
-            .mtime = mtime,
-        });
-
-        return component;
-    }
 };
 
 /// Check if a file exists
 fn fileExists(path: []const u8) bool {
     std.fs.cwd().access(path, .{}) catch return false;
     return true;
-}
-
-/// Read a file's contents
-fn readFile(allocator: Allocator, path: []const u8) ![]const u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, 1024 * 1024);
-}
-
-/// Get file modification time
-fn getFileMtime(path: []const u8) !i128 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const stat = try file.stat();
-    return stat.mtime;
 }
 
 // ============================================================================

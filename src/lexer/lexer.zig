@@ -364,11 +364,8 @@ pub const Lexer = struct {
         }
 
         const lexeme = self.source[start_pos..self.position];
-        var lower_buf: [32]u8 = undefined;
-        const lower_len = @min(lexeme.len, 32);
-        const lower_lexeme = std.ascii.lowerString(lower_buf[0..lower_len], lexeme[0..lower_len]);
-
-        const token_type = keywords.get(lower_lexeme) orelse .identifier;
+        // Keywords are case-sensitive: 'self' is a keyword, but 'Self' is an identifier (type reference)
+        const token_type = keywords.get(lexeme) orelse .identifier;
 
         return .{
             .type = token_type,

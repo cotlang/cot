@@ -248,7 +248,12 @@ pub fn cast_integer(ctx: *NativeContext) NativeError!?Value {
             const f = val.asFloat();
             return Value.initInt(@intFromFloat(f));
         },
+        .boolean => {
+            // Convert boolean to integer (true -> 1, false -> 0)
+            return Value.initInt(if (val.asBool()) 1 else 0);
+        },
         else => {
+            // Unknown type - return 0
             return Value.initInt(0);
         },
     }

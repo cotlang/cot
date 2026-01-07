@@ -1,114 +1,14 @@
-//! Dex: Real-time Server-Rendered UI Framework
+//! Dex: Full-Stack Web Framework for Cot
 //!
-//! Dex is Cot's answer to Phoenix LiveView - a server-rendered, real-time UI
-//! framework that eliminates the frontend/backend divide.
+//! Dex provides the server-side infrastructure for building web applications
+//! with Cot as the backend and React/Vue/Svelte as the frontend.
 //!
-//! Named after Dex, a loyal 14-year-old husky/cattle dog mix.
+//! The core framework code is written in Zig and lives in the cot repo.
+//! Frontend packages (@dex/react, etc.) live in the cotlang/dex repo.
+//!
+//! Named after Dexter, John's dog.
 
 const std = @import("std");
-
-// Template engine
-pub const template = struct {
-    // Lexer
-    pub const Lexer = @import("template/lexer.zig").Lexer;
-    pub const Token = @import("template/lexer.zig").Token;
-    pub const TokenType = @import("template/lexer.zig").TokenType;
-
-    // Parser
-    pub const Parser = @import("template/parser.zig").Parser;
-    pub const Node = @import("template/parser.zig").Node;
-    pub const NodeType = @import("template/parser.zig").NodeType;
-    pub const NodeData = @import("template/parser.zig").NodeData;
-    pub const Attribute = @import("template/parser.zig").Attribute;
-    pub const AttributeValue = @import("template/parser.zig").AttributeValue;
-    pub const EventBinding = @import("template/parser.zig").EventBinding;
-
-    // Renderer
-    pub const Renderer = @import("template/renderer.zig").Renderer;
-    pub const Context = @import("template/renderer.zig").Context;
-    pub const Value = @import("template/renderer.zig").Value;
-};
-
-// Component runtime
-pub const component = struct {
-    pub const ComponentDef = @import("component.zig").ComponentDef;
-    pub const ComponentInstance = @import("component.zig").ComponentInstance;
-    pub const StateField = @import("component.zig").StateField;
-    pub const PropDef = @import("component.zig").PropDef;
-    pub const Event = @import("component.zig").Event;
-    pub const Registry = @import("component.zig").Registry;
-};
-
-// DOM diffing
-pub const diff = struct {
-    pub const Differ = @import("diff.zig").Differ;
-    pub const Patch = @import("diff.zig").Patch;
-    pub const PatchOp = @import("diff.zig").PatchOp;
-    pub const PatchSet = @import("diff.zig").PatchSet;
-};
-
-// Socket management
-pub const socket = struct {
-    pub const Manager = @import("socket.zig").Manager;
-    pub const Session = @import("socket.zig").Session;
-    pub const ClientMessage = @import("socket.zig").ClientMessage;
-    pub const ClientMessageType = @import("socket.zig").ClientMessageType;
-};
-
-// PubSub for real-time features
-pub const pubsub = struct {
-    pub const Broker = @import("pubsub.zig").Broker;
-    pub const Message = @import("pubsub.zig").Message;
-    pub const Subscription = @import("pubsub.zig").Subscription;
-};
-
-// Presence tracking for real-time multi-user features
-pub const presence = struct {
-    pub const PresenceState = @import("presence.zig").PresenceState;
-    pub const Presence = @import("presence.zig").Presence;
-    pub const PresenceDiff = @import("presence.zig").PresenceDiff;
-    pub const Metadata = @import("presence.zig").Metadata;
-};
-
-// Component file parser (.dx files)
-pub const component_parser = struct {
-    pub const ComponentLexer = @import("component_parser.zig").ComponentLexer;
-    pub const ComponentParser = @import("component_parser.zig").ComponentParser;
-    pub const PageParser = @import("component_parser.zig").PageParser;
-    pub const ParsedComponent = @import("component_parser.zig").ParsedComponent;
-    pub const ParseErrorContext = @import("component_parser.zig").ParseErrorContext;
-    pub const ParseError = @import("component_parser.zig").ParseError;
-    pub const toComponentDef = @import("component_parser.zig").toComponentDef;
-    pub const parseSource = @import("component_parser.zig").parseSource;
-    pub const isPageFormat = @import("component_parser.zig").isPageFormat;
-    pub const isUiFormat = @import("component_parser.zig").isUiFormat;
-};
-
-// Live route handler
-pub const live = struct {
-    pub const LiveContext = @import("live_handler.zig").LiveContext;
-    pub const LiveRoute = @import("live_handler.zig").LiveRoute;
-    pub const PendingPatch = @import("live_handler.zig").PendingPatch;
-};
-
-// Hydration (server state → client)
-pub const hydration = struct {
-    pub const PageHydrationData = @import("hydration.zig").PageHydrationData;
-    pub const ComponentHydrationData = @import("hydration.zig").ComponentHydrationData;
-    pub const serializeValue = @import("hydration.zig").serializeValue;
-    pub const serializeContext = @import("hydration.zig").serializeContext;
-    pub const fromComponent = @import("hydration.zig").fromComponent;
-};
-
-// Component compiler (Dex AST → executable components)
-pub const compiler = struct {
-    pub const Compiler = @import("compiler.zig").Compiler;
-    pub const CompiledComponent = @import("compiler.zig").CompiledComponent;
-    pub const ComponentInstance = @import("compiler.zig").ComponentInstance;
-    pub const CompiledHandler = @import("compiler.zig").CompiledHandler;
-    pub const CompiledStateField = @import("compiler.zig").CompiledStateField;
-    pub const TypeTag = @import("compiler.zig").TypeTag;
-};
 
 // Page routing and SSR
 pub const page = struct {
@@ -143,14 +43,6 @@ pub const layout = struct {
     pub const LayoutResolver = @import("layout.zig").LayoutResolver;
 };
 
-// Built-in components
-pub const components = struct {
-    pub const link = @import("components/link.zig");
-    pub const Link = link.LinkProps;
-    pub const renderLink = link.render;
-    pub const NavLink = link.NavLink;
-};
-
 // Response helpers
 pub const response = struct {
     pub const Response = @import("response.zig").Response;
@@ -169,70 +61,10 @@ pub const response = struct {
     pub const badRequest = @import("response.zig").badRequest;
 };
 
-// Content system (Markdown/MDX)
-pub const content = struct {
-    // Markdown parser
-    pub const markdown = @import("content/markdown.zig");
-    pub const MarkdownParser = markdown.Parser;
-    pub const MarkdownOptions = markdown.Options;
-    pub const TocEntry = markdown.TocEntry;
-    pub const CodeBlock = markdown.CodeBlock;
-
-    // Frontmatter parser
-    pub const frontmatter = @import("content/frontmatter.zig");
-    pub const Frontmatter = frontmatter.Frontmatter;
-    pub const parseFrontmatter = frontmatter.parse;
-    pub const generateMetaTags = frontmatter.generateMetaTags;
-
-    // Syntax highlighting
-    pub const highlight = @import("content/highlight.zig");
-    pub const Highlighter = highlight.Highlighter;
-    pub const TokenType = highlight.TokenType;
-    pub const Language = highlight.Language;
-
-    // MDX parser (Markdown + Components)
-    pub const mdx = @import("content/mdx.zig");
-    pub const MdxParser = mdx.Parser;
-    pub const MdxOptions = mdx.Options;
-    pub const ComponentProps = mdx.ComponentProps;
-    pub const ComponentRegistry = mdx.ComponentRegistry;
-
-    // Content loader (file conventions and routing)
-    pub const loader = @import("content/loader.zig");
-    pub const ContentLoader = loader.Loader;
-    pub const ContentEntry = loader.ContentEntry;
-    pub const NavItem = loader.NavItem;
-
-    // Built-in documentation components
-    pub const doc_components = @import("content/components.zig");
-    pub const CalloutType = doc_components.CalloutType;
-    pub const createComponentRegistry = doc_components.createRegistry;
-};
-
 test {
-    _ = @import("template/lexer.zig");
-    _ = @import("template/parser.zig");
-    _ = @import("template/renderer.zig");
-    _ = @import("component.zig");
-    _ = @import("diff.zig");
-    _ = @import("socket.zig");
-    _ = @import("pubsub.zig");
-    _ = @import("presence.zig");
-    _ = @import("component_parser.zig");
-    _ = @import("live_handler.zig");
-    _ = @import("hydration.zig");
-    _ = @import("compiler.zig");
     _ = @import("page.zig");
     _ = @import("document.zig");
     _ = @import("response.zig");
     _ = @import("router.zig");
     _ = @import("layout.zig");
-    _ = @import("components/link.zig");
-    // Content system
-    _ = @import("content/markdown.zig");
-    _ = @import("content/frontmatter.zig");
-    _ = @import("content/highlight.zig");
-    _ = @import("content/mdx.zig");
-    _ = @import("content/loader.zig");
-    _ = @import("content/components.zig");
 }

@@ -1040,6 +1040,14 @@ pub const NodeStore = struct {
         return idx;
     }
 
+    /// Add an associated type reference: Self.Item or T.Item
+    pub fn addAssociatedType(self: *Self, base_type: TypeIdx, assoc_name: StringId) !TypeIdx {
+        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
+        try self.type_tags.append(self.allocator, .associated_type);
+        try self.type_data.append(self.allocator, .{ .a = base_type.toInt(), .b = @intFromEnum(assoc_name) });
+        return idx;
+    }
+
     /// Add a trait object type: dyn Trait
     pub fn addTraitObjectType(self: *Self, trait_name: StringId) !TypeIdx {
         const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));

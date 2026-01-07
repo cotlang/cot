@@ -81,10 +81,18 @@ pub const Parser = struct {
     // Flag to disable struct initializer parsing (e.g., in for-loop iterable)
     allow_struct_init: bool = true,
 
+    // Flag for handling `>>` as two `>` tokens in generic contexts.
+    // When the parser needs a `>` but sees `>>`, it consumes the `>>` and sets this flag.
+    // The next time a `>` is needed, this flag is cleared instead of advancing.
+    pending_gt: bool = false,
+
     const Self = @This();
     const MAX_NESTING_DEPTH: u8 = 128;
     const MAX_ERRORS: usize = 100;
     const MAX_TYPE_PARAMS: usize = 16;
+    const MAX_ASSOC_TYPES: usize = 8;
+    // Marker to distinguish associated types from methods in scratch buffer
+    const ASSOC_TYPE_MARKER: u32 = 0xFFFFFFFE;
 
     pub fn init(allocator: std.mem.Allocator, tokens: []const Token, store: *NodeStore, strings: *StringInterner) Self {
         return .{
@@ -464,7 +472,7 @@ pub const Parser = struct {
         return idx;
     }
 
-    /// Parse trait definition: trait Name<T> { fn method(self) -> T; }
+    /// Parse trait definition: trait Name<T> { type Item; fn method(self) -> T; }
     fn parseTraitDef(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_trait, "Expected 'trait'");
@@ -477,17 +485,48 @@ pub const Parser = struct {
 
         _ = try self.consume(.lbrace, "Expected '{'");
 
-        // Parse method signatures (with optional default bodies)
+        // Parse associated types and method signatures
         try self.store.markScratch();
         errdefer {
             self.store.rollbackScratch();
             self.clearTypeParams(type_param_count);
         }
 
+        // First pass: collect associated types (stored at beginning of scratch)
+        // We store them separately and count them
+        var assoc_types_temp: [MAX_ASSOC_TYPES * 2]u32 = undefined; // [name, bound] pairs
+        var assoc_type_count: u32 = 0;
+
         var method_count: u32 = 0;
         while (!self.check(.rbrace) and !self.isAtEnd()) {
+            // Check for associated type: type Name; or type Name: Bound;
+            if (self.check(.kw_type)) {
+                _ = self.advance(); // consume 'type'
+                const type_name_token = try self.consume(.identifier, "Expected associated type name");
+                const type_name_id = self.internString(type_name_token.lexeme) catch return error.OutOfMemory;
+
+                // Optional bound: type Item: Comparable;
+                var bound_type: TypeIdx = .null;
+                if (self.match(&[_]TokenType{.colon})) {
+                    bound_type = try self.parseType();
+                }
+
+                _ = self.match(&[_]TokenType{.semicolon}); // optional semicolon
+
+                if (assoc_type_count >= MAX_ASSOC_TYPES) {
+                    self.addError("Too many associated types in trait (max 8)");
+                    return error.InvalidSyntax;
+                }
+
+                // Store in temp buffer
+                assoc_types_temp[assoc_type_count * 2] = @intFromEnum(type_name_id);
+                assoc_types_temp[assoc_type_count * 2 + 1] = bound_type.toInt();
+                assoc_type_count += 1;
+                continue;
+            }
+
             // Parse method signature: fn name(params) -> return_type;
-            _ = try self.consume(.kw_fn, "Expected 'fn' for trait method");
+            _ = try self.consume(.kw_fn, "Expected 'fn' or 'type' in trait definition");
             const method_name_token = try self.consume(.identifier, "Expected method name");
             const method_name = self.internString(method_name_token.lexeme) catch return error.OutOfMemory;
 
@@ -567,11 +606,21 @@ pub const Parser = struct {
         const methods = self.store.getScratchU32s();
         self.store.commitScratch();
 
-        // Store trait def
-        const methods_start = self.store.extra_data.items.len;
+        // Store trait def with new layout:
+        // [method_count, type_param_count, type_params_start, assoc_type_count, ...assoc_types..., ...methods...]
+        const extra_start = self.store.extra_data.items.len;
         self.store.extra_data.append(self.allocator, method_count) catch return error.OutOfMemory;
         self.store.extra_data.append(self.allocator, type_param_count) catch return error.OutOfMemory;
         self.store.extra_data.append(self.allocator, type_params_start) catch return error.OutOfMemory;
+        self.store.extra_data.append(self.allocator, assoc_type_count) catch return error.OutOfMemory;
+
+        // Store associated types: [name, bound] pairs
+        for (0..assoc_type_count) |i| {
+            self.store.extra_data.append(self.allocator, assoc_types_temp[i * 2]) catch return error.OutOfMemory;
+            self.store.extra_data.append(self.allocator, assoc_types_temp[i * 2 + 1]) catch return error.OutOfMemory;
+        }
+
+        // Store method signatures
         for (methods) |m| {
             self.store.extra_data.append(self.allocator, m) catch return error.OutOfMemory;
         }
@@ -581,13 +630,13 @@ pub const Parser = struct {
         self.store.stmt_locs.append(self.allocator, loc) catch return error.OutOfMemory;
         self.store.stmt_data.append(self.allocator, .{
             .a = @intFromEnum(name),
-            .b = @intCast(methods_start),
+            .b = @intCast(extra_start),
         }) catch return error.OutOfMemory;
 
         return idx;
     }
 
-    /// Parse impl block: impl Trait for Type { methods }
+    /// Parse impl block: impl Trait for Type { type Item = T; methods }
     fn parseImplBlock(self: *Self) ParseError!StmtIdx {
         const loc = self.currentLoc();
         _ = try self.consume(.kw_impl, "Expected 'impl'");
@@ -603,14 +652,43 @@ pub const Parser = struct {
 
         _ = try self.consume(.lbrace, "Expected '{'");
 
-        // Parse method implementations
+        // Parse associated type bindings and method implementations
         try self.store.markScratch();
         errdefer self.store.rollbackScratch();
 
+        // Track associated type bindings separately
+        var assoc_bindings_temp: [MAX_ASSOC_TYPES * 2]u32 = undefined; // [name, concrete_type] pairs
+        var assoc_binding_count: u32 = 0;
+
+        var method_count: u32 = 0;
         while (!self.check(.rbrace) and !self.isAtEnd()) {
+            // Check for associated type binding: type Name = ConcreteType;
+            if (self.check(.kw_type)) {
+                _ = self.advance(); // consume 'type'
+                const type_name_token = try self.consume(.identifier, "Expected associated type name");
+                const type_name_id = self.internString(type_name_token.lexeme) catch return error.OutOfMemory;
+
+                _ = try self.consume(.equals, "Expected '=' after associated type name");
+                const concrete_type = try self.parseType();
+
+                _ = self.match(&[_]TokenType{.semicolon}); // optional semicolon
+
+                if (assoc_binding_count >= MAX_ASSOC_TYPES) {
+                    self.addError("Too many associated type bindings in impl (max 8)");
+                    return error.InvalidSyntax;
+                }
+
+                // Store in temp buffer
+                assoc_bindings_temp[assoc_binding_count * 2] = @intFromEnum(type_name_id);
+                assoc_bindings_temp[assoc_binding_count * 2 + 1] = concrete_type.toInt();
+                assoc_binding_count += 1;
+                continue;
+            }
+
             // Each method is a full fn definition
             const method_stmt = try self.parseFnDef();
             self.store.pushScratchU32(method_stmt.toInt()) catch return error.OutOfMemory;
+            method_count += 1;
         }
 
         _ = try self.consume(.rbrace, "Expected '}'");
@@ -619,11 +697,21 @@ pub const Parser = struct {
         const methods = self.store.getScratchU32s();
         self.store.commitScratch();
 
-        // Store impl block
-        const methods_start = self.store.extra_data.items.len;
-        self.store.extra_data.append(self.allocator, @intCast(methods.len)) catch return error.OutOfMemory; // method count
+        // Store impl block with new layout:
+        // [method_count, trait_type, target_type, assoc_binding_count, ...assoc_bindings..., method_stmt_idx...]
+        const extra_start = self.store.extra_data.items.len;
+        self.store.extra_data.append(self.allocator, method_count) catch return error.OutOfMemory;
         self.store.extra_data.append(self.allocator, trait_type.toInt()) catch return error.OutOfMemory;
         self.store.extra_data.append(self.allocator, target_type.toInt()) catch return error.OutOfMemory;
+        self.store.extra_data.append(self.allocator, assoc_binding_count) catch return error.OutOfMemory;
+
+        // Store associated type bindings: [name, concrete_type] pairs
+        for (0..assoc_binding_count) |i| {
+            self.store.extra_data.append(self.allocator, assoc_bindings_temp[i * 2]) catch return error.OutOfMemory;
+            self.store.extra_data.append(self.allocator, assoc_bindings_temp[i * 2 + 1]) catch return error.OutOfMemory;
+        }
+
+        // Store method statement indices
         for (methods) |m| {
             self.store.extra_data.append(self.allocator, m) catch return error.OutOfMemory;
         }
@@ -633,7 +721,7 @@ pub const Parser = struct {
         self.store.stmt_locs.append(self.allocator, loc) catch return error.OutOfMemory;
         self.store.stmt_data.append(self.allocator, .{
             .a = trait_type.toInt(),
-            .b = @intCast(methods_start),
+            .b = @intCast(extra_start),
         }) catch return error.OutOfMemory;
 
         return idx;
@@ -880,7 +968,11 @@ pub const Parser = struct {
 
         // Zig-style: require parentheses around scrutinee
         _ = try self.consume(.lparen, "Expected '(' after 'switch'");
+        // Disable struct init parsing to avoid ambiguity with < operator
+        const prev_allow_struct_init = self.allow_struct_init;
+        self.allow_struct_init = false;
         const scrutinee = try self.parseExpression();
+        self.allow_struct_init = prev_allow_struct_init;
         _ = try self.consume(.rparen, "Expected ')' after switch expression");
 
         return self.parseSwitchBody(scrutinee, loc);
@@ -1040,6 +1132,11 @@ pub const Parser = struct {
                 next != .kw_var and next != .kw_if and next != .kw_for and
                 next != .kw_while and next != .kw_loop and next != .kw_return)
             {
+                // Note: We DON'T disable allow_struct_init here because:
+                // - "return n < 10" is distinguished from "return Type<Args>{}" by checking
+                //   if the identifier starts with uppercase (type naming convention)
+                // - See parseUnary() around line 1604 where is_type_name check prevents
+                //   lowercase variables from being parsed as generic struct inits
                 value = try self.parseExpression();
             }
         }
@@ -1503,7 +1600,13 @@ pub const Parser = struct {
             if (self.allow_struct_init) {
                 if (self.check(.lt)) {
                     // Could be a generic struct init: Box<i64> { ... }
-                    return self.parseGenericStructInit(name, loc);
+                    // Only treat as generic struct init if the identifier starts with uppercase
+                    // (type naming convention). This avoids "n < 10" being parsed as "n<type>".
+                    const lexeme = self.previous().lexeme;
+                    const is_type_name = lexeme.len > 0 and lexeme[0] >= 'A' and lexeme[0] <= 'Z';
+                    if (is_type_name) {
+                        return self.parseGenericStructInit(name, loc);
+                    }
                 } else if (self.check(.lbrace)) {
                     return self.parseStructInit(name, loc);
                 }
@@ -1688,14 +1791,14 @@ pub const Parser = struct {
 
         // Collect type arguments
         var type_arg_count: u32 = 0;
-        while (!self.check(.gt) and !self.isAtEnd()) {
+        while (!self.checkGt() and !self.isAtEnd()) {
             const type_arg = try self.parseType();
             self.store.pushScratchU32(type_arg.toInt()) catch return error.OutOfMemory;
             type_arg_count += 1;
             if (!self.match(&[_]TokenType{.comma})) break;
         }
 
-        _ = try self.consume(.gt, "Expected '>' after type arguments");
+        _ = try self.consumeGt("Expected '>' after type arguments");
 
         // Now parse the struct initializer body: { .field = value, ... }
         _ = try self.consume(.lbrace, "Expected '{' after type arguments in struct initializer");
@@ -1880,7 +1983,7 @@ pub const Parser = struct {
         const start_count = self.type_params.items.len;
         var param_index: u16 = 0;
 
-        while (!self.check(.gt) and !self.isAtEnd()) {
+        while (!self.checkGt() and !self.isAtEnd()) {
             if (param_index >= MAX_TYPE_PARAMS) {
                 self.addError("Too many type parameters (max 16)");
                 return error.InvalidSyntax;
@@ -1909,7 +2012,7 @@ pub const Parser = struct {
             if (!self.match(&[_]TokenType{.comma})) break;
         }
 
-        _ = try self.consume(.gt, "Expected '>' after type parameters");
+        _ = try self.consumeGt("Expected '>' after type parameters");
         return @intCast(self.type_params.items.len - start_count);
     }
 
@@ -2042,16 +2145,37 @@ pub const Parser = struct {
 
         // Check if this is a type parameter in scope
         if (self.findTypeParam(name_id)) |param| {
-            return self.store.addTypeParam(param.name, param.index) catch return error.OutOfMemory;
+            const base_type = self.store.addTypeParam(param.name, param.index) catch return error.OutOfMemory;
+            // Check for associated type: T.Item
+            return self.maybeParseAssociatedType(base_type);
         }
 
         // Check for generic instantiation: Foo<T, U>
         if (self.check(.lt)) {
-            return try self.parseGenericInstantiation(name_id);
+            const base_type = try self.parseGenericInstantiation(name_id);
+            // Check for associated type on generic instance
+            return self.maybeParseAssociatedType(base_type);
         }
 
         // Plain named type reference
-        return self.store.addNamedType(name_id) catch return error.OutOfMemory;
+        const base_type = self.store.addNamedType(name_id) catch return error.OutOfMemory;
+        // Check for associated type: Self.Item or TypeName.Item
+        return self.maybeParseAssociatedType(base_type);
+    }
+
+    /// Check for and parse associated type suffix: .AssocName
+    /// Returns the original type if no associated type suffix, otherwise the associated type
+    fn maybeParseAssociatedType(self: *Self, base_type: TypeIdx) ParseError!TypeIdx {
+        if (self.check(.period)) {
+            // Peek ahead to see if it's an identifier (associated type) vs struct init (.field = ...)
+            if (self.peekNext().type == .identifier) {
+                _ = self.advance(); // consume '.'
+                const assoc_name_token = try self.consume(.identifier, "Expected associated type name");
+                const assoc_name_id = self.internString(assoc_name_token.lexeme) catch return error.OutOfMemory;
+                return self.store.addAssociatedType(base_type, assoc_name_id) catch return error.OutOfMemory;
+            }
+        }
+        return base_type;
     }
 
     /// Parse generic type arguments: <T, U, i32>
@@ -2063,7 +2187,7 @@ pub const Parser = struct {
         errdefer self.store.rollbackScratch();
 
         var count: usize = 0;
-        while (!self.check(.gt) and !self.isAtEnd()) {
+        while (!self.checkGt() and !self.isAtEnd()) {
             if (count >= MAX_TYPE_PARAMS) {
                 self.addError("Too many type arguments (max 16)");
                 return error.InvalidSyntax;
@@ -2076,7 +2200,7 @@ pub const Parser = struct {
             if (!self.match(&[_]TokenType{.comma})) break;
         }
 
-        _ = try self.consume(.gt, "Expected '>' after type arguments");
+        _ = try self.consumeGt("Expected '>' after type arguments");
 
         // Get type args from scratch and convert to TypeIdx slice
         const type_arg_u32s = self.store.getScratchU32s();
@@ -2101,7 +2225,7 @@ pub const Parser = struct {
         const value_type = try self.parseType();
         _ = try self.consume(.comma, "Expected ',' in Result<T, E>");
         const error_type = try self.parseType();
-        _ = try self.consume(.gt, "Expected '>' after Result type arguments");
+        _ = try self.consumeGt("Expected '>' after Result type arguments");
         return self.store.addErrorUnionType(value_type, error_type) catch return error.OutOfMemory;
     }
 
@@ -2109,7 +2233,7 @@ pub const Parser = struct {
     fn parseOptionType(self: *Self) ParseError!TypeIdx {
         _ = try self.consume(.lt, "Expected '<' after Option");
         const inner_type = try self.parseType();
-        _ = try self.consume(.gt, "Expected '>' after Option type argument");
+        _ = try self.consumeGt("Expected '>' after Option type argument");
         return self.store.addOptionalType(inner_type) catch return error.OutOfMemory;
     }
 
@@ -2119,7 +2243,7 @@ pub const Parser = struct {
         const key_type = try self.parseType();
         _ = try self.consume(.comma, "Expected ',' in Map<K, V>");
         const value_type = try self.parseType();
-        _ = try self.consume(.gt, "Expected '>' after Map type arguments");
+        _ = try self.consumeGt("Expected '>' after Map type arguments");
         return self.store.addMapType(key_type, value_type) catch return error.OutOfMemory;
     }
 
@@ -2127,7 +2251,7 @@ pub const Parser = struct {
     fn parseListType(self: *Self) ParseError!TypeIdx {
         _ = try self.consume(.lt, "Expected '<' after List");
         const element_type = try self.parseType();
-        _ = try self.consume(.gt, "Expected '>' after List type argument");
+        _ = try self.consumeGt("Expected '>' after List type argument");
         return self.store.addListType(element_type) catch return error.OutOfMemory;
     }
 
@@ -2137,12 +2261,28 @@ pub const Parser = struct {
 
     fn check(self: *Self, token_type: TokenType) bool {
         if (self.isAtEnd()) return false;
+        // Handle pending `>` from a split `>>` token
+        if (token_type == .gt and self.pending_gt) return true;
         return self.peek().type == token_type;
+    }
+
+    /// Check if current token is `>`, also accepting `>>` (shr) in generic contexts.
+    /// This allows parsing nested generics like `Iterator<Option<i64>>`.
+    fn checkGt(self: *Self) bool {
+        if (self.isAtEnd()) return false;
+        if (self.pending_gt) return true;
+        const t = self.peek().type;
+        return t == .gt or t == .shr;
     }
 
     fn match(self: *Self, types: []const TokenType) bool {
         for (types) |t| {
             if (self.check(t)) {
+                // Handle pending `>` from a split `>>` token - don't advance, just clear the flag
+                if (t == .gt and self.pending_gt) {
+                    self.pending_gt = false;
+                    return true;
+                }
                 _ = self.advance();
                 return true;
             }
@@ -2191,6 +2331,46 @@ pub const Parser = struct {
             .message = message,
             .line = self.peek().line,
             .column = self.peek().column,
+        }) catch {};
+
+        return error.UnexpectedToken;
+    }
+
+    /// Consume a `>` token, also accepting `>>` (shr) and splitting it into two `>` tokens.
+    /// This is essential for parsing nested generics like `Map<string, Option<i64>>`.
+    fn consumeGt(self: *Self, message: []const u8) ParseError!Token {
+        // If we have a pending `>` from a previous `>>` split, consume it
+        if (self.pending_gt) {
+            self.pending_gt = false;
+            // Return a synthetic token based on previous position
+            return self.previous();
+        }
+
+        const current_token = self.peek();
+
+        // Normal `>` token
+        if (current_token.type == .gt) {
+            return self.advance();
+        }
+
+        // `>>` (shr) token - split it into two `>` tokens
+        if (current_token.type == .shr) {
+            self.pending_gt = true; // Mark that we owe another `>`
+            return self.advance(); // Consume the `>>` and return the first `>`
+        }
+
+        // Neither `>` nor `>>` - error
+        log.debug("consumeGt failed: expected > or >>, got {s} '{s}' at {d}:{d}", .{
+            @tagName(current_token.type),
+            current_token.lexeme,
+            current_token.line,
+            current_token.column,
+        });
+
+        self.errors.append(self.allocator, .{
+            .message = message,
+            .line = current_token.line,
+            .column = current_token.column,
         }) catch {};
 
         return error.UnexpectedToken;

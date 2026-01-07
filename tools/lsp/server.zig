@@ -18,7 +18,6 @@ const JsonArray = protocol.JsonArray;
 pub const Language = enum {
     cot, // Modern .cot syntax
     dbl, // Legacy .dbl syntax
-    dex, // Dex component files
 
     pub fn fromUri(uri: []const u8) Language {
         // Check last few characters for extension
@@ -28,13 +27,6 @@ pub const Language = enum {
                 std.ascii.eqlIgnoreCase(ext, ".dbo"))
             {
                 return .dbl;
-            }
-        }
-        // Check for .dx (3 chars)
-        if (uri.len >= 3) {
-            const ext3 = uri[uri.len - 3 ..];
-            if (std.ascii.eqlIgnoreCase(ext3, ".dx")) {
-                return .dex;
             }
         }
         return .cot;
@@ -541,7 +533,6 @@ pub const Server = struct {
         switch (doc.language) {
             .cot => try self.indexCotDocument(doc),
             .dbl => try self.indexDblDocument(doc),
-            .dex => {}, // DEX component files - no indexing yet
         }
     }
 
@@ -885,7 +876,6 @@ pub fn analyzeDocument(allocator: Allocator, doc: *const Document) ![]protocol.D
     switch (doc.language) {
         .cot => try analyzeCot(allocator, doc.content, &diagnostics),
         .dbl => try analyzeDbl(allocator, doc.content, &diagnostics),
-        .dex => try analyzeDex(allocator, doc.content, &diagnostics),
     }
 
     return diagnostics.toOwnedSlice(allocator);
@@ -1080,58 +1070,6 @@ fn analyzeDbl(allocator: Allocator, source: []const u8, diagnostics: *std.ArrayL
     }
 }
 
-fn analyzeDex(allocator: Allocator, source: []const u8, diagnostics: *std.ArrayListUnmanaged(protocol.Diagnostic)) !void {
-    // Use the Dex component parser through the framework
-    const dex = cot.framework.dex;
-
-    // Tokenize using ComponentLexer
-    var lexer = dex.component_parser.ComponentLexer.init(allocator, source);
-    const tokens = lexer.tokenize() catch |err| {
-        try diagnostics.append(allocator, .{
-            .range = .{
-                .start = .{ .line = 0, .character = 0 },
-                .end = .{ .line = 0, .character = 1 },
-            },
-            .severity = .Error,
-            .message = @errorName(err),
-        });
-        return;
-    };
-    defer allocator.free(tokens);
-
-    // Parse tokens with error context for detailed error reporting
-    var error_context = dex.component_parser.ParseErrorContext.init(allocator);
-    error_context.setSource(source);
-
-    var parser = dex.component_parser.ComponentParser.init(allocator, tokens, &error_context);
-    defer parser.deinit();
-
-    _ = parser.parse() catch {
-        // Use detailed error from error context if available
-        if (error_context.last_error) |parse_err| {
-            try diagnostics.append(allocator, .{
-                .range = .{
-                    .start = .{ .line = if (parse_err.line > 0) parse_err.line - 1 else 0, .character = if (parse_err.column > 0) parse_err.column - 1 else 0 },
-                    .end = .{ .line = if (parse_err.line > 0) parse_err.line - 1 else 0, .character = parse_err.column },
-                },
-                .severity = .Error,
-                .message = parse_err.message,
-            });
-        } else {
-            // Fallback to generic error
-            try diagnostics.append(allocator, .{
-                .range = .{
-                    .start = .{ .line = 0, .character = 0 },
-                    .end = .{ .line = 0, .character = 1 },
-                },
-                .severity = .Error,
-                .message = "Dex component parse error",
-            });
-        }
-        return;
-    };
-}
-
 /// Get document symbols
 pub fn getDocumentSymbols(allocator: Allocator, doc: *const Document) ![]protocol.DocumentSymbol {
     var symbols: std.ArrayListUnmanaged(protocol.DocumentSymbol) = .empty;
@@ -1140,7 +1078,6 @@ pub fn getDocumentSymbols(allocator: Allocator, doc: *const Document) ![]protoco
     switch (doc.language) {
         .cot => try getCotSymbols(allocator, doc.content, &symbols),
         .dbl => try getDblSymbols(allocator, doc.content, &symbols),
-        .dex => try getDexSymbols(allocator, doc.content, &symbols),
     }
 
     return symbols.toOwnedSlice(allocator);
@@ -1547,48 +1484,6 @@ fn getDblSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayLi
     }
 }
 
-fn getDexSymbols(allocator: Allocator, source: []const u8, symbols: *std.ArrayListUnmanaged(protocol.DocumentSymbol)) !void {
-    // Parse Dex component to extract symbols using unified parser
-    const dex = cot.framework.dex;
-
-    // Use the unified parser that handles both page and component formats
-    var error_context = dex.component_parser.ParseErrorContext.init(allocator);
-    error_context.setSource(source);
-
-    const parsed = dex.component_parser.parseSource(allocator, source, &error_context) catch return;
-
-    // Add component name as class symbol
-    try symbols.append(allocator, .{
-        .name = try allocator.dupe(u8, parsed.name),
-        .kind = .Class,
-        .range = .{
-            .start = .{ .line = 0, .character = 0 },
-            .end = .{ .line = 100, .character = 0 },
-        },
-        .selection_range = .{
-            .start = .{ .line = 0, .character = 10 },
-            .end = .{ .line = 0, .character = 10 + @as(u32, @intCast(parsed.name.len)) },
-        },
-    });
-
-    // Add methods as function symbols
-    for (parsed.methods, 0..) |method, i| {
-        const line: u32 = @intCast(10 + i * 5); // Approximate line numbers
-        try symbols.append(allocator, .{
-            .name = try allocator.dupe(u8, method.name),
-            .kind = .Method,
-            .range = .{
-                .start = .{ .line = line, .character = 0 },
-                .end = .{ .line = line + 5, .character = 0 },
-            },
-            .selection_range = .{
-                .start = .{ .line = line, .character = 5 },
-                .end = .{ .line = line, .character = 5 + @as(u32, @intCast(method.name.len)) },
-            },
-        });
-    }
-}
-
 // ============================================================
 // Document Formatting
 // ============================================================
@@ -1608,7 +1503,6 @@ pub fn formatDocument(allocator: Allocator, doc: *const Document, tab_size: u32,
     const lang: formatter.Language = switch (doc.language) {
         .cot => .cot,
         .dbl => .dbl,
-        .dex => return &.{}, // Dex files don't have formatting yet
     };
 
     // Get edits from shared formatter

@@ -39,6 +39,8 @@ pub const GenericDef = lower_types.GenericDef;
 pub const InstantiationKey = lower_types.InstantiationKey;
 pub const TraitMethodSig = lower_types.TraitMethodSig;
 pub const TraitDef = lower_types.TraitDef;
+pub const AssociatedTypeDef = lower_types.AssociatedTypeDef;
+pub const AssociatedTypeBinding = lower_types.AssociatedTypeBinding;
 pub const ImplKey = lower_types.ImplKey;
 pub const MethodImpl = lower_types.MethodImpl;
 const ImplKeyContext = lower_types.ImplKeyContext;
@@ -164,6 +166,12 @@ pub const Lowerer = struct {
     /// Trait implementations (ImplKey -> method implementations)
     impl_methods: ImplMethodsMap,
 
+    /// Associated type bindings for each impl (ImplKey -> associated type bindings)
+    impl_assoc_types: ImplAssocTypesMap,
+
+    /// Current impl block context (set during impl block lowering for Self.Item resolution)
+    current_impl_key: ?ImplKey,
+
     /// Comptime evaluator for evaluating comptime conditions during lowering
     comptime_evaluator: comptime_eval.Evaluator,
 
@@ -182,6 +190,7 @@ pub const Lowerer = struct {
     source_file: ?[]const u8,
 
     const ImplMethodsMap = std.HashMap(ImplKey, []const MethodImpl, ImplKeyContext, std.hash_map.default_max_load_percentage);
+    const ImplAssocTypesMap = std.HashMap(ImplKey, []const AssociatedTypeBinding, ImplKeyContext, std.hash_map.default_max_load_percentage);
 
     /// Known builtin function names (lowercase)
     const known_builtins = std.StaticStringMap(void).initComptime(.{
@@ -293,6 +302,8 @@ pub const Lowerer = struct {
             .fn_return_types = std.StringHashMap(ir.Type).init(allocator),
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
             .impl_methods = ImplMethodsMap.init(allocator),
+            .impl_assoc_types = ImplAssocTypesMap.init(allocator),
+            .current_impl_key = null,
             .comptime_evaluator = comptime_eval.Evaluator.init(allocator, store, strings),
             .imported_namespaces = std.StringHashMap(void).init(allocator),
             .emit_arc = options.emit_arc,
@@ -1310,7 +1321,7 @@ pub const Lowerer = struct {
         return name_copy;
     }
 
-    /// Lower a trait definition - stores trait method signatures for later lookup
+    /// Lower a trait definition - stores trait method signatures and associated types for later lookup
     fn lowerTraitDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
         const loc = self.store.stmtLoc(stmt_idx);
@@ -1318,37 +1329,59 @@ pub const Lowerer = struct {
 
         const name_id: StringId = @enumFromInt(data.a);
         const trait_name = self.strings.get(name_id);
-        const methods_start = data.b;
+        const extra_start = data.b;
 
         debug.print(.ir, "Lowering trait: {s}", .{trait_name});
 
-        // Parse extra_data: [method_count, type_param_count, type_params_start, ...method_data...]
-        const method_count = self.store.extra_data.items[methods_start];
-        const type_param_count: u16 = @intCast(self.store.extra_data.items[methods_start + 1]);
-        // const type_params_start = self.store.extra_data.items[methods_start + 2]; // unused for now
+        // Parse extra_data: [method_count, type_param_count, type_params_start, assoc_type_count, ...assoc_types..., ...method_data...]
+        const method_count = self.store.extra_data.items[extra_start];
+        const type_param_count: u16 = @intCast(self.store.extra_data.items[extra_start + 1]);
+        // const type_params_start = self.store.extra_data.items[extra_start + 2]; // unused for now
+        const assoc_type_count = self.store.extra_data.items[extra_start + 3];
+
+        var offset: u32 = 4; // Skip method_count, type_param_count, type_params_start, assoc_type_count
+
+        // Parse associated types: [name, bound] pairs
+        var assoc_types: std.ArrayListUnmanaged(AssociatedTypeDef) = .{};
+        defer assoc_types.deinit(self.allocator);
+
+        for (0..assoc_type_count) |_| {
+            const assoc_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
+            const assoc_name = self.strings.get(assoc_name_id);
+            offset += 1;
+
+            const bound_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
+            offset += 1;
+
+            try assoc_types.append(self.allocator, .{
+                .name = assoc_name,
+                .bound_type_idx = bound_type_idx,
+            });
+
+            debug.print(.ir, "  Associated type: {s}", .{assoc_name});
+        }
 
         // Parse method signatures
         // Layout: [method_name, param_count, return_type, has_default, default_body, param_quads...] for each method
         var methods: std.ArrayListUnmanaged(TraitMethodSig) = .{};
         defer methods.deinit(self.allocator);
 
-        var offset: u32 = 3; // Skip method_count, type_param_count, type_params_start
         for (0..method_count) |_| {
             // Read method header: [method_name, param_count, return_type, has_default, default_body]
-            const method_name_id: StringId = @enumFromInt(self.store.extra_data.items[methods_start + offset]);
+            const method_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
             const method_name = self.strings.get(method_name_id);
             offset += 1;
 
-            const param_count = self.store.extra_data.items[methods_start + offset];
+            const param_count = self.store.extra_data.items[extra_start + offset];
             offset += 1;
 
-            const return_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[methods_start + offset]);
+            const return_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
             offset += 1;
 
-            const has_default = self.store.extra_data.items[methods_start + offset] != 0;
+            const has_default = self.store.extra_data.items[extra_start + offset] != 0;
             offset += 1;
 
-            const default_body_raw = self.store.extra_data.items[methods_start + offset];
+            const default_body_raw = self.store.extra_data.items[extra_start + offset];
             const default_body_idx: ?StmtIdx = if (has_default) @enumFromInt(default_body_raw) else null;
             offset += 1;
 
@@ -1360,8 +1393,8 @@ pub const Lowerer = struct {
 
                 for (0..param_count) |_| {
                     // Store name and type as raw u32 values
-                    try param_data.append(self.allocator, self.store.extra_data.items[methods_start + offset]); // name
-                    try param_data.append(self.allocator, self.store.extra_data.items[methods_start + offset + 1]); // type
+                    try param_data.append(self.allocator, self.store.extra_data.items[extra_start + offset]); // name
+                    try param_data.append(self.allocator, self.store.extra_data.items[extra_start + offset + 1]); // type
                     offset += 4; // Skip is_ref and default too
                 }
                 raw_param_data = try param_data.toOwnedSlice(self.allocator);
@@ -1386,23 +1419,25 @@ pub const Lowerer = struct {
             }
         }
 
-        // Store the trait definition
+        // Store the trait definition with associated types
         try self.trait_defs.put(trait_name, .{
             .name = trait_name,
             .type_param_count = type_param_count,
             .methods = try methods.toOwnedSlice(self.allocator),
+            .associated_types = try assoc_types.toOwnedSlice(self.allocator),
         });
     }
 
-    /// Lower an impl block - registers method implementations for a trait+type pair
+    /// Lower an impl block - registers method implementations and associated type bindings for a trait+type pair
     fn lowerImplBlock(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
-        const methods_start = data.b;
+        const extra_start = data.b;
 
-        // Parse extra_data: [method_count, trait_type, target_type, method_stmt_idx...]
-        const method_count = self.store.extra_data.items[methods_start];
-        const trait_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[methods_start + 1]);
-        const target_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[methods_start + 2]);
+        // Parse extra_data: [method_count, trait_type, target_type, assoc_binding_count, ...assoc_bindings..., method_stmt_idx...]
+        const method_count = self.store.extra_data.items[extra_start];
+        const trait_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1]);
+        const target_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + 2]);
+        const assoc_binding_count = self.store.extra_data.items[extra_start + 3];
 
         // Get trait and target type names
         const trait_name = self.getTypeName(trait_type_idx) orelse {
@@ -1416,14 +1451,44 @@ pub const Lowerer = struct {
         else
             trait_name;
 
-        debug.print(.ir, "Lowering impl {s} for {s} with {d} methods", .{ trait_name, target_name, method_count });
+        debug.print(.ir, "Lowering impl {s} for {s} with {d} methods, {d} associated types", .{ trait_name, target_name, method_count, assoc_binding_count });
+
+        // Parse associated type bindings: [name, concrete_type] pairs
+        var offset: u32 = 4; // Skip method_count, trait_type, target_type, assoc_binding_count
+
+        var assoc_bindings: std.ArrayListUnmanaged(AssociatedTypeBinding) = .{};
+        defer assoc_bindings.deinit(self.allocator);
+
+        for (0..assoc_binding_count) |_| {
+            const assoc_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
+            const assoc_name = self.strings.get(assoc_name_id);
+            offset += 1;
+
+            const concrete_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
+            offset += 1;
+
+            try assoc_bindings.append(self.allocator, .{
+                .name = assoc_name,
+                .concrete_type_idx = concrete_type_idx,
+            });
+
+            debug.print(.ir, "  Associated type binding: {s}", .{assoc_name});
+        }
+
+        // Store associated type bindings for this impl (for later type resolution)
+        const impl_key = ImplKey{ .trait_name = trait_name, .type_name = target_name };
+        try self.impl_assoc_types.put(impl_key, try assoc_bindings.toOwnedSlice(self.allocator));
+
+        // Set current impl context for Self.Item resolution during method lowering
+        self.current_impl_key = impl_key;
+        defer self.current_impl_key = null;
 
         // Collect method implementations
         var methods: std.ArrayListUnmanaged(MethodImpl) = .{};
         defer methods.deinit(self.allocator);
 
         for (0..method_count) |i| {
-            const method_stmt_raw = self.store.extra_data.items[methods_start + 3 + i];
+            const method_stmt_raw = self.store.extra_data.items[extra_start + offset + i];
             const method_stmt_idx: StmtIdx = @enumFromInt(method_stmt_raw);
 
             // Get the method name from the fn_def statement
@@ -1449,9 +1514,23 @@ pub const Lowerer = struct {
             try self.lowerImplMethod(method_stmt_idx, qualified_name_owned);
         }
 
-        // Check for missing methods that have default implementations
+        // Validate trait requirements (associated types and methods)
         const trait_def = self.trait_defs.get(trait_name);
         if (trait_def) |td| {
+            // Check for missing associated types
+            for (td.associated_types) |assoc_type_def| {
+                var found = false;
+                for (assoc_bindings.items) |binding| {
+                    if (std.mem.eql(u8, binding.name, assoc_type_def.name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    debug.print(.ir, "Warning: impl {s} for {s} is missing associated type '{s}'", .{ trait_name, target_name, assoc_type_def.name });
+                }
+            }
+
             // Build a set of implemented method names
             var implemented = std.StringHashMap(void).init(self.allocator);
             defer implemented.deinit();
@@ -2087,6 +2166,9 @@ pub const Lowerer = struct {
             const types_slice = try param_types.toOwnedSlice(self.allocator);
             try self.fn_param_types.put(qualified_name, types_slice);
         }
+
+        // Register return type for method call resolution
+        try self.fn_return_types.put(qualified_name, return_type);
 
         // Create function type with qualified name
         const func_type = ir.FunctionType{

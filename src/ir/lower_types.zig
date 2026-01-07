@@ -77,11 +77,26 @@ pub const TraitMethodSig = struct {
     raw_param_data: ?[]const u32 = null,
 };
 
-/// Trait definition - stores method signatures for a trait
+/// Associated type declaration in a trait (e.g., `type Item;`)
+pub const AssociatedTypeDef = struct {
+    name: []const u8,
+    /// Optional bound constraint (e.g., `type Item: Comparable;`)
+    bound_type_idx: ast.TypeIdx = .null,
+};
+
+/// Associated type binding in an impl block (e.g., `type Item = i64;`)
+pub const AssociatedTypeBinding = struct {
+    name: []const u8,
+    /// The concrete type this associated type is bound to
+    concrete_type_idx: ast.TypeIdx,
+};
+
+/// Trait definition - stores method signatures and associated types for a trait
 pub const TraitDef = struct {
     name: []const u8,
     type_param_count: u16,
     methods: []const TraitMethodSig,
+    associated_types: []const AssociatedTypeDef = &.{},
 };
 
 /// Key for looking up trait implementations

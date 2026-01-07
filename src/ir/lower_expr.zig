@@ -1290,8 +1290,18 @@ pub fn lowerSliceExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerE
     const start_val = try lowerExpression(l, parts.start);
     const end_val = try lowerExpression(l, parts.end);
 
-    // Check if source is an array type
-    const is_array = switch (source_val.ty) {
+    log.debug("lowerSliceExpr: source_val.ty = {}", .{source_val.ty});
+
+    // Check if source is a string type (including [N]u8 byte arrays which represent string literals)
+    const is_string = switch (source_val.ty) {
+        .string => true,
+        // [N]u8 byte arrays are string literals
+        .array => |a| a.element.* == .u8,
+        else => false,
+    };
+
+    // Check if source is a non-string array type
+    const is_array = if (is_string) false else switch (source_val.ty) {
         .array => true,
         .slice => true,
         .list => true,
@@ -2511,9 +2521,12 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         if (maybe_struct_type) |struct_type| {
             const type_name = struct_type.name;
 
+            log.debug("Method call on struct: type={s} method={s}", .{ type_name, field_name });
+
             // Look up inherent impl (impl TypeName { ... })
             // For inherent impls, trait_name == type_name
             if (l.lookupTraitMethod(type_name, type_name, field_name)) |_| {
+                log.debug("  -> found in inherent impl", .{});
                 // Found the method! Lower arguments and emit call with object as first arg
                 var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer method_args.deinit(l.allocator);
@@ -2541,12 +2554,14 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     return LowerError.OutOfMemory;
                 };
 
-                // Determine return type from the method's signature
-                // For now, use a generic approach - could be improved with proper type inference
-                const result_type = getBuiltinReturnType(method_name, args_slice);
+                // Look up return type from fn_return_types first (set when impl method was lowered)
+                const result_type: ir.Type = if (l.fn_return_types.get(method_name)) |rt|
+                    rt
+                else
+                    getBuiltinReturnType(method_name, args_slice);
                 const result = func.newValue(result_type);
 
-                debug.print(.ir, "Dispatching method call: {s}.{s} with {d} args", .{ type_name, field_name, args_slice.len });
+                debug.print(.ir, "Dispatching method call: {s}.{s} with {d} args result_type={s}", .{ type_name, field_name, args_slice.len, @tagName(result_type) });
 
                 try l.emit(.{
                     .call = .{
@@ -2562,6 +2577,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             // Look up trait impl (impl TraitName for TypeName { ... })
             // Check all trait implementations for this type
             if (l.findTraitMethodForType(type_name, field_name)) |qualified_name| {
+                log.debug("  -> found in trait impl: {s}", .{qualified_name});
                 // Found the method in a trait impl! Lower arguments and emit call
                 var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer method_args.deinit(l.allocator);
@@ -2577,10 +2593,21 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 }
 
                 const args_slice = try method_args.toOwnedSlice(l.allocator);
-                const result_type = getBuiltinReturnType(qualified_name, args_slice);
+
+                // Look up return type from fn_return_types (set when impl method was lowered)
+                // Fall back to getBuiltinReturnType only if not found
+                const fn_rt = l.fn_return_types.get(qualified_name);
+                log.debug("  -> fn_return_types lookup: {s} -> {?s}", .{
+                    qualified_name,
+                    if (fn_rt) |t| @tagName(t) else null,
+                });
+                const result_type: ir.Type = if (fn_rt) |rt|
+                    rt
+                else
+                    getBuiltinReturnType(qualified_name, args_slice);
                 const result = func.newValue(result_type);
 
-                debug.print(.ir, "Dispatching trait method call: {s} with {d} args", .{ qualified_name, args_slice.len });
+                log.debug("  -> result_type={s}", .{@tagName(result_type)});
 
                 try l.emit(.{
                     .call = .{
@@ -2620,10 +2647,14 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     return LowerError.OutOfMemory;
                 };
 
-                const result_type = getBuiltinReturnType(method_name, args_slice);
+                // Look up return type from fn_return_types first
+                const result_type: ir.Type = if (l.fn_return_types.get(method_name)) |rt|
+                    rt
+                else
+                    getBuiltinReturnType(method_name, args_slice);
                 const result = func.newValue(result_type);
 
-                debug.print(.ir, "Dispatching fallback struct method call: {s} with {d} args", .{ method_name, args_slice.len });
+                debug.print(.ir, "Dispatching fallback struct method call: {s} with {d} args result_type={s}", .{ method_name, args_slice.len, @tagName(result_type) });
 
                 try l.emit(.{
                     .call = .{
@@ -2819,7 +2850,20 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         if (args_slice.len >= type_param_count) {
             var type_args: [16]ir.Type = undefined; // Max 16 type params
             for (0..type_param_count) |i| {
-                type_args[i] = args_slice[i].ty;
+                var inferred_type = args_slice[i].ty;
+
+                // Coerce [N]u8 array types to string for generic inference
+                // String literals have internal type [N]u8, but for generic functions
+                // we want to treat them as `string` type so that identity("hello")
+                // becomes identity<string> not identity<[5]u8>
+                if (inferred_type == .array) {
+                    if (inferred_type.array.element.* == .u8) {
+                        inferred_type = .{ .string = {} };
+                        debug.print(.ir, "Generic type inference: coerced [N]u8 array to string", .{});
+                    }
+                }
+
+                type_args[i] = inferred_type;
             }
 
             // Instantiate the generic function
@@ -3061,8 +3105,15 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const args_slice = try args.toOwnedSlice(l.allocator);
     // NOTE: args_slice is freed by Block.deinit when the call instruction is cleaned up
 
-    const result_type = getBuiltinReturnType(callee_name, args_slice);
+    // Look up return type from fn_return_types first (set when method was lowered)
+    // This correctly handles trait impl methods like "Point.to_string" -> string
+    const result_type: ir.Type = if (l.fn_return_types.get(callee_name)) |rt|
+        rt
+    else
+        getBuiltinReturnType(callee_name, args_slice);
     const result = func.newValue(result_type);
+
+    debug.print(.ir, "lowerMethodCall: callee={s} result_type={s}", .{ callee_name, @tagName(result_type) });
 
     try l.emit(.{
         .call = .{
@@ -3866,6 +3917,63 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
             const trait_name_id: StringId = @enumFromInt(data.a);
             const trait_name = l.strings.get(trait_name_id);
             break :blk .{ .trait_object = .{ .trait_name = trait_name } };
+        },
+        // Associated type reference: Self.Item or T.Item
+        .associated_type => blk: {
+            const base_type_idx: TypeIdx = @enumFromInt(data.a);
+            const assoc_name_id: StringId = @enumFromInt(data.b);
+            const assoc_name = l.strings.get(assoc_name_id);
+
+            // Get the base type to determine what struct/type it refers to
+            const base_tag = l.store.typeTag(base_type_idx);
+            const base_data = l.store.typeData(base_type_idx);
+
+            // If base is a type parameter named "Self" and we're in an impl block
+            if (base_tag == .type_param) {
+                const param_name_id: StringId = @enumFromInt(base_data.a);
+                const param_name = l.strings.get(param_name_id);
+
+                if (std.mem.eql(u8, param_name, "Self")) {
+                    // Look up in current impl context
+                    if (l.current_impl_key) |impl_key| {
+                        if (l.impl_assoc_types.get(impl_key)) |bindings| {
+                            for (bindings) |binding| {
+                                if (std.mem.eql(u8, binding.name, assoc_name)) {
+                                    // Resolve the concrete type
+                                    break :blk try lowerTypeIdx(l, binding.concrete_type_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Type parameter substitution: look up what T is substituted with
+                if (l.type_param_substitutions.get(param_name)) |_| {
+                    // T is substituted, but we need the associated type from its impl
+                    // For now, fall through to void - full generic associated type support TBD
+                }
+            }
+
+            // If base is a named type (concrete struct), try to find its impl
+            if (base_tag == .named) {
+                const type_name_id: StringId = @enumFromInt(base_data.a);
+                const type_name = l.strings.get(type_name_id);
+
+                // Search all impls for this type to find the associated type binding
+                var impl_it = l.impl_assoc_types.iterator();
+                while (impl_it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.type_name, type_name)) {
+                        for (entry.value_ptr.*) |binding| {
+                            if (std.mem.eql(u8, binding.name, assoc_name)) {
+                                break :blk try lowerTypeIdx(l, binding.concrete_type_idx);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Associated type not found - return void as fallback
+            break :blk .void;
         },
         .tuple, .error_union, .inferred, .any, .never => .void,
     };

@@ -344,6 +344,15 @@ pub const Emitter = struct {
             .any => try self.writer.writeAll("any"),
             .never => try self.writer.writeAll("never"),
             .trait_object => try self.writer.writeAll("dyn Trait"),
+            .associated_type => {
+                // Emit as BaseType.AssocName (e.g., Self.Item)
+                const data = self.store.typeData(idx);
+                const base_type = TypeIdx.fromInt(data.a);
+                const assoc_name: StringId = @enumFromInt(data.b);
+                try self.emitType(base_type);
+                try self.writer.writeByte('.');
+                try self.writeStringId(assoc_name);
+            },
         }
     }
 

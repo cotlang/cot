@@ -107,6 +107,14 @@ fn allocateStructFieldSlots(e: *BytecodeEmitter, prefix: []const u8, struct_type
 
 /// Emit alloca instruction - allocate local variable
 pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void {
+    // Debug: Log ALL alloca instructions to trace type confusion bugs
+    log.debug("emitAlloca: name={s} result.id={d} type={s} local_count={d}", .{
+        a.name,
+        a.result.id,
+        @tagName(a.ty),
+        e.local_count,
+    });
+
     // Struct types always get new local slots for each instance
     // Don't use the type's global registration - that's just layout info
     if (a.ty == .@"struct") {
@@ -132,6 +140,12 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
 
     // Array types: u8 arrays (DBL buffers) use single slot, other arrays use multiple slots
     if (a.ty == .array) {
+        log.debug("emitAlloca: array detected - name={s} element_type={s} length={d}", .{
+            a.name,
+            @tagName(a.ty.array.element.*),
+            a.ty.array.length,
+        });
+
         // Check if this is a parameter (already registered as local) - use existing slot
         if (e.locals.get(a.name)) |local_info| {
             try e.value_slots.put(a.result.id, local_info.slot);
@@ -152,6 +166,7 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
         // u8 arrays (DBL alpha/string buffers): single slot holding a buffer value
         if (a.ty.array.element.* == .u8) {
             e.local_count += 1;
+            log.debug("emitAlloca: EMITTING alloc_buffer for {s} at slot {d} size={d}", .{ a.name, base_slot, array_len });
             debug.print(.emit, "alloca buffer: {s} slot={d} size={d}", .{ a.name, base_slot, array_len });
 
             // Emit buffer initialization: alloc_buffer rd, size
@@ -645,6 +660,15 @@ pub fn emitBrif(e: *BytecodeEmitter, c: ir.Instruction.CondBranch) EmitError!voi
 /// before returning, so the caller can write them back to the original slots.
 /// For struct returns, all fields are loaded into consecutive high registers (r14, r15 for 2-field, etc.)
 pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
+    // Debug: trace return value type for debugging generic/trait issues
+    if (r) |val| {
+        log.debug("emitReturn: val.id={d} val.ty={s} func={s}", .{
+            val.id,
+            @tagName(val.ty),
+            if (e.current_func) |f| f.name else "(no func)",
+        });
+    }
+
     // Determine how many registers the return value needs
     // Struct returns use multiple high registers (e.g., r14, r15 for 2 fields)
     var return_field_count: u8 = 0;
@@ -860,6 +884,33 @@ fn emitNativeCall(e: *BytecodeEmitter, c: ir.Instruction.Call) EmitError!void {
 }
 
 fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) EmitError!void {
+    // CRITICAL: Before making a call, spill any live intermediate value.
+    // Calls clobber ALL registers - there are no callee-saved registers.
+    // This is essential for expressions like `!f() and g()` where the result of !f()
+    // might be in any register (e.g., r1 from log_not) and would be clobbered by g().
+    log.debug("emitUserCall: callee={s} last_result_value={?d} last_result_reg={d}", .{
+        c.callee,
+        e.last_result_value,
+        e.last_result_reg,
+    });
+    if (e.last_result_value) |prev_value_id| {
+        // Spill the previous result regardless of which register it's in.
+        // The callee can clobber any register during execution.
+        if (e.spilled_values.get(prev_value_id) == null) {
+            const spill_slot = e.allocateSpillSlot();
+            log.debug("SPILL (pre-call): value_id={d} from r{d} to slot {d}", .{ prev_value_id, e.last_result_reg, spill_slot });
+            try e.emitSpillStore(e.last_result_reg, spill_slot);
+            try e.spilled_values.put(prev_value_id, spill_slot);
+        }
+        // Remove from register allocator so getValueInReg will reload from spill slot
+        const spill_reg = e.last_result_reg;
+        _ = e.reg_alloc.value_to_reg.remove(prev_value_id);
+        e.reg_alloc.reg_to_value[spill_reg] = null;
+        e.reg_alloc.free_regs |= @as(u16, 1) << spill_reg;
+        // Invalidate last_result since we've spilled it
+        e.last_result_value = null;
+    }
+
     // Load arguments to registers
     // For struct arguments (including pointer-to-struct), we need to load ALL fields into consecutive registers
     var reg_offset: u8 = 0;
@@ -988,6 +1039,17 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
             }
         }
         // Non-struct return: value is in r15
+        // CRITICAL: Store the result to a slot immediately to preserve it across subsequent instructions.
+        // Without this, expressions like `fib(n-1) + fib(n-2)` fail because:
+        //   1. fib(n-1) returns in r15, set as last_result
+        //   2. Computing n-2 (a sub instruction) overwrites last_result with reg=0
+        //   3. fib(n-2) returns in r15
+        //   4. When emitting the add, fib(n-1)'s result is lost (neither in last_result nor spilled)
+        // By storing to a slot immediately, we ensure the value can be recovered via value_slots.
+        const spill_slot = e.allocateSpillSlot();
+        log.debug("STORE call result: value_id={d} from r15 to slot {d}", .{ result.id, spill_slot });
+        try e.emitSpillStore(15, spill_slot);
+        try e.value_slots.put(result.id, spill_slot);
         e.setLastResult(result.id, 15);
     }
 }
@@ -1365,10 +1427,50 @@ pub fn emitArrayLen(e: *BytecodeEmitter, al: ir.Instruction.UnaryOp) EmitError!v
     e.setLastResult(al.result.id, 0);
 }
 
-/// Emit array_slice instruction
-/// Format: [rd:4|inclusive:1|0:3] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+/// Emit array_slice or str_slice instruction depending on source type
+/// For arrays: Format: [rd:4|inclusive:1|0:3] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+/// For strings: Format: [dest_reg:4|src_reg:4] [start_reg:4|end_reg:4] [is_length:8]
 pub fn emitArraySlice(e: *BytecodeEmitter, as: ir.Instruction.ArraySlice) EmitError!void {
-    // Look up the source array's stack slot (same logic as array_load)
+    // Check if source is a string type - use str_slice instead of array_slice
+    if (as.source.isString()) {
+        debug.print(.emit, "str_slice: source.id={d} source.ty={}", .{ as.source.id, as.source.ty });
+
+        // Load source string into register (r3)
+        try e.emitValueToReg(as.source, 3);
+        // Load start index into r1
+        try e.emitValueToReg(as.start, 1);
+        // Load end index into r2
+        try e.emitValueToReg(as.end, 2);
+
+        // For inclusive slicing (..=), we need to add 1 to the end index to make it exclusive
+        // The str_slice opcode expects exclusive end index when is_length=0
+        if (as.inclusive) {
+            // end = end + 1
+            try e.emitOpcode(.add);
+            try e.emitU8((2 << 4) | 2); // rd=2, rs1=2
+            try e.emitU8(0); // rs2=0 (will load constant 1)
+            // Load constant 1 into r4 and add
+            const one_idx = try e.addConstant(.{ .integer = 1 });
+            try e.emitOpcode(.load_const);
+            try e.emitU8(4); // r4
+            try e.emitU16(one_idx);
+            try e.emitOpcode(.add);
+            try e.emitU8((2 << 4) | 2); // rd=2, rs1=2
+            try e.emitU8(4); // rs2=4
+        }
+
+        // Emit: str_slice rd=0, rs=3, start_reg=1, end_reg=2, is_length=0
+        // Format: [dest_reg:4|src_reg:4] [start_reg:4|end_reg:4] [is_length:8]
+        try e.emitOpcode(.str_slice);
+        try e.emitU8((0 << 4) | 3); // dest_reg=0, src_reg=3
+        try e.emitU8((1 << 4) | 2); // start_reg=1, end_reg=2
+        try e.emitU8(0); // is_length=0 (Cot mode: end is exclusive index)
+
+        e.setLastResult(as.result.id, 0);
+        return;
+    }
+
+    // Array slicing: Look up the source array's stack slot (same logic as array_load)
     const array_slot: u16 = if (e.array_ptr_targets.get(as.source.id)) |slot|
         slot
     else if (e.value_slots.get(as.source.id)) |slot_info|
