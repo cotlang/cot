@@ -299,9 +299,10 @@ pub const Opcode = enum(u8) {
     // Function Calls (0x70-0x7F)
     // ============================================
 
-    /// call routine_idx, argc - call function
-    /// Args in r0..r(argc-1), return in r15
-    /// Format: [argc:4|0] [routine_idx:16]
+    /// call routine_idx, argc, stack_argc - call function
+    /// Args in r0..r(argc-1), plus stack_argc args already pushed to stack
+    /// Format: [argc:4|stack_argc:4] [routine_idx:16]
+    /// Total args = argc + stack_argc
     call = 0x70,
 
     /// call_external import_idx, argc - call external function
@@ -327,6 +328,18 @@ pub const Opcode = enum(u8) {
     /// ret_val rs - return value in rs
     /// Format: [rs:4|0] [0]
     ret_val = 0x76,
+
+    /// push_arg slot - push local slot value to stack for overflow args
+    /// Format: [0] [slot:16]
+    push_arg = 0x77,
+
+    /// push_arg_reg rs - push register value to stack for overflow args
+    /// Format: [rs:4|0] [0]
+    push_arg_reg = 0x78,
+
+    /// pop_arg slot - pop stack value to local slot (callee prologue)
+    /// Format: [0] [slot:16]
+    pop_arg = 0x79,
 
     // ============================================
     // Record/Field Operations (0x80-0x8F)
@@ -832,7 +845,7 @@ pub const Opcode = enum(u8) {
             .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => 2,
             .is_null, .is_type, .select => 2,
             .load_null, .load_true, .load_false => 2,
-            .ret, .ret_val, .throw => 2,
+            .ret, .ret_val, .throw, .push_arg_reg => 2,
             .free_record, .clear_record => 2,
             .load_field_fast, .store_field_fast => 2,
             .str_concat, .str_len, .str_index, .str_slice => 2,
@@ -872,6 +885,7 @@ pub const Opcode = enum(u8) {
             .jeq, .jne, .jlt, .jge => 3,
             .set_error_handler => 3,
             .call, .call_external, .call_native, .call_dynamic => 3,
+            .push_arg, .pop_arg => 3,
             .new_record, .load_field, .store_field => 3,
             .to_fixed_string => 3,
             .debug_line => 3, // [0] [line:16] = 3 operand bytes

@@ -932,6 +932,7 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     const routine_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
     vm.ip += 3;
     const argc: u4 = @truncate(ops >> 4);
+    const stack_argc: u4 = @truncate(ops & 0xF); // Number of overflow args already on stack
 
     if (routine_idx >= module.routines.len) {
         return vm.fail(VMError.InvalidRoutine, "Routine index out of bounds");
@@ -944,24 +945,36 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 
     // Push call frame
+    // stack_pointer saved is BEFORE overflow args, so they're cleaned up on return
+    const caller_sp = vm.sp;
     vm.call_stack.append(.{
         .module = module,
         .routine_index = routine_idx,
         .return_ip = vm.ip,
         .base_pointer = vm.fp,
-        .stack_pointer = vm.sp,
+        .stack_pointer = caller_sp - @as(u32, stack_argc),
         .caller_module_index = vm.current_module_index,
     }) catch return vm.fail(VMError.StackOverflow, "Call stack overflow");
 
     // Copy args from r0..r(argc-1) to stack (as locals for callee)
     const routine = module.routines[routine_idx];
-    vm.fp = vm.sp;
+    vm.fp = vm.sp; // New frame starts after overflow args (they're below fp now)
     for (0..argc) |i| {
         vm.stack[vm.sp] = vm.registers[i];
         vm.sp += 1;
     }
-    // Reserve space for remaining locals
-    for (argc..routine.local_count) |_| {
+
+    // Copy overflow args from caller's stack (below fp) to callee's locals
+    // They were pushed at positions caller_sp - stack_argc to caller_sp - 1
+    // and need to end up at slots argc..argc+stack_argc-1
+    for (0..stack_argc) |i| {
+        vm.stack[vm.sp] = vm.stack[caller_sp - @as(u32, stack_argc) + i];
+        vm.sp += 1;
+    }
+
+    // Reserve space for remaining locals (after argc + stack_argc)
+    const total_args = @as(u32, argc) + @as(u32, stack_argc);
+    for (total_args..routine.local_count) |_| {
         vm.stack[vm.sp] = Value.null_val;
         vm.sp += 1;
     }
@@ -1047,6 +1060,47 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
     } else {
         return .return_from_main;
     }
+}
+
+/// push_arg slot - push local slot value to stack for overflow args
+pub fn op_push_arg(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3;
+
+    // Push value from local slot to stack
+    const value = vm.stack[vm.fp + slot];
+    vm.stack[vm.sp] = value;
+    vm.sp += 1;
+
+    return .continue_dispatch;
+}
+
+/// push_arg_reg rs - push register value to stack for overflow args
+pub fn op_push_arg_reg(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rs: u4 = @truncate(ops >> 4);
+
+    // Push register value to stack
+    vm.stack[vm.sp] = vm.registers[rs];
+    vm.sp += 1;
+
+    return .continue_dispatch;
+}
+
+/// pop_arg slot - pop stack value to local slot (not typically needed, call handles this)
+pub fn op_pop_arg(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3;
+
+    // Pop value from stack to local slot
+    if (vm.sp == 0) {
+        return vm.fail(VMError.StackUnderflow, "Stack underflow in pop_arg");
+    }
+    vm.sp -= 1;
+    vm.stack[vm.fp + slot] = vm.stack[vm.sp];
+
+    return .continue_dispatch;
 }
 
 // ============================================================================

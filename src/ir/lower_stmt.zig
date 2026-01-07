@@ -1237,5 +1237,10 @@ pub fn lowerGlobalLetDecl(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
     };
 
     try l.global_variables.put(name, global_val);
+
+    // Also add to the IR module's globals list so the bytecode emitter knows about it
+    // This is needed for store_global/load_global to work correctly
+    try l.module.addGlobal(name, var_type, false);
+
     debug.print(.ir, "Registered global: {s}", .{name});
 }

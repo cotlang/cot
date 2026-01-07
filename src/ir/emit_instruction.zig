@@ -185,7 +185,7 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
 
     // Non-struct types: check for existing registrations
     if (e.globals.get(a.name)) |global_info| {
-        // Use the existing global slot
+        // Use the existing global slot (0x8000 bit marks it as global)
         try e.value_slots.put(a.result.id, global_info.slot | 0x8000);
     } else if (e.locals.get(a.name)) |local_info| {
         // This is a parameter - use the existing parameter slot
@@ -456,7 +456,10 @@ pub fn emitConstNull(e: *BytecodeEmitter, c: ConstNull) EmitError!void {
 /// Emit binary arithmetic instruction
 pub fn emitBinaryArith(e: *BytecodeEmitter, op: Opcode, lhs: ir.Value, rhs: ir.Value, result: ir.Value) EmitError!void {
     const lhs_reg = try e.getValueInReg(lhs, 0);
-    const rhs_reg = try e.getValueInReg(rhs, 1);
+    // Choose a temp_reg for rhs that won't conflict with lhs_reg.
+    // If lhs ended up in r1 (e.g., from last_result), use r0 for rhs instead.
+    const rhs_temp_reg: u4 = if (lhs_reg == 1) 0 else 1;
+    const rhs_reg = try e.getValueInReg(rhs, rhs_temp_reg);
 
     // Allocate a fresh register for the result, spilling if necessary
     const dest_reg = try e.allocateWithSpill(result.id);
@@ -531,7 +534,9 @@ fn isStringType(ty: ir.Type) bool {
 /// Emit icmp instruction
 pub fn emitIcmp(e: *BytecodeEmitter, c: ir.Instruction.IcmpOp) EmitError!void {
     const lhs_reg = try e.getValueInReg(c.lhs, 0);
-    const rhs_reg = try e.getValueInReg(c.rhs, 1);
+    // Choose a temp_reg for rhs that won't conflict with lhs_reg.
+    const rhs_temp_reg: u4 = if (lhs_reg == 1) 0 else 1;
+    const rhs_reg = try e.getValueInReg(c.rhs, rhs_temp_reg);
 
     // Allocate a fresh register for the result, spilling if necessary
     const dest_reg = try e.allocateWithSpill(c.result.id);
@@ -912,47 +917,127 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     }
 
     // Load arguments to registers
-    // For struct arguments (including pointer-to-struct), we need to load ALL fields into consecutive registers
-    var reg_offset: u8 = 0;
+    // For struct arguments by VALUE (is_ref=false), we expand all fields into consecutive registers.
+    // For struct arguments by REFERENCE (is_ref=true, was *struct), we pass just the base slot.
+    // This is semantically correct: *struct means "reference to struct", not "copy of struct".
+    //
+    // We need the callee's signature to know which params are by-ref.
+    // Get callee function to check is_ref on params (use optional to handle missing case)
+    const callee_func_opt = blk: {
+        if (e.ir_module) |ir_mod| {
+            if (routine_idx < ir_mod.functions.items.len) {
+                break :blk ir_mod.functions.items[routine_idx];
+            }
+        }
+        break :blk null;
+    };
+
+    // First pass: calculate total slots needed to determine if we need stack overflow
+    var total_slots: usize = 0;
     for (c.args) |arg| {
-        // Check for struct type OR pointer-to-struct type
-        // When passing &obj, the argument type is *struct but we still need to expand the struct fields
         const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
             arg.ty.@"struct"
-        else if (arg.ty == .ptr and arg.ty.ptr.* == .@"struct")
-            arg.ty.ptr.*.@"struct"
+        else
+            null;
+        if (struct_type_opt) |struct_type| {
+            total_slots += getSlotCount(ir.Type{ .@"struct" = struct_type });
+        } else {
+            total_slots += 1;
+        }
+    }
+
+    // Determine how many args go in registers vs stack
+    // Note: argc field in call opcode is 4 bits (max 15), so max register args is 15
+    // This means r0-r14 for args, with r15 available for return value
+    const reg_argc: u8 = @intCast(@min(total_slots, 15));
+    const stack_argc: u8 = if (total_slots > 15) @intCast(total_slots - 15) else 0;
+
+    log.debug("emitUserCall: total_slots={d} reg_argc={d} stack_argc={d}", .{ total_slots, reg_argc, stack_argc });
+
+    // If overflow, push overflow args to stack FIRST (in order: slot 15, 16, 17, ...)
+    // These will be copied to callee's local slots 15+ by the call handler
+    if (stack_argc > 0) {
+        var slot_idx: usize = 0; // Track absolute slot position across all args
+        for (c.args) |arg| {
+            const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
+                arg.ty.@"struct"
+            else
+                null;
+            const slot_count: usize = if (struct_type_opt) |st|
+                getSlotCount(ir.Type{ .@"struct" = st })
+            else
+                1;
+
+            // For each slot of this arg, check if it goes to stack (slot_idx >= 15)
+            for (0..slot_count) |field_offset| {
+                const abs_slot = slot_idx + field_offset;
+                if (abs_slot >= 15) {
+                    // This slot goes to stack
+                    if (e.value_slots.get(arg.id)) |base_slot| {
+                        const src_slot = base_slot + field_offset;
+                        try e.emitOpcode(.push_arg);
+                        try e.emitU8(0);
+                        try e.emitU16(@intCast(src_slot));
+                    } else {
+                        // Value not in slot - load to temp register and push
+                        try e.emitValueToReg(arg, 0);
+                        try e.emitOpcode(.push_arg_reg);
+                        try e.emitU8(0 << 4);
+                        try e.emitU8(0);
+                    }
+                }
+            }
+            slot_idx += slot_count;
+        }
+    }
+
+    // Load register arguments (slots 0-15) to r0-r15
+    var reg_offset: u8 = 0;
+    for (c.args, 0..) |arg, arg_idx| {
+        // Check if this param is by-reference (was *struct, converted to struct with is_ref=true)
+        const is_ref_param = blk: {
+            if (callee_func_opt) |callee_func| {
+                if (arg_idx < callee_func.signature.params.len) {
+                    break :blk callee_func.signature.params[arg_idx].is_ref;
+                }
+            }
+            break :blk false;
+        };
+        _ = is_ref_param; // Used for writeback logic after call
+
+        const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
+            arg.ty.@"struct"
         else
             null;
 
         if (struct_type_opt) |struct_type| {
-            // Struct argument: load all fields (including nested) from consecutive slots to consecutive registers
             const field_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
+
             if (e.value_slots.get(arg.id)) |base_slot| {
                 for (0..field_count) |field_idx| {
-                    if (reg_offset < 16) {
-                        const slot = base_slot + field_idx;
-                        if (slot < 256) {
-                            try e.emitOpcode(.load_local);
-                            try e.emitU8(reg_offset << 4);
-                            try e.emitU8(@intCast(slot));
-                        } else if (slot < 65536) {
-                            try e.emitOpcode(.load_local16);
-                            try e.emitU8(reg_offset << 4);
-                            try e.emitU16(@intCast(slot));
-                        }
-                        reg_offset += 1;
+                    if (reg_offset >= 15) break; // Rest goes to stack (max 15 register args)
+                    const slot = base_slot + field_idx;
+                    if (slot < 256) {
+                        try e.emitOpcode(.load_local);
+                        try e.emitU8(reg_offset << 4);
+                        try e.emitU8(@intCast(slot));
+                    } else if (slot < 65536) {
+                        try e.emitOpcode(.load_local16);
+                        try e.emitU8(reg_offset << 4);
+                        try e.emitU16(@intCast(slot));
                     }
+                    reg_offset += 1;
                 }
             } else {
-                // No slot - maybe already in a register or constant, use fallback
-                if (reg_offset < 16) {
+                if (reg_offset < 15) {
                     try e.emitValueToReg(arg, @intCast(reg_offset));
+                    const advance = @min(field_count, 15 - reg_offset);
+                    reg_offset += @intCast(advance);
                 }
-                reg_offset += @intCast(field_count);
             }
         } else {
             // Non-struct argument: load single value to single register
-            if (reg_offset < 16) {
+            if (reg_offset < 15) {
                 try e.emitValueToReg(arg, @intCast(reg_offset));
                 reg_offset += 1;
             }
@@ -960,9 +1045,9 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     }
 
     try e.emitOpcode(.call);
-    // argc is the number of registers used, not the number of arguments
-    // (struct arguments expand to multiple registers)
-    try e.emitU8(reg_offset << 4);
+    // Format: [argc:4|stack_argc:4] [routine_idx:16]
+    // argc = number of register args (0-15), stack_argc = number of stack args
+    try e.emitU8((reg_argc << 4) | stack_argc);
     try e.emitU16(routine_idx);
 
     // Emit store-back for ref parameters

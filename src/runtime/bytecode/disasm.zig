@@ -433,6 +433,24 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}", .{rs});
             },
 
+            // push_arg slot - [0] [slot:16]
+            .push_arg => {
+                const slot: u16 = @bitCast(operands[1..3].*);
+                try self.writer.print(" slot#{}", .{slot});
+            },
+
+            // push_arg_reg rs - [rs:4|0] [0]
+            .push_arg_reg => {
+                const rs: u4 = @truncate(operands[0] >> 4);
+                try self.writer.print(" r{}", .{rs});
+            },
+
+            // pop_arg slot - [0] [slot:16]
+            .pop_arg => {
+                const slot: u16 = @bitCast(operands[1..3].*);
+                try self.writer.print(" slot#{}", .{slot});
+            },
+
             // ============================================
             // Record/Field Operations (0x80-0x8F)
             // ============================================

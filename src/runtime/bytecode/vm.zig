@@ -1355,6 +1355,9 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.call_dynamic)] = &vm_opcodes.op_call_dynamic;
         table[@intFromEnum(Opcode.ret)] = &vm_opcodes.op_ret;
         table[@intFromEnum(Opcode.ret_val)] = &vm_opcodes.op_ret_val;
+        table[@intFromEnum(Opcode.push_arg)] = &vm_opcodes.op_push_arg;
+        table[@intFromEnum(Opcode.push_arg_reg)] = &vm_opcodes.op_push_arg_reg;
+        table[@intFromEnum(Opcode.pop_arg)] = &vm_opcodes.op_pop_arg;
 
         // Record/Field Operations (0x80-0x8F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.load_record_buf)] = &vm_opcodes.op_load_record_buf;

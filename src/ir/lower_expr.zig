@@ -501,8 +501,10 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx
     }
 
     // Check local variables first (via scopes), then global variables
-    const ptr = l.scopes.get(name) orelse
-        l.global_variables.get(name) orelse blk: {
+    const local_ptr = l.scopes.get(name);
+    const global_ptr = if (local_ptr == null) l.global_variables.get(name) else null;
+
+    const ptr = local_ptr orelse global_ptr orelse blk: {
         l.setErrorContext(
             LowerError.UndefinedVariable,
             "Undefined variable: '{s}'",
@@ -519,6 +521,41 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx
         .ptr => |p| p.*,
         else => ptr.ty,
     };
+
+    // For global variables, emit an alloca so the bytecode emitter can track the value ID
+    // This is necessary because the bytecode emitter's value_slots map is per-function,
+    // and the emitAlloca handler checks the globals map and sets the 0x8000 bit.
+    if (global_ptr != null) {
+        // Create a new value for this reference to the global within this function
+        const alloca_result = func.newValue(.{ .ptr = switch (ptr.ty) {
+            .ptr => |p| p,
+            else => blk: {
+                const ty_ptr = l.allocator.create(ir.Type) catch return LowerError.OutOfMemory;
+                ty_ptr.* = ptr.ty;
+                l.allocated_types.append(l.allocator, ty_ptr) catch return LowerError.OutOfMemory;
+                break :blk ty_ptr;
+            },
+        } });
+
+        // Emit alloca for the global variable
+        try l.emit(.{
+            .alloca = .{
+                .name = name,
+                .ty = value_type,
+                .result = alloca_result,
+            },
+        });
+
+        // Now emit load using the alloca result as the ptr
+        const result = func.newValue(value_type);
+        try l.emit(.{
+            .load = .{
+                .ptr = alloca_result,
+                .result = result,
+            },
+        });
+        return result;
+    }
 
     // Check if this is a weak reference type
     // If so, emit weak_load which returns optional (may be null if target freed)
@@ -3331,11 +3368,12 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
     const type_name_id: StringId = @enumFromInt(data.a);
     const type_name = l.strings.get(type_name_id);
     if (type_name.len == 0) {
+        const err_loc = l.store.exprLoc(expr_idx);
         l.setErrorContext(
             LowerError.UndefinedType,
             "Empty type name in generic struct literal",
             .{},
-            .{ .line = 0, .column = 0 },
+            err_loc,
             "generic struct literal must have a type name",
             .{},
         );
@@ -3355,15 +3393,62 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
         try type_args.append(l.allocator, arg_type);
     }
 
+    // Get source location for error reporting
+    const expr_loc = l.store.exprLoc(expr_idx);
+
+    // Check if the generic struct definition exists and provide helpful error
+    const generic_def = l.generic_struct_defs.get(type_name);
+    if (generic_def == null) {
+        // Check if it's a built-in like List or Map
+        const is_builtin = std.mem.eql(u8, type_name, "List") or
+            std.mem.eql(u8, type_name, "Map") or
+            std.mem.eql(u8, type_name, "Option") or
+            std.mem.eql(u8, type_name, "Result");
+
+        if (is_builtin) {
+            l.setErrorContext(
+                LowerError.UndefinedType,
+                "Cannot use built-in generic type '{s}' in struct literal syntax",
+                .{type_name},
+                expr_loc,
+                "'{s}' is a built-in type. Use '{s}.new()' or '{s}{{}}' syntax instead",
+                .{ type_name, type_name, type_name },
+            );
+        } else {
+            l.setErrorContext(
+                LowerError.UndefinedType,
+                "Generic struct '{s}' is not defined",
+                .{type_name},
+                expr_loc,
+                "no generic struct named '{s}' was found in scope. Did you forget to define it?",
+                .{type_name},
+            );
+        }
+        return LowerError.UndefinedType;
+    }
+
+    // Check type argument count
+    if (type_args.items.len != generic_def.?.type_param_count) {
+        l.setErrorContext(
+            LowerError.UndefinedType,
+            "Wrong number of type arguments for generic struct '{s}'",
+            .{type_name},
+            expr_loc,
+            "expected {d} type argument(s), but got {d}",
+            .{ generic_def.?.type_param_count, type_args.items.len },
+        );
+        return LowerError.UndefinedType;
+    }
+
     // Instantiate the generic struct
     const struct_type = try l.instantiateGenericStruct(type_name, type_args.items) orelse {
         l.setErrorContext(
             LowerError.UndefinedType,
             "Failed to instantiate generic struct '{s}'",
             .{type_name},
-            .{ .line = 0, .column = 0 },
-            "generic type '{s}' could not be instantiated with the given type arguments",
-            .{type_name},
+            expr_loc,
+            "internal error: instantiation failed after validation passed",
+            .{},
         );
         return LowerError.UndefinedType;
     };

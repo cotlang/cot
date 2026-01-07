@@ -375,6 +375,18 @@ pub const BytecodeEmitter = struct {
             }
         }
 
+        // Register global variables from the IR module
+        // This allows functions to properly reference globals with store_global/load_global
+        log.debug("Registering {d} global variables from IR module", .{ir_module.globals.items.len});
+        for (ir_module.globals.items) |global| {
+            log.debug("Registering global variable: '{s}' -> slot {d}", .{ global.name, self.global_count });
+            try self.globals.put(global.name, .{
+                .slot = self.global_count,
+                .is_global = true,
+            });
+            self.global_count += 1;
+        }
+
         // Second pass: emit all functions
         for (ir_module.functions.items) |func| {
             try self.emitFunction(func);
@@ -520,7 +532,13 @@ pub const BytecodeEmitter = struct {
         self.current_routine_start = @intCast(self.code.items.len);
 
         // Allocate locals for parameters
-        // For struct-typed parameters, flatten into individual field slots with qualified names
+        // For struct-typed parameters, we expand all fields to individual slots.
+        // The is_ref flag indicates copy-back semantics (mutations visible to caller)
+        // but doesn't change the slot allocation - we still need slots for all fields.
+        //
+        // TODO: Implement proper stack-based overflow for large structs (Option B)
+        // when total parameters would exceed 16 register slots.
+        // See claude/plan-stack-argument-overflow.md
         for (func.signature.params) |param| {
             if (param.ty == .@"struct") {
                 // Structure parameter - allocate slots for each field with qualified names

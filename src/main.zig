@@ -753,7 +753,23 @@ fn runFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     }
 
     cot.runWithFile(allocator, source, filename) catch |err| {
-        try printStderr("Runtime error: {}\n", .{err});
+        // Check if this is a compile-time error by looking at the error name
+        const err_name = @errorName(err);
+        const is_compile_error = std.mem.startsWith(u8, err_name, "Undefined") or
+            std.mem.startsWith(u8, err_name, "Type") or
+            std.mem.startsWith(u8, err_name, "Invalid") or
+            std.mem.startsWith(u8, err_name, "Unsupported") or
+            std.mem.startsWith(u8, err_name, "Unknown") or
+            std.mem.startsWith(u8, err_name, "Verification") or
+            std.mem.startsWith(u8, err_name, "Missing") or
+            std.mem.eql(u8, err_name, "LowerError");
+
+        if (is_compile_error) {
+            // Compile-time error - error details were already printed by the compiler
+            try printStderr("{s}: Compilation failed: {s}\n", .{ filename, err_name });
+        } else {
+            try printStderr("{s}: Runtime error: {s}\n", .{ filename, err_name });
+        }
     };
 }
 
