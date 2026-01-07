@@ -222,7 +222,8 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     if (file_target) |target| {
-        if (std.mem.endsWith(u8, target, ".cot") or std.mem.endsWith(u8, target, ".cbo")) {
+        // Single-file mode: .cot, .cbo files, or stdin (-)
+        if (std.mem.endsWith(u8, target, ".cot") or std.mem.endsWith(u8, target, ".cbo") or std.mem.eql(u8, target, "-")) {
             switch (selected_runtime) {
                 .zig => try runFileAuto(allocator, target),
                 .rs => try runWithRustRuntime(allocator, target),
@@ -278,34 +279,22 @@ fn runWithRustRuntime(allocator: std.mem.Allocator, target: []const u8) !void {
 fn cmdCompile(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         try printErr("Error: compile requires a filename\n");
-        try printErr("Usage: cot compile <file.cot> [-o output.cbo] [--no-packages]\n");
+        try printErr("Usage: cot compile <file.cot> [-o output.cbo]\n");
         return;
     }
 
     var output_file: ?[]const u8 = null;
-    var no_packages: bool = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-o") and i + 1 < args.len) {
             output_file = args[i + 1];
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--no-packages")) {
-            no_packages = true;
+        } else if (std.mem.eql(u8, args[i], "--packages") or std.mem.eql(u8, args[i], "--no-packages")) {
+            // Legacy flags - ignore, we auto-detect now
         }
     }
 
-    // Try package-based compilation first (if cot.json exists)
-    if (!no_packages) {
-        if (hasWorkspaceConfig(allocator, args[0])) {
-            compileWithPackages(allocator, args[0], output_file) catch |err| {
-                if (err == error.CompilationFailed) std.process.exit(1);
-                return err;
-            };
-            return;
-        }
-    }
-
-    // Fall back to single-file compilation
+    // Simple single-file compilation - just works
     compileFile(allocator, args[0], output_file) catch |err| {
         if (err == error.CompilationFailed) std.process.exit(1);
         return err;
@@ -639,6 +628,61 @@ fn printStderr(comptime fmt: []const u8, args: anytype) !void {
     try stderr.flush();
 }
 
+/// Print a runtime error in compiler-style format: file:line: error[EXXX]: message
+fn printRuntimeError(vm: *cot.bytecode.VM, mod: *const cot.bytecode.Module, err: anyerror, bytecode_file: []const u8) void {
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_file = std.fs.File.stderr();
+    var stderr_writer = stderr_file.writer(&stderr_buffer);
+    const w = &stderr_writer.interface;
+
+    // Get location info from VM
+    const loc = vm.getLocation();
+    const rich_err = cot.bytecode.VM.getLastError();
+
+    // Determine source file (from module debug info, or fall back to bytecode file)
+    const source_file = mod.source_file orelse bytecode_file;
+
+    // Get line number (from rich error if available, otherwise 0)
+    const line: u32 = if (rich_err) |re| re.source_line else 0;
+
+    // Print in compiler-style format: file:line: error: message
+    if (line > 0) {
+        w.print("\x1b[1m{s}:{d}: \x1b[31merror\x1b[0m\x1b[1m: {s}\x1b[0m\n", .{
+            source_file,
+            line,
+            @errorName(err),
+        }) catch {};
+    } else {
+        w.print("\x1b[1m{s}: \x1b[31merror\x1b[0m\x1b[1m: {s}\x1b[0m\n", .{
+            source_file,
+            @errorName(err),
+        }) catch {};
+    }
+
+    // Print rich error message if available
+    if (rich_err) |re| {
+        if (re.message.len > 0) {
+            w.print("  \x1b[36mmessage\x1b[0m: {s}\n", .{re.message}) catch {};
+        }
+        if (re.detail) |detail| {
+            w.print("  \x1b[36mdetail\x1b[0m: {s}\n", .{detail}) catch {};
+        }
+    }
+
+    // Print location details
+    const routine_name = loc.routine orelse "main";
+    w.print("  \x1b[36mat\x1b[0m: {s} (IP: 0x{x:0>4})\n", .{ routine_name, loc.ip }) catch {};
+
+    // Print opcode if available
+    if (rich_err) |re| {
+        if (re.opcode) |op| {
+            w.print("  \x1b[36mopcode\x1b[0m: {s}\n", .{@tagName(op)}) catch {};
+        }
+    }
+
+    w.flush() catch {};
+}
+
 /// Read a line from stdin into buffer, returning slice or null on EOF
 fn readLine(buf: []u8) ?[]u8 {
     const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
@@ -708,7 +752,7 @@ fn runFile(allocator: std.mem.Allocator, filename: []const u8) !void {
         std.posix.chdir(dir) catch {};
     }
 
-    cot.run(allocator, source) catch |err| {
+    cot.runWithFile(allocator, source, filename) catch |err| {
         try printStderr("Runtime error: {}\n", .{err});
     };
 }
@@ -762,7 +806,7 @@ fn runBytecodeFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     try vm.loadExtension(dbl_ext.dbl_extension);
 
     vm.execute(&mod) catch |err| {
-        try printStderr("VM error: {}\n", .{err});
+        printRuntimeError(&vm, &mod, err, filename);
     };
 }
 
@@ -903,7 +947,7 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
     defer allocator.free(processed_stmts);
 
     // Lower AST to IR using detailed error reporting
-    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{ .source_file = filename });
     const ir_module = switch (lower_result) {
         .ok => |module| module,
         .err => |e| {
@@ -976,6 +1020,9 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
     };
     defer mod.deinit();
 
+    // Set source file for runtime error reporting
+    mod.source_file = try allocator.dupe(u8, filename);
+
     // Create tracer
     // At --level=full, show raw value bits for debugging NaN-boxing issues
     var tracer = trace_mod.Tracer.init(allocator, .{
@@ -998,7 +1045,8 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
 
     try printStderr("=== Execution Trace ===\n", .{});
     vm.execute(&mod) catch |err| {
-        try printStderr("\nVM error: {}\n", .{err});
+        try printStderr("\n", .{});
+        printRuntimeError(&vm, &mod, err, filename);
         // Dump history on error
         try printStderr("\n", .{});
         const stderr_file: std.fs.File = .stderr();
@@ -1066,7 +1114,8 @@ fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: 
 
     try printStderr("=== Execution Trace ===\n", .{});
     vm.execute(&mod) catch |err| {
-        try printStderr("\nVM error: {}\n", .{err});
+        try printStderr("\n", .{});
+        printRuntimeError(&vm, &mod, err, filename);
         // Dump history on error
         try printStderr("\n", .{});
         // Use stderr for trace dump - requires a buffer for Zig 0.15
@@ -1649,23 +1698,35 @@ fn parseFileIntoStore(
     return top_level;
 }
 
+/// Import info with source location for error reporting
+const ImportInfo = struct {
+    name: []const u8,
+    line: u32,
+    column: u32,
+};
+
 /// Extract import paths from parsed statements
 fn extractImports(
     allocator: std.mem.Allocator,
     store: *const cot.ast.NodeStore,
     strings: *const cot.base.StringInterner,
     stmts: []const cot.ast.StmtIdx,
-) ![][]const u8 {
-    var imports: std.ArrayListUnmanaged([]const u8) = .{};
+) ![]ImportInfo {
+    var imports: std.ArrayListUnmanaged(ImportInfo) = .{};
 
     for (stmts) |stmt_idx| {
         const tag = store.stmtTag(stmt_idx);
         if (tag == .import_stmt) {
             const data = store.stmtData(stmt_idx);
             const module_name = strings.get(data.getName());
+            const loc = store.stmtLoc(stmt_idx);
             // Duplicate the string since we need to return owned data
             const duped = try allocator.dupe(u8, module_name);
-            try imports.append(allocator, duped);
+            try imports.append(allocator, .{
+                .name = duped,
+                .line = loc.line,
+                .column = loc.column,
+            });
         }
     }
 
@@ -1946,16 +2007,51 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     // Extract imports from main file and parse them (recursively)
     const imports = try extractImports(allocator, &store, &strings, main_stmts);
 
+    // Read source file for error display
+    const source_content = std.fs.cwd().readFileAlloc(allocator, filename, 1024 * 1024) catch "";
+
     // Parse each imported file (in order, non-recursive for now)
-    for (imports) |module_name| {
-        const import_path = try resolveImportPath(allocator, base_dir, module_name);
+    for (imports) |import_info| {
+        const import_path = try resolveImportPath(allocator, base_dir, import_info.name);
 
         // Skip if already parsed
         if (parsed_files.contains(import_path)) continue;
 
         // Check if file exists
         std.fs.cwd().access(import_path, .{}) catch {
-            try printStderr("Error: Cannot find import '{s}' (looked for '{s}')\n", .{ module_name, import_path });
+            // Print error with source location
+            try printStderr("\x1b[1;31merror\x1b[0m: cannot find import '\x1b[1m{s}\x1b[0m'\n", .{import_info.name});
+            try printStderr("  \x1b[1;34m-->\x1b[0m {s}:{d}:{d}\n", .{ filename, import_info.line, import_info.column });
+            try printStderr("   \x1b[1;34m|\x1b[0m\n", .{});
+
+            // Show the source line if we have it
+            if (source_content.len > 0) {
+                var line_num: u32 = 1;
+                var line_start: usize = 0;
+                var line_end: usize = 0;
+                for (source_content, 0..) |c, idx| {
+                    if (c == '\n') {
+                        if (line_num == import_info.line) {
+                            line_end = idx;
+                            break;
+                        }
+                        line_num += 1;
+                        line_start = idx + 1;
+                    }
+                }
+                if (line_end == 0) line_end = source_content.len;
+                const line_content = source_content[line_start..line_end];
+                try printStderr("\x1b[1;34m{d:>3} |\x1b[0m {s}\n", .{ import_info.line, line_content });
+                try printStderr("   \x1b[1;34m|\x1b[0m \x1b[1;31m", .{});
+                // Print caret at column position
+                var col: u32 = 1;
+                while (col < import_info.column) : (col += 1) {
+                    try printStderr(" ", .{});
+                }
+                try printStderr("^\x1b[0m\n", .{});
+            }
+
+            try printStderr("\n\x1b[1;36mhint\x1b[0m: if '{s}' is a workspace package, use '\x1b[1mcot build\x1b[0m' instead\n", .{import_info.name});
             return error.CompilationFailed;
         };
 
@@ -1996,7 +2092,7 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     defer allocator.free(processed_stmts);
 
     // Lower AST to IR using NodeStore directly (with details for better error messages)
-    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{ .source_file = filename });
     const ir_module = switch (lower_result) {
         .ok => |module| module,
         .err => |e| {
@@ -2066,6 +2162,9 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
         return error.CompilationFailed;
     };
     // No defer mod.deinit() needed - arena handles cleanup
+
+    // Set source file for runtime error reporting
+    mod.source_file = try allocator.dupe(u8, filename);
 
     // Determine output filename
     const out_name = if (output_file) |of|
@@ -2238,7 +2337,7 @@ fn runTests(allocator: std.mem.Allocator, filename: []const u8, filter: ?[]const
     defer allocator.free(processed_stmts);
 
     // Lower AST to IR with detailed error reporting
-    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{ .source_file = filename });
     const ir_module = switch (lower_result) {
         .ok => |module| module,
         .err => |e| {
@@ -2398,7 +2497,7 @@ fn dumpIR(backing_allocator: std.mem.Allocator, filename: []const u8) !void {
     defer allocator.free(processed_stmts);
 
     // Lower to IR using detailed error reporting
-    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+    const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{ .source_file = filename });
     const ir_module = switch (lower_result) {
         .ok => |module| module,
         .err => |e| {
@@ -2495,7 +2594,7 @@ fn disasmFile(backing_allocator: std.mem.Allocator, filename: []const u8) !void 
         defer allocator.free(processed_stmts);
 
         // Lower to IR using detailed error reporting
-        const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{});
+        const lower_result = cot.ir_lower.lowerWithDetails(allocator, &store, &strings, processed_stmts, filename, .{ .source_file = filename });
         const ir_module = switch (lower_result) {
             .ok => |module| module,
             .err => |e| {

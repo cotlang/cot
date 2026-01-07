@@ -269,6 +269,12 @@ pub const Lexer = struct {
                 self.line += 1;
                 self.column = 0;
             }
+            // Skip escape sequences like \" or \\
+            if (self.peek() == '\\' and self.position + 1 < self.source.len) {
+                _ = self.advance(); // skip backslash
+                _ = self.advance(); // skip escaped char
+                continue;
+            }
             _ = self.advance();
         }
 
@@ -615,7 +621,6 @@ pub const Lexer = struct {
         .{ "try", .kw_try },
         .{ "catch", .kw_catch },
         .{ "throw", .kw_throw },
-        .{ "finally", .kw_finally },
         .{ "defer", .kw_defer },
 
         // Other

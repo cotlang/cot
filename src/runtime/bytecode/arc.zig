@@ -535,6 +535,21 @@ pub const WeakRegistry = struct {
         self.refs.deinit();
     }
 
+    /// Clear all weak references by setting them to null.
+    /// Call this BEFORE releasing owned values during VM shutdown.
+    /// This prevents double-free when owned values and weak refs point to the same memory.
+    pub fn clearAllWeakRefs(self: *Self) void {
+        var it = self.refs.iterator();
+        while (it.next()) |entry| {
+            // Set all weak ref locations to null
+            for (entry.value_ptr.items) |weak_ref_loc| {
+                weak_ref_loc.* = Value.null_val;
+                self.total_invalidated += 1;
+            }
+        }
+        log.debug("WeakRegistry: cleared all weak refs during shutdown", .{});
+    }
+
     /// Register a weak reference location that points to a target value.
     /// The weak_ref_loc points to the Value that will be set to null when target is freed.
     pub fn registerWeakRef(self: *Self, target: Value, weak_ref_loc: *Value) !void {

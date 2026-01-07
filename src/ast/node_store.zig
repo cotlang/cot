@@ -546,29 +546,40 @@ pub const NodeStore = struct {
         return idx;
     }
 
-    /// Add a slice expression: object[start..end]
-    pub fn addSliceExpr(self: *Self, object: ExprIdx, start_expr: ExprIdx, end_expr: ExprIdx, loc: SourceLoc) !ExprIdx {
-        // Store start and end in extra_data
+    /// Add an optional index expression (null-safe): expr?[index]
+    pub fn addOptionalIndex(self: *Self, object: ExprIdx, index_expr: ExprIdx, loc: SourceLoc) !ExprIdx {
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
+        try self.expr_tags.append(self.allocator, .optional_index);
+        try self.expr_locs.append(self.allocator, loc);
+        try self.expr_data.append(self.allocator, NodeData.index(object, index_expr));
+        return idx;
+    }
+
+    /// Add a slice expression: object[start..end] or object[start..=end]
+    pub fn addSliceExpr(self: *Self, object: ExprIdx, start_expr: ExprIdx, end_expr: ExprIdx, inclusive: bool, loc: SourceLoc) !ExprIdx {
+        // Store start, end, and inclusive flag in extra_data
         const extra_start: ExtraIdx = @enumFromInt(@as(u32, @intCast(self.extra_data.items.len)));
         try self.extra_data.append(self.allocator, start_expr.toInt());
         try self.extra_data.append(self.allocator, end_expr.toInt());
+        try self.extra_data.append(self.allocator, @intFromBool(inclusive));
 
         const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
         try self.expr_tags.append(self.allocator, .slice_expr);
         try self.expr_locs.append(self.allocator, loc);
-        // a = object, b = extra_data index for [start, end]
+        // a = object, b = extra_data index for [start, end, inclusive]
         try self.expr_data.append(self.allocator, .{ .a = object.toInt(), .b = extra_start.toInt() });
         return idx;
     }
 
     /// Get slice expression parts
-    pub fn getSliceExprParts(self: *const Self, expr_idx: ExprIdx) struct { object: ExprIdx, start: ExprIdx, end: ExprIdx } {
+    pub fn getSliceExprParts(self: *const Self, expr_idx: ExprIdx) struct { object: ExprIdx, start: ExprIdx, end: ExprIdx, inclusive: bool } {
         const data = self.exprData(expr_idx);
         const object = ExprIdx.fromInt(data.a);
         const extra_start = data.b;
         const start = ExprIdx.fromInt(self.extra_data.items[extra_start]);
         const end = ExprIdx.fromInt(self.extra_data.items[extra_start + 1]);
-        return .{ .object = object, .start = start, .end = end };
+        const inclusive = self.extra_data.items[extra_start + 2] != 0;
+        return .{ .object = object, .start = start, .end = end, .inclusive = inclusive };
     }
 
     /// Add a type test expression (expr is Type)
@@ -860,14 +871,14 @@ pub const NodeStore = struct {
     }
 
     /// Add a generic function definition
-    /// type_params: StringIds for type parameter names (e.g., T, U)
+    /// type_params: pairs of [name, bound] for each type parameter (e.g., T, Trait or T, null)
     /// params format: [name, type, is_ref, default_value, ...] (4 values per param)
     pub fn addGenericFnDef(self: *Self, name: StringId, type_params: []const u32, params: []const u32, return_type: TypeIdx, body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        // Store as: [param_count, type_param_count, type_param1, type_param2, ..., param1_name, param1_type, param1_is_ref, param1_default, ..., return_type, body]
+        // Store as: [param_count, type_param_count, tp1_name, tp1_bound, tp2_name, tp2_bound, ..., param1_name, param1_type, param1_is_ref, param1_default, ..., return_type, body]
         const params_start: ExtraIdx = @enumFromInt(@as(u32, @intCast(self.extra_data.items.len)));
         try self.extra_data.append(self.allocator, @intCast(params.len / 4)); // param count (4 values per param)
-        try self.extra_data.append(self.allocator, @intCast(type_params.len)); // type param count
-        // Store type parameter names
+        try self.extra_data.append(self.allocator, @intCast(type_params.len / 2)); // type param count (2 values per type param: name, bound)
+        // Store type parameter (name, bound) pairs
         for (type_params) |tp| {
             try self.extra_data.append(self.allocator, tp);
         }

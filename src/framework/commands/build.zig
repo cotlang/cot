@@ -188,14 +188,14 @@ pub fn printHelp() !void {
         \\  -r, --release     Release build (bundle into single executable)
         \\  -f, --filter=X    Build only project X (Turborepo-style)
         \\  -o, --output      Output directory override
-        \\  -c, --clean       Clean build (remove cache first)
-        \\  -R, --rebuild     Full rebuild (remove all caches and recompile everything)
+        \\  -c, --clean       Clean build (remove project cache first)
+        \\  -R, --rebuild     Full rebuild (remove ALL caches and recompile everything)
         \\  -h, --help        Show this help
         \\
         \\Verbosity:
         \\  -q, --quiet       Errors only (silent)
         \\  (default)         Progress + warnings + errors
-        \\  -v, --verbose     + timing, file counts, stages
+        \\  -v, --verbose     + timing, cache status, file counts
         \\  -vv               + IR/bytecode details
         \\  -vvv              + instruction-level tracing
         \\
@@ -204,9 +204,18 @@ pub fn printHelp() !void {
         \\  Release apps:     bin/<name> (single executable, runs on Cot VM)
         \\  Release libs:     bin/<name>.cotpkg (library package)
         \\
+        \\Cache:
+        \\  Incremental builds use content-based hashing for reliable cache invalidation:
+        \\  - Source file changes are detected via content hash (not timestamp)
+        \\  - Config changes (cot.json) invalidate dependent files
+        \\  - Compiler upgrades invalidate all caches
+        \\  - Dependency changes propagate to dependent packages
+        \\  Use -v to see cache hit/miss status, -R to force full rebuild.
+        \\
         \\Examples:
-        \\  cot build                      Build all (development)
-        \\  cot build -v                   Build with timing info
+        \\  cot build                      Build all (development, uses cache)
+        \\  cot build -v                   Build with cache status info
+        \\  cot build --rebuild            Force full rebuild (ignore cache)
         \\  cot build --release            Build all (production bundle)
         \\  cot build --clean --release    Clean release build
         \\

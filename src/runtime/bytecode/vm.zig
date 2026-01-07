@@ -754,6 +754,12 @@ pub const VM = struct {
         }
         self.global_buffers.deinit(self.allocator);
 
+        // IMPORTANT: Clear all weak references BEFORE releasing owned values.
+        // Weak refs don't own their targets, so we must null them out first
+        // to prevent double-free when the same memory is referenced by both
+        // a weak ref and an owned value.
+        self.weak_registry.clearAllWeakRefs();
+
         // Release all ARC-managed values before freeing the heap
         // This ensures proper reference counting cleanup
         self.releaseAllRegisters();
@@ -1324,6 +1330,7 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.log_or)] = &vm_opcodes.op_log_or;
         table[@intFromEnum(Opcode.log_not)] = &vm_opcodes.op_log_not;
         table[@intFromEnum(Opcode.is_null)] = &vm_opcodes.op_is_null;
+        table[@intFromEnum(Opcode.is_type)] = &vm_opcodes.op_is_type;
         table[@intFromEnum(Opcode.select)] = &vm_opcodes.op_select;
         table[@intFromEnum(Opcode.ptr_offset)] = &vm_opcodes.op_ptr_offset;
         table[@intFromEnum(Opcode.shl)] = &vm_opcodes.op_shl;
@@ -1370,6 +1377,7 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.array_store)] = &vm_opcodes.op_array_store;
         table[@intFromEnum(Opcode.array_len)] = &vm_opcodes.op_array_len;
         table[@intFromEnum(Opcode.array_slice)] = &vm_opcodes.op_array_slice;
+        table[@intFromEnum(Opcode.array_load_opt)] = &vm_opcodes.op_array_load_opt;
 
         // Math Functions (0xC0-0xCF) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.fn_round)] = &vm_opcodes.op_fn_round;
@@ -1550,6 +1558,7 @@ pub const VM = struct {
             .fixed_string => |aval| Value.initFixedString(self.valueAllocator(), @constCast(aval.data)) catch Value.null_val,
             .identifier => |idval| Value.initString(self.valueAllocator(), idval) catch Value.null_val,
             .float => |fval| Value{ .bits = @bitCast(fval) }, // NaN-boxed floats store bits directly
+            .boolean => |bval| Value.initBool(bval),
             else => Value.null_val,
         };
     }
@@ -1858,6 +1867,8 @@ pub const VM = struct {
     }
 
     /// Call a routine in an external module
+    /// Note: Arguments are in registers (r0, r1, ...) not on the stack,
+    /// because call_dynamic uses register-based argument passing.
     fn callExternalRoutine(self: *Self, ext_module: *const Module, routine_idx: u16, arg_count: u8) VMError!void {
         debug.print(.vm, "callExternalRoutine: routine_idx={d}, module has {d} routines", .{ routine_idx, ext_module.routines.len });
 
@@ -1886,9 +1897,9 @@ pub const VM = struct {
         }
         debug.print(.vm, "callExternalRoutine: module_index={any}", .{module_index});
 
-        // Calculate caller's sp before args were pushed
-        const caller_sp = self.sp - @as(u32, arg_count);
-        debug.print(.vm, "callExternalRoutine: caller_sp={d}, self.sp={d}, arg_count={d}", .{ caller_sp, self.sp, arg_count });
+        // Save the current stack pointer as caller_sp (args are NOT on stack, they're in registers)
+        const caller_sp = self.sp;
+        debug.print(.vm, "callExternalRoutine: caller_sp={d}, arg_count={d}", .{ caller_sp, arg_count });
 
         // Save call frame with CURRENT module (for return)
         debug.print(.vm, "callExternalRoutine: saving call frame", .{});
@@ -1906,10 +1917,14 @@ pub const VM = struct {
         self.current_module_index = module_index;
         debug.print(.vm, "callExternalRoutine: switched to module index {any}, current_module now has {d} routines", .{ module_index, ext_module.routines.len });
 
-        // Set up new frame
-        self.fp = self.sp - @as(u32, arg_count);
-        self.ip = routine.code_offset;
-        debug.print(.vm, "callExternalRoutine: set up frame, fp={d}, ip={d}", .{ self.fp, self.ip });
+        // Copy arguments from registers to stack (callee expects them as locals)
+        // Set up new frame pointer at current stack position
+        self.fp = self.sp;
+        for (0..arg_count) |i| {
+            self.stack[self.sp] = self.registers[i];
+            self.sp += 1;
+        }
+        debug.print(.vm, "callExternalRoutine: copied {d} args from registers to stack, fp={d}, sp={d}", .{ arg_count, self.fp, self.sp });
 
         // Reserve space for additional local variables beyond the parameters and initialize to 0
         if (routine.local_count > arg_count) {
@@ -1920,7 +1935,9 @@ pub const VM = struct {
             self.sp += extra_locals;
         }
 
-        debug.print(.vm, "callExternalRoutine: SUCCESS, sp={d}", .{self.sp});
+        // Jump to routine entry point
+        self.ip = routine.code_offset;
+        debug.print(.vm, "callExternalRoutine: SUCCESS, ip={d}, sp={d}", .{ self.ip, self.sp });
     }
 
     /// Convert a GlobalValue to a VM Value

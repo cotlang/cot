@@ -577,6 +577,29 @@ pub fn op_is_null(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
+/// is_type rd, rs, type_tag - check if value is of given type
+/// type_tag: 0=null, 1=bool, 2=int, 3=float, 4=string
+pub fn op_is_type(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const type_tag = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+    const val = vm.registers[rs];
+    const val_tag = val.tag();
+
+    const is_match = switch (type_tag) {
+        0 => val_tag == .null_val, // null
+        1 => val_tag == .boolean, // bool
+        2 => val_tag == .integer, // int/i64
+        3 => val_tag == .float or val_tag == .implied_decimal, // float/f64/decimal
+        4 => val_tag == .string or val_tag == .fixed_string, // string
+        else => false,
+    };
+    vm.writeRegister(rd, Value.initBool(is_match));
+    return .continue_dispatch;
+}
+
 /// select rd, cond, rtrue, rfalse - conditional select
 pub fn op_select(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops1 = module.code[vm.ip];
@@ -1570,13 +1593,16 @@ pub fn op_weak_ref(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rs: u4 = @truncate(ops);
 
     const source_value = vm.registers[rs];
-
-    // Store the value without retain (weak reference doesn't own the value)
-    // We need to clear any previous value in rd first (with release)
     const old_value = vm.registers[rd];
-    if (arc.needsArc(old_value)) {
-        arc.release(old_value, vm.allocator);
+
+    // If rd already holds a weak reference, unregister it from the registry.
+    // IMPORTANT: We do NOT release the old value because weak refs don't own their targets.
+    // The weak registry just needs to stop tracking this location.
+    if (!old_value.isNull()) {
+        vm.weak_registry.unregisterWeakRef(old_value, &vm.registers[rd]);
     }
+
+    // Store the new value (without retain - weak refs don't own their targets)
     vm.registers[rd] = source_value;
 
     // Register this location in the weak registry
@@ -3162,6 +3188,51 @@ pub fn op_array_load(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
+/// array_load_opt rd, idx_reg - optional load from array, returns null if out of bounds
+/// Format: [idx_reg:8] [slot:16] [len:16]
+/// Result stored in r0, returns null instead of throwing on out-of-bounds
+pub fn op_array_load_opt(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const idx_reg: u4 = @truncate(module.code[vm.ip]);
+    const slot_lo = module.code[vm.ip + 1];
+    const slot_hi = module.code[vm.ip + 2];
+    const len_lo = module.code[vm.ip + 3];
+    const len_hi = module.code[vm.ip + 4];
+    vm.ip += 5;
+
+    const slot: u16 = (@as(u16, slot_hi) << 8) | slot_lo;
+    const array_len: u16 = (@as(u16, len_hi) << 8) | len_lo;
+
+    // Get the index value from register
+    const idx_val = vm.registers[idx_reg];
+    if (idx_val.tag() != .integer) {
+        // Return null for non-integer index instead of throwing
+        vm.writeRegister(0, Value.null_val);
+        return .continue_dispatch;
+    }
+    const idx = idx_val.asInt();
+
+    // Return null for negative index
+    if (idx < 0) {
+        vm.writeRegister(0, Value.null_val);
+        return .continue_dispatch;
+    }
+
+    // Return null for out of bounds index (check against array length)
+    if (@as(u64, @intCast(idx)) >= array_len) {
+        vm.writeRegister(0, Value.null_val);
+        return .continue_dispatch;
+    }
+
+    // The array base is at stack[fp + slot], each element at consecutive slots
+    const base_index = vm.fp + slot;
+    const elem_index = base_index + @as(usize, @intCast(idx));
+
+    // Load the element into r0
+    vm.writeRegister(0, vm.stack[elem_index]);
+
+    return .continue_dispatch;
+}
+
 /// array_store idx_reg, val_reg - store to array at stack slot
 /// Format: [idx_reg:4|val_reg:4] [slot:16]
 pub fn op_array_store(vm: *VM, module: *const Module) VMError!DispatchResult {
@@ -3222,9 +3293,9 @@ pub fn op_array_len(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
-/// array_slice rd, start_reg, end_reg, slot - rd = arr[start..end]
-/// Creates a new list containing elements from start to end (exclusive)
-/// Format: [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+/// array_slice rd, start_reg, end_reg, slot - rd = arr[start..end] or arr[start..=end]
+/// Creates a new list containing elements from start to end (exclusive unless inclusive flag set)
+/// Format: [rd:4|inclusive:1|0:3] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
 pub fn op_array_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops1 = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -3233,6 +3304,7 @@ pub fn op_array_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 4;
 
     const rd: u4 = @truncate(ops1 >> 4);
+    const inclusive = (ops1 & 0x08) != 0; // bit 3 is inclusive flag
     const start_reg: u4 = @truncate(ops2 >> 4);
     const end_reg: u4 = @truncate(ops2 & 0xF);
     const slot: u16 = (@as(u16, slot_hi) << 8) | slot_lo;
@@ -3246,7 +3318,12 @@ pub fn op_array_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 
     const start_idx = start_val.asInt();
-    const end_idx = end_val.asInt();
+    var end_idx = end_val.asInt();
+
+    // For inclusive slicing (..=), add 1 to make end index exclusive
+    if (inclusive) {
+        end_idx += 1;
+    }
 
     if (start_idx < 0 or end_idx < 0) {
         return vm.fail(VMError.ArrayOutOfBounds, "Array slice indices cannot be negative");

@@ -1033,7 +1033,11 @@ pub const Emitter = struct {
         try self.emitExpression(parts.object);
         try self.writer.writeByte('[');
         try self.emitExpression(parts.start);
-        try self.writer.writeAll("..");
+        if (parts.inclusive) {
+            try self.writer.writeAll("..=");
+        } else {
+            try self.writer.writeAll("..");
+        }
         try self.emitExpression(parts.end);
         try self.writer.writeByte(']');
     }

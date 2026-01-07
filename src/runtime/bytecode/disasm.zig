@@ -287,6 +287,22 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}, r{}", .{ rd, rs });
             },
 
+            // is_type rd, rs, type_tag - [rd:4|rs:4] [type_tag:8]
+            .is_type => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                const type_tag = operands[1];
+                const type_name = switch (type_tag) {
+                    0 => "null",
+                    1 => "bool",
+                    2 => "int",
+                    3 => "float",
+                    4 => "string",
+                    else => "unknown",
+                };
+                try self.writer.print(" r{}, r{}, {s}", .{ rd, rs, type_name });
+            },
+
             // select rd, rcond, rtrue, rfalse - [rd:4|rcond:4] [rtrue:4|rfalse:4]
             .select => {
                 const rd: u4 = @truncate(operands[0] >> 4);
@@ -603,13 +619,23 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}, len(${})", .{ rd, slot });
             },
 
-            // array_slice - [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+            // array_slice - [rd:4|inclusive:1|0:3] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
             .array_slice => {
                 const rd: u4 = @truncate(operands[0] >> 4);
+                const inclusive = (operands[0] & 0x08) != 0;
                 const start_reg: u4 = @truncate(operands[1] >> 4);
                 const end_reg: u4 = @truncate(operands[1] & 0xF);
                 const slot = std.mem.readInt(u16, operands[2..4], .little);
-                try self.writer.print(" r{}, ${}[r{}:r{}]", .{ rd, slot, start_reg, end_reg });
+                const range_op = if (inclusive) "..=" else "..";
+                try self.writer.print(" r{}, ${}[r{}{s}r{}]", .{ rd, slot, start_reg, range_op, end_reg });
+            },
+
+            // array_load_opt idx_reg, slot, len - [idx_reg:8] [slot:16] [len:16] - optional load, returns null on OOB
+            .array_load_opt => {
+                const idx_reg = operands[0];
+                const slot = std.mem.readInt(u16, operands[1..3], .little);
+                const len = std.mem.readInt(u16, operands[3..5], .little);
+                try self.writer.print(" r0, ${}?[r{}] (len={})", .{ slot, idx_reg, len });
             },
 
             // ============================================
@@ -1001,6 +1027,7 @@ pub const Disassembler = struct {
             .record_ref => |r| try self.writer.print("record#{}", .{r}),
             .routine_ref => |r| try self.writer.print("routine#{}", .{r}),
             .float => |v| try self.writer.print("float({})", .{v}),
+            .boolean => |v| try self.writer.print("bool({})", .{v}),
         }
     }
 

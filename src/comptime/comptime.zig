@@ -150,8 +150,10 @@ pub const Evaluator = struct {
 
         switch (tag) {
             .const_decl => {
-                // Const declarations don't generate runtime code
-                // They've already been registered, so skip them
+                // Const declarations are registered for comptime evaluation above,
+                // but we still need to pass them to the lowerer so they can be
+                // registered as global variables visible in function scopes.
+                try output.append(self.allocator, stmt_idx);
             },
             .comptime_if => {
                 // Get comptime_if data:

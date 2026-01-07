@@ -268,7 +268,7 @@ pub const Verifier = struct {
             .store_struct_buf => |op| {
                 try self.checkValueDefined(op.value);
             },
-            .array_load => |op| {
+            .array_load, .array_load_opt => |op| {
                 try self.checkValueDefined(op.array_ptr);
                 try self.checkValueDefined(op.index);
             },
@@ -299,6 +299,9 @@ pub const Verifier = struct {
                 try self.checkValueDefined(op.value);
             },
             .wrap_optional, .unwrap_optional, .is_null => |op| {
+                try self.checkValueDefined(op.operand);
+            },
+            .is_type => |op| {
                 try self.checkValueDefined(op.operand);
             },
             .str_len, .array_len => |op| {

@@ -450,10 +450,19 @@ fn runBytecodeFileWithDeps(
     extension.initRegistry(allocator);
     defer extension.deinitRegistry();
 
+    // Dependency module info: path + package name for qualified function registration
+    const DepModule = struct {
+        path: []const u8,
+        package_name: []const u8,
+    };
+
     // Load dependency packages
-    var dep_modules = std.ArrayListUnmanaged([]const u8){};
+    var dep_modules = std.ArrayListUnmanaged(DepModule){};
     defer {
-        for (dep_modules.items) |path| allocator.free(path);
+        for (dep_modules.items) |dep| {
+            allocator.free(dep.path);
+            allocator.free(dep.package_name);
+        }
         dep_modules.deinit(allocator);
     }
 
@@ -497,14 +506,24 @@ fn runBytecodeFileWithDeps(
                     var loaded_any = false;
                     var iter = dir.iterate();
                     while (iter.next() catch null) |file_entry| {
-                        // Look for .cotc or .cbo files, or extensionless bundles
+                        // Look for .cotc, .cbo, .cotpkg files, or extensionless bundles
                         if (file_entry.kind == .file) {
                             const is_module = std.mem.endsWith(u8, file_entry.name, ".cotc") or
                                 std.mem.endsWith(u8, file_entry.name, ".cbo") or
+                                std.mem.endsWith(u8, file_entry.name, ".cotpkg") or
                                 std.mem.eql(u8, file_entry.name, dep_name);
                             if (is_module) {
                                 const module_path = try std.fs.path.join(allocator, &.{ dep_output, file_entry.name });
-                                try dep_modules.append(allocator, module_path);
+                                // Convert to absolute path now, before potential chdir
+                                const abs_module_path = std.fs.cwd().realpathAlloc(allocator, module_path) catch module_path;
+                                if (abs_module_path.ptr != module_path.ptr) {
+                                    allocator.free(module_path);
+                                }
+                                const dep_name_dupe = try allocator.dupe(u8, dep_name);
+                                try dep_modules.append(allocator, .{
+                                    .path = abs_module_path,
+                                    .package_name = dep_name_dupe,
+                                });
                                 loaded_any = true;
                             }
                         }
@@ -527,11 +546,12 @@ fn runBytecodeFileWithDeps(
     var vm = cot.bytecode.VM.init(allocator);
     defer vm.deinit();
 
-    // Load dependency modules into VM
-    for (dep_modules.items) |module_path| {
-        debug.print(.general, "Loading module: {s}", .{module_path});
-        vm.native_registry.loadModule(module_path) catch |err| {
-            debug.print(.general, "Warning: Could not load module {s}: {}", .{ module_path, err });
+    // Load dependency modules into VM with package prefixes for qualified function calls
+    debug.print(.general, "Loading {d} dependency modules", .{dep_modules.items.len});
+    for (dep_modules.items) |dep| {
+        debug.print(.general, "Loading module: {s} (prefix: {s})", .{ dep.path, dep.package_name });
+        vm.native_registry.loadModuleWithPrefix(dep.path, dep.package_name) catch |err| {
+            debug.print(.general, "Warning: Could not load module {s}: {}", .{ dep.path, err });
         };
     }
 

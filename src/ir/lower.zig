@@ -178,6 +178,9 @@ pub const Lowerer = struct {
     /// Current source location being processed (for error messages)
     current_loc: SourceLoc,
 
+    /// Source file path (for @file() builtin and error messages)
+    source_file: ?[]const u8,
+
     const ImplMethodsMap = std.HashMap(ImplKey, []const MethodImpl, ImplKeyContext, std.hash_map.default_max_load_percentage);
 
     /// Known builtin function names (lowercase)
@@ -294,6 +297,7 @@ pub const Lowerer = struct {
             .imported_namespaces = std.StringHashMap(void).init(allocator),
             .emit_arc = options.emit_arc,
             .current_loc = .{ .line = 0, .column = 0 },
+            .source_file = options.source_file,
         };
 
         // Pre-populate type maps from dependency context (for cross-package compilation)
@@ -403,16 +407,18 @@ pub const Lowerer = struct {
             inner_map.deinit();
         }
         self.enum_types.deinit();
-        // Free generic struct type_param_names slices
+        // Free generic struct type_param_names and type_param_bounds slices
         var gen_struct_iter = self.generic_struct_defs.valueIterator();
         while (gen_struct_iter.next()) |def| {
             self.allocator.free(def.type_param_names);
+            self.allocator.free(def.type_param_bounds);
         }
         self.generic_struct_defs.deinit();
-        // Free generic function type_param_names slices
+        // Free generic function type_param_names and type_param_bounds slices
         var gen_fn_iter = self.generic_fn_defs.valueIterator();
         while (gen_fn_iter.next()) |def| {
             self.allocator.free(def.type_param_names);
+            self.allocator.free(def.type_param_bounds);
         }
         self.generic_fn_defs.deinit();
         self.instantiated_fns.deinit();
@@ -501,12 +507,16 @@ pub const Lowerer = struct {
                 }
             },
             .impls => {
+                debug.print(.ir, "impls pass: checking stmt tag={s}", .{@tagName(tag)});
                 if (tag == .impl_block) {
+                    debug.print(.ir, "impls pass: found impl_block, lowering", .{});
                     try self.lowerImplBlock(stmt_idx);
                 }
             },
             .globals => {
-                if (tag == .let_decl) {
+                // Handle both let and const declarations at module level
+                if (tag == .let_decl or tag == .const_decl) {
+                    debug.print(.ir, "globals pass: lowering {s} decl", .{@tagName(tag)});
                     try lower_stmt.lowerGlobalLetDecl(self, stmt_idx);
                 }
             },
@@ -532,6 +542,14 @@ pub const Lowerer = struct {
     pub fn lowerProgram(self: *Self, top_level: []const StmtIdx) LowerError!*ir.Module {
         log.debug("Lowering program with {d} top-level statements", .{top_level.len});
         debug.print(.ir, "Lowering program with {d} top-level statements", .{top_level.len});
+
+        // Process import statements first - they define namespaces used throughout
+        for (top_level) |stmt_idx| {
+            const tag = self.store.stmtTag(stmt_idx);
+            if (tag == .import_stmt) {
+                try self.trackImport(stmt_idx);
+            }
+        }
 
         // Register top-level const declarations with the comptime evaluator
         // This must happen first so comptime conditions can reference constants
@@ -567,9 +585,11 @@ pub const Lowerer = struct {
         }
 
         // Third pass: collect impl blocks
+        debug.print(.ir, "=== Starting impls pass with {d} statements ===", .{top_level.len});
         for (top_level) |stmt_idx| {
             try self.processStatementForDefinitions(stmt_idx, .impls);
         }
+        debug.print(.ir, "=== Finished impls pass ===", .{});
 
         // Fourth pass: register top-level let declarations as globals
         // (These come from DBL common blocks and need to be visible in all functions)
@@ -726,19 +746,28 @@ pub const Lowerer = struct {
         if (type_param_count > 0) {
             debug.print(.ir, "  -> Generic struct with {d} type params, storing as template", .{type_param_count});
 
-            // Extract type parameter names
+            // Extract type parameter names and bounds
+            // storeTypeParams format: [count, name0, bound0, name1, bound1, ...]
             var type_param_names: std.ArrayListUnmanaged(StringId) = .{};
             defer type_param_names.deinit(self.allocator);
+            var type_param_bounds: std.ArrayListUnmanaged(ast.TypeIdx) = .{};
+            defer type_param_bounds.deinit(self.allocator);
 
             for (0..type_param_count) |i| {
-                const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[type_params_start + i]);
+                // Names are at positions 1, 3, 5, ... (skip count at 0)
+                const name_idx = type_params_start + 1 + @as(u32, @intCast(i)) * 2;
+                const bound_idx = name_idx + 1;
+                const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[name_idx]);
+                const param_bound: ast.TypeIdx = @enumFromInt(self.store.extra_data.items[bound_idx]);
                 try type_param_names.append(self.allocator, param_name_id);
+                try type_param_bounds.append(self.allocator, param_bound);
             }
 
             const generic_def = GenericDef{
                 .stmt_idx = stmt_idx,
                 .type_param_count = @intCast(type_param_count),
                 .type_param_names = try type_param_names.toOwnedSlice(self.allocator),
+                .type_param_bounds = try type_param_bounds.toOwnedSlice(self.allocator),
             };
 
             try self.generic_struct_defs.put(name, generic_def);
@@ -980,6 +1009,22 @@ pub const Lowerer = struct {
 
         debug.print(.ir, "Instantiating generic struct: {s}", .{mangled_name});
 
+        // Validate type bounds
+        for (generic_def.type_param_bounds, type_args, 0..) |bound_idx, arg_type, i| {
+            if (!bound_idx.isNull()) {
+                // There's a bound - check if the type implements the required trait
+                const bound_name = self.resolveTypeIdxName(bound_idx);
+                if (bound_name) |trait_name| {
+                    if (!self.typeImplementsTrait(arg_type, trait_name)) {
+                        const param_name = self.strings.get(generic_def.type_param_names[i]);
+                        debug.print(.ir, "Type bound violation: {s} does not implement {s}", .{ @tagName(arg_type), trait_name });
+                        log.err("Type '{s}' does not implement trait '{s}' required for type parameter '{s}'", .{ @tagName(arg_type), trait_name, param_name });
+                        return null;
+                    }
+                }
+            }
+        }
+
         // Set up type parameter substitutions
         self.type_param_substitutions.clearRetainingCapacity();
         for (generic_def.type_param_names, type_args) |param_name_id, arg_type| {
@@ -1082,6 +1127,15 @@ pub const Lowerer = struct {
                         writer.writeAll("array") catch return null;
                     }
                 },
+                .@"struct" => |st| writer.writeAll(st.name) catch return null,
+                .ptr => |p| {
+                    writer.writeAll("*") catch return null;
+                    if (p.* == .@"struct") {
+                        writer.writeAll(p.@"struct".name) catch return null;
+                    } else {
+                        writer.writeAll("?") catch return null;
+                    }
+                },
                 else => writer.writeAll("?") catch return null,
             }
         }
@@ -1096,6 +1150,22 @@ pub const Lowerer = struct {
         }
 
         debug.print(.ir, "Instantiating generic function: {s}", .{mangled_name});
+
+        // Validate type bounds
+        for (generic_def.type_param_bounds, type_args, 0..) |bound_idx, arg_type, i| {
+            if (!bound_idx.isNull()) {
+                // There's a bound - check if the type implements the required trait
+                const bound_name = self.resolveTypeIdxName(bound_idx);
+                if (bound_name) |trait_name| {
+                    if (!self.typeImplementsTrait(arg_type, trait_name)) {
+                        const param_name = self.strings.get(generic_def.type_param_names[i]);
+                        debug.print(.ir, "Type bound violation: {s} does not implement {s}", .{ @tagName(arg_type), trait_name });
+                        log.err("Type '{s}' does not implement trait '{s}' required for type parameter '{s}'", .{ @tagName(arg_type), trait_name, param_name });
+                        return LowerError.TypeMismatch;
+                    }
+                }
+            }
+        }
 
         // Set up type parameter substitutions
         self.type_param_substitutions.clearRetainingCapacity();
@@ -1119,8 +1189,8 @@ pub const Lowerer = struct {
         var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
         defer params.deinit(self.allocator);
 
-        // Skip past type params
-        var extra_idx = extra_start.toInt() + 2 + type_param_count;
+        // Skip past type params (each type param is 2 values: name, bound)
+        var extra_idx = extra_start.toInt() + 2 + type_param_count * 2;
         for (0..param_count) |_| {
             const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
             const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
@@ -1172,11 +1242,13 @@ pub const Lowerer = struct {
         // Save current context
         const saved_func = self.current_func;
         const saved_block = self.current_block;
+        // Save current scope - reset() orphans but doesn't destroy scopes
+        const saved_scope = self.scopes.current;
 
         self.current_func = func;
         self.current_block = func.entry;
 
-        // Clear scope for new function
+        // Create fresh scope for the instantiated function
         self.scopes.reset();
 
         // Add parameters as local variables (same as lowerFnDef)
@@ -1205,12 +1277,19 @@ pub const Lowerer = struct {
             try self.lowerStatement(body_idx);
         }
 
+        // Add implicit return if not terminated
+        if (!self.current_block.?.isTerminated()) {
+            try self.emit(.{ .return_ = null });
+        }
+
         // Clear substitutions
         self.type_param_substitutions.clearRetainingCapacity();
 
         // Restore context
         self.current_func = saved_func;
         self.current_block = saved_block;
+        // Restore scope to continue lowering calling function
+        self.scopes.current = saved_scope;
 
         // Add function to module
         try self.module.addFunction(func);
@@ -1238,10 +1317,10 @@ pub const Lowerer = struct {
         self.current_loc = loc; // Set location for error messages
 
         const name_id: StringId = @enumFromInt(data.a);
-        const name = self.strings.get(name_id);
+        const trait_name = self.strings.get(name_id);
         const methods_start = data.b;
 
-        debug.print(.ir, "Lowering trait: {s}", .{name});
+        debug.print(.ir, "Lowering trait: {s}", .{trait_name});
 
         // Parse extra_data: [method_count, type_param_count, type_params_start, ...method_data...]
         const method_count = self.store.extra_data.items[methods_start];
@@ -1249,13 +1328,13 @@ pub const Lowerer = struct {
         // const type_params_start = self.store.extra_data.items[methods_start + 2]; // unused for now
 
         // Parse method signatures
-        // Layout: [method_name, param_count, return_type, param_pairs...] for each method
+        // Layout: [method_name, param_count, return_type, has_default, default_body, param_quads...] for each method
         var methods: std.ArrayListUnmanaged(TraitMethodSig) = .{};
         defer methods.deinit(self.allocator);
 
         var offset: u32 = 3; // Skip method_count, type_param_count, type_params_start
         for (0..method_count) |_| {
-            // Read method header: [method_name, param_count, return_type]
+            // Read method header: [method_name, param_count, return_type, has_default, default_body]
             const method_name_id: StringId = @enumFromInt(self.store.extra_data.items[methods_start + offset]);
             const method_name = self.strings.get(method_name_id);
             offset += 1;
@@ -1266,26 +1345,50 @@ pub const Lowerer = struct {
             const return_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[methods_start + offset]);
             offset += 1;
 
-            // Skip param data (param_count * 2 entries for name + type)
-            offset += param_count * 2;
+            const has_default = self.store.extra_data.items[methods_start + offset] != 0;
+            offset += 1;
 
-            const return_type = if (return_type_idx != .null)
-                try self.lowerTypeIdx(return_type_idx)
-            else
-                .void;
+            const default_body_raw = self.store.extra_data.items[methods_start + offset];
+            const default_body_idx: ?StmtIdx = if (has_default) @enumFromInt(default_body_raw) else null;
+            offset += 1;
+
+            // Store raw param data for default impl generation (don't resolve types yet)
+            var raw_param_data: ?[]u32 = null;
+            if (has_default and param_count > 0) {
+                var param_data: std.ArrayListUnmanaged(u32) = .{};
+                defer param_data.deinit(self.allocator);
+
+                for (0..param_count) |_| {
+                    // Store name and type as raw u32 values
+                    try param_data.append(self.allocator, self.store.extra_data.items[methods_start + offset]); // name
+                    try param_data.append(self.allocator, self.store.extra_data.items[methods_start + offset + 1]); // type
+                    offset += 4; // Skip is_ref and default too
+                }
+                raw_param_data = try param_data.toOwnedSlice(self.allocator);
+            } else {
+                // Just skip the param data
+                offset += param_count * 4;
+            }
 
             try methods.append(self.allocator, .{
                 .name = method_name,
                 .param_count = param_count,
-                .return_type = return_type,
+                .return_type_idx = return_type_idx,
+                .has_default = has_default,
+                .default_body_stmt_idx = default_body_idx,
+                .raw_param_data = raw_param_data,
             });
 
-            debug.print(.ir, "  Method: {s}({d} params) -> {}", .{ method_name, param_count, return_type });
+            if (has_default) {
+                debug.print(.ir, "  Method: {s}({d} params) [has default]", .{ method_name, param_count });
+            } else {
+                debug.print(.ir, "  Method: {s}({d} params)", .{ method_name, param_count });
+            }
         }
 
         // Store the trait definition
-        try self.trait_defs.put(name, .{
-            .name = name,
+        try self.trait_defs.put(trait_name, .{
+            .name = trait_name,
             .type_param_count = type_param_count,
             .methods = try methods.toOwnedSlice(self.allocator),
         });
@@ -1346,12 +1449,171 @@ pub const Lowerer = struct {
             try self.lowerImplMethod(method_stmt_idx, qualified_name_owned);
         }
 
+        // Check for missing methods that have default implementations
+        const trait_def = self.trait_defs.get(trait_name);
+        if (trait_def) |td| {
+            // Build a set of implemented method names
+            var implemented = std.StringHashMap(void).init(self.allocator);
+            defer implemented.deinit();
+            for (methods.items) |m| {
+                try implemented.put(m.method_name, {});
+            }
+
+            // Check each trait method for defaults
+            for (td.methods) |trait_method| {
+                if (!implemented.contains(trait_method.name)) {
+                    // Method not implemented - check for default
+                    if (trait_method.has_default and trait_method.default_body_stmt_idx != null) {
+                        debug.print(.ir, "  Using default impl for {s}.{s}", .{ target_name, trait_method.name });
+
+                        // Generate the qualified function name
+                        var qualified_name_buf: [256]u8 = undefined;
+                        const qualified_name = std.fmt.bufPrint(&qualified_name_buf, "{s}.{s}", .{ target_name, trait_method.name }) catch {
+                            return LowerError.OutOfMemory;
+                        };
+                        const qualified_name_owned = try self.allocator.dupe(u8, qualified_name);
+
+                        // Lower the default method implementation
+                        try self.lowerDefaultTraitMethod(
+                            trait_method,
+                            target_name,
+                            qualified_name_owned,
+                        );
+
+                        // Add to the methods list
+                        try methods.append(self.allocator, .{
+                            .method_name = trait_method.name,
+                            .fn_stmt_idx = .null, // No AST stmt - generated from default
+                        });
+                    } else {
+                        // Missing required method with no default
+                        debug.print(.ir, "Warning: missing impl for {s}.{s} (no default)", .{ target_name, trait_method.name });
+                    }
+                }
+            }
+        }
+
         // Store the implementation mapping
         const key = ImplKey{
             .trait_name = trait_name,
             .type_name = target_name,
         };
         try self.impl_methods.put(key, try methods.toOwnedSlice(self.allocator));
+    }
+
+    /// Lower a default trait method implementation for a specific type
+    /// This generates a function like `Point.debug` using the default body from `Display.debug`
+    fn lowerDefaultTraitMethod(
+        self: *Self,
+        trait_method: TraitMethodSig,
+        target_type_name: []const u8,
+        qualified_name: []const u8,
+    ) LowerError!void {
+        debug.print(.ir, "Lowering default trait method: {s}", .{qualified_name});
+
+        // Build the function parameters from raw param data
+        // raw_param_data format: [name0, type0, name1, type1, ...]
+        var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
+        defer params.deinit(self.allocator);
+
+        // Look up the target struct type to use for 'self'
+        const target_struct_type: ?ir.Type = blk: {
+            if (self.struct_types.get(target_type_name)) |s| {
+                break :blk .{ .@"struct" = s };
+            }
+            if (self.instantiated_structs.get(target_type_name)) |s| {
+                break :blk .{ .@"struct" = s };
+            }
+            break :blk null;
+        };
+
+        const raw_data = trait_method.raw_param_data;
+        if (raw_data) |data| {
+            var i: usize = 0;
+            while (i < data.len) : (i += 2) {
+                const name_id: StringId = @enumFromInt(data[i]);
+                const type_idx: TypeIdx = @enumFromInt(data[i + 1]);
+
+                const param_name = self.strings.get(name_id);
+
+                // For 'self' parameter, use the target struct type instead of the trait type
+                const param_type = if (std.mem.eql(u8, param_name, "self") and target_struct_type != null)
+                    target_struct_type.?
+                else
+                    try self.lowerTypeIdx(type_idx);
+
+                try params.append(self.allocator, .{
+                    .name = param_name,
+                    .ty = param_type,
+                    .is_ref = false,
+                });
+            }
+        }
+
+        // Resolve return type
+        const return_type = if (trait_method.return_type_idx != .null)
+            try self.lowerTypeIdx(trait_method.return_type_idx)
+        else
+            .void;
+
+        // Store param types for call-site type checking (before moving params to func_type)
+        if (params.items.len > 0) {
+            var param_types: std.ArrayListUnmanaged(ir.Type) = .{};
+            defer param_types.deinit(self.allocator);
+            for (params.items) |param| {
+                try param_types.append(self.allocator, param.ty);
+            }
+            const types_slice = try param_types.toOwnedSlice(self.allocator);
+            try self.fn_param_types.put(qualified_name, types_slice);
+        }
+
+        // Create function type
+        const func_type = ir.FunctionType{
+            .params = try params.toOwnedSlice(self.allocator),
+            .return_type = return_type,
+            .is_variadic = false,
+        };
+
+        // Create function using the proper init
+        const func = try ir.Function.init(self.allocator, qualified_name, func_type);
+
+        self.current_func = func;
+        self.current_block = func.entry;
+        self.scopes.reset();
+
+        // Note: We don't need to track self_type explicitly - method resolution happens
+        // based on the qualified function name (e.g., Point.debug) which is handled
+        // by the call expression lowering.
+
+        // Add parameters as local variables (especially 'self')
+        for (func_type.params) |param| {
+            const ty_ptr = try self.allocator.create(ir.Type);
+            ty_ptr.* = param.ty;
+            try self.allocated_types.append(self.allocator, ty_ptr);
+
+            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+            try self.emit(.{
+                .alloca = .{
+                    .ty = param.ty,
+                    .name = param.name,
+                    .result = alloca_result,
+                },
+            });
+            try self.scopes.put(param.name, alloca_result);
+        }
+
+        // Lower the default body
+        const body_stmt_idx = trait_method.default_body_stmt_idx.?;
+        try self.lowerStatement(body_stmt_idx);
+
+        // Add implicit return if not terminated
+        if (!self.current_block.?.isTerminated()) {
+            try self.emit(.{ .return_ = null });
+        }
+
+        // Register the function
+        try self.fn_return_types.put(qualified_name, return_type);
+        try self.module.addFunction(func);
     }
 
     /// Get the name of a type from its TypeIdx
@@ -1365,8 +1627,93 @@ pub const Lowerer = struct {
                 const name_id: StringId = @enumFromInt(type_data.a);
                 return self.strings.get(name_id);
             },
+            .generic_instance => {
+                // Generic type like Container<i64> or Box<i64>
+                // Build the full mangled name
+                const type_data = self.store.typeData(type_idx);
+                const base_type_idx: TypeIdx = @enumFromInt(type_data.a);
+                const args_start = type_data.b;
+
+                // Get base type name
+                const base_name = self.getTypeName(base_type_idx) orelse return null;
+
+                // Get type argument count (first value in extra_data at args_start)
+                const arg_count = self.store.extra_data.items[args_start];
+
+                // Build mangled name: BaseName<Arg1, Arg2, ...>
+                var name_buf: [256]u8 = undefined;
+                var stream = std.io.fixedBufferStream(&name_buf);
+                const writer = stream.writer();
+                writer.writeAll(base_name) catch return null;
+                writer.writeAll("<") catch return null;
+
+                for (0..arg_count) |i| {
+                    if (i > 0) writer.writeAll(", ") catch return null;
+                    const arg_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[args_start + 1 + i]);
+                    const arg_name = self.getTypeName(arg_type_idx) orelse "?";
+                    writer.writeAll(arg_name) catch return null;
+                }
+                writer.writeAll(">") catch return null;
+
+                // Allocate and return the mangled name
+                return self.allocator.dupe(u8, stream.getWritten()) catch return null;
+            },
+            // Primitive types
+            .i8 => return "i8",
+            .i16 => return "i16",
+            .i32 => return "i32",
+            .i64 => return "i64",
+            .isize => return "isize",
+            .u8 => return "u8",
+            .u16 => return "u16",
+            .u32 => return "u32",
+            .u64 => return "u64",
+            .usize => return "usize",
+            .f32 => return "f32",
+            .f64 => return "f64",
+            .bool => return "bool",
+            .string => return "string",
+            .void => return "void",
             else => return null,
         }
+    }
+
+    /// Resolve a TypeIdx to its name (for bound checking)
+    fn resolveTypeIdxName(self: *Self, type_idx: ast.TypeIdx) ?[]const u8 {
+        if (type_idx.isNull()) return null;
+
+        const tag = self.store.typeTag(type_idx);
+        switch (tag) {
+            .named => {
+                const type_data = self.store.typeData(type_idx);
+                const name_id: StringId = @enumFromInt(type_data.a);
+                return self.strings.get(name_id);
+            },
+            else => return null,
+        }
+    }
+
+    /// Check if an IR type implements a trait
+    fn typeImplementsTrait(self: *Self, ir_type: ir.Type, trait_name: []const u8) bool {
+        // Get the type name from the IR type
+        const type_name: []const u8 = switch (ir_type) {
+            .i32 => "i32",
+            .i64 => "i64",
+            .f32 => "f32",
+            .f64 => "f64",
+            .bool => "bool",
+            .string => "string",
+            .@"struct" => |s| s.name,
+            else => return false, // Unknown types don't implement traits
+        };
+
+        // Check if there's an impl block for this type+trait combination
+        const key = ImplKey{
+            .trait_name = trait_name,
+            .type_name = type_name,
+        };
+
+        return self.impl_methods.contains(key);
     }
 
     /// Look up a trait method implementation for a specific type
@@ -1411,8 +1758,8 @@ pub const Lowerer = struct {
         var param_types: std.ArrayListUnmanaged(ir.Type) = .{};
         defer param_types.deinit(self.allocator);
 
-        // Skip past type params: extra_start + 1 (param_count) + 1 (type_param_count) + type_param_count
-        var extra_idx = extra_start.toInt() + 2 + type_param_count;
+        // Skip past type params: each type param is 2 values (name, bound)
+        var extra_idx = extra_start.toInt() + 2 + type_param_count * 2;
         for (0..param_count) |_| {
             const param_type_idx: ast.TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
             const default_expr_raw: u32 = self.store.extra_data.items[extra_idx + 3];
@@ -1444,6 +1791,33 @@ pub const Lowerer = struct {
             .type_name = type_name,
         };
         return self.impl_methods.contains(key);
+    }
+
+    /// Find a trait method implementation for a type (searches all trait impls)
+    /// Returns the qualified function name (e.g., "Point.print") or null if not found
+    pub fn findTraitMethodForType(self: *Self, type_name: []const u8, method_name: []const u8) ?[]const u8 {
+        // Iterate over all impl entries to find one that matches this type and method
+        var iter = self.impl_methods.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const methods = entry.value_ptr.*;
+
+            // Check if this impl is for the given type (and not an inherent impl)
+            if (std.mem.eql(u8, key.type_name, type_name) and !std.mem.eql(u8, key.trait_name, key.type_name)) {
+                // Check if this impl has the method we're looking for
+                for (methods) |method| {
+                    if (std.mem.eql(u8, method.method_name, method_name)) {
+                        // Build qualified function name: TypeName.method_name
+                        var fn_name_buf: [256]u8 = undefined;
+                        const qualified_fn_name = std.fmt.bufPrint(&fn_name_buf, "{s}.{s}", .{ type_name, method_name }) catch {
+                            return null;
+                        };
+                        return self.allocator.dupe(u8, qualified_fn_name) catch null;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /// Build VTables from all trait implementations
@@ -1489,12 +1863,26 @@ pub const Lowerer = struct {
             const trait_def = entry.value_ptr.*;
 
             // Convert lower_types.TraitMethodSig to ir.TraitMethodSig
+            // Now we can resolve types since all types are registered
             var methods: std.ArrayListUnmanaged(ir.TraitMethodSig) = .{};
             for (trait_def.methods) |method| {
+                // Resolve the return type (now safe since types are registered)
+                const return_type = if (method.return_type_idx != .null)
+                    self.lowerTypeIdx(method.return_type_idx) catch .void
+                else
+                    .void;
+
+                // Generate default function name if this method has a default
+                const default_fn_name: ?[]const u8 = if (method.has_default)
+                    std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ trait_def.name, method.name }) catch null
+                else
+                    null;
+
                 try methods.append(self.allocator, .{
                     .name = method.name,
                     .param_count = method.param_count,
-                    .return_type = method.return_type,
+                    .return_type = return_type,
+                    .default_fn_name = default_fn_name,
                 });
             }
 
@@ -1526,19 +1914,27 @@ pub const Lowerer = struct {
         if (type_param_count > 0) {
             debug.print(.ir, "  -> Generic function with {d} type params, storing as template", .{type_param_count});
 
-            // Collect type param names
+            // Collect type param names and bounds
+            // Format: [param_count, type_param_count, tp1_name, tp1_bound, tp2_name, tp2_bound, ...]
             var type_param_names: std.ArrayListUnmanaged(StringId) = .{};
             defer type_param_names.deinit(self.allocator);
+            var type_param_bounds: std.ArrayListUnmanaged(ast.TypeIdx) = .{};
+            defer type_param_bounds.deinit(self.allocator);
 
             for (0..type_param_count) |i| {
-                const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start.toInt() + 2 + i]);
+                const name_idx = extra_start.toInt() + 2 + @as(u32, @intCast(i)) * 2;
+                const bound_idx = name_idx + 1;
+                const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[name_idx]);
+                const param_bound: ast.TypeIdx = @enumFromInt(self.store.extra_data.items[bound_idx]);
                 try type_param_names.append(self.allocator, param_name_id);
+                try type_param_bounds.append(self.allocator, param_bound);
             }
 
             const generic_def = GenericDef{
                 .stmt_idx = stmt_idx,
                 .type_param_count = @intCast(type_param_count),
                 .type_param_names = try type_param_names.toOwnedSlice(self.allocator),
+                .type_param_bounds = try type_param_bounds.toOwnedSlice(self.allocator),
             };
 
             try self.generic_fn_defs.put(name, generic_def);
@@ -1548,8 +1944,8 @@ pub const Lowerer = struct {
         var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
         defer params.deinit(self.allocator);
 
-        // Skip past type params: extra_start + 1 (param_count) + 1 (type_param_count) + type_param_count
-        var extra_idx = extra_start.toInt() + 2 + type_param_count;
+        // Skip past type params: each type param is 2 values (name, bound)
+        var extra_idx = extra_start.toInt() + 2 + type_param_count * 2;
         for (0..param_count) |_| {
             const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
             const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
@@ -1645,8 +2041,8 @@ pub const Lowerer = struct {
         var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
         defer params.deinit(self.allocator);
 
-        // Skip past type params: extra_start + 1 (param_count) + 1 (type_param_count) + type_param_count
-        var extra_idx = extra_start.toInt() + 2 + type_param_count;
+        // Skip past type params: each type param is 2 values (name, bound)
+        var extra_idx = extra_start.toInt() + 2 + type_param_count * 2;
         for (0..param_count) |_| {
             const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
             const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
@@ -2008,14 +2404,15 @@ pub const Lowerer = struct {
         const finally_body_raw = self.store.extra_data.items[extra_start + 2];
         const finally_body: ?StmtIdx = if (finally_body_raw != 0) @enumFromInt(finally_body_raw) else null;
 
-        // Check if finally block is used - not yet implemented
+        // finally was removed from Cot (use defer instead)
+        // This error only triggers for DBL legacy code using finally
         if (finally_body != null) {
             self.setErrorContext(
                 LowerError.UnsupportedFeature,
-                "'finally' block not yet implemented",
+                "'finally' is not supported - use 'defer' instead",
                 .{},
                 loc,
-                "use 'defer' for cleanup code that must always run",
+                "defer provides the same cleanup semantics as finally",
                 .{},
             );
             return LowerError.UnsupportedFeature;
@@ -2396,6 +2793,9 @@ pub const LowerOptions = struct {
 
     /// Types from compiled dependencies (for cross-package compilation)
     dependency_types: ?*DependencyTypeContext = null,
+
+    /// Source file path (for @file() builtin and error messages)
+    source_file: ?[]const u8 = null,
 };
 
 /// Main entry point for lowering

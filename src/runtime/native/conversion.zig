@@ -243,6 +243,11 @@ pub fn cast_integer(ctx: *NativeContext) NativeError!?Value {
             // Already integer - return as-is
             return Value.initInt(val.asInt());
         },
+        .float => {
+            // Truncate float to integer
+            const f = val.asFloat();
+            return Value.initInt(@intFromFloat(f));
+        },
         else => {
             return Value.initInt(0);
         },

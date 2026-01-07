@@ -175,12 +175,18 @@ pub fn formatParseError(source: []const u8, line: usize, column: usize, message:
 
 /// Compile and execute Cot source code using bytecode/VM pipeline
 pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
+    return runWithFile(allocator, source, null);
+}
+
+/// Run Cot source with optional source file path (for @file() builtin)
+pub fn runWithFile(allocator: std.mem.Allocator, source: []const u8, source_file: ?[]const u8) !void {
     // Initialize extension registry
     extension.initRegistry(allocator);
     defer extension.deinitRegistry();
 
     // Compile to bytecode module
-    var module = try compileToModule(allocator, source, "main");
+    const module_name = if (source_file) |f| std.fs.path.stem(f) else "main";
+    var module = try compileToModuleWithFile(allocator, source, module_name, source_file);
     defer module.deinit();
 
     // Execute in VM
@@ -192,6 +198,11 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) !void {
 
 /// Compile Cot source to bytecode using the IR pipeline
 pub fn compileToModule(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8) !bytecode.Module {
+    return compileToModuleWithFile(allocator, source, module_name, null);
+}
+
+/// Compile Cot source to bytecode with optional source file path
+pub fn compileToModuleWithFile(allocator: std.mem.Allocator, source: []const u8, module_name: []const u8, source_file: ?[]const u8) !bytecode.Module {
     // Tokenize
     var lex = lexer.Lexer.init(source);
     const tokens = try lex.tokenize(allocator);
@@ -225,7 +236,7 @@ pub fn compileToModule(allocator: std.mem.Allocator, source: []const u8, module_
     }
 
     // Lower to IR using detailed error reporting
-    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{});
+    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{ .source_file = source_file });
     const ir_module = switch (lower_result) {
         .ok => |module| module,
         .err => |e| {
@@ -284,7 +295,7 @@ pub fn lowerToIR(allocator: std.mem.Allocator, source: []const u8, module_name: 
     }
 
     // Lower to IR using detailed error reporting
-    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{});
+    const lower_result = ir_lower.lowerWithDetails(allocator, &store, &strings, top_level, module_name, .{ .source_file = module_name });
     return switch (lower_result) {
         .ok => |module| module,
         .err => |e| {

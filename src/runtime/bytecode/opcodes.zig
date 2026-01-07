@@ -240,6 +240,11 @@ pub const Opcode = enum(u8) {
     /// Format: [rd:4|rs1:4] [rs2:4|0]
     shr = 0x5B,
 
+    /// is_type rd, rs, type_tag - rd = (rs is type_tag)
+    /// Format: [rd:4|rs:4] [type_tag:8]
+    /// type_tag: 0=null, 1=bool, 2=int, 3=float, 4=string
+    is_type = 0x5C,
+
     // ============================================
     // Control Flow (0x60-0x6F)
     // ============================================
@@ -500,10 +505,15 @@ pub const Opcode = enum(u8) {
     /// Format: [map:4|key:4] [field_count:8] [base_reg:8] [0]
     map_get_struct = 0xBA,
 
-    /// array_slice rd, start_reg, end_reg, slot - rd = arr[start..end]
-    /// Creates a new list containing elements from start to end (exclusive)
-    /// Format: [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+    /// array_slice rd, start_reg, end_reg, slot - rd = arr[start..end] or arr[start..=end]
+    /// Creates a new list containing elements from start to end (exclusive unless inclusive flag set)
+    /// Format: [rd:4|inclusive:1|0:3] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
     array_slice = 0xBB,
+
+    /// array_load_opt rd, idx_reg, slot, len - optional load from array, returns null if out of bounds
+    /// Format: [idx_reg:8] [slot:16] [len:16]
+    /// Result stored in r0, returns null instead of throwing on out-of-bounds
+    array_load_opt = 0xBC,
 
     // ============================================
     // Built-in Functions (0xC0-0xCF)
@@ -820,7 +830,7 @@ pub const Opcode = enum(u8) {
             .cmp_str_eq, .cmp_str_lt, .cmp_str_ne, .cmp_str_le, .cmp_str_gt, .cmp_str_ge => 2,
             .log_and, .log_or, .log_not => 2,
             .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => 2,
-            .is_null, .select => 2,
+            .is_null, .is_type, .select => 2,
             .load_null, .load_true, .load_false => 2,
             .ret, .ret_val, .throw => 2,
             .free_record, .clear_record => 2,
@@ -830,6 +840,7 @@ pub const Opcode = enum(u8) {
             .str_find, .str_replace, .str_setchar => 2,
             .to_int, .to_str, .to_bool, .to_dec, .to_char, .format_decimal, .parse_decimal => 2,
             .array_load, .array_store, .array_len => 3, // [idx_reg/regs:8] [slot:16]
+            .array_load_opt => 5, // [idx_reg:8] [slot:16] [len:16]
             .array_slice => 4, // [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
             .fn_abs, .fn_sqrt, .fn_sin, .fn_cos, .fn_tan => 2,
             .fn_log, .fn_log10, .fn_exp, .fn_round, .fn_trunc => 2,

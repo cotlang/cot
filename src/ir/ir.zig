@@ -510,6 +510,7 @@ pub const Instruction = union(enum) {
     wrap_optional: UnaryOp,
     unwrap_optional: UnaryOp,
     is_null: UnaryOp,
+    is_type: IsTypeOp, // Type check: result = (operand is type_tag)
 
     // ====== Weak reference operations (Cot-specific) ======
     weak_ref: UnaryOp, // Create weak reference: result = weak(operand)
@@ -537,6 +538,7 @@ pub const Instruction = union(enum) {
 
     // ====== Array operations ======
     array_load: ArrayOp,
+    array_load_opt: ArrayOp, // Optional indexing - returns null on out-of-bounds
     array_store: ArrayStore,
     array_len: UnaryOp,
     array_slice: ArraySlice,
@@ -625,6 +627,24 @@ pub const Instruction = union(enum) {
     // Unary operation
     pub const UnaryOp = struct {
         operand: Value,
+        result: Value,
+    };
+
+    // Runtime type tag for is_type instruction
+    // Maps to VM value tags
+    pub const RuntimeTypeTag = enum(u8) {
+        null_val = 0,
+        boolean = 1,
+        integer = 2,
+        float = 3,
+        string = 4,
+        // Note: For DBL compatibility, we may need to add implied_decimal, fixed_string, etc.
+    };
+
+    // Type check operation: result = (operand is type_tag)
+    pub const IsTypeOp = struct {
+        operand: Value,
+        type_tag: RuntimeTypeTag,
         result: Value,
     };
 
@@ -768,7 +788,8 @@ pub const Instruction = union(enum) {
     pub const ArraySlice = struct {
         source: Value, // Source array
         start: Value, // Start index (0-based)
-        end: Value, // End index (exclusive)
+        end: Value, // End index (exclusive unless inclusive=true)
+        inclusive: bool = false, // If true, end index is inclusive (..=)
         result: Value, // Result slice value
         loc: ?SourceLoc = null,
     };
@@ -1017,9 +1038,9 @@ pub const Instruction = union(enum) {
             .try_begin, .try_end, .catch_begin, .throw => .exception,
             .bitcast, .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce => .conversion,
             .iconst, .f32const, .f64const, .const_string, .const_null => .constant,
-            .wrap_optional, .unwrap_optional, .is_null => .optional,
+            .wrap_optional, .unwrap_optional, .is_null, .is_type => .optional,
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
-            .array_load, .array_store, .array_len, .array_slice => .array,
+            .array_load, .array_load_opt, .array_store, .array_len, .array_slice => .array,
             .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => .map,
             .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => .list,
             .debug_line => .debug,
@@ -1087,12 +1108,13 @@ pub const Instruction = union(enum) {
             .call => |c| c.result,
             .call_indirect => |c| c.result,
             .load_struct_buf => |l| l.result,
-            .array_load => |a| a.result,
+            .array_load, .array_load_opt => |a| a.result,
             .array_slice => |a| a.result,
             .bitcast => |c| c.result,
             .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| op.result,
             .sextend, .uextend => |e| e.result,
             .wrap_optional, .unwrap_optional, .is_null => |op| op.result,
+            .is_type => |op| op.result,
             .format_decimal => |f| f.result,
             .parse_decimal => |p| p.result,
             // Map operations with results
@@ -1359,6 +1381,8 @@ pub const TraitMethodSig = struct {
     name: []const u8,
     param_count: u32,
     return_type: Type,
+    /// If this method has a default implementation, the function name (e.g., "TraitName.method")
+    default_fn_name: ?[]const u8 = null,
 };
 
 // ============================================================================

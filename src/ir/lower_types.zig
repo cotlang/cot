@@ -32,6 +32,9 @@ pub const GenericDef = struct {
     type_param_count: u16,
     /// Type parameter names (stored as StringIds)
     type_param_names: []const StringId,
+    /// Type parameter bounds (TypeIdx for each, .null if no bound)
+    /// Same length as type_param_names
+    type_param_bounds: []const ast.TypeIdx,
 };
 
 /// Key for caching instantiated generics
@@ -63,7 +66,15 @@ pub const InstantiationKey = struct {
 pub const TraitMethodSig = struct {
     name: []const u8,
     param_count: u32,
-    return_type: ir.Type,
+    /// Return type - stored as raw TypeIdx, resolved later during impl
+    return_type_idx: ast.TypeIdx,
+    /// If this method has a default implementation, this is true
+    has_default: bool = false,
+    /// The body statement index for lowering the default implementation
+    default_body_stmt_idx: ?ast.StmtIdx = null,
+    /// Raw parameter info for default impl generation (name StringId + type TypeIdx pairs)
+    /// Length is param_count * 2
+    raw_param_data: ?[]const u32 = null,
 };
 
 /// Trait definition - stores method signatures for a trait

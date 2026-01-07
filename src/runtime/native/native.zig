@@ -306,6 +306,160 @@ pub const NativeRegistry = struct {
         }
     }
 
+    /// Load a bytecode module with a package prefix for qualified function calls
+    /// Functions will be registered as both "prefix.name" and "name"
+    pub fn loadModuleWithPrefix(self: *Self, path: []const u8, package_prefix: []const u8) !void {
+        debug.print(.general, "loadModuleWithPrefix: path={s} prefix={s}", .{ path, package_prefix });
+        const mod_file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            debug.print(.general, "loadModuleWithPrefix: Failed to open file: {}", .{err});
+            return NativeError.FileError;
+        };
+        defer mod_file.close();
+
+        const bytes = mod_file.readToEndAlloc(self.allocator, 1024 * 1024 * 100) catch |err| {
+            debug.print(.general, "loadModuleWithPrefix: Failed to read: {}", .{err});
+            return NativeError.FileError;
+        };
+        defer self.allocator.free(bytes);
+        debug.print(.general, "loadModuleWithPrefix: Read {d} bytes", .{bytes.len});
+
+        const mod_ptr = try self.allocator.create(bytecode.Module);
+        errdefer self.allocator.destroy(mod_ptr);
+
+        // Check if this is a bundle (CBUNDLE header) or raw module (CBO1 header)
+        const is_bundle = bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "CBUNDLE\x00");
+        debug.print(.general, "loadModuleWithPrefix: is_bundle={}", .{is_bundle});
+
+        const module_bytes = if (is_bundle) blk: {
+            // Parse bundle header: "CBUNDLE\0" (8) + version (1) + module_count (4) = 13 bytes
+            if (bytes.len < 13) {
+                debug.print(.general, "loadModuleWithPrefix: Bundle too small", .{});
+                return NativeError.FileError;
+            }
+            const module_count = std.mem.readInt(u32, bytes[9..13], .little);
+            if (module_count == 0) {
+                debug.print(.general, "loadModuleWithPrefix: No modules in bundle", .{});
+                return NativeError.FileError;
+            }
+
+            // Parse module table: each entry is offset (4) + size (4) + type (1) = 9 bytes
+            // Find the first module (type 0 = main, type 1 = library, etc.)
+            const table_start: usize = 13;
+            var module_offset: ?u32 = null;
+            var module_size: ?u32 = null;
+            for (0..module_count) |i| {
+                const entry_start = table_start + (i * 9);
+                if (entry_start + 9 > bytes.len) break;
+                const offset = std.mem.readInt(u32, bytes[entry_start..][0..4], .little);
+                const size = std.mem.readInt(u32, bytes[entry_start + 4 ..][0..4], .little);
+                // Take first module regardless of type for library packages
+                module_offset = offset;
+                module_size = size;
+                break;
+            }
+
+            if (module_offset == null or module_size == null) {
+                debug.print(.general, "loadModuleWithPrefix: No module found in bundle", .{});
+                return NativeError.FileError;
+            }
+
+            const start = module_offset.?;
+            const end = start + module_size.?;
+            if (end > bytes.len) {
+                debug.print(.general, "loadModuleWithPrefix: Module extends beyond bundle", .{});
+                return NativeError.FileError;
+            }
+            debug.print(.general, "loadModuleWithPrefix: Extracted module at offset {d} size {d}", .{ start, module_size.? });
+            break :blk bytes[start..end];
+        } else bytes;
+
+        var fbs = std.io.fixedBufferStream(module_bytes);
+
+        mod_ptr.* = bytecode.Module.deserialize(self.allocator, fbs.reader()) catch |err| {
+            debug.print(.general, "loadModuleWithPrefix: Failed to deserialize: {}", .{err});
+            return NativeError.FileError;
+        };
+
+        mod_ptr.calculateGlobalsCount();
+        debug.print(.general, "Module globals_count: {d}", .{mod_ptr.globals_count});
+
+        const module_index: u16 = @intCast(self.loaded_modules.items.len);
+        try self.loaded_modules.append(self.allocator, mod_ptr);
+
+        if (mod_ptr.globals_count > 0) {
+            const globals = try self.allocator.alloc(GlobalValue, mod_ptr.globals_count);
+            for (globals) |*g| {
+                g.* = .{ .null_val = {} };
+            }
+            try self.module_globals.append(self.allocator, globals);
+            debug.print(.general, "Allocated {d} global slots for module {d}", .{ mod_ptr.globals_count, module_index });
+        } else {
+            try self.module_globals.append(self.allocator, &[_]GlobalValue{});
+        }
+
+        debug.print(.general, "Module has {d} exports, {d} routines, prefix='{s}'", .{ mod_ptr.exports.len, mod_ptr.routines.len, package_prefix });
+
+        // Helper to register a function with both qualified and unqualified names
+        const RegisterHelper = struct {
+            fn register(
+                subroutines: *std.StringHashMap(CallableDef),
+                alloc: std.mem.Allocator,
+                unqual_name: []const u8,
+                prefix: []const u8,
+                mod_idx: u16,
+                routine_idx: u16,
+            ) !void {
+                // Register with unqualified name
+                try subroutines.put(unqual_name, .{
+                    .name = unqual_name,
+                    .sub_type = .bytecode,
+                    .native_fn = null,
+                    .module_index = mod_idx,
+                    .routine_index = routine_idx,
+                });
+
+                // Register with qualified name if prefix is provided
+                if (prefix.len > 0) {
+                    const qualified_name = std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, unqual_name }) catch return;
+                    debug.print(.general, "  Registering qualified: '{s}' (module={d}, routine={d})", .{ qualified_name, mod_idx, routine_idx });
+                    try subroutines.put(qualified_name, .{
+                        .name = qualified_name,
+                        .sub_type = .bytecode,
+                        .native_fn = null,
+                        .module_index = mod_idx,
+                        .routine_index = routine_idx,
+                    });
+                }
+            }
+        };
+
+        if (mod_ptr.exports.len == 0 and mod_ptr.routines.len > 0) {
+            debug.print(.general, "No exports, registering all routines", .{});
+            for (mod_ptr.routines, 0..) |routine, i| {
+                const name = switch (mod_ptr.getConstant(routine.name_index).?) {
+                    .identifier => |n| n,
+                    else => continue,
+                };
+                if (std.mem.eql(u8, name, "main")) continue;
+
+                debug.print(.general, "  Registering routine: '{s}' (module={d}, routine={d})", .{ name, module_index, i });
+                try RegisterHelper.register(&self.subroutines, self.allocator, name, package_prefix, module_index, @intCast(i));
+            }
+        }
+
+        for (mod_ptr.exports) |export_entry| {
+            if (export_entry.kind == .routine) {
+                const name = switch (mod_ptr.getConstant(export_entry.name_index).?) {
+                    .identifier => |n| n,
+                    else => continue,
+                };
+
+                debug.print(.general, "  Registering subroutine: '{s}' (module={d}, routine={d})", .{ name, module_index, export_entry.index });
+                try RegisterHelper.register(&self.subroutines, self.allocator, name, package_prefix, module_index, export_entry.index);
+            }
+        }
+    }
+
     /// Look up a callable by name
     pub fn lookup(self: *Self, name: []const u8) ?CallableDef {
         var lower_buf: [256]u8 = undefined;

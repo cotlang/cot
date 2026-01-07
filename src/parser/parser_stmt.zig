@@ -296,15 +296,9 @@ pub fn parseTry(p: *Parser) ParseError!StmtIdx {
     _ = try p.consume(.lbrace, "Expected '{'");
     const catch_body = try parseBlock(p);
 
-    // Optional finally block
-    var finally_body: StmtIdx = .null;
-    if (p.match(&[_]TokenType{.kw_finally})) {
-        _ = try p.consume(.lbrace, "Expected '{'");
-        finally_body = try parseBlock(p);
-    }
-
+    // Note: finally was removed from Cot - use defer instead
     p.exitNesting();
-    return p.store.addTryStmt(try_body, err_binding, catch_body, finally_body, loc) catch return error.OutOfMemory;
+    return p.store.addTryStmt(try_body, err_binding, catch_body, .null, loc) catch return error.OutOfMemory;
 }
 
 pub fn parseThrow(p: *Parser) ParseError!StmtIdx {

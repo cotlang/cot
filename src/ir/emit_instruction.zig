@@ -399,8 +399,14 @@ pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!
 
 /// Emit iconst instruction
 pub fn emitIconst(e: *BytecodeEmitter, c: Iconst) EmitError!void {
-    const const_idx = try e.addConstant(.{ .integer = c.value });
-    try e.value_consts.put(c.result.id, const_idx);
+    // Handle boolean constants separately to preserve type at runtime
+    if (c.ty == .bool) {
+        const const_idx = try e.addConstant(.{ .boolean = c.value != 0 });
+        try e.value_consts.put(c.result.id, const_idx);
+    } else {
+        const const_idx = try e.addConstant(.{ .integer = c.value });
+        try e.value_consts.put(c.result.id, const_idx);
+    }
 }
 
 /// Emit f32const instruction
@@ -1289,6 +1295,35 @@ pub fn emitArrayLoad(e: *BytecodeEmitter, al: ir.Instruction.ArrayOp) EmitError!
     e.setLastResult(al.result.id, 0);
 }
 
+/// Emit array_load_opt instruction (optional indexing - returns null on out-of-bounds)
+pub fn emitArrayLoadOpt(e: *BytecodeEmitter, al: ir.Instruction.ArrayOp) EmitError!void {
+    const array_slot: u16 = if (e.array_ptr_targets.get(al.array_ptr.id)) |slot|
+        slot
+    else if (e.value_slots.get(al.array_ptr.id)) |slot_info|
+        slot_info & 0x7FFF
+    else
+        0;
+
+    // Get the array length from the type
+    const array_len: u16 = switch (al.array_ptr.ty) {
+        .array => |a| @intCast(a.length),
+        .ptr => |p| switch (p.*) {
+            .array => |a| @intCast(a.length),
+            else => 0,
+        },
+        else => 0,
+    };
+
+    debug.print(.emit, "array_load_opt: ptr.id={d} -> array_slot={d}, len={d}", .{ al.array_ptr.id, array_slot, array_len });
+
+    try e.emitValueToReg(al.index, 0);
+    try e.emitOpcode(.array_load_opt);
+    try e.emitU8(0);
+    try e.emitU16(array_slot);
+    try e.emitU16(array_len);
+    e.setLastResult(al.result.id, 0);
+}
+
 /// Emit array_store instruction
 pub fn emitArrayStore(e: *BytecodeEmitter, as: ir.Instruction.ArrayStore) EmitError!void {
     // First check array_ptr_targets for pointer indirection
@@ -1331,7 +1366,7 @@ pub fn emitArrayLen(e: *BytecodeEmitter, al: ir.Instruction.UnaryOp) EmitError!v
 }
 
 /// Emit array_slice instruction
-/// Format: [rd:4|0] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
+/// Format: [rd:4|inclusive:1|0:3] [start_reg:4|end_reg:4] [slot_lo:8] [slot_hi:8]
 pub fn emitArraySlice(e: *BytecodeEmitter, as: ir.Instruction.ArraySlice) EmitError!void {
     // Look up the source array's stack slot (same logic as array_load)
     const array_slot: u16 = if (e.array_ptr_targets.get(as.source.id)) |slot|
@@ -1341,15 +1376,17 @@ pub fn emitArraySlice(e: *BytecodeEmitter, as: ir.Instruction.ArraySlice) EmitEr
     else
         0;
 
-    debug.print(.emit, "array_slice: source.id={d} -> array_slot={d}", .{ as.source.id, array_slot });
+    debug.print(.emit, "array_slice: source.id={d} -> array_slot={d} inclusive={}", .{ as.source.id, array_slot, as.inclusive });
 
     // Load start and end indices into registers
     try e.emitValueToReg(as.start, 1);
     try e.emitValueToReg(as.end, 2);
 
     // Emit: array_slice rd=0, start_reg=1, end_reg=2, slot
+    // Encode inclusive flag in bit 3 of first byte
+    const inclusive_flag: u8 = if (as.inclusive) 0x08 else 0x00;
     try e.emitOpcode(.array_slice);
-    try e.emitU8(0 << 4); // rd=0, padding=0
+    try e.emitU8((0 << 4) | inclusive_flag); // rd=0, inclusive flag in bit 3
     try e.emitU8((1 << 4) | 2); // start_reg=1, end_reg=2
     try e.emitU16(array_slot);
 
@@ -1773,6 +1810,16 @@ pub fn emitIsNull(e: *BytecodeEmitter, n: ir.Instruction.UnaryOp) EmitError!void
     try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
     try e.emitU8(0);
     e.setLastResult(n.result.id, dest_reg);
+}
+
+/// Emit is_type instruction: rd = (rs is type_tag)
+pub fn emitIsType(e: *BytecodeEmitter, op: ir.Instruction.IsTypeOp) EmitError!void {
+    const src_reg = try e.getValueInReg(op.operand, 0);
+    const dest_reg: u4 = 1;
+    try e.emitOpcode(.is_type);
+    try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
+    try e.emitU8(@intFromEnum(op.type_tag));
+    e.setLastResult(op.result.id, dest_reg);
 }
 
 /// Emit select instruction: rd = cond ? rtrue : rfalse

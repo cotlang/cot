@@ -14,6 +14,7 @@
 //! - Type lowering
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("../ast/mod.zig");
 const ir = @import("ir.zig");
 const cot_runtime = @import("cot_runtime");
@@ -44,6 +45,7 @@ const UnaryOp = ast.UnaryOp;
 const InterpStringPartTag = ast.InterpStringPartTag;
 const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
+const TypeTag = ast.TypeTag;
 
 // ============================================================================
 // Source Location Conversion
@@ -110,6 +112,35 @@ fn isStdNamespaceFunction(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "std.");
 }
 
+/// Check if a qualified name represents an imported package function (e.g., "utils.add")
+fn isImportedPackageFunction(l: *Lowerer, qualified_name: []const u8) bool {
+    // Extract the first component (package name)
+    const dot_pos = std.mem.indexOf(u8, qualified_name, ".") orelse return false;
+    const package_name = qualified_name[0..dot_pos];
+
+    // Check if this package was imported
+    return l.imported_namespaces.contains(package_name);
+}
+
+/// Get return type for an imported package function
+fn getPackageFunctionReturnType(l: *Lowerer, qualified_name: []const u8) ir.Type {
+    // Try to get from fn_return_types (populated from DependencyTypeContext)
+    if (l.fn_return_types.get(qualified_name)) |ret_type| {
+        return ret_type;
+    }
+
+    // Also try just the function name part (after the package prefix)
+    if (std.mem.indexOf(u8, qualified_name, ".")) |dot_pos| {
+        const fn_name = qualified_name[dot_pos + 1 ..];
+        if (l.fn_return_types.get(fn_name)) |ret_type| {
+            return ret_type;
+        }
+    }
+
+    // Default to i64 if unknown (common case for numeric functions)
+    return .i64;
+}
+
 // ============================================================================
 // Main Expression Lowering
 // ============================================================================
@@ -166,17 +197,7 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             return LowerError.UnsupportedFeature;
         },
         .comptime_builtin => {
-            // Comptime builtins should be evaluated at compile time by the comptime evaluator
-            // If we get here, a comptime builtin wasn't resolved during constant folding
-            l.setErrorContext(
-                LowerError.UnsupportedFeature,
-                "Compile-time builtin (@file, @line, etc.) not yet implemented",
-                .{},
-                loc,
-                "comptime builtins require compile-time evaluation which is not yet supported",
-                .{},
-            );
-            return LowerError.UnsupportedFeature;
+            return lowerComptimeBuiltin(l, func, expr_idx, loc);
         },
         .if_expr, .match_expr, .block_expr => {
             // Expression forms (if/match/block as expressions) not yet supported
@@ -192,30 +213,8 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             return LowerError.UnsupportedFeature;
         },
         .optional_member => return lowerOptionalMember(l, func, expr_idx),
-        .optional_index => {
-            // Optional indexing (?[]) not yet supported
-            l.setErrorContext(
-                LowerError.UnsupportedFeature,
-                "Optional indexing operator '?[' not yet implemented",
-                .{},
-                loc,
-                "use explicit null check instead: if (x != null) {{ x[i] }}",
-                .{},
-            );
-            return LowerError.UnsupportedFeature;
-        },
-        .is_expr => {
-            // Type checking expressions not yet supported
-            l.setErrorContext(
-                LowerError.UnsupportedFeature,
-                "Type check operator 'is' not yet implemented",
-                .{},
-                loc,
-                "runtime type checking is not yet supported",
-                .{},
-            );
-            return LowerError.UnsupportedFeature;
-        },
+        .optional_index => return lowerOptionalIndex(l, func, expr_idx),
+        .is_expr => return lowerIsExpr(l, func, expr_idx),
         .interp_string => return lowerInterpString(l, func, expr_idx),
     }
 }
@@ -403,6 +402,74 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx
             .{},
         );
         return LowerError.UndefinedVariable;
+    }
+
+    // Check if this is a compile-time constant
+    if (l.comptime_evaluator.constants.get(name_id)) |ct_value| {
+        // Emit the constant value directly using the same patterns as literal lowering
+        switch (ct_value) {
+            .integer => |i| {
+                const result = func.newValue(.i64);
+                try l.emit(.{
+                    .iconst = .{
+                        .ty = .i64,
+                        .value = i,
+                        .result = result,
+                    },
+                });
+                return result;
+            },
+            .boolean => |b| {
+                const value: i64 = if (b) 1 else 0;
+                const result = func.newValue(.bool);
+                try l.emit(.{
+                    .iconst = .{
+                        .ty = .bool,
+                        .value = value,
+                        .result = result,
+                    },
+                });
+                return result;
+            },
+            .string => |s| {
+                const result = func.newValue(.string);
+                try l.emit(.{
+                    .const_string = .{
+                        .value = s,
+                        .result = result,
+                    },
+                });
+                return result;
+            },
+            .decimal => |d| {
+                // Convert scaled integer to float
+                const scale: i64 = std.math.powi(i64, 10, d.scale) catch 1;
+                const scale_factor: f64 = @floatFromInt(scale);
+                const float_val: f64 = @as(f64, @floatFromInt(d.value)) / scale_factor;
+                const result = func.newValue(.f64);
+                try l.emit(.{
+                    .f64const = .{
+                        .value = float_val,
+                        .result = result,
+                    },
+                });
+                return result;
+            },
+            .undefined => {
+                // Create void optional type for null
+                const ty_ptr = try l.allocator.create(ir.Type);
+                ty_ptr.* = .void;
+                try l.allocated_types.append(l.allocator, ty_ptr);
+                const result = func.newValue(.{ .optional = ty_ptr });
+                try l.emit(.{
+                    .const_null = .{
+                        .ty = .{ .optional = ty_ptr },
+                        .result = result,
+                    },
+                });
+                return result;
+            },
+        }
     }
 
     // Check if this is a captured variable from a closure
@@ -1211,7 +1278,7 @@ pub fn lowerIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError
     return result;
 }
 
-/// Lower a slice expression: expr[start..end]
+/// Lower a slice expression: expr[start..end] or expr[start..=end]
 pub fn lowerSliceExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
     const parts = l.store.getSliceExprParts(expr_idx);
     const slice_loc = l.store.exprLoc(expr_idx);
@@ -1264,6 +1331,7 @@ pub fn lowerSliceExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerE
                 .source = source_val,
                 .start = start_val,
                 .end = end_val,
+                .inclusive = parts.inclusive,
                 .result = result,
                 .loc = toIrLoc(slice_loc),
             },
@@ -1392,6 +1460,533 @@ pub fn lowerOptionalMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) L
     return LowerError.UndefinedVariable;
 }
 
+/// Lower an optional index expression: expr?[index]
+/// Returns null if index is out of bounds, otherwise returns the element
+pub fn lowerOptionalIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const data = l.store.exprData(expr_idx);
+    const object_idx = data.getObject();
+    const index_idx = data.getIndex();
+
+    // Lower the object expression
+    const object_val = try lowerExpression(l, object_idx);
+
+    // Lower the index expression
+    const index_val = try lowerExpression(l, index_idx);
+
+    // Handle list types - list_get already returns null on out-of-bounds
+    if (object_val.ty == .list) {
+        const elem_type = object_val.ty.list.element_type.*;
+        const result = func.newValue(elem_type);
+        try l.emit(.{
+            .list_get = .{
+                .list = object_val,
+                .index = index_val,
+                .result = result,
+                .loc = null,
+            },
+        });
+        return result;
+    }
+
+    // Handle array types - use array_load_opt which returns null on out-of-bounds
+    const is_array = switch (object_val.ty) {
+        .array => true,
+        .ptr => |p| switch (p.*) {
+            .array => true,
+            else => false,
+        },
+        else => false,
+    };
+
+    if (is_array) {
+        // Get element type
+        const elem_type: ir.Type = switch (object_val.ty) {
+            .array => |a| a.element.*,
+            .ptr => |p| switch (p.*) {
+                .array => |a| a.element.*,
+                else => .i64,
+            },
+            else => .i64,
+        };
+
+        // Use array_load_opt which handles bounds checking in the VM
+        // and returns null for out-of-bounds indices
+        const result = func.newValue(elem_type);
+        try l.emit(.{
+            .array_load_opt = .{
+                .array_ptr = object_val,
+                .index = index_val,
+                .result = result,
+            },
+        });
+
+        return result;
+    }
+
+    // Unsupported type for optional indexing
+    const loc = l.store.exprLoc(expr_idx);
+    l.setErrorContext(
+        LowerError.UnsupportedFeature,
+        "Optional indexing operator '?[' requires array or list type",
+        .{},
+        loc,
+        "the object type does not support indexing",
+        .{},
+    );
+    return LowerError.UnsupportedFeature;
+}
+
+/// Lower a type check expression: expr is Type
+/// Returns true if expr's runtime type matches the specified type
+pub fn lowerIsExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const data = l.store.exprData(expr_idx);
+    const value_idx: ExprIdx = @enumFromInt(data.a);
+    const type_idx: TypeIdx = @enumFromInt(data.b);
+
+    // Lower the expression to check
+    const value = try lowerExpression(l, value_idx);
+
+    // Get the AST type tag
+    const type_tag = l.store.typeTag(type_idx);
+
+    // Map AST TypeTag to IR RuntimeTypeTag
+    const result = func.newValue(.bool);
+
+    // Map AST type to runtime type tag
+    const runtime_tag: ir.Instruction.RuntimeTypeTag = switch (type_tag) {
+        // Integer types
+        .i8, .i16, .i32, .i64, .u8, .u16, .u32, .u64, .isize, .usize => .integer,
+        // Float types
+        .f32, .f64, .decimal => .float,
+        // Boolean
+        .bool => .boolean,
+        // String
+        .string => .string,
+        // For other types, return false (unsupported runtime check)
+        else => {
+            const loc = l.store.exprLoc(expr_idx);
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Type check 'is' not supported for this type",
+                .{},
+                loc,
+                "runtime type checking is only supported for primitive types",
+                .{},
+            );
+            return LowerError.UnsupportedFeature;
+        },
+    };
+
+    // Emit is_type instruction
+    try l.emit(.{ .is_type = .{
+        .operand = value,
+        .type_tag = runtime_tag,
+        .result = result,
+    } });
+
+    return result;
+}
+
+// ============================================================================
+// Compile-Time Builtins
+// ============================================================================
+
+/// Get IR type from an expression that represents a type (e.g., identifier "i64")
+fn getTypeFromExpr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Type {
+    const expr_tag = l.store.exprTag(expr_idx);
+
+    if (expr_tag == .identifier) {
+        // Get the identifier name
+        const ident_data = l.store.exprData(expr_idx);
+        const name_id: StringId = @enumFromInt(ident_data.a);
+        const type_name = l.strings.get(name_id);
+
+        // Map common type names to IR types
+        if (std.mem.eql(u8, type_name, "i8")) return .i8;
+        if (std.mem.eql(u8, type_name, "i16")) return .i16;
+        if (std.mem.eql(u8, type_name, "i32")) return .i32;
+        if (std.mem.eql(u8, type_name, "i64")) return .i64;
+        if (std.mem.eql(u8, type_name, "u8")) return .u8;
+        if (std.mem.eql(u8, type_name, "u16")) return .u16;
+        if (std.mem.eql(u8, type_name, "u32")) return .u32;
+        if (std.mem.eql(u8, type_name, "u64")) return .u64;
+        if (std.mem.eql(u8, type_name, "isize")) return .isize;
+        if (std.mem.eql(u8, type_name, "usize")) return .usize;
+        if (std.mem.eql(u8, type_name, "f32")) return .f32;
+        if (std.mem.eql(u8, type_name, "f64")) return .f64;
+        if (std.mem.eql(u8, type_name, "bool")) return .bool;
+        if (std.mem.eql(u8, type_name, "void")) return .void;
+        if (std.mem.eql(u8, type_name, "string")) return .string;
+
+        // Check for struct types
+        if (l.struct_types.get(type_name)) |struct_type| {
+            return .{ .@"struct" = struct_type };
+        }
+
+        // Unknown type
+        return LowerError.UndefinedType;
+    }
+
+    // Not an identifier - unsupported
+    return LowerError.InvalidExpression;
+}
+
+/// Get the name of an IR type as a string
+fn getTypeName(ty: ir.Type) []const u8 {
+    return switch (ty) {
+        .void => "void",
+        .bool => "bool",
+        .i8 => "i8",
+        .i16 => "i16",
+        .i32 => "i32",
+        .i64 => "i64",
+        .u8 => "u8",
+        .u16 => "u16",
+        .u32 => "u32",
+        .u64 => "u64",
+        .isize => "isize",
+        .usize => "usize",
+        .f32 => "f32",
+        .f64 => "f64",
+        .string => "string",
+        .@"struct" => |st| st.name,
+        .@"union" => |un| un.name,
+        .ptr => "*",
+        .optional => "?",
+        .weak => "weak",
+        .array => "array",
+        .slice => "slice",
+        .implied_decimal => "decimal",
+        .fixed_decimal => "fixed_decimal",
+        .function => "fn",
+        .trait_object => "trait_object",
+        .map => "map",
+        .list => "list",
+    };
+}
+
+/// Lower a compile-time builtin expression (@os, @arch, @file, @line, @sizeof, etc.)
+pub fn lowerComptimeBuiltin(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx, loc: SourceLoc) LowerError!ir.Value {
+    const data = l.store.exprData(expr_idx);
+    const name_id: StringId = @enumFromInt(data.a);
+    const name = l.strings.get(name_id);
+
+    // Extract arguments
+    const args_len = data.b >> 16;
+    const args_start = data.b & 0xFFFF;
+
+    // @os() - current operating system
+    if (std.mem.eql(u8, name, "os")) {
+        const os_name = switch (builtin.os.tag) {
+            .macos => "macos",
+            .linux => "linux",
+            .windows => "windows",
+            .freebsd => "freebsd",
+            .openbsd => "openbsd",
+            .netbsd => "netbsd",
+            .freestanding => "freestanding",
+            else => "unknown",
+        };
+        const result = func.newValue(.string);
+        const name_str = l.allocator.dupe(u8, os_name) catch return LowerError.OutOfMemory;
+        try l.emit(.{
+            .const_string = .{
+                .value = name_str,
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @arch() - current CPU architecture
+    if (std.mem.eql(u8, name, "arch")) {
+        const arch_name = switch (builtin.cpu.arch) {
+            .x86_64 => "x86_64",
+            .aarch64 => "arm64",
+            .x86 => "x86",
+            .arm => "arm",
+            .wasm32 => "wasm32",
+            .wasm64 => "wasm64",
+            .riscv64 => "riscv64",
+            else => "unknown",
+        };
+        const result = func.newValue(.string);
+        const name_str = l.allocator.dupe(u8, arch_name) catch return LowerError.OutOfMemory;
+        try l.emit(.{
+            .const_string = .{
+                .value = name_str,
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @file() - current source file path
+    if (std.mem.eql(u8, name, "file")) {
+        const file_path = l.source_file orelse "unknown";
+        const result = func.newValue(.string);
+        const path_str = l.allocator.dupe(u8, file_path) catch return LowerError.OutOfMemory;
+        try l.emit(.{
+            .const_string = .{
+                .value = path_str,
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @line() - current line number
+    if (std.mem.eql(u8, name, "line")) {
+        const result = func.newValue(.i64);
+        try l.emit(.{
+            .iconst = .{
+                .ty = .i64,
+                .value = @intCast(loc.line),
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @sizeof(T) - size of type in bytes
+    if (std.mem.eql(u8, name, "sizeof") or std.mem.eql(u8, name, "sizeOf")) {
+        if (args_len < 1) {
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "@sizeof requires a type argument",
+                .{},
+                loc,
+                "usage: @sizeof(Type)",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        }
+        // Get the expression argument - it should be an identifier representing a type
+        const expr_arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start]);
+        const ir_type = try getTypeFromExpr(l, expr_arg_idx);
+        const size = ir_type.sizeInBytes();
+
+        const result = func.newValue(.i64);
+        try l.emit(.{
+            .iconst = .{
+                .ty = .i64,
+                .value = @intCast(size),
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @alignof(T) - alignment of type
+    if (std.mem.eql(u8, name, "alignof") or std.mem.eql(u8, name, "alignOf")) {
+        if (args_len < 1) {
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "@alignof requires a type argument",
+                .{},
+                loc,
+                "usage: @alignof(Type)",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        }
+        // Get the expression argument - it should be an identifier representing a type
+        const expr_arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start]);
+        const ir_type = try getTypeFromExpr(l, expr_arg_idx);
+        // For now, use size as alignment (simple alignment)
+        const align_val = ir_type.sizeInBytes();
+
+        const result = func.newValue(.i64);
+        try l.emit(.{
+            .iconst = .{
+                .ty = .i64,
+                .value = @intCast(align_val),
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @version() - compiler version
+    if (std.mem.eql(u8, name, "version")) {
+        const result = func.newValue(.string);
+        const version_str = l.allocator.dupe(u8, "0.1.0") catch return LowerError.OutOfMemory;
+        try l.emit(.{
+            .const_string = .{
+                .value = version_str,
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @defined(NAME) - check if constant is defined
+    if (std.mem.eql(u8, name, "defined")) {
+        // For now, always return false unless we integrate with comptime evaluator
+        const result = func.newValue(.bool);
+        try l.emit(.{
+            .iconst = .{
+                .ty = .bool,
+                .value = 0, // false
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @typeName(T) - get the name of a type as a string
+    if (std.mem.eql(u8, name, "typeName")) {
+        if (args_len < 1) {
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "@typeName requires a type argument",
+                .{},
+                loc,
+                "usage: @typeName(Type)",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        }
+        const expr_arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start]);
+        const ir_type = try getTypeFromExpr(l, expr_arg_idx);
+        const type_name_str = getTypeName(ir_type);
+
+        const result = func.newValue(.string);
+        const name_str = l.allocator.dupe(u8, type_name_str) catch return LowerError.OutOfMemory;
+        try l.emit(.{
+            .const_string = .{
+                .value = name_str,
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @hasField(T, "field") - check if a struct type has a field
+    if (std.mem.eql(u8, name, "hasField")) {
+        if (args_len < 2) {
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "@hasField requires a type and field name arguments",
+                .{},
+                loc,
+                "usage: @hasField(Type, \"field_name\")",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        }
+        const type_arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start]);
+        const field_arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + 1]);
+
+        const ir_type = try getTypeFromExpr(l, type_arg_idx);
+
+        // Get the field name from the string literal
+        const field_expr_tag = l.store.exprTag(field_arg_idx);
+        if (field_expr_tag != .string_literal) {
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "@hasField second argument must be a string literal",
+                .{},
+                loc,
+                "usage: @hasField(Type, \"field_name\")",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        }
+        const field_data = l.store.exprData(field_arg_idx);
+        const field_name_id: StringId = @enumFromInt(field_data.a);
+        const field_name = l.strings.get(field_name_id);
+
+        // Check if the type is a struct and has the field
+        const has_field = switch (ir_type) {
+            .@"struct" => |st| blk: {
+                for (st.fields) |f| {
+                    if (std.mem.eql(u8, f.name, field_name)) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+
+        const result = func.newValue(.bool);
+        try l.emit(.{
+            .iconst = .{
+                .ty = .bool,
+                .value = if (has_field) 1 else 0,
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // @fieldNames(T) - get field names of a struct as a comma-separated string
+    if (std.mem.eql(u8, name, "fieldNames")) {
+        if (args_len < 1) {
+            l.setErrorContext(
+                LowerError.InvalidExpression,
+                "@fieldNames requires a type argument",
+                .{},
+                loc,
+                "usage: @fieldNames(StructType)",
+                .{},
+            );
+            return LowerError.InvalidExpression;
+        }
+        const expr_arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start]);
+        const ir_type = try getTypeFromExpr(l, expr_arg_idx);
+
+        // Check that we have a struct type
+        const st = switch (ir_type) {
+            .@"struct" => |s| s,
+            else => {
+                l.setErrorContext(
+                    LowerError.InvalidExpression,
+                    "@fieldNames requires a struct type",
+                    .{},
+                    loc,
+                    "provided type is not a struct",
+                    .{},
+                );
+                return LowerError.InvalidExpression;
+            },
+        };
+
+        // Build a comma-separated string of field names
+        var names_list: std.ArrayListUnmanaged(u8) = .{};
+        defer names_list.deinit(l.allocator);
+
+        for (st.fields, 0..) |f, i| {
+            if (i > 0) {
+                try names_list.append(l.allocator, ',');
+            }
+            try names_list.appendSlice(l.allocator, f.name);
+        }
+
+        const result = func.newValue(.string);
+        const names_str = l.allocator.dupe(u8, names_list.items) catch return LowerError.OutOfMemory;
+        try l.emit(.{
+            .const_string = .{
+                .value = names_str,
+                .result = result,
+            },
+        });
+        return result;
+    }
+
+    // Unknown builtin
+    l.setErrorContext(
+        LowerError.UnsupportedFeature,
+        "Unknown comptime builtin '@{s}'",
+        .{name},
+        loc,
+        "supported builtins: @os, @arch, @file, @line, @sizeof, @alignof, @version, @typeName, @hasField, @fieldNames",
+        .{},
+    );
+    return LowerError.UnsupportedFeature;
+}
+
 // ============================================================================
 // Function and Method Calls
 // ============================================================================
@@ -1409,7 +2004,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // Get callee name
     const callee_tag = l.store.exprTag(callee_idx);
 
-    // Check for namespace-qualified function calls (e.g., std.math.abs, std.io.println)
+    // Check for namespace-qualified function calls (e.g., std.math.abs, std.io.println, utils.add)
     if (callee_tag == .member) {
         var qualified_buf: [256]u8 = undefined;
         if (extractQualifiedName(l.store, l.strings, callee_idx, &qualified_buf)) |qualified_name| {
@@ -1436,6 +2031,41 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 try l.emit(.{
                     .call = .{
                         .callee = native_name,
+                        .args = args_slice,
+                        .result = result,
+                        .loc = toIrLoc(call_loc),
+                    },
+                });
+                return result;
+            }
+
+            // Check if this is an imported package function (e.g., utils.add)
+            if (isImportedPackageFunction(l, qualified_name)) {
+                // Lower arguments
+                var pkg_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                defer pkg_args.deinit(l.allocator);
+                for (0..args_count) |i| {
+                    const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                    const arg_val = try lowerExpression(l, arg_idx);
+                    try pkg_args.append(l.allocator, arg_val);
+                }
+
+                // Allocate the function name
+                const fn_name = l.allocator.dupe(u8, qualified_name) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                const args_slice = try pkg_args.toOwnedSlice(l.allocator);
+
+                // Get return type from dependency types if available
+                const result_type = getPackageFunctionReturnType(l, qualified_name);
+                const result = func.newValue(result_type);
+
+                debug.print(.ir, "Emitting cross-package call to {s}", .{qualified_name});
+
+                try l.emit(.{
+                    .call = .{
+                        .callee = fn_name,
                         .args = args_slice,
                         .result = result,
                         .loc = toIrLoc(call_loc),
@@ -1553,9 +2183,57 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 return result;
             }
 
-            // StructName.new() - create new struct instance
-            if (std.mem.eql(u8, field_name, "new")) {
-                if (l.struct_types.get(object_name)) |struct_type| {
+            // StructName.method() - check for impl method first
+            if (l.struct_types.get(object_name)) |struct_type| {
+                // Build qualified method name: TypeName.method_name
+                const qualified_name = std.fmt.allocPrint(
+                    l.allocator,
+                    "{s}.{s}",
+                    .{ object_name, field_name },
+                ) catch return LowerError.OutOfMemory;
+
+                // Check if this method exists as a function (from impl block)
+                var method_exists = false;
+                for (l.module.functions.items) |fn_def| {
+                    if (std.mem.eql(u8, fn_def.name, qualified_name)) {
+                        method_exists = true;
+                        break;
+                    }
+                }
+
+                if (method_exists) {
+                    // Call the impl method as a static function
+                    debug.print(.ir, "lowerCall: calling impl method {s}", .{qualified_name});
+
+                    // Lower arguments
+                    var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                    defer method_args.deinit(l.allocator);
+                    for (0..args_count) |i| {
+                        const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                        const arg_val = try lowerExpression(l, arg_idx);
+                        try method_args.append(l.allocator, arg_val);
+                    }
+
+                    const args_slice = try method_args.toOwnedSlice(l.allocator);
+
+                    // Get return type from impl method signature
+                    const result_type = l.fn_return_types.get(qualified_name) orelse
+                        ir.Type{ .@"struct" = struct_type };
+                    const result = func.newValue(result_type);
+
+                    try l.emit(.{
+                        .call = .{
+                            .callee = qualified_name,
+                            .args = args_slice,
+                            .result = result,
+                            .loc = toIrLoc(call_loc),
+                        },
+                    });
+                    return result;
+                } else if (std.mem.eql(u8, field_name, "new")) {
+                    // No impl method found - fallback to default struct allocation
+                    l.allocator.free(qualified_name);
+
                     // Create a pointer to the struct type for the IR value
                     const struct_type_ptr = try l.allocator.create(ir.Type);
                     struct_type_ptr.* = .{ .@"struct" = struct_type };
@@ -1577,6 +2255,8 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                         },
                     });
                     return struct_ptr;
+                } else {
+                    l.allocator.free(qualified_name);
                 }
             }
         }
@@ -1770,7 +2450,11 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             if (l.trait_defs.get(trait_name)) |trait_def| {
                 for (trait_def.methods) |method| {
                     if (std.mem.eql(u8, method.name, field_name)) {
-                        return_type = method.return_type;
+                        // Resolve return type from TypeIdx (safe now since types are registered)
+                        return_type = if (method.return_type_idx != .null)
+                            l.lowerTypeIdx(method.return_type_idx) catch .void
+                        else
+                            .void;
                         break;
                     }
                 }
@@ -1804,8 +2488,6 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
         // Check if this is a method call on a user-defined struct type
         // This handles calls like: point.distance(other) where Point has an impl block
-        debug.print(.ir, "Checking for struct method: field={s}, object_ty={any}", .{ field_name, object_val.ty });
-
         // Extract struct type from the value's type (may be direct struct or pointer to struct)
         const maybe_struct_type: ?*const ir.StructType = blk: {
             if (object_val.ty == .@"struct") {
@@ -1865,6 +2547,83 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 const result = func.newValue(result_type);
 
                 debug.print(.ir, "Dispatching method call: {s}.{s} with {d} args", .{ type_name, field_name, args_slice.len });
+
+                try l.emit(.{
+                    .call = .{
+                        .callee = method_name,
+                        .args = args_slice,
+                        .result = result,
+                        .loc = toIrLoc(call_loc),
+                    },
+                });
+                return result;
+            }
+
+            // Look up trait impl (impl TraitName for TypeName { ... })
+            // Check all trait implementations for this type
+            if (l.findTraitMethodForType(type_name, field_name)) |qualified_name| {
+                // Found the method in a trait impl! Lower arguments and emit call
+                var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                defer method_args.deinit(l.allocator);
+
+                // Pass self as a single struct value
+                try method_args.append(l.allocator, object_val);
+
+                // Then the explicit arguments
+                for (0..args_count) |i| {
+                    const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                    const arg_val = try lowerExpression(l, arg_idx);
+                    try method_args.append(l.allocator, arg_val);
+                }
+
+                const args_slice = try method_args.toOwnedSlice(l.allocator);
+                const result_type = getBuiltinReturnType(qualified_name, args_slice);
+                const result = func.newValue(result_type);
+
+                debug.print(.ir, "Dispatching trait method call: {s} with {d} args", .{ qualified_name, args_slice.len });
+
+                try l.emit(.{
+                    .call = .{
+                        .callee = qualified_name,
+                        .args = args_slice,
+                        .result = result,
+                        .loc = toIrLoc(call_loc),
+                    },
+                });
+                return result;
+            }
+
+            // Method not found in impl_methods yet (might be because we're lowering default impl)
+            // Still emit the call with qualified name - bytecode emitter will resolve it
+            {
+                var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                defer method_args.deinit(l.allocator);
+
+                // Pass self as first argument
+                try method_args.append(l.allocator, object_val);
+
+                // Then explicit arguments
+                for (0..args_count) |i| {
+                    const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                    const arg_val = try lowerExpression(l, arg_idx);
+                    try method_args.append(l.allocator, arg_val);
+                }
+
+                // Build qualified method name
+                var method_name_buf: [256]u8 = undefined;
+                const qualified_method_name = std.fmt.bufPrint(&method_name_buf, "{s}.{s}", .{ type_name, field_name }) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                const args_slice = try method_args.toOwnedSlice(l.allocator);
+                const method_name = l.allocator.dupe(u8, qualified_method_name) catch {
+                    return LowerError.OutOfMemory;
+                };
+
+                const result_type = getBuiltinReturnType(method_name, args_slice);
+                const result = func.newValue(result_type);
+
+                debug.print(.ir, "Dispatching fallback struct method call: {s} with {d} args", .{ method_name, args_slice.len });
 
                 try l.emit(.{
                     .call = .{
@@ -2219,7 +2978,11 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         if (l.trait_defs.get(trait_name)) |trait_def| {
             for (trait_def.methods) |method| {
                 if (std.mem.eql(u8, method.name, method_name_borrowed)) {
-                    return_type = method.return_type;
+                    // Resolve return type from TypeIdx (safe now since types are registered)
+                    return_type = if (method.return_type_idx != .null)
+                        l.lowerTypeIdx(method.return_type_idx) catch .void
+                    else
+                        .void;
                     break;
                 }
             }

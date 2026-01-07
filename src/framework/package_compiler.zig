@@ -2,6 +2,13 @@
 //!
 //! Compiles packages in dependency order, producing one .cbo per package,
 //! then links them together into a final executable.
+//!
+//! Cache Invalidation:
+//! Uses content-based hashing for reliable cache invalidation:
+//! - Source file content changes are detected via xxHash
+//! - Configuration (cot.json) changes invalidate cache
+//! - Compiler version changes invalidate cache
+//! - Dependency changes transitively invalidate dependent packages
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,12 +20,17 @@ const Module = bytecode.Module;
 const bytecode_mod = bytecode.module;
 const Constant = bytecode_mod.Constant;
 const package = @import("package.zig");
+const build_cache = @import("build/cache.zig");
 
 const Package = package.Package;
 const PackageManager = package.PackageManager;
 const ExportTable = package.ExportTable;
 const ExportedSymbol = package.ExportedSymbol;
 const SymbolKind = package.SymbolKind;
+
+const BuildCache = build_cache.BuildCache;
+const CacheManifest = build_cache.CacheManifest;
+const BuildMode = build_cache.BuildMode;
 
 /// Exported types from a compiled package (for cross-package type resolution)
 pub const ExportedTypes = struct {
@@ -86,12 +98,24 @@ pub const WorkspaceCompiler = struct {
     compiled: std.StringHashMapUnmanaged(*CompiledPackage),
     cache_dir: ?[]const u8,
 
+    /// Build cache for content-based invalidation
+    build_cache: ?*BuildCache,
+
+    /// Build mode (affects cache key)
+    build_mode: BuildMode,
+
+    /// Verbose logging
+    verbose: bool,
+
     pub fn init(allocator: Allocator, pm: *PackageManager) WorkspaceCompiler {
         return .{
             .allocator = allocator,
             .pm = pm,
             .compiled = .empty,
             .cache_dir = null,
+            .build_cache = null,
+            .build_mode = .debug,
+            .verbose = false,
         };
     }
 
@@ -102,6 +126,11 @@ pub const WorkspaceCompiler = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.compiled.deinit(self.allocator);
+
+        if (self.build_cache) |cache| {
+            cache.deinit();
+            self.allocator.destroy(cache);
+        }
 
         if (self.cache_dir) |dir| {
             self.allocator.free(dir);
@@ -115,65 +144,102 @@ pub const WorkspaceCompiler = struct {
         }
         self.cache_dir = try self.allocator.dupe(u8, dir);
 
-        // Ensure cache directory exists
-        std.fs.cwd().makePath(dir) catch {};
-    }
-
-    /// Compute a hash of source file modification times for cache invalidation
-    fn computeSourceHash(self: *WorkspaceCompiler, pkg: *Package) u64 {
-        _ = self;
-        var hash: u64 = 0;
-        for (pkg.source_files.items) |source_file| {
-            const file = std.fs.cwd().openFile(source_file, .{}) catch continue;
-            defer file.close();
-            const stat = file.stat() catch continue;
-            // Combine mtime (truncated to u64) and size into hash
-            hash ^= @truncate(@as(u128, @bitCast(stat.mtime)));
-            hash ^= stat.size;
-            hash = hash *% 31;
+        // Initialize build cache
+        if (self.build_cache) |old_cache| {
+            old_cache.deinit();
+            self.allocator.destroy(old_cache);
         }
-        return hash;
+
+        const cache_ptr = try self.allocator.create(BuildCache);
+        cache_ptr.* = try BuildCache.init(self.allocator, dir);
+        self.build_cache = cache_ptr;
     }
 
-    /// Get cache file path for a package
-    fn getCachePath(self: *WorkspaceCompiler, pkg_name: []const u8, buf: []u8) ![]const u8 {
-        const cache_dir = self.cache_dir orelse return error.NoCacheDir;
-        return std.fmt.bufPrint(buf, "{s}/{s}.cbo", .{ cache_dir, pkg_name }) catch error.BufferTooSmall;
+    /// Set build mode (debug/release)
+    pub fn setBuildMode(self: *WorkspaceCompiler, is_release: bool) void {
+        self.build_mode = BuildMode.fromBool(is_release);
     }
 
-    /// Get cache manifest path for a package
-    fn getManifestPath(self: *WorkspaceCompiler, pkg_name: []const u8, buf: []u8) ![]const u8 {
-        const cache_dir = self.cache_dir orelse return error.NoCacheDir;
-        return std.fmt.bufPrint(buf, "{s}/{s}.manifest", .{ cache_dir, pkg_name }) catch error.BufferTooSmall;
+    /// Enable verbose logging
+    pub fn setVerbose(self: *WorkspaceCompiler, verbose: bool) void {
+        self.verbose = verbose;
     }
 
-    /// Try to load a package from cache
+    /// Get config path for a package
+    fn getConfigPath(self: *WorkspaceCompiler, pkg: *Package) !?[]const u8 {
+        // Look for cot.json in the package directory
+        const config_path = try std.fs.path.join(self.allocator, &.{ pkg.path, "cot.json" });
+        std.fs.cwd().access(config_path, .{}) catch {
+            self.allocator.free(config_path);
+            return null;
+        };
+        return config_path;
+    }
+
+    /// Collect cache keys from compiled dependencies
+    fn collectDependencyKeys(self: *WorkspaceCompiler, pkg: *Package) !std.StringHashMapUnmanaged(u64) {
+        var dep_keys: std.StringHashMapUnmanaged(u64) = .empty;
+        errdefer dep_keys.deinit(self.allocator);
+
+        for (pkg.dependencies.items) |dep_name| {
+            // Get cache key from already-compiled dependency
+            if (self.build_cache) |cache| {
+                if (try cache.getCacheKey(dep_name)) |key| {
+                    try dep_keys.put(self.allocator, dep_name, key);
+                }
+            }
+        }
+
+        return dep_keys;
+    }
+
+    /// Try to load a package from cache (using content-based validation)
     fn loadFromCache(self: *WorkspaceCompiler, pkg: *Package) !?*CompiledPackage {
-        var manifest_path_buf: [512]u8 = undefined;
-        var cache_path_buf: [512]u8 = undefined;
+        const cache = self.build_cache orelse return null;
 
-        const manifest_path = self.getManifestPath(pkg.name, &manifest_path_buf) catch return null;
-        const cache_path = self.getCachePath(pkg.name, &cache_path_buf) catch return null;
+        // Get config path
+        const config_path = try self.getConfigPath(pkg);
+        defer if (config_path) |p| self.allocator.free(p);
 
-        // Read manifest to get stored hash
-        const manifest_file = std.fs.cwd().openFile(manifest_path, .{}) catch return null;
-        defer manifest_file.close();
+        // Collect dependency cache keys
+        var dep_keys = try self.collectDependencyKeys(pkg);
+        defer dep_keys.deinit(self.allocator);
 
-        var stored_hash_buf: [8]u8 = undefined;
-        const bytes_read = manifest_file.readAll(&stored_hash_buf) catch return null;
-        if (bytes_read != 8) return null;
-        const stored_hash = std.mem.readInt(u64, &stored_hash_buf, .little);
+        // Validate cache
+        const status = try cache.isCacheValid(
+            pkg.name,
+            pkg.source_files.items,
+            config_path,
+            self.build_mode,
+            &dep_keys,
+        );
 
-        // Compute current hash
-        const current_hash = self.computeSourceHash(pkg);
-
-        // Cache hit if hashes match
-        if (stored_hash != current_hash) {
+        if (!status.valid) {
+            if (self.verbose) {
+                std.debug.print("  Cache miss for '{s}': {s}\n", .{
+                    pkg.name,
+                    status.reason.toString(),
+                });
+            }
             return null;
         }
 
+        if (self.verbose) {
+            std.debug.print("  Cache hit for '{s}' (key: {x:0>16})\n", .{ pkg.name, status.cache_key });
+        }
+
         // Load bytecode from cache
-        const cache_file = std.fs.cwd().openFile(cache_path, .{}) catch return null;
+        const cache_dir = self.cache_dir orelse return null;
+        const bytecode_filename = try std.fmt.allocPrint(self.allocator, "{s}.cbo", .{pkg.name});
+        defer self.allocator.free(bytecode_filename);
+        const bytecode_path = try std.fs.path.join(self.allocator, &.{
+            cache_dir,
+            pkg.name,
+            bytecode_filename,
+        });
+        defer self.allocator.free(bytecode_path);
+
+        const cache_file = std.fs.cwd().openFile(bytecode_path, .{}) catch return null;
         defer cache_file.close();
 
         const bytecode_data = cache_file.readToEndAlloc(self.allocator, 100 * 1024 * 1024) catch return null;
@@ -194,24 +260,47 @@ pub const WorkspaceCompiler = struct {
 
     /// Save a compiled package to cache
     fn saveToCache(self: *WorkspaceCompiler, pkg: *Package, compiled: *CompiledPackage) void {
-        var manifest_buf: [512]u8 = undefined;
-        var cache_buf: [512]u8 = undefined;
+        const cache = self.build_cache orelse return;
+        const cache_dir = self.cache_dir orelse return;
 
-        const manifest_path = self.getManifestPath(pkg.name, &manifest_buf) catch return;
-        const cache_path = self.getCachePath(pkg.name, &cache_buf) catch return;
+        // Create package cache directory
+        const pkg_cache_dir = std.fs.path.join(self.allocator, &.{ cache_dir, pkg.name }) catch return;
+        defer self.allocator.free(pkg_cache_dir);
+        std.fs.cwd().makePath(pkg_cache_dir) catch {};
 
         // Write bytecode
+        const bytecode_filename = std.fmt.allocPrint(self.allocator, "{s}.cbo", .{pkg.name}) catch return;
+        defer self.allocator.free(bytecode_filename);
+        const cache_path = std.fs.path.join(self.allocator, &.{ pkg_cache_dir, bytecode_filename }) catch return;
+        defer self.allocator.free(cache_path);
+
         const cache_file = std.fs.cwd().createFile(cache_path, .{}) catch return;
         defer cache_file.close();
         cache_file.writeAll(compiled.bytecode) catch return;
 
-        // Write manifest with source hash
-        const manifest_file = std.fs.cwd().createFile(manifest_path, .{}) catch return;
-        defer manifest_file.close();
-        const hash = self.computeSourceHash(pkg);
-        var hash_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &hash_buf, hash, .little);
-        manifest_file.writeAll(&hash_buf) catch return;
+        // Get config path
+        const config_path = self.getConfigPath(pkg) catch null;
+        defer if (config_path) |p| self.allocator.free(p);
+
+        // Collect dependency keys
+        var dep_keys = self.collectDependencyKeys(pkg) catch return;
+        defer dep_keys.deinit(self.allocator);
+
+        // Create and save manifest
+        var manifest = cache.createManifest(
+            pkg.name,
+            pkg.source_files.items,
+            config_path,
+            self.build_mode,
+            &dep_keys,
+        ) catch return;
+        defer manifest.deinit(self.allocator);
+
+        cache.saveManifest(&manifest) catch return;
+
+        if (self.verbose) {
+            std.debug.print("  Cached '{s}' (key: {x:0>16})\n", .{ pkg.name, manifest.cache_key });
+        }
     }
 
     /// Compile all packages in dependency order
@@ -627,7 +716,11 @@ fn compilePackageFiles(
         .ok => |module| module,
         .err => |e| {
             if (e.detail) |detail| {
-                std.debug.print("IR lowering error in package '{s}': {s}\n", .{ pkg.name, detail.message });
+                std.debug.print("IR lowering error in package '{s}':\n", .{pkg.name});
+                std.debug.print("  {s}:{d}:{d}: error: {s}\n", .{ primary_file, detail.line, detail.column, detail.message });
+                if (detail.context.len > 0) {
+                    std.debug.print("  while {s}\n", .{detail.context});
+                }
             } else {
                 std.debug.print("IR lowering error in package '{s}': {}\n", .{ pkg.name, e.kind });
             }

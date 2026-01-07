@@ -401,6 +401,14 @@ pub const Printer = struct {
                 try self.printValue(al.index);
                 try self.writer.writeAll("]");
             },
+            .array_load_opt => |al| {
+                try self.printValue(al.result);
+                try self.writer.writeAll(" = array_load_opt ");
+                try self.printValue(al.array_ptr);
+                try self.writer.writeAll("?[");
+                try self.printValue(al.index);
+                try self.writer.writeAll("]");
+            },
             .array_store => |as| {
                 try self.writer.writeAll("array_store ");
                 try self.printValue(as.array_ptr);
@@ -415,7 +423,11 @@ pub const Printer = struct {
                 try self.printValue(as.source);
                 try self.writer.writeAll("[");
                 try self.printValue(as.start);
-                try self.writer.writeAll(":");
+                if (as.inclusive) {
+                    try self.writer.writeAll("..=");
+                } else {
+                    try self.writer.writeAll("..");
+                }
                 try self.printValue(as.end);
                 try self.writer.writeAll("]");
             },
@@ -443,6 +455,12 @@ pub const Printer = struct {
             .wrap_optional => |op| try self.printUnaryOp("wrap_optional", op),
             .unwrap_optional => |op| try self.printUnaryOp("unwrap_optional", op),
             .is_null => |op| try self.printUnaryOp("is_null", op),
+            .is_type => |op| {
+                try self.writer.print("is_type ", .{});
+                try self.printValue(op.operand);
+                try self.writer.print(", {s} -> ", .{@tagName(op.type_tag)});
+                try self.printValue(op.result);
+            },
 
             // Store struct buffer
             .store_struct_buf => |sb| {

@@ -87,6 +87,7 @@ pub const ConstantTag = enum(u8) {
     record_ref = 0x06,
     routine_ref = 0x07,
     float = 0x08, // f64 floating point
+    boolean = 0x09, // boolean true/false
 };
 
 /// Constant pool value
@@ -99,6 +100,7 @@ pub const Constant = union(ConstantTag) {
     record_ref: u16,
     routine_ref: u16,
     float: f64,
+    boolean: bool,
 
     /// Serialize constant to writer
     pub fn serialize(self: Constant, writer: anytype) !void {
@@ -129,6 +131,7 @@ pub const Constant = union(ConstantTag) {
                 const bits: u64 = @bitCast(val);
                 try writer.writeInt(u64, bits, .little);
             },
+            .boolean => |val| try writer.writeByte(if (val) 1 else 0),
         }
     }
 
@@ -169,6 +172,7 @@ pub const Constant = union(ConstantTag) {
                 const bits = try reader.readInt(u64, .little);
                 break :blk .{ .float = @bitCast(bits) };
             },
+            .boolean => .{ .boolean = (try reader.readByte()) != 0 },
         };
     }
 };
@@ -512,6 +516,14 @@ pub const Module = struct {
                 try writer.writeAll(method.fn_name);
             }
         }
+
+        // Write debug info section (source file)
+        if (self.source_file) |sf| {
+            try writer.writeInt(u16, @intCast(sf.len), .little);
+            try writer.writeAll(sf);
+        } else {
+            try writer.writeInt(u16, 0, .little);
+        }
     }
 
     /// Deserialize module from bytes
@@ -666,6 +678,17 @@ pub const Module = struct {
                     module.vtables[i].methods = &[_]VTableMethod{};
                 }
             }
+        }
+
+        // Read debug info section (source file) - optional for backward compat
+        const source_file_len = reader.readInt(u16, .little) catch 0;
+        if (source_file_len > 0) {
+            const source_file = try allocator.alloc(u8, source_file_len);
+            reader.readNoEof(source_file) catch {
+                allocator.free(source_file);
+                return module;
+            };
+            module.source_file = source_file;
         }
 
         return module;

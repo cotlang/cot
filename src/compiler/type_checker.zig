@@ -102,7 +102,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .call_indirect => {}, // Indirect calls checked at runtime
 
         // Array operations
-        .array_load => |a| self.checkArrayLoad(a),
+        .array_load, .array_load_opt => |a| self.checkArrayLoad(a),
         .array_store => |a| self.checkArrayStore(a),
 
         // These don't need type checking (Cranelift names)
@@ -112,7 +112,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => {},
         .load_struct_buf, .store_struct_buf, .str_compare, .str_copy, .str_len, .ineg => {},
         .try_begin, .try_end, .catch_begin, .throw => {},
-        .wrap_optional, .unwrap_optional, .is_null => {},
+        .wrap_optional, .unwrap_optional, .is_null, .is_type => {},
         .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => {},
         .array_len, .array_slice, .debug_line, .select, .ptr_offset => {},
         .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => {},

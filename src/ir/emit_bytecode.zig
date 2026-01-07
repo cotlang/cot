@@ -722,6 +722,7 @@ pub const BytecodeEmitter = struct {
 
             // Null/optional operations
             .is_null => |n| try emit_inst.emitIsNull(self, n),
+            .is_type => |op| try emit_inst.emitIsType(self, op),
             .select => |s| try emit_inst.emitSelect(self, s),
 
             // Pointer operations
@@ -764,6 +765,7 @@ pub const BytecodeEmitter = struct {
 
             // Array operations
             .array_load => |al| try emit_inst.emitArrayLoad(self, al),
+            .array_load_opt => |al| try emit_inst.emitArrayLoadOpt(self, al),
             .array_store => |as| try emit_inst.emitArrayStore(self, as),
             .array_len => |al| try emit_inst.emitArrayLen(self, al),
             .array_slice => |as| try emit_inst.emitArraySlice(self, as),

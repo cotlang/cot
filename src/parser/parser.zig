@@ -6,6 +6,7 @@
 //! For DBL syntax (.dbl files), use the cot-dbl frontend package.
 
 const std = @import("std");
+const log = std.log.scoped(.parser);
 const Token = @import("../lexer/token.zig").Token;
 const TokenType = @import("../lexer/token.zig").TokenType;
 
@@ -284,14 +285,13 @@ pub const Parser = struct {
         // This prevents nested scratch usage from leaking data to parent callers
         self.store.rollbackScratch();
 
-        // Extract type param names for generic function storage
-        var type_param_names: [MAX_TYPE_PARAMS]u32 = undefined;
+        // Extract type param (name, bound) pairs for generic function storage
+        var type_param_pairs: [MAX_TYPE_PARAMS * 2]u32 = undefined;
         if (type_param_count > 0) {
-            // Type params are stored as [count, name1, bound1, name2, bound2, ...] at type_params_start
-            // We just need the names (StringIds)
             const start_idx = self.type_params.items.len - type_param_count;
             for (self.type_params.items[start_idx..], 0..) |param, i| {
-                type_param_names[i] = @intFromEnum(param.name);
+                type_param_pairs[i * 2] = @intFromEnum(param.name);
+                type_param_pairs[i * 2 + 1] = param.bound.toInt();
             }
         }
         _ = type_params_start; // Stored separately in extra_data, not needed for fn_def
@@ -299,7 +299,7 @@ pub const Parser = struct {
         // Clear type params from scope
         self.clearTypeParams(type_param_count);
 
-        return self.store.addGenericFnDef(name, type_param_names[0..type_param_count], params_copy, return_type, body, loc) catch return error.OutOfMemory;
+        return self.store.addGenericFnDef(name, type_param_pairs[0 .. type_param_count * 2], params_copy, return_type, body, loc) catch return error.OutOfMemory;
     }
 
     fn parseStructDef(self: *Self) ParseError!StmtIdx {
@@ -477,7 +477,7 @@ pub const Parser = struct {
 
         _ = try self.consume(.lbrace, "Expected '{'");
 
-        // Parse method signatures (no bodies)
+        // Parse method signatures (with optional default bodies)
         try self.store.markScratch();
         errdefer {
             self.store.rollbackScratch();
@@ -530,11 +530,23 @@ pub const Parser = struct {
                 return_type = try self.parseType();
             }
 
-            // Store method signature: [method_name, param_count, return_type, param_quads...]
+            // Check for default implementation body (optional)
+            var default_body: StmtIdx = .null;
+            if (self.check(.lbrace)) {
+                _ = self.advance(); // consume '{'
+                default_body = try self.parseBlock();
+            } else {
+                // Expect semicolon or comma for methods without default body
+                _ = self.match(&[_]TokenType{ .semicolon, .comma });
+            }
+
+            // Store method signature: [method_name, param_count, return_type, has_default, default_body, param_quads...]
             // This order makes parsing easier - we know param_count before reading params
             self.store.pushScratchU32(@intFromEnum(method_name)) catch return error.OutOfMemory;
             self.store.pushScratchU32(param_count) catch return error.OutOfMemory;
             self.store.pushScratchU32(return_type.toInt()) catch return error.OutOfMemory;
+            self.store.pushScratchU32(if (default_body != .null) 1 else 0) catch return error.OutOfMemory;
+            self.store.pushScratchU32(default_body.toInt()) catch return error.OutOfMemory;
             // Now store the param quads (name, type, is_ref, default_value)
             for (0..param_count) |i| {
                 self.store.pushScratchU32(params_temp[i * 4]) catch return error.OutOfMemory;
@@ -544,9 +556,6 @@ pub const Parser = struct {
             }
 
             method_count += 1;
-
-            // Expect semicolon or comma
-            _ = self.match(&[_]TokenType{ .semicolon, .comma });
         }
 
         _ = try self.consume(.rbrace, "Expected '}'");
@@ -1064,15 +1073,9 @@ pub const Parser = struct {
         _ = try self.consume(.lbrace, "Expected '{'");
         const catch_body = try self.parseBlock();
 
-        // Optional finally block
-        var finally_body: StmtIdx = .null;
-        if (self.match(&[_]TokenType{.kw_finally})) {
-            _ = try self.consume(.lbrace, "Expected '{'");
-            finally_body = try self.parseBlock();
-        }
-
+        // Note: finally was removed from Cot - use defer instead
         self.exitNesting();
-        return self.store.addTryStmt(try_body, err_binding, catch_body, finally_body, loc) catch return error.OutOfMemory;
+        return self.store.addTryStmt(try_body, err_binding, catch_body, .null, loc) catch return error.OutOfMemory;
     }
 
     fn parseThrow(self: *Self) ParseError!StmtIdx {
@@ -1331,16 +1334,15 @@ pub const Parser = struct {
         const type_name = type_token.lexeme;
 
         // Map type name to cast function
+        // For enum types or i64, we use cast_integer since enums are integers
         const cast_func: []const u8 = if (std.mem.eql(u8, type_name, "alpha") or std.mem.eql(u8, type_name, "string"))
             "cast_alpha"
-        else if (std.mem.eql(u8, type_name, "decimal"))
+        else if (std.mem.eql(u8, type_name, "decimal") or std.mem.eql(u8, type_name, "f64"))
             "cast_decimal"
-        else if (std.mem.eql(u8, type_name, "integer") or std.mem.eql(u8, type_name, "int"))
-            "cast_integer"
-        else {
-            self.addError("Unknown cast type, expected: alpha, string, decimal, integer, or int");
-            return error.UnexpectedToken;
-        };
+        else
+            // All other types (integer, int, i64, i32, u64, u32, or enum types) use cast_integer
+            // Enum values are integers, so casting to/from enum is effectively integer cast
+            "cast_integer";
 
         // Create call expression: cast_func(left)
         const func_id = self.internString(cast_func) catch return error.OutOfMemory;
@@ -1388,13 +1390,14 @@ pub const Parser = struct {
                 // Parse at precedence above range to stop before '..' operator
                 const start_expr = try self.parseExpressionPrec(.range);
 
-                // Check for slice syntax: expr[start..end]
-                if (self.match(&[_]TokenType{.range})) {
+                // Check for slice syntax: expr[start..end] or expr[start..=end]
+                if (self.match(&[_]TokenType{ .range, .range_inclusive })) {
+                    const inclusive = self.previous().type == .range_inclusive;
                     // Parse end expression (can be any expression)
                     const end_expr = try self.parseExpression();
                     _ = try self.consume(.rbracket, "Expected ']'");
                     self.exitNesting();
-                    result = self.store.addSliceExpr(result, start_expr, end_expr, self.currentLoc()) catch return error.OutOfMemory;
+                    result = self.store.addSliceExpr(result, start_expr, end_expr, inclusive, self.currentLoc()) catch return error.OutOfMemory;
                 } else {
                     // Regular index expression: expr[index]
                     _ = try self.consume(.rbracket, "Expected ']'");
@@ -1406,6 +1409,14 @@ pub const Parser = struct {
                 const field_token = try self.consume(.identifier, "Expected field name");
                 const field = self.internString(field_token.lexeme) catch return error.OutOfMemory;
                 result = self.store.addOptionalMember(result, field, self.currentLoc()) catch return error.OutOfMemory;
+            } else if (self.match(&[_]TokenType{.question_lbracket})) {
+                // Optional index access: expr?[index] (null-safe, returns null on out-of-bounds)
+                try self.enterNesting();
+                errdefer self.exitNesting();
+                const index_expr = try self.parseExpression();
+                _ = try self.consume(.rbracket, "Expected ']'");
+                self.exitNesting();
+                result = self.store.addOptionalIndex(result, index_expr, self.currentLoc()) catch return error.OutOfMemory;
             } else {
                 break;
             }
@@ -2165,6 +2176,16 @@ pub const Parser = struct {
 
     fn consume(self: *Self, token_type: TokenType, message: []const u8) ParseError!Token {
         if (self.check(token_type)) return self.advance();
+
+        // Enhanced diagnostic: show expected vs actual token
+        const actual = self.peek();
+        log.debug("consume failed: expected {s}, got {s} '{s}' at {d}:{d}", .{
+            @tagName(token_type),
+            @tagName(actual.type),
+            actual.lexeme,
+            actual.line,
+            actual.column,
+        });
 
         self.errors.append(self.allocator, .{
             .message = message,

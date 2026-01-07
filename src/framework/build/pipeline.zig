@@ -10,6 +10,12 @@
 //! - Apps (release): .cot-out/apps/<name>/<name> (no extension, like Go/Rust)
 //! - Libraries (release): .cot-out/packages/<name>/<name>.cotpkg (package file)
 //! - Development cache: .cot-out/.cache/<name>/<name>.cotc (compiled modules)
+//!
+//! Cache Invalidation:
+//! Uses content-based hashing for reliable incremental builds:
+//! - Source file content changes trigger recompilation
+//! - Config file (cot.json) changes trigger recompilation
+//! - Compiler version changes trigger recompilation
 
 const std = @import("std");
 const config = @import("../config.zig");
@@ -17,6 +23,7 @@ const workspace = @import("../workspace.zig");
 const resolver = @import("../resolver.zig");
 const discovery = @import("../discovery.zig");
 const bundler = @import("bundler.zig");
+const build_cache = @import("cache.zig");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
@@ -24,6 +31,11 @@ const builtin = @import("builtin");
 const cot = @import("cot");
 const ast = cot.ast;
 const schema = cot.schema;
+
+// Build cache types
+const BuildCache = build_cache.BuildCache;
+const CacheManifest = build_cache.CacheManifest;
+const BuildMode = build_cache.BuildMode;
 
 /// File extensions
 pub const Extensions = struct {
@@ -57,6 +69,8 @@ pub const FileResult = struct {
     output: []const u8,
     success: bool,
     error_message: ?[]const u8 = null,
+    /// Whether this file was loaded from cache (skipped compilation)
+    cache_hit: bool = false,
 };
 
 /// Build result for a project
@@ -67,6 +81,7 @@ pub const ProjectResult = struct {
     success: bool,
     total_files: usize = 0,
     compiled_files: usize = 0,
+    cached_files: usize = 0,
     failed_files: usize = 0,
     bundled: bool = false,
     bundle_path: ?[]const u8 = null,
@@ -132,6 +147,12 @@ pub const Pipeline = struct {
     schema_metadata: ?schema.SchemaMetadata = null,
     schema_file: ?schema.SchemaFile = null,
 
+    /// Build cache for incremental compilation
+    file_cache: ?*BuildCache = null,
+
+    /// Current workspace root for config path resolution
+    workspace_root: ?[]const u8 = null,
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, options: BuildOptions) Self {
@@ -140,12 +161,21 @@ pub const Pipeline = struct {
             .options = options,
             .schema_metadata = null,
             .schema_file = null,
+            .file_cache = null,
+            .workspace_root = null,
         };
     }
 
     /// Clean up any cached schema data
     pub fn deinit(self: *Self) void {
         self.clearSchemaCache();
+        if (self.file_cache) |cache| {
+            cache.deinit();
+            self.allocator.destroy(cache);
+        }
+        if (self.workspace_root) |root| {
+            self.allocator.free(root);
+        }
     }
 
     /// Clear the schema cache between projects
@@ -275,9 +305,31 @@ pub const Pipeline = struct {
         var result = BuildResult.init(self.allocator);
         errdefer result.deinit();
 
+        // Store workspace root for config path resolution
+        if (self.workspace_root) |old| {
+            self.allocator.free(old);
+        }
+        self.workspace_root = try self.allocator.dupe(u8, ws.root_path);
+
+        // Initialize build cache (for incremental builds)
+        if (self.file_cache == null and !self.options.rebuild) {
+            const cache_dir = try std.fs.path.join(self.allocator, &.{ ws.root_path, ".cot-out", ".cache" });
+            defer self.allocator.free(cache_dir);
+
+            const cache_ptr = try self.allocator.create(BuildCache);
+            cache_ptr.* = try BuildCache.init(self.allocator, cache_dir);
+            self.file_cache = cache_ptr;
+        }
+
         // Full rebuild: clean all caches before building
         if (self.options.rebuild) {
             try self.cleanAllCaches(ws);
+            // Destroy any existing cache
+            if (self.file_cache) |cache| {
+                cache.deinit();
+                self.allocator.destroy(cache);
+                self.file_cache = null;
+            }
         }
 
         // Resolve dependencies for build order
@@ -446,6 +498,7 @@ pub const Pipeline = struct {
 
             if (file_result.success) {
                 result.compiled_files += 1;
+                if (file_result.cache_hit) result.cached_files += 1;
             } else {
                 result.failed_files += 1;
                 result.success = false;
@@ -470,6 +523,7 @@ pub const Pipeline = struct {
 
             if (file_result.success) {
                 result.compiled_files += 1;
+                if (file_result.cache_hit) result.cached_files += 1;
             } else {
                 result.failed_files += 1;
                 result.success = false;
@@ -493,6 +547,7 @@ pub const Pipeline = struct {
 
             if (file_result.success) {
                 result.compiled_files += 1;
+                if (file_result.cache_hit) result.cached_files += 1;
             } else {
                 result.failed_files += 1;
                 result.success = false;
@@ -516,6 +571,7 @@ pub const Pipeline = struct {
 
             if (file_result.success) {
                 result.compiled_files += 1;
+                if (file_result.cache_hit) result.cached_files += 1;
             } else {
                 result.failed_files += 1;
                 result.success = false;
@@ -539,6 +595,7 @@ pub const Pipeline = struct {
 
             if (file_result.success) {
                 result.compiled_files += 1;
+                if (file_result.cache_hit) result.cached_files += 1;
             } else {
                 result.failed_files += 1;
                 result.success = false;
@@ -577,6 +634,7 @@ pub const Pipeline = struct {
 
                 if (file_result.success) {
                     result.compiled_files += 1;
+                    if (file_result.cache_hit) result.cached_files += 1;
                 } else {
                     result.failed_files += 1;
                     result.success = false;
@@ -593,11 +651,64 @@ pub const Pipeline = struct {
             .source = try self.allocator.dupe(u8, source_path),
             .output = try self.allocator.dupe(u8, output_path),
             .success = false,
+            .cache_hit = false,
         };
 
         // For DBL files, spawn cot-dbl as external process
         if (std.mem.endsWith(u8, source_path, ".dbl")) {
             return self.compileDblFile(source_path, output_path, &result);
+        }
+
+        // Check cache for valid compiled output
+        if (self.file_cache) |cache| {
+            // Create a unique cache key from the source path
+            const source_basename = std.fs.path.basename(source_path);
+            const source_files = &[_][]const u8{source_path};
+
+            // Get project config path if available
+            var config_path: ?[]const u8 = null;
+            if (self.workspace_root) |root| {
+                // Try to find cot.json relative to source file
+                const source_dir = std.fs.path.dirname(source_path) orelse root;
+                config_path = std.fs.path.join(self.allocator, &.{ source_dir, "cot.json" }) catch null;
+                if (config_path) |cp| {
+                    std.fs.cwd().access(cp, .{}) catch {
+                        self.allocator.free(cp);
+                        config_path = null;
+                    };
+                }
+            }
+            defer if (config_path) |cp| self.allocator.free(cp);
+
+            // No dependencies for individual files (simplified model)
+            var empty_deps: std.StringHashMapUnmanaged(u64) = .empty;
+            const build_mode = BuildMode.fromBool(self.options.release);
+
+            const status = cache.isCacheValid(
+                source_basename,
+                source_files,
+                config_path,
+                build_mode,
+                &empty_deps,
+            ) catch null;
+
+            if (status) |s| {
+                if (s.valid) {
+                    // Check if output file exists
+                    std.fs.cwd().access(output_path, .{}) catch {
+                        // Output doesn't exist, need to recompile
+                    };
+                    if (std.fs.cwd().access(output_path, .{})) |_| {
+                        // Cache hit! Skip compilation
+                        result.success = true;
+                        result.cache_hit = true;
+                        if (self.options.verbose) {
+                            std.debug.print("  Cache hit: {s}\n", .{source_basename});
+                        }
+                        return result;
+                    } else |_| {}
+                }
+            }
         }
 
         // Read source file
@@ -707,6 +818,48 @@ pub const Pipeline = struct {
             return result;
         };
 
+        // Save to cache for future builds
+        if (self.file_cache) |cache| {
+            const source_basename = std.fs.path.basename(source_path);
+            const source_files = &[_][]const u8{source_path};
+
+            // Get project config path if available
+            var config_path_for_cache: ?[]const u8 = null;
+            if (self.workspace_root) |root| {
+                const source_dir = std.fs.path.dirname(source_path) orelse root;
+                config_path_for_cache = std.fs.path.join(self.allocator, &.{ source_dir, "cot.json" }) catch null;
+                if (config_path_for_cache) |cp| {
+                    std.fs.cwd().access(cp, .{}) catch {
+                        self.allocator.free(cp);
+                        config_path_for_cache = null;
+                    };
+                }
+            }
+            defer if (config_path_for_cache) |cp| self.allocator.free(cp);
+
+            var empty_deps: std.StringHashMapUnmanaged(u64) = .empty;
+            const build_mode = BuildMode.fromBool(self.options.release);
+
+            var manifest = cache.createManifest(
+                source_basename,
+                source_files,
+                config_path_for_cache,
+                build_mode,
+                &empty_deps,
+            ) catch {
+                // Cache save failure is non-fatal
+                result.success = true;
+                return result;
+            };
+            defer manifest.deinit(self.allocator);
+
+            cache.saveManifest(&manifest) catch {};
+
+            if (self.options.verbose) {
+                std.debug.print("  Cached: {s} (key: {x:0>16})\n", .{ source_basename, manifest.cache_key });
+            }
+        }
+
         result.success = true;
         return result;
     }
@@ -804,13 +957,23 @@ pub fn printBuildSummary(result: *const BuildResult, writer: anytype) !void {
                 try writer.print("    Error: {s}\n", .{err});
             }
         } else {
-            // Individual files output
-            try writer.print("{s} {s}: {d}/{d} files compiled\n", .{
-                status,
-                project.name,
-                project.compiled_files,
-                project.total_files,
-            });
+            // Individual files output - show cache hits if any
+            if (project.cached_files > 0) {
+                try writer.print("{s} {s}: {d} compiled, {d} cached, {d} total\n", .{
+                    status,
+                    project.name,
+                    project.compiled_files - project.cached_files,
+                    project.cached_files,
+                    project.total_files,
+                });
+            } else {
+                try writer.print("{s} {s}: {d}/{d} files compiled\n", .{
+                    status,
+                    project.name,
+                    project.compiled_files,
+                    project.total_files,
+                });
+            }
 
             // Show errors for failed files
             for (project.files.items) |file| {

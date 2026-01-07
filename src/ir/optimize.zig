@@ -572,10 +572,13 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .wrap_optional, .unwrap_optional, .is_null => |op| {
             used.put(op.operand.id, {}) catch {};
         },
+        .is_type => |op| {
+            used.put(op.operand.id, {}) catch {};
+        },
         .field_ptr => |f| {
             used.put(f.struct_ptr.id, {}) catch {};
         },
-        .array_load => |a| {
+        .array_load, .array_load_opt => |a| {
             used.put(a.array_ptr.id, {}) catch {};
             used.put(a.index.id, {}) catch {};
         },
@@ -1648,6 +1651,7 @@ fn instructionUsesValue(inst: ir.Instruction, value_id: u32) bool {
         .ineg, .bnot, .log_not, .str_len => |op| op.operand.id == value_id,
         .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| op.operand.id == value_id,
         .wrap_optional, .unwrap_optional, .is_null => |op| op.operand.id == value_id,
+        .is_type => |op| op.operand.id == value_id,
         .weak_ref, .weak_load => |op| op.operand.id == value_id,
         .array_len => |op| op.operand.id == value_id,
         // Comparison
@@ -1669,7 +1673,7 @@ fn instructionUsesValue(inst: ir.Instruction, value_id: u32) bool {
             break :blk false;
         },
         // Array operations
-        .array_load => |op| op.array_ptr.id == value_id or op.index.id == value_id,
+        .array_load, .array_load_opt => |op| op.array_ptr.id == value_id or op.index.id == value_id,
         .array_store => |op| op.array_ptr.id == value_id or op.index.id == value_id or op.value.id == value_id,
         // Map operations
         .map_set => |op| op.map.id == value_id or op.key.id == value_id or op.value.id == value_id,
