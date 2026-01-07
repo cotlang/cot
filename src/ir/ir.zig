@@ -1528,6 +1528,10 @@ pub const Module = struct {
 
         // Free vtables and their method entries
         for (self.vtables.items) |vtable| {
+            // Free fn_name strings inside each entry
+            for (vtable.methods) |entry| {
+                self.allocator.free(entry.fn_name);
+            }
             self.allocator.free(vtable.methods);
         }
         self.vtables.deinit(self.allocator);

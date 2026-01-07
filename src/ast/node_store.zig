@@ -43,11 +43,12 @@ pub const SourceLoc = packed struct {
     }
 };
 
-/// Node data - 8 bytes of packed data per node
+/// Node data - 12 bytes of packed data per node
 /// Interpretation depends on the tag
 pub const NodeData = packed struct {
     a: u32 = 0,
     b: u32 = 0,
+    c: u32 = 0, // Used for DBL format flag (0 = Cot, 1 = DBL)
 
     pub const empty: NodeData = .{};
 

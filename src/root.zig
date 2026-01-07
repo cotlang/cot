@@ -1,4 +1,4 @@
-//! Cot - Commercial Oriented Transactions
+//! Cot
 //!
 //! A modern language for business software.
 //! Designed for migrating and modernizing legacy business applications.

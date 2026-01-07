@@ -215,8 +215,14 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
                 break :blk .incompatible;
             },
             else => blk: {
-                // Non-optional can be assigned to optional
+                // Non-optional can be assigned to optional (T -> ?T)
                 if (typesEqual(target_inner.*, value_deref)) {
+                    break :blk .implicit_conversion;
+                }
+                // *T can be assigned to ?*T (pointer to optional pointer)
+                // When value is *T, value_deref is T, but we need to compare
+                // target_inner (which is *T) with the original value type
+                if (typesEqual(target_inner.*, value)) {
                     break :blk .implicit_conversion;
                 }
                 break :blk .incompatible;

@@ -84,7 +84,6 @@ pub const Lexer = struct {
             ',' => return self.makeToken(.comma, self.source[start_pos..self.position]),
             ';' => return self.makeToken(.semicolon, self.source[start_pos..self.position]),
             '#' => return self.makeToken(.hash, self.source[start_pos..self.position]),
-            '@' => return self.makeToken(.at, self.source[start_pos..self.position]),
             '%' => return self.makeToken(.percent, self.source[start_pos..self.position]),
             '~' => return self.makeToken(.tilde, self.source[start_pos..self.position]),
             else => {},
@@ -221,6 +220,14 @@ pub const Lexer = struct {
             return self.makeToken(.caret, self.source[start_pos..self.position]);
         }
 
+        // At: @ or @"quoted identifier"
+        if (c == '@') {
+            if (self.match('"')) {
+                return self.scanQuotedIdentifier(start_pos, start_col);
+            }
+            return self.makeToken(.at, self.source[start_pos..self.position]);
+        }
+
         // Dot: . .. ..=
         if (c == '.') {
             if (self.match('.')) {
@@ -352,6 +359,48 @@ pub const Lexer = struct {
         return .{
             .type = .integer_literal,
             .lexeme = self.source[start_pos..self.position],
+            .line = self.line,
+            .column = start_col,
+            .span = Span.init(start_pos, self.position),
+        };
+    }
+
+    /// Scan a quoted identifier: @"keyword" -> identifier with lexeme "keyword"
+    /// This allows using reserved words as identifiers (Zig-style syntax)
+    fn scanQuotedIdentifier(self: *Self, start_pos: usize, start_col: usize) Token {
+        const content_start = self.position; // After the opening quote
+
+        while (!self.isAtEnd() and self.peek() != '"') {
+            if (self.peek() == '\\' and self.position + 1 < self.source.len) {
+                // Skip escape sequence
+                _ = self.advance();
+            }
+            if (self.peek() == '\n') {
+                self.line += 1;
+                self.column = 0;
+            }
+            _ = self.advance();
+        }
+
+        if (self.isAtEnd()) {
+            // Unterminated quoted identifier
+            return .{
+                .type = .invalid,
+                .lexeme = self.source[start_pos..self.position],
+                .line = self.line,
+                .column = start_col,
+                .span = Span.init(start_pos, self.position),
+            };
+        }
+
+        const content = self.source[content_start..self.position];
+        _ = self.advance(); // Consume closing quote
+
+        // Return as identifier - the lexeme is the content without quotes
+        // Note: The full span includes @"..." for error reporting
+        return .{
+            .type = .identifier,
+            .lexeme = content,
             .line = self.line,
             .column = start_col,
             .span = Span.init(start_pos, self.position),
@@ -837,4 +886,48 @@ test "lexer interpolated string escaped dollar" {
 
     // Should be a regular string since \${ is escaped
     try std.testing.expectEqual(TokenType.string_literal, tokens[0].type);
+}
+
+test "lexer quoted identifier for keyword" {
+    // @"struct" should produce an identifier with lexeme "struct"
+    var lexer = Lexer.init("@\"struct\"");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqualStrings("struct", tokens[0].lexeme);
+}
+
+test "lexer quoted identifier in context" {
+    // Using a quoted identifier as a field name
+    var lexer = Lexer.init("x.@\"type\"");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqualStrings("x", tokens[0].lexeme);
+    try std.testing.expectEqual(TokenType.period, tokens[1].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[2].type);
+    try std.testing.expectEqualStrings("type", tokens[2].lexeme);
+}
+
+test "lexer quoted identifier with spaces" {
+    // @"my field" - identifier with spaces (useful for FFI)
+    var lexer = Lexer.init("@\"my field\"");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.identifier, tokens[0].type);
+    try std.testing.expectEqualStrings("my field", tokens[0].lexeme);
+}
+
+test "lexer at sign without quote" {
+    // Plain @ should still work for comptime builtins
+    var lexer = Lexer.init("@sizeof");
+    const tokens = try lexer.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+
+    try std.testing.expectEqual(TokenType.at, tokens[0].type);
+    try std.testing.expectEqual(TokenType.identifier, tokens[1].type);
+    try std.testing.expectEqualStrings("sizeof", tokens[1].lexeme);
 }

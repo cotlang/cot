@@ -1172,7 +1172,8 @@ pub const Parser = struct {
         const variants = self.store.getScratchU32s();
         self.store.commitScratch();
 
-        // Store enum def: count followed by (name, value) pairs
+        // Store enum def in standard format: [count, name1, value1, name2, value2, ...]
+        // All frontends (Cot, DBL) use this unified format with explicit values.
         const variants_start = self.store.extra_data.items.len;
         self.store.extra_data.append(self.allocator, variant_count) catch return ParseError.OutOfMemory;
         for (variants) |v| {
@@ -1484,12 +1485,14 @@ pub const Parser = struct {
         // If there are methods, create impl_block
         if (methods.items.len > 0) {
             // Store methods in extra_data
-            // Format: [method_count, trait_type, target_type, method1, method2, ...]
+            // Format: [method_count, trait_type, target_type, assoc_binding_count, method1, method2, ...]
+            // assoc_binding_count is 0 for DBL classes (no associated types)
             const methods_start = self.store.extra_data.items.len;
             const class_type = self.store.addNamedType(class_name_id) catch return ParseError.OutOfMemory;
             self.store.extra_data.append(self.allocator, @intCast(methods.items.len)) catch return ParseError.OutOfMemory;
             self.store.extra_data.append(self.allocator, class_type.toInt()) catch return ParseError.OutOfMemory; // trait type
             self.store.extra_data.append(self.allocator, class_type.toInt()) catch return ParseError.OutOfMemory; // target type (same for inherent impl)
+            self.store.extra_data.append(self.allocator, 0) catch return ParseError.OutOfMemory; // assoc_binding_count = 0
             for (methods.items) |m| {
                 self.store.extra_data.append(self.allocator, m.toInt()) catch return ParseError.OutOfMemory;
             }
@@ -3709,33 +3712,57 @@ pub const Parser = struct {
                 return self.store.addGrouping(inner, loc) catch return ParseError.OutOfMemory;
             },
             .percent => {
-                // DBL built-in function: %string(), %len(), %trim(), etc.
+                // DBL built-in function: %string(), %len(), %trim(), %upcase(), %locase(), etc.
                 _ = self.advance(); // consume '%'
-                if (self.check(.identifier)) {
-                    const func_tok = self.advance();
-                    const func_id = try self.intern(func_tok.lexeme);
-                    var func_expr = self.store.addIdentifier(func_id, loc) catch return ParseError.OutOfMemory;
 
-                    // Parse arguments
-                    if (self.check(.lparen)) {
+                // Accept identifiers OR keywords (some DBL builtins like upcase/locase are keywords)
+                const func_name = blk: {
+                    if (self.check(.identifier)) {
+                        break :blk self.advance().lexeme;
+                    } else if (self.check(.kw_upcase)) {
                         _ = self.advance();
-                        var args: std.ArrayListUnmanaged(ExprIdx) = .{};
-                        errdefer args.deinit(self.allocator);
-
-                        if (!self.check(.rparen)) {
-                            args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
-                            while (self.match(&[_]TokenType{.comma})) {
-                                args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
-                            }
-                        }
-                        _ = try self.consume(.rparen, "Expected ')'");
-                        func_expr = self.store.addCall(func_expr, args.items, loc) catch return ParseError.OutOfMemory;
-                        args.deinit(self.allocator); // Free ArrayList backing memory after data is copied
+                        break :blk "upcase";
+                    } else if (self.check(.kw_locase)) {
+                        _ = self.advance();
+                        break :blk "locase";
+                    } else if (self.check(.kw_init)) {
+                        _ = self.advance();
+                        break :blk "init";
+                    } else if (self.check(.kw_clear)) {
+                        _ = self.advance();
+                        break :blk "clear";
+                    } else if (self.check(.kw_find)) {
+                        _ = self.advance();
+                        break :blk "find";
+                    } else if (self.check(.kw_data)) {
+                        _ = self.advance();
+                        break :blk "data";
+                    } else {
+                        self.addError("Expected function name after '%'");
+                        return ParseError.InvalidExpression;
                     }
-                    return func_expr;
+                };
+
+                const func_id = try self.intern(func_name);
+                var func_expr = self.store.addIdentifier(func_id, loc) catch return ParseError.OutOfMemory;
+
+                // Parse arguments
+                if (self.check(.lparen)) {
+                    _ = self.advance();
+                    var args: std.ArrayListUnmanaged(ExprIdx) = .{};
+                    errdefer args.deinit(self.allocator);
+
+                    if (!self.check(.rparen)) {
+                        args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
+                        while (self.match(&[_]TokenType{.comma})) {
+                            args.append(self.allocator, try self.parseExpression()) catch return ParseError.OutOfMemory;
+                        }
+                    }
+                    _ = try self.consume(.rparen, "Expected ')'");
+                    func_expr = self.store.addCall(func_expr, args.items, loc) catch return ParseError.OutOfMemory;
+                    args.deinit(self.allocator); // Free ArrayList backing memory after data is copied
                 }
-                self.addError("Expected function name after '%'");
-                return ParseError.InvalidExpression;
+                return func_expr;
             },
             .cast_alpha, .cast_decimal, .cast_integer => {
                 // DBL cast operators: ^a(), ^d(), ^i()

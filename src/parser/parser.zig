@@ -455,10 +455,13 @@ pub const Parser = struct {
         self.store.commitScratch();
 
         // Store enum def
+        // Standard format: [count, name1, value1, name2, value2, ...]
+        // All frontends (Cot, DBL) output this format. Values are explicit.
         const variants_start = self.store.extra_data.items.len;
         self.store.extra_data.append(self.allocator, @intCast(variants.len)) catch return error.OutOfMemory;
-        for (variants) |v| {
-            self.store.extra_data.append(self.allocator, v) catch return error.OutOfMemory;
+        for (variants, 0..) |v, i| {
+            self.store.extra_data.append(self.allocator, v) catch return error.OutOfMemory; // name
+            self.store.extra_data.append(self.allocator, @intCast(i)) catch return error.OutOfMemory; // value (auto-numbered)
         }
 
         const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.store.stmt_tags.items.len)));

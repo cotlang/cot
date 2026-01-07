@@ -156,6 +156,9 @@ pub const Lowerer = struct {
     /// Used for type coercion during call lowering (e.g., struct to trait object)
     fn_param_types: std.StringHashMap([]const ir.Type),
 
+    /// Owned strings that need to be freed (e.g., qualified method names)
+    owned_strings: std.ArrayListUnmanaged([]const u8),
+
     /// Function return types (function name -> return type)
     /// Used to determine call expression result types for user-defined functions
     fn_return_types: std.StringHashMap(ir.Type),
@@ -299,6 +302,7 @@ pub const Lowerer = struct {
             .closure_env_value = null,
             .fn_param_defaults = std.StringHashMap([]const u32).init(allocator),
             .fn_param_types = std.StringHashMap([]const ir.Type).init(allocator),
+            .owned_strings = .{},
             .fn_return_types = std.StringHashMap(ir.Type).init(allocator),
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
             .impl_methods = ImplMethodsMap.init(allocator),
@@ -451,7 +455,28 @@ pub const Lowerer = struct {
             self.allocator.free(defaults.*);
         }
         self.fn_param_defaults.deinit();
+
+        // Free function param types slices
+        var param_types_iter = self.fn_param_types.valueIterator();
+        while (param_types_iter.next()) |types| {
+            self.allocator.free(types.*);
+        }
+        self.fn_param_types.deinit();
+
         self.fn_return_types.deinit();
+
+        // Free impl associated types slices
+        var assoc_iter = self.impl_assoc_types.valueIterator();
+        while (assoc_iter.next()) |bindings| {
+            self.allocator.free(bindings.*);
+        }
+        self.impl_assoc_types.deinit();
+
+        // Free owned strings (qualified method names, etc.)
+        for (self.owned_strings.items) |s| {
+            self.allocator.free(s);
+        }
+        self.owned_strings.deinit(self.allocator);
 
         // NOTE: allocated_types ownership was transferred to the Module in lowerProgram.
         // No cleanup needed here.
@@ -474,7 +499,7 @@ pub const Lowerer = struct {
 
     /// Process a statement for type/function definitions, recursively handling blocks.
     /// This is used to find definitions inside namespaces (which are represented as blocks).
-    fn processStatementForDefinitions(self: *Self, stmt_idx: StmtIdx, pass: enum { struct_names, structs, traits, impls, globals, fn_sigs, fn_bodies, tests }) LowerError!void {
+    fn processStatementForDefinitions(self: *Self, stmt_idx: StmtIdx, pass: enum { struct_names, structs, traits, fn_sigs, impl_sigs, globals, impl_bodies, fn_bodies, tests }) LowerError!void {
         const tag = self.store.stmtTag(stmt_idx);
 
         // Handle blocks by recursively processing their contents
@@ -517,11 +542,18 @@ pub const Lowerer = struct {
                     try self.lowerTraitDef(stmt_idx);
                 }
             },
-            .impls => {
-                debug.print(.ir, "impls pass: checking stmt tag={s}", .{@tagName(tag)});
+            .impl_sigs => {
+                debug.print(.ir, "impl_sigs pass: checking stmt tag={s}", .{@tagName(tag)});
                 if (tag == .impl_block) {
-                    debug.print(.ir, "impls pass: found impl_block, lowering", .{});
-                    try self.lowerImplBlock(stmt_idx);
+                    debug.print(.ir, "impl_sigs pass: collecting signatures", .{});
+                    try self.collectImplSignatures(stmt_idx);
+                }
+            },
+            .impl_bodies => {
+                debug.print(.ir, "impl_bodies pass: checking stmt tag={s}", .{@tagName(tag)});
+                if (tag == .impl_block) {
+                    debug.print(.ir, "impl_bodies pass: lowering bodies", .{});
+                    try self.lowerImplBodies(stmt_idx);
                 }
             },
             .globals => {
@@ -595,24 +627,25 @@ pub const Lowerer = struct {
             try self.processStatementForDefinitions(stmt_idx, .traits);
         }
 
-        // Third pass: collect impl blocks
-        debug.print(.ir, "=== Starting impls pass with {d} statements ===", .{top_level.len});
+        // Third pass: collect function SIGNATURES (params/defaults only, no body)
+        // This must happen before impl method bodies can call standalone functions
         for (top_level) |stmt_idx| {
-            try self.processStatementForDefinitions(stmt_idx, .impls);
+            try self.processStatementForDefinitions(stmt_idx, .fn_sigs);
         }
-        debug.print(.ir, "=== Finished impls pass ===", .{});
 
-        // Fourth pass: register top-level let declarations as globals
+        // Fourth pass: collect impl method SIGNATURES
+        // This must happen before any method bodies are lowered so methods can call each other
+        debug.print(.ir, "=== Starting impl_sigs pass with {d} statements ===", .{top_level.len});
+        for (top_level) |stmt_idx| {
+            try self.processStatementForDefinitions(stmt_idx, .impl_sigs);
+        }
+        debug.print(.ir, "=== Finished impl_sigs pass ===", .{});
+
+        // Fifth pass: register top-level let declarations as globals
         // (These come from DBL common blocks and need to be visible in all functions)
         // Must run BEFORE function lowering so functions can reference globals
         for (top_level) |stmt_idx| {
             try self.processStatementForDefinitions(stmt_idx, .globals);
-        }
-
-        // Fifth pass: collect function SIGNATURES (params/defaults only, no body)
-        // This must happen before body lowering so call sites can use defaults
-        for (top_level) |stmt_idx| {
-            try self.processStatementForDefinitions(stmt_idx, .fn_sigs);
         }
 
         // Sixth pass: lower function BODIES
@@ -620,7 +653,14 @@ pub const Lowerer = struct {
             try self.processStatementForDefinitions(stmt_idx, .fn_bodies);
         }
 
-        // Seventh pass: lower test definitions
+        // Seventh pass: lower impl method BODIES
+        debug.print(.ir, "=== Starting impl_bodies pass with {d} statements ===", .{top_level.len});
+        for (top_level) |stmt_idx| {
+            try self.processStatementForDefinitions(stmt_idx, .impl_bodies);
+        }
+        debug.print(.ir, "=== Finished impl_bodies pass ===", .{});
+
+        // Eighth pass: lower test definitions
         for (top_level) |stmt_idx| {
             try self.processStatementForDefinitions(stmt_idx, .tests);
         }
@@ -910,8 +950,8 @@ pub const Lowerer = struct {
     }
 
     /// Lower an enum definition - extract variant names and values
-    /// DBL format in extra_data: [count, name1, value1, name2, value2, ...]
-    /// Cot format in extra_data: [count, name1, name2, ...]
+    /// Standard format in extra_data: [count, name1, value1, name2, value2, ...]
+    /// All frontends (Cot, DBL) output this unified format with explicit values.
     fn lowerEnumDef(self: *Self, stmt_idx: StmtIdx) LowerError!void {
         const data = self.store.stmtData(stmt_idx);
         const loc = self.store.stmtLoc(stmt_idx);
@@ -925,6 +965,7 @@ pub const Lowerer = struct {
         debug.print(.ir, "Lowering enum: {s}", .{name});
 
         // Get variants from extra_data
+        // Standard format: [count, name1, value1, name2, value2, ...]
         const extra_start = data.b;
         const variant_count = self.store.extra_data.items[extra_start];
 
@@ -932,23 +973,19 @@ pub const Lowerer = struct {
         var variants = std.StringHashMap(i64).init(self.allocator);
         errdefer variants.deinit();
 
-        var extra_idx = extra_start + 1;
-
-        // Cot format: just names, auto-increment values from 0
-        // Note: DBL enum format with explicit values would need a format indicator
-        // in the extra_data to distinguish from Cot format. For now, we only
-        // support the Cot format (auto-increment).
-        var auto_value: i64 = 0;
+        // Parse name/value pairs
+        var extra_idx = extra_start + 1; // skip count only
         for (0..variant_count) |_| {
             const variant_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+            extra_idx += 1;
+            const variant_value: i64 = @as(i32, @bitCast(self.store.extra_data.items[extra_idx]));
             extra_idx += 1;
 
             const variant_name = self.strings.get(variant_name_id);
             if (variant_name.len == 0) continue;
 
-            try variants.put(variant_name, auto_value);
-            debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, auto_value });
-            auto_value += 1;
+            try variants.put(variant_name, variant_value);
+            debug.print(.ir, "  variant '{s}' = {d}", .{ variant_name, variant_value });
         }
 
         // Check if we have a forward-declared enum to clean up
@@ -1212,16 +1249,10 @@ pub const Lowerer = struct {
             if (param_name.len == 0) continue;
 
             // Lower type with substitutions active
-            var param_type = try self.lowerTypeIdx(param_type_idx);
+            const param_type = try self.lowerTypeIdx(param_type_idx);
 
-            var is_ref = param_direction_raw != 0;
-            if (param_type == .ptr) {
-                const pointee = param_type.ptr.*;
-                if (pointee == .@"struct") {
-                    param_type = pointee;
-                    is_ref = true;
-                }
-            }
+            // Track ref parameters - keep pointer types for type checking correctness
+            const is_ref = param_direction_raw != 0 or param_type == .ptr;
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -1578,6 +1609,350 @@ pub const Lowerer = struct {
             .type_name = target_name,
         };
         try self.impl_methods.put(key, try methods.toOwnedSlice(self.allocator));
+    }
+
+    /// Collect impl method SIGNATURES only (no body lowering)
+    /// This runs before body lowering so methods can call each other and standalone functions
+    fn collectImplSignatures(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const extra_start = data.b;
+
+        // Parse extra_data: [method_count, trait_type, target_type, assoc_binding_count, ...assoc_bindings..., method_stmt_idx...]
+        const method_count = self.store.extra_data.items[extra_start];
+        const trait_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1]);
+        const target_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + 2]);
+        const assoc_binding_count = self.store.extra_data.items[extra_start + 3];
+
+        // Get trait and target type names
+        const trait_name = self.getTypeName(trait_type_idx) orelse {
+            debug.print(.ir, "Warning: impl block has invalid trait type", .{});
+            return;
+        };
+
+        // target_type is optional (for inherent impls, it's null)
+        const target_name = if (target_type_idx != .null)
+            self.getTypeName(target_type_idx) orelse trait_name
+        else
+            trait_name;
+
+        debug.print(.ir, "Collecting impl {s} for {s} signatures: {d} methods, {d} associated types", .{ trait_name, target_name, method_count, assoc_binding_count });
+
+        // Parse associated type bindings: [name, concrete_type] pairs
+        var offset: u32 = 4; // Skip method_count, trait_type, target_type, assoc_binding_count
+
+        var assoc_bindings: std.ArrayListUnmanaged(AssociatedTypeBinding) = .{};
+        defer assoc_bindings.deinit(self.allocator);
+
+        for (0..assoc_binding_count) |_| {
+            const assoc_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
+            const assoc_name = self.strings.get(assoc_name_id);
+            offset += 1;
+
+            const concrete_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + offset]);
+            offset += 1;
+
+            try assoc_bindings.append(self.allocator, .{
+                .name = assoc_name,
+                .concrete_type_idx = concrete_type_idx,
+            });
+
+            debug.print(.ir, "  Associated type binding: {s}", .{assoc_name});
+        }
+
+        // Store associated type bindings for this impl (for later type resolution)
+        const impl_key = ImplKey{ .trait_name = trait_name, .type_name = target_name };
+        try self.impl_assoc_types.put(impl_key, try assoc_bindings.toOwnedSlice(self.allocator));
+
+        // Set current impl context for Self.Item resolution during signature collection
+        self.current_impl_key = impl_key;
+        defer self.current_impl_key = null;
+
+        // Collect method signatures (no body lowering)
+        var methods: std.ArrayListUnmanaged(MethodImpl) = .{};
+        defer methods.deinit(self.allocator);
+
+        for (0..method_count) |i| {
+            const method_stmt_raw = self.store.extra_data.items[extra_start + offset + i];
+            const method_stmt_idx: StmtIdx = @enumFromInt(method_stmt_raw);
+
+            // Get the method name from the fn_def statement
+            const fn_data = self.store.stmtData(method_stmt_idx);
+            const fn_name_id = fn_data.getName();
+            const fn_name = self.strings.get(fn_name_id);
+
+            // Create qualified function name: TypeName.method_name
+            var qualified_name_buf: [256]u8 = undefined;
+            const qualified_name = std.fmt.bufPrint(&qualified_name_buf, "{s}.{s}", .{ target_name, fn_name }) catch {
+                return LowerError.OutOfMemory;
+            };
+            const qualified_name_owned = try self.allocator.dupe(u8, qualified_name);
+            self.owned_strings.append(self.allocator, qualified_name_owned) catch return LowerError.OutOfMemory;
+
+            debug.print(.ir, "  Collecting signature: {s} -> {s}", .{ fn_name, qualified_name_owned });
+
+            // Collect the method signature only (no body)
+            try self.collectImplMethodSignature(method_stmt_idx, qualified_name_owned);
+
+            try methods.append(self.allocator, .{
+                .method_name = fn_name,
+                .fn_stmt_idx = method_stmt_idx,
+            });
+        }
+
+        // Store the implementation mapping (for method lookup)
+        const key = ImplKey{
+            .trait_name = trait_name,
+            .type_name = target_name,
+        };
+        try self.impl_methods.put(key, try methods.toOwnedSlice(self.allocator));
+    }
+
+    /// Lower impl method BODIES only (signatures already collected)
+    fn lowerImplBodies(self: *Self, stmt_idx: StmtIdx) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+        const extra_start = data.b;
+
+        // Parse extra_data: [method_count, trait_type, target_type, assoc_binding_count, ...assoc_bindings..., method_stmt_idx...]
+        const method_count = self.store.extra_data.items[extra_start];
+        const trait_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1]);
+        const target_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_start + 2]);
+        const assoc_binding_count = self.store.extra_data.items[extra_start + 3];
+
+        // Get trait and target type names
+        const trait_name = self.getTypeName(trait_type_idx) orelse {
+            return;
+        };
+
+        const target_name = if (target_type_idx != .null)
+            self.getTypeName(target_type_idx) orelse trait_name
+        else
+            trait_name;
+
+        debug.print(.ir, "Lowering impl {s} for {s} bodies: {d} methods", .{ trait_name, target_name, method_count });
+
+        // Skip associated type bindings
+        const offset: u32 = 4 + assoc_binding_count * 2;
+
+        // Set current impl context
+        const impl_key = ImplKey{ .trait_name = trait_name, .type_name = target_name };
+        self.current_impl_key = impl_key;
+        defer self.current_impl_key = null;
+
+        // Lower method bodies
+        for (0..method_count) |i| {
+            const method_stmt_raw = self.store.extra_data.items[extra_start + offset + i];
+            const method_stmt_idx: StmtIdx = @enumFromInt(method_stmt_raw);
+
+            const fn_data = self.store.stmtData(method_stmt_idx);
+            const fn_name_id = fn_data.getName();
+            const fn_name = self.strings.get(fn_name_id);
+
+            var qualified_name_buf: [256]u8 = undefined;
+            const qualified_name = std.fmt.bufPrint(&qualified_name_buf, "{s}.{s}", .{ target_name, fn_name }) catch {
+                return LowerError.OutOfMemory;
+            };
+            const qualified_name_owned = try self.allocator.dupe(u8, qualified_name);
+            self.owned_strings.append(self.allocator, qualified_name_owned) catch return LowerError.OutOfMemory;
+
+            debug.print(.ir, "  Lowering body: {s}", .{qualified_name_owned});
+
+            // Lower the method body (signature already registered)
+            try self.lowerImplMethodBody(method_stmt_idx, qualified_name_owned);
+        }
+
+        // Handle default trait method implementations
+        const trait_def = self.trait_defs.get(trait_name);
+        if (trait_def) |td| {
+            // Get the implemented methods from impl_methods
+            if (self.impl_methods.get(impl_key)) |methods| {
+                // Build a set of implemented method names
+                var implemented = std.StringHashMap(void).init(self.allocator);
+                defer implemented.deinit();
+                for (methods) |m| {
+                    try implemented.put(m.method_name, {});
+                }
+
+                // Check each trait method for defaults
+                for (td.methods) |trait_method| {
+                    if (!implemented.contains(trait_method.name)) {
+                        // Method not implemented - check for default
+                        if (trait_method.has_default and trait_method.default_body_stmt_idx != null) {
+                            debug.print(.ir, "  Using default impl for {s}.{s}", .{ target_name, trait_method.name });
+
+                            // Generate the qualified function name
+                            var qualified_name_buf: [256]u8 = undefined;
+                            const qualified_name = std.fmt.bufPrint(&qualified_name_buf, "{s}.{s}", .{ target_name, trait_method.name }) catch {
+                                return LowerError.OutOfMemory;
+                            };
+                            const qualified_name_owned = try self.allocator.dupe(u8, qualified_name);
+
+                            // Lower the default method implementation
+                            try self.lowerDefaultTraitMethod(
+                                trait_method,
+                                target_name,
+                                qualified_name_owned,
+                            );
+                        } else {
+                            debug.print(.ir, "Warning: missing impl for {s}.{s} (no default)", .{ target_name, trait_method.name });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collect signature for an impl method (no body lowering)
+    fn collectImplMethodSignature(self: *Self, stmt_idx: StmtIdx, qualified_name: []const u8) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+
+        debug.print(.ir, "Collecting impl method signature: {s}", .{qualified_name});
+
+        // Parse extra data: [param_count, type_param_count, type_params..., param1_name, param1_type, ..., return_type, body]
+        const extra_start = data.getParamsStart();
+        const param_count = self.store.getExtra(extra_start);
+        const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
+
+        var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
+        defer params.deinit(self.allocator);
+
+        // Skip past type params: each type param is 2 values (name, bound)
+        var extra_idx = extra_start.toInt() + 2 + type_param_count * 2;
+        for (0..param_count) |_| {
+            const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+            const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+            const param_direction_raw: u32 = self.store.extra_data.items[extra_idx + 2];
+            extra_idx += 4; // 4 values per param: name, type, is_ref, default_value
+
+            const param_name = self.strings.get(param_name_id);
+            if (param_name.len == 0) continue;
+            var param_type = try self.lowerTypeIdx(param_type_idx);
+
+            // For mutable self parameter only (*StructType), convert to value type with is_ref
+            // This enables pass-by-reference semantics for the receiver
+            // Do NOT apply to other pointer-to-struct parameters - they should stay as pointers
+            var is_ref = param_direction_raw != 0;
+            if (std.mem.eql(u8, param_name, "self") and param_type == .ptr) {
+                const pointee = param_type.ptr.*;
+                if (pointee == .@"struct") {
+                    param_type = pointee;
+                    is_ref = true;
+                }
+            }
+
+            try params.append(self.allocator, .{
+                .name = param_name,
+                .ty = param_type,
+                .is_ref = is_ref,
+            });
+        }
+
+        const return_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx]);
+        const return_type = try self.lowerTypeIdx(return_type_idx);
+
+        // Store param types for call-site type checking
+        if (params.items.len > 0) {
+            var param_types: std.ArrayListUnmanaged(ir.Type) = .{};
+            defer param_types.deinit(self.allocator);
+            for (params.items) |param| {
+                try param_types.append(self.allocator, param.ty);
+            }
+            const types_slice = try param_types.toOwnedSlice(self.allocator);
+            try self.fn_param_types.put(qualified_name, types_slice);
+        }
+
+        // Register return type for method call resolution
+        try self.fn_return_types.put(qualified_name, return_type);
+    }
+
+    /// Lower impl method BODY only (signature already collected)
+    fn lowerImplMethodBody(self: *Self, stmt_idx: StmtIdx, qualified_name: []const u8) LowerError!void {
+        const data = self.store.stmtData(stmt_idx);
+
+        debug.print(.ir, "Lowering impl method body: {s}", .{qualified_name});
+
+        // Parse extra data: [param_count, type_param_count, type_params..., param1_name, param1_type, ..., return_type, body]
+        const extra_start = data.getParamsStart();
+        const param_count = self.store.getExtra(extra_start);
+        const type_param_count = self.store.extra_data.items[extra_start.toInt() + 1];
+
+        var params: std.ArrayListUnmanaged(ir.FunctionType.Param) = .{};
+        defer params.deinit(self.allocator);
+
+        // Skip past type params: each type param is 2 values (name, bound)
+        var extra_idx = extra_start.toInt() + 2 + type_param_count * 2;
+        for (0..param_count) |_| {
+            const param_name_id: StringId = @enumFromInt(self.store.extra_data.items[extra_idx]);
+            const param_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+            const param_direction_raw: u32 = self.store.extra_data.items[extra_idx + 2];
+            extra_idx += 4;
+
+            const param_name = self.strings.get(param_name_id);
+            if (param_name.len == 0) continue;
+            var param_type = try self.lowerTypeIdx(param_type_idx);
+
+            // For mutable self parameter only (*StructType), convert to value type with is_ref
+            // This enables pass-by-reference semantics for the receiver
+            // Do NOT apply to other pointer-to-struct parameters - they should stay as pointers
+            var is_ref = param_direction_raw != 0;
+            if (std.mem.eql(u8, param_name, "self") and param_type == .ptr) {
+                const pointee = param_type.ptr.*;
+                if (pointee == .@"struct") {
+                    param_type = pointee;
+                    is_ref = true;
+                }
+            }
+
+            try params.append(self.allocator, .{
+                .name = param_name,
+                .ty = param_type,
+                .is_ref = is_ref,
+            });
+        }
+
+        const return_type_idx: TypeIdx = @enumFromInt(self.store.extra_data.items[extra_idx]);
+        const body_idx: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_idx + 1]);
+
+        const return_type = try self.lowerTypeIdx(return_type_idx);
+
+        // Create function type with qualified name
+        const func_type = ir.FunctionType{
+            .params = try params.toOwnedSlice(self.allocator),
+            .return_type = return_type,
+            .is_variadic = false,
+        };
+
+        const func = try ir.Function.init(self.allocator, qualified_name, func_type);
+
+        self.current_func = func;
+        self.current_block = func.entry;
+        self.scopes.reset();
+
+        // Add parameters as local variables
+        for (func_type.params) |param| {
+            const ty_ptr = try self.allocator.create(ir.Type);
+            ty_ptr.* = param.ty;
+            try self.allocated_types.append(self.allocator, ty_ptr);
+
+            const alloca_result = func.newValue(.{ .ptr = ty_ptr });
+            try self.emit(.{
+                .alloca = .{
+                    .ty = param.ty,
+                    .name = param.name,
+                    .result = alloca_result,
+                },
+            });
+            try self.scopes.put(param.name, alloca_result);
+        }
+
+        // Lower function body
+        try self.lowerStatement(body_idx);
+
+        // Add implicit return if not terminated
+        if (!self.current_block.?.isTerminated()) {
+            try self.emit(.{ .return_ = null });
+        }
+
+        try self.module.addFunction(func);
     }
 
     /// Lower a default trait method implementation for a specific type
@@ -2034,19 +2409,12 @@ pub const Lowerer = struct {
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
-            var param_type = try self.lowerTypeIdx(param_type_idx);
+            const param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // For pointer-to-struct parameters, convert to value type with is_ref=true
-            // This allows the bytecode VM to handle write-back correctly
-            var is_ref = param_direction_raw != 0;
-            if (param_type == .ptr) {
-                const pointee = param_type.ptr.*;
-                if (pointee == .@"struct") {
-                    // Convert *struct(T) to struct(T) with is_ref=true
-                    param_type = pointee;
-                    is_ref = true;
-                }
-            }
+            // Track if this is a ref parameter for bytecode write-back
+            // Note: We keep the original pointer type for type checking correctness.
+            // The is_ref flag is used by bytecode emission for calling convention.
+            const is_ref = param_direction_raw != 0 or param_type == .ptr;
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -2132,10 +2500,11 @@ pub const Lowerer = struct {
             if (param_name.len == 0) continue;
             var param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // For pointer-to-struct parameters (mutable self), convert to value type with is_ref
-            // This allows the bytecode VM to handle write-back correctly
+            // For mutable self parameter only (*StructType), convert to value type with is_ref
+            // This enables pass-by-reference semantics for the receiver
+            // Do NOT apply to other pointer-to-struct parameters - they should stay as pointers
             var is_ref = param_direction_raw != 0;
-            if (param_type == .ptr) {
+            if (std.mem.eql(u8, param_name, "self") and param_type == .ptr) {
                 const pointee = param_type.ptr.*;
                 if (pointee == .@"struct") {
                     // Convert *struct(T) to struct(T) with is_ref=true
@@ -2290,7 +2659,8 @@ pub const Lowerer = struct {
         switch (tag) {
             .assignment => {
                 try self.emitDebugLine(loc);
-                try lower_stmt.lowerAssignment(self, data);
+                const ir_loc: ir.SourceLoc = .{ .line = loc.line, .column = loc.column };
+                try lower_stmt.lowerAssignment(self, data, ir_loc);
             },
             .if_stmt => {
                 try self.emitDebugLine(loc);
@@ -3003,13 +3373,13 @@ pub fn analyzeSemantics(
         lowerer.processStatementForDefinitions(stmt_idx, .traits) catch {};
     }
     for (top_level) |stmt_idx| {
-        lowerer.processStatementForDefinitions(stmt_idx, .impls) catch {};
+        lowerer.processStatementForDefinitions(stmt_idx, .fn_sigs) catch {};
+    }
+    for (top_level) |stmt_idx| {
+        lowerer.processStatementForDefinitions(stmt_idx, .impl_sigs) catch {};
     }
     for (top_level) |stmt_idx| {
         lowerer.processStatementForDefinitions(stmt_idx, .globals) catch {};
-    }
-    for (top_level) |stmt_idx| {
-        lowerer.processStatementForDefinitions(stmt_idx, .fn_sigs) catch {};
     }
 
     // Now analyze each function body separately to collect multiple errors

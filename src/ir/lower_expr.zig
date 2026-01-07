@@ -52,7 +52,7 @@ const TypeTag = ast.TypeTag;
 // ============================================================================
 
 /// Convert AST SourceLoc to IR SourceLoc for error reporting
-fn toIrLoc(loc: SourceLoc) ir.SourceLoc {
+pub fn toIrLoc(loc: SourceLoc) ir.SourceLoc {
     return .{
         .line = loc.line,
         .column = loc.column,
@@ -1120,11 +1120,12 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                 return result;
             } else {
                 // Variant not found in this enum
+                const loc = l.store.exprLoc(expr_idx);
                 l.setErrorContext(
                     LowerError.UndefinedVariable,
                     "Unknown enum variant '{s}.{s}'",
                     .{ object_name, field_name },
-                    .{ .line = 0, .column = 0 },
+                    loc,
                     "variant '{s}' does not exist in enum '{s}'",
                     .{ field_name, object_name },
                 );
@@ -3315,12 +3316,13 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // data.b = start index in extra_data
     const type_name_id: StringId = @enumFromInt(data.a);
     const type_name = l.strings.get(type_name_id);
+    const loc = l.store.exprLoc(expr_idx);
     if (type_name.len == 0) {
         l.setErrorContext(
             LowerError.UndefinedType,
             "Empty type name in struct literal",
             .{},
-            .{ .line = 0, .column = 0 },
+            loc,
             "struct literal must have a type name",
             .{},
         );
@@ -3333,7 +3335,7 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             LowerError.UndefinedType,
             "Unknown struct type '{s}'",
             .{type_name},
-            .{ .line = 0, .column = 0 },
+            loc,
             "type '{s}' is not defined",
             .{type_name},
         );
@@ -3686,15 +3688,21 @@ fn lowerNewList(
     elem_count: u32,
     loc: SourceLoc,
 ) LowerError!ir.Value {
-    _ = extra_start;
-    _ = type_arg_count;
+    // Get element type for the list from type arguments
+    // extra_data layout: [type_arg_count, type_args..., ...]
+    // extra_start points to type_arg_count, so first type arg is at extra_start + 1
 
-    // Get element type for the list (first type arg)
-    // For now, we use i64 as default element type
+    var elem_type: ir.Type = .i64; // Default fallback
+    if (type_arg_count > 0) {
+        // Read the first type argument (element type)
+        const type_arg_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 1));
+        const type_arg_idx: ast.TypeIdx = @enumFromInt(type_arg_raw);
+        elem_type = try lowerTypeIdx(l, type_arg_idx);
+    }
 
     // Allocate element type pointer
     const elem_type_ptr = try l.allocator.create(ir.Type);
-    elem_type_ptr.* = .i64;
+    elem_type_ptr.* = elem_type;
     try l.allocated_types.append(l.allocator, elem_type_ptr);
 
     // Allocate a new list type
@@ -3740,18 +3748,34 @@ fn lowerNewMap(
     elem_count: u32,
     loc: SourceLoc,
 ) LowerError!ir.Value {
-    _ = extra_start;
-    _ = type_arg_count;
     _ = count_idx;
     _ = elem_count;
 
-    // Allocate key and value type pointers (default to string -> i64)
+    // Get key and value types from type arguments
+    // extra_data layout: [type_arg_count, type_args..., ...]
+    // Map<K, V> has 2 type args: key type at extra_start+1, value type at extra_start+2
+
+    var key_type: ir.Type = .string; // Default fallback
+    var val_type: ir.Type = .i64; // Default fallback
+    if (type_arg_count >= 2) {
+        // Read key type (first type argument)
+        const key_type_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 1));
+        const key_type_idx: ast.TypeIdx = @enumFromInt(key_type_raw);
+        key_type = try lowerTypeIdx(l, key_type_idx);
+
+        // Read value type (second type argument)
+        const val_type_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 2));
+        const val_type_idx: ast.TypeIdx = @enumFromInt(val_type_raw);
+        val_type = try lowerTypeIdx(l, val_type_idx);
+    }
+
+    // Allocate key and value type pointers
     const key_type_ptr = try l.allocator.create(ir.Type);
-    key_type_ptr.* = .string;
+    key_type_ptr.* = key_type;
     try l.allocated_types.append(l.allocator, key_type_ptr);
 
     const val_type_ptr = try l.allocator.create(ir.Type);
-    val_type_ptr.* = .i64;
+    val_type_ptr.* = val_type;
     try l.allocated_types.append(l.allocator, val_type_ptr);
 
     // Allocate map type

@@ -180,7 +180,7 @@ pub fn lowerThrow(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
 // ============================================================================
 
 /// Lower an assignment statement
-pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
+pub fn lowerAssignment(l: *Lowerer, data: NodeData, loc: ?ir.SourceLoc) LowerError!void {
     const target_idx = data.getTarget();
     const value_idx = data.getValue();
 
@@ -202,7 +202,7 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
                     .map = object_val,
                     .key = key_val,
                     .value = value,
-                    .loc = null,
+                    .loc = loc,
                 },
             });
             return;
@@ -331,6 +331,7 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
             .store = .{
                 .ptr = target,
                 .value = weak_value,
+                .loc = loc,
             },
         });
         _ = inner_type;
@@ -371,6 +372,7 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
         .store = .{
             .ptr = target,
             .value = value,
+            .loc = loc,
         },
     });
 }
@@ -1035,10 +1037,14 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
     }
 
     // Special case: if init_val is a pointer to a struct or array (from struct/array init),
-    // use it directly instead of creating a wrapper pointer. This ensures that
+    // AND the declared type is the struct/array itself (not a pointer type),
+    // use the pointer directly instead of creating a wrapper pointer. This ensures that
     // field_ptr and array indexing calculations work correctly in the slot-based VM.
+    //
+    // This does NOT apply when the declared type is a pointer (e.g., var ptr: *Node = &node),
+    // because in that case we need the normal *(*Node) storage pattern.
     if (init_val) |val| {
-        if (val.ty == .ptr) {
+        if (val.ty == .ptr and var_type != .ptr) {
             const pointee = val.ty.ptr.*;
             if (pointee == .@"struct" or pointee == .array) {
                 // Register this variable name as an alias to the struct/array pointer
@@ -1066,12 +1072,13 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
 
     // Store init value if present
     if (init_val) |val| {
+        // Get source location from init expression for error reporting
+        const init_loc = if (init_idx != .null) l.store.exprLoc(init_idx) else ast.SourceLoc{ .line = 0, .column = 0 };
+        const ir_loc = lower_expr.toIrLoc(init_loc);
+
         // Check if target type is a trait object - need to emit make_trait_object
         if (var_type == .trait_object) {
             const trait_name = var_type.trait_object.trait_name;
-
-            // Get source location from init expression for error reporting
-            const init_loc = if (init_idx != .null) l.store.exprLoc(init_idx) else ast.SourceLoc{ .line = 0, .column = 0 };
 
             // Get the concrete type name from the value's type
             const type_name = getTypeName(val.ty) orelse {
@@ -1116,6 +1123,7 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
                 .store = .{
                     .ptr = alloca_result,
                     .value = trait_obj_val,
+                    .loc = ir_loc,
                 },
             });
         } else {
@@ -1123,6 +1131,7 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
                 .store = .{
                     .ptr = alloca_result,
                     .value = val,
+                    .loc = ir_loc,
                 },
             });
         }

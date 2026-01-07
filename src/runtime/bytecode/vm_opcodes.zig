@@ -287,7 +287,7 @@ pub fn op_mul(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
-/// div rd, ra, rb - division
+/// div rd, ra, rb - division (handles both int and float)
 pub fn op_div(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const ops2 = module.code[vm.ip + 1];
@@ -295,11 +295,26 @@ pub fn op_div(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const ra: u4 = @truncate(ops & 0xF);
     const rb: u4 = @truncate(ops2 >> 4);
-    const divisor = vm.registers[rb].toInt();
-    if (divisor == 0) {
-        return vm.fail(VMError.DivisionByZero, "Division by zero");
+    const val_a = vm.registers[ra];
+    const val_b = vm.registers[rb];
+
+    // Check if either operand is a float - if so, use float division
+    if (val_a.isFloat() or val_b.isFloat()) {
+        const a_float = if (val_a.isFloat()) val_a.asFloat() else @as(f64, @floatFromInt(val_a.toInt()));
+        const b_float = if (val_b.isFloat()) val_b.asFloat() else @as(f64, @floatFromInt(val_b.toInt()));
+        if (b_float == 0.0) {
+            return vm.fail(VMError.DivisionByZero, "Division by zero");
+        }
+        // Store result as float (NaN-boxed - bits are the f64 directly)
+        vm.writeRegister(rd, Value{ .bits = @bitCast(a_float / b_float) });
+    } else {
+        // Integer division
+        const divisor = val_b.toInt();
+        if (divisor == 0) {
+            return vm.fail(VMError.DivisionByZero, "Division by zero");
+        }
+        vm.writeRegister(rd, Value.initInt(@divTrunc(val_a.toInt(), divisor)));
     }
-    vm.writeRegister(rd, Value.initInt(@divTrunc(vm.registers[ra].toInt(), divisor)));
     return .continue_dispatch;
 }
 
@@ -1354,6 +1369,9 @@ pub fn op_str_concat(vm: *VM, module: *const Module) VMError!DispatchResult {
     @memcpy(result[0..s1.len], s1);
     @memcpy(result[s1.len..], s2);
 
+    // Track buffer for cleanup at VM shutdown
+    try vm.global_buffers.append(vm.allocator, result);
+
     // Store result as string value
     vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
     return .continue_dispatch;
@@ -1396,6 +1414,9 @@ pub fn op_str_trim(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Allocate and copy result
     const result = vm.allocator.alloc(u8, trimmed.len) catch return VMError.OutOfMemory;
     @memcpy(result, trimmed);
+
+    // Track buffer for cleanup at VM shutdown
+    try vm.global_buffers.append(vm.allocator, result);
 
     // Store result as string value
     vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
@@ -1502,6 +1523,9 @@ pub fn op_fn_datetime(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Allocate string for result
     const result_str = vm.allocator.alloc(u8, 20) catch return VMError.OutOfMemory;
     @memcpy(result_str, &buf);
+
+    // Track buffer for cleanup at VM shutdown
+    try vm.global_buffers.append(vm.allocator, result_str);
 
     vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result_str) catch return VMError.OutOfMemory);
     return .continue_dispatch;
@@ -1627,6 +1651,9 @@ pub fn op_str_slice_store(vm: *VM, module: *const Module) VMError!DispatchResult
         @memset(result[start + write_len .. start + length], ' ');
     }
 
+    // Track buffer for cleanup at VM shutdown
+    try vm.global_buffers.append(vm.allocator, result);
+
     // Store result back to rd
     vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
     return .continue_dispatch;
@@ -1677,6 +1704,9 @@ pub fn op_format_decimal(vm: *VM, module: *const Module) VMError!DispatchResult 
     } else {
         @memcpy(result, formatted);
     }
+
+    // Track buffer for cleanup at VM shutdown
+    try vm.global_buffers.append(vm.allocator, result);
 
     // Store result as string value
     vm.writeRegister(rd, Value.initString(vm.valueAllocator(), result) catch return VMError.OutOfMemory);
@@ -2382,8 +2412,9 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
                 return vm.fail(VMError.OutOfMemory, "Failed to copy record buffer");
             };
             @memcpy(result_copy, existing_buf);
+            // Track buffer for cleanup at VM shutdown
+            try vm.global_buffers.append(vm.allocator, result_copy);
             const result = Value.initFixedString(vm.valueAllocator(), result_copy) catch {
-                vm.allocator.free(result_copy);
                 return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
             };
             vm.writeRegister(rd, result);
@@ -2460,9 +2491,11 @@ pub fn op_load_record_buf(vm: *VM, module: *const Module) VMError!DispatchResult
         }
     }
 
+    // Track buffer for cleanup at VM shutdown
+    try vm.global_buffers.append(vm.allocator, buffer);
+
     // Create a fixed string value from the buffer and store in destination register
     const result = Value.initFixedString(vm.valueAllocator(), buffer) catch {
-        vm.allocator.free(buffer);
         return vm.fail(VMError.OutOfMemory, "Failed to create record buffer value");
     };
     vm.writeRegister(rd, result);
@@ -2516,8 +2549,9 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
                     return vm.fail(VMError.OutOfMemory, "Failed to allocate record buffer");
                 };
                 @memcpy(new_buf, buffer);
+                // Track buffer for cleanup at VM shutdown
+                try vm.global_buffers.append(vm.allocator, new_buf);
                 const new_val = Value.initFixedString(vm.valueAllocator(), new_buf) catch {
-                    vm.allocator.free(new_buf);
                     return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
                 };
                 // Inline ARC for slot write
@@ -2570,8 +2604,12 @@ pub fn op_store_record_buf(vm: *VM, module: *const Module) VMError!DispatchResul
             .string => {
                 const str_copy = vm.allocator.alloc(u8, size) catch continue;
                 @memcpy(str_copy, src);
-                const new_val = Value.initFixedString(vm.valueAllocator(), str_copy) catch {
+                // Track buffer for cleanup at VM shutdown
+                vm.global_buffers.append(vm.allocator, str_copy) catch {
                     vm.allocator.free(str_copy);
+                    continue;
+                };
+                const new_val = Value.initFixedString(vm.valueAllocator(), str_copy) catch {
                     continue;
                 };
                 // Inline ARC for slot write
@@ -2600,9 +2638,11 @@ pub fn op_alloc_buffer(vm: *VM, module: *const Module) VMError!DispatchResult {
     };
     @memset(buffer, ' ');
 
+    // Track buffer for cleanup at VM shutdown
+    try vm.global_buffers.append(vm.allocator, buffer);
+
     // Create mutable FixedString value
     const val = Value.initFixedString(vm.valueAllocator(), buffer) catch {
-        vm.allocator.free(buffer);
         return vm.fail(VMError.OutOfMemory, "Failed to create fixed string");
     };
 
