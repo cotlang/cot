@@ -641,6 +641,26 @@ pub const Printer = struct {
                 }
                 try self.writer.writeAll(")");
             },
+
+            // Heap record operations
+            .heap_alloc => |h| {
+                try self.printValue(h.result);
+                try self.writer.writeAll(" = heap_alloc ");
+                try self.printType(h.ty);
+                try self.writer.print(" (fields: {d})", .{h.field_count});
+            },
+            .store_field_heap => |s| {
+                try self.writer.writeAll("store_field_heap ");
+                try self.printValue(s.record);
+                try self.writer.print("[{d}] = ", .{s.field_index});
+                try self.printValue(s.value);
+            },
+            .load_field_heap => |l| {
+                try self.printValue(l.result);
+                try self.writer.writeAll(" = load_field_heap ");
+                try self.printValue(l.record);
+                try self.writer.print("[{d}]", .{l.field_index});
+            },
         }
     }
 
@@ -738,6 +758,7 @@ pub const Printer = struct {
                 try self.printType(l.element_type.*);
                 try self.writer.writeAll(">");
             },
+            .heap_record => |s| try self.writer.print("new {s}", .{s.name}),
             .weak => |inner| {
                 try self.writer.writeAll("weak ");
                 try self.printType(inner.*);

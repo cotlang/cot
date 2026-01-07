@@ -2400,3 +2400,44 @@ pub fn emitCallTraitMethod(e: *BytecodeEmitter, c: ir.Instruction.CallTraitMetho
     // Return value is in r15 (placed there by ret_val)
     e.setLastResult(c.result.id, 15);
 }
+
+// ============================================================================
+// Heap Record Operations (for `new` keyword)
+// ============================================================================
+
+/// Emit heap_alloc instruction - allocate a heap record
+/// Format: [opcode] [rd:4|0:4] [field_count:16]
+pub fn emitHeapAlloc(e: *BytecodeEmitter, h: ir.Instruction.HeapAlloc) EmitError!void {
+    const dest_reg: u4 = 0;
+
+    // Emit: new_record rd, field_count
+    try e.emitOpcode(.new_record);
+    try e.emitU8((@as(u8, dest_reg) << 4) | 0);
+    try e.emitU16(@intCast(h.field_count));
+
+    e.setLastResult(h.result.id, dest_reg);
+}
+
+/// Emit store_field_heap instruction - store value to heap record field
+/// Format: [opcode] [record_reg:4|val_reg:4] [field_idx:16]
+pub fn emitStoreFieldHeap(e: *BytecodeEmitter, s: ir.Instruction.StoreFieldHeap) EmitError!void {
+    const record_reg = try e.getValueInReg(s.record, 0);
+    const val_reg = try e.getValueInReg(s.value, 1);
+
+    try e.emitOpcode(.store_field);
+    try e.emitU8((@as(u8, record_reg) << 4) | val_reg);
+    try e.emitU16(@intCast(s.field_index));
+}
+
+/// Emit load_field_heap instruction - load value from heap record field
+/// Format: [opcode] [rd:4|record_reg:4] [field_idx:16]
+pub fn emitLoadFieldHeap(e: *BytecodeEmitter, l: ir.Instruction.LoadFieldHeap) EmitError!void {
+    const record_reg = try e.getValueInReg(l.record, 0);
+    const dest_reg: u4 = 1;
+
+    try e.emitOpcode(.load_field);
+    try e.emitU8((@as(u8, dest_reg) << 4) | record_reg);
+    try e.emitU16(@intCast(l.field_index));
+
+    e.setLastResult(l.result.id, dest_reg);
+}

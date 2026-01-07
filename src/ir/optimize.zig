@@ -741,6 +741,15 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
                 used.put(arg.id, {}) catch {};
             }
         },
+        // Heap record operations
+        .heap_alloc => {}, // No input values to mark
+        .store_field_heap => |s| {
+            used.put(s.record.id, {}) catch {};
+            used.put(s.value.id, {}) catch {};
+        },
+        .load_field_heap => |l| {
+            used.put(l.record.id, {}) catch {};
+        },
     }
 }
 

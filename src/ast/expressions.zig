@@ -84,6 +84,9 @@ pub const ExpressionTag = enum(u8) {
     /// Generic struct initializer: Box<i64>{ .value = 42 }
     generic_struct_init,
 
+    /// Heap allocation: new Point{ .x = 1 }, new List<i64>, new Map<K,V>{ ... }
+    new_expr,
+
     /// Lambda/closure: |x| x + 1, |x, y| { return x + y; }
     lambda,
 

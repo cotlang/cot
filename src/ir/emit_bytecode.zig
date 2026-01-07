@@ -849,6 +849,11 @@ pub const BytecodeEmitter = struct {
             .make_trait_object => |m| try emit_inst.emitMakeTraitObject(self, m),
             .call_trait_method => |c| try emit_inst.emitCallTraitMethod(self, c),
 
+            // Heap record operations
+            .heap_alloc => |h| try emit_inst.emitHeapAlloc(self, h),
+            .store_field_heap => |s| try emit_inst.emitStoreFieldHeap(self, s),
+            .load_field_heap => |l| try emit_inst.emitLoadFieldHeap(self, l),
+
             else => {
                 // Other instructions not yet implemented
             },
@@ -1563,6 +1568,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .function => .int64, // Function pointers
         .map => .int64, // Map handles are pointer-sized
         .list => .int64, // List handles are pointer-sized
+        .heap_record => .int64, // Heap record references are pointer-sized
         .weak => .int64, // Weak references are pointer-sized
         .trait_object => .int64, // Trait objects are pointer-sized (vtable + data)
     };

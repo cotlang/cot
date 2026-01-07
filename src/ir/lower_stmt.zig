@@ -209,6 +209,36 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData) LowerError!void {
         }
     }
 
+    // Check if target is a member access on a heap record: p.x = value
+    if (target_tag == .member) {
+        const target_data = l.store.exprData(target_idx);
+        const object_idx = target_data.getObject();
+        const field_id = target_data.getField();
+
+        // Try to lower the object to see if it's a heap record
+        const object_val = try l.lowerExpression(object_idx);
+        if (object_val.ty == .heap_record) {
+            const struct_type = object_val.ty.heap_record;
+            const field_name = l.strings.get(field_id);
+
+            // Find field index in struct type
+            for (struct_type.fields, 0..) |field, i| {
+                if (std.mem.eql(u8, field.name, field_name)) {
+                    const value = try l.lowerExpression(value_idx);
+                    try l.emit(.{
+                        .store_field_heap = .{
+                            .record = object_val,
+                            .field_index = @intCast(i),
+                            .value = value,
+                        },
+                    });
+                    return;
+                }
+            }
+            // Field not found - fall through to normal handling which will error
+        }
+    }
+
     // Check if target is a struct-typed variable (for db_read buffer unpacking)
     // Uses StructHelper for centralized struct detection
     if (StructHelper.detectStructTypeFromExpr(&l.scopes, l.store, l.strings, target_idx)) |info| {

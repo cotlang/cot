@@ -317,6 +317,16 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             },
             else => .incompatible,
         },
+        // Heap records (from `new` keyword) - same struct types are compatible
+        .heap_record => |target_struct| switch (value_deref) {
+            .heap_record => |value_struct| blk: {
+                if (std.mem.eql(u8, target_struct.name, value_struct.name)) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            else => .incompatible,
+        },
     };
 }
 
@@ -348,6 +358,7 @@ pub fn typesEqual(a: Type, b: Type) bool {
         .function => false, // Function types would need more complex comparison
         .map => true, // Maps are structurally typed (compare key/value types if needed)
         .list => |al| typesEqual(al.element_type.*, b.list.element_type.*),
+        .heap_record => |ah| std.mem.eql(u8, ah.name, b.heap_record.name),
         .weak => |aw| typesEqual(aw.*, b.weak.*),
         .trait_object => |at| std.mem.eql(u8, at.trait_name, b.trait_object.trait_name),
     };
@@ -526,6 +537,7 @@ pub fn typeName(ty: Type) []const u8 {
         .function => "function",
         .map => "Map",
         .list => "List",
+        .heap_record => "heap_record",
         .weak => "weak",
         .trait_object => "trait_object",
     };
@@ -573,6 +585,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         .function => writer.writeAll("function") catch {},
         .map => writer.writeAll("Map") catch {},
         .list => |l| writer.print("List<{s}>", .{typeName(l.element_type.*)}) catch {},
+        .heap_record => |s| writer.print("new {s}", .{s.name}) catch {},
         .weak => |w| {
             var inner_buf: [64]u8 = undefined;
             const inner = formatType(w.*, &inner_buf);

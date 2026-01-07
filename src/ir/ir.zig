@@ -91,6 +91,10 @@ pub const Type = union(enum) {
     /// List type (dynamic array)
     list: *const ListType,
 
+    /// Heap-allocated record (created with `new` keyword)
+    /// Points to the struct type but represents a heap reference, not a stack pointer
+    heap_record: *const StructType,
+
     /// Trait object type (dynamic dispatch)
     trait_object: TraitObjectType,
 
@@ -134,6 +138,7 @@ pub const Type = union(enum) {
             .function => 8, // Function pointer
             .map => 8, // Map pointer
             .list => 8, // List pointer
+            .heap_record => 8, // Heap record reference (NaN-boxed value)
             .trait_object => 16, // Fat pointer: data + vtable
         };
     }
@@ -157,6 +162,7 @@ pub const Type = union(enum) {
             .function => 8,
             .map => 8,
             .list => 8,
+            .heap_record => 8,
             .trait_object => 8, // Fat pointer alignment
         };
     }
@@ -188,6 +194,7 @@ pub const Type = union(enum) {
             .function => "void*",
             .map => "void*",
             .list => "void*",
+            .heap_record => "void*",
             .trait_object => "cot_trait_object_t*", // Fat pointer struct
         };
     }
@@ -399,6 +406,8 @@ fn typeNeedsArc(ty: Type) bool {
         .function => false,
         // Trait objects contain a pointer to the data, which may need ARC
         .trait_object => true,
+        // Heap records are reference counted
+        .heap_record => true,
     };
 }
 
@@ -564,6 +573,11 @@ pub const Instruction = union(enum) {
     list_len: ListLen,
     list_clear: ListClear,
 
+    // ====== Heap record operations (for `new` keyword) ======
+    heap_alloc: HeapAlloc, // Allocate a heap record: result = new Struct
+    store_field_heap: StoreFieldHeap, // Store to heap record field: record.field[idx] = value
+    load_field_heap: LoadFieldHeap, // Load from heap record field: result = record.field[idx]
+
     // ====== Closure operations ======
     make_closure: MakeClosure,
 
@@ -573,6 +587,27 @@ pub const Instruction = union(enum) {
 
     // ====== Debug information ======
     debug_line: struct { line: u32, column: u32 },
+
+    // Heap allocation instruction (for `new` keyword)
+    pub const HeapAlloc = struct {
+        ty: Type, // The struct type to allocate
+        field_count: u32, // Number of fields in the struct
+        result: Value, // Result value (pointer to heap record)
+    };
+
+    // Store to heap record field
+    pub const StoreFieldHeap = struct {
+        record: Value, // Heap record value
+        field_index: u32, // Field index
+        value: Value, // Value to store
+    };
+
+    // Load from heap record field
+    pub const LoadFieldHeap = struct {
+        record: Value, // Heap record value
+        field_index: u32, // Field index
+        result: Value, // Loaded value
+    };
 
     // Allocate instruction
     pub const Alloca = struct {
@@ -1028,21 +1063,25 @@ pub const Instruction = union(enum) {
     /// Get the category of this instruction
     pub fn category(self: Instruction) Category {
         return switch (self) {
-            .alloca, .load, .store, .field_ptr, .load_struct_buf, .store_struct_buf => .memory,
+            .alloca, .load, .store, .field_ptr, .ptr_offset, .load_struct_buf, .store_struct_buf => .memory,
+            .heap_alloc, .store_field_heap, .load_field_heap => .memory, // Heap record ops are memory category
             .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem, .ineg, .round, .trunc => .arithmetic,
             .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => .bitwise,
             .icmp => .comparison,
             .log_and, .log_or, .log_not => .logical,
             .str_concat, .str_compare, .str_copy, .str_slice, .str_slice_store, .str_len => .string,
-            .jump, .brif, .br_table, .return_, .call, .call_indirect, .trap => .control,
+            .jump, .brif, .br_table, .return_, .call, .call_indirect, .trap, .select => .control,
             .try_begin, .try_end, .catch_begin, .throw => .exception,
-            .bitcast, .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce => .conversion,
+            .bitcast, .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce, .format_decimal, .parse_decimal => .conversion,
             .iconst, .f32const, .f64const, .const_string, .const_null => .constant,
             .wrap_optional, .unwrap_optional, .is_null, .is_type => .optional,
+            .weak_ref, .weak_load => .optional, // Weak refs are optional-like
+            .arc_retain, .arc_release, .arc_move => .memory, // ARC ops are memory category
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
             .array_load, .array_load_opt, .array_store, .array_len, .array_slice => .array,
             .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => .map,
             .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => .list,
+            .make_closure, .make_trait_object, .call_trait_method => .control, // Closure/trait ops are control
             .debug_line => .debug,
         };
     }
@@ -1141,15 +1180,18 @@ pub const Instruction = union(enum) {
             // Trait object operations
             .make_trait_object => |m| m.result,
             .call_trait_method => |c| c.result,
+            // Heap record operations
+            .heap_alloc => |h| h.result,
+            .load_field_heap => |l| l.result,
             // Instructions that don't produce values
-            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear, .list_push, .list_set, .list_clear, .arc_retain, .arc_release => null,
+            .store, .jump, .brif, .br_table, .return_, .trap, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .debug_line, .try_begin, .try_end, .catch_begin, .throw, .str_slice_store, .str_copy, .map_set, .map_delete, .map_clear, .list_push, .list_set, .list_clear, .arc_retain, .arc_release, .store_field_heap => null,
         };
     }
 
     /// Check if this instruction has side effects (I/O, memory stores, exceptions)
     pub fn hasSideEffects(self: Instruction) bool {
         return switch (self) {
-            .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store, .map_set, .map_delete, .map_clear, .list_push, .list_pop, .list_set, .list_clear => true,
+            .store, .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock, .store_struct_buf, .array_store, .throw, .trap, .call, .call_indirect, .str_copy, .str_slice_store, .map_set, .map_delete, .map_clear, .list_push, .list_pop, .list_set, .list_clear, .store_field_heap => true,
             else => false,
         };
     }

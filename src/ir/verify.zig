@@ -404,6 +404,15 @@ pub const Verifier = struct {
                     try self.checkValueDefined(arg);
                 }
             },
+            // Heap record operations
+            .heap_alloc => {}, // No input values
+            .store_field_heap => |op| {
+                try self.checkValueDefined(op.record);
+                try self.checkValueDefined(op.value);
+            },
+            .load_field_heap => |op| {
+                try self.checkValueDefined(op.record);
+            },
         }
     }
 
@@ -450,6 +459,7 @@ pub const Verifier = struct {
             .function => "function",
             .map => "Map",
             .list => "List",
+            .heap_record => "heap_record",
             .weak => "weak",
             .trait_object => "trait_object",
         };

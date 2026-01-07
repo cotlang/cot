@@ -202,6 +202,7 @@ pub const Emitter = struct {
             .array_init => try self.emitArrayInit(idx),
             .struct_init => try self.emitStructInit(idx),
             .generic_struct_init => try self.emitGenericStructInit(idx),
+            .new_expr => try self.emitNewExpr(idx),
             .lambda => try self.emitLambda(idx),
             .comptime_builtin => try self.emitComptimeBuiltin(idx),
             .grouping => try self.emitGrouping(idx),
@@ -1199,6 +1200,14 @@ pub const Emitter = struct {
     fn emitGenericStructInit(self: *Self, idx: ExprIdx) anyerror!void {
         _ = idx;
         try self.writer.writeAll("<...>{}"); // Simplified
+    }
+
+    fn emitNewExpr(self: *Self, idx: ExprIdx) anyerror!void {
+        const data = self.store.exprData(idx);
+        const type_name: StringId = @enumFromInt(data.a);
+        try self.writer.writeAll("new ");
+        try self.writeStringId(type_name);
+        try self.writer.writeAll("{ ... }"); // Simplified
     }
 
     fn emitLambda(self: *Self, idx: ExprIdx) anyerror!void {

@@ -182,6 +182,7 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .array_init => return lowerArrayInit(l, expr_idx),
         .struct_init => return lowerStructInit(l, expr_idx),
         .generic_struct_init => return lowerGenericStructInit(l, expr_idx),
+        .new_expr => return lowerNewExpr(l, expr_idx),
         .lambda => return lowerLambda(l, expr_idx),
         .range => {
             // Range expressions are lowered by for loop handling, not as standalone values
@@ -1136,6 +1137,35 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
     // Need to evaluate call first, store to temp, then access field
     if (object_tag == .call or object_tag == .method_call) {
         const object_val = try lowerExpression(l, object_idx);
+
+        // Check if call returns a heap record - use load_field_heap directly
+        if (object_val.ty == .heap_record) {
+            const struct_type = object_val.ty.heap_record;
+            for (struct_type.fields, 0..) |field, i| {
+                if (std.mem.eql(u8, field.name, field_name)) {
+                    const result = func.newValue(field.ty);
+                    try l.emit(.{
+                        .load_field_heap = .{
+                            .record = object_val,
+                            .field_index = @intCast(i),
+                            .result = result,
+                        },
+                    });
+                    return result;
+                }
+            }
+            const loc = l.store.exprLoc(expr_idx);
+            l.setErrorContext(
+                LowerError.UndefinedVariable,
+                "struct '{s}' has no field '{s}'",
+                .{ struct_type.name, field_name },
+                .{ .line = loc.line, .column = loc.column },
+                "field not found in heap record returned by call",
+                .{},
+            );
+            return LowerError.UndefinedVariable;
+        }
+
         // Object should be a struct - get its type
         const struct_type = switch (object_val.ty) {
             .@"struct" => |s| s,
@@ -1239,7 +1269,41 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
         return LowerError.UndefinedVariable;
     }
 
-    // Not an enum or call access - proceed with regular member access via lvalue
+    // Check if object is a heap record (created with `new` keyword)
+    // In this case, we need to use load_field_heap instead of field_ptr + load
+    const object_val = try lowerExpression(l, object_idx);
+    if (object_val.ty == .heap_record) {
+        const struct_type = object_val.ty.heap_record;
+
+        // Find field in struct type
+        for (struct_type.fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, field_name)) {
+                const result = func.newValue(field.ty);
+                try l.emit(.{
+                    .load_field_heap = .{
+                        .record = object_val,
+                        .field_index = @intCast(i),
+                        .result = result,
+                    },
+                });
+                return result;
+            }
+        }
+
+        // Field not found
+        const loc = l.store.exprLoc(expr_idx);
+        l.setErrorContext(
+            LowerError.UndefinedVariable,
+            "struct '{s}' has no field '{s}'",
+            .{ struct_type.name, field_name },
+            .{ .line = loc.line, .column = loc.column },
+            "field not found in heap record type",
+            .{},
+        );
+        return LowerError.UndefinedVariable;
+    }
+
+    // Not an enum, call, or heap record access - proceed with regular member access via lvalue
     const ptr = try lowerMemberPtr(l, expr_idx);
     // ptr is a pointer to the field, so the loaded value type is the pointee type
     const pointee_ty: ir.Type = switch (ptr.ty) {
@@ -1709,6 +1773,7 @@ fn getTypeName(ty: ir.Type) []const u8 {
         .trait_object => "trait_object",
         .map => "map",
         .list => "list",
+        .heap_record => |hr| hr.name,
     };
 }
 
@@ -3533,6 +3598,282 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
 
     // Return pointer to struct
     return struct_ptr;
+}
+
+// ============================================================================
+// New Expression (Heap Allocation)
+// ============================================================================
+
+/// Lower a new expression: new Type{ ... } or new Type<T>{ ... } or new Type<T>
+/// Allocates on the heap with ARC management
+pub fn lowerNewExpr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
+    const func = l.current_func orelse return LowerError.OutOfMemory;
+    const data = l.store.exprData(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
+
+    // data.a = type_name (StringId)
+    // data.b = start index in extra_data
+    const type_name_id: StringId = @enumFromInt(data.a);
+    const type_name = l.strings.get(type_name_id);
+    if (type_name.len == 0) {
+        l.setErrorContext(
+            LowerError.UndefinedType,
+            "Empty type name in 'new' expression",
+            .{},
+            loc,
+            "'new' expression must have a type name",
+            .{},
+        );
+        return LowerError.UndefinedType;
+    }
+
+    const extra_start: ast.ExtraIdx = @enumFromInt(data.b);
+    const type_arg_count = l.store.getExtra(extra_start);
+
+    // Calculate where count/marker is located (after type args)
+    const count_idx: ast.ExtraIdx = @enumFromInt(@intFromEnum(extra_start) + 1 + type_arg_count);
+    const count_or_marker = l.store.getExtra(count_idx);
+
+    // Check if this is element mode (high bit set) - for List/Map collections
+    const is_element_mode = (count_or_marker & 0x80000000) != 0;
+
+    if (is_element_mode) {
+        // Collection initialization: new List<i64>{ 1, 2, 3 }
+        const elem_count = count_or_marker & 0x7FFFFFFF;
+
+        // Check if it's List or Map
+        if (std.mem.eql(u8, type_name, "List")) {
+            return lowerNewList(l, func, extra_start, type_arg_count, count_idx, elem_count, loc);
+        } else if (std.mem.eql(u8, type_name, "Map")) {
+            return lowerNewMap(l, func, extra_start, type_arg_count, count_idx, elem_count, loc);
+        } else {
+            l.setErrorContext(
+                LowerError.UnsupportedFeature,
+                "Collection-style initialization only valid for List and Map",
+                .{},
+                loc,
+                "use field-style initialization (.field = value) for struct '{s}'",
+                .{type_name},
+            );
+            return LowerError.UnsupportedFeature;
+        }
+    }
+
+    // Field-style or empty: struct or empty collection
+    const field_count = count_or_marker;
+
+    // Check for empty collection: new List<i64> or new Map<K,V>
+    if (field_count == 0 and type_arg_count > 0) {
+        if (std.mem.eql(u8, type_name, "List")) {
+            return lowerNewList(l, func, extra_start, type_arg_count, count_idx, 0, loc);
+        } else if (std.mem.eql(u8, type_name, "Map")) {
+            return lowerNewMap(l, func, extra_start, type_arg_count, count_idx, 0, loc);
+        }
+        // Fall through to struct handling for generic structs like Box<i64>{}
+    }
+
+    // Struct initialization: new Point{ .x = 1 } or new Box<i64>{ .value = 42 }
+    return lowerNewStruct(l, func, type_name, extra_start, type_arg_count, count_idx, field_count, loc);
+}
+
+/// Lower new List<T>{ elements... } or new List<T>
+fn lowerNewList(
+    l: *Lowerer,
+    func: *ir.Function,
+    extra_start: ast.ExtraIdx,
+    type_arg_count: u32,
+    count_idx: ast.ExtraIdx,
+    elem_count: u32,
+    loc: SourceLoc,
+) LowerError!ir.Value {
+    _ = extra_start;
+    _ = type_arg_count;
+
+    // Get element type for the list (first type arg)
+    // For now, we use i64 as default element type
+
+    // Allocate element type pointer
+    const elem_type_ptr = try l.allocator.create(ir.Type);
+    elem_type_ptr.* = .i64;
+    try l.allocated_types.append(l.allocator, elem_type_ptr);
+
+    // Allocate a new list type
+    const list_type = try l.allocator.create(ir.ListType);
+    list_type.* = .{ .element_type = elem_type_ptr };
+    try l.module.allocated_list_types.append(l.allocator, list_type);
+
+    // Create list_new instruction
+    const list_val = func.newValue(.{ .list = list_type });
+    try l.emit(.{
+        .list_new = .{
+            .element_type = elem_type_ptr,
+            .result = list_val,
+            .loc = toIrLoc(loc),
+        },
+    });
+
+    // Push each element
+    for (0..elem_count) |i| {
+        const elem_expr_raw = l.store.getExtra(@enumFromInt(@intFromEnum(count_idx) + 1 + i));
+        const elem_expr_idx: ExprIdx = @enumFromInt(elem_expr_raw);
+        const elem_val = try lowerExpression(l, elem_expr_idx);
+
+        try l.emit(.{
+            .list_push = .{
+                .list = list_val,
+                .value = elem_val,
+                .loc = toIrLoc(loc),
+            },
+        });
+    }
+
+    return list_val;
+}
+
+/// Lower new Map<K,V>{ ... } or new Map<K,V>
+fn lowerNewMap(
+    l: *Lowerer,
+    func: *ir.Function,
+    extra_start: ast.ExtraIdx,
+    type_arg_count: u32,
+    count_idx: ast.ExtraIdx,
+    elem_count: u32,
+    loc: SourceLoc,
+) LowerError!ir.Value {
+    _ = extra_start;
+    _ = type_arg_count;
+    _ = count_idx;
+    _ = elem_count;
+
+    // Allocate key and value type pointers (default to string -> i64)
+    const key_type_ptr = try l.allocator.create(ir.Type);
+    key_type_ptr.* = .string;
+    try l.allocated_types.append(l.allocator, key_type_ptr);
+
+    const val_type_ptr = try l.allocator.create(ir.Type);
+    val_type_ptr.* = .i64;
+    try l.allocated_types.append(l.allocator, val_type_ptr);
+
+    // Allocate map type
+    const map_type = try l.allocator.create(ir.MapType);
+    map_type.* = .{ .key_type = key_type_ptr, .value_type = val_type_ptr };
+
+    // Create map_new instruction
+    const map_val = func.newValue(.{ .map = map_type });
+    try l.emit(.{
+        .map_new = .{
+            .result = map_val,
+            .flags = 1, // bit 0 = case_sensitive (true), bit 1 = preserve_spaces (false)
+            .loc = toIrLoc(loc),
+        },
+    });
+
+    // TODO: If we have key-value pairs, add them
+    // For now, just create an empty map
+
+    return map_val;
+}
+
+/// Lower new StructType{ .field = value, ... }
+fn lowerNewStruct(
+    l: *Lowerer,
+    func: *ir.Function,
+    type_name: []const u8,
+    extra_start: ast.ExtraIdx,
+    type_arg_count: u32,
+    count_idx: ast.ExtraIdx,
+    field_count: u32,
+    loc: SourceLoc,
+) LowerError!ir.Value {
+    // Look up struct type (handle generics if needed)
+    var struct_type: *const ir.StructType = undefined;
+
+    if (type_arg_count > 0) {
+        // Generic struct: instantiate with type arguments
+        var type_args: std.ArrayListUnmanaged(ir.Type) = .{};
+        defer type_args.deinit(l.allocator);
+
+        for (0..type_arg_count) |i| {
+            const type_arg_idx = TypeIdx.fromInt(l.store.extra_data.items[@intFromEnum(extra_start) + 1 + i]);
+            const arg_type = try lowerTypeIdx(l, type_arg_idx);
+            try type_args.append(l.allocator, arg_type);
+        }
+
+        struct_type = try l.instantiateGenericStruct(type_name, type_args.items) orelse {
+            l.setErrorContext(
+                LowerError.UndefinedType,
+                "Failed to instantiate generic struct '{s}'",
+                .{type_name},
+                loc,
+                "check that the struct is defined and type arguments are valid",
+                .{},
+            );
+            return LowerError.UndefinedType;
+        };
+    } else {
+        // Non-generic struct
+        struct_type = l.struct_types.get(type_name) orelse {
+            l.setErrorContext(
+                LowerError.UndefinedType,
+                "Unknown struct type '{s}'",
+                .{type_name},
+                loc,
+                "type '{s}' is not defined",
+                .{type_name},
+            );
+            return LowerError.UndefinedType;
+        };
+    }
+
+    // Create struct type for allocation
+    const struct_ir_type = ir.Type{ .@"struct" = struct_type };
+
+    // Emit heap_alloc instruction - result is a heap_record type
+    const heap_record = func.newValue(.{ .heap_record = struct_type });
+    try l.emit(.{
+        .heap_alloc = .{
+            .ty = struct_ir_type,
+            .field_count = @intCast(struct_type.fields.len),
+            .result = heap_record,
+        },
+    });
+
+    // Store each field value
+    for (0..field_count) |i| {
+        const field_name_id_raw = l.store.getExtra(@enumFromInt(@intFromEnum(count_idx) + 1 + i * 2));
+        const field_expr_raw = l.store.getExtra(@enumFromInt(@intFromEnum(count_idx) + 2 + i * 2));
+
+        const field_name_id: StringId = @enumFromInt(field_name_id_raw);
+        const field_name = l.strings.get(field_name_id);
+        const field_expr_idx: ExprIdx = @enumFromInt(field_expr_raw);
+
+        // Find field index in struct type
+        var field_index: ?u32 = null;
+        for (struct_type.fields, 0..) |field, idx| {
+            if (std.mem.eql(u8, field.name, field_name)) {
+                field_index = @intCast(idx);
+                break;
+            }
+        }
+
+        if (field_index) |idx| {
+            // Lower the field value
+            const field_val = try lowerExpression(l, field_expr_idx);
+
+            // Emit store_field_heap instruction
+            try l.emit(.{
+                .store_field_heap = .{
+                    .record = heap_record,
+                    .field_index = idx,
+                    .value = field_val,
+                },
+            });
+        }
+        // Skip unknown fields silently
+    }
+
+    // Return the heap record
+    return heap_record;
 }
 
 // ============================================================================

@@ -125,6 +125,8 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .arc_retain, .arc_release, .arc_move => {},
         // Trait object operations
         .make_trait_object, .call_trait_method => {},
+        // Heap record operations
+        .heap_alloc, .store_field_heap, .load_field_heap => {},
     }
 }
 

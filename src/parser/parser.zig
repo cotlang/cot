@@ -1621,6 +1621,11 @@ pub const Parser = struct {
             return self.store.addIdentifier(name, loc) catch return error.OutOfMemory;
         }
 
+        // New expression: new Type{ ... } or new Type<T>{ ... } or new Type<T>
+        if (self.match(&[_]TokenType{.kw_new})) {
+            return self.parseNewExpr(loc);
+        }
+
         // Grouping or tuple
         if (self.match(&[_]TokenType{.lparen})) {
             try self.enterNesting();
@@ -1853,6 +1858,205 @@ pub const Parser = struct {
 
         self.exitNesting();
         return idx;
+    }
+
+    /// Parse a new expression: new Type{ ... } or new Type<T>{ ... } or new Type<T>
+    fn parseNewExpr(self: *Self, loc: SourceLoc) ParseError!ExprIdx {
+        // Expect type name
+        const type_token = try self.consume(.identifier, "Expected type name after 'new'");
+        const type_name = self.internString(type_token.lexeme) catch return error.OutOfMemory;
+
+        // Check for generic type arguments: <T, U, ...>
+        const has_type_args = self.check(.lt);
+
+        // Check if we have type args or a brace (for struct init)
+        if (has_type_args) {
+            // Parse generic: new Box<i64>{ ... } or new List<i64>
+            _ = try self.consume(.lt, "Expected '<'");
+
+            try self.store.markScratch();
+            errdefer self.store.rollbackScratch();
+
+            // Collect type arguments
+            var type_arg_count: u32 = 0;
+            while (!self.checkGt() and !self.isAtEnd()) {
+                const type_arg = try self.parseType();
+                self.store.pushScratchU32(type_arg.toInt()) catch return error.OutOfMemory;
+                type_arg_count += 1;
+                if (!self.match(&[_]TokenType{.comma})) break;
+            }
+
+            _ = try self.consumeGt("Expected '>' after type arguments");
+
+            const type_args = self.store.getScratchU32s();
+
+            // Check if we have an initializer
+            if (self.check(.lbrace)) {
+                // Parse struct/collection initializer
+                _ = try self.consume(.lbrace, "Expected '{'");
+                try self.enterNesting();
+                errdefer self.exitNesting();
+
+                // Check if it's field-style (.field = value) or element-style (value, value)
+                if (self.check(.period)) {
+                    // Struct-style: { .field = value, ... }
+                    try self.store.markScratch();
+                    errdefer self.store.rollbackScratch();
+
+                    while (!self.check(.rbrace) and !self.isAtEnd()) {
+                        _ = try self.consume(.period, "Expected '.'");
+                        const field_token = try self.consume(.identifier, "Expected field name");
+                        const field_name = self.internString(field_token.lexeme) catch return error.OutOfMemory;
+                        _ = try self.consume(.equals, "Expected '='");
+                        const value = try self.parseExpression();
+
+                        self.store.pushScratchU32(@intFromEnum(field_name)) catch return error.OutOfMemory;
+                        self.store.pushScratchU32(value.toInt()) catch return error.OutOfMemory;
+
+                        _ = self.match(&[_]TokenType{.comma});
+                    }
+
+                    _ = try self.consume(.rbrace, "Expected '}'");
+
+                    const fields = self.store.getScratchU32s();
+                    self.store.commitScratch();
+
+                    // Store new_expr with type args and fields
+                    const extra_start = self.store.extra_data.items.len;
+                    // [type_arg_count, type_args..., field_count, fields...]
+                    self.store.extra_data.append(self.allocator, type_arg_count) catch return error.OutOfMemory;
+                    for (type_args) |ta| {
+                        self.store.extra_data.append(self.allocator, ta) catch return error.OutOfMemory;
+                    }
+                    self.store.extra_data.append(self.allocator, @intCast(fields.len / 2)) catch return error.OutOfMemory;
+                    for (fields) |f| {
+                        self.store.extra_data.append(self.allocator, f) catch return error.OutOfMemory;
+                    }
+
+                    self.store.rollbackScratch(); // rollback type_args scratch
+
+                    const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.store.expr_tags.items.len)));
+                    self.store.expr_tags.append(self.allocator, .new_expr) catch return error.OutOfMemory;
+                    self.store.expr_locs.append(self.allocator, loc) catch return error.OutOfMemory;
+                    self.store.expr_data.append(self.allocator, .{
+                        .a = @intFromEnum(type_name),
+                        .b = @intCast(extra_start),
+                    }) catch return error.OutOfMemory;
+
+                    self.exitNesting();
+                    return idx;
+                } else {
+                    // Collection-style: { value, value, ... } for List
+                    try self.store.markScratch();
+                    errdefer self.store.rollbackScratch();
+
+                    while (!self.check(.rbrace) and !self.isAtEnd()) {
+                        const elem = try self.parseExpression();
+                        self.store.pushScratchU32(elem.toInt()) catch return error.OutOfMemory;
+                        _ = self.match(&[_]TokenType{.comma});
+                    }
+
+                    _ = try self.consume(.rbrace, "Expected '}'");
+
+                    const elems = self.store.getScratchU32s();
+                    self.store.commitScratch();
+
+                    // Store new_expr with type args and elements (negative field count indicates elements)
+                    const extra_start = self.store.extra_data.items.len;
+                    self.store.extra_data.append(self.allocator, type_arg_count) catch return error.OutOfMemory;
+                    for (type_args) |ta| {
+                        self.store.extra_data.append(self.allocator, ta) catch return error.OutOfMemory;
+                    }
+                    // Use high bit to indicate element mode vs field mode
+                    const elem_count_marker: u32 = 0x80000000 | @as(u32, @intCast(elems.len));
+                    self.store.extra_data.append(self.allocator, elem_count_marker) catch return error.OutOfMemory;
+                    for (elems) |e| {
+                        self.store.extra_data.append(self.allocator, e) catch return error.OutOfMemory;
+                    }
+
+                    self.store.rollbackScratch(); // rollback type_args scratch
+
+                    const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.store.expr_tags.items.len)));
+                    self.store.expr_tags.append(self.allocator, .new_expr) catch return error.OutOfMemory;
+                    self.store.expr_locs.append(self.allocator, loc) catch return error.OutOfMemory;
+                    self.store.expr_data.append(self.allocator, .{
+                        .a = @intFromEnum(type_name),
+                        .b = @intCast(extra_start),
+                    }) catch return error.OutOfMemory;
+
+                    self.exitNesting();
+                    return idx;
+                }
+            } else {
+                // No brace - empty collection: new List<i64>
+                const extra_start = self.store.extra_data.items.len;
+                self.store.extra_data.append(self.allocator, type_arg_count) catch return error.OutOfMemory;
+                for (type_args) |ta| {
+                    self.store.extra_data.append(self.allocator, ta) catch return error.OutOfMemory;
+                }
+                self.store.extra_data.append(self.allocator, 0) catch return error.OutOfMemory; // no fields/elements
+
+                self.store.commitScratch();
+
+                const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.store.expr_tags.items.len)));
+                self.store.expr_tags.append(self.allocator, .new_expr) catch return error.OutOfMemory;
+                self.store.expr_locs.append(self.allocator, loc) catch return error.OutOfMemory;
+                self.store.expr_data.append(self.allocator, .{
+                    .a = @intFromEnum(type_name),
+                    .b = @intCast(extra_start),
+                }) catch return error.OutOfMemory;
+
+                return idx;
+            }
+        } else if (self.check(.lbrace)) {
+            // Non-generic struct init: new Point{ .x = 1 }
+            _ = try self.consume(.lbrace, "Expected '{'");
+            try self.enterNesting();
+            errdefer self.exitNesting();
+
+            try self.store.markScratch();
+            errdefer self.store.rollbackScratch();
+
+            while (!self.check(.rbrace) and !self.isAtEnd()) {
+                _ = try self.consume(.period, "Expected '.'");
+                const field_token = try self.consume(.identifier, "Expected field name");
+                const field_name = self.internString(field_token.lexeme) catch return error.OutOfMemory;
+                _ = try self.consume(.equals, "Expected '='");
+                const value = try self.parseExpression();
+
+                self.store.pushScratchU32(@intFromEnum(field_name)) catch return error.OutOfMemory;
+                self.store.pushScratchU32(value.toInt()) catch return error.OutOfMemory;
+
+                _ = self.match(&[_]TokenType{.comma});
+            }
+
+            _ = try self.consume(.rbrace, "Expected '}'");
+
+            const fields = self.store.getScratchU32s();
+            self.store.commitScratch();
+
+            const extra_start = self.store.extra_data.items.len;
+            // [type_arg_count=0, field_count, fields...]
+            self.store.extra_data.append(self.allocator, 0) catch return error.OutOfMemory; // no type args
+            self.store.extra_data.append(self.allocator, @intCast(fields.len / 2)) catch return error.OutOfMemory;
+            for (fields) |f| {
+                self.store.extra_data.append(self.allocator, f) catch return error.OutOfMemory;
+            }
+
+            const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.store.expr_tags.items.len)));
+            self.store.expr_tags.append(self.allocator, .new_expr) catch return error.OutOfMemory;
+            self.store.expr_locs.append(self.allocator, loc) catch return error.OutOfMemory;
+            self.store.expr_data.append(self.allocator, .{
+                .a = @intFromEnum(type_name),
+                .b = @intCast(extra_start),
+            }) catch return error.OutOfMemory;
+
+            self.exitNesting();
+            return idx;
+        } else {
+            self.addError("Expected '{' or '<' after type name in new expression");
+            return error.InvalidSyntax;
+        }
     }
 
     /// Parse an interpolated string: "Hello ${name}!"

@@ -211,6 +211,7 @@ pub const TokenType = enum {
     kw_or,
     kw_not,
     kw_weak, // weak reference modifier
+    kw_new, // heap allocation
 
     // Keywords - async
     kw_async,
@@ -268,6 +269,7 @@ pub const TokenType = enum {
             .kw_or,
             .kw_not,
             .kw_weak,
+            .kw_new,
             .kw_async,
             .kw_await,
             .kw_comptime,

@@ -1361,6 +1361,9 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.pop_arg)] = &vm_opcodes.op_pop_arg;
 
         // Record/Field Operations (0x80-0x8F) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.new_record)] = &vm_opcodes.op_new_record;
+        table[@intFromEnum(Opcode.load_field)] = &vm_opcodes.op_load_field;
+        table[@intFromEnum(Opcode.store_field)] = &vm_opcodes.op_store_field;
         table[@intFromEnum(Opcode.load_record_buf)] = &vm_opcodes.op_load_record_buf;
         table[@intFromEnum(Opcode.store_record_buf)] = &vm_opcodes.op_store_record_buf;
         table[@intFromEnum(Opcode.alloc_buffer)] = &vm_opcodes.op_alloc_buffer;

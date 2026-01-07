@@ -17,6 +17,7 @@ const Closure = value_mod.Closure;
 const TraitObject = value_mod.TraitObject;
 const List = value_mod.List;
 const StructBox = value_mod.StructBox;
+const Record = value_mod.Record;
 const arc = @import("arc.zig");
 
 // Forward declaration - VM is imported at comptime to avoid circular import
@@ -2252,6 +2253,89 @@ pub fn op_decr_int(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     vm.writeRegister(rd, Value.initInt(vm.registers[rd].toInt() - 1));
+    return .continue_dispatch;
+}
+
+// ============================================================================
+// Heap Record Operations (for `new` keyword)
+// ============================================================================
+
+/// new_record rd, field_count - create a new heap record with field_count fields
+/// Format: [rd:4|0] [field_count:16]
+pub fn op_new_record(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 3;
+    const rd: u4 = @truncate(ops >> 4);
+    const field_count = std.mem.readInt(u16, module.code[vm.ip - 2 ..][0..2], .little);
+
+    // Allocate a heap record using ARC
+    // Records are stored as arrays of Values
+    const record = arc.create(vm.allocator, Record) catch {
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate record");
+    };
+
+    // Allocate field storage
+    const data = vm.allocator.alloc(u8, field_count * @sizeOf(Value)) catch {
+        // Clean up the record allocation on failure
+        // Note: Can't use arc.release here as record hasn't been wrapped in a Value yet
+        vm.allocator.destroy(record);
+        return vm.fail(VMError.OutOfMemory, "Failed to allocate record fields");
+    };
+
+    // Initialize all fields to null
+    const fields: []Value = @as([*]Value, @ptrCast(@alignCast(data.ptr)))[0..field_count];
+    for (fields) |*f| {
+        f.* = Value.null_val;
+    }
+
+    record.* = .{ .type_id = 0, .data = data };
+    vm.writeRegister(rd, Value.initRecord(record));
+    return .continue_dispatch;
+}
+
+/// load_field rd, rs, field_idx - rd = rs.field[field_idx]
+/// Format: [rd:4|rs:4] [field_idx:16]
+pub fn op_load_field(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 3;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+    const field_idx = std.mem.readInt(u16, module.code[vm.ip - 2 ..][0..2], .little);
+
+    const record_val = vm.registers[rs];
+    if (record_val.asRecord()) |record| {
+        const field_count = record.data.len / @sizeOf(Value);
+        if (field_idx < field_count) {
+            const fields: []Value = @as([*]Value, @ptrCast(@alignCast(record.data.ptr)))[0..field_count];
+            vm.writeRegister(rd, fields[field_idx]);
+        } else {
+            vm.writeRegister(rd, Value.null_val);
+        }
+    } else {
+        vm.writeRegister(rd, Value.null_val);
+    }
+    return .continue_dispatch;
+}
+
+/// store_field rd, rs, field_idx - rd.field[field_idx] = rs
+/// Format: [rd:4|rs:4] [field_idx:16]
+pub fn op_store_field(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 3;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+    const field_idx = std.mem.readInt(u16, module.code[vm.ip - 2 ..][0..2], .little);
+
+    const record_val = vm.registers[rd];
+    const value = vm.registers[rs];
+
+    if (record_val.asRecord()) |record| {
+        const field_count = record.data.len / @sizeOf(Value);
+        if (field_idx < field_count) {
+            const fields: []Value = @as([*]Value, @ptrCast(@alignCast(record.data.ptr)))[0..field_count];
+            fields[field_idx] = value;
+        }
+    }
     return .continue_dispatch;
 }
 
