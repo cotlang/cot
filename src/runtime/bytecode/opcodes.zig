@@ -341,6 +341,12 @@ pub const Opcode = enum(u8) {
     /// Format: [0] [slot:16]
     pop_arg = 0x79,
 
+    /// ret_large count - return with count values on stack (for large struct returns)
+    /// Format: [count:8] [0]
+    /// Before this opcode, caller should have pushed `count` values using push_arg.
+    /// This opcode restores the frame but adjusts sp to preserve the pushed return values.
+    ret_large = 0x7A,
+
     // ============================================
     // Record/Field Operations (0x80-0x8F)
     // ============================================
@@ -845,7 +851,7 @@ pub const Opcode = enum(u8) {
             .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => 2,
             .is_null, .is_type, .select => 2,
             .load_null, .load_true, .load_false => 2,
-            .ret, .ret_val, .throw, .push_arg_reg => 2,
+            .ret, .ret_val, .ret_large, .throw, .push_arg_reg => 2,
             .free_record, .clear_record => 2,
             .load_field_fast, .store_field_fast => 2,
             .str_concat, .str_len, .str_index, .str_slice => 2,

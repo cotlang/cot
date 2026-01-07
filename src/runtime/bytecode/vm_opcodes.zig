@@ -138,9 +138,16 @@ pub fn op_load_false(vm: *VM, module: *const Module) VMError!DispatchResult {
 pub fn op_load_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const slot = module.code[vm.ip + 1];
+    const prev_ip = vm.ip - 1; // IP of the opcode itself
     vm.ip += 2;
     const rd: u4 = @truncate(ops >> 4);
     const val = vm.stack[vm.fp + slot];
+
+    // Slot-level tracing
+    if (vm.tracer) |tracer| {
+        tracer.onSlotLoad(@intCast(prev_ip), slot, rd, val);
+    }
+
     vm.writeRegister(rd, val);
     return .continue_dispatch;
 }
@@ -149,9 +156,19 @@ pub fn op_load_local(vm: *VM, module: *const Module) VMError!DispatchResult {
 pub fn op_store_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const slot = module.code[vm.ip + 1];
+    const prev_ip = vm.ip - 1;
     vm.ip += 2;
     const rs: u4 = @truncate(ops >> 4);
-    vm.writeStack(vm.fp + slot, vm.registers[rs]);
+    const new_value = vm.registers[rs];
+    const stack_idx = vm.fp + slot;
+
+    // Slot-level tracing: capture old value before overwrite (critical for debugging)
+    if (vm.tracer) |tracer| {
+        const old_value = vm.stack[stack_idx];
+        tracer.onSlotStore(@intCast(prev_ip), slot, rs, old_value, new_value);
+    }
+
+    vm.writeStack(stack_idx, new_value);
     return .continue_dispatch;
 }
 
@@ -159,9 +176,17 @@ pub fn op_store_local(vm: *VM, module: *const Module) VMError!DispatchResult {
 pub fn op_load_local16(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    const prev_ip = vm.ip - 1;
     vm.ip += 3;
     const rd: u4 = @truncate(ops >> 4);
-    vm.writeRegister(rd, vm.stack[vm.fp + slot]);
+    const val = vm.stack[vm.fp + slot];
+
+    // Slot-level tracing
+    if (vm.tracer) |tracer| {
+        tracer.onSlotLoad(@intCast(prev_ip), slot, rd, val);
+    }
+
+    vm.writeRegister(rd, val);
     return .continue_dispatch;
 }
 
@@ -169,9 +194,19 @@ pub fn op_load_local16(vm: *VM, module: *const Module) VMError!DispatchResult {
 pub fn op_store_local16(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    const prev_ip = vm.ip - 1;
     vm.ip += 3;
     const rs: u4 = @truncate(ops >> 4);
-    vm.writeStack(vm.fp + slot, vm.registers[rs]);
+    const new_value = vm.registers[rs];
+    const stack_idx = vm.fp + slot;
+
+    // Slot-level tracing: capture old value before overwrite
+    if (vm.tracer) |tracer| {
+        const old_value = vm.stack[stack_idx];
+        tracer.onSlotStore(@intCast(prev_ip), slot, rs, old_value, new_value);
+    }
+
+    vm.writeStack(stack_idx, new_value);
     return .continue_dispatch;
 }
 
@@ -944,6 +979,25 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
         _ = vm.recordJITCall(module_idx, routine_idx);
     }
 
+    // DEBUG: Print call info with routine name
+    const routine = module.routines[routine_idx];
+    const routine_name = if (routine.name_index < module.constants.len)
+        switch (module.constants[routine.name_index]) {
+            .identifier => |s| s,
+            else => "<unknown>",
+        }
+    else
+        "<unknown>";
+    std.debug.print("[CALL] routine={s} idx={d} argc={d} stack_argc={d} fp={d} sp={d}\n", .{
+        routine_name, routine_idx, argc, stack_argc, vm.fp, vm.sp,
+    });
+
+    // DEBUG: Print register args
+    for (0..argc) |i| {
+        const val = vm.registers[i];
+        std.debug.print("  r{d} = {s}\n", .{ i, @tagName(val.tag()) });
+    }
+
     // Push call frame
     // stack_pointer saved is BEFORE overflow args, so they're cleaned up on return
     const caller_sp = vm.sp;
@@ -957,7 +1011,6 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     }) catch return vm.fail(VMError.StackOverflow, "Call stack overflow");
 
     // Copy args from r0..r(argc-1) to stack (as locals for callee)
-    const routine = module.routines[routine_idx];
     vm.fp = vm.sp; // New frame starts after overflow args (they're below fp now)
     for (0..argc) |i| {
         vm.stack[vm.sp] = vm.registers[i];
@@ -970,6 +1023,26 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     for (0..stack_argc) |i| {
         vm.stack[vm.sp] = vm.stack[caller_sp - @as(u32, stack_argc) + i];
         vm.sp += 1;
+    }
+
+    // DEBUG: Print callee slots 0-22 (Parser struct size)
+    std.debug.print("  [After setup] fp={d} sp={d} local_count={d}\n", .{ vm.fp, vm.sp, routine.local_count });
+    const num_slots_to_show = @min(routine.local_count, 23);
+    for (0..num_slots_to_show) |slot| {
+        const val = vm.stack[vm.fp + slot];
+        switch (val.tag()) {
+            .integer => std.debug.print("    slot[{d}] = int:{d}\n", .{ slot, val.asInt() }),
+            .boolean => std.debug.print("    slot[{d}] = bool:{}\n", .{ slot, val.asBool() }),
+            .string => {
+                const s = val.asString();
+                if (s.len > 20) {
+                    std.debug.print("    slot[{d}] = str:\"{s}...\" (len={d})\n", .{ slot, s[0..20], s.len });
+                } else {
+                    std.debug.print("    slot[{d}] = str:\"{s}\"\n", .{ slot, s });
+                }
+            },
+            else => std.debug.print("    slot[{d}] = {s}\n", .{ slot, @tagName(val.tag()) }),
+        }
     }
 
     // Reserve space for remaining locals (after argc + stack_argc)
@@ -1062,13 +1135,53 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 }
 
+/// ret_large count - return with count values already pushed to stack (for large struct returns)
+/// This is like ret but adjusts sp to preserve the pushed return values.
+/// The caller pushed `count` values before this return, and they need to survive the frame restore.
+pub fn op_ret_large(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const count = module.code[vm.ip];
+    vm.ip += 2;
+
+    if (vm.call_stack.pop()) |frame| {
+        // Copy back ref parameters to caller's registers (same as op_ret)
+        const routine = module.routines[frame.routine_index];
+        for (routine.params, 0..) |param, i| {
+            if (param.mode == .ref) {
+                vm.writeRegister(@truncate(i), vm.stack[vm.fp + i]);
+            }
+        }
+
+        // Key difference from ret: we need to preserve `count` values that were
+        // pushed to the stack for the large struct return.
+        // The values are at vm.sp - count to vm.sp - 1 (already pushed by push_arg)
+        // We copy them to the caller's stack space starting at frame.stack_pointer
+
+        // First, copy the return values to caller's stack (at stack_pointer)
+        const src_base = vm.sp - @as(u32, count);
+        for (0..count) |i| {
+            vm.stack[frame.stack_pointer + i] = vm.stack[src_base + i];
+        }
+
+        // Restore frame, but sp points AFTER the return values
+        vm.fp = frame.base_pointer;
+        vm.sp = frame.stack_pointer + @as(u32, count);
+        vm.ip = frame.return_ip;
+        vm.current_module = frame.module;
+        vm.current_module_index = frame.caller_module_index;
+        return .continue_dispatch;
+    } else {
+        return .return_from_main;
+    }
+}
+
 /// push_arg slot - push local slot value to stack for overflow args
 pub fn op_push_arg(vm: *VM, module: *const Module) VMError!DispatchResult {
     const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
     vm.ip += 3;
 
     // Push value from local slot to stack
-    const value = vm.stack[vm.fp + slot];
+    const stack_addr = vm.fp + slot;
+    const value = vm.stack[stack_addr];
     vm.stack[vm.sp] = value;
     vm.sp += 1;
 
@@ -1419,6 +1532,14 @@ pub fn op_str_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Get start and end/length parameters
     const start_val: i64 = vm.registers[start_reg].asInt();
     const end_or_len_val: i64 = vm.registers[end_or_len_reg].asInt();
+
+    // Debug: show str_slice parameters
+    {
+        const debug = @import("../../runtime/debug.zig");
+        debug.print(.vm, "str_slice: src_len={d} start_val={d} end_val={d} is_length={d}", .{
+            source.len, start_val, end_or_len_val, is_length,
+        });
+    }
 
     // Calculate actual start and length based on mode
     var start: usize = undefined;
@@ -2907,12 +3028,13 @@ pub fn op_list_push_struct(vm: *VM, module: *const Module) VMError!DispatchResul
     return .continue_dispatch;
 }
 
-/// list_get_struct - get struct from list and expand to consecutive HIGH registers
-/// Format: [list:4|idx:4] [field_count:8] [base_reg:8] [0]
+/// list_get_struct - get struct from list and expand to consecutive SLOTS
+/// Format: [list:4|idx:4] [field_count:8] [dest_slot:16]
+/// This writes directly to slots, avoiding the 16-register limitation.
 pub fn op_list_get_struct(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const field_count = module.code[vm.ip + 1];
-    const base_reg = module.code[vm.ip + 2];
+    const dest_slot: u16 = @as(u16, module.code[vm.ip + 2]) | (@as(u16, module.code[vm.ip + 3]) << 8);
     vm.ip += 4;
     const list_reg: u4 = @truncate(ops >> 4);
     const idx_reg: u4 = @truncate(ops & 0xF);
@@ -2931,13 +3053,12 @@ pub fn op_list_get_struct(vm: *VM, module: *const Module) VMError!DispatchResult
         return vm.fail(VMError.InvalidType, "Expected StructBox in list");
     };
 
-    // Expand struct fields to consecutive high registers with retain
-    // (caller will store these to stack slots that get cleaned up)
+    // Expand struct fields directly to consecutive slots (no register limit)
     const copy_count = @min(field_count, box.field_count);
     for (0..copy_count) |i| {
         const val = box.fields[i];
-        arc.retain(val); // Caller gets their own reference
-        vm.registers[base_reg + i] = val;
+        arc.retain(val); // Slot gets its own reference
+        vm.stack[vm.fp + dest_slot + i] = val;
     }
 
     return .continue_dispatch;

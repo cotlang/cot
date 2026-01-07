@@ -480,6 +480,70 @@ pub const Output = struct {
         }
     }
 
+    /// Write slot store trace - shows old value being overwritten (critical for debugging)
+    pub fn writeSlotStore(self: *Self, ip: u32, slot: u16, reg: u4, old_value: Value, new_value: Value) void {
+        var old_buf: [64]u8 = undefined;
+        var new_buf: [64]u8 = undefined;
+        const old_repr = old_value.debugRepr(&old_buf);
+        const new_repr = new_value.debugRepr(&new_buf);
+
+        switch (self.config.format) {
+            .human => {
+                self.color(Color.yellow);
+                self.write("[SLOT] ", .{});
+                self.color(Color.reset);
+                self.write("0x{x:0>4} store ${d} <- r{d}: ", .{ ip, slot, reg });
+                self.color(Color.dim);
+                self.write("old=", .{});
+                self.color(Color.magenta);
+                self.write("{s}", .{old_repr});
+                self.color(Color.dim);
+                self.write(" new=", .{});
+                self.color(Color.green);
+                self.write("{s}", .{new_repr});
+                self.color(Color.reset);
+                self.newline();
+            },
+            .json => {
+                self.write(
+                    \\{{"event":"slot_store","ip":{d},"slot":{d},"reg":{d},"old":"{s}","new":"{s}"}}
+                , .{ ip, slot, reg, old_repr, new_repr });
+                self.newline();
+            },
+            .compact => {
+                self.write("STR:{x:0>4}:${d}<-r{d}:{s}->{s}\n", .{ ip, slot, reg, old_repr, new_repr });
+            },
+        }
+    }
+
+    /// Write slot load trace
+    pub fn writeSlotLoad(self: *Self, ip: u32, slot: u16, reg: u4, value: Value) void {
+        var buf: [64]u8 = undefined;
+        const repr = value.debugRepr(&buf);
+
+        switch (self.config.format) {
+            .human => {
+                self.color(Color.cyan);
+                self.write("[SLOT] ", .{});
+                self.color(Color.reset);
+                self.write("0x{x:0>4} load  r{d} <- ${d}: ", .{ ip, reg, slot });
+                self.color(Color.green);
+                self.write("{s}", .{repr});
+                self.color(Color.reset);
+                self.newline();
+            },
+            .json => {
+                self.write(
+                    \\{{"event":"slot_load","ip":{d},"slot":{d},"reg":{d},"value":"{s}"}}
+                , .{ ip, slot, reg, repr });
+                self.newline();
+            },
+            .compact => {
+                self.write("LDR:{x:0>4}:r{d}<-${d}:{s}\n", .{ ip, reg, slot, repr });
+            },
+        }
+    }
+
     /// Write section header (for crash dumps)
     pub fn writeHeader(self: *Self, title: []const u8) void {
         switch (self.config.format) {
@@ -537,44 +601,94 @@ pub const Output = struct {
         }
     }
 
+    /// Helper to write a single register with its value
+    fn writeRegister(self: *Self, index: usize, reg: RegisterSnapshot) void {
+        self.color(Color.register);
+        self.write("r{d}", .{index});
+        self.color(Color.reset);
+        self.write("=", .{});
+        self.color(Color.value);
+        // Format with type info
+        var buf: [64]u8 = undefined;
+        const repr = reg.format(&buf);
+        self.write("{s}", .{repr});
+        // Show raw bits for debugging NaN-boxing issues
+        if (self.config.show_raw_bits) {
+            self.color(Color.dim);
+            self.write("[0x{x:0>16}]", .{reg.bits});
+        }
+        self.color(Color.reset);
+    }
+
     /// Write register state with type information (verbose mode)
     /// Uses debugRepr to show values with their types
     /// When show_raw_bits is enabled, also displays raw 64-bit representation
     /// (useful for debugging NaN-boxing issues)
+    ///
+    /// Format:
+    ///   Low registers (r0-r7):  | r0=42 r1=str:"hello"
+    ///   High registers (r8-r15): | r10=103 r11=str:"fn" r12=1  (struct return values)
     pub fn writeRegisterSnapshots(self: *Self, regs: []const RegisterSnapshot) void {
         switch (self.config.format) {
             .human => {
-                self.write("  | ", .{});
-                // Only show non-null registers to reduce noise
-                var first = true;
-                for (regs, 0..) |reg, i| {
-                    // Skip null values to reduce clutter
-                    if (reg.tag == .null_val) continue;
-
-                    if (!first) self.write(" ", .{});
-                    first = false;
-
-                    self.color(Color.register);
-                    self.write("r{d}", .{i});
-                    self.color(Color.reset);
-                    self.write("=", .{});
-                    self.color(Color.value);
-                    // Format with type info
-                    var buf: [64]u8 = undefined;
-                    const repr = reg.format(&buf);
-                    self.write("{s}", .{repr});
-                    // Show raw bits for debugging NaN-boxing issues
-                    if (self.config.show_raw_bits) {
-                        self.color(Color.dim);
-                        self.write("[0x{x:0>16}]", .{reg.bits});
+                // Show low registers (r0-r7) - general purpose
+                var has_low = false;
+                for (0..@min(8, regs.len)) |i| {
+                    if (regs[i].tag != .null_val) {
+                        has_low = true;
+                        break;
                     }
-                    self.color(Color.reset);
                 }
-                // If all registers were null, show that
-                if (first) {
+
+                // Show high registers (r8-r15) - used for struct returns
+                var has_high = false;
+                if (regs.len > 8) {
+                    for (8..regs.len) |i| {
+                        if (regs[i].tag != .null_val) {
+                            has_high = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!has_low and !has_high) {
+                    self.write("  | ", .{});
                     self.color(Color.dim);
                     self.write("(all nil)", .{});
                     self.color(Color.reset);
+                    return;
+                }
+
+                // Output low registers
+                if (has_low) {
+                    self.write("  | ", .{});
+                    var first = true;
+                    for (0..@min(8, regs.len)) |i| {
+                        if (regs[i].tag == .null_val) continue;
+                        if (!first) self.write(" ", .{});
+                        first = false;
+                        self.writeRegister(i, regs[i]);
+                    }
+                }
+
+                // Output high registers on same line if both present, otherwise with prefix
+                if (has_high) {
+                    if (has_low) {
+                        self.write(" ", .{});
+                        self.color(Color.dim);
+                        self.write("||", .{});
+                        self.color(Color.reset);
+                        self.write(" ", .{});
+                    } else {
+                        self.write("  | ", .{});
+                    }
+                    var first = true;
+                    for (8..regs.len) |i| {
+                        if (regs[i].tag == .null_val) continue;
+                        if (!first) self.write(" ", .{});
+                        first = false;
+                        self.writeRegister(i, regs[i]);
+                    }
                 }
             },
             .json => {

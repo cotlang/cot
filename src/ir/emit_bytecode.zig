@@ -564,7 +564,9 @@ pub const BytecodeEmitter = struct {
                         .slot = self.local_count,
                         .is_global = false,
                     });
-                    self.local_count += 1;
+                    // Use getSlotCount to properly account for nested struct sizes
+                    const slot_count = emit_inst.getSlotCount(field.ty);
+                    self.local_count += @intCast(slot_count);
                 }
             } else {
                 // Normal parameter - single slot
@@ -587,8 +589,9 @@ pub const BytecodeEmitter = struct {
                     const is_struct = a.ty == .@"struct";
                     const skip_global_check = is_struct;
                     const in_globals = if (skip_global_check) false else self.globals.contains(a.name);
-                    debug.print(.emit, "Pre-pass alloca: name='{s}' ty={any} global={} local={} skip_global={}", .{ a.name, a.ty, in_globals, self.locals.contains(a.name), skip_global_check });
-                    if (!in_globals and !self.locals.contains(a.name)) {
+                    const in_locals = self.locals.contains(a.name);
+                    debug.print(.emit, "Pre-pass alloca: name='{s}' ty={any} global={} local={} skip_global={}", .{ a.name, a.ty, in_globals, in_locals, skip_global_check });
+                    if (!in_globals and !in_locals) {
                         if (is_struct) {
                             // Struct type: count FLATTENED slots for nested structs
                             const slot_count = emit_inst.getSlotCount(a.ty);
@@ -619,7 +622,8 @@ pub const BytecodeEmitter = struct {
         var param_slot_count: u16 = 0;
         for (func.signature.params) |param| {
             // Use flattened slot count for nested structs
-            param_slot_count += @intCast(emit_inst.getSlotCount(param.ty));
+            const slot_count = emit_inst.getSlotCount(param.ty);
+            param_slot_count += @intCast(slot_count);
         }
         self.local_count = param_slot_count;
 
@@ -689,12 +693,25 @@ pub const BytecodeEmitter = struct {
     }
 
     /// Emit a basic block
+    /// Two-pass emission: first allocas (to establish slot assignments), then everything else
     fn emitBlock(self: *Self, block: *const ir.Block) EmitError!void {
         // Update actual block offset
         try self.block_offsets.put(block, @intCast(self.code.items.len));
 
+        // First pass: emit all allocas to establish slot assignments BEFORE any other code
+        // This ensures struct allocas get their pre-computed slots, not slots consumed by
+        // function call return values (large struct returns allocate from local_count)
         for (block.instructions.items) |inst| {
-            try self.emitInstruction(&inst);
+            if (inst == .alloca) {
+                try self.emitInstruction(&inst);
+            }
+        }
+
+        // Second pass: emit all non-alloca instructions
+        for (block.instructions.items) |inst| {
+            if (inst != .alloca) {
+                try self.emitInstruction(&inst);
+            }
         }
     }
 
@@ -1153,6 +1170,13 @@ pub const BytecodeEmitter = struct {
             return;
         }
 
+        // Check if value was spilled - reload from spill slot
+        if (self.spilled_values.get(value.id)) |spill_slot| {
+            debug.print(.emit, "emitValueToReg: reloading spilled value_id={d} from slot {d} to r{d}", .{ value.id, spill_slot, dest });
+            try self.emitSpillLoad(dest, spill_slot);
+            return;
+        }
+
         // Check if value is a constant - load from constant pool
         if (self.value_consts.get(value.id)) |const_idx| {
             try self.emitRegLoadConst(dest, const_idx);
@@ -1166,17 +1190,13 @@ pub const BytecodeEmitter = struct {
                 const slot = slot_info & 0x7FFF;
                 try self.emitRegLoadGlobal(dest, slot);
             } else {
-                // Local variable
+                // Local variable - use 16-bit variant for slots >= 256
                 if (slot_info < 256) {
                     try self.emitRegLoadLocal(dest, @intCast(slot_info));
                 } else {
-                    self.setError(
-                        "Local variable storage exceeds 256-slot limit (slot {d})",
-                        .{slot_info},
-                        "DBL record buffers with large alpha fields may exceed this limit. Consider using smaller field sizes or fewer variables.",
-                        .{},
-                    );
-                    return EmitError.TooManyLocals;
+                    try self.emitOpcode(.load_local16);
+                    try self.emitU8(@as(u8, dest) << 4);
+                    try self.emitU16(@intCast(slot_info));
                 }
             }
         }
@@ -1247,18 +1267,15 @@ pub const BytecodeEmitter = struct {
                 debug.print(.emit, "  -> slot path (global): slot={d} -> r{d}", .{ slot, temp_reg });
                 try self.emitRegLoadGlobal(temp_reg, slot);
             } else {
-                // Local variable
+                // Local variable - use 16-bit variant for slots >= 256
                 if (slot_info < 256) {
                     debug.print(.emit, "  -> slot path (local): slot={d} -> r{d}", .{ slot_info, temp_reg });
                     try self.emitRegLoadLocal(temp_reg, @intCast(slot_info));
                 } else {
-                    self.setError(
-                        "Local variable storage exceeds 256-slot limit (slot {d})",
-                        .{slot_info},
-                        "DBL record buffers with large alpha fields may exceed this limit. Consider using smaller field sizes or fewer variables.",
-                        .{},
-                    );
-                    return EmitError.TooManyLocals;
+                    debug.print(.emit, "  -> slot path (local16): slot={d} -> r{d}", .{ slot_info, temp_reg });
+                    try self.emitOpcode(.load_local16);
+                    try self.emitU8(@as(u8, temp_reg) << 4);
+                    try self.emitU16(@intCast(slot_info));
                 }
             }
             return temp_reg;
@@ -1366,6 +1383,19 @@ pub const BytecodeEmitter = struct {
             self.max_spill_slots_used = slots_used;
         }
         return slot;
+    }
+
+    /// Allocate multiple consecutive slots (for structs)
+    /// Returns the base slot index. The struct fields will be at base_slot, base_slot+1, etc.
+    pub fn allocateSlots(self: *Self, value_id: u32, count: usize) EmitError!u16 {
+        _ = value_id; // May be used for tracking in the future
+        const base_slot = self.next_spill_slot;
+        self.next_spill_slot += @intCast(count);
+        const slots_used = self.next_spill_slot - self.spill_slot_base;
+        if (slots_used > self.max_spill_slots_used) {
+            self.max_spill_slots_used = slots_used;
+        }
+        return base_slot;
     }
 
     /// Emit store_local for spilling a register to a slot

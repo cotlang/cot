@@ -136,7 +136,7 @@ const commands = [_]Command{
     .{ .name = "repl", .handler = cmdRepl, .description = "Start interactive REPL", .category = .core },
 
     // Debug commands
-    .{ .name = "trace", .handler = cmdTrace, .description = "Run with execution tracing", .usage = "<file> [--level=opcodes|verbose]", .category = .debug },
+    .{ .name = "trace", .handler = cmdTrace, .description = "Run with execution tracing", .usage = "<file> [--level=opcodes|verbose|slots]", .category = .debug },
     .{ .name = "debug", .handler = cmdDebug, .description = "Interactive debugger", .usage = "<file>", .category = .debug },
     .{ .name = "validate", .handler = cmdValidate, .description = "Validate bytecode integrity", .usage = "<file.cbo> [--strict]", .category = .debug },
     .{ .name = "disasm", .handler = cmdDisasm, .description = "Disassemble bytecode", .usage = "<file.cot|.cbo>", .category = .debug },
@@ -358,7 +358,7 @@ fn cmdRepl(allocator: std.mem.Allocator, _: []const []const u8) !void {
 fn cmdTrace(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         try printErr("Error: trace requires a filename\n");
-        try printErr("Usage: cot trace <file.cot|file.cbo> [--level=opcodes|routines|verbose]\n");
+        try printErr("Usage: cot trace <file.cot|file.cbo> [--level=opcodes|routines|verbose|slots]\n");
         return;
     }
 
@@ -366,7 +366,20 @@ fn cmdTrace(allocator: std.mem.Allocator, args: []const []const u8) !void {
     for (args[1..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--level=")) {
             const level_str = arg[8..];
-            trace_level = if (std.mem.eql(u8, level_str, "none")) .none else if (std.mem.eql(u8, level_str, "routines")) .routines else if (std.mem.eql(u8, level_str, "opcodes")) .opcodes else if (std.mem.eql(u8, level_str, "verbose")) .verbose else if (std.mem.eql(u8, level_str, "full")) .full else .opcodes;
+            trace_level = if (std.mem.eql(u8, level_str, "none"))
+                .none
+            else if (std.mem.eql(u8, level_str, "routines"))
+                .routines
+            else if (std.mem.eql(u8, level_str, "opcodes"))
+                .opcodes
+            else if (std.mem.eql(u8, level_str, "verbose"))
+                .verbose
+            else if (std.mem.eql(u8, level_str, "full"))
+                .full
+            else if (std.mem.eql(u8, level_str, "slots"))
+                .slots
+            else
+                .opcodes;
         }
     }
 
@@ -551,7 +564,7 @@ fn printUsage() !void {
         \\
         \\Options:
         \\  compile -o <file>           Output file (default: <input>.cbo)
-        \\  trace --level=<level>       none, routines, opcodes, verbose, full
+        \\  trace --level=<level>       none, routines, opcodes, verbose, full, slots
         \\  run --runtime=<rt>          zig (default), rs (Rust runtime)
         \\
         \\Examples:
@@ -846,6 +859,7 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
         .opcodes => "--level=opcodes",
         .verbose => "--level=verbose",
         .full => "--level=full",
+        .slots => "--level=slots",
     };
     if (try tryDispatchToFrontend(allocator, filename, &[_][]const u8{ "trace", level_str })) {
         return;

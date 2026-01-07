@@ -427,18 +427,23 @@ fn run(self: *Self) VMError!void {
                 const routine_idx = std.mem.readInt(u16, module.code[self.ip + 1 ..][0..2], .little);
                 self.ip += 3;
                 const argc: u4 = @truncate(ops >> 4);
+                const stack_argc: u4 = @truncate(ops & 0xF); // Number of overflow args already on stack
 
                 if (routine_idx >= module.routines.len) {
                     return self.fail(VMError.InvalidRoutine, "Routine index out of bounds");
                 }
 
-                // Push call frame
+                // Save caller's sp before we modify it (needed to access overflow args)
+                const caller_sp = self.sp;
+
+                // Push call frame - stack_pointer is adjusted to exclude overflow args
+                // so they can be properly cleaned up on return
                 self.call_stack.append(.{
                     .module = module,
                     .routine_index = routine_idx,
                     .return_ip = self.ip,
                     .base_pointer = self.fp,
-                    .stack_pointer = self.sp,
+                    .stack_pointer = caller_sp - @as(u32, stack_argc),
                     .caller_module_index = self.current_module_index,
                 }) catch return self.fail(VMError.StackOverflow, "Call stack overflow");
 
@@ -449,8 +454,18 @@ fn run(self: *Self) VMError!void {
                     self.stack[self.sp] = self.registers[i];
                     self.sp += 1;
                 }
-                // Reserve space for remaining locals
-                for (argc..routine.local_count) |_| {
+
+                // Copy overflow args from caller's stack (below fp) to callee's locals
+                // They were pushed at positions caller_sp - stack_argc to caller_sp - 1
+                // and need to end up at slots argc..argc+stack_argc-1
+                for (0..stack_argc) |i| {
+                    self.stack[self.sp] = self.stack[caller_sp - @as(u32, stack_argc) + i];
+                    self.sp += 1;
+                }
+
+                // Reserve space for remaining locals (after argc + stack_argc)
+                const total_args = @as(u32, argc) + @as(u32, stack_argc);
+                for (total_args..routine.local_count) |_| {
                     self.stack[self.sp] = Value.null_val;
                     self.sp += 1;
                 }

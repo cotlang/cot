@@ -39,6 +39,11 @@ pub const TraceLevel = enum(u8) {
     /// Full state dump including stack
     full = 4,
 
+    /// Slot-level tracing: shows load/store to local slots with values
+    /// Output: [SLOT] store $31: old=int:60 new=bool:true (r15)
+    /// Critical for debugging struct field corruption bugs
+    slots = 5,
+
     /// Check if level logs opcodes
     pub fn logsOpcodes(self: TraceLevel) bool {
         return @intFromEnum(self) >= @intFromEnum(TraceLevel.opcodes);
@@ -53,6 +58,11 @@ pub const TraceLevel = enum(u8) {
     pub fn logsRegisters(self: TraceLevel) bool {
         return @intFromEnum(self) >= @intFromEnum(TraceLevel.verbose);
     }
+
+    /// Check if level logs slot access (load/store to locals)
+    pub fn logsSlots(self: TraceLevel) bool {
+        return @intFromEnum(self) >= @intFromEnum(TraceLevel.slots);
+    }
 };
 
 /// Event type for trace entries
@@ -64,6 +74,8 @@ pub const TraceEvent = enum(u8) {
     native_return, // Native function return
     error_, // Error occurred
     breakpoint, // Hit breakpoint
+    slot_store, // Store to local slot
+    slot_load, // Load from local slot
 };
 
 /// Register snapshot with type information for verbose tracing
@@ -110,9 +122,9 @@ pub const TraceEntry = struct {
     /// Call depth at this point
     call_depth: u16,
 
-    /// Register snapshots (r0-r7 for verbose mode)
+    /// Register snapshots (all 16 registers r0-r15 for verbose mode)
     /// Stores type tags for proper display
-    registers: [8]RegisterSnapshot,
+    registers: [16]RegisterSnapshot,
 
     /// Additional context depending on event type
     context: Context,
@@ -137,6 +149,16 @@ pub const TraceEntry = struct {
             err: u16, // Error code
         },
         breakpoint: void,
+        slot_store: SlotAccess,
+        slot_load: SlotAccess,
+    };
+
+    /// Context for slot access tracing (critical for debugging struct corruption)
+    pub const SlotAccess = struct {
+        slot: u16, // Slot number
+        reg: u4, // Register involved
+        old_value: RegisterSnapshot, // Previous value in slot (for stores)
+        new_value: RegisterSnapshot, // Value being stored/loaded
     };
 };
 
@@ -269,9 +291,9 @@ pub const Tracer = struct {
         // Check filter
         if (!self.config.filter.matches(ip, line, false)) return;
 
-        // Create register snapshots with type info
-        var reg_snapshots: [8]RegisterSnapshot = undefined;
-        for (0..8) |i| {
+        // Create register snapshots with type info for all 16 registers
+        var reg_snapshots: [16]RegisterSnapshot = undefined;
+        for (0..16) |i| {
             reg_snapshots[i] = RegisterSnapshot.fromValue(registers[i]);
         }
 
@@ -318,7 +340,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16,
             .context = .{ .call = .{
                 .target_len = @intCast(len),
                 .arg_count = arg_count,
@@ -348,10 +370,10 @@ pub const Tracer = struct {
         }
 
         // Capture return value in register snapshot if provided
-        var reg_snapshots = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8;
+        var reg_snapshots = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16;
         if (return_value) |val| {
-            // Put return value in the display (slot 7 represents r15)
-            reg_snapshots[7] = RegisterSnapshot.fromValue(val);
+            // Put return value in r15 slot (index 15)
+            reg_snapshots[15] = RegisterSnapshot.fromValue(val);
         }
 
         const entry = TraceEntry{
@@ -385,7 +407,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16,
             .context = .{ .native_call = .{
                 .name_len = @intCast(@min(name.len, 255)),
                 .arg_count = arg_count,
@@ -414,7 +436,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16,
             .context = .{ .native_call = .{
                 .name_len = @intCast(@min(name.len, 255)),
                 .arg_count = arg_count,
@@ -444,7 +466,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = self.current_line,
             .call_depth = self.call_depth,
-            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16,
             .context = .{ .native_return = .{ .has_value = result != null } },
         };
 
@@ -453,6 +475,64 @@ pub const Tracer = struct {
         if (self.config.level.logsRoutines()) {
             self.output.writeNativeReturn(name, result, ip);
         }
+    }
+
+    /// Called when storing to a local slot
+    /// Critical for debugging struct field corruption - shows OLD value before overwrite
+    pub fn onSlotStore(self: *Self, ip: u32, slot: u16, reg: u4, old_value: Value, new_value: Value) void {
+        // Only trace if slots level is enabled
+        if (!self.config.level.logsSlots()) return;
+
+        const old_snap = RegisterSnapshot.fromValue(old_value);
+        const new_snap = RegisterSnapshot.fromValue(new_value);
+
+        const entry = TraceEntry{
+            .timestamp = @truncate(std.time.nanoTimestamp()),
+            .event = .slot_store,
+            .ip = ip,
+            .opcode = .store_local,
+            .line = self.current_line,
+            .call_depth = self.call_depth,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16,
+            .context = .{ .slot_store = .{
+                .slot = slot,
+                .reg = reg,
+                .old_value = old_snap,
+                .new_value = new_snap,
+            } },
+        };
+
+        self.history.push(entry);
+        self.output.writeSlotStore(ip, slot, reg, old_value, new_value);
+    }
+
+    /// Called when loading from a local slot
+    pub fn onSlotLoad(self: *Self, ip: u32, slot: u16, reg: u4, value: Value) void {
+        // Only trace if slots level is enabled
+        if (!self.config.level.logsSlots()) return;
+
+        const val_snap = RegisterSnapshot.fromValue(value);
+
+        const entry = TraceEntry{
+            .timestamp = @truncate(std.time.nanoTimestamp()),
+            .event = .slot_load,
+            .ip = ip,
+            .opcode = .load_local,
+            .line = self.current_line,
+            .call_depth = self.call_depth,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16,
+            .context = .{
+                .slot_load = .{
+                    .slot = slot,
+                    .reg = reg,
+                    .old_value = val_snap, // Not used for loads
+                    .new_value = val_snap,
+                },
+            },
+        };
+
+        self.history.push(entry);
+        self.output.writeSlotLoad(ip, slot, reg, value);
     }
 
     /// Called when an error occurs
@@ -466,7 +546,7 @@ pub const Tracer = struct {
             .opcode = null,
             .line = line,
             .call_depth = self.call_depth,
-            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 8,
+            .registers = [_]RegisterSnapshot{RegisterSnapshot.fromValue(Value.null_val)} ** 16,
             .context = .{ .error_ = .{ .err = 0 } },
         };
 
@@ -543,6 +623,33 @@ pub const Tracer = struct {
                 try writer.print("[{d}] 0x{x:0>4} BREAKPOINT\n", .{
                     entry.line,
                     entry.ip,
+                });
+            },
+            .slot_store => {
+                const ctx = entry.context.slot_store;
+                var old_buf: [64]u8 = undefined;
+                var new_buf: [64]u8 = undefined;
+                const old_repr = ctx.old_value.format(&old_buf);
+                const new_repr = ctx.new_value.format(&new_buf);
+                try writer.print("[{d}] 0x{x:0>4} STORE ${d} <- r{d}: {s} -> {s}\n", .{
+                    entry.line,
+                    entry.ip,
+                    ctx.slot,
+                    ctx.reg,
+                    old_repr,
+                    new_repr,
+                });
+            },
+            .slot_load => {
+                const ctx = entry.context.slot_load;
+                var buf: [64]u8 = undefined;
+                const repr = ctx.new_value.format(&buf);
+                try writer.print("[{d}] 0x{x:0>4} LOAD r{d} <- ${d}: {s}\n", .{
+                    entry.line,
+                    entry.ip,
+                    ctx.reg,
+                    ctx.slot,
+                    repr,
                 });
             },
         }

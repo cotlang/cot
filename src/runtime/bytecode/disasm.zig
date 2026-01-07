@@ -433,6 +433,12 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}", .{rs});
             },
 
+            // ret_large count - [count:8] [0]
+            .ret_large => {
+                const count: u8 = operands[0];
+                try self.writer.print(" count={}", .{count});
+            },
+
             // push_arg slot - [0] [slot:16]
             .push_arg => {
                 const slot: u16 = @bitCast(operands[1..3].*);
