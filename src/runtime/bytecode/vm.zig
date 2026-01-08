@@ -370,11 +370,6 @@ pub const VM = struct {
     /// Retains the new value and releases the old value.
     /// When runtime_arc_enabled is false, skips ARC (compiler handles it).
     pub inline fn writeRegister(self: *Self, reg: u4, value: Value) void {
-        // Debug: Check if writing a stack pointer
-        if (value.isStackPtr()) {
-            std.debug.print("[writeRegister] reg={d}, value.bits=0x{x:0>16} BEFORE\n", .{ reg, value.bits });
-        }
-
         if (self.runtime_arc_enabled) {
             const old = self.registers[reg];
 
@@ -387,11 +382,6 @@ pub const VM = struct {
 
         // Store new value
         self.registers[reg] = value;
-
-        // Debug: Verify stored value
-        if (value.isStackPtr()) {
-            std.debug.print("[writeRegister] reg={d}, stored.bits=0x{x:0>16} AFTER\n", .{ reg, self.registers[reg].bits });
-        }
     }
 
     /// Write a value to the stack with ARC management.

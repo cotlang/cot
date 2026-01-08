@@ -145,22 +145,12 @@ pub fn op_load_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const val = vm.stack[vm.fp + slot];
 
-    // Debug: Check if loading a stack pointer
-    if (val.isStackPtr()) {
-        std.debug.print("[load_local] rd={d}, slot={d}, value.bits=0x{x:0>16} (STACK_PTR)\n", .{ rd, slot, val.bits });
-    }
-
     // Slot-level tracing
     if (vm.tracer) |tracer| {
         tracer.onSlotLoad(@intCast(prev_ip), slot, rd, val);
     }
 
     vm.writeRegister(rd, val);
-
-    // Debug: Verify register AFTER entire load_local
-    if (val.isStackPtr()) {
-        std.debug.print("[load_local END] vm.registers[{d}].bits=0x{x:0>16}\n", .{ rd, vm.registers[rd].bits });
-    }
 
     return .continue_dispatch;
 }
@@ -174,11 +164,6 @@ pub fn op_store_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rs: u4 = @truncate(ops >> 4);
     const new_value = vm.registers[rs];
     const stack_idx = vm.fp + slot;
-
-    // Debug: Check if storing a stack pointer
-    if (new_value.isStackPtr()) {
-        std.debug.print("[store_local] rs={d}, slot={d}, value.bits=0x{x:0>16} (STACK_PTR)\n", .{ rs, slot, new_value.bits });
-    }
 
     // Slot-level tracing: capture old value before overwrite (critical for debugging)
     if (vm.tracer) |tracer| {
@@ -1122,9 +1107,6 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
 
 /// call_dynamic name_idx, argc - call by name at runtime
 pub fn op_call_dynamic(vm: *VM, module: *const Module) VMError!DispatchResult {
-    // Debug: Check r0 at start of call_dynamic
-    std.debug.print("[call_dynamic START] r0.bits=0x{x:0>16}, isStackPtr={}\n", .{ vm.registers[0].bits, vm.registers[0].isStackPtr() });
-
     // Format: [argc:4|0] [name_idx:16]
     const argc: u8 = @truncate(module.code[vm.ip] >> 4);
     const name_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
@@ -1304,7 +1286,6 @@ pub fn op_get_local_ptr(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Create a stack pointer to the local slot in the current frame
     // frame_offset=0 means current frame
     const stack_ptr_val = Value.initStackPtr(0, slot);
-    std.debug.print("[get_local_ptr] rd={d}, slot={d}, fp={d}, value.bits=0x{x:0>16}\n", .{ rd, slot, vm.fp, stack_ptr_val.bits });
     vm.registers[rd] = stack_ptr_val;
 
     return .continue_dispatch;
@@ -1322,7 +1303,6 @@ pub fn op_load_indirect(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rs: u4 = @truncate(ops);
 
     const ptr_val = vm.registers[rs];
-    std.debug.print("[load_indirect] rd={d}, rs={d}, offset={d}, ptr_val.bits=0x{x:0>16}, isStackPtr={}, tag={}\n", .{ rd, rs, offset, ptr_val.bits, ptr_val.isStackPtr(), @intFromEnum(ptr_val.tag()) });
 
     // Check if it's a stack pointer
     if (ptr_val.asStackPtr()) |sp| {

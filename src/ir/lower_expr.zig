@@ -1192,10 +1192,12 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
             } else {
                 // Variant not found in this enum
                 const loc = l.store.exprLoc(expr_idx);
-                l.setErrorContext(
+                const file_id = l.store.exprFileId(expr_idx);
+                l.setErrorContextWithFileId(
                     LowerError.UndefinedVariable,
                     "Unknown enum variant '{s}.{s}'",
                     .{ object_name, field_name },
+                    file_id,
                     loc,
                     "variant '{s}' does not exist in enum '{s}'",
                     .{ field_name, object_name },
@@ -3406,14 +3408,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     var object_ptr: ?ir.Value = null;
     if (object_is_lvalue) {
         // Try to get pointer to the object for methods that take self: *T
-        log.debug("lowerMethodCall: object is lvalue (tag={s}), trying lowerLValue", .{@tagName(object_tag)});
-        object_ptr = lowerLValue(l, object_idx) catch |err| blk: {
-            log.debug("lowerMethodCall: lowerLValue failed with {any}", .{err});
-            break :blk null;
-        };
-        if (object_ptr) |ptr| {
-            log.debug("lowerMethodCall: got object_ptr id={d} ty={s}", .{ ptr.id, @tagName(ptr.ty) });
-        }
+        object_ptr = lowerLValue(l, object_idx) catch null;
     }
     // Always get object value for type checking
     object_val = try lowerExpression(l, object_idx);

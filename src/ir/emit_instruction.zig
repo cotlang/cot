@@ -208,7 +208,24 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
                 });
                 return;
             }
-            // Non-param pointer-to-struct: treat as regular pointer
+            // Non-param pointer-to-struct local variable (e.g., var p: *MyStruct = &obj)
+            // Allocate a slot for the pointer variable and track it
+            // so that loads from this slot can be identified as dynamic stack pointers
+            const ptr_slot = e.local_count;
+            try e.locals.put(a.name, .{
+                .slot = ptr_slot,
+                .is_global = false,
+            });
+            try e.value_slots.put(a.result.id, ptr_slot);
+            try e.ptr_to_struct_local_allocas.put(a.result.id, ptr_slot);
+            e.local_count += 1;
+            log.debug("alloca ptr-to-struct local: name={s} result.id={d} slot={d}", .{
+                a.name, a.result.id, ptr_slot,
+            });
+            debug.print(.emit, "alloca ptr-to-struct local: name={s} result.id={d} slot={d}", .{
+                a.name, a.result.id, ptr_slot,
+            });
+            return;
         }
     }
 
@@ -291,6 +308,21 @@ pub fn emitLoad(e: *BytecodeEmitter, l: ir.Instruction.Load) EmitError!void {
         try e.stack_ptr_value_ids.put(l.result.id, ptr_slot);
         try e.value_slots.put(l.result.id, ptr_slot);
         log.debug("load: propagate stack_ptr_value_ids ptr.id={d} -> result.id={d} ptr_slot={d}", .{
+            l.ptr.id, l.result.id, ptr_slot,
+        });
+    }
+
+    // Track loads from ptr-to-struct local variables
+    // When we load from a local like `var p: *MyStruct = &obj`, the loaded value
+    // is a dynamic stack pointer that needs load_indirect for field access
+    if (e.ptr_to_struct_local_allocas.get(l.ptr.id)) |ptr_slot| {
+        // The loaded value is a stack pointer stored at ptr_slot
+        // Track this so emitFieldPtr knows to use indirect access
+        try e.dynamic_stack_ptr_sources.put(l.result.id, ptr_slot);
+        log.debug("load: dynamic stack ptr from local: ptr.id={d} -> result.id={d} ptr_slot={d}", .{
+            l.ptr.id, l.result.id, ptr_slot,
+        });
+        debug.print(.emit, "load: dynamic stack ptr from local: ptr.id={d} -> result.id={d} ptr_slot={d}", .{
             l.ptr.id, l.result.id, ptr_slot,
         });
     }
@@ -618,6 +650,115 @@ pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!
             });
             debug.print(.emit, "field_ptr (indirect): struct_ptr.id={d} ptr_slot={d} field_offset={d} -> result.id={d}", .{
                 fp.struct_ptr.id, ptr_slot, field_offset, fp.result.id,
+            });
+        }
+        return;
+    }
+
+    // Check if this is accessing through a dynamic stack pointer (loaded from ptr-to-struct local)
+    // This is similar to stack_ptr_value_ids but for local pointer variables, not parameters
+    if (e.dynamic_stack_ptr_sources.get(fp.struct_ptr.id)) |ptr_slot| {
+        log.debug("emitFieldPtr: FOUND in dynamic_stack_ptr_sources! ptr_slot={d}", .{ptr_slot});
+        // Get the struct type to calculate field offset
+        const struct_type: ?*const ir.StructType = if (fp.struct_ptr.ty == .@"struct")
+            fp.struct_ptr.ty.@"struct"
+        else if (fp.struct_ptr.ty == .ptr and fp.struct_ptr.ty.ptr.* == .@"struct")
+            fp.struct_ptr.ty.ptr.*.@"struct"
+        else
+            null;
+
+        const field_offset: u32 = if (struct_type) |st|
+            getFieldOffset(st, fp.field_index)
+        else
+            fp.field_index;
+
+        // Check if the field type is a struct (needs derived StackPtr) or primitive (needs load_indirect)
+        log.debug("emitFieldPtr: dynamic ptr result.ty={s}", .{@tagName(fp.result.ty)});
+        const field_is_struct = if (fp.result.ty == .ptr) blk: {
+            log.debug("emitFieldPtr: result is ptr, pointee={s}", .{@tagName(fp.result.ty.ptr.*)});
+            break :blk fp.result.ty.ptr.* == .@"struct";
+        } else false;
+
+        if (field_is_struct) {
+            // Field is a struct - track as derived stack pointer
+            log.debug("emitFieldPtr: DYNAMIC DERIVED PTR - struct field result.id={d} ptr_slot={d} offset={d}", .{
+                fp.result.id, ptr_slot, field_offset,
+            });
+            try e.derived_stack_ptrs.put(fp.result.id, .{
+                .base_slot = ptr_slot,
+                .field_offset = @intCast(field_offset),
+            });
+            debug.print(.emit, "field_ptr (dynamic derived ptr): struct_ptr.id={d} ptr_slot={d} field_offset={d} -> result.id={d}", .{
+                fp.struct_ptr.id, ptr_slot, field_offset, fp.result.id,
+            });
+        } else {
+            // Field is primitive - track for indirect field access
+            log.debug("emitFieldPtr: DYNAMIC INDIRECT FIELD - primitive field result.id={d} ptr_slot={d} offset={d}", .{
+                fp.result.id, ptr_slot, field_offset,
+            });
+            try e.indirect_fields.put(fp.result.id, .{
+                .ptr_slot = ptr_slot,
+                .field_offset = @intCast(field_offset),
+            });
+            debug.print(.emit, "field_ptr (dynamic indirect): struct_ptr.id={d} ptr_slot={d} field_offset={d} -> result.id={d}", .{
+                fp.struct_ptr.id, ptr_slot, field_offset, fp.result.id,
+            });
+        }
+        return;
+    }
+
+    // Check if this is accessing through a derived stack pointer (nested struct field through stack pointer)
+    // This handles cases like outer_ptr.inner.value where .inner is a struct field
+    if (e.derived_stack_ptrs.get(fp.struct_ptr.id)) |info| {
+        log.debug("emitFieldPtr: FOUND in derived_stack_ptrs! base_slot={d} field_offset={d}", .{
+            info.base_slot, info.field_offset,
+        });
+        // Get the struct type to calculate field offset
+        const struct_type: ?*const ir.StructType = if (fp.struct_ptr.ty == .@"struct")
+            fp.struct_ptr.ty.@"struct"
+        else if (fp.struct_ptr.ty == .ptr and fp.struct_ptr.ty.ptr.* == .@"struct")
+            fp.struct_ptr.ty.ptr.*.@"struct"
+        else
+            null;
+
+        const new_field_offset: u32 = if (struct_type) |st|
+            getFieldOffset(st, fp.field_index)
+        else
+            fp.field_index;
+
+        // Combined offset = existing offset + new field offset
+        const combined_offset = info.field_offset + @as(u16, @intCast(new_field_offset));
+
+        // Check if the field type is a struct (needs derived StackPtr) or primitive (needs load_indirect)
+        log.debug("emitFieldPtr: derived ptr result.ty={s}", .{@tagName(fp.result.ty)});
+        const field_is_struct = if (fp.result.ty == .ptr) blk: {
+            log.debug("emitFieldPtr: result is ptr, pointee={s}", .{@tagName(fp.result.ty.ptr.*)});
+            break :blk fp.result.ty.ptr.* == .@"struct";
+        } else false;
+
+        if (field_is_struct) {
+            // Field is a struct - create new derived stack pointer with combined offset
+            log.debug("emitFieldPtr: NESTED DERIVED PTR - struct field result.id={d} base_slot={d} offset={d}", .{
+                fp.result.id, info.base_slot, combined_offset,
+            });
+            try e.derived_stack_ptrs.put(fp.result.id, .{
+                .base_slot = info.base_slot,
+                .field_offset = combined_offset,
+            });
+            debug.print(.emit, "field_ptr (nested derived ptr): struct_ptr.id={d} base_slot={d} combined_offset={d} -> result.id={d}", .{
+                fp.struct_ptr.id, info.base_slot, combined_offset, fp.result.id,
+            });
+        } else {
+            // Field is primitive - track for indirect field access with combined offset
+            log.debug("emitFieldPtr: NESTED INDIRECT FIELD - primitive field result.id={d} ptr_slot={d} offset={d}", .{
+                fp.result.id, info.base_slot, combined_offset,
+            });
+            try e.indirect_fields.put(fp.result.id, .{
+                .ptr_slot = info.base_slot,
+                .field_offset = combined_offset,
+            });
+            debug.print(.emit, "field_ptr (nested indirect): struct_ptr.id={d} base_slot={d} combined_offset={d} -> result.id={d}", .{
+                fp.struct_ptr.id, info.base_slot, combined_offset, fp.result.id,
             });
         }
         return;

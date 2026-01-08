@@ -272,6 +272,16 @@ pub const BytecodeEmitter = struct {
     // These need a derived StackPtr for method calls, not a loaded value
     derived_stack_ptrs: std.AutoHashMap(u32, DerivedStackPtrInfo), // value_id -> info
 
+    // Local pointer-to-struct variable tracking
+    // Maps alloca result ID to slot for local variables of type *Struct
+    // Used to track when we load a stack pointer from a local variable
+    ptr_to_struct_local_allocas: std.AutoHashMap(u32, u16), // alloca_result_id -> slot
+
+    // Dynamic stack pointer tracking
+    // Maps loaded value IDs to the slot where the stack pointer was loaded from
+    // Used by emitFieldPtr to detect field access through loaded pointer values
+    dynamic_stack_ptr_sources: std.AutoHashMap(u32, u16), // loaded_value_id -> ptr_slot
+
     // Current routine being emitted
     current_routine_start: u32,
 
@@ -334,6 +344,8 @@ pub const BytecodeEmitter = struct {
             .stack_ptr_value_ids = std.AutoHashMap(u32, u16).init(allocator),
             .indirect_fields = std.AutoHashMap(u32, IndirectFieldInfo).init(allocator),
             .derived_stack_ptrs = std.AutoHashMap(u32, DerivedStackPtrInfo).init(allocator),
+            .ptr_to_struct_local_allocas = std.AutoHashMap(u32, u16).init(allocator),
+            .dynamic_stack_ptr_sources = std.AutoHashMap(u32, u16).init(allocator),
             .current_routine_start = 0,
             .current_func = null,
             .ir_module = null,
@@ -363,6 +375,8 @@ pub const BytecodeEmitter = struct {
         self.stack_ptr_value_ids.deinit();
         self.indirect_fields.deinit();
         self.derived_stack_ptrs.deinit();
+        self.ptr_to_struct_local_allocas.deinit();
+        self.dynamic_stack_ptr_sources.deinit();
         self.reg_alloc.deinit();
         self.spilled_values.deinit();
         // Free escape analysis results if any
@@ -595,6 +609,8 @@ pub const BytecodeEmitter = struct {
         self.stack_ptr_value_ids.clearRetainingCapacity();
         self.indirect_fields.clearRetainingCapacity();
         self.derived_stack_ptrs.clearRetainingCapacity();
+        self.ptr_to_struct_local_allocas.clearRetainingCapacity();
+        self.dynamic_stack_ptr_sources.clearRetainingCapacity();
         self.value_consts.clearRetainingCapacity();
         self.reg_alloc.reset(); // Reset register allocation for new function
         self.last_result_value = null; // Reset last result tracking
@@ -1382,8 +1398,12 @@ pub const BytecodeEmitter = struct {
             } else {
                 // Check if this is a pointer-to-struct type that needs get_local_ptr
                 // This handles &struct_var expressions which need stack pointers
+                // IMPORTANT: If this value is a LOADED pointer from a ptr-to-struct local
+                // (tracked in dynamic_stack_ptr_sources), use load_local instead.
+                // The slot already contains a pointer VALUE, not an address to take.
                 const is_ptr_to_struct = value.ty == .ptr and value.ty.ptr.* == .@"struct";
-                if (is_ptr_to_struct) {
+                const is_loaded_ptr = self.dynamic_stack_ptr_sources.contains(value.id);
+                if (is_ptr_to_struct and !is_loaded_ptr) {
                     // Emit get_local_ptr to create a stack pointer
                     try self.emitOpcode(.get_local_ptr);
                     try self.emitU8(@as(u8, dest) << 4);
