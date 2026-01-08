@@ -345,7 +345,27 @@ pub const Opcode = enum(u8) {
     /// Handler reads: slot = u16 at ip, then ip += 2
     pop_arg = 0x79,
 
-    // 0x7A-0x7F reserved for future control flow opcodes
+    // ============================================
+    // Stack Pointer Operations (0x7A-0x7D)
+    // For passing pointers to stack-allocated structs
+    // ============================================
+
+    /// get_local_ptr rd, slot - rd = stack pointer to local slot
+    /// Creates a StackPtr value pointing to the specified local variable slot.
+    /// Format: [rd:4|0] [slot:16]
+    get_local_ptr = 0x7A,
+
+    /// load_indirect rd, rs, offset - rd = stack[resolve(rs).slot + offset]
+    /// Loads a value through a stack pointer with a field offset.
+    /// Format: [rd:4|rs:4] [offset:16]
+    load_indirect = 0x7B,
+
+    /// store_indirect rs_ptr, offset, rs_val - stack[resolve(rs_ptr).slot + offset] = rs_val
+    /// Stores a value through a stack pointer with a field offset.
+    /// Format: [rs_ptr:4|rs_val:4] [offset:16]
+    store_indirect = 0x7C,
+
+    // 0x7D-0x7F reserved for future stack pointer opcodes
 
     // ============================================
     // Record/Field Operations (0x80-0x8F)
@@ -936,6 +956,10 @@ pub const Opcode = enum(u8) {
             .set_error_handler => 3,
             .call, .call_external, .call_native, .call_dynamic => 3,
             .push_arg, .pop_arg => 2, // [slot:16] = 2 operand bytes
+            // Stack pointer operations
+            .get_local_ptr => 3, // [rd:4|0] [slot:16] = 1 + 2 = 3
+            .load_indirect => 3, // [rd:4|rs:4] [offset:16] = 1 + 2 = 3
+            .store_indirect => 3, // [rs_ptr:4|rs_val:4] [offset:16] = 1 + 2 = 3
             .new_record, .load_field, .store_field => 3,
             .to_fixed_string => 3,
             .debug_line => 3, // [0] [line:16] = 3 operand bytes

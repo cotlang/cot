@@ -121,15 +121,16 @@ fn allocateStructFieldSlots(e: *BytecodeEmitter, prefix: []const u8, struct_type
 /// Emit alloca instruction - allocate local variable
 pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void {
     // Debug: Log ALL alloca instructions to trace type confusion bugs
-    log.debug("emitAlloca: name={s} result.id={d} type={s} local_count={d}", .{
+    const pointee_type_str: []const u8 = if (a.ty == .ptr) @tagName(a.ty.ptr.*) else "N/A";
+    log.debug("emitAlloca: name={s} result.id={d} type={s} pointee={s} local_count={d}", .{
         a.name,
         a.result.id,
         @tagName(a.ty),
+        pointee_type_str,
         e.local_count,
     });
 
-    // Struct types always get new local slots for each instance
-    // Don't use the type's global registration - that's just layout info
+    // Struct types: check escape analysis to determine stack vs heap allocation
     if (a.ty == .@"struct") {
         // Check if this is a parameter (already registered as local)
         if (e.locals.get(a.name)) |local_info| {
@@ -139,6 +140,38 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
             return;
         }
 
+        // Check escape analysis - if local escapes, heap allocate instead
+        if (e.localNeedsHeap(a.name)) {
+            const struct_type = a.ty.@"struct";
+            log.debug("emitAlloca: struct '{s}' escapes, using heap allocation", .{a.name});
+
+            // Emit heap allocation: new_record rd, field_count
+            const dest_reg: u4 = 0;
+            e.prepareDestReg(dest_reg);
+            try e.emitOpcode(.new_record);
+            try e.emitU8((@as(u8, dest_reg) << 4) | 0);
+            try e.emitU16(@intCast(struct_type.fields.len));
+
+            // Store the heap record in a local slot
+            const slot = e.local_count;
+            e.local_count += 1;
+            try e.locals.put(a.name, .{
+                .slot = slot,
+                .is_global = false,
+            });
+            // Track as value_slots (loadable runtime value, not struct_base_slots)
+            try e.value_slots.put(a.result.id, slot);
+
+            // Store the heap record to the local slot
+            try e.emitOpcode(.store_local);
+            try e.emitU8(@as(u8, dest_reg) << 4);
+            try e.emitU8(@intCast(slot));
+
+            e.setLastResult(a.result.id, dest_reg);
+            return;
+        }
+
+        // Stack allocation (default) - allocate slots for struct fields
         const struct_type = a.ty.@"struct";
         const base_slot = e.local_count;
         // Register the struct base slot
@@ -153,6 +186,30 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
         // Allocate slots for each field, recursively handling nested structs
         try allocateStructFieldSlots(e, a.name, struct_type);
         return;
+    }
+
+    // Pointer-to-struct types: these are stack pointer parameters
+    // The callee receives a StackPtr value and accesses fields via load_indirect
+    if (a.ty == .ptr) {
+        log.debug("alloca: ptr type detected, pointee={s}", .{@tagName(a.ty.ptr.*)});
+        if (a.ty.ptr.* == .@"struct") {
+            log.debug("alloca: ptr-to-struct detected, name='{s}' stack_ptr_params.count={d}", .{
+                a.name, e.stack_ptr_params.count(),
+            });
+            // Check if this is a stack pointer parameter (already registered)
+            if (e.stack_ptr_params.get(a.name)) |ptr_slot| {
+                // Map the alloca result to the stack pointer param slot
+                // This tells emitFieldPtr to use indirect access
+                try e.value_slots.put(a.result.id, ptr_slot);
+                // Also track this value ID as a stack pointer for indirect field access
+                try e.stack_ptr_value_ids.put(a.result.id, ptr_slot);
+                log.debug("alloca ptr-to-struct param: name={s} result.id={d} ptr_slot={d}", .{
+                    a.name, a.result.id, ptr_slot,
+                });
+                return;
+            }
+            // Non-param pointer-to-struct: treat as regular pointer
+        }
     }
 
     // Array types: u8 arrays (DBL buffers) use single slot, other arrays use multiple slots
@@ -225,6 +282,28 @@ pub fn emitLoad(e: *BytecodeEmitter, l: ir.Instruction.Load) EmitError!void {
     if (e.array_ptr_targets.get(l.ptr.id)) |array_slot| {
         try e.array_ptr_targets.put(l.result.id, array_slot);
         debug.print(.emit, "load: propagate array ptr id={d} -> result={d} array_slot={d}", .{ l.ptr.id, l.result.id, array_slot });
+    }
+
+    // Propagate stack pointer value ID tracking through loads
+    // When loading from a stack pointer param's alloca, the loaded value is also a stack pointer
+    log.debug("load: checking stack_ptr_value_ids for ptr.id={d}", .{l.ptr.id});
+    if (e.stack_ptr_value_ids.get(l.ptr.id)) |ptr_slot| {
+        try e.stack_ptr_value_ids.put(l.result.id, ptr_slot);
+        try e.value_slots.put(l.result.id, ptr_slot);
+        log.debug("load: propagate stack_ptr_value_ids ptr.id={d} -> result.id={d} ptr_slot={d}", .{
+            l.ptr.id, l.result.id, ptr_slot,
+        });
+    }
+
+    // Propagate indirect field access info through loads
+    // When loading from a field_ptr result that's in indirect_fields, propagate the info
+    if (e.indirect_fields.get(l.ptr.id)) |info| {
+        try e.indirect_fields.put(l.result.id, info);
+        log.debug("load: propagate indirect_fields ptr.id={d} -> result.id={d} ptr_slot={d} field_offset={d}", .{
+            l.ptr.id, l.result.id, info.ptr_slot, info.field_offset,
+        });
+        // Note: we don't put this in value_slots - it will be handled by getValueInReg's indirect_fields check
+        return; // No bytecode emitted for loads from indirect fields
     }
 
     // Propagate struct_base_slots - when loading from a struct pointer,
@@ -308,6 +387,31 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
         } else {
             try e.emitRegStoreLocal(0, @intCast(fv_info.base_slot));
         }
+        return;
+    }
+
+    // Check if this is an indirect field store (storing through stack pointer)
+    if (e.indirect_fields.get(s.ptr.id)) |info| {
+        debug.print(.emit, "store: indirect field ptr_slot={d} field_offset={d}", .{
+            info.ptr_slot, info.field_offset,
+        });
+        // Load the value to store into r0
+        try e.emitValueToReg(s.value, 0);
+        // Load the stack pointer value into r1
+        if (info.ptr_slot < 256) {
+            try e.emitOpcode(.load_local);
+            try e.emitU8(1 << 4); // r1
+            try e.emitU8(@intCast(info.ptr_slot));
+        } else {
+            try e.emitOpcode(.load_local16);
+            try e.emitU8(1 << 4); // r1
+            try e.emitU16(info.ptr_slot);
+        }
+        // Emit store_indirect: rs_ptr, offset, rs_val
+        // Format: [opcode] [rs_ptr:4|rs_val:4] [offset:16]
+        try e.emitOpcode(.store_indirect);
+        try e.emitU8((1 << 4) | 0); // r1 (ptr), r0 (val)
+        try e.emitU16(info.field_offset);
         return;
     }
 
@@ -451,7 +555,39 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
 /// Emit field_ptr instruction
 /// Uses getFieldOffset to properly calculate slot offset for nested structs.
 pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!void {
-    // First check struct_base_slots (for stack-allocated structs from alloca),
+    log.debug("emitFieldPtr: struct_ptr.id={d} checking stack_ptr_value_ids (count={d})", .{
+        fp.struct_ptr.id, e.stack_ptr_value_ids.count(),
+    });
+    // Check if this is accessing through a stack pointer parameter
+    // If so, we need to use indirect field access (load_indirect/store_indirect)
+    if (e.stack_ptr_value_ids.get(fp.struct_ptr.id)) |ptr_slot| {
+        log.debug("emitFieldPtr: FOUND in stack_ptr_value_ids! ptr_slot={d}", .{ptr_slot});
+        // Get the struct type to calculate field offset
+        const struct_type: ?*const ir.StructType = if (fp.struct_ptr.ty == .@"struct")
+            fp.struct_ptr.ty.@"struct"
+        else if (fp.struct_ptr.ty == .ptr and fp.struct_ptr.ty.ptr.* == .@"struct")
+            fp.struct_ptr.ty.ptr.*.@"struct"
+        else
+            null;
+
+        const field_offset: u32 = if (struct_type) |st|
+            getFieldOffset(st, fp.field_index)
+        else
+            fp.field_index;
+
+        // Record indirect field access info for this result
+        // When loading this value, we'll emit load_indirect instead of load_local
+        try e.indirect_fields.put(fp.result.id, .{
+            .ptr_slot = ptr_slot,
+            .field_offset = @intCast(field_offset),
+        });
+        debug.print(.emit, "field_ptr (indirect): struct_ptr.id={d} ptr_slot={d} field_offset={d} -> result.id={d}", .{
+            fp.struct_ptr.id, ptr_slot, field_offset, fp.result.id,
+        });
+        return;
+    }
+
+    // Direct field access - First check struct_base_slots (for stack-allocated structs from alloca),
     // then fall back to value_slots (for other pointer sources like parameters)
     const struct_slot = e.struct_base_slots.get(fp.struct_ptr.id) orelse
         e.value_slots.get(fp.struct_ptr.id) orelse {
@@ -804,11 +940,11 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
                             try e.emitU8(@intCast(slot));
                         }
                     }
-                    // Second pass: push overflow slots (16+) to arg stack
+                    // Second pass: push overflow slots (15+) to arg stack
                     // These will be popped by the caller after the call returns
                     for (0..slot_count) |field_idx| {
                         const reg: u8 = reg_offset + @as(u8, @intCast(field_idx));
-                        if (reg >= 16) {
+                        if (reg >= 15) {
                             const slot: u16 = @intCast(local_info.slot + field_idx);
                             // push_arg format: [opcode] [slot:16] - 3 bytes total
                             try e.emitOpcode(.push_arg);
@@ -1126,12 +1262,13 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     }
 
     // Load arguments to registers
-    // For struct arguments by VALUE (is_ref=false), we expand all fields into consecutive registers.
-    // For struct arguments by REFERENCE (is_ref=true, was *struct), we pass just the base slot.
-    // This is semantically correct: *struct means "reference to struct", not "copy of struct".
+    // For struct arguments, we check if the callee expects a pointer-to-struct parameter:
+    // - Pointer-to-struct param (*MyStruct): Pass a single StackPtr value via get_local_ptr.
+    //   This is the standard mechanism for method calls (self: *MyStruct).
+    // - Direct struct param with is_ref (DBL types): Expand all fields for copy-back semantics.
+    // - Direct struct param without callee info: Fall back to field expansion.
     //
-    // We need the callee's signature to know which params are by-ref.
-    // Get callee function to check is_ref on params (use optional to handle missing case)
+    // Get callee function to determine parameter types
     const callee_func_opt = blk: {
         if (e.ir_module) |ir_mod| {
             if (routine_idx < ir_mod.functions.items.len) {
@@ -1143,7 +1280,7 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
     // First pass: calculate total slots needed to determine if we need stack overflow
     var total_slots: usize = 0;
-    for (c.args) |arg| {
+    for (c.args, 0..) |arg, arg_idx| {
         // Check for struct type by value (NOT pointer-to-struct).
         // A pointer like *Expr is just 8 bytes regardless of what it points to.
         // Only actual struct values need multiple slots.
@@ -1152,8 +1289,29 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
         else
             null;
         if (struct_type_opt) |struct_type| {
-            const slot_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
-            total_slots += slot_count;
+            // Check if we'll use stack pointer for this arg (single slot instead of expansion)
+            const callee_expects_ptr = blk: {
+                if (callee_func_opt) |callee_func| {
+                    if (arg_idx < callee_func.signature.params.len) {
+                        const param_ty = callee_func.signature.params[arg_idx].ty;
+                        if (param_ty == .ptr and param_ty.ptr.* == .@"struct") {
+                            // Also check it's not is_ref (DBL needs expansion)
+                            if (!callee_func.signature.params[arg_idx].is_ref) {
+                                // Check if we have the struct in local slots
+                                const has_slot = e.value_slots.contains(arg.id) or e.struct_base_slots.contains(arg.id);
+                                if (has_slot) break :blk true;
+                            }
+                        }
+                    }
+                }
+                break :blk false;
+            };
+            if (callee_expects_ptr) {
+                total_slots += 1; // Stack pointer is a single value
+            } else {
+                const slot_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
+                total_slots += slot_count;
+            }
         } else {
             total_slots += 1;
         }
@@ -1171,13 +1329,34 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     // These will be copied to callee's local slots 15+ by the call handler
     if (stack_argc > 0) {
         var slot_idx: usize = 0; // Track absolute slot position across all args
-        for (c.args) |arg| {
+        for (c.args, 0..) |arg, arg_idx| {
             // Check for struct type by value (NOT pointer-to-struct, same as first pass)
             const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
                 arg.ty.@"struct"
             else
                 null;
-            const slot_count: usize = if (struct_type_opt) |st|
+
+            // Check if we're using stack pointer for this arg (consistent with first pass)
+            const using_stack_ptr = blk: {
+                if (struct_type_opt) |_| {
+                    if (callee_func_opt) |callee_func| {
+                        if (arg_idx < callee_func.signature.params.len) {
+                            const param_ty = callee_func.signature.params[arg_idx].ty;
+                            if (param_ty == .ptr and param_ty.ptr.* == .@"struct") {
+                                if (!callee_func.signature.params[arg_idx].is_ref) {
+                                    const has_slot = e.value_slots.contains(arg.id) or e.struct_base_slots.contains(arg.id);
+                                    if (has_slot) break :blk true;
+                                }
+                            }
+                        }
+                    }
+                }
+                break :blk false;
+            };
+
+            const slot_count: usize = if (using_stack_ptr)
+                1 // Stack pointer is a single value
+            else if (struct_type_opt) |st|
                 getSlotCount(ir.Type{ .@"struct" = st })
             else
                 1;
@@ -1187,19 +1366,30 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                 const abs_slot = slot_idx + field_offset;
                 if (abs_slot >= 15) {
                     // This slot goes to stack
-                    // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
-                    const arg_base_slot = e.value_slots.get(arg.id) orelse e.struct_base_slots.get(arg.id);
-                    if (arg_base_slot) |base_slot| {
-                        const src_slot = base_slot + field_offset;
-                        // push_arg format: [opcode] [slot:16] - 3 bytes total
-                        try e.emitOpcode(.push_arg);
-                        try e.emitU16(@intCast(src_slot));
-                    } else {
-                        // Value not in slot - load to temp register and push
-                        try e.emitValueToReg(arg, 0);
+                    if (using_stack_ptr) {
+                        // Stack pointer - emit get_local_ptr and push
+                        const base_slot = e.value_slots.get(arg.id) orelse e.struct_base_slots.get(arg.id).?;
+                        try e.emitOpcode(.get_local_ptr);
+                        try e.emitU8(0 << 4); // temp register r0
+                        try e.emitU16(@intCast(base_slot));
                         try e.emitOpcode(.push_arg_reg);
                         try e.emitU8(0 << 4);
                         try e.emitU8(0);
+                    } else {
+                        // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
+                        const arg_base_slot = e.value_slots.get(arg.id) orelse e.struct_base_slots.get(arg.id);
+                        if (arg_base_slot) |base_slot| {
+                            const src_slot = base_slot + field_offset;
+                            // push_arg format: [opcode] [slot:16] - 3 bytes total
+                            try e.emitOpcode(.push_arg);
+                            try e.emitU16(@intCast(src_slot));
+                        } else {
+                            // Value not in slot - load to temp register and push
+                            try e.emitValueToReg(arg, 0);
+                            try e.emitOpcode(.push_arg_reg);
+                            try e.emitU8(0 << 4);
+                            try e.emitU8(0);
+                        }
                     }
                 }
             }
@@ -1221,7 +1411,22 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
             }
             break :blk false;
         };
-        _ = is_ref_param; // Used for writeback logic after call
+
+        // Check if callee expects a pointer-to-struct parameter
+        // If so, we should pass a stack pointer instead of expanding fields
+        const callee_expects_ptr_to_struct = blk: {
+            if (callee_func_opt) |callee_func| {
+                if (arg_idx < callee_func.signature.params.len) {
+                    const param_ty = callee_func.signature.params[arg_idx].ty;
+                    if (param_ty == .ptr) {
+                        if (param_ty.ptr.* == .@"struct") {
+                            break :blk true;
+                        }
+                    }
+                }
+            }
+            break :blk false;
+        };
 
         // Check for struct type by value (NOT pointer-to-struct)
         // A pointer like *Expr is passed as a single 8-byte value.
@@ -1246,7 +1451,46 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                 arg_idx, value_slot, struct_slot,
             });
             const struct_base_slot = value_slot orelse struct_slot;
-            if (struct_base_slot) |base_slot| {
+
+            // If callee expects a pointer-to-struct and this is a LOCAL STACK-ALLOCATED struct,
+            // emit get_local_ptr instead of expanding fields.
+            // This allows passing large structs efficiently as a single value.
+            // IMPORTANT: Only use stack pointer when struct_base_slots is set (actual stack struct).
+            // value_slots alone means it's a heap pointer stored in a slot - pass it directly.
+            // Exception: DBL records with is_ref need field expansion for copy-back semantics.
+            const use_stack_ptr = callee_expects_ptr_to_struct and !is_ref_param and struct_slot != null;
+
+            // Check if this is a heap pointer stored in value_slots (not a stack-allocated struct)
+            // Heap pointers should be passed as single values, not expanded
+            const is_heap_ptr = callee_expects_ptr_to_struct and value_slot != null and struct_slot == null;
+
+            if (is_heap_ptr) {
+                // Heap record pointer - load as single value
+                log.debug("emitUserCall: heap pointer arg[{d}] at slot={d}", .{ arg_idx, value_slot.? });
+                if (reg_offset < 15) {
+                    if (value_slot.? < 256) {
+                        try e.emitOpcode(.load_local);
+                        try e.emitU8(reg_offset << 4);
+                        try e.emitU8(@intCast(value_slot.?));
+                    } else {
+                        try e.emitOpcode(.load_local16);
+                        try e.emitU8(reg_offset << 4);
+                        try e.emitU16(value_slot.?);
+                    }
+                    reg_offset += 1;
+                }
+            } else if (use_stack_ptr) {
+                const base_slot = struct_base_slot.?;
+                log.debug("emitUserCall: using stack pointer for struct arg[{d}] base_slot={d}", .{
+                    arg_idx, base_slot,
+                });
+                // Emit get_local_ptr to create a stack pointer value
+                // Format: [rd:4|0] [slot:16]
+                try e.emitOpcode(.get_local_ptr);
+                try e.emitU8(reg_offset << 4);
+                try e.emitU16(@intCast(base_slot));
+                reg_offset += 1;
+            } else if (struct_base_slot) |base_slot| {
                 log.debug("emitUserCall: loading struct fields from base_slot={d} to regs starting at r{d}", .{
                     base_slot, reg_offset,
                 });
@@ -1282,12 +1526,21 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     }
 
     try e.emitOpcode(.call);
-    // Format: [argc:4|stack_argc:4] [routine_idx:16]
-    // argc = number of register args (0-15), stack_argc = number of stack args
-    try e.emitU8((reg_argc << 4) | stack_argc);
-    try e.emitU16(routine_idx);
+    // Format: [argc:4|stack_argc_low:4] [routine_idx:16] [stack_argc_ext:16 if stack_argc_low==15]
+    // argc = number of register args (0-15)
+    // If stack_argc_low < 15: stack_argc = stack_argc_low
+    // If stack_argc_low == 15: stack_argc = next 16-bit value (extended format for >14 overflow args)
+    if (stack_argc <= 14) {
+        try e.emitU8((reg_argc << 4) | stack_argc);
+        try e.emitU16(routine_idx);
+    } else {
+        // Extended format: use 15 as sentinel, then emit actual stack_argc as u16 after routine_idx
+        try e.emitU8((reg_argc << 4) | 0x0F);
+        try e.emitU16(routine_idx);
+        try e.emitU16(stack_argc);
+    }
 
-    // Emit store-back for ref parameters
+    // Emit store-back for ref parameters and pointer-to-struct parameters
     // For struct parameters, we need to write back ALL fields, not just the first slot
     // For large structs (>16 slots), first 16 come from registers, rest from arg stack
     if (e.ir_module) |ir_mod| {
@@ -1298,6 +1551,7 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                 // Determine how many slots/registers this parameter uses (flattened for nested structs)
                 const slot_count: usize = getSlotCount(param.ty);
 
+                // Write back ONLY for is_ref parameters (DBL types with copy-back semantics)
                 if (param.is_ref and param_idx < c.args.len) {
                     if (e.value_slots.get(c.args[param_idx].id)) |base_slot| {
                         // First: write back slots 0-15 from registers
@@ -1317,13 +1571,13 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                                 }
                             }
                         }
-                        // Second: pop overflow slots (16+) from arg stack
+                        // Second: pop overflow slots (15+) from arg stack
                         // Callee pushed these in forward order, so we pop in reverse order
                         // to get them into the correct destination slots
                         var overflow_count: usize = 0;
                         for (0..slot_count) |field_idx| {
                             const reg = param_reg_offset + field_idx;
-                            if (reg >= 16) overflow_count += 1;
+                            if (reg >= 15) overflow_count += 1;
                         }
                         if (overflow_count > 0) {
                             // Pop in reverse order (stack is LIFO)
@@ -1331,7 +1585,7 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                             while (i > 0) {
                                 i -= 1;
                                 const reg = param_reg_offset + i;
-                                if (reg >= 16) {
+                                if (reg >= 15) {
                                     const slot = base_slot + i;
                                     // pop_arg format: [opcode] [slot:16] - 3 bytes total
                                     try e.emitOpcode(.pop_arg);
@@ -1926,6 +2180,8 @@ pub fn emitParseDecimal(e: *BytecodeEmitter, pd: ir.Instruction.ParseDecimal) Em
 /// Emit map_new instruction
 pub fn emitMapNew(e: *BytecodeEmitter, mn: ir.Instruction.MapNew) EmitError!void {
     const dest_reg: u4 = 0;
+    // Spill any existing value in r0 before overwriting
+    e.prepareDestReg(dest_reg);
     try e.emitOpcode(.map_new);
     try e.emitU8((@as(u8, dest_reg) << 4) | (mn.flags & 0x0F));
     try e.emitU8(0);
@@ -2090,6 +2346,8 @@ pub fn emitMapKeyAt(e: *BytecodeEmitter, mk: ir.Instruction.MapKeyAt) EmitError!
 /// Emit list_new instruction
 pub fn emitListNew(e: *BytecodeEmitter, ln: ir.Instruction.ListNew) EmitError!void {
     const dest_reg: u4 = 0;
+    // Spill any existing value in r0 before overwriting
+    e.prepareDestReg(dest_reg);
     try e.emitOpcode(.list_new);
     try e.emitU8((@as(u8, dest_reg) << 4) | 0);
     try e.emitU8(0);
@@ -2556,6 +2814,8 @@ pub fn emitCallTraitMethod(e: *BytecodeEmitter, c: ir.Instruction.CallTraitMetho
 /// Format: [opcode] [rd:4|0:4] [field_count:16]
 pub fn emitHeapAlloc(e: *BytecodeEmitter, h: ir.Instruction.HeapAlloc) EmitError!void {
     const dest_reg: u4 = 0;
+    // Spill any existing value in r0 before overwriting
+    e.prepareDestReg(dest_reg);
 
     // Emit: new_record rd, field_count
     try e.emitOpcode(.new_record);

@@ -1375,8 +1375,10 @@ pub const Lowerer = struct {
             // Lower type with substitutions active
             const param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // Track ref parameters - keep pointer types for type checking correctness
-            const is_ref = param_direction_raw != 0 or param_type == .ptr;
+            // NOTE: We preserve the declared type (*struct(T)) for type checking.
+            // The is_ref flag indicates bytecode should use copy-back semantics.
+            // Only DBL-specific types (implied_decimal, fixed_decimal, array of u8) need this.
+            const is_ref = param_direction_raw != 0 or ir.isDblRefType(param_type);
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -1949,19 +1951,12 @@ pub const Lowerer = struct {
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
-            var param_type = try self.lowerTypeIdx(param_type_idx);
+            const param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // For mutable self parameter only (*StructType), convert to value type with is_ref
-            // This enables pass-by-reference semantics for the receiver
-            // Do NOT apply to other pointer-to-struct parameters - they should stay as pointers
-            var is_ref = param_direction_raw != 0;
-            if (std.mem.eql(u8, param_name, "self") and param_type == .ptr) {
-                const pointee = param_type.ptr.*;
-                if (pointee == .@"struct") {
-                    param_type = pointee;
-                    is_ref = true;
-                }
-            }
+            // NOTE: We preserve the declared type (*struct(T)) for type checking.
+            // The is_ref flag indicates bytecode should use copy-back semantics.
+            // Only DBL-specific types (implied_decimal, fixed_decimal, array of u8) need this.
+            const is_ref = param_direction_raw != 0 or ir.isDblRefType(param_type);
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -2012,19 +2007,12 @@ pub const Lowerer = struct {
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
-            var param_type = try self.lowerTypeIdx(param_type_idx);
+            const param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // For mutable self parameter only (*StructType), convert to value type with is_ref
-            // This enables pass-by-reference semantics for the receiver
-            // Do NOT apply to other pointer-to-struct parameters - they should stay as pointers
-            var is_ref = param_direction_raw != 0;
-            if (std.mem.eql(u8, param_name, "self") and param_type == .ptr) {
-                const pointee = param_type.ptr.*;
-                if (pointee == .@"struct") {
-                    param_type = pointee;
-                    is_ref = true;
-                }
-            }
+            // NOTE: We preserve the declared type (*struct(T)) for type checking.
+            // The is_ref flag indicates bytecode should use copy-back semantics.
+            // Only DBL-specific types (implied_decimal, fixed_decimal, array of u8) need this.
+            const is_ref = param_direction_raw != 0 or ir.isDblRefType(param_type);
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -2535,10 +2523,11 @@ pub const Lowerer = struct {
             if (param_name.len == 0) continue;
             const param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // Track if this is a ref parameter for bytecode write-back
-            // Note: We keep the original pointer type for type checking correctness.
-            // The is_ref flag is used by bytecode emission for calling convention.
-            const is_ref = param_direction_raw != 0 or param_type == .ptr;
+            // Track if this is a ref parameter for bytecode write-back.
+            // NOTE: We preserve the declared type (*struct(T)) for type checking.
+            // The is_ref flag indicates bytecode should use copy-back semantics.
+            // Only DBL-specific types (implied_decimal, fixed_decimal, array of u8) need this.
+            const is_ref = param_direction_raw != 0 or ir.isDblRefType(param_type);
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -2622,20 +2611,12 @@ pub const Lowerer = struct {
 
             const param_name = self.strings.get(param_name_id);
             if (param_name.len == 0) continue;
-            var param_type = try self.lowerTypeIdx(param_type_idx);
+            const param_type = try self.lowerTypeIdx(param_type_idx);
 
-            // For mutable self parameter only (*StructType), convert to value type with is_ref
-            // This enables pass-by-reference semantics for the receiver
-            // Do NOT apply to other pointer-to-struct parameters - they should stay as pointers
-            var is_ref = param_direction_raw != 0;
-            if (std.mem.eql(u8, param_name, "self") and param_type == .ptr) {
-                const pointee = param_type.ptr.*;
-                if (pointee == .@"struct") {
-                    // Convert *struct(T) to struct(T) with is_ref=true
-                    param_type = pointee;
-                    is_ref = true;
-                }
-            }
+            // NOTE: We preserve the declared type (*struct(T)) for type checking.
+            // The is_ref flag indicates bytecode should use copy-back semantics.
+            // Only DBL-specific types (implied_decimal, fixed_decimal, array of u8) need this.
+            const is_ref = param_direction_raw != 0 or ir.isDblRefType(param_type);
 
             try params.append(self.allocator, .{
                 .name = param_name,
@@ -2783,7 +2764,7 @@ pub const Lowerer = struct {
         switch (tag) {
             .assignment => {
                 try self.emitDebugLine(loc);
-                const ir_loc: ir.SourceLoc = .{ .line = loc.line, .column = loc.column };
+                const ir_loc = lower_expr.toIrLocForStmt(self, stmt_idx);
                 try lower_stmt.lowerAssignment(self, data, ir_loc);
             },
             .if_stmt => {

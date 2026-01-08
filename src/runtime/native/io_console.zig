@@ -165,5 +165,10 @@ fn writeValue(writer: anytype, val: Value) void {
                 writer.print("<object:{d}>", .{val.objectTypeId() orelse 0}) catch {};
             }
         },
+        .stack_ptr => {
+            if (val.asStackPtr()) |sp| {
+                writer.print("<stack_ptr:frame={d},slot={d}>", .{ sp.frame_offset, sp.slot }) catch {};
+            }
+        },
     }
 }

@@ -200,6 +200,15 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
                 }
                 break :blk .incompatible;
             },
+            // heap_record (from `new Foo{}`) is compatible with *struct(Foo)
+            .heap_record => |value_struct| blk: {
+                if (target_ptr.* == .@"struct") {
+                    if (std.mem.eql(u8, target_ptr.@"struct".name, value_struct.name)) {
+                        break :blk .compatible;
+                    }
+                }
+                break :blk .incompatible;
+            },
             else => .incompatible,
         },
 
@@ -251,6 +260,13 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
 
         .@"struct" => |target_struct| switch (value_deref) {
             .@"struct" => |value_struct| blk: {
+                if (std.mem.eql(u8, target_struct.name, value_struct.name)) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            // heap_record (from `new Foo{}`) is compatible with struct(Foo)
+            .heap_record => |value_struct| blk: {
                 if (std.mem.eql(u8, target_struct.name, value_struct.name)) {
                     break :blk .compatible;
                 }

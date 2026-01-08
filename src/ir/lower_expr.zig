@@ -52,10 +52,44 @@ const TypeTag = ast.TypeTag;
 // ============================================================================
 
 /// Convert AST SourceLoc to IR SourceLoc for error reporting
+/// Note: This does not include file path - use toIrLocWithFile for that
 pub fn toIrLoc(loc: SourceLoc) ir.SourceLoc {
     return .{
         .line = loc.line,
         .column = loc.column,
+    };
+}
+
+/// Convert AST expression to IR SourceLoc with file path for accurate error reporting
+/// This should be used when the expression might come from an imported file
+pub fn toIrLocForExpr(l: *const Lowerer, expr_idx: ExprIdx) ir.SourceLoc {
+    const loc = l.store.exprLoc(expr_idx);
+    const file_id = l.store.exprFileId(expr_idx);
+    const file_path = if (file_id != .unknown)
+        l.store.getFilePath(file_id)
+    else
+        l.source_file;
+
+    return .{
+        .line = loc.line,
+        .column = loc.column,
+        .file_path = file_path,
+    };
+}
+
+/// Convert AST statement to IR SourceLoc with file path for accurate error reporting
+pub fn toIrLocForStmt(l: *const Lowerer, stmt_idx: StmtIdx) ir.SourceLoc {
+    const loc = l.store.stmtLoc(stmt_idx);
+    const file_id = l.store.stmtFileId(stmt_idx);
+    const file_path = if (file_id != .unknown)
+        l.store.getFilePath(file_id)
+    else
+        l.source_file;
+
+    return .{
+        .line = loc.line,
+        .column = loc.column,
+        .file_path = file_path,
     };
 }
 
@@ -1122,7 +1156,25 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
         if (l.enum_types.get(object_name)) |variants| {
             // Look up the variant value
             if (variants.get(field_name)) |variant_value| {
-                // Return constant integer value
+                // Check if this enum is a sum type
+                if (l.module.enums.get(object_name)) |enum_def| {
+                    if (enum_def.is_sum_type) {
+                        // For sum types, always emit variant_construct (even for no-payload variants)
+                        // This ensures type consistency: all variants return Variant type
+                        const result = func.newValue(.variant);
+                        const loc = l.store.exprLoc(expr_idx);
+                        try l.emit(.{
+                            .variant_construct = .{
+                                .tag = @intCast(variant_value),
+                                .payload = &[_]ir.Value{}, // Empty payload for no-payload variants
+                                .result = result,
+                                .loc = toIrLoc(loc),
+                            },
+                        });
+                        return result;
+                    }
+                }
+                // Simple enum (not a sum type) - return constant integer value
                 const result = func.newValue(.i64);
                 try l.emit(.{
                     .iconst = .{
@@ -2822,8 +2874,10 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     return LowerError.OutOfMemory;
                 };
 
-                // Pass self as a single struct value (not expanded into fields)
-                // The function signature expects one parameter of struct type
+                // For struct instance method calls, pass self as a single struct value.
+                // The bytecode emitter will expand the struct if needed.
+                // Note: This matches the callee's expectation of receiving self as a value
+                // that can be accessed via field offsets.
                 try method_args.append(l.allocator, object_val);
 
                 // Then the explicit arguments
@@ -2867,7 +2921,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer method_args.deinit(l.allocator);
 
-                // Pass self as a single struct value
+                // For struct instance method calls, pass self as a single struct value.
                 try method_args.append(l.allocator, object_val);
 
                 // Then the explicit arguments
@@ -2911,7 +2965,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer method_args.deinit(l.allocator);
 
-                // Pass self as first argument
+                // For struct instance method calls, pass self as a single struct value.
                 try method_args.append(l.allocator, object_val);
 
                 // Then explicit arguments
@@ -4286,8 +4340,10 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         else
             ir.Type.void;
 
-        // is_ref: 0 = by value, non-zero = by reference
-        const is_ref = param_direction_raw != 0;
+        // NOTE: We preserve the declared type (*struct(T)) for type checking.
+        // The is_ref flag indicates bytecode should use copy-back semantics.
+        // Only DBL-specific types (implied_decimal, fixed_decimal, array of u8) need this.
+        const is_ref = param_direction_raw != 0 or ir.isDblRefType(param_type);
 
         params.append(l.allocator, .{
             .name = param_name,

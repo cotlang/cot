@@ -136,7 +136,8 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
 fn checkStore(self: *Self, store: ir.Instruction.Store) void {
     const target_ty = derefType(store.ptr.ty);
     const value_ty = store.value.ty;
-    const loc = locToRange(store.loc);
+    const loc_info = locToInfo(store.loc);
+    const error_file = loc_info.file_path orelse self.file_path;
 
     // Debug logging to help diagnose type mismatches (enable with COT_DEBUG_TYPE_CHECK=1)
     if (target_ty == .void and value_ty != .void) {
@@ -166,8 +167,8 @@ fn checkStore(self: *Self, store: ir.Instruction.Store) void {
             var value_buf: [64]u8 = undefined;
             self.collector.addWarning(
                 .W003_implicit_conversion,
-                self.file_path,
-                loc,
+                error_file,
+                loc_info.range,
                 "assignment may lose precision: '{s}' to '{s}'",
                 .{
                     type_rules.formatType(value_ty, &value_buf),
@@ -181,8 +182,8 @@ fn checkStore(self: *Self, store: ir.Instruction.Store) void {
             var value_buf: [64]u8 = undefined;
             self.collector.addError(
                 .E200_type_mismatch,
-                self.file_path,
-                loc,
+                error_file,
+                loc_info.range,
                 "cannot assign '{s}' to '{s}'",
                 .{
                     type_rules.formatType(value_ty, &value_buf),
@@ -366,7 +367,27 @@ fn checkArrayStore(self: *Self, arr: ir.Instruction.ArrayStore) void {
     }
 }
 
-/// Convert IR source location to diagnostic SourceRange
+/// Location info extracted from IR source location
+const LocInfo = struct {
+    range: SourceRange,
+    file_path: ?[]const u8,
+};
+
+/// Convert IR source location to diagnostic SourceRange and optional file_path
+fn locToInfo(loc: ?ir.SourceLoc) LocInfo {
+    if (loc) |l| {
+        return .{
+            .range = SourceRange.fromLoc(l.line, l.column),
+            .file_path = l.file_path,
+        };
+    }
+    return .{
+        .range = SourceRange.none,
+        .file_path = null,
+    };
+}
+
+/// Convert IR source location to diagnostic SourceRange (legacy, no file_path)
 fn locToRange(loc: ?ir.SourceLoc) SourceRange {
     if (loc) |l| {
         return SourceRange.fromLoc(l.line, l.column);

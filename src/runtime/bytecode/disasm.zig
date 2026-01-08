@@ -457,6 +457,33 @@ pub const Disassembler = struct {
             },
 
             // ============================================
+            // Stack Pointer Operations (0x7A-0x7D)
+            // ============================================
+
+            // get_local_ptr rd, slot - [rd:4|0] [slot:16]
+            .get_local_ptr => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const slot: u16 = @bitCast(operands[1..3].*);
+                try self.writer.print(" r{}, slot#{}", .{ rd, slot });
+            },
+
+            // load_indirect rd, rs, offset - [rd:4|rs:4] [offset:16]
+            .load_indirect => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const rs: u4 = @truncate(operands[0] & 0xF);
+                const offset: u16 = @bitCast(operands[1..3].*);
+                try self.writer.print(" r{}, r{}, +{}", .{ rd, rs, offset });
+            },
+
+            // store_indirect rs_ptr, offset, rs_val - [rs_ptr:4|rs_val:4] [offset:16]
+            .store_indirect => {
+                const rs_ptr: u4 = @truncate(operands[0] >> 4);
+                const rs_val: u4 = @truncate(operands[0] & 0xF);
+                const offset: u16 = @bitCast(operands[1..3].*);
+                try self.writer.print(" r{}, +{}, r{}", .{ rs_ptr, offset, rs_val });
+            },
+
+            // ============================================
             // Record/Field Operations (0x80-0x8F)
             // ============================================
 

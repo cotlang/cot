@@ -109,6 +109,10 @@ pub var last_error: ?RuntimeError = null;
 /// This ensures the message slice remains valid after the function returns
 var error_message_buf: [128]u8 = undefined;
 
+/// Static buffer for error details (register/value info)
+var error_detail_buf: [128]u8 = undefined;
+var error_detail_len: usize = 0;
+
 /// Global crash context accessible from signal handlers
 pub var crash_context: CrashContext = .{};
 
@@ -372,8 +376,8 @@ pub const VM = struct {
             // Retain new value first (handles case where new == old)
             arc.retain(value);
 
-            // Release old value
-            arc.release(old, self.allocator);
+            // Release old value (use valueAllocator() because objects were allocated from the arena)
+            arc.release(old, self.valueAllocator());
         }
 
         // Store new value
@@ -390,8 +394,8 @@ pub const VM = struct {
             // Retain new value first (handles case where new == old)
             arc.retain(value);
 
-            // Release old value
-            arc.release(old, self.allocator);
+            // Release old value (use valueAllocator() because objects were allocated from the arena)
+            arc.release(old, self.valueAllocator());
         }
 
         // Store new value
@@ -425,7 +429,8 @@ pub const VM = struct {
     pub fn releaseStackRange(self: *Self, start: usize, end: usize) void {
         for (start..end) |i| {
             if (self.runtime_arc_enabled) {
-                arc.release(self.stack[i], self.allocator);
+                // Use valueAllocator() because objects were allocated from the arena (heap)
+                arc.release(self.stack[i], self.valueAllocator());
             }
             self.stack[i] = Value.null_val;
         }
@@ -437,7 +442,8 @@ pub const VM = struct {
     pub fn releaseAllRegisters(self: *Self) void {
         for (&self.registers) |*reg| {
             if (self.runtime_arc_enabled) {
-                arc.release(reg.*, self.allocator);
+                // Use valueAllocator() because objects were allocated from the arena (heap)
+                arc.release(reg.*, self.valueAllocator());
             }
             reg.* = Value.null_val;
         }
@@ -785,9 +791,10 @@ pub const VM = struct {
         self.releaseAllRegisters();
         self.releaseStackRange(0, self.sp);
 
-        // Release global values
+        // Release global values (use valueAllocator() because objects were allocated from the arena)
+        const val_alloc = self.valueAllocator();
         for (self.globals.items) |val| {
-            arc.release(val, self.allocator);
+            arc.release(val, val_alloc);
         }
         self.globals.deinit(self.allocator);
 
@@ -850,10 +857,24 @@ pub const VM = struct {
         return .{ .ip = @intCast(self.ip), .routine = current_routine };
     }
 
+    /// Set error detail info into static buffer before calling fail()
+    /// Use this for runtime-determined info like register numbers and types
+    pub fn setErrorDetail(self: *Self, reg_name: []const u8, type_name: []const u8) void {
+        _ = self;
+        const result = std.fmt.bufPrint(&error_detail_buf, "{s} contains {s}", .{ reg_name, type_name }) catch {
+            error_detail_len = 0;
+            return;
+        };
+        error_detail_len = result.len;
+    }
+
     /// Create a rich error with full context and return the VMError
     /// This should be used instead of bare `return VMError.X` to capture context
     pub fn fail(self: *Self, err: VMError, message: []const u8) VMError {
-        return self.failWithDetail(err, message, null);
+        // Use static detail buffer if it was set
+        const detail: ?[]const u8 = if (error_detail_len > 0) error_detail_buf[0..error_detail_len] else null;
+        error_detail_len = 0; // Clear for next use
+        return self.failWithDetail(err, message, detail);
     }
 
     /// Create a rich error with full context and additional detail
@@ -1284,6 +1305,7 @@ pub const VM = struct {
             .record_ref => return "<record>",
             .handle => return "<handle>",
             .object => return "<object>",
+            .stack_ptr => return "<stack_ptr>",
         }
     }
 
@@ -1378,6 +1400,11 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.push_arg)] = &vm_opcodes.op_push_arg;
         table[@intFromEnum(Opcode.push_arg_reg)] = &vm_opcodes.op_push_arg_reg;
         table[@intFromEnum(Opcode.pop_arg)] = &vm_opcodes.op_pop_arg;
+
+        // Stack Pointer Operations (0x7A-0x7D) - extracted to vm_opcodes.zig
+        table[@intFromEnum(Opcode.get_local_ptr)] = &vm_opcodes.op_get_local_ptr;
+        table[@intFromEnum(Opcode.load_indirect)] = &vm_opcodes.op_load_indirect;
+        table[@intFromEnum(Opcode.store_indirect)] = &vm_opcodes.op_store_indirect;
 
         // Record/Field Operations (0x80-0x8F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.new_record)] = &vm_opcodes.op_new_record;

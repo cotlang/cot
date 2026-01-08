@@ -10,6 +10,9 @@ const module = cot_runtime.bytecode.module;
 const opcodes = cot_runtime.bytecode.opcodes;
 const debug = cot_runtime.debug;
 
+// Escape analysis for determining stack vs heap allocation
+const escape_analysis = @import("../compiler/escape_analysis.zig");
+
 // Builtin function definitions (extracted to reduce file size)
 const emit_builtins = @import("emit_builtins.zig");
 const BuiltinDef = emit_builtins.BuiltinDef;
@@ -68,6 +71,15 @@ const FieldViewInfo = struct {
     byte_offset: u16, // Byte offset into the buffer
     length: u16, // Length of this field in bytes
     is_global: bool, // Whether the base slot is a global
+};
+
+/// Indirect field access information for stack pointer parameters
+/// When accessing fields through a stack pointer, we need to:
+/// 1. Load the stack pointer value from its slot
+/// 2. Use load_indirect/store_indirect with the field offset
+const IndirectFieldInfo = struct {
+    ptr_slot: u16, // Slot containing the stack pointer value
+    field_offset: u16, // Offset of this field within the struct
 };
 
 /// Register allocator for register-based bytecode emission
@@ -230,6 +242,21 @@ pub const BytecodeEmitter = struct {
     // so that array_load can use the correct slot when accessing through the pointer
     array_ptr_targets: std.AutoHashMap(u32, u16), // value_id -> array_slot
 
+    // Stack pointer parameter tracking
+    // Maps parameter names to their slots for pointer-to-struct params
+    // These params receive a StackPtr value and use indirect field access
+    stack_ptr_params: std.StringHashMap(u16), // param_name -> slot
+
+    // Stack pointer value ID tracking
+    // Maps IR value IDs (from alloca/load) to their stack pointer slots
+    // Used by emitFieldPtr to detect indirect field access
+    stack_ptr_value_ids: std.AutoHashMap(u32, u16), // value_id -> ptr_slot
+
+    // Indirect field access tracking
+    // Maps IR value ID to info needed for load_indirect/store_indirect
+    // Used when accessing fields through stack pointer parameters
+    indirect_fields: std.AutoHashMap(u32, IndirectFieldInfo), // value_id -> info
+
     // Current routine being emitted
     current_routine_start: u32,
 
@@ -253,6 +280,10 @@ pub const BytecodeEmitter = struct {
     next_spill_slot: u16 = 0, // Next available spill slot
     spilled_values: std.AutoHashMap(u32, u16), // value_id -> spill_slot
     max_spill_slots_used: u16 = 0, // Track maximum for local_count
+
+    // Escape analysis results for current function
+    // Maps local variable name to whether it needs heap allocation
+    escape_states: ?escape_analysis.EscapeAnalysisResult = null,
 
     // Track allocated strings that need to be freed (e.g., qualified field names)
     allocated_strings: std.ArrayListUnmanaged([]const u8) = .{},
@@ -284,6 +315,9 @@ pub const BytecodeEmitter = struct {
             .value_consts = std.AutoHashMap(u32, u16).init(allocator),
             .field_view_info = std.AutoHashMap(u32, FieldViewInfo).init(allocator),
             .array_ptr_targets = std.AutoHashMap(u32, u16).init(allocator),
+            .stack_ptr_params = std.StringHashMap(u16).init(allocator),
+            .stack_ptr_value_ids = std.AutoHashMap(u32, u16).init(allocator),
+            .indirect_fields = std.AutoHashMap(u32, IndirectFieldInfo).init(allocator),
             .current_routine_start = 0,
             .current_func = null,
             .ir_module = null,
@@ -309,8 +343,15 @@ pub const BytecodeEmitter = struct {
         self.value_consts.deinit();
         self.field_view_info.deinit();
         self.array_ptr_targets.deinit();
+        self.stack_ptr_params.deinit();
+        self.stack_ptr_value_ids.deinit();
+        self.indirect_fields.deinit();
         self.reg_alloc.deinit();
         self.spilled_values.deinit();
+        // Free escape analysis results if any
+        if (self.escape_states) |*es| {
+            es.deinit();
+        }
         // Free allocated strings (qualified field names, etc.)
         for (self.allocated_strings.items) |s| {
             self.allocator.free(s);
@@ -533,25 +574,58 @@ pub const BytecodeEmitter = struct {
         self.pending_jumps.clearRetainingCapacity();
         self.value_slots.clearRetainingCapacity();
         self.struct_base_slots.clearRetainingCapacity();
+        self.stack_ptr_params.clearRetainingCapacity();
+        self.stack_ptr_value_ids.clearRetainingCapacity();
+        self.indirect_fields.clearRetainingCapacity();
         self.value_consts.clearRetainingCapacity();
         self.reg_alloc.reset(); // Reset register allocation for new function
         self.last_result_value = null; // Reset last result tracking
         self.resetSpillState(); // Reset spill state for new function
 
+        // Run escape analysis to determine which locals need heap allocation
+        // Free previous result if any
+        if (self.escape_states) |*es| {
+            es.deinit();
+        }
+        // Note: ir.Function is const but escape_analysis needs mutable for iteration
+        // We cast away const here since analysis doesn't actually modify the function
+        self.escape_states = escape_analysis.analyzeFunction(self.allocator, @constCast(func)) catch null;
+        if (self.escape_states) |es| {
+            log.debug("Escape analysis for {s}: {d} locals analyzed", .{ func.name, es.states.count() });
+        }
+
         self.current_routine_start = @intCast(self.code.items.len);
 
         // Allocate locals for parameters
-        // For struct-typed parameters, we expand all fields to individual slots.
-        // The is_ref flag indicates copy-back semantics (mutations visible to caller)
-        // but doesn't change the slot allocation - we still need slots for all fields.
-        //
-        // TODO: Implement proper stack-based overflow for large structs (Option B)
-        // when total parameters would exceed 16 register slots.
-        // See claude/plan-stack-argument-overflow.md
+        // Two cases for struct-typed parameters:
+        // 1. Pointer-to-struct (*MyStruct): Single slot for a StackPtr value.
+        //    The caller passes a stack pointer, callee uses load_indirect/store_indirect.
+        //    This is the standard mechanism for method calls (self: *MyStruct).
+        // 2. Direct struct (MyStruct): Expand all fields to individual slots.
+        //    Used for DBL types with is_ref copy-back semantics.
         for (func.signature.params) |param| {
-            if (param.ty == .@"struct") {
-                // Structure parameter - allocate slots for each field with qualified names
-                const struct_type = param.ty.@"struct";
+            // Check for struct types.
+            // Pointer-to-struct params receive a stack pointer (single value).
+            // Direct struct params expand all fields to slots (legacy, DBL semantics).
+            const is_ptr_to_struct = param.ty == .ptr and param.ty.ptr.* == .@"struct";
+            const struct_type_opt: ?*const ir.StructType = if (param.ty == .@"struct")
+                param.ty.@"struct"
+            else
+                null;
+
+            if (is_ptr_to_struct) {
+                // Pointer-to-struct parameter: allocate 1 slot for the stack pointer
+                // The caller passes a StackPtr value, field access uses load_indirect/store_indirect
+                try self.locals.put(param.name, .{
+                    .slot = self.local_count,
+                    .is_global = false,
+                });
+                // Track this as a stack pointer param for indirect field access
+                try self.stack_ptr_params.put(param.name, self.local_count);
+                self.local_count += 1;
+                debug.print(.emit, "param {s}: pointer-to-struct, 1 slot (stack pointer)", .{param.name});
+            } else if (struct_type_opt) |struct_type| {
+                // Direct struct parameter - allocate slots for each field
                 const base_slot = self.local_count;
 
                 // Also register the base parameter name pointing to the first field slot
@@ -577,6 +651,7 @@ pub const BytecodeEmitter = struct {
                     const slot_count = emit_inst.getSlotCount(field.ty);
                     self.local_count += @intCast(slot_count);
                 }
+                debug.print(.emit, "param {s}: direct struct, {d} slots", .{ param.name, self.local_count - base_slot });
             } else {
                 // Normal parameter - single slot
                 try self.locals.put(param.name, .{
@@ -627,11 +702,14 @@ pub const BytecodeEmitter = struct {
         // Reset for actual emission (allocas will be processed again)
         const total_declared_locals = self.local_count;
         debug.print(.emit, "Pre-pass done: total_declared_locals={d}, spill_slot_base will be {d}", .{ total_declared_locals, total_declared_locals });
-        // Count actual parameter slots (struct params expand to multiple slots)
+        // Count actual parameter slots
+        // Pointer-to-struct params take 1 slot (stack pointer), direct structs expand
         var param_slot_count: u16 = 0;
         for (func.signature.params) |param| {
-            // Use flattened slot count for nested structs
-            const slot_count = emit_inst.getSlotCount(param.ty);
+            const slot_count: u32 = if (param.ty == .ptr and param.ty.ptr.* == .@"struct")
+                1 // Pointer-to-struct: single slot for stack pointer
+            else
+                emit_inst.getSlotCount(param.ty);
             param_slot_count += @intCast(slot_count);
         }
         self.local_count = param_slot_count;
@@ -1202,6 +1280,27 @@ pub const BytecodeEmitter = struct {
             return;
         }
 
+        // Check if value is an indirect field (accessed through stack pointer)
+        if (self.indirect_fields.get(value.id)) |info| {
+            log.debug("emitValueToReg: indirect field value_id={d} ptr_slot={d} field_offset={d} -> r{d}", .{
+                value.id, info.ptr_slot, info.field_offset, dest,
+            });
+            // First, load the stack pointer value into a temp register
+            const ptr_reg: u4 = if (dest < 13) dest + 1 else dest;
+            if (info.ptr_slot < 256) {
+                try self.emitRegLoadLocal(ptr_reg, @intCast(info.ptr_slot));
+            } else {
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, ptr_reg) << 4);
+                try self.emitU16(info.ptr_slot);
+            }
+            // Now emit load_indirect: rd, rs_ptr, offset
+            try self.emitOpcode(.load_indirect);
+            try self.emitU8((@as(u8, dest) << 4) | ptr_reg);
+            try self.emitU16(info.field_offset);
+            return;
+        }
+
         // Otherwise, load from value source based on how it was defined
         if (self.value_slots.get(value.id)) |slot_info| {
             if (slot_info & 0x8000 != 0) {
@@ -1209,14 +1308,39 @@ pub const BytecodeEmitter = struct {
                 const slot = slot_info & 0x7FFF;
                 try self.emitRegLoadGlobal(dest, slot);
             } else {
-                // Local variable - use 16-bit variant for slots >= 256
-                if (slot_info < 256) {
-                    try self.emitRegLoadLocal(dest, @intCast(slot_info));
-                } else {
-                    try self.emitOpcode(.load_local16);
+                // Check if this is a pointer-to-struct type that needs get_local_ptr
+                // This handles &struct_var expressions which need stack pointers
+                const is_ptr_to_struct = value.ty == .ptr and value.ty.ptr.* == .@"struct";
+                if (is_ptr_to_struct) {
+                    // Emit get_local_ptr to create a stack pointer
+                    try self.emitOpcode(.get_local_ptr);
                     try self.emitU8(@as(u8, dest) << 4);
                     try self.emitU16(@intCast(slot_info));
+                } else {
+                    // Local variable - use 16-bit variant for slots >= 256
+                    if (slot_info < 256) {
+                        try self.emitRegLoadLocal(dest, @intCast(slot_info));
+                    } else {
+                        try self.emitOpcode(.load_local16);
+                        try self.emitU8(@as(u8, dest) << 4);
+                        try self.emitU16(@intCast(slot_info));
+                    }
                 }
+            }
+            return;
+        }
+
+        // Check struct_base_slots for pointer-to-struct types (&struct_var)
+        // Struct allocas register in struct_base_slots, and &struct gets a ptr type
+        // We need get_local_ptr to create a stack pointer to the struct's base slot
+        const is_ptr_to_struct = value.ty == .ptr and value.ty.ptr.* == .@"struct";
+        if (is_ptr_to_struct) {
+            if (self.struct_base_slots.get(value.id)) |base_slot| {
+                log.debug("emitValueToReg: ptr-to-struct id={d} using struct_base_slot={d} -> get_local_ptr", .{ value.id, base_slot });
+                try self.emitOpcode(.get_local_ptr);
+                try self.emitU8(@as(u8, dest) << 4);
+                try self.emitU16(@intCast(base_slot));
+                return;
             }
         }
     }
@@ -1278,6 +1402,30 @@ pub const BytecodeEmitter = struct {
             return temp_reg;
         }
 
+        // Check if value is an indirect field (accessed through stack pointer)
+        // Emit load_indirect: rd = stack[ptr_slot].field_offset
+        if (self.indirect_fields.get(value.id)) |info| {
+            debug.print(.emit, "  -> indirect field path: ptr_slot={d} field_offset={d} -> r{d}", .{
+                info.ptr_slot, info.field_offset, temp_reg,
+            });
+            // First, load the stack pointer value into a temp register
+            // We'll use temp_reg+1 for the pointer (or temp_reg if it's the only one we have)
+            const ptr_reg: u4 = if (temp_reg < 13) temp_reg + 1 else temp_reg;
+            if (info.ptr_slot < 256) {
+                try self.emitRegLoadLocal(ptr_reg, @intCast(info.ptr_slot));
+            } else {
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, ptr_reg) << 4);
+                try self.emitU16(info.ptr_slot);
+            }
+            // Now emit load_indirect: rd, rs_ptr, offset
+            // Format: [opcode] [rd:4|rs:4] [offset:16]
+            try self.emitOpcode(.load_indirect);
+            try self.emitU8((@as(u8, temp_reg) << 4) | ptr_reg);
+            try self.emitU16(info.field_offset);
+            return temp_reg;
+        }
+
         // Check if value is in a slot - load into temp register
         if (self.value_slots.get(value.id)) |slot_info| {
             if (slot_info & 0x8000 != 0) {
@@ -1286,8 +1434,16 @@ pub const BytecodeEmitter = struct {
                 debug.print(.emit, "  -> slot path (global): slot={d} -> r{d}", .{ slot, temp_reg });
                 try self.emitRegLoadGlobal(temp_reg, slot);
             } else {
-                // Local variable - use 16-bit variant for slots >= 256
-                if (slot_info < 256) {
+                // Check if this is a pointer-to-struct type that needs get_local_ptr
+                // This handles &struct_var expressions which need stack pointers
+                const is_ptr_to_struct = value.ty == .ptr and value.ty.ptr.* == .@"struct";
+                if (is_ptr_to_struct) {
+                    // Emit get_local_ptr to create a stack pointer
+                    debug.print(.emit, "  -> slot path (ptr_to_struct): slot={d} -> r{d} via get_local_ptr", .{ slot_info, temp_reg });
+                    try self.emitOpcode(.get_local_ptr);
+                    try self.emitU8(@as(u8, temp_reg) << 4);
+                    try self.emitU16(@intCast(slot_info));
+                } else if (slot_info < 256) {
                     debug.print(.emit, "  -> slot path (local): slot={d} -> r{d}", .{ slot_info, temp_reg });
                     try self.emitRegLoadLocal(temp_reg, @intCast(slot_info));
                 } else {
@@ -1298,6 +1454,20 @@ pub const BytecodeEmitter = struct {
                 }
             }
             return temp_reg;
+        }
+
+        // Check struct_base_slots for pointer-to-struct types (&struct_var)
+        // Struct allocas register in struct_base_slots, and &struct gets a ptr type
+        // We need get_local_ptr to create a stack pointer to the struct's base slot
+        const is_ptr_to_struct = value.ty == .ptr and value.ty.ptr.* == .@"struct";
+        if (is_ptr_to_struct) {
+            if (self.struct_base_slots.get(value.id)) |base_slot| {
+                debug.print(.emit, "  -> struct_base_slot path (ptr_to_struct): slot={d} -> r{d} via get_local_ptr", .{ base_slot, temp_reg });
+                try self.emitOpcode(.get_local_ptr);
+                try self.emitU8(@as(u8, temp_reg) << 4);
+                try self.emitU16(@intCast(base_slot));
+                return temp_reg;
+            }
         }
 
         // Fall back to allocating a new register (this shouldn't happen often)
@@ -1472,6 +1642,15 @@ pub const BytecodeEmitter = struct {
         self.spill_slot_base = 0;
         self.next_spill_slot = 0;
         self.max_spill_slots_used = 0;
+    }
+
+    /// Check if a local variable needs heap allocation (based on escape analysis)
+    pub fn localNeedsHeap(self: *const Self, name: []const u8) bool {
+        if (self.escape_states) |es| {
+            return es.needsHeap(name);
+        }
+        // No escape analysis - default to stack allocation
+        return false;
     }
 
     /// Setup spill slots for a function (call after counting locals)

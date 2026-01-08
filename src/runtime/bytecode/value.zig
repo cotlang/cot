@@ -35,6 +35,7 @@ pub const Tag = enum {
     record_ref,
     handle,
     object, // Extension-defined types (Map, Set, etc.)
+    stack_ptr, // Pointer to stack slot (frame_offset + slot)
 
     /// Get type name for debugging
     pub fn name(self: Tag) []const u8 {
@@ -50,6 +51,7 @@ pub const Tag = enum {
             .record_ref => "record",
             .handle => "handle",
             .object => "object",
+            .stack_ptr => "stack_ptr",
         };
     }
 };
@@ -184,12 +186,13 @@ pub const Variant = struct {
         return variant;
     }
 
-    /// Free internal resources. Called by ARC when refcount reaches 0.
+    /// Free internal resources.
+    /// Note: Variant cleanup is handled directly by arc.zig freeObject,
+    /// which releases payload field values and frees the payload StructBox.
+    /// This method is kept for API consistency but does nothing.
     pub fn deinitInternal(self: *Variant) void {
-        if (self.payload) |box| {
-            // Release the StructBox (ARC will handle actual deallocation)
-            arc.release(self.allocator, box);
-        }
+        _ = self;
+        // No-op: arc.zig handles payload StructBox cleanup directly
     }
 
     /// Get number of payload values
@@ -220,6 +223,16 @@ pub const TraitObject = struct {
     data: Value,
     /// Index into the module's vtable array
     vtable_idx: u16,
+};
+
+/// Stack pointer - points to a slot in a stack frame
+/// Used for passing pointers to stack-allocated structs without copying.
+/// Encoded inline in the NaN-boxed value (no heap allocation).
+pub const StackPtr = packed struct {
+    /// Frame offset: 0 = current frame, -1 = caller, -2 = grandcaller, etc.
+    frame_offset: i16,
+    /// Slot index within that frame's local variables
+    slot: u16,
 };
 
 /// Dynamic list - growable array of values
@@ -293,6 +306,8 @@ pub const Value = extern struct {
     const TAG_TRUE: u64 = 0x7FFC_0000_0000_0002;
     // Small integers: 0x7FFD + sign-extended 47-bit value
     const TAG_SMALL_INT: u64 = 0x7FFD_0000_0000_0000;
+    // Stack pointers: 0x7FFD_8 + 32-bit payload (frame_offset:i16 + slot:u16)
+    const TAG_STACK_PTR: u64 = 0x7FFD_8000_0000_0000;
     // Pointers: 0x7FFE/F + 46-bit pointer (bits 46+ for type, bits 0-45 for pointer)
     const TAG_STRING: u64 = 0x7FFE_0000_0000_0000;
     const TAG_FIXED_STR: u64 = 0x7FFE_8000_0000_0000;
@@ -463,6 +478,15 @@ pub const Value = extern struct {
         return initObject(VARIANT_TYPE_ID, v);
     }
 
+    /// Create a stack pointer value (inline, no heap allocation)
+    /// frame_offset: 0 = current frame, -1 = caller, -2 = grandcaller
+    /// slot: Index within that frame's local variables
+    pub fn initStackPtr(frame_offset: i16, slot: u16) Self {
+        const sp = StackPtr{ .frame_offset = frame_offset, .slot = slot };
+        const payload: u32 = @bitCast(sp);
+        return .{ .bits = TAG_STACK_PTR | @as(u64, payload) };
+    }
+
     // ========================================================================
     // Type checking and tagging
     // ========================================================================
@@ -474,6 +498,8 @@ pub const Value = extern struct {
 
         // SMALL_INT uses 48-bit payload, check with 16-bit tag mask
         if ((self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT) return .integer;
+        // STACK_PTR uses 32-bit payload, check with 20-bit tag mask (0x7FFD_8)
+        if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_STACK_PTR) return .stack_ptr;
         // BOXED_INT uses 46-bit pointer, check with 18-bit tag mask
         if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_BOXED_INT) return .integer;
         // Check OBJECT before STRING since OBJECT uses more specific mask
@@ -577,6 +603,11 @@ pub const Value = extern struct {
     pub fn isVariant(self: Self) bool {
         if (!self.isObject()) return false;
         return self.objectTypeId() == VARIANT_TYPE_ID;
+    }
+
+    /// Check if this is a stack pointer
+    pub fn isStackPtr(self: Self) bool {
+        return (self.bits & 0xFFFF_F000_0000_0000) == TAG_STACK_PTR;
     }
 
     /// Get the type_id of an object value
@@ -712,6 +743,13 @@ pub const Value = extern struct {
         return self.objectPtr(Variant);
     }
 
+    /// Get stack pointer value
+    pub fn asStackPtr(self: Self) ?StackPtr {
+        if (!self.isStackPtr()) return null;
+        const payload: u32 = @truncate(self.bits);
+        return @bitCast(payload);
+    }
+
     // ========================================================================
     // Conversion methods (compatibility with old API)
     // ========================================================================
@@ -801,6 +839,11 @@ pub const Value = extern struct {
                     try writer.print("<object:type={d}>", .{type_id});
                 }
             },
+            .stack_ptr => {
+                if (self.asStackPtr()) |sp| {
+                    try writer.print("<stack_ptr:frame={d},slot={d}>", .{ sp.frame_offset, sp.slot });
+                }
+            },
         }
     }
 
@@ -821,6 +864,7 @@ pub const Value = extern struct {
             .record_ref => "rec",
             .handle => "hnd",
             .object => "obj",
+            .stack_ptr => "sptr",
         };
 
         writer.print("{s}:", .{tag_name}) catch {};
@@ -851,6 +895,11 @@ pub const Value = extern struct {
             .record_ref => writer.writeAll("<record>") catch {},
             .handle => writer.print("{d}", .{self.asHandle() orelse 0}) catch {},
             .object => writer.print("type={d}", .{self.objectTypeId() orelse 0}) catch {},
+            .stack_ptr => {
+                if (self.asStackPtr()) |sp| {
+                    writer.print("f{d}+s{d}", .{ sp.frame_offset, sp.slot }) catch {};
+                }
+            },
         }
 
         return fbs.getWritten();

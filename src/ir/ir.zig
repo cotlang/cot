@@ -245,6 +245,9 @@ pub const StructType = struct {
     fields: []const Field,
     size: u32,
     alignment: u32,
+    /// True for DBL RECORD types that need field expansion and copy-back semantics.
+    /// Regular Cot structs use stack pointers (single value) for method calls.
+    is_dbl_record: bool = false,
 
     pub const Field = struct {
         name: []const u8,
@@ -275,7 +278,7 @@ pub const FunctionType = struct {
     pub const Param = struct {
         name: []const u8,
         ty: Type,
-        is_ref: bool, // by value (false) or by reference (true)
+        is_ref: bool, // DBL copy-back semantics (true requires field expansion and writeback)
         default_value: ?Value = null, // optional default value for optional params
     };
 };
@@ -419,10 +422,28 @@ fn typeNeedsArc(ty: Type) bool {
     };
 }
 
+/// Check if a type is a DBL-specific type that requires is_ref copy-back semantics.
+/// DBL types (fixedstring/alpha, implied_decimal, fixed_decimal) need special handling
+/// because DBL subroutines copy modified values back to callers by default.
+/// Cot core types (including pointers like *struct) do NOT need this behavior.
+pub fn isDblRefType(ty: Type) bool {
+    return switch (ty) {
+        // DBL decimal types
+        .implied_decimal, .fixed_decimal => true,
+        // DBL alpha/fixedstring - array of u8 with fixed length
+        .array => |a| a.element.* == .u8,
+        // Pointer to DBL type also needs ref semantics
+        .ptr => |p| isDblRefType(p.*),
+        // Everything else is a Cot core type - no copy-back needed
+        else => false,
+    };
+}
+
 /// Source location for error reporting
 pub const SourceLoc = struct {
     line: u32,
     column: u32,
+    file_path: ?[]const u8 = null, // Optional: set for imported files
 };
 
 /// Integer comparison condition codes (matches Cranelift IntCC)

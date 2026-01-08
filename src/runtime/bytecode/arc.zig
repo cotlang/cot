@@ -56,6 +56,8 @@ const StructBox = value_mod.StructBox;
 const STRUCT_BOX_TYPE_ID = value_mod.STRUCT_BOX_TYPE_ID;
 const List = value_mod.List;
 const LIST_TYPE_ID = value_mod.LIST_TYPE_ID;
+const Variant = value_mod.Variant;
+const VARIANT_TYPE_ID = value_mod.VARIANT_TYPE_ID;
 const OrderedMap = @import("ordered_map.zig").OrderedMap;
 
 // Scoped logging
@@ -331,7 +333,7 @@ pub fn getHeapPtr(value: Value) ?*anyopaque {
             break :blk if (ptr != 0) @ptrFromInt(ptr) else null;
         },
         // Inline types - no heap allocation
-        .null_val, .boolean, .integer, .float, .handle => null,
+        .null_val, .boolean, .integer, .float, .handle, .stack_ptr => null,
     };
 }
 
@@ -343,8 +345,12 @@ fn freeWithHeader(ptr: *anyopaque, comptime data_size: usize, allocator: std.mem
 
     // Validate header pointer alignment before attempting free
     const header_addr = @intFromPtr(header);
+    const ptr_addr = @intFromPtr(ptr);
+
+    log.debug("freeWithHeader: ptr=0x{x} header=0x{x} data_size={d} total_size={d}", .{ ptr_addr, header_addr, data_size, total_size });
+
     if (header_addr % 8 != 0) {
-        log.err("ARC freeWithHeader: misaligned header: header_addr=0x{x} ptr_addr=0x{x} data_size={d}", .{ header_addr, @intFromPtr(ptr), data_size });
+        log.err("ARC freeWithHeader: misaligned header: header_addr=0x{x} ptr_addr=0x{x} data_size={d}", .{ header_addr, ptr_addr, data_size });
         @panic("ARC: freeWithHeader called with misaligned header");
     }
 
@@ -352,15 +358,18 @@ fn freeWithHeader(ptr: *anyopaque, comptime data_size: usize, allocator: std.mem
     const bytes_ptr: [*]align(8) u8 = @ptrCast(@alignCast(header));
     const bytes = bytes_ptr[0..total_size];
 
+    log.debug("freeWithHeader: calling allocator.free on bytes_ptr=0x{x} len={d}", .{ @intFromPtr(bytes_ptr), bytes.len });
     allocator.free(bytes);
+    log.debug("freeWithHeader: free completed", .{});
 }
 
 /// Free a heap-allocated object.
 /// Handles recursive release for containers (maps).
 fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void {
     const header = getHeader(ptr);
+    const tag = value.tag();
 
-    log.debug("ARC free: tag={s} ptr={*}", .{ @tagName(value.tag()), ptr });
+    log.debug("ARC freeObject: tag={s} ptr=0x{x} bits=0x{x}", .{ @tagName(tag), @intFromPtr(ptr), value.bits });
 
     // Mark as poisoned to catch use-after-free
     header.poison();
@@ -435,14 +444,27 @@ fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void 
                 // Deinit list internals (frees the items array)
                 list.items.deinit(list.allocator);
                 freeWithHeader(ptr, @sizeOf(List), allocator);
+            } else if (value.asVariant()) |variant| {
+                // Variant (type_id 21) - release payload StructBox if present
+                if (variant.payload) |payload_box| {
+                    // Release all values in the payload
+                    for (payload_box.fields) |field| {
+                        release(field, allocator);
+                    }
+                    // Free the payload's fields array
+                    payload_box.deinitInternal();
+                    // Free the StructBox itself
+                    freeWithHeader(@ptrCast(payload_box), @sizeOf(StructBox), allocator);
+                }
+                freeWithHeader(ptr, @sizeOf(Variant), allocator);
             } else {
                 // Unknown object type - log warning and skip
                 log.warn("Unknown object type_id {} - cannot free", .{type_id});
             }
         },
 
-        // Inline types should never reach here
-        .null_val, .boolean, .integer, .float, .handle => unreachable,
+        // Inline types should never reach here (they don't have ARC headers)
+        .null_val, .boolean, .integer, .float, .handle, .stack_ptr => unreachable,
     }
 }
 
@@ -504,13 +526,21 @@ pub fn freeObjectForced(value: Value, ptr: *anyopaque, allocator: std.mem.Alloca
                 // List - free structure without recursively releasing values
                 list.items.deinit(list.allocator);
                 freeWithHeader(ptr, @sizeOf(List), allocator);
+            } else if (value.asVariant()) |variant| {
+                // Variant - free structure without recursively releasing payload values
+                if (variant.payload) |payload_box| {
+                    payload_box.deinitInternal();
+                    freeWithHeader(@ptrCast(payload_box), @sizeOf(StructBox), allocator);
+                }
+                freeWithHeader(ptr, @sizeOf(Variant), allocator);
             } else {
                 // Unknown object type - log warning
                 log.warn("Unknown object type_id {} - cannot free (forced)", .{type_id});
             }
         },
 
-        .null_val, .boolean, .integer, .float, .handle => unreachable,
+        // Inline types should never reach here (they don't have ARC headers)
+        .null_val, .boolean, .integer, .float, .handle, .stack_ptr => unreachable,
     }
 }
 

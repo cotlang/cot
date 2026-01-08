@@ -306,7 +306,7 @@ fn getHeapPtr(value: Value) ?*anyopaque {
             const ptr = value.bits & Value.OBJ_PTR_MASK;
             break :blk if (ptr != 0) @ptrFromInt(ptr) else null;
         },
-        .null_val, .boolean, .integer, .float, .handle => null,
+        .null_val, .boolean, .integer, .float, .handle, .stack_ptr => null,
     };
 }
 

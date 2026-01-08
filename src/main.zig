@@ -207,8 +207,11 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var selected_runtime: runtime_selector.Runtime = .zig;
     var file_target: ?[]const u8 = null;
 
+    // Parse args until we hit "--" (which separates cot args from program args)
     for (args) |arg| {
-        if (std.mem.startsWith(u8, arg, "--runtime=")) {
+        if (std.mem.eql(u8, arg, "--")) {
+            break; // Stop parsing cot args, rest are for the program
+        } else if (std.mem.startsWith(u8, arg, "--runtime=")) {
             const runtime_name = arg[10..];
             if (runtime_selector.Runtime.fromString(runtime_name)) |r| {
                 selected_runtime = r;
@@ -835,12 +838,12 @@ fn runBytecodeFile(allocator: std.mem.Allocator, filename: []const u8) !void {
     defer file.close();
 
     const bytes = try file.readToEndAlloc(allocator, 1024 * 1024 * 10); // 10MB max
-
-    // Change to the source file's directory so relative paths work correctly
-    if (std.fs.path.dirname(filename)) |dir| {
-        std.posix.chdir(dir) catch {};
-    }
     defer allocator.free(bytes);
+
+    // NOTE: Unlike source files, bytecode files should NOT change the working directory.
+    // A compiled program behaves like a normal executable - its CWD is wherever it was
+    // invoked from, not where the .cbo file is located. This allows compiled programs
+    // to work with relative paths in the caller's directory.
 
     // Initialize extension registry
     extension.initRegistry(allocator);
@@ -1135,10 +1138,9 @@ fn traceBytecodeFile(allocator: std.mem.Allocator, filename: []const u8, level: 
     const bytes = try file.readToEndAlloc(allocator, 1024 * 1024 * 10); // 10MB max
     defer allocator.free(bytes);
 
-    // Change to the source file's directory so relative paths work correctly
-    if (std.fs.path.dirname(filename)) |dir| {
-        std.posix.chdir(dir) catch {};
-    }
+    // NOTE: Unlike source files, bytecode files should NOT change the working directory.
+    // A compiled program behaves like a normal executable - its CWD is wherever it was
+    // invoked from, not where the .cbo file is located.
 
     // Initialize extension registry
     extension.initRegistry(allocator);

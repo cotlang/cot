@@ -989,9 +989,18 @@ pub fn op_log_or(vm: *VM, module: *const Module) VMError!DispatchResult {
 pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const routine_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
-    vm.ip += 3;
     const argc: u4 = @truncate(ops >> 4);
-    const stack_argc: u4 = @truncate(ops & 0xF); // Number of overflow args already on stack
+    const stack_argc_low: u4 = @truncate(ops & 0xF);
+
+    // Handle extended format: if stack_argc_low == 15, read actual count from next 2 bytes
+    const stack_argc: u16 = if (stack_argc_low == 15) blk: {
+        const ext = std.mem.readInt(u16, module.code[vm.ip + 3 ..][0..2], .little);
+        vm.ip += 5; // opcode byte + ops byte + routine_idx (2) + stack_argc_ext (2)
+        break :blk ext;
+    } else blk: {
+        vm.ip += 3; // opcode byte + ops byte + routine_idx (2)
+        break :blk @as(u16, stack_argc_low);
+    };
 
     if (routine_idx >= module.routines.len) {
         return vm.fail(VMError.InvalidRoutine, "Routine index out of bounds");
@@ -1020,9 +1029,17 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Copy args from r0..r(argc-1) to stack (as locals for callee)
     // CRITICAL: Must retain heap values - callee will release them when storing
     // new values to these slots, and we need caller's copy to remain valid.
+    // NOTE: Stack pointers need their frame_offset adjusted by -1 because the
+    // callee's frame is now one level deeper than when the pointer was created.
     vm.fp = vm.sp; // New frame starts after overflow args (they're below fp now)
     for (0..argc) |i| {
-        const arg_value = vm.registers[i];
+        var arg_value = vm.registers[i];
+        // Adjust stack pointers: decrement frame_offset to account for new call frame
+        if (arg_value.isStackPtr()) {
+            if (arg_value.asStackPtr()) |sp| {
+                arg_value = Value.initStackPtr(sp.frame_offset - 1, sp.slot);
+            }
+        }
         if (vm.runtime_arc_enabled) arc.retain(arg_value);
         vm.stack[vm.sp] = arg_value;
         vm.sp += 1;
@@ -1032,8 +1049,15 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
     // They were pushed at positions caller_sp - stack_argc to caller_sp - 1
     // and need to end up at slots argc..argc+stack_argc-1
     // CRITICAL: Same retain requirement as register args above.
+    // NOTE: Stack pointers also need frame_offset adjustment like register args.
     for (0..stack_argc) |i| {
-        const arg_value = vm.stack[caller_sp - @as(u32, stack_argc) + i];
+        var arg_value = vm.stack[caller_sp - @as(u32, stack_argc) + i];
+        // Adjust stack pointers: decrement frame_offset to account for new call frame
+        if (arg_value.isStackPtr()) {
+            if (arg_value.asStackPtr()) |sp| {
+                arg_value = Value.initStackPtr(sp.frame_offset - 1, sp.slot);
+            }
+        }
         if (vm.runtime_arc_enabled) arc.retain(arg_value);
         vm.stack[vm.sp] = arg_value;
         vm.sp += 1;
@@ -1214,6 +1238,132 @@ pub fn op_pop_arg(vm: *VM, module: *const Module) VMError!DispatchResult {
     vm.stack[vm.fp + slot] = vm.stack[vm.sp];
 
     return .continue_dispatch;
+}
+
+// ============================================================================
+// Stack Pointer Operations
+// ============================================================================
+
+/// get_local_ptr rd, slot - rd = stack pointer to local slot
+/// Creates a StackPtr value pointing to the specified local variable slot.
+pub fn op_get_local_ptr(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3;
+
+    const rd: u4 = @truncate(ops >> 4);
+
+    // Create a stack pointer to the local slot in the current frame
+    // frame_offset=0 means current frame
+    vm.registers[rd] = Value.initStackPtr(0, slot);
+
+    return .continue_dispatch;
+}
+
+/// load_indirect rd, rs, offset - rd = ptr_val[offset]
+/// Loads a value through a pointer with a field offset.
+/// Works for both stack pointers and heap records (polymorphic).
+pub fn op_load_indirect(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const offset = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3;
+
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops);
+
+    const ptr_val = vm.registers[rs];
+
+    // Check if it's a stack pointer
+    if (ptr_val.asStackPtr()) |sp| {
+        // Resolve the frame's base pointer
+        const base_ptr = try resolveFrameBasePointer(vm, sp.frame_offset);
+        const abs_slot = base_ptr + sp.slot + offset;
+
+        if (abs_slot >= vm.sp) {
+            return vm.fail(VMError.StackOverflow, "load_indirect: slot out of bounds");
+        }
+
+        vm.registers[rd] = vm.stack[abs_slot];
+        return .continue_dispatch;
+    }
+
+    // Check if it's a heap record
+    if (ptr_val.asRecord()) |record| {
+        const field_count = record.data.len / @sizeOf(Value);
+        if (offset < field_count) {
+            const fields: []Value = @as([*]Value, @ptrCast(@alignCast(record.data.ptr)))[0..field_count];
+            vm.writeRegister(rd, fields[offset]);
+        } else {
+            vm.writeRegister(rd, Value.null_val);
+        }
+        return .continue_dispatch;
+    }
+
+    return vm.fail(VMError.InvalidType, "load_indirect: expected stack pointer or record");
+}
+
+/// store_indirect rs_ptr, offset, rs_val - ptr_val[offset] = rs_val
+/// Stores a value through a pointer with a field offset.
+/// Works for both stack pointers and heap records (polymorphic).
+pub fn op_store_indirect(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const offset = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
+    vm.ip += 3;
+
+    const rs_ptr: u4 = @truncate(ops >> 4);
+    const rs_val: u4 = @truncate(ops);
+
+    const ptr_val = vm.registers[rs_ptr];
+    const value = vm.registers[rs_val];
+
+    // Check if it's a stack pointer
+    if (ptr_val.asStackPtr()) |sp| {
+        // Resolve the frame's base pointer
+        const base_ptr = try resolveFrameBasePointer(vm, sp.frame_offset);
+        const abs_slot = base_ptr + sp.slot + offset;
+
+        if (abs_slot >= vm.sp) {
+            return vm.fail(VMError.StackOverflow, "store_indirect: slot out of bounds");
+        }
+
+        vm.stack[abs_slot] = value;
+        return .continue_dispatch;
+    }
+
+    // Check if it's a heap record
+    if (ptr_val.asRecord()) |record| {
+        const field_count = record.data.len / @sizeOf(Value);
+        if (offset < field_count) {
+            const fields: []Value = @as([*]Value, @ptrCast(@alignCast(record.data.ptr)))[0..field_count];
+            fields[offset] = value;
+        }
+        return .continue_dispatch;
+    }
+
+    return vm.fail(VMError.InvalidType, "store_indirect: expected stack pointer or record");
+}
+
+/// Resolve a frame offset to an absolute base pointer
+/// frame_offset=0 means current frame (vm.fp)
+/// frame_offset=-1 means caller's frame, etc.
+fn resolveFrameBasePointer(vm: *VM, frame_offset: i16) VMError!usize {
+    if (frame_offset == 0) {
+        // Current frame
+        return vm.fp;
+    } else if (frame_offset < 0) {
+        // Walk back through call stack
+        const depth: usize = @intCast(-frame_offset);
+        if (depth > vm.call_stack.len) {
+            return vm.fail(VMError.StackUnderflow, "stack pointer references invalid frame");
+        }
+        // call_stack[len-1] is the frame we came from (caller)
+        // call_stack[len-2] is the caller's caller, etc.
+        const frame_idx = vm.call_stack.len - depth;
+        return vm.call_stack.buffer[frame_idx].base_pointer;
+    } else {
+        // Positive frame_offset not supported (would reference future frames)
+        return vm.fail(VMError.InvalidType, "stack pointer: positive frame_offset not supported");
+    }
 }
 
 // ============================================================================
@@ -3079,6 +3229,27 @@ pub fn op_list_len(vm: *VM, module: *const Module) VMError!DispatchResult {
 
     const list_val = vm.registers[list_reg];
     const list = list_val.asList() orelse {
+        // Store register info in the VM's error detail buffer
+        const reg_msg = switch (list_reg) {
+            0 => "r0",
+            1 => "r1",
+            2 => "r2",
+            3 => "r3",
+            4 => "r4",
+            5 => "r5",
+            6 => "r6",
+            7 => "r7",
+            8 => "r8",
+            9 => "r9",
+            10 => "r10",
+            11 => "r11",
+            12 => "r12",
+            13 => "r13",
+            14 => "r14",
+            15 => "r15",
+        };
+        const type_name = list_val.typeName();
+        vm.setErrorDetail(reg_msg, type_name);
         return vm.fail(VMError.InvalidType, "Expected list value");
     };
 

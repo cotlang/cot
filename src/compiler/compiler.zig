@@ -10,6 +10,7 @@ pub const DiagnosticCollector = @import("diagnostic_collector.zig");
 pub const formatter = @import("diagnostic_formatter.zig");
 pub const type_rules = @import("type_rules.zig");
 pub const TypeChecker = @import("type_checker.zig");
+pub const escape_analysis = @import("escape_analysis.zig");
 
 // Re-export commonly used types
 pub const Diagnostic = diagnostics.Diagnostic;
@@ -17,6 +18,11 @@ pub const SourceRange = diagnostics.SourceRange;
 pub const Code = diagnostics.Code;
 pub const Level = diagnostics.Level;
 pub const Suggestion = diagnostics.Suggestion;
+
+// Escape analysis re-exports
+pub const EscapeState = escape_analysis.EscapeState;
+pub const EscapeAnalysisResult = escape_analysis.EscapeAnalysisResult;
+pub const analyzeEscapes = escape_analysis.analyzeFunction;
 
 // Format options for output
 pub const FormatOptions = formatter.FormatOptions;
