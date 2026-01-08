@@ -1046,6 +1046,14 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
     } else {
         // No type and no init - default to void (error will be caught later)
         var_type = .void;
+        // Debug: log when void type is assigned due to missing init
+        if (std.posix.getenv("COT_DEBUG_TYPE_CHECK")) |_| {
+            std.debug.print("[TYPE_CHECK] Void type assigned to variable '{s}' (init_idx={}, type_idx={})\n", .{
+                name,
+                @intFromEnum(init_idx),
+                @intFromEnum(type_idx),
+            });
+        }
     }
 
     // Special case: if init_val is a pointer to a struct or array (from struct/array init),
@@ -1083,10 +1091,27 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
     try l.scopes.put(name, alloca_result);
 
     // Store init value if present
-    if (init_val) |val| {
+    if (init_val) |init_v| {
         // Get source location from init expression for error reporting
         const init_loc = if (init_idx != .null) l.store.exprLoc(init_idx) else ast.SourceLoc{ .line = 0, .column = 0 };
         const ir_loc = lower_expr.toIrLoc(init_loc);
+
+        // Fix for empty array/slice literals: lowerArrayInit returns void for empty [],
+        // but if we have an explicit slice/list type annotation, create a properly typed value
+        var val = init_v;
+        if (val.ty == .void) {
+            switch (var_type) {
+                .slice => {
+                    // Empty slice: use the declared slice type
+                    val = func.newValue(var_type);
+                },
+                .list => {
+                    // Empty list: use the declared list type
+                    val = func.newValue(var_type);
+                },
+                else => {},
+            }
+        }
 
         // Check if target type is a trait object - need to emit make_trait_object
         if (var_type == .trait_object) {
@@ -1139,6 +1164,17 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
                 },
             });
         } else {
+            // Debug: log store emission for const/let decls
+            if (std.posix.getenv("COT_DEBUG_TYPE_CHECK")) |_| {
+                var ptr_buf: [64]u8 = undefined;
+                var val_buf: [64]u8 = undefined;
+                std.debug.print("[TYPE_CHECK] Store in letDecl: var '{s}', ptr_type={s}, val_type={s}, line={d}\n", .{
+                    name,
+                    @import("../compiler/type_rules.zig").formatType(alloca_result.ty, &ptr_buf),
+                    @import("../compiler/type_rules.zig").formatType(val.ty, &val_buf),
+                    ir_loc.line,
+                });
+            }
             try l.emit(.{
                 .store = .{
                     .ptr = alloca_result,

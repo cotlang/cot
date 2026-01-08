@@ -22,6 +22,7 @@ pub const Category = enum {
     ir,
     emit,
     vm,
+    type_check,
 };
 
 // Platform detection
@@ -42,6 +43,7 @@ pub fn isEnabled(category: Category) bool {
         .ir => "COT_DEBUG_IR",
         .emit => "COT_DEBUG_EMIT",
         .vm => "COT_DEBUG_VM",
+        .type_check => "COT_DEBUG_TYPE_CHECK",
     };
 
     if (std.posix.getenv(category_var)) |val| {
@@ -71,6 +73,7 @@ pub fn print(category: Category, comptime fmt: []const u8, args: anytype) void {
         .ir => std.debug.print("[IR] ", .{}),
         .emit => std.debug.print("[EMIT] ", .{}),
         .vm => std.debug.print("[VM] ", .{}),
+        .type_check => std.debug.print("[TYPE_CHECK] ", .{}),
     }
 
     std.debug.print(fmt ++ "\n", args);

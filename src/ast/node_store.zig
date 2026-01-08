@@ -726,6 +726,27 @@ pub const NodeStore = struct {
         };
     }
 
+    /// Add an if expression: if (cond) then_expr else else_expr
+    /// Unlike if statements, if expressions require an else branch
+    pub fn addIfExpr(self: *Self, cond: ExprIdx, then_expr: ExprIdx, else_expr: ExprIdx, loc: SourceLoc) !ExprIdx {
+        // Store else_expr in extra_data (same pattern as addIfStmt)
+        const extra_start = try self.addExtra(else_expr.toInt());
+        return self.appendExpr(.if_expr, loc, .{
+            .a = cond.toInt(),
+            .b = (then_expr.toInt() << 16) | extra_start.toInt(),
+        });
+    }
+
+    /// Get if expression parts
+    pub fn getIfExprParts(self: *const Self, expr_idx: ExprIdx) struct { cond: ExprIdx, then_expr: ExprIdx, else_expr: ExprIdx } {
+        const data = self.exprData(expr_idx);
+        const cond: ExprIdx = @enumFromInt(data.a);
+        const then_expr: ExprIdx = @enumFromInt(data.b >> 16);
+        const extra_idx: u16 = @truncate(data.b);
+        const else_expr: ExprIdx = @enumFromInt(self.extra_data.items[extra_idx]);
+        return .{ .cond = cond, .then_expr = then_expr, .else_expr = else_expr };
+    }
+
     // ========================================
     // Statement Builders
     // ========================================

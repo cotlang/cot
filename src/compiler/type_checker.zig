@@ -138,6 +138,18 @@ fn checkStore(self: *Self, store: ir.Instruction.Store) void {
     const value_ty = store.value.ty;
     const loc = locToRange(store.loc);
 
+    // Debug logging to help diagnose type mismatches (enable with COT_DEBUG_TYPE_CHECK=1)
+    if (target_ty == .void and value_ty != .void) {
+        if (std.posix.getenv("COT_DEBUG_TYPE_CHECK")) |_| {
+            var value_buf: [64]u8 = undefined;
+            const line = if (store.loc) |l| l.line else 0;
+            std.debug.print("[TYPE_CHECK] Store to void ptr at line {d}, value type: {s}\n", .{
+                line,
+                type_rules.formatType(value_ty, &value_buf),
+            });
+        }
+    }
+
     const compat = type_rules.isAssignable(target_ty, value_ty);
 
     switch (compat) {

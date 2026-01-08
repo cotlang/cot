@@ -1257,8 +1257,10 @@ pub const Parser = struct {
         if (!self.check(.rbrace) and !self.check(.semicolon) and !self.isAtEnd()) {
             // Check if there's actually an expression following
             const next = self.peek().type;
+            // Note: .kw_if is NOT excluded here because if-expressions are valid return values
+            // e.g., "return if (cond) x else y"
             if (next != .kw_fn and next != .kw_struct and next != .kw_const and
-                next != .kw_var and next != .kw_if and next != .kw_for and
+                next != .kw_var and next != .kw_for and
                 next != .kw_while and next != .kw_loop and next != .kw_return)
             {
                 // Note: We DON'T disable allow_struct_init here because:
@@ -1754,6 +1756,11 @@ pub const Parser = struct {
             return self.store.addIdentifier(name, loc) catch return error.OutOfMemory;
         }
 
+        // If expression: if (cond) expr else expr
+        if (self.match(&[_]TokenType{.kw_if})) {
+            return self.parseIfExpr(loc);
+        }
+
         // New expression: new Type{ ... } or new Type<T>{ ... } or new Type<T>
         if (self.match(&[_]TokenType{.kw_new})) {
             return self.parseNewExpr(loc);
@@ -1791,7 +1798,17 @@ pub const Parser = struct {
             return self.parseComptimeBuiltin(loc);
         }
 
-        self.addError("Expected expression");
+        // Provide more context about what was found
+        const current = self.peek();
+        // Allocate message so it persists
+        const msg = std.fmt.allocPrint(self.allocator, "Expected expression, found '{s}' ({s})", .{
+            current.lexeme,
+            @tagName(current.type),
+        }) catch {
+            self.addError("Expected expression");
+            return error.ExpectedExpression;
+        };
+        self.addError(msg);
         return error.ExpectedExpression;
     }
 
@@ -2293,6 +2310,36 @@ pub const Parser = struct {
 
         self.exitNesting();
         return idx;
+    }
+
+    /// Parse an if expression: if (cond) expr else expr
+    /// The else branch is REQUIRED (if-expressions must be total)
+    fn parseIfExpr(self: *Self, loc: SourceLoc) ParseError!ExprIdx {
+        try self.enterNesting();
+        errdefer self.exitNesting();
+
+        // Require parentheses around condition
+        _ = try self.consume(.lparen, "Expected '(' after 'if'");
+        const prev_allow_struct_init = self.allow_struct_init;
+        self.allow_struct_init = false;
+        const condition = try self.parseExpression();
+        self.allow_struct_init = prev_allow_struct_init;
+        _ = try self.consume(.rparen, "Expected ')' after condition");
+
+        // Parse then branch - can be a single expression
+        const then_expr = try self.parsePrefixExpr();
+
+        // Require else branch for if-expressions
+        _ = try self.consume(.kw_else, "If-expression requires 'else' branch");
+
+        // Parse else branch (nested if, or expression)
+        const else_expr = if (self.check(.kw_if)) blk: {
+            _ = self.advance();
+            break :blk try self.parseIfExpr(self.currentLoc());
+        } else try self.parsePrefixExpr();
+
+        self.exitNesting();
+        return self.store.addIfExpr(condition, then_expr, else_expr, loc) catch return error.OutOfMemory;
     }
 
     fn parseRangeExpr(self: *Self, start: ExprIdx, end: ExprIdx, inclusive: bool, loc: SourceLoc) ParseError!ExprIdx {

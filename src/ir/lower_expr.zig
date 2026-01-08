@@ -200,8 +200,11 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .comptime_builtin => {
             return lowerComptimeBuiltin(l, func, expr_idx, loc);
         },
-        .if_expr, .match_expr, .block_expr => {
-            // Expression forms (if/match/block as expressions) not yet supported
+        .if_expr => {
+            return lowerIfExpr(l, func, expr_idx);
+        },
+        .match_expr, .block_expr => {
+            // Expression forms (match/block as expressions) not yet supported
             // These would require SSA phi nodes or temporary variables
             l.setErrorContext(
                 LowerError.UnsupportedFeature,
@@ -589,6 +592,12 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx
 
     // Load the value from the pointer - result has the dereferenced type (value_type)
     const result = func.newValue(value_type);
+    debug.print(.ir, "lowerIdentifier: '{s}' ptr.ty={s} value_type={s} result.ty={s}", .{
+        name,
+        @tagName(ptr.ty),
+        @tagName(value_type),
+        @tagName(result.ty),
+    });
     try l.emit(.{
         .load = .{
             .ptr = ptr,
@@ -1647,6 +1656,63 @@ pub fn lowerOptionalIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) Lo
         .{},
     );
     return LowerError.UnsupportedFeature;
+}
+
+/// Lower an if expression using the select instruction
+/// if (cond) then_expr else else_expr -> select(cond, then_val, else_val)
+pub fn lowerIfExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const parts = l.store.getIfExprParts(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
+
+    // Evaluate condition
+    const cond_val = try lowerExpression(l, parts.cond);
+
+    // Lower both branches
+    const then_val = try lowerExpression(l, parts.then_expr);
+    const else_val = try lowerExpression(l, parts.else_expr);
+
+    // Type check: branches must have compatible types
+    if (!typesCompatible(then_val.ty, else_val.ty)) {
+        l.setErrorContext(
+            LowerError.TypeMismatch,
+            "If expression branches have incompatible types",
+            .{},
+            loc,
+            "lowering if expression",
+            .{},
+        );
+        return LowerError.TypeMismatch;
+    }
+
+    // Emit select instruction
+    const result = func.newValue(then_val.ty);
+    try l.emit(.{
+        .select = .{
+            .condition = cond_val,
+            .true_val = then_val,
+            .false_val = else_val,
+            .result = result,
+        },
+    });
+    return result;
+}
+
+/// Check if two types are compatible for if-expression branches
+fn typesCompatible(t1: ir.Type, t2: ir.Type) bool {
+    // Exact match
+    if (std.meta.eql(t1, t2)) return true;
+
+    // String literals are [N]u8 arrays - treat all u8 arrays as compatible strings
+    if (isU8Array(t1) and isU8Array(t2)) return true;
+
+    return false;
+}
+
+/// Check if a type is a u8 array (string literal type)
+fn isU8Array(ty: ir.Type) bool {
+    if (ty != .array) return false;
+    const elem = ty.array.element.*;
+    return elem == .u8;
 }
 
 /// Lower a type check expression: expr is Type
@@ -3566,16 +3632,33 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
         if (field_index) |idx| {
             // Lower the field value
-            const field_val = try lowerExpression(l, field_expr_idx);
+            var field_val = try lowerExpression(l, field_expr_idx);
+
+            // Get field type
+            const field_type = struct_type.fields[idx].ty;
+
+            // Fix for empty array/slice literals: lowerArrayInit returns void for empty [],
+            // but if the field type is slice/list, create a properly typed value
+            if (field_val.ty == .void) {
+                switch (field_type) {
+                    .slice => {
+                        // Empty slice: use the field's slice type
+                        field_val = func.newValue(field_type);
+                    },
+                    .list => {
+                        // Empty list: use the field's list type
+                        field_val = func.newValue(field_type);
+                    },
+                    else => {},
+                }
+            }
+
             debug.print(.ir, "struct init field {d}: '{s}' val.id={d} val.ty={s}", .{
                 idx,
                 field_name,
                 field_val.id,
                 @tagName(field_val.ty),
             });
-
-            // Get field type
-            const field_type = struct_type.fields[idx].ty;
             const field_type_ptr = try l.allocator.create(ir.Type);
             field_type_ptr.* = field_type;
             try l.allocated_types.append(l.allocator, field_type_ptr);
