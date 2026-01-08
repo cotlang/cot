@@ -867,6 +867,13 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}.clear()", .{list_reg});
             },
 
+            // list_to_slice rd, list - [rd:4|list:4] [0]
+            .list_to_slice => {
+                const rd: u4 = @truncate(operands[0] >> 4);
+                const list_reg: u4 = @truncate(operands[0] & 0xF);
+                try self.writer.print(" r{} = r{}.to_slice()", .{ rd, list_reg });
+            },
+
             // list_push_struct - [list:4|0] [field_count:8] [base_slot:16]
             .list_push_struct => {
                 const list_reg: u4 = @truncate(operands[0] >> 4);

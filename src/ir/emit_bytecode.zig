@@ -211,6 +211,12 @@ pub const BytecodeEmitter = struct {
     // IR value to stack slot mapping
     value_slots: std.AutoHashMap(u32, u16), // value_id -> stack_slot
 
+    // Struct base slot mapping - tracks where stack-allocated structs live
+    // This is separate from value_slots because struct pointers are compile-time
+    // concepts (slot references), not loadable runtime values. The struct's fields
+    // occupy the slots, not the pointer itself.
+    struct_base_slots: std.AutoHashMap(u32, u16), // struct_ptr value_id -> base_slot
+
     // IR value to constant pool index (for constants that can be loaded on demand)
     value_consts: std.AutoHashMap(u32, u16), // value_id -> constant_pool_index
 
@@ -274,6 +280,7 @@ pub const BytecodeEmitter = struct {
             .block_offsets = std.AutoHashMap(*const ir.Block, u32).init(allocator),
             .pending_jumps = .{},
             .value_slots = std.AutoHashMap(u32, u16).init(allocator),
+            .struct_base_slots = std.AutoHashMap(u32, u16).init(allocator),
             .value_consts = std.AutoHashMap(u32, u16).init(allocator),
             .field_view_info = std.AutoHashMap(u32, FieldViewInfo).init(allocator),
             .array_ptr_targets = std.AutoHashMap(u32, u16).init(allocator),
@@ -298,6 +305,7 @@ pub const BytecodeEmitter = struct {
         self.block_offsets.deinit();
         self.pending_jumps.deinit(self.allocator);
         self.value_slots.deinit();
+        self.struct_base_slots.deinit();
         self.value_consts.deinit();
         self.field_view_info.deinit();
         self.array_ptr_targets.deinit();
@@ -524,6 +532,7 @@ pub const BytecodeEmitter = struct {
         self.block_offsets.clearRetainingCapacity();
         self.pending_jumps.clearRetainingCapacity();
         self.value_slots.clearRetainingCapacity();
+        self.struct_base_slots.clearRetainingCapacity();
         self.value_consts.clearRetainingCapacity();
         self.reg_alloc.reset(); // Reset register allocation for new function
         self.last_result_value = null; // Reset last result tracking
@@ -832,6 +841,7 @@ pub const BytecodeEmitter = struct {
             .list_set => |ls| try emit_inst.emitListSet(self, ls),
             .list_len => |ll| try emit_inst.emitListLen(self, ll),
             .list_clear => |lc| try emit_inst.emitListClear(self, lc),
+            .list_to_slice => |lts| try emit_inst.emitListToSlice(self, lts),
 
             // Weak reference operations
             .weak_ref => |w| try emit_inst.emitWeakRef(self, w),

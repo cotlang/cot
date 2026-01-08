@@ -665,6 +665,31 @@ fn printRuntimeError(vm: *cot.bytecode.VM, mod: *const cot.bytecode.Module, err:
             line,
             @errorName(err),
         }) catch {};
+
+        // Try to read and display the source line
+        blk: {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            const file = std.fs.cwd().openFile(source_file, .{}) catch break :blk;
+            defer file.close();
+            const content = file.readToEndAlloc(alloc, 10 * 1024 * 1024) catch break :blk;
+            defer alloc.free(content);
+            // Find the requested line
+            var line_num: u32 = 0;
+            var start: usize = 0;
+            for (content, 0..) |c, i| {
+                if (c == '\n') {
+                    line_num += 1;
+                    if (line_num == line) {
+                        const line_content = content[start..i];
+                        w.print("  {d: >4} | {s}\n", .{ line, line_content }) catch {};
+                        break;
+                    }
+                    start = i + 1;
+                }
+            }
+        }
     } else {
         w.print("\x1b[1m{s}: \x1b[31merror\x1b[0m\x1b[1m: {s}\x1b[0m\n", .{
             source_file,
@@ -678,7 +703,9 @@ fn printRuntimeError(vm: *cot.bytecode.VM, mod: *const cot.bytecode.Module, err:
             w.print("  \x1b[36mmessage\x1b[0m: {s}\n", .{re.message}) catch {};
         }
         if (re.detail) |detail| {
-            w.print("  \x1b[36mdetail\x1b[0m: {s}\n", .{detail}) catch {};
+            if (detail.len > 0) {
+                w.print("  \x1b[36mdetail\x1b[0m: {s}\n", .{detail}) catch {};
+            }
         }
     }
 
@@ -914,6 +941,10 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
     var store = cot.ast.NodeStore.init(allocator, &strings);
     defer store.deinit();
 
+    // Register file for error tracking
+    const file_id = store.registerFile(filename) catch .unknown;
+    store.setCurrentFile(file_id);
+
     // Parse
     var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
     defer parse.deinit();
@@ -982,9 +1013,11 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
         .ok => |module| module,
         .err => |e| {
             if (e.detail) |detail| {
+                // Use file path from error detail if available (for imports), otherwise use main filename
+                const error_file = detail.file_path orelse filename;
                 collector.addError(
                     .E300_undefined_label,
-                    filename,
+                    error_file,
                     diagnostics.SourceRange.fromLoc(detail.line, detail.column),
                     "{s}",
                     .{detail.message},
@@ -1673,6 +1706,10 @@ fn parseFileIntoStore(
     const source = try file.readToEndAlloc(allocator, 1024 * 1024 * 10);
     collector.cacheSource(filename, source) catch {};
 
+    // Register file for error tracking and set as current file for parsing
+    const file_id = store.registerFile(filename) catch .unknown;
+    store.setCurrentFile(file_id);
+
     // Tokenize
     var lex = cot.lexer.Lexer.init(source);
     const tokens = lex.tokenize(allocator) catch |err| {
@@ -2127,9 +2164,11 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
         .ok => |module| module,
         .err => |e| {
             if (e.detail) |detail| {
+                // Use file path from error detail if available (for imports), otherwise use main filename
+                const error_file = detail.file_path orelse filename;
                 collector.addError(
                     .E300_undefined_label,
-                    filename,
+                    error_file,
                     diagnostics.SourceRange.fromLoc(detail.line, detail.column),
                     "{s}",
                     .{detail.message},
@@ -2315,6 +2354,10 @@ fn runTests(allocator: std.mem.Allocator, filename: []const u8, filter: ?[]const
 
     var store = cot.ast.NodeStore.init(allocator, &strings);
     defer store.deinit();
+
+    // Register file for error tracking
+    const file_id = store.registerFile(filename) catch .unknown;
+    store.setCurrentFile(file_id);
 
     // Parse
     var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
@@ -2508,6 +2551,10 @@ fn dumpIR(backing_allocator: std.mem.Allocator, filename: []const u8) !void {
     var strings = cot.base.StringInterner.init(allocator);
     var store = cot.ast.NodeStore.init(allocator, &strings);
 
+    // Register file for error tracking
+    const file_id = store.registerFile(filename) catch .unknown;
+    store.setCurrentFile(file_id);
+
     // Parse
     var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
     const top_level = parse.parse() catch |err| {
@@ -2532,7 +2579,8 @@ fn dumpIR(backing_allocator: std.mem.Allocator, filename: []const u8) !void {
         .ok => |module| module,
         .err => |e| {
             if (e.detail) |detail| {
-                try printStderr("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                const error_file = detail.file_path orelse filename;
+                try printStderr("{s}:{d}:{d}: error: {s}\n", .{ error_file, detail.line, detail.column, detail.message });
                 if (detail.context.len > 0) {
                     try printStderr("  while {s}\n", .{detail.context});
                 }
@@ -2606,6 +2654,10 @@ fn disasmFile(backing_allocator: std.mem.Allocator, filename: []const u8) !void 
         var strings = cot.base.StringInterner.init(allocator);
         var store = cot.ast.NodeStore.init(allocator, &strings);
 
+        // Register file for error tracking
+        const file_id = store.registerFile(filename) catch .unknown;
+        store.setCurrentFile(file_id);
+
         var parse = cot.parser.Parser.init(allocator, tokens, &store, &strings);
         const top_level = parse.parse() catch |err| {
             try printStderr("Parser error: {}\n", .{err});
@@ -2629,7 +2681,8 @@ fn disasmFile(backing_allocator: std.mem.Allocator, filename: []const u8) !void 
             .ok => |module| module,
             .err => |e| {
                 if (e.detail) |detail| {
-                    try printStderr("{d}:{d}: error: {s}\n", .{ detail.line, detail.column, detail.message });
+                    const error_file = detail.file_path orelse filename;
+                    try printStderr("{s}:{d}:{d}: error: {s}\n", .{ error_file, detail.line, detail.column, detail.message });
                     if (detail.context.len > 0) {
                         try printStderr("  while {s}\n", .{detail.context});
                     }

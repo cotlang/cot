@@ -133,7 +133,9 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
     if (a.ty == .@"struct") {
         // Check if this is a parameter (already registered as local)
         if (e.locals.get(a.name)) |local_info| {
-            try e.value_slots.put(a.result.id, local_info.slot);
+            // Use struct_base_slots for struct pointers - they're compile-time slot
+            // references, not loadable runtime values
+            try e.struct_base_slots.put(a.result.id, local_info.slot);
             return;
         }
 
@@ -144,7 +146,9 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
             .slot = base_slot,
             .is_global = false,
         });
-        try e.value_slots.put(a.result.id, base_slot);
+        // Use struct_base_slots instead of value_slots - struct pointers are
+        // compile-time concepts pointing to where fields live, not loadable values
+        try e.struct_base_slots.put(a.result.id, base_slot);
         debug.print(.emit, "alloca struct: name={s} result.id={d} base_slot={d}", .{ a.name, a.result.id, base_slot });
         // Allocate slots for each field, recursively handling nested structs
         try allocateStructFieldSlots(e, a.name, struct_type);
@@ -296,11 +300,12 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
     }
 
     // Regular store
-    // Check if this is a struct value being stored (either direct struct or pointer-to-struct)
+    // Check if this is a struct value being stored (by VALUE, not a pointer)
+    // IMPORTANT: Pointer-to-struct types (like *Expr) are NOT struct values!
+    // A pointer is always a single 8-byte value regardless of what it points to.
+    // Only actual struct types need multi-slot storage.
     const struct_type_opt: ?*const ir.StructType = if (s.value.ty == .@"struct")
         s.value.ty.@"struct"
-    else if (s.value.ty == .ptr and s.value.ty.ptr.* == .@"struct")
-        s.value.ty.ptr.*.@"struct"
     else
         null;
 
@@ -380,15 +385,22 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
 
     // Special case: storing an array value/pointer into a pointer slot
     // Track the array slot so array_load can use it when accessing through the pointer
+    // BUT: If the destination is a struct field (has a slot), we must emit the actual store
+    //      because struct fields need the value copied, not just pointer tracking.
     if (s.value.ty == .array or (s.value.ty == .ptr and s.value.ty.ptr.* == .array)) {
-        if (e.value_slots.get(s.value.id)) |value_slot| {
-            const array_slot = value_slot & 0x7FFF;
-            // Record that the target pointer (s.ptr.id) points to this array slot
-            try e.array_ptr_targets.put(s.ptr.id, array_slot);
-            debug.print(.emit, "store: array ptr tracking id={d} -> array_slot={d}", .{ s.ptr.id, array_slot });
-            // For array pointer stores, no actual bytecode needed - just tracking
-            // The array is accessed directly by slot in array_load
-            return;
+        const dest_is_struct_field = e.value_slots.get(s.ptr.id) != null;
+        if (!dest_is_struct_field) {
+            if (e.value_slots.get(s.value.id)) |value_slot| {
+                const array_slot = value_slot & 0x7FFF;
+                // Record that the target pointer (s.ptr.id) points to this array slot
+                try e.array_ptr_targets.put(s.ptr.id, array_slot);
+                debug.print(.emit, "store: array ptr tracking id={d} -> array_slot={d}", .{ s.ptr.id, array_slot });
+                // For array pointer stores, no actual bytecode needed - just tracking
+                // The array is accessed directly by slot in array_load
+                return;
+            }
+        } else {
+            debug.print(.emit, "store: array to struct field, emitting actual store", .{});
         }
     }
 
@@ -413,39 +425,44 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
 /// Emit field_ptr instruction
 /// Uses getFieldOffset to properly calculate slot offset for nested structs.
 pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!void {
-    if (e.value_slots.get(fp.struct_ptr.id)) |struct_slot| {
-        // Get the struct type to calculate proper offset
-        const struct_type: ?*const ir.StructType = if (fp.struct_ptr.ty == .@"struct")
-            fp.struct_ptr.ty.@"struct"
-        else if (fp.struct_ptr.ty == .ptr and fp.struct_ptr.ty.ptr.* == .@"struct")
-            fp.struct_ptr.ty.ptr.*.@"struct"
-        else
-            null;
+    // First check struct_base_slots (for stack-allocated structs from alloca),
+    // then fall back to value_slots (for other pointer sources like parameters)
+    const struct_slot = e.struct_base_slots.get(fp.struct_ptr.id) orelse
+        e.value_slots.get(fp.struct_ptr.id) orelse {
+        debug.print(.emit, "WARNING: field_ptr struct_ptr.id={d} not found in struct_base_slots or value_slots", .{fp.struct_ptr.id});
+        return;
+    };
 
-        // Debug: show type information
-        debug.print(.emit, "emitFieldPtr: struct_ptr.ty={s} field_index={d} struct_type={s}", .{
-            @tagName(fp.struct_ptr.ty),
-            fp.field_index,
-            if (struct_type) |st| st.name else "<null>",
-        });
+    // Get the struct type to calculate proper offset
+    const struct_type: ?*const ir.StructType = if (fp.struct_ptr.ty == .@"struct")
+        fp.struct_ptr.ty.@"struct"
+    else if (fp.struct_ptr.ty == .ptr and fp.struct_ptr.ty.ptr.* == .@"struct")
+        fp.struct_ptr.ty.ptr.*.@"struct"
+    else
+        null;
 
-        // Calculate field offset accounting for nested struct sizes
-        const field_offset: u32 = if (struct_type) |st|
-            getFieldOffset(st, fp.field_index)
-        else blk: {
-            debug.print(.emit, "  WARNING: No struct type for field_ptr, using raw index!", .{});
-            break :blk fp.field_index;
-        };
+    // Debug: show type information
+    debug.print(.emit, "emitFieldPtr: struct_ptr.ty={s} field_index={d} struct_type={s}", .{
+        @tagName(fp.struct_ptr.ty),
+        fp.field_index,
+        if (struct_type) |st| st.name else "<null>",
+    });
 
-        const field_slot = (struct_slot & 0x7FFF) + @as(u16, @intCast(field_offset));
-        const is_global = (struct_slot & 0x8000) != 0;
-        try e.value_slots.put(fp.result.id, field_slot | (if (is_global) @as(u16, 0x8000) else 0));
-        debug.print(.emit, "field_ptr: struct_slot={d} field_index={d} field_offset={d} -> slot {d}", .{
-            struct_slot & 0x7FFF, fp.field_index, field_offset, field_slot,
-        });
-    } else {
-        debug.print(.emit, "WARNING: field_ptr struct_ptr.id={d} not in value_slots", .{fp.struct_ptr.id});
-    }
+    // Calculate field offset accounting for nested struct sizes
+    const field_offset: u32 = if (struct_type) |st|
+        getFieldOffset(st, fp.field_index)
+    else blk: {
+        debug.print(.emit, "  WARNING: No struct type for field_ptr, using raw index!", .{});
+        break :blk fp.field_index;
+    };
+
+    const field_slot = (struct_slot & 0x7FFF) + @as(u16, @intCast(field_offset));
+    const is_global = (struct_slot & 0x8000) != 0;
+    // Field pointers go in value_slots - they ARE loadable values (pointing to individual field slots)
+    try e.value_slots.put(fp.result.id, field_slot | (if (is_global) @as(u16, 0x8000) else 0));
+    debug.print(.emit, "field_ptr: struct_slot={d} field_index={d} field_offset={d} -> slot {d}", .{
+        struct_slot & 0x7FFF, fp.field_index, field_offset, field_slot,
+    });
 }
 
 // ============================================================================
@@ -781,21 +798,34 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
     var return_base_reg: u8 = 15;
 
     if (r) |val| {
-        // Check for struct type OR pointer-to-struct type
-        // Struct literals have pointer-to-struct type (the address of the temporary struct)
-        const struct_type_opt: ?*const ir.StructType = if (val.ty == .@"struct")
-            val.ty.@"struct"
-        else if (val.ty == .ptr and val.ty.ptr.* == .@"struct")
-            val.ty.ptr.*.@"struct"
-        else
-            null;
+        // Check if the FUNCTION'S declared return type is a struct (by value return).
+        // This is the key distinction:
+        //   - Function returns `Lexer` → return struct by value (expand all fields)
+        //   - Function returns `*Expr` → return pointer (single 8-byte value)
+        // The value's type may be `.ptr` in both cases (struct literals create stack pointers),
+        // but the function signature determines whether we expand fields or not.
+        const struct_type_opt: ?*const ir.StructType = blk: {
+            // First check the function's declared return type
+            if (e.current_func) |func| {
+                if (func.signature.return_type == .@"struct") {
+                    break :blk func.signature.return_type.@"struct";
+                }
+            }
+            // Fall back to checking the value's type (for cases without function context)
+            if (val.ty == .@"struct") {
+                break :blk val.ty.@"struct";
+            }
+            break :blk null;
+        };
 
         // Additional debug for all types - print before the main line to see pointee
         const ptr_to_type_str: []const u8 = if (val.ty == .ptr) @tagName(val.ty.ptr.*) else "N/A";
-        debug.print(.emit, "emitReturn: val.id={d} val.ty={s} ptr_to={s} struct_type_opt={s} has_slot={} func={s}", .{
+        const func_ret_type_str: []const u8 = if (e.current_func) |f| @tagName(f.signature.return_type) else "?";
+        debug.print(.emit, "emitReturn: val.id={d} val.ty={s} ptr_to={s} func_ret={s} struct_type_opt={s} has_slot={} func={s}", .{
             val.id,
             @tagName(val.ty),
             ptr_to_type_str,
+            func_ret_type_str,
             if (struct_type_opt != null) "yes" else "no",
             e.value_slots.get(val.id) != null,
             if (e.current_func) |f| f.name else "?",
@@ -1056,11 +1086,11 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     // First pass: calculate total slots needed to determine if we need stack overflow
     var total_slots: usize = 0;
     for (c.args) |arg| {
-        // Check for struct type OR pointer-to-struct type (for ref params like &lex)
+        // Check for struct type by value (NOT pointer-to-struct).
+        // A pointer like *Expr is just 8 bytes regardless of what it points to.
+        // Only actual struct values need multiple slots.
         const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
             arg.ty.@"struct"
-        else if (arg.ty == .ptr and arg.ty.ptr.* == .@"struct")
-            arg.ty.ptr.*.@"struct"
         else
             null;
         if (struct_type_opt) |struct_type| {
@@ -1084,11 +1114,9 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     if (stack_argc > 0) {
         var slot_idx: usize = 0; // Track absolute slot position across all args
         for (c.args) |arg| {
-            // Check for struct type OR pointer-to-struct type (same as first pass)
+            // Check for struct type by value (NOT pointer-to-struct, same as first pass)
             const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
                 arg.ty.@"struct"
-            else if (arg.ty == .ptr and arg.ty.ptr.* == .@"struct")
-                arg.ty.ptr.*.@"struct"
             else
                 null;
             const slot_count: usize = if (struct_type_opt) |st|
@@ -1133,11 +1161,10 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
         };
         _ = is_ref_param; // Used for writeback logic after call
 
-        // Check for struct type OR pointer-to-struct type (for ref params like &lex)
+        // Check for struct type by value (NOT pointer-to-struct)
+        // A pointer like *Expr is passed as a single 8-byte value.
         const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
             arg.ty.@"struct"
-        else if (arg.ty == .ptr and arg.ty.ptr.* == .@"struct")
-            arg.ty.ptr.*.@"struct"
         else
             null;
 
@@ -2135,6 +2162,16 @@ pub fn emitListClear(e: *BytecodeEmitter, lc: ir.Instruction.ListClear) EmitErro
     try e.emitOpcode(.list_clear);
     try e.emitU8((@as(u8, list_reg) << 4) | 0);
     try e.emitU8(0);
+}
+
+/// Emit list_to_slice instruction: converts List<T> to []T
+pub fn emitListToSlice(e: *BytecodeEmitter, lts: ir.Instruction.ListToSlice) EmitError!void {
+    const list_reg = try e.getValueInReg(lts.list, 0);
+    const dest_reg: u4 = 1;
+    try e.emitOpcode(.list_to_slice);
+    try e.emitU8((@as(u8, dest_reg) << 4) | list_reg);
+    try e.emitU8(0);
+    e.setLastResult(lts.result.id, dest_reg);
 }
 
 // ============================================================================

@@ -581,6 +581,11 @@ pub const Printer = struct {
                 try self.writer.writeAll("list_clear ");
                 try self.printValue(l.list);
             },
+            .list_to_slice => |l| {
+                try self.printValue(l.result);
+                try self.writer.writeAll(" = list_to_slice ");
+                try self.printValue(l.list);
+            },
 
             // Closure operations
             .make_closure => |c| {

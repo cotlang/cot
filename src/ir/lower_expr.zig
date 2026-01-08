@@ -788,10 +788,11 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             },
         },
         else => {
-            l.setErrorContext(
+            l.setErrorContextWithFileId(
                 LowerError.TypeMismatch,
                 "cannot access field '{s}' - expected pointer type",
                 .{field_name},
+                l.store.exprFileId(expr_idx),
                 loc,
                 "lowering member access (object is not a pointer)",
                 .{},
@@ -2154,7 +2155,23 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             }
 
             // Check if this is an imported package function (e.g., utils.add)
-            if (isImportedPackageFunction(l, qualified_name)) {
+            // BUT NOT if the first component is a local variable (method call on instance)
+            // e.g., if we have: var parser = Parser.create(); parser.parseModule()
+            // The variable `parser` might shadow the import `parser`, but it's a method call
+            const is_local_var = blk: {
+                const dot_pos = std.mem.indexOf(u8, qualified_name, ".") orelse break :blk false;
+                const first_component = qualified_name[0..dot_pos];
+                // Check if this is a local variable in any scope
+                if (l.scopes.get(first_component)) |_| {
+                    break :blk true;
+                }
+                // Also check global variables
+                if (l.global_variables.contains(first_component)) {
+                    break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_local_var and isImportedPackageFunction(l, qualified_name)) {
                 // Lower arguments
                 var pkg_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer pkg_args.deinit(l.allocator);
@@ -2627,6 +2644,22 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     },
                 });
                 return func.newValue(.void);
+            } else if (std.mem.eql(u8, field_name, "to_slice")) {
+                // Convert List<T> to []T slice
+                // The result type is a slice of the element type
+                const slice_type_ptr = try l.allocator.create(ir.Type);
+                slice_type_ptr.* = elem_type;
+                try l.allocated_types.append(l.allocator, slice_type_ptr);
+
+                const result = func.newValue(.{ .slice = slice_type_ptr });
+                try l.emit(.{
+                    .list_to_slice = .{
+                        .list = object_val,
+                        .result = result,
+                        .loc = null,
+                    },
+                });
+                return result;
             }
         }
 
@@ -2852,12 +2885,59 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     }
 
     // Dupe the callee name so Block.deinit can consistently free it
+    // Also track if this is a method call that needs object as first argument
+    // And track the qualified name for return type lookup (TypeName.methodName)
+    var method_object: ?ir.Value = null;
+    var qualified_callee_for_lookup: ?[]const u8 = null;
     const callee_name = if (callee_tag == .identifier) blk: {
         const callee_data = l.store.exprData(callee_idx);
         const name_id = callee_data.getName();
         const name = l.strings.get(name_id);
         break :blk l.allocator.dupe(u8, name) catch return LowerError.OutOfMemory;
-    } else l.allocator.dupe(u8, "") catch return LowerError.OutOfMemory;
+    } else if (callee_tag == .member) blk: {
+        // Method call that wasn't handled by special cases above (e.g., enum methods)
+        // Extract method name from member expression and lower the object
+        const callee_data = l.store.exprData(callee_idx);
+        const object_idx = callee_data.getObject();
+        const field_id = callee_data.getField();
+        const field_name = l.strings.get(field_id);
+        // Lower the object so we can pass it as the first argument
+        method_object = try lowerExpression(l, object_idx);
+
+        // For return type lookup, we need the qualified name (TypeName.methodName)
+        // Get the type name from the object's type
+        if (method_object) |obj| {
+            const type_name: ?[]const u8 = switch (obj.ty) {
+                .@"struct" => |s| s.name,
+                .ptr => |p| switch (p.*) {
+                    .@"struct" => |s| s.name,
+                    else => null,
+                },
+                else => null,
+            };
+            if (type_name) |tn| {
+                var qualified_buf: [256]u8 = undefined;
+                const qualified = std.fmt.bufPrint(&qualified_buf, "{s}.{s}", .{ tn, field_name }) catch null;
+                if (qualified) |q| {
+                    qualified_callee_for_lookup = l.allocator.dupe(u8, q) catch null;
+                }
+            }
+        }
+
+        break :blk l.allocator.dupe(u8, field_name) catch return LowerError.OutOfMemory;
+    } else blk: {
+        // Unsupported callee expression type - emit error
+        l.setErrorContext(
+            LowerError.UnsupportedFeature,
+            "Unsupported callee expression type: {s}",
+            .{@tagName(callee_tag)},
+            call_loc,
+            "only identifiers and method calls are supported",
+            .{},
+        );
+        break :blk l.allocator.dupe(u8, "") catch return LowerError.OutOfMemory;
+    };
+    defer if (qualified_callee_for_lookup) |q| l.allocator.free(q);
 
     // Check if this is a database I/O call that needs structure serialization
     const is_db_write = std.mem.eql(u8, callee_name, "db_store") or std.mem.eql(u8, callee_name, "db_write");
@@ -2865,6 +2945,11 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // Lower arguments
     var args: std.ArrayListUnmanaged(ir.Value) = .{};
     defer args.deinit(l.allocator);
+
+    // If this is a method call, prepend the object as the first argument
+    if (method_object) |obj| {
+        try args.append(l.allocator, obj);
+    }
 
     // Get expected parameter types for this function (if known)
     const param_types = l.fn_param_types.get(callee_name);
@@ -3059,12 +3144,23 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     }
 
     // Determine result type:
-    // 1. First check if this is a user-defined function with a known return type
-    // 2. Otherwise fall back to builtin return type inference
-    const result_type: ir.Type = if (l.fn_return_types.get(actual_callee)) |rt|
-        rt
-    else
-        getBuiltinReturnType(actual_callee, args_slice);
+    // 1. For method calls, first try qualified name (TypeName.methodName)
+    // 2. Then try the callee name directly
+    // 3. Otherwise fall back to builtin return type inference
+    const result_type: ir.Type = blk: {
+        // First try qualified name for method calls (e.g., Parser.parseModule)
+        if (qualified_callee_for_lookup) |qname| {
+            if (l.fn_return_types.get(qname)) |rt| {
+                break :blk rt;
+            }
+        }
+        // Then try the actual callee name
+        if (l.fn_return_types.get(actual_callee)) |rt| {
+            break :blk rt;
+        }
+        // Fall back to builtin return type
+        break :blk getBuiltinReturnType(actual_callee, args_slice);
+    };
     const result = func.newValue(result_type);
 
     try l.emit(.{
@@ -3471,6 +3567,12 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         if (field_index) |idx| {
             // Lower the field value
             const field_val = try lowerExpression(l, field_expr_idx);
+            debug.print(.ir, "struct init field {d}: '{s}' val.id={d} val.ty={s}", .{
+                idx,
+                field_name,
+                field_val.id,
+                @tagName(field_val.ty),
+            });
 
             // Get field type
             const field_type = struct_type.fields[idx].ty;
@@ -3480,6 +3582,11 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
             // Get pointer to field
             const field_ptr = func.newValue(.{ .ptr = field_type_ptr });
+            debug.print(.ir, "  emitting field_ptr: struct_ptr.id={d} field_idx={d} result.id={d}", .{
+                struct_ptr.id,
+                idx,
+                field_ptr.id,
+            });
             try l.emit(.{
                 .field_ptr = .{
                     .struct_ptr = struct_ptr,
@@ -3489,17 +3596,24 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             });
 
             // Store value to field
+            debug.print(.ir, "  emitting store: ptr.id={d} val.id={d}", .{
+                field_ptr.id,
+                field_val.id,
+            });
             try l.emit(.{
                 .store = .{
                     .ptr = field_ptr,
                     .value = field_val,
                 },
             });
+        } else {
+            debug.print(.ir, "struct init: unknown field '{s}'", .{field_name});
         }
         // Skip unknown fields silently (could add warning)
     }
 
     // Return pointer to struct
+    debug.print(.ir, "struct init done: returning ptr.id={d}", .{struct_ptr.id});
     return struct_ptr;
 }
 

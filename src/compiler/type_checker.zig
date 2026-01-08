@@ -116,7 +116,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => {},
         .array_len, .array_slice, .debug_line, .select, .ptr_offset => {},
         .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => {},
-        .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => {},
+        .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear, .list_to_slice => {},
         // Closure operations
         .make_closure => {},
         // Weak reference operations

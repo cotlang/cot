@@ -1423,6 +1423,7 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.list_set)] = &vm_opcodes.op_list_set;
         table[@intFromEnum(Opcode.list_len)] = &vm_opcodes.op_list_len;
         table[@intFromEnum(Opcode.list_clear)] = &vm_opcodes.op_list_clear;
+        table[@intFromEnum(Opcode.list_to_slice)] = &vm_opcodes.op_list_to_slice;
 
         // List struct operations (0xB5-0xB8) - for storing structs in lists
         table[@intFromEnum(Opcode.list_push_struct)] = &vm_opcodes.op_list_push_struct;
@@ -1798,7 +1799,7 @@ pub const VM = struct {
         // Not found in module, try external native function registry
         const def = self.native_registry.lookup(routine_name) orelse {
             debug.print(.vm, "NATIVE {s} failed: function not found", .{routine_name});
-            return VMError.InvalidOpcode;
+            return self.failWithDetail(VMError.InvalidRoutine, "Function not found", routine_name);
         };
 
         switch (def.sub_type) {
@@ -1806,7 +1807,7 @@ pub const VM = struct {
                 // Get the external bytecode module
                 const ext_module = self.native_registry.getLoadedModule(def.module_index.?) orelse {
                     debug.print(.vm, "NATIVE {s} failed: module not found", .{routine_name});
-                    return VMError.InvalidOpcode;
+                    return self.failWithDetail(VMError.UnresolvedImport, "Module not found for external function", routine_name);
                 };
 
                 // Call into the external module

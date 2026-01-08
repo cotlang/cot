@@ -371,6 +371,9 @@ pub const Verifier = struct {
             .list_clear => |op| {
                 try self.checkValueDefined(op.list);
             },
+            .list_to_slice => |op| {
+                try self.checkValueDefined(op.list);
+            },
             // Closure operations
             .make_closure => |op| {
                 try self.checkValueDefined(op.env);

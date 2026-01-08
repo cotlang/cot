@@ -1030,7 +1030,19 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
         var_type = try l.lowerTypeIdx(type_idx);
     } else if (init_val) |val| {
         // Infer type from init expression
-        var_type = val.ty;
+        // If init is a pointer to struct/array (from struct/array init expression),
+        // infer the underlying type so `var f = Foo{...}` has type Foo, not *Foo.
+        // This ensures the aliasing optimization below is triggered.
+        if (val.ty == .ptr) {
+            const pointee = val.ty.ptr.*;
+            if (pointee == .@"struct" or pointee == .array) {
+                var_type = pointee;
+            } else {
+                var_type = val.ty;
+            }
+        } else {
+            var_type = val.ty;
+        }
     } else {
         // No type and no init - default to void (error will be caught later)
         var_type = .void;

@@ -1607,7 +1607,9 @@ pub const Parser = struct {
                 } else {
                     const field_token = try self.consume(.identifier, "Expected field name");
                     const field = self.internString(field_token.lexeme) catch return error.OutOfMemory;
-                    result = self.store.addMember(result, field, self.currentLoc()) catch return error.OutOfMemory;
+                    // Use field_token location, not currentLoc (which points to next token)
+                    const loc = SourceLoc.init(@intCast(field_token.line), @intCast(field_token.column));
+                    result = self.store.addMember(result, field, loc) catch return error.OutOfMemory;
                 }
             } else if (self.match(&[_]TokenType{.lbracket})) {
                 try self.enterNesting();
@@ -1634,7 +1636,9 @@ pub const Parser = struct {
                 // Optional member access: expr?.field (null-safe)
                 const field_token = try self.consume(.identifier, "Expected field name");
                 const field = self.internString(field_token.lexeme) catch return error.OutOfMemory;
-                result = self.store.addOptionalMember(result, field, self.currentLoc()) catch return error.OutOfMemory;
+                // Use field_token location, not currentLoc (which points to next token)
+                const loc = SourceLoc.init(@intCast(field_token.line), @intCast(field_token.column));
+                result = self.store.addOptionalMember(result, field, loc) catch return error.OutOfMemory;
             } else if (self.match(&[_]TokenType{.question_lbracket})) {
                 // Optional index access: expr?[index] (null-safe, returns null on out-of-bounds)
                 try self.enterNesting();

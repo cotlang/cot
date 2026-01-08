@@ -239,12 +239,17 @@ pub const Lowerer = struct {
     pub const ErrorContext = struct {
         kind: LowerError,
         message: []const u8,
+        file_path: ?[]const u8, // Source file path (from FileId lookup)
         line: u32,
         column: u32,
         context: []const u8, // What we were trying to do (e.g., "lowering assignment to 'x'")
 
         pub fn format(self: ErrorContext, writer: anytype) !void {
-            try writer.print("{d}:{d}: error: {s}\n", .{ self.line, self.column, self.message });
+            if (self.file_path) |path| {
+                try writer.print("{s}:{d}:{d}: error: {s}\n", .{ path, self.line, self.column, self.message });
+            } else {
+                try writer.print("{d}:{d}: error: {s}\n", .{ self.line, self.column, self.message });
+            }
             if (self.context.len > 0) {
                 try writer.print("  while {s}\n", .{self.context});
             }
@@ -402,6 +407,32 @@ pub const Lowerer = struct {
         self.last_error = .{
             .kind = err,
             .message = message,
+            .file_path = self.source_file,
+            .line = loc.line,
+            .column = loc.column,
+            .context = context,
+        };
+    }
+
+    /// Set error context with file_id lookup (for more precise file tracking)
+    pub fn setErrorContextWithFileId(
+        self: *Self,
+        err: LowerError,
+        comptime message_fmt: []const u8,
+        message_args: anytype,
+        file_id: ast.FileId,
+        loc: SourceLoc,
+        comptime context_fmt: []const u8,
+        context_args: anytype,
+    ) void {
+        const message = std.fmt.allocPrint(self.allocator, message_fmt, message_args) catch "allocation failed";
+        const context = std.fmt.allocPrint(self.allocator, context_fmt, context_args) catch "";
+        // Look up file path from NodeStore
+        const file_path = self.store.getFilePath(file_id);
+        self.last_error = .{
+            .kind = err,
+            .message = message,
+            .file_path = file_path,
             .line = loc.line,
             .column = loc.column,
             .context = context,
@@ -3372,6 +3403,7 @@ pub const ErrorDetail = struct {
     context: []const u8,
     line: u32,
     column: u32,
+    file_path: ?[]const u8 = null,
 };
 
 /// Result type for lowering with error details
@@ -3419,6 +3451,7 @@ pub fn lowerWithDetails(
             .context = allocator.dupe(u8, ctx.context) catch ctx.context,
             .line = ctx.line,
             .column = ctx.column,
+            .file_path = ctx.file_path,
         } else null;
 
         lowerer.deinit();

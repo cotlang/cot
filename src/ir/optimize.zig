@@ -708,6 +708,9 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .list_clear => |l| {
             used.put(l.list.id, {}) catch {};
         },
+        .list_to_slice => |l| {
+            used.put(l.list.id, {}) catch {};
+        },
         // Closure operations
         .make_closure => |c| {
             used.put(c.env.id, {}) catch {};

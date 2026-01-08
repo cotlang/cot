@@ -3135,6 +3135,26 @@ pub fn op_list_clear(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
+/// list_to_slice rd, list - rd = list.to_slice() (converts List<T> to []T)
+/// The result is the same list - in Cot, lists can be used as slices directly
+pub fn op_list_to_slice(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const list_reg: u4 = @truncate(ops);
+
+    const list_val = vm.registers[list_reg];
+    // Verify it's actually a list
+    _ = list_val.asList() orelse {
+        return vm.fail(VMError.InvalidType, "Expected list value");
+    };
+
+    // In Cot, lists and slices are interchangeable at runtime
+    // The list itself is returned - type difference is compile-time only
+    vm.writeRegister(rd, list_val);
+    return .continue_dispatch;
+}
+
 /// list_push_struct - push struct from consecutive slots as a StructBox
 /// Format: [list:4|0] [field_count:8] [base_slot:16]
 pub fn op_list_push_struct(vm: *VM, module: *const Module) VMError!DispatchResult {

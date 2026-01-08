@@ -28,6 +28,21 @@ const types = @import("types.zig");
 pub const TypeTag = types.TypeTag;
 pub const Mutability = types.Mutability;
 
+/// File identifier for tracking source files across imports
+pub const FileId = enum(u16) {
+    /// Unknown/default file (index 0)
+    unknown = 0,
+    _,
+
+    pub fn fromInt(val: u16) FileId {
+        return @enumFromInt(val);
+    }
+
+    pub fn toInt(self: FileId) u16 {
+        return @intFromEnum(self);
+    }
+};
+
 /// Source location for error reporting
 pub const SourceLoc = packed struct {
     line: u24,
@@ -39,6 +54,29 @@ pub const SourceLoc = packed struct {
         return .{
             .line = @intCast(@min(line, std.math.maxInt(u24))),
             .column = @intCast(@min(column, std.math.maxInt(u8))),
+        };
+    }
+
+    /// Create a full source location with file, line, and column
+    pub fn withFile(file_id: FileId, line: u32, column: u32) FullSourceLoc {
+        return .{
+            .file_id = file_id,
+            .loc = init(line, column),
+        };
+    }
+};
+
+/// Full source location including file identifier
+pub const FullSourceLoc = struct {
+    file_id: FileId,
+    loc: SourceLoc,
+
+    pub const zero: FullSourceLoc = .{ .file_id = .unknown, .loc = SourceLoc.zero };
+
+    pub fn init(file_id: FileId, line: u32, column: u32) FullSourceLoc {
+        return .{
+            .file_id = file_id,
+            .loc = SourceLoc.init(line, column),
         };
     }
 };
@@ -304,14 +342,20 @@ pub const NodeStore = struct {
     /// Reference to string interner (not owned)
     strings: *StringInterner,
 
+    // File table: maps FileId -> file path
+    // Index 0 is reserved for "unknown"
+    file_paths: std.ArrayListUnmanaged([]const u8),
+
     // Statement SoA arrays
     stmt_tags: std.ArrayListUnmanaged(StatementTag),
     stmt_locs: std.ArrayListUnmanaged(SourceLoc),
+    stmt_file_ids: std.ArrayListUnmanaged(FileId),
     stmt_data: std.ArrayListUnmanaged(NodeData),
 
     // Expression SoA arrays
     expr_tags: std.ArrayListUnmanaged(ExpressionTag),
     expr_locs: std.ArrayListUnmanaged(SourceLoc),
+    expr_file_ids: std.ArrayListUnmanaged(FileId),
     expr_data: std.ArrayListUnmanaged(NodeData),
 
     // Type SoA arrays
@@ -327,6 +371,9 @@ pub const NodeStore = struct {
     scratch_u32: std.ArrayListUnmanaged(u32),
     scratch_marks: std.ArrayListUnmanaged(ScratchMark),
 
+    // Current file being parsed (set by parser before parsing each file)
+    current_file_id: FileId,
+
     const Self = @This();
 
     const ScratchMark = struct {
@@ -337,14 +384,17 @@ pub const NodeStore = struct {
 
     /// Initialize a new NodeStore
     pub fn init(allocator: std.mem.Allocator, strings: *StringInterner) Self {
-        return .{
+        var self = Self{
             .allocator = allocator,
             .strings = strings,
+            .file_paths = .{},
             .stmt_tags = .{},
             .stmt_locs = .{},
+            .stmt_file_ids = .{},
             .stmt_data = .{},
             .expr_tags = .{},
             .expr_locs = .{},
+            .expr_file_ids = .{},
             .expr_data = .{},
             .type_tags = .{},
             .type_data = .{},
@@ -353,16 +403,28 @@ pub const NodeStore = struct {
             .scratch_exprs = .{},
             .scratch_u32 = .{},
             .scratch_marks = .{},
+            .current_file_id = .unknown,
         };
+        // Reserve index 0 for "unknown" file
+        self.file_paths.append(allocator, "<unknown>") catch {};
+        return self;
+    }
+
+    /// Set the current file being parsed (call before parsing each file)
+    pub fn setCurrentFile(self: *Self, file_id: FileId) void {
+        self.current_file_id = file_id;
     }
 
     /// Clean up all resources
     pub fn deinit(self: *Self) void {
+        self.file_paths.deinit(self.allocator);
         self.stmt_tags.deinit(self.allocator);
         self.stmt_locs.deinit(self.allocator);
+        self.stmt_file_ids.deinit(self.allocator);
         self.stmt_data.deinit(self.allocator);
         self.expr_tags.deinit(self.allocator);
         self.expr_locs.deinit(self.allocator);
+        self.expr_file_ids.deinit(self.allocator);
         self.expr_data.deinit(self.allocator);
         self.type_tags.deinit(self.allocator);
         self.type_data.deinit(self.allocator);
@@ -371,6 +433,33 @@ pub const NodeStore = struct {
         self.scratch_exprs.deinit(self.allocator);
         self.scratch_u32.deinit(self.allocator);
         self.scratch_marks.deinit(self.allocator);
+    }
+
+    // ========================================
+    // File Table Methods
+    // ========================================
+
+    /// Register a file and get its FileId
+    pub fn registerFile(self: *Self, file_path: []const u8) !FileId {
+        // Check if already registered
+        for (self.file_paths.items, 0..) |path, i| {
+            if (std.mem.eql(u8, path, file_path)) {
+                return FileId.fromInt(@intCast(i));
+            }
+        }
+        // Add new file
+        const id: u16 = @intCast(self.file_paths.items.len);
+        try self.file_paths.append(self.allocator, file_path);
+        return FileId.fromInt(id);
+    }
+
+    /// Get file path for a FileId
+    pub fn getFilePath(self: *const Self, file_id: FileId) []const u8 {
+        const idx = file_id.toInt();
+        if (idx < self.file_paths.items.len) {
+            return self.file_paths.items[idx];
+        }
+        return "<unknown>";
     }
 
     // ========================================
@@ -383,6 +472,22 @@ pub const NodeStore = struct {
 
     pub fn stmtLoc(self: *const Self, idx: StmtIdx) SourceLoc {
         return self.stmt_locs.items[idx.toInt()];
+    }
+
+    pub fn stmtFileId(self: *const Self, idx: StmtIdx) FileId {
+        const i = idx.toInt();
+        if (i < self.stmt_file_ids.items.len) {
+            return self.stmt_file_ids.items[i];
+        }
+        return .unknown;
+    }
+
+    /// Get full source location with file for a statement
+    pub fn stmtFullLoc(self: *const Self, idx: StmtIdx) FullSourceLoc {
+        return .{
+            .file_id = self.stmtFileId(idx),
+            .loc = self.stmtLoc(idx),
+        };
     }
 
     pub fn stmtData(self: *const Self, idx: StmtIdx) NodeData {
@@ -399,6 +504,22 @@ pub const NodeStore = struct {
 
     pub fn exprLoc(self: *const Self, idx: ExprIdx) SourceLoc {
         return self.expr_locs.items[idx.toInt()];
+    }
+
+    pub fn exprFileId(self: *const Self, idx: ExprIdx) FileId {
+        const i = idx.toInt();
+        if (i < self.expr_file_ids.items.len) {
+            return self.expr_file_ids.items[i];
+        }
+        return .unknown;
+    }
+
+    /// Get full source location with file for an expression
+    pub fn exprFullLoc(self: *const Self, idx: ExprIdx) FullSourceLoc {
+        return .{
+            .file_id = self.exprFileId(idx),
+            .loc = self.exprLoc(idx),
+        };
     }
 
     pub fn exprData(self: *const Self, idx: ExprIdx) NodeData {
@@ -444,116 +565,78 @@ pub const NodeStore = struct {
     // Expression Builders
     // ========================================
 
+    /// Internal helper to append an expression with file tracking
+    fn appendExpr(self: *Self, tag: ExpressionTag, loc: SourceLoc, data: NodeData) !ExprIdx {
+        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
+        try self.expr_tags.append(self.allocator, tag);
+        try self.expr_locs.append(self.allocator, loc);
+        try self.expr_file_ids.append(self.allocator, self.current_file_id);
+        try self.expr_data.append(self.allocator, data);
+        return idx;
+    }
+
     /// Add an integer literal expression
     pub fn addIntLiteral(self: *Self, value: i64, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .int_literal);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.intLiteral(value));
-        return idx;
+        return self.appendExpr(.int_literal, loc, NodeData.intLiteral(value));
     }
 
     /// Add a float literal expression
     pub fn addFloatLiteral(self: *Self, value: f64, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
         const bits: u64 = @bitCast(value);
-        try self.expr_tags.append(self.allocator, .float_literal);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, .{
+        return self.appendExpr(.float_literal, loc, .{
             .a = @truncate(bits),
             .b = @truncate(bits >> 32),
         });
-        return idx;
     }
 
     /// Add a string literal expression
     pub fn addStringLiteral(self: *Self, str_id: StringId, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .string_literal);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.identifier(str_id));
-        return idx;
+        return self.appendExpr(.string_literal, loc, NodeData.identifier(str_id));
     }
 
     /// Add a boolean literal expression
     pub fn addBoolLiteral(self: *Self, value: bool, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .bool_literal);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, .{ .a = @intFromBool(value), .b = 0 });
-        return idx;
+        return self.appendExpr(.bool_literal, loc, .{ .a = @intFromBool(value), .b = 0 });
     }
 
     /// Add a null literal expression
     pub fn addNullLiteral(self: *Self, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .null_literal);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.empty);
-        return idx;
+        return self.appendExpr(.null_literal, loc, NodeData.empty);
     }
 
     /// Add an identifier expression
     pub fn addIdentifier(self: *Self, name: StringId, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .identifier);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.identifier(name));
-        return idx;
+        return self.appendExpr(.identifier, loc, NodeData.identifier(name));
     }
 
     /// Add a binary expression
     pub fn addBinary(self: *Self, lhs: ExprIdx, op: BinaryOp, rhs: ExprIdx, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .binary);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.binary(lhs, rhs, op));
-        return idx;
+        return self.appendExpr(.binary, loc, NodeData.binary(lhs, rhs, op));
     }
 
     /// Add a unary expression
     pub fn addUnary(self: *Self, op: UnaryOp, operand: ExprIdx, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .unary);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.unary(operand, op));
-        return idx;
+        return self.appendExpr(.unary, loc, NodeData.unary(operand, op));
     }
 
     /// Add a member access expression
     pub fn addMember(self: *Self, object: ExprIdx, field: StringId, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .member);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.member(object, field));
-        return idx;
+        return self.appendExpr(.member, loc, NodeData.member(object, field));
     }
 
     /// Add an optional member access expression (null-safe): expr?.field
     pub fn addOptionalMember(self: *Self, object: ExprIdx, field: StringId, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .optional_member);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.member(object, field));
-        return idx;
+        return self.appendExpr(.optional_member, loc, NodeData.member(object, field));
     }
 
     /// Add an index expression
     pub fn addIndex(self: *Self, object: ExprIdx, index_expr: ExprIdx, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .index);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.index(object, index_expr));
-        return idx;
+        return self.appendExpr(.index, loc, NodeData.index(object, index_expr));
     }
 
     /// Add an optional index expression (null-safe): expr?[index]
     pub fn addOptionalIndex(self: *Self, object: ExprIdx, index_expr: ExprIdx, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .optional_index);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.index(object, index_expr));
-        return idx;
+        return self.appendExpr(.optional_index, loc, NodeData.index(object, index_expr));
     }
 
     /// Add a slice expression: object[start..end] or object[start..=end]
@@ -563,13 +646,8 @@ pub const NodeStore = struct {
         try self.extra_data.append(self.allocator, start_expr.toInt());
         try self.extra_data.append(self.allocator, end_expr.toInt());
         try self.extra_data.append(self.allocator, @intFromBool(inclusive));
-
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .slice_expr);
-        try self.expr_locs.append(self.allocator, loc);
         // a = object, b = extra_data index for [start, end, inclusive]
-        try self.expr_data.append(self.allocator, .{ .a = object.toInt(), .b = extra_start.toInt() });
-        return idx;
+        return self.appendExpr(.slice_expr, loc, .{ .a = object.toInt(), .b = extra_start.toInt() });
     }
 
     /// Get slice expression parts
@@ -585,52 +663,34 @@ pub const NodeStore = struct {
 
     /// Add a type test expression (expr is Type)
     pub fn addIsExpr(self: *Self, expr: ExprIdx, type_idx: TypeIdx, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .is_expr);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, NodeData.isExpr(expr, type_idx));
-        return idx;
+        return self.appendExpr(.is_expr, loc, NodeData.isExpr(expr, type_idx));
     }
 
     /// Add a call expression
     pub fn addCall(self: *Self, callee: ExprIdx, args: []const ExprIdx, loc: SourceLoc) !ExprIdx {
         // Store args in extra_data
         const args_start = try self.addExtraSlice(args);
-
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .call);
-        try self.expr_locs.append(self.allocator, loc);
         // Pack: callee in a, args count in b high bits, args start in extra
-        try self.expr_data.append(self.allocator, .{
+        return self.appendExpr(.call, loc, .{
             .a = callee.toInt(),
             .b = (@as(u32, @intCast(args.len)) << 16) | args_start.toInt(),
         });
-        return idx;
     }
 
     /// Add a grouping/parenthesized expression
     pub fn addGrouping(self: *Self, inner: ExprIdx, loc: SourceLoc) !ExprIdx {
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .grouping);
-        try self.expr_locs.append(self.allocator, loc);
-        try self.expr_data.append(self.allocator, .{ .a = inner.toInt(), .b = 0 });
-        return idx;
+        return self.appendExpr(.grouping, loc, .{ .a = inner.toInt(), .b = 0 });
     }
 
     /// Add a comptime builtin expression: @name() or @name(args)
     pub fn addComptimeBuiltin(self: *Self, name: StringId, args: []const ExprIdx, loc: SourceLoc) !ExprIdx {
         // Store args in extra_data if present
         const args_start: ExtraIdx = if (args.len > 0) try self.addExtraSlice(args) else ExtraIdx.fromInt(0);
-
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .comptime_builtin);
-        try self.expr_locs.append(self.allocator, loc);
         // Pack: name in a, args count in b high bits, args start in b low bits
-        try self.expr_data.append(self.allocator, .{
+        return self.appendExpr(.comptime_builtin, loc, .{
             .a = @intFromEnum(name),
             .b = (@as(u32, @intCast(args.len)) << 16) | args_start.toInt(),
         });
-        return idx;
     }
 
     /// Add an interpolated string expression: "Hello ${name}!"
@@ -645,16 +705,11 @@ pub const NodeStore = struct {
         for (parts_data) |p| {
             try self.extra_data.append(self.allocator, p);
         }
-
-        const idx: ExprIdx = @enumFromInt(@as(u32, @intCast(self.expr_tags.items.len)));
-        try self.expr_tags.append(self.allocator, .interp_string);
-        try self.expr_locs.append(self.allocator, loc);
         // Pack: parts_start in a, reserved in b
-        try self.expr_data.append(self.allocator, .{
+        return self.appendExpr(.interp_string, loc, .{
             .a = parts_start.toInt(),
             .b = 0,
         });
-        return idx;
     }
 
     /// Get interpolated string parts data
@@ -675,22 +730,24 @@ pub const NodeStore = struct {
     // Statement Builders
     // ========================================
 
+    /// Internal helper to append a statement with file tracking
+    fn appendStmt(self: *Self, tag: StatementTag, loc: SourceLoc, data: NodeData) !StmtIdx {
+        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
+        try self.stmt_tags.append(self.allocator, tag);
+        try self.stmt_locs.append(self.allocator, loc);
+        try self.stmt_file_ids.append(self.allocator, self.current_file_id);
+        try self.stmt_data.append(self.allocator, data);
+        return idx;
+    }
+
     /// Add an expression statement
     pub fn addExprStmt(self: *Self, expr: ExprIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .expression);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.exprStmt(expr));
-        return idx;
+        return self.appendStmt(.expression, loc, NodeData.exprStmt(expr));
     }
 
     /// Add an assignment statement
     pub fn addAssignment(self: *Self, target: ExprIdx, value: ExprIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .assignment);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.assignment(target, value));
-        return idx;
+        return self.appendStmt(.assignment, loc, NodeData.assignment(target, value));
     }
 
     /// Add a let declaration
@@ -698,56 +755,35 @@ pub const NodeStore = struct {
         // Store init expr in extra_data along with mutability flag
         const extra_start = try self.addExtra(init_expr.toInt());
         _ = try self.addExtra(@intFromBool(is_mut));
-
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .let_decl);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.let_decl, loc, .{
             .a = @intFromEnum(name),
             .b = (type_idx.toInt() << 16) | extra_start.toInt(),
         });
-        return idx;
     }
 
     /// Add a const declaration
     pub fn addConstDecl(self: *Self, name: StringId, type_idx: TypeIdx, init_expr: ExprIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .const_decl);
-        try self.stmt_locs.append(self.allocator, loc);
         // Pack: name in a, type and init packed in b + extra
         const extra_start = try self.addExtra(init_expr.toInt());
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.const_decl, loc, .{
             .a = @intFromEnum(name),
             .b = (type_idx.toInt() << 16) | extra_start.toInt(),
         });
-        return idx;
     }
 
     /// Add a return statement
     pub fn addReturn(self: *Self, value: ExprIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .return_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.returnStmt(value));
-        return idx;
+        return self.appendStmt(.return_stmt, loc, NodeData.returnStmt(value));
     }
 
     /// Add a break statement
     pub fn addBreak(self: *Self, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .break_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.empty);
-        return idx;
+        return self.appendStmt(.break_stmt, loc, NodeData.empty);
     }
 
     /// Add a continue statement
     pub fn addContinue(self: *Self, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .continue_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.empty);
-        return idx;
+        return self.appendStmt(.continue_stmt, loc, NodeData.empty);
     }
 
     /// Add a try-catch statement
@@ -759,108 +795,69 @@ pub const NodeStore = struct {
         const extra_start = try self.addExtra(@intFromEnum(err_binding));
         _ = try self.addExtra(catch_body.toInt());
         _ = try self.addExtra(finally_body.toInt());
-
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .try_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.try_stmt, loc, .{
             .a = try_body.toInt(),
             .b = extra_start.toInt(),
         });
-        return idx;
     }
 
     /// Add a throw statement
     pub fn addThrowStmt(self: *Self, value: ExprIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .throw_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.throw_stmt, loc, .{
             .a = value.toInt(),
             .b = 0,
         });
-        return idx;
     }
 
     /// Add a defer statement
     /// The body is a block or expression that executes at scope exit
     pub fn addDeferStmt(self: *Self, body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .defer_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.defer_stmt, loc, .{
             .a = body.toInt(),
             .b = 0,
         });
-        return idx;
     }
 
     /// Add a block statement
     pub fn addBlock(self: *Self, stmts: []const StmtIdx, loc: SourceLoc) !StmtIdx {
         const span = try self.addStmtSpan(stmts);
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .block);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.block(span));
-        return idx;
+        return self.appendStmt(.block, loc, NodeData.block(span));
     }
 
     /// Add a record block (like block but doesn't introduce a new scope - for DBL records)
     pub fn addRecordBlock(self: *Self, stmts: []const StmtIdx, loc: SourceLoc) !StmtIdx {
         const span = try self.addStmtSpan(stmts);
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .record_block);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.block(span));
-        return idx;
+        return self.appendStmt(.record_block, loc, NodeData.block(span));
     }
 
     /// Add an if statement
     pub fn addIfStmt(self: *Self, cond: ExprIdx, then_body: StmtIdx, else_body: StmtIdx, loc: SourceLoc) !StmtIdx {
         // Store else_body in extra_data
         const extra_start = try self.addExtra(else_body.toInt());
-
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .if_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.if_stmt, loc, .{
             .a = cond.toInt(),
             .b = (then_body.toInt() << 16) | extra_start.toInt(),
         });
-        return idx;
     }
 
     /// Add a while statement
     pub fn addWhileStmt(self: *Self, cond: ExprIdx, body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .while_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.whileStmt(cond, body));
-        return idx;
+        return self.appendStmt(.while_stmt, loc, NodeData.whileStmt(cond, body));
     }
 
     /// Add a for statement
     pub fn addForStmt(self: *Self, binding: StringId, iterable: ExprIdx, body: StmtIdx, loc: SourceLoc) !StmtIdx {
         // Store body in extra_data
         const extra_start = try self.addExtra(body.toInt());
-
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .for_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.for_stmt, loc, .{
             .a = @intFromEnum(binding),
             .b = (iterable.toInt() << 16) | extra_start.toInt(),
         });
-        return idx;
     }
 
     /// Add a loop statement (infinite loop)
     pub fn addLoopStmt(self: *Self, body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .loop_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{ .a = body.toInt(), .b = 0 });
-        return idx;
+        return self.appendStmt(.loop_stmt, loc, .{ .a = body.toInt(), .b = 0 });
     }
 
     /// Add a function definition
@@ -891,34 +888,22 @@ pub const NodeStore = struct {
         try self.extra_data.append(self.allocator, return_type.toInt());
         try self.extra_data.append(self.allocator, body.toInt());
 
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .fn_def);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.fnDef(name, params_start));
-        return idx;
+        return self.appendStmt(.fn_def, loc, NodeData.fnDef(name, params_start));
     }
 
     /// Add an import statement
     pub fn addImport(self: *Self, module_path: StringId, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .import_stmt);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, NodeData.identifier(module_path));
-        return idx;
+        return self.appendStmt(.import_stmt, loc, NodeData.identifier(module_path));
     }
 
     /// Add a test definition
     /// data.a = name StringId
     /// data.b = body StmtIdx (block statement)
     pub fn addTestDef(self: *Self, name: StringId, body: StmtIdx, loc: SourceLoc) !StmtIdx {
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .test_def);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.test_def, loc, .{
             .a = @intFromEnum(name),
             .b = body.toInt(),
         });
-        return idx;
     }
 
     /// Get test definition data
@@ -937,15 +922,10 @@ pub const NodeStore = struct {
         // Store base_field and offset in extra_data
         const extra_start = try self.addExtra(@intFromEnum(base_field));
         _ = try self.addExtra(@bitCast(offset));
-
-        const idx: StmtIdx = @enumFromInt(@as(u32, @intCast(self.stmt_tags.items.len)));
-        try self.stmt_tags.append(self.allocator, .field_view);
-        try self.stmt_locs.append(self.allocator, loc);
-        try self.stmt_data.append(self.allocator, .{
+        return self.appendStmt(.field_view, loc, .{
             .a = @intFromEnum(name),
             .b = (type_idx.toInt() << 16) | extra_start.toInt(),
         });
-        return idx;
     }
 
     // ========================================

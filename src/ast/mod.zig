@@ -58,6 +58,8 @@ pub const node_store = @import("node_store.zig");
 pub const NodeStore = node_store.NodeStore;
 pub const NodeData = node_store.NodeData;
 pub const SourceLoc = node_store.SourceLoc;
+pub const FileId = node_store.FileId;
+pub const FullSourceLoc = node_store.FullSourceLoc;
 
 // Re-export view structs
 pub const views = @import("views.zig");

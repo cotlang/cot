@@ -552,6 +552,10 @@ pub const Opcode = enum(u8) {
     /// Result stored in r0, returns null instead of throwing on out-of-bounds
     array_load_opt = 0xBC,
 
+    /// list_to_slice rd, list_reg - rd = list.to_slice() (converts List<T> to []T)
+    /// Format: [rd:4|list:4] [0]
+    list_to_slice = 0xBD,
+
     // ============================================
     // Built-in Functions (0xC0-0xCF)
     // ============================================
@@ -917,7 +921,7 @@ pub const Opcode = enum(u8) {
             // List operations
             .list_new, .list_push, .list_pop => 2,
             .list_get, .list_set => 2,
-            .list_len, .list_clear => 2,
+            .list_len, .list_clear, .list_to_slice => 2,
             // List struct operations (4 bytes: opcode + field_count + slot16)
             .list_push_struct, .list_get_struct, .list_pop_struct, .list_set_struct => 4,
             // Map struct operations (4 bytes: opcode + field_count + slot16/base_reg)

@@ -580,6 +580,7 @@ pub const Instruction = union(enum) {
     list_set: ListSet,
     list_len: ListLen,
     list_clear: ListClear,
+    list_to_slice: ListToSlice,
 
     // ====== Heap record operations (for `new` keyword) ======
     heap_alloc: HeapAlloc, // Allocate a heap record: result = new Struct
@@ -964,6 +965,13 @@ pub const Instruction = union(enum) {
         loc: ?SourceLoc = null,
     };
 
+    /// List to slice - convert List<T> to []T
+    pub const ListToSlice = struct {
+        list: Value, // List to convert
+        result: Value, // Result slice value
+        loc: ?SourceLoc = null,
+    };
+
     /// Make closure - create a closure from a function and captured environment
     pub const MakeClosure = struct {
         func_name: []const u8, // Name of the lambda function
@@ -1107,7 +1115,7 @@ pub const Instruction = union(enum) {
             .io_open, .io_close, .io_read, .io_write, .io_delete, .io_unlock => .io,
             .array_load, .array_load_opt, .array_store, .array_len, .array_slice => .array,
             .map_new, .map_set, .map_get, .map_delete, .map_has, .map_len, .map_clear, .map_keys, .map_values, .map_key_at => .map,
-            .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear => .list,
+            .list_new, .list_push, .list_pop, .list_get, .list_set, .list_len, .list_clear, .list_to_slice => .list,
             .make_closure, .make_trait_object, .call_trait_method => .control, // Closure/trait ops are control
             .variant_construct => .memory, // Variant construction allocates memory
             .variant_get_tag => .memory, // Variant tag extraction
@@ -1198,6 +1206,7 @@ pub const Instruction = union(enum) {
             .list_pop => |l| l.result,
             .list_get => |l| l.result,
             .list_len => |l| l.result,
+            .list_to_slice => |l| l.result,
             // Closure operations
             .make_closure => |c| c.result,
             .select => |s| s.result,
