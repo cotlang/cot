@@ -145,12 +145,23 @@ pub fn op_load_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rd: u4 = @truncate(ops >> 4);
     const val = vm.stack[vm.fp + slot];
 
+    // Debug: Check if loading a stack pointer
+    if (val.isStackPtr()) {
+        std.debug.print("[load_local] rd={d}, slot={d}, value.bits=0x{x:0>16} (STACK_PTR)\n", .{ rd, slot, val.bits });
+    }
+
     // Slot-level tracing
     if (vm.tracer) |tracer| {
         tracer.onSlotLoad(@intCast(prev_ip), slot, rd, val);
     }
 
     vm.writeRegister(rd, val);
+
+    // Debug: Verify register AFTER entire load_local
+    if (val.isStackPtr()) {
+        std.debug.print("[load_local END] vm.registers[{d}].bits=0x{x:0>16}\n", .{ rd, vm.registers[rd].bits });
+    }
+
     return .continue_dispatch;
 }
 
@@ -163,6 +174,11 @@ pub fn op_store_local(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rs: u4 = @truncate(ops >> 4);
     const new_value = vm.registers[rs];
     const stack_idx = vm.fp + slot;
+
+    // Debug: Check if storing a stack pointer
+    if (new_value.isStackPtr()) {
+        std.debug.print("[store_local] rs={d}, slot={d}, value.bits=0x{x:0>16} (STACK_PTR)\n", .{ rs, slot, new_value.bits });
+    }
 
     // Slot-level tracing: capture old value before overwrite (critical for debugging)
     if (vm.tracer) |tracer| {
@@ -665,19 +681,29 @@ pub fn op_select(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
-/// ptr_offset rd, rs, offset - byte-level pointer arithmetic for field views
+/// ptr_offset rd, rs, offset - pointer arithmetic for derived pointers
 /// Format: [rd:4|rs:4] [offset_lo] [offset_hi]
+/// For StackPtr values, creates a derived StackPtr with adjusted slot offset.
 /// For string/buffer values, this creates a view at the specified byte offset.
-/// The offset is stored in the high bits of the value for later use by load/store.
 pub fn op_ptr_offset(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
-    const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little));
+    const offset: u16 = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
     vm.ip += 3;
     const rd: u4 = @truncate(ops >> 4);
     const rs: u4 = @truncate(ops & 0xF);
-    _ = offset; // Offset handling deferred until byte-level memory is implemented
-    // For now, just copy the value - byte-level addressing will be added later
-    vm.writeRegister(rd, vm.registers[rs]);
+
+    const src_val = vm.registers[rs];
+
+    // For StackPtr values, create a derived StackPtr with adjusted slot
+    if (src_val.asStackPtr()) |sp| {
+        // Create new StackPtr with same frame_offset but adjusted slot
+        const new_slot = sp.slot + offset;
+        vm.writeRegister(rd, Value.initStackPtr(sp.frame_offset, new_slot));
+        return .continue_dispatch;
+    }
+
+    // For other values, just copy (byte-level addressing not yet implemented)
+    vm.writeRegister(rd, src_val);
     return .continue_dispatch;
 }
 
@@ -775,6 +801,25 @@ pub fn op_jmp(vm: *VM, module: *const Module) VMError!DispatchResult {
     const new_ip = end_of_instr + offset;
 
     if (new_ip < 0 or new_ip >= @as(i32, @intCast(module.code.len))) {
+        return vm.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
+    }
+
+    vm.ip = @intCast(new_ip);
+    return .continue_dispatch;
+}
+
+/// jmp32 offset32 - unconditional jump with 32-bit offset
+/// Format: [opcode][unused][offset:32]
+/// Offset is relative to end of instruction (after all 6 bytes)
+pub fn op_jmp32(vm: *VM, module: *const Module) VMError!DispatchResult {
+    // Read signed 32-bit offset from bytes 2-5 (vm.ip points to byte 1 after main loop increment)
+    const offset: i32 = @bitCast(std.mem.readInt(u32, module.code[vm.ip + 1 ..][0..4], .little));
+
+    // Calculate new IP (offset is relative to end of instruction = vm.ip + 5)
+    const end_of_instr: i64 = @intCast(vm.ip + 5);
+    const new_ip = end_of_instr + offset;
+
+    if (new_ip < 0 or new_ip >= @as(i64, @intCast(module.code.len))) {
         return vm.fail(VMError.BytecodeOutOfBounds, "Jump target out of bounds");
     }
 
@@ -1077,6 +1122,9 @@ pub fn op_call(vm: *VM, module: *const Module) VMError!DispatchResult {
 
 /// call_dynamic name_idx, argc - call by name at runtime
 pub fn op_call_dynamic(vm: *VM, module: *const Module) VMError!DispatchResult {
+    // Debug: Check r0 at start of call_dynamic
+    std.debug.print("[call_dynamic START] r0.bits=0x{x:0>16}, isStackPtr={}\n", .{ vm.registers[0].bits, vm.registers[0].isStackPtr() });
+
     // Format: [argc:4|0] [name_idx:16]
     const argc: u8 = @truncate(module.code[vm.ip] >> 4);
     const name_idx = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
@@ -1255,7 +1303,9 @@ pub fn op_get_local_ptr(vm: *VM, module: *const Module) VMError!DispatchResult {
 
     // Create a stack pointer to the local slot in the current frame
     // frame_offset=0 means current frame
-    vm.registers[rd] = Value.initStackPtr(0, slot);
+    const stack_ptr_val = Value.initStackPtr(0, slot);
+    std.debug.print("[get_local_ptr] rd={d}, slot={d}, fp={d}, value.bits=0x{x:0>16}\n", .{ rd, slot, vm.fp, stack_ptr_val.bits });
+    vm.registers[rd] = stack_ptr_val;
 
     return .continue_dispatch;
 }
@@ -1272,6 +1322,7 @@ pub fn op_load_indirect(vm: *VM, module: *const Module) VMError!DispatchResult {
     const rs: u4 = @truncate(ops);
 
     const ptr_val = vm.registers[rs];
+    std.debug.print("[load_indirect] rd={d}, rs={d}, offset={d}, ptr_val.bits=0x{x:0>16}, isStackPtr={}, tag={}\n", .{ rd, rs, offset, ptr_val.bits, ptr_val.isStackPtr(), @intFromEnum(ptr_val.tag()) });
 
     // Check if it's a stack pointer
     if (ptr_val.asStackPtr()) |sp| {
@@ -1283,7 +1334,8 @@ pub fn op_load_indirect(vm: *VM, module: *const Module) VMError!DispatchResult {
             return vm.fail(VMError.StackOverflow, "load_indirect: slot out of bounds");
         }
 
-        vm.registers[rd] = vm.stack[abs_slot];
+        // Use writeRegister to properly handle ARC (retain new value, release old)
+        vm.writeRegister(rd, vm.stack[abs_slot]);
         return .continue_dispatch;
     }
 
@@ -1305,6 +1357,7 @@ pub fn op_load_indirect(vm: *VM, module: *const Module) VMError!DispatchResult {
 /// store_indirect rs_ptr, offset, rs_val - ptr_val[offset] = rs_val
 /// Stores a value through a pointer with a field offset.
 /// Works for both stack pointers and heap records (polymorphic).
+/// NOTE: This operation handles ARC by retaining the new value and releasing the old one.
 pub fn op_store_indirect(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     const offset = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
@@ -1326,7 +1379,8 @@ pub fn op_store_indirect(vm: *VM, module: *const Module) VMError!DispatchResult 
             return vm.fail(VMError.StackOverflow, "store_indirect: slot out of bounds");
         }
 
-        vm.stack[abs_slot] = value;
+        // Use writeStack to properly handle ARC (retain new value, release old)
+        vm.writeStack(abs_slot, value);
         return .continue_dispatch;
     }
 
@@ -1335,7 +1389,16 @@ pub fn op_store_indirect(vm: *VM, module: *const Module) VMError!DispatchResult 
         const field_count = record.data.len / @sizeOf(Value);
         if (offset < field_count) {
             const fields: []Value = @as([*]Value, @ptrCast(@alignCast(record.data.ptr)))[0..field_count];
+            const old_value = fields[offset];
+
+            // Retain the new value before storing
+            arc.retain(value);
+
+            // Store the new value
             fields[offset] = value;
+
+            // Release the old value
+            arc.release(old_value, vm.allocator);
         }
         return .continue_dispatch;
     }
@@ -1526,6 +1589,35 @@ pub fn op_str_len(vm: *VM, module: *const Module) VMError!DispatchResult {
 
     // Store length as integer
     vm.writeRegister(rd, Value.initInt(@intCast(s.len)));
+    return .continue_dispatch;
+}
+
+/// str_index rd, rs, idx_reg - rd = rs[idx_reg]
+/// Returns the byte value (as i64) at the specified index in the string.
+/// Format: [rd:4|rs:4] [idx_reg:4|0]
+pub fn op_str_index(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const ops = module.code[vm.ip];
+    const ops2 = module.code[vm.ip + 1];
+    vm.ip += 2;
+    const rd: u4 = @truncate(ops >> 4);
+    const rs: u4 = @truncate(ops & 0xF);
+    const idx_reg: u4 = @truncate(ops2 >> 4);
+
+    // Get string from register
+    var buf: [32]u8 = undefined;
+    const s = vm.valueToStringSlice(vm.registers[rs], &buf);
+
+    // Get index
+    const idx_val = vm.registers[idx_reg].asInt();
+    const idx: usize = if (idx_val >= 0) @intCast(idx_val) else 0;
+
+    // Bounds check and get byte value
+    if (idx < s.len) {
+        vm.writeRegister(rd, Value.initInt(@intCast(s[idx])));
+    } else {
+        // Out of bounds returns 0
+        vm.writeRegister(rd, Value.initInt(0));
+    }
     return .continue_dispatch;
 }
 
@@ -2483,6 +2575,7 @@ pub fn op_load_field(vm: *VM, module: *const Module) VMError!DispatchResult {
 
 /// store_field rd, rs, field_idx - rd.field[field_idx] = rs
 /// Format: [rd:4|rs:4] [field_idx:16]
+/// NOTE: This operation handles ARC by retaining the new value and releasing the old one.
 pub fn op_store_field(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 3;
@@ -2497,7 +2590,16 @@ pub fn op_store_field(vm: *VM, module: *const Module) VMError!DispatchResult {
         const field_count = record.data.len / @sizeOf(Value);
         if (field_idx < field_count) {
             const fields: []Value = @as([*]Value, @ptrCast(@alignCast(record.data.ptr)))[0..field_count];
+            const old_value = fields[field_idx];
+
+            // Retain the new value before storing (if it's an ARC type)
+            arc.retain(value);
+
+            // Store the new value
             fields[field_idx] = value;
+
+            // Release the old value (if it was an ARC type)
+            arc.release(old_value, vm.allocator);
         }
     }
     return .continue_dispatch;

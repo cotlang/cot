@@ -334,11 +334,50 @@ pub const Lexer = struct {
     }
 
     fn scanNumber(self: *Self, start_pos: usize, start_col: usize) Token {
+        // Check for hex prefix: 0x or 0X
+        // At this point, the first digit (e.g., '0') has been consumed by advance()
+        // So self.position points to the next character
+        if (self.source[start_pos] == '0' and !self.isAtEnd() and
+            (self.peek() == 'x' or self.peek() == 'X'))
+        {
+            _ = self.advance(); // consume 'x' or 'X'
+            // Consume hex digits
+            while (!self.isAtEnd() and isHexDigit(self.peek())) {
+                _ = self.advance();
+            }
+            return .{
+                .type = .integer_literal,
+                .lexeme = self.source[start_pos..self.position],
+                .line = self.line,
+                .column = start_col,
+                .span = Span.init(start_pos, self.position),
+            };
+        }
+
+        // Check for binary prefix: 0b or 0B
+        if (self.source[start_pos] == '0' and !self.isAtEnd() and
+            (self.peek() == 'b' or self.peek() == 'B'))
+        {
+            _ = self.advance(); // consume 'b' or 'B'
+            // Consume binary digits
+            while (!self.isAtEnd() and (self.peek() == '0' or self.peek() == '1')) {
+                _ = self.advance();
+            }
+            return .{
+                .type = .integer_literal,
+                .lexeme = self.source[start_pos..self.position],
+                .line = self.line,
+                .column = start_col,
+                .span = Span.init(start_pos, self.position),
+            };
+        }
+
+        // Decimal number - consume remaining digits
         while (!self.isAtEnd() and std.ascii.isDigit(self.peek())) {
             _ = self.advance();
         }
 
-        // Decimal point
+        // Decimal point (floating point)
         if (!self.isAtEnd() and self.peek() == '.' and
             self.position + 1 < self.source.len and
             std.ascii.isDigit(self.source[self.position + 1]))
@@ -363,6 +402,12 @@ pub const Lexer = struct {
             .column = start_col,
             .span = Span.init(start_pos, self.position),
         };
+    }
+
+    fn isHexDigit(c: u8) bool {
+        return std.ascii.isDigit(c) or
+            (c >= 'a' and c <= 'f') or
+            (c >= 'A' and c <= 'F');
     }
 
     /// Scan a quoted identifier: @"keyword" -> identifier with lexeme "keyword"

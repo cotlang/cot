@@ -238,6 +238,13 @@ pub const Printer = struct {
                 try self.writer.print(", is_length={}, ", .{s.is_length});
                 try self.printValue(s.value);
             },
+            .str_byte_at => |s| {
+                try self.printValue(s.result);
+                try self.writer.writeAll(" = str_byte_at ");
+                try self.printValue(s.string);
+                try self.writer.writeAll(", ");
+                try self.printValue(s.index);
+            },
 
             // Control flow (Cranelift names)
             .jump => |b| {
@@ -786,6 +793,7 @@ pub const Printer = struct {
             },
             .trait_object => |t| try self.writer.print("dyn {s}", .{t.trait_name}),
             .variant => try self.writer.writeAll("variant"),
+            .@"enum" => |e| try self.writer.print("enum({s})", .{e.name}),
         }
     }
 

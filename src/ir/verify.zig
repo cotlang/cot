@@ -307,6 +307,10 @@ pub const Verifier = struct {
             .str_len, .array_len => |op| {
                 try self.checkValueDefined(op.operand);
             },
+            .str_byte_at => |op| {
+                try self.checkValueDefined(op.string);
+                try self.checkValueDefined(op.index);
+            },
             .throw => |op| {
                 try self.checkValueDefined(op.value);
             },
@@ -475,6 +479,7 @@ pub const Verifier = struct {
             .weak => "weak",
             .trait_object => "trait_object",
             .variant => "variant",
+            .@"enum" => "enum",
         };
     }
 

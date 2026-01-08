@@ -96,6 +96,7 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .str_concat => |op| self.checkStringConcat(op),
         .str_slice => {}, // Slice operations are type-safe
         .str_slice_store => {}, // Slice store operations are type-safe
+        .str_byte_at => {}, // Byte access is type-safe (string, int -> int)
 
         // Function calls
         .call => |c| self.checkCall(c),
@@ -197,15 +198,16 @@ fn checkStore(self: *Self, store: ir.Instruction.Store) void {
 /// Check a binary operation
 fn checkBinaryOp(self: *Self, op: ir.Instruction.BinaryOp, op_type: type_rules.BinaryOpType, op_name: []const u8) void {
     const result = type_rules.checkBinaryOp(op_type, op.lhs.ty, op.rhs.ty);
-    const loc = locToRange(op.loc);
+    const loc_info = locToInfo(op.loc);
+    const error_file = loc_info.file_path orelse self.file_path;
 
     if (!result.ok) {
         var lhs_buf: [64]u8 = undefined;
         var rhs_buf: [64]u8 = undefined;
         self.collector.addError(
             .E206_incompatible_operands,
-            self.file_path,
-            loc,
+            error_file,
+            loc_info.range,
             "operator '{s}' cannot be applied to '{s}' and '{s}'",
             .{
                 op_name,
@@ -219,15 +221,16 @@ fn checkBinaryOp(self: *Self, op: ir.Instruction.BinaryOp, op_type: type_rules.B
 /// Check icmp (integer comparison) instruction
 fn checkIcmpOp(self: *Self, op: ir.Instruction.IcmpOp) void {
     const result = type_rules.checkBinaryOp(.comparison, op.lhs.ty, op.rhs.ty);
-    const loc = locToRange(op.loc);
+    const loc_info = locToInfo(op.loc);
+    const error_file = loc_info.file_path orelse self.file_path;
 
     if (!result.ok) {
         var lhs_buf: [64]u8 = undefined;
         var rhs_buf: [64]u8 = undefined;
         self.collector.addError(
             .E206_incompatible_operands,
-            self.file_path,
-            loc,
+            error_file,
+            loc_info.range,
             "comparison cannot be applied to '{s}' and '{s}'",
             .{
                 type_rules.formatType(op.lhs.ty, &lhs_buf),
@@ -240,15 +243,16 @@ fn checkIcmpOp(self: *Self, op: ir.Instruction.IcmpOp) void {
 /// Check string concatenation
 fn checkStringConcat(self: *Self, op: ir.Instruction.BinaryOp) void {
     const result = type_rules.checkBinaryOp(.string_concat, op.lhs.ty, op.rhs.ty);
-    const loc = locToRange(op.loc);
+    const loc_info = locToInfo(op.loc);
+    const error_file = loc_info.file_path orelse self.file_path;
 
     if (!result.ok) {
         var lhs_buf: [64]u8 = undefined;
         var rhs_buf: [64]u8 = undefined;
         self.collector.addError(
             .E206_incompatible_operands,
-            self.file_path,
-            loc,
+            error_file,
+            loc_info.range,
             "string concatenation requires string operands, got '{s}' and '{s}'",
             .{
                 type_rules.formatType(op.lhs.ty, &lhs_buf),
@@ -260,7 +264,8 @@ fn checkStringConcat(self: *Self, op: ir.Instruction.BinaryOp) void {
 
 /// Check a function call
 fn checkCall(self: *Self, call: ir.Instruction.Call) void {
-    const loc = locToRange(call.loc);
+    const loc_info = locToInfo(call.loc);
+    const error_file = loc_info.file_path orelse self.file_path;
 
     // Look up the function in the module
     for (self.module.functions.items) |func| {
@@ -274,8 +279,8 @@ fn checkCall(self: *Self, call: ir.Instruction.Call) void {
             if (call.args.len != expected_args) {
                 self.collector.addError(
                     .E204_argument_count_mismatch,
-                    self.file_path,
-                    loc,
+                    error_file,
+                    loc_info.range,
                     "function '{s}' expects {d} arguments, got {d}",
                     .{ call.callee, expected_args, call.args.len },
                 );
@@ -293,8 +298,8 @@ fn checkCall(self: *Self, call: ir.Instruction.Call) void {
                     var actual_buf: [64]u8 = undefined;
                     self.collector.addError(
                         .E205_argument_type_mismatch,
-                        self.file_path,
-                        loc,
+                        error_file,
+                        loc_info.range,
                         "argument {d} to '{s}': expected '{s}', got '{s}'",
                         .{
                             arg_idx + 1,
@@ -315,15 +320,16 @@ fn checkCall(self: *Self, call: ir.Instruction.Call) void {
 
 /// Check array load
 fn checkArrayLoad(self: *Self, arr: ir.Instruction.ArrayOp) void {
-    const loc = locToRange(arr.loc);
+    const loc_info = locToInfo(arr.loc);
+    const error_file = loc_info.file_path orelse self.file_path;
 
     // Index must be numeric
     if (!type_rules.isNumeric(arr.index.ty)) {
         var buf: [64]u8 = undefined;
         self.collector.addError(
             .E208_array_index_type,
-            self.file_path,
-            loc,
+            error_file,
+            loc_info.range,
             "array index must be numeric, got '{s}'",
             .{type_rules.formatType(arr.index.ty, &buf)},
         );
@@ -332,15 +338,16 @@ fn checkArrayLoad(self: *Self, arr: ir.Instruction.ArrayOp) void {
 
 /// Check array store
 fn checkArrayStore(self: *Self, arr: ir.Instruction.ArrayStore) void {
-    const loc = locToRange(arr.loc);
+    const loc_info = locToInfo(arr.loc);
+    const error_file = loc_info.file_path orelse self.file_path;
 
     // Index must be numeric
     if (!type_rules.isNumeric(arr.index.ty)) {
         var buf: [64]u8 = undefined;
         self.collector.addError(
             .E208_array_index_type,
-            self.file_path,
-            loc,
+            error_file,
+            loc_info.range,
             "array index must be numeric, got '{s}'",
             .{type_rules.formatType(arr.index.ty, &buf)},
         );
@@ -355,8 +362,8 @@ fn checkArrayStore(self: *Self, arr: ir.Instruction.ArrayStore) void {
             var actual_buf: [64]u8 = undefined;
             self.collector.addError(
                 .E200_type_mismatch,
-                self.file_path,
-                loc,
+                error_file,
+                loc_info.range,
                 "cannot store '{s}' in array of '{s}'",
                 .{
                     type_rules.formatType(arr.value.ty, &actual_buf),

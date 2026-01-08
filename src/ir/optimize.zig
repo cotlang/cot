@@ -611,6 +611,10 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
             used.put(s.length_or_end.id, {}) catch {};
             used.put(s.value.id, {}) catch {};
         },
+        .str_byte_at => |s| {
+            used.put(s.string.id, {}) catch {};
+            used.put(s.index.id, {}) catch {};
+        },
         .str_copy => |c| {
             used.put(c.dest.id, {}) catch {};
             used.put(c.src.id, {}) catch {};
@@ -1670,6 +1674,7 @@ fn instructionUsesValue(inst: ir.Instruction, value_id: u32) bool {
         .str_concat, .str_compare => |op| op.lhs.id == value_id or op.rhs.id == value_id,
         // Unary operations
         .ineg, .bnot, .log_not, .str_len => |op| op.operand.id == value_id,
+        .str_byte_at => |op| op.string.id == value_id or op.index.id == value_id,
         .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| op.operand.id == value_id,
         .wrap_optional, .unwrap_optional, .is_null => |op| op.operand.id == value_id,
         .is_type => |op| op.operand.id == value_id,

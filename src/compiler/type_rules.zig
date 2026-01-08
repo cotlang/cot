@@ -136,6 +136,7 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             .u8, .u16, .u32 => .compatible,
             .u64 => .lossy_conversion,
             .implied_decimal, .fixed_decimal => .lossy_conversion,
+            .@"enum" => .compatible, // Enums are represented as i64
             else => .incompatible,
         },
 
@@ -354,6 +355,17 @@ pub fn isAssignable(target: Type, value: Type) Compatibility {
             .variant => .compatible,
             else => .incompatible,
         },
+        // Enum types - enums are compatible with same enum type or i64
+        .@"enum" => |target_enum| switch (value_deref) {
+            .@"enum" => |value_enum| blk: {
+                if (std.mem.eql(u8, target_enum.name, value_enum.name)) {
+                    break :blk .compatible;
+                }
+                break :blk .incompatible;
+            },
+            .i64 => .compatible, // Enums are represented as i64
+            else => .incompatible,
+        },
     };
 }
 
@@ -389,6 +401,7 @@ pub fn typesEqual(a: Type, b: Type) bool {
         .weak => |aw| typesEqual(aw.*, b.weak.*),
         .trait_object => |at| std.mem.eql(u8, at.trait_name, b.trait_object.trait_name),
         .variant => true, // Variant types are equal if tags match (already checked above)
+        .@"enum" => |ae| std.mem.eql(u8, ae.name, b.@"enum".name),
     };
 }
 
@@ -458,6 +471,19 @@ fn checkComparisonOp(lhs: Type, rhs: Type) BinaryOpResult {
     }
 
     if (isString(lhs) and isString(rhs)) {
+        return .{ .ok = true, .result_type = .{ .bool = {} } };
+    }
+
+    // Enum comparisons: enum-enum or enum-i64
+    const lhs_is_enum = lhs == .@"enum";
+    const rhs_is_enum = rhs == .@"enum";
+    if (lhs_is_enum and rhs_is_enum) {
+        return .{ .ok = true, .result_type = .{ .bool = {} } };
+    }
+    if (lhs_is_enum and (rhs == .i64 or rhs == .i32)) {
+        return .{ .ok = true, .result_type = .{ .bool = {} } };
+    }
+    if (rhs_is_enum and (lhs == .i64 or lhs == .i32)) {
         return .{ .ok = true, .result_type = .{ .bool = {} } };
     }
 
@@ -569,6 +595,7 @@ pub fn typeName(ty: Type) []const u8 {
         .weak => "weak",
         .trait_object => "trait_object",
         .variant => "variant",
+        .@"enum" => "enum",
     };
 }
 
@@ -623,6 +650,7 @@ pub fn formatType(ty: Type, buf: []u8) []const u8 {
         },
         .trait_object => |t| writer.print("dyn {s}", .{t.trait_name}) catch {},
         .variant => writer.writeAll("variant") catch {},
+        .@"enum" => |e| writer.print("{s}", .{e.name}) catch {},
     }
 
     return fbs.getWritten();

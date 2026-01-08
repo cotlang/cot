@@ -82,6 +82,15 @@ const IndirectFieldInfo = struct {
     field_offset: u16, // Offset of this field within the struct
 };
 
+/// Derived stack pointer information for nested struct access
+/// When accessing a struct field through a stack pointer (e.g., self.inner),
+/// we need to create a derived StackPtr to pass to method calls.
+/// This is different from IndirectFieldInfo which is for loading primitive VALUES.
+const DerivedStackPtrInfo = struct {
+    base_slot: u16, // Slot containing the base StackPtr value
+    field_offset: u16, // Offset to add to create the derived pointer
+};
+
 /// Register allocator for register-based bytecode emission
 /// Uses a linear scan approach with 16 virtual registers (r0-r15)
 pub const RegisterAllocator = struct {
@@ -254,8 +263,14 @@ pub const BytecodeEmitter = struct {
 
     // Indirect field access tracking
     // Maps IR value ID to info needed for load_indirect/store_indirect
-    // Used when accessing fields through stack pointer parameters
+    // Used when accessing PRIMITIVE fields through stack pointer parameters
     indirect_fields: std.AutoHashMap(u32, IndirectFieldInfo), // value_id -> info
+
+    // Derived stack pointer tracking
+    // Maps IR value ID to info needed for ptr_offset bytecode
+    // Used when accessing STRUCT fields through stack pointer parameters
+    // These need a derived StackPtr for method calls, not a loaded value
+    derived_stack_ptrs: std.AutoHashMap(u32, DerivedStackPtrInfo), // value_id -> info
 
     // Current routine being emitted
     current_routine_start: u32,
@@ -318,6 +333,7 @@ pub const BytecodeEmitter = struct {
             .stack_ptr_params = std.StringHashMap(u16).init(allocator),
             .stack_ptr_value_ids = std.AutoHashMap(u32, u16).init(allocator),
             .indirect_fields = std.AutoHashMap(u32, IndirectFieldInfo).init(allocator),
+            .derived_stack_ptrs = std.AutoHashMap(u32, DerivedStackPtrInfo).init(allocator),
             .current_routine_start = 0,
             .current_func = null,
             .ir_module = null,
@@ -346,6 +362,7 @@ pub const BytecodeEmitter = struct {
         self.stack_ptr_params.deinit();
         self.stack_ptr_value_ids.deinit();
         self.indirect_fields.deinit();
+        self.derived_stack_ptrs.deinit();
         self.reg_alloc.deinit();
         self.spilled_values.deinit();
         // Free escape analysis results if any
@@ -577,6 +594,7 @@ pub const BytecodeEmitter = struct {
         self.stack_ptr_params.clearRetainingCapacity();
         self.stack_ptr_value_ids.clearRetainingCapacity();
         self.indirect_fields.clearRetainingCapacity();
+        self.derived_stack_ptrs.clearRetainingCapacity();
         self.value_consts.clearRetainingCapacity();
         self.reg_alloc.reset(); // Reset register allocation for new function
         self.last_result_value = null; // Reset last result tracking
@@ -854,6 +872,7 @@ pub const BytecodeEmitter = struct {
             .str_concat => |s| try emit_inst.emitStrConcat(self, s),
             .str_slice => |s| try emit_inst.emitStrSlice(self, s),
             .str_slice_store => |s| try emit_inst.emitStrSliceStore(self, s),
+            .str_byte_at => |s| try emit_inst.emitStrByteAt(self, s),
             .str_compare, .str_copy => return EmitError.InvalidInstruction,
 
             // Control flow
@@ -1189,20 +1208,32 @@ pub const BytecodeEmitter = struct {
         try self.emitU8(@as(u8, src2) << 4);
     }
 
-    /// Emit register jump: jmp offset
+    /// Emit register jump: jmp32 offset (uses 32-bit offset for large code support)
     pub fn emitRegJmp(self: *Self, target: *const ir.Block) EmitError!void {
-        try self.emitOpcode(.jmp);
+        try self.emitOpcode(.jmp32);
         try self.emitU8(0); // Unused first byte
-        try self.addPendingJump(target, false);
-        try self.emitI16(0); // Placeholder
+        try self.addPendingJump(target, true);
+        try self.emitI32(0); // Placeholder for 32-bit offset
     }
 
-    /// Emit register conditional jump: jz/jnz cond, offset
+    /// Emit register conditional jump using trampoline pattern for large code support.
+    /// We emit: [inverted_cond, skip_over_jmp32] [jmp32, target]
+    /// This ensures conditional jumps work for any code size.
     pub fn emitRegCondJmp(self: *Self, op: Opcode, cond: u4, target: *const ir.Block) EmitError!void {
-        try self.emitOpcode(op);
+        // Invert the condition: jz becomes jnz, jnz becomes jz
+        const inverted_op: Opcode = if (op == .jz) .jnz else .jz;
+
+        // Emit inverted conditional jump to skip the jmp32 instruction
+        // jmp32 is 6 bytes total (1 opcode + 1 unused + 4 offset)
+        try self.emitOpcode(inverted_op);
         try self.emitU8(@as(u8, cond) << 4);
-        try self.addPendingJump(target, false);
-        try self.emitI16(0); // Placeholder
+        try self.emitI16(6); // Skip over the following jmp32
+
+        // Emit unconditional wide jump to the actual target
+        try self.emitOpcode(.jmp32);
+        try self.emitU8(0); // Unused byte
+        try self.addPendingJump(target, true);
+        try self.emitI32(0); // Placeholder for 32-bit offset
     }
 
     /// Emit register call: call argc, routine_idx
@@ -1280,24 +1311,65 @@ pub const BytecodeEmitter = struct {
             return;
         }
 
+        // Check if value is a derived stack pointer (struct field accessed through stack pointer)
+        // This needs ptr_offset to create a new StackPtr, not load_indirect
+        if (self.derived_stack_ptrs.get(value.id)) |info| {
+            log.debug("emitValueToReg: derived stack ptr value_id={d} base_slot={d} field_offset={d} -> r{d}", .{
+                value.id, info.base_slot, info.field_offset, dest,
+            });
+            // First, load the base StackPtr value into the destination register
+            if (info.base_slot < 256) {
+                try self.emitRegLoadLocal(dest, @intCast(info.base_slot));
+            } else {
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, dest) << 4);
+                try self.emitU16(info.base_slot);
+            }
+            // Now emit ptr_offset: rd = rs + offset (creates derived StackPtr)
+            // Format: [rd:4|rs:4] [offset:16]
+            try self.emitOpcode(.ptr_offset);
+            try self.emitU8((@as(u8, dest) << 4) | dest);
+            try self.emitU16(info.field_offset);
+            return;
+        }
+
         // Check if value is an indirect field (accessed through stack pointer)
         if (self.indirect_fields.get(value.id)) |info| {
             log.debug("emitValueToReg: indirect field value_id={d} ptr_slot={d} field_offset={d} -> r{d}", .{
                 value.id, info.ptr_slot, info.field_offset, dest,
             });
-            // First, load the stack pointer value into a temp register
-            const ptr_reg: u4 = if (dest < 13) dest + 1 else dest;
+            // First, load the stack pointer value into the destination register
+            // Then load_indirect will use dest as both source and destination
+            // This is safe because VM reads ptr from rs before writing to rd
             if (info.ptr_slot < 256) {
-                try self.emitRegLoadLocal(ptr_reg, @intCast(info.ptr_slot));
+                try self.emitRegLoadLocal(dest, @intCast(info.ptr_slot));
             } else {
                 try self.emitOpcode(.load_local16);
-                try self.emitU8(@as(u8, ptr_reg) << 4);
+                try self.emitU8(@as(u8, dest) << 4);
                 try self.emitU16(info.ptr_slot);
             }
             // Now emit load_indirect: rd, rs_ptr, offset
+            // Using dest for both rd and rs is safe - VM reads rs first
             try self.emitOpcode(.load_indirect);
-            try self.emitU8((@as(u8, dest) << 4) | ptr_reg);
+            try self.emitU8((@as(u8, dest) << 4) | dest);
             try self.emitU16(info.field_offset);
+            return;
+        }
+
+        // Check if this is a stack pointer value (from a pointer-to-struct parameter)
+        // These are tracked in stack_ptr_value_ids and should be loaded directly
+        // (the slot already contains a StackPtr value, no need for get_local_ptr)
+        if (self.stack_ptr_value_ids.get(value.id)) |ptr_slot| {
+            log.debug("emitValueToReg: stack pointer value id={d} ptr_slot={d} -> r{d}", .{
+                value.id, ptr_slot, dest,
+            });
+            if (ptr_slot < 256) {
+                try self.emitRegLoadLocal(dest, @intCast(ptr_slot));
+            } else {
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, dest) << 4);
+                try self.emitU16(ptr_slot);
+            }
             return;
         }
 
@@ -1402,27 +1474,65 @@ pub const BytecodeEmitter = struct {
             return temp_reg;
         }
 
+        // Check if value is a derived stack pointer (struct field accessed through stack pointer)
+        // Emit ptr_offset: rd = base_ptr + offset (creates derived StackPtr)
+        if (self.derived_stack_ptrs.get(value.id)) |info| {
+            debug.print(.emit, "  -> derived stack ptr path: base_slot={d} field_offset={d} -> r{d}", .{
+                info.base_slot, info.field_offset, temp_reg,
+            });
+            // First, load the base StackPtr value into the destination register
+            if (info.base_slot < 256) {
+                try self.emitRegLoadLocal(temp_reg, @intCast(info.base_slot));
+            } else {
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, temp_reg) << 4);
+                try self.emitU16(info.base_slot);
+            }
+            // Now emit ptr_offset: rd = rs + offset (creates derived StackPtr)
+            // Format: [rd:4|rs:4] [offset:16]
+            try self.emitOpcode(.ptr_offset);
+            try self.emitU8((@as(u8, temp_reg) << 4) | temp_reg);
+            try self.emitU16(info.field_offset);
+            return temp_reg;
+        }
+
         // Check if value is an indirect field (accessed through stack pointer)
         // Emit load_indirect: rd = stack[ptr_slot].field_offset
         if (self.indirect_fields.get(value.id)) |info| {
             debug.print(.emit, "  -> indirect field path: ptr_slot={d} field_offset={d} -> r{d}", .{
                 info.ptr_slot, info.field_offset, temp_reg,
             });
-            // First, load the stack pointer value into a temp register
-            // We'll use temp_reg+1 for the pointer (or temp_reg if it's the only one we have)
-            const ptr_reg: u4 = if (temp_reg < 13) temp_reg + 1 else temp_reg;
+            // First, load the stack pointer value into the destination register
+            // Then load_indirect will use temp_reg as both source and destination
+            // This is safe because VM reads ptr from rs before writing to rd
             if (info.ptr_slot < 256) {
-                try self.emitRegLoadLocal(ptr_reg, @intCast(info.ptr_slot));
+                try self.emitRegLoadLocal(temp_reg, @intCast(info.ptr_slot));
             } else {
                 try self.emitOpcode(.load_local16);
-                try self.emitU8(@as(u8, ptr_reg) << 4);
+                try self.emitU8(@as(u8, temp_reg) << 4);
                 try self.emitU16(info.ptr_slot);
             }
             // Now emit load_indirect: rd, rs_ptr, offset
             // Format: [opcode] [rd:4|rs:4] [offset:16]
+            // Using temp_reg for both rd and rs is safe - VM reads rs first
             try self.emitOpcode(.load_indirect);
-            try self.emitU8((@as(u8, temp_reg) << 4) | ptr_reg);
+            try self.emitU8((@as(u8, temp_reg) << 4) | temp_reg);
             try self.emitU16(info.field_offset);
+            return temp_reg;
+        }
+
+        // Check if this is a stack pointer value (from a pointer-to-struct parameter)
+        // These are tracked in stack_ptr_value_ids and should be loaded directly
+        // (the slot already contains a StackPtr value, no need for get_local_ptr)
+        if (self.stack_ptr_value_ids.get(value.id)) |ptr_slot| {
+            debug.print(.emit, "  -> stack pointer value path: ptr_slot={d} -> r{d}", .{ ptr_slot, temp_reg });
+            if (ptr_slot < 256) {
+                try self.emitRegLoadLocal(temp_reg, @intCast(ptr_slot));
+            } else {
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, temp_reg) << 4);
+                try self.emitU16(ptr_slot);
+            }
             return temp_reg;
         }
 
@@ -1685,12 +1795,12 @@ pub const BytecodeEmitter = struct {
         }
     }
 
-    /// Emit jump to block
+    /// Emit jump to block (uses 32-bit offset for large code support)
     fn emitJump(self: *Self, target: *const ir.Block) EmitError!void {
-        try self.emitOpcode(.jmp);
+        try self.emitOpcode(.jmp32);
         try self.emitU8(0); // Unused byte
-        try self.addPendingJump(target, false);
-        try self.emitI16(0); // Placeholder
+        try self.addPendingJump(target, true);
+        try self.emitI32(0); // Placeholder for 32-bit offset
     }
 
     /// Add pending jump for later patching
@@ -1708,7 +1818,9 @@ pub const BytecodeEmitter = struct {
             const target_offset = self.block_offsets.get(jump.target_block) orelse
                 return EmitError.UndefinedBlock;
 
-            const current_offset = jump.patch_offset + 2; // After the offset bytes
+            // Calculate offset from after the offset bytes themselves
+            const offset_size: u32 = if (jump.is_wide) 4 else 2;
+            const current_offset = jump.patch_offset + offset_size;
             const relative_offset = @as(i32, @intCast(target_offset)) - @as(i32, @intCast(current_offset));
 
             if (jump.is_wide) {
@@ -1788,6 +1900,7 @@ fn irTypeToDataType(ty: ir.Type) module.DataTypeCode {
         .weak => .int64, // Weak references are pointer-sized
         .trait_object => .int64, // Trait objects are pointer-sized (vtable + data)
         .variant => .int64, // Variant values are pointer-sized (NaN-boxed)
+        .@"enum" => .int64, // Enum values are integer-sized
     };
 }
 

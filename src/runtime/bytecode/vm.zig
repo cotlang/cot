@@ -370,6 +370,11 @@ pub const VM = struct {
     /// Retains the new value and releases the old value.
     /// When runtime_arc_enabled is false, skips ARC (compiler handles it).
     pub inline fn writeRegister(self: *Self, reg: u4, value: Value) void {
+        // Debug: Check if writing a stack pointer
+        if (value.isStackPtr()) {
+            std.debug.print("[writeRegister] reg={d}, value.bits=0x{x:0>16} BEFORE\n", .{ reg, value.bits });
+        }
+
         if (self.runtime_arc_enabled) {
             const old = self.registers[reg];
 
@@ -382,6 +387,11 @@ pub const VM = struct {
 
         // Store new value
         self.registers[reg] = value;
+
+        // Debug: Verify stored value
+        if (value.isStackPtr()) {
+            std.debug.print("[writeRegister] reg={d}, stored.bits=0x{x:0>16} AFTER\n", .{ reg, self.registers[reg].bits });
+        }
     }
 
     /// Write a value to the stack with ARC management.
@@ -1384,6 +1394,7 @@ pub const VM = struct {
 
         // Control Flow (0x60-0x6F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.jmp)] = &vm_opcodes.op_jmp;
+        table[@intFromEnum(Opcode.jmp32)] = &vm_opcodes.op_jmp32;
         table[@intFromEnum(Opcode.jz)] = &vm_opcodes.op_jz;
         table[@intFromEnum(Opcode.jnz)] = &vm_opcodes.op_jnz;
         table[@intFromEnum(Opcode.loop_start)] = &vm_opcodes.op_loop_nop;
@@ -1417,6 +1428,7 @@ pub const VM = struct {
         // String Operations (0x90-0x9F) - extracted to vm_opcodes.zig
         table[@intFromEnum(Opcode.str_concat)] = &vm_opcodes.op_str_concat;
         table[@intFromEnum(Opcode.str_len)] = &vm_opcodes.op_str_len;
+        table[@intFromEnum(Opcode.str_index)] = &vm_opcodes.op_str_index;
         table[@intFromEnum(Opcode.str_trim)] = &vm_opcodes.op_str_trim;
         table[@intFromEnum(Opcode.str_slice_store)] = &vm_opcodes.op_str_slice_store;
         table[@intFromEnum(Opcode.str_slice)] = &vm_opcodes.op_str_slice;

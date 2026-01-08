@@ -295,6 +295,15 @@ pub fn emitLoad(e: *BytecodeEmitter, l: ir.Instruction.Load) EmitError!void {
         });
     }
 
+    // Propagate derived stack pointer tracking through loads
+    // When loading from a struct field accessed through a stack pointer, the result is also a derived stack pointer
+    if (e.derived_stack_ptrs.get(l.ptr.id)) |info| {
+        try e.derived_stack_ptrs.put(l.result.id, info);
+        log.debug("load: propagate derived_stack_ptrs ptr.id={d} -> result.id={d} base_slot={d} field_offset={d}", .{
+            l.ptr.id, l.result.id, info.base_slot, info.field_offset,
+        });
+    }
+
     // Propagate indirect field access info through loads
     // When loading from a field_ptr result that's in indirect_fields, propagate the info
     if (e.indirect_fields.get(l.ptr.id)) |info| {
@@ -575,15 +584,42 @@ pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!
         else
             fp.field_index;
 
-        // Record indirect field access info for this result
-        // When loading this value, we'll emit load_indirect instead of load_local
-        try e.indirect_fields.put(fp.result.id, .{
-            .ptr_slot = ptr_slot,
-            .field_offset = @intCast(field_offset),
-        });
-        debug.print(.emit, "field_ptr (indirect): struct_ptr.id={d} ptr_slot={d} field_offset={d} -> result.id={d}", .{
-            fp.struct_ptr.id, ptr_slot, field_offset, fp.result.id,
-        });
+        // Check if the field type is a struct (meaning we need a derived StackPtr for method calls)
+        // vs a primitive (where we need load_indirect to get the value)
+        // The result type of field_ptr is *FieldType, so check if the pointee is a struct
+        log.debug("emitFieldPtr: result.ty={s}", .{@tagName(fp.result.ty)});
+        const field_is_struct = if (fp.result.ty == .ptr) blk: {
+            log.debug("emitFieldPtr: result is ptr, pointee={s}", .{@tagName(fp.result.ty.ptr.*)});
+            break :blk fp.result.ty.ptr.* == .@"struct";
+        } else false;
+
+        if (field_is_struct) {
+            // Field is a struct - track as derived stack pointer for method calls
+            // When loading this value, we'll emit ptr_offset to create a derived StackPtr
+            log.debug("emitFieldPtr: DERIVED STACK PTR - struct field result.id={d} base={d} offset={d}", .{
+                fp.result.id, ptr_slot, field_offset,
+            });
+            try e.derived_stack_ptrs.put(fp.result.id, .{
+                .base_slot = ptr_slot,
+                .field_offset = @intCast(field_offset),
+            });
+            debug.print(.emit, "field_ptr (derived ptr): struct_ptr.id={d} ptr_slot={d} field_offset={d} -> result.id={d}", .{
+                fp.struct_ptr.id, ptr_slot, field_offset, fp.result.id,
+            });
+        } else {
+            // Field is primitive - track for indirect field access
+            // When loading this value, we'll emit load_indirect instead of load_local
+            log.debug("emitFieldPtr: INDIRECT FIELD - primitive field result.id={d} ptr_slot={d} offset={d}", .{
+                fp.result.id, ptr_slot, field_offset,
+            });
+            try e.indirect_fields.put(fp.result.id, .{
+                .ptr_slot = ptr_slot,
+                .field_offset = @intCast(field_offset),
+            });
+            debug.print(.emit, "field_ptr (indirect): struct_ptr.id={d} ptr_slot={d} field_offset={d} -> result.id={d}", .{
+                fp.struct_ptr.id, ptr_slot, field_offset, fp.result.id,
+            });
+        }
         return;
     }
 
@@ -861,6 +897,19 @@ pub fn emitStrSliceStore(e: *BytecodeEmitter, s: ir.Instruction.StrSliceStore) E
     } else {
         debug.print(.emit, "WARNING: str_substr_store target_ptr id={d} not found in value_slots", .{s.target_ptr.id});
     }
+}
+
+/// Emit str_byte_at instruction: s[i] -> byte value (i64)
+pub fn emitStrByteAt(e: *BytecodeEmitter, s: ir.Instruction.StrByteAt) EmitError!void {
+    const str_reg = try e.getValueInReg(s.string, 0);
+    const idx_reg = try e.getValueInReg(s.index, 1);
+    const dest_reg: u4 = 2;
+    // str_index rd, rs, idx_reg - rd = rs[idx_reg]
+    // Format: [rd:4|rs:4] [idx_reg:4|0]
+    try e.emitOpcode(.str_index);
+    try e.emitU8((@as(u8, dest_reg) << 4) | str_reg);
+    try e.emitU8(@as(u8, idx_reg) << 4);
+    e.setLastResult(s.result.id, dest_reg);
 }
 
 // ============================================================================

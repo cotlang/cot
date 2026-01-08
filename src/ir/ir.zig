@@ -102,6 +102,14 @@ pub const Type = union(enum) {
     /// Used to tag values as variant instances that need variant_get_tag for matching
     variant: void,
 
+    /// Enum type (simple enum with known type name)
+    /// Used to track the type of enum values for method resolution
+    @"enum": *const EnumType,
+
+    pub const EnumType = struct {
+        name: []const u8,
+    };
+
     pub const TraitObjectType = struct {
         trait_name: []const u8,
     };
@@ -145,6 +153,7 @@ pub const Type = union(enum) {
             .heap_record => 8, // Heap record reference (NaN-boxed value)
             .trait_object => 16, // Fat pointer: data + vtable
             .variant => 8, // Variant value (NaN-boxed)
+            .@"enum" => 8, // Enum value (i64)
         };
     }
 
@@ -170,6 +179,7 @@ pub const Type = union(enum) {
             .heap_record => 8,
             .trait_object => 8, // Fat pointer alignment
             .variant => 8, // Variant value alignment
+            .@"enum" => 8, // Enum value alignment
         };
     }
 
@@ -419,6 +429,8 @@ fn typeNeedsArc(ty: Type) bool {
         .heap_record => true,
         // Variants are reference counted
         .variant => true,
+        // Enums are simple integers
+        .@"enum" => false,
     };
 }
 
@@ -507,6 +519,7 @@ pub const Instruction = union(enum) {
     str_slice: StrSlice,
     str_slice_store: StrSliceStore,
     str_len: UnaryOp,
+    str_byte_at: StrByteAt, // Get byte value at index: s[i] -> i64
 
     // ====== Control flow (Cranelift names) ======
     jump: Branch, // Unconditional jump (was: br)
@@ -1055,6 +1068,14 @@ pub const Instruction = union(enum) {
         loc: ?SourceLoc = null,
     };
 
+    /// String byte at - get byte value at index: s[i] -> i64
+    pub const StrByteAt = struct {
+        string: Value, // Source string
+        index: Value, // Index (0-based)
+        result: Value, // Result i64 byte value
+        loc: ?SourceLoc = null,
+    };
+
     // I/O operations for ISAM file access
     pub const IoOpen = struct {
         channel: Value,
@@ -1125,7 +1146,7 @@ pub const Instruction = union(enum) {
             .band, .bor, .bxor, .bnot, .ishl, .sshr, .ushr => .bitwise,
             .icmp => .comparison,
             .log_and, .log_or, .log_not => .logical,
-            .str_concat, .str_compare, .str_copy, .str_slice, .str_slice_store, .str_len => .string,
+            .str_concat, .str_compare, .str_copy, .str_slice, .str_slice_store, .str_len, .str_byte_at => .string,
             .jump, .brif, .br_table, .return_, .call, .call_indirect, .trap, .select => .control,
             .try_begin, .try_end, .catch_begin, .throw => .exception,
             .bitcast, .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce, .format_decimal, .parse_decimal => .conversion,
@@ -1197,6 +1218,7 @@ pub const Instruction = union(enum) {
             .str_concat, .str_compare => |op| op.result,
             .str_len, .array_len => |op| op.result,
             .str_slice => |s| s.result,
+            .str_byte_at => |s| s.result,
             .iconst => |c| c.result,
             .f32const => |c| c.result,
             .f64const => |c| c.result,

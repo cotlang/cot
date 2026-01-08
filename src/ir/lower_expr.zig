@@ -1175,7 +1175,12 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                     }
                 }
                 // Simple enum (not a sum type) - return constant integer value
-                const result = func.newValue(.i64);
+                // Create enum type that carries the enum name for method resolution
+                const enum_type = try l.allocator.create(ir.Type.EnumType);
+                enum_type.* = .{ .name = object_name };
+                try l.allocated_types.append(l.allocator, @ptrCast(enum_type));
+
+                const result = func.newValue(.{ .@"enum" = enum_type });
                 try l.emit(.{
                     .iconst = .{
                         .ty = .i64,
@@ -1421,6 +1426,24 @@ pub fn lowerIndex(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError
         try l.emit(.{
             .list_get = .{
                 .list = object_val,
+                .index = index_val,
+                .result = result,
+                .loc = null,
+            },
+        });
+        return result;
+    }
+
+    // Check if object is a string type or byte array - emit str_byte_at instruction
+    // s[i] returns the byte value (i64) at index i
+    // String literals are typed as [N]u8 arrays, so we need to check for both
+    const is_string_type = object_val.ty == .string or (object_val.ty == .array and object_val.ty.array.element.* == .u8);
+    if (is_string_type) {
+        const index_val = try lowerExpression(l, index_idx);
+        const result = func.newValue(.i64); // Byte value as i64
+        try l.emit(.{
+            .str_byte_at = .{
+                .string = object_val,
                 .index = index_val,
                 .result = result,
                 .loc = null,
@@ -1899,6 +1922,7 @@ fn getTypeName(ty: ir.Type) []const u8 {
         .list => "list",
         .heap_record => |hr| hr.name,
         .variant => "variant",
+        .@"enum" => |e| e.name,
     };
 }
 
@@ -2590,6 +2614,46 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     l.allocator.free(qualified_name);
                 }
             }
+
+            // EnumName.method() - check for impl method on enum types
+            if (l.enum_types.contains(object_name)) {
+                // Build qualified method name: EnumName.method_name
+                const qualified_name = std.fmt.allocPrint(
+                    l.allocator,
+                    "{s}.{s}",
+                    .{ object_name, field_name },
+                ) catch return LowerError.OutOfMemory;
+
+                // Check if this method exists in fn_return_types
+                if (l.fn_return_types.get(qualified_name)) |return_type| {
+                    // Call the enum impl method as a static function
+                    debug.print(.ir, "lowerCall: calling enum impl method {s}", .{qualified_name});
+
+                    // Lower arguments
+                    var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
+                    defer method_args.deinit(l.allocator);
+                    for (0..args_count) |i| {
+                        const arg_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[args_start + i]);
+                        const arg_val = try lowerExpression(l, arg_idx);
+                        try method_args.append(l.allocator, arg_val);
+                    }
+
+                    const args_slice = try method_args.toOwnedSlice(l.allocator);
+                    const result = func.newValue(return_type);
+
+                    try l.emit(.{
+                        .call = .{
+                            .callee = qualified_name,
+                            .args = args_slice,
+                            .result = result,
+                            .loc = toIrLoc(call_loc),
+                        },
+                    });
+                    return result;
+                } else {
+                    l.allocator.free(qualified_name);
+                }
+            }
         }
 
         // Check if this is a method call on a map instance: m.set(), m.get(), etc.
@@ -3033,8 +3097,10 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         if (method_object) |obj| {
             const type_name: ?[]const u8 = switch (obj.ty) {
                 .@"struct" => |s| s.name,
+                .@"enum" => |e| e.name,
                 .ptr => |p| switch (p.*) {
                     .@"struct" => |s| s.name,
+                    .@"enum" => |e| e.name,
                     else => null,
                 },
                 else => null,
@@ -3264,6 +3330,17 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 actual_callee = instantiated_name;
                 debug.print(.ir, "Calling instantiated generic: {s}", .{actual_callee});
             }
+        }
+    }
+
+    // For method calls on struct/enum types, use the qualified name as the callee
+    // This ensures Color.name() calls "Color.name" not just "name"
+    if (qualified_callee_for_lookup) |qname| {
+        if (l.fn_return_types.contains(qname)) {
+            // Method exists with qualified name - use it
+            l.allocator.free(callee_name);
+            actual_callee = l.allocator.dupe(u8, qname) catch return LowerError.OutOfMemory;
+            debug.print(.ir, "Using qualified method name: {s}", .{actual_callee});
         }
     }
 
@@ -4651,9 +4728,12 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
             if (l.struct_types.get(name)) |struct_type| {
                 break :blk .{ .@"struct" = struct_type };
             }
-            // Check if it's an enum type - enums are represented as i64 at runtime
+            // Check if it's an enum type - create proper enum type to preserve name for method resolution
             if (l.enum_types.contains(name)) {
-                break :blk .i64;
+                const enum_type = try l.allocator.create(ir.Type.EnumType);
+                enum_type.* = .{ .name = name };
+                try l.allocated_types.append(l.allocator, @ptrCast(enum_type));
+                break :blk .{ .@"enum" = enum_type };
             }
             l.setErrorContext(
                 LowerError.UndefinedType,

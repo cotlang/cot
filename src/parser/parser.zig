@@ -1702,9 +1702,9 @@ pub const Parser = struct {
             return self.store.addNullLiteral(loc) catch return error.OutOfMemory;
         }
 
-        // Integer literal
+        // Integer literal (supports decimal, hex 0x, binary 0b)
         if (self.match(&[_]TokenType{.integer_literal})) {
-            const value = std.fmt.parseInt(i64, self.previous().lexeme, 10) catch 0;
+            const value = std.fmt.parseInt(i64, self.previous().lexeme, 0) catch 0;
             return self.store.addIntLiteral(value, loc) catch return error.OutOfMemory;
         }
 
