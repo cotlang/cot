@@ -227,18 +227,30 @@ pub fn emitLoad(e: *BytecodeEmitter, l: ir.Instruction.Load) EmitError!void {
         debug.print(.emit, "load: propagate array ptr id={d} -> result={d} array_slot={d}", .{ l.ptr.id, l.result.id, array_slot });
     }
 
+    // Propagate struct_base_slots - when loading from a struct pointer,
+    // the loaded value also needs to know where its fields are stored
+    if (e.struct_base_slots.get(l.ptr.id)) |base_slot| {
+        try e.struct_base_slots.put(l.result.id, base_slot);
+        // Also put in value_slots so writeback mechanism can find it for is_ref parameters
+        try e.value_slots.put(l.result.id, base_slot);
+        log.debug("load: propagate struct_base_slots ptr.id={d} -> result.id={d} base_slot={d}", .{ l.ptr.id, l.result.id, base_slot });
+    }
+
     if (e.value_slots.get(l.ptr.id)) |slot_info| {
         try e.value_slots.put(l.result.id, slot_info);
+        log.debug("load: propagate value_slots ptr.id={d} -> result.id={d} slot={d}", .{ l.ptr.id, l.result.id, slot_info });
     } else if (e.value_consts.get(l.ptr.id)) |const_idx| {
         try e.value_consts.put(l.result.id, const_idx);
+    } else if (e.struct_base_slots.get(l.ptr.id)) |_| {
+        // Already handled above - struct values are tracked in struct_base_slots, not value_slots
     } else if (e.last_result_value) |last_id| {
         if (last_id == l.ptr.id) {
             e.setLastResult(l.result.id, e.last_result_reg);
         } else {
-            debug.print(.emit, "WARNING: .load ptr.id={d} not found, last_result={d}", .{ l.ptr.id, last_id });
+            log.debug("WARNING: .load ptr.id={d} not found, last_result={d}", .{ l.ptr.id, last_id });
         }
     } else {
-        debug.print(.emit, "WARNING: .load ptr.id={d} not found", .{l.ptr.id});
+        log.debug("WARNING: .load ptr.id={d} not found", .{l.ptr.id});
     }
 }
 
@@ -304,8 +316,18 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
     // IMPORTANT: Pointer-to-struct types (like *Expr) are NOT struct values!
     // A pointer is always a single 8-byte value regardless of what it points to.
     // Only actual struct types need multi-slot storage.
+    //
+    // SPECIAL CASE: Nested struct initialization
+    // When storing a ptr-to-struct to a struct field (the field expects a struct value),
+    // we need to COPY all fields from the source struct to the destination.
+    // This happens when: .span = Span{ .start = 0, .end = 2 }
+    // The Span{} creates a temp struct and returns a pointer, but we need to copy values.
     const struct_type_opt: ?*const ir.StructType = if (s.value.ty == .@"struct")
         s.value.ty.@"struct"
+    else if (s.value.ty == .ptr and s.value.ty.ptr.* == .@"struct" and
+        s.ptr.ty == .ptr and s.ptr.ty.ptr.* == .@"struct")
+        // Both source and destination are pointers to structs - copy the struct fields
+        s.value.ty.ptr.*.@"struct"
     else
         null;
 
@@ -313,9 +335,11 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
         // Use flattened slot count to handle nested structs
         const field_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
 
-        // Check if source value has slots (from local struct)
-        if (e.value_slots.get(s.value.id)) |value_slot| {
-            if (e.value_slots.get(s.ptr.id)) |ptr_slot| {
+        // Check if source value has slots (from local struct or struct_base_slots)
+        const value_slot_opt: ?u16 = e.value_slots.get(s.value.id) orelse e.struct_base_slots.get(s.value.id);
+        const ptr_slot_opt: ?u16 = e.value_slots.get(s.ptr.id) orelse e.struct_base_slots.get(s.ptr.id);
+        if (value_slot_opt) |value_slot| {
+            if (ptr_slot_opt) |ptr_slot| {
                 // Struct-to-struct copy: copy all fields from source slots to dest slots
                 debug.print(.emit, "store struct: copying {d} fields from slot {d} to slot {d}", .{
                     field_count, value_slot & 0x7FFF, ptr_slot & 0x7FFF,
@@ -357,8 +381,8 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
                 // This store is for a struct returned from a function call
                 // The struct fields are in consecutive high registers starting at last_result_reg
                 // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
-                const ptr_slot_opt: ?u16 = e.value_slots.get(s.ptr.id) orelse e.struct_base_slots.get(s.ptr.id);
-                if (ptr_slot_opt) |ptr_slot| {
+                const call_ptr_slot_opt: ?u16 = e.value_slots.get(s.ptr.id) orelse e.struct_base_slots.get(s.ptr.id);
+                if (call_ptr_slot_opt) |ptr_slot| {
                     const return_base_reg = e.last_result_reg;
                     const dst_base = ptr_slot & 0x7FFF;
                     debug.print(.emit, "store struct from call: {d} fields from r{d} to slot {d}", .{
@@ -1137,7 +1161,9 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                 const abs_slot = slot_idx + field_offset;
                 if (abs_slot >= 15) {
                     // This slot goes to stack
-                    if (e.value_slots.get(arg.id)) |base_slot| {
+                    // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
+                    const arg_base_slot = e.value_slots.get(arg.id) orelse e.struct_base_slots.get(arg.id);
+                    if (arg_base_slot) |base_slot| {
                         const src_slot = base_slot + field_offset;
                         try e.emitOpcode(.push_arg);
                         try e.emitU8(0);
@@ -1157,7 +1183,9 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
     // Load register arguments (slots 0-15) to r0-r15
     var reg_offset: u8 = 0;
+    log.debug("emitUserCall: loading {d} args to registers", .{c.args.len});
     for (c.args, 0..) |arg, arg_idx| {
+        log.debug("emitUserCall: processing arg[{d}] id={d} type={s}", .{ arg_idx, arg.id, @tagName(arg.ty) });
         // Check if this param is by-reference (was *struct, converted to struct with is_ref=true)
         const is_ref_param = blk: {
             if (callee_func_opt) |callee_func| {
@@ -1171,6 +1199,9 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
         // Check for struct type by value (NOT pointer-to-struct)
         // A pointer like *Expr is passed as a single 8-byte value.
+        debug.print(.emit, "emitUserCall: arg[{d}] id={d} type={s}", .{
+            arg_idx, arg.id, @tagName(arg.ty),
+        });
         const struct_type_opt: ?*const ir.StructType = if (arg.ty == .@"struct")
             arg.ty.@"struct"
         else
@@ -1178,8 +1209,21 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
         if (struct_type_opt) |struct_type| {
             const field_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
+            log.debug("emitUserCall: arg[{d}] is struct type={s} field_count={d} arg.id={d}", .{
+                arg_idx, struct_type.name, field_count, arg.id,
+            });
 
-            if (e.value_slots.get(arg.id)) |base_slot| {
+            // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
+            const value_slot = e.value_slots.get(arg.id);
+            const struct_slot = e.struct_base_slots.get(arg.id);
+            log.debug("emitUserCall: arg[{d}] value_slots={?d} struct_base_slots={?d}", .{
+                arg_idx, value_slot, struct_slot,
+            });
+            const struct_base_slot = value_slot orelse struct_slot;
+            if (struct_base_slot) |base_slot| {
+                log.debug("emitUserCall: loading struct fields from base_slot={d} to regs starting at r{d}", .{
+                    base_slot, reg_offset,
+                });
                 for (0..field_count) |field_idx| {
                     if (reg_offset >= 15) break; // Rest goes to stack (max 15 register args)
                     const slot = base_slot + field_idx;
@@ -1195,6 +1239,7 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                     reg_offset += 1;
                 }
             } else {
+                log.debug("emitUserCall: arg[{d}] struct NOT found in slots, using emitValueToReg", .{arg_idx});
                 if (reg_offset < 15) {
                     try e.emitValueToReg(arg, @intCast(reg_offset));
                     const advance = @min(field_count, 15 - reg_offset);
@@ -1277,7 +1322,10 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                         debug.print(.emit, "  large struct return: slot_count={d} > 16, using stack-based return", .{field_count});
 
                         // Allocate slots for the result if not already allocated
+                        // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
                         const result_base_slot = if (e.value_slots.get(result.id)) |slot|
+                            slot
+                        else if (e.struct_base_slots.get(result.id)) |slot|
                             slot
                         else blk: {
                             const base = e.local_count;

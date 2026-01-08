@@ -3262,7 +3262,30 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const method_name_borrowed = l.strings.get(method_id);
 
     // Get object value
-    const object_val = try lowerExpression(l, object_idx);
+    // For struct method calls with self: *T, we need to pass a pointer, not a copy.
+    // If the object is an lvalue (field access, variable), get its address instead of loading it.
+    const object_tag = l.store.exprTag(object_idx);
+    const object_is_lvalue = switch (object_tag) {
+        .identifier, .member, .index => true,
+        else => false,
+    };
+
+    // Try to get pointer for lvalues first (needed for self: *T methods)
+    var object_val: ir.Value = undefined;
+    var object_ptr: ?ir.Value = null;
+    if (object_is_lvalue) {
+        // Try to get pointer to the object for methods that take self: *T
+        log.debug("lowerMethodCall: object is lvalue (tag={s}), trying lowerLValue", .{@tagName(object_tag)});
+        object_ptr = lowerLValue(l, object_idx) catch |err| blk: {
+            log.debug("lowerMethodCall: lowerLValue failed with {any}", .{err});
+            break :blk null;
+        };
+        if (object_ptr) |ptr| {
+            log.debug("lowerMethodCall: got object_ptr id={d} ty={s}", .{ ptr.id, @tagName(ptr.ty) });
+        }
+    }
+    // Always get object value for type checking
+    object_val = try lowerExpression(l, object_idx);
 
     // Check if object is a map type - emit map instructions
     if (isMapType(object_val.ty)) {
@@ -3409,7 +3432,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // Check if this is an impl method call on a struct
     // For struct types, we need to use a qualified name like "Counter.get"
     var callee_name: []const u8 = undefined;
-    const self_arg = object_val;
+    var self_arg = object_val;
 
     if (object_val.ty == .@"struct") {
         const struct_type = object_val.ty.@"struct";
@@ -3420,6 +3443,15 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             .{ struct_type.name, method_name_borrowed },
         ) catch return LowerError.OutOfMemory;
         debug.print(.ir, "lowerMethodCall: struct method {s}", .{callee_name});
+
+        // For struct methods, check if we have a pointer to pass as self
+        // This is needed for methods that take self: *T to modify the original
+        if (object_ptr) |ptr| {
+            log.debug("lowerMethodCall: using object_ptr id={d} ty={s} as self (enables mutation)", .{ ptr.id, @tagName(ptr.ty) });
+            self_arg = ptr;
+        } else {
+            log.debug("lowerMethodCall: no object_ptr available, using object_val id={d} ty={s}", .{ object_val.id, @tagName(object_val.ty) });
+        }
     } else if (object_val.ty == .ptr) {
         // Pointer to struct - dereference to get struct type name
         const pointee = object_val.ty.ptr.*;
