@@ -321,8 +321,10 @@ pub const Opcode = enum(u8) {
     /// Format: [argc:4|0] [name_idx:16]
     call_dynamic = 0x74,
 
-    /// ret - return void
-    /// Format: [0] [0]
+    /// ret count - return with optional overflow values preserved on stack
+    /// Format: [count:8] [0]
+    /// If count > 0, preserves that many values pushed via push_arg for caller to pop.
+    /// count=0 for normal returns, count>0 for large struct returns or ref param writeback.
     ret = 0x75,
 
     /// ret_val rs - return value in rs
@@ -330,22 +332,20 @@ pub const Opcode = enum(u8) {
     ret_val = 0x76,
 
     /// push_arg slot - push local slot value to stack for overflow args
-    /// Format: [0] [slot:16]
+    /// Instruction: [opcode:8] [slot_lo:8] [slot_hi:8] = 3 bytes total
+    /// Handler reads: slot = u16 at ip, then ip += 2
     push_arg = 0x77,
 
     /// push_arg_reg rs - push register value to stack for overflow args
-    /// Format: [rs:4|0] [0]
+    /// Instruction: [opcode:8] [rs:4|0:4] [0:8] = 3 bytes total (but only 2 operand bytes used)
     push_arg_reg = 0x78,
 
     /// pop_arg slot - pop stack value to local slot (callee prologue)
-    /// Format: [0] [slot:16]
+    /// Instruction: [opcode:8] [slot_lo:8] [slot_hi:8] = 3 bytes total
+    /// Handler reads: slot = u16 at ip, then ip += 2
     pop_arg = 0x79,
 
-    /// ret_large count - return with count values on stack (for large struct returns)
-    /// Format: [count:8] [0]
-    /// Before this opcode, caller should have pushed `count` values using push_arg.
-    /// This opcode restores the frame but adjusts sp to preserve the pushed return values.
-    ret_large = 0x7A,
+    // 0x7A-0x7F reserved for future control flow opcodes
 
     // ============================================
     // Record/Field Operations (0x80-0x8F)
@@ -895,7 +895,7 @@ pub const Opcode = enum(u8) {
             .bit_and, .bit_or, .bit_xor, .bit_not, .shl, .shr => 2,
             .is_null, .is_type, .select => 2,
             .load_null, .load_true, .load_false => 2,
-            .ret, .ret_val, .ret_large, .throw, .push_arg_reg => 2,
+            .ret, .ret_val, .throw, .push_arg_reg => 2,
             .free_record, .clear_record => 2,
             .load_field_fast, .store_field_fast => 2,
             .str_concat, .str_len, .str_index, .str_slice => 2,
@@ -935,7 +935,7 @@ pub const Opcode = enum(u8) {
             .jeq, .jne, .jlt, .jge => 3,
             .set_error_handler => 3,
             .call, .call_external, .call_native, .call_dynamic => 3,
-            .push_arg, .pop_arg => 3,
+            .push_arg, .pop_arg => 2, // [slot:16] = 2 operand bytes
             .new_record, .load_field, .store_field => 3,
             .to_fixed_string => 3,
             .debug_line => 3, // [0] [line:16] = 3 operand bytes

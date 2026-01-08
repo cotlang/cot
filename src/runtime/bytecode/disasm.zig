@@ -424,8 +424,13 @@ pub const Disassembler = struct {
                 }
             },
 
-            // ret - [0] [0]
-            .ret => {},
+            // ret count - [count:8] [0]
+            .ret => {
+                const count: u8 = operands[0];
+                if (count > 0) {
+                    try self.writer.print(" count={}", .{count});
+                }
+            },
 
             // ret_val rs - [rs:4|0] [0]
             .ret_val => {
@@ -433,15 +438,9 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}", .{rs});
             },
 
-            // ret_large count - [count:8] [0]
-            .ret_large => {
-                const count: u8 = operands[0];
-                try self.writer.print(" count={}", .{count});
-            },
-
-            // push_arg slot - [0] [slot:16]
+            // push_arg slot - [slot:16] (2 operand bytes)
             .push_arg => {
-                const slot: u16 = @bitCast(operands[1..3].*);
+                const slot: u16 = @bitCast(operands[0..2].*);
                 try self.writer.print(" slot#{}", .{slot});
             },
 
@@ -451,9 +450,9 @@ pub const Disassembler = struct {
                 try self.writer.print(" r{}", .{rs});
             },
 
-            // pop_arg slot - [0] [slot:16]
+            // pop_arg slot - [slot:16] (2 operand bytes)
             .pop_arg => {
-                const slot: u16 = @bitCast(operands[1..3].*);
+                const slot: u16 = @bitCast(operands[0..2].*);
                 try self.writer.print(" slot#{}", .{slot});
             },
 

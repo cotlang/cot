@@ -1062,9 +1062,12 @@ pub fn op_call_dynamic(vm: *VM, module: *const Module) VMError!DispatchResult {
     return .continue_dispatch;
 }
 
-/// ret - return from subroutine
+/// ret count - return from subroutine, preserving `count` overflow values on stack
+/// Format: [count:8] [0] - count=0 for void return, count>0 for overflow values
 pub fn op_ret(vm: *VM, module: *const Module) VMError!DispatchResult {
+    const count: u8 = module.code[vm.ip];
     vm.ip += 2;
+
     if (vm.call_stack.pop()) |frame| {
         // Copy back ref parameters to caller's registers
         const routine = module.routines[frame.routine_index];
@@ -1077,19 +1080,30 @@ pub fn op_ret(vm: *VM, module: *const Module) VMError!DispatchResult {
 
         // Release all callee's local slots.
         // CRITICAL: This balances the retain done in op_call when copying args.
-        // For ref params, ownership is transferred to caller (copied to register above),
-        // but we still release here because op_call retained them. The net effect:
-        // - op_call: +1 refcount
-        // - op_ret: -1 refcount
-        // - Caller's store_local after call: +1 refcount (for the new slot owner)
-        // This ensures no double-free: callee's release is balanced by call's retain.
         if (vm.runtime_arc_enabled) {
             for (0..routine.local_count) |i| {
                 arc.release(vm.stack[vm.fp + i], vm.allocator);
             }
         }
 
-        vm.sp = frame.stack_pointer;
+        if (count > 0) {
+            // Overflow return: preserve `count` values that were pushed via push_arg
+            // Copy them from current stack position to caller's stack space
+            const src_base = vm.sp - @as(u32, count);
+            for (0..count) |i| {
+                vm.stack[frame.stack_pointer + i] = vm.stack[src_base + i];
+            }
+            // Release pushed values (ownership transferred to caller via copy)
+            if (vm.runtime_arc_enabled) {
+                for (0..count) |i| {
+                    arc.release(vm.stack[src_base + i], vm.allocator);
+                }
+            }
+            vm.sp = frame.stack_pointer + @as(u32, count);
+        } else {
+            vm.sp = frame.stack_pointer;
+        }
+
         vm.fp = frame.base_pointer;
         vm.ip = frame.return_ip;
         vm.current_module = frame.module;
@@ -1152,71 +1166,15 @@ pub fn op_ret_val(vm: *VM, module: *const Module) VMError!DispatchResult {
     }
 }
 
-/// ret_large count - return with count values already pushed to stack (for large struct returns)
-/// This is like ret but adjusts sp to preserve the pushed return values.
-/// The caller pushed `count` values before this return, and they need to survive the frame restore.
-pub fn op_ret_large(vm: *VM, module: *const Module) VMError!DispatchResult {
-    const count = module.code[vm.ip];
-    vm.ip += 2;
-
-    if (vm.call_stack.pop()) |frame| {
-        // Copy back ref parameters to caller's registers (same as op_ret)
-        const routine = module.routines[frame.routine_index];
-        for (routine.params, 0..) |param, i| {
-            if (param.mode == .ref) {
-                vm.writeRegister(@truncate(i), vm.stack[vm.fp + i]);
-            }
-        }
-
-        // CRITICAL: Release local slots BEFORE copying return values.
-        // The return values will be copied to frame.stack_pointer, which may overlap
-        // with local slots (vm.fp to vm.fp + local_count). If we release after copying,
-        // we'd release the just-copied return values, corrupting them.
-        if (vm.runtime_arc_enabled) {
-            for (0..routine.local_count) |i| {
-                arc.release(vm.stack[vm.fp + i], vm.allocator);
-            }
-        }
-
-        // Key difference from ret: we need to preserve `count` values that were
-        // pushed to the stack for the large struct return.
-        // The values are at vm.sp - count to vm.sp - 1 (already pushed by push_arg)
-        // We copy them to the caller's stack space starting at frame.stack_pointer
-
-        // Copy the return values to caller's stack (at stack_pointer)
-        const src_base = vm.sp - @as(u32, count);
-        for (0..count) |i| {
-            vm.stack[frame.stack_pointer + i] = vm.stack[src_base + i];
-        }
-
-        // Release pushed return values (transfer ownership to caller via the copy above)
-        // The values were retained when pushed via push_arg, now caller owns them.
-        if (vm.runtime_arc_enabled) {
-            for (0..count) |i| {
-                arc.release(vm.stack[src_base + i], vm.allocator);
-            }
-        }
-
-        // Restore frame, but sp points AFTER the return values
-        vm.fp = frame.base_pointer;
-        vm.sp = frame.stack_pointer + @as(u32, count);
-        vm.ip = frame.return_ip;
-        vm.current_module = frame.module;
-        vm.current_module_index = frame.caller_module_index;
-        return .continue_dispatch;
-    } else {
-        return .return_from_main;
-    }
-}
-
 /// push_arg slot - push local slot value to stack for overflow args
+/// Format: [slot:16] = 2 operand bytes. Dispatch already advanced past opcode.
 pub fn op_push_arg(vm: *VM, module: *const Module) VMError!DispatchResult {
-    const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
-    vm.ip += 3;
+    const slot = std.mem.readInt(u16, module.code[vm.ip..][0..2], .little);
+    vm.ip += 2;
 
     // Push value from local slot to stack
     // CRITICAL: Must retain because the pushed copy becomes an independent reference.
-    // ret_large will release this when transferring ownership to caller.
+    // ret with count > 0 will release this when transferring ownership to caller.
     const stack_addr = vm.fp + slot;
     const value = vm.stack[stack_addr];
     if (vm.runtime_arc_enabled) arc.retain(value);
@@ -1243,9 +1201,10 @@ pub fn op_push_arg_reg(vm: *VM, module: *const Module) VMError!DispatchResult {
 }
 
 /// pop_arg slot - pop stack value to local slot (not typically needed, call handles this)
+/// Format: [slot:16] = 2 operand bytes. Dispatch already advanced past opcode.
 pub fn op_pop_arg(vm: *VM, module: *const Module) VMError!DispatchResult {
-    const slot = std.mem.readInt(u16, module.code[vm.ip + 1 ..][0..2], .little);
-    vm.ip += 3;
+    const slot = std.mem.readInt(u16, module.code[vm.ip..][0..2], .little);
+    vm.ip += 2;
 
     // Pop value from stack to local slot
     if (vm.sp == 0) {

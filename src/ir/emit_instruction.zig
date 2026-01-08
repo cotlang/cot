@@ -784,13 +784,17 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
             }
         }
 
-        // Now copy ref params back to registers
+        // Now copy ref params back to registers (and stack for overflow)
+        // For large structs (>16 slots), first 16 slots go to r0-r15,
+        // remaining slots are pushed to arg stack for caller to pop
         reg_offset = 0;
+        var ref_overflow_count: u8 = 0; // Track overflow slots pushed for ref params
         for (func.signature.params) |param| {
             const slot_count: u8 = @intCast(getSlotCount(param.ty));
 
             if (param.is_ref) {
                 if (e.locals.get(param.name)) |local_info| {
+                    // First pass: load slots 0-15 into registers r0-r15
                     for (0..slot_count) |field_idx| {
                         const slot: u16 = @intCast(local_info.slot + field_idx);
                         const reg: u8 = reg_offset + @as(u8, @intCast(field_idx));
@@ -800,9 +804,32 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
                             try e.emitU8(@intCast(slot));
                         }
                     }
+                    // Second pass: push overflow slots (16+) to arg stack
+                    // These will be popped by the caller after the call returns
+                    for (0..slot_count) |field_idx| {
+                        const reg: u8 = reg_offset + @as(u8, @intCast(field_idx));
+                        if (reg >= 16) {
+                            const slot: u16 = @intCast(local_info.slot + field_idx);
+                            // push_arg format: [opcode] [slot:16] - 3 bytes total
+                            try e.emitOpcode(.push_arg);
+                            try e.emitU16(slot);
+                            ref_overflow_count += 1;
+                        }
+                    }
                 }
             }
             reg_offset += slot_count;
+        }
+
+        // If we pushed overflow slots for ref param writeback, use ret with count > 0
+        // to preserve them on the stack for the caller to pop
+        if (ref_overflow_count > 0 and r == null) {
+            // Void return with ref param overflow: use ret with count
+            debug.print(.emit, "emitReturn: void return with {d} ref overflow slots, using ret count={d}", .{ ref_overflow_count, ref_overflow_count });
+            try e.emitOpcode(.ret);
+            try e.emitU8(ref_overflow_count);
+            try e.emitU8(0);
+            return;
         }
 
         // Clear register allocator state for clobbered registers (max 16)
@@ -866,19 +893,18 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
 
             // Check if struct is too large to fit in registers (max 16)
             if (total_field_count > 16) {
-                // Large struct: push all fields to stack for ret_large
+                // Large struct: push all fields to stack for ret with count
                 // The caller will pop them after the call returns
                 const large_base_slot_opt: ?u16 = e.value_slots.get(val.id) orelse e.struct_base_slots.get(val.id);
                 if (large_base_slot_opt) |base_slot| {
                     debug.print(.emit, "emitReturn: large struct with {d} fields, base_slot={d}, using stack-based return", .{ total_field_count, base_slot });
                     for (0..total_field_count) |field_idx| {
                         const slot = base_slot + field_idx;
-                        // push_arg format: [0] [slot:16]
+                        // push_arg format: [opcode] [slot:16] - 3 bytes total
                         try e.emitOpcode(.push_arg);
-                        try e.emitU8(0);
                         try e.emitU16(@intCast(slot));
                     }
-                    // Mark for ret_large - use special value to indicate stack-based return
+                    // Mark for ret with count - use special value to indicate stack-based return
                     return_field_count = @intCast(total_field_count);
                     return_base_reg = 255; // Sentinel value indicating large struct return
                 } else {
@@ -950,9 +976,9 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
     // The struct fields are already in high registers and will survive the return.
     if (r != null) {
         if (return_base_reg == 255) {
-            // Large struct return: use ret_large with count
+            // Large struct return: use ret with count
             // Format: [count:8] [0]
-            try e.emitOpcode(.ret_large);
+            try e.emitOpcode(.ret);
             try e.emitU8(return_field_count);
             try e.emitU8(0);
         } else if (return_field_count > 1) {
@@ -1165,8 +1191,8 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                     const arg_base_slot = e.value_slots.get(arg.id) orelse e.struct_base_slots.get(arg.id);
                     if (arg_base_slot) |base_slot| {
                         const src_slot = base_slot + field_offset;
+                        // push_arg format: [opcode] [slot:16] - 3 bytes total
                         try e.emitOpcode(.push_arg);
-                        try e.emitU8(0);
                         try e.emitU16(@intCast(src_slot));
                     } else {
                         // Value not in slot - load to temp register and push
@@ -1263,6 +1289,7 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
     // Emit store-back for ref parameters
     // For struct parameters, we need to write back ALL fields, not just the first slot
+    // For large structs (>16 slots), first 16 come from registers, rest from arg stack
     if (e.ir_module) |ir_mod| {
         if (routine_idx < ir_mod.functions.items.len) {
             const callee_func = ir_mod.functions.items[routine_idx];
@@ -1273,19 +1300,43 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
                 if (param.is_ref and param_idx < c.args.len) {
                     if (e.value_slots.get(c.args[param_idx].id)) |base_slot| {
-                        // Write back all slots for this parameter
+                        // First: write back slots 0-15 from registers
                         for (0..slot_count) |field_idx| {
                             const reg = param_reg_offset + field_idx;
-                            const slot = base_slot + field_idx;
-                            if (slot <= 255 and reg <= 255) {
-                                try e.emitOpcode(.store_local);
-                                // store_local format: [rs:4|0:4] slot - register in high nibble
-                                try e.emitU8(@as(u8, @intCast(reg)) << 4);
-                                try e.emitU8(@intCast(slot));
-                            } else if (slot <= 65535) {
-                                try e.emitOpcode(.store_local16);
-                                try e.emitU8(@as(u8, @intCast(reg)) << 4);
-                                try e.emitU16(@intCast(slot));
+                            if (reg < 16) {
+                                const slot = base_slot + field_idx;
+                                if (slot <= 255) {
+                                    try e.emitOpcode(.store_local);
+                                    // store_local format: [rs:4|0:4] slot - register in high nibble
+                                    try e.emitU8(@as(u8, @intCast(reg)) << 4);
+                                    try e.emitU8(@intCast(slot));
+                                } else if (slot <= 65535) {
+                                    try e.emitOpcode(.store_local16);
+                                    try e.emitU8(@as(u8, @intCast(reg)) << 4);
+                                    try e.emitU16(@intCast(slot));
+                                }
+                            }
+                        }
+                        // Second: pop overflow slots (16+) from arg stack
+                        // Callee pushed these in forward order, so we pop in reverse order
+                        // to get them into the correct destination slots
+                        var overflow_count: usize = 0;
+                        for (0..slot_count) |field_idx| {
+                            const reg = param_reg_offset + field_idx;
+                            if (reg >= 16) overflow_count += 1;
+                        }
+                        if (overflow_count > 0) {
+                            // Pop in reverse order (stack is LIFO)
+                            var i: usize = slot_count;
+                            while (i > 0) {
+                                i -= 1;
+                                const reg = param_reg_offset + i;
+                                if (reg >= 16) {
+                                    const slot = base_slot + i;
+                                    // pop_arg format: [opcode] [slot:16] - 3 bytes total
+                                    try e.emitOpcode(.pop_arg);
+                                    try e.emitU16(@intCast(slot));
+                                }
                             }
                         }
                     }
@@ -1317,7 +1368,7 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
                     // Handle large structs that exceed register capacity
                     if (field_count > 16) {
-                        // Large struct: return values are on the stack after ret_large
+                        // Large struct: return values are on the stack after ret with count
                         // Pop them into result slots
                         debug.print(.emit, "  large struct return: slot_count={d} > 16, using stack-based return", .{field_count});
 
@@ -1340,9 +1391,8 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
                         while (i > 0) {
                             i -= 1;
                             const dst_slot = result_base_slot + i;
-                            // pop_arg format: [0] [slot:16]
+                            // pop_arg format: [opcode] [slot:16] - 3 bytes total
                             try e.emitOpcode(.pop_arg);
-                            try e.emitU8(0);
                             try e.emitU16(@intCast(dst_slot));
                         }
                         return;

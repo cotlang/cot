@@ -1375,7 +1375,6 @@ pub const VM = struct {
         table[@intFromEnum(Opcode.call_dynamic)] = &vm_opcodes.op_call_dynamic;
         table[@intFromEnum(Opcode.ret)] = &vm_opcodes.op_ret;
         table[@intFromEnum(Opcode.ret_val)] = &vm_opcodes.op_ret_val;
-        table[@intFromEnum(Opcode.ret_large)] = &vm_opcodes.op_ret_large;
         table[@intFromEnum(Opcode.push_arg)] = &vm_opcodes.op_push_arg;
         table[@intFromEnum(Opcode.push_arg_reg)] = &vm_opcodes.op_push_arg_reg;
         table[@intFromEnum(Opcode.pop_arg)] = &vm_opcodes.op_pop_arg;
