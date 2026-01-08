@@ -2782,18 +2782,38 @@ pub const Parser = struct {
 
         _ = try self.consume(.kw_endtry, "Expected 'endtry'");
 
-        // Create blocks for try, catch, and finally bodies
+        // Create blocks for try and catch bodies
         const try_block = self.store.addBlock(try_stmts.items, loc) catch return ParseError.OutOfMemory;
         try_stmts.deinit(self.allocator);
 
         const catch_block = self.store.addBlock(catch_stmts.items, loc) catch return ParseError.OutOfMemory;
         catch_stmts.deinit(self.allocator);
 
-        const finally_block = self.store.addBlock(finally_stmts.items, loc) catch return ParseError.OutOfMemory;
-        finally_stmts.deinit(self.allocator);
+        // Transform finally → defer for Cot core compatibility
+        // DBL: try { A } catch { B } finally { C } endtry
+        // Cot: defer { C }; try { A } catch { B }
+        //
+        // If there's a finally block, we need to wrap everything:
+        // 1. Create a defer statement with the finally contents
+        // 2. Create the try/catch (with no finally)
+        // 3. Wrap both in a block so defer scope is correct
+        if (finally_stmts.items.len > 0) {
+            // Create defer block from finally statements
+            const finally_block = self.store.addBlock(finally_stmts.items, loc) catch return ParseError.OutOfMemory;
+            finally_stmts.deinit(self.allocator);
+            const defer_stmt = self.store.addDeferStmt(finally_block, loc) catch return ParseError.OutOfMemory;
 
-        // DBL doesn't support named error bindings, pass null_id
-        return self.store.addTryStmt(try_block, .null_id, catch_block, finally_block, loc) catch return ParseError.OutOfMemory;
+            // Create try/catch with no finally (pass .null for finally_body)
+            const try_stmt = self.store.addTryStmt(try_block, .null_id, catch_block, .null, loc) catch return ParseError.OutOfMemory;
+
+            // Wrap defer + try/catch in a block so defer scope is correct
+            var wrapper_stmts = [_]StmtIdx{ defer_stmt, try_stmt };
+            return self.store.addBlock(&wrapper_stmts, loc) catch return ParseError.OutOfMemory;
+        } else {
+            finally_stmts.deinit(self.allocator);
+            // No finally - just emit try/catch with null finally_body
+            return self.store.addTryStmt(try_block, .null_id, catch_block, .null, loc) catch return ParseError.OutOfMemory;
+        }
     }
 
     /// Parse throw statement

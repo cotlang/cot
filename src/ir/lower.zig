@@ -2978,7 +2978,8 @@ pub const Lowerer = struct {
         const err_binding: StringId = @enumFromInt(err_binding_raw);
         const catch_body: StmtIdx = @enumFromInt(self.store.extra_data.items[extra_start + 1]);
         const finally_body_raw = self.store.extra_data.items[extra_start + 2];
-        const finally_body: ?StmtIdx = if (finally_body_raw != 0) @enumFromInt(finally_body_raw) else null;
+        // StmtIdx.null is maxInt(u32), not 0 - check against the actual null sentinel
+        const finally_body: ?StmtIdx = if (finally_body_raw != StmtIdx.null.toInt()) @enumFromInt(finally_body_raw) else null;
 
         // finally was removed from Cot (use defer instead)
         // This error only triggers for DBL legacy code using finally

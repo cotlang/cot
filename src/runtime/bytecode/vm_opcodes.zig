@@ -852,6 +852,7 @@ pub fn op_loop_nop(vm: *VM, module: *const Module) VMError!DispatchResult {
 /// set_error_handler offset16 - set error handler at relative offset
 /// Format: [opcode][offset_lo][offset_hi] = 3 bytes
 /// Note: IP is already at opcode+1 when handler is called (dispatch pre-increments)
+/// Pushes a new handler onto the stack for nested try/catch support.
 pub fn op_set_error_handler(vm: *VM, module: *const Module) VMError!DispatchResult {
     // ip is at offset_lo (dispatch already skipped opcode), read 16-bit offset
     const offset: i16 = @bitCast(std.mem.readInt(u16, module.code[vm.ip..][0..2], .little));
@@ -865,50 +866,56 @@ pub fn op_set_error_handler(vm: *VM, module: *const Module) VMError!DispatchResu
         return vm.fail(VMError.BytecodeOutOfBounds, "Error handler target out of bounds");
     }
 
-    // Save current stack state for unwinding on throw
-    vm.error_handler_ip = @intCast(handler_ip);
-    vm.error_handler_sp = vm.sp;
-    vm.error_handler_fp = vm.fp;
-    vm.error_handler_call_depth = vm.call_stack.len;
+    // Push new handler onto stack (preserves outer handlers for nested try/catch)
+    vm.error_handlers.append(.{
+        .ip = @intCast(handler_ip),
+        .sp = vm.sp,
+        .fp = vm.fp,
+        .call_depth = vm.call_stack.len,
+    }) catch {
+        return vm.fail(VMError.StackOverflow, "Too many nested try/catch blocks");
+    };
 
     vm.ip += 2; // offset (2) = 2 more bytes (3 total with opcode)
     return .continue_dispatch;
 }
 
 /// clear_error_handler - remove current error handler
+/// Note: This opcode has no operands. The main dispatch loop already advanced
+/// IP past the opcode byte, so we don't need to advance IP here.
+/// Pops the current handler from the stack, restoring the outer handler (if any).
 pub fn op_clear_error_handler(vm: *VM, module: *const Module) VMError!DispatchResult {
     _ = module;
-    vm.error_handler_ip = null;
-    vm.ip += 1;
+    // Pop the current handler from the stack
+    _ = vm.error_handlers.popOrNull();
     return .continue_dispatch;
 }
 
 /// throw rs - throw exception with value in rs
 /// Format: [opcode][rs:4|0][0]
+/// Uses the top handler from the stack and pops it (so re-throws use outer handlers).
 pub fn op_throw(vm: *VM, module: *const Module) VMError!DispatchResult {
     _ = module;
     const ops = vm.current_module.?.code[vm.ip + 1];
     const rs: u4 = @truncate(ops >> 4);
     const error_value = vm.registers[rs];
 
-    // Check if there's an error handler set
-    if (vm.error_handler_ip) |handler_ip| {
+    // Check if there's an error handler set (use top of stack)
+    if (vm.error_handlers.popOrNull()) |handler| {
         // Store error value in r0 for catch block access
         vm.registers[0] = error_value;
 
         // Restore stack state to when the handler was set (unwind call stack)
-        vm.sp = vm.error_handler_sp;
-        vm.fp = vm.error_handler_fp;
+        vm.sp = handler.sp;
+        vm.fp = handler.fp;
 
         // Pop call frames back to the saved depth
-        while (vm.call_stack.len > vm.error_handler_call_depth) {
+        while (vm.call_stack.len > handler.call_depth) {
             _ = vm.call_stack.pop();
         }
 
-        // Jump to handler
-        vm.ip = handler_ip;
-        // Clear the handler (it's consumed)
-        vm.error_handler_ip = null;
+        // Jump to handler (handler was already popped from stack)
+        vm.ip = handler.ip;
         return .continue_dispatch;
     } else {
         // No handler - abort with unhandled exception

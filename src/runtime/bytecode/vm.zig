@@ -68,6 +68,35 @@ const STACK_SIZE = 16384;
 /// Maximum call depth (imported from vm_types)
 const MAX_CALL_DEPTH = vm_types.MAX_CALL_DEPTH;
 
+/// Maximum nested try/catch depth
+const MAX_ERROR_HANDLERS = 32;
+
+/// Error handler state for try/catch
+pub const ErrorHandler = struct {
+    ip: u32, // Absolute IP of error handler
+    sp: usize, // Stack pointer when handler was set
+    fp: usize, // Frame pointer when handler was set
+    call_depth: usize, // Call stack depth when handler was set
+};
+
+/// Fixed-size stack of error handlers for nested try/catch
+pub const ErrorHandlerStack = struct {
+    buffer: [MAX_ERROR_HANDLERS]ErrorHandler = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *ErrorHandlerStack, item: ErrorHandler) error{Overflow}!void {
+        if (self.len >= MAX_ERROR_HANDLERS) return error.Overflow;
+        self.buffer[self.len] = item;
+        self.len += 1;
+    }
+
+    pub fn popOrNull(self: *ErrorHandlerStack) ?ErrorHandler {
+        if (self.len == 0) return null;
+        self.len -= 1;
+        return self.buffer[self.len];
+    }
+};
+
 /// Opcode handler function type for dispatch table
 /// Note: This must stay in vm.zig because it references VM
 pub const OpcodeHandler = *const fn (*VM, *const Module) VMError!DispatchResult;
@@ -135,11 +164,8 @@ pub const VM = struct {
     current_module_index: ?u16, // Index into native_registry.module_globals (null = main module)
     modules: std.ArrayList(*const Module),
 
-    // Error handling
-    error_handler_ip: ?u32, // Absolute IP of error handler (null = no handler)
-    error_handler_sp: usize, // Stack pointer when handler was set
-    error_handler_fp: usize, // Frame pointer when handler was set
-    error_handler_call_depth: usize, // Call stack depth when handler was set
+    // Error handling - stack for nested try/catch support
+    error_handlers: ErrorHandlerStack,
     last_error: ?VMError, // Last error that occurred (for %ERROR function)
 
     // Debugger support
@@ -197,10 +223,7 @@ pub const VM = struct {
             .current_module = null,
             .current_module_index = null,
             .modules = .{},
-            .error_handler_ip = null,
-            .error_handler_sp = 0,
-            .error_handler_fp = 0,
-            .error_handler_call_depth = 0,
+            .error_handlers = .{},
             .last_error = null,
             .debugger = Debugger.init(allocator),
             .stop_reason = null,
@@ -237,10 +260,7 @@ pub const VM = struct {
             .current_module = null,
             .current_module_index = null,
             .modules = .{},
-            .error_handler_ip = null,
-            .error_handler_sp = 0,
-            .error_handler_fp = 0,
-            .error_handler_call_depth = 0,
+            .error_handlers = .{},
             .last_error = null,
             .debugger = Debugger.init(allocator),
             .stop_reason = null,
@@ -2375,12 +2395,22 @@ pub const VM = struct {
     /// Returns true if we jumped to error handler (caller should continue execution)
     /// Returns false if no handler set (caller should propagate error)
     pub fn handleIoError(self: *Self, err: VMError) bool {
-        if (self.error_handler_ip) |handler_ip| {
+        if (self.error_handlers.popOrNull()) |handler| {
             // Save error for %ERROR function
             self.last_error = err;
+
+            // Restore stack state to when the handler was set
+            self.sp = handler.sp;
+            self.fp = handler.fp;
+
+            // Pop call frames back to the saved depth
+            while (self.call_stack.len > handler.call_depth) {
+                _ = self.call_stack.pop();
+            }
+
             // Jump to error handler
-            self.ip = handler_ip;
-            debug.print(.vm, "IO Error handled: jumping to IP {d}", .{handler_ip});
+            self.ip = handler.ip;
+            debug.print(.vm, "IO Error handled: jumping to IP {d}", .{handler.ip});
             return true;
         }
         return false;

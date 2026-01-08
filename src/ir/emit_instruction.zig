@@ -356,7 +356,9 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
             if (last_id == s.value.id and field_count <= 16) {
                 // This store is for a struct returned from a function call
                 // The struct fields are in consecutive high registers starting at last_result_reg
-                if (e.value_slots.get(s.ptr.id)) |ptr_slot| {
+                // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
+                const ptr_slot_opt: ?u16 = e.value_slots.get(s.ptr.id) orelse e.struct_base_slots.get(s.ptr.id);
+                if (ptr_slot_opt) |ptr_slot| {
                     const return_base_reg = e.last_result_reg;
                     const dst_base = ptr_slot & 0x7FFF;
                     debug.print(.emit, "store struct from call: {d} fields from r{d} to slot {d}", .{
@@ -821,13 +823,16 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
         // Additional debug for all types - print before the main line to see pointee
         const ptr_to_type_str: []const u8 = if (val.ty == .ptr) @tagName(val.ty.ptr.*) else "N/A";
         const func_ret_type_str: []const u8 = if (e.current_func) |f| @tagName(f.signature.return_type) else "?";
-        debug.print(.emit, "emitReturn: val.id={d} val.ty={s} ptr_to={s} func_ret={s} struct_type_opt={s} has_slot={} func={s}", .{
+        const has_value_slot = e.value_slots.get(val.id) != null;
+        const has_struct_slot = e.struct_base_slots.get(val.id) != null;
+        debug.print(.emit, "emitReturn: val.id={d} val.ty={s} ptr_to={s} func_ret={s} struct_type_opt={s} value_slot={} struct_slot={} func={s}", .{
             val.id,
             @tagName(val.ty),
             ptr_to_type_str,
             func_ret_type_str,
             if (struct_type_opt != null) "yes" else "no",
-            e.value_slots.get(val.id) != null,
+            has_value_slot,
+            has_struct_slot,
             if (e.current_func) |f| f.name else "?",
         });
 
@@ -839,7 +844,8 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
             if (total_field_count > 16) {
                 // Large struct: push all fields to stack for ret_large
                 // The caller will pop them after the call returns
-                if (e.value_slots.get(val.id)) |base_slot| {
+                const large_base_slot_opt: ?u16 = e.value_slots.get(val.id) orelse e.struct_base_slots.get(val.id);
+                if (large_base_slot_opt) |base_slot| {
                     debug.print(.emit, "emitReturn: large struct with {d} fields, base_slot={d}, using stack-based return", .{ total_field_count, base_slot });
                     for (0..total_field_count) |field_idx| {
                         const slot = base_slot + field_idx;
@@ -870,7 +876,9 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
                 });
 
                 // Load ALL struct fields (including nested) into consecutive high registers
-                if (e.value_slots.get(val.id)) |base_slot| {
+                // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
+                const base_slot_opt: ?u16 = e.value_slots.get(val.id) orelse e.struct_base_slots.get(val.id);
+                if (base_slot_opt) |base_slot| {
                     debug.print(.emit, "emitReturn: loading struct fields from slot {d}, count={d}", .{ base_slot, return_field_count });
                     for (0..return_field_count) |field_idx| {
                         const slot = base_slot + field_idx;
