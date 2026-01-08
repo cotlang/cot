@@ -2057,6 +2057,8 @@ pub fn emitListPop(e: *BytecodeEmitter, lp: ir.Instruction.ListPop) EmitError!vo
     // Non-struct: use regular list_pop
     const list_reg = try e.getValueInReg(lp.list, 0);
     const dest_reg: u4 = 1;
+    // Spill any existing value in dest_reg BEFORE the instruction clobbers it
+    e.prepareDestReg(dest_reg);
     try e.emitOpcode(.list_pop);
     try e.emitU8((@as(u8, dest_reg) << 4) | list_reg);
     try e.emitU8(0);
@@ -2102,6 +2104,8 @@ pub fn emitListGet(e: *BytecodeEmitter, lg: ir.Instruction.ListGet) EmitError!vo
     const list_reg = try e.getValueInReg(lg.list, 0);
     const idx_reg = try e.getValueInReg(lg.index, 1);
     const dest_reg: u4 = 2;
+    // Spill any existing value in dest_reg BEFORE the instruction clobbers it
+    e.prepareDestReg(dest_reg);
     try e.emitOpcode(.list_get);
     try e.emitU8((@as(u8, dest_reg) << 4) | list_reg);
     try e.emitU8((@as(u8, idx_reg) << 4) | 0);

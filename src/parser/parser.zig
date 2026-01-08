@@ -203,8 +203,9 @@ pub const Parser = struct {
             .kw_import => self.parseImport(),
             .kw_test => self.parseTestDef(),
             .kw_pub => self.parsePubDecl(),
+            .kw_comptime => self.parseComptime(),
             else => {
-                self.addError("Expected 'fn', 'struct', 'union', 'enum', 'trait', 'impl', 'const', 'var', 'type', 'test', or 'import' at top level");
+                self.addError("unexpected token at top level");
                 _ = self.advance();
                 return error.UnexpectedToken;
             },

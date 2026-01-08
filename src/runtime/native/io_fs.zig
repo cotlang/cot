@@ -35,6 +35,7 @@ pub fn register(registry: anytype) !void {
     // File operations
     try registry.registerNative("std.fs.read_file", fs_read_file);
     try registry.registerNative("std.fs.write_file", fs_write_file);
+    try registry.registerNative("std.fs.write_bytes", fs_write_bytes);
     try registry.registerNative("std.fs.append_file", fs_append_file);
     try registry.registerNative("std.fs.copy_file", fs_copy_file);
 
@@ -55,6 +56,7 @@ pub fn register(registry: anytype) !void {
     // Short names for convenience
     try registry.registerNative("read_file", fs_read_file);
     try registry.registerNative("write_file", fs_write_file);
+    try registry.registerNative("write_bytes", fs_write_bytes);
     try registry.registerNative("append_file", fs_append_file);
     try registry.registerNative("copy_file", fs_copy_file);
     try registry.registerNative("fs_exists", fs_exists);
@@ -111,6 +113,50 @@ fn fs_write_file(ctx: *NativeContext) NativeError!?Value {
     };
 
     debug.print(.general, "write_file: wrote {} bytes to '{s}'", .{ content.len, path });
+    return Value.initBool(true);
+}
+
+/// write_bytes(path, bytes: List<i64>) -> bool
+/// Write binary bytes (as List<i64> with values 0-255) to file. Returns true on success.
+/// Used for writing bytecode files.
+fn fs_write_bytes(ctx: *NativeContext) NativeError!?Value {
+    const path = ctx.getArgString(0) catch return NativeError.InvalidArgument;
+
+    // Get the list of bytes
+    const list_val = ctx.args[1];
+    const list_ptr = list_val.asList() orelse return NativeError.InvalidArgument;
+
+    // Get list length
+    const len = list_ptr.len();
+
+    // Allocate buffer for bytes
+    const buf = ctx.allocator.alloc(u8, len) catch return NativeError.OutOfMemory;
+    defer ctx.allocator.free(buf);
+
+    // Convert i64 values to u8 bytes
+    for (0..len) |i| {
+        const val = list_ptr.get(i) orelse return NativeError.InvalidArgument;
+        const int_val = val.asInt();
+        if (int_val < 0 or int_val > 255) {
+            debug.print(.general, "write_bytes: byte value {} out of range at index {}", .{ int_val, i });
+            return NativeError.InvalidArgument;
+        }
+        buf[i] = @intCast(int_val);
+    }
+
+    // Write to file
+    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+        debug.print(.general, "write_bytes: failed to create '{s}': {}", .{ path, err });
+        return Value.initBool(false);
+    };
+    defer file.close();
+
+    file.writeAll(buf) catch |err| {
+        debug.print(.general, "write_bytes: failed to write '{s}': {}", .{ path, err });
+        return Value.initBool(false);
+    };
+
+    debug.print(.general, "write_bytes: wrote {} bytes to '{s}'", .{ len, path });
     return Value.initBool(true);
 }
 

@@ -8,10 +8,13 @@
 
 const std = @import("std");
 const native = @import("native.zig");
+const value_mod = @import("../bytecode/value.zig");
+const arc = @import("../bytecode/arc.zig");
 const NativeContext = native.NativeContext;
 const NativeError = native.NativeError;
 const NativeFn = native.NativeFn;
 const Value = native.Value;
+const List = value_mod.List;
 
 /// Register all system functions with both namespaced and short names
 pub fn register(registry: anytype) !void {
@@ -21,6 +24,10 @@ pub fn register(registry: anytype) !void {
     try registry.registerNative("std.system.setlog", setlog);
     try registry.registerNative("std.system.error", getError);
     try registry.registerNative("std.system.mem", mem);
+
+    // Process functions
+    try registry.registerNative("std.process.args", processArgs);
+    try registry.registerNative("process_args", processArgs);
 
     // Short names (DBL compatibility)
     try registry.registerNative("flags", flags);
@@ -74,4 +81,24 @@ pub fn mem(ctx: *NativeContext) NativeError!?Value {
 
     // Return handle (pointer as integer)
     return Value.initHandle(@intFromPtr(buf.ptr));
+}
+
+/// std.process.args() -> List<string>
+/// Returns command-line arguments as a list of strings.
+/// First element is the program name, followed by arguments.
+pub fn processArgs(ctx: *NativeContext) NativeError!?Value {
+    // Get args iterator
+    var args_iter = std.process.args();
+
+    // Create list for results using ARC allocation (includes ARC header)
+    const list_ptr = arc.create(ctx.allocator, List) catch return NativeError.OutOfMemory;
+    list_ptr.* = List.init(ctx.allocator);
+
+    // Iterate and collect all args
+    while (args_iter.next()) |arg| {
+        const str_val = Value.initString(ctx.allocator, arg) catch return NativeError.OutOfMemory;
+        list_ptr.push(str_val) catch return NativeError.OutOfMemory;
+    }
+
+    return Value.initList(list_ptr);
 }

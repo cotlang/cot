@@ -1028,6 +1028,15 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
     if (type_idx != .null) {
         // Explicit type annotation
         var_type = try l.lowerTypeIdx(type_idx);
+        // Debug: log type resolution
+        if (std.posix.getenv("COT_DEBUG_TYPE_CHECK")) |_| {
+            var buf: [64]u8 = undefined;
+            const type_rules = @import("../compiler/type_rules.zig");
+            std.debug.print("[TYPE_CHECK] Variable '{s}' has explicit type: {s}\n", .{
+                name,
+                type_rules.formatType(var_type, &buf),
+            });
+        }
     } else if (init_val) |val| {
         // Infer type from init expression
         // If init is a pointer to struct/array (from struct/array init expression),
@@ -1042,6 +1051,15 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
             }
         } else {
             var_type = val.ty;
+        }
+        // Debug: log type inference
+        if (std.posix.getenv("COT_DEBUG_TYPE_CHECK")) |_| {
+            var buf: [64]u8 = undefined;
+            const type_rules = @import("../compiler/type_rules.zig");
+            std.debug.print("[TYPE_CHECK] Variable '{s}' inferred type from init: {s}\n", .{
+                name,
+                type_rules.formatType(var_type, &buf),
+            });
         }
     } else {
         // No type and no init - default to void (error will be caught later)
@@ -1296,16 +1314,21 @@ pub fn lowerGlobalLetDecl(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
     const name = l.strings.get(name_id);
     if (name.len == 0) return LowerError.UndefinedVariable;
 
-    // Get type from packed data
+    // Get type and init from packed data (same layout as lowerLetDecl)
     const type_raw = (data.b >> 16) & 0xFFFF;
     const type_idx: TypeIdx = if (type_raw == 0xFFFF) .null else @enumFromInt(type_raw);
+    const extra_idx = data.b & 0xFFFF;
+    const init_idx: ExprIdx = @enumFromInt(l.store.extra_data.items[extra_idx]);
 
     // Determine the variable type
     var var_type: ir.Type = undefined;
     if (type_idx != .null) {
         var_type = try l.lowerTypeIdx(type_idx);
+    } else if (init_idx != .null) {
+        // Try to infer type from init expression (for globals like: var x = new List<T>)
+        var_type = try inferTypeFromExpr(l, init_idx);
     } else {
-        // Default to void if no type (shouldn't happen for common blocks)
+        // Default to void if no type and no init
         var_type = .void;
     }
 
@@ -1330,4 +1353,101 @@ pub fn lowerGlobalLetDecl(l: *Lowerer, stmt_idx: StmtIdx) LowerError!void {
     try l.module.addGlobal(name, var_type, false);
 
     debug.print(.ir, "Registered global: {s}", .{name});
+}
+
+/// Infer the type of an expression without lowering it
+/// Used during the globals pass to determine global variable types from init expressions
+fn inferTypeFromExpr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Type {
+    const tag = l.store.exprTag(expr_idx);
+    const data = l.store.exprData(expr_idx);
+
+    switch (tag) {
+        .new_expr => {
+            // new Type{} or new Type<Args>{}
+            // data.a = type_name (StringId), data.b = extra_data start
+            const type_name_id: StringId = @enumFromInt(data.a);
+            const type_name = l.strings.get(type_name_id);
+
+            const extra_start: ast.ExtraIdx = @enumFromInt(data.b);
+            const type_arg_count = l.store.getExtra(extra_start);
+
+            // Check for built-in collection types
+            if (std.mem.eql(u8, type_name, "List")) {
+                // List<T> - get the element type from type arguments
+                if (type_arg_count > 0) {
+                    const type_arg_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 1));
+                    const type_arg_idx: ast.TypeIdx = @enumFromInt(type_arg_raw);
+                    const elem_type = try l.lowerTypeIdx(type_arg_idx);
+
+                    const elem_type_ptr = try l.allocator.create(ir.Type);
+                    elem_type_ptr.* = elem_type;
+                    try l.allocated_types.append(l.allocator, elem_type_ptr);
+
+                    const list_type = try l.allocator.create(ir.ListType);
+                    list_type.* = .{ .element_type = elem_type_ptr };
+                    try l.module.allocated_list_types.append(l.allocator, list_type);
+
+                    return .{ .list = list_type };
+                }
+                return .void;
+            } else if (std.mem.eql(u8, type_name, "Map")) {
+                // Map<K, V> - get key and value types
+                if (type_arg_count >= 2) {
+                    const key_type_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 1));
+                    const val_type_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 2));
+                    const key_type_idx: ast.TypeIdx = @enumFromInt(key_type_raw);
+                    const val_type_idx: ast.TypeIdx = @enumFromInt(val_type_raw);
+                    const key_type = try l.lowerTypeIdx(key_type_idx);
+                    const val_type = try l.lowerTypeIdx(val_type_idx);
+
+                    const key_type_ptr = try l.allocator.create(ir.Type);
+                    key_type_ptr.* = key_type;
+                    try l.allocated_types.append(l.allocator, key_type_ptr);
+
+                    const val_type_ptr = try l.allocator.create(ir.Type);
+                    val_type_ptr.* = val_type;
+                    try l.allocated_types.append(l.allocator, val_type_ptr);
+
+                    const map_type = try l.allocator.create(ir.MapType);
+                    map_type.* = .{ .key_type = key_type_ptr, .value_type = val_type_ptr };
+
+                    return .{ .map = map_type };
+                }
+                return .void;
+            } else {
+                // Regular struct type - look it up or instantiate if generic
+                if (type_arg_count > 0) {
+                    // Generic struct
+                    var type_args: std.ArrayListUnmanaged(ir.Type) = .{};
+                    defer type_args.deinit(l.allocator);
+
+                    for (0..type_arg_count) |i| {
+                        const type_arg_idx = TypeIdx.fromInt(l.store.extra_data.items[@intFromEnum(extra_start) + 1 + i]);
+                        const arg_type = try l.lowerTypeIdx(type_arg_idx);
+                        try type_args.append(l.allocator, arg_type);
+                    }
+
+                    const struct_type = try l.instantiateGenericStruct(type_name, type_args.items) orelse {
+                        return .void;
+                    };
+                    return .{ .heap_record = struct_type };
+                } else {
+                    // Non-generic struct
+                    const struct_type = l.struct_types.get(type_name) orelse {
+                        return .void;
+                    };
+                    return .{ .heap_record = struct_type };
+                }
+            }
+        },
+        .int_literal => return .i64,
+        .float_literal => return .f64,
+        .string_literal => return .string,
+        .bool_literal => return .bool,
+        else => {
+            // For other expression types, default to void
+            // The type checker will catch any mismatches
+            return .void;
+        },
+    }
 }

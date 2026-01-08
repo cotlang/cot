@@ -737,10 +737,11 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     var object_ptr = try lowerLValue(l, object_idx);
     const field_name = l.strings.get(field_id);
     if (field_name.len == 0) {
-        l.setErrorContext(
+        l.setErrorContextWithFileId(
             LowerError.UndefinedVariable,
             "Undefined field: (empty name)",
             .{},
+            l.store.exprFileId(expr_idx),
             loc,
             "lowering member access",
             .{},
@@ -772,10 +773,11 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                         break :blk s;
                     },
                     else => {
-                        l.setErrorContext(
+                        l.setErrorContextWithFileId(
                             LowerError.TypeMismatch,
                             "cannot access field '{s}' on non-struct pointer type",
                             .{field_name},
+                            l.store.exprFileId(expr_idx),
                             loc,
                             "lowering member access (inner pointer is not a struct)",
                             .{},
@@ -785,10 +787,11 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 }
             },
             else => {
-                l.setErrorContext(
+                l.setErrorContextWithFileId(
                     LowerError.TypeMismatch,
                     "cannot access field '{s}' on non-struct type",
                     .{field_name},
+                    l.store.exprFileId(expr_idx),
                     loc,
                     "lowering member access (pointer target is not a struct)",
                     .{},
@@ -836,10 +839,11 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         return result;
     }
 
-    l.setErrorContext(
+    l.setErrorContextWithFileId(
         LowerError.UndefinedVariable,
         "Field '{s}' not found in struct '{s}'",
         .{ field_name, struct_type.name },
+        l.store.exprFileId(expr_idx),
         loc,
         "lowering member access",
         .{},
@@ -3845,10 +3849,25 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
 
         if (field_index) |idx| {
             // Lower the field value
-            const field_val = try lowerExpression(l, field_expr_idx);
+            var field_val = try lowerExpression(l, field_expr_idx);
 
             // Get field type
             const field_type = struct_type.fields[idx].ty;
+
+            // Fix for empty array/slice literals: lowerArrayInit returns void for empty [],
+            // but if the field type is slice/list, create a properly typed value
+            if (field_val.ty == .void) {
+                switch (field_type) {
+                    .slice => {
+                        field_val = func.newValue(field_type);
+                    },
+                    .list => {
+                        field_val = func.newValue(field_type);
+                    },
+                    else => {},
+                }
+            }
+
             const field_type_ptr = try l.allocator.create(ir.Type);
             field_type_ptr.* = field_type;
             try l.allocated_types.append(l.allocator, field_type_ptr);
@@ -4158,7 +4177,21 @@ fn lowerNewStruct(
 
         if (field_index) |idx| {
             // Lower the field value
-            const field_val = try lowerExpression(l, field_expr_idx);
+            var field_val = try lowerExpression(l, field_expr_idx);
+
+            // Get field type and fix empty array/slice literals
+            const field_type = struct_type.fields[idx].ty;
+            if (field_val.ty == .void) {
+                switch (field_type) {
+                    .slice => {
+                        field_val = func.newValue(field_type);
+                    },
+                    .list => {
+                        field_val = func.newValue(field_type);
+                    },
+                    else => {},
+                }
+            }
 
             // Emit store_field_heap instruction
             try l.emit(.{
@@ -4739,9 +4772,35 @@ pub fn isListType(ty: ir.Type) bool {
     };
 }
 
+// ============================================================================
+// Compile-time static types for native functions with complex return types
+// These can't be expressed in natives.toml (which only supports simple types)
+// ============================================================================
+
+/// Static string type for use in ListType definitions
+const static_string_type: ir.Type = .string;
+
+/// Static ListType for List<string>
+const list_string_type: ir.ListType = .{
+    .element_type = &static_string_type,
+};
+
+/// Static IR Type for List<string>
+const ir_list_string_type: ir.Type = .{
+    .list = &list_string_type,
+};
+
 /// Determine return type of builtin functions using generated spec-based lookup.
 /// The FunctionReturnTypes map is auto-generated from spec/natives.toml.
 pub fn getBuiltinReturnType(name: []const u8, args: []const ir.Value) ir.Type {
+    // Special cases for functions with complex return types not expressible in natives.toml
+    if (std.mem.eql(u8, name, "process_args")) {
+        return ir_list_string_type; // Returns List<string>
+    }
+    if (std.mem.eql(u8, name, "write_bytes")) {
+        return .bool; // Returns bool (success/failure)
+    }
+
     // O(1) lookup in the generated static map from spec/natives.toml
     // This includes all native functions AND opcode builtins (len, size, trim, atrim)
     if (native_types.getReturnType(name)) |ty| {

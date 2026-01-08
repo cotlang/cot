@@ -54,6 +54,8 @@ const Closure = value_mod.Closure;
 const CLOSURE_TYPE_ID = value_mod.CLOSURE_TYPE_ID;
 const StructBox = value_mod.StructBox;
 const STRUCT_BOX_TYPE_ID = value_mod.STRUCT_BOX_TYPE_ID;
+const List = value_mod.List;
+const LIST_TYPE_ID = value_mod.LIST_TYPE_ID;
 const OrderedMap = @import("ordered_map.zig").OrderedMap;
 
 // Scoped logging
@@ -425,6 +427,14 @@ fn freeObject(value: Value, ptr: *anyopaque, allocator: std.mem.Allocator) void 
                 }
                 sbox.deinitInternal();
                 freeWithHeader(ptr, @sizeOf(StructBox), allocator);
+            } else if (value.asList()) |list| {
+                // List (type_id 19) - release all values stored in the list
+                for (list.items.items) |item| {
+                    release(item, allocator);
+                }
+                // Deinit list internals (frees the items array)
+                list.items.deinit(list.allocator);
+                freeWithHeader(ptr, @sizeOf(List), allocator);
             } else {
                 // Unknown object type - log warning and skip
                 log.warn("Unknown object type_id {} - cannot free", .{type_id});
@@ -490,6 +500,10 @@ pub fn freeObjectForced(value: Value, ptr: *anyopaque, allocator: std.mem.Alloca
                 // StructBox - free structure without recursively releasing values
                 sbox.deinitInternal();
                 freeWithHeader(ptr, @sizeOf(StructBox), allocator);
+            } else if (value.asList()) |list| {
+                // List - free structure without recursively releasing values
+                list.items.deinit(list.allocator);
+                freeWithHeader(ptr, @sizeOf(List), allocator);
             } else {
                 // Unknown object type - log warning
                 log.warn("Unknown object type_id {} - cannot free (forced)", .{type_id});

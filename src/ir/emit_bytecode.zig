@@ -1305,11 +1305,46 @@ pub const BytecodeEmitter = struct {
         return try self.getOrAllocReg(value);
     }
 
+    /// Prepare a destination register by spilling any existing value BEFORE an instruction uses it.
+    /// This must be called BEFORE emitting instructions that write to a hardcoded destination register,
+    /// because setLastResult() is called AFTER the instruction and would spill the NEW value, not the old one.
+    ///
+    /// Example: For `list_get r2, list[idx]` where r2 contains an important intermediate value,
+    /// calling prepareDestReg(2) will spill r2's current value before list_get overwrites it.
+    pub fn prepareDestReg(self: *Self, reg: u4) void {
+        // Check if last_result is in this register
+        if (self.last_result_value) |prev_value_id| {
+            if (self.last_result_reg == reg) {
+                // Spill if not already spilled
+                if (self.spilled_values.get(prev_value_id) == null) {
+                    const spill_slot = self.allocateSpillSlot();
+                    log.debug("SPILL (prepareDestReg): value_id={d} from r{d} to slot {d}", .{ prev_value_id, reg, spill_slot });
+                    self.emitSpillStore(reg, spill_slot) catch {};
+                    self.spilled_values.put(prev_value_id, spill_slot) catch {};
+                }
+                // Clear last_result since we're about to overwrite it
+                self.last_result_value = null;
+            }
+        }
+        // Also check register allocator for values assigned to this register
+        if (self.reg_alloc.reg_to_value[reg]) |existing_value| {
+            if (self.spilled_values.get(existing_value) == null) {
+                const spill_slot = self.allocateSpillSlot();
+                log.debug("SPILL (prepareDestReg/reg_alloc): value_id={d} from r{d} to slot {d}", .{ existing_value, reg, spill_slot });
+                self.emitSpillStore(reg, spill_slot) catch {};
+                self.spilled_values.put(existing_value, spill_slot) catch {};
+            }
+            // Remove from register allocator
+            _ = self.reg_alloc.value_to_reg.remove(existing_value);
+            self.reg_alloc.reg_to_value[reg] = null;
+            self.reg_alloc.free_regs |= @as(u16, 1) << reg;
+        }
+    }
+
     /// Set the last computed result (for SSA value chains without permanent register allocation)
     /// Also registers the value with the register allocator so it can be found later.
-    /// IMPORTANT: Before overwriting last_result, spill the previous value so it can be
-    /// recovered later. This is critical for expressions like `f() + g()` where both calls
-    /// return in the same register (r15) - we need to preserve f()'s result before calling g().
+    /// NOTE: For instructions with hardcoded destination registers, call prepareDestReg() BEFORE
+    /// emitting the instruction, then call setLastResult() AFTER.
     pub fn setLastResult(self: *Self, value_id: u32, reg: u4) void {
         log.debug("setLastResult: value_id={d} reg={d} (prev_value={?d} prev_reg={d})", .{
             value_id,
@@ -1318,20 +1353,8 @@ pub const BytecodeEmitter = struct {
             self.last_result_reg,
         });
 
-        // Before overwriting, spill the previous last_result if it exists and uses the same register
-        // This ensures intermediate values aren't lost when making multiple calls
-        if (self.last_result_value) |prev_value_id| {
-            if (self.last_result_reg == reg and prev_value_id != value_id) {
-                // Previous value is in the same register we're about to overwrite
-                // Spill it if not already spilled
-                if (self.spilled_values.get(prev_value_id) == null) {
-                    const spill_slot = self.allocateSpillSlot();
-                    log.debug("SPILL (last_result): value_id={d} from r{d} to slot {d}", .{ prev_value_id, reg, spill_slot });
-                    self.emitSpillStore(reg, spill_slot) catch {};
-                    self.spilled_values.put(prev_value_id, spill_slot) catch {};
-                }
-            }
-        }
+        // Note: We no longer spill here because prepareDestReg should be called before
+        // the instruction. This function just records where the result ended up.
 
         self.last_result_value = value_id;
         self.last_result_reg = reg;
