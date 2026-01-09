@@ -937,17 +937,36 @@ pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
     // For range iteration, the loop variable IS the user-visible binding
     try l.scopes.put(binding_name, loop_var);
 
-    // Initialize loop variable to range start
+    // Create alloca for end bound to preserve it across loop iterations
+    // This is necessary because the end value's register may be clobbered during the loop body
+    const end_ty_ptr = try l.allocator.create(ir.Type);
+    end_ty_ptr.* = .i64;
+    try l.allocated_types.append(l.allocator, end_ty_ptr);
+
+    const end_var = func.newValue(.{ .ptr = end_ty_ptr });
+    try l.emit(.{
+        .alloca = .{
+            .ty = .i64,
+            .name = "_loop_end",
+            .result = end_var,
+        },
+    });
+
+    // Initialize loop variable to range start and store end bound
     try l.emit(.{ .store = .{ .ptr = loop_var, .value = start_val, .loc = ir_loc } });
+    try l.emit(.{ .store = .{ .ptr = end_var, .value = end_val, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Condition block - check loop_var <= end (or < for non-inclusive)
+    // Load both values from memory each iteration to avoid register clobbering
     l.current_block = cond_block;
     const current_val = func.newValue(.i64);
     try l.emit(.{ .load = .{ .ptr = loop_var, .result = current_val } });
+    const end_loaded = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = end_var, .result = end_loaded } });
     const cond_result = func.newValue(.bool);
     const cmp_cond: ir.IntCC = if (is_inclusive) .sle else .slt;
-    try l.emit(.{ .icmp = .{ .cond = cmp_cond, .lhs = current_val, .rhs = end_val, .result = cond_result } });
+    try l.emit(.{ .icmp = .{ .cond = cmp_cond, .lhs = current_val, .rhs = end_loaded, .result = cond_result } });
     try l.emit(.{ .brif = .{ .condition = cond_result, .then_block = body_block, .else_block = exit_block } });
 
     // Body block
