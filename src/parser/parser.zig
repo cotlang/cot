@@ -1595,36 +1595,16 @@ pub const Parser = struct {
         return self.store.addBinary(left, op, right, loc) catch return error.OutOfMemory;
     }
 
-    /// Parse a cast operator: expr as type
-    /// Converts to a call to cast_alpha, cast_decimal, or cast_integer
+    /// Parse a cast operator: expr as Type
+    /// Creates a cast_expr node with the expression and target type
     fn parseCastOp(self: *Self, left: ExprIdx) ParseError!ExprIdx {
         _ = self.advance(); // consume 'as'
         const loc = self.currentLoc();
 
-        // Parse the target type name
-        const type_token = try self.consume(.identifier, "Expected type name after 'as'");
-        const type_name = type_token.lexeme;
+        // Parse the target type
+        const type_idx = try self.parseType();
 
-        // Map type name to cast function
-        // For enum types or i64, we use cast_integer since enums are integers
-        const cast_func: []const u8 = if (std.mem.eql(u8, type_name, "alpha") or std.mem.eql(u8, type_name, "string"))
-            "cast_alpha"
-        else if (std.mem.eql(u8, type_name, "decimal") or std.mem.eql(u8, type_name, "f64"))
-            "cast_decimal"
-        else
-            // All other types (integer, int, i64, i32, u64, u32, or enum types) use cast_integer
-            // Enum values are integers, so casting to/from enum is effectively integer cast
-            "cast_integer";
-
-        // Create call expression: cast_func(left)
-        const func_id = self.internString(cast_func) catch return error.OutOfMemory;
-        const func_expr = self.store.addIdentifier(func_id, loc) catch return error.OutOfMemory;
-
-        // Create single-element args array
-        var args_buf: [1]ExprIdx = .{left};
-        const args = self.allocator.dupe(ExprIdx, &args_buf) catch return error.OutOfMemory;
-
-        return self.store.addCall(func_expr, args, loc) catch return error.OutOfMemory;
+        return self.store.addCastExpr(left, type_idx, loc) catch return error.OutOfMemory;
     }
 
     /// Parse a type test operator: expr is Type

@@ -194,6 +194,15 @@ pub const Lowerer = struct {
     /// Source file path (for @file() builtin and error messages)
     source_file: ?[]const u8,
 
+    /// Narrowed member paths (for type narrowing after null checks on member expressions)
+    /// Maps full member path (e.g., "l.current_scope") to the narrowed type
+    /// Used when accessing a member that has been null-checked to use unwrapped type
+    narrowed_members: std.StringHashMap(ir.Type),
+
+    /// Stack of narrowed member save points (for scope management)
+    /// Each entry stores the set of keys that were added at that scope level
+    narrowed_member_scopes: std.ArrayListUnmanaged(std.StringHashMap(void)),
+
     const ImplMethodsMap = std.HashMap(ImplKey, []const MethodImpl, ImplKeyContext, std.hash_map.default_max_load_percentage);
     const ImplAssocTypesMap = std.HashMap(ImplKey, []const AssociatedTypeBinding, ImplKeyContext, std.hash_map.default_max_load_percentage);
 
@@ -320,6 +329,8 @@ pub const Lowerer = struct {
             .emit_arc = options.emit_arc,
             .current_loc = .{ .line = 0, .column = 0 },
             .source_file = options.source_file,
+            .narrowed_members = std.StringHashMap(ir.Type).init(allocator),
+            .narrowed_member_scopes = .{},
         };
 
         // Pre-populate type maps from dependency context (for cross-package compilation)
@@ -522,6 +533,56 @@ pub const Lowerer = struct {
             self.allocator.free(w.message);
         }
         self.warnings.deinit(self.allocator);
+
+        // Clean up narrowed member tracking
+        self.narrowed_members.deinit();
+        for (self.narrowed_member_scopes.items) |*scope_keys| {
+            scope_keys.deinit();
+        }
+        self.narrowed_member_scopes.deinit(self.allocator);
+    }
+
+    // ============================================================================
+    // Narrowed Member Management
+    // ============================================================================
+
+    /// Push a new scope for narrowed member tracking.
+    /// Called when entering a block or if-body where members may be narrowed.
+    pub fn pushNarrowedMemberScope(self: *Self) !void {
+        try self.narrowed_member_scopes.append(self.allocator, std.StringHashMap(void).init(self.allocator));
+    }
+
+    /// Pop the current scope for narrowed member tracking.
+    /// Removes all member narrowings added in this scope.
+    pub fn popNarrowedMemberScope(self: *Self) void {
+        if (self.narrowed_member_scopes.items.len == 0) return;
+        // Manually pop since ArrayListUnmanaged doesn't have popOrNull
+        const last_idx = self.narrowed_member_scopes.items.len - 1;
+        var scope_keys = self.narrowed_member_scopes.items[last_idx];
+        self.narrowed_member_scopes.items.len = last_idx;
+        // Remove all keys that were added in this scope
+        var iter = scope_keys.keyIterator();
+        while (iter.next()) |key| {
+            _ = self.narrowed_members.remove(key.*);
+        }
+        scope_keys.deinit();
+    }
+
+    /// Add a narrowed member path with its narrowed type.
+    /// For example, after `if (l.current_scope != null)`, call this with
+    /// path="l.current_scope" and the unwrapped type.
+    pub fn addNarrowedMember(self: *Self, path: []const u8, narrowed_ty: ir.Type) !void {
+        try self.narrowed_members.put(path, narrowed_ty);
+        // Track this key in the current scope for cleanup on pop
+        if (self.narrowed_member_scopes.items.len > 0) {
+            var current_scope = &self.narrowed_member_scopes.items[self.narrowed_member_scopes.items.len - 1];
+            try current_scope.put(path, {});
+        }
+    }
+
+    /// Get the narrowed type for a member path, if it has been narrowed.
+    pub fn getNarrowedMemberType(self: *const Self, path: []const u8) ?ir.Type {
+        return self.narrowed_members.get(path);
     }
 
     /// Emit an instruction to the current block
@@ -2803,11 +2864,11 @@ pub const Lowerer = struct {
             },
             .let_decl => {
                 try self.emitDebugLine(loc);
-                try lower_stmt.lowerLetDecl(self, data);
+                try lower_stmt.lowerLetDecl(self, stmt_idx, data);
             },
             .const_decl => {
                 try self.emitDebugLine(loc);
-                try lower_stmt.lowerConstDecl(self, data);
+                try lower_stmt.lowerConstDecl(self, stmt_idx, data);
             },
             .io_open => {
                 try self.emitDebugLine(loc);

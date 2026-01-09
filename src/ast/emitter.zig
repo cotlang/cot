@@ -212,6 +212,7 @@ pub const Emitter = struct {
             .optional_member => try self.emitOptionalMember(idx),
             .optional_index => try self.emitOptionalIndex(idx),
             .is_expr => try self.emitIsExpr(idx),
+            .cast_expr => try self.emitCastExpr(idx),
             .interp_string => {}, // TODO: implement interpolated string emission
         }
     }
@@ -1278,6 +1279,15 @@ pub const Emitter = struct {
         const type_idx: TypeIdx = @enumFromInt(data.b);
         try self.emitExpression(expr_idx);
         try self.writer.writeAll(" is ");
+        try self.emitType(type_idx);
+    }
+
+    fn emitCastExpr(self: *Self, idx: ExprIdx) anyerror!void {
+        const data = self.store.exprData(idx);
+        const expr_idx: ExprIdx = @enumFromInt(data.a);
+        const type_idx: TypeIdx = @enumFromInt(data.b);
+        try self.emitExpression(expr_idx);
+        try self.writer.writeAll(" as ");
         try self.emitType(type_idx);
     }
 

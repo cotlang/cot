@@ -253,6 +253,7 @@ pub fn lowerExpression(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         .optional_member => return lowerOptionalMember(l, func, expr_idx),
         .optional_index => return lowerOptionalIndex(l, func, expr_idx),
         .is_expr => return lowerIsExpr(l, func, expr_idx),
+        .cast_expr => return lowerCastExpr(l, func, expr_idx),
         .interp_string => return lowerInterpString(l, func, expr_idx),
     }
 }
@@ -820,6 +821,39 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     },
                 }
             },
+            .optional => |opt_inner| blk: {
+                // Pointer to optional case: *?*Struct
+                // This happens when accessing a field through an optional pointer
+                // Check if the optional contains a pointer to struct
+                if (opt_inner.* == .ptr) {
+                    const inner_ptr = opt_inner.ptr;
+                    if (inner_ptr.* == .@"struct") {
+                        // It's *?*Struct - load the optional pointer value
+                        // The value may be null at runtime but type narrowing
+                        // should have ensured we only get here if it's non-null
+                        const loaded_ptr = func.newValue(.{ .optional = opt_inner });
+                        try l.emit(.{
+                            .load = .{
+                                .ptr = object_ptr,
+                                .result = loaded_ptr,
+                            },
+                        });
+                        object_ptr = loaded_ptr;
+                        break :blk inner_ptr.*.@"struct";
+                    }
+                }
+                // Not a valid optional pointer to struct
+                l.setErrorContextWithFileId(
+                    LowerError.TypeMismatch,
+                    "cannot access field '{s}' on optional type",
+                    .{field_name},
+                    l.store.exprFileId(expr_idx),
+                    loc,
+                    "lowering member access (pointer target is optional)",
+                    .{},
+                );
+                return LowerError.TypeMismatch;
+            },
             else => {
                 l.setErrorContextWithFileId(
                     LowerError.TypeMismatch,
@@ -1141,12 +1175,42 @@ pub fn lowerUnary(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx: Exp
 /// Lower a member access expression
 pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
     const data = l.store.exprData(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
     const object_idx = data.getObject();
     const field_id = data.getField();
     const field_name = l.strings.get(field_id);
 
-    // Check if this is an enum member access (EnumName.Variant)
+    // Check if this member path has been narrowed (e.g., after null check)
+    // Build the member path for lookup
     const object_tag = l.store.exprTag(object_idx);
+    if (object_tag == .identifier) {
+        const obj_data = l.store.exprData(object_idx);
+        const obj_name_id = obj_data.getName();
+        const obj_name = l.strings.get(obj_name_id);
+
+        // Try to find this member path in narrowed_members
+        var path_buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}.{s}", .{ obj_name, field_name }) catch "";
+        if (path.len > 0) {
+            if (l.getNarrowedMemberType(path)) |narrowed_ty| {
+                // This member has been narrowed - use the narrowed type
+                // Lower the object and access the field, but return with narrowed type
+                const ptr = try lowerMemberPtr(l, expr_idx);
+                // The original ptr.ty might be ?*T, but we know it's *T now
+                // Create a result with the narrowed type
+                const result = func.newValue(narrowed_ty);
+                try l.emit(.{
+                    .load = .{
+                        .ptr = ptr,
+                        .result = result,
+                    },
+                });
+                return result;
+            }
+        }
+    }
+
+    // Check if this is an enum member access (EnumName.Variant)
     if (object_tag == .identifier) {
         const object_data = l.store.exprData(object_idx);
         const object_name_id = object_data.getName();
@@ -1162,7 +1226,6 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                         // For sum types, always emit variant_construct (even for no-payload variants)
                         // This ensures type consistency: all variants return Variant type
                         const result = func.newValue(.variant);
-                        const loc = l.store.exprLoc(expr_idx);
                         try l.emit(.{
                             .variant_construct = .{
                                 .tag = @intCast(variant_value),
@@ -1191,7 +1254,6 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                 return result;
             } else {
                 // Variant not found in this enum
-                const loc = l.store.exprLoc(expr_idx);
                 const file_id = l.store.exprFileId(expr_idx);
                 l.setErrorContextWithFileId(
                     LowerError.UndefinedVariable,
@@ -1228,7 +1290,6 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                     return result;
                 }
             }
-            const loc = l.store.exprLoc(expr_idx);
             l.setErrorContext(
                 LowerError.UndefinedVariable,
                 "struct '{s}' has no field '{s}'",
@@ -1246,12 +1307,11 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
             .ptr => |p| switch (p.*) {
                 .@"struct" => |s| s,
                 else => {
-                    const loc = l.store.exprLoc(expr_idx);
                     l.setErrorContext(
                         LowerError.TypeMismatch,
                         "cannot access field '{s}' on non-struct call result",
                         .{field_name},
-                        .{ .line = loc.line, .column = loc.column },
+                        loc,
                         "call result is not a struct type",
                         .{},
                     );
@@ -1259,12 +1319,11 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                 },
             },
             else => {
-                const loc = l.store.exprLoc(expr_idx);
                 l.setErrorContext(
                     LowerError.TypeMismatch,
                     "cannot access field '{s}' on non-struct call result",
                     .{field_name},
-                    .{ .line = loc.line, .column = loc.column },
+                    loc,
                     "call result is not a struct type",
                     .{},
                 );
@@ -1301,6 +1360,7 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
                     .store = .{
                         .ptr = temp_ptr,
                         .value = object_val,
+                        .loc = toIrLoc(loc),
                     },
                 });
 
@@ -1331,12 +1391,11 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
         }
 
         // Field not found
-        const loc = l.store.exprLoc(expr_idx);
         l.setErrorContext(
             LowerError.UndefinedVariable,
             "struct '{s}' has no field '{s}'",
             .{ struct_type.name, field_name },
-            .{ .line = loc.line, .column = loc.column },
+            loc,
             "field not found in struct type",
             .{},
         );
@@ -1365,12 +1424,11 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
         }
 
         // Field not found
-        const loc = l.store.exprLoc(expr_idx);
         l.setErrorContext(
             LowerError.UndefinedVariable,
             "struct '{s}' has no field '{s}'",
             .{ struct_type.name, field_name },
-            .{ .line = loc.line, .column = loc.column },
+            loc,
             "field not found in heap record type",
             .{},
         );
@@ -1843,6 +1901,41 @@ pub fn lowerIsExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
         .type_tag = runtime_tag,
         .result = result,
     } });
+
+    return result;
+}
+
+/// Lower a type cast expression: expr as Type
+/// Converts the expression to the target type
+pub fn lowerCastExpr(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerError!ir.Value {
+    const data = l.store.exprData(expr_idx);
+    const value_idx: ExprIdx = @enumFromInt(data.a);
+    const type_idx: TypeIdx = @enumFromInt(data.b);
+
+    // Lower the expression to cast
+    const value = try lowerExpression(l, value_idx);
+
+    // Get the target IR type
+    const target_type = try lowerTypeIdx(l, type_idx);
+
+    // If types are the same, just return the value
+    if (std.meta.eql(value.ty, target_type)) {
+        return value;
+    }
+
+    // Create result with target type
+    const result = func.newValue(target_type);
+
+    // Emit bitcast instruction to convert between types
+    // At runtime, integers are all i64, so this is mostly a type annotation change
+    // The VM will handle actual truncation/extension as needed
+    try l.emit(.{
+        .bitcast = .{
+            .operand = value,
+            .target_type = target_type,
+            .result = result,
+        },
+    });
 
     return result;
 }
@@ -3377,6 +3470,36 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         }
     }
 
+    // Check if function exists before emitting call
+    // For non-method calls (method_object == null), verify the function is defined
+    const is_known_function = blk: {
+        // Method calls are handled separately, allow them
+        if (method_object != null) break :blk true;
+        // Check qualified name for method calls
+        if (qualified_callee_for_lookup) |qname| {
+            if (l.fn_return_types.contains(qname)) break :blk true;
+        }
+        // Check user-defined functions
+        if (l.fn_return_types.contains(actual_callee)) break :blk true;
+        // Check native/builtin functions
+        if (native_types.getReturnType(actual_callee) != null) break :blk true;
+        // Check special-case builtins not in natives.toml
+        if (isSpecialCaseBuiltin(actual_callee)) break :blk true;
+        break :blk false;
+    };
+
+    if (!is_known_function) {
+        l.setErrorContext(
+            LowerError.UnknownFunction,
+            "undefined function '{s}'",
+            .{actual_callee},
+            call_loc,
+            "function not found in scope or as a builtin",
+            .{},
+        );
+        return LowerError.UnknownFunction;
+    }
+
     // Determine result type:
     // 1. For method calls, first try qualified name (TypeName.methodName)
     // 2. Then try the callee name directly
@@ -3891,6 +4014,7 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 .store = .{
                     .ptr = field_ptr,
                     .value = field_val,
+                    .loc = toIrLoc(loc),
                 },
             });
         } else {
@@ -3908,6 +4032,7 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
+    const loc = l.store.exprLoc(expr_idx);
 
     // data.a = type_name (StringId)
     // data.b = start index in extra_data
@@ -3915,12 +4040,11 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
     const type_name_id: StringId = @enumFromInt(data.a);
     const type_name = l.strings.get(type_name_id);
     if (type_name.len == 0) {
-        const err_loc = l.store.exprLoc(expr_idx);
         l.setErrorContext(
             LowerError.UndefinedType,
             "Empty type name in generic struct literal",
             .{},
-            err_loc,
+            loc,
             "generic struct literal must have a type name",
             .{},
         );
@@ -4087,6 +4211,7 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
                 .store = .{
                     .ptr = field_ptr,
                     .value = field_val,
+                    .loc = toIrLoc(loc),
                 },
             });
         }
@@ -4997,6 +5122,13 @@ const list_string_type: ir.ListType = .{
 const ir_list_string_type: ir.Type = .{
     .list = &list_string_type,
 };
+
+/// Check if a function name is a special-case builtin not in natives.toml
+/// These have complex return types that can't be expressed in the TOML spec
+fn isSpecialCaseBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "process_args") or
+        std.mem.eql(u8, name, "write_bytes");
+}
 
 /// Determine return type of builtin functions using generated spec-based lookup.
 /// The FunctionReturnTypes map is auto-generated from spec/natives.toml.

@@ -496,10 +496,13 @@ pub const Value = extern struct {
         if (self.bits == TAG_NULL) return .null_val;
         if (self.bits == TAG_TRUE or self.bits == TAG_FALSE) return .boolean;
 
-        // SMALL_INT uses 48-bit payload, check with 16-bit tag mask
-        if ((self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT) return .integer;
+        // CRITICAL: STACK_PTR must be checked BEFORE SMALL_INT!
+        // Both share 0x7FFD prefix, but STACK_PTR has bit 47 set (0x7FFD_8xxx).
+        // SMALL_INT's 16-bit mask would incorrectly match STACK_PTR values.
         // STACK_PTR uses 32-bit payload, check with 20-bit tag mask (0x7FFD_8)
         if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_STACK_PTR) return .stack_ptr;
+        // SMALL_INT uses 48-bit payload, check with 16-bit tag mask
+        if ((self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT) return .integer;
         // BOXED_INT uses 46-bit pointer, check with 18-bit tag mask
         if ((self.bits & 0xFFFF_C000_0000_0000) == TAG_BOXED_INT) return .integer;
         // Check OBJECT before STRING since OBJECT uses more specific mask
@@ -527,6 +530,8 @@ pub const Value = extern struct {
     pub fn isInt(self: Self) bool {
         // SMALL_INT uses 48-bit payload (bits 0-47), tag in bits 48-63
         // BOXED_INT uses 46-bit pointer (bits 0-45), tag in bits 46-63
+        // CRITICAL: Must exclude STACK_PTR which shares 0x7FFD prefix with SMALL_INT
+        if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_STACK_PTR) return false;
         const is_small = (self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT;
         const is_boxed = (self.bits & 0xFFFF_C000_0000_0000) == TAG_BOXED_INT;
         return is_small or is_boxed;
@@ -646,6 +651,8 @@ pub const Value = extern struct {
 
     /// Get integer value
     pub fn asInt(self: Self) i64 {
+        // CRITICAL: Must exclude STACK_PTR which shares 0x7FFD prefix with SMALL_INT
+        if ((self.bits & 0xFFFF_F000_0000_0000) == TAG_STACK_PTR) return 0;
         // SMALL_INT: 16-bit tag (0x7FFD) + 48-bit signed payload
         if ((self.bits & 0xFFFF_0000_0000_0000) == TAG_SMALL_INT) {
             // Extract 48-bit signed integer and sign-extend

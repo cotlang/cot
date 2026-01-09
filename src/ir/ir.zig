@@ -1284,6 +1284,316 @@ pub const Instruction = union(enum) {
     pub fn isMap(self: Instruction) bool {
         return self.category() == .map;
     }
+
+    /// Get all operand values used by this instruction (for liveness analysis)
+    /// Returns a slice of values that this instruction reads from.
+    /// Note: This returns a bounded array to avoid allocation.
+    pub fn getOperands(self: Instruction) []const Value {
+        // Use a static buffer to return operands without allocation
+        // Maximum 4 operands for any instruction
+        const S = struct {
+            var buf: [8]Value = undefined;
+        };
+
+        return switch (self) {
+            // No operands
+            .iconst, .f32const, .f64const, .const_string, .const_null, .alloca, .debug_line, .try_begin, .try_end, .trap => &[_]Value{},
+
+            // Single operand
+            .load => |l| blk: {
+                S.buf[0] = l.ptr;
+                break :blk S.buf[0..1];
+            },
+            .ineg, .log_not, .bnot, .str_len, .array_len => |op| blk: {
+                S.buf[0] = op.operand;
+                break :blk S.buf[0..1];
+            },
+            .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .ireduce => |op| blk: {
+                S.buf[0] = op.operand;
+                break :blk S.buf[0..1];
+            },
+            .wrap_optional, .unwrap_optional, .is_null => |op| blk: {
+                S.buf[0] = op.operand;
+                break :blk S.buf[0..1];
+            },
+            .weak_ref, .weak_load, .arc_move => |op| blk: {
+                S.buf[0] = op.operand;
+                break :blk S.buf[0..1];
+            },
+            .return_ => |r| if (r) |v| blk: {
+                S.buf[0] = v;
+                break :blk S.buf[0..1];
+            } else &[_]Value{},
+            .jump => &[_]Value{},
+            .io_close => |c| blk: {
+                S.buf[0] = c.channel;
+                break :blk S.buf[0..1];
+            },
+            .io_delete => |c| blk: {
+                S.buf[0] = c.channel;
+                break :blk S.buf[0..1];
+            },
+            .io_unlock => |c| blk: {
+                S.buf[0] = c.channel;
+                break :blk S.buf[0..1];
+            },
+            .list_len => |l| blk: {
+                S.buf[0] = l.list;
+                break :blk S.buf[0..1];
+            },
+            .map_len => |m| blk: {
+                S.buf[0] = m.map;
+                break :blk S.buf[0..1];
+            },
+            .map_clear => |m| blk: {
+                S.buf[0] = m.map;
+                break :blk S.buf[0..1];
+            },
+            .map_keys => |m| blk: {
+                S.buf[0] = m.map;
+                break :blk S.buf[0..1];
+            },
+            .map_values => |m| blk: {
+                S.buf[0] = m.map;
+                break :blk S.buf[0..1];
+            },
+            .list_clear => |l| blk: {
+                S.buf[0] = l.list;
+                break :blk S.buf[0..1];
+            },
+            .list_pop => |l| blk: {
+                S.buf[0] = l.list;
+                break :blk S.buf[0..1];
+            },
+            .list_new, .map_new => &[_]Value{},
+            .list_to_slice => |l| blk: {
+                S.buf[0] = l.list;
+                break :blk S.buf[0..1];
+            },
+            .variant_get_tag => |v| blk: {
+                S.buf[0] = v.variant;
+                break :blk S.buf[0..1];
+            },
+            .sextend, .uextend => |e| blk: {
+                S.buf[0] = e.operand;
+                break :blk S.buf[0..1];
+            },
+            .bitcast => |c| blk: {
+                S.buf[0] = c.operand;
+                break :blk S.buf[0..1];
+            },
+            .is_type => |op| blk: {
+                S.buf[0] = op.operand;
+                break :blk S.buf[0..1];
+            },
+            .arc_retain => |op| blk: {
+                S.buf[0] = op.value;
+                break :blk S.buf[0..1];
+            },
+            .arc_release => |op| blk: {
+                S.buf[0] = op.value;
+                break :blk S.buf[0..1];
+            },
+            .throw => |t| blk: {
+                S.buf[0] = t.value;
+                break :blk S.buf[0..1];
+            },
+            .catch_begin => &[_]Value{},
+            .heap_alloc => &[_]Value{},
+
+            // Two operands
+            .store => |s| blk: {
+                S.buf[0] = s.ptr;
+                S.buf[1] = s.value;
+                break :blk S.buf[0..2];
+            },
+            .iadd, .isub, .imul, .sdiv, .udiv, .srem, .urem => |op| blk: {
+                S.buf[0] = op.lhs;
+                S.buf[1] = op.rhs;
+                break :blk S.buf[0..2];
+            },
+            .band, .bor, .bxor, .ishl, .sshr, .ushr => |op| blk: {
+                S.buf[0] = op.lhs;
+                S.buf[1] = op.rhs;
+                break :blk S.buf[0..2];
+            },
+            .icmp => |op| blk: {
+                S.buf[0] = op.lhs;
+                S.buf[1] = op.rhs;
+                break :blk S.buf[0..2];
+            },
+            .log_and, .log_or => |op| blk: {
+                S.buf[0] = op.lhs;
+                S.buf[1] = op.rhs;
+                break :blk S.buf[0..2];
+            },
+            .str_concat, .str_compare => |op| blk: {
+                S.buf[0] = op.lhs;
+                S.buf[1] = op.rhs;
+                break :blk S.buf[0..2];
+            },
+            .str_copy => |s| blk: {
+                S.buf[0] = s.dest;
+                S.buf[1] = s.src;
+                break :blk S.buf[0..2];
+            },
+            .str_byte_at => |s| blk: {
+                S.buf[0] = s.string;
+                S.buf[1] = s.index;
+                break :blk S.buf[0..2];
+            },
+            .round => |op| blk: {
+                S.buf[0] = op.value;
+                S.buf[1] = op.places;
+                break :blk S.buf[0..2];
+            },
+            .trunc => |op| blk: {
+                S.buf[0] = op.value;
+                S.buf[1] = op.places;
+                break :blk S.buf[0..2];
+            },
+            .field_ptr => |f| blk: {
+                S.buf[0] = f.struct_ptr;
+                break :blk S.buf[0..1];
+            },
+            .ptr_offset => |p| blk: {
+                S.buf[0] = p.base_ptr;
+                break :blk S.buf[0..1];
+            },
+            .brif => |b| blk: {
+                S.buf[0] = b.condition;
+                break :blk S.buf[0..1];
+            },
+            .br_table => |s| blk: {
+                S.buf[0] = s.value;
+                break :blk S.buf[0..1];
+            },
+            .array_load => |a| blk: {
+                S.buf[0] = a.array_ptr;
+                S.buf[1] = a.index;
+                break :blk S.buf[0..2];
+            },
+            .array_load_opt => |a| blk: {
+                S.buf[0] = a.array_ptr;
+                S.buf[1] = a.index;
+                break :blk S.buf[0..2];
+            },
+            .map_get => |m| blk: {
+                S.buf[0] = m.map;
+                S.buf[1] = m.key;
+                break :blk S.buf[0..2];
+            },
+            .map_has => |m| blk: {
+                S.buf[0] = m.map;
+                S.buf[1] = m.key;
+                break :blk S.buf[0..2];
+            },
+            .map_delete => |m| blk: {
+                S.buf[0] = m.map;
+                S.buf[1] = m.key;
+                break :blk S.buf[0..2];
+            },
+            .map_key_at => |m| blk: {
+                S.buf[0] = m.map;
+                S.buf[1] = m.index;
+                break :blk S.buf[0..2];
+            },
+            .list_get => |l| blk: {
+                S.buf[0] = l.list;
+                S.buf[1] = l.index;
+                break :blk S.buf[0..2];
+            },
+            .list_push => |l| blk: {
+                S.buf[0] = l.list;
+                S.buf[1] = l.value;
+                break :blk S.buf[0..2];
+            },
+            .load_field_heap => |l| blk: {
+                S.buf[0] = l.record;
+                break :blk S.buf[0..1];
+            },
+            .store_field_heap => |s| blk: {
+                S.buf[0] = s.record;
+                S.buf[1] = s.value;
+                break :blk S.buf[0..2];
+            },
+            .format_decimal => |f| blk: {
+                S.buf[0] = f.value;
+                break :blk S.buf[0..1];
+            },
+            .parse_decimal => |p| blk: {
+                S.buf[0] = p.value;
+                break :blk S.buf[0..1];
+            },
+            .variant_construct => |v| v.payload,
+
+            // Three operands
+            .str_slice => |s| blk: {
+                S.buf[0] = s.source;
+                S.buf[1] = s.start;
+                S.buf[2] = s.length_or_end;
+                break :blk S.buf[0..3];
+            },
+            .array_slice => |a| blk: {
+                S.buf[0] = a.source;
+                S.buf[1] = a.start;
+                S.buf[2] = a.end;
+                break :blk S.buf[0..3];
+            },
+            .array_store => |a| blk: {
+                S.buf[0] = a.array_ptr;
+                S.buf[1] = a.index;
+                S.buf[2] = a.value;
+                break :blk S.buf[0..3];
+            },
+            .map_set => |m| blk: {
+                S.buf[0] = m.map;
+                S.buf[1] = m.key;
+                S.buf[2] = m.value;
+                break :blk S.buf[0..3];
+            },
+            .list_set => |l| blk: {
+                S.buf[0] = l.list;
+                S.buf[1] = l.index;
+                S.buf[2] = l.value;
+                break :blk S.buf[0..3];
+            },
+            .select => |s| blk: {
+                S.buf[0] = s.condition;
+                S.buf[1] = s.true_val;
+                S.buf[2] = s.false_val;
+                break :blk S.buf[0..3];
+            },
+
+            // Four operands
+            .str_slice_store => |s| blk: {
+                S.buf[0] = s.target;
+                S.buf[1] = s.start;
+                S.buf[2] = s.length_or_end;
+                S.buf[3] = s.value;
+                break :blk S.buf[0..4];
+            },
+
+            // Variable operands (call, etc.) - return empty, caller should handle specially
+            .call => &[_]Value{},
+            .call_indirect => &[_]Value{},
+
+            // IO operations
+            .io_open, .io_read, .io_write => &[_]Value{},
+
+            // Struct buffer operations
+            .load_struct_buf, .store_struct_buf => &[_]Value{},
+
+            // Closure and trait operations
+            .make_closure => &[_]Value{},
+            .make_trait_object => |m| blk: {
+                S.buf[0] = m.value;
+                break :blk S.buf[0..1];
+            },
+            .call_trait_method => &[_]Value{},
+            // Note: try_begin and try_end are handled above with other no-operand instructions
+        };
+    }
 };
 
 // ============================================================================

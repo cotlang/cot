@@ -1048,8 +1048,12 @@ fn traceSourceFile(allocator: std.mem.Allocator, filename: []const u8, level: tr
     var type_checker = TypeChecker.init(allocator, &collector, ir_module, filename);
     type_checker.check();
 
-    if (collector.hasErrors()) {
+    // Print all diagnostics (errors and warnings)
+    if (collector.hasErrors() or collector.hasWarnings()) {
         formatter.printToStderr(&collector, .{ .use_color = true });
+    }
+
+    if (collector.hasErrors()) {
         return;
     }
 
@@ -2195,9 +2199,12 @@ fn compileFile(backing_allocator: std.mem.Allocator, filename: []const u8, outpu
     var type_checker = TypeChecker.init(allocator, &collector, ir_module, filename);
     type_checker.check();
 
-    // If type checking found errors, report them and stop
-    if (collector.hasErrors()) {
+    // Print all diagnostics (errors and warnings)
+    if (collector.hasErrors() or collector.hasWarnings()) {
         formatter.printToStderr(&collector, .{ .use_color = true });
+    }
+
+    if (collector.hasErrors()) {
         return error.CompilationFailed;
     }
 

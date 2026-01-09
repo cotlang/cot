@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const ir = @import("ir.zig");
+const regalloc = @import("regalloc.zig");
 const cot_runtime = @import("cot_runtime");
 const module = cot_runtime.bytecode.module;
 const opcodes = cot_runtime.bytecode.opcodes;
@@ -97,115 +98,6 @@ const DerivedStackPtrInfo = struct {
 const HeapFieldPtrInfo = struct {
     struct_ptr_id: u32, // Value ID of the heap record pointer
     field_index: u32, // Field index to access
-};
-
-/// Register allocator for register-based bytecode emission
-/// Uses a linear scan approach with 16 virtual registers (r0-r15)
-pub const RegisterAllocator = struct {
-    /// Bitmask of available registers (1 = free, 0 = in use)
-    /// r0-r7: caller-saved, r8-r13: callee-saved, r14: frame pointer (reserved), r15: return (reserved)
-    free_regs: u16,
-
-    /// Maps IR value ID to register number (0-15)
-    value_to_reg: std.AutoHashMap(u32, u4),
-
-    /// Maps register to IR value ID (for spilling)
-    reg_to_value: [16]?u32,
-
-    /// Spill slots for values that couldn't fit in registers
-    spill_slots: std.ArrayList(u32),
-
-    /// Allocator for internal data structures
-    alloc: Allocator,
-
-    const Self = @This();
-
-    /// Initial free registers: r0-r13 (0x3FFF), r14-r15 reserved
-    const INITIAL_FREE: u16 = 0x3FFF;
-
-    pub fn init(allocator: Allocator) Self {
-        return .{
-            .free_regs = INITIAL_FREE,
-            .value_to_reg = std.AutoHashMap(u32, u4).init(allocator),
-            .reg_to_value = [_]?u32{null} ** 16,
-            .spill_slots = .{},
-            .alloc = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.value_to_reg.deinit();
-        self.spill_slots.deinit(self.alloc);
-    }
-
-    /// Reset allocator state for a new function
-    pub fn reset(self: *Self) void {
-        self.free_regs = INITIAL_FREE;
-        self.value_to_reg.clearRetainingCapacity();
-        self.reg_to_value = [_]?u32{null} ** 16;
-        self.spill_slots.clearRetainingCapacity();
-    }
-
-    /// Allocate a register for a value. Returns null if all registers are in use.
-    pub fn allocate(self: *Self, value_id: u32) ?u4 {
-        // Find first free register (prefer caller-saved r0-r7 first)
-        var reg: u4 = 0;
-        while (reg < 14) : (reg += 1) {
-            const mask = @as(u16, 1) << reg;
-            if (self.free_regs & mask != 0) {
-                // Found a free register
-                self.free_regs &= ~mask;
-                self.value_to_reg.put(value_id, reg) catch return null;
-                self.reg_to_value[reg] = value_id;
-                return reg;
-            }
-        }
-        return null; // All registers in use
-    }
-
-    /// Get the register holding a value, if any
-    pub fn getRegister(self: *Self, value_id: u32) ?u4 {
-        return self.value_to_reg.get(value_id);
-    }
-
-    /// Free a register (value is no longer needed)
-    pub fn free(self: *Self, reg: u4) void {
-        if (reg >= 14) return; // Don't free reserved registers
-        const mask = @as(u16, 1) << reg;
-        self.free_regs |= mask;
-        if (self.reg_to_value[reg]) |value_id| {
-            _ = self.value_to_reg.remove(value_id);
-        }
-        self.reg_to_value[reg] = null;
-    }
-
-    /// Free the register holding a specific value
-    pub fn freeValue(self: *Self, value_id: u32) void {
-        if (self.value_to_reg.get(value_id)) |reg| {
-            self.free(reg);
-        }
-    }
-
-    /// Mark a value as being in a specific register (for parameters)
-    pub fn assignRegister(self: *Self, value_id: u32, reg: u4) !void {
-        if (reg >= 14) return;
-        const mask = @as(u16, 1) << reg;
-        self.free_regs &= ~mask;
-        try self.value_to_reg.put(value_id, reg);
-        self.reg_to_value[reg] = value_id;
-    }
-
-    /// Check if a specific register is free
-    pub fn isRegisterFree(self: *Self, reg: u4) bool {
-        if (reg >= 14) return false;
-        const mask = @as(u16, 1) << reg;
-        return self.free_regs & mask != 0;
-    }
-
-    /// Count of free registers
-    pub fn freeCount(self: *Self) u32 {
-        return @popCount(self.free_regs & INITIAL_FREE);
-    }
 };
 
 /// Bytecode emitter
@@ -305,8 +197,9 @@ pub const BytecodeEmitter = struct {
     // IR module being emitted (for looking up function signatures)
     ir_module: ?*const ir.Module,
 
-    // Register allocator for register-based bytecode
-    reg_alloc: RegisterAllocator,
+    // Go-style register allocator with use distance tracking
+    // Single source of truth for register state - tracks value→register and register→value mappings
+    reg_state: regalloc.RegAllocState,
 
     // Track the last computed intermediate result (for SSA value chains)
     // This avoids permanently allocating registers for temp results
@@ -315,10 +208,14 @@ pub const BytecodeEmitter = struct {
 
     // Register spilling support
     // When all registers are in use, we spill a register to a stack slot
+    // Spill slot tracking is handled by reg_state (ValueState.spill_slot)
     spill_slot_base: u16 = 0, // First slot available for spilling
     next_spill_slot: u16 = 0, // Next available spill slot
-    spilled_values: std.AutoHashMap(u32, u16), // value_id -> spill_slot
     max_spill_slots_used: u16 = 0, // Track maximum for local_count
+
+    // No-spill mask: registers that cannot be spilled during current instruction
+    // Set this before loading operands to protect already-loaded operands
+    nospill_mask: u16 = 0,
 
     // Escape analysis results for current function
     // Maps local variable name to whether it needs heap allocation
@@ -364,8 +261,7 @@ pub const BytecodeEmitter = struct {
             .current_routine_start = 0,
             .current_func = null,
             .ir_module = null,
-            .reg_alloc = RegisterAllocator.init(allocator),
-            .spilled_values = std.AutoHashMap(u32, u16).init(allocator),
+            .reg_state = regalloc.RegAllocState.init(allocator),
         };
     }
 
@@ -393,8 +289,7 @@ pub const BytecodeEmitter = struct {
         self.ptr_to_struct_local_allocas.deinit();
         self.dynamic_stack_ptr_sources.deinit();
         self.heap_field_ptrs.deinit();
-        self.reg_alloc.deinit();
-        self.spilled_values.deinit();
+        self.reg_state.deinit();
         // Free escape analysis results if any
         if (self.escape_states) |*es| {
             es.deinit();
@@ -629,7 +524,7 @@ pub const BytecodeEmitter = struct {
         self.dynamic_stack_ptr_sources.clearRetainingCapacity();
         self.heap_field_ptrs.clearRetainingCapacity();
         self.value_consts.clearRetainingCapacity();
-        self.reg_alloc.reset(); // Reset register allocation for new function
+        self.reg_state.reset(); // Reset register allocator for new function
         self.last_result_value = null; // Reset last result tracking
         self.resetSpillState(); // Reset spill state for new function
 
@@ -665,16 +560,25 @@ pub const BytecodeEmitter = struct {
                 null;
 
             if (is_ptr_to_struct) {
-                // Pointer-to-struct parameter: allocate 1 slot for the stack pointer
-                // The caller passes a StackPtr value, field access uses load_indirect/store_indirect
+                // Pointer-to-struct parameter: allocate 1 slot for the pointer value.
+                // This could be either:
+                //   - A StackPtr (from &local_struct or another *Struct param)
+                //   - A heap record pointer (from new Struct{} or a function returning *Struct)
+                //
+                // We DON'T add to stack_ptr_params because we can't know at compile time
+                // which type will be passed. Field accesses will use heap record semantics
+                // (load_field), which works for both cases at runtime.
+                //
+                // NOTE: For methods with `self: *T`, the caller passes either:
+                // - StackPtr for stack-allocated structs (method called on &obj)
+                // - Heap record pointer for heap-allocated structs (method called on new T{})
                 try self.locals.put(param.name, .{
                     .slot = self.local_count,
                     .is_global = false,
                 });
-                // Track this as a stack pointer param for indirect field access
-                try self.stack_ptr_params.put(param.name, self.local_count);
+                // DO NOT add to stack_ptr_params - use heap record semantics instead
                 self.local_count += 1;
-                debug.print(.emit, "param {s}: pointer-to-struct, 1 slot (stack pointer)", .{param.name});
+                debug.print(.emit, "param {s}: pointer-to-struct, 1 slot (heap pointer semantics)", .{param.name});
             } else if (struct_type_opt) |struct_type| {
                 // Direct struct parameter - allocate slots for each field
                 const base_slot = self.local_count;
@@ -768,6 +672,14 @@ pub const BytecodeEmitter = struct {
         // Setup spill slots after ALL declared locals are accounted for
         self.spill_slot_base = total_declared_locals;
         self.next_spill_slot = total_declared_locals;
+        self.reg_state.setSpillBase(total_declared_locals);
+
+        // Compute use distances for Go-style register allocation (backward pass)
+        // This must be done before emitting any instructions
+        self.reg_state.computeUseDistances(func) catch |err| {
+            log.warn("Failed to compute use distances: {}", .{err});
+            // Continue without use distance info - spill decisions will be less optimal
+        };
 
         // First pass: record block offsets
         // We need to know where each block starts before emitting jumps
@@ -1291,24 +1203,25 @@ pub const BytecodeEmitter = struct {
     /// Get or allocate a register for an IR value
     pub fn getOrAllocReg(self: *Self, value: ir.Value) EmitError!u4 {
         // Check if value already has a register
-        if (self.reg_alloc.getRegister(value.id)) |reg| {
+        if (self.reg_state.getRegister(value.id)) |reg| {
             return reg;
         }
 
-        // Allocate a new register
-        if (self.reg_alloc.allocate(value.id)) |reg| {
-            return reg;
-        }
+        // Allocate a new register using Go-style farthest-next-use spilling
+        const reg = self.reg_state.allocReg(regalloc.ALLOCATABLE_MASK) catch {
+            debug.print(.emit, "ERROR: Out of registers for value.id={d}", .{value.id});
+            self.setError(
+                "Ran out of CPU registers during code generation",
+                .{},
+                "The expression is too complex. Try breaking it into smaller statements.",
+                .{},
+            );
+            return EmitError.TooManyLocals;
+        };
 
-        // Out of registers - need to spill (fall back to stack-based for now)
-        debug.print(.emit, "ERROR: Out of registers for value.id={d}, free_regs=0x{x:0>4}", .{ value.id, self.reg_alloc.free_regs });
-        self.setError(
-            "Ran out of CPU registers during code generation",
-            .{},
-            "The expression is too complex. Try breaking it into smaller statements.",
-            .{},
-        );
-        return EmitError.TooManyLocals;
+        // Assign value to the allocated register
+        self.reg_state.assignReg(value.id, reg) catch {};
+        return reg;
     }
 
     /// Emit a value into a specific register (for register-based mode)
@@ -1324,7 +1237,7 @@ pub const BytecodeEmitter = struct {
         }
 
         // If value is already in a register, move it
-        if (self.reg_alloc.getRegister(value.id)) |src| {
+        if (self.reg_state.getRegister(value.id)) |src| {
             if (src != dest) {
                 try self.emitRegMov(dest, src);
             }
@@ -1332,7 +1245,7 @@ pub const BytecodeEmitter = struct {
         }
 
         // Check if value was spilled - reload from spill slot
-        if (self.spilled_values.get(value.id)) |spill_slot| {
+        if (self.reg_state.getSpillSlot(value.id)) |spill_slot| {
             debug.print(.emit, "emitValueToReg: reloading spilled value_id={d} from slot {d} to r{d}", .{ value.id, spill_slot, dest });
             try self.emitSpillLoad(dest, spill_slot);
             return;
@@ -1395,8 +1308,12 @@ pub const BytecodeEmitter = struct {
             debug.print(.emit, "emitValueToReg: heap field ptr value_id={d} struct_ptr_id={d} field_index={d} -> r{d}", .{
                 value.id, info.struct_ptr_id, info.field_index, dest,
             });
-            // Get the heap record pointer into a register (use a temp register that won't conflict)
+            // Choose a temp register for the struct pointer that won't conflict with dest.
+            // IMPORTANT: We must spill any value in the temp register before using it,
+            // because other values may have been loaded into registers earlier in the
+            // same expression (e.g., s.str[s.idx..s.idx+1] loads multiple heap fields).
             const struct_ptr_reg: u4 = if (dest == 0) 1 else 0;
+            self.prepareDestReg(struct_ptr_reg); // Spill any live value in temp register
             const actual_struct_reg = try self.getValueInRegById(info.struct_ptr_id, struct_ptr_reg);
 
             // Emit load_field: dest = rs.fields[field_index]
@@ -1431,27 +1348,19 @@ pub const BytecodeEmitter = struct {
                 const slot = slot_info & 0x7FFF;
                 try self.emitRegLoadGlobal(dest, slot);
             } else {
-                // Check if this is a pointer-to-struct type that needs get_local_ptr
-                // This handles &struct_var expressions which need stack pointers
-                // IMPORTANT: If this value is a LOADED pointer from a ptr-to-struct local
-                // (tracked in dynamic_stack_ptr_sources), use load_local instead.
-                // The slot already contains a pointer VALUE, not an address to take.
-                const is_ptr_to_struct = value.ty == .ptr and value.ty.ptr.* == .@"struct";
-                const is_loaded_ptr = self.dynamic_stack_ptr_sources.contains(value.id);
-                if (is_ptr_to_struct and !is_loaded_ptr) {
-                    // Emit get_local_ptr to create a stack pointer
-                    try self.emitOpcode(.get_local_ptr);
+                // Local variable in value_slots - always use load_local.
+                // value_slots contains VALUES (including pointer values like *Struct).
+                // We load the VALUE from the slot, not take the address of the slot.
+                //
+                // get_local_ptr is ONLY for &struct_var expressions where we need
+                // to create a stack pointer to a struct allocated in struct_base_slots.
+                // That case is handled in the struct_base_slots check below.
+                if (slot_info < 256) {
+                    try self.emitRegLoadLocal(dest, @intCast(slot_info));
+                } else {
+                    try self.emitOpcode(.load_local16);
                     try self.emitU8(@as(u8, dest) << 4);
                     try self.emitU16(@intCast(slot_info));
-                } else {
-                    // Local variable - use 16-bit variant for slots >= 256
-                    if (slot_info < 256) {
-                        try self.emitRegLoadLocal(dest, @intCast(slot_info));
-                    } else {
-                        try self.emitOpcode(.load_local16);
-                        try self.emitU8(@as(u8, dest) << 4);
-                        try self.emitU16(@intCast(slot_info));
-                    }
                 }
             }
             return;
@@ -1483,19 +1392,43 @@ pub const BytecodeEmitter = struct {
         }
 
         // If value is already in a register, use that
-        if (self.reg_alloc.getRegister(value_id)) |src| {
+        if (self.reg_state.getRegister(value_id)) |src| {
             return src;
         }
 
+        // CRITICAL: Before using temp_reg, check if it holds a value that needs to be preserved.
+        // If so, spill it first. This prevents clobbering live values.
+        if (self.reg_state.getRegValue(temp_reg)) |existing_value| {
+            // Spill the existing value if not already spilled
+            if (self.reg_state.getSpillSlot(existing_value) == null) {
+                const spill_slot = self.allocateSpillSlot();
+                debug.print(.emit, "SPILL (getValueInRegById): value_id={d} from r{d} to slot {d}", .{ existing_value, temp_reg, spill_slot });
+                try self.emitSpillStore(temp_reg, spill_slot);
+                self.reg_state.setSpillSlot(existing_value, spill_slot) catch {};
+            }
+            // If this was the last_result, invalidate it so subsequent lookups find it via spill slot
+            if (self.last_result_value) |last_id| {
+                if (last_id == existing_value) {
+                    self.last_result_value = null;
+                }
+            }
+            // Free the register
+            self.reg_state.freeReg(temp_reg);
+        }
+
         // Check if value was spilled - reload it into temp_reg
-        if (self.spilled_values.get(value_id)) |spill_slot| {
+        if (self.reg_state.getSpillSlot(value_id)) |spill_slot| {
             try self.emitSpillLoad(temp_reg, spill_slot);
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value_id, temp_reg) catch {};
             return temp_reg;
         }
 
         // Check if value is a constant - load into temp register
         if (self.value_consts.get(value_id)) |const_idx| {
             try self.emitRegLoadConst(temp_reg, const_idx);
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value_id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1512,6 +1445,8 @@ pub const BytecodeEmitter = struct {
                 try self.emitU8(@as(u8, temp_reg) << 4);
                 try self.emitU16(@intCast(slot_info));
             }
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value_id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1534,39 +1469,37 @@ pub const BytecodeEmitter = struct {
         }
 
         // If value is already in a register, use that
-        if (self.reg_alloc.getRegister(value.id)) |src| {
-            debug.print(.emit, "  -> reg_alloc path: returning r{d}", .{src});
+        if (self.reg_state.getRegister(value.id)) |src| {
+            debug.print(.emit, "  -> reg_state path: returning r{d}", .{src});
             return src;
         }
 
         // Before using temp_reg, check if it holds a value that needs to be preserved
         // If so, spill it first
-        if (self.reg_alloc.reg_to_value[temp_reg]) |existing_value| {
+        if (self.reg_state.getRegValue(temp_reg)) |existing_value| {
             // Spill the existing value if not already spilled
-            if (self.spilled_values.get(existing_value) == null) {
+            if (self.reg_state.getSpillSlot(existing_value) == null) {
                 const spill_slot = self.allocateSpillSlot();
                 debug.print(.emit, "SPILL (pre-load): value_id={d} from r{d} to slot {d}", .{ existing_value, temp_reg, spill_slot });
                 try self.emitSpillStore(temp_reg, spill_slot);
-                try self.spilled_values.put(existing_value, spill_slot);
+                self.reg_state.setSpillSlot(existing_value, spill_slot) catch {};
             }
-            // If this was the last_result, invalidate it so subsequent lookups find it in spilled_values
+            // If this was the last_result, invalidate it so subsequent lookups find it via spill slot
             if (self.last_result_value) |last_id| {
                 if (last_id == existing_value) {
                     self.last_result_value = null;
                 }
             }
-            // Remove from register allocator
-            _ = self.reg_alloc.value_to_reg.remove(existing_value);
-            self.reg_alloc.reg_to_value[temp_reg] = null;
-            self.reg_alloc.free_regs |= @as(u16, 1) << temp_reg;
+            // Free the register
+            self.reg_state.freeReg(temp_reg);
         }
 
         // Check if value was spilled - reload it into temp_reg
-        if (self.spilled_values.get(value.id)) |spill_slot| {
+        if (self.reg_state.getSpillSlot(value.id)) |spill_slot| {
             debug.print(.emit, "RELOAD: value_id={d} from slot {d} to r{d}", .{ value.id, spill_slot, temp_reg });
             try self.emitSpillLoad(temp_reg, spill_slot);
-            // Note: we don't remove from spilled_values - the value might be needed again
-            // and we'd need to reload it. The spill slot is stable for this function.
+            // Track in reg_state so subsequent spill checks know this reg is in use.
+            self.reg_state.assignReg(value.id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1574,6 +1507,8 @@ pub const BytecodeEmitter = struct {
         if (self.value_consts.get(value.id)) |const_idx| {
             debug.print(.emit, "  -> const path: const_idx={d} -> r{d}", .{ const_idx, temp_reg });
             try self.emitRegLoadConst(temp_reg, const_idx);
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value.id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1596,6 +1531,8 @@ pub const BytecodeEmitter = struct {
             try self.emitOpcode(.ptr_offset);
             try self.emitU8((@as(u8, temp_reg) << 4) | temp_reg);
             try self.emitU16(info.field_offset);
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value.id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1621,6 +1558,8 @@ pub const BytecodeEmitter = struct {
             try self.emitOpcode(.load_indirect);
             try self.emitU8((@as(u8, temp_reg) << 4) | temp_reg);
             try self.emitU16(info.field_offset);
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value.id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1631,8 +1570,15 @@ pub const BytecodeEmitter = struct {
                 info.struct_ptr_id, info.field_index, temp_reg,
             });
             // Get the heap record pointer into a register
-            // Use a different temp register to avoid clobbering
-            const struct_ptr_reg: u4 = if (temp_reg == 0) 1 else 0;
+            // CRITICAL: Pick a register that isn't protected by nospill_mask
+            // This prevents clobbering operands that were already loaded
+            var struct_ptr_reg: u4 = 0;
+            while (struct_ptr_reg < 14) {
+                if (struct_ptr_reg != temp_reg and (self.nospill_mask >> struct_ptr_reg & 1 == 0)) {
+                    break;
+                }
+                struct_ptr_reg += 1;
+            }
             const actual_struct_reg = try self.getValueInRegById(info.struct_ptr_id, struct_ptr_reg);
 
             // Emit load_field: rd = rs.fields[field_index]
@@ -1640,6 +1586,8 @@ pub const BytecodeEmitter = struct {
             try self.emitOpcode(.load_field);
             try self.emitU8((@as(u8, temp_reg) << 4) | actual_struct_reg);
             try self.emitU16(@intCast(info.field_index));
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value.id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1655,36 +1603,31 @@ pub const BytecodeEmitter = struct {
                 try self.emitU8(@as(u8, temp_reg) << 4);
                 try self.emitU16(ptr_slot);
             }
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value.id, temp_reg) catch {};
             return temp_reg;
         }
 
         // Check if value is in a slot - load into temp register
+        // NOTE: value_slots stores pointer VALUES (like heap record pointers from function calls).
+        // For &struct_var expressions (where we need get_local_ptr), see struct_base_slots below.
         if (self.value_slots.get(value.id)) |slot_info| {
             if (slot_info & 0x8000 != 0) {
                 // Global variable
                 const slot = slot_info & 0x7FFF;
                 debug.print(.emit, "  -> slot path (global): slot={d} -> r{d}", .{ slot, temp_reg });
                 try self.emitRegLoadGlobal(temp_reg, slot);
+            } else if (slot_info < 256) {
+                debug.print(.emit, "  -> slot path (local): slot={d} -> r{d}", .{ slot_info, temp_reg });
+                try self.emitRegLoadLocal(temp_reg, @intCast(slot_info));
             } else {
-                // Check if this is a pointer-to-struct type that needs get_local_ptr
-                // This handles &struct_var expressions which need stack pointers
-                const is_ptr_to_struct = value.ty == .ptr and value.ty.ptr.* == .@"struct";
-                if (is_ptr_to_struct) {
-                    // Emit get_local_ptr to create a stack pointer
-                    debug.print(.emit, "  -> slot path (ptr_to_struct): slot={d} -> r{d} via get_local_ptr", .{ slot_info, temp_reg });
-                    try self.emitOpcode(.get_local_ptr);
-                    try self.emitU8(@as(u8, temp_reg) << 4);
-                    try self.emitU16(@intCast(slot_info));
-                } else if (slot_info < 256) {
-                    debug.print(.emit, "  -> slot path (local): slot={d} -> r{d}", .{ slot_info, temp_reg });
-                    try self.emitRegLoadLocal(temp_reg, @intCast(slot_info));
-                } else {
-                    debug.print(.emit, "  -> slot path (local16): slot={d} -> r{d}", .{ slot_info, temp_reg });
-                    try self.emitOpcode(.load_local16);
-                    try self.emitU8(@as(u8, temp_reg) << 4);
-                    try self.emitU16(@intCast(slot_info));
-                }
+                debug.print(.emit, "  -> slot path (local16): slot={d} -> r{d}", .{ slot_info, temp_reg });
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, temp_reg) << 4);
+                try self.emitU16(@intCast(slot_info));
             }
+            // Track in reg_state so subsequent spill checks know this reg is in use
+            self.reg_state.assignReg(value.id, temp_reg) catch {};
             return temp_reg;
         }
 
@@ -1698,6 +1641,8 @@ pub const BytecodeEmitter = struct {
                 try self.emitOpcode(.get_local_ptr);
                 try self.emitU8(@as(u8, temp_reg) << 4);
                 try self.emitU16(@intCast(base_slot));
+                // Track in reg_state so subsequent spill checks know this reg is in use
+                self.reg_state.assignReg(value.id, temp_reg) catch {};
                 return temp_reg;
             }
         }
@@ -1718,28 +1663,26 @@ pub const BytecodeEmitter = struct {
         if (self.last_result_value) |prev_value_id| {
             if (self.last_result_reg == reg) {
                 // Spill if not already spilled
-                if (self.spilled_values.get(prev_value_id) == null) {
+                if (self.reg_state.getSpillSlot(prev_value_id) == null) {
                     const spill_slot = self.allocateSpillSlot();
                     log.debug("SPILL (prepareDestReg): value_id={d} from r{d} to slot {d}", .{ prev_value_id, reg, spill_slot });
                     self.emitSpillStore(reg, spill_slot) catch {};
-                    self.spilled_values.put(prev_value_id, spill_slot) catch {};
+                    self.reg_state.setSpillSlot(prev_value_id, spill_slot) catch {};
                 }
                 // Clear last_result since we're about to overwrite it
                 self.last_result_value = null;
             }
         }
-        // Also check register allocator for values assigned to this register
-        if (self.reg_alloc.reg_to_value[reg]) |existing_value| {
-            if (self.spilled_values.get(existing_value) == null) {
+        // Also check reg_state for values assigned to this register
+        if (self.reg_state.getRegValue(reg)) |existing_value| {
+            if (self.reg_state.getSpillSlot(existing_value) == null) {
                 const spill_slot = self.allocateSpillSlot();
-                log.debug("SPILL (prepareDestReg/reg_alloc): value_id={d} from r{d} to slot {d}", .{ existing_value, reg, spill_slot });
+                log.debug("SPILL (prepareDestReg/reg_state): value_id={d} from r{d} to slot {d}", .{ existing_value, reg, spill_slot });
                 self.emitSpillStore(reg, spill_slot) catch {};
-                self.spilled_values.put(existing_value, spill_slot) catch {};
+                self.reg_state.setSpillSlot(existing_value, spill_slot) catch {};
             }
-            // Remove from register allocator
-            _ = self.reg_alloc.value_to_reg.remove(existing_value);
-            self.reg_alloc.reg_to_value[reg] = null;
-            self.reg_alloc.free_regs |= @as(u16, 1) << reg;
+            // Free the register
+            self.reg_state.freeReg(reg);
         }
     }
 
@@ -1760,9 +1703,9 @@ pub const BytecodeEmitter = struct {
 
         self.last_result_value = value_id;
         self.last_result_reg = reg;
-        // Also track in register allocator so value can be retrieved later
+        // Also track in reg_state so value can be retrieved later
         // (even after last_result is overwritten by subsequent computations)
-        self.reg_alloc.assignRegister(value_id, reg) catch {};
+        self.reg_state.assignReg(value_id, reg) catch {};
     }
 
     // ============================================
@@ -1771,37 +1714,29 @@ pub const BytecodeEmitter = struct {
 
     /// Allocate a register for a value, spilling if necessary.
     /// This is the main entry point for register allocation that handles spilling.
+    /// Uses the new reg_state allocator with use-distance-based spilling.
     pub fn allocateWithSpill(self: *Self, value_id: u32) EmitError!u4 {
-        // First try normal allocation
-        if (self.reg_alloc.allocate(value_id)) |reg| {
-            return reg;
-        }
-
-        // No free registers - spill one
-        const spill_reg = self.selectSpillCandidate();
-        const spilled_value = self.reg_alloc.reg_to_value[spill_reg] orelse {
-            // No value in this register (shouldn't happen, but handle gracefully)
-            debug.print(.emit, "WARNING: spill candidate r{d} has no value", .{spill_reg});
-            return spill_reg;
+        // Use reg_state's allocReg which handles spilling automatically based on use distances
+        const reg = self.reg_state.allocReg(regalloc.ALLOCATABLE_MASK) catch {
+            debug.print(.emit, "WARNING: allocateWithSpill failed for value_id={d}", .{value_id});
+            return EmitError.TooManyLocals;
         };
 
-        // Allocate a spill slot and emit store_local to save the value
-        const spill_slot = self.allocateSpillSlot();
-        debug.print(.emit, "SPILL: value_id={d} from r{d} to slot {d}", .{ spilled_value, spill_reg, spill_slot });
-        try self.emitSpillStore(spill_reg, spill_slot);
+        // If reg_state spilled a value, emit the spill code
+        // Note: reg_state.spillReg() returns the spill slot and updates ValueState.spill_slot
+        // but doesn't emit bytecode. We need to check if a spill happened.
+        if (self.reg_state.getRegValue(reg)) |existing_value| {
+            // A value was in this register before allocReg - it should have been spilled
+            if (self.reg_state.getSpillSlot(existing_value)) |spill_slot| {
+                debug.print(.emit, "SPILL: value_id={d} from r{d} to slot {d}", .{ existing_value, reg, spill_slot });
+                try self.emitSpillStore(reg, spill_slot);
+            }
+        }
 
-        // Track the spilled value
-        try self.spilled_values.put(spilled_value, spill_slot);
+        // Assign the new value to the register
+        self.reg_state.assignReg(value_id, reg) catch {};
 
-        // Remove from register allocator
-        _ = self.reg_alloc.value_to_reg.remove(spilled_value);
-        self.reg_alloc.reg_to_value[spill_reg] = null;
-
-        // Now allocate the freed register for the new value
-        self.reg_alloc.reg_to_value[spill_reg] = value_id;
-        try self.reg_alloc.value_to_reg.put(value_id, spill_reg);
-
-        return spill_reg;
+        return reg;
     }
 
     /// Select a register to spill.
@@ -1810,7 +1745,7 @@ pub const BytecodeEmitter = struct {
         // Start from r2 (r0, r1 are temp registers for operand loading)
         var reg: u4 = 2;
         while (reg < 14) : (reg += 1) {
-            if (self.reg_alloc.reg_to_value[reg] != null) {
+            if (self.reg_state.getRegValue(reg) != null) {
                 return reg;
             }
         }
@@ -1870,7 +1805,7 @@ pub const BytecodeEmitter = struct {
 
     /// Reset spill state for a new function
     fn resetSpillState(self: *Self) void {
-        self.spilled_values.clearRetainingCapacity();
+        // Note: spill slot tracking is now handled by reg_state (ValueState.spill_slot)
         self.spill_slot_base = 0;
         self.next_spill_slot = 0;
         self.max_spill_slots_used = 0;

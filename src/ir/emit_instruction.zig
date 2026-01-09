@@ -208,21 +208,40 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
                 });
                 return;
             }
-            // Non-param pointer-to-struct local variable (e.g., var p: *MyStruct = &obj)
-            // Allocate a slot for the pointer variable and track it
-            // so that loads from this slot can be identified as dynamic stack pointers
+            // Check if this is a *Struct parameter (already registered in locals by beginRoutine)
+            // This handles heap pointer semantics - the parameter slot holds a heap record pointer.
+            if (e.locals.get(a.name)) |local_info| {
+                try e.value_slots.put(a.result.id, local_info.slot);
+                debug.print(.emit, "alloca ptr-to-struct param (heap pointer): {s} slot={d}", .{ a.name, local_info.slot });
+                return;
+            }
+            // Non-param pointer-to-struct local variable
+            // This could hold either:
+            //   - Stack pointer: var p: *MyStruct = &stack_obj
+            //   - Heap pointer: var p: *MyStruct = new MyStruct{} or makeFunc()
+            //
+            // We CAN'T know at alloca time which it is - that depends on what's stored.
+            // So we treat it as a regular pointer local. The actual semantics (stack vs heap)
+            // will be determined by the store operation:
+            //   - Storing &expr will emit get_local_ptr and create a StackPtr
+            //   - Storing a heap record pointer will store the heap pointer value
+            //
+            // Field access through loaded values will use heap semantics (load_field).
+            // Stack pointer parameters are handled by stack_ptr_params, not this path.
             const ptr_slot = e.local_count;
             try e.locals.put(a.name, .{
                 .slot = ptr_slot,
                 .is_global = false,
             });
             try e.value_slots.put(a.result.id, ptr_slot);
-            try e.ptr_to_struct_local_allocas.put(a.result.id, ptr_slot);
+            // NOTE: We intentionally do NOT add to ptr_to_struct_local_allocas here.
+            // Stack pointer semantics are ONLY for parameters (tracked in stack_ptr_params).
+            // Local *Struct variables should use heap pointer semantics.
             e.local_count += 1;
             log.debug("alloca ptr-to-struct local: name={s} result.id={d} slot={d}", .{
                 a.name, a.result.id, ptr_slot,
             });
-            debug.print(.emit, "alloca ptr-to-struct local: name={s} result.id={d} slot={d}", .{
+            debug.print(.emit, "alloca ptr-to-struct local (heap pointer): name={s} result.id={d} slot={d}", .{
                 a.name, a.result.id, ptr_slot,
             });
             return;
@@ -466,6 +485,147 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
         try e.emitU8((1 << 4) | 0); // r1 (ptr), r0 (val)
         try e.emitU16(info.field_offset);
         return;
+    }
+
+    // Check if this is a STRUCT field store through derived stack pointer
+    // This handles: self.previous = self.current (where both are struct fields)
+    // We need to copy all slots from source struct to dest struct using load_indirect/store_indirect
+    if (e.derived_stack_ptrs.get(s.ptr.id)) |dest_info| {
+        // Destination is a struct field accessed through stack pointer
+        // Check if we're storing a struct type (need multi-slot copy)
+        const struct_type_opt: ?*const ir.StructType = if (s.value.ty == .@"struct")
+            s.value.ty.@"struct"
+        else if (s.value.ty == .ptr and s.value.ty.ptr.* == .@"struct")
+            s.value.ty.ptr.*.@"struct"
+        else
+            null;
+
+        if (struct_type_opt) |struct_type| {
+            const field_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
+            debug.print(.emit, "store: derived stack ptr struct copy, {d} fields, dest base_slot={d} offset={d}", .{
+                field_count, dest_info.base_slot, dest_info.field_offset,
+            });
+
+            // Check if source is also a derived stack pointer (self.field = self.other_field)
+            if (e.derived_stack_ptrs.get(s.value.id)) |src_info| {
+                debug.print(.emit, "  source also derived: base_slot={d} offset={d}", .{
+                    src_info.base_slot, src_info.field_offset,
+                });
+
+                // Both source and dest are struct fields accessed through stack pointers
+                // Copy slot by slot using load_indirect / store_indirect
+                for (0..field_count) |slot_idx| {
+                    const src_offset = src_info.field_offset + @as(u16, @intCast(slot_idx));
+                    const dst_offset = dest_info.field_offset + @as(u16, @intCast(slot_idx));
+
+                    // Load base stack pointer for source into r0
+                    if (src_info.base_slot < 256) {
+                        try e.emitOpcode(.load_local);
+                        try e.emitU8(0 << 4); // r0
+                        try e.emitU8(@intCast(src_info.base_slot));
+                    } else {
+                        try e.emitOpcode(.load_local16);
+                        try e.emitU8(0 << 4); // r0
+                        try e.emitU16(src_info.base_slot);
+                    }
+
+                    // load_indirect r1, r0, src_offset (load source slot into r1)
+                    try e.emitOpcode(.load_indirect);
+                    try e.emitU8((1 << 4) | 0); // rd=r1, rs_ptr=r0
+                    try e.emitU16(src_offset);
+
+                    // Load base stack pointer for dest into r0 (may be same as src, that's ok)
+                    if (dest_info.base_slot < 256) {
+                        try e.emitOpcode(.load_local);
+                        try e.emitU8(0 << 4); // r0
+                        try e.emitU8(@intCast(dest_info.base_slot));
+                    } else {
+                        try e.emitOpcode(.load_local16);
+                        try e.emitU8(0 << 4); // r0
+                        try e.emitU16(dest_info.base_slot);
+                    }
+
+                    // store_indirect r0, dst_offset, r1 (store r1 to dest slot)
+                    try e.emitOpcode(.store_indirect);
+                    try e.emitU8((0 << 4) | 1); // rs_ptr=r0, rs_val=r1
+                    try e.emitU16(dst_offset);
+                }
+                return;
+            }
+
+            // Source is not a derived stack ptr - check if it has local slots
+            const src_slot_opt: ?u16 = e.value_slots.get(s.value.id) orelse e.struct_base_slots.get(s.value.id);
+            if (src_slot_opt) |src_slot| {
+                const src_base = src_slot & 0x7FFF;
+                debug.print(.emit, "  source from local slot {d}", .{src_base});
+
+                // Copy from local slots to derived stack ptr destination
+                for (0..field_count) |slot_idx| {
+                    const actual_src_slot = src_base + slot_idx;
+                    const dst_offset = dest_info.field_offset + @as(u16, @intCast(slot_idx));
+
+                    // Load source slot value into r0
+                    if (actual_src_slot < 256) {
+                        try e.emitOpcode(.load_local);
+                        try e.emitU8(0 << 4); // r0
+                        try e.emitU8(@intCast(actual_src_slot));
+                    } else {
+                        try e.emitOpcode(.load_local16);
+                        try e.emitU8(0 << 4); // r0
+                        try e.emitU16(@intCast(actual_src_slot));
+                    }
+
+                    // Load dest base stack pointer into r1
+                    if (dest_info.base_slot < 256) {
+                        try e.emitOpcode(.load_local);
+                        try e.emitU8(1 << 4); // r1
+                        try e.emitU8(@intCast(dest_info.base_slot));
+                    } else {
+                        try e.emitOpcode(.load_local16);
+                        try e.emitU8(1 << 4); // r1
+                        try e.emitU16(dest_info.base_slot);
+                    }
+
+                    // store_indirect r1, dst_offset, r0
+                    try e.emitOpcode(.store_indirect);
+                    try e.emitU8((1 << 4) | 0); // rs_ptr=r1, rs_val=r0
+                    try e.emitU16(dst_offset);
+                }
+                return;
+            }
+
+            // Source might be last_result from a function call - check that
+            if (e.last_result_value) |last_id| {
+                if (last_id == s.value.id and field_count <= 16) {
+                    const return_base_reg = e.last_result_reg;
+                    debug.print(.emit, "  source from call result starting at r{d}", .{return_base_reg});
+
+                    // Copy from registers to derived stack ptr destination
+                    for (0..field_count) |slot_idx| {
+                        const src_reg: u8 = return_base_reg + @as(u8, @intCast(slot_idx));
+                        const dst_offset = dest_info.field_offset + @as(u16, @intCast(slot_idx));
+
+                        // Load dest base stack pointer into r0 (use r0 as temp, value is in src_reg)
+                        if (dest_info.base_slot < 256) {
+                            try e.emitOpcode(.load_local);
+                            try e.emitU8(0 << 4); // r0
+                            try e.emitU8(@intCast(dest_info.base_slot));
+                        } else {
+                            try e.emitOpcode(.load_local16);
+                            try e.emitU8(0 << 4); // r0
+                            try e.emitU16(dest_info.base_slot);
+                        }
+
+                        // store_indirect r0, dst_offset, src_reg
+                        try e.emitOpcode(.store_indirect);
+                        try e.emitU8((0 << 4) | src_reg); // rs_ptr=r0, rs_val=src_reg
+                        try e.emitU16(dst_offset);
+                    }
+                    return;
+                }
+            }
+        }
+        // If not a struct type, fall through to single-value store below
     }
 
     // Check if this is a heap field store (storing through heap record pointer from function call)
@@ -799,12 +959,60 @@ pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!
         return;
     }
 
-    // Direct field access - First check struct_base_slots (for stack-allocated structs from alloca),
-    // then fall back to value_slots (for other pointer sources like parameters)
-    const struct_slot_opt = e.struct_base_slots.get(fp.struct_ptr.id) orelse
-        e.value_slots.get(fp.struct_ptr.id);
+    // Check if this is accessing through an optional pointer type (e.g., ?*Node)
+    // Optional pointers are heap pointers stored in a slot, not stack-allocated structs
+    // Field access needs to go through load_field, not slot arithmetic
+    const is_optional_ptr_to_struct = blk: {
+        if (fp.struct_ptr.ty == .optional) {
+            if (fp.struct_ptr.ty.optional.* == .ptr) {
+                if (fp.struct_ptr.ty.optional.ptr.* == .@"struct") {
+                    break :blk true;
+                }
+            }
+        }
+        break :blk false;
+    };
 
-    if (struct_slot_opt == null) {
+    if (is_optional_ptr_to_struct) {
+        // Optional pointer to struct - this is a heap pointer in a register/slot
+        // Track as heap field pointer so emitLoad emits load_field
+        debug.print(.emit, "field_ptr: optional ptr-to-struct type - tracking as heap field ptr (field_index={d})", .{
+            fp.field_index,
+        });
+        try e.heap_field_ptrs.put(fp.result.id, .{
+            .struct_ptr_id = fp.struct_ptr.id,
+            .field_index = fp.field_index,
+        });
+        return;
+    }
+
+    // Check if the struct_ptr type is ptr(struct) - meaning the value is a pointer
+    // to a struct stored elsewhere (not a stack-allocated struct at this slot)
+    const is_ptr_to_struct = fp.struct_ptr.ty == .ptr and fp.struct_ptr.ty.ptr.* == .@"struct";
+
+    // Direct field access - First check struct_base_slots (for stack-allocated structs from alloca)
+    const struct_base_slot_opt = e.struct_base_slots.get(fp.struct_ptr.id);
+
+    if (struct_base_slot_opt == null) {
+        // Not a stack-allocated struct base. Check if it's a pointer value in a slot.
+        if (e.value_slots.get(fp.struct_ptr.id)) |_| {
+            // Found in value_slots - if the type is ptr(struct), the slot contains a pointer
+            // to a struct, not the struct itself. Need to use heap field access.
+            if (is_ptr_to_struct) {
+                log.debug("emitFieldPtr: ptr-to-struct in value_slot -> heap field ptr (field_index={d})", .{
+                    fp.field_index,
+                });
+                debug.print(.emit, "field_ptr: ptr-to-struct in value_slot -> heap field ptr (field_index={d})", .{
+                    fp.field_index,
+                });
+                try e.heap_field_ptrs.put(fp.result.id, .{
+                    .struct_ptr_id = fp.struct_ptr.id,
+                    .field_index = fp.field_index,
+                });
+                return;
+            }
+        }
+
         // struct_ptr is not in any slot table - it's likely a heap record pointer in a register
         // (e.g., from list_get, new, or loaded from a pointer variable)
         // Track this as a heap field pointer so emitLoad can emit load_field
@@ -817,7 +1025,7 @@ pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!
         });
         return;
     }
-    const struct_slot = struct_slot_opt.?;
+    const struct_slot = struct_base_slot_opt.?;
 
     // Get the struct type to calculate proper offset
     const struct_type: ?*const ir.StructType = if (fp.struct_ptr.ty == .@"struct")
@@ -888,6 +1096,8 @@ pub fn emitConstString(e: *BytecodeEmitter, c: ConstString) EmitError!void {
 /// Emit const_null instruction - load null into a register
 pub fn emitConstNull(e: *BytecodeEmitter, c: ConstNull) EmitError!void {
     const dest_reg: u4 = 0;
+    // Spill any existing value in r0 before overwriting
+    e.prepareDestReg(dest_reg);
     try e.emitRegLoadLiteral(.load_null, dest_reg);
     e.setLastResult(c.result.id, dest_reg);
 }
@@ -1049,9 +1259,18 @@ pub fn emitStrConcat(e: *BytecodeEmitter, s: ir.Instruction.BinaryOp) EmitError!
 
 /// Emit str_slice instruction
 pub fn emitStrSlice(e: *BytecodeEmitter, s: ir.Instruction.StrSlice) EmitError!void {
+    // Load all operands - protect loaded registers with nospill_mask to prevent clobbering
+    e.nospill_mask = 0;
+
     const src_reg = try e.getValueInReg(s.source, 0);
+    e.nospill_mask |= @as(u16, 1) << src_reg; // Protect source register
+
     const start_reg = try e.getValueInReg(s.start, 1);
+    e.nospill_mask |= @as(u16, 1) << start_reg; // Protect start register
+
     const len_reg = try e.getValueInReg(s.length_or_end, 2);
+    e.nospill_mask = 0; // Clear after all operands loaded
+
     const dest_reg: u4 = 3;
     try e.emitOpcode(.str_slice);
     try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
@@ -1152,7 +1371,7 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
                 });
                 try e.emitSpillStore(e.last_result_reg, return_spill_slot.?);
                 // Track the spill so getValueInReg can find it
-                try e.spilled_values.put(e.last_result_value.?, return_spill_slot.?);
+                e.reg_state.setSpillSlot(e.last_result_value.?, return_spill_slot.?) catch {};
                 e.last_result_value = null;
             }
         }
@@ -1209,11 +1428,7 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
         const clear_count = @min(reg_offset, 16);
         if (clear_count > 0) {
             for (0..clear_count) |reg_idx| {
-                if (e.reg_alloc.reg_to_value[@intCast(reg_idx)]) |value_id| {
-                    _ = e.reg_alloc.value_to_reg.remove(value_id);
-                    e.reg_alloc.reg_to_value[@intCast(reg_idx)] = null;
-                    e.reg_alloc.free_regs |= @as(u16, 1) << @intCast(reg_idx);
-                }
+                e.reg_state.freeReg(@intCast(reg_idx));
             }
         }
     }
@@ -1483,17 +1698,15 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     if (e.last_result_value) |prev_value_id| {
         // Spill the previous result regardless of which register it's in.
         // The callee can clobber any register during execution.
-        if (e.spilled_values.get(prev_value_id) == null) {
+        if (e.reg_state.getSpillSlot(prev_value_id) == null) {
             const spill_slot = e.allocateSpillSlot();
             log.debug("SPILL (pre-call): value_id={d} from r{d} to slot {d}", .{ prev_value_id, e.last_result_reg, spill_slot });
             try e.emitSpillStore(e.last_result_reg, spill_slot);
-            try e.spilled_values.put(prev_value_id, spill_slot);
+            e.reg_state.setSpillSlot(prev_value_id, spill_slot) catch {};
         }
-        // Remove from register allocator so getValueInReg will reload from spill slot
+        // Free the register so getValueInReg will reload from spill slot
         const spill_reg = e.last_result_reg;
-        _ = e.reg_alloc.value_to_reg.remove(prev_value_id);
-        e.reg_alloc.reg_to_value[spill_reg] = null;
-        e.reg_alloc.free_regs |= @as(u16, 1) << spill_reg;
+        e.reg_state.freeReg(spill_reg);
         // Invalidate last_result since we've spilled it
         e.last_result_value = null;
     }

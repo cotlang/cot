@@ -112,6 +112,9 @@ pub const ExpressionTag = enum(u8) {
     /// Type test expression: expr is Type
     is_expr,
 
+    /// Type cast expression: expr as Type
+    cast_expr,
+
     /// Interpolated string: "Hello ${name}!"
     /// Desugared to str_concat calls during lowering
     interp_string,

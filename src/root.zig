@@ -57,6 +57,7 @@ pub const ir_lower = @import("ir/lower.zig");
 pub const ir_optimize = @import("ir/optimize.zig");
 pub const ir_printer = @import("ir/printer.zig");
 pub const ir_emit_bytecode = @import("ir/emit_bytecode.zig");
+pub const ir_regalloc = @import("ir/regalloc.zig");
 
 // Semantic analysis types for LSP
 pub const SemanticDiagnostic = ir_lower.SemanticDiagnostic;

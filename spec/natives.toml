@@ -819,6 +819,29 @@ cases = [
 
 # -----------------------------------------------------------------------------
 
+[functions.str]
+namespace = "std.convert"
+description = "Convert any value to string representation (alias for 'string')"
+since = "1.0.0"
+
+[functions.str.signature]
+params = [
+    { name = "value", type = "any" }
+]
+returns = "string"
+
+[functions.str.behavior]
+pure = true
+throws = false
+
+[functions.str.tests]
+cases = [
+    { args = [42], expect = "42" },
+    { args = [true], expect = "true" },
+]
+
+# -----------------------------------------------------------------------------
+
 [functions.integer]
 namespace = "std.convert"
 description = "Convert value to integer"

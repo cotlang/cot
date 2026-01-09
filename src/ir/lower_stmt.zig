@@ -37,6 +37,8 @@ const TypeIdx = ast.TypeIdx;
 const NodeData = ast.NodeData;
 const SourceLoc = ast.SourceLoc;
 const ForStmtView = ast.ForStmtView;
+const BinaryOp = ast.BinaryOp;
+const ExpressionTag = ast.ExpressionTag;
 
 // Struct serialization helpers
 const StructHelper = struct_serial.StructHelper;
@@ -209,14 +211,16 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData, loc: ?ir.SourceLoc) LowerErr
         }
     }
 
-    // Check if target is a member access on a heap record: p.x = value
-    // Also handles pointer-to-struct types (from function calls returning *Struct)
+    // Check if target is a member access on a heap record or ptr-to-struct: p.x = value
+    // Use store_field_heap for PRIMITIVE field types (single-slot storage).
+    // For STRUCT field types, fall through to normal assignment which handles
+    // multi-slot struct copy via field_ptr + store.
     if (target_tag == .member) {
         const target_data = l.store.exprData(target_idx);
         const object_idx = target_data.getObject();
         const field_id = target_data.getField();
 
-        // Try to lower the object to see if it's a heap record or pointer-to-struct
+        // Try to lower the object to see if it's a heap record or ptr-to-struct
         const object_val = try l.lowerExpression(object_idx);
 
         // Get struct type from heap_record or ptr-to-struct
@@ -233,6 +237,15 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData, loc: ?ir.SourceLoc) LowerErr
             // Find field index in struct type
             for (st.fields, 0..) |field, i| {
                 if (std.mem.eql(u8, field.name, field_name)) {
+                    // Check if the FIELD TYPE is a struct (needs multi-slot copy)
+                    // If so, fall through to normal assignment handling
+                    const field_is_struct = (field.ty == .@"struct");
+                    if (field_is_struct) {
+                        debug.print(.ir, "store to struct field through ptr - using normal path for multi-slot copy", .{});
+                        break; // Fall through to normal assignment
+                    }
+
+                    // Primitive field - use store_field_heap (single-slot store)
                     const value = try l.lowerExpression(value_idx);
                     try l.emit(.{
                         .store_field_heap = .{
@@ -244,7 +257,7 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData, loc: ?ir.SourceLoc) LowerErr
                     return;
                 }
             }
-            // Field not found - fall through to normal handling which will error
+            // Field not found or is struct type - fall through to normal handling
         }
     }
 
@@ -387,6 +400,159 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData, loc: ?ir.SourceLoc) LowerErr
 }
 
 // ============================================================================
+// Type Narrowing
+// ============================================================================
+
+/// Information about a variable that can be narrowed after a null check
+const NarrowingInfo = struct {
+    /// The variable name (for simple identifiers) or qualified path (for members)
+    name: []const u8,
+    /// Whether the check is `!= null` (true) or `== null` (false)
+    is_not_null: bool,
+    /// Whether this is a member expression (e.g., l.current_scope)
+    is_member: bool,
+    /// Expression index of the variable/member being checked (for getting its type)
+    expr_idx: ExprIdx,
+};
+
+/// Extended narrowing info for compound conditions
+const CompoundNarrowingInfo = struct {
+    /// First variable to narrow
+    first: ?NarrowingInfo,
+    /// Second variable to narrow (for compound conditions)
+    second: ?NarrowingInfo,
+    /// Whether this is a compound condition
+    is_compound: bool,
+};
+
+/// Detect if a condition expression is a null check pattern like `x != null` or `x == null`
+/// Also handles member expressions like `l.current_scope != null`
+/// Returns narrowing info if detected, null otherwise.
+fn detectNullCheck(l: *const Lowerer, cond_idx: ExprIdx) ?NarrowingInfo {
+    // Check if the condition is a binary expression
+    const cond_tag = l.store.exprTag(cond_idx);
+    if (cond_tag != .binary) return null;
+
+    const cond_data = l.store.exprData(cond_idx);
+    const op = cond_data.getBinaryOp();
+
+    // Only handle == or !=
+    if (op != .eq and op != .ne) return null;
+
+    const lhs_idx = cond_data.getLhs();
+    const rhs_idx = cond_data.getRhs();
+
+    const lhs_tag = l.store.exprTag(lhs_idx);
+    const rhs_tag = l.store.exprTag(rhs_idx);
+
+    // One side must be null_literal, the other must be an identifier or member
+    var var_idx: ExprIdx = undefined;
+    var is_member = false;
+    if (lhs_tag == .null_literal) {
+        if (rhs_tag == .identifier) {
+            var_idx = rhs_idx;
+        } else if (rhs_tag == .member) {
+            var_idx = rhs_idx;
+            is_member = true;
+        } else {
+            return null;
+        }
+    } else if (rhs_tag == .null_literal) {
+        if (lhs_tag == .identifier) {
+            var_idx = lhs_idx;
+        } else if (lhs_tag == .member) {
+            var_idx = lhs_idx;
+            is_member = true;
+        } else {
+            return null;
+        }
+    } else {
+        return null;
+    }
+
+    // Extract the variable/member name
+    const name = if (is_member)
+        extractMemberPath(l, var_idx)
+    else blk: {
+        const var_data = l.store.exprData(var_idx);
+        const name_id: StringId = @enumFromInt(var_data.a);
+        break :blk l.strings.get(name_id);
+    };
+
+    if (name.len == 0) return null;
+
+    return .{
+        .name = name,
+        .is_not_null = (op == .ne),
+        .is_member = is_member,
+        .expr_idx = var_idx,
+    };
+}
+
+/// Extract a dotted path from a member expression (e.g., "l.current_scope")
+/// Returns empty string if extraction fails
+fn extractMemberPath(l: *const Lowerer, expr_idx: ExprIdx) []const u8 {
+    const tag = l.store.exprTag(expr_idx);
+
+    if (tag == .identifier) {
+        const data = l.store.exprData(expr_idx);
+        const name_id: StringId = @enumFromInt(data.a);
+        return l.strings.get(name_id);
+    }
+
+    if (tag == .member) {
+        // Handle single-level member access (obj.field)
+        const data = l.store.exprData(expr_idx);
+        const object_idx = data.getObject();
+        const field_id: StringId = @enumFromInt(data.b);
+
+        // Check if object is an identifier (single-level: x.field)
+        const obj_tag = l.store.exprTag(object_idx);
+        if (obj_tag == .identifier) {
+            // Build the full path "obj.field" for member narrowing tracking
+            const obj_data = l.store.exprData(object_idx);
+            const obj_name_id: StringId = @enumFromInt(obj_data.a);
+            const obj_name = l.strings.get(obj_name_id);
+            const field_name = l.strings.get(field_id);
+
+            // Create the qualified path - we need a stable string
+            // Use the string interner to intern the combined path
+            var buf: [256]u8 = undefined;
+            const path = std.fmt.bufPrint(&buf, "{s}.{s}", .{ obj_name, field_name }) catch return "";
+            // Intern the path so it has stable lifetime
+            const interned = l.strings.intern(path) catch return "";
+            return l.strings.get(interned);
+        }
+    }
+
+    return "";
+}
+
+/// Unwrap an optional type to get the inner type
+/// Handles both direct optional types and pointers to optional types
+fn unwrapOptionalType(ty: ir.Type) ?ir.Type {
+    return switch (ty) {
+        // Direct optional: ?T -> T
+        .optional => |inner| inner.*,
+        // Pointer to optional: *?T -> we need to return the inner type
+        // but the caller needs to know to create *T
+        .ptr => |inner| switch (inner.*) {
+            .optional => |opt_inner| opt_inner.*,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// Check if a type is a pointer to an optional type
+fn isPointerToOptional(ty: ir.Type) bool {
+    return switch (ty) {
+        .ptr => |inner| inner.* == .optional,
+        else => false,
+    };
+}
+
+// ============================================================================
 // Control Flow
 // ============================================================================
 
@@ -402,6 +568,66 @@ pub fn lowerIf(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
     const extra_idx_raw = data.b & 0xFFFF;
     const else_body_raw = l.store.extra_data.items[extra_idx_raw];
     const else_body: StmtIdx = @enumFromInt(else_body_raw);
+
+    // Detect null check pattern for type narrowing
+    // If condition is `x != null`, narrow x's type in then-block
+    // If condition is `x == null`, narrow x's type in else-block
+    // If condition is `x == null` and then-block terminates (return), narrow after if
+    const narrowing = detectNullCheck(l, cond_idx);
+    var narrowed_value: ?ir.Value = null;
+    var narrowed_member_type: ?ir.Type = null;
+
+    if (narrowing) |info| {
+        if (info.is_member) {
+            // For member expressions, we need to get the type differently.
+            // Lower the member expression to get its type, then compute the narrowed type.
+            // Note: This emits IR for the member access, but that's part of the condition anyway.
+            const member_val = l.lowerExpression(info.expr_idx) catch null;
+            if (member_val) |mv| {
+                // Check if it's an optional type that can be narrowed
+                if (unwrapOptionalType(mv.ty)) |inner_ty| {
+                    // Create the narrowed type (for optional, just return inner)
+                    const narrowed_ty: ir.Type = if (isPointerToOptional(mv.ty)) blk: {
+                        const ty_ptr = l.allocator.create(ir.Type) catch break :blk mv.ty;
+                        ty_ptr.* = inner_ty;
+                        l.allocated_types.append(l.allocator, ty_ptr) catch break :blk mv.ty;
+                        break :blk .{ .ptr = ty_ptr };
+                    } else inner_ty;
+
+                    narrowed_member_type = narrowed_ty;
+                }
+            }
+        } else {
+            // For simple identifiers, look up in scope
+            if (l.scopes.get(info.name)) |current_value| {
+                // Check if it's an optional type that can be narrowed
+                // Handle both direct optional (?T) and pointer to optional (*?T) cases
+                if (unwrapOptionalType(current_value.ty)) |inner_ty| {
+                    // Create the narrowed type
+                    // If original was *?T, narrowed should be *T
+                    // If original was ?T, narrowed should be T
+                    const narrowed_ty: ir.Type = if (isPointerToOptional(current_value.ty)) blk: {
+                        // Need to allocate a new type pointer for *T
+                        const ty_ptr = l.allocator.create(ir.Type) catch {
+                            break :blk current_value.ty; // Fallback, won't narrow
+                        };
+                        ty_ptr.* = inner_ty;
+                        l.allocated_types.append(l.allocator, ty_ptr) catch {
+                            break :blk current_value.ty; // Fallback, won't narrow
+                        };
+                        break :blk .{ .ptr = ty_ptr };
+                    } else inner_ty;
+
+                    // Create a value with the narrowed (non-optional) type
+                    // Keep the same id so the same storage location is used
+                    narrowed_value = ir.Value{
+                        .id = current_value.id,
+                        .ty = narrowed_ty,
+                    };
+                }
+            }
+        }
+    }
 
     // Evaluate condition
     const cond_val = try l.lowerExpression(cond_idx);
@@ -420,24 +646,96 @@ pub fn lowerIf(l: *Lowerer, _: StmtIdx, data: NodeData) LowerError!void {
         },
     });
 
-    // Then block
+    // Then block - apply type narrowing if condition was `x != null`
     l.current_block = then_block;
+
+    // Determine if we should narrow in the then block
+    const can_narrow = (narrowed_value != null) or (narrowed_member_type != null);
+    const narrow_in_then = narrowing != null and narrowing.?.is_not_null and can_narrow;
+
+    if (narrow_in_then) {
+        if (narrowing.?.is_member) {
+            // Member narrowing - use narrowed_members map
+            try l.pushNarrowedMemberScope();
+            try l.addNarrowedMember(narrowing.?.name, narrowed_member_type.?);
+        } else {
+            // Variable narrowing - use scope
+            try l.scopes.push();
+            try l.scopes.put(narrowing.?.name, narrowed_value.?);
+        }
+    }
     try l.lowerStatement(then_body);
-    if (!l.current_block.?.isTerminated()) {
+    if (narrow_in_then) {
+        if (narrowing.?.is_member) {
+            l.popNarrowedMemberScope();
+        } else {
+            l.scopes.pop();
+        }
+    }
+    const then_terminated = l.current_block.?.isTerminated();
+    if (!then_terminated) {
         try l.emit(.{ .jump = .{ .target = merge_block } });
     }
 
-    // Else block
+    // Else block - apply type narrowing if condition was `x == null`
     l.current_block = else_block;
+    const narrow_in_else = narrowing != null and !narrowing.?.is_not_null and can_narrow;
     if (else_body != .null) {
+        if (narrow_in_else) {
+            if (narrowing.?.is_member) {
+                try l.pushNarrowedMemberScope();
+                try l.addNarrowedMember(narrowing.?.name, narrowed_member_type.?);
+            } else {
+                try l.scopes.push();
+                try l.scopes.put(narrowing.?.name, narrowed_value.?);
+            }
+        }
         try l.lowerStatement(else_body);
+        if (narrow_in_else) {
+            if (narrowing.?.is_member) {
+                l.popNarrowedMemberScope();
+            } else {
+                l.scopes.pop();
+            }
+        }
     }
-    if (!l.current_block.?.isTerminated()) {
+    const else_terminated = l.current_block.?.isTerminated();
+    if (!else_terminated) {
         try l.emit(.{ .jump = .{ .target = merge_block } });
     }
 
     // Continue at merge block
     l.current_block = merge_block;
+
+    // Early-return type narrowing:
+    // If condition was `x == null` and then-block terminates (early return),
+    // the code after this if can assume x is non-null.
+    // Apply narrowing to the current scope for subsequent statements.
+    if (narrowing) |info| {
+        if (info.is_member) {
+            if (narrowed_member_type) |nmt| {
+                // Pattern: `if (x.y == null) { return }` - narrow after the if
+                if (!info.is_not_null and then_terminated and !else_terminated) {
+                    try l.addNarrowedMember(info.name, nmt);
+                }
+                // Pattern: `if (x.y != null) { } else { return }` - narrow after the if
+                else if (info.is_not_null and !then_terminated and else_terminated) {
+                    try l.addNarrowedMember(info.name, nmt);
+                }
+            }
+        } else {
+            if (narrowed_value) |nv| {
+                // Pattern: `if (x == null) { return }` - narrow after the if
+                if (!info.is_not_null and then_terminated and !else_terminated) {
+                    try l.scopes.put(info.name, nv);
+                }
+                // Pattern: `if (x != null) { } else { return }` - narrow after the if
+                else if (info.is_not_null and !then_terminated and else_terminated) {
+                    try l.scopes.put(info.name, nv);
+                }
+            }
+        }
+    }
 }
 
 /// Lower a return statement
@@ -570,6 +868,7 @@ pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
     log.debug("lowerFor: entering", .{});
 
     const func = l.current_func orelse return LowerError.OutOfMemory;
+    const ir_loc = lower_expr.toIrLocForStmt(l, idx);
 
     // Use ForStmtView to correctly extract packed data
     const for_view = ForStmtView.from(l.store, idx);
@@ -639,7 +938,7 @@ pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
     try l.scopes.put(binding_name, loop_var);
 
     // Initialize loop variable to range start
-    try l.emit(.{ .store = .{ .ptr = loop_var, .value = start_val } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = start_val, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Condition block - check loop_var <= end (or < for non-inclusive)
@@ -666,7 +965,7 @@ pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
     try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = one } });
     const incremented = func.newValue(.i64);
     try l.emit(.{ .iadd = .{ .lhs = loaded_val, .rhs = one, .result = incremented } });
-    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Restore loop context
@@ -697,6 +996,7 @@ fn lowerCollectionIteration(
     // Check the type of the iterable to determine how to iterate
     const iterable_type = iterable_val.ty;
     const loc = l.store.exprLoc(iterable_idx);
+    const ir_loc = lower_expr.toIrLoc(loc);
 
     log.debug("lowerCollectionIteration: iterable_type tag = {s}", .{@tagName(iterable_type)});
 
@@ -767,12 +1067,12 @@ fn lowerCollectionIteration(
     });
     const len_val = func.newValue(.i64);
     try l.emit(.{ .array_len = .{ .operand = array_val, .result = len_val } });
-    try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val } });
+    try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val, .loc = ir_loc } });
 
     // Initialize index counter to 0
     const zero = func.newValue(.i64);
     try l.emit(.{ .iconst = .{ .ty = .i64, .value = 0, .result = zero } });
-    try l.emit(.{ .store = .{ .ptr = loop_var, .value = zero } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = zero, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Condition block: check index < length
@@ -810,7 +1110,7 @@ fn lowerCollectionIteration(
             .result = elem_var,
         },
     });
-    try l.emit(.{ .store = .{ .ptr = elem_var, .value = element_val } });
+    try l.emit(.{ .store = .{ .ptr = elem_var, .value = element_val, .loc = ir_loc } });
 
     // Temporarily shadow the loop counter variable with the element variable
     // Save old binding and set new one
@@ -839,7 +1139,7 @@ fn lowerCollectionIteration(
     try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = incr_one } });
     const incremented = func.newValue(.i64);
     try l.emit(.{ .iadd = .{ .lhs = loaded_idx, .rhs = incr_one, .result = incremented } });
-    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Restore loop context
@@ -865,6 +1165,10 @@ fn lowerMapIteration(
     prev_exit: ?*ir.Block,
     prev_continue: ?*ir.Block,
 ) LowerError!void {
+    // Get location for error reporting
+    const stmt_loc = l.store.stmtLoc(body_idx);
+    const ir_loc = lower_expr.toIrLoc(stmt_loc);
+
     // Map keys are always strings in Cot
     const key_type: ir.Type = .string;
     const key_type_ptr = try l.allocator.create(ir.Type);
@@ -887,12 +1191,12 @@ fn lowerMapIteration(
     // Get map length directly using map_len and store it
     const len_val = func.newValue(.i64);
     try l.emit(.{ .map_len = .{ .map = map_val, .result = len_val } });
-    try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val } });
+    try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val, .loc = ir_loc } });
 
     // Initialize index counter to 1 (map_key_at uses 1-based indexing)
     const one = func.newValue(.i64);
     try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = one } });
-    try l.emit(.{ .store = .{ .ptr = loop_var, .value = one } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = one, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Condition block: check index <= length (1-based)
@@ -926,7 +1230,7 @@ fn lowerMapIteration(
             .result = elem_var,
         },
     });
-    try l.emit(.{ .store = .{ .ptr = elem_var, .value = key_val } });
+    try l.emit(.{ .store = .{ .ptr = elem_var, .value = key_val, .loc = ir_loc } });
 
     // Bind the key variable
     const old_binding = l.scopes.get(binding_name);
@@ -954,7 +1258,7 @@ fn lowerMapIteration(
     try l.emit(.{ .iconst = .{ .ty = .i64, .value = 1, .result = incr_one } });
     const incremented = func.newValue(.i64);
     try l.emit(.{ .iadd = .{ .lhs = loaded_idx, .rhs = incr_one, .result = incremented } });
-    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented } });
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = incremented, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
     // Restore loop context
@@ -1004,14 +1308,14 @@ pub fn lowerLoop(l: *Lowerer, data: NodeData) LowerError!void {
 // ============================================================================
 
 /// Lower a const declaration (same as let at runtime, but semantically immutable)
-pub fn lowerConstDecl(l: *Lowerer, data: NodeData) LowerError!void {
+pub fn lowerConstDecl(l: *Lowerer, stmt_idx: StmtIdx, data: NodeData) LowerError!void {
     // Constants are lowered the same as let declarations at runtime
     // The only difference is compile-time enforcement of immutability
-    return lowerLetDecl(l, data);
+    return lowerLetDecl(l, stmt_idx, data);
 }
 
 /// Lower a let declaration
-pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
+pub fn lowerLetDecl(l: *Lowerer, stmt_idx: StmtIdx, data: NodeData) LowerError!void {
     const func = l.current_func orelse return LowerError.OutOfMemory;
 
     const name_id = data.getName();
@@ -1129,9 +1433,9 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
 
     // Store init value if present
     if (init_val) |init_v| {
-        // Get source location from init expression for error reporting
-        const init_loc = if (init_idx != .null) l.store.exprLoc(init_idx) else ast.SourceLoc{ .line = 0, .column = 0 };
-        const ir_loc = lower_expr.toIrLoc(init_loc);
+        // Get source location from the statement for accurate error reporting
+        const stmt_loc = l.store.stmtLoc(stmt_idx);
+        const ir_loc = lower_expr.toIrLocForStmt(l, stmt_idx);
 
         // Fix for empty array/slice literals: lowerArrayInit returns void for empty [],
         // but if we have an explicit slice/list type annotation, create a properly typed value
@@ -1160,7 +1464,7 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
                     LowerError.TypeMismatch,
                     "cannot create trait object from non-struct type",
                     .{},
-                    init_loc,
+                    stmt_loc,
                     "lowering variable declaration for '{s}'",
                     .{name},
                 );
@@ -1173,7 +1477,7 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
                     LowerError.TypeMismatch,
                     "type '{s}' does not implement trait '{s}'",
                     .{ type_name, trait_name },
-                    init_loc,
+                    stmt_loc,
                     "lowering variable declaration for '{s}'",
                     .{name},
                 );

@@ -19,6 +19,7 @@ const Value = native.Value;
 pub fn register(registry: anytype) !void {
     // Namespaced names (std.convert.*)
     try registry.registerNative("std.convert.string", string);
+    try registry.registerNative("std.convert.str", string); // Alias for string()
     try registry.registerNative("std.convert.integer", integer);
     try registry.registerNative("std.convert.decimal", decimal);
     try registry.registerNative("std.convert.char", char);
