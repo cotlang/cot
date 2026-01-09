@@ -1,16 +1,78 @@
-ACTIVE_PLAN: ~/cotlang/claude/FEATURE_COMPLETION_PLAN.md
-CURRENT_PHASE: Phase A Complete - All core features done
-CURRENT_TASK: Async/await needs design decision
-NOTES:
-- ARC implementation: ✅ Complete
-- Associated types: ✅ Complete
-- Generics: ✅ Complete (fixed string return + trait dispatch)
-- Package system: ✅ Complete (verified 100%)
-- Comptime builtins: ✅ ~95% done
-- Traits: ✅ Complete
+ACTIVE_PLAN: Remove Struct Flattening (self-hosting blocker)
+CURRENT_PHASE: COMPLETE
+CURRENT_TASK: None - main objectives achieved
 
-REMAINING WORK:
-- Async/await: 0% - Needs design decision (goroutines vs async/await vs actors)
-- Standard library gaps (std.json, std.http, std.net, std.regex)
+# Remove Struct Flattening - Execution Plan
 
-NEXT: User needs to decide on concurrency model before async/await can be implemented
+## Goal
+Remove the legacy struct flattening approach where struct fields are spread across
+local slots. Instead, use record semantics consistently for all structs.
+
+## Status: MAIN OBJECTIVES ACHIEVED
+
+The critical path is complete:
+- Nested struct field access works (test_nested_ret.cot)
+- Self-hosting compiler works (cot-minimal on hello.cot)
+
+## Completed Phases
+
+### Phase 1: Analyze Current Struct Handling [COMPLETE]
+Identified struct handling patterns across:
+- `src/ir/lower_stmt.zig` - struct variable declarations
+- `src/ir/lower_expr.zig` - struct literals, field access
+- `src/ir/emit_instruction.zig` - struct emission, alloca
+- `src/ir/emit_bytecode.zig` - struct_base_slots, value_slots
+
+### Phase 2: Update IR Lowering [COMPLETE]
+Changed `lowerStructInit` and `lowerGenericStructInit` to use:
+- `heap_alloc` to allocate struct on heap
+- `store_field_heap` to store each field value
+
+### Phase 3: Update Function Return Convention [COMPLETE]
+- Struct returns now use single heap_record pointer in r15
+- Added `callResultType()` helper to convert struct->heap_record
+
+### Phase 4: Update Call Site Handling [COMPLETE]
+- All call sites now use `callResultType()` for struct returns
+- Variables storing struct call results are stored directly (no alloca indirection)
+- Fixed `lowerIdentifier` to return heap_record values directly
+
+### Phase 5: Remove Flattening Logic [OPTIONAL CLEANUP]
+The old flattening code still exists but is no longer used in the critical path.
+Can be cleaned up in a future pass:
+- `struct_base_slots` hashmap
+- `allocateStructFieldSlots` function
+- Slot offset calculations in field access
+- High register return spreading
+
+### Phase 6: Test with Nested Struct [COMPLETE]
+`test_nested_ret.cot` now works:
+```
+name = test
+inner.value = 42
+Done!
+```
+
+### Phase 7: Test Self-Hosting Compiler [COMPLETE]
+cot-minimal successfully compiles and runs hello.cot:
+```
+Hello from cot-minimal!
+```
+
+## Key Changes Summary
+
+1. **lower_expr.zig**:
+   - `lowerStructInit` and `lowerGenericStructInit` use heap_alloc + store_field_heap
+   - Added `callResultType()` to convert struct returns to heap_record
+   - All call sites apply `callResultType()` to result type
+   - `lowerIdentifier` returns heap_record values directly (no load)
+   - `lowerMember` handles heap_record field access with load_field_heap
+   - `lowerMemberPtr` handles heap_record objects for chained access
+
+2. **lower_stmt.zig**:
+   - Variable declarations store heap_record values directly in scopes
+
+3. **emit_instruction.zig**:
+   - `emitReturn` handles heap_record as single pointer in r15
+   - `emitUserCall` handles heap_record results from single register
+   - `emitStoreFieldHeap` protects record register from clobbering

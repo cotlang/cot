@@ -2102,6 +2102,23 @@ pub const Lowerer = struct {
 
         // Add parameters as local variables
         for (func_type.params) |param| {
+            // For struct parameters, they are now passed as heap_record pointers.
+            // Store them directly in scopes as heap_record type (no alloca needed for value tracking).
+            if (param.ty == .@"struct") {
+                const heap_record_val = func.newValue(.{ .heap_record = param.ty.@"struct" });
+                // Emit alloca with struct type for bytecode slot allocation,
+                // but store heap_record value in scopes for field access
+                try self.emit(.{
+                    .alloca = .{
+                        .ty = param.ty,
+                        .name = param.name,
+                        .result = heap_record_val,
+                    },
+                });
+                try self.scopes.put(param.name, heap_record_val);
+                continue;
+            }
+
             const ty_ptr = try self.allocator.create(ir.Type);
             ty_ptr.* = param.ty;
             try self.allocated_types.append(self.allocator, ty_ptr);
@@ -2622,6 +2639,23 @@ pub const Lowerer = struct {
 
         // Add parameters as local variables
         for (func_type.params) |param| {
+            // For struct parameters, they are now passed as heap_record pointers.
+            // Store them directly in scopes as heap_record type (no alloca needed for value tracking).
+            if (param.ty == .@"struct") {
+                const heap_record_val = func.newValue(.{ .heap_record = param.ty.@"struct" });
+                // Emit alloca with struct type for bytecode slot allocation,
+                // but store heap_record value in scopes for field access
+                try self.emit(.{
+                    .alloca = .{
+                        .ty = param.ty,
+                        .name = param.name,
+                        .result = heap_record_val,
+                    },
+                });
+                try self.scopes.put(param.name, heap_record_val);
+                continue;
+            }
+
             const ty_ptr = try self.allocator.create(ir.Type);
             ty_ptr.* = param.ty;
             try self.allocated_types.append(self.allocator, ty_ptr);
@@ -2720,6 +2754,23 @@ pub const Lowerer = struct {
 
         // Add parameters as local variables
         for (func_type.params) |param| {
+            // For struct parameters, they are now passed as heap_record pointers.
+            // Store them directly in scopes as heap_record type (no alloca needed for value tracking).
+            if (param.ty == .@"struct") {
+                const heap_record_val = func.newValue(.{ .heap_record = param.ty.@"struct" });
+                // Emit alloca with struct type for bytecode slot allocation,
+                // but store heap_record value in scopes for field access
+                try self.emit(.{
+                    .alloca = .{
+                        .ty = param.ty,
+                        .name = param.name,
+                        .result = heap_record_val,
+                    },
+                });
+                try self.scopes.put(param.name, heap_record_val);
+                continue;
+            }
+
             const ty_ptr = try self.allocator.create(ir.Type);
             ty_ptr.* = param.ty;
             try self.allocated_types.append(self.allocator, ty_ptr);

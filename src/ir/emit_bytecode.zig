@@ -579,34 +579,16 @@ pub const BytecodeEmitter = struct {
                 // DO NOT add to stack_ptr_params - use heap record semantics instead
                 self.local_count += 1;
                 debug.print(.emit, "param {s}: pointer-to-struct, 1 slot (heap pointer semantics)", .{param.name});
-            } else if (struct_type_opt) |struct_type| {
-                // Direct struct parameter - allocate slots for each field
-                const base_slot = self.local_count;
-
-                // Also register the base parameter name pointing to the first field slot
-                // This allows the alloca for this parameter to find the existing registration
+            } else if (struct_type_opt) |_| {
+                // Direct struct parameter - now passed as heap_record pointer (single slot)
+                // With the removal of struct flattening, struct-by-value parameters
+                // are passed as heap pointers, just like pointer-to-struct parameters.
                 try self.locals.put(param.name, .{
-                    .slot = base_slot,
+                    .slot = self.local_count,
                     .is_global = false,
                 });
-
-                for (struct_type.fields) |field| {
-                    const qualified_name = std.fmt.allocPrint(
-                        self.allocator,
-                        "{s}.{s}",
-                        .{ param.name, field.name },
-                    ) catch return EmitError.OutOfMemory;
-                    // Track allocated string for cleanup
-                    self.allocated_strings.append(self.allocator, qualified_name) catch return EmitError.OutOfMemory;
-                    try self.locals.put(qualified_name, .{
-                        .slot = self.local_count,
-                        .is_global = false,
-                    });
-                    // Use getSlotCount to properly account for nested struct sizes
-                    const slot_count = emit_inst.getSlotCount(field.ty);
-                    self.local_count += @intCast(slot_count);
-                }
-                debug.print(.emit, "param {s}: direct struct, {d} slots", .{ param.name, self.local_count - base_slot });
+                self.local_count += 1;
+                debug.print(.emit, "param {s}: direct struct as heap pointer, 1 slot", .{param.name});
             } else {
                 // Normal parameter - single slot
                 try self.locals.put(param.name, .{
@@ -632,10 +614,9 @@ pub const BytecodeEmitter = struct {
                     debug.print(.emit, "Pre-pass alloca: name='{s}' ty={any} global={} local={} skip_global={}", .{ a.name, a.ty, in_globals, in_locals, skip_global_check });
                     if (!in_globals and !in_locals) {
                         if (is_struct) {
-                            // Struct type: count FLATTENED slots for nested structs
-                            const slot_count = emit_inst.getSlotCount(a.ty);
-                            debug.print(.emit, "  -> counted as {d} slots for struct fields (flattened)", .{slot_count});
-                            self.local_count += @intCast(slot_count);
+                            // Struct type: single slot for heap record pointer (no flattening)
+                            debug.print(.emit, "  -> struct counted as 1 slot (heap pointer)", .{});
+                            self.local_count += 1;
                         } else if (a.ty == .array) {
                             // Array of u8 (DBL alpha/string buffer): single slot for the buffer value
                             // Other arrays: one slot per element (legacy behavior)
@@ -658,11 +639,13 @@ pub const BytecodeEmitter = struct {
         const total_declared_locals = self.local_count;
         debug.print(.emit, "Pre-pass done: total_declared_locals={d}, spill_slot_base will be {d}", .{ total_declared_locals, total_declared_locals });
         // Count actual parameter slots
-        // Pointer-to-struct params take 1 slot (stack pointer), direct structs expand
+        // With struct flattening removed, all struct params (direct or pointer) are single slots
         var param_slot_count: u16 = 0;
         for (func.signature.params) |param| {
             const slot_count: u32 = if (param.ty == .ptr and param.ty.ptr.* == .@"struct")
-                1 // Pointer-to-struct: single slot for stack pointer
+                1 // Pointer-to-struct: single slot for heap pointer
+            else if (param.ty == .@"struct")
+                1 // Direct struct: single slot for heap pointer (no flattening)
             else
                 emit_inst.getSlotCount(param.ty);
             param_slot_count += @intCast(slot_count);

@@ -1457,6 +1457,13 @@ pub fn lowerLetDecl(l: *Lowerer, stmt_idx: StmtIdx, data: NodeData) LowerError!v
                 return;
             }
         }
+        // For heap_record values, store directly - no need for alloca indirection.
+        // heap_record is already a pointer to the heap-allocated struct, so we
+        // just need to track the value ID for later field access.
+        if (val.ty == .heap_record) {
+            try l.scopes.put(name, val);
+            return;
+        }
     }
 
     // Allocate variable

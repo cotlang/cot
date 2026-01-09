@@ -81,40 +81,6 @@ const StoreStructBuf = std.meta.TagPayload(ir.Instruction, .store_struct_buf);
 const DebugLine = std.meta.TagPayload(ir.Instruction, .debug_line);
 
 // ============================================================================
-// Slot Allocation Helpers
-// ============================================================================
-
-/// Recursively allocate local slots for struct fields, handling nested structs.
-/// For a struct like Outer{ x: i64, inner: Inner{ a: i64, b: i64 }, y: i64 },
-/// this allocates slots as: x, inner.a, inner.b, y (4 slots, not 3).
-fn allocateStructFieldSlots(e: *BytecodeEmitter, prefix: []const u8, struct_type: *const ir.StructType) EmitError!void {
-    for (struct_type.fields) |field| {
-        const qualified_name = std.fmt.allocPrint(
-            e.allocator,
-            "{s}.{s}",
-            .{ prefix, field.name },
-        ) catch return EmitError.OutOfMemory;
-        // Track allocated string for cleanup
-        e.allocated_strings.append(e.allocator, qualified_name) catch return EmitError.OutOfMemory;
-
-        // Register this field's base slot
-        try e.locals.put(qualified_name, .{
-            .slot = e.local_count,
-            .is_global = false,
-        });
-        debug.print(.emit, "  field {s} -> slot {d}", .{ qualified_name, e.local_count });
-
-        if (field.ty == .@"struct") {
-            // Nested struct: recursively allocate slots for its fields
-            try allocateStructFieldSlots(e, qualified_name, field.ty.@"struct");
-        } else {
-            // Primitive type: allocate single slot
-            e.local_count += 1;
-        }
-    }
-}
-
-// ============================================================================
 // Memory Operations
 // ============================================================================
 
@@ -171,21 +137,12 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
             return;
         }
 
-        // Stack allocation (default) - allocate slots for struct fields
-        const struct_type = a.ty.@"struct";
-        const base_slot = e.local_count;
-        // Register the struct base slot
-        try e.locals.put(a.name, .{
-            .slot = base_slot,
-            .is_global = false,
-        });
-        // Use struct_base_slots instead of value_slots - struct pointers are
-        // compile-time concepts pointing to where fields live, not loadable values
-        try e.struct_base_slots.put(a.result.id, base_slot);
-        debug.print(.emit, "alloca struct: name={s} result.id={d} base_slot={d}", .{ a.name, a.result.id, base_slot });
-        // Allocate slots for each field, recursively handling nested structs
-        try allocateStructFieldSlots(e, a.name, struct_type);
-        return;
+        // NOTE: Stack allocation with struct field flattening has been removed.
+        // All struct allocations now go through heap allocation (new_record).
+        // If we reach here, it's an error - all struct allocas should either:
+        // 1. Be parameters (found in locals above)
+        // 2. Need heap allocation (localNeedsHeap returned true)
+        @panic("unreachable: struct alloca without heap allocation or pre-registered local");
     }
 
     // Pointer-to-struct types: these are stack pointer parameters
@@ -1108,15 +1065,25 @@ pub fn emitConstNull(e: *BytecodeEmitter, c: ConstNull) EmitError!void {
 /// Emit binary arithmetic instruction
 pub fn emitBinaryArith(e: *BytecodeEmitter, op: Opcode, lhs: ir.Value, rhs: ir.Value, result: ir.Value) EmitError!void {
     const lhs_reg = try e.getValueInReg(lhs, 0);
+
+    // CRITICAL: Track lhs in reg_state BEFORE loading rhs.
+    // This ensures that if loading rhs requires intermediate operations (like
+    // loading a struct pointer to access a field), those operations will spill
+    // lhs if they need to use lhs_reg, rather than clobbering it silently.
+    e.reg_state.assignReg(lhs.id, lhs_reg) catch {};
+
     // Choose a temp_reg for rhs that won't conflict with lhs_reg.
     // If lhs ended up in r1 (e.g., from last_result), use r0 for rhs instead.
     const rhs_temp_reg: u4 = if (lhs_reg == 1) 0 else 1;
     const rhs_reg = try e.getValueInReg(rhs, rhs_temp_reg);
 
+    // Re-fetch lhs in case it was spilled during rhs load
+    const final_lhs_reg = try e.getValueInReg(lhs, 0);
+
     // Allocate a fresh register for the result, spilling if necessary
     const dest_reg = try e.allocateWithSpill(result.id);
 
-    try e.emitRegArith(op, dest_reg, lhs_reg, rhs_reg);
+    try e.emitRegArith(op, dest_reg, final_lhs_reg, rhs_reg);
     e.setLastResult(result.id, dest_reg);
 }
 
@@ -1445,123 +1412,133 @@ pub fn emitReturn(e: *BytecodeEmitter, r: ?ir.Value) EmitError!void {
     var return_base_reg: u8 = 15;
 
     if (r) |val| {
-        // Check if the FUNCTION'S declared return type is a struct (by value return).
-        // This is the key distinction:
-        //   - Function returns `Lexer` → return struct by value (expand all fields)
-        //   - Function returns `*Expr` → return pointer (single 8-byte value)
-        // The value's type may be `.ptr` in both cases (struct literals create stack pointers),
-        // but the function signature determines whether we expand fields or not.
-        const struct_type_opt: ?*const ir.StructType = blk: {
-            // First check the function's declared return type
-            if (e.current_func) |func| {
-                if (func.signature.return_type == .@"struct") {
-                    break :blk func.signature.return_type.@"struct";
-                }
-            }
-            // Fall back to checking the value's type (for cases without function context)
-            if (val.ty == .@"struct") {
-                break :blk val.ty.@"struct";
-            }
-            break :blk null;
-        };
-
-        // Additional debug for all types - print before the main line to see pointee
-        const ptr_to_type_str: []const u8 = if (val.ty == .ptr) @tagName(val.ty.ptr.*) else "N/A";
-        const func_ret_type_str: []const u8 = if (e.current_func) |f| @tagName(f.signature.return_type) else "?";
-        const has_value_slot = e.value_slots.get(val.id) != null;
-        const has_struct_slot = e.struct_base_slots.get(val.id) != null;
-        debug.print(.emit, "emitReturn: val.id={d} val.ty={s} ptr_to={s} func_ret={s} struct_type_opt={s} value_slot={} struct_slot={} func={s}", .{
-            val.id,
-            @tagName(val.ty),
-            ptr_to_type_str,
-            func_ret_type_str,
-            if (struct_type_opt != null) "yes" else "no",
-            has_value_slot,
-            has_struct_slot,
-            if (e.current_func) |f| f.name else "?",
-        });
-
-        if (struct_type_opt) |struct_type| {
-            // Use flattened slot count to handle nested structs properly
-            const total_field_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
-
-            // Check if struct is too large to fit in registers (max 16)
-            if (total_field_count > 16) {
-                // Large struct: push all fields to stack for ret with count
-                // The caller will pop them after the call returns
-                const large_base_slot_opt: ?u16 = e.value_slots.get(val.id) orelse e.struct_base_slots.get(val.id);
-                if (large_base_slot_opt) |base_slot| {
-                    debug.print(.emit, "emitReturn: large struct with {d} fields, base_slot={d}, using stack-based return", .{ total_field_count, base_slot });
-                    for (0..total_field_count) |field_idx| {
-                        const slot = base_slot + field_idx;
-                        // push_arg format: [opcode] [slot:16] - 3 bytes total
-                        try e.emitOpcode(.push_arg);
-                        try e.emitU16(@intCast(slot));
-                    }
-                    // Mark for ret with count - use special value to indicate stack-based return
-                    return_field_count = @intCast(total_field_count);
-                    return_base_reg = 255; // Sentinel value indicating large struct return
-                } else {
-                    // Struct not in slots - shouldn't happen for large returns
-                    debug.print(.emit, "WARNING: large struct return value not in slots", .{});
-                    try e.emitValueToReg(val, 15);
-                    return_field_count = 1;
-                    return_base_reg = 15;
-                }
-            } else {
-                return_field_count = @intCast(total_field_count);
-                // Use high registers: for 2 fields use r14, r15; for 3 use r13, r14, r15, etc.
-                return_base_reg = 16 - return_field_count;
-
-                debug.print(.emit, "emitReturn: struct with {d} fields, loading into r{d}-r{d}", .{
-                    return_field_count,
-                    return_base_reg,
-                    return_base_reg + return_field_count - 1,
-                });
-
-                // Load ALL struct fields (including nested) into consecutive high registers
-                // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
-                const base_slot_opt: ?u16 = e.value_slots.get(val.id) orelse e.struct_base_slots.get(val.id);
-                if (base_slot_opt) |base_slot| {
-                    debug.print(.emit, "emitReturn: loading struct fields from slot {d}, count={d}", .{ base_slot, return_field_count });
-                    for (0..return_field_count) |field_idx| {
-                        const slot = base_slot + field_idx;
-                        const reg: u8 = return_base_reg + @as(u8, @intCast(field_idx));
-                        debug.print(.emit, "  field {d}: slot {d} -> r{d}", .{ field_idx, slot, reg });
-                        if (slot < 256) {
-                            try e.emitOpcode(.load_local);
-                            try e.emitU8(reg << 4);
-                            try e.emitU8(@intCast(slot));
-                        } else if (slot < 65536) {
-                            try e.emitOpcode(.load_local16);
-                            try e.emitU8(reg << 4);
-                            try e.emitU16(@intCast(slot));
-                        }
-                    }
-                    debug.print(.emit, "emitReturn: done loading {d} fields", .{return_field_count});
-                } else if (e.last_result_value != null and e.last_result_value.? == val.id) {
-                    // Struct returned from a function call - already in registers
-                    // The struct fields are in consecutive high registers starting at last_result_reg
-                    // We just need to use ret (not ret_val) to preserve all the registers
-                    debug.print(.emit, "emitReturn: struct from call result, already in r{d}-r{d}", .{
-                        e.last_result_reg,
-                        e.last_result_reg + @as(u8, @intCast(return_field_count)) - 1,
-                    });
-                    // Fields are already in the right registers, just keep the count for ret decision
-                    return_base_reg = e.last_result_reg;
-                } else {
-                    // Fallback: struct value not in slots and not from call - use single register
-                    debug.print(.emit, "WARNING: struct return value not in slots or last_result, falling back to single register", .{});
-                    try e.emitValueToReg(val, 15);
-                    return_field_count = 1;
-                    return_base_reg = 15;
-                }
-            }
-        } else {
-            // Non-struct return: single value into r15
+        // Check if the value is a heap-allocated record.
+        // With heap record semantics, structs are returned as a single pointer to the record,
+        // NOT spread across multiple registers. This simplifies nested struct access.
+        if (val.ty == .heap_record) {
+            debug.print(.emit, "emitReturn: heap_record val.id={d}, returning as single pointer", .{val.id});
             try e.emitValueToReg(val, 15);
             return_field_count = 1;
-        }
+            return_base_reg = 15;
+        } else {
+            // Legacy path: Check if the FUNCTION'S declared return type is a struct (by value return).
+            // This is the key distinction:
+            //   - Function returns `Lexer` → return struct by value (expand all fields)
+            //   - Function returns `*Expr` → return pointer (single 8-byte value)
+            // The value's type may be `.ptr` in both cases (struct literals create stack pointers),
+            // but the function signature determines whether we expand fields or not.
+            const struct_type_opt: ?*const ir.StructType = blk: {
+                // First check the function's declared return type
+                if (e.current_func) |func| {
+                    if (func.signature.return_type == .@"struct") {
+                        break :blk func.signature.return_type.@"struct";
+                    }
+                }
+                // Fall back to checking the value's type (for cases without function context)
+                if (val.ty == .@"struct") {
+                    break :blk val.ty.@"struct";
+                }
+                break :blk null;
+            };
+
+            // Additional debug for all types - print before the main line to see pointee
+            const ptr_to_type_str: []const u8 = if (val.ty == .ptr) @tagName(val.ty.ptr.*) else "N/A";
+            const func_ret_type_str: []const u8 = if (e.current_func) |f| @tagName(f.signature.return_type) else "?";
+            const has_value_slot = e.value_slots.get(val.id) != null;
+            const has_struct_slot = e.struct_base_slots.get(val.id) != null;
+            debug.print(.emit, "emitReturn: val.id={d} val.ty={s} ptr_to={s} func_ret={s} struct_type_opt={s} value_slot={} struct_slot={} func={s}", .{
+                val.id,
+                @tagName(val.ty),
+                ptr_to_type_str,
+                func_ret_type_str,
+                if (struct_type_opt != null) "yes" else "no",
+                has_value_slot,
+                has_struct_slot,
+                if (e.current_func) |f| f.name else "?",
+            });
+
+            if (struct_type_opt) |struct_type| {
+                // Use flattened slot count to handle nested structs properly
+                const total_field_count = getSlotCount(ir.Type{ .@"struct" = struct_type });
+
+                // Check if struct is too large to fit in registers (max 16)
+                if (total_field_count > 16) {
+                    // Large struct: push all fields to stack for ret with count
+                    // The caller will pop them after the call returns
+                    const large_base_slot_opt: ?u16 = e.value_slots.get(val.id) orelse e.struct_base_slots.get(val.id);
+                    if (large_base_slot_opt) |base_slot| {
+                        debug.print(.emit, "emitReturn: large struct with {d} fields, base_slot={d}, using stack-based return", .{ total_field_count, base_slot });
+                        for (0..total_field_count) |field_idx| {
+                            const slot = base_slot + field_idx;
+                            // push_arg format: [opcode] [slot:16] - 3 bytes total
+                            try e.emitOpcode(.push_arg);
+                            try e.emitU16(@intCast(slot));
+                        }
+                        // Mark for ret with count - use special value to indicate stack-based return
+                        return_field_count = @intCast(total_field_count);
+                        return_base_reg = 255; // Sentinel value indicating large struct return
+                    } else {
+                        // Struct not in slots - shouldn't happen for large returns
+                        debug.print(.emit, "WARNING: large struct return value not in slots", .{});
+                        try e.emitValueToReg(val, 15);
+                        return_field_count = 1;
+                        return_base_reg = 15;
+                    }
+                } else {
+                    return_field_count = @intCast(total_field_count);
+                    // Use high registers: for 2 fields use r14, r15; for 3 use r13, r14, r15, etc.
+                    return_base_reg = 16 - return_field_count;
+
+                    debug.print(.emit, "emitReturn: struct with {d} fields, loading into r{d}-r{d}", .{
+                        return_field_count,
+                        return_base_reg,
+                        return_base_reg + return_field_count - 1,
+                    });
+
+                    // Load ALL struct fields (including nested) into consecutive high registers
+                    // Check both value_slots (for loaded values) and struct_base_slots (for alloca'd structs)
+                    const base_slot_opt: ?u16 = e.value_slots.get(val.id) orelse e.struct_base_slots.get(val.id);
+                    if (base_slot_opt) |base_slot| {
+                        debug.print(.emit, "emitReturn: loading struct fields from slot {d}, count={d}", .{ base_slot, return_field_count });
+                        for (0..return_field_count) |field_idx| {
+                            const slot = base_slot + field_idx;
+                            const reg: u8 = return_base_reg + @as(u8, @intCast(field_idx));
+                            debug.print(.emit, "  field {d}: slot {d} -> r{d}", .{ field_idx, slot, reg });
+                            if (slot < 256) {
+                                try e.emitOpcode(.load_local);
+                                try e.emitU8(reg << 4);
+                                try e.emitU8(@intCast(slot));
+                            } else if (slot < 65536) {
+                                try e.emitOpcode(.load_local16);
+                                try e.emitU8(reg << 4);
+                                try e.emitU16(@intCast(slot));
+                            }
+                        }
+                        debug.print(.emit, "emitReturn: done loading {d} fields", .{return_field_count});
+                    } else if (e.last_result_value != null and e.last_result_value.? == val.id) {
+                        // Struct returned from a function call - already in registers
+                        // The struct fields are in consecutive high registers starting at last_result_reg
+                        // We just need to use ret (not ret_val) to preserve all the registers
+                        debug.print(.emit, "emitReturn: struct from call result, already in r{d}-r{d}", .{
+                            e.last_result_reg,
+                            e.last_result_reg + @as(u8, @intCast(return_field_count)) - 1,
+                        });
+                        // Fields are already in the right registers, just keep the count for ret decision
+                        return_base_reg = e.last_result_reg;
+                    } else {
+                        // Fallback: struct value not in slots and not from call - use single register
+                        debug.print(.emit, "WARNING: struct return value not in slots or last_result, falling back to single register", .{});
+                        try e.emitValueToReg(val, 15);
+                        return_field_count = 1;
+                        return_base_reg = 15;
+                    }
+                }
+            } else {
+                // Non-struct return: single value into r15
+                try e.emitValueToReg(val, 15);
+                return_field_count = 1;
+            }
+        } // close else for heap_record check
     }
 
     // Emit the actual return
@@ -2063,6 +2040,17 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
     // For struct returns, the callee puts all fields into consecutive high registers
     // (r14, r15 for 2-field struct, etc.) - we need to store them all to result slots
     if (c.result) |result| {
+        // Check if result is heap_record - if so, it's a single pointer value, not spread
+        if (result.ty == .heap_record) {
+            debug.print(.emit, "emitUserCall: heap_record result.id={d}, treating as single pointer in r15", .{result.id});
+            // Heap-allocated struct returns a single pointer in r15
+            const spill_slot = e.allocateSpillSlot();
+            try e.emitSpillStore(15, spill_slot);
+            try e.value_slots.put(result.id, spill_slot);
+            e.setLastResult(result.id, 15);
+            return;
+        }
+
         if (e.ir_module) |ir_mod| {
             if (routine_idx < ir_mod.functions.items.len) {
                 const callee_func = ir_mod.functions.items[routine_idx];
@@ -3301,8 +3289,16 @@ pub fn emitHeapAlloc(e: *BytecodeEmitter, h: ir.Instruction.HeapAlloc) EmitError
 /// Emit store_field_heap instruction - store value to heap record field
 /// Format: [opcode] [record_reg:4|val_reg:4] [field_idx:16]
 pub fn emitStoreFieldHeap(e: *BytecodeEmitter, s: ir.Instruction.StoreFieldHeap) EmitError!void {
+    // Get the record register first
     const record_reg = try e.getValueInReg(s.record, 0);
-    const val_reg = try e.getValueInReg(s.value, 1);
+
+    // Track the record in reg_state so it's protected from clobbering
+    // when we load the value into another register
+    e.reg_state.assignReg(s.record.id, record_reg) catch {};
+
+    // Choose a different temp register for value if record is in r0 or r1
+    const val_temp_reg: u4 = if (record_reg == 0 or record_reg == 1) 2 else 1;
+    const val_reg = try e.getValueInReg(s.value, val_temp_reg);
 
     try e.emitOpcode(.store_field);
     try e.emitU8((@as(u8, record_reg) << 4) | val_reg);

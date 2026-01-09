@@ -156,6 +156,16 @@ fn isImportedPackageFunction(l: *Lowerer, qualified_name: []const u8) bool {
     return l.imported_namespaces.contains(package_name);
 }
 
+/// Convert a type to its call-result representation.
+/// Struct types are converted to heap_record since structs are now heap-allocated.
+/// This ensures call sites handle struct returns as single pointer values.
+fn callResultType(ty: ir.Type) ir.Type {
+    if (ty == .@"struct") {
+        return .{ .heap_record = ty.@"struct" };
+    }
+    return ty;
+}
+
 /// Get return type for an imported package function
 fn getPackageFunctionReturnType(l: *Lowerer, qualified_name: []const u8) ir.Type {
     // Try to get from fn_return_types (populated from DependencyTypeContext)
@@ -625,6 +635,16 @@ pub fn lowerIdentifier(l: *Lowerer, func: *ir.Function, data: NodeData, expr_idx
         return result;
     }
 
+    // If the scope value is not a pointer (e.g., heap_record stored directly),
+    // just return it without loading
+    if (ptr.ty != .ptr) {
+        debug.print(.ir, "lowerIdentifier: '{s}' non-ptr scope value, returning directly ty={s}", .{
+            name,
+            @tagName(ptr.ty),
+        });
+        return ptr;
+    }
+
     // Load the value from the pointer - result has the dereferenced type (value_type)
     const result = func.newValue(value_type);
     debug.print(.ir, "lowerIdentifier: '{s}' ptr.ty={s} value_type={s} result.ty={s}", .{
@@ -779,6 +799,38 @@ pub fn lowerMemberPtr(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
             l.store.exprFileId(expr_idx),
             loc,
             "lowering member access",
+            .{},
+        );
+        return LowerError.UndefinedVariable;
+    }
+
+    // Handle heap_record objects: use load_field_heap to get the field value
+    // For heap records, we can't get a pointer to a field, but if the field is itself
+    // a pointer (like *AST), we return that pointer value which can be used for further access
+    if (object_ptr.ty == .heap_record) {
+        const struct_type = object_ptr.ty.heap_record;
+        for (struct_type.fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, field_name)) {
+                // For pointer fields, load and return the pointer value
+                // This allows chained access like parse_result.ast.statements
+                const result = func.newValue(field.ty);
+                try l.emit(.{
+                    .load_field_heap = .{
+                        .record = object_ptr,
+                        .field_index = @intCast(i),
+                        .result = result,
+                    },
+                });
+                return result;
+            }
+        }
+        l.setErrorContextWithFileId(
+            LowerError.UndefinedVariable,
+            "struct '{s}' has no field '{s}'",
+            .{ struct_type.name, field_name },
+            l.store.exprFileId(expr_idx),
+            loc,
+            "field not found in heap record type (lowerMemberPtr)",
             .{},
         );
         return LowerError.UndefinedVariable;
@@ -1279,7 +1331,12 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
             const struct_type = object_val.ty.heap_record;
             for (struct_type.fields, 0..) |field, i| {
                 if (std.mem.eql(u8, field.name, field_name)) {
-                    const result = func.newValue(field.ty);
+                    // If the field type is struct, convert to heap_record for consistent access.
+                    const result_ty = if (field.ty == .@"struct")
+                        ir.Type{ .heap_record = field.ty.@"struct" }
+                    else
+                        field.ty;
+                    const result = func.newValue(result_ty);
                     try l.emit(.{
                         .load_field_heap = .{
                             .record = object_val,
@@ -1411,7 +1468,13 @@ pub fn lowerMember(l: *Lowerer, func: *ir.Function, expr_idx: ExprIdx) LowerErro
         // Find field in struct type
         for (struct_type.fields, 0..) |field, i| {
             if (std.mem.eql(u8, field.name, field_name)) {
-                const result = func.newValue(field.ty);
+                // If the field type is struct, convert to heap_record for consistent access.
+                // Nested structs are also heap-allocated in the new model.
+                const result_ty = if (field.ty == .@"struct")
+                    ir.Type{ .heap_record = field.ty.@"struct" }
+                else
+                    field.ty;
+                const result = func.newValue(result_ty);
                 try l.emit(.{
                     .load_field_heap = .{
                         .record = object_val,
@@ -2431,7 +2494,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
                 // Get return type from dependency types if available
                 const result_type = getPackageFunctionReturnType(l, qualified_name);
-                const result = func.newValue(result_type);
+                const result = func.newValue(callResultType(result_type));
 
                 debug.print(.ir, "Emitting cross-package call to {s}", .{qualified_name});
 
@@ -2669,7 +2732,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     // Get return type from impl method signature
                     const result_type = l.fn_return_types.get(qualified_name) orelse
                         ir.Type{ .@"struct" = struct_type };
-                    const result = func.newValue(result_type);
+                    const result = func.newValue(callResultType(result_type));
 
                     try l.emit(.{
                         .call = .{
@@ -2734,7 +2797,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     }
 
                     const args_slice = try method_args.toOwnedSlice(l.allocator);
-                    const result = func.newValue(return_type);
+                    const result = func.newValue(callResultType(return_type));
 
                     try l.emit(.{
                         .call = .{
@@ -2994,7 +3057,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
             const args_slice = try trait_args.toOwnedSlice(l.allocator);
             const method_name = l.allocator.dupe(u8, field_name) catch return LowerError.OutOfMemory;
-            const result = func.newValue(return_type);
+            const result = func.newValue(callResultType(return_type));
 
             try l.emit(.{
                 .call_trait_method = .{
@@ -3010,10 +3073,13 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
         // Check if this is a method call on a user-defined struct type
         // This handles calls like: point.distance(other) where Point has an impl block
-        // Extract struct type from the value's type (may be direct struct or pointer to struct)
+        // Extract struct type from the value's type (may be direct struct, heap_record, or pointer to struct)
         const maybe_struct_type: ?*const ir.StructType = blk: {
             if (object_val.ty == .@"struct") {
                 break :blk object_val.ty.@"struct";
+            } else if (object_val.ty == .heap_record) {
+                // Heap-allocated struct - use the underlying struct type
+                break :blk object_val.ty.heap_record;
             } else if (object_val.ty == .ptr) {
                 // Pointer to struct
                 const pointee = object_val.ty.ptr;
@@ -3053,7 +3119,10 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 // For self by value, pass the struct value (emitter will expand if needed).
                 // When the object is a struct value and we have a pointer from lowerLValue,
                 // use the pointer so mutations via self: *T work correctly.
-                const self_arg = if (object_val.ty == .@"struct" and object_ptr != null)
+                // For heap_record, the value is already a pointer to the heap-allocated record.
+                const self_arg = if (object_val.ty == .heap_record)
+                    object_val // heap_record is already a pointer
+                else if (object_val.ty == .@"struct" and object_ptr != null)
                     object_ptr.?
                 else
                     object_val;
@@ -3078,7 +3147,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     rt
                 else
                     getBuiltinReturnType(method_name, args_slice);
-                const result = func.newValue(result_type);
+                const result = func.newValue(callResultType(result_type));
 
                 debug.print(.ir, "Dispatching method call: {s}.{s} with {d} args result_type={s}", .{ type_name, field_name, args_slice.len, @tagName(result_type) });
 
@@ -3129,7 +3198,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     rt
                 else
                     getBuiltinReturnType(qualified_name, args_slice);
-                const result = func.newValue(result_type);
+                const result = func.newValue(callResultType(result_type));
 
                 log.debug("  -> result_type={s}", .{@tagName(result_type)});
 
@@ -3181,7 +3250,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     rt
                 else
                     getBuiltinReturnType(method_name, args_slice);
-                const result = func.newValue(result_type);
+                const result = func.newValue(callResultType(result_type));
 
                 debug.print(.ir, "Dispatching fallback struct method call: {s} with {d} args result_type={s}", .{ method_name, args_slice.len, @tagName(result_type) });
 
@@ -3518,7 +3587,7 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         // Fall back to builtin return type
         break :blk getBuiltinReturnType(actual_callee, args_slice);
     };
-    const result = func.newValue(result_type);
+    const result = func.newValue(callResultType(result_type));
 
     try l.emit(.{
         .call = .{
@@ -3701,7 +3770,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
         const args_slice = try args.toOwnedSlice(l.allocator);
         const method_name = l.allocator.dupe(u8, method_name_borrowed) catch return LowerError.OutOfMemory;
-        const result = func.newValue(return_type);
+        const result = func.newValue(callResultType(return_type));
 
         try l.emit(.{
             .call_trait_method = .{
@@ -3738,6 +3807,19 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         } else {
             log.debug("lowerMethodCall: no object_ptr available, using object_val id={d} ty={s}", .{ object_val.id, @tagName(object_val.ty) });
         }
+    } else if (object_val.ty == .heap_record) {
+        // Heap-allocated struct - use the struct type name for method lookup
+        const struct_type = object_val.ty.heap_record;
+        callee_name = std.fmt.allocPrint(
+            l.allocator,
+            "{s}.{s}",
+            .{ struct_type.name, method_name_borrowed },
+        ) catch return LowerError.OutOfMemory;
+        debug.print(.ir, "lowerMethodCall: heap_record method {s}", .{callee_name});
+
+        // For heap_record methods, the object_val is already a pointer to the record
+        // Use it directly as self (no need for object_ptr indirection)
+        self_arg = object_val;
     } else if (object_val.ty == .ptr) {
         // Pointer to struct - dereference to get struct type name
         const pointee = object_val.ty.ptr.*;
@@ -3782,7 +3864,7 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         rt
     else
         getBuiltinReturnType(callee_name, args_slice);
-    const result = func.newValue(result_type);
+    const result = func.newValue(callResultType(result_type));
 
     debug.print(.ir, "lowerMethodCall: callee={s} result_type={s}", .{ callee_name, @tagName(result_type) });
 
@@ -3876,6 +3958,7 @@ pub fn lowerArrayInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 }
 
 /// Lower a struct initialization expression
+/// Uses heap allocation with record semantics for consistent field access.
 pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     const func = l.current_func orelse return LowerError.OutOfMemory;
     const data = l.store.exprData(expr_idx);
@@ -3912,34 +3995,27 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
 
     // Get field count and field data from extra
     const extra_start: ast.ExtraIdx = @enumFromInt(data.b);
-    const field_count = l.store.getExtra(extra_start);
+    const init_field_count = l.store.getExtra(extra_start);
 
-    // Create struct type for allocation
-    const struct_ir_type = ir.Type{ .@"struct" = struct_type };
-    const struct_type_ptr = try l.allocator.create(ir.Type);
-    struct_type_ptr.* = struct_ir_type;
-    try l.allocated_types.append(l.allocator, struct_type_ptr);
-
-    // Allocate stack space for struct
-    // Use a unique name combining type name and value ID to ensure each instance
-    // gets its own slots in the bytecode emitter
-    const struct_ptr = func.newValue(.{ .ptr = struct_type_ptr });
-    const unique_name = std.fmt.allocPrint(
-        l.allocator,
-        "{s}${d}",
-        .{ type_name, struct_ptr.id },
-    ) catch return LowerError.OutOfMemory;
+    // Allocate heap record for the struct
+    // Result type is heap_record which uses load_field/store_field consistently
+    const record = func.newValue(.{ .heap_record = struct_type });
+    debug.print(.ir, "struct init: allocating heap record for '{s}' with {d} fields, result.id={d}", .{
+        type_name,
+        struct_type.fields.len,
+        record.id,
+    });
     try l.emit(.{
-        .alloca = .{
-            .ty = struct_ir_type,
-            .name = unique_name,
-            .result = struct_ptr,
+        .heap_alloc = .{
+            .ty = ir.Type{ .@"struct" = struct_type },
+            .field_count = @intCast(struct_type.fields.len),
+            .result = record,
         },
     });
 
-    // Store each field
+    // Store each field using store_field_heap
     var field_i: u32 = 0;
-    while (field_i < field_count) : (field_i += 1) {
+    while (field_i < init_field_count) : (field_i += 1) {
         // Each field has: (field_name_id, expr_idx) in extra_data
         const field_name_id_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 1 + field_i * 2));
         const field_expr_raw = l.store.getExtra(@enumFromInt(@intFromEnum(extra_start) + 2 + field_i * 2));
@@ -3986,35 +4062,13 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 field_val.id,
                 @tagName(field_val.ty),
             });
-            const field_type_ptr = try l.allocator.create(ir.Type);
-            field_type_ptr.* = field_type;
-            try l.allocated_types.append(l.allocator, field_type_ptr);
 
-            // Get pointer to field
-            const field_ptr = func.newValue(.{ .ptr = field_type_ptr });
-            debug.print(.ir, "  emitting field_ptr: struct_ptr.id={d} field_idx={d} result.id={d}", .{
-                struct_ptr.id,
-                idx,
-                field_ptr.id,
-            });
+            // Store value to field using store_field_heap
             try l.emit(.{
-                .field_ptr = .{
-                    .struct_ptr = struct_ptr,
+                .store_field_heap = .{
+                    .record = record,
                     .field_index = idx,
-                    .result = field_ptr,
-                },
-            });
-
-            // Store value to field
-            debug.print(.ir, "  emitting store: ptr.id={d} val.id={d}", .{
-                field_ptr.id,
-                field_val.id,
-            });
-            try l.emit(.{
-                .store = .{
-                    .ptr = field_ptr,
                     .value = field_val,
-                    .loc = toIrLoc(loc),
                 },
             });
         } else {
@@ -4023,9 +4077,9 @@ pub fn lowerStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         // Skip unknown fields silently (could add warning)
     }
 
-    // Return pointer to struct
-    debug.print(.ir, "struct init done: returning ptr.id={d}", .{struct_ptr.id});
-    return struct_ptr;
+    // Return heap record value
+    debug.print(.ir, "struct init done: returning heap_record id={d}", .{record.id});
+    return record;
 }
 
 /// Lower a generic struct initialization expression: Box<i64>{ .value = 42 }
@@ -4128,30 +4182,23 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
     const field_count_offset = @intFromEnum(extra_start) + 1 + type_arg_count;
     const field_count = l.store.extra_data.items[field_count_offset];
 
-    // Create struct type for allocation
-    const struct_ir_type = ir.Type{ .@"struct" = struct_type };
-    const struct_type_ptr = try l.allocator.create(ir.Type);
-    struct_type_ptr.* = struct_ir_type;
-    try l.allocated_types.append(l.allocator, struct_type_ptr);
-
-    // Allocate stack space for struct
-    // Use a unique name combining type name and value ID to ensure each instance
-    // gets its own slots in the bytecode emitter
-    const struct_ptr = func.newValue(.{ .ptr = struct_type_ptr });
-    const unique_name = std.fmt.allocPrint(
-        l.allocator,
-        "{s}${d}",
-        .{ type_name, struct_ptr.id },
-    ) catch return LowerError.OutOfMemory;
+    // Allocate heap record for the struct
+    // Result type is heap_record which uses load_field/store_field consistently
+    const record = func.newValue(.{ .heap_record = struct_type });
+    debug.print(.ir, "generic struct init: allocating heap record for '{s}' with {d} fields, result.id={d}", .{
+        type_name,
+        struct_type.fields.len,
+        record.id,
+    });
     try l.emit(.{
-        .alloca = .{
-            .ty = struct_ir_type,
-            .name = unique_name,
-            .result = struct_ptr,
+        .heap_alloc = .{
+            .ty = ir.Type{ .@"struct" = struct_type },
+            .field_count = @intCast(struct_type.fields.len),
+            .result = record,
         },
     });
 
-    // Store each field
+    // Store each field using store_field_heap
     var field_i: u32 = 0;
     while (field_i < field_count) : (field_i += 1) {
         // Each field has: (field_name_id, expr_idx) in extra_data
@@ -4192,34 +4239,26 @@ pub fn lowerGenericStructInit(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Valu
                 }
             }
 
-            const field_type_ptr = try l.allocator.create(ir.Type);
-            field_type_ptr.* = field_type;
-            try l.allocated_types.append(l.allocator, field_type_ptr);
-
-            // Get pointer to field
-            const field_ptr = func.newValue(.{ .ptr = field_type_ptr });
-            try l.emit(.{
-                .field_ptr = .{
-                    .struct_ptr = struct_ptr,
-                    .field_index = idx,
-                    .result = field_ptr,
-                },
+            debug.print(.ir, "generic struct init field {d}: '{s}' val.id={d}", .{
+                idx,
+                field_name,
+                field_val.id,
             });
 
-            // Store value to field
+            // Store value to field using store_field_heap
             try l.emit(.{
-                .store = .{
-                    .ptr = field_ptr,
+                .store_field_heap = .{
+                    .record = record,
+                    .field_index = idx,
                     .value = field_val,
-                    .loc = toIrLoc(loc),
                 },
             });
         }
         // Skip unknown fields silently
     }
 
-    // Return pointer to struct
-    return struct_ptr;
+    // Return heap record value
+    return record;
 }
 
 // ============================================================================
@@ -4683,6 +4722,21 @@ pub fn lowerLambda(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // Add parameters as local variables
     var env_value: ?ir.Value = null;
     for (func_type.params, 0..) |param, i| {
+        // For struct parameters, they are now passed as heap_record pointers.
+        // Store them directly in scopes as heap_record type.
+        if (param.ty == .@"struct") {
+            const heap_record_val = lambda_func.newValue(.{ .heap_record = param.ty.@"struct" });
+            try l.emit(.{
+                .alloca = .{
+                    .ty = param.ty,
+                    .name = param.name,
+                    .result = heap_record_val,
+                },
+            });
+            l.scopes.put(param.name, heap_record_val) catch return LowerError.OutOfMemory;
+            continue;
+        }
+
         const ty_ptr = l.allocator.create(ir.Type) catch return LowerError.OutOfMemory;
         ty_ptr.* = param.ty;
         l.allocated_types.append(l.allocator, ty_ptr) catch return LowerError.OutOfMemory;
