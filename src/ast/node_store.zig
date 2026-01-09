@@ -360,6 +360,8 @@ pub const NodeStore = struct {
 
     // Type SoA arrays
     type_tags: std.ArrayListUnmanaged(TypeTag),
+    type_locs: std.ArrayListUnmanaged(SourceLoc),
+    type_file_ids: std.ArrayListUnmanaged(FileId),
     type_data: std.ArrayListUnmanaged(NodeData),
 
     // Variable-length extra data (packed u32 values)
@@ -397,6 +399,8 @@ pub const NodeStore = struct {
             .expr_file_ids = .{},
             .expr_data = .{},
             .type_tags = .{},
+            .type_locs = .{},
+            .type_file_ids = .{},
             .type_data = .{},
             .extra_data = .{},
             .scratch_stmts = .{},
@@ -427,6 +431,8 @@ pub const NodeStore = struct {
         self.expr_file_ids.deinit(self.allocator);
         self.expr_data.deinit(self.allocator);
         self.type_tags.deinit(self.allocator);
+        self.type_locs.deinit(self.allocator);
+        self.type_file_ids.deinit(self.allocator);
         self.type_data.deinit(self.allocator);
         self.extra_data.deinit(self.allocator);
         self.scratch_stmts.deinit(self.allocator);
@@ -536,6 +542,22 @@ pub const NodeStore = struct {
 
     pub fn typeData(self: *const Self, idx: TypeIdx) NodeData {
         return self.type_data.items[idx.toInt()];
+    }
+
+    pub fn typeLoc(self: *const Self, idx: TypeIdx) SourceLoc {
+        const type_idx = idx.toInt();
+        if (type_idx < self.type_locs.items.len) {
+            return self.type_locs.items[type_idx];
+        }
+        return SourceLoc.unknown;
+    }
+
+    pub fn typeFileId(self: *const Self, idx: TypeIdx) FileId {
+        const type_idx = idx.toInt();
+        if (type_idx < self.type_file_ids.items.len) {
+            return self.type_file_ids.items[type_idx];
+        }
+        return .unknown;
     }
 
     // ========================================
@@ -953,29 +975,35 @@ pub const NodeStore = struct {
     // Type Builders
     // ========================================
 
-    /// Add a primitive type
-    pub fn addPrimitiveType(self: *Self, tag: TypeTag) !TypeIdx {
+    /// Internal helper to append a type with all tracking arrays
+    fn appendType(self: *Self, tag: TypeTag, loc: SourceLoc, data: NodeData) !TypeIdx {
         const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
         try self.type_tags.append(self.allocator, tag);
-        try self.type_data.append(self.allocator, NodeData.empty);
+        try self.type_locs.append(self.allocator, loc);
+        try self.type_file_ids.append(self.allocator, self.current_file_id);
+        try self.type_data.append(self.allocator, data);
         return idx;
+    }
+
+    /// Add a primitive type
+    pub fn addPrimitiveType(self: *Self, tag: TypeTag) !TypeIdx {
+        return self.appendType(tag, SourceLoc.unknown, NodeData.empty);
     }
 
     /// Add a decimal type (DBL decimal type like d6)
     /// precision is the number of digits, scale is decimal places (0 for integers)
     pub fn addDecimalType(self: *Self, precision: u32, scale: u32) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .decimal);
-        try self.type_data.append(self.allocator, .{ .a = precision, .b = scale });
-        return idx;
+        return self.appendType(.decimal, SourceLoc.unknown, .{ .a = precision, .b = scale });
     }
 
-    /// Add a named type reference
+    /// Add a named type reference (with source location for error reporting)
+    pub fn addNamedTypeLoc(self: *Self, name: StringId, loc: SourceLoc) !TypeIdx {
+        return self.appendType(.named, loc, NodeData.identifier(name));
+    }
+
+    /// Add a named type reference (without location - for backwards compatibility)
     pub fn addNamedType(self: *Self, name: StringId) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .named);
-        try self.type_data.append(self.allocator, NodeData.identifier(name));
-        return idx;
+        return self.addNamedTypeLoc(name, SourceLoc.unknown);
     }
 
     /// Add a Self type (used for untyped 'self' parameter in methods)
@@ -987,92 +1015,59 @@ pub const NodeStore = struct {
 
     /// Add an array type
     pub fn addArrayType(self: *Self, elem_type: TypeIdx, size: u32) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .array);
-        try self.type_data.append(self.allocator, .{ .a = elem_type.toInt(), .b = size });
-        return idx;
+        return self.appendType(.array, SourceLoc.unknown, .{ .a = elem_type.toInt(), .b = size });
     }
 
     /// Add a slice type
     pub fn addSliceType(self: *Self, elem_type: TypeIdx) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .slice);
-        try self.type_data.append(self.allocator, .{ .a = elem_type.toInt(), .b = 0 });
-        return idx;
+        return self.appendType(.slice, SourceLoc.unknown, .{ .a = elem_type.toInt(), .b = 0 });
     }
 
     /// Add an optional type
     pub fn addOptionalType(self: *Self, inner_type: TypeIdx) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .optional);
-        try self.type_data.append(self.allocator, .{ .a = inner_type.toInt(), .b = 0 });
-        return idx;
+        return self.appendType(.optional, SourceLoc.unknown, .{ .a = inner_type.toInt(), .b = 0 });
     }
 
     /// Add a weak reference type: weak T
     /// Weak references don't keep the referenced value alive (for breaking cycles)
     pub fn addWeakType(self: *Self, inner_type: TypeIdx) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .weak);
-        try self.type_data.append(self.allocator, .{ .a = inner_type.toInt(), .b = 0 });
-        return idx;
+        return self.appendType(.weak, SourceLoc.unknown, .{ .a = inner_type.toInt(), .b = 0 });
     }
 
     /// Add an error union type: T!E (value_type!error_type)
     pub fn addErrorUnionType(self: *Self, value_type: TypeIdx, error_type: TypeIdx) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .error_union);
-        try self.type_data.append(self.allocator, .{ .a = value_type.toInt(), .b = error_type.toInt() });
-        return idx;
+        return self.appendType(.error_union, SourceLoc.unknown, .{ .a = value_type.toInt(), .b = error_type.toInt() });
     }
 
     /// Add a map type: Map<K, V>
     pub fn addMapType(self: *Self, key_type: TypeIdx, value_type: TypeIdx) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .map);
-        try self.type_data.append(self.allocator, .{ .a = key_type.toInt(), .b = value_type.toInt() });
-        return idx;
+        return self.appendType(.map, SourceLoc.unknown, .{ .a = key_type.toInt(), .b = value_type.toInt() });
     }
 
     /// Add a list type: List<T>
     pub fn addListType(self: *Self, element_type: TypeIdx) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .list);
-        try self.type_data.append(self.allocator, .{ .a = element_type.toInt(), .b = 0 });
-        return idx;
+        return self.appendType(.list, SourceLoc.unknown, .{ .a = element_type.toInt(), .b = 0 });
     }
 
     /// Add an associated type reference: Self.Item or T.Item
     pub fn addAssociatedType(self: *Self, base_type: TypeIdx, assoc_name: StringId) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .associated_type);
-        try self.type_data.append(self.allocator, .{ .a = base_type.toInt(), .b = @intFromEnum(assoc_name) });
-        return idx;
+        return self.appendType(.associated_type, SourceLoc.unknown, .{ .a = base_type.toInt(), .b = @intFromEnum(assoc_name) });
     }
 
     /// Add a trait object type: dyn Trait
     pub fn addTraitObjectType(self: *Self, trait_name: StringId) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .trait_object);
-        try self.type_data.append(self.allocator, .{ .a = @intFromEnum(trait_name), .b = 0 });
-        return idx;
+        return self.appendType(.trait_object, SourceLoc.unknown, .{ .a = @intFromEnum(trait_name), .b = 0 });
     }
 
     /// Add a pointer type
     pub fn addPointerType(self: *Self, pointee: TypeIdx, mutability: Mutability) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .pointer);
-        try self.type_data.append(self.allocator, .{ .a = pointee.toInt(), .b = @intFromEnum(mutability) });
-        return idx;
+        return self.appendType(.pointer, SourceLoc.unknown, .{ .a = pointee.toInt(), .b = @intFromEnum(mutability) });
     }
 
     /// Add a type parameter reference (e.g., T in fn foo<T>)
     /// index: the position of this type param in the enclosing generic context (0 for first, 1 for second, etc.)
     pub fn addTypeParam(self: *Self, name: StringId, index: u16) !TypeIdx {
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .type_param);
-        try self.type_data.append(self.allocator, .{ .a = @intFromEnum(name), .b = index });
-        return idx;
+        return self.appendType(.type_param, SourceLoc.unknown, .{ .a = @intFromEnum(name), .b = index });
     }
 
     /// Add a generic instantiation (e.g., Vec<i32>)
@@ -1085,12 +1080,7 @@ pub const NodeStore = struct {
         for (type_args) |arg| {
             try self.extra_data.append(self.allocator, arg.toInt());
         }
-
-        const idx: TypeIdx = @enumFromInt(@as(u32, @intCast(self.type_tags.items.len)));
-        try self.type_tags.append(self.allocator, .generic_instance);
-        // Pack: base type in a, args_start in b
-        try self.type_data.append(self.allocator, .{ .a = base_type.toInt(), .b = args_start });
-        return idx;
+        return self.appendType(.generic_instance, SourceLoc.unknown, .{ .a = base_type.toInt(), .b = args_start });
     }
 
     // ========================================

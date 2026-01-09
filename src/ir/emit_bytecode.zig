@@ -91,6 +91,14 @@ const DerivedStackPtrInfo = struct {
     field_offset: u16, // Offset to add to create the derived pointer
 };
 
+/// Heap field pointer information for accessing fields through heap record pointers.
+/// When a pointer to a heap-allocated struct is in a register (e.g., from list_get),
+/// we need to use load_field instead of load_local to access its fields.
+const HeapFieldPtrInfo = struct {
+    struct_ptr_id: u32, // Value ID of the heap record pointer
+    field_index: u32, // Field index to access
+};
+
 /// Register allocator for register-based bytecode emission
 /// Uses a linear scan approach with 16 virtual registers (r0-r15)
 pub const RegisterAllocator = struct {
@@ -282,6 +290,12 @@ pub const BytecodeEmitter = struct {
     // Used by emitFieldPtr to detect field access through loaded pointer values
     dynamic_stack_ptr_sources: std.AutoHashMap(u32, u16), // loaded_value_id -> ptr_slot
 
+    // Heap field pointer tracking
+    // Maps field_ptr result ID to info needed to emit load_field for heap records.
+    // Used when accessing fields through a heap record pointer in a register
+    // (e.g., pointer returned from list_get, or loaded from a pointer variable)
+    heap_field_ptrs: std.AutoHashMap(u32, HeapFieldPtrInfo), // field_ptr_result_id -> info
+
     // Current routine being emitted
     current_routine_start: u32,
 
@@ -346,6 +360,7 @@ pub const BytecodeEmitter = struct {
             .derived_stack_ptrs = std.AutoHashMap(u32, DerivedStackPtrInfo).init(allocator),
             .ptr_to_struct_local_allocas = std.AutoHashMap(u32, u16).init(allocator),
             .dynamic_stack_ptr_sources = std.AutoHashMap(u32, u16).init(allocator),
+            .heap_field_ptrs = std.AutoHashMap(u32, HeapFieldPtrInfo).init(allocator),
             .current_routine_start = 0,
             .current_func = null,
             .ir_module = null,
@@ -377,6 +392,7 @@ pub const BytecodeEmitter = struct {
         self.derived_stack_ptrs.deinit();
         self.ptr_to_struct_local_allocas.deinit();
         self.dynamic_stack_ptr_sources.deinit();
+        self.heap_field_ptrs.deinit();
         self.reg_alloc.deinit();
         self.spilled_values.deinit();
         // Free escape analysis results if any
@@ -611,6 +627,7 @@ pub const BytecodeEmitter = struct {
         self.derived_stack_ptrs.clearRetainingCapacity();
         self.ptr_to_struct_local_allocas.clearRetainingCapacity();
         self.dynamic_stack_ptr_sources.clearRetainingCapacity();
+        self.heap_field_ptrs.clearRetainingCapacity();
         self.value_consts.clearRetainingCapacity();
         self.reg_alloc.reset(); // Reset register allocation for new function
         self.last_result_value = null; // Reset last result tracking
@@ -1372,6 +1389,24 @@ pub const BytecodeEmitter = struct {
             return;
         }
 
+        // Check if value is a heap field pointer (field accessed through heap record pointer)
+        // Emit load_field: dest = record_reg.fields[field_index]
+        if (self.heap_field_ptrs.get(value.id)) |info| {
+            debug.print(.emit, "emitValueToReg: heap field ptr value_id={d} struct_ptr_id={d} field_index={d} -> r{d}", .{
+                value.id, info.struct_ptr_id, info.field_index, dest,
+            });
+            // Get the heap record pointer into a register (use a temp register that won't conflict)
+            const struct_ptr_reg: u4 = if (dest == 0) 1 else 0;
+            const actual_struct_reg = try self.getValueInRegById(info.struct_ptr_id, struct_ptr_reg);
+
+            // Emit load_field: dest = rs.fields[field_index]
+            // Format: [rd:4|rs:4] [field_idx:16]
+            try self.emitOpcode(.load_field);
+            try self.emitU8((@as(u8, dest) << 4) | actual_struct_reg);
+            try self.emitU16(@intCast(info.field_index));
+            return;
+        }
+
         // Check if this is a stack pointer value (from a pointer-to-struct parameter)
         // These are tracked in stack_ptr_value_ids and should be loaded directly
         // (the slot already contains a StackPtr value, no need for get_local_ptr)
@@ -1435,6 +1470,54 @@ pub const BytecodeEmitter = struct {
                 return;
             }
         }
+    }
+
+    /// Get a value into a register by its ID (when we don't have the full ir.Value).
+    /// This is used when we need to load a value that was tracked separately (e.g., heap field pointers).
+    fn getValueInRegById(self: *Self, value_id: u32, temp_reg: u4) EmitError!u4 {
+        // Check if this is the last computed result (SSA chaining)
+        if (self.last_result_value) |last_id| {
+            if (last_id == value_id) {
+                return self.last_result_reg;
+            }
+        }
+
+        // If value is already in a register, use that
+        if (self.reg_alloc.getRegister(value_id)) |src| {
+            return src;
+        }
+
+        // Check if value was spilled - reload it into temp_reg
+        if (self.spilled_values.get(value_id)) |spill_slot| {
+            try self.emitSpillLoad(temp_reg, spill_slot);
+            return temp_reg;
+        }
+
+        // Check if value is a constant - load into temp register
+        if (self.value_consts.get(value_id)) |const_idx| {
+            try self.emitRegLoadConst(temp_reg, const_idx);
+            return temp_reg;
+        }
+
+        // Check if value is in a slot - load into temp register
+        if (self.value_slots.get(value_id)) |slot_info| {
+            if (slot_info & 0x8000 != 0) {
+                // Global variable
+                const slot = slot_info & 0x7FFF;
+                try self.emitRegLoadGlobal(temp_reg, slot);
+            } else if (slot_info < 256) {
+                try self.emitRegLoadLocal(temp_reg, @intCast(slot_info));
+            } else {
+                try self.emitOpcode(.load_local16);
+                try self.emitU8(@as(u8, temp_reg) << 4);
+                try self.emitU16(@intCast(slot_info));
+            }
+            return temp_reg;
+        }
+
+        // Fallback - value not found, return temp_reg and hope for the best
+        debug.print(.emit, "WARNING: getValueInRegById fallback for value_id={d}", .{value_id});
+        return temp_reg;
     }
 
     /// Get or allocate a register for a value, or load it into a temp register if it's a constant/slot
@@ -1538,6 +1621,25 @@ pub const BytecodeEmitter = struct {
             try self.emitOpcode(.load_indirect);
             try self.emitU8((@as(u8, temp_reg) << 4) | temp_reg);
             try self.emitU16(info.field_offset);
+            return temp_reg;
+        }
+
+        // Check if value is a heap field pointer (field accessed through heap record pointer)
+        // Emit load_field: rd = record_reg.fields[field_index]
+        if (self.heap_field_ptrs.get(value.id)) |info| {
+            debug.print(.emit, "  -> heap field ptr path: struct_ptr_id={d} field_index={d} -> r{d}", .{
+                info.struct_ptr_id, info.field_index, temp_reg,
+            });
+            // Get the heap record pointer into a register
+            // Use a different temp register to avoid clobbering
+            const struct_ptr_reg: u4 = if (temp_reg == 0) 1 else 0;
+            const actual_struct_reg = try self.getValueInRegById(info.struct_ptr_id, struct_ptr_reg);
+
+            // Emit load_field: rd = rs.fields[field_index]
+            // Format: [rd:4|rs:4] [field_idx:16]
+            try self.emitOpcode(.load_field);
+            try self.emitU8((@as(u8, temp_reg) << 4) | actual_struct_reg);
+            try self.emitU16(@intCast(info.field_index));
             return temp_reg;
         }
 

@@ -347,6 +347,18 @@ pub fn emitLoad(e: *BytecodeEmitter, l: ir.Instruction.Load) EmitError!void {
         return; // No bytecode emitted for loads from indirect fields
     }
 
+    // Propagate heap field pointer info through loads
+    // When loading from a field_ptr result that's in heap_field_ptrs, propagate the info
+    // The actual load_field bytecode will be emitted when getValueInReg is called on the result
+    if (e.heap_field_ptrs.get(l.ptr.id)) |info| {
+        try e.heap_field_ptrs.put(l.result.id, info);
+        debug.print(.emit, "load: propagate heap_field_ptrs ptr.id={d} -> result.id={d} struct_ptr_id={d} field_index={d}", .{
+            l.ptr.id, l.result.id, info.struct_ptr_id, info.field_index,
+        });
+        // No bytecode emitted here - load_field will be emitted in getValueInReg
+        return;
+    }
+
     // Propagate struct_base_slots - when loading from a struct pointer,
     // the loaded value also needs to know where its fields are stored
     if (e.struct_base_slots.get(l.ptr.id)) |base_slot| {
@@ -453,6 +465,22 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
         try e.emitOpcode(.store_indirect);
         try e.emitU8((1 << 4) | 0); // r1 (ptr), r0 (val)
         try e.emitU16(info.field_offset);
+        return;
+    }
+
+    // Check if this is a heap field store (storing through heap record pointer from function call)
+    if (e.heap_field_ptrs.get(s.ptr.id)) |info| {
+        debug.print(.emit, "store: heap field struct_ptr_id={d} field_index={d}", .{
+            info.struct_ptr_id, info.field_index,
+        });
+        // Get the heap record pointer into r0
+        const record_reg = try e.getValueInReg(ir.Value{ .id = info.struct_ptr_id, .ty = .void }, 0);
+        // Get the value to store into r1
+        const val_reg = try e.getValueInReg(s.value, 1);
+        // Emit store_field: [opcode] [record_reg:4|val_reg:4] [field_idx:16]
+        try e.emitOpcode(.store_field);
+        try e.emitU8((@as(u8, record_reg) << 4) | val_reg);
+        try e.emitU16(@intCast(info.field_index));
         return;
     }
 
@@ -590,6 +618,13 @@ pub fn emitStore(e: *BytecodeEmitter, s: ir.Instruction.Store) EmitError!void {
                 try e.emitU16(@intCast(slot_info));
             }
         }
+        // Track that the stored value can be reloaded from this slot.
+        // This is critical for heap pointers (e.g., from list_get) that need to be
+        // accessed multiple times - after register clobbering, we can reload from the slot.
+        try e.value_slots.put(s.value.id, slot_info);
+        debug.print(.emit, "store: tracking value.id={d} in slot {d} for reload", .{
+            s.value.id, slot_info & 0x7FFF,
+        });
     }
 }
 
@@ -766,11 +801,23 @@ pub fn emitFieldPtr(e: *BytecodeEmitter, fp: ir.Instruction.FieldPtr) EmitError!
 
     // Direct field access - First check struct_base_slots (for stack-allocated structs from alloca),
     // then fall back to value_slots (for other pointer sources like parameters)
-    const struct_slot = e.struct_base_slots.get(fp.struct_ptr.id) orelse
-        e.value_slots.get(fp.struct_ptr.id) orelse {
-        debug.print(.emit, "WARNING: field_ptr struct_ptr.id={d} not found in struct_base_slots or value_slots", .{fp.struct_ptr.id});
+    const struct_slot_opt = e.struct_base_slots.get(fp.struct_ptr.id) orelse
+        e.value_slots.get(fp.struct_ptr.id);
+
+    if (struct_slot_opt == null) {
+        // struct_ptr is not in any slot table - it's likely a heap record pointer in a register
+        // (e.g., from list_get, new, or loaded from a pointer variable)
+        // Track this as a heap field pointer so emitLoad can emit load_field
+        debug.print(.emit, "field_ptr: struct_ptr.id={d} not in slots - tracking as heap field ptr (field_index={d})", .{
+            fp.struct_ptr.id, fp.field_index,
+        });
+        try e.heap_field_ptrs.put(fp.result.id, .{
+            .struct_ptr_id = fp.struct_ptr.id,
+            .field_index = fp.field_index,
+        });
         return;
-    };
+    }
+    const struct_slot = struct_slot_opt.?;
 
     // Get the struct type to calculate proper offset
     const struct_type: ?*const ir.StructType = if (fp.struct_ptr.ty == .@"struct")
@@ -1470,7 +1517,10 @@ fn emitUserCall(e: *BytecodeEmitter, c: ir.Instruction.Call, routine_idx: u16) E
 
     // First pass: calculate total slots needed to determine if we need stack overflow
     var total_slots: usize = 0;
+    // Trace arguments for debugging method call issues (pointer vs struct expansion)
+    debug.print(.emit, "emitUserCall: callee={s} args.len={d}", .{ c.callee, c.args.len });
     for (c.args, 0..) |arg, arg_idx| {
+        debug.print(.emit, "emitUserCall: arg[{d}] id={d} ty={s}", .{ arg_idx, arg.id, @tagName(arg.ty) });
         // Check for struct type by value (NOT pointer-to-struct).
         // A pointer like *Expr is just 8 bytes regardless of what it points to.
         // Only actual struct values need multiple slots.
@@ -2379,12 +2429,12 @@ pub fn emitMapNew(e: *BytecodeEmitter, mn: ir.Instruction.MapNew) EmitError!void
 }
 
 /// Emit map_set instruction
+/// NOTE: For Map<K, *V> (pointers to structs), we use regular map_set since
+/// we're storing the pointer value, not the struct itself.
 pub fn emitMapSet(e: *BytecodeEmitter, ms: ir.Instruction.MapSet) EmitError!void {
-    // Check if this is a struct value being stored
+    // Check if this is a struct value being stored (NOT a pointer to struct)
     const struct_type_opt: ?*const ir.StructType = if (ms.value.ty == .@"struct")
         ms.value.ty.@"struct"
-    else if (ms.value.ty == .ptr and ms.value.ty.ptr.* == .@"struct")
-        ms.value.ty.ptr.*.@"struct"
     else
         null;
 
@@ -2417,12 +2467,12 @@ pub fn emitMapSet(e: *BytecodeEmitter, ms: ir.Instruction.MapSet) EmitError!void
 
 /// Emit map_get instruction
 /// For struct value types, emits map_get_struct to expand to high registers.
+/// NOTE: For Map<K, *V> (pointers to structs), we use regular map_get since
+/// we're retrieving the pointer value, not the struct itself.
 pub fn emitMapGet(e: *BytecodeEmitter, mg: ir.Instruction.MapGet) EmitError!void {
-    // Check if the result type is a struct
+    // Check if the result type is a struct (NOT a pointer to struct)
     const struct_type_opt: ?*const ir.StructType = if (mg.result.ty == .@"struct")
         mg.result.ty.@"struct"
-    else if (mg.result.ty == .ptr and mg.result.ty.ptr.* == .@"struct")
-        mg.result.ty.ptr.*.@"struct"
     else
         null;
 
@@ -2546,12 +2596,12 @@ pub fn emitListNew(e: *BytecodeEmitter, ln: ir.Instruction.ListNew) EmitError!vo
 
 /// Emit list_push instruction
 /// For struct types, emits list_push_struct to handle multi-slot values.
+/// NOTE: For List<*T> (pointers to structs), we use regular list_push since
+/// we're storing the pointer value, not the struct itself.
 pub fn emitListPush(e: *BytecodeEmitter, lp: ir.Instruction.ListPush) EmitError!void {
-    // Check if this is a struct value being pushed
+    // Check if this is a struct value being pushed (NOT a pointer to struct)
     const struct_type_opt: ?*const ir.StructType = if (lp.value.ty == .@"struct")
         lp.value.ty.@"struct"
-    else if (lp.value.ty == .ptr and lp.value.ty.ptr.* == .@"struct")
-        lp.value.ty.ptr.*.@"struct"
     else
         null;
 
@@ -2582,12 +2632,12 @@ pub fn emitListPush(e: *BytecodeEmitter, lp: ir.Instruction.ListPush) EmitError!
 
 /// Emit list_pop instruction
 /// For struct element types, emits list_pop_struct to expand to consecutive slots.
+/// NOTE: For List<*T> (pointers to structs), we use regular list_pop since
+/// we're retrieving the pointer value, not the struct itself.
 pub fn emitListPop(e: *BytecodeEmitter, lp: ir.Instruction.ListPop) EmitError!void {
-    // Check if the result type is a struct
+    // Check if the result type is a struct (NOT a pointer to struct)
     const struct_type_opt: ?*const ir.StructType = if (lp.result.ty == .@"struct")
         lp.result.ty.@"struct"
-    else if (lp.result.ty == .ptr and lp.result.ty.ptr.* == .@"struct")
-        lp.result.ty.ptr.*.@"struct"
     else
         null;
 
@@ -2622,12 +2672,12 @@ pub fn emitListPop(e: *BytecodeEmitter, lp: ir.Instruction.ListPop) EmitError!vo
 /// Emit list_get instruction
 /// For struct element types, emits list_get_struct which writes directly to slots.
 /// This avoids the 16-register limitation by using slot-based storage.
+/// NOTE: For List<*T> (pointers to structs), we use regular list_get since
+/// we're retrieving the pointer value, not the struct itself.
 pub fn emitListGet(e: *BytecodeEmitter, lg: ir.Instruction.ListGet) EmitError!void {
-    // Check if the result type is a struct
+    // Check if the result type is a struct (NOT a pointer to struct)
     const struct_type_opt: ?*const ir.StructType = if (lg.result.ty == .@"struct")
         lg.result.ty.@"struct"
-    else if (lg.result.ty == .ptr and lg.result.ty.ptr.* == .@"struct")
-        lg.result.ty.ptr.*.@"struct"
     else
         null;
 
@@ -2668,12 +2718,12 @@ pub fn emitListGet(e: *BytecodeEmitter, lg: ir.Instruction.ListGet) EmitError!vo
 
 /// Emit list_set instruction
 /// For struct element types, emits list_set_struct to pack from consecutive slots.
+/// NOTE: For List<*T> (pointers to structs), we use regular list_set since
+/// we're storing the pointer value, not the struct itself.
 pub fn emitListSet(e: *BytecodeEmitter, ls: ir.Instruction.ListSet) EmitError!void {
-    // Check if the value type is a struct
+    // Check if the value type is a struct (NOT a pointer to struct)
     const struct_type_opt: ?*const ir.StructType = if (ls.value.ty == .@"struct")
         ls.value.ty.@"struct"
-    else if (ls.value.ty == .ptr and ls.value.ty.ptr.* == .@"struct")
-        ls.value.ty.ptr.*.@"struct"
     else
         null;
 

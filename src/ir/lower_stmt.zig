@@ -210,19 +210,28 @@ pub fn lowerAssignment(l: *Lowerer, data: NodeData, loc: ?ir.SourceLoc) LowerErr
     }
 
     // Check if target is a member access on a heap record: p.x = value
+    // Also handles pointer-to-struct types (from function calls returning *Struct)
     if (target_tag == .member) {
         const target_data = l.store.exprData(target_idx);
         const object_idx = target_data.getObject();
         const field_id = target_data.getField();
 
-        // Try to lower the object to see if it's a heap record
+        // Try to lower the object to see if it's a heap record or pointer-to-struct
         const object_val = try l.lowerExpression(object_idx);
-        if (object_val.ty == .heap_record) {
-            const struct_type = object_val.ty.heap_record;
+
+        // Get struct type from heap_record or ptr-to-struct
+        const struct_type: ?*const ir.StructType = if (object_val.ty == .heap_record)
+            object_val.ty.heap_record
+        else if (object_val.ty == .ptr and object_val.ty.ptr.* == .@"struct")
+            object_val.ty.ptr.*.@"struct"
+        else
+            null;
+
+        if (struct_type) |st| {
             const field_name = l.strings.get(field_id);
 
             // Find field index in struct type
-            for (struct_type.fields, 0..) |field, i| {
+            for (st.fields, 0..) |field, i| {
                 if (std.mem.eql(u8, field.name, field_name)) {
                     const value = try l.lowerExpression(value_idx);
                     try l.emit(.{
@@ -1039,12 +1048,16 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
         }
     } else if (init_val) |val| {
         // Infer type from init expression
-        // If init is a pointer to struct/array (from struct/array init expression),
-        // infer the underlying type so `var f = Foo{...}` has type Foo, not *Foo.
-        // This ensures the aliasing optimization below is triggered.
+        // If init is a pointer to array (from array init expression),
+        // infer the underlying type so `var arr = [1, 2, 3]` has type [3]i64, not *[3]i64.
+        // This ensures the array aliasing optimization below is triggered.
+        //
+        // NOTE: We do NOT strip the pointer for struct types anymore.
+        // When the init is a method call returning *Struct (like `items.get(0)`),
+        // we need to keep the pointer type so the value can be stored and reloaded.
         if (val.ty == .ptr) {
             const pointee = val.ty.ptr.*;
-            if (pointee == .@"struct" or pointee == .array) {
+            if (pointee == .array) {
                 var_type = pointee;
             } else {
                 var_type = val.ty;
@@ -1074,19 +1087,25 @@ pub fn lowerLetDecl(l: *Lowerer, data: NodeData) LowerError!void {
         }
     }
 
-    // Special case: if init_val is a pointer to a struct or array (from struct/array init),
-    // AND the declared type is the struct/array itself (not a pointer type),
+    // Special case: if init_val is a pointer to an array (from array init),
+    // AND the declared type is the array itself (not a pointer type),
     // use the pointer directly instead of creating a wrapper pointer. This ensures that
-    // field_ptr and array indexing calculations work correctly in the slot-based VM.
+    // array indexing calculations work correctly in the slot-based VM.
+    //
+    // NOTE: We do NOT apply this optimization for struct pointers anymore.
+    // When the init is a method call returning *Struct (like `items.get(0)`),
+    // the pointer value must be stored in a local slot so it can be reloaded
+    // after register clobbering. The aliasing optimization assumed the pointer
+    // would remain in its register, which is not safe.
     //
     // This does NOT apply when the declared type is a pointer (e.g., var ptr: *Node = &node),
     // because in that case we need the normal *(*Node) storage pattern.
     if (init_val) |val| {
         if (val.ty == .ptr and var_type != .ptr) {
             const pointee = val.ty.ptr.*;
-            if (pointee == .@"struct" or pointee == .array) {
-                // Register this variable name as an alias to the struct/array pointer
-                // The struct/array init already allocated slots for the fields/elements
+            if (pointee == .array) {
+                // Register this variable name as an alias to the array pointer
+                // The array init already allocated slots for the elements
                 try l.scopes.put(name, val);
                 return;
             }

@@ -164,6 +164,49 @@ pub const Parser = struct {
         return self.strings.intern(str);
     }
 
+    /// Process escape sequences in a string literal
+    /// Returns owned memory that must be freed by caller if different from input
+    fn processEscapes(self: *Self, str: []const u8) ![]const u8 {
+        // Quick check: does the string contain any backslashes?
+        var has_escape = false;
+        for (str) |c| {
+            if (c == '\\') {
+                has_escape = true;
+                break;
+            }
+        }
+        if (!has_escape) {
+            return str;
+        }
+
+        // Process escapes
+        var result = std.ArrayListUnmanaged(u8){};
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < str.len) {
+            if (str[i] == '\\' and i + 1 < str.len) {
+                const next = str[i + 1];
+                const escaped: u8 = switch (next) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    '"' => '"',
+                    '0' => 0,
+                    else => next, // Unknown escape, keep as-is
+                };
+                try result.append(self.allocator, escaped);
+                i += 2;
+            } else {
+                try result.append(self.allocator, str[i]);
+                i += 1;
+            }
+        }
+
+        return result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+    }
+
     // ============================================================
     // Main Parse Entry Point
     // ============================================================
@@ -1717,7 +1760,8 @@ pub const Parser = struct {
         // String literal
         if (self.match(&[_]TokenType{.string_literal})) {
             const lexeme = self.previous().lexeme;
-            const str = if (lexeme.len >= 2) lexeme[1 .. lexeme.len - 1] else lexeme;
+            const raw_str = if (lexeme.len >= 2) lexeme[1 .. lexeme.len - 1] else lexeme;
+            const str = self.processEscapes(raw_str) catch return error.OutOfMemory;
             const str_id = self.internString(str) catch return error.OutOfMemory;
             return self.store.addStringLiteral(str_id, loc) catch return error.OutOfMemory;
         }
@@ -2542,8 +2586,9 @@ pub const Parser = struct {
             return self.maybeParseAssociatedType(base_type);
         }
 
-        // Plain named type reference
-        const base_type = self.store.addNamedType(name_id) catch return error.OutOfMemory;
+        // Plain named type reference - pass location for error reporting
+        const type_loc = SourceLoc.init(@intCast(name_token.line), @intCast(name_token.column));
+        const base_type = self.store.addNamedTypeLoc(name_id, type_loc) catch return error.OutOfMemory;
         // Check for associated type: Self.Item or TypeName.Item
         return self.maybeParseAssociatedType(base_type);
     }

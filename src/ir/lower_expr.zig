@@ -2659,6 +2659,22 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
         }
 
         // Check if this is a method call on a map instance: m.set(), m.get(), etc.
+        // For struct method calls with self: *T, we need to pass a pointer, not a copy.
+        // If the object is an lvalue (field access, variable), get its address.
+        const object_is_lvalue = switch (object_tag) {
+            .identifier, .member, .index => true,
+            else => false,
+        };
+        var object_ptr: ?ir.Value = null;
+        if (object_is_lvalue) {
+            object_ptr = lowerLValue(l, object_idx) catch |err| blk: {
+                debug.print(.ir, "lowerCall: lowerLValue failed with {s} for object", .{@errorName(err)});
+                break :blk null;
+            };
+            if (object_ptr) |ptr| {
+                debug.print(.ir, "lowerCall: got object_ptr.ty={s} for method call", .{@tagName(ptr.ty)});
+            }
+        }
         const object_val = try lowerExpression(l, object_idx);
         if (isMapType(object_val.ty)) {
             // Lower arguments
@@ -2940,11 +2956,16 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                     return LowerError.OutOfMemory;
                 };
 
-                // For struct instance method calls, pass self as a single struct value.
-                // The bytecode emitter will expand the struct if needed.
-                // Note: This matches the callee's expectation of receiving self as a value
-                // that can be accessed via field offsets.
-                try method_args.append(l.allocator, object_val);
+                // For struct instance method calls that take self: *T, pass a pointer.
+                // For self by value, pass the struct value (emitter will expand if needed).
+                // When the object is a struct value and we have a pointer from lowerLValue,
+                // use the pointer so mutations via self: *T work correctly.
+                const self_arg = if (object_val.ty == .@"struct" and object_ptr != null)
+                    object_ptr.?
+                else
+                    object_val;
+                debug.print(.ir, "lowerCall: inherent impl self_arg.ty={s}", .{@tagName(self_arg.ty)});
+                try method_args.append(l.allocator, self_arg);
 
                 // Then the explicit arguments
                 for (0..args_count) |i| {
@@ -2987,8 +3008,13 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer method_args.deinit(l.allocator);
 
-                // For struct instance method calls, pass self as a single struct value.
-                try method_args.append(l.allocator, object_val);
+                // For struct instance method calls that take self: *T, pass a pointer.
+                const self_arg = if (object_val.ty == .@"struct" and object_ptr != null)
+                    object_ptr.?
+                else
+                    object_val;
+                debug.print(.ir, "lowerCall: trait impl self_arg.ty={s}", .{@tagName(self_arg.ty)});
+                try method_args.append(l.allocator, self_arg);
 
                 // Then the explicit arguments
                 for (0..args_count) |i| {
@@ -3031,8 +3057,13 @@ pub fn lowerCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
                 var method_args: std.ArrayListUnmanaged(ir.Value) = .{};
                 defer method_args.deinit(l.allocator);
 
-                // For struct instance method calls, pass self as a single struct value.
-                try method_args.append(l.allocator, object_val);
+                // For struct instance method calls that take self: *T, pass a pointer.
+                const self_arg = if (object_val.ty == .@"struct" and object_ptr != null)
+                    object_ptr.?
+                else
+                    object_val;
+                debug.print(.ir, "lowerCall: fallback self_arg.ty={s}", .{@tagName(self_arg.ty)});
+                try method_args.append(l.allocator, self_arg);
 
                 // Then explicit arguments
                 for (0..args_count) |i| {
@@ -3408,7 +3439,13 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     var object_ptr: ?ir.Value = null;
     if (object_is_lvalue) {
         // Try to get pointer to the object for methods that take self: *T
-        object_ptr = lowerLValue(l, object_idx) catch null;
+        object_ptr = lowerLValue(l, object_idx) catch |err| blk: {
+            debug.print(.ir, "lowerMethodCall: lowerLValue failed with {s} for {s}", .{ @errorName(err), @tagName(object_tag) });
+            break :blk null;
+        };
+        if (object_ptr) |ptr| {
+            debug.print(.ir, "lowerMethodCall: lowerLValue succeeded, ptr.ty={s}", .{@tagName(ptr.ty)});
+        }
     }
     // Always get object value for type checking
     object_val = try lowerExpression(l, object_idx);
@@ -3600,6 +3637,11 @@ pub fn lowerMethodCall(l: *Lowerer, expr_idx: ExprIdx) LowerError!ir.Value {
     // Build arguments: self first, then remaining args
     var args: std.ArrayListUnmanaged(ir.Value) = .{};
     defer args.deinit(l.allocator);
+    // Trace argument type for debugging method calls (helps diagnose pointer vs struct issues)
+    debug.print(.ir, "lowerMethodCall: callee={s} self_arg.id={d} self_arg.ty={s}", .{ callee_name, self_arg.id, @tagName(self_arg.ty) });
+    if (object_ptr) |ptr| {
+        debug.print(.ir, "lowerMethodCall: object_ptr.id={d} object_ptr.ty={s}", .{ ptr.id, @tagName(ptr.ty) });
+    }
     try args.append(l.allocator, self_arg);
 
     for (0..args_count) |i| {
@@ -4730,11 +4772,14 @@ pub fn lowerTypeIdx(l: *Lowerer, type_idx: TypeIdx) LowerError!ir.Type {
                 try l.allocated_types.append(l.allocator, @ptrCast(enum_type));
                 break :blk .{ .@"enum" = enum_type };
             }
+            // Get the location from the type node itself (if available), otherwise use current_loc
+            const type_loc = l.store.typeLoc(type_idx);
+            const loc = if (type_loc.line != 0) type_loc else l.current_loc;
             l.setErrorContext(
                 LowerError.UndefinedType,
                 "Unknown type '{s}'",
                 .{name},
-                l.current_loc,
+                loc,
                 "type '{s}' is not a defined struct or enum",
                 .{name},
             );

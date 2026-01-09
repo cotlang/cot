@@ -687,6 +687,16 @@ pub fn op_ptr_offset(vm: *VM, module: *const Module) VMError!DispatchResult {
         return .continue_dispatch;
     }
 
+    // Check if it's a heap record (shouldn't be offset-adjusted, this is a bug)
+    if (src_val.asRecord()) |_| {
+        std.debug.print("WARNING: ptr_offset called on heap record, returning as-is\n", .{});
+        vm.writeRegister(rd, src_val);
+        return .continue_dispatch;
+    }
+
+    // Debug: unexpected type
+    std.debug.print("WARNING: ptr_offset on unknown type, bits=0x{X:0>16}, tag={s}\n", .{ src_val.bits, @tagName(src_val.tag()) });
+
     // For other values, just copy (byte-level addressing not yet implemented)
     vm.writeRegister(rd, src_val);
     return .continue_dispatch;
@@ -1286,6 +1296,12 @@ pub fn op_get_local_ptr(vm: *VM, module: *const Module) VMError!DispatchResult {
     // Create a stack pointer to the local slot in the current frame
     // frame_offset=0 means current frame
     const stack_ptr_val = Value.initStackPtr(0, slot);
+
+    // Debug: verify the stack pointer is correctly tagged
+    if (!stack_ptr_val.isStackPtr()) {
+        std.debug.print("ERROR: initStackPtr(0, {}) produced non-stack-ptr value: 0x{X:0>16}\n", .{ slot, stack_ptr_val.bits });
+    }
+
     vm.registers[rd] = stack_ptr_val;
 
     return .continue_dispatch;
@@ -2531,6 +2547,7 @@ pub fn op_new_record(vm: *VM, module: *const Module) VMError!DispatchResult {
 
 /// load_field rd, rs, field_idx - rd = rs.field[field_idx]
 /// Format: [rd:4|rs:4] [field_idx:16]
+/// Polymorphic: works with both heap records AND stack pointers to structs.
 pub fn op_load_field(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 3;
@@ -2539,6 +2556,8 @@ pub fn op_load_field(vm: *VM, module: *const Module) VMError!DispatchResult {
     const field_idx = std.mem.readInt(u16, module.code[vm.ip - 2 ..][0..2], .little);
 
     const record_val = vm.registers[rs];
+
+    // Handle heap records
     if (record_val.asRecord()) |record| {
         const field_count = record.data.len / @sizeOf(Value);
         if (field_idx < field_count) {
@@ -2547,15 +2566,30 @@ pub fn op_load_field(vm: *VM, module: *const Module) VMError!DispatchResult {
         } else {
             vm.writeRegister(rd, Value.null_val);
         }
-    } else {
-        vm.writeRegister(rd, Value.null_val);
+        return .continue_dispatch;
     }
+
+    // Handle stack pointers to structs
+    if (record_val.asStackPtr()) |sp| {
+        const base_ptr = try resolveFrameBasePointer(vm, sp.frame_offset);
+        const abs_slot = base_ptr + sp.slot + field_idx;
+
+        if (abs_slot >= vm.sp) {
+            vm.writeRegister(rd, Value.null_val);
+        } else {
+            vm.writeRegister(rd, vm.stack[abs_slot]);
+        }
+        return .continue_dispatch;
+    }
+
+    vm.writeRegister(rd, Value.null_val);
     return .continue_dispatch;
 }
 
 /// store_field rd, rs, field_idx - rd.field[field_idx] = rs
 /// Format: [rd:4|rs:4] [field_idx:16]
 /// NOTE: This operation handles ARC by retaining the new value and releasing the old one.
+/// Polymorphic: works with both heap records AND stack pointers to structs.
 pub fn op_store_field(vm: *VM, module: *const Module) VMError!DispatchResult {
     const ops = module.code[vm.ip];
     vm.ip += 3;
@@ -2566,6 +2600,7 @@ pub fn op_store_field(vm: *VM, module: *const Module) VMError!DispatchResult {
     const record_val = vm.registers[rd];
     const value = vm.registers[rs];
 
+    // Handle heap records
     if (record_val.asRecord()) |record| {
         const field_count = record.data.len / @sizeOf(Value);
         if (field_idx < field_count) {
@@ -2581,7 +2616,24 @@ pub fn op_store_field(vm: *VM, module: *const Module) VMError!DispatchResult {
             // Release the old value (if it was an ARC type)
             arc.release(old_value, vm.allocator);
         }
+        return .continue_dispatch;
     }
+
+    // Handle stack pointers to structs
+    if (record_val.asStackPtr()) |sp| {
+        // Resolve the frame's base pointer
+        const base_ptr = try resolveFrameBasePointer(vm, sp.frame_offset);
+        const abs_slot = base_ptr + sp.slot + field_idx;
+
+        if (abs_slot >= vm.sp) {
+            return vm.fail(VMError.StackOverflow, "store_field: slot out of bounds");
+        }
+
+        // Use writeStack to properly handle ARC (retain new value, release old)
+        vm.writeStack(abs_slot, value);
+        return .continue_dispatch;
+    }
+
     return .continue_dispatch;
 }
 
