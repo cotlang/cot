@@ -146,8 +146,8 @@ pub fn emitAlloca(e: *BytecodeEmitter, a: ir.Instruction.Alloca) EmitError!void 
             log.debug("emitAlloca: struct '{s}' escapes, using heap allocation", .{a.name});
 
             // Emit heap allocation: new_record rd, field_count
-            const dest_reg: u4 = 0;
-            e.prepareDestReg(dest_reg);
+            // Allocate a fresh register for the result, spilling if necessary
+            const dest_reg = try e.allocateWithSpill(a.result.id);
             try e.emitOpcode(.new_record);
             try e.emitU8((@as(u8, dest_reg) << 4) | 0);
             try e.emitU16(@intCast(struct_type.fields.len));
@@ -1095,9 +1095,8 @@ pub fn emitConstString(e: *BytecodeEmitter, c: ConstString) EmitError!void {
 
 /// Emit const_null instruction - load null into a register
 pub fn emitConstNull(e: *BytecodeEmitter, c: ConstNull) EmitError!void {
-    const dest_reg: u4 = 0;
-    // Spill any existing value in r0 before overwriting
-    e.prepareDestReg(dest_reg);
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(c.result.id);
     try e.emitRegLoadLiteral(.load_null, dest_reg);
     e.setLastResult(c.result.id, dest_reg);
 }
@@ -1124,7 +1123,8 @@ pub fn emitBinaryArith(e: *BytecodeEmitter, op: Opcode, lhs: ir.Value, rhs: ir.V
 /// Emit ineg instruction
 pub fn emitIneg(e: *BytecodeEmitter, n: ir.Instruction.UnaryOp) EmitError!void {
     const src_reg = try e.getValueInReg(n.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(n.result.id);
     try e.emitRegUnary(.neg, dest_reg, src_reg);
     e.setLastResult(n.result.id, dest_reg);
 }
@@ -1133,7 +1133,8 @@ pub fn emitIneg(e: *BytecodeEmitter, n: ir.Instruction.UnaryOp) EmitError!void {
 /// fn_round rd, rs, prec - Format: [rd:4|rs:4] [prec:8]
 pub fn emitRound(e: *BytecodeEmitter, r: ir.Instruction.RoundOp) EmitError!void {
     const value_reg = try e.getValueInReg(r.value, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(r.result.id);
 
     // Get precision value - must be a constant or loaded value
     const prec: u8 = if (e.value_consts.get(r.places.id)) |const_idx| blk: {
@@ -1159,7 +1160,8 @@ pub fn emitRound(e: *BytecodeEmitter, r: ir.Instruction.RoundOp) EmitError!void 
 /// fn_trunc rd, rs - Format: [rd:4|rs:4] [0]
 pub fn emitTrunc(e: *BytecodeEmitter, t: ir.Instruction.RoundOp) EmitError!void {
     const value_reg = try e.getValueInReg(t.value, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(t.result.id);
 
     // fn_trunc uses the places value as precision
     // For DBL compatibility, places specifies decimal positions to keep
@@ -1211,7 +1213,8 @@ pub fn emitIcmp(e: *BytecodeEmitter, c: ir.Instruction.IcmpOp) EmitError!void {
 /// Emit logical not instruction
 pub fn emitLogNot(e: *BytecodeEmitter, l: ir.Instruction.UnaryOp) EmitError!void {
     const src_reg = try e.getValueInReg(l.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(l.result.id);
     try e.emitRegUnary(.log_not, dest_reg, src_reg);
     e.setLastResult(l.result.id, dest_reg);
 }
@@ -1219,7 +1222,8 @@ pub fn emitLogNot(e: *BytecodeEmitter, l: ir.Instruction.UnaryOp) EmitError!void
 /// Emit bitwise not instruction
 pub fn emitBitNot(e: *BytecodeEmitter, b: ir.Instruction.UnaryOp) EmitError!void {
     const src_reg = try e.getValueInReg(b.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(b.result.id);
     try e.emitRegUnary(.bit_not, dest_reg, src_reg);
     e.setLastResult(b.result.id, dest_reg);
 }
@@ -1271,7 +1275,8 @@ pub fn emitStrSlice(e: *BytecodeEmitter, s: ir.Instruction.StrSlice) EmitError!v
     const len_reg = try e.getValueInReg(s.length_or_end, 2);
     e.nospill_mask = 0; // Clear after all operands loaded
 
-    const dest_reg: u4 = 3;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(s.result.id);
     try e.emitOpcode(.str_slice);
     try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
     try e.emitU8((@as(u8, start_reg) << 4) | len_reg);
@@ -1310,7 +1315,8 @@ pub fn emitStrSliceStore(e: *BytecodeEmitter, s: ir.Instruction.StrSliceStore) E
 pub fn emitStrByteAt(e: *BytecodeEmitter, s: ir.Instruction.StrByteAt) EmitError!void {
     const str_reg = try e.getValueInReg(s.string, 0);
     const idx_reg = try e.getValueInReg(s.index, 1);
-    const dest_reg: u4 = 2;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(s.result.id);
     // str_index rd, rs, idx_reg - rd = rs[idx_reg]
     // Format: [rd:4|rs:4] [idx_reg:4|0]
     try e.emitOpcode(.str_index);
@@ -2609,7 +2615,8 @@ pub fn emitBrTable(e: *BytecodeEmitter, s: ir.Instruction.Switch) EmitError!void
 /// Emit format_decimal instruction
 pub fn emitFormatDecimal(e: *BytecodeEmitter, fd: ir.Instruction.FormatDecimal) EmitError!void {
     const src_reg = try e.getValueInReg(fd.value, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(fd.result.id);
     try e.emitOpcode(.format_decimal);
     try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
     try e.emitU8(@intCast(fd.width));
@@ -2619,7 +2626,8 @@ pub fn emitFormatDecimal(e: *BytecodeEmitter, fd: ir.Instruction.FormatDecimal) 
 /// Emit parse_decimal instruction
 pub fn emitParseDecimal(e: *BytecodeEmitter, pd: ir.Instruction.ParseDecimal) EmitError!void {
     const src_reg = try e.getValueInReg(pd.value, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(pd.result.id);
     try e.emitOpcode(.parse_decimal);
     try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
     try e.emitU8(0);
@@ -2632,9 +2640,8 @@ pub fn emitParseDecimal(e: *BytecodeEmitter, pd: ir.Instruction.ParseDecimal) Em
 
 /// Emit map_new instruction
 pub fn emitMapNew(e: *BytecodeEmitter, mn: ir.Instruction.MapNew) EmitError!void {
-    const dest_reg: u4 = 0;
-    // Spill any existing value in r0 before overwriting
-    e.prepareDestReg(dest_reg);
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(mn.result.id);
     try e.emitOpcode(.map_new);
     try e.emitU8((@as(u8, dest_reg) << 4) | (mn.flags & 0x0F));
     try e.emitU8(0);
@@ -2716,7 +2723,8 @@ pub fn emitMapGet(e: *BytecodeEmitter, mg: ir.Instruction.MapGet) EmitError!void
     // Non-struct: use regular map_get
     const map_reg = try e.getValueInReg(mg.map, 0);
     const key_reg = try e.getValueInReg(mg.key, 1);
-    const dest_reg: u4 = 2;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(mg.result.id);
     try e.emitOpcode(.map_get);
     try e.emitU8((@as(u8, dest_reg) << 4) | map_reg);
     try e.emitU8((@as(u8, key_reg) << 4) | 0);
@@ -2736,7 +2744,8 @@ pub fn emitMapDelete(e: *BytecodeEmitter, md: ir.Instruction.MapDelete) EmitErro
 pub fn emitMapHas(e: *BytecodeEmitter, mh: ir.Instruction.MapHas) EmitError!void {
     const map_reg = try e.getValueInReg(mh.map, 0);
     const key_reg = try e.getValueInReg(mh.key, 1);
-    const dest_reg: u4 = 2;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(mh.result.id);
     try e.emitOpcode(.map_has);
     try e.emitU8((@as(u8, dest_reg) << 4) | map_reg);
     try e.emitU8((@as(u8, key_reg) << 4) | 0);
@@ -2746,7 +2755,8 @@ pub fn emitMapHas(e: *BytecodeEmitter, mh: ir.Instruction.MapHas) EmitError!void
 /// Emit map_len instruction
 pub fn emitMapLen(e: *BytecodeEmitter, ml: ir.Instruction.MapLen) EmitError!void {
     const map_reg = try e.getValueInReg(ml.map, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(ml.result.id);
     try e.emitOpcode(.map_len);
     try e.emitU8((@as(u8, dest_reg) << 4) | map_reg);
     try e.emitU8(0);
@@ -2764,7 +2774,8 @@ pub fn emitMapClear(e: *BytecodeEmitter, mc: ir.Instruction.MapClear) EmitError!
 /// Emit map_keys instruction
 pub fn emitMapKeys(e: *BytecodeEmitter, mk: ir.Instruction.MapKeys) EmitError!void {
     const map_reg = try e.getValueInReg(mk.map, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(mk.result.id);
     try e.emitOpcode(.map_keys);
     try e.emitU8((@as(u8, dest_reg) << 4) | map_reg);
     try e.emitU8(0);
@@ -2774,7 +2785,8 @@ pub fn emitMapKeys(e: *BytecodeEmitter, mk: ir.Instruction.MapKeys) EmitError!vo
 /// Emit map_values instruction
 pub fn emitMapValues(e: *BytecodeEmitter, mv: ir.Instruction.MapValues) EmitError!void {
     const map_reg = try e.getValueInReg(mv.map, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(mv.result.id);
     try e.emitOpcode(.map_values);
     try e.emitU8((@as(u8, dest_reg) << 4) | map_reg);
     try e.emitU8(0);
@@ -2785,7 +2797,8 @@ pub fn emitMapValues(e: *BytecodeEmitter, mv: ir.Instruction.MapValues) EmitErro
 pub fn emitMapKeyAt(e: *BytecodeEmitter, mk: ir.Instruction.MapKeyAt) EmitError!void {
     const map_reg = try e.getValueInReg(mk.map, 0);
     const idx_reg = try e.getValueInReg(mk.index, 1);
-    const dest_reg: u4 = 2;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(mk.result.id);
     try e.emitOpcode(.map_key_at);
     try e.emitU8((@as(u8, dest_reg) << 4) | map_reg);
     try e.emitU8(@as(u8, idx_reg) << 4);
@@ -2798,9 +2811,8 @@ pub fn emitMapKeyAt(e: *BytecodeEmitter, mk: ir.Instruction.MapKeyAt) EmitError!
 
 /// Emit list_new instruction
 pub fn emitListNew(e: *BytecodeEmitter, ln: ir.Instruction.ListNew) EmitError!void {
-    const dest_reg: u4 = 0;
-    // Spill any existing value in r0 before overwriting
-    e.prepareDestReg(dest_reg);
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(ln.result.id);
     try e.emitOpcode(.list_new);
     try e.emitU8((@as(u8, dest_reg) << 4) | 0);
     try e.emitU8(0);
@@ -2873,9 +2885,8 @@ pub fn emitListPop(e: *BytecodeEmitter, lp: ir.Instruction.ListPop) EmitError!vo
 
     // Non-struct: use regular list_pop
     const list_reg = try e.getValueInReg(lp.list, 0);
-    const dest_reg: u4 = 1;
-    // Spill any existing value in dest_reg BEFORE the instruction clobbers it
-    e.prepareDestReg(dest_reg);
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(lp.result.id);
     try e.emitOpcode(.list_pop);
     try e.emitU8((@as(u8, dest_reg) << 4) | list_reg);
     try e.emitU8(0);
@@ -2920,9 +2931,8 @@ pub fn emitListGet(e: *BytecodeEmitter, lg: ir.Instruction.ListGet) EmitError!vo
     // Non-struct: use regular list_get
     const list_reg = try e.getValueInReg(lg.list, 0);
     const idx_reg = try e.getValueInReg(lg.index, 1);
-    const dest_reg: u4 = 2;
-    // Spill any existing value in dest_reg BEFORE the instruction clobbers it
-    e.prepareDestReg(dest_reg);
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(lg.result.id);
     try e.emitOpcode(.list_get);
     try e.emitU8((@as(u8, dest_reg) << 4) | list_reg);
     try e.emitU8((@as(u8, idx_reg) << 4) | 0);
@@ -2970,7 +2980,8 @@ pub fn emitListSet(e: *BytecodeEmitter, ls: ir.Instruction.ListSet) EmitError!vo
 /// Emit list_len instruction
 pub fn emitListLen(e: *BytecodeEmitter, ll: ir.Instruction.ListLen) EmitError!void {
     const list_reg = try e.getValueInReg(ll.list, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(ll.result.id);
     try e.emitOpcode(.list_len);
     try e.emitU8((@as(u8, dest_reg) << 4) | list_reg);
     try e.emitU8(0);
@@ -2988,7 +2999,8 @@ pub fn emitListClear(e: *BytecodeEmitter, lc: ir.Instruction.ListClear) EmitErro
 /// Emit list_to_slice instruction: converts List<T> to []T
 pub fn emitListToSlice(e: *BytecodeEmitter, lts: ir.Instruction.ListToSlice) EmitError!void {
     const list_reg = try e.getValueInReg(lts.list, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(lts.result.id);
     try e.emitOpcode(.list_to_slice);
     try e.emitU8((@as(u8, dest_reg) << 4) | list_reg);
     try e.emitU8(0);
@@ -3002,7 +3014,8 @@ pub fn emitListToSlice(e: *BytecodeEmitter, lts: ir.Instruction.ListToSlice) Emi
 /// Emit is_null instruction: rd = (rs == null)
 pub fn emitIsNull(e: *BytecodeEmitter, n: ir.Instruction.UnaryOp) EmitError!void {
     const src_reg = try e.getValueInReg(n.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(n.result.id);
     try e.emitOpcode(.is_null);
     try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
     try e.emitU8(0);
@@ -3012,7 +3025,8 @@ pub fn emitIsNull(e: *BytecodeEmitter, n: ir.Instruction.UnaryOp) EmitError!void
 /// Emit is_type instruction: rd = (rs is type_tag)
 pub fn emitIsType(e: *BytecodeEmitter, op: ir.Instruction.IsTypeOp) EmitError!void {
     const src_reg = try e.getValueInReg(op.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(op.result.id);
     try e.emitOpcode(.is_type);
     try e.emitU8((@as(u8, dest_reg) << 4) | src_reg);
     try e.emitU8(@intFromEnum(op.type_tag));
@@ -3024,7 +3038,8 @@ pub fn emitSelect(e: *BytecodeEmitter, s: ir.Instruction.Select) EmitError!void 
     const cond_reg = try e.getValueInReg(s.condition, 0);
     const true_reg = try e.getValueInReg(s.true_val, 1);
     const false_reg = try e.getValueInReg(s.false_val, 2);
-    const dest_reg: u4 = 3;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(s.result.id);
     try e.emitOpcode(.select);
     try e.emitU8((@as(u8, dest_reg) << 4) | cond_reg);
     try e.emitU8((@as(u8, true_reg) << 4) | false_reg);
@@ -3077,7 +3092,8 @@ pub fn emitPtrOffset(e: *BytecodeEmitter, p: ir.Instruction.PtrOffset) EmitError
     }
 
     const base_reg = try e.getValueInReg(p.base_ptr, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(p.result.id);
     try e.emitOpcode(.ptr_offset);
     try e.emitU8((@as(u8, dest_reg) << 4) | base_reg);
     // Emit offset as signed 16-bit
@@ -3100,7 +3116,8 @@ pub fn emitPtrOffset(e: *BytecodeEmitter, p: ir.Instruction.PtrOffset) EmitError
 /// weak_ref rd, rs - Creates weak reference without retaining
 pub fn emitWeakRef(e: *BytecodeEmitter, w: ir.Instruction.UnaryOp) EmitError!void {
     const src_reg = try e.getValueInReg(w.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(w.result.id);
     try e.emitRegUnary(.weak_ref, dest_reg, src_reg);
     e.setLastResult(w.result.id, dest_reg);
 }
@@ -3109,7 +3126,8 @@ pub fn emitWeakRef(e: *BytecodeEmitter, w: ir.Instruction.UnaryOp) EmitError!voi
 /// weak_load rd, rs - Returns the value or null if target was freed
 pub fn emitWeakLoad(e: *BytecodeEmitter, w: ir.Instruction.UnaryOp) EmitError!void {
     const src_reg = try e.getValueInReg(w.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(w.result.id);
     try e.emitRegUnary(.weak_load, dest_reg, src_reg);
     e.setLastResult(w.result.id, dest_reg);
 }
@@ -3140,7 +3158,8 @@ pub fn emitArcRelease(e: *BytecodeEmitter, a: ir.Instruction.ArcOp) EmitError!vo
 /// arc_move rd, rs - Copies rs to rd, nulls rs
 pub fn emitArcMove(e: *BytecodeEmitter, a: ir.Instruction.UnaryOp) EmitError!void {
     const src_reg = try e.getValueInReg(a.operand, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(a.result.id);
     try e.emitRegUnary(.arc_move, dest_reg, src_reg);
     e.setLastResult(a.result.id, dest_reg);
 }
@@ -3153,7 +3172,8 @@ pub fn emitArcMove(e: *BytecodeEmitter, a: ir.Instruction.UnaryOp) EmitError!voi
 /// make_closure rd, env_reg, fn_idx - Creates a closure value
 pub fn emitMakeClosure(e: *BytecodeEmitter, c: ir.Instruction.MakeClosure) EmitError!void {
     const env_reg = try e.getValueInReg(c.env, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(c.result.id);
 
     // Look up the function index by name
     var fn_idx: u16 = 0;
@@ -3189,7 +3209,8 @@ pub fn emitMakeClosure(e: *BytecodeEmitter, c: ir.Instruction.MakeClosure) EmitE
 /// make_trait_object rd, src_reg, vtable_idx - Creates a trait object (fat pointer)
 pub fn emitMakeTraitObject(e: *BytecodeEmitter, m: ir.Instruction.MakeTraitObject) EmitError!void {
     const src_reg = try e.getValueInReg(m.value, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(m.result.id);
 
     // Look up the vtable index by trait_name and type_name
     var vtable_idx: u16 = 0;
@@ -3266,9 +3287,8 @@ pub fn emitCallTraitMethod(e: *BytecodeEmitter, c: ir.Instruction.CallTraitMetho
 /// Emit heap_alloc instruction - allocate a heap record
 /// Format: [opcode] [rd:4|0:4] [field_count:16]
 pub fn emitHeapAlloc(e: *BytecodeEmitter, h: ir.Instruction.HeapAlloc) EmitError!void {
-    const dest_reg: u4 = 0;
-    // Spill any existing value in r0 before overwriting
-    e.prepareDestReg(dest_reg);
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(h.result.id);
 
     // Emit: new_record rd, field_count
     try e.emitOpcode(.new_record);
@@ -3293,7 +3313,8 @@ pub fn emitStoreFieldHeap(e: *BytecodeEmitter, s: ir.Instruction.StoreFieldHeap)
 /// Format: [opcode] [rd:4|record_reg:4] [field_idx:16]
 pub fn emitLoadFieldHeap(e: *BytecodeEmitter, l: ir.Instruction.LoadFieldHeap) EmitError!void {
     const record_reg = try e.getValueInReg(l.record, 0);
-    const dest_reg: u4 = 1;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(l.result.id);
 
     try e.emitOpcode(.load_field);
     try e.emitU8((@as(u8, dest_reg) << 4) | record_reg);
@@ -3317,8 +3338,8 @@ pub fn emitVariantConstruct(e: *BytecodeEmitter, v: ir.Instruction.VariantConstr
         _ = try e.getValueInReg(payload_val, @intCast(i));
     }
 
-    // Result goes to r0 (or first register after payload setup)
-    const dest_reg: u4 = 0;
+    // Allocate a fresh register for the result, spilling if necessary
+    const dest_reg = try e.allocateWithSpill(v.result.id);
 
     try e.emitOpcode(.variant_construct);
     try e.emitU8((@as(u8, dest_reg) << 4) | argc);
@@ -3339,4 +3360,83 @@ pub fn emitVariantGetTag(e: *BytecodeEmitter, v: ir.Instruction.VariantGetTag) E
     try e.emitU8(0); // padding
 
     e.setLastResult(v.result.id, dest_reg);
+}
+
+// ============================================================================
+// Phi Node Operations
+// ============================================================================
+
+/// Emit phi instruction - SSA value merge at control flow join points
+///
+/// For self-referential (loop-invariant) phis like:
+///   end = phi [(entry, end_val), (incr, end)]
+///
+/// We store the source value to a local slot. On first iteration, this initializes
+/// the phi. On subsequent iterations, for self-referential phis, the value is
+/// already there (redundant store, but correct). For nested loops, each phi gets
+/// its own dedicated slot, preventing clobbering.
+///
+/// For true phi nodes with different values from each predecessor,
+/// proper phi elimination would be needed (inserting copies at predecessor
+/// block ends). For now we only support self-referential loop-invariant phis.
+pub fn emitPhi(e: *BytecodeEmitter, p: ir.Instruction.Phi) EmitError!void {
+    // Find the non-self-referential source value
+    // For a self-referential phi like [(entry, val), (incr, phi_result)],
+    // we want 'val' as the source
+    var source_value: ?ir.Value = null;
+    for (p.args) |arg| {
+        if (arg.value.id != p.result.id) {
+            source_value = arg.value;
+            break;
+        }
+    }
+
+    if (source_value) |src| {
+        // Check if phi result already has a dedicated slot (from previous iteration)
+        if (e.value_slots.get(p.result.id)) |existing_slot| {
+            // For self-referential loop-invariant phis, the value is already in the
+            // phi's slot from the first iteration. We just need to load it into a
+            // register for use by subsequent instructions.
+            // We do NOT reload from the source because its slot may have been
+            // overwritten by other allocations in the loop body.
+            // Allocate a fresh register for the result, spilling if necessary
+            const dest_reg = try e.allocateWithSpill(p.result.id);
+            try e.emitOpcode(.load_local);
+            try e.emitU8(@as(u8, dest_reg) << 4);
+            try e.emitU8(@intCast(existing_slot));
+
+            e.setLastResult(p.result.id, dest_reg);
+
+            debug.print(.emit, "emitPhi: result.id={d} -> load from slot {d} (existing)", .{
+                p.result.id,
+                existing_slot,
+            });
+        } else {
+            // First time seeing this phi - allocate a dedicated local slot
+            const slot = e.local_count;
+            e.local_count += 1;
+
+            // Register the slot for the phi result
+            try e.value_slots.put(p.result.id, slot);
+
+            // Get source value into a register
+            const src_reg = try e.getValueInReg(src, 0);
+
+            // Store to the phi's dedicated slot
+            try e.emitOpcode(.store_local);
+            try e.emitU8(@as(u8, src_reg) << 4);
+            try e.emitU8(@intCast(slot));
+
+            e.setLastResult(p.result.id, src_reg);
+
+            debug.print(.emit, "emitPhi: result.id={d} source.id={d} -> slot {d} (new)", .{
+                p.result.id,
+                src.id,
+                slot,
+            });
+        }
+    } else {
+        // All args are self-referential - shouldn't happen with well-formed phi
+        log.warn("emitPhi: all phi args are self-referential, no source value", .{});
+    }
 }

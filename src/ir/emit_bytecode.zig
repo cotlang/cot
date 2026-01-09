@@ -910,6 +910,11 @@ pub const BytecodeEmitter = struct {
             .variant_construct => |v| try emit_inst.emitVariantConstruct(self, v),
             .variant_get_tag => |v| try emit_inst.emitVariantGetTag(self, v),
 
+            // Phi nodes (SSA value merge at control flow join points)
+            // For loop-invariant values (self-referential phis), we just copy the entry value
+            // to the phi result on first iteration. The value stays in place for subsequent iterations.
+            .phi => |p| try emit_inst.emitPhi(self, p),
+
             else => {
                 // Other instructions not yet implemented
             },

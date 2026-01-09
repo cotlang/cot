@@ -689,6 +689,18 @@ pub const Printer = struct {
                 try self.writer.writeAll(" = variant_get_tag ");
                 try self.printValue(v.variant);
             },
+
+            // Phi nodes (SSA)
+            .phi => |p| {
+                try self.printValue(p.result);
+                try self.writer.writeAll(" = phi ");
+                for (p.args, 0..) |arg, i| {
+                    if (i > 0) try self.writer.writeAll(", ");
+                    try self.writer.print("[{s}: ", .{arg.block.label});
+                    try self.printValue(arg.value);
+                    try self.writer.writeAll("]");
+                }
+            },
         }
     }
 

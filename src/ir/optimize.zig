@@ -766,6 +766,12 @@ fn markInstructionUses(inst: ir.Instruction, used: *std.AutoHashMap(u32, void)) 
         .variant_get_tag => |v| {
             used.put(v.variant.id, {}) catch {};
         },
+        // Phi nodes - mark all incoming values as used
+        .phi => |p| {
+            for (p.args) |arg| {
+                used.put(arg.value.id, {}) catch {};
+            }
+        },
     }
 }
 

@@ -429,6 +429,12 @@ pub const Verifier = struct {
             .variant_get_tag => |op| {
                 try self.checkValueDefined(op.variant);
             },
+            // Phi nodes - check all incoming values
+            .phi => |op| {
+                for (op.args) |arg| {
+                    try self.checkValueDefined(arg.value);
+                }
+            },
         }
     }
 

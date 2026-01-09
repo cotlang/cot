@@ -130,6 +130,8 @@ fn checkInstruction(self: *Self, inst: ir.Instruction) void {
         .heap_alloc, .store_field_heap, .load_field_heap => {},
         // Variant operations (sum types)
         .variant_construct, .variant_get_tag => {},
+        // Phi nodes (SSA merge) - type-safe by construction
+        .phi => {},
     }
 }
 

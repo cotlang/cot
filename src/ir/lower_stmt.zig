@@ -889,10 +889,15 @@ pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
     try l.allocated_types.append(l.allocator, ty_ptr);
 
     const loop_var = func.newValue(.{ .ptr = ty_ptr });
+
+    // Use unique name for each loop's index to avoid nested loop conflicts
+    // The value ID makes each loop's index distinct
+    const iter_name = try std.fmt.allocPrint(l.allocator, "_iter_idx_{d}", .{loop_var.id});
+
     try l.emit(.{
         .alloca = .{
             .ty = .i64,
-            .name = "_iter_idx", // Internal name to avoid conflict with binding_name
+            .name = iter_name,
             .result = loop_var,
         },
     });
@@ -937,36 +942,40 @@ pub fn lowerFor(l: *Lowerer, idx: StmtIdx, _: NodeData) LowerError!void {
     // For range iteration, the loop variable IS the user-visible binding
     try l.scopes.put(binding_name, loop_var);
 
-    // Create alloca for end bound to preserve it across loop iterations
-    // This is necessary because the end value's register may be clobbered during the loop body
+    // Save current block as entry block for phi references
+    _ = l.current_block.?;
+
+    // Create alloca for end bound - this ensures it has a dedicated slot that won't
+    // be overwritten by other allocations in the loop body (phi elimination pattern)
     const end_ty_ptr = try l.allocator.create(ir.Type);
     end_ty_ptr.* = .i64;
     try l.allocated_types.append(l.allocator, end_ty_ptr);
-
     const end_var = func.newValue(.{ .ptr = end_ty_ptr });
-    try l.emit(.{
-        .alloca = .{
-            .ty = .i64,
-            .name = "_loop_end",
-            .result = end_var,
-        },
-    });
+    const end_var_name = try std.fmt.allocPrint(l.allocator, "_end_{d}", .{end_var.id});
+    try l.emit(.{ .alloca = .{ .ty = .i64, .name = end_var_name, .result = end_var } });
 
-    // Initialize loop variable to range start and store end bound
-    try l.emit(.{ .store = .{ .ptr = loop_var, .value = start_val, .loc = ir_loc } });
+    // Store end bound to its dedicated slot (phi elimination: copy at predecessor end)
     try l.emit(.{ .store = .{ .ptr = end_var, .value = end_val, .loc = ir_loc } });
+
+    // Initialize loop variable to range start
+    try l.emit(.{ .store = .{ .ptr = loop_var, .value = start_val, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
-    // Condition block - check loop_var <= end (or < for non-inclusive)
-    // Load both values from memory each iteration to avoid register clobbering
+    // Condition block
     l.current_block = cond_block;
+
+    // Load end bound from its dedicated slot (phi result - value was stored at entry)
+    const end_phi = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = end_var, .result = end_phi } });
+
+    // Load current loop counter from alloca
     const current_val = func.newValue(.i64);
     try l.emit(.{ .load = .{ .ptr = loop_var, .result = current_val } });
-    const end_loaded = func.newValue(.i64);
-    try l.emit(.{ .load = .{ .ptr = end_var, .result = end_loaded } });
+
+    // Compare and branch
     const cond_result = func.newValue(.bool);
     const cmp_cond: ir.IntCC = if (is_inclusive) .sle else .slt;
-    try l.emit(.{ .icmp = .{ .cond = cmp_cond, .lhs = current_val, .rhs = end_loaded, .result = cond_result } });
+    try l.emit(.{ .icmp = .{ .cond = cmp_cond, .lhs = current_val, .rhs = end_phi, .result = cond_result } });
     try l.emit(.{ .brif = .{ .condition = cond_result, .then_block = body_block, .else_block = exit_block } });
 
     // Body block
@@ -1072,20 +1081,23 @@ fn lowerCollectionIteration(
 
     // Array iteration: use array_len and array_load
 
-    // Get array length and store it in a variable so it persists across blocks
-    const ty_ptr = try l.allocator.create(ir.Type);
-    ty_ptr.* = .i64;
-    try l.allocated_types.append(l.allocator, ty_ptr);
-    const len_var = func.newValue(.{ .ptr = ty_ptr });
-    try l.emit(.{
-        .alloca = .{
-            .ty = .i64,
-            .name = "_array_len",
-            .result = len_var,
-        },
-    });
+    // Current block is entry block (we don't need explicit reference anymore)
+    _ = l.current_block.?;
+
+    // Get array length (computed once in entry block)
     const len_val = func.newValue(.i64);
     try l.emit(.{ .array_len = .{ .operand = array_val, .result = len_val } });
+
+    // Create alloca for length - this ensures it has a dedicated slot that won't
+    // be overwritten by other allocations in the loop body
+    const len_ty_ptr = try l.allocator.create(ir.Type);
+    len_ty_ptr.* = .i64;
+    try l.allocated_types.append(l.allocator, len_ty_ptr);
+    const len_var = func.newValue(.{ .ptr = len_ty_ptr });
+    const len_var_name = try std.fmt.allocPrint(l.allocator, "_len_{d}", .{len_var.id});
+    try l.emit(.{ .alloca = .{ .ty = .i64, .name = len_var_name, .result = len_var } });
+
+    // Store length to its dedicated slot (phi elimination: copy at predecessor end)
     try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val, .loc = ir_loc } });
 
     // Initialize index counter to 0
@@ -1094,14 +1106,20 @@ fn lowerCollectionIteration(
     try l.emit(.{ .store = .{ .ptr = loop_var, .value = zero, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
-    // Condition block: check index < length
+    // Condition block
     l.current_block = cond_block;
+
+    // Load length from its dedicated slot (phi result - value was stored at entry)
+    const len_phi = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = len_var, .result = len_phi } });
+
+    // Load current index from alloca
     const current_idx = func.newValue(.i64);
     try l.emit(.{ .load = .{ .ptr = loop_var, .result = current_idx } });
-    const loaded_len = func.newValue(.i64);
-    try l.emit(.{ .load = .{ .ptr = len_var, .result = loaded_len } });
+
+    // Compare and branch
     const cond_result = func.newValue(.bool);
-    try l.emit(.{ .icmp = .{ .cond = .slt, .lhs = current_idx, .rhs = loaded_len, .result = cond_result } });
+    try l.emit(.{ .icmp = .{ .cond = .slt, .lhs = current_idx, .rhs = len_phi, .result = cond_result } });
     try l.emit(.{ .brif = .{ .condition = cond_result, .then_block = body_block, .else_block = exit_block } });
 
     // Body block: load element at current index
@@ -1194,22 +1212,23 @@ fn lowerMapIteration(
     key_type_ptr.* = key_type;
     try l.allocated_types.append(l.allocator, key_type_ptr);
 
-    // Allocate variable for map length so it persists across blocks
+    // Save current block as entry block
+    _ = l.current_block.?;
+
+    // Get map length directly using map_len (computed once in entry block)
+    const len_val = func.newValue(.i64);
+    try l.emit(.{ .map_len = .{ .map = map_val, .result = len_val } });
+
+    // Create alloca for length - this ensures it has a dedicated slot that won't
+    // be overwritten by other allocations in the loop body (phi elimination pattern)
     const len_ty_ptr = try l.allocator.create(ir.Type);
     len_ty_ptr.* = .i64;
     try l.allocated_types.append(l.allocator, len_ty_ptr);
     const len_var = func.newValue(.{ .ptr = len_ty_ptr });
-    try l.emit(.{
-        .alloca = .{
-            .ty = .i64,
-            .name = "_map_len",
-            .result = len_var,
-        },
-    });
+    const len_var_name = try std.fmt.allocPrint(l.allocator, "_map_len_{d}", .{len_var.id});
+    try l.emit(.{ .alloca = .{ .ty = .i64, .name = len_var_name, .result = len_var } });
 
-    // Get map length directly using map_len and store it
-    const len_val = func.newValue(.i64);
-    try l.emit(.{ .map_len = .{ .map = map_val, .result = len_val } });
+    // Store length to its dedicated slot (phi elimination: copy at predecessor end)
     try l.emit(.{ .store = .{ .ptr = len_var, .value = len_val, .loc = ir_loc } });
 
     // Initialize index counter to 1 (map_key_at uses 1-based indexing)
@@ -1218,15 +1237,20 @@ fn lowerMapIteration(
     try l.emit(.{ .store = .{ .ptr = loop_var, .value = one, .loc = ir_loc } });
     try l.emit(.{ .jump = .{ .target = cond_block } });
 
-    // Condition block: check index <= length (1-based)
+    // Condition block
     l.current_block = cond_block;
+
+    // Load length from its dedicated slot (phi result - value was stored at entry)
+    const len_phi = func.newValue(.i64);
+    try l.emit(.{ .load = .{ .ptr = len_var, .result = len_phi } });
+
+    // Load current index from alloca
     const current_idx = func.newValue(.i64);
     try l.emit(.{ .load = .{ .ptr = loop_var, .result = current_idx } });
-    const loaded_len = func.newValue(.i64);
-    try l.emit(.{ .load = .{ .ptr = len_var, .result = loaded_len } });
+
+    // Compare and branch (use <= because 1-based: index 1..length inclusive)
     const cond_result = func.newValue(.bool);
-    // Use <= because 1-based: index 1..length inclusive
-    try l.emit(.{ .icmp = .{ .cond = .sle, .lhs = current_idx, .rhs = loaded_len, .result = cond_result } });
+    try l.emit(.{ .icmp = .{ .cond = .sle, .lhs = current_idx, .rhs = len_phi, .result = cond_result } });
     try l.emit(.{ .brif = .{ .condition = cond_result, .then_block = body_block, .else_block = exit_block } });
 
     // Body block: get key at current index using map_key_at

@@ -526,6 +526,7 @@ pub const Instruction = union(enum) {
     brif: CondBranch, // Branch if (was: cond_br)
     br_table: Switch, // Branch table (was: switch_br)
     return_: ?Value, // Return (was: ret)
+    phi: Phi, // SSA phi node - merges values from different predecessors
 
     // ====== Function calls ======
     call: Call,
@@ -764,6 +765,20 @@ pub const Instruction = union(enum) {
         pub const Case = struct {
             value: i64,
             target: *Block,
+        };
+    };
+
+    // SSA Phi node - merges values from different predecessor blocks
+    // Used at control flow join points (e.g., loop headers, after if/else)
+    pub const Phi = struct {
+        result: Value,
+        /// Array of (predecessor_block, value) pairs
+        /// At runtime, the value from the predecessor we came from is selected
+        args: []const PhiArg,
+
+        pub const PhiArg = struct {
+            block: *Block,
+            value: Value,
         };
     };
 
@@ -1147,7 +1162,7 @@ pub const Instruction = union(enum) {
             .icmp => .comparison,
             .log_and, .log_or, .log_not => .logical,
             .str_concat, .str_compare, .str_copy, .str_slice, .str_slice_store, .str_len, .str_byte_at => .string,
-            .jump, .brif, .br_table, .return_, .call, .call_indirect, .trap, .select => .control,
+            .jump, .brif, .br_table, .return_, .call, .call_indirect, .trap, .select, .phi => .control,
             .try_begin, .try_end, .catch_begin, .throw => .exception,
             .bitcast, .fcvt_from_sint, .fcvt_from_uint, .fcvt_to_sint, .fcvt_to_uint, .sextend, .uextend, .ireduce, .format_decimal, .parse_decimal => .conversion,
             .iconst, .f32const, .f64const, .const_string, .const_null => .constant,
@@ -1253,6 +1268,7 @@ pub const Instruction = union(enum) {
             // Closure operations
             .make_closure => |c| c.result,
             .select => |s| s.result,
+            .phi => |p| p.result,
             .ptr_offset => |p| p.result,
             // Weak reference operations
             .weak_ref, .weak_load => |op| op.result,
@@ -1574,9 +1590,17 @@ pub const Instruction = union(enum) {
                 break :blk S.buf[0..4];
             },
 
-            // Variable operands (call, etc.) - return empty, caller should handle specially
+            // Variable operands (call, phi, etc.) - return empty or limited, caller should handle specially
             .call => &[_]Value{},
             .call_indirect => &[_]Value{},
+            // Phi nodes - extract values from args (up to buffer limit)
+            .phi => |p| blk: {
+                const count = @min(p.args.len, S.buf.len);
+                for (p.args[0..count], 0..) |arg, i| {
+                    S.buf[i] = arg.value;
+                }
+                break :blk S.buf[0..count];
+            },
 
             // IO operations
             .io_open, .io_read, .io_write => &[_]Value{},
