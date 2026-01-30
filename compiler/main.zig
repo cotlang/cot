@@ -113,7 +113,7 @@ pub fn main() !void {
             test_mode = true;
         } else if (std.mem.startsWith(u8, arg, "--target=")) {
             compile_target = Target.parse(arg[9..]) orelse {
-                std.debug.print("Error: Unknown target. Use: arm64-macos, amd64-linux\n", .{});
+                std.debug.print("Error: Unknown target. Use: wasm32, arm64-macos, amd64-linux\n", .{});
                 return;
             };
         } else if (std.mem.eql(u8, arg, "--target")) {
@@ -121,7 +121,7 @@ pub fn main() !void {
                 std.debug.print("Error: --target requires an argument\n", .{});
                 return;
             }) orelse {
-                std.debug.print("Error: Unknown target. Use: arm64-macos, amd64-linux\n", .{});
+                std.debug.print("Error: Unknown target. Use: wasm32, arm64-macos, amd64-linux\n", .{});
                 return;
             };
         } else if (!std.mem.startsWith(u8, arg, "-")) {

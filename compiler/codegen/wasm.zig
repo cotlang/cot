@@ -28,6 +28,11 @@ pub const Module = struct {
     func_count: u32 = 0,
     export_count: u32 = 0,
 
+    // Memory configuration
+    has_memory: bool = false,
+    memory_min_pages: u32 = 0, // Minimum pages (64KB each)
+    memory_max_pages: ?u32 = null, // Maximum pages (optional)
+
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{ .allocator = allocator };
     }
@@ -37,6 +42,14 @@ pub const Module = struct {
         self.funcs.deinit(self.allocator);
         self.exports.deinit(self.allocator);
         self.codes.deinit(self.allocator);
+    }
+
+    /// Add linear memory with specified page limits.
+    /// Each page is 64KB. min_pages is required, max_pages is optional.
+    pub fn addMemory(self: *Module, min_pages: u32, max_pages: ?u32) void {
+        self.has_memory = true;
+        self.memory_min_pages = min_pages;
+        self.memory_max_pages = max_pages;
     }
 
     /// Add a function type and return its index.
@@ -92,6 +105,23 @@ pub const Module = struct {
             try enc.encodeULEB128(func_section.writer(self.allocator), self.func_count);
             try func_section.appendSlice(self.allocator, self.funcs.items);
             try enc.writeSection(output, .function, func_section.items);
+        }
+
+        // Memory section (section ID 5)
+        if (self.has_memory) {
+            var mem_section: std.ArrayListUnmanaged(u8) = .{};
+            defer mem_section.deinit(self.allocator);
+            const mem_writer = mem_section.writer(self.allocator);
+            try enc.encodeULEB128(mem_writer, 1); // 1 memory
+            if (self.memory_max_pages) |max| {
+                try mem_writer.writeByte(0x01); // limits with max
+                try enc.encodeULEB128(mem_writer, self.memory_min_pages);
+                try enc.encodeULEB128(mem_writer, max);
+            } else {
+                try mem_writer.writeByte(0x00); // limits without max
+                try enc.encodeULEB128(mem_writer, self.memory_min_pages);
+            }
+            try enc.writeSection(output, .memory, mem_section.items);
         }
 
         // Export section
@@ -156,6 +186,18 @@ pub const CodeBuilder = struct {
     /// Emit local.set instruction.
     pub fn emitLocalSet(self: *CodeBuilder, idx: u32) !void {
         try self.buf.append(self.allocator, Op.local_set);
+        try enc.encodeULEB128(self.writer(), idx);
+    }
+
+    /// Emit global.get instruction.
+    pub fn emitGlobalGet(self: *CodeBuilder, idx: u32) !void {
+        try self.buf.append(self.allocator, Op.global_get);
+        try enc.encodeULEB128(self.writer(), idx);
+    }
+
+    /// Emit global.set instruction.
+    pub fn emitGlobalSet(self: *CodeBuilder, idx: u32) !void {
+        try self.buf.append(self.allocator, Op.global_set);
         try enc.encodeULEB128(self.writer(), idx);
     }
 
@@ -311,6 +353,16 @@ pub const CodeBuilder = struct {
         try self.buf.append(self.allocator, Op.i64_eqz);
     }
 
+    /// Emit i32.add instruction.
+    pub fn emitI32Add(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_add);
+    }
+
+    /// Emit i32.sub instruction.
+    pub fn emitI32Sub(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_sub);
+    }
+
     /// Emit call instruction.
     pub fn emitCall(self: *CodeBuilder, func_idx: u32) !void {
         try self.buf.append(self.allocator, Op.call);
@@ -383,14 +435,56 @@ pub const CodeBuilder = struct {
         try self.buf.append(self.allocator, Op.i32_wrap_i64);
     }
 
+    /// Emit i64.load instruction with alignment and offset.
+    /// Memory address should be on the stack (i32).
+    pub fn emitI64Load(self: *CodeBuilder, align_log2: u32, offset: u32) !void {
+        try self.buf.append(self.allocator, Op.i64_load);
+        try enc.encodeULEB128(self.writer(), align_log2); // alignment (log2)
+        try enc.encodeULEB128(self.writer(), offset); // offset
+    }
+
+    /// Emit i64.store instruction with alignment and offset.
+    /// Stack: [address (i32), value (i64)] -> []
+    pub fn emitI64Store(self: *CodeBuilder, align_log2: u32, offset: u32) !void {
+        try self.buf.append(self.allocator, Op.i64_store);
+        try enc.encodeULEB128(self.writer(), align_log2); // alignment (log2)
+        try enc.encodeULEB128(self.writer(), offset); // offset
+    }
+
+    /// Emit i32.load instruction with alignment and offset.
+    pub fn emitI32Load(self: *CodeBuilder, align_log2: u32, offset: u32) !void {
+        try self.buf.append(self.allocator, Op.i32_load);
+        try enc.encodeULEB128(self.writer(), align_log2);
+        try enc.encodeULEB128(self.writer(), offset);
+    }
+
+    /// Emit i32.store instruction with alignment and offset.
+    pub fn emitI32Store(self: *CodeBuilder, align_log2: u32, offset: u32) !void {
+        try self.buf.append(self.allocator, Op.i32_store);
+        try enc.encodeULEB128(self.writer(), align_log2);
+        try enc.encodeULEB128(self.writer(), offset);
+    }
+
+    /// Set the number of locals (beyond parameters).
+    pub fn setLocalCount(self: *CodeBuilder, count: u32) void {
+        self.local_count = count;
+    }
+
     /// Finish building and return the function body bytes.
-    /// Includes local declarations (empty for now) and end opcode.
+    /// Includes local declarations and end opcode.
     pub fn finish(self: *CodeBuilder) ![]const u8 {
         var body: std.ArrayListUnmanaged(u8) = .{};
         errdefer body.deinit(self.allocator);
 
-        // Local declarations (0 for now)
-        try enc.encodeULEB128(body.writer(self.allocator), 0);
+        // Local declarations
+        if (self.local_count > 0) {
+            // One entry: count of i64 locals
+            try enc.encodeULEB128(body.writer(self.allocator), 1); // 1 local type group
+            try enc.encodeULEB128(body.writer(self.allocator), self.local_count); // count
+            try body.append(self.allocator, @intFromEnum(ValType.i64)); // type
+        } else {
+            try enc.encodeULEB128(body.writer(self.allocator), 0); // no locals
+        }
 
         // Instructions
         try body.appendSlice(self.allocator, self.buf.items);

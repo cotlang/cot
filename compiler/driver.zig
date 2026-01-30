@@ -16,12 +16,14 @@ const stackalloc_mod = @import("ssa/stackalloc.zig");
 const expand_calls = @import("ssa/passes/expand_calls.zig");
 const decompose = @import("ssa/passes/decompose.zig");
 const schedule = @import("ssa/passes/schedule.zig");
+const layout = @import("ssa/passes/layout.zig");
 const lower_wasm = @import("ssa/passes/lower_wasm.zig");
 const target_mod = @import("core/target.zig");
 const pipeline_debug = @import("pipeline_debug.zig");
 
 // Wasm codegen
-const wasm = @import("codegen/wasm.zig");
+const wasm_old = @import("codegen/wasm.zig"); // Old module builder (for CodeBuilder)
+const wasm = @import("codegen/wasm/wasm.zig"); // New Go-style package (for Linker)
 const wasm_gen = @import("codegen/wasm_gen.zig");
 
 // Native codegen modules - will be added in Round 5
@@ -275,11 +277,15 @@ pub const Driver = struct {
     }
 
     /// Generate WebAssembly binary.
+    /// Uses Go-style Linker for module structure with proper SP globals.
     fn generateWasmCode(self: *Driver, funcs: []const ir_mod.Func, type_reg: *types_mod.TypeRegistry) ![]u8 {
         pipeline_debug.log(.codegen, "driver: generating Wasm for {d} functions", .{funcs.len});
 
-        var module = wasm.Module.init(self.allocator);
-        defer module.deinit();
+        var linker = wasm.Linker.init(self.allocator);
+        defer linker.deinit();
+
+        // Configure memory (1 page = 64KB minimum)
+        linker.setMemory(1, null);
 
         // Build function name -> index mapping
         var func_indices = wasm_gen.FuncIndexMap{};
@@ -303,6 +309,7 @@ pub const Driver = struct {
 
             // Run Wasm-specific passes (no regalloc needed!)
             try schedule.schedule(ssa_func);
+            try layout.layout(ssa_func);  // Order blocks (Go's layout.go)
             try lower_wasm.lower(ssa_func);
 
             // Determine function signature
@@ -322,24 +329,29 @@ pub const Driver = struct {
             const has_return = ir_func.return_type != types_mod.TypeRegistry.VOID;
             const results: []const wasm.ValType = if (has_return) &[_]wasm.ValType{.i64} else &[_]wasm.ValType{};
 
-            // Add function to module
-            const type_idx = try module.addFuncType(params[0..param_count], results);
-            const func_idx = try module.addFunc(type_idx);
+            // Add function type to linker
+            const type_idx = try linker.addType(params[0..param_count], results);
 
-            // Export "main" function
-            if (std.mem.eql(u8, ir_func.name, "main")) {
-                try module.addExport(ir_func.name, .func, func_idx);
-            }
-
-            // Generate code
+            // Generate function body code (still using old wasm_gen for now)
             const body = try wasm_gen.genFuncWithIndices(self.allocator, ssa_func, &func_indices);
-            defer self.allocator.free(body);
-            try module.addCode(body);
+            errdefer self.allocator.free(body);
+
+            // Determine if function should be exported
+            const exported = std.mem.eql(u8, ir_func.name, "main");
+
+            // Add function to linker
+            _ = try linker.addFunc(.{
+                .name = ir_func.name,
+                .type_idx = type_idx,
+                .code = body, // Linker takes ownership
+                .exported = exported,
+            });
         }
 
-        // Emit Wasm binary
+        // Emit Wasm binary using Go-style linker
+        // This includes proper sections: type, function, memory, global (SP), export, code
         var output: std.ArrayListUnmanaged(u8) = .{};
-        try module.emit(output.writer(self.allocator));
+        try linker.emit(output.writer(self.allocator));
         return output.toOwnedSlice(self.allocator);
     }
 };

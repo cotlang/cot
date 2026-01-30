@@ -14,7 +14,10 @@ const debug = @import("../../pipeline_debug.zig");
 
 /// Reorder blocks to minimize jumps.
 pub fn layout(f: *Func) !void {
-    debug.log(.ssa, "layout: processing '{s}'", .{f.name});
+    debug.log(.codegen, "layout: processing '{s}', entry=b{d}", .{
+        f.name,
+        if (f.entry) |e| e.id else 0,
+    });
 
     if (f.blocks.items.len <= 1) {
         f.laidout = true;
@@ -123,16 +126,19 @@ pub fn layout(f: *Func) !void {
         }
 
         // 2. Try first unscheduled successor
+        var found = false;
         for (b.succs) |edge| {
             const succ_idx = id_to_idx.get(edge.b.id) orelse continue;
             if (!scheduled[succ_idx] and !is_exit[succ_idx]) {
                 current_idx = succ_idx;
-                continue;
+                found = true;
+                break;
             }
         }
+        if (found) continue;
 
         // 3. Try zero-degree blocks (LIFO for depth-first)
-        var found = false;
+        found = false;
         while (zerodegree.items.len > 0) {
             const idx = zerodegree.pop() orelse break;
             if (!scheduled[idx]) {
@@ -182,7 +188,10 @@ pub fn layout(f: *Func) !void {
     }
 
     f.laidout = true;
-    debug.log(.ssa, "  laid out {d} blocks", .{order.items.len});
+    debug.log(.codegen, "  laid out {d} blocks, first=b{d}", .{
+        order.items.len,
+        if (order.items.len > 0) order.items[0].id else 0,
+    });
 }
 
 // ============================================================================
