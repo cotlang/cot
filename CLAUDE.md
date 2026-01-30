@@ -1,5 +1,29 @@
 # Claude AI Instructions
 
+## Zig 0.15 API Changes
+
+**ArrayList requires allocator for each operation:**
+```zig
+// OLD (Zig 0.13)
+var list = std.ArrayList(u8).init(allocator);
+try list.append(42);
+const w = list.writer();
+
+// NEW (Zig 0.15) - use ArrayListUnmanaged
+var list: std.ArrayListUnmanaged(u8) = .{};
+defer list.deinit(allocator);
+try list.append(allocator, 42);
+const w = list.writer(allocator);
+```
+
+**Key patterns:**
+- Use `std.ArrayListUnmanaged(T)` instead of `std.ArrayList(T)`
+- Pass `allocator` to `append()`, `appendSlice()`, `writer()`, `deinit()`
+- Initialize with `.{}` instead of `.init(allocator)`
+- Store allocator in struct if needed for multiple operations
+
+---
+
 ## Project: Cot Programming Language
 
 **Cot** is a Wasm-first programming language for full-stack web development.
