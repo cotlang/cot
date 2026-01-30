@@ -1,6 +1,6 @@
 # Cot Language Design Summary
 
-Reference document summarizing key decisions from legacy cotlang documentation.
+Reference document summarizing key design decisions for the Cot programming language.
 
 ---
 
@@ -115,10 +115,15 @@ comptime if (@os() == "windows") { }
 ```
 
 ### Primitive Types
-- Signed: `i8`, `i16`, `i32`, `i64` (default), `isize`
+
+**Friendly aliases** (for developer convenience):
+- `int` → `i64`, `float` → `f64`, `uint` → `u64`
+
+**Full precision types** (when needed):
+- Signed: `i8`, `i16`, `i32`, `i64`, `isize`
 - Unsigned: `u8`, `u16`, `u32`, `u64`, `usize`
 - Float: `f32`, `f64`
-- Other: `bool`, `string`, `decimal` (financial math), `void`
+- Other: `bool`, `string`, `void`
 
 ---
 
@@ -230,7 +235,7 @@ std.sql      // sql_open(), sql_exec(), sql_query(), sql_fetch()
 1. **Explicit over implicit** - No hidden control flow or magic
 2. **Composition over inheritance** - Traits and impl, not class hierarchies
 3. **Null safety by default** - Optional types are explicit (`?T`)
-4. **Business-first types** - `decimal` for money, DateTime built-in
+4. **Friendly types** - `int`, `float`, `string` for everyday use
 5. **Fast compilation, fast execution**
 6. **Pragmatic, not dogmatic** - Good ideas from many languages
 
@@ -266,9 +271,9 @@ std.sql      // sql_open(), sql_exec(), sql_query(), sql_fetch()
 "The native Go with richer types, the practical Rust without the learning curve, the modern Java without verbosity."
 
 ### Unique Selling Points
-1. **First-class decimal type** - Financial apps without float errors
-2. **Native compilation** - No JVM/CLR startup penalty
-3. **Business-domain focus** - SQL, schema in stdlib
+1. **Wasm-first** - Same code runs in browser, server, and edge
+2. **Native compilation** - AOT to native when performance matters
+3. **Approachable types** - Friendly aliases, not systems-programming verbosity
 4. **Clean syntax** - Modern, not 1990s enterprise
 5. **Fast compilation** - Zig-speed compilation
 
@@ -287,8 +292,8 @@ std.sql      // sql_open(), sql_exec(), sql_query(), sql_fetch()
 
 **vs Rust:**
 - Simpler memory model (ARC vs ownership)
-- Lower learning curve for business developers
-- Business types (decimal) first-class
+- Lower learning curve
+- Friendly type aliases for everyday use
 
 **vs C#:**
 - Cross-platform native (no Windows perception)
@@ -303,7 +308,7 @@ std.sql      // sql_open(), sql_exec(), sql_query(), sql_fetch()
 **Required for success:**
 - Genuine productivity advantage (not just different)
 - Competitive performance (faster than JVM, comparable to Go)
-- One killer use case (financial apps? legacy modernization?)
+- One killer use case (full-stack Wasm apps)
 - Sustained multi-year development
 
 **Risk factors:**
