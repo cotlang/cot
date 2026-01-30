@@ -118,12 +118,14 @@ comptime if (@os() == "windows") { }
 
 **Friendly aliases** (for developer convenience):
 - `int` → `i64`, `float` → `f64`, `uint` → `u64`
+- `string` → `[]u8` (slice of bytes)
+- `byte` → `u8`
 
 **Full precision types** (when needed):
 - Signed: `i8`, `i16`, `i32`, `i64`, `isize`
 - Unsigned: `u8`, `u16`, `u32`, `u64`, `usize`
 - Float: `f32`, `f64`
-- Other: `bool`, `string`, `void`
+- Other: `bool`, `void`
 
 ---
 
