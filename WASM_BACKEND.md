@@ -1,361 +1,476 @@
-# Wasm Backend Execution Plan
+# Wasm Backend Implementation Plan
 
-This document details how we will implement the Wasm backend for the Cot compiler.
+## Status
 
----
-
-## Overview
-
-**Input:** Cot IR (from `compiler/frontend/ir.zig`)
-**Output:** WebAssembly binary (`.wasm` file)
-
-```
-Cot Source → Scanner → Parser → Checker → Lowerer → IR → [Wasm Codegen] → .wasm
-                                                              ↑
-                                                         THIS DOCUMENT
-```
+| Milestone | Status | Tests |
+|-----------|--------|-------|
+| M1: Binary Encoding | DONE | 14 tests |
+| M2: Module Builder | DONE | 5 tests |
+| M3: E2E Return 42 | TODO | 0 tests |
+| M4: E2E Add Function | TODO | 0 tests |
+| M5: Control Flow | TODO | 0 tests |
+| M6: Strings | TODO | 0 tests |
+| M7: Memory/ARC | TODO | 0 tests |
 
 ---
 
-## Wasm Binary Format
+## Architecture (Based on Go's Wasm Backend)
 
-A Wasm module consists of sections, each with a specific ID:
+Go's Wasm backend (`cmd/compile/internal/wasm/ssa.go`) teaches us:
+
+1. **Clear separation**: `ssaGenValue` handles each SSA op, `ssaGenBlock` handles control flow
+2. **Helper functions**: `getValue64()` pushes operand to stack, `setReg()` stores result
+3. **Type-driven dispatch**: Switch on operation type, emit corresponding Wasm instructions
+
+**Cot's architecture:**
 
 ```
-┌────────────────────────────────────────┐
-│  Magic Number (0x00 0x61 0x73 0x6D)    │  4 bytes
-│  Version (0x01 0x00 0x00 0x00)         │  4 bytes
-├────────────────────────────────────────┤
-│  Section 1: Type (0x01)                │  Function signatures
-│  Section 2: Import (0x02)              │  External functions
-│  Section 3: Function (0x03)            │  Function index → type index
-│  Section 5: Memory (0x05)              │  Linear memory declaration
-│  Section 7: Export (0x07)              │  Public functions
-│  Section 10: Code (0x0A)               │  Function bodies (bytecode)
-│  Section 11: Data (0x0B)               │  Static data (strings, etc.)
-└────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  compiler/codegen/                                          │
+├─────────────────────────────────────────────────────────────┤
+│  wasm_opcodes.zig    │ Wasm instruction constants (DONE)    │
+│  wasm_encode.zig     │ LEB128, section encoding (DONE)      │
+│  wasm.zig            │ Module/CodeBuilder (DONE)            │
+│  wasm_codegen.zig    │ IR → Wasm translation (TODO)         │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+**Key insight from Go**: The codegen walks the IR, and for each node:
+1. Recursively emit operands (pushes values to Wasm stack)
+2. Emit the operation (consumes stack values, produces result)
+3. Store result if needed (to Wasm local)
 
 ---
 
-## File Structure
+## Milestone 3: E2E "Return 42"
 
-```
-compiler/codegen/
-├── wasm.zig           # Main Wasm codegen (orchestrates everything)
-├── wasm_encode.zig    # Binary encoding helpers (LEB128, sections)
-├── wasm_opcodes.zig   # Wasm instruction constants
-└── wasm_runtime.zig   # ARC runtime functions (future)
-```
+**Goal:** Compile Cot source `fn answer() int { return 42 }` to working Wasm.
 
----
+### Step 3.1: Install wasmtime
 
-## Implementation Phases
-
-### Phase 1: Binary Format Foundation
-
-**Goal:** Emit a valid but minimal `.wasm` file
-
-**Files to create:**
-- `compiler/codegen/wasm_opcodes.zig` - Opcode constants
-- `compiler/codegen/wasm_encode.zig` - Binary encoding
-
-**Key tasks:**
-
-1. **LEB128 encoding** (Wasm's variable-length integers)
-   ```zig
-   fn encodeULEB128(writer: anytype, value: u64) !void
-   fn encodeSLEB128(writer: anytype, value: i64) !void
-   ```
-
-2. **Section encoding**
-   ```zig
-   fn writeSection(writer: anytype, section_id: u8, content: []const u8) !void
-   ```
-
-3. **Type encoding**
-   ```zig
-   const ValType = enum(u8) { i32 = 0x7F, i64 = 0x7E, f32 = 0x7D, f64 = 0x7C };
-   fn writeFuncType(writer: anytype, params: []ValType, results: []ValType) !void
-   ```
-
-**Test:** Generate minimal valid Wasm, validate with `wasm-validate`
-
-```zig
-test "emit minimal wasm module" {
-    // Module that exports: fn answer() i64 { return 42; }
-    var output = std.ArrayList(u8).init(allocator);
-    try emitMinimalModule(&output);
-    // Validate with wasmtime or wasm-tools
-}
-```
-
----
-
-### Phase 2: IR → Wasm Translation
-
-**Goal:** Translate Cot IR operations to Wasm stack instructions
-
-**File to create:**
-- `compiler/codegen/wasm.zig` - Main codegen
-
-**IR to Wasm mapping:**
-
-| Cot IR | Wasm Instruction | Notes |
-|--------|------------------|-------|
-| `const_int` | `i64.const` | |
-| `const_float` | `f64.const` | |
-| `const_bool` | `i32.const 0/1` | Bools are i32 in Wasm |
-| `load_local` | `local.get` | |
-| `store_local` | `local.set` / `local.tee` | |
-| `binary(add)` | `i64.add` / `f64.add` | Type-dependent |
-| `binary(sub)` | `i64.sub` / `f64.sub` | |
-| `binary(mul)` | `i64.mul` / `f64.mul` | |
-| `binary(div)` | `i64.div_s` / `f64.div` | Signed for ints |
-| `binary(mod)` | `i64.rem_s` | |
-| `binary(eq)` | `i64.eq` / `f64.eq` | |
-| `binary(lt)` | `i64.lt_s` / `f64.lt` | |
-| `unary(neg)` | `i64.const 0` + `i64.sub` | No direct neg in Wasm |
-| `unary(not)` | `i32.eqz` | |
-| `call` | `call $func_idx` | |
-| `ret` | `return` | Or implicit at end |
-
-**Control flow:**
-
-| Cot IR | Wasm | Notes |
-|--------|------|-------|
-| `jump` | `br` | Branch to label |
-| `branch` | `br_if` / `if-else` | |
-| `phi` | N/A | Handled via locals |
-
-**Phi elimination strategy:**
-Wasm doesn't have phi nodes. Convert to explicit local assignments:
-
-```
-IR:                          Wasm:
-b1:                          (block $b1
-  ...                          ...
-  jump b3                      local.set $phi_x
-                               br $b3)
-b2:                          (block $b2
-  ...                          ...
-  jump b3                      local.set $phi_x
-                               br $b3)
-b3:                          (block $b3
-  x = phi(b1: v1, b2: v2)      local.get $phi_x
-  ...                          ...)
-```
-
-**Test:** Compile `fn add(a: i64, b: i64) i64 { return a + b }`, run in wasmtime
-
----
-
-### Phase 3: Function Compilation
-
-**Goal:** Compile complete functions with locals and control flow
-
-**Key tasks:**
-
-1. **Local variable mapping**
-   - Map IR locals to Wasm locals
-   - Track types for each local
-
-2. **Function prologue/epilogue**
-   ```wasm
-   (func $add (param $a i64) (param $b i64) (result i64)
-     (local $temp i64)  ;; Any additional locals
-     ;; body
-   )
-   ```
-
-3. **Control flow graph → Wasm structured control**
-
-   Wasm requires structured control flow (no arbitrary gotos). Strategy:
-   - Analyze CFG
-   - Identify loops (back edges)
-   - Convert to nested `block`/`loop`/`if` structure
-
-   ```
-   IR CFG:                 Wasm:
-   ┌──→ header ──┐         (loop $loop
-   │      ↓      │           (block $exit
-   │    body ────┘             header...
-   │      ↓                    br_if $exit (condition)
-   └── latch                   body...
-         ↓                     br $loop))
-       exit
-   ```
-
-**Test:** Compile factorial function, verify correct output
-
----
-
-### Phase 4: Memory and Data
-
-**Goal:** Handle strings, arrays, and heap allocation
-
-**Memory layout:**
-```
-┌─────────────────────────────────────────────────┐
-│  0x0000: Static data (strings, globals)         │
-│  ...                                            │
-│  HEAP_START: Dynamic allocations →              │
-│                                                 │
-│                              ← STACK_START      │
-│  STACK grows down (if needed for nested calls)  │
-└─────────────────────────────────────────────────┘
-```
-
-**String handling:**
-- Strings stored in Data section
-- Runtime representation: `{ ptr: i32, len: i32 }`
-
-**Data section encoding:**
-```zig
-fn emitDataSection(strings: []const []const u8) ![]u8 {
-    // For each string:
-    // - Offset in linear memory
-    // - Bytes
-}
-```
-
-**Test:** Compile program with string literal, verify in memory
-
----
-
-### Phase 5: Imports and Exports
-
-**Goal:** Interface with host environment
-
-**Required imports for runtime:**
-```wasm
-(import "env" "print_i64" (func $print_i64 (param i64)))
-(import "env" "print_str" (func $print_str (param i32 i32)))  ;; ptr, len
-```
-
-**Exports:**
-```wasm
-(export "main" (func $main))
-(export "memory" (memory 0))
-```
-
-**Test:** Call imported print function from Cot code
-
----
-
-### Phase 6: ARC Runtime
-
-**Goal:** Automatic reference counting for heap objects
-
-**Runtime functions (compiled into Wasm):**
-```
-cot_alloc(size: i32) -> i32      // Returns pointer
-cot_free(ptr: i32)               // Free memory
-cot_retain(ptr: i32)             // Increment refcount
-cot_release(ptr: i32)            // Decrement, free if zero
-```
-
-**Object header:**
-```
-┌──────────────────────────────┐
-│  refcount: i32               │  4 bytes
-│  size: i32                   │  4 bytes
-├──────────────────────────────┤
-│  payload...                  │
-└──────────────────────────────┘
-```
-
-**Compiler inserts retain/release:**
-```cot
-fn example(s: string) {     // retain(s) inserted at entry
-    let s2 = s              // retain(s) for copy
-    ...
-}                           // release(s2), release(s) at exit
-```
-
-**Test:** Verify refcount increments/decrements correctly
-
----
-
-## Milestone Checklist
-
-### Milestone 1: "Hello Wasm"
-- [ ] `wasm_opcodes.zig` with basic opcodes
-- [ ] `wasm_encode.zig` with LEB128, section encoding
-- [ ] Emit valid minimal module (empty function)
-- [ ] Validate with `wasm-validate` or `wasmtime`
-
-### Milestone 2: "Return 42"
-- [ ] Type section encoding
-- [ ] Function section encoding
-- [ ] Code section with `i64.const 42` + `return`
-- [ ] Export section
-- [ ] Run in wasmtime, verify returns 42
-
-### Milestone 3: "Add Two Numbers"
-- [ ] Parameter handling (`local.get`)
-- [ ] Binary operations (`i64.add`, etc.)
-- [ ] Compile: `fn add(a: i64, b: i64) i64 { return a + b }`
-- [ ] Run in wasmtime with arguments
-
-### Milestone 4: "Control Flow"
-- [ ] If/else → Wasm `if`/`else`/`end`
-- [ ] While loops → Wasm `loop`/`block`/`br`
-- [ ] Compile: factorial function
-- [ ] Verify correct output
-
-### Milestone 5: "Strings"
-- [ ] Data section for string literals
-- [ ] String runtime representation
-- [ ] Import print function
-- [ ] Compile: `print("Hello, World!")`
-
-### Milestone 6: "Memory"
-- [ ] Heap allocator in Wasm
-- [ ] ARC runtime functions
-- [ ] Compile program with dynamic allocation
-- [ ] Verify no memory leaks
-
----
-
-## Testing Strategy
-
-**Unit tests:** Each encoding function tested in isolation
-
-**Integration tests:**
-1. Compile Cot source
-2. Emit `.wasm`
-3. Run with wasmtime
-4. Verify output
-
-**Test runner:**
 ```bash
-# In CI or locally
-zig build test                           # Unit tests
-./test_wasm.sh                           # Integration tests
-wasmtime run output.wasm --invoke main   # Manual verification
+brew install wasmtime
 ```
+
+**Verify:** `wasmtime --version` works.
+
+### Step 3.2: Write the E2E test FIRST
+
+**File:** `compiler/codegen/wasm_codegen_test.zig`
+
+```zig
+const std = @import("std");
+const wasm_codegen = @import("wasm_codegen.zig");
+
+test "e2e: return 42" {
+    const source = "fn answer() int { return 42 }";
+
+    // Compile to Wasm bytes
+    const wasm_bytes = try wasm_codegen.compileSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(wasm_bytes);
+
+    // Write to temp file
+    const tmp_path = "/tmp/test_return42.wasm";
+    try std.fs.cwd().writeFile(tmp_path, wasm_bytes);
+
+    // Run with wasmtime
+    const result = try std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &[_][]const u8{ "wasmtime", tmp_path, "--invoke", "answer" },
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    // Verify output
+    try std.testing.expectEqualStrings("42\n", result.stdout);
+}
+```
+
+**This test will FAIL initially. That's correct. Now implement to make it pass.**
+
+### Step 3.3: Create wasm_codegen.zig
+
+**File:** `compiler/codegen/wasm_codegen.zig`
+
+**Structure (follow Go's pattern):**
+
+```zig
+//! IR to WebAssembly code generator.
+//! Follows Go's wasm/ssa.go architecture.
+
+const std = @import("std");
+const wasm = @import("wasm.zig");
+const ir = @import("../frontend/ir.zig");
+const parser = @import("../frontend/parser.zig");
+const checker = @import("../frontend/checker.zig");
+const lower = @import("../frontend/lower.zig");
+const types = @import("../frontend/types.zig");
+
+/// Compile Cot source code to Wasm binary.
+pub fn compileSource(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    // 1. Parse
+    var p = parser.Parser.init(allocator, source, "test.cot");
+    const ast = try p.parse();
+
+    // 2. Type check
+    var type_reg = try types.TypeRegistry.init(allocator);
+    defer type_reg.deinit();
+    var c = checker.Checker.init(allocator, &type_reg);
+    try c.check(ast);
+
+    // 3. Lower to IR
+    var l = lower.Lowerer.init(allocator, &type_reg);
+    const ir_funcs = try l.lower(ast);
+
+    // 4. Generate Wasm
+    return try compileModule(allocator, ir_funcs, &type_reg);
+}
+
+/// Compile IR functions to Wasm module.
+pub fn compileModule(
+    allocator: std.mem.Allocator,
+    funcs: []const ir.Func,
+    type_reg: *const types.TypeRegistry,
+) ![]u8 {
+    var module = wasm.Module.init(allocator);
+    defer module.deinit();
+
+    for (funcs) |*func| {
+        try compileFunc(&module, func, type_reg);
+    }
+
+    var output: std.ArrayListUnmanaged(u8) = .{};
+    try module.emit(output.writer(allocator));
+    return output.toOwnedSlice(allocator);
+}
+
+/// Compile a single IR function to Wasm.
+fn compileFunc(
+    module: *wasm.Module,
+    func: *const ir.Func,
+    type_reg: *const types.TypeRegistry,
+) !void {
+    // 1. Build Wasm function type
+    const params = try buildParamTypes(module.allocator, func);
+    const results = try buildResultTypes(module.allocator, func);
+    const type_idx = try module.addFuncType(params, results);
+
+    // 2. Add function to module
+    const func_idx = try module.addFunc(type_idx);
+
+    // 3. Export if public (for now, export all)
+    try module.addExport(func.name, .func, func_idx);
+
+    // 4. Generate function body
+    var code = wasm.CodeBuilder.init(module.allocator);
+    defer code.deinit();
+
+    try emitFuncBody(&code, func, type_reg);
+
+    const body = try code.finish();
+    defer module.allocator.free(body);
+    try module.addCode(body);
+}
+
+/// Emit function body by walking IR nodes.
+fn emitFuncBody(
+    code: *wasm.CodeBuilder,
+    func: *const ir.Func,
+    type_reg: *const types.TypeRegistry,
+) !void {
+    // Walk blocks in order
+    for (func.blocks) |block| {
+        for (block.nodes) |node_idx| {
+            try emitNode(code, func.getNode(node_idx), func, type_reg);
+        }
+    }
+}
+
+/// Emit a single IR node (like Go's ssaGenValue).
+fn emitNode(
+    code: *wasm.CodeBuilder,
+    node: *const ir.Node,
+    func: *const ir.Func,
+    type_reg: *const types.TypeRegistry,
+) !void {
+    switch (node.data) {
+        .const_int => |ci| try code.emitI64Const(ci.value),
+        .ret => |r| {
+            if (r.value) |val_idx| {
+                try emitNode(code, func.getNode(val_idx), func, type_reg);
+            }
+            // Implicit return at function end - no explicit return needed
+        },
+        else => {},
+    }
+}
+
+fn buildParamTypes(allocator: std.mem.Allocator, func: *const ir.Func) ![]const wasm.ValType {
+    var params: std.ArrayListUnmanaged(wasm.ValType) = .{};
+    for (func.params) |param| {
+        try params.append(allocator, cotTypeToWasm(param.type_idx));
+    }
+    return params.toOwnedSlice(allocator);
+}
+
+fn buildResultTypes(allocator: std.mem.Allocator, func: *const ir.Func) ![]const wasm.ValType {
+    if (func.return_type == types.TypeRegistry.VOID) {
+        return &[_]wasm.ValType{};
+    }
+    var results: std.ArrayListUnmanaged(wasm.ValType) = .{};
+    try results.append(allocator, cotTypeToWasm(func.return_type));
+    return results.toOwnedSlice(allocator);
+}
+
+fn cotTypeToWasm(type_idx: types.TypeIndex) wasm.ValType {
+    return switch (type_idx) {
+        types.TypeRegistry.BOOL => .i32,
+        types.TypeRegistry.I32, types.TypeRegistry.U32 => .i32,
+        types.TypeRegistry.I64, types.TypeRegistry.U64 => .i64,
+        types.TypeRegistry.F32 => .f32,
+        types.TypeRegistry.F64 => .f64,
+        else => .i64, // Default for int, pointers, etc.
+    };
+}
+```
+
+### Step 3.4: Success Criteria
+
+**STOP when:**
+- [ ] `zig test compiler/codegen/wasm_codegen_test.zig` passes
+- [ ] `wasmtime /tmp/test_return42.wasm --invoke answer` outputs `42`
+
+**DO NOT proceed to Milestone 4 until M3 is complete.**
 
 ---
 
-## Dependencies
+## Milestone 4: E2E "Add Two Numbers"
 
-**Build time:**
-- None (pure Zig)
+**Goal:** Compile `fn add(a: int, b: int) int { return a + b }` to working Wasm.
 
-**Test time:**
-- `wasmtime` or `wasmer` for running Wasm
-- `wasm-tools` for validation (optional)
+### Step 4.1: Write the E2E test FIRST
 
-**Runtime (for Cot programs):**
-- Browser: Native Wasm support
-- Server: wasmtime, wasmer, or AOT-compiled native
+```zig
+test "e2e: add two numbers" {
+    const source = "fn add(a: int, b: int) int { return a + b }";
+
+    const wasm_bytes = try wasm_codegen.compileSource(std.testing.allocator, source);
+    defer std.testing.allocator.free(wasm_bytes);
+
+    try std.fs.cwd().writeFile("/tmp/test_add.wasm", wasm_bytes);
+
+    // wasmtime run /tmp/test_add.wasm --invoke add 3 5
+    const result = try std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &[_][]const u8{ "wasmtime", "/tmp/test_add.wasm", "--invoke", "add", "3", "5" },
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+
+    try std.testing.expectEqualStrings("8\n", result.stdout);
+}
+```
+
+### Step 4.2: Add to emitNode
+
+```zig
+fn emitNode(...) !void {
+    switch (node.data) {
+        .const_int => |ci| try code.emitI64Const(ci.value),
+
+        .load_local, .local_ref => |lr| try code.emitLocalGet(lr.local_idx),
+
+        .binary => |bin| {
+            // Emit left operand (pushes to stack)
+            try emitNode(code, func.getNode(bin.left), func, type_reg);
+            // Emit right operand (pushes to stack)
+            try emitNode(code, func.getNode(bin.right), func, type_reg);
+            // Emit operation (consumes two, produces one)
+            try emitBinaryOp(code, bin.op, isFloat(node.type_idx));
+        },
+
+        .ret => |r| {
+            if (r.value) |val_idx| {
+                try emitNode(code, func.getNode(val_idx), func, type_reg);
+            }
+        },
+
+        else => {},
+    }
+}
+
+fn emitBinaryOp(code: *wasm.CodeBuilder, op: ir.BinaryOp, is_float: bool) !void {
+    if (is_float) {
+        switch (op) {
+            .add => try code.emitF64Add(),
+            .sub => try code.emitF64Sub(),
+            .mul => try code.emitF64Mul(),
+            .div => try code.emitF64Div(),
+            else => {},
+        }
+    } else {
+        switch (op) {
+            .add => try code.emitI64Add(),
+            .sub => try code.emitI64Sub(),
+            .mul => try code.emitI64Mul(),
+            .div => try code.emitI64DivS(),
+            .mod => try code.emitI64RemS(),
+            else => {},
+        }
+    }
+}
+```
+
+### Step 4.3: Success Criteria
+
+**STOP when:**
+- [ ] `zig test compiler/codegen/wasm_codegen_test.zig` passes (both tests)
+- [ ] `wasmtime /tmp/test_add.wasm --invoke add 3 5` outputs `8`
+- [ ] `wasmtime /tmp/test_add.wasm --invoke add 100 200` outputs `300`
+
+---
+
+## Milestone 5: Control Flow
+
+**Goal:** Compile functions with if/else and loops.
+
+### Step 5.1: Write tests FIRST
+
+```zig
+test "e2e: absolute value" {
+    const source =
+        \\fn abs(x: int) int {
+        \\    if (x < 0) { return -x }
+        \\    return x
+        \\}
+    ;
+    // ... test abs(-5) == 5, abs(5) == 5
+}
+
+test "e2e: factorial" {
+    const source =
+        \\fn factorial(n: int) int {
+        \\    var result: int = 1
+        \\    var i: int = 1
+        \\    while (i <= n) {
+        \\        result = result * i
+        \\        i = i + 1
+        \\    }
+        \\    return result
+        \\}
+    ;
+    // ... test factorial(5) == 120
+}
+```
+
+### Step 5.2: Control Flow Strategy
+
+**Wasm has structured control flow.** No arbitrary gotos.
+
+**IR `branch` → Wasm `if`/`else`/`end`:**
+```
+IR:                         Wasm:
+branch cond, then, else  →  (if (result i64)
+                              (then ...)
+                              (else ...))
+```
+
+**IR loops → Wasm `loop`/`block`/`br`:**
+```
+IR:                         Wasm:
+loop_header:              →  (block $exit
+  branch cond, body, exit     (loop $loop
+body:                           ;; condition
+  ...                           br_if $exit
+  jump loop_header              ;; body
+exit:                           br $loop))
+```
+
+### Step 5.3: Implementation
+
+Add to `emitNode`:
+- `branch` → `if`/`else`/`end`
+- `jump` → `br`
+- Handle block structure
+
+**This is the hardest part.** Take it slow. One test at a time.
+
+---
+
+## Milestone 6: Strings
+
+**Goal:** Compile programs with string literals.
+
+### Step 6.1: Tests FIRST
+
+```zig
+test "e2e: hello world" {
+    const source =
+        \\fn main() {
+        \\    print("Hello, World!")
+        \\}
+    ;
+    // Run and verify stdout contains "Hello, World!"
+}
+```
+
+### Step 6.2: Implementation
+
+1. **Data section**: String literals go in Wasm data section
+2. **Import print**: `(import "env" "print" (func $print (param i32 i32)))`
+3. **String representation**: `{ ptr: i32, len: i32 }`
+
+---
+
+## Milestone 7: Memory and ARC
+
+**Goal:** Dynamic memory allocation with automatic reference counting.
+
+### Step 7.1: Tests FIRST
+
+```zig
+test "e2e: dynamic string" {
+    const source =
+        \\fn greet(name: string) string {
+        \\    return "Hello, " + name + "!"
+        \\}
+    ;
+    // Test that memory is properly allocated and freed
+}
+```
+
+### Step 7.2: Implementation
+
+1. **Memory section**: Declare linear memory
+2. **Allocator**: Bump allocator or free list
+3. **ARC runtime**: `cot_retain`, `cot_release`
+4. **Compiler inserts calls**: At function entry/exit, assignments
+
+---
+
+## Rules for Implementation
+
+1. **Write test FIRST.** Test must fail before implementing.
+2. **One milestone at a time.** Do not start M4 until M3 passes.
+3. **Run tests after every change.** `zig test compiler/codegen/wasm_codegen_test.zig`
+4. **Commit after each passing test.** Small, incremental commits.
+5. **If stuck, ask.** Don't spiral. Don't hack. Ask for direction.
+
+---
+
+## Files to Create (Summary)
+
+| Milestone | File | Purpose |
+|-----------|------|---------|
+| M3 | `compiler/codegen/wasm_codegen.zig` | IR → Wasm translation |
+| M3 | `compiler/codegen/wasm_codegen_test.zig` | E2E tests |
+| M6 | Update `wasm.zig` | Data section support |
+| M7 | `runtime/wasm_runtime.zig` | ARC functions in Wasm |
 
 ---
 
 ## Reference
 
-- [Wasm Binary Format Spec](https://webassembly.github.io/spec/core/binary/index.html)
-- [Wasm Instructions](https://webassembly.github.io/spec/core/syntax/instructions.html)
-- [LEB128 Encoding](https://en.wikipedia.org/wiki/LEB128)
-- `bootstrap-0.2/DESIGN.md` - Architecture context
+- Go's Wasm backend: `~/learning/go/src/cmd/compile/internal/wasm/ssa.go`
+- Wasm spec: https://webassembly.github.io/spec/core/
+- `bootstrap-0.2/DESIGN.md` - Overall architecture
