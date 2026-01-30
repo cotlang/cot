@@ -47,6 +47,11 @@ pub const dwarf = @import("dwarf.zig");
 pub const macho = @import("obj/macho.zig");
 pub const elf = @import("obj/elf.zig");
 
+// Wasm codegen
+pub const wasm = @import("codegen/wasm.zig");
+pub const wasm_opcodes = @import("codegen/wasm_opcodes.zig");
+pub const wasm_encode = @import("codegen/wasm_encode.zig");
+
 const Target = core_target.Target;
 const Driver = driver.Driver;
 

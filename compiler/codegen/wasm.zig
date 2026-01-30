@@ -2,13 +2,13 @@
 //! Compiles Cot IR to WebAssembly binary format.
 
 const std = @import("std");
-const op = @import("wasm_opcodes.zig");
+const wasm_op = @import("wasm_opcodes.zig");
 const enc = @import("wasm_encode.zig");
 
-pub const Op = op.Op;
-pub const ValType = op.ValType;
-pub const Section = op.Section;
-pub const ExportKind = op.ExportKind;
+pub const Op = wasm_op.Op;
+pub const ValType = wasm_op.ValType;
+pub const Section = wasm_op.Section;
+pub const ExportKind = wasm_op.ExportKind;
 
 // ============================================================================
 // Module Builder
@@ -172,6 +172,154 @@ pub const CodeBuilder = struct {
     /// Emit i64.mul instruction.
     pub fn emitI64Mul(self: *CodeBuilder) !void {
         try self.buf.append(self.allocator, Op.i64_mul);
+    }
+
+    /// Emit i64.div_s instruction.
+    pub fn emitI64DivS(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_div_s);
+    }
+
+    /// Emit i64.rem_s instruction.
+    pub fn emitI64RemS(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_rem_s);
+    }
+
+    /// Emit i64.eq instruction.
+    pub fn emitI64Eq(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_eq);
+    }
+
+    /// Emit i64.ne instruction.
+    pub fn emitI64Ne(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_ne);
+    }
+
+    /// Emit i64.lt_s instruction.
+    pub fn emitI64LtS(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_lt_s);
+    }
+
+    /// Emit i64.le_s instruction.
+    pub fn emitI64LeS(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_le_s);
+    }
+
+    /// Emit i64.gt_s instruction.
+    pub fn emitI64GtS(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_gt_s);
+    }
+
+    /// Emit i64.ge_s instruction.
+    pub fn emitI64GeS(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_ge_s);
+    }
+
+    /// Emit i64.and instruction.
+    pub fn emitI64And(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_and);
+    }
+
+    /// Emit i64.or instruction.
+    pub fn emitI64Or(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_or);
+    }
+
+    /// Emit i64.xor instruction.
+    pub fn emitI64Xor(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_xor);
+    }
+
+    /// Emit i64.shl instruction.
+    pub fn emitI64Shl(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_shl);
+    }
+
+    /// Emit i64.shr_s instruction.
+    pub fn emitI64ShrS(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_shr_s);
+    }
+
+    /// Emit f64.const instruction.
+    pub fn emitF64Const(self: *CodeBuilder, value: f64) !void {
+        try self.buf.append(self.allocator, Op.f64_const);
+        const bytes = @as([8]u8, @bitCast(value));
+        try self.buf.appendSlice(self.allocator, &bytes);
+    }
+
+    /// Emit f64.add instruction.
+    pub fn emitF64Add(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_add);
+    }
+
+    /// Emit f64.sub instruction.
+    pub fn emitF64Sub(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_sub);
+    }
+
+    /// Emit f64.mul instruction.
+    pub fn emitF64Mul(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_mul);
+    }
+
+    /// Emit f64.div instruction.
+    pub fn emitF64Div(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_div);
+    }
+
+    /// Emit f64.eq instruction.
+    pub fn emitF64Eq(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_eq);
+    }
+
+    /// Emit f64.ne instruction.
+    pub fn emitF64Ne(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_ne);
+    }
+
+    /// Emit f64.lt instruction.
+    pub fn emitF64Lt(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_lt);
+    }
+
+    /// Emit f64.le instruction.
+    pub fn emitF64Le(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_le);
+    }
+
+    /// Emit f64.gt instruction.
+    pub fn emitF64Gt(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_gt);
+    }
+
+    /// Emit f64.ge instruction.
+    pub fn emitF64Ge(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_ge);
+    }
+
+    /// Emit f64.neg instruction.
+    pub fn emitF64Neg(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_neg);
+    }
+
+    /// Emit i32.eqz instruction (for boolean not).
+    pub fn emitI32Eqz(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_eqz);
+    }
+
+    /// Emit i64.eqz instruction.
+    pub fn emitI64Eqz(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_eqz);
+    }
+
+    /// Emit call instruction.
+    pub fn emitCall(self: *CodeBuilder, func_idx: u32) !void {
+        try self.buf.append(self.allocator, Op.call);
+        try enc.encodeULEB128(self.writer(), func_idx);
+    }
+
+    /// Emit drop instruction.
+    pub fn emitDrop(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.drop);
     }
 
     /// Emit return instruction.
