@@ -273,11 +273,19 @@ pub const AMD64CodeGen = struct {
                     const scratch: Reg = if (hint_reg == .r11) .r10 else .r11;
                     try self.rematerializeValue(value.args[0], scratch);
                     const type_size = self.getTypeSize(value.type_idx);
-                    const load = if (type_size == 1) asm_mod.encodeLoadByteDisp32(hint_reg, scratch, 0)
-                        else if (type_size == 2) asm_mod.encodeLoadWordDisp32(hint_reg, scratch, 0)
-                        else if (type_size == 4) asm_mod.encodeLoadDwordDisp32(hint_reg, scratch, 0)
-                        else asm_mod.encodeLoadDisp32(hint_reg, scratch, 0);
-                    try self.emitBytes(load.data[0..load.len]);
+                    if (type_size == 1) {
+                        const load = asm_mod.encodeLoadByteDisp32(hint_reg, scratch, 0);
+                        try self.emitBytes(load.data[0..load.len]);
+                    } else if (type_size == 2) {
+                        const load = asm_mod.encodeLoadWordDisp32(hint_reg, scratch, 0);
+                        try self.emitBytes(load.data[0..load.len]);
+                    } else if (type_size == 4) {
+                        const load = asm_mod.encodeLoadDwordDisp32(hint_reg, scratch, 0);
+                        try self.emitBytes(load.data[0..load.len]);
+                    } else {
+                        const load = asm_mod.encodeLoadDisp32(hint_reg, scratch, 0);
+                        try self.emitBytes(load.data[0..load.len]);
+                    }
                 }
             },
             .const_string, .const_ptr => {
@@ -3068,8 +3076,13 @@ pub const AMD64CodeGen = struct {
 
     /// Emit PUSH or POP for a register
     fn emitPushPop(self: *AMD64CodeGen, reg: Reg, is_push: bool) !void {
-        const enc = if (is_push) asm_mod.encodePush(reg) else asm_mod.encodePop(reg);
-        try self.emitBytes(enc.data[0..enc.len]);
+        if (is_push) {
+            const enc = asm_mod.encodePush(reg);
+            try self.emitBytes(enc.data[0..enc.len]);
+        } else {
+            const enc = asm_mod.encodePop(reg);
+            try self.emitBytes(enc.data[0..enc.len]);
+        }
     }
 
     /// Load immediate value into register.

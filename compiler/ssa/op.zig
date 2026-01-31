@@ -59,6 +59,7 @@ pub const Op = enum(u16) {
     addr, local_addr, global_addr, off_ptr, add_ptr, sub_ptr,
     store_wb, move, zero,
     var_def, var_live, var_kill,
+    sp, store_sp, // Stack pointer operations for Wasm->native AOT
 
     // === Control Flow ===
     phi, copy, fwd_ref, arg,

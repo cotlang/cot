@@ -252,6 +252,8 @@ fn lowerValue(v: *Value) bool {
         .wasm_lowered_move, .wasm_lowered_zero, .wasm_lowered_nil_check,
         .wasm_lowered_static_call, .wasm_lowered_closure_call, .wasm_lowered_inter_call,
         .wasm_lowered_retain, .wasm_lowered_release,
+        // Wasm->native AOT ops (used for native backend, not Wasm output)
+        .sp, .store_sp,
         => null,
 
         // ARM64/AMD64 ops - should not appear in Wasm lowering

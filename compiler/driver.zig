@@ -244,8 +244,6 @@ pub const Driver = struct {
 
     /// Unified code generation for all architectures.
     fn generateCode(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry, source_file: []const u8, source_text: []const u8) ![]u8 {
-        _ = source_file;
-        _ = source_text;
         _ = globals;
 
         // Wasm target: use Wasm codegen pipeline
@@ -266,21 +264,40 @@ pub const Driver = struct {
 
         pipeline_debug.log(.codegen, "driver: parsed {d} functions from Wasm", .{wasm_module.code.len});
 
-        // Step 3: Convert each Wasm function to SSA and process
+        // Step 3: Initialize native codegen based on target architecture
+        var arm64_gen: ?arm64_codegen.ARM64CodeGen = null;
+        var amd64_gen: ?amd64_codegen.AMD64CodeGen = null;
+        defer if (arm64_gen) |*g| g.deinit();
+        defer if (amd64_gen) |*g| g.deinit();
+
+        if (self.target.arch == .arm64) {
+            arm64_gen = arm64_codegen.ARM64CodeGen.init(self.allocator);
+            arm64_gen.?.setTypeRegistry(type_reg);
+            arm64_gen.?.setDebugInfo(source_file, source_text);
+        } else if (self.target.arch == .amd64) {
+            amd64_gen = amd64_codegen.AMD64CodeGen.init(self.allocator);
+            amd64_gen.?.setTypeRegistry(type_reg);
+            amd64_gen.?.setDebugInfo(source_file, source_text);
+        } else {
+            pipeline_debug.log(.codegen, "driver: unsupported native target: {s}", .{@tagName(self.target.arch)});
+            return error.UnsupportedTarget;
+        }
+
+        // Step 4: Convert each Wasm function to SSA and generate native code
         var converter = wasm_to_ssa.WasmToSSA.init(self.allocator, &wasm_module);
         defer converter.deinit();
 
         for (0..wasm_module.code.len) |func_idx| {
             const ssa_func = converter.convert(func_idx) catch |e| {
                 pipeline_debug.log(.codegen, "driver: failed to convert function {d}: {any}", .{ func_idx, e });
-                continue; // Skip functions that fail to convert
+                continue;
             };
             defer {
                 ssa_func.deinit();
                 self.allocator.destroy(ssa_func);
             }
 
-            pipeline_debug.log(.codegen, "driver: converted function {d} to SSA", .{func_idx});
+            pipeline_debug.log(.codegen, "driver: converted function {d} '{s}' to SSA", .{ func_idx, ssa_func.name });
 
             // Run SSA passes for native codegen
             try expand_calls.expandCalls(ssa_func, type_reg);
@@ -290,29 +307,43 @@ pub const Driver = struct {
             var regalloc_state = try regalloc_mod.regalloc(self.allocator, ssa_func, self.target);
             defer regalloc_state.deinit();
 
-            _ = try stackalloc_mod.stackalloc(ssa_func, regalloc_state.getSpillLive());
+            const stack_result = try stackalloc_mod.stackalloc(ssa_func, regalloc_state.getSpillLive());
+            const frame_size = stack_result.frame_size;
 
-            // Use generic codegen to produce pseudo-assembly (validates pipeline)
-            // Real ARM64/AMD64 codegen will replace this once ported
-            var codegen = generic_codegen.GenericCodeGen.init(self.allocator);
-            defer codegen.deinit();
-
-            var pseudo_asm: std.ArrayListUnmanaged(u8) = .{};
-            defer pseudo_asm.deinit(self.allocator);
-
-            codegen.generate(ssa_func, pseudo_asm.writer(self.allocator)) catch |e| {
-                pipeline_debug.log(.codegen, "driver: generic codegen failed: {any}", .{e});
-                continue;
-            };
-
-            pipeline_debug.log(.codegen, "driver: generated {d} bytes of pseudo-asm for function {d}", .{
-                pseudo_asm.items.len,
-                func_idx,
-            });
+            // Generate native code
+            if (arm64_gen) |*gen| {
+                gen.setRegAllocState(&regalloc_state);
+                gen.setFrameSize(frame_size);
+                gen.generateBinary(ssa_func, ssa_func.name) catch |e| {
+                    pipeline_debug.log(.codegen, "driver: ARM64 codegen failed for {s}: {any}", .{ ssa_func.name, e });
+                    continue;
+                };
+                pipeline_debug.log(.codegen, "driver: generated ARM64 code for '{s}'", .{ssa_func.name});
+            } else if (amd64_gen) |*gen| {
+                gen.setRegAllocState(&regalloc_state);
+                gen.setFrameSize(frame_size);
+                gen.generateBinary(ssa_func, ssa_func.name) catch |e| {
+                    pipeline_debug.log(.codegen, "driver: AMD64 codegen failed for {s}: {any}", .{ ssa_func.name, e });
+                    continue;
+                };
+                pipeline_debug.log(.codegen, "driver: generated AMD64 code for '{s}'", .{ssa_func.name});
+            }
         }
 
-        // Return empty for now - real native codegen will return ELF/Mach-O bytes
-        return try self.allocator.dupe(u8, "");
+        // Step 5: Finalize and produce object file
+        // NOTE: ARM64CodeGen.finalize() and AMD64CodeGen.finalize() already produce
+        // complete object files (Mach-O or ELF respectively), so we return directly.
+        if (arm64_gen) |*gen| {
+            const object_file = try gen.finalize();
+            pipeline_debug.log(.codegen, "driver: finalized {d} bytes of ARM64 Mach-O object", .{object_file.len});
+            return object_file;
+        } else if (amd64_gen) |*gen| {
+            const object_file = try gen.finalize();
+            pipeline_debug.log(.codegen, "driver: finalized {d} bytes of AMD64 ELF object", .{object_file.len});
+            return object_file;
+        }
+
+        return error.NoCodeGenerated;
     }
 
     /// Generate WebAssembly binary.

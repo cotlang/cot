@@ -683,7 +683,7 @@ pub const ARM64CodeGen = struct {
             const value = block.values.items[i];
             if (value.uses == 0) {
                 const has_side_effects = switch (value.op) {
-                    .store, .move, .static_call, .closure_call, .load_reg => true,
+                    .store, .store_sp, .move, .static_call, .closure_call, .load_reg => true,
                     else => false,
                 };
                 if (!has_side_effects) {
@@ -704,7 +704,7 @@ pub const ARM64CodeGen = struct {
             // Generating an extra MOV is cheap; skipping it causes register clobbering.
             if (value.uses == 0) {
                 const has_side_effects = switch (value.op) {
-                    .store, .move, .static_call, .closure_call, .load_reg, .copy => true,
+                    .store, .store_sp, .move, .static_call, .closure_call, .load_reg, .copy => true,
                     // Don't skip const_int - may be a rematerialized value
                     .const_int, .const_64, .const_bool, .const_nil => true,
                     else => false,
@@ -1921,6 +1921,41 @@ pub const ARM64CodeGen = struct {
                 debug.log(.codegen, "      -> ADRP+ADD x{d}, _{s} (global)", .{ dest_reg, global_name });
             },
 
+            // === Stack Pointer Operations (Wasm->Native AOT) ===
+            // These ops are created by wasm_to_ssa.zig when converting Wasm globals (SP).
+            // In Wasm, SP is a global variable. In native code, we use the actual SP register.
+
+            .sp => {
+                // Get the stack pointer into a general-purpose register
+                // This is used for Wasm memory operations that reference SP+offset
+                const maybe_reg = value.regOrNull();
+                if (maybe_reg == null) {
+                    debug.log(.codegen, "      (sp skipped - evicted)", .{});
+                    return;
+                }
+                const dest_reg: u5 = @intCast(maybe_reg.?);
+                // MOV xN, SP (encoded as ADD xN, SP, #0)
+                try self.emit(asm_mod.encodeADDImm(dest_reg, 31, 0, 0));
+                debug.log(.codegen, "      -> MOV x{d}, SP (sp)", .{dest_reg});
+            },
+
+            .store_sp => {
+                // Store a value to the stack pointer (Wasm global.set for SP)
+                // This adjusts the native stack pointer. Used for Wasm frame allocation.
+                // Note: We need to track this adjustment for the epilogue.
+                if (value.args.len > 0) {
+                    const new_sp = value.args[0];
+                    const src_reg = self.getRegForValue(new_sp) orelse blk: {
+                        try self.ensureInReg(new_sp, 16);
+                        break :blk @as(u5, 16);
+                    };
+                    // MOV SP, xN (encoded as ADD SP, xN, #0 with SP as dest)
+                    // ARM64 requires 16-byte alignment for SP
+                    try self.emit(asm_mod.encodeADDImm(31, src_reg, 0, 0));
+                    debug.log(.codegen, "      -> MOV SP, x{d} (store_sp)", .{src_reg});
+                }
+            },
+
             .addr => {
                 // Address of a symbol (function for function pointers)
                 // aux.string contains the symbol name
@@ -2511,6 +2546,10 @@ pub const ARM64CodeGen = struct {
                     try self.emitAddImm(dest, 31, @intCast(base_offset + self.call_stack_adjustment));
                 } else try self.emit(asm_mod.encodeMOVZ(dest, 0, 0));
             },
+            .sp => {
+                // Get stack pointer into dest register
+                try self.emit(asm_mod.encodeADDImm(dest, 31, 0, 0));
+            },
             else => try self.emit(asm_mod.encodeMOVZ(dest, 0, 0)),
         }
     }
@@ -2823,7 +2862,7 @@ pub const ARM64CodeGen = struct {
         if (self.line_entries.items.len > 0 and self.debug_source_text.len > 0) {
             writer.setDebugInfo(self.debug_source_file, self.debug_source_text);
             for (self.line_entries.items) |entry| {
-                try writer.addLineEntries(&[_]macho.MachOWriter.LineEntry{.{ .code_offset = entry.code_offset, .source_offset = entry.source_offset }});
+                try writer.addLineEntries(&[_]macho.LineEntry{.{ .code_offset = entry.code_offset, .source_offset = entry.source_offset }});
             }
             try writer.generateDebugSections();
         }

@@ -171,7 +171,7 @@ const ConvertState = struct {
                 } else {
                     // End of function - create return
                     if (self.value_stack.pop()) |ret_val| {
-                        self.current_block.controls[0] = ret_val;
+                        self.current_block.setControl(ret_val);
                     }
                     self.current_block.kind = .ret;
                 }
@@ -199,6 +199,29 @@ const ConvertState = struct {
                 try self.current_block.addValue(self.allocator, v);
                 try self.value_stack.push(self.allocator, v);
             },
+
+            // Global access (SP register for stack locals)
+            wasm.Op.global_get => {
+                const idx = self.readULEB128();
+                // Global 0 is typically SP - create a stack pointer reference
+                const v = try self.func.newValue(.sp, TypeRegistry.I32, self.current_block, .{});
+                v.aux_int = @intCast(idx);
+                try self.current_block.addValue(self.allocator, v);
+                try self.value_stack.push(self.allocator, v);
+            },
+            wasm.Op.global_set => {
+                const idx = self.readULEB128();
+                const value = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                // For SP updates, create a store to SP
+                const v = try self.func.newValue(.store_sp, TypeRegistry.VOID, self.current_block, .{});
+                v.aux_int = @intCast(idx);
+                v.addArg(value);
+                try self.current_block.addValue(self.allocator, v);
+            },
+
+            // 32-bit arithmetic (for address calculations)
+            wasm.Op.i32_add => try self.emitBinaryOp(.add),
+            wasm.Op.i32_sub => try self.emitBinaryOp(.sub),
 
             // Binary arithmetic
             wasm.Op.i64_add => try self.emitBinaryOp(.add),
@@ -288,7 +311,7 @@ const ConvertState = struct {
                 const end_block = try self.func.newBlock(.plain);
 
                 self.current_block.kind = .if_;
-                self.current_block.controls[0] = cond;
+                self.current_block.setControl(cond);
                 try self.current_block.addEdgeTo(self.allocator, then_block);
                 try self.current_block.addEdgeTo(self.allocator, else_block);
 
@@ -328,7 +351,7 @@ const ConvertState = struct {
                     const cont_block = try self.func.newBlock(.plain);
 
                     self.current_block.kind = .if_;
-                    self.current_block.controls[0] = cond;
+                    self.current_block.setControl(cond);
                     try self.current_block.addEdgeTo(self.allocator, target);
                     try self.current_block.addEdgeTo(self.allocator, cont_block);
                     self.current_block = cont_block;
@@ -336,7 +359,7 @@ const ConvertState = struct {
             },
             wasm.Op.return_op => {
                 if (self.value_stack.pop()) |ret_val| {
-                    self.current_block.controls[0] = ret_val;
+                    self.current_block.setControl(ret_val);
                 }
                 self.current_block.kind = .ret;
             },
@@ -368,11 +391,48 @@ const ConvertState = struct {
 
             wasm.Op.nop => {},
 
-            // Memory operations (simplified - just skip the immediates)
-            wasm.Op.i64_load, wasm.Op.i32_load, wasm.Op.i64_store, wasm.Op.i32_store => {
+            // Memory operations
+            wasm.Op.i64_load => {
                 _ = self.readULEB128(); // align
-                _ = self.readULEB128(); // offset
-                // For now, just pass through as a placeholder
+                const offset = self.readULEB128(); // offset
+                const addr = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                const v = try self.func.newValue(.load, TypeRegistry.I64, self.current_block, .{});
+                v.addArg(addr);
+                v.aux_int = @intCast(offset);
+                try self.current_block.addValue(self.allocator, v);
+                try self.value_stack.push(self.allocator, v);
+            },
+            wasm.Op.i32_load => {
+                _ = self.readULEB128();
+                const offset = self.readULEB128();
+                const addr = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                const v = try self.func.newValue(.load, TypeRegistry.I32, self.current_block, .{});
+                v.addArg(addr);
+                v.aux_int = @intCast(offset);
+                try self.current_block.addValue(self.allocator, v);
+                try self.value_stack.push(self.allocator, v);
+            },
+            wasm.Op.i64_store => {
+                _ = self.readULEB128(); // align
+                const offset = self.readULEB128(); // offset
+                const value = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                const addr = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                const v = try self.func.newValue(.store, TypeRegistry.VOID, self.current_block, .{});
+                v.addArg(addr);
+                v.addArg(value);
+                v.aux_int = @intCast(offset);
+                try self.current_block.addValue(self.allocator, v);
+            },
+            wasm.Op.i32_store => {
+                _ = self.readULEB128();
+                const offset = self.readULEB128();
+                const value = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                const addr = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                const v = try self.func.newValue(.store, TypeRegistry.VOID, self.current_block, .{});
+                v.addArg(addr);
+                v.addArg(value);
+                v.aux_int = @intCast(offset);
+                try self.current_block.addValue(self.allocator, v);
             },
 
             else => {

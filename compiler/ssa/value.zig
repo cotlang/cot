@@ -3,6 +3,7 @@
 const std = @import("std");
 const types = @import("../core/types.zig");
 const Op = @import("op.zig").Op;
+const abi = @import("../codegen/native/abi.zig");
 
 pub const ID = types.ID;
 pub const INVALID_ID = types.INVALID_ID;
@@ -28,16 +29,68 @@ pub const Aux = union(enum) {
 };
 
 /// Auxiliary data for function calls.
+/// Contains ABI information used by register allocation and native codegen.
+/// Reference: Go's ssa/op.go:118-122, bootstrap-0.2/src/ssa/value.zig
 pub const AuxCall = struct {
     fn_name: []const u8 = "",
     func_sym: ?*anyopaque = null,
     allocator: ?std.mem.Allocator = null,
+    /// ABI information describing how parameters and results are passed.
+    abi_info: ?*const abi.ABIParamResultInfo = null,
     // Register info computed lazily by regalloc
     inputs: []const u8 = &.{},
     outputs: []const u8 = &.{},
     clobbers: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) AuxCall { return .{ .allocator = alloc }; }
+
+    /// Check if this call uses hidden return pointer (>16B return on ARM64/AMD64)
+    pub fn usesHiddenReturn(self: *const AuxCall) bool {
+        if (self.abi_info) |info| {
+            return info.uses_hidden_return;
+        }
+        return false;
+    }
+
+    /// Get the hidden return size (0 if not using hidden return)
+    pub fn hiddenReturnSize(self: *const AuxCall) u32 {
+        if (self.abi_info) |info| {
+            return info.hidden_return_size;
+        }
+        return 0;
+    }
+
+    /// Get registers used for argument N
+    pub fn regsOfArg(self: *const AuxCall, which: usize) []const abi.RegIndex {
+        if (self.abi_info) |info| {
+            return info.regsOfArg(which);
+        }
+        return &.{};
+    }
+
+    /// Get registers used for result N
+    pub fn regsOfResult(self: *const AuxCall, which: usize) []const abi.RegIndex {
+        if (self.abi_info) |info| {
+            return info.regsOfResult(which);
+        }
+        return &.{};
+    }
+
+    /// Get stack offset for argument N
+    pub fn offsetOfArg(self: *const AuxCall, which: usize) i32 {
+        if (self.abi_info) |info| {
+            return info.offsetOfArg(which);
+        }
+        return 0;
+    }
+
+    /// Get stack offset for result N
+    pub fn offsetOfResult(self: *const AuxCall, which: usize) i32 {
+        if (self.abi_info) |info| {
+            return info.offsetOfResult(which);
+        }
+        return 0;
+    }
 };
 
 /// SSA Value - represents a single operation's result.
@@ -158,16 +211,24 @@ pub const Value = struct {
         return self.args[self.args.len - 1];
     }
 
+    /// Get the assigned home location (register or stack slot).
+    /// This is set by the register allocator via func.setHome().
+    /// Pattern from Go's SSA: value.getHome() delegates to func.reg_alloc[id].
+    pub fn getHome(self: *const Value) ?Location {
+        const b = self.block orelse return self.home;
+        return b.func.getHome(self.id) orelse self.home;
+    }
+
     pub fn getReg(self: *const Value) u8 {
-        const loc = self.home orelse @panic("Value.getReg: no location");
+        const loc = self.getHome() orelse @panic("Value.getReg: no location");
         return switch (loc) { .register => |r| r, .stack => @panic("Value.getReg: in stack") };
     }
     pub fn regOrNull(self: *const Value) ?u8 {
-        const loc = self.home orelse return null;
+        const loc = self.getHome() orelse return null;
         return switch (loc) { .register => |r| r, .stack => null };
     }
     pub fn hasReg(self: *const Value) bool {
-        const loc = self.home orelse return false;
+        const loc = self.getHome() orelse return false;
         return loc == .register;
     }
 
@@ -190,6 +251,8 @@ pub const Location = union(enum) {
 
     pub fn reg(self: Location) u8 { return switch (self) { .register => |r| r, .stack => @panic("not a register") }; }
     pub fn isReg(self: Location) bool { return self == .register; }
+    pub fn isStack(self: Location) bool { return self == .stack; }
+    pub fn stackOffset(self: Location) i32 { return switch (self) { .stack => |s| s, .register => @panic("not a stack slot") }; }
 };
 
 pub const Block = @import("block.zig").Block;
