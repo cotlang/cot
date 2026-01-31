@@ -11,9 +11,8 @@ The Cot compiler is at a crossroads. The Wasm backend is ~70% complete (M1-M9), 
 ## Current State
 
 ### Test Status
-- **317 passed** - Frontend, SSA core, Wasm backend basics
-- **1 failed** - `wasm_gen.test.genFunc - add two args` (pre-existing Wasm issue)
-- **22 skipped** - Native codegen tests (disabled because AOT not implemented)
+- **376 passed** - Frontend, SSA, Wasm backend, native codegen unit tests
+- **22 skipped** - Native codegen integration tests (pending Phase 4 wiring)
 
 ### Code Paths
 

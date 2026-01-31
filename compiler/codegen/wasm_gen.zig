@@ -181,6 +181,10 @@ pub const FuncGen = struct {
                 // Comparisons don't need locals - they're generated on-demand for branches
                 if (self.isCmp(v)) continue;
 
+                // OnWasmStack values don't need locals - they stay on stack until consumed
+                // Go reference: values with OnWasmStack=true skip register allocation
+                if (self.isOnWasmStack(v)) continue;
+
                 // Values that produce results need locals
                 if (self.producesValue(v)) {
                     const local_idx = self.next_local;
@@ -220,6 +224,23 @@ pub const FuncGen = struct {
             => true,
             else => false,
         };
+    }
+
+    /// Check if a value is "OnWasmStack" - only used as a block control.
+    /// Go reference: wasm/ssa.go checks v.OnWasmStack before generating/storing.
+    /// Values that are only used as block controls (return values) don't need locals.
+    /// They can stay on the Wasm stack and be consumed directly by ssaGenBlock.
+    fn isOnWasmStack(self: *const FuncGen, v: *const SsaValue) bool {
+        // Must have exactly one use (the block control)
+        if (v.uses != 1) return false;
+
+        // Check if this value is used as a block control
+        for (self.ssa_func.blocks.items) |block| {
+            if (block.controls[0]) |ctrl| {
+                if (ctrl.id == v.id) return true;
+            }
+        }
+        return false;
     }
 
     /// Check if a value is a comparison (produces i32, used by branches).
@@ -515,6 +536,10 @@ pub const FuncGen = struct {
                 // Rematerializable values (constants, local_addr) are generated on-demand
                 // Don't generate them here - they can be regenerated when needed
                 if (self.isRematerializable(v)) return;
+
+                // OnWasmStack values are generated inline by ssaGenBlock
+                // Go reference: if v.OnWasmStack { continue } in ssaGenValue
+                if (self.isOnWasmStack(v)) return;
 
                 // Generate value onto stack
                 try self.ssaGenValueOnStack(v);

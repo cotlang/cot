@@ -13,7 +13,7 @@ After this is complete, the `codegen/native/` code will be **tested and exercise
 
 ## Current Status: Phases 1-3 COMPLETE
 
-**Test Results:** 375/398 passed, 1 failed (pre-existing), 22 skipped
+**Test Results:** 376/398 passed, 22 skipped
 
 All native codegen files have been copied and integrated.
 

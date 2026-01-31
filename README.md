@@ -19,7 +19,7 @@ See **[VISION.md](VISION.md)** for the complete language vision and strategy.
 | AOT Native | ✅ Ported | ARM64/AMD64 codegen refactored (~20% reduction) |
 | AOT Native | 🔄 Phase 4 Next | Wire into driver, enable native binary output |
 
-**Tests: 375/398 passed, 1 failed (wasm_gen), 22 skipped (native)**
+**Tests: 376/398 passed, 22 skipped (native)**
 
 ## Architecture
 

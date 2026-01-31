@@ -101,6 +101,6 @@ call_stack_adjustment: u32 = 0, // Track SP adjustment during call setup
 
 ## Verification
 
-- `zig build test`: 375/398 passed, 1 failed (pre-existing wasm_gen issue), 22 skipped (native tests)
+- `zig build test`: 376/398 passed, 22 skipped (native tests)
 - ARM64 codegen test passes
 - No logic changes, only formatting

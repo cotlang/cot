@@ -106,6 +106,6 @@ From 60 lines with verbose save/restore to 20 lines using emitPushPop helper.
 
 ## Verification
 
-- `zig build test`: 375/398 passed, 1 failed (pre-existing wasm_gen issue), 22 skipped (native tests)
+- `zig build test`: 376/398 passed, 22 skipped (native tests)
 - AMD64 codegen test passes
 - No logic changes, only formatting

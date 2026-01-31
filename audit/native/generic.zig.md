@@ -109,7 +109,7 @@ pub const native_generic = @import("codegen/native/generic.zig");
 
 ```bash
 zig build test
-# 328/351 tests passed, 1 failed, 22 skipped
+# 376/398 tests passed, 22 skipped
 # generic.zig test passes
 ```
 

@@ -32,7 +32,7 @@
 
 ### Test Status
 
-**375/398 passed, 1 failed (wasm_gen.zig), 22 skipped (native tests)**
+**376/398 passed, 22 skipped (native tests)**
 
 ---
 

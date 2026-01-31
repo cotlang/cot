@@ -4,7 +4,7 @@
 
 All compiler files have been ported and refactored to 0.3.
 
-**Tests: 375/398 passed, 1 failed (wasm_gen), 22 skipped (native)**
+**Tests: 376/398 passed, 22 skipped (native)**
 
 ---
 
@@ -112,9 +112,6 @@ All compiler files have been ported and refactored to 0.3.
 ---
 
 ## Current Issues
-
-### Failing Test (1)
-- `wasm_gen.zig` - test failure needs investigation
 
 ### Skipped Tests (22)
 - Native codegen tests skipped pending Phase 4 wiring
