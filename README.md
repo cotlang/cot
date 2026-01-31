@@ -14,28 +14,29 @@ See **[VISION.md](VISION.md)** for the complete language vision and strategy.
 |-----------|--------|-------------|
 | Frontend | ✅ Done | Scanner, parser, type checker, IR lowering |
 | SSA Infrastructure | ✅ Done | Values, blocks, functions, passes |
-| Wasm Backend | ✅ M1-M11 Done | Constants, arithmetic, control flow, loops, function calls, CLI, memory, pointers |
-| Wasm Backend | 🔄 M12 Next | Structs (layout, field access) |
+| Wasm Backend | ✅ M1-M12 Done | Constants, arithmetic, control flow, loops, calls, memory, pointers, structs |
+| Wasm Backend | 🔄 M13 Next | Arrays/Slices (bounds checking, ptr+len) |
 | AOT Native | ✅ Ported | ARM64/AMD64 codegen refactored (~20% reduction) |
 | AOT Native | 🔄 Phase 4 Next | Wire into driver, enable native binary output |
 
-**Tests: 382/404 passed, 22 skipped (native)**
+**Tests: 385/407 passed, 22 skipped (native)**
 
 ## Architecture
 
 ```
 Cot Source → Frontend → IR → Wasm Codegen → .wasm file
                                    ↓
-                              [M1-M11 DONE]
+                              [M1-M12 DONE]
                               - Constants, arithmetic
                               - Control flow (if/else, loops)
                               - Function calls
                               - Linear memory (load/store)
                               - Pointers (off_ptr, add_ptr, sub_ptr)
+                              - Structs (field read/write)
                               - CLI: cot --target=wasm32 file.cot
 
-                              [M12+ TODO]
-                              - Structs, arrays
+                              [M13+ TODO]
+                              - Arrays/slices
                               - Strings, ARC
 
 AOT Path (future):

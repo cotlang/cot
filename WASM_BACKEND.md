@@ -428,9 +428,13 @@ pub fn compileToWasm(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 - [x] Tests: off_ptr, add_ptr, sub_ptr with load verification
 - Go reference: OpOffPtr → OpWasmI64AddConst (rewriteWasm.go:415)
 
-### M12: Structs
-- [ ] Struct layout in linear memory
-- [ ] Field access via memory offsets
+### M12: Structs ✅
+- [x] Struct layout computed in types.zig (StructType with field offsets)
+- [x] Field read: `local_addr` → `off_ptr(field_offset)` → `load`
+- [x] Field write: `local_addr` → `off_ptr(field_offset)` → `store`
+- [x] Multi-field access verified
+- [x] Tests: field read, field write, multi-field access
+- Go reference: rewrite.go rewriteStructLoad/rewriteStructStore
 
 ### M13: Arrays/Slices
 - [ ] Array bounds checking

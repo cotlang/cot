@@ -1239,3 +1239,181 @@ test "genFunc - sub_ptr subtracts variable offset from pointer" {
     }
     try testing.expect(found_i32_sub);
 }
+
+// ============================================================================
+// M12: Struct Operations Tests
+// Go reference: rewrite.go rewriteStructLoad/rewriteStructStore
+// Pattern: local_addr → off_ptr(field_offset) → load/store
+// ============================================================================
+
+test "genFunc - struct field read via off_ptr + load" {
+    // Simulates: struct Point { x: i64, y: i64 }; return p.y
+    // p is at local slot 0, y is at offset 8
+    const allocator = testing.allocator;
+
+    var f = SsaFunc.init(allocator, "test_struct_field_read");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // local_addr slot 0 (struct base)
+    const base = try f.newValue(.local_addr, 0, b, .{});
+    base.aux_int = 0;
+    base.*.uses = 1;
+    try b.addValue(allocator, base);
+
+    // off_ptr: base + 8 (field y at offset 8)
+    const field_addr = try f.newValue(.off_ptr, 0, b, .{});
+    field_addr.addArg(base);
+    field_addr.aux_int = 8; // offset of field y
+    field_addr.*.uses = 1;
+    try b.addValue(allocator, field_addr);
+
+    // load i64 from field address
+    const load = try f.newValue(.wasm_i64_load, 0, b, .{});
+    load.addArg(field_addr);
+    load.aux_int = 0;
+    load.*.uses = 1;
+    try b.addValue(allocator, load);
+    b.controls[0] = load;
+
+    const body = try genFunc(allocator, &f);
+    defer allocator.free(body);
+
+    // Verify: global.get(SP), i32.const(8), i32.add, i64.load
+    try testing.expect(body.len >= 8);
+    var found_global_get = false;
+    var found_i32_add = false;
+    var found_i64_load = false;
+    for (body) |byte| {
+        if (byte == Op.global_get) found_global_get = true;
+        if (byte == Op.i32_add) found_i32_add = true;
+        if (byte == Op.i64_load) found_i64_load = true;
+    }
+    try testing.expect(found_global_get);
+    try testing.expect(found_i32_add);
+    try testing.expect(found_i64_load);
+}
+
+test "genFunc - struct field write via off_ptr + store" {
+    // Simulates: struct Point { x: i64, y: i64 }; p.x = 42
+    // p is at local slot 0, x is at offset 0
+    const allocator = testing.allocator;
+
+    var f = SsaFunc.init(allocator, "test_struct_field_write");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // local_addr slot 0 (struct base)
+    const base = try f.newValue(.local_addr, 0, b, .{});
+    base.aux_int = 0;
+    base.*.uses = 1;
+    try b.addValue(allocator, base);
+
+    // off_ptr: base + 0 (field x at offset 0)
+    const field_addr = try f.newValue(.off_ptr, 0, b, .{});
+    field_addr.addArg(base);
+    field_addr.aux_int = 0; // offset of field x
+    field_addr.*.uses = 1;
+    try b.addValue(allocator, field_addr);
+
+    // value to store
+    const val = try f.newValue(.wasm_i64_const, 0, b, .{});
+    val.aux_int = 42;
+    val.*.uses = 1;
+    try b.addValue(allocator, val);
+
+    // store to field address
+    const store = try f.newValue(.wasm_i64_store, 0, b, .{});
+    store.addArg(field_addr);
+    store.addArg(val);
+    store.aux_int = 0;
+    try b.addValue(allocator, store);
+
+    // return void (just a constant for the test)
+    const ret = try f.newValue(.wasm_i64_const, 0, b, .{});
+    ret.aux_int = 0;
+    ret.*.uses = 1;
+    try b.addValue(allocator, ret);
+    b.controls[0] = ret;
+
+    const body = try genFunc(allocator, &f);
+    defer allocator.free(body);
+
+    // Verify: has i64.store
+    try testing.expect(body.len >= 8);
+    var found_i64_store = false;
+    for (body) |byte| {
+        if (byte == Op.i64_store) found_i64_store = true;
+    }
+    try testing.expect(found_i64_store);
+}
+
+test "genFunc - multi-field struct access" {
+    // Simulates accessing multiple fields: return p.x + p.y
+    // struct Point { x: i64, y: i64 } at slot 0
+    const allocator = testing.allocator;
+
+    var f = SsaFunc.init(allocator, "test_multi_field");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // Access field x (offset 0)
+    const base1 = try f.newValue(.local_addr, 0, b, .{});
+    base1.aux_int = 0;
+    base1.*.uses = 1;
+    try b.addValue(allocator, base1);
+
+    const addr_x = try f.newValue(.off_ptr, 0, b, .{});
+    addr_x.addArg(base1);
+    addr_x.aux_int = 0;
+    addr_x.*.uses = 1;
+    try b.addValue(allocator, addr_x);
+
+    const load_x = try f.newValue(.wasm_i64_load, 0, b, .{});
+    load_x.addArg(addr_x);
+    load_x.aux_int = 0;
+    load_x.*.uses = 1;
+    try b.addValue(allocator, load_x);
+
+    // Access field y (offset 8)
+    const base2 = try f.newValue(.local_addr, 0, b, .{});
+    base2.aux_int = 0;
+    base2.*.uses = 1;
+    try b.addValue(allocator, base2);
+
+    const addr_y = try f.newValue(.off_ptr, 0, b, .{});
+    addr_y.addArg(base2);
+    addr_y.aux_int = 8;
+    addr_y.*.uses = 1;
+    try b.addValue(allocator, addr_y);
+
+    const load_y = try f.newValue(.wasm_i64_load, 0, b, .{});
+    load_y.addArg(addr_y);
+    load_y.aux_int = 0;
+    load_y.*.uses = 1;
+    try b.addValue(allocator, load_y);
+
+    // Add them
+    const add = try f.newValue(.wasm_i64_add, 0, b, .{});
+    add.addArg(load_x);
+    add.addArg(load_y);
+    add.*.uses = 1;
+    try b.addValue(allocator, add);
+    b.controls[0] = add;
+
+    const body = try genFunc(allocator, &f);
+    defer allocator.free(body);
+
+    // Should have two i64.load and one i64.add
+    var load_count: u32 = 0;
+    var found_add = false;
+    for (body) |byte| {
+        if (byte == Op.i64_load) load_count += 1;
+        if (byte == Op.i64_add) found_add = true;
+    }
+    try testing.expectEqual(@as(u32, 2), load_count);
+    try testing.expect(found_add);
+}
