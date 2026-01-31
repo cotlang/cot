@@ -9,7 +9,9 @@ const wasm = @import("../wasm_opcodes.zig");
 const Func = @import("../../ssa/func.zig").Func;
 const Block = @import("../../ssa/block.zig").Block;
 const BlockKind = @import("../../ssa/block.zig").BlockKind;
-const Value = @import("../../ssa/value.zig").Value;
+const value_mod = @import("../../ssa/value.zig");
+const Value = value_mod.Value;
+const Location = value_mod.Location;
 const Op = @import("../../ssa/op.zig").Op;
 const TypeRegistry = @import("../../frontend/types.zig").TypeRegistry;
 
@@ -116,6 +118,9 @@ pub const WasmToSSA = struct {
         for (func_type.params, 0..) |_, i| {
             const arg = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
             arg.aux_int = @intCast(i);
+            // Pre-assign arguments to their native ABI registers (x0-x7 on ARM64)
+            // This tells regalloc these registers are occupied
+            arg.home = .{ .register = @intCast(i) };
             try entry.addValue(self.allocator, arg);
             try locals.append(self.allocator, arg);
         }

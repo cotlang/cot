@@ -96,7 +96,7 @@ pub const ARM64CodeGen = struct {
     symbols: std.ArrayListUnmanaged(macho.Symbol),
     relocations: std.ArrayListUnmanaged(Relocation),
     regalloc_state: ?*const regalloc.RegAllocState,
-    frame_size: u32 = 16,
+    frame_size: u32 = 64, // Minimum 64 bytes: 16 for FP/LR, 48 for Wasm locals
     next_spill_slot: u32 = 0,
     spill_slot_map: std.AutoHashMapUnmanaged(*const Value, u32),
     block_offsets: std.AutoHashMapUnmanaged(u32, u32),
@@ -142,7 +142,10 @@ pub const ARM64CodeGen = struct {
     }
 
     pub fn setRegAllocState(self: *ARM64CodeGen, state: *const regalloc.RegAllocState) void { self.regalloc_state = state; }
-    pub fn setFrameSize(self: *ARM64CodeGen, size: u32) void { self.frame_size = size; }
+    pub fn setFrameSize(self: *ARM64CodeGen, size: u32) void {
+        // Minimum 64 bytes: 16 for FP/LR, 48 for Wasm locals during AOT
+        self.frame_size = @max(size, 64);
+    }
     pub fn setGlobals(self: *ARM64CodeGen, globs: []const ir_mod.Global) void { self.globals = globs; }
     pub fn setTypeRegistry(self: *ARM64CodeGen, reg: *const TypeRegistry) void { self.type_reg = reg; }
     pub fn setDebugInfo(self: *ARM64CodeGen, source_file: []const u8, source_text: []const u8) void {
@@ -1928,17 +1931,14 @@ pub const ARM64CodeGen = struct {
             // Note: store_sp is still a no-op to prevent corrupting the native stack.
 
             .sp => {
-                // Get native stack pointer into a register
-                // This provides a valid base address for Wasm memory operations
-                const maybe_reg = value.regOrNull();
-                if (maybe_reg == null) {
-                    debug.log(.codegen, "      (sp skipped - evicted)", .{});
-                    return;
-                }
-                const dest_reg: u5 = @intCast(maybe_reg.?);
-                // MOV xN, SP (encoded as ADD xN, SP, #0)
-                try self.emit(asm_mod.encodeADDImm(dest_reg, 31, 0, 0));
-                debug.log(.codegen, "      -> MOV x{d}, SP (wasm sp)", .{dest_reg});
+                // Get wasm stack pointer - ALWAYS use x16 to avoid clobbering args.
+                // IMPORTANT: Offset past saved FP/LR (16 bytes at [SP]).
+                // The prologue does STP x29, x30, [sp, #-frame]!, so [SP] has saved regs.
+                // Wasm locals should start at SP+16 to avoid overwriting them.
+                const dest_reg: u5 = 16;
+                // ADD x16, SP, #16 (skip over saved FP/LR)
+                try self.emit(asm_mod.encodeADDImm(dest_reg, 31, 16, 0));
+                debug.log(.codegen, "      -> ADD x{d}, SP, #16 (wasm sp, skip FP/LR)", .{dest_reg});
             },
 
             .store_sp => {
@@ -2548,6 +2548,8 @@ pub const ARM64CodeGen = struct {
 
     fn getRegForValue(self: *ARM64CodeGen, value: *const Value) ?u5 {
         _ = self;
+        // sp values always use x16 to avoid clobbering argument registers
+        if (value.op == .sp) return 16;
         return if (value.regOrNull()) |reg| @intCast(reg) else null;
     }
 

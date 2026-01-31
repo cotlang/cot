@@ -1,0 +1,15 @@
+// EXPECT: exit_code=2
+// fib(3) = fib(2) + fib(1) = 1 + 1 = 2
+// fib(2) = fib(1) + fib(0) = 1 + 0 = 1
+// fib(1) = 1
+// fib(0) = 0
+fn fib(n: int) int {
+    if (n <= 1) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() int {
+    return fib(3);
+}

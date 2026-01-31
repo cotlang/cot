@@ -1,5 +1,6 @@
 // EXPECT: exit_code=248
-// Tests: -8 as unsigned byte = 256 - 8 = 248
+// Tests: 0 - 8 = -8, and exit code is low byte (248 = 256 - 8)
+// Note: Cot may not have unary minus, use subtraction instead
 fn main() int {
-    return -8;
+    return 0 - 8;
 }

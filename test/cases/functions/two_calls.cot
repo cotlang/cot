@@ -1,0 +1,16 @@
+// EXPECT: exit_code=7
+// Tests: double(2) + double(1) = 4 + 2 = 6... wait that's wrong
+// Actually: 2*2 + 2*1 = 4 + 2 = 6, but let me use 3 for main
+// double(3) + double(2) = 6 + 4 = 10... but exit code is 8 bits
+// Let's use: double(2) + identity(3) = 4 + 3 = 7
+fn double(x: int) int {
+    return x * 2;
+}
+
+fn identity(x: int) int {
+    return x;
+}
+
+fn main() int {
+    return double(2) + identity(3);
+}
