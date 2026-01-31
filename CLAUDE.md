@@ -123,8 +123,28 @@ COT_DEBUG=parse,lower,codegen zig build test
 
 1. Check the relevant planning doc (WASM_BACKEND.md or AOT_EXECUTION_PLAN.md)
 2. Check if bootstrap-0.2 has working code for this
-3. Reference DESIGN.md for intended architecture
-4. Report the issue clearly and ask user how to proceed
+3. **Study ~/learning/ reference implementations** (Go, Swift) to copy proven designs
+4. Reference DESIGN.md for intended architecture
+5. Report the issue clearly and ask user how to proceed
+
+### Persistence Requirements
+
+**NEVER give up on difficult code.** This project requires professional-grade implementation:
+
+- **DO NOT** comment out failing tests - fix them
+- **DO NOT** mark features as "needs work" and move on - complete them
+- **DO NOT** stash code or restore from git to avoid problems - solve them
+- **DO NOT** leave "TODO" comments for issues you encountered - resolve them now
+- **DO NOT** create "known issues" sections - there should be no known issues
+
+When code is difficult:
+1. Study the reference implementation in `~/learning/go/` or `~/learning/swift/`
+2. Understand WHY the reference design works
+3. Apply the same pattern to Cot
+4. Keep iterating until ALL tests pass
+5. Never move on until the feature is complete
+
+The project succeeds through persistence and copying proven designs, not shortcuts.
 
 ---
 

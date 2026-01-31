@@ -11,6 +11,7 @@
 //! - ssaGenBlock: emit control flow for block transitions
 
 const std = @import("std");
+const arc = @import("arc.zig");
 
 /// Error set for code generation.
 /// Go uses panic() for errors; Zig needs explicit error handling.
@@ -64,13 +65,27 @@ pub const FuncGen = struct {
     block_depth: u32,
 
     /// Maps block ID to its nesting depth (Go's blockDepths).
+    /// For loops, this is the continue target (inner loop depth).
     block_depths: std.AutoHashMapUnmanaged(u32, u32),
+
+    /// Maps loop header block ID to its exit depth (for break).
+    /// This is the outer block that wraps the loop.
+    loop_exit_depths: std.AutoHashMapUnmanaged(u32, u32),
 
     /// Blocks that are loop headers.
     loop_headers: std.AutoHashMapUnmanaged(u32, void),
 
+    /// Stack of active loop header IDs (for tracking when to close loops)
+    active_loops: std.ArrayListUnmanaged(u32),
+
+    /// Maps exit block ID to its loop header ID (for closing loops)
+    loop_exit_blocks: std.AutoHashMapUnmanaged(u32, u32),
+
     /// Maps function names to Wasm function indices.
     func_indices: ?*const FuncIndexMap,
+
+    /// ARC runtime function indices (null if ARC not enabled).
+    runtime_funcs: ?arc.RuntimeFunctions,
 
     /// Go's OnWasmStackSkipped counter.
     /// When we skip generating a value (because OnWasmStack=true),
@@ -91,11 +106,20 @@ pub const FuncGen = struct {
             .param_count = 0,
             .block_depth = 0,
             .block_depths = .{},
+            .loop_exit_depths = .{},
             .loop_headers = .{},
+            .active_loops = .{},
+            .loop_exit_blocks = .{},
             .func_indices = null,
+            .runtime_funcs = null,
             .on_wasm_stack_skipped = 0,
             .frame_size = 0,
         };
+    }
+
+    /// Set ARC runtime function indices.
+    pub fn setRuntimeFunctions(self: *FuncGen, funcs: arc.RuntimeFunctions) void {
+        self.runtime_funcs = funcs;
     }
 
     pub fn deinit(self: *FuncGen) void {
@@ -103,7 +127,10 @@ pub const FuncGen = struct {
         self.value_to_local.deinit(self.allocator);
         self.block_to_idx.deinit(self.allocator);
         self.block_depths.deinit(self.allocator);
+        self.loop_exit_depths.deinit(self.allocator);
         self.loop_headers.deinit(self.allocator);
+        self.active_loops.deinit(self.allocator);
+        self.loop_exit_blocks.deinit(self.allocator);
     }
 
     /// Generate code for the entire function.
@@ -146,11 +173,23 @@ pub const FuncGen = struct {
         }
 
         // Generate code for each block (layout pass already ordered them)
+        // Note: We don't try to close loops based on exit block detection - this is
+        // fragile because block layout may not match Wasm's structured control flow.
+        // Loops are closed at function end (after all blocks processed).
         const blocks = self.ssa_func.blocks.items;
         for (blocks, 0..) |block, i| {
             const next: ?*const SsaBlock = if (i + 1 < blocks.len) blocks[i + 1] else null;
             const is_loop_header = self.loop_headers.contains(block.id);
             try self.genBlockWithNext(block, next, is_loop_header);
+        }
+
+        // Close any remaining open loops at end of function
+        while (self.active_loops.items.len > 0) {
+            _ = self.active_loops.pop();
+            try self.code.emitEnd(); // end loop
+            self.block_depth -= 1;
+            try self.code.emitEnd(); // end outer block
+            self.block_depth -= 1;
         }
 
         // Set local count (beyond parameters)
@@ -220,7 +259,7 @@ pub const FuncGen = struct {
         return switch (v.op) {
             .wasm_i64_const, .wasm_i32_const, .wasm_f64_const,
             .const_int, .const_32, .const_64, .const_float,
-            .local_addr,
+            .local_addr, .global_addr,
             => true,
             else => false,
         };
@@ -273,11 +312,23 @@ pub const FuncGen = struct {
 
     fn findLoopHeaders(self: *FuncGen) !void {
         const blocks = self.ssa_func.blocks.items;
+        // First pass: find all loop headers (blocks with back-edges)
         for (blocks, 0..) |block, block_idx| {
             for (block.succs) |edge| {
                 const succ_idx = self.block_to_idx.get(edge.b.id) orelse continue;
                 if (succ_idx <= block_idx) {
                     try self.loop_headers.put(self.allocator, edge.b.id, {});
+                }
+            }
+        }
+        // Second pass: for each loop header, find its exit block
+        // Loop headers are typically if_ blocks where succ[1] is the exit
+        for (blocks) |block| {
+            if (self.loop_headers.contains(block.id)) {
+                if (block.kind == .if_ and block.succs.len >= 2) {
+                    // succ[1] is the false/exit branch
+                    const exit_block = block.succs[1].b;
+                    try self.loop_exit_blocks.put(self.allocator, exit_block.id, block.id);
                 }
             }
         }
@@ -306,9 +357,22 @@ pub const FuncGen = struct {
         });
 
         if (is_loop_header) {
-            try self.code.emitLoop(BLOCK_TYPE_VOID);
+            // Wasm loop pattern for break/continue:
+            // block $exit      ; depth N - break target (br 1 from inside loop)
+            //   loop $continue ; depth N+1 - continue target (br 0 from inside loop)
+            //     ... body ...
+            //   end
+            // end
+            try self.code.emitBlock(BLOCK_TYPE_VOID); // outer block for break
+            self.block_depth += 1;
+            try self.loop_exit_depths.put(self.allocator, block.id, self.block_depth);
+
+            try self.code.emitLoop(BLOCK_TYPE_VOID); // inner loop for continue
             self.block_depth += 1;
             try self.block_depths.put(self.allocator, block.id, self.block_depth);
+
+            // Track this loop as active for closing at exit block
+            try self.active_loops.append(self.allocator, block.id);
         }
 
         // Generate values
@@ -338,11 +402,13 @@ pub const FuncGen = struct {
                     const succ = b.succs[0].b;
                     if (next == null or next.?.id != succ.id) {
                         if (self.block_depths.get(succ.id)) |target_depth| {
-                            // Back edge to loop
+                            // Back edge to loop - emit br to continue
+                            // Go pattern: br (currentDepth - targetDepth)
+                            // This branches to the loop instruction for continue
                             const rel_depth = self.block_depth - target_depth;
                             try self.code.emitBr(rel_depth);
-                            try self.code.emitEnd();
-                            self.block_depth -= 1;
+                            // NOTE: Do NOT emit end here - ends are emitted by generate()
+                            // when we reach the loop exit block
                         }
                         // Forward jumps handled by block layout
                     }
@@ -484,6 +550,40 @@ pub const FuncGen = struct {
                 }
             },
 
+            // ARC runtime calls (Swift pattern from HeapObject.cpp)
+            .wasm_lowered_retain => {
+                // cot_retain(obj) -> obj
+                // Push object pointer (i32)
+                try self.getValue32(v.args[0]);
+                // Call cot_retain
+                if (self.runtime_funcs) |rt| {
+                    try self.code.emitCall(rt.retain_idx);
+                } else {
+                    // No runtime - this is an error, but emit unreachable for safety
+                    try self.code.emitUnreachable();
+                }
+                // cot_retain returns the object pointer, store if used
+                if (v.uses > 0) {
+                    try self.setReg(v);
+                } else {
+                    try self.code.emitDrop();
+                }
+            },
+
+            .wasm_lowered_release => {
+                // cot_release(obj) -> void
+                // Push object pointer (i32)
+                try self.getValue32(v.args[0]);
+                // Call cot_release
+                if (self.runtime_funcs) |rt| {
+                    try self.code.emitCall(rt.release_idx);
+                } else {
+                    // No runtime - emit unreachable for safety
+                    try self.code.emitUnreachable();
+                }
+                // cot_release returns nothing
+            },
+
             // Stores (Go lines 280-284)
             .wasm_i64_store => {
                 try self.getValue32(v.args[0]); // address
@@ -581,6 +681,16 @@ pub const FuncGen = struct {
                     try self.code.emitI32Const(offset);
                     try self.code.emitI32Add();
                 }
+            },
+
+            // Global address (for global variables in linear memory)
+            // Globals are stored at fixed addresses: GLOBAL_BASE + (index * 8)
+            // GLOBAL_BASE = 0x20000 (128KB, after stack and heap start)
+            .global_addr => {
+                const GLOBAL_BASE: i32 = 0x20000;
+                const global_idx: i32 = @intCast(v.aux_int);
+                const addr: i32 = GLOBAL_BASE + (global_idx * 8);
+                try self.code.emitI32Const(addr);
             },
 
             // ================================================================
@@ -946,9 +1056,11 @@ pub const FuncGen = struct {
         _ = self;
         return switch (v.op) {
             // Address computations produce i32 (Wasm uses 32-bit linear memory)
-            .local_addr, .off_ptr, .add_ptr, .sub_ptr => true,
+            .local_addr, .global_addr, .off_ptr, .add_ptr, .sub_ptr => true,
             // String/slice pointers produce i32
             .string_ptr, .slice_ptr, .const_string => true,
+            // ARC retain returns object pointer (i32)
+            .wasm_lowered_retain => true,
             // i32 operations
             .wasm_i32_const, .const_32, .wasm_i32_load => true,
             // Comparisons produce i32
@@ -989,7 +1101,7 @@ pub const FuncGen = struct {
 
 /// Generate Wasm code for an SSA function.
 pub fn genFunc(allocator: std.mem.Allocator, ssa_func: *const SsaFunc) ![]const u8 {
-    return genFuncWithIndices(allocator, ssa_func, null);
+    return genFuncWithIndices(allocator, ssa_func, null, null);
 }
 
 /// Generate Wasm code for an SSA function with function index resolution.
@@ -997,9 +1109,13 @@ pub fn genFuncWithIndices(
     allocator: std.mem.Allocator,
     ssa_func: *const SsaFunc,
     func_indices: ?*const FuncIndexMap,
+    runtime_funcs: ?arc.RuntimeFunctions,
 ) ![]const u8 {
     var gen = FuncGen.init(allocator, ssa_func);
     gen.func_indices = func_indices;
+    if (runtime_funcs) |rf| {
+        gen.setRuntimeFunctions(rf);
+    }
     defer gen.deinit();
     return gen.generate();
 }
@@ -1950,4 +2066,135 @@ test "genFunc - string_len from const_string" {
         if (byte == Op.i64_const) found_i64_const = true;
     }
     try testing.expect(found_i64_const);
+}
+
+// ============================================================================
+// M15: ARC (Reference Counting) Tests
+// Reference: Swift's HeapObject.cpp retain/release patterns
+// ============================================================================
+
+test "genFunc - wasm_lowered_retain emits call to cot_retain" {
+    // Test that retain operation emits a call instruction
+    const allocator = testing.allocator;
+
+    // Create a module with ARC runtime to get function indices
+    var module = wasm.Module.init(allocator);
+    defer module.deinit();
+    const runtime_funcs = try arc.addRuntimeFunctions(&module);
+
+    var f = SsaFunc.init(allocator, "test_retain");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // Simulate an object pointer (i32 const)
+    const obj_ptr = try f.newValue(.wasm_i32_const, 0, b, .{});
+    obj_ptr.aux_int = 0x10000; // Some memory address
+    obj_ptr.*.uses = 1;
+    try b.addValue(allocator, obj_ptr);
+
+    // wasm_lowered_retain(obj_ptr)
+    const retain = try f.newValue(.wasm_lowered_retain, 0, b, .{});
+    retain.addArg(obj_ptr);
+    retain.*.uses = 1; // Use the result
+    try b.addValue(allocator, retain);
+    b.controls[0] = retain;
+
+    // Generate with ARC runtime
+    const body = try genFuncWithIndices(allocator, &f, null, runtime_funcs);
+    defer allocator.free(body);
+
+    // Should contain a call instruction to retain function
+    try testing.expect(body.len >= 5);
+    var found_call = false;
+    for (body) |byte| {
+        if (byte == Op.call) found_call = true;
+    }
+    try testing.expect(found_call);
+}
+
+test "genFunc - wasm_lowered_release emits call to cot_release" {
+    // Test that release operation emits a call instruction
+    const allocator = testing.allocator;
+
+    // Create a module with ARC runtime
+    var module = wasm.Module.init(allocator);
+    defer module.deinit();
+    const runtime_funcs = try arc.addRuntimeFunctions(&module);
+
+    var f = SsaFunc.init(allocator, "test_release");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // Simulate an object pointer
+    const obj_ptr = try f.newValue(.wasm_i32_const, 0, b, .{});
+    obj_ptr.aux_int = 0x10000;
+    obj_ptr.*.uses = 1;
+    try b.addValue(allocator, obj_ptr);
+
+    // wasm_lowered_release(obj_ptr)
+    const release = try f.newValue(.wasm_lowered_release, 0, b, .{});
+    release.addArg(obj_ptr);
+    try b.addValue(allocator, release);
+
+    // Return constant (release has no result)
+    const ret = try f.newValue(.wasm_i64_const, 0, b, .{});
+    ret.aux_int = 0;
+    ret.*.uses = 1;
+    try b.addValue(allocator, ret);
+    b.controls[0] = ret;
+
+    // Generate with ARC runtime
+    const body = try genFuncWithIndices(allocator, &f, null, runtime_funcs);
+    defer allocator.free(body);
+
+    // Should contain a call instruction to release function
+    try testing.expect(body.len >= 5);
+    var found_call = false;
+    for (body) |byte| {
+        if (byte == Op.call) found_call = true;
+    }
+    try testing.expect(found_call);
+}
+
+test "genFunc - retain/release without runtime emits unreachable" {
+    // Test that retain/release without runtime functions traps safely
+    const allocator = testing.allocator;
+
+    var f = SsaFunc.init(allocator, "test_no_runtime");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // Object pointer
+    const obj_ptr = try f.newValue(.wasm_i32_const, 0, b, .{});
+    obj_ptr.aux_int = 0x10000;
+    obj_ptr.*.uses = 1;
+    try b.addValue(allocator, obj_ptr);
+
+    // wasm_lowered_retain without runtime - should emit unreachable
+    const retain = try f.newValue(.wasm_lowered_retain, 0, b, .{});
+    retain.addArg(obj_ptr);
+    retain.*.uses = 0; // Don't use result
+    try b.addValue(allocator, retain);
+
+    // Return constant
+    const ret = try f.newValue(.wasm_i64_const, 0, b, .{});
+    ret.aux_int = 0;
+    ret.*.uses = 1;
+    try b.addValue(allocator, ret);
+    b.controls[0] = ret;
+
+    // Generate WITHOUT ARC runtime (runtime_funcs = null)
+    const body = try genFunc(allocator, &f);
+    defer allocator.free(body);
+
+    // Should contain unreachable instruction (0x00)
+    try testing.expect(body.len >= 3);
+    var found_unreachable = false;
+    for (body) |byte| {
+        if (byte == Op.unreachable_op) found_unreachable = true;
+    }
+    try testing.expect(found_unreachable);
 }

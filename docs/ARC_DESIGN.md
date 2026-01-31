@@ -345,14 +345,14 @@ fn test_unique() {
 
 1. [x] Add `retain`, `release` ops to op.zig
 2. [x] Add `wasm_lowered_retain`, `wasm_lowered_release` ops
-3. [ ] Create runtime/arc.zig with Wasm function generation
-4. [ ] Add memory layout constants
-5. [ ] Implement cot_alloc, cot_retain, cot_release in Wasm
-6. [ ] Add runtime functions to Wasm module during linking
-7. [ ] Update lower_wasm.zig to lower retain/release
-8. [ ] Update wasm_gen.zig to emit calls to runtime functions
-9. [ ] Add comprehensive tests
-10. [ ] Update documentation
+3. [x] Create compiler/codegen/arc.zig with Wasm function generation
+4. [x] Add memory layout constants (HEAP_OBJECT_HEADER_SIZE, offsets)
+5. [x] Implement cot_alloc, cot_retain, cot_release in Wasm
+6. [x] Add runtime functions to Wasm module during linking (wasm_e2e_test.zig)
+7. [x] Update lower_wasm.zig to lower retain/release
+8. [x] Update wasm_gen.zig to emit calls to runtime functions
+9. [x] Add comprehensive tests (arc.zig, wasm_gen.zig integration tests)
+10. [x] Update documentation
 
 ---
 

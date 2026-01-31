@@ -6,9 +6,9 @@
 //! Reference: ~/learning/swift/stdlib/public/runtime/HeapObject.cpp
 
 const std = @import("std");
-const wasm = @import("../compiler/codegen/wasm.zig");
-const Op = @import("../compiler/codegen/wasm_opcodes.zig").Op;
-const enc = @import("../compiler/codegen/wasm_encode.zig");
+const wasm = @import("wasm.zig");
+const Op = @import("wasm_opcodes.zig").Op;
+const enc = @import("wasm_encode.zig");
 const ValType = wasm.ValType;
 
 // Block type constants for Wasm control flow (from spec)
@@ -391,10 +391,10 @@ test "generated module emits valid wasm" {
     _ = try addRuntimeFunctions(&module);
 
     // Emit the module
-    var output = std.ArrayList(u8).init(allocator);
-    defer output.deinit();
+    var output: std.ArrayListUnmanaged(u8) = .{};
+    defer output.deinit(allocator);
 
-    try module.emit(output.writer());
+    try module.emit(output.writer(allocator));
 
     // Verify magic number
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x61, 0x73, 0x6D }, output.items[0..4]);

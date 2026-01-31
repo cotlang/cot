@@ -372,7 +372,8 @@ pub const Driver = struct {
             const type_idx = try linker.addType(params[0..param_count], results);
 
             // Generate function body code (still using old wasm_gen for now)
-            const body = try wasm_gen.genFuncWithIndices(self.allocator, ssa_func, &func_indices);
+            // Note: ARC runtime functions not yet wired into main driver
+            const body = try wasm_gen.genFuncWithIndices(self.allocator, ssa_func, &func_indices, null);
             errdefer self.allocator.free(body);
 
             // Determine if function should be exported

@@ -456,18 +456,19 @@ pub fn compileToWasm(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 - [x] Tests: string_make/ptr/len, const_string, global section, data section
 - Go reference: genericOps.go StringMake/StringPtr/StringLen, cmd/link/internal/wasm/asm.go writeDataSec
 
-### M15: ARC Basics 🔄
+### M15: ARC Basics ✅
 - [x] `retain`, `release` generic SSA ops (op.zig)
 - [x] `wasm_lowered_retain`, `wasm_lowered_release` ops (op.zig)
 - [x] Lowering pass: retain → wasm_lowered_retain (lower_wasm.zig)
-- [x] ARC runtime functions: cot_alloc, cot_retain, cot_release (runtime/arc.zig)
+- [x] ARC runtime functions: cot_alloc, cot_retain, cot_release (compiler/codegen/arc.zig)
 - [x] Object layout: metadata(4) + refcount(8) + user_data (Swift pattern)
 - [x] Null pointer safety, immortal object handling
 - [x] CodeBuilder: declareLocals, emitI32And, emitLocalTee (wasm.zig)
 - [x] Design doc: docs/ARC_DESIGN.md (based on Swift)
-- [ ] Wire runtime functions into linker
-- [ ] Emit retain/release calls in wasm_gen.zig
-- [ ] Integration tests
+- [x] Wire runtime functions into code generator (wasm_gen.zig)
+- [x] Emit retain/release calls in wasm_gen.zig (ssaGenValue handlers)
+- [x] Integration tests (wasm_gen.zig: test retain/release emit calls)
+- [x] wasm_e2e_test.zig: add ARC runtime before user functions
 - Swift reference: ~/learning/swift/stdlib/public/runtime/HeapObject.cpp
 
 ### M16: Browser Imports

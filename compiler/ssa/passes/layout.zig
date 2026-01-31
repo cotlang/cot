@@ -40,11 +40,10 @@ pub fn layout(f: *Func) !void {
     @memset(scheduled, false);
 
     // Track indegree (number of unscheduled predecessors)
-    var indegree = try allocator.alloc(usize, num_blocks);
+    // Use isize to allow negative values (Go pattern for detecting exit blocks)
+    var indegree = try allocator.alloc(isize, num_blocks);
     defer allocator.free(indegree);
-    for (f.blocks.items, 0..) |b, i| {
-        indegree[i] = b.preds.len;
-    }
+    @memset(indegree, 0); // Initialize to 0 (Go pattern: exit blocks stay at 0)
 
     // Result order
     var order = std.ArrayListUnmanaged(*Block){};
@@ -68,9 +67,12 @@ pub fn layout(f: *Func) !void {
         }
     }
 
-    // Initialize zerodegree with non-exit blocks that have no predecessors
+    // Initialize indegree and zerodegree for NON-exit blocks only (Go pattern)
+    // Exit blocks keep indegree=0, so when decremented they go negative,
+    // which signals they should be scheduled last.
     for (f.blocks.items, 0..) |b, i| {
-        if (is_exit[i]) continue;
+        if (is_exit[i]) continue; // Exit blocks stay at indegree=0
+        indegree[i] = @intCast(b.preds.len);
         if (b.preds.len == 0) {
             try zerodegree.append(allocator, i);
         }
@@ -91,21 +93,25 @@ pub fn layout(f: *Func) !void {
         try order.append(allocator, b);
         scheduled[current_idx] = true;
 
-        // Update successors' indegree
-        // Traverse in reverse order (like Go) for better scheduling
+        // Update successors' indegree (Go pattern from layout.go:111-120)
+        // Traverse in reverse order for better scheduling
+        // Key: ALWAYS decrement indegree, even for exit blocks (allows negative)
+        // Exit blocks start at 0, go to -1 when decremented, get added to succs
         var i: usize = b.succs.len;
         while (i > 0) {
             i -= 1;
             const succ = b.succs[i].b;
             const succ_idx = id_to_idx.get(succ.id) orelse continue;
 
-            if (indegree[succ_idx] > 0) {
-                indegree[succ_idx] -= 1;
-                if (indegree[succ_idx] == 0 and !is_exit[succ_idx]) {
-                    try zerodegree.append(allocator, succ_idx);
-                } else if (!scheduled[succ_idx]) {
-                    try succs.append(allocator, succ_idx);
-                }
+            // Go: indegree[c.ID]-- (unconditional, can go negative)
+            indegree[succ_idx] -= 1;
+
+            if (indegree[succ_idx] == 0) {
+                // Go: add to zerodegree (exit blocks never reach 0, they go -1)
+                try zerodegree.append(allocator, succ_idx);
+            } else {
+                // Go: add to succs if indegree != 0 (includes negative for exit blocks)
+                try succs.append(allocator, succ_idx);
             }
         }
 
@@ -149,10 +155,13 @@ pub fn layout(f: *Func) !void {
         }
         if (found) continue;
 
-        // 4. Try recently seen successors
+        // 4. Try recently seen successors (Go pattern: no is_exit check)
+        // Exit blocks get scheduled here after zerodegree is empty.
+        // This is correct because loop bodies reach indegree=0 (go to zerodegree)
+        // while exit blocks go to indegree=-1 (stay in succs until now).
         while (succs.items.len > 0) {
             const idx = succs.pop() orelse break;
-            if (!scheduled[idx] and !is_exit[idx]) {
+            if (!scheduled[idx]) {
                 current_idx = idx;
                 found = true;
                 break;
@@ -160,17 +169,7 @@ pub fn layout(f: *Func) !void {
         }
         if (found) continue;
 
-        // 5. Try any non-exit unscheduled block
-        for (0..num_blocks) |idx| {
-            if (!scheduled[idx] and !is_exit[idx]) {
-                current_idx = idx;
-                found = true;
-                break;
-            }
-        }
-        if (found) continue;
-
-        // 6. Finally, schedule exit blocks
+        // 5. Try any unscheduled block (fallback)
         for (0..num_blocks) |idx| {
             if (!scheduled[idx]) {
                 current_idx = idx;

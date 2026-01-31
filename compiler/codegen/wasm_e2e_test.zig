@@ -20,6 +20,7 @@ const lower_wasm = @import("../ssa/passes/lower_wasm.zig");
 const schedule = @import("../ssa/passes/schedule.zig");
 const wasm = @import("wasm.zig");
 const wasm_gen = @import("wasm_gen.zig");
+const arc = @import("arc.zig");
 
 const TypeRegistry = types.TypeRegistry;
 const Func = ssa_builder.Func;
@@ -78,10 +79,25 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
     // Build Wasm module
     var module = wasm.Module.init(allocator);
 
-    // First pass: build function name -> index mapping
+    // Add memory for linear memory (1 page = 64KB)
+    module.addMemory(1, null);
+
+    // Add stack pointer global (index 0, expected by wasm_gen)
+    // SP starts at 65536 (top of first memory page, grows down)
+    _ = try module.addGlobal(.i32, true, 65536);
+
+    // Add ARC runtime functions (they get indices 0-4)
+    // Note: heap_ptr global will be at index 1
+    const runtime_funcs = try arc.addRuntimeFunctions(&module);
+
+    // Count runtime functions for index offset
+    // Runtime functions: alloc, retain, release, retain_count, is_unique = 5 functions
+    const runtime_func_count: u32 = 5;
+
+    // First pass: build function name -> index mapping (offset by runtime functions)
     var func_indices = wasm_gen.FuncIndexMap{};
     for (ir_data.funcs, 0..) |*ir_func, i| {
-        try func_indices.put(allocator, ir_func.name, @intCast(i));
+        try func_indices.put(allocator, ir_func.name, @as(u32, @intCast(i)) + runtime_func_count);
     }
 
     // Second pass: process each function
@@ -128,8 +144,8 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
             try module.addExport(ir_func.name, .func, func_idx);
         }
 
-        // Generate code with function index resolution
-        const body = try wasm_gen.genFuncWithIndices(allocator, ssa_func, &func_indices);
+        // Generate code with function index resolution and ARC runtime
+        const body = try wasm_gen.genFuncWithIndices(allocator, ssa_func, &func_indices, runtime_funcs);
         try module.addCode(body);
     }
 
@@ -327,6 +343,219 @@ test "M8: recursive function call" {
         \\fn factorial(n: int) int {
         \\    if n <= 1 { return 1; }
         \\    return n * factorial(n - 1);
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+// ============================================================================
+// P1: Control Flow Completeness (Parity with bootstrap-0.2)
+// ============================================================================
+
+test "P1.1: break in while loop" {
+    const code =
+        \\fn find_threshold(limit: int) int {
+        \\    var i = 0;
+        \\    var sum = 0;
+        \\    while i < 100 {
+        \\        sum = sum + i;
+        \\        if sum > limit {
+        \\            break;
+        \\        }
+        \\        i = i + 1;
+        \\    }
+        \\    return i;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "P1.1: break in nested loops" {
+    const code =
+        \\fn nested_break() int {
+        \\    var count = 0;
+        \\    var i = 0;
+        \\    while i < 10 {
+        \\        var j = 0;
+        \\        while j < 10 {
+        \\            count = count + 1;
+        \\            if j > 3 {
+        \\                break;
+        \\            }
+        \\            j = j + 1;
+        \\        }
+        \\        i = i + 1;
+        \\    }
+        \\    return count;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+test "P1.2: continue in while loop" {
+    const code =
+        \\fn sum_odd(n: int) int {
+        \\    var i = 0;
+        \\    var sum = 0;
+        \\    while i < n {
+        \\        i = i + 1;
+        \\        if i % 2 == 0 {
+        \\            continue;
+        \\        }
+        \\        sum = sum + i;
+        \\    }
+        \\    return sum;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "P1.2: continue in nested loops" {
+    const code =
+        \\fn skip_evens() int {
+        \\    var total = 0;
+        \\    var i = 0;
+        \\    while i < 5 {
+        \\        i = i + 1;
+        \\        var j = 0;
+        \\        while j < 5 {
+        \\            j = j + 1;
+        \\            if j % 2 == 0 {
+        \\                continue;
+        \\            }
+        \\            total = total + 1;
+        \\        }
+        \\    }
+        \\    return total;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+// ============================================================================
+// P2: Variables & Scope (Parity with bootstrap-0.2)
+// ============================================================================
+
+test "P2.1: global variable read" {
+    const code =
+        \\var counter: int = 42;
+        \\
+        \\fn get_counter() int {
+        \\    return counter;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "P2.1: global variable write" {
+    const code =
+        \\var counter: int = 0;
+        \\
+        \\fn increment() int {
+        \\    counter = counter + 1;
+        \\    return counter;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+test "P2.1: global used in multiple functions" {
+    const code =
+        \\var total: int = 0;
+        \\
+        \\fn add_to_total(x: int) {
+        \\    total = total + x;
+        \\}
+        \\
+        \\fn get_total() int {
+        \\    return total;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+// ============================================================================
+// P3: Type System (Parity with bootstrap-0.2)
+// ============================================================================
+
+test "P3.3: float arithmetic" {
+    const code =
+        \\fn add_floats(a: float, b: float) float {
+        \\    return a + b;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+test "P3.3: float comparison" {
+    const code =
+        \\fn max_float(a: float, b: float) float {
+        \\    if a > b {
+        \\        return a;
+        \\    }
+        \\    return b;
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+test "P3.3: float constant" {
+    const code =
+        \\fn pi() float {
+        \\    return 3.14159;
         \\}
     ;
 
