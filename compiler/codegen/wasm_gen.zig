@@ -937,3 +937,124 @@ test "genFunc - simple if block" {
     try testing.expect(body.len > 0);
     try testing.expectEqual(Op.end, body[body.len - 1]);
 }
+
+// ============================================================================
+// M10: Linear Memory Tests
+// Go reference: wasm/ssa.go lines 280-284 (stores), 379-382 (loads)
+// ============================================================================
+
+test "genFunc - local_addr generates SP-relative address" {
+    // local_addr produces: global.get 0 (SP), i32.const offset, i32.add
+    const allocator = testing.allocator;
+
+    var f = SsaFunc.init(allocator, "test_local_addr");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // local_addr with slot 1 (offset = 8 bytes)
+    const addr = try f.newValue(.local_addr, 0, b, .{});
+    addr.aux_int = 1; // slot 1 -> offset 8
+    addr.*.uses = 1;
+    try b.addValue(allocator, addr);
+    b.controls[0] = addr;
+
+    const body = try genFunc(allocator, &f);
+    defer allocator.free(body);
+
+    // Should have prologue (SP adjustment) + local_addr code + epilogue + return
+    try testing.expect(body.len >= 8);
+    try testing.expectEqual(Op.end, body[body.len - 1]);
+}
+
+test "genFunc - store and load round-trip" {
+    // Test: store a constant to memory via local_addr, then load it back
+    // Go pattern: getValue32(addr), getValue64(value), i64.store offset
+    const allocator = testing.allocator;
+
+    var f = SsaFunc.init(allocator, "test_store_load");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // Get address of slot 0
+    const addr = try f.newValue(.local_addr, 0, b, .{});
+    addr.aux_int = 0; // slot 0
+    addr.*.uses = 2; // used by store and load
+    try b.addValue(allocator, addr);
+
+    // Store constant 42 to that address
+    const val = try f.newValue(.wasm_i64_const, 0, b, .{});
+    val.aux_int = 42;
+    val.*.uses = 1;
+    try b.addValue(allocator, val);
+
+    const store = try f.newValue(.wasm_i64_store, 0, b, .{});
+    store.addArg(addr);
+    store.addArg(val);
+    store.aux_int = 0; // offset 0
+    try b.addValue(allocator, store);
+
+    // Load from same address
+    const load = try f.newValue(.wasm_i64_load, 0, b, .{});
+    load.addArg(addr);
+    load.aux_int = 0; // offset 0
+    load.*.uses = 1;
+    try b.addValue(allocator, load);
+    b.controls[0] = load;
+
+    const body = try genFunc(allocator, &f);
+    defer allocator.free(body);
+
+    // Verify structure: should have store and load ops
+    try testing.expect(body.len >= 10);
+    try testing.expectEqual(Op.end, body[body.len - 1]);
+
+    // Find i64.store (0x37) and i64.load (0x29) in the body
+    var found_store = false;
+    var found_load = false;
+    for (body) |byte| {
+        if (byte == Op.i64_store) found_store = true;
+        if (byte == Op.i64_load) found_load = true;
+    }
+    try testing.expect(found_store);
+    try testing.expect(found_load);
+}
+
+test "genFunc - frame size computed from local_addr slots" {
+    // Multiple local_addr values should compute correct frame size
+    const allocator = testing.allocator;
+
+    var f = SsaFunc.init(allocator, "test_frame");
+    defer f.deinit();
+
+    const b = try f.newBlock(.ret);
+
+    // local_addr slot 0
+    const addr0 = try f.newValue(.local_addr, 0, b, .{});
+    addr0.aux_int = 0;
+    addr0.*.uses = 1;
+    try b.addValue(allocator, addr0);
+
+    // local_addr slot 2 (max slot = 2, so frame = (2+1)*8 = 24, aligned to 32)
+    const addr2 = try f.newValue(.local_addr, 0, b, .{});
+    addr2.aux_int = 2;
+    addr2.*.uses = 1;
+    try b.addValue(allocator, addr2);
+
+    // Return constant
+    const ret = try f.newValue(.wasm_i64_const, 0, b, .{});
+    ret.aux_int = 0;
+    ret.*.uses = 1;
+    try b.addValue(allocator, ret);
+    b.controls[0] = ret;
+
+    const body = try genFunc(allocator, &f);
+    defer allocator.free(body);
+
+    // Prologue should decrement SP by frame size
+    // global.get 0 (SP), i32.const frame_size, i32.sub, global.set 0
+    try testing.expect(body.len >= 8);
+    try testing.expectEqual(Op.global_get, body[1]);
+    try testing.expectEqual(Op.end, body[body.len - 1]);
+}

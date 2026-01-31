@@ -410,9 +410,15 @@ pub fn compileToWasm(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 - [x] Test: `fn main() int { return 42; }` compiles and runs correctly
 - Note: Functions with parameters need M10 (linear memory) for full support
 
-### M10: Linear Memory
-- [ ] Add memory section to module
-- [ ] Implement `wasm_i64_load`, `wasm_i64_store`
+### M10: Linear Memory ✅
+- [x] Memory section in Linker (1 page = 64KB)
+- [x] Global section with SP (global 0, initialized to 65536)
+- [x] `local_addr` generates SP-relative addresses
+- [x] `wasm_i64_load`, `wasm_i64_store` with offsets
+- [x] `wasm_i32_load`, `wasm_i32_store` for addresses
+- [x] Prologue/epilogue SP adjustment for frame allocation
+- [x] Tests: local_addr, store+load round-trip, frame size
+- Go reference: wasm/ssa.go lines 280-284 (stores), 379-382 (loads)
 
 ### M11: Pointers
 - [ ] Pointer types in Wasm (i32 addresses)

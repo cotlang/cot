@@ -20,8 +20,9 @@
 | M4-M5 | ✅ Done | E2E: return 42, add two numbers |
 | M6-M7 | ✅ Done | Control flow (if/else, loops) |
 | M8-M9 | ✅ Done | Function calls, CLI outputs .wasm |
-| **M10** | 🔄 **Next** | Linear memory (load/store) |
-| M11-M16 | TODO | Pointers, structs, arrays, strings, ARC |
+| M10 | ✅ Done | Linear memory (load/store, SP global, frame allocation) |
+| **M11** | 🔄 **Next** | Pointers (address-of, dereference) |
+| M12-M16 | TODO | Structs, arrays, strings, ARC |
 
 ### AOT Native Progress
 
@@ -32,7 +33,7 @@
 
 ### Test Status
 
-**376/398 passed, 22 skipped (native tests)**
+**379/401 passed, 22 skipped (native tests)**
 
 ---
 
