@@ -1921,13 +1921,15 @@ pub const ARM64CodeGen = struct {
                 debug.log(.codegen, "      -> ADRP+ADD x{d}, _{s} (global)", .{ dest_reg, global_name });
             },
 
-            // === Stack Pointer Operations (Wasm->Native AOT) ===
-            // These ops are created by wasm_to_ssa.zig when converting Wasm globals (SP).
-            // In Wasm, SP is a global variable. In native code, we use the actual SP register.
+            // === Wasm Stack Pointer Operations for AOT ===
+            // In Wasm, global 0 is a pointer into linear memory (the "Wasm stack").
+            // For AOT, we use the native stack frame as the Wasm memory area.
+            // The prologue already allocates frame space, so we can use SP as the base.
+            // Note: store_sp is still a no-op to prevent corrupting the native stack.
 
             .sp => {
-                // Get the stack pointer into a general-purpose register
-                // This is used for Wasm memory operations that reference SP+offset
+                // Get native stack pointer into a register
+                // This provides a valid base address for Wasm memory operations
                 const maybe_reg = value.regOrNull();
                 if (maybe_reg == null) {
                     debug.log(.codegen, "      (sp skipped - evicted)", .{});
@@ -1936,24 +1938,14 @@ pub const ARM64CodeGen = struct {
                 const dest_reg: u5 = @intCast(maybe_reg.?);
                 // MOV xN, SP (encoded as ADD xN, SP, #0)
                 try self.emit(asm_mod.encodeADDImm(dest_reg, 31, 0, 0));
-                debug.log(.codegen, "      -> MOV x{d}, SP (sp)", .{dest_reg});
+                debug.log(.codegen, "      -> MOV x{d}, SP (wasm sp)", .{dest_reg});
             },
 
             .store_sp => {
-                // Store a value to the stack pointer (Wasm global.set for SP)
-                // This adjusts the native stack pointer. Used for Wasm frame allocation.
-                // Note: We need to track this adjustment for the epilogue.
-                if (value.args.len > 0) {
-                    const new_sp = value.args[0];
-                    const src_reg = self.getRegForValue(new_sp) orelse blk: {
-                        try self.ensureInReg(new_sp, 16);
-                        break :blk @as(u5, 16);
-                    };
-                    // MOV SP, xN (encoded as ADD SP, xN, #0 with SP as dest)
-                    // ARM64 requires 16-byte alignment for SP
-                    try self.emit(asm_mod.encodeADDImm(31, src_reg, 0, 0));
-                    debug.log(.codegen, "      -> MOV SP, x{d} (store_sp)", .{src_reg});
-                }
+                // Don't actually modify native SP based on Wasm adjustments.
+                // The native stack frame is fixed by the prologue.
+                // This prevents stack corruption from Wasm's frame allocation patterns.
+                debug.log(.codegen, "      (store_sp - ignored for AOT)", .{});
             },
 
             .addr => {
@@ -2547,7 +2539,7 @@ pub const ARM64CodeGen = struct {
                 } else try self.emit(asm_mod.encodeMOVZ(dest, 0, 0));
             },
             .sp => {
-                // Get stack pointer into dest register
+                // Get native stack pointer into dest register (for Wasm memory ops)
                 try self.emit(asm_mod.encodeADDImm(dest, 31, 0, 0));
             },
             else => try self.emit(asm_mod.encodeMOVZ(dest, 0, 0)),

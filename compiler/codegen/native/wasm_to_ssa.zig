@@ -137,6 +137,7 @@ pub const WasmToSSA = struct {
             .locals = locals,
             .code = code.body,
             .pos = 0,
+            .module = self.module,
         };
         defer state.value_stack.deinit(self.allocator);
         defer state.control_stack.deinit(self.allocator);
@@ -156,6 +157,7 @@ const ConvertState = struct {
     locals: std.ArrayListUnmanaged(?*Value),
     code: []const u8,
     pos: usize,
+    module: *const wasm_parser.WasmModule,
 
     fn convertBody(self: *ConvertState) !void {
         while (self.pos < self.code.len) {
@@ -367,10 +369,36 @@ const ConvertState = struct {
             // Function calls
             wasm.Op.call => {
                 const func_idx = self.readULEB128();
+
+                // Get function type to determine parameter count
+                const type_idx = self.module.funcs[@intCast(func_idx)];
+                const func_type = self.module.types[type_idx];
+                const param_count = func_type.params.len;
+
+                // Pop arguments from stack into temp buffer
+                var args_buf: [16]*Value = undefined;
+                for (0..param_count) |i| {
+                    args_buf[param_count - 1 - i] = self.value_stack.pop() orelse return ConvertError.StackUnderflow;
+                }
+
                 const call_val = try self.func.newValue(.static_call, TypeRegistry.I64, self.current_block, .{});
                 call_val.aux_int = @intCast(func_idx);
+
+                // Add arguments to call value
+                for (args_buf[0..param_count]) |arg| {
+                    call_val.addArg(arg);
+                }
+
+                // Look up function name from exports
+                const func_name = self.getFuncName(@intCast(func_idx));
+                call_val.aux = .{ .string = func_name };
+
                 try self.current_block.addValue(self.allocator, call_val);
-                try self.value_stack.push(self.allocator, call_val);
+
+                // Push result if function returns a value
+                if (func_type.results.len > 0) {
+                    try self.value_stack.push(self.allocator, call_val);
+                }
             },
 
             // Drop and select
@@ -488,6 +516,16 @@ const ConvertState = struct {
             result |= ~@as(i64, 0) << shift;
         }
         return result;
+    }
+
+    /// Get function name from exports, or return "unknown" for internal functions.
+    fn getFuncName(self: *ConvertState, func_idx: usize) []const u8 {
+        for (self.module.exports) |exp| {
+            if (exp.kind == .func and exp.index == func_idx) {
+                return exp.name;
+            }
+        }
+        return "unknown";
     }
 };
 

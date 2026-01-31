@@ -407,8 +407,9 @@ pub const Driver = struct {
             const body = try wasm_gen.genFuncWithIndices(self.allocator, ssa_func, &func_indices, null);
             errdefer self.allocator.free(body);
 
-            // Determine if function should be exported
-            const exported = std.mem.eql(u8, ir_func.name, "main");
+            // Export all functions for AOT compatibility
+            // (AOT needs function names to resolve calls)
+            const exported = true;
 
             // Add function to linker
             _ = try linker.addFunc(.{
