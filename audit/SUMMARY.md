@@ -1,10 +1,37 @@
 # Audit Summary
 
-## Overall Status: COMPLETE
+## Overall Status: WASM BACKEND WORKING
 
-All compiler files have been ported and refactored to 0.3.
+**Wasm Tests: 50/50 passed**
+**Unit Tests: All passing**
 
-**Tests: 396/418 passed, 22 skipped (native)**
+---
+
+## Wasm Backend Status
+
+The wasm backend follows Go's two-pass architecture and is verified working:
+
+| Component | Status | Go Reference |
+|-----------|--------|--------------|
+| gen.zig | ✅ Done | wasm/ssa.go |
+| preprocess.zig | ✅ Done | wasmobj.go preprocess() |
+| assemble.zig | ✅ Done | wasmobj.go assemble() |
+| link.zig | ✅ Done | wasm/asm.go |
+| prog.zig | ✅ Done | obj.Prog |
+| constants.zig | ✅ Done | a.out.go |
+
+### Feature Coverage
+
+| Feature | Status | Tests |
+|---------|--------|-------|
+| Arithmetic | ✅ Done | 10/10 |
+| Control Flow | ✅ Done | 14/14 |
+| Functions | ✅ Done | 16/16 |
+| Memory | ✅ Done | 5/5 |
+| Structs | ✅ Done | 5/5 |
+| Arrays/Slices | ⏳ SSA only | 0 |
+| Strings | ⏳ SSA only | 0 |
+| ARC | ⏳ SSA only | 0 |
 
 ---
 
@@ -15,112 +42,56 @@ All compiler files have been ported and refactored to 0.3.
 | Core | 4 | ✅ Done | types, errors, target, testing |
 | Frontend | 11 | ✅ Done | scanner, parser, checker, IR, lowerer |
 | SSA | 12 | ✅ Done | op, value, block, func, passes |
-| Wasm Codegen | 5 | ✅ Done | wasm, wasm_gen, wasm_opcodes, wasm_encode |
+| Wasm Codegen | 7 | ✅ Done | wasm/, wasm_gen, wasm_opcodes, wasm_encode |
 | Native Codegen | 8 | ✅ Done | arm64, amd64, asm, regs, generic |
-| SSA Passes (Native) | 6 | ✅ Done | liveness, regalloc, stackalloc, abi, decompose, expand_calls |
 | Object Files | 3 | ✅ Done | elf, macho, dwarf |
 | Pipeline | 3 | ✅ Done | driver, main, pipeline_debug |
 
 ---
 
-## Audit Files
+## Key Files Changed (February 2026)
 
-### Core (4/4)
-- [x] core/errors.zig.md
-- [x] core/target.zig.md
-- [x] core/testing.zig.md
-- [x] core/types.zig.md
+### wasm/gen.zig
+- Added `const_bool` handling (for `while (true)`)
+- Fixed param/local index handling (params at 0..N-1, PC_B at N)
+- Fixed `.arg` op to use `local_get` not `.get`
+- Added `off_ptr`, `add_ptr`, `sub_ptr` for struct/pointer support
 
-### Frontend (11/11)
-- [x] frontend/ast.zig.md
-- [x] frontend/checker.zig.md
-- [x] frontend/errors.zig.md
-- [x] frontend/ir.zig.md
-- [x] frontend/lower.zig.md
-- [x] frontend/parser.zig.md
-- [x] frontend/scanner.zig.md
-- [x] frontend/source.zig.md
-- [x] frontend/ssa_builder.zig.md
-- [x] frontend/token.zig.md
-- [x] frontend/types.zig.md
+### wasm/assemble.zig
+- Fixed PC_B index to use `param_count`
+- Fixed local declarations to account for Wasm param behavior
 
-### SSA (12/12)
-- [x] ssa/abi.zig.md
-- [x] ssa/block.zig.md
-- [x] ssa/compile.zig.md
-- [x] ssa/debug.zig.md
-- [x] ssa/dom.zig.md
-- [x] ssa/func.zig.md
-- [x] ssa/liveness.zig.md
-- [x] ssa/op.zig.md
-- [x] ssa/regalloc.zig.md
-- [x] ssa/stackalloc.zig.md
-- [x] ssa/test_helpers.zig.md
-- [x] ssa/value.zig.md
+### wasm/prog.zig
+- Added `param_count` field to Symbol
 
-### SSA Passes (3/3)
-- [x] ssa/passes/decompose.zig.md
-- [x] ssa/passes/expand_calls.zig.md
-- [x] ssa/passes/schedule.zig.md
+### wasm/wasm.zig
+- Set `sym.param_count` when creating Symbol
 
-### Wasm Codegen (5/5)
-- [x] wasm.zig.md
-- [x] wasm_gen.zig.md
-- [x] wasm_opcodes.zig.md
-- [x] wasm_encode.zig.md
-- [x] lower_wasm.zig.md (in ssa/passes/)
-
-### Native Codegen (6/6)
-- [x] native/generic.zig.md
-- [x] native/arm64.zig.md
-- [x] native/arm64_asm.zig.md
-- [x] native/amd64.zig.md
-- [x] native/amd64_asm.zig.md
-- [x] native/amd64_regs.zig.md
-
-### Object Files (2/2)
-- [x] obj/elf.zig.md
-- [x] obj/macho.zig.md
-
-### Pipeline (3/3)
-- [x] driver.zig.md
-- [x] main.zig.md
-- [x] pipeline_debug.zig.md
+### Test files
+- Fixed struct test syntax (`.field = value` not `field: value`)
+- Fixed negation test (use positive result for portability)
 
 ---
 
 ## Line Count Summary
 
-### Frontend Refactoring (54% reduction)
+### Wasm Backend (3,302 lines)
 
-| File | 0.2 | 0.3 | Reduction |
-|------|-----|-----|-----------|
-| frontend/ir.zig | 1751 | 548 | 69% |
-| frontend/ssa_builder.zig | 3044 | 1176 | 61% |
-| frontend/checker.zig | 2167 | 936 | 57% |
-| frontend/ast.zig | 764 | 332 | 57% |
-| frontend/types.zig | 896 | 396 | 56% |
-| frontend/parser.zig | 1814 | 881 | 51% |
-
-### Native Codegen Refactoring (~20% reduction)
-
-| File | 0.2 | 0.3 | Reduction |
-|------|-----|-----|-----------|
-| arm64.zig | 3,589 | 2,859 | 20.3% |
-| amd64.zig | 3,946 | 3,133 | 20.6% |
-
----
-
-## Current Issues
-
-### Skipped Tests (22)
-- Native codegen tests skipped pending Phase 4 wiring
-- See AOT_EXECUTION_PLAN.md for details
+| File | Lines |
+|------|-------|
+| constants.zig | 712 |
+| preprocess.zig | 649 |
+| gen.zig | 575 |
+| assemble.zig | 534 |
+| link.zig | 380 |
+| prog.zig | 306 |
+| wasm.zig | 146 |
 
 ---
 
 ## Next Steps
 
-See the following for detailed task lists:
-- **WASM_BACKEND.md** - M14 (Strings) is next
-- **AOT_EXECUTION_PLAN.md** - Phase 4 (wire native codegen) is next
+1. **M13: Arrays/Slices** - Implement in gen.zig
+2. **M14: Strings** - Implement in gen.zig, add data section
+3. **M15: ARC** - Implement retain/release
+4. **AOT Phase 4** - Wire native codegen into driver

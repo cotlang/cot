@@ -43,19 +43,26 @@ for cot_file in $(find "$CASES_DIR" -name "*.cot" | sort); do
         continue
     fi
 
-    # Compile to native
-    if ! "$COT" "$cot_file" --target="$TARGET" -o "$TMP_BIN" 2>/dev/null; then
+    # Compile to object, then link
+    OBJ_FILE="$TMP_BIN.o"
+    if ! "$COT" "$cot_file" -o "$OBJ_FILE" 2>/dev/null; then
         echo "✗ $name: compilation failed"
         ((failed++)) || true
         continue
     fi
 
-    # Make executable
-    chmod +x "$TMP_BIN"
+    # Link to executable
+    if ! clang "$OBJ_FILE" -o "$TMP_BIN" -lSystem 2>/dev/null; then
+        echo "✗ $name: linking failed"
+        ((failed++)) || true
+        continue
+    fi
 
-    # Run and capture exit code
+    # Run and capture exit code (don't fail on non-zero)
+    set +e
     "$TMP_BIN" 2>/dev/null
     result=$?
+    set -e
 
     if [ "$result" = "$expected" ]; then
         echo "✓ $name"

@@ -5,6 +5,6 @@ struct Data {
 }
 
 fn main() int {
-    let d: Data = Data { value: 42, flag: 1 };
+    let d: Data = Data { .value = 42, .flag = 1 };
     return d.value;
 }

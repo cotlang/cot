@@ -149,6 +149,26 @@ pub const WasmToSSA = struct {
 
         try state.convertBody();
 
+        // Debug: dump block structure
+        const debug = @import("../../pipeline_debug.zig");
+        debug.log(.codegen, "wasm_to_ssa: converted function '{s}'", .{func.name});
+        for (func.blocks.items) |b| {
+            var succ_ids: [8]u32 = undefined;
+            var succ_count: usize = 0;
+            for (b.succs, 0..) |edge, i| {
+                if (i >= 8) break;
+                succ_ids[i] = edge.b.id;
+                succ_count += 1;
+            }
+            debug.log(.codegen, "  b{d} ({s}): {d} values, {d} succs -> {any}", .{
+                b.id,
+                @tagName(b.kind),
+                b.values.items.len,
+                b.succs.len,
+                succ_ids[0..succ_count],
+            });
+        }
+
         return func;
     }
 };
@@ -163,18 +183,51 @@ const ConvertState = struct {
     code: []const u8,
     pos: usize,
     module: *const wasm_parser.WasmModule,
+    reachable: bool = true, // Track if current code is reachable
 
     fn convertBody(self: *ConvertState) !void {
+        const debug = @import("../../pipeline_debug.zig");
         while (self.pos < self.code.len) {
             const opcode = self.code[self.pos];
             self.pos += 1;
+
+            // Trace control flow opcodes
+            if (opcode == wasm.Op.block or opcode == wasm.Op.loop or
+                opcode == wasm.Op.if_op or opcode == wasm.Op.else_op or
+                opcode == wasm.Op.br or opcode == wasm.Op.br_if or opcode == wasm.Op.end)
+            {
+                const op_name = switch (opcode) {
+                    wasm.Op.block => "block",
+                    wasm.Op.loop => "loop",
+                    wasm.Op.if_op => "if",
+                    wasm.Op.else_op => "else",
+                    wasm.Op.br => "br",
+                    wasm.Op.br_if => "br_if",
+                    wasm.Op.end => "end",
+                    else => "?",
+                };
+                debug.log(.codegen, "wasm_to_ssa: op={s} current=b{d} reachable={}", .{
+                    op_name,
+                    self.current_block.id,
+                    self.reachable,
+                });
+            }
 
             if (opcode == wasm.Op.end) {
                 // End of function or block
                 if (self.control_stack.items.len > 0) {
                     const frame = self.control_stack.pop().?;
-                    try self.current_block.addEdgeTo(self.allocator, frame.end_block);
+                    // Only add edge from current block if it's reachable and not a return
+                    if (self.reachable and self.current_block.kind != .ret) {
+                        try self.current_block.addEdgeTo(self.allocator, frame.end_block);
+                    }
+                    // For if without else, connect else_block to end_block
+                    if (frame.opcode == .if_ and frame.else_block != null) {
+                        try frame.else_block.?.addEdgeTo(self.allocator, frame.end_block);
+                    }
                     self.current_block = frame.end_block;
+                    // Restore reachability after end of block (end_block is reachable if anyone branches to it)
+                    self.reachable = true;
                 } else {
                     // End of function - create return
                     if (self.value_stack.pop()) |ret_val| {
@@ -229,6 +282,7 @@ const ConvertState = struct {
             // 32-bit arithmetic (for address calculations)
             wasm.Op.i32_add => try self.emitBinaryOp(.add),
             wasm.Op.i32_sub => try self.emitBinaryOp(.sub),
+            wasm.Op.i32_eqz => try self.emitUnaryOp(.wasm_i32_eqz),
 
             // Binary arithmetic
             wasm.Op.i64_add => try self.emitBinaryOp(.add),
@@ -334,10 +388,15 @@ const ConvertState = struct {
             wasm.Op.else_op => {
                 if (self.control_stack.items.len > 0) {
                     var frame = &self.control_stack.items[self.control_stack.items.len - 1];
-                    try self.current_block.addEdgeTo(self.allocator, frame.end_block);
+                    // Only add edge if then-block is reachable (wasn't terminated by br/return)
+                    if (self.reachable) {
+                        try self.current_block.addEdgeTo(self.allocator, frame.end_block);
+                    }
                     if (frame.else_block) |else_blk| {
                         self.current_block = else_blk;
                         frame.else_block = null;
+                        // Restore reachability for else block
+                        self.reachable = true;
                     }
                 }
             },
@@ -347,6 +406,10 @@ const ConvertState = struct {
                     const frame = self.control_stack.items[self.control_stack.items.len - 1 - @as(usize, @intCast(label))];
                     const target = if (frame.opcode == .loop) frame.start_block else frame.end_block;
                     try self.current_block.addEdgeTo(self.allocator, target);
+                    // After unconditional branch, any following code is unreachable.
+                    // Create a dead block to collect it (will be eliminated by layout).
+                    self.current_block = try self.func.newBlock(.plain);
+                    self.reachable = false;
                 }
             },
             wasm.Op.br_if => {
@@ -369,6 +432,7 @@ const ConvertState = struct {
                     self.current_block.setControl(ret_val);
                 }
                 self.current_block.kind = .ret;
+                self.reachable = false;
             },
 
             // Function calls

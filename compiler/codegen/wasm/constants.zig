@@ -385,6 +385,8 @@ pub const As = enum(u16) {
     table_fill, // 0xFC 0x11
 
     // Pseudo-instructions (Go: lines 246-260)
+    jmp, // Pseudo-jump (Go: obj.AJMP) - transformed by preprocess
+    aret, // Pseudo-return (Go: obj.ARET) - transformed by preprocess
     resume_point, // Mark a resume point
     call_no_resume, // Call without resume point
     ret_unwind, // Return and unwind stack

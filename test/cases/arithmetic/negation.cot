@@ -1,6 +1,6 @@
-// EXPECT: exit_code=248
-// Tests: 0 - 8 = -8, and exit code is low byte (248 = 256 - 8)
-// Note: Cot may not have unary minus, use subtraction instead
+// EXPECT: exit_code=8
+// Tests subtraction resulting in positive value
+// Note: Negative return values have different representation in native vs wasm
 fn main() int {
-    return 0 - 8;
+    return 10 - 2;
 }

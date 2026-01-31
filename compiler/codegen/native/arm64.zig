@@ -1499,6 +1499,25 @@ pub const ARM64CodeGen = struct {
                 }
             },
 
+            // Wasm eqz: compare with zero, set 1 if zero, 0 otherwise
+            .wasm_i32_eqz, .wasm_i64_eqz => {
+                const args = value.args;
+                if (args.len >= 1) {
+                    const op_reg = self.getRegForValue(args[0]) orelse blk: {
+                        try self.ensureInReg(args[0], 0);
+                        break :blk @as(u5, 0);
+                    };
+                    const dest_reg = self.getDestRegForValue(value);
+
+                    // CMP op, #0 (sets flags)
+                    try self.emit(asm_mod.encodeCMPImm(op_reg, 0));
+
+                    // CSET dest, EQ (set to 1 if equal to zero)
+                    try self.emit(asm_mod.encodeCSET(dest_reg, .eq));
+                    debug.log(.codegen, "      -> CMP x{d}, #0; CSET x{d}, EQ (eqz)", .{ op_reg, dest_reg });
+                }
+            },
+
             .copy => {
                 // Copy emits MOV from source to dest
                 // Following Go's pattern: copy is a simple register-to-register move

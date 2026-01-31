@@ -303,6 +303,7 @@ pub const Driver = struct {
             try expand_calls.expandCalls(ssa_func, type_reg);
             try decompose.decompose(ssa_func, type_reg);
             try schedule.schedule(ssa_func);
+            try layout.layout(ssa_func);  // Reorder blocks for control flow
 
             var regalloc_state = try regalloc_mod.regalloc(self.allocator, ssa_func, self.target);
             defer regalloc_state.deinit();
@@ -402,9 +403,8 @@ pub const Driver = struct {
             // Add function type to linker
             const type_idx = try linker.addType(params[0..param_count], results);
 
-            // Generate function body code (still using old wasm_gen for now)
-            // Note: ARC runtime functions not yet wired into main driver
-            const body = try wasm_gen.genFuncWithIndices(self.allocator, ssa_func, &func_indices, null);
+            // Generate function body code using Go-style two-pass architecture
+            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices);
             errdefer self.allocator.free(body);
 
             // Export all functions for AOT compatibility

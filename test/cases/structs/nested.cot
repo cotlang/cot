@@ -10,8 +10,8 @@ struct Outer {
 
 fn main() int {
     let o: Outer = Outer {
-        inner: Inner { value: 3 },
-        extra: 3
+        .inner = Inner { .value = 3 },
+        .extra = 3
     };
     return o.inner.value + o.extra;
 }

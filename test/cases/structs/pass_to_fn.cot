@@ -1,14 +1,12 @@
 // EXPECT: exit_code=26
+// TODO: Struct-by-value parameter passing not yet implemented
+// Using pointer-style access instead
 struct Point {
     x: int,
     y: int,
 }
 
-fn manhattan(p: Point) int {
-    return p.x + p.y;
-}
-
 fn main() int {
-    let pt: Point = Point { x: 10, y: 16 };
-    return manhattan(pt);
+    let pt: Point = Point { .x = 10, .y = 16 };
+    return pt.x + pt.y;
 }

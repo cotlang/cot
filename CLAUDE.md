@@ -1,5 +1,40 @@
 # Claude AI Instructions
 
+## CRITICAL WARNING - READ THIS FIRST
+
+### 1. Understand the Pipeline
+
+**Cot compiles ALL code through Wasm first.** Native output (Mach-O, ELF) is AOT-compiled FROM Wasm.
+
+- `cot file.cot` → produces native executable (goes through Wasm internally)
+- `cot --target=wasm32 file.cot` → produces .wasm file directly
+
+**Do NOT be surprised by Mach-O/ELF output.** This is the expected default behavior.
+
+### 2. Copy Go's Code
+
+**Claude has repeatedly failed this project by ignoring one simple instruction: COPY GO'S CODE.**
+
+On January 31, 2026, a user explicitly told Claude:
+> "the project has been months and months of claude not following basic instructions to copy the logic from go. claude insists on writing its own logic."
+
+**DO NOT:**
+- "Figure out" how something should work
+- Write comments reasoning about logic
+- Invent your own approach
+
+**DO:**
+- Find the equivalent Go code in ~/learning/go/
+- Copy it directly, translating Go syntax to Zig
+- If you don't understand Go's code, read more of it until you do
+
+The Go compiler is at `~/learning/go/src/cmd/`. Key Wasm files:
+- `compile/internal/wasm/ssa.go` - SSA to Wasm codegen
+- `internal/obj/wasm/wasmobj.go` - Assembly to binary
+- `link/internal/wasm/asm.go` - Linker
+
+---
+
 ## Project: Cot Programming Language
 
 **Cot** is a Wasm-first programming language for full-stack web development.
@@ -10,7 +45,7 @@
 
 ---
 
-## Current State (January 2026)
+## Current State (February 2026)
 
 ### Wasm Backend Progress
 
@@ -18,25 +53,39 @@
 |-----------|--------|-------------|
 | M1-M3 | ✅ Done | Wasm SSA ops, lowering pass, code generator |
 | M4-M5 | ✅ Done | E2E: return 42, add two numbers |
-| M6-M7 | ✅ Done | Control flow (if/else, loops) |
-| M8-M9 | ✅ Done | Function calls, CLI outputs .wasm |
+| M6-M7 | ✅ Done | Control flow (if/else, loops, break, continue) |
+| M8-M9 | ✅ Done | Function calls (params, recursion), CLI outputs .wasm |
 | M10 | ✅ Done | Linear memory (load/store, SP global, frame allocation) |
 | M11 | ✅ Done | Pointers (off_ptr, add_ptr, sub_ptr) |
 | M12 | ✅ Done | Structs (field read/write via off_ptr) |
-| M13 | ✅ Done | Arrays/Slices (bounds check, slice_ptr/len) |
-| **M14** | 🔄 **Next** | Strings (data section, string ops) |
-| M15-M16 | TODO | ARC, browser imports |
+| **M13** | 🔄 **Next** | Arrays/Slices (SSA ops exist, gen.zig needs implementation) |
+| M14 | ⏳ TODO | Strings (SSA ops exist, gen.zig needs implementation) |
+| M15 | ⏳ TODO | ARC (SSA ops exist, gen.zig needs implementation) |
+| M16 | ⏳ TODO | Browser imports (JS interop) |
+
+### Verified Test Coverage (50/50 passing)
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Arithmetic | 10 | ✅ All pass |
+| Control Flow | 14 | ✅ All pass |
+| Functions | 16 | ✅ All pass |
+| Memory | 5 | ✅ All pass |
+| Structs | 5 | ✅ All pass |
+
+### Known Gaps
+
+- **Struct-by-value params**: Not yet implemented (workaround: use field access directly)
+- **Arrays/Slices**: SSA ops defined but gen.zig doesn't emit wasm
+- **Strings**: SSA ops defined but gen.zig doesn't emit wasm
+- **ARC**: SSA ops defined but gen.zig doesn't emit wasm
 
 ### AOT Native Progress
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| Phase 1-3 | ✅ Done | ARM64/AMD64 backends ported & refactored (~20% reduction) |
-| **Phase 4** | 🔄 **Next** | Wire into driver, enable native binary output |
-
-### Test Status
-
-**389/411 passed, 22 skipped (native tests)**
+| Phase 1-3 | ✅ Done | ARM64/AMD64 backends ported & refactored |
+| **Phase 4** | 🔄 Pending | Wire into driver, enable native binary output |
 
 ---
 
@@ -52,23 +101,56 @@
 
 ---
 
-## Architecture
+## Architecture - IMPORTANT: READ THIS
+
+**Cot is a Wasm-first compiler. ALL code paths go through Wasm.**
 
 ```
-Cot Compiler (Wasm path - PRIMARY):
-  Cot Source → Scanner → Parser → Checker → Lowerer → IR → SSA → Wasm
-                                                             ↓
-                                                   compiler/ssa/passes/lower_wasm.zig
-                                                             ↓
-                                                   compiler/codegen/wasm_gen.zig
-                                                             ↓
-                                                        .wasm file
+                           Cot Source
+                               ↓
+                    Scanner → Parser → Checker → IR → SSA
+                               ↓
+                    lower_wasm.zig (SSA → Wasm SSA ops)
+                               ↓
+                    wasm/ package (Wasm bytecode)
+                               ↓
+              ┌────────────────┴────────────────┐
+              ↓                                 ↓
+        --target=wasm32                   --target=native (default)
+              ↓                                 ↓
+         .wasm file                    wasm_parser → wasm_to_ssa
+                                               ↓
+                                      regalloc → arm64/amd64
+                                               ↓
+                                        .o file (Mach-O/ELF)
+                                               ↓
+                                         linker (clang)
+                                               ↓
+                                        executable
+```
 
-AOT Compiler (Native path - SECONDARY):
-  .wasm → wasm_parser → wasm_to_ssa → SSA → regalloc → Native → ELF/Mach-O
-                                              ↓
-                                    compiler/codegen/native/arm64.zig
-                                    compiler/codegen/native/amd64.zig
+**Key points for Claude:**
+1. **Native output is Mach-O/ELF** - This is EXPECTED, not an error
+2. **Native goes through Wasm** - The pipeline is: Cot → Wasm → Native (AOT)
+3. **To get .wasm output**: Use `--target=wasm32`
+4. **Default is native**: Running `cot file.cot` produces a native executable
+
+**Testing Wasm output:**
+```bash
+# Compile to wasm
+./zig-out/bin/cot --target=wasm32 test.cot -o test.wasm
+
+# Run with Node.js
+node -e 'const fs=require("fs"); const wasm=fs.readFileSync("test.wasm");
+WebAssembly.instantiate(wasm).then(r=>console.log(r.instance.exports.main()));'
+```
+
+**Testing native output:**
+```bash
+# Compile to native (default)
+./zig-out/bin/cot test.cot -o test
+./test
+echo $?  # Shows return value
 ```
 
 ---
@@ -152,32 +234,39 @@ The project succeeds through persistence and copying proven designs, not shortcu
 
 | Need | Location |
 |------|----------|
-| Wasm backend code | `compiler/codegen/wasm*.zig` |
+| **Wasm codegen (core)** | `compiler/codegen/wasm/` |
 | Wasm lowering | `compiler/ssa/passes/lower_wasm.zig` |
-| Native codegen | `compiler/codegen/native/` |
+| Native AOT codegen | `compiler/codegen/native/` |
+| Wasm→Native converter | `compiler/codegen/native/wasm_to_ssa.zig` |
 | SSA infrastructure | `compiler/ssa/` |
 | Frontend | `compiler/frontend/` |
-| Wasm milestones | `WASM_BACKEND.md` |
-| AOT phases | `AOT_EXECUTION_PLAN.md` |
-| Architecture spec | `../bootstrap-0.2/DESIGN.md` |
-| Audit docs | `audit/` |
+| Driver (orchestrates all) | `compiler/driver.zig` |
+| CLI entry point | `compiler/main.zig` |
+
+| Documentation | Purpose |
+|---------------|---------|
+| `WASM_BACKEND.md` | Wasm implementation status and Go references |
+| `AOT_EXECUTION_PLAN.md` | Native AOT compilation phases |
+| `audit/SUMMARY.md` | Test results and component status |
 
 ---
 
 ## Current Tasks
 
-### Priority 1: Fix Failing Test
-The wasm_gen.zig test is failing. Investigate and fix before proceeding.
+### Option A: M16 Browser Imports
+- Import section for JS interop
+- console.log, DOM access
+- Go reference: `cmd/link/internal/wasm/asm.go` writeImportSec
 
-### Priority 2: M10 Linear Memory
-- Add memory section to Wasm module
-- Implement load/store ops in wasm_gen.zig
-- This unlocks pointers, structs, and most real programs
-
-### Priority 3: AOT Phase 4
+### Option B: AOT Phase 4
 - Wire ARM64/AMD64 into driver.zig
 - Un-skip 22 native tests
-- Enable native binary compilation
+- Enable `cot build --native` for native binary output
+
+### Option C: E2E Testing
+- Create full end-to-end test programs in Cot
+- Test strings, structs, arrays working together
+- Verify wasm output runs correctly in wasmtime
 
 ---
 
