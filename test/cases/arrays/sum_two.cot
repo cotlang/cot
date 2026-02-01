@@ -1,0 +1,5 @@
+// EXPECT: exit_code=3
+fn main() i64 {
+    var arr = [1, 2]
+    return arr[0] + arr[1]
+}

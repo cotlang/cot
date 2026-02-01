@@ -2,7 +2,23 @@
 
 ## CRITICAL WARNING - READ THIS FIRST
 
-### 1. Understand the Pipeline
+### 1. Standard Approach: Copy Go Exactly
+
+**Every language feature follows the same pattern:**
+
+1. Find the equivalent Go code in `~/learning/go/src/cmd/`
+2. Understand how Go implements it
+3. Copy the pattern directly, translating Go syntax to Zig
+4. Do NOT invent new approaches or "figure out" how things should work
+
+**Example - Slice Decomposition:**
+- Go file: `compile/internal/ssa/rewritedec.go`
+- Go pattern: `SliceLen(SliceMake(ptr, len, cap))` → `len`
+- Cot copy: `slice_len(slice_make(ptr, len))` → `copy(len)`
+
+This is straightforward when you copy Go. It becomes complex when you try to invent.
+
+### 2. Understand the Pipeline
 
 **Cot compiles ALL code through Wasm first.** Native output (Mach-O, ELF) is AOT-compiled FROM Wasm.
 
@@ -11,12 +27,17 @@
 
 **Do NOT be surprised by Mach-O/ELF output.** This is the expected default behavior.
 
-### 2. Copy Go's Code
+### 3. Key Go Reference Files
 
-**Claude has repeatedly failed this project by ignoring one simple instruction: COPY GO'S CODE.**
+The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 
-On January 31, 2026, a user explicitly told Claude:
-> "the project has been months and months of claude not following basic instructions to copy the logic from go. claude insists on writing its own logic."
+| Feature | Go File | What to Copy |
+|---------|---------|--------------|
+| SSA → Wasm | `compile/internal/wasm/ssa.go` | Op handling patterns |
+| Slice/String decompose | `compile/internal/ssa/rewritedec.go` | Compound type rewrites |
+| Wasm assembly | `internal/obj/wasm/wasmobj.go` | Binary encoding |
+| Wasm linking | `link/internal/wasm/asm.go` | Section layout |
+| Generic rewrites | `compile/internal/ssa/rewritegeneric.go` | Algebraic simplification |
 
 **DO NOT:**
 - "Figure out" how something should work
@@ -24,14 +45,9 @@ On January 31, 2026, a user explicitly told Claude:
 - Invent your own approach
 
 **DO:**
-- Find the equivalent Go code in ~/learning/go/
-- Copy it directly, translating Go syntax to Zig
+- Find the equivalent Go code
+- Copy it directly
 - If you don't understand Go's code, read more of it until you do
-
-The Go compiler is at `~/learning/go/src/cmd/`. Key Wasm files:
-- `compile/internal/wasm/ssa.go` - SSA to Wasm codegen
-- `internal/obj/wasm/wasmobj.go` - Assembly to binary
-- `link/internal/wasm/asm.go` - Linker
 
 ---
 
@@ -58,12 +74,12 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key Wasm files:
 | M10 | ✅ Done | Linear memory (load/store, SP global, frame allocation) |
 | M11 | ✅ Done | Pointers (off_ptr, add_ptr, sub_ptr) |
 | M12 | ✅ Done | Structs (field read/write via off_ptr) |
-| **M13** | 🔄 **Next** | Arrays/Slices (SSA ops exist, gen.zig needs implementation) |
-| M14 | ⏳ TODO | Strings (SSA ops exist, gen.zig needs implementation) |
+| M13 | ✅ Done | Arrays/Slices (decomposition in lower_wasm, frame size fix) |
+| **M14** | 🔄 **Next** | Strings (SSA ops exist, gen.zig needs implementation) |
 | M15 | ⏳ TODO | ARC (SSA ops exist, gen.zig needs implementation) |
 | M16 | ⏳ TODO | Browser imports (JS interop) |
 
-### Verified Test Coverage (50/50 passing)
+### Verified Test Coverage (55/55 passing)
 
 | Category | Tests | Status |
 |----------|-------|--------|
@@ -72,11 +88,11 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key Wasm files:
 | Functions | 16 | ✅ All pass |
 | Memory | 5 | ✅ All pass |
 | Structs | 5 | ✅ All pass |
+| Arrays | 5 | ✅ All pass |
 
 ### Known Gaps
 
 - **Struct-by-value params**: Not yet implemented (workaround: use field access directly)
-- **Arrays/Slices**: SSA ops defined but gen.zig doesn't emit wasm
 - **Strings**: SSA ops defined but gen.zig doesn't emit wasm
 - **ARC**: SSA ops defined but gen.zig doesn't emit wasm
 

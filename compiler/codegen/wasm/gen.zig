@@ -536,8 +536,20 @@ pub const GenState = struct {
         }
     }
 
-    /// Compute frame size from local_addr slots
+    /// Compute frame size from local sizes (copied from IR)
+    /// Go reference: This matches how Go computes frame layout in obj/link.go
     fn computeFrameSize(self: *const GenState) i32 {
+        // Use actual local sizes from IR (populated by ssa_builder.zig)
+        if (self.func.local_sizes.len > 0) {
+            var total: i32 = 0;
+            for (self.func.local_sizes) |size| {
+                total += @intCast(size);
+            }
+            // Align to 16 bytes
+            return @divTrunc((total + 15), 16) * 16;
+        }
+
+        // Fallback: scan for local_addr ops (for backwards compatibility)
         var max_slot: i32 = -1;
         for (self.func.blocks.items) |block| {
             for (block.values.items) |v| {
@@ -549,7 +561,7 @@ pub const GenState = struct {
         }
         if (max_slot < 0) return 0;
         const size = (max_slot + 1) * 8;
-        return @divTrunc((size + 15), 16) * 16; // Align to 16
+        return @divTrunc((size + 15), 16) * 16;
     }
 };
 
