@@ -1422,3 +1422,237 @@ test "MachBuffer basic operations" {
 
     try testing.expectEqual(@as(usize, 8), buf.data.items.len);
 }
+
+// =============================================================================
+// Task 4.11: Test simple programs using emit() with real Inst structures
+// =============================================================================
+
+test "emit return 42" {
+    // Test: MOVZ X0, #42 followed by RET
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    // MOVZ X0, #42
+    const x0 = xreg(0);
+    const imm42 = MoveWideConst.maybeFromU64(42).?;
+    const movz_inst = Inst{ .mov_wide = .{
+        .op = .movz,
+        .rd = Writable(Reg).fromReg(x0),
+        .imm = imm42,
+        .size = .size64,
+    } };
+    emit(&movz_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+
+    // RET
+    const ret_inst = Inst{ .ret = {} };
+    emit(&ret_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 8), buf.curOffset());
+
+    // Verify RET encoding: D65F03C0
+    const ret_bytes = buf.data.items[4..8];
+    try testing.expectEqual(@as(u8, 0xC0), ret_bytes[0]);
+    try testing.expectEqual(@as(u8, 0x03), ret_bytes[1]);
+    try testing.expectEqual(@as(u8, 0x5F), ret_bytes[2]);
+    try testing.expectEqual(@as(u8, 0xD6), ret_bytes[3]);
+}
+
+test "emit add two registers" {
+    // Test: ADD X0, X0, X1
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    const x0 = xreg(0);
+    const x1 = xreg(1);
+    const add_inst = Inst{ .alu_rrr = .{
+        .alu_op = .add,
+        .size = .size64,
+        .rd = Writable(Reg).fromReg(x0),
+        .rn = x0,
+        .rm = x1,
+    } };
+    emit(&add_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+}
+
+test "emit sub immediate" {
+    // Test: SUB X0, X0, #10
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    const x0 = xreg(0);
+    const imm10 = Imm12.maybeFromU64(10).?;
+    const sub_inst = Inst{ .alu_rr_imm12 = .{
+        .alu_op = .sub,
+        .size = .size64,
+        .rd = Writable(Reg).fromReg(x0),
+        .rn = x0,
+        .imm12 = imm10,
+    } };
+    emit(&sub_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+}
+
+// Note: alu_rrrr (MADD/MSUB) not yet implemented in emit - see Task 4.15+
+
+// =============================================================================
+// Task 4.12: Test control flow instructions
+// =============================================================================
+
+test "emit unconditional jump" {
+    // Test: B label
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    const label = MachLabel.fromU32(0);
+    const jump_inst = Inst{ .jump = .{
+        .dest = BranchTarget{ .label = label },
+    } };
+    emit(&jump_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+}
+
+test "emit conditional branch" {
+    // Test: B.EQ label (branch if equal)
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    const label = MachLabel.fromU32(0);
+    const fallthrough = MachLabel.fromU32(1);
+    const cond_br_inst = Inst{ .cond_br = .{
+        .kind = CondBrKind{ .cond = Cond.eq },
+        .taken = BranchTarget{ .label = label },
+        .not_taken = BranchTarget{ .label = fallthrough },
+    } };
+    emit(&cond_br_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+}
+
+test "emit compare and branch" {
+    // Test: SUBS XZR, X0, X1 (CMP X0, X1) followed by B.LT
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    // CMP X0, X1 is actually SUBS XZR, X0, X1
+    const x0 = xreg(0);
+    const x1 = xreg(1);
+    const xzr = zeroReg();
+    const cmp_inst = Inst{ .alu_rrr = .{
+        .alu_op = .subs,
+        .size = .size64,
+        .rd = Writable(Reg).fromReg(xzr),
+        .rn = x0,
+        .rm = x1,
+    } };
+    emit(&cmp_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+
+    // B.LT label
+    const label = MachLabel.fromU32(0);
+    const fallthrough = MachLabel.fromU32(1);
+    const blt_inst = Inst{ .cond_br = .{
+        .kind = CondBrKind{ .cond = Cond.lt },
+        .taken = BranchTarget{ .label = label },
+        .not_taken = BranchTarget{ .label = fallthrough },
+    } };
+    emit(&blt_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 8), buf.curOffset());
+}
+
+// =============================================================================
+// Task 4.13: Test function call instructions
+// =============================================================================
+
+test "emit function call" {
+    // Test: BL label (branch with link)
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    const target = MachLabel.fromU32(0);
+    const call_inst = Inst{ .call = .{
+        .dest = BranchTarget{ .label = target },
+    } };
+    emit(&call_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+}
+
+test "emit indirect call" {
+    // Test: BLR X8 (branch with link to register)
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    const x8 = xreg(8);
+    const call_ind_inst = Inst{ .call_ind = .{
+        .rn = x8,
+    } };
+    emit(&call_ind_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+}
+
+test "emit stack frame setup" {
+    // Test: STP X29, X30, [SP, #-16]! (prologue) and LDP X29, X30, [SP], #16 (epilogue)
+    const testing = std.testing;
+    var buf = MachBuffer.init(testing.allocator);
+    defer buf.deinit();
+
+    var emit_state = EmitState{};
+    const emit_info = EmitInfo.init(.{});
+
+    const x29 = xreg(29);
+    const x30 = xreg(30);
+
+    // STP X29, X30, [SP, #-16]! (save frame pointer and link register)
+    const Type = args.Type;
+    const offset_neg = SImm7Scaled.maybeFromI64(-16, Type.i64).?;
+    const stp_inst = Inst{ .store_p64 = .{
+        .rt = x29,
+        .rt2 = x30,
+        .mem = PairAMode{ .sp_pre_indexed = .{ .simm7 = offset_neg } },
+        .flags = MemFlags{},
+    } };
+    emit(&stp_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+
+    // LDP X29, X30, [SP], #16 (restore frame pointer and link register)
+    const offset_pos = SImm7Scaled.maybeFromI64(16, Type.i64).?;
+    const ldp_inst = Inst{ .load_p64 = .{
+        .rt = Writable(Reg).fromReg(x29),
+        .rt2 = Writable(Reg).fromReg(x30),
+        .mem = PairAMode{ .sp_post_indexed = .{ .simm7 = offset_pos } },
+        .flags = MemFlags{},
+    } };
+    emit(&ldp_inst, &buf, &emit_info, &emit_state);
+    try testing.expectEqual(@as(u32, 8), buf.curOffset());
+}
