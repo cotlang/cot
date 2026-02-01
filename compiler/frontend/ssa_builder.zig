@@ -674,10 +674,33 @@ pub const SSABuilder = struct {
         ptr.addArg2(base, offset);
         try cur.addValue(self.allocator, ptr);
 
-        const load = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+        // Choose the right load op based on type size
+        // Go reference: wasm/ssa.go loadOp() function
+        const load_op = self.getLoadOp(type_idx);
+        const load = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load.addArg(ptr);
         try cur.addValue(self.allocator, load);
         return load;
+    }
+
+    /// Choose the correct load operation based on type size and signedness.
+    /// Follows Go's loadOp pattern from wasm/ssa.go:535-566.
+    fn getLoadOp(self: *SSABuilder, type_idx: TypeIndex) Op {
+        const type_info = self.type_registry.get(type_idx);
+        if (type_info == .basic) {
+            return switch (type_info.basic) {
+                .i8_type => .load8s,
+                .u8_type => .load8,
+                .i16_type => .load16s,
+                .u16_type => .load16,
+                .i32_type => .load32s,
+                .u32_type => .load32,
+                .f32_type => .load32, // TODO: .load_f32
+                .f64_type => .load,   // TODO: .load_f64
+                else => .load,
+            };
+        }
+        return .load;
     }
 
     fn convertStoreIndexLocal(self: *SSABuilder, s: ir.StoreIndexLocal, cur: *Block) !*Value {

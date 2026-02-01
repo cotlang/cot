@@ -1,0 +1,6 @@
+// String indexing: last character
+// EXPECT: exit_code=111
+fn main() i64 {
+    let s = "hello"
+    return s[4]
+}

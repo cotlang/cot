@@ -347,6 +347,24 @@ pub const TypeRegistry = struct {
         // Same basic types
         if (from_t == .basic and to_t == .basic and from_t.basic == to_t.basic) return true;
 
+        // Integer widening: smaller integers can be assigned to larger integers
+        // u8 -> u16/u32/u64/i16/i32/i64, i8 -> i16/i32/i64, etc.
+        if (from_t == .basic and to_t == .basic and from_t.basic.isInteger() and to_t.basic.isInteger()) {
+            const from_size = from_t.basic.size();
+            const to_size = to_t.basic.size();
+            const from_signed = from_t.basic.isSigned();
+            const to_signed = to_t.basic.isSigned();
+
+            // Same signedness: allow if target is larger or equal
+            if (from_signed == to_signed) return to_size >= from_size;
+
+            // Unsigned to signed: allow if target is strictly larger (to fit sign bit)
+            if (!from_signed and to_signed) return to_size > from_size;
+
+            // Signed to unsigned: not allowed implicitly (could lose sign)
+            return false;
+        }
+
         // Slices
         if (from_t == .slice and to_t == .slice) return self.equal(from_t.slice.elem, to_t.slice.elem);
         if (from_t == .array and to_t == .slice) return self.equal(from_t.array.elem, to_t.slice.elem);

@@ -362,6 +362,44 @@ pub const GenState = struct {
                 p.to = prog_mod.constAddr(v.aux_int); // offset
             },
 
+            // Sized memory loads - Go reference: wasm/ssa.go loadOp()
+            .wasm_i64_load8_u => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load8_u);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load8_s => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load8_s);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load16_u => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load16_u);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load16_s => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load16_s);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load32_u => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load32_u);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_load32_s => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+                const p = try self.builder.append(.i64_load32_s);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+
             // Local address
             .local_addr => {
                 // SP + actual_byte_offset
