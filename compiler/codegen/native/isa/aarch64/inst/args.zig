@@ -326,8 +326,8 @@ pub const CondBrKind = union(enum) {
     /// Return the inverted branch condition.
     pub fn invert(self: CondBrKind) CondBrKind {
         return switch (self) {
-            .zero => |z| .{ .not_zero = z },
-            .not_zero => |nz| .{ .zero = nz },
+            .zero => |z| .{ .not_zero = .{ .reg = z.reg, .size = z.size } },
+            .not_zero => |nz| .{ .zero = .{ .reg = nz.reg, .size = nz.size } },
             .cond => |c| .{ .cond = c.invert() },
         };
     }
@@ -645,6 +645,8 @@ pub const TestBitAndBranchKind = enum {
 
 /// Kind for BranchTargetType instruction (BTI).
 pub const BranchTargetType = enum {
+    /// No target type (just a NOP-like hint)
+    none,
     /// Jump target (BR instruction).
     j,
     /// Call target (BLR instruction).
@@ -654,6 +656,7 @@ pub const BranchTargetType = enum {
 
     pub fn bits(self: BranchTargetType) u32 {
         return switch (self) {
+            .none => 0b00,
             .j => 0b01,
             .c => 0b10,
             .jc => 0b11,

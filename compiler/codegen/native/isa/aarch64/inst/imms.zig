@@ -71,8 +71,8 @@ pub const SImm7Scaled = struct {
 
     /// Create a SImm7Scaled from a raw offset and the known scale type, if possible.
     pub fn maybeFromI64(value: i64, scale_ty: Type) ?SImm7Scaled {
-        std.debug.assert(scale_ty.kind == .i64 or scale_ty.kind == .i32 or
-            scale_ty.kind == .f64 or scale_ty.kind == .i8x16);
+        std.debug.assert(scale_ty.kind == .int64 or scale_ty.kind == .int32 or
+            scale_ty.kind == .float64 or scale_ty.kind == .vec_i8x16);
         const scale = scale_ty.bytes();
         std.debug.assert(std.math.isPowerOfTwo(scale));
         const scale_i64: i64 = @intCast(scale);

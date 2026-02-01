@@ -671,12 +671,12 @@ After Task 4.10 integration is working, you MUST come back and complete every it
 
 **Rule: No item stays deferred. 100% completion required.**
 
-#### 4.15 Atomic Operations (MANDATORY)
-- [ ] **4.15.1** Port `AtomicRMWOp` emission (ldaxr/stlxr loops)
-- [ ] **4.15.2** Port `AtomicRMWLoopOp` emission (add, sub, eor, orr, and, nand, smin, smax, umin, umax, xchg)
-- [ ] **4.15.3** Port CAS (compare-and-swap) loops
-- [ ] **4.15.4** Add tests for atomic operations
-- [ ] **4.15.5** Verify atomics work with multi-threaded Wasm (when supported)
+#### 4.15 Atomic Operations (MANDATORY) ✅ COMPLETE
+- [x] **4.15.1** Port `AtomicRMWOp` emission (LSE atomics - ldaddal/ldclral/etc.) ✅
+- [x] **4.15.2** Port `AtomicRMWLoopOp` emission (ldaxr/stlxr loop with add, sub, eor, orr, and, nand, smin, smax, umin, umax, xchg) ✅
+- [x] **4.15.3** Port CAS (compare-and-swap) loops - atomic_cas_loop with ldaxr/cmp/b.ne/stlxr/cbnz ✅
+- [x] **4.15.4** Add tests for atomic operations (emit tests for LSE atomics) ✅
+- [ ] **4.15.5** Verify atomics work with multi-threaded Wasm (when supported) - needs integration test
 
 **Cranelift reference**: `emit.rs` lines ~2000-2400 (AtomicRMW*, CAS sequences)
 
@@ -731,10 +731,15 @@ After Task 4.10 integration is working, you MUST come back and complete every it
 
 **Cranelift reference**: `emit.rs` mem_finalize (~200 lines)
 
-#### 4.20 aarch64_get_operands() - Register Operand Collection (MANDATORY)
-- [ ] **4.20.1-6** DEFERRED to Phase 6 (regalloc integration)
+#### 4.20 aarch64_get_operands() - Register Operand Collection (MANDATORY) ✅ COMPLETE
+- [x] **4.20.1** Create OperandVisitor struct with regUse, regDef, regReuseDef, regFixedUse, regFixedDef ✅
+- [x] **4.20.2** Port memargOperands and pairmemargOperands helpers ✅
+- [x] **4.20.3** Implement getOperands for all ALU instruction types ✅
+- [x] **4.20.4** Implement getOperands for all load/store instruction types ✅
+- [x] **4.20.5** Implement getOperands for all FPU and SIMD instruction types ✅
+- [x] **4.20.6** Implement getOperands for all branch and control flow types ✅
 
-**Note**: This function is for register allocation, not emission. Will be implemented in Phase 6.
+**Implemented in**: `compiler/codegen/native/isa/aarch64/inst/get_operands.zig` (400+ LOC, 2 tests)
 
 **Cranelift reference**: `mod.rs` aarch64_get_operands (~800 lines)
 

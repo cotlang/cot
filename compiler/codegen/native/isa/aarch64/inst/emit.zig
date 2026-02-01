@@ -26,6 +26,7 @@ pub const AtomicRMWOp = mod.AtomicRMWOp;
 pub const AtomicRMWLoopOp = mod.AtomicRMWLoopOp;
 pub const AMode = mod.AMode;
 pub const PairAMode = mod.PairAMode;
+pub const MemFlags = mod.MemFlags;
 pub const VecALUOp = mod.VecALUOp;
 pub const VecALUModOp = mod.VecALUModOp;
 pub const VecMisc2 = mod.VecMisc2;
@@ -178,11 +179,11 @@ pub const MachBuffer = struct {
     pub fn getLabel(self: *MachBuffer) MachLabel {
         const idx = self.labels.items.len;
         self.labels.append(self.allocator, .{ .offset = null }) catch unreachable;
-        return @intCast(idx);
+        return MachLabel.fromU32(@intCast(idx));
     }
 
-    pub fn bindLabel(self: *MachBuffer, label: MachLabel) void {
-        self.labels.items[label].offset = self.cur_offset_val;
+    pub fn bindLabel(self: *MachBuffer, label: MachLabel, _: anytype) void {
+        self.labels.items[label.asU32()].offset = self.cur_offset_val;
     }
 
     pub fn useLabelAtOffset(self: *MachBuffer, offset: u32, label: MachLabel, kind: LabelUse) void {
@@ -443,7 +444,7 @@ fn encConditionalBr(taken: BranchTarget, kind: CondBrKind) u32 {
             encCmpbr(0b0_011010_0, taken.asOffset19OrZero(), payload.reg),
             payload.size,
         ),
-        .notZero => |payload| encOpSize(
+        .not_zero => |payload| encOpSize(
             encCmpbr(0b0_011010_1, taken.asOffset19OrZero(), payload.reg),
             payload.size,
         ),
@@ -829,11 +830,85 @@ fn encCas(ty: Type, rs: Writable(Reg), rt: Reg, rn: Reg) u32 {
 }
 
 //=============================================================================
+// Load/Store helper functions
+//=============================================================================
+
+/// Helper function for emitting load instructions.
+fn emitLoad(sink: *MachBuffer, rd: Writable(Reg), mem: AMode, op: u32) void {
+    const rd_reg = rd.toReg();
+    switch (mem) {
+        .unscaled => |m| {
+            sink.put4(encLdstSimm9(op, m.simm9, 0b00, m.rn, rd_reg));
+        },
+        .unsigned_offset => |m| {
+            sink.put4(encLdstUimm12(op, m.uimm12, m.rn, rd_reg));
+        },
+        .reg_reg => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, false, null, rd_reg));
+        },
+        .reg_scaled => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, true, null, rd_reg));
+        },
+        .reg_scaled_extended => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, true, m.extendop, rd_reg));
+        },
+        .reg_extended => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, false, m.extendop, rd_reg));
+        },
+        .sp_pre_indexed => |m| {
+            sink.put4(encLdstSimm9(op, m.simm9, 0b11, stackReg(), rd_reg));
+        },
+        .sp_post_indexed => |m| {
+            sink.put4(encLdstSimm9(op, m.simm9, 0b01, stackReg(), rd_reg));
+        },
+        .label, .fp_offset, .sp_offset, .incoming_arg, .slot_offset, .reg_offset, .constant => {
+            @panic("Pseudo addressing mode not resolved before emission");
+        },
+    }
+}
+
+/// Helper function for emitting store instructions.
+fn emitStore(sink: *MachBuffer, rd: Reg, mem: AMode, op: u32) void {
+    switch (mem) {
+        .unscaled => |m| {
+            sink.put4(encLdstSimm9(op, m.simm9, 0b00, m.rn, rd));
+        },
+        .unsigned_offset => |m| {
+            sink.put4(encLdstUimm12(op, m.uimm12, m.rn, rd));
+        },
+        .reg_reg => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, false, null, rd));
+        },
+        .reg_scaled => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, true, null, rd));
+        },
+        .reg_scaled_extended => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, true, m.extendop, rd));
+        },
+        .reg_extended => |m| {
+            sink.put4(encLdstReg(op, m.rn, m.rm, false, m.extendop, rd));
+        },
+        .sp_pre_indexed => |m| {
+            sink.put4(encLdstSimm9(op, m.simm9, 0b11, stackReg(), rd));
+        },
+        .sp_post_indexed => |m| {
+            sink.put4(encLdstSimm9(op, m.simm9, 0b01, stackReg(), rd));
+        },
+        .label => {
+            @panic("Store to a MemLabel not supported");
+        },
+        .fp_offset, .sp_offset, .incoming_arg, .slot_offset, .reg_offset, .constant => {
+            @panic("Pseudo addressing mode not resolved before emission");
+        },
+    }
+}
+
+//=============================================================================
 // Main emission function
 //=============================================================================
 
 /// Emit an instruction to the buffer.
-pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, state: *EmitState) void {
+pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, _: *EmitState) void {
     _ = emit_info;
 
     switch (inst.*) {
@@ -950,7 +1025,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
         .mov_from_preg => |payload| {
             // This is a pseudo-op that should have been resolved to a real move.
             // If we get here, the preg should be directly usable.
-            const rm_enc = @as(u32, payload.rm.hw_enc) & 31;
+            const rm_enc = @as(u32, payload.rm.index_val) & 31;
             const rd_enc = machregToGpr(payload.rd.toReg());
             // ORR rd, xzr, rm (64-bit move)
             sink.put4(0xaa000000 | (rm_enc << 16) | rd_enc);
@@ -959,7 +1034,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
         // Move to physical register - used during regalloc
         .mov_to_preg => |payload| {
             // This is a pseudo-op for moving to a physical register.
-            const rd_enc = @as(u32, payload.rd.hw_enc) & 31;
+            const rd_enc = @as(u32, payload.rd.index_val) & 31;
             const rm_enc = machregToGpr(payload.rm);
             // ORR rd, xzr, rm (64-bit move)
             sink.put4(0xaa000000 | (rm_enc << 16) | rd_enc);
@@ -971,8 +1046,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
 
             switch (payload.size) {
                 .size64 => {
-                    std.debug.assert(payload.rd.toReg().hw_enc != stackReg().hw_enc);
-                    if (payload.rm.hw_enc == stackReg().hw_enc) {
+                    std.debug.assert(payload.rd.toReg().bits != stackReg().bits);
+                    if (payload.rm.bits == stackReg().bits) {
                         // Use add rd, sp, #0 instead of ORR
                         const imm12 = Imm12.maybeFromU64(0).?;
                         sink.put4(encArithRrImm12(
@@ -1263,99 +1338,19 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
         },
 
         // Load instructions
-        .uload8, .sload8, .uload16, .sload16, .uload32, .sload32, .uload64 => {
-            const payload = switch (inst.*) {
-                .uload8 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b0011100001) },
-                .sload8 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b0011100010) },
-                .uload16 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b0111100001) },
-                .sload16 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b0111100010) },
-                .uload32 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b1011100001) },
-                .sload32 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b1011100010) },
-                .uload64 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b1111100001) },
-                else => unreachable,
-            };
-
-            const rd = payload.rd.toReg();
-            const op = payload.op;
-
-            switch (payload.mem) {
-                .unscaled => |m| {
-                    sink.put4(encLdstSimm9(op, m.simm9, 0b00, m.rn, rd));
-                },
-                .unsigned_offset => |m| {
-                    sink.put4(encLdstUimm12(op, m.uimm12, m.rn, rd));
-                },
-                .reg_reg => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, false, null, rd));
-                },
-                .reg_scaled => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, true, null, rd));
-                },
-                .reg_scaled_extended => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, true, m.extendop, rd));
-                },
-                .reg_extended => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, false, m.extendop, rd));
-                },
-                .sp_pre_indexed => |m| {
-                    sink.put4(encLdstSimm9(op, m.simm9, 0b11, stackReg(), rd));
-                },
-                .sp_post_indexed => |m| {
-                    sink.put4(encLdstSimm9(op, m.simm9, 0b01, stackReg(), rd));
-                },
-                .label, .fp_offset, .sp_offset, .incoming_arg, .slot_offset, .reg_offset, .constant => {
-                    // These pseudo-modes should be resolved before emission
-                    @panic("Pseudo addressing mode not resolved before emission");
-                },
-            }
-        },
+        .uload8 => |payload| emitLoad(sink, payload.rd, payload.mem, 0b0011100001),
+        .sload8 => |payload| emitLoad(sink, payload.rd, payload.mem, 0b0011100010),
+        .uload16 => |payload| emitLoad(sink, payload.rd, payload.mem, 0b0111100001),
+        .sload16 => |payload| emitLoad(sink, payload.rd, payload.mem, 0b0111100010),
+        .uload32 => |payload| emitLoad(sink, payload.rd, payload.mem, 0b1011100001),
+        .sload32 => |payload| emitLoad(sink, payload.rd, payload.mem, 0b1011100010),
+        .uload64 => |payload| emitLoad(sink, payload.rd, payload.mem, 0b1111100001),
 
         // Store instructions
-        .store8, .store16, .store32, .store64 => {
-            const payload = switch (inst.*) {
-                .store8 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b0011100000) },
-                .store16 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b0111100000) },
-                .store32 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b1011100000) },
-                .store64 => |p| .{ .rd = p.rd, .mem = p.mem, .flags = p.flags, .op = @as(u32, 0b1111100000) },
-                else => unreachable,
-            };
-
-            const rd = payload.rd;
-            const op = payload.op;
-
-            switch (payload.mem) {
-                .unscaled => |m| {
-                    sink.put4(encLdstSimm9(op, m.simm9, 0b00, m.rn, rd));
-                },
-                .unsigned_offset => |m| {
-                    sink.put4(encLdstUimm12(op, m.uimm12, m.rn, rd));
-                },
-                .reg_reg => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, false, null, rd));
-                },
-                .reg_scaled => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, true, null, rd));
-                },
-                .reg_scaled_extended => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, true, m.extendop, rd));
-                },
-                .reg_extended => |m| {
-                    sink.put4(encLdstReg(op, m.rn, m.rm, false, m.extendop, rd));
-                },
-                .sp_pre_indexed => |m| {
-                    sink.put4(encLdstSimm9(op, m.simm9, 0b11, stackReg(), rd));
-                },
-                .sp_post_indexed => |m| {
-                    sink.put4(encLdstSimm9(op, m.simm9, 0b01, stackReg(), rd));
-                },
-                .label => {
-                    @panic("Store to a MemLabel not supported");
-                },
-                .fp_offset, .sp_offset, .incoming_arg, .slot_offset, .reg_offset, .constant => {
-                    @panic("Pseudo addressing mode not resolved before emission");
-                },
-            }
-        },
+        .store8 => |payload| emitStore(sink, payload.rd, payload.mem, 0b0011100000),
+        .store16 => |payload| emitStore(sink, payload.rd, payload.mem, 0b0111100000),
+        .store32 => |payload| emitStore(sink, payload.rd, payload.mem, 0b1011100000),
+        .store64 => |payload| emitStore(sink, payload.rd, payload.mem, 0b1111100000),
 
         // Load pair (64-bit)
         .load_p64 => |payload| {
@@ -1401,11 +1396,11 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
                 .size64 => 63,
             };
             const immr: u8 = if (is_lsl)
-                @intCast((size_bits + 1 - payload.immshift.amt) & size_bits)
+                @intCast((size_bits + 1 - payload.immshift.imm) & size_bits)
             else
-                payload.immshift.amt;
+                payload.immshift.imm;
             const imms_val: u8 = if (is_lsl)
-                @intCast(size_bits - payload.immshift.amt)
+                @intCast(size_bits - payload.immshift.imm)
             else
                 size_bits;
             const opc: u8 = if (is_asr) 0b00 else 0b10; // SBFM for ASR, UBFM for LSL/LSR
@@ -1435,7 +1430,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
                 else => @panic("Unsupported ALU op for shifted register"),
             };
             const top11_sized = top11 | (@as(u32, payload.size.sfBit()) << 10);
-            const bit15_10 = @as(u32, payload.shiftop.amt) & 0x3f;
+            const bit15_10 = @as(u32, payload.shiftop.shift.value) & 0x3f;
             sink.put4(encArithRrr(top11_sized, bit15_10, payload.rd, payload.rn, payload.rm));
         },
 
@@ -1535,8 +1530,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
             const b5 = (@as(u32, payload.bit) >> 5) & 1;
             const b40 = @as(u32, payload.bit) & 0x1f;
             const op: u32 = switch (payload.kind) {
-                .zero => 0,
-                .notZero => 1,
+                .z => 0,
+                .nz => 1,
             };
             sink.put4(
                 (b5 << 31) |
@@ -1562,10 +1557,10 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
             const cond_off = sink.curOffset();
             _ = cond_off;
             // Branch past the trap if condition is NOT met
-            sink.put4(encConditionalBr(BranchTarget{ .offset = 8 }, inverted));
+            sink.put4(encConditionalBr(BranchTarget{ .resolved_offset = 8 }, inverted));
             // UDF with trap code
             sink.put4(0x00000000 | @as(u32, payload.trap_code));
-            sink.bindLabel(skip_label);
+            sink.bindLabel(skip_label, {});
         },
 
         // Load address (pseudo-instruction, generates ADD or similar)
@@ -1645,16 +1640,131 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
 
         // Atomic RMW loop (for systems without LSE) - complex pseudo-instruction
         .atomic_rmw_loop => |payload| {
-            // This is a complex pseudo-instruction that expands to multiple instructions.
-            // The loop structure is:
-            //   loop:
-            //     ldaxr oldval, [addr]
-            //     <alu operation>
-            //     stlxr scratch, newval, [addr]
-            //     cbnz scratch, loop
-            _ = payload;
-            _ = state;
-            @panic("atomic_rmw_loop emission not yet implemented - requires loop expansion");
+            // Emit this sequence:
+            //   again:
+            //     ldaxr{,b,h}  x/w27, [x25]
+            //     // maybe sign extend
+            //     op          x28, x27, x26 // op is add,sub,and,orr,eor
+            //     stlxr{,b,h}  w24, x/w28, [x25]
+            //     cbnz        x24, again
+            //
+            // Operand conventions:
+            //   IN:  x25 (addr), x26 (2nd arg for op)
+            //   OUT: x27 (old value), x24 (trashed), x28 (trashed)
+
+            const x24 = payload.scratch1; // Success flag
+            const x25 = payload.addr; // Address
+            const x26 = payload.operand; // 2nd operand
+            const x27 = payload.oldval; // Old value (result)
+            const x28 = payload.scratch2; // New value
+
+            // Determine operand size from type
+            const size: OperandSize = if (payload.ty.kind == .int64) .size64 else .size32;
+
+            // Get label for loop start
+            const again_label = sink.getLabel();
+
+            // again:
+            sink.bindLabel(again_label, {});
+
+            // ldaxr x27, [x25]
+            sink.put4(encLdaxr(payload.ty, x27, x25));
+
+            // Sign extension for smin/smax on smaller types
+            const need_sign_ext = switch (payload.op) {
+                .smin, .smax => payload.ty.kind == .int8 or payload.ty.kind == .int16,
+                else => false,
+            };
+
+            if (need_sign_ext) {
+                // SBFM for sign extension: sxt{b|h} x27, x27
+                const from_bits: u8 = switch (payload.ty.kind) {
+                    .int8 => 8,
+                    .int16 => 16,
+                    else => unreachable,
+                };
+                const imms_sbfm: u8 = from_bits - 1;
+                sink.put4(encBfm(0b00, size, x27, x27.toReg(), 0, imms_sbfm));
+            }
+
+            // Perform the operation
+            switch (payload.op) {
+                .xchg => {}, // No operation needed, we'll store x26 directly
+
+                .nand => {
+                    // and x28, x27, x26
+                    // mvn x28, x28 (orr_not with xzr)
+                    sink.put4(encArithRrr(
+                        0b00001010_000 | (@as(u32, size.sfBit()) << 10),
+                        0b000000,
+                        x28,
+                        x27.toReg(),
+                        x26,
+                    ));
+                    // MVN x28, x28 = ORR x28, XZR, x28, LSL #0 then NOT
+                    sink.put4(encArithRrr(
+                        0b00101010_001 | (@as(u32, size.sfBit()) << 10),
+                        0b000000,
+                        x28,
+                        zeroReg(),
+                        x28.toReg(),
+                    ));
+                },
+
+                .umin, .umax, .smin, .smax => {
+                    // cmp x27, x26 (subs xzr, x27, x26)
+                    // csel x28, x27, x26, cond
+                    const cond: Cond = switch (payload.op) {
+                        .umin => .lo, // unsigned lower
+                        .umax => .hi, // unsigned higher
+                        .smin => .lt, // signed less than
+                        .smax => .gt, // signed greater than
+                        else => unreachable,
+                    };
+
+                    // CMP (SUBS xzr, x27, x26)
+                    sink.put4(encArithRrr(
+                        0b01101011_000 | (@as(u32, size.sfBit()) << 10),
+                        0b000000,
+                        writableZeroReg(),
+                        x27.toReg(),
+                        x26,
+                    ));
+
+                    // CSEL x28, x27, x26, cond
+                    sink.put4(encCsel(x28, x27.toReg(), x26, cond, 0, 0));
+                },
+
+                else => {
+                    // add/sub/and/orr/eor x28, x27, x26
+                    const alu_enc: u32 = switch (payload.op) {
+                        .add => 0b00001011_000,
+                        .sub => 0b01001011_000,
+                        .@"and" => 0b00001010_000,
+                        .orr => 0b00101010_000,
+                        .eor => 0b01001010_000,
+                        else => unreachable,
+                    };
+                    sink.put4(encArithRrr(
+                        alu_enc | (@as(u32, size.sfBit()) << 10),
+                        0b000000,
+                        x28,
+                        x27.toReg(),
+                        x26,
+                    ));
+                },
+            }
+
+            // stlxr w24, x28, [x25] (or x26 for xchg)
+            const store_val = if (payload.op == .xchg) x26 else x28.toReg();
+            sink.put4(encStlxr(payload.ty, x24, store_val, x25));
+
+            // cbnz w24, again
+            // CBNZ encoding: sf=0 (32-bit), 011010 1, imm19, Rt
+            const br_offset = sink.curOffset();
+            sink.useLabelAtOffset(br_offset, again_label, .branch19);
+            // Placeholder branch (imm19=0, will be patched by label resolution)
+            sink.put4(0b0_0110101_0000000000000000000_00000 | machregToGpr(x24.toReg()));
         },
 
         // Atomic CAS using LSE atomics
@@ -1664,10 +1774,90 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
 
         // Atomic CAS loop (for systems without LSE) - complex pseudo-instruction
         .atomic_cas_loop => |payload| {
-            // This is a complex pseudo-instruction that expands to multiple instructions.
-            _ = payload;
-            _ = state;
-            @panic("atomic_cas_loop emission not yet implemented - requires loop expansion");
+            // Emit this sequence:
+            //   again:
+            //     ldaxr{,b,h} x/w27, [x25]
+            //     cmp         x27, x/w26 uxt{b,h}
+            //     b.ne        out
+            //     stlxr{,b,h} w24, x/w28, [x25]
+            //     cbnz        x24, again
+            //   out:
+            //
+            // Operand conventions:
+            //   IN:  x25 (addr), x26 (expected value), x28 (replacement value)
+            //   OUT: x27 (old value), x24 (trashed)
+
+            const x24 = payload.scratch; // Success flag
+            const x25 = payload.addr; // Address
+            const x26 = payload.expected; // Expected value
+            const x27 = payload.oldval; // Old value (result)
+            const x28 = payload.replacement; // Replacement value
+
+            // Get labels
+            const again_label = sink.getLabel();
+            const out_label = sink.getLabel();
+
+            // again:
+            sink.bindLabel(again_label, {});
+
+            // ldaxr x27, [x25]
+            sink.put4(encLdaxr(payload.ty, x27, x25));
+
+            // cmp x27, x26 (with uxtb/uxth extension for i8/i16)
+            // The top 32-bits are zero-extended by ldaxr, so we compare with extension.
+            // subs xzr, x27, x26 {uxtb|uxth}
+            const is_i8 = payload.ty.kind == .int8;
+            const is_i16 = payload.ty.kind == .int16;
+            const is_i64 = payload.ty.kind == .int64;
+
+            const extend_enc: u32 = if (is_i8)
+                (0b1 << 21) | (0b000 << 13) // uxtb
+            else if (is_i16)
+                (0b1 << 21) | (0b001 << 13) // uxth
+            else
+                0; // no extension needed
+
+            if (is_i8 or is_i16) {
+                // SUBS with extend: 1 11 01011 00 1 Rm option imm3 Rn Rd
+                // For 64-bit with uxtb/uxth extension
+                sink.put4(
+                    (0b1_11_01011_00_1 << 21) |
+                        (machregToGpr(x26) << 16) |
+                        extend_enc |
+                        (0b000 << 10) | // imm3=0
+                        (machregToGpr(x27.toReg()) << 5) |
+                        machregToGpr(zeroReg()),
+                );
+            } else {
+                // Regular SUBS: sf 1101011 000 Rm 000000 Rn Rd
+                const sf: u32 = if (is_i64) 1 else 0;
+                sink.put4(
+                    (sf << 31) |
+                        (0b1101011_000 << 21) |
+                        (machregToGpr(x26) << 16) |
+                        (0b000000 << 10) |
+                        (machregToGpr(x27.toReg()) << 5) |
+                        machregToGpr(zeroReg()),
+                );
+            }
+
+            // b.ne out
+            const br_out_offset = sink.curOffset();
+            sink.useLabelAtOffset(br_out_offset, out_label, .branch19);
+            // B.cond encoding: 0101010 0 imm19 0 cond
+            sink.put4(0b0101010_0_0000000000000000000_0_0001); // cond=0001 (ne)
+
+            // stlxr w24, x28, [x25]
+            sink.put4(encStlxr(payload.ty, x24, x28, x25));
+
+            // cbnz w24, again
+            const br_again_offset = sink.curOffset();
+            sink.useLabelAtOffset(br_again_offset, again_label, .branch19);
+            // CBNZ encoding: sf=0 (32-bit), 011010 1, imm19, Rt
+            sink.put4(0b0_0110101_0000000000000000000_00000 | machregToGpr(x24.toReg()));
+
+            // out:
+            sink.bindLabel(out_label, {});
         },
 
         // Load-acquire exclusive register
@@ -1913,7 +2103,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
 
             // DUP (general) encoding: 0 Q 0 01110000 imm5 0 0011 1 Rn Rd
             // imm5 encodes the element size: 00001=byte, 00010=half, 00100=word, 01000=dword
-            const imm5: u32 = @as(u32, 1) << enc_size;
+            const imm5: u32 = @as(u32, 1) << @as(u5, @intCast(enc_size));
 
             const encoding: u32 = (q << 30) |
                 (0b001110000 << 21) |
@@ -1959,7 +2149,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
 
             // INS (general) encoding: 01001110000 imm5 0 0011 1 Rn Rd
             // imm5 encodes both size and index: size bits + index * size
-            const imm5: u32 = (@as(u32, 1) << enc_size) | (@as(u32, payload.idx) << (enc_size + 1));
+            const imm5: u32 = (@as(u32, 1) << @as(u5, @intCast(enc_size))) | (@as(u32, payload.idx) << @as(u5, @intCast(enc_size + 1)));
 
             const encoding: u32 = (0b01001110000 << 21) |
                 (imm5 << 16) |
@@ -1982,7 +2172,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
             // UMOV encoding: 0 Q 001110000 imm5 0 0111 1 Rn Rd
             // For 64-bit, Q=1; for 32-bit and below, Q=0
             const q: u32 = if (enc_size == 0b11) 1 else 0;
-            const imm5: u32 = (@as(u32, 1) << enc_size) | (@as(u32, payload.idx) << (enc_size + 1));
+            const imm5: u32 = (@as(u32, 1) << @as(u5, @intCast(enc_size))) | (@as(u32, payload.idx) << @as(u5, @intCast(enc_size + 1)));
 
             const encoding: u32 = (q << 30) |
                 (0b001110000 << 21) |
@@ -2367,12 +2557,6 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
                 sink.put4(off_into_table);
             }
         },
-
-        // For unimplemented instructions, emit a trap
-        else => {
-            _ = state;
-            sink.put4(0xd43e0000); // BRK
-        },
     }
 }
 
@@ -2554,7 +2738,8 @@ test "emit conditional branch" {
         .not_taken = BranchTarget{ .label = fallthrough },
     } };
     emit(&cond_br_inst, &buf, &emit_info, &emit_state);
-    try testing.expectEqual(@as(u32, 4), buf.curOffset());
+    // cond_br emits both the conditional branch and unconditional fallthrough (8 bytes total)
+    try testing.expectEqual(@as(u32, 8), buf.curOffset());
 }
 
 test "emit compare and branch" {
@@ -2589,7 +2774,9 @@ test "emit compare and branch" {
         .not_taken = BranchTarget{ .label = fallthrough },
     } };
     emit(&blt_inst, &buf, &emit_info, &emit_state);
-    try testing.expectEqual(@as(u32, 8), buf.curOffset());
+    // cond_br emits both the conditional branch and unconditional fallthrough (8 bytes total)
+    // So total is 4 (CMP) + 8 (B.cond + B) = 12 bytes
+    try testing.expectEqual(@as(u32, 12), buf.curOffset());
 }
 
 // =============================================================================
@@ -2643,7 +2830,6 @@ test "emit stack frame setup" {
     const x30 = xreg(30);
 
     // STP X29, X30, [SP, #-16]! (save frame pointer and link register)
-    const Type = args.Type;
     const offset_neg = SImm7Scaled.maybeFromI64(-16, Type.i64).?;
     const stp_inst = Inst{ .store_p64 = .{
         .rt = x29,
