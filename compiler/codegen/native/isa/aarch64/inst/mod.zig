@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 pub const regs = @import("regs.zig");
 pub const imms = @import("imms.zig");
 pub const args = @import("args.zig");
+pub const emit = @import("emit.zig");
 
 // Re-export commonly used types
 pub const xreg = regs.xreg;
