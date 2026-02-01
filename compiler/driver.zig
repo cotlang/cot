@@ -26,6 +26,8 @@ const elf = @import("codegen/native/elf.zig");
 const dwarf = @import("codegen/native/dwarf.zig");
 const schedule = @import("ssa/passes/schedule.zig");
 const layout = @import("ssa/passes/layout.zig");
+const rewritegeneric = @import("ssa/passes/rewritegeneric.zig");
+const rewritedec = @import("ssa/passes/rewritedec.zig");
 const lower_wasm = @import("ssa/passes/lower_wasm.zig");
 const target_mod = @import("core/target.zig");
 const pipeline_debug = @import("pipeline_debug.zig");
@@ -365,7 +367,25 @@ pub const Driver = struct {
             try func_indices.put(self.allocator, ir_func.name, @intCast(i));
         }
 
-        // Process each function
+        // ====================================================================
+        // Pass 1: Collect all string literals and add to linker
+        // ====================================================================
+        var string_offsets = std.StringHashMap(i32).init(self.allocator);
+        defer string_offsets.deinit();
+
+        for (funcs) |*ir_func| {
+            for (ir_func.string_literals) |str| {
+                if (!string_offsets.contains(str)) {
+                    const offset = try linker.addData(str);
+                    try string_offsets.put(str, offset);
+                    pipeline_debug.log(.codegen, "driver: string literal at offset {d}: \"{s}\"", .{ offset, str });
+                }
+            }
+        }
+
+        // ====================================================================
+        // Pass 2: Generate code for each function
+        // ====================================================================
         for (funcs) |*ir_func| {
             // Build SSA
             var ssa_builder = try ssa_builder_mod.SSABuilder.init(self.allocator, ir_func, type_reg);
@@ -379,8 +399,16 @@ pub const Driver = struct {
             ssa_builder.deinit();
 
             // Run Wasm-specific passes (no regalloc needed!)
+            // Following Go's pass order:
+            // 1. rewritegeneric - ConstString → StringMake (Go: rewritegeneric.go)
+            // 2. rewritedec - string/slice decomposition (Go: rewritedec.go)
+            // 3. schedule - value ordering
+            // 4. layout - block ordering (Go: layout.go)
+            // 5. lower_wasm - generic → wasm ops (Go: lower.go)
+            try rewritegeneric.rewrite(self.allocator, ssa_func, &string_offsets);
+            try rewritedec.rewrite(self.allocator, ssa_func);
             try schedule.schedule(ssa_func);
-            try layout.layout(ssa_func);  // Order blocks (Go's layout.go)
+            try layout.layout(ssa_func);
             try lower_wasm.lower(ssa_func);
 
             // Determine function signature
@@ -404,7 +432,7 @@ pub const Driver = struct {
             const type_idx = try linker.addType(params[0..param_count], results);
 
             // Generate function body code using Go-style two-pass architecture
-            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices);
+            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets);
             errdefer self.allocator.free(body);
 
             // Export all functions for AOT compatibility
@@ -421,7 +449,7 @@ pub const Driver = struct {
         }
 
         // Emit Wasm binary using Go-style linker
-        // This includes proper sections: type, function, memory, global (SP), export, code
+        // This includes proper sections: type, function, memory, global (SP), export, code, data
         var output: std.ArrayListUnmanaged(u8) = .{};
         try linker.emit(output.writer(self.allocator));
         return output.toOwnedSlice(self.allocator);

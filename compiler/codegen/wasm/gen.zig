@@ -71,6 +71,9 @@ pub const GenState = struct {
     /// Maps function names to Wasm function indices
     func_indices: ?*const FuncIndexMap = null,
 
+    /// Maps string literal content to memory offsets
+    string_offsets: ?*const std.StringHashMap(i32) = null,
+
     pub fn init(allocator: std.mem.Allocator, func: *const SsaFunc) GenState {
         return .{
             .allocator = allocator,
@@ -84,6 +87,10 @@ pub const GenState = struct {
 
     pub fn setFuncIndices(self: *GenState, indices: *const FuncIndexMap) void {
         self.func_indices = indices;
+    }
+
+    pub fn setStringOffsets(self: *GenState, offsets: *const std.StringHashMap(i32)) void {
+        self.string_offsets = offsets;
     }
 
     pub fn deinit(self: *GenState) void {
@@ -252,6 +259,10 @@ pub const GenState = struct {
                 // Booleans are i32 in Wasm (0 or 1)
                 _ = try self.builder.appendFrom(.i32_const, prog_mod.constAddr(if (v.aux_int != 0) @as(i64, 1) else @as(i64, 0)));
             },
+
+            // NOTE: const_string is rewritten to string_make by rewritegeneric.zig
+            // NOTE: string_ptr/string_len/slice_ptr/slice_len are decomposed by rewritedec.zig
+            // If we see these ops here, decomposition didn't run or pattern didn't match
 
             // Arithmetic (i64)
             .wasm_i64_add => {

@@ -1,18 +1,12 @@
 //! Wasm Lowering Pass - Convert generic SSA ops to Wasm-specific ops.
 //!
-//! Go reference:
-//!   - cmd/compile/internal/ssa/lower*.go (op lowering)
-//!   - cmd/compile/internal/ssa/rewritedec.go (slice/string decomposition)
+//! Go reference: cmd/compile/internal/ssa/lower.go
 //!
-//! This pass does two things:
-//! 1. Decompose compound types (slices, strings) into their components
-//!    - slice_ptr(slice_make(ptr, len)) → ptr
-//!    - slice_len(slice_make(ptr, len)) → len
-//!    - string_ptr(string_make(ptr, len)) → ptr
-//!    - string_len(string_make(ptr, len)) → len
+//! This pass transforms architecture-independent ops (add, sub, load) into
+//! Wasm-specific ops (wasm_i64_add, wasm_i64_sub, wasm_i64_load).
 //!
-//! 2. Transform architecture-independent ops (add, sub, load) into
-//!    Wasm-specific ops (wasm_i64_add, wasm_i64_sub, wasm_i64_load).
+//! NOTE: Decomposition is handled by rewritedec.zig (runs before this pass).
+//! NOTE: ConstString rewriting is handled by rewritegeneric.zig (runs before this pass).
 //!
 //! After this pass, all remaining ops should be either:
 //! - Wasm-specific (wasm_*)
@@ -28,19 +22,16 @@ const TypeIndex = @import("../value.zig").TypeIndex;
 const debug = @import("../../pipeline_debug.zig");
 
 /// Lower a function's generic ops to Wasm-specific ops.
+/// Decomposition should be done by rewritedec.zig BEFORE calling this.
 pub fn lower(f: *Func) !void {
     debug.log(.codegen, "lower_wasm: processing '{s}'", .{f.name});
 
     var lowered: usize = 0;
-    var decomposed: usize = 0;
     var unchanged: usize = 0;
 
     for (f.blocks.items) |block| {
         for (block.values.items) |v| {
-            // First try decomposition (Go: rewritedec.go)
-            if (decomposeValue(v)) {
-                decomposed += 1;
-            } else if (lowerValue(v)) {
+            if (lowerValue(v)) {
                 lowered += 1;
             } else {
                 unchanged += 1;
@@ -48,88 +39,7 @@ pub fn lower(f: *Func) !void {
         }
     }
 
-    debug.log(.codegen, "  decomposed {d}, lowered {d}, unchanged {d}", .{ decomposed, lowered, unchanged });
-}
-
-/// Decompose compound type ops into their components.
-/// Go reference: cmd/compile/internal/ssa/rewritedec.go
-/// Returns true if decomposition was applied.
-fn decomposeValue(v: *Value) bool {
-    switch (v.op) {
-        // ====================================================================
-        // Slice decomposition (Go: rewriteValuedec_OpSlicePtr/Len)
-        // ====================================================================
-        .slice_ptr => {
-            // match: (SlicePtr (SliceMake ptr len))
-            // result: ptr
-            if (v.args.len >= 1) {
-                const slice_arg = v.args[0];
-                if (slice_arg.op == .slice_make and slice_arg.args.len >= 2) {
-                    const ptr = slice_arg.args[0];
-                    debug.log(.codegen, "  decompose v{d}: slice_ptr(slice_make) -> copy v{d}", .{ v.id, ptr.id });
-                    v.op = .copy;
-                    v.args[0] = ptr;
-                    v.args = v.args[0..1];
-                    return true;
-                }
-            }
-            return false;
-        },
-        .slice_len => {
-            // match: (SliceLen (SliceMake ptr len))
-            // result: len
-            if (v.args.len >= 1) {
-                const slice_arg = v.args[0];
-                if (slice_arg.op == .slice_make and slice_arg.args.len >= 2) {
-                    const len = slice_arg.args[1];
-                    debug.log(.codegen, "  decompose v{d}: slice_len(slice_make) -> copy v{d}", .{ v.id, len.id });
-                    v.op = .copy;
-                    v.args[0] = len;
-                    v.args = v.args[0..1];
-                    return true;
-                }
-            }
-            return false;
-        },
-
-        // ====================================================================
-        // String decomposition (same pattern as slices)
-        // ====================================================================
-        .string_ptr => {
-            // match: (StringPtr (StringMake ptr len))
-            // result: ptr
-            if (v.args.len >= 1) {
-                const str_arg = v.args[0];
-                if (str_arg.op == .string_make and str_arg.args.len >= 2) {
-                    const ptr = str_arg.args[0];
-                    debug.log(.codegen, "  decompose v{d}: string_ptr(string_make) -> copy v{d}", .{ v.id, ptr.id });
-                    v.op = .copy;
-                    v.args[0] = ptr;
-                    v.args = v.args[0..1];
-                    return true;
-                }
-            }
-            return false;
-        },
-        .string_len => {
-            // match: (StringLen (StringMake ptr len))
-            // result: len
-            if (v.args.len >= 1) {
-                const str_arg = v.args[0];
-                if (str_arg.op == .string_make and str_arg.args.len >= 2) {
-                    const len = str_arg.args[1];
-                    debug.log(.codegen, "  decompose v{d}: string_len(string_make) -> copy v{d}", .{ v.id, len.id });
-                    v.op = .copy;
-                    v.args[0] = len;
-                    v.args = v.args[0..1];
-                    return true;
-                }
-            }
-            return false;
-        },
-
-        else => return false,
-    }
+    debug.log(.codegen, "  lowered {d}, unchanged {d}", .{ lowered, unchanged });
 }
 
 /// Lower a single value's op from generic to Wasm-specific.
@@ -617,79 +527,4 @@ test "wasm ops remain unchanged" {
     try testing.expectEqual(Op.wasm_i64_add, b.values.items[0].op);
 }
 
-test "decompose slice_ptr(slice_make) to copy" {
-    // Go reference: rewriteValuedec_OpSlicePtr in rewritedec.go
-    // match: (SlicePtr (SliceMake ptr len))
-    // result: ptr
-    const allocator = testing.allocator;
-    var f = Func.init(allocator, "slice_decompose");
-    defer f.deinit();
-
-    const b = try f.newBlock(.first);
-
-    // Create ptr and len values
-    const ptr = try f.newValue(.const_ptr, 0, b, .{});
-    ptr.aux_int = 0x1000;
-    try b.addValue(allocator, ptr);
-
-    const len = try f.newValue(.const_int, 0, b, .{});
-    len.aux_int = 42;
-    try b.addValue(allocator, len);
-
-    // Create slice_make(ptr, len)
-    const slice_make = try f.newValue(.slice_make, 0, b, .{});
-    slice_make.addArg(ptr);
-    slice_make.addArg(len);
-    try b.addValue(allocator, slice_make);
-
-    // Create slice_ptr(slice_make) - should decompose to copy(ptr)
-    const slice_ptr = try f.newValue(.slice_ptr, 0, b, .{});
-    slice_ptr.addArg(slice_make);
-    try b.addValue(allocator, slice_ptr);
-
-    // Create slice_len(slice_make) - should decompose to copy(len)
-    const slice_len = try f.newValue(.slice_len, 0, b, .{});
-    slice_len.addArg(slice_make);
-    try b.addValue(allocator, slice_len);
-
-    try lower(&f);
-
-    // slice_ptr should become copy(ptr)
-    try testing.expectEqual(Op.copy, b.values.items[3].op);
-    try testing.expectEqual(ptr, b.values.items[3].args[0]);
-
-    // slice_len should become copy(len)
-    try testing.expectEqual(Op.copy, b.values.items[4].op);
-    try testing.expectEqual(len, b.values.items[4].args[0]);
-}
-
-test "decompose string_len(string_make) to copy" {
-    // Same pattern as slices, for strings
-    const allocator = testing.allocator;
-    var f = Func.init(allocator, "string_decompose");
-    defer f.deinit();
-
-    const b = try f.newBlock(.first);
-
-    const ptr = try f.newValue(.const_ptr, 0, b, .{});
-    try b.addValue(allocator, ptr);
-
-    const len = try f.newValue(.const_int, 0, b, .{});
-    len.aux_int = 5;
-    try b.addValue(allocator, len);
-
-    const string_make = try f.newValue(.string_make, 0, b, .{});
-    string_make.addArg(ptr);
-    string_make.addArg(len);
-    try b.addValue(allocator, string_make);
-
-    const string_len = try f.newValue(.string_len, 0, b, .{});
-    string_len.addArg(string_make);
-    try b.addValue(allocator, string_len);
-
-    try lower(&f);
-
-    // string_len should become copy(len)
-    try testing.expectEqual(Op.copy, b.values.items[3].op);
-    try testing.expectEqual(len, b.values.items[3].args[0]);
-}
+// NOTE: Decomposition tests have been moved to rewritedec.zig

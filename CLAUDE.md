@@ -75,11 +75,11 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | M11 | ✅ Done | Pointers (off_ptr, add_ptr, sub_ptr) |
 | M12 | ✅ Done | Structs (field read/write via off_ptr) |
 | M13 | ✅ Done | Arrays/Slices (decomposition in lower_wasm, frame size fix) |
-| **M14** | 🔄 **Next** | Strings (SSA ops exist, gen.zig needs implementation) |
-| M15 | ⏳ TODO | ARC (SSA ops exist, gen.zig needs implementation) |
+| M14 | ✅ Done | Strings (rewritegeneric + rewritedec passes, Go-matching structure) |
+| **M15** | 🔄 **Next** | ARC (SSA ops exist, gen.zig needs implementation) |
 | M16 | ⏳ TODO | Browser imports (JS interop) |
 
-### Verified Test Coverage (55/55 passing)
+### Verified Test Coverage (58/58 passing)
 
 | Category | Tests | Status |
 |----------|-------|--------|
@@ -89,11 +89,11 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | Memory | 5 | ✅ All pass |
 | Structs | 5 | ✅ All pass |
 | Arrays | 5 | ✅ All pass |
+| Strings | 3 | ✅ All pass |
 
 ### Known Gaps
 
 - **Struct-by-value params**: Not yet implemented (workaround: use field access directly)
-- **Strings**: SSA ops defined but gen.zig doesn't emit wasm
 - **ARC**: SSA ops defined but gen.zig doesn't emit wasm
 
 ### AOT Native Progress
@@ -248,16 +248,18 @@ The project succeeds through persistence and copying proven designs, not shortcu
 
 ## File Locations
 
-| Need | Location |
-|------|----------|
-| **Wasm codegen (core)** | `compiler/codegen/wasm/` |
-| Wasm lowering | `compiler/ssa/passes/lower_wasm.zig` |
-| Native AOT codegen | `compiler/codegen/native/` |
-| Wasm→Native converter | `compiler/codegen/native/wasm_to_ssa.zig` |
-| SSA infrastructure | `compiler/ssa/` |
-| Frontend | `compiler/frontend/` |
-| Driver (orchestrates all) | `compiler/driver.zig` |
-| CLI entry point | `compiler/main.zig` |
+| Need | Location | Go Equivalent |
+|------|----------|---------------|
+| **Wasm codegen (core)** | `compiler/codegen/wasm/` | `wasm/ssa.go` |
+| ConstString rewrite | `compiler/ssa/passes/rewritegeneric.zig` | `rewritegeneric.go` |
+| Slice/String decompose | `compiler/ssa/passes/rewritedec.zig` | `rewritedec.go` |
+| Op lowering (generic→wasm) | `compiler/ssa/passes/lower_wasm.zig` | `lower.go` |
+| Native AOT codegen | `compiler/codegen/native/` | - |
+| Wasm→Native converter | `compiler/codegen/native/wasm_to_ssa.zig` | - |
+| SSA infrastructure | `compiler/ssa/` | `ssa/*.go` |
+| Frontend | `compiler/frontend/` | - |
+| Driver (orchestrates all) | `compiler/driver.zig` | `compile.go` |
+| CLI entry point | `compiler/main.zig` | - |
 
 | Documentation | Purpose |
 |---------------|---------|

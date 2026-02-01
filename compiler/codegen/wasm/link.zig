@@ -125,6 +125,26 @@ pub const Linker = struct {
         self.memory_max_pages = max_pages;
     }
 
+    /// Add a data segment for static data (string literals, etc.)
+    /// Returns the offset in memory where the data will be placed
+    pub fn addData(self: *Linker, data: []const u8) !i32 {
+        // Data starts after stack area (at low memory)
+        // Stack grows down from 64KB, data grows up from 0
+        var offset: i32 = 0;
+        for (self.data_segments.items) |seg| {
+            const seg_end = seg.offset + @as(i32, @intCast(seg.data.len));
+            if (seg_end > offset) offset = seg_end;
+        }
+        // Align to 8 bytes
+        offset = (offset + 7) & ~@as(i32, 7);
+
+        try self.data_segments.append(self.allocator, .{
+            .offset = offset,
+            .data = data,
+        });
+        return offset;
+    }
+
     /// Link and emit the Wasm module
     pub fn emit(self: *Linker, writer: anytype) !void {
         debugLog( "link: emitting module with {d} types, {d} funcs", .{
@@ -271,6 +291,29 @@ pub const Linker = struct {
                 try code_buf.appendSlice(self.allocator, f.code);
             }
             try writeSection(writer, self.allocator, .code, code_buf.items);
+        }
+
+        // ====================================================================
+        // Data Section (Go: asm.go writeDataSec)
+        // ====================================================================
+        if (self.data_segments.items.len > 0) {
+            var data_buf = std.ArrayListUnmanaged(u8){};
+            defer data_buf.deinit(self.allocator);
+
+            try assemble.writeULEB128(self.allocator, &data_buf, self.data_segments.items.len);
+            for (self.data_segments.items) |seg| {
+                // Memory index (always 0)
+                try assemble.writeULEB128(self.allocator, &data_buf, 0);
+                // i32.const offset
+                try data_buf.append(self.allocator, 0x41); // i32.const
+                try assemble.writeSLEB128(self.allocator, &data_buf, seg.offset);
+                // end
+                try data_buf.append(self.allocator, 0x0B);
+                // data
+                try assemble.writeULEB128(self.allocator, &data_buf, seg.data.len);
+                try data_buf.appendSlice(self.allocator, seg.data);
+            }
+            try writeSection(writer, self.allocator, .data, data_buf.items);
         }
 
         debugLog( "  link complete", .{});

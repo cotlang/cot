@@ -56,6 +56,9 @@ const debug = @import("../../pipeline_debug.zig");
 /// Function index map type (re-export from gen)
 pub const FuncIndexMap = gen.FuncIndexMap;
 
+/// String offset map type
+pub const StringOffsetMap = std.StringHashMap(i32);
+
 /// Generate WebAssembly bytecode for a function.
 ///
 /// This is the main entry point that ties together Go's two-pass architecture:
@@ -64,10 +67,12 @@ pub const FuncIndexMap = gen.FuncIndexMap;
 /// 3. assemble.zig: Prog chain → bytes (like Go's wasmobj.go)
 ///
 /// @param func_indices: Optional map of function names to Wasm function indices (for calls)
+/// @param string_offsets: Map of string literal content to memory offsets (for const_string)
 pub fn generateFunc(
     allocator: std.mem.Allocator,
     ssa_func: *const SsaFunc,
     func_indices: ?*const FuncIndexMap,
+    string_offsets: ?*const StringOffsetMap,
 ) ![]u8 {
     debug.log(.codegen, "wasm: generateFunc '{s}'", .{ssa_func.name});
 
@@ -77,6 +82,9 @@ pub fn generateFunc(
 
     if (func_indices) |indices| {
         gen_state.setFuncIndices(indices);
+    }
+    if (string_offsets) |offsets| {
+        gen_state.setStringOffsets(offsets);
     }
 
     try gen_state.generate();

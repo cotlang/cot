@@ -1,0 +1,5 @@
+// EXPECT: exit_code=5
+fn main() i64 {
+    let s = "hello"
+    return len(s)
+}
