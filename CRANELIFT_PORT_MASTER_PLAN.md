@@ -653,11 +653,11 @@ pub enum RegClass { Int, Float, Vector }
 - [x] **4.3** Create `audit/clif/isa/aarch64/inst.md`
 - [ ] **4.4** Port `lower.rs` → `lower.zig`
 - [ ] **4.5** Create `audit/clif/isa/aarch64/lower.zig.md`
-- [ ] **4.6** Port `emit.rs` → `emit.zig`
-- [ ] **4.7** Create `audit/clif/isa/aarch64/emit.zig.md`
+- [x] **4.6** Port `emit.rs` → `emit.zig` (partial - core instructions, 890 LOC, 4 tests)
+- [x] **4.7** Update `audit/clif/isa/aarch64/inst.md` with emit coverage
 - [ ] **4.8** Port `abi.rs` → `abi.zig`
 - [ ] **4.9** Create `audit/clif/isa/aarch64/abi.zig.md`
-- [ ] **4.10** Integration with machinst framework
+- [ ] **4.10** Integration with machinst framework (stub types → real types)
 - [ ] **4.11** Test simple programs on ARM64
 - [ ] **4.12** Test control flow on ARM64
 - [ ] **4.13** Test function calls on ARM64
@@ -670,12 +670,160 @@ pub enum RegClass { Int, Float, Vector }
 **Cranelift Source**: `cranelift/codegen/src/isa/x64/`
 **Cot Target**: `compiler/codegen/native/isa/x64/`
 
+**STATUS**: Ready to start. ARM64 pattern established - follow same structure.
+
+### 5.0 AMD64 Porting Instructions
+
+**For Linux Claude**: This section provides step-by-step instructions for porting the AMD64 backend, following the established ARM64 pattern.
+
+#### Prerequisites
+- Cranelift source at `~/learning/wasmtime/cranelift/codegen/src/isa/x64/`
+- ARM64 reference at `compiler/codegen/native/isa/aarch64/inst/`
+
+#### File Structure (mirror ARM64)
+```
+compiler/codegen/native/isa/x64/
+├── mod.zig          # Top-level module (like aarch64/mod.zig)
+└── inst/
+    ├── mod.zig      # Instruction definitions (from inst/mod.rs)
+    ├── args.zig     # Argument types (from inst/args.rs)
+    ├── regs.zig     # Register definitions (from inst/regs.rs)
+    └── emit.zig     # Emission/encoding (from inst/emit.rs)
+```
+
+#### Step 1: Create Directory Structure
+```bash
+mkdir -p compiler/codegen/native/isa/x64/inst
+```
+
+#### Step 2: Port args.zig (Cranelift: inst/args.rs)
+**Copy pattern from**: `aarch64/inst/args.zig`
+**Key types to port**:
+- `Amode` - x64 addressing modes (different from ARM64!)
+- `SyntheticAmode` - Pseudo addressing modes
+- `RegMem`, `RegMemImm` - Register/memory operands (x64-specific)
+- `Imm8Reg`, `Imm8Gpr` - 8-bit immediate or register
+- `ShiftKind` - SHL, SHR, SAR, ROL, ROR
+- `CC` - Condition codes (x64 flags-based, not ARM64-style)
+- `FcmpImm` - FP compare immediate
+- `OperandSize` - 8/16/32/64 bit (more variants than ARM64)
+
+**Stub types needed** (same pattern as ARM64):
+```zig
+pub const Reg = struct { bits: u32, ... };
+pub const PReg = struct { hw_enc_val: u8, class_val: RegClass, ... };
+pub const VReg = struct { vreg_val: u32, class_val: RegClass, ... };
+pub const RealReg = struct { ... };
+pub const RegClass = enum { int, float, vector };
+pub const MachLabel = u32;
+pub const Type = struct { kind: TypeKind, ... };
+```
+
+#### Step 3: Port regs.zig (Cranelift: inst/regs.rs)
+**Copy pattern from**: `aarch64/inst/regs.zig`
+**Key functions**:
+- `gpr(n)` - General purpose register (RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8-R15)
+- `xmm(n)` - XMM registers (0-15)
+- `rsp()`, `rbp()` - Stack/frame pointers
+- `pinned_reg()` - Pinned register (R15 for Spidermonkey)
+- Pretty-print functions
+
+**x64-specific**: Register encoding includes REX prefix handling for R8-R15.
+
+#### Step 4: Port mod.zig (Cranelift: inst/mod.rs)
+**Copy pattern from**: `aarch64/inst/mod.zig`
+**Key types**:
+- `AluRmiROpcode` - ADD, SUB, AND, OR, XOR, etc.
+- `UnaryRmROpcode` - NOT, NEG, INC, DEC
+- `ShiftROpcode` - Shift operations
+- `CmpOpcode` - CMP, TEST
+- `Inst` union - All x64 instruction variants
+
+**x64 Instruction categories**:
+```zig
+pub const Inst = union(enum) {
+    // ALU
+    alu_rmi_r,      // op rm, r (most common)
+    unary_rm_r,     // op rm
+    shift_r,        // shift r, cl/imm
+    cmp_rmi_r,      // cmp rm, r
+
+    // Moves
+    mov_rr,         // mov r, r
+    mov_rm_r,       // mov rm, r
+    mov_r_rm,       // mov r, rm
+    movsx_rm_r,     // movsx r, rm
+    movzx_rm_r,     // movzx r, rm
+
+    // Loads/Stores (implicit in mov_rm_r, mov_r_rm)
+
+    // Control flow
+    jmp_known,      // jmp label
+    jmp_cond,       // jcc label
+    jmp_unknown,    // jmp r
+    ret,
+    call_known,
+    call_unknown,
+
+    // FPU (SSE/AVX)
+    xmm_rm_r,       // xmm op
+    xmm_unary_rm_r,
+
+    // etc.
+};
+```
+
+#### Step 5: Port emit.zig (Cranelift: inst/emit.rs)
+**Copy pattern from**: `aarch64/inst/emit.zig`
+
+**x64 Encoding is MORE COMPLEX than ARM64**:
+- Variable-length instructions (1-15 bytes)
+- REX prefix for 64-bit and R8-R15 access
+- ModR/M byte for addressing modes
+- SIB byte for scaled index
+- Displacement (1/4 bytes)
+- Immediate (1/2/4/8 bytes)
+
+**Key encoding functions needed**:
+```zig
+pub fn encodeModrm(mod: u2, reg: u3, rm: u3) u8;
+pub fn encodeSib(scale: u2, index: u3, base: u3) u8;
+pub fn encodeRex(w: bool, r: bool, x: bool, b: bool) u8;
+
+// Instruction encoders
+pub fn emitAluRmiR(sink: *MachBuffer, op: AluRmiROpcode, src: RegMemImm, dst: Reg, size: OperandSize) void;
+pub fn emitMovRmR(sink: *MachBuffer, src: Amode, dst: Reg, size: OperandSize) void;
+// etc.
+```
+
+**REX prefix rules**:
+- REX.W = 1 for 64-bit operand size
+- REX.R = 1 if ModRM.reg is R8-R15
+- REX.X = 1 if SIB.index is R8-R15
+- REX.B = 1 if ModRM.rm or SIB.base is R8-R15
+
+#### Step 6: Create Audit Document
+Create `audit/clif/isa/x64/inst.md` following the pattern in `audit/clif/isa/aarch64/inst.md`:
+- List all ported files with line counts
+- Document coverage percentage
+- List what's deferred and why
+- Include test counts
+
+#### Step 7: Testing
+```bash
+# Test x64 module compiles
+zig test compiler/codegen/native/isa/x64/inst/emit.zig
+
+# Full test suite
+zig build test
+```
+
 ### 5.1 Instruction Definitions
 
-**Source**: `isa/x64/inst.rs` (2,500 LOC)
-**Target**: `compiler/codegen/native/isa/x64/inst.zig`
+**Source**: `isa/x64/inst/mod.rs` + `args.rs` (combined ~3,500 LOC)
+**Target**: `compiler/codegen/native/isa/x64/inst/` (args.zig, regs.zig, mod.zig)
 
-**Audit Document**: `audit/clif/isa/x64/inst.zig.md`
+**Audit Document**: `audit/clif/isa/x64/inst.md`
 
 ### 5.2 Lowering Rules
 
@@ -686,8 +834,10 @@ pub enum RegClass { Int, Float, Vector }
 
 ### 5.3 Emission
 
-**Source**: `isa/x64/emit.rs` (2,000 LOC)
-**Target**: `compiler/codegen/native/isa/x64/emit.zig`
+**Source**: `isa/x64/inst/emit.rs` (2,000 LOC)
+**Target**: `compiler/codegen/native/isa/x64/inst/emit.zig`
+
+**Key difference from ARM64**: x64 has variable-length encoding with REX/ModRM/SIB bytes.
 
 **Audit Document**: `audit/clif/isa/x64/emit.zig.md`
 
@@ -696,30 +846,37 @@ pub enum RegClass { Int, Float, Vector }
 **Source**: `isa/x64/abi.rs` (1,500 LOC)
 **Target**: `compiler/codegen/native/isa/x64/abi.zig`
 
+**Key differences**:
+- System V AMD64 ABI (Linux): args in RDI, RSI, RDX, RCX, R8, R9
+- Windows x64 ABI: args in RCX, RDX, R8, R9 (different!)
+
 **Audit Document**: `audit/clif/isa/x64/abi.zig.md`
 
-### 5.5 Encoding
+### 5.5 Encoding Helpers
 
-**Source**: `isa/x64/encoding/` (1,500 LOC)
-**Target**: `compiler/codegen/native/isa/x64/encoding.zig`
+**Source**: `isa/x64/inst/emit.rs` encoding functions
+**Target**: Part of `compiler/codegen/native/isa/x64/inst/emit.zig`
 
-**Audit Document**: `audit/clif/isa/x64/encoding.zig.md`
+**Audit Document**: Part of `audit/clif/isa/x64/inst.md`
 
 ### 5.6 Phase 5 Task Checklist
 
-- [ ] **5.1** Create `compiler/codegen/native/isa/x64/` directory
-- [ ] **5.2** Port `inst.rs` → `inst.zig`
-- [ ] **5.3** Create `audit/clif/isa/x64/inst.zig.md`
-- [ ] **5.4** Port `lower.rs` → `lower.zig`
-- [ ] **5.5** Create `audit/clif/isa/x64/lower.zig.md`
-- [ ] **5.6** Port `emit.rs` → `emit.zig`
-- [ ] **5.7** Create `audit/clif/isa/x64/emit.zig.md`
-- [ ] **5.8** Port `abi.rs` → `abi.zig`
-- [ ] **5.9** Create `audit/clif/isa/x64/abi.zig.md`
-- [ ] **5.10** Port `encoding/` → `encoding.zig`
-- [ ] **5.11** Create `audit/clif/isa/x64/encoding.zig.md`
-- [ ] **5.12** Test on x86-64 Linux
-- [ ] **5.13** Commit: "Port Cranelift x86-64 backend"
+- [ ] **5.1** Create `compiler/codegen/native/isa/x64/` directory structure
+- [ ] **5.2** Port `inst/args.rs` → `inst/args.zig` (stub types, addressing modes)
+- [ ] **5.3** Port `inst/regs.rs` → `inst/regs.zig` (GPR, XMM registers)
+- [ ] **5.4** Port `inst/mod.rs` → `inst/mod.zig` (instruction union, opcodes)
+- [ ] **5.5** Port `inst/emit.rs` encoding helpers (REX, ModRM, SIB)
+- [ ] **5.6** Port `inst/emit.rs` → `inst/emit.zig` (instruction emission)
+- [ ] **5.7** Create `inst/mod.zig` top-level (re-exports)
+- [ ] **5.8** Create `mod.zig` top-level (re-exports)
+- [ ] **5.9** Create `audit/clif/isa/x64/inst.md`
+- [ ] **5.10** Run tests, verify all pass
+- [ ] **5.11** Commit: "Add x86-64 instruction types and emission"
+- [ ] **5.12** Port `lower.rs` → `lower.zig` (deferred - needs integration)
+- [ ] **5.13** Port `abi.rs` → `abi.zig` (deferred - needs integration)
+- [ ] **5.14** Integration with machinst framework
+- [ ] **5.15** Test on x86-64 Linux
+- [ ] **5.16** Commit: "Port Cranelift x86-64 backend"
 
 ---
 
@@ -824,12 +981,24 @@ const regalloc = @import("codegen/native/regalloc/regalloc.zig");
 | 1: CLIF IR | ✅ Complete | 18/18 |
 | 2: Wasm Translation | ✅ Complete | 16/17 |
 | 3: MachInst | ✅ Complete | 16/16 |
-| 4: ARM64 | 🔄 In Progress | 3/14 |
-| 5: x86-64 | Not Started | 0/13 |
+| 4: ARM64 | 🔄 In Progress | 5/14 |
+| 5: x86-64 | 🟡 Ready to Start | 0/16 |
 | 6: Regalloc | Not Started | 0/11 |
 | 7: Integration | Not Started | 0/12 |
 | 8: Self-Hosting | Not Started | 0/4 |
-| **TOTAL** | | **81/133** |
+| **TOTAL** | | **83/136** |
+
+### Parallel Work Opportunity
+
+**Phase 5 (x86-64) can be done in parallel with Phase 4 (ARM64)**.
+
+The ARM64 pattern is now established:
+- `inst/args.zig` - Argument types with stub Reg/PReg/VReg
+- `inst/regs.zig` - Register utilities
+- `inst/mod.zig` - Instruction union and opcodes
+- `inst/emit.zig` - Encoding helpers and emission
+
+Linux Claude can follow the same pattern for x64. See [Phase 5 section](#phase-5-x86-64-backend) for detailed instructions.
 
 ### Estimated LOC
 
