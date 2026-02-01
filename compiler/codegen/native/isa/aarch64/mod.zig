@@ -8,12 +8,29 @@ const std = @import("std");
 // Sub-modules
 pub const inst = @import("inst/mod.zig");
 pub const lower = @import("lower.zig");
+pub const abi = @import("abi.zig");
 pub const regs = inst.regs;
 pub const imms = inst.imms;
 pub const args = inst.args;
 
 // Re-export lowering backend
 pub const AArch64LowerBackend = lower.AArch64LowerBackend;
+
+// Re-export ABI types
+pub const AArch64MachineDeps = abi.AArch64MachineDeps;
+pub const CallConv = abi.CallConv;
+pub const ArgsOrRets = abi.ArgsOrRets;
+pub const FrameLayout = abi.FrameLayout;
+pub const ABIArg = abi.ABIArg;
+pub const ABIArgSlot = abi.ABIArgSlot;
+pub const AbiParam = abi.AbiParam;
+pub const StackAMode = abi.StackAMode;
+pub const PRegSet = abi.PRegSet;
+pub const MachineEnv = abi.MachineEnv;
+pub const IsaFlags = abi.IsaFlags;
+pub const SettingsFlags = abi.SettingsFlags;
+pub const Signature = abi.Signature;
+pub const createRegEnv = abi.createRegEnv;
 
 // Re-export instruction types
 pub const Inst = inst.Inst;

@@ -655,8 +655,8 @@ pub enum RegClass { Int, Float, Vector }
 - [x] **4.5** Create `audit/clif/isa/aarch64/lower.zig.md` ✅ COMPLETE
 - [x] **4.6** Port `emit.rs` → `emit.zig` ✅ COMPLETE (1,424 LOC, all instruction types + FPU, 28 tests)
 - [x] **4.7** Update `audit/clif/isa/aarch64/inst.md` with emit coverage ✅ COMPLETE
-- [ ] **4.8** Port `abi.rs` → `abi.zig`
-- [ ] **4.9** Create `audit/clif/isa/aarch64/abi.zig.md`
+- [x] **4.8** Port `abi.rs` → `abi.zig` ✅ COMPLETE (1,700+ LOC, 8 tests - ABIMachineSpec, frame layout, clobber sets)
+- [x] **4.9** Create `audit/clif/isa/aarch64/abi.zig.md` ✅ COMPLETE
 - [ ] **4.10** Integration with machinst framework (stub types → real types)
 - [ ] **4.11** Test simple programs on ARM64
 - [ ] **4.12** Test control flow on ARM64
