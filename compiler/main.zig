@@ -39,23 +39,16 @@ pub const pipeline_debug = @import("pipeline_debug.zig");
 pub const driver = @import("driver.zig");
 
 // Native codegen (AOT compiler path)
-pub const native_liveness = @import("codegen/native/liveness.zig");
-pub const native_regalloc = @import("codegen/native/regalloc.zig");
-pub const native_stackalloc = @import("codegen/native/stackalloc.zig");
-pub const native_abi = @import("codegen/native/abi.zig");
-pub const native_decompose = @import("codegen/native/decompose.zig");
-pub const native_expand_calls = @import("codegen/native/expand_calls.zig");
+// NOTE: Most native codegen was removed for Cranelift-style rewrite.
+// See CRANELIFT_PORT_MASTER_PLAN.md for progress.
+// Kept files: object file formats and instruction encoding (architecture agnostic)
 pub const native_dwarf = @import("codegen/native/dwarf.zig");
 pub const native_macho = @import("codegen/native/macho.zig");
 pub const native_elf = @import("codegen/native/elf.zig");
 pub const native_wasm_parser = @import("codegen/native/wasm_parser.zig");
-pub const native_wasm_to_ssa = @import("codegen/native/wasm_to_ssa.zig");
-pub const native_generic = @import("codegen/native/generic.zig");
 pub const native_arm64_asm = @import("codegen/native/arm64_asm.zig");
-pub const native_arm64 = @import("codegen/native/arm64.zig");
 pub const native_amd64_regs = @import("codegen/native/amd64_regs.zig");
 pub const native_amd64_asm = @import("codegen/native/amd64_asm.zig");
-pub const native_amd64 = @import("codegen/native/amd64.zig");
 
 // Wasm codegen
 pub const wasm = @import("codegen/wasm.zig");

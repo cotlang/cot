@@ -12,21 +12,12 @@ const ir_mod = @import("frontend/ir.zig");
 const ssa_builder_mod = @import("frontend/ssa_builder.zig");
 const source_mod = @import("frontend/source.zig");
 // Native codegen imports (AOT compiler path)
-const regalloc_mod = @import("codegen/native/regalloc.zig");
-const stackalloc_mod = @import("codegen/native/stackalloc.zig");
-const expand_calls = @import("codegen/native/expand_calls.zig");
-const decompose = @import("codegen/native/decompose.zig");
-const wasm_parser = @import("codegen/native/wasm_parser.zig");
-const wasm_to_ssa = @import("codegen/native/wasm_to_ssa.zig");
-const generic_codegen = @import("codegen/native/generic.zig");
-const arm64_codegen = @import("codegen/native/arm64.zig");
-const amd64_codegen = @import("codegen/native/amd64.zig");
-const macho = @import("codegen/native/macho.zig");
-const elf = @import("codegen/native/elf.zig");
-const dwarf = @import("codegen/native/dwarf.zig");
+// NOTE: Native codegen is being rewritten with Cranelift architecture.
+// See CRANELIFT_PORT_MASTER_PLAN.md for status and progress.
 const schedule = @import("ssa/passes/schedule.zig");
 const layout = @import("ssa/passes/layout.zig");
 const rewritegeneric = @import("ssa/passes/rewritegeneric.zig");
+const decompose_builtin = @import("ssa/passes/decompose.zig");
 const rewritedec = @import("ssa/passes/rewritedec.zig");
 const lower_wasm = @import("ssa/passes/lower_wasm.zig");
 const target_mod = @import("core/target.zig");
@@ -254,100 +245,24 @@ pub const Driver = struct {
             return self.generateWasmCode(funcs, type_reg);
         }
 
-        // Native target: AOT compilation path (Wasm → SSA → Native)
-        // Step 1: Generate Wasm bytecode first
-        const wasm_bytes = try self.generateWasmCode(funcs, type_reg);
-        defer self.allocator.free(wasm_bytes);
-
-        pipeline_debug.log(.codegen, "driver: AOT compiling {d} bytes of Wasm to native", .{wasm_bytes.len});
-
-        // Step 2: Parse Wasm binary
-        var wasm_module = try wasm_parser.parse(self.allocator, wasm_bytes);
-        defer wasm_module.deinit();
-
-        pipeline_debug.log(.codegen, "driver: parsed {d} functions from Wasm", .{wasm_module.code.len});
-
-        // Step 3: Initialize native codegen based on target architecture
-        var arm64_gen: ?arm64_codegen.ARM64CodeGen = null;
-        var amd64_gen: ?amd64_codegen.AMD64CodeGen = null;
-        defer if (arm64_gen) |*g| g.deinit();
-        defer if (amd64_gen) |*g| g.deinit();
-
-        if (self.target.arch == .arm64) {
-            arm64_gen = arm64_codegen.ARM64CodeGen.init(self.allocator);
-            arm64_gen.?.setTypeRegistry(type_reg);
-            arm64_gen.?.setDebugInfo(source_file, source_text);
-        } else if (self.target.arch == .amd64) {
-            amd64_gen = amd64_codegen.AMD64CodeGen.init(self.allocator);
-            amd64_gen.?.setTypeRegistry(type_reg);
-            amd64_gen.?.setDebugInfo(source_file, source_text);
-        } else {
-            pipeline_debug.log(.codegen, "driver: unsupported native target: {s}", .{@tagName(self.target.arch)});
-            return error.UnsupportedTarget;
-        }
-
-        // Step 4: Convert each Wasm function to SSA and generate native code
-        var converter = wasm_to_ssa.WasmToSSA.init(self.allocator, &wasm_module);
-        defer converter.deinit();
-
-        for (0..wasm_module.code.len) |func_idx| {
-            const ssa_func = converter.convert(func_idx) catch |e| {
-                pipeline_debug.log(.codegen, "driver: failed to convert function {d}: {any}", .{ func_idx, e });
-                continue;
-            };
-            defer {
-                ssa_func.deinit();
-                self.allocator.destroy(ssa_func);
-            }
-
-            pipeline_debug.log(.codegen, "driver: converted function {d} '{s}' to SSA", .{ func_idx, ssa_func.name });
-
-            // Run SSA passes for native codegen
-            try expand_calls.expandCalls(ssa_func, type_reg);
-            try decompose.decompose(ssa_func, type_reg);
-            try schedule.schedule(ssa_func);
-            try layout.layout(ssa_func);  // Reorder blocks for control flow
-
-            var regalloc_state = try regalloc_mod.regalloc(self.allocator, ssa_func, self.target);
-            defer regalloc_state.deinit();
-
-            const stack_result = try stackalloc_mod.stackalloc(ssa_func, regalloc_state.getSpillLive());
-            const frame_size = stack_result.frame_size;
-
-            // Generate native code
-            if (arm64_gen) |*gen| {
-                gen.setRegAllocState(&regalloc_state);
-                gen.setFrameSize(frame_size);
-                gen.generateBinary(ssa_func, ssa_func.name) catch |e| {
-                    pipeline_debug.log(.codegen, "driver: ARM64 codegen failed for {s}: {any}", .{ ssa_func.name, e });
-                    continue;
-                };
-                pipeline_debug.log(.codegen, "driver: generated ARM64 code for '{s}'", .{ssa_func.name});
-            } else if (amd64_gen) |*gen| {
-                gen.setRegAllocState(&regalloc_state);
-                gen.setFrameSize(frame_size);
-                gen.generateBinary(ssa_func, ssa_func.name) catch |e| {
-                    pipeline_debug.log(.codegen, "driver: AMD64 codegen failed for {s}: {any}", .{ ssa_func.name, e });
-                    continue;
-                };
-                pipeline_debug.log(.codegen, "driver: generated AMD64 code for '{s}'", .{ssa_func.name});
-            }
-        }
-
-        // Step 5: Finalize and produce object file
-        // NOTE: ARM64CodeGen.finalize() and AMD64CodeGen.finalize() already produce
-        // complete object files (Mach-O or ELF respectively), so we return directly.
-        if (arm64_gen) |*gen| {
-            const object_file = try gen.finalize();
-            pipeline_debug.log(.codegen, "driver: finalized {d} bytes of ARM64 Mach-O object", .{object_file.len});
-            return object_file;
-        } else if (amd64_gen) |*gen| {
-            const object_file = try gen.finalize();
-            pipeline_debug.log(.codegen, "driver: finalized {d} bytes of AMD64 ELF object", .{object_file.len});
-            return object_file;
-        }
-
-        return error.NoCodeGenerated;
+        // Native target: AOT compilation path (Wasm → Native)
+        // NOTE: Native codegen is being rewritten with Cranelift-style architecture.
+        // See CRANELIFT_PORT_MASTER_PLAN.md for progress.
+        //
+        // The previous implementation (Go-style SSA with phi nodes) has been removed
+        // because it was architecturally incompatible with Wasm→Native compilation.
+        // Cranelift uses block parameters instead of phi nodes, and has a proper
+        // machine instruction framework with regalloc2.
+        //
+        // TODO: Implement Cranelift-style pipeline:
+        // 1. Wasm → CLIF IR translation (Phase 2)
+        // 2. CLIF IR → MachInst lowering (Phase 3-5)
+        // 3. Register allocation (Phase 6)
+        // 4. Code emission (Phase 4-5)
+        _ = source_file;
+        _ = source_text;
+        pipeline_debug.log(.codegen, "driver: native codegen not yet implemented (Cranelift port in progress)", .{});
+        return error.NativeCodegenNotImplemented;
     }
 
     /// Generate WebAssembly binary.
@@ -365,10 +280,11 @@ pub const Driver = struct {
         linker.setMemory(3, null);
 
         // ====================================================================
-        // Add ARC runtime functions first (they get indices 0, 1, 2)
+        // Add ARC runtime functions first (they get indices 0, 1, 2, ...)
         // ====================================================================
         const arc_funcs = try arc.addToLinker(self.allocator, &linker);
-        const arc_func_count: u32 = 3; // alloc, retain, and release
+        // Get actual count from linker - never hardcode (Go: len(hostImports))
+        const arc_func_count = linker.funcCount();
 
         // Set minimum table size of 1 for call_indirect (destructor calls)
         // Table entry 0 is reserved (null/no destructor)
@@ -383,6 +299,9 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, arc.ALLOC_NAME, arc_funcs.alloc_idx);
         try func_indices.put(self.allocator, arc.RETAIN_NAME, arc_funcs.retain_idx);
         try func_indices.put(self.allocator, arc.RELEASE_NAME, arc_funcs.release_idx);
+        try func_indices.put(self.allocator, arc.STRING_CONCAT_NAME, arc_funcs.string_concat_idx);
+        try func_indices.put(self.allocator, arc.APPEND_NAME, arc_funcs.append_idx);
+        try func_indices.put(self.allocator, arc.MEMSET_ZERO_NAME, arc_funcs.memset_zero_idx);
 
         // Add user function names (offset by ARC function count)
         for (funcs, 0..) |*ir_func, i| {
@@ -474,11 +393,14 @@ pub const Driver = struct {
             // Run Wasm-specific passes (no regalloc needed!)
             // Following Go's pass order:
             // 1. rewritegeneric - ConstString → StringMake (Go: rewritegeneric.go)
-            // 2. rewritedec - string/slice decomposition (Go: rewritedec.go)
-            // 3. schedule - value ordering
-            // 4. layout - block ordering (Go: layout.go)
-            // 5. lower_wasm - generic → wasm ops (Go: lower.go)
+            // 2. decompose - phi decomposition for slices/strings (Go: decompose.go)
+            // 3. rewritedec - string/slice decomposition (Go: rewritedec.go)
+            // 4. schedule - value ordering
+            // 5. layout - block ordering (Go: layout.go)
+            // 6. lower_wasm - generic → wasm ops (Go: lower.go)
+            // NOTE: phi lowering removed - Wasm stack machine handles phis differently
             try rewritegeneric.rewrite(self.allocator, ssa_func, &string_offsets);
+            try decompose_builtin.decompose(self.allocator, ssa_func);
             try rewritedec.rewrite(self.allocator, ssa_func);
             try schedule.schedule(ssa_func);
             try layout.layout(ssa_func);
