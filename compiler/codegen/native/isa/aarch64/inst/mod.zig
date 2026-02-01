@@ -939,6 +939,127 @@ pub const Inst = union(enum) {
         targets: BranchTargetType,
     },
 
+    // Return.
+    ret,
+
+    // FPU compare.
+    fpu_cmp: struct {
+        size: ScalarSize,
+        rn: Reg,
+        rm: Reg,
+    },
+
+    // FPU unary operation (abs, neg, sqrt, cvt).
+    fpu_rr: struct {
+        fpu_op: FPUOp1,
+        size: ScalarSize,
+        rd: Writable(Reg),
+        rn: Reg,
+    },
+
+    // FPU binary operation (add, sub, mul, div, max, min).
+    fpu_rrr: struct {
+        fpu_op: FPUOp2,
+        size: ScalarSize,
+        rd: Writable(Reg),
+        rn: Reg,
+        rm: Reg,
+    },
+
+    // FPU ternary operation (madd, msub).
+    fpu_rrrr: struct {
+        fpu_op: FPUOp3,
+        size: ScalarSize,
+        rd: Writable(Reg),
+        rn: Reg,
+        rm: Reg,
+        ra: Reg,
+    },
+
+    // FPU rounding.
+    fpu_round: struct {
+        mode: FpuRoundMode,
+        size: ScalarSize,
+        rd: Writable(Reg),
+        rn: Reg,
+    },
+
+    // FPU to integer conversion.
+    fpu_to_int: struct {
+        op: FpuToIntOp,
+        rd: Writable(Reg),
+        rn: Reg,
+    },
+
+    // Integer to FPU conversion.
+    int_to_fpu: struct {
+        op: IntToFpuOp,
+        rd: Writable(Reg),
+        rn: Reg,
+    },
+
+    // FPU load (32-bit).
+    fpu_load32: struct {
+        rd: Writable(Reg),
+        mem: AMode,
+        flags: MemFlags,
+    },
+
+    // FPU load (64-bit).
+    fpu_load64: struct {
+        rd: Writable(Reg),
+        mem: AMode,
+        flags: MemFlags,
+    },
+
+    // FPU load (128-bit).
+    fpu_load128: struct {
+        rd: Writable(Reg),
+        mem: AMode,
+        flags: MemFlags,
+    },
+
+    // FPU store (32-bit).
+    fpu_store32: struct {
+        rd: Reg,
+        mem: AMode,
+        flags: MemFlags,
+    },
+
+    // FPU store (64-bit).
+    fpu_store64: struct {
+        rd: Reg,
+        mem: AMode,
+        flags: MemFlags,
+    },
+
+    // FPU store (128-bit).
+    fpu_store128: struct {
+        rd: Reg,
+        mem: AMode,
+        flags: MemFlags,
+    },
+
+    // Move to NZCV flags.
+    mov_to_nzcv: struct {
+        rn: Reg,
+    },
+
+    // Move from NZCV flags.
+    mov_from_nzcv: struct {
+        rd: Writable(Reg),
+    },
+
+    // Call instruction.
+    call: struct {
+        dest: BranchTarget,
+    },
+
+    // Call indirect.
+    call_ind: struct {
+        rn: Reg,
+    },
+
     /// Generic constructor for a load (zero-extending where appropriate).
     pub fn genLoad(into_reg: Writable(Reg), mem: AMode, ty: Type, flags: MemFlags) Inst {
         return switch (ty.kind) {

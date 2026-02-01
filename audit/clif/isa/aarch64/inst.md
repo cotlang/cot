@@ -2,6 +2,21 @@
 
 **Source:** `cranelift/codegen/src/isa/aarch64/inst/`
 
+## ⚠️ MANDATORY COMPLETION NOTICE ⚠️
+
+**Current Status: 50% ported. After Task 4.10, ALL deferred items MUST be completed.**
+
+This module has deferred functionality that MUST be implemented for 100% coverage.
+See `CRANELIFT_PORT_MASTER_PLAN.md` Tasks 4.15-4.23 for the mandatory completion checklist.
+
+**DO NOT consider ARM64 backend complete until:**
+- [ ] All 8 deferred items are implemented (Tasks 4.15-4.22)
+- [ ] Final verification passes (Task 4.23)
+- [ ] The `else => BRK` fallback is removed from emit.zig
+- [ ] Coverage reaches 100%
+
+---
+
 ## Overview
 
 This module implements AArch64 (ARM64) machine instruction types, immediate encodings, register utilities, argument types, and binary code emission. This is Phase 4 Tasks 4.2 and 4.6 of the Cranelift port.
@@ -13,9 +28,9 @@ This module implements AArch64 (ARM64) machine instruction types, immediate enco
 | args.rs | args.zig | 726 | 790 | 109% |
 | imms.rs | imms.zig | 1,242 | 806 | 65% |
 | regs.rs | regs.zig | 281 | 297 | 106% |
-| mod.rs | mod.zig | 3,114 | 1,044 | 34% |
-| emit.rs | emit.zig | 3,687 | 890 | 24% |
-| **Total** | | **9,050** | **3,827** | **42%** |
+| mod.rs | mod.zig | 3,114 | 1,166 | 37% |
+| emit.rs | emit.zig | 3,687 | 1,424 | 39% |
+| **Total** | | **9,050** | **4,483** | **50%** |
 
 **Note:**
 - mod.rs is partially ported - instruction enum variants and basic operations ported, but `aarch64_get_operands` (800+ lines) and `print_with_state` (1500+ lines) deferred.
@@ -141,22 +156,37 @@ This module implements AArch64 (ARM64) machine instruction types, immediate enco
 | ALU RRRR | ✅ Complete | MADD, MSUB, UMADDL, SMADDL |
 | ALU RR Imm12 | ✅ Complete | ADD/SUB with 12-bit immediate |
 | ALU RR ImmLogic | ✅ Complete | ORR/AND/EOR with logical immediate |
+| ALU RR ImmShift | ✅ Complete | LSL, LSR, ASR with immediate |
+| ALU RRR Shift | ✅ Complete | Operations with shifted register |
+| ALU RRR Extend | ✅ Complete | Operations with extended register |
 | Bit Operations | ✅ Complete | CLZ, CLS, RBIT, REV |
 | Move Wide | ✅ Complete | MOVZ, MOVN, MOVK |
-| Move | ✅ Complete | Register moves |
+| Move | ✅ Complete | Register moves, mov_from_preg, mov_to_preg |
 | Conditional Select | ✅ Complete | CSEL, CSNEG, CSET, CSETM |
+| Conditional Compare | ✅ Complete | CCMP, CCMP_imm |
+| Extend | ✅ Complete | Sign/zero extension |
 | Loads | ✅ Complete | LDRB/H/W/X signed/unsigned |
 | Stores | ✅ Complete | STRB/H/W/X |
 | Load/Store Pairs | ✅ Complete | LDP, STP (64-bit) |
-| Branches | ✅ Complete | B, B.cond, RET |
+| Load Address | ✅ Complete | LEA-like operations |
+| Branches | ✅ Complete | B, BL, B.cond, RET, BR, BLR |
+| Test & Branch | ✅ Complete | TBZ, TBNZ |
 | ADR/ADRP | ✅ Complete | PC-relative addressing |
 | FPU Moves | ✅ Complete | FMOV (32/64/128) |
 | FPU Compare | ✅ Complete | FCMP |
+| FPU Unary | ✅ Complete | FABS, FNEG, FSQRT, FCVT |
+| FPU Binary | ✅ Complete | FADD, FSUB, FMUL, FDIV, FMAX, FMIN |
+| FPU Ternary | ✅ Complete | FMADD, FMSUB |
+| FPU Rounding | ✅ Complete | FRINTN, FRINTP, FRINTM, FRINTZ |
+| FPU↔Int Convert | ✅ Complete | FCVTZS/U, SCVTF, UCVTF |
+| FPU Load/Store | ✅ Complete | LDR/STR (32/64/128-bit FP) |
+| NZCV Moves | ✅ Complete | MSR/MRS for NZCV |
 | Fence | ✅ Complete | DMB ISH |
+| BTI | ✅ Complete | Branch target identification |
 | Nop/Brk/Udf | ✅ Complete | Debug/trap instructions |
+| Trap If | ✅ Complete | Conditional trap |
 | Atomics | ⏳ Deferred | AtomicRMW, CAS loops |
 | Vector ALU | ⏳ Deferred | SIMD operations |
-| FPU Arithmetic | ⏳ Deferred | FADD, FMUL, etc. |
 | Jump Tables | ⏳ Deferred | JTSequence |
 | External Names | ⏳ Deferred | LoadExtNameGot, etc. |
 
@@ -170,45 +200,46 @@ This module implements AArch64 (ARM64) machine instruction types, immediate enco
 | mod.zig | 4 |
 | emit.zig | 4 |
 | aarch64/mod.zig | 1 |
-| **Total** | **29** |
+| **Total** | **28** |
 
 ## What's Deferred
 
-### 1. Atomic Operations (AtomicRMW, CAS loops)
+**⚠️ CRITICAL: All items below MUST be completed after Task 4.10 ⚠️**
+
+See `CRANELIFT_PORT_MASTER_PLAN.md` Tasks 4.15-4.23 for mandatory completion checklist.
+These are NOT optional deferrals - they MUST be implemented for 100% coverage.
+
+### 1. Atomic Operations (AtomicRMW, CAS loops) → Task 4.15
 - **Why deferred:** Atomics require complex multi-instruction sequences with loops (ldaxr/stlxr). The Wasm backend doesn't use atomics yet (single-threaded model).
-- **When to implement:** When adding multi-threading support to the Wasm-to-native AOT path, or if Wasm threads proposal is implemented.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.15 checklist.
 
-### 2. Vector/SIMD Operations (VecALUOp, VecMisc2)
+### 2. Vector/SIMD Operations (VecALUOp, VecMisc2) → Task 4.16
 - **Why deferred:** SIMD requires ~50 additional instruction variants. The core AOT path uses scalar operations only.
-- **When to implement:** When optimizing hot loops or implementing Wasm SIMD proposal.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.16 checklist (17 sub-items).
 
-### 3. FPU Arithmetic (FADD, FMUL, FDIV, etc.)
-- **Why deferred:** While FPU moves/compares are done, full arithmetic needs ~20 more instruction variants. Current Wasm backend focuses on integer operations.
-- **When to implement:** When the Wasm backend generates floating-point code paths.
-
-### 4. Jump Tables (JTSequence)
+### 3. Jump Tables (JTSequence) → Task 4.17
 - **Why deferred:** Jump tables are a complex multi-instruction pseudo-op requiring label management. Switch statements can use if/else chains initially.
-- **When to implement:** When optimizing large switch statements in generated code.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.17 checklist.
 
-### 5. External Name Loading (LoadExtNameGot, LoadExtNameNear, LoadExtNameFar)
+### 4. External Name Loading (LoadExtNameGot, LoadExtNameNear, LoadExtNameFar) → Task 4.18
 - **Why deferred:** These handle dynamic linking relocations. Initial AOT produces static executables.
-- **When to implement:** When adding shared library support or PIC code generation.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.18 checklist.
 
-### 6. mem_finalize() - Address Mode Finalization
+### 5. mem_finalize() - Address Mode Finalization → Task 4.19
 - **Why deferred:** Converts pseudo-modes (SPOffset, FPOffset) to real modes using spilltmp register. Requires frame layout integration.
-- **When to implement:** Task 4.10 when integrating with the ABI/frame layout system.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.19 checklist.
 
-### 7. aarch64_get_operands() - Register Operand Collection
+### 6. aarch64_get_operands() - Register Operand Collection → Task 4.20
 - **Why deferred:** 800+ lines collecting register uses/defs for regalloc. Not needed until register allocator is wired in.
-- **When to implement:** Task 4.10 when integrating with regalloc.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.20 checklist.
 
-### 8. print_with_state() - Pretty Printing
-- **Why deferred:** 1500+ lines for disassembly output. Nice-to-have for debugging but not required for code generation.
-- **When to implement:** When debugging native code output becomes necessary.
+### 7. print_with_state() - Pretty Printing → Task 4.21
+- **Why deferred:** 1500+ lines for disassembly output. Required for debugging native code issues.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.21 checklist.
 
-### 9. emit_tests.rs (7,972 lines)
+### 8. emit_tests.rs (7,972 lines) → Task 4.22
 - **Why deferred:** Comprehensive emission tests. The encoding helpers have basic tests; full coverage requires more infrastructure.
-- **When to implement:** After Task 4.10 integration, as validation before enabling native output.
+- **When to implement:** MANDATORY after Task 4.10. See Task 4.22 checklist.
 
 ## Key Algorithms
 

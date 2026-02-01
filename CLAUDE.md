@@ -121,9 +121,9 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 
 | Document | Purpose |
 |----------|---------|
-| `ROADMAP_PHASE2.md` | **M17-M24 detailed plan with Go/Swift research** |
+| `CRANELIFT_PORT_MASTER_PLAN.md` | **Native AOT codegen - Cranelift port phases & tasks** |
+| `ROADMAP_PHASE2.md` | M17-M24 detailed plan with Go/Swift research |
 | `WASM_BACKEND.md` | Wasm milestones M1-M16, implementation details |
-| `AOT_EXECUTION_PLAN.md` | Native codegen phases, task checklist |
 | `VISION.md` | Language vision, strategy, roadmap |
 | `README.md` | Project overview and quick start |
 | `../bootstrap-0.2/DESIGN.md` | Technical architecture specification |
@@ -133,6 +133,8 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 ## Architecture - IMPORTANT: READ THIS
 
 **Cot is a Wasm-first compiler. ALL code paths go through Wasm.**
+
+**The native AOT path uses Cranelift's architecture (fully ported to Zig).**
 
 ```
                            Cot Source
@@ -147,9 +149,22 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
               ↓                                 ↓
         --target=wasm32                   --target=native (default)
               ↓                                 ↓
-         .wasm file                    wasm_parser → wasm_to_ssa
+         .wasm file                    wasm_parser (parse Wasm binary)
                                                ↓
-                                      regalloc → arm64/amd64
+                                      wasm_to_clif/ (Wasm → CLIF IR)
+                                               ↓
+                                      ir/clif/ (CLIF IR representation)
+                                               ↓
+                                      machinst/lower.zig (CLIF → MachInst)
+                                               ↓
+                                      isa/aarch64/lower.zig (ARM64 patterns)
+                                      isa/x64/lower.zig (AMD64 patterns)
+                                               ↓
+                                      isa/*/inst/ (MachInst types)
+                                               ↓
+                                      isa/*/emit.zig (MachInst → bytes)
+                                               ↓
+                                      machinst/buffer.zig (code buffer)
                                                ↓
                                         .o file (Mach-O/ELF)
                                                ↓
@@ -158,11 +173,19 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
                                         executable
 ```
 
+**Cranelift Port Structure (see CRANELIFT_PORT_MASTER_PLAN.md):**
+- `compiler/ir/clif/` - CLIF IR types, DFG, layout, builder
+- `compiler/codegen/native/wasm_to_clif/` - Wasm → CLIF translation
+- `compiler/codegen/native/machinst/` - Machine instruction framework
+- `compiler/codegen/native/isa/aarch64/` - ARM64 backend
+- `compiler/codegen/native/isa/x64/` - AMD64 backend (TODO)
+
 **Key points for Claude:**
 1. **Native output is Mach-O/ELF** - This is EXPECTED, not an error
-2. **Native goes through Wasm** - The pipeline is: Cot → Wasm → Native (AOT)
+2. **Native goes through Wasm then CLIF IR** - Pipeline: Cot → Wasm → CLIF IR → MachInst → Native
 3. **To get .wasm output**: Use `--target=wasm32`
 4. **Default is native**: Running `cot file.cot` produces a native executable
+5. **Follow Cranelift exactly**: The port must match Cranelift's architecture 100%
 
 **Testing Wasm output:**
 ```bash

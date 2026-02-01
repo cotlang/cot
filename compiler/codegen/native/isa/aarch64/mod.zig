@@ -7,9 +7,13 @@ const std = @import("std");
 
 // Sub-modules
 pub const inst = @import("inst/mod.zig");
+pub const lower = @import("lower.zig");
 pub const regs = inst.regs;
 pub const imms = inst.imms;
 pub const args = inst.args;
+
+// Re-export lowering backend
+pub const AArch64LowerBackend = lower.AArch64LowerBackend;
 
 // Re-export instruction types
 pub const Inst = inst.Inst;

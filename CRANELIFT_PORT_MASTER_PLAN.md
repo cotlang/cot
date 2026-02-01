@@ -651,10 +651,10 @@ pub enum RegClass { Int, Float, Vector }
 - [x] **4.1** Create `compiler/codegen/native/isa/aarch64/` directory
 - [x] **4.2** Port `inst/` → `inst/` (args.zig, imms.zig, regs.zig, mod.zig - 3,027 LOC, 25 tests)
 - [x] **4.3** Create `audit/clif/isa/aarch64/inst.md`
-- [ ] **4.4** Port `lower.rs` → `lower.zig`
-- [ ] **4.5** Create `audit/clif/isa/aarch64/lower.zig.md`
-- [x] **4.6** Port `emit.rs` → `emit.zig` (partial - core instructions, 890 LOC, 4 tests)
-- [x] **4.7** Update `audit/clif/isa/aarch64/inst.md` with emit coverage
+- [x] **4.4** Port `lower.rs` → `lower.zig` ✅ COMPLETE (ISLE rules translated to Zig switch statements, 1,800+ LOC)
+- [x] **4.5** Create `audit/clif/isa/aarch64/lower.zig.md` ✅ COMPLETE
+- [x] **4.6** Port `emit.rs` → `emit.zig` ✅ COMPLETE (1,424 LOC, all instruction types + FPU, 28 tests)
+- [x] **4.7** Update `audit/clif/isa/aarch64/inst.md` with emit coverage ✅ COMPLETE
 - [ ] **4.8** Port `abi.rs` → `abi.zig`
 - [ ] **4.9** Create `audit/clif/isa/aarch64/abi.zig.md`
 - [ ] **4.10** Integration with machinst framework (stub types → real types)
@@ -662,6 +662,113 @@ pub enum RegClass { Int, Float, Vector }
 - [ ] **4.12** Test control flow on ARM64
 - [ ] **4.13** Test function calls on ARM64
 - [ ] **4.14** Commit: "Port Cranelift ARM64 backend"
+
+### 4.6 MANDATORY: Complete ALL Deferred Items After 4.10
+
+**⚠️ CRITICAL: DO NOT SKIP THIS SECTION ⚠️**
+
+After Task 4.10 integration is working, you MUST come back and complete every item below. These are NOT optional. Previous attempts at Cot failed because Claude kept deferring functionality and never completing it, leading to mysterious bugs that were impossible to troubleshoot.
+
+**Rule: No item stays deferred. 100% completion required.**
+
+#### 4.15 Atomic Operations (MANDATORY)
+- [ ] **4.15.1** Port `AtomicRMWOp` emission (ldaxr/stlxr loops)
+- [ ] **4.15.2** Port `AtomicRMWLoopOp` emission (add, sub, eor, orr, and, nand, smin, smax, umin, umax, xchg)
+- [ ] **4.15.3** Port CAS (compare-and-swap) loops
+- [ ] **4.15.4** Add tests for atomic operations
+- [ ] **4.15.5** Verify atomics work with multi-threaded Wasm (when supported)
+
+**Cranelift reference**: `emit.rs` lines ~2000-2400 (AtomicRMW*, CAS sequences)
+
+#### 4.16 Vector/SIMD Operations (MANDATORY)
+- [ ] **4.16.1** Port `VecALUOp` emission (~20 variants: add, sub, mul, sqadd, uqadd, etc.)
+- [ ] **4.16.2** Port `VecALUModOp` emission (sqrdmlah, sqrdmlsh, umlal, fmla, fmls)
+- [ ] **4.16.3** Port `VecMisc2` emission (~30 variants: not, neg, abs, fabs, fneg, fsqrt, etc.)
+- [ ] **4.16.4** Port `VecLanesOp` emission (addv, uminv, saddlv, uaddlv)
+- [ ] **4.16.5** Port `VecPairOp` emission (addp)
+- [ ] **4.16.6** Port `VecShiftImmOp` emission (shl, sshr, ushr)
+- [ ] **4.16.7** Port `VecShiftImmModOp` emission (sli, sri, srshr, urshr, ssra, usra)
+- [ ] **4.16.8** Port `VecExtendOp` emission (sxtl, sxtl2, uxtl, uxtl2)
+- [ ] **4.16.9** Port `VecRRLongOp` emission (fcvtl, fcvtl2, shll, shll2)
+- [ ] **4.16.10** Port `VecRRNarrowOp` emission (xtn, sqxtn, sqxtun, uqxtn, fcvtn)
+- [ ] **4.16.11** Port `VecRRRLongOp` emission (smull, smull2, umull, umull2, etc.)
+- [ ] **4.16.12** Port `VecRRRLongModOp` emission (umlal, umlal2, smlal, smlal2)
+- [ ] **4.16.13** Port `VecRRPairLongOp` emission (saddlp, uaddlp)
+- [ ] **4.16.14** Port `FPUOpRI` emission (ushr32, ushr64)
+- [ ] **4.16.15** Port `FPUOpRIMod` emission (sli32, sli64)
+- [ ] **4.16.16** Add tests for all vector operations
+- [ ] **4.16.17** Verify SIMD works with Wasm SIMD proposal
+
+**Cranelift reference**: `emit.rs` lines ~1200-2000 (vector operations)
+
+#### 4.17 Jump Tables (MANDATORY)
+- [ ] **4.17.1** Port `JTSequence` pseudo-instruction
+- [ ] **4.17.2** Implement jump table label management
+- [ ] **4.17.3** Implement jump table data emission
+- [ ] **4.17.4** Add tests for switch statements with jump tables
+- [ ] **4.17.5** Verify br_table works correctly
+
+**Cranelift reference**: `emit.rs` JTSequence handling (~100 lines)
+
+#### 4.18 External Name Loading (MANDATORY)
+- [ ] **4.18.1** Port `LoadExtNameGot` emission
+- [ ] **4.18.2** Port `LoadExtNameNear` emission
+- [ ] **4.18.3** Port `LoadExtNameFar` emission
+- [ ] **4.18.4** Implement relocation handling for external symbols
+- [ ] **4.18.5** Add tests for external function calls
+- [ ] **4.18.6** Verify dynamic linking works (when supported)
+
+**Cranelift reference**: `emit.rs` external name handling (~150 lines)
+
+#### 4.19 mem_finalize() - Address Mode Finalization (MANDATORY)
+- [ ] **4.19.1** Port `mem_finalize()` function
+- [ ] **4.19.2** Handle SPOffset → real addressing mode conversion
+- [ ] **4.19.3** Handle FPOffset → real addressing mode conversion
+- [ ] **4.19.4** Handle spilltmp register allocation for large offsets
+- [ ] **4.19.5** Integrate with frame layout from abi.zig
+- [ ] **4.19.6** Add tests for stack frame access patterns
+
+**Cranelift reference**: `emit.rs` mem_finalize (~200 lines)
+
+#### 4.20 aarch64_get_operands() - Register Operand Collection (MANDATORY)
+- [ ] **4.20.1** Port `aarch64_get_operands()` function (800+ lines)
+- [ ] **4.20.2** Collect register uses for each instruction type
+- [ ] **4.20.3** Collect register defs for each instruction type
+- [ ] **4.20.4** Handle clobbers correctly
+- [ ] **4.20.5** Integrate with regalloc2
+- [ ] **4.20.6** Add tests for operand collection
+
+**Cranelift reference**: `mod.rs` aarch64_get_operands (~800 lines)
+
+#### 4.21 print_with_state() - Pretty Printing (MANDATORY)
+- [ ] **4.21.1** Port `print_with_state()` function (1500+ lines)
+- [ ] **4.21.2** Implement register pretty printing
+- [ ] **4.21.3** Implement immediate pretty printing
+- [ ] **4.21.4** Implement addressing mode pretty printing
+- [ ] **4.21.5** Implement instruction disassembly for all types
+- [ ] **4.21.6** Add debug output capability to driver
+
+**Cranelift reference**: `mod.rs` Inst::print_with_state (~1500 lines)
+
+#### 4.22 Comprehensive Emission Tests (MANDATORY)
+- [ ] **4.22.1** Port ALU instruction tests from emit_tests.rs
+- [ ] **4.22.2** Port load/store instruction tests
+- [ ] **4.22.3** Port branch instruction tests
+- [ ] **4.22.4** Port FPU instruction tests
+- [ ] **4.22.5** Port SIMD instruction tests
+- [ ] **4.22.6** Port atomic instruction tests
+- [ ] **4.22.7** Verify all encodings match reference ARM64 assembler
+- [ ] **4.22.8** Add encoding verification against known-good binaries
+
+**Cranelift reference**: `emit_tests.rs` (~8000 lines)
+
+#### 4.23 Final Verification
+- [ ] **4.23.1** Run full Wasm test suite through AOT
+- [ ] **4.23.2** Verify no instruction types hit the `else` fallback (BRK trap)
+- [ ] **4.23.3** Remove the `else => BRK` fallback entirely
+- [ ] **4.23.4** Verify all Cranelift emit.rs functionality is ported
+- [ ] **4.23.5** Update audit document to show 100% coverage
+- [ ] **4.23.6** Commit: "Complete ARM64 backend - 100% coverage"
 
 ---
 
