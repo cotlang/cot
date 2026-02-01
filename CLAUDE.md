@@ -88,8 +88,8 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | M12 | ✅ Done | Structs (field read/write via off_ptr) |
 | M13 | ✅ Done | Arrays/Slices (decomposition in lower_wasm, frame size fix) |
 | M14 | ✅ Done | Strings (rewritegeneric + rewritedec passes, Go-matching structure) |
-| **M15** | 🔄 **Next** | ARC (SSA ops exist, gen.zig needs implementation) |
-| M16 | ⏳ TODO | Browser imports (JS interop) |
+| M15 | ✅ Done | ARC runtime (retain/release in arc.zig, integrated with Linker) |
+| M16 | ✅ Done | Browser imports (import section, import-aware exports in link.zig) |
 
 ### Verified Test Coverage (58/58 passing)
 

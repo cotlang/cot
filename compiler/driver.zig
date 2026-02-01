@@ -36,6 +36,7 @@ const pipeline_debug = @import("pipeline_debug.zig");
 const wasm_old = @import("codegen/wasm.zig"); // Old module builder (for CodeBuilder)
 const wasm = @import("codegen/wasm/wasm.zig"); // New Go-style package (for Linker)
 const wasm_gen = @import("codegen/wasm_gen.zig");
+const arc = @import("codegen/arc.zig"); // ARC runtime
 
 // Native codegen modules - will be added in Round 5
 // const arm64_codegen = @import("codegen/arm64.zig");
@@ -360,11 +361,24 @@ pub const Driver = struct {
         // Configure memory (1 page = 64KB minimum)
         linker.setMemory(1, null);
 
+        // ====================================================================
+        // Add ARC runtime functions first (they get indices 0, 1)
+        // ====================================================================
+        const arc_funcs = try arc.addToLinker(self.allocator, &linker);
+        const arc_func_count: u32 = 2; // retain and release
+
         // Build function name -> index mapping
+        // ARC functions come first, then user functions
         var func_indices = wasm_gen.FuncIndexMap{};
         defer func_indices.deinit(self.allocator);
+
+        // Add ARC function names to index map
+        try func_indices.put(self.allocator, arc.RETAIN_NAME, arc_funcs.retain_idx);
+        try func_indices.put(self.allocator, arc.RELEASE_NAME, arc_funcs.release_idx);
+
+        // Add user function names (offset by ARC function count)
         for (funcs, 0..) |*ir_func, i| {
-            try func_indices.put(self.allocator, ir_func.name, @intCast(i));
+            try func_indices.put(self.allocator, ir_func.name, @intCast(i + arc_func_count));
         }
 
         // ====================================================================

@@ -54,20 +54,32 @@ Cot Source → Frontend → IR → SSA → lower_wasm.zig → wasm/ package → 
 | slice_make | ⏳ SSA only | Needs gen.zig implementation |
 | bounds_check | ⏳ SSA only | Needs gen.zig implementation |
 
-### TODO (M14-M16)
+### Completed (M14-M15)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| string_len | ⏳ SSA only | M14 |
-| string_ptr | ⏳ SSA only | M14 |
-| string_make | ⏳ SSA only | M14 |
-| string_concat | ⏳ SSA only | M14 |
-| retain/release | ⏳ SSA only | M15 - needs runtime |
-| Import section | ❌ TODO | M16 - JS interop |
+| string_len | ✅ Done | M14 - rewritegeneric + rewritedec |
+| string_ptr | ✅ Done | M14 - decomposed to ptr_const |
+| string_make | ✅ Done | M14 - Go-style decomposition |
+| retain/release | ✅ Done | M15 - ARC runtime in wasm/arc.zig |
+
+### Completed (M16)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Import section | ✅ Done | M16 - WasmImport struct, addImport(), writeImportSec() |
+| Import-aware exports | ✅ Done | M16 - Function indices offset by import count |
+
+### TODO (Future)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Frontend import syntax | ⏳ TODO | Parse `import func ... from "module"` |
+| console.log builtin | ⏳ TODO | Map to env.console_log import |
 
 ## Test Results
 
-**50/50 Wasm tests passing:**
+**58/58 Wasm tests passing:**
 
 ```
 Arithmetic:    10/10 ✓
@@ -75,6 +87,7 @@ Control Flow:  14/14 ✓
 Functions:     16/16 ✓
 Memory:         5/5  ✓
 Structs:        5/5  ✓
+Strings:        3/3  ✓
 ```
 
 ## Key Implementation Details

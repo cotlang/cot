@@ -7,9 +7,8 @@
 
 const std = @import("std");
 const wasm = @import("wasm.zig");
-const Op = @import("wasm_opcodes.zig").Op;
-const enc = @import("wasm_encode.zig");
-const ValType = wasm.ValType;
+const wasm_link = @import("wasm/wasm.zig");
+const ValType = wasm_link.ValType;
 
 // Block type constants for Wasm control flow (from spec)
 const BLOCK_VOID: u8 = 0x40;
@@ -43,10 +42,21 @@ pub const INITIAL_REFCOUNT: i64 = 1;
 pub const HEAP_START: u32 = 0x10000; // 64KB reserved for stack
 
 // =============================================================================
-// Runtime Function Indices
+// Runtime Function Info
 // =============================================================================
 
+/// Runtime function indices (new simplified API for Linker)
 pub const RuntimeFunctions = struct {
+    /// cot_retain index
+    retain_idx: u32,
+
+    /// cot_release index
+    release_idx: u32,
+};
+
+/// Legacy runtime function indices (old API for wasm.Module)
+/// Kept for backward compatibility with E2E tests
+pub const LegacyRuntimeFunctions = struct {
     /// cot_alloc(metadata: i32, size: i32) -> i32
     alloc_idx: u32,
 
@@ -66,24 +76,185 @@ pub const RuntimeFunctions = struct {
     heap_ptr_global: u32,
 };
 
+/// ARC function names for lookup
+pub const RETAIN_NAME = "cot_retain";
+pub const RELEASE_NAME = "cot_release";
+
 // =============================================================================
-// Code Generation for Runtime Functions
+// Code Generation for Runtime Functions (for new Linker API)
 // =============================================================================
 
-/// Adds ARC runtime functions to a Wasm module.
+/// Adds ARC runtime functions to a Wasm Linker.
 /// Returns the indices of the generated functions.
-pub fn addRuntimeFunctions(module: *wasm.Module) !RuntimeFunctions {
+pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !RuntimeFunctions {
+    // Generate retain function: (i64) -> i64
+    // Note: Using i64 for pointers to match Cot's default type
+    const retain_type = try linker.addType(&[_]ValType{.i64}, &[_]ValType{.i64});
+    const retain_body = try generateRetainBody(allocator);
+    const retain_idx = try linker.addFunc(.{
+        .name = RETAIN_NAME,
+        .type_idx = retain_type,
+        .code = retain_body,
+        .exported = false,
+    });
+
+    // Generate release function: (i64) -> void
+    const release_type = try linker.addType(&[_]ValType{.i64}, &[_]ValType{});
+    const release_body = try generateReleaseBody(allocator);
+    const release_idx = try linker.addFunc(.{
+        .name = RELEASE_NAME,
+        .type_idx = release_type,
+        .code = release_body,
+        .exported = false,
+    });
+
+    return RuntimeFunctions{
+        .retain_idx = retain_idx,
+        .release_idx = release_idx,
+    };
+}
+
+/// Generates bytecode for cot_retain(obj: i64) -> i64
+/// Increments refcount. Returns obj for tail call optimization (Swift pattern).
+fn generateRetainBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // Parameter: obj (local 0, i64)
+    // Local 1: header_ptr (i64)
+    // Local 2: old_count (i64)
+
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i64, .i64 });
+
+    // if (obj == 0) return 0
+    try code.emitLocalGet(0);
+    try code.emitI64Eqz();
+    try code.emitIf(BLOCK_VOID); // void type since we return inside
+    try code.emitI64Const(0);
+    try code.emitReturn();
+    try code.emitEnd();
+
+    // header_ptr = obj - USER_DATA_OFFSET
+    try code.emitLocalGet(0);
+    try code.emitI64Const(@intCast(USER_DATA_OFFSET));
+    try code.emitI64Sub();
+    try code.emitLocalSet(1);
+
+    // old_count = i64.load(header_ptr + REFCOUNT_OFFSET)
+    // Need i32 address for memory ops, so wrap
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitI64Load(3, REFCOUNT_OFFSET);
+    try code.emitLocalSet(2);
+
+    // if (old_count >= IMMORTAL_REFCOUNT) return obj
+    try code.emitLocalGet(2);
+    try code.emitI64Const(IMMORTAL_REFCOUNT);
+    try code.emitI64GeS();
+    try code.emitIf(BLOCK_VOID); // void type since we return inside
+    try code.emitLocalGet(0);
+    try code.emitReturn();
+    try code.emitEnd();
+
+    // i64.store(header_ptr + REFCOUNT_OFFSET, old_count + 1)
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(2);
+    try code.emitI64Const(1);
+    try code.emitI64Add();
+    try code.emitI64Store(3, REFCOUNT_OFFSET);
+
+    // return obj
+    try code.emitLocalGet(0);
+
+    return code.finish();
+}
+
+/// Generates bytecode for cot_release(obj: i64) -> void
+/// Decrements refcount. Frees object if count reaches zero.
+fn generateReleaseBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // Parameter: obj (local 0, i64)
+    // Local 1: header_ptr (i64)
+    // Local 2: old_count (i64)
+    // Local 3: new_count (i64)
+
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i64, .i64, .i64 });
+
+    // if (obj == 0) return
+    try code.emitLocalGet(0);
+    try code.emitI64Eqz();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitReturn();
+    try code.emitEnd();
+
+    // header_ptr = obj - USER_DATA_OFFSET
+    try code.emitLocalGet(0);
+    try code.emitI64Const(@intCast(USER_DATA_OFFSET));
+    try code.emitI64Sub();
+    try code.emitLocalSet(1);
+
+    // old_count = i64.load(header_ptr + REFCOUNT_OFFSET)
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitI64Load(3, REFCOUNT_OFFSET);
+    try code.emitLocalSet(2);
+
+    // if (old_count >= IMMORTAL_REFCOUNT) return
+    try code.emitLocalGet(2);
+    try code.emitI64Const(IMMORTAL_REFCOUNT);
+    try code.emitI64GeS();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitReturn();
+    try code.emitEnd();
+
+    // new_count = old_count - 1
+    try code.emitLocalGet(2);
+    try code.emitI64Const(1);
+    try code.emitI64Sub();
+    try code.emitLocalSet(3); // Store to local without leaving on stack
+
+    // i64.store(header_ptr + REFCOUNT_OFFSET, new_count)
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(3);
+    try code.emitI64Store(3, REFCOUNT_OFFSET);
+
+    // if (new_count == 0) { /* free object */ }
+    // For M15, we don't actually free memory (bump allocator)
+    // Future: call destructor, add to free list
+    try code.emitLocalGet(3);
+    try code.emitI64Eqz();
+    try code.emitIf(BLOCK_VOID);
+    // TODO: Call destructor via metadata lookup
+    // TODO: Add to free list for reuse
+    // For now, just a marker that the object is dead
+    try code.emitEnd();
+
+    return code.finish();
+}
+
+// =============================================================================
+// Legacy API (for wasm.Module - used by E2E tests)
+// =============================================================================
+
+/// Adds ARC runtime functions to a Wasm module (legacy API).
+/// Returns the indices of the generated functions.
+/// DEPRECATED: Use addToLinker() with the new Linker API instead.
+pub fn addRuntimeFunctions(module: *wasm.Module) !LegacyRuntimeFunctions {
     // Add heap_ptr global (mutable i32, initialized to HEAP_START)
     const heap_ptr_global = try module.addGlobal(.i32, true, HEAP_START);
 
-    // Generate runtime functions
-    const alloc_idx = try generateAllocFunction(module, heap_ptr_global);
-    const retain_idx = try generateRetainFunction(module);
-    const release_idx = try generateReleaseFunction(module, heap_ptr_global);
-    const retain_count_idx = try generateRetainCountFunction(module);
-    const is_unique_idx = try generateIsUniqueFunction(module, retain_count_idx);
+    // Generate runtime functions using i32 pointers (legacy behavior)
+    const alloc_idx = try generateLegacyAllocFunction(module, heap_ptr_global);
+    const retain_idx = try generateLegacyRetainFunction(module);
+    const release_idx = try generateLegacyReleaseFunction(module);
+    const retain_count_idx = try generateLegacyRetainCountFunction(module);
+    const is_unique_idx = try generateLegacyIsUniqueFunction(module, retain_count_idx);
 
-    return RuntimeFunctions{
+    return LegacyRuntimeFunctions{
         .alloc_idx = alloc_idx,
         .retain_idx = retain_idx,
         .release_idx = release_idx,
@@ -94,17 +265,14 @@ pub fn addRuntimeFunctions(module: *wasm.Module) !RuntimeFunctions {
 }
 
 /// Generates: cot_alloc(metadata: i32, size: i32) -> i32
-/// Allocates a new heap object with initial refcount of 1.
-fn generateAllocFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
+fn generateLegacyAllocFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
     var code = wasm.CodeBuilder.init(module.allocator);
     defer code.deinit();
 
     // Parameters: metadata (local 0), size (local 1)
     // Local 2: ptr (allocated address)
     // Local 3: total_size
-
-    // Declare locals: ptr: i32, total_size: i32
-    _ = try code.declareLocals(&[_]ValType{ .i32, .i32 });
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32 });
 
     // total_size = size + HEAP_OBJECT_HEADER_SIZE
     try code.emitLocalGet(1); // size
@@ -143,7 +311,7 @@ fn generateAllocFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
     try code.emitI32Add();
 
     // Function type: (i32, i32) -> i32
-    const type_idx = try module.addFuncType(&[_]ValType{ .i32, .i32 }, &[_]ValType{.i32});
+    const type_idx = try module.addFuncType(&[_]wasm.ValType{ .i32, .i32 }, &[_]wasm.ValType{.i32});
     const func_idx = try module.addFunc(type_idx);
 
     const body = try code.finish();
@@ -153,17 +321,15 @@ fn generateAllocFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
     return func_idx;
 }
 
-/// Generates: cot_retain(obj: i32) -> i32
-/// Increments refcount. Returns obj for tail call optimization (Swift pattern).
-fn generateRetainFunction(module: *wasm.Module) !u32 {
+/// Generates: cot_retain(obj: i32) -> i32 (legacy i32 pointer version)
+fn generateLegacyRetainFunction(module: *wasm.Module) !u32 {
     var code = wasm.CodeBuilder.init(module.allocator);
     defer code.deinit();
 
     // Parameter: obj (local 0)
     // Local 1: header_ptr (i32)
     // Local 2: old_count (i64)
-
-    _ = try code.declareLocals(&[_]ValType{ .i32, .i64 });
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i64 });
 
     // if (obj == 0) return 0
     try code.emitLocalGet(0);
@@ -204,7 +370,7 @@ fn generateRetainFunction(module: *wasm.Module) !u32 {
     try code.emitLocalGet(0);
 
     // Function type: (i32) -> i32
-    const type_idx = try module.addFuncType(&[_]ValType{.i32}, &[_]ValType{.i32});
+    const type_idx = try module.addFuncType(&[_]wasm.ValType{.i32}, &[_]wasm.ValType{.i32});
     const func_idx = try module.addFunc(type_idx);
 
     const body = try code.finish();
@@ -214,11 +380,8 @@ fn generateRetainFunction(module: *wasm.Module) !u32 {
     return func_idx;
 }
 
-/// Generates: cot_release(obj: i32) -> void
-/// Decrements refcount. Frees object if count reaches zero.
-fn generateReleaseFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
-    _ = heap_ptr_global; // Will be used for free list in future
-
+/// Generates: cot_release(obj: i32) -> void (legacy i32 pointer version)
+fn generateLegacyReleaseFunction(module: *wasm.Module) !u32 {
     var code = wasm.CodeBuilder.init(module.allocator);
     defer code.deinit();
 
@@ -226,8 +389,7 @@ fn generateReleaseFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
     // Local 1: header_ptr (i32)
     // Local 2: old_count (i64)
     // Local 3: new_count (i64)
-
-    _ = try code.declareLocals(&[_]ValType{ .i32, .i64, .i64 });
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i64, .i64 });
 
     // if (obj == 0) return
     try code.emitLocalGet(0);
@@ -259,7 +421,7 @@ fn generateReleaseFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
     try code.emitLocalGet(2);
     try code.emitI64Const(1);
     try code.emitI64Sub();
-    try code.emitLocalTee(3);
+    try code.emitLocalSet(3); // Store to local without leaving on stack
 
     // i64.store(header_ptr + REFCOUNT_OFFSET, new_count)
     try code.emitLocalGet(1);
@@ -267,18 +429,13 @@ fn generateReleaseFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
     try code.emitI64Store(3, REFCOUNT_OFFSET);
 
     // if (new_count == 0) { /* free object */ }
-    // For M15, we don't actually free memory (bump allocator)
-    // Future: call destructor, add to free list
     try code.emitLocalGet(3);
     try code.emitI64Eqz();
     try code.emitIf(BLOCK_VOID);
-    // TODO: Call destructor via metadata lookup
-    // TODO: Add to free list for reuse
-    // For now, just a marker that the object is dead
     try code.emitEnd();
 
     // Function type: (i32) -> void
-    const type_idx = try module.addFuncType(&[_]ValType{.i32}, &[_]ValType{});
+    const type_idx = try module.addFuncType(&[_]wasm.ValType{.i32}, &[_]wasm.ValType{});
     const func_idx = try module.addFunc(type_idx);
 
     const body = try code.finish();
@@ -289,8 +446,7 @@ fn generateReleaseFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 {
 }
 
 /// Generates: cot_retain_count(obj: i32) -> i64
-/// Returns the current reference count.
-fn generateRetainCountFunction(module: *wasm.Module) !u32 {
+fn generateLegacyRetainCountFunction(module: *wasm.Module) !u32 {
     var code = wasm.CodeBuilder.init(module.allocator);
     defer code.deinit();
 
@@ -310,7 +466,7 @@ fn generateRetainCountFunction(module: *wasm.Module) !u32 {
     try code.emitI64Load(3, REFCOUNT_OFFSET);
 
     // Function type: (i32) -> i64
-    const type_idx = try module.addFuncType(&[_]ValType{.i32}, &[_]ValType{.i64});
+    const type_idx = try module.addFuncType(&[_]wasm.ValType{.i32}, &[_]wasm.ValType{.i64});
     const func_idx = try module.addFunc(type_idx);
 
     const body = try code.finish();
@@ -321,8 +477,7 @@ fn generateRetainCountFunction(module: *wasm.Module) !u32 {
 }
 
 /// Generates: cot_is_uniquely_referenced(obj: i32) -> i32
-/// Returns 1 if refcount is exactly 1, 0 otherwise.
-fn generateIsUniqueFunction(module: *wasm.Module, retain_count_idx: u32) !u32 {
+fn generateLegacyIsUniqueFunction(module: *wasm.Module, retain_count_idx: u32) !u32 {
     var code = wasm.CodeBuilder.init(module.allocator);
     defer code.deinit();
 
@@ -341,7 +496,7 @@ fn generateIsUniqueFunction(module: *wasm.Module, retain_count_idx: u32) !u32 {
     try code.emitI64Eq();
 
     // Function type: (i32) -> i32
-    const type_idx = try module.addFuncType(&[_]ValType{.i32}, &[_]ValType{.i32});
+    const type_idx = try module.addFuncType(&[_]wasm.ValType{.i32}, &[_]wasm.ValType{.i32});
     const func_idx = try module.addFunc(type_idx);
 
     const body = try code.finish();
@@ -366,39 +521,40 @@ test "memory layout constants" {
     try std.testing.expectEqual(@as(i64, 0x7FFFFFFFFFFFFFFF), IMMORTAL_REFCOUNT);
 }
 
-test "addRuntimeFunctions creates all functions" {
+test "generateRetainBody produces valid bytecode" {
     const allocator = std.testing.allocator;
-    var module = wasm.Module.init(allocator);
-    defer module.deinit();
+    const body = try generateRetainBody(allocator);
+    defer allocator.free(body);
 
-    const funcs = try addRuntimeFunctions(&module);
+    // Should have content
+    try std.testing.expect(body.len > 0);
 
-    // Verify we got distinct function indices
-    try std.testing.expect(funcs.alloc_idx != funcs.retain_idx);
-    try std.testing.expect(funcs.retain_idx != funcs.release_idx);
-    try std.testing.expect(funcs.release_idx != funcs.retain_count_idx);
-    try std.testing.expect(funcs.retain_count_idx != funcs.is_unique_idx);
-
-    // Verify global was created
-    try std.testing.expectEqual(@as(u32, 0), funcs.heap_ptr_global);
+    // Should end with 0x0b (end opcode)
+    try std.testing.expectEqual(@as(u8, 0x0b), body[body.len - 1]);
 }
 
-test "generated module emits valid wasm" {
+test "generateReleaseBody produces valid bytecode" {
     const allocator = std.testing.allocator;
-    var module = wasm.Module.init(allocator);
-    defer module.deinit();
+    const body = try generateReleaseBody(allocator);
+    defer allocator.free(body);
 
-    _ = try addRuntimeFunctions(&module);
+    // Should have content
+    try std.testing.expect(body.len > 0);
 
-    // Emit the module
-    var output: std.ArrayListUnmanaged(u8) = .{};
-    defer output.deinit(allocator);
+    // Should end with 0x0b (end opcode)
+    try std.testing.expectEqual(@as(u8, 0x0b), body[body.len - 1]);
+}
 
-    try module.emit(output.writer(allocator));
+test "addToLinker creates functions" {
+    const allocator = std.testing.allocator;
+    var linker = wasm_link.Linker.init(allocator);
+    defer linker.deinit();
 
-    // Verify magic number
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x61, 0x73, 0x6D }, output.items[0..4]);
+    const funcs = try addToLinker(allocator, &linker);
 
-    // Verify version
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x00, 0x00, 0x00 }, output.items[4..8]);
+    // Verify we got distinct function indices
+    try std.testing.expect(funcs.retain_idx != funcs.release_idx);
+
+    // Verify functions were added
+    try std.testing.expectEqual(@as(usize, 2), linker.funcs.items.len);
 }

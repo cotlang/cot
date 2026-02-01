@@ -426,6 +426,42 @@ pub const GenState = struct {
                 p.to = prog_mod.constAddr(func_idx);
             },
 
+            .wasm_lowered_retain => {
+                // ARC retain: call cot_retain(obj) -> obj
+                // Push the object pointer argument
+                try self.getValue64(v.args[0]);
+                // Look up cot_retain function index
+                const func_idx: i64 = if (self.func_indices) |indices| blk: {
+                    if (indices.get("cot_retain")) |idx| {
+                        break :blk @intCast(idx);
+                    }
+                    break :blk 0; // Fallback (should not happen)
+                } else 0;
+                const p = try self.builder.append(.call);
+                p.to = prog_mod.constAddr(func_idx);
+                // Result is on stack, store to local if needed
+                if (self.value_to_local.get(v.id)) |local| {
+                    const set_p = try self.builder.append(.local_set);
+                    set_p.to = prog_mod.constAddr(local);
+                }
+            },
+
+            .wasm_lowered_release => {
+                // ARC release: call cot_release(obj) -> void
+                // Push the object pointer argument
+                try self.getValue64(v.args[0]);
+                // Look up cot_release function index
+                const func_idx: i64 = if (self.func_indices) |indices| blk: {
+                    if (indices.get("cot_release")) |idx| {
+                        break :blk @intCast(idx);
+                    }
+                    break :blk 0; // Fallback (should not happen)
+                } else 0;
+                const p = try self.builder.append(.call);
+                p.to = prog_mod.constAddr(func_idx);
+                // No result (void function)
+            },
+
             else => {
                 debug.log(.codegen, "wasm/gen: unhandled op {s}", .{@tagName(v.op)});
             },

@@ -51,6 +51,13 @@ pub const WasmFunc = struct {
     }
 };
 
+/// Host import definition (Go: hostImport in asm.go)
+pub const WasmImport = struct {
+    module: []const u8, // e.g., "env", "wasi_snapshot_preview1"
+    name: []const u8, // e.g., "console_log"
+    type_idx: u32, // Function type index
+};
+
 /// Module linker state
 pub const Linker = struct {
     allocator: std.mem.Allocator,
@@ -58,6 +65,9 @@ pub const Linker = struct {
     // Type section
     types: std.ArrayListUnmanaged(FuncType) = .{},
     type_storage: std.ArrayListUnmanaged(c.ValType) = .{}, // Storage for param/result slices
+
+    // Import section (Go: hostImports in asm.go)
+    imports: std.ArrayListUnmanaged(WasmImport) = .{},
 
     // Functions
     funcs: std.ArrayListUnmanaged(WasmFunc) = .{},
@@ -78,6 +88,7 @@ pub const Linker = struct {
             f.deinit(self.allocator);
         }
         self.funcs.deinit(self.allocator);
+        self.imports.deinit(self.allocator);
         self.types.deinit(self.allocator);
         self.type_storage.deinit(self.allocator);
         self.data_segments.deinit(self.allocator);
@@ -110,6 +121,19 @@ pub const Linker = struct {
         });
 
         return @intCast(self.types.items.len - 1);
+    }
+
+    /// Add a host import (Go: collecting hostImports in asm.go)
+    /// Returns the import's function index (imports get indices 0..N-1)
+    pub fn addImport(self: *Linker, import: WasmImport) !u32 {
+        const idx: u32 = @intCast(self.imports.items.len);
+        try self.imports.append(self.allocator, import);
+        return idx;
+    }
+
+    /// Get the number of imports (for offsetting native function indices)
+    pub fn numImports(self: *const Linker) u32 {
+        return @intCast(self.imports.items.len);
     }
 
     /// Add a function
@@ -178,6 +202,29 @@ pub const Linker = struct {
                 }
             }
             try writeSection(writer, self.allocator, .type, type_buf.items);
+        }
+
+        // ====================================================================
+        // Import Section (Go: asm.go writeImportSec)
+        // ====================================================================
+        if (self.imports.items.len > 0) {
+            var import_buf = std.ArrayListUnmanaged(u8){};
+            defer import_buf.deinit(self.allocator);
+
+            try assemble.writeULEB128(self.allocator, &import_buf, self.imports.items.len);
+            for (self.imports.items) |imp| {
+                // Module name
+                try assemble.writeULEB128(self.allocator, &import_buf, imp.module.len);
+                try import_buf.appendSlice(self.allocator, imp.module);
+                // Function name
+                try assemble.writeULEB128(self.allocator, &import_buf, imp.name.len);
+                try import_buf.appendSlice(self.allocator, imp.name);
+                // Import kind: 0x00 for function
+                try import_buf.append(self.allocator, 0x00);
+                // Function type index
+                try assemble.writeULEB128(self.allocator, &import_buf, imp.type_idx);
+            }
+            try writeSection(writer, self.allocator, .import, import_buf.items);
         }
 
         // ====================================================================
@@ -258,13 +305,15 @@ pub const Linker = struct {
 
             try assemble.writeULEB128(self.allocator, &export_buf, export_count);
 
-            // Export functions
+            // Export functions (indices offset by import count)
+            const import_count = self.imports.items.len;
             for (self.funcs.items, 0..) |f, i| {
                 if (f.exported) {
                     try assemble.writeULEB128(self.allocator, &export_buf, f.name.len);
                     try export_buf.appendSlice(self.allocator, f.name);
                     try export_buf.append(self.allocator, @intFromEnum(c.ExportKind.func));
-                    try assemble.writeULEB128(self.allocator, &export_buf, i);
+                    // Function index = import_count + native_index (Go: asm.go line 356)
+                    try assemble.writeULEB128(self.allocator, &export_buf, import_count + i);
                 }
             }
 
@@ -420,4 +469,66 @@ test "linker emit" {
     // Verify header
     try testing.expectEqualSlices(u8, &c.WASM_MAGIC, output.items[0..4]);
     try testing.expectEqual(@as(u8, 1), output.items[4]); // version
+}
+
+test "linker with imports" {
+    const allocator = testing.allocator;
+    var linker = Linker.init(allocator);
+    defer linker.deinit();
+
+    // Add import type: (i64) -> void
+    const import_type = try linker.addType(&[_]c.ValType{.i64}, &[_]c.ValType{});
+
+    // Add import: env.console_log
+    const import_idx = try linker.addImport(.{
+        .module = "env",
+        .name = "console_log",
+        .type_idx = import_type,
+    });
+    try testing.expectEqual(@as(u32, 0), import_idx);
+
+    // Add native function type: () -> i64
+    const func_type = try linker.addType(&[_]c.ValType{}, &[_]c.ValType{.i64});
+
+    // Add native function: main
+    const code = &[_]u8{
+        0x00, // 0 locals
+        0x42, 0x2A, // i64.const 42
+        0x0B, // end
+    };
+    const func_idx = try linker.addFunc(.{
+        .name = "main",
+        .type_idx = func_type,
+        .code = try allocator.dupe(u8, code),
+        .exported = true,
+    });
+    try testing.expectEqual(@as(u32, 0), func_idx); // Native index is 0
+
+    // numImports should be 1
+    try testing.expectEqual(@as(u32, 1), linker.numImports());
+
+    // Emit
+    var output = std.ArrayListUnmanaged(u8){};
+    defer output.deinit(allocator);
+    try linker.emit(output.writer(allocator));
+
+    // Verify header
+    try testing.expectEqualSlices(u8, &c.WASM_MAGIC, output.items[0..4]);
+
+    // Find import section (section ID 2)
+    var found_import_section = false;
+    var i: usize = 8; // Skip header
+    while (i < output.items.len) {
+        const section_id = output.items[i];
+        if (section_id == @intFromEnum(c.Section.import)) {
+            found_import_section = true;
+            break;
+        }
+        // Skip to next section
+        i += 1;
+        if (i >= output.items.len) break;
+        const size = output.items[i]; // Simplified: assumes size < 128
+        i += 1 + size;
+    }
+    try testing.expect(found_import_section);
 }

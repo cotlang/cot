@@ -1,2 +1,7 @@
 .zig-cache/
 zig-out/
+
+# Build artifacts
+a.out
+a.out.o
+*.wasm

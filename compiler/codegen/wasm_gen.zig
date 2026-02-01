@@ -85,7 +85,7 @@ pub const FuncGen = struct {
     func_indices: ?*const FuncIndexMap,
 
     /// ARC runtime function indices (null if ARC not enabled).
-    runtime_funcs: ?arc.RuntimeFunctions,
+    runtime_funcs: ?arc.LegacyRuntimeFunctions,
 
     /// Go's OnWasmStackSkipped counter.
     /// When we skip generating a value (because OnWasmStack=true),
@@ -118,7 +118,7 @@ pub const FuncGen = struct {
     }
 
     /// Set ARC runtime function indices.
-    pub fn setRuntimeFunctions(self: *FuncGen, funcs: arc.RuntimeFunctions) void {
+    pub fn setRuntimeFunctions(self: *FuncGen, funcs: arc.LegacyRuntimeFunctions) void {
         self.runtime_funcs = funcs;
     }
 
@@ -1109,7 +1109,7 @@ pub fn genFuncWithIndices(
     allocator: std.mem.Allocator,
     ssa_func: *const SsaFunc,
     func_indices: ?*const FuncIndexMap,
-    runtime_funcs: ?arc.RuntimeFunctions,
+    runtime_funcs: ?arc.LegacyRuntimeFunctions,
 ) ![]const u8 {
     var gen = FuncGen.init(allocator, ssa_func);
     gen.func_indices = func_indices;
