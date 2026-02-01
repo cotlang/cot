@@ -11,6 +11,18 @@
 3. Copy the pattern directly, translating Go syntax to Zig
 4. Do NOT invent new approaches or "figure out" how things should work
 
+**Case Study - M14 Strings (February 2026):**
+
+Claude initially tried to "figure out" string handling by adding hacky special-case code in gen.zig. This created 100+ lines of messy code that didn't work properly.
+
+When Claude stopped and copied Go's approach instead:
+- Audited Go's `rewritegeneric.go` and `rewritedec.go`
+- Created matching files: `rewritegeneric.zig` and `rewritedec.zig`
+- Copied Go's pass structure and transformation patterns exactly
+- Result: Clean code, all tests passing, completed in one session
+
+**The lesson:** Copying Go took less effort AND produced better code. Inventing takes MORE effort and produces worse code. There is no upside to inventing.
+
 **Example - Slice Decomposition:**
 - Go file: `compile/internal/ssa/rewritedec.go`
 - Go pattern: `SliceLen(SliceMake(ptr, len, cap))` → `len`
