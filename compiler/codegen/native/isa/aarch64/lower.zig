@@ -1667,31 +1667,148 @@ pub const AArch64LowerBackend = struct {
     // =========================================================================
 
     fn lowerCall(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        // Call lowering.
+        // Port of cranelift/codegen/src/isa/aarch64/lower.rs call lowering
+        //
+        // AAPCS64 ABI:
+        // - Integer/pointer arguments: X0-X7
+        // - Float arguments: V0-V7
+        // - Return value: X0 (integer), V0 (float)
         _ = self;
-        _ = ir_inst;
 
-        // TODO: Full call lowering requires ABI handling
-        // This is a placeholder
+        const inst_data = ctx.data(ir_inst);
+
+        // Get the function reference
+        const func_ref = inst_data.getFuncRef() orelse return null;
+
+        // Get the external function data
+        const ext_func = ctx.extFuncData(func_ref) orelse return null;
+        _ = ext_func; // Will be used for the actual call target
+
+        // Get arguments
+        const num_args = ctx.numInputs(ir_inst);
+
+        // Move arguments to ABI registers (X0-X7 for integers)
+        var int_arg_idx: u8 = 0;
+        for (0..num_args) |i| {
+            const arg_val = ctx.putInputInRegs(ir_inst, i);
+            const arg_reg = arg_val.onlyReg() orelse continue;
+            const arg_ty = ctx.inputTy(ir_inst, i);
+
+            // Check if this is an integer or float argument
+            if (!arg_ty.isFloat() and int_arg_idx < 8) {
+                // Move to integer ABI register (X0-X7)
+                const dst_reg = regs.xreg(int_arg_idx);
+                const size = operandSizeFromType(arg_ty) orelse .size64;
+
+                ctx.emit(Inst{
+                    .mov = .{
+                        .size = size,
+                        .rd = Writable(Reg).fromReg(dst_reg),
+                        .rm = arg_reg,
+                    },
+                }) catch return null;
+                int_arg_idx += 1;
+            }
+            // TODO: Handle float arguments and stack arguments
+        }
+
+        // Emit the call instruction
+        // For now, emit a placeholder - full implementation would resolve the target
         ctx.emit(Inst{
             .call = .{
                 .dest = .{ .label = MachLabel.fromBlock(BlockIndex.new(0)) },
             },
         }) catch return null;
 
+        // Handle return value
+        const num_outputs = ctx.numOutputs(ir_inst);
+        if (num_outputs > 0) {
+            // Return value is in X0
+            const ret_ty = ctx.outputTy(ir_inst, 0);
+            const dst = ctx.allocTmp(ret_ty) catch return null;
+            const dst_reg = dst.onlyReg() orelse return null;
+
+            // Move X0 to destination
+            const ret_size = operandSizeFromType(ret_ty) orelse .size64;
+            ctx.emit(Inst{
+                .mov = .{
+                    .size = ret_size,
+                    .rd = dst_reg,
+                    .rm = regs.xreg(0),
+                },
+            }) catch return null;
+
+            var output = InstOutput{};
+            output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+            return output;
+        }
+
         return InstOutput{};
     }
 
     fn lowerCallIndirect(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        // Indirect call lowering.
+        // The callee address is the first input, remaining inputs are arguments.
         _ = self;
 
-        const callee = ctx.putInputInRegs(ir_inst, 0);
-        const callee_reg = callee.onlyReg() orelse return null;
+        const num_inputs = ctx.numInputs(ir_inst);
+        if (num_inputs == 0) return null;
 
+        // Get the callee (first input)
+        const callee_val = ctx.putInputInRegs(ir_inst, 0);
+        const callee_reg = callee_val.onlyReg() orelse return null;
+
+        // Move arguments to ABI registers (skip first input which is callee)
+        var int_arg_idx: u8 = 0;
+        for (1..num_inputs) |i| {
+            const arg_val = ctx.putInputInRegs(ir_inst, i);
+            const arg_reg = arg_val.onlyReg() orelse continue;
+            const arg_ty = ctx.inputTy(ir_inst, i);
+
+            if (!arg_ty.isFloat() and int_arg_idx < 8) {
+                const dst_reg = regs.xreg(int_arg_idx);
+                const arg_size = operandSizeFromType(arg_ty) orelse .size64;
+
+                ctx.emit(Inst{
+                    .mov = .{
+                        .size = arg_size,
+                        .rd = Writable(Reg).fromReg(dst_reg),
+                        .rm = arg_reg,
+                    },
+                }) catch return null;
+
+                int_arg_idx += 1;
+            }
+        }
+
+        // Emit indirect call through the callee register
         ctx.emit(Inst{
             .call_ind = .{
                 .rn = callee_reg,
             },
         }) catch return null;
+
+        // Handle return value
+        const num_outputs = ctx.numOutputs(ir_inst);
+        if (num_outputs > 0) {
+            const ret_ty = ctx.outputTy(ir_inst, 0);
+            const dst = ctx.allocTmp(ret_ty) catch return null;
+            const dst_reg = dst.onlyReg() orelse return null;
+            const ret_size = operandSizeFromType(ret_ty) orelse .size64;
+
+            ctx.emit(Inst{
+                .mov = .{
+                    .size = ret_size,
+                    .rd = dst_reg,
+                    .rm = regs.xreg(0),
+                },
+            }) catch return null;
+
+            var output = InstOutput{};
+            output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+            return output;
+        }
 
         return InstOutput{};
     }

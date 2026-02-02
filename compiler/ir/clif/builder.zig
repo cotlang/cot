@@ -392,6 +392,18 @@ pub const FuncBuilder = struct {
             else => null,
         };
 
+        // Extract func_ref for call
+        const func_ref: ?FuncRef = switch (data) {
+            .call => |d| d.func_ref,
+            else => null,
+        };
+
+        // Extract sig_ref for call_indirect
+        const sig_ref: ?SigRef = switch (data) {
+            .call_indirect => |d| d.sig_ref,
+            else => null,
+        };
+
         // Extract args for the ValueList
         const args_slice: []const Value = switch (data) {
             .nullary => &[_]Value{},
@@ -445,6 +457,8 @@ pub const FuncBuilder = struct {
             .jump_table = jump_table,
             .stack_slot = stack_slot,
             .stack_offset = stack_offset,
+            .func_ref = func_ref,
+            .sig_ref = sig_ref,
         });
 
         // Create result value if needed

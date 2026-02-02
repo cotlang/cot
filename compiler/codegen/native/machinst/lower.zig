@@ -86,6 +86,7 @@ pub const JumpTable = clif.JumpTable;
 pub const Function = clif.Function;
 pub const DataFlowGraph = clif.DataFlowGraph;
 pub const Layout = clif.Layout;
+pub const ExtFuncData = clif.ExtFuncData;
 
 // Value management
 pub const ValueDef = clif.ValueDef;
@@ -830,6 +831,18 @@ pub fn Lower(comptime I: type) type {
         /// Port of cranelift/codegen/src/machinst/lower.rs stack_slot_data
         pub fn stackSlotData(self: *const Self, slot: StackSlot) ?*const StackSlotData {
             return self.f.getStackSlot(slot);
+        }
+
+        /// Get external function data for a function reference.
+        /// Port of cranelift/codegen/src/machinst/lower.rs ext_func_data
+        pub fn extFuncData(self: *const Self, func_ref: FuncRef) ?*const ExtFuncData {
+            return self.f.getExtFunc(func_ref);
+        }
+
+        /// Get signature data for a signature reference.
+        /// Port of cranelift/codegen/src/machinst/lower.rs signature
+        pub fn signatureData(self: *const Self, sig_ref: SigRef) ?*const Signature {
+            return self.f.getSignature(sig_ref);
         }
 
         /// Get the byte offset for a sized stack slot.

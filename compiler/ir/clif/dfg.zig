@@ -409,6 +409,10 @@ pub const InstData = struct {
     stack_slot: ?StackSlot = null,
     /// Stack slot offset (for stack_load/stack_store).
     stack_offset: ?i32 = null,
+    /// Function reference (for call).
+    func_ref: ?FuncRef = null,
+    /// Signature reference (for call_indirect).
+    sig_ref: ?SigRef = null,
 
     pub const EMPTY: InstData = .{
         .opcode = .nop,
@@ -453,6 +457,16 @@ pub const InstData = struct {
     /// Get the stack slot offset (for stack_load/stack_store).
     pub fn getStackOffset(self: InstData) ?i32 {
         return self.stack_offset;
+    }
+
+    /// Get the function reference (for call).
+    pub fn getFuncRef(self: InstData) ?FuncRef {
+        return self.func_ref;
+    }
+
+    /// Get the signature reference (for call_indirect).
+    pub fn getSigRef(self: InstData) ?SigRef {
+        return self.sig_ref;
     }
 
     /// Get the single block destination (for jump instructions).
