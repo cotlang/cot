@@ -26,7 +26,7 @@
 | 6.13 | Allocation Loop | ion/process.rs, ion/reg_traversal.rs | process.zig | ✅ Done | 6/6 |
 | 6.14 | Spill Allocation | ion/spill.rs | spill.zig | ✅ Done | 4/4 |
 | 6.15 | Move Insertion | ion/moves.rs | ion_moves.zig | ✅ Done | 4/4 |
-| 6.17 | Public API | lib.rs | regalloc.zig | ⏳ TODO | - |
+| 6.17 | Public API | lib.rs | regalloc.zig | ✅ Done | 2/2 |
 
 ---
 

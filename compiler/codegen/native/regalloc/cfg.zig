@@ -272,6 +272,16 @@ pub const CFGInfo = struct {
         self.approx_loop_depth.deinit(allocator);
     }
 
+    /// Clear for reuse, retaining capacity.
+    pub fn clear(self: *CFGInfo) void {
+        self.postorder.clearRetainingCapacity();
+        self.domtree.clearRetainingCapacity();
+        self.insn_block.clearRetainingCapacity();
+        self.block_entry.clearRetainingCapacity();
+        self.block_exit.clearRetainingCapacity();
+        self.approx_loop_depth.clearRetainingCapacity();
+    }
+
     /// Initialize CFGInfo from a Function.
     ///
     /// The `Func` type must have methods:

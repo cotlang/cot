@@ -538,6 +538,10 @@ pub const PRegData = struct {
             .is_stack = false,
         };
     }
+
+    pub fn deinit(self: *PRegData, allocator: std.mem.Allocator) void {
+        self.allocations.deinit(allocator);
+    }
 };
 
 //=============================================================================
@@ -731,6 +735,10 @@ pub const PrioQueue = struct {
             return .{ .bundle = entry.bundle, .hint = entry.hint };
         }
         return null;
+    }
+
+    pub fn clear(self: *PrioQueue) void {
+        while (self.heap.removeOrNull()) |_| {}
     }
 };
 
