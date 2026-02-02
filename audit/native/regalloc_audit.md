@@ -25,7 +25,7 @@
 | 6.12 | Bundle Merging + Requirements | ion/merge.rs, ion/requirement.rs | merge.zig | ✅ Done | 10/10 |
 | 6.13 | Allocation Loop | ion/process.rs, ion/reg_traversal.rs | process.zig | ✅ Done | 6/6 |
 | 6.14 | Spill Allocation | ion/spill.rs | spill.zig | ✅ Done | 4/4 |
-| 6.15 | Move Insertion | ion/moves.rs | ion_moves.zig | ⏳ TODO | - |
+| 6.15 | Move Insertion | ion/moves.rs | ion_moves.zig | 🔄 Partial | 4/4 |
 | 6.17 | Public API | lib.rs | regalloc.zig | ⏳ TODO | - |
 
 ---
