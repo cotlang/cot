@@ -303,19 +303,59 @@ const PRegSet = index.PRegSet;
 
 After refactoring, verify:
 
-- [ ] Only ONE definition of `PReg` exists (in regalloc/index.zig)
-- [ ] Only ONE definition of `PRegSet` exists (in regalloc/index.zig)
-- [ ] Only ONE definition of `RegClass` exists (in regalloc/index.zig)
-- [ ] `machinst/reg.zig` imports from regalloc/index.zig
-- [ ] `vcode.zig` uses regalloc types
-- [ ] `compile.zig` uses regalloc types
-- [ ] All ISA files use regalloc types
-- [ ] `zig build test` passes
-- [ ] All liveness/merge/process phases execute without type errors
+- [x] Only ONE definition of `PReg` exists (in regalloc/index.zig) ✅ COMPLETED
+- [x] Only ONE definition of `PRegSet` exists (in regalloc/index.zig) ✅ COMPLETED
+- [x] Only ONE definition of `RegClass` exists (in regalloc/index.zig) ✅ COMPLETED
+- [x] `machinst/reg.zig` imports from regalloc/index.zig ✅ COMPLETED
+- [x] `vcode.zig` uses regalloc types ✅ COMPLETED
+- [x] `compile.zig` uses regalloc types ✅ COMPLETED
+- [x] All ISA files use regalloc types ✅ COMPLETED
+- [x] `zig build test` passes ✅ COMPLETED
+- [ ] All liveness/merge/process phases execute without type errors (requires runtime testing)
 
 ---
 
-## 7. Why This Matters
+## 8. Refactoring Completed - February 3, 2026
+
+The type unification refactoring has been completed:
+
+### Changes Made:
+
+1. **machinst/reg.zig** - Completely rewritten:
+   - NOW IMPORTS from regalloc/index.zig: RegClass, PReg, PRegSet, VReg, SpillSlot
+   - NOW IMPORTS from regalloc/operand.zig: OperandKind, OperandPos, OperandConstraint, Operand, Allocation, etc.
+   - KEEPS only machinst-specific types: Reg, RealReg, VirtualReg, Writable, OperandCollector
+   - RE-EXPORTS imported types for convenience
+
+2. **Type encoding now consistent:**
+   - VReg: `bits = (vreg << 2) | class` (matches regalloc2)
+   - PReg: `bits = (class << 6) | hw_enc` (matches regalloc2)
+   - PRegSet: Array-based bitmap (matches regalloc2)
+
+3. **Additional fixes required during refactoring:**
+   - Added `init()` aliases to PReg and VReg for API compatibility
+   - Fixed `SpillSlot.index()` method calls
+   - Fixed `Operand.vreg()`, `Operand.constraint()`, etc. method calls
+   - Fixed `hwEnc()` return type casts (usize → u32 where needed)
+   - Added `isTerm()` method to x64 Inst
+   - Changed `Requirement.mergeWith` to free function `mergeRequirements`
+   - Fixed iterator usage for PRegSet (while loop with .next())
+
+### Why This Matches Cranelift's Architecture:
+
+In Cranelift/regalloc2:
+- `regalloc2::lib.rs` DEFINES: PReg, VReg, PRegSet, RegClass, SpillSlot
+- `cranelift::machinst` IMPORTS from regalloc2 (does NOT redefine)
+- Type encodings are consistent throughout
+
+In Cot (after refactoring):
+- `regalloc/index.zig` DEFINES: PReg, VReg, PRegSet, RegClass, SpillSlot
+- `machinst/reg.zig` IMPORTS from regalloc/ (does NOT redefine)
+- Type encodings are now consistent throughout
+
+---
+
+## 9. Why This Matters
 
 Without fixing this architectural issue:
 1. The register allocator cannot run

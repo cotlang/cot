@@ -382,6 +382,11 @@ pub const BlockIndex = struct {
     pub fn isValid(self: Self) bool {
         return self.index_val != INVALID;
     }
+
+    /// Check if two BlockIndex values are equal.
+    pub fn eql(self: Self, other: Self) bool {
+        return self.index_val == other.index_val;
+    }
 };
 
 // ============================================================================

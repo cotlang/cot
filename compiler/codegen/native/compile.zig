@@ -59,7 +59,9 @@ pub const Inst = regalloc_index.Inst;
 pub const InstRange = regalloc_index.InstRange;
 pub const VReg = regalloc_index.VReg;
 pub const PReg = regalloc_index.PReg;
-pub const PRegSet = regalloc_index.PRegSet;
+// PRegSet from machinst/reg.zig matches what vcode returns
+const machinst_reg = @import("machinst/reg.zig");
+pub const PRegSet = machinst_reg.PRegSet;
 pub const RegClass = regalloc_index.RegClass;
 
 // =============================================================================

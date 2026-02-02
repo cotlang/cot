@@ -187,6 +187,16 @@ pub const InstRange = struct {
     pub fn iter(self: InstRange) InstRangeIterator {
         return .{ .current = self.from.index, .end = self.to.index };
     }
+
+    /// Iterate over instructions in reverse order.
+    /// Ported from regalloc2's InstRange::rev_iter()
+    pub fn reverseIter(self: InstRange) InstRangeReverseIterator {
+        return .{
+            .current = if (self.to.index > 0) self.to.index - 1 else 0,
+            .start = self.from.index,
+            .done = self.isEmpty(),
+        };
+    }
 };
 
 pub const InstRangeIterator = struct {
@@ -197,6 +207,25 @@ pub const InstRangeIterator = struct {
         if (self.current >= self.end) return null;
         const inst = Inst{ .index = self.current };
         self.current += 1;
+        return inst;
+    }
+};
+
+/// Reverse iterator for instruction ranges.
+/// Ported from regalloc2's InstRange reverse iteration support.
+pub const InstRangeReverseIterator = struct {
+    current: u32,
+    start: u32,
+    done: bool,
+
+    pub fn next(self: *InstRangeReverseIterator) ?Inst {
+        if (self.done) return null;
+        const inst = Inst{ .index = self.current };
+        if (self.current == self.start) {
+            self.done = true;
+        } else {
+            self.current -= 1;
+        }
         return inst;
     }
 };
@@ -240,6 +269,11 @@ pub const PReg = struct {
         return .{
             .bits = (@as(u8, @intFromEnum(reg_class)) << MAX_BITS) | @as(u8, @intCast(hw_enc)),
         };
+    }
+
+    /// Alias for new() - for API compatibility.
+    pub inline fn init(hw_enc: u8, reg_class: RegClass) PReg {
+        return new(hw_enc, reg_class);
     }
 
     /// Get the physical register number (hardware encoding).
@@ -403,7 +437,13 @@ pub const PRegSet = struct {
     }
 
     /// Iterate over registers in the set.
+    /// Ported from regalloc2's PRegSet::iter()
     pub fn iter(self: *const PRegSet) PRegSetIterator {
+        return .{ .bits = self.bits, .current_idx = 0 };
+    }
+
+    /// Alias for iter() - matches naming used in some call sites.
+    pub fn iterate(self: PRegSet) PRegSetIterator {
         return .{ .bits = self.bits, .current_idx = 0 };
     }
 
@@ -477,6 +517,11 @@ pub const VReg = struct {
         return .{
             .bits = (@as(u32, @intCast(vreg_num)) << 2) | @intFromEnum(reg_class),
         };
+    }
+
+    /// Alias for new() - for API compatibility.
+    pub inline fn init(vreg_num: u32, reg_class: RegClass) VReg {
+        return new(vreg_num, reg_class);
     }
 
     /// Get the virtual register number.

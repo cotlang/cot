@@ -108,69 +108,6 @@ pub const Requirement = union(enum) {
     stack,
     fixed_stack: PReg,
 
-    /// Merge two requirements, returning the combined requirement or an error.
-    pub fn merge(self: Requirement, other: Requirement) RequirementConflict!Requirement {
-        // Any matches anything
-        if (self == .any) return other;
-        if (other == .any) return self;
-
-        return switch (self) {
-            .any => unreachable, // Handled above
-            .register => switch (other) {
-                .any => unreachable,
-                .register => .register,
-                .fixed_reg => |preg| .{ .fixed_reg = preg },
-                .limit => |max| .{ .limit = max },
-                .stack, .fixed_stack => error.Conflict,
-            },
-            .fixed_reg => |self_preg| switch (other) {
-                .any => unreachable,
-                .register => .{ .fixed_reg = self_preg },
-                .fixed_reg => |other_preg| {
-                    if (self_preg.eql(other_preg)) {
-                        return .{ .fixed_reg = self_preg };
-                    }
-                    return error.Conflict;
-                },
-                .limit => |max| {
-                    if (max > self_preg.hwEnc()) {
-                        return .{ .fixed_reg = self_preg };
-                    }
-                    return error.Conflict;
-                },
-                .stack, .fixed_stack => error.Conflict,
-            },
-            .limit => |self_max| switch (other) {
-                .any => unreachable,
-                .register => .{ .limit = self_max },
-                .fixed_reg => |preg| {
-                    if (self_max > preg.hwEnc()) {
-                        return .{ .fixed_reg = preg };
-                    }
-                    return error.Conflict;
-                },
-                .limit => |other_max| .{ .limit = @min(self_max, other_max) },
-                .stack, .fixed_stack => error.Conflict,
-            },
-            .stack => switch (other) {
-                .any => unreachable,
-                .stack => .stack,
-                .fixed_stack => |preg| .{ .fixed_stack = preg },
-                .register, .fixed_reg, .limit => error.Conflict,
-            },
-            .fixed_stack => |self_preg| switch (other) {
-                .any => unreachable,
-                .stack => .{ .fixed_stack = self_preg },
-                .fixed_stack => |other_preg| {
-                    if (self_preg.eql(other_preg)) {
-                        return .{ .fixed_stack = self_preg };
-                    }
-                    return error.Conflict;
-                },
-                .register, .fixed_reg, .limit => error.Conflict,
-            },
-        };
-    }
 
     /// Check if this requirement is stack-based.
     pub fn isStack(self: Requirement) bool {
@@ -188,6 +125,66 @@ pub const Requirement = union(enum) {
         };
     }
 };
+
+/// Merge two requirements, returning the combined requirement or an error.
+pub fn mergeRequirements(a: Requirement, b: Requirement) RequirementConflict!Requirement {
+    return switch (a) {
+        .any => b, // Any matches anything
+        .register => switch (b) {
+            .any => a,
+            .register => .register,
+            .fixed_reg => |preg| .{ .fixed_reg = preg },
+            .limit => |max| .{ .limit = max },
+            .stack, .fixed_stack => error.Conflict,
+        },
+        .fixed_reg => |a_preg| switch (b) {
+            .any => a,
+            .register => .{ .fixed_reg = a_preg },
+            .fixed_reg => |b_preg| {
+                if (a_preg.eql(b_preg)) {
+                    return .{ .fixed_reg = a_preg };
+                }
+                return error.Conflict;
+            },
+            .limit => |max| {
+                if (max > a_preg.hwEnc()) {
+                    return .{ .fixed_reg = a_preg };
+                }
+                return error.Conflict;
+            },
+            .stack, .fixed_stack => error.Conflict,
+        },
+        .limit => |a_max| switch (b) {
+            .any => a,
+            .register => .{ .limit = a_max },
+            .fixed_reg => |preg| {
+                if (a_max > preg.hwEnc()) {
+                    return .{ .fixed_reg = preg };
+                }
+                return error.Conflict;
+            },
+            .limit => |b_max| .{ .limit = @min(a_max, b_max) },
+            .stack, .fixed_stack => error.Conflict,
+        },
+        .stack => switch (b) {
+            .any => a,
+            .stack => .stack,
+            .fixed_stack => |preg| .{ .fixed_stack = preg },
+            .register, .fixed_reg, .limit => error.Conflict,
+        },
+        .fixed_stack => |a_preg| switch (b) {
+            .any => a,
+            .stack => .{ .fixed_stack = a_preg },
+            .fixed_stack => |b_preg| {
+                if (a_preg.eql(b_preg)) {
+                    return .{ .fixed_stack = a_preg };
+                }
+                return error.Conflict;
+            },
+            .register, .fixed_reg, .limit => error.Conflict,
+        },
+    };
+}
 
 //=============================================================================
 // MergeContext - Context for bundle merging
@@ -238,14 +235,14 @@ pub const MergeContext = struct {
         self: *const Self,
         bundle: LiveBundleIndex,
     ) error{ConflictAt}!Requirement {
-        var req = Requirement.any;
+        var req: Requirement = .any;
         var last_pos = ProgPoint.before(Inst.new(0));
 
         for (self.bundles.items[bundle.index()].ranges.items) |entry| {
             const range_data = &self.ranges.items[entry.index.index()];
             for (range_data.uses.items) |u| {
                 const r = self.requirementFromOperand(u.operand);
-                req = req.merge(r) catch {
+                req = mergeRequirements(req, r) catch {
                     // Determine conflict type for split suggestion
                     _ = if (req.isStack() and r.isReg())
                         RequirementConflictAt{ .stack_to_reg = u.pos }
@@ -270,7 +267,7 @@ pub const MergeContext = struct {
     ) RequirementConflict!Requirement {
         const req_a = self.computeRequirement(a) catch return error.Conflict;
         const req_b = self.computeRequirement(b) catch return error.Conflict;
-        return req_a.merge(req_b);
+        return mergeRequirements(req_a, req_b);
     }
 
     /// Transfer cached properties from one bundle to another.
@@ -705,7 +702,7 @@ pub const MergeContext = struct {
             }
             self.recomputeBundleProperties(bundle);
             const prio = self.bundles.items[bundle_idx].prio;
-            try self.allocation_queue.insert(self.allocator, bundle, prio, PReg.invalid());
+            try self.allocation_queue.insert(bundle, prio, PReg.invalid());
         }
         self.merged_bundle_count.* = self.allocation_queue.heap.items.len;
     }
@@ -718,10 +715,10 @@ pub const MergeContext = struct {
 test "Requirement merge - Any with anything" {
     const any: Requirement = .any;
 
-    try std.testing.expectEqual(Requirement.register, try any.merge(.register));
-    try std.testing.expectEqual(Requirement.stack, try any.merge(.stack));
-    try std.testing.expectEqual(Requirement{ .limit = 5 }, try any.merge(.{ .limit = 5 }));
-    try std.testing.expectEqual(Requirement.any, try any.merge(.any));
+    try std.testing.expectEqual(Requirement.register, try mergeRequirements(any, .register));
+    try std.testing.expectEqual(Requirement.stack, try mergeRequirements(any, .stack));
+    try std.testing.expectEqual(Requirement{ .limit = 5 }, try mergeRequirements(any, .{ .limit = 5 }));
+    try std.testing.expectEqual(Requirement.any, try mergeRequirements(any, .any));
 }
 
 test "Requirement merge - Same kinds" {
@@ -730,16 +727,16 @@ test "Requirement merge - Same kinds" {
     const lim5: Requirement = .{ .limit = 5 };
     const lim3: Requirement = .{ .limit = 3 };
 
-    try std.testing.expectEqual(Requirement.register, try reg.merge(.register));
-    try std.testing.expectEqual(Requirement.stack, try stk.merge(.stack));
-    try std.testing.expectEqual(Requirement{ .limit = 3 }, try lim5.merge(.{ .limit = 3 }));
-    try std.testing.expectEqual(Requirement{ .limit = 3 }, try lim3.merge(.{ .limit = 5 }));
+    try std.testing.expectEqual(Requirement.register, try mergeRequirements(reg, .register));
+    try std.testing.expectEqual(Requirement.stack, try mergeRequirements(stk, .stack));
+    try std.testing.expectEqual(Requirement{ .limit = 3 }, try mergeRequirements(lim5, .{ .limit = 3 }));
+    try std.testing.expectEqual(Requirement{ .limit = 3 }, try mergeRequirements(lim3, .{ .limit = 5 }));
 }
 
 test "Requirement merge - FixedReg same" {
     const preg = PReg.new(5, RegClass.int);
     const req: Requirement = .{ .fixed_reg = preg };
-    try std.testing.expectEqual(req, try req.merge(req));
+    try std.testing.expectEqual(req, try mergeRequirements(req, req));
 }
 
 test "Requirement merge - FixedReg different - conflict" {
@@ -747,7 +744,7 @@ test "Requirement merge - FixedReg different - conflict" {
     const preg2 = PReg.new(6, RegClass.int);
     const req1: Requirement = .{ .fixed_reg = preg1 };
     const req2: Requirement = .{ .fixed_reg = preg2 };
-    try std.testing.expectError(error.Conflict, req1.merge(req2));
+    try std.testing.expectError(error.Conflict, mergeRequirements(req1, req2));
 }
 
 test "Requirement merge - Register with FixedReg" {
@@ -755,7 +752,7 @@ test "Requirement merge - Register with FixedReg" {
     const reg: Requirement = .register;
     try std.testing.expectEqual(
         Requirement{ .fixed_reg = preg },
-        try reg.merge(.{ .fixed_reg = preg }),
+        try mergeRequirements(reg, .{ .fixed_reg = preg }),
     );
 }
 
@@ -766,20 +763,20 @@ test "Requirement merge - Limit with FixedReg" {
     // Limit(10) + FixedReg(5) = FixedReg(5) because 10 > 5
     try std.testing.expectEqual(
         Requirement{ .fixed_reg = preg },
-        try lim10.merge(.{ .fixed_reg = preg }),
+        try mergeRequirements(lim10, .{ .fixed_reg = preg }),
     );
     // Limit(3) + FixedReg(5) = Conflict because 3 <= 5
     try std.testing.expectError(
         error.Conflict,
-        lim3.merge(.{ .fixed_reg = preg }),
+        mergeRequirements(lim3, .{ .fixed_reg = preg }),
     );
 }
 
 test "Requirement merge - Stack with Register - conflict" {
     const stk: Requirement = .stack;
     const reg: Requirement = .register;
-    try std.testing.expectError(error.Conflict, stk.merge(.register));
-    try std.testing.expectError(error.Conflict, reg.merge(.stack));
+    try std.testing.expectError(error.Conflict, mergeRequirements(stk, .register));
+    try std.testing.expectError(error.Conflict, mergeRequirements(reg, .stack));
 }
 
 test "Requirement is_stack and is_reg" {

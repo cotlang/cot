@@ -278,7 +278,7 @@ const XMM_NAMES: [16][]const u8 = .{
 /// Pretty-print a register with a given size in bytes.
 pub fn prettyPrintReg(reg: Reg, size: u8) []const u8 {
     if (reg.toRealReg()) |rreg| {
-        const enc = rreg.hwEnc();
+        const enc: u8 = @intCast(rreg.hwEnc());
         return switch (rreg.class()) {
             .int => prettyPrintGpr(enc, size),
             .float => prettyPrintXmm(enc),

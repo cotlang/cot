@@ -15,13 +15,15 @@ const ion_data = @import("ion_data.zig");
 const cfg_mod = @import("cfg.zig");
 const env_mod = @import("env.zig");
 const output_mod = @import("output.zig");
+// PRegSet from machinst matches what vcode returns
+const machinst_reg = @import("../machinst/reg.zig");
 
 const Block = index.Block;
 const Inst = index.Inst;
 const InstRange = index.InstRange;
 const VReg = index.VReg;
 const PReg = index.PReg;
-const PRegSet = index.PRegSet;
+const PRegSet = machinst_reg.PRegSet;
 const RegClass = index.RegClass;
 const Operand = operand_mod.Operand;
 const OperandConstraint = operand_mod.OperandConstraint;
@@ -443,8 +445,7 @@ pub fn computeLiveness(
     }
 
     // Worklist algorithm (using stack - order doesn't matter for fixed point)
-    while (ctx.scratch_workqueue.items.len > 0) {
-        const block = ctx.scratch_workqueue.pop();
+    while (ctx.scratch_workqueue.pop()) |block| {
         _ = ctx.scratch_workqueue_set.remove(block.rawU32());
 
         ctx.stats.livein_iterations += 1;
@@ -591,7 +592,8 @@ pub fn buildLiveranges(
         var inst_iter = insns.reverseIter();
         while (inst_iter.next()) |inst| {
             // Mark clobbers
-            for (func.instClobbers(inst).iterate()) |clobber| {
+            var clobber_iter = func.instClobbers(inst).iterate();
+            while (clobber_iter.next()) |clobber| {
                 const clobber_range = CodeRange{
                     .from = ProgPoint.after(inst),
                     .to = ProgPoint.before(inst.next()),
@@ -613,64 +615,75 @@ pub fn buildLiveranges(
             }
 
             // Collect late-def fixed registers for conflict detection
-            var late_def_fixed = std.BoundedArray(PReg, 8){};
+            var late_def_fixed_buf: [8]PReg = undefined;
+            var late_def_fixed_len: usize = 0;
             for (func.instOperands(inst)) |op| {
-                if (op.constraint() == .fixed_reg) {
-                    if (op.pos() == .late and op.kind() == .def) {
-                        late_def_fixed.append(op.constraint().fixed_reg) catch {};
-                    }
+                switch (op.constraint()) {
+                    .fixed_reg => |fixed_preg| {
+                        if (op.pos() == .late and op.kind() == .def) {
+                            if (late_def_fixed_len < 8) {
+                                late_def_fixed_buf[late_def_fixed_len] = fixed_preg;
+                                late_def_fixed_len += 1;
+                            }
+                        }
+                    },
+                    else => {},
                 }
             }
+            const late_def_fixed = late_def_fixed_buf[0..late_def_fixed_len];
 
             // Preprocess fixed-reg conflicts
             ctx.scratch_operand_rewrites.clearRetainingCapacity();
             for (func.instOperands(inst), 0..) |op, i| {
                 if (op.asFixedNonAllocatable() != null) continue;
 
-                if (op.constraint() == .fixed_reg) {
-                    const preg = op.constraint().fixed_reg;
-                    if (op.pos() == .early and op.kind() == .use and live.get(op.vreg().vreg())) {
-                        // Check for conflict with late def or clobber
-                        var has_conflict = false;
-                        for (late_def_fixed.slice()) |def_preg| {
-                            if (def_preg.eql(preg)) {
-                                has_conflict = true;
-                                break;
-                            }
-                        }
-                        if (!has_conflict) {
-                            for (func.instClobbers(inst).iterate()) |clobber| {
-                                if (clobber.eql(preg)) {
+                switch (op.constraint()) {
+                    .fixed_reg => |preg| {
+                        if (op.pos() == .early and op.kind() == .use and live.get(op.vreg().vreg())) {
+                            // Check for conflict with late def or clobber
+                            var has_conflict = false;
+                            for (late_def_fixed) |def_preg| {
+                                if (def_preg.eql(preg)) {
                                     has_conflict = true;
                                     break;
                                 }
                             }
+                            if (!has_conflict) {
+                                var clobber_it2 = func.instClobbers(inst).iterate();
+                                while (clobber_it2.next()) |clobber| {
+                                    if (clobber.eql(preg)) {
+                                        has_conflict = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (has_conflict) {
+                                // Add fixup
+                                const pos = ProgPoint.before(inst);
+                                try ctx.multi_fixed_reg_fixups.append(ctx.allocator, .{
+                                    .pos = pos,
+                                    .from_slot = try slotIdx(i),
+                                    .to_slot = try slotIdx(i),
+                                    .to_preg = PRegIndex.new(preg.index()),
+                                    .vreg = VRegIndex.new(op.vreg().vreg()),
+                                    .level = .initial,
+                                });
+
+                                // Reserve register
+                                try ctx.addLiverangeToPreg(CodeRange.singleton(pos), preg);
+
+                                // Rewrite constraint to Any
+                                try ctx.scratch_operand_rewrites.put(i, Operand.new(
+                                    op.vreg(),
+                                    .any,
+                                    op.kind(),
+                                    op.pos(),
+                                ));
+                            }
                         }
-
-                        if (has_conflict) {
-                            // Add fixup
-                            const pos = ProgPoint.before(inst);
-                            try ctx.multi_fixed_reg_fixups.append(ctx.allocator, .{
-                                .pos = pos,
-                                .from_slot = try slotIdx(i),
-                                .to_slot = try slotIdx(i),
-                                .to_preg = PRegIndex.new(preg.index()),
-                                .vreg = VRegIndex.new(op.vreg().vreg()),
-                                .level = .initial,
-                            });
-
-                            // Reserve register
-                            try ctx.addLiverangeToPreg(CodeRange.singleton(pos), preg);
-
-                            // Rewrite constraint to Any
-                            try ctx.scratch_operand_rewrites.put(i, Operand.new(
-                                op.vreg(),
-                                .any,
-                                op.kind(),
-                                op.pos(),
-                            ));
-                        }
-                    }
+                    },
+                    else => {},
                 }
             }
 
@@ -845,7 +858,9 @@ pub fn buildLiveranges(
 /// Fixup pass for vregs with multiple fixed-register constraints at the same position.
 /// Rewrites conflicting constraints to Any and records fixups for later move insertion.
 pub fn fixupMultiFixedVregs(ctx: *LivenessContext) !void {
-    var extra_clobbers = std.BoundedArray(struct { preg: PReg, pos: ProgPoint }, 8){};
+    const ExtraClobber = struct { preg: PReg, pos: ProgPoint };
+    var extra_clobbers_buf: [8]ExtraClobber = undefined;
+    var extra_clobbers_len: usize = 0;
 
     for (0..ctx.vregs.items.len) |vreg_idx| {
         const vreg = VRegIndex.new(vreg_idx);
@@ -959,18 +974,21 @@ pub fn fixupMultiFixedVregs(ctx: *LivenessContext) !void {
                             );
 
                             // Record extra clobber
-                            extra_clobbers.append(.{ .preg = preg, .pos = u.pos }) catch {};
+                            if (extra_clobbers_len < 8) {
+                                extra_clobbers_buf[extra_clobbers_len] = .{ .preg = preg, .pos = u.pos };
+                                extra_clobbers_len += 1;
+                            }
                         }
                     }
 
                     // Add extra clobbers
-                    for (extra_clobbers.slice()) |ec| {
+                    for (extra_clobbers_buf[0..extra_clobbers_len]) |ec| {
                         try ctx.addLiverangeToPreg(
                             CodeRange{ .from = ec.pos, .to = ec.pos.nextPoint() },
                             ec.preg,
                         );
                     }
-                    extra_clobbers.len = 0;
+                    extra_clobbers_len = 0;
                 }
 
                 group_start = group_end;

@@ -751,7 +751,7 @@ pub const FrameLayout = struct {
 
     /// Get the offset of a spill slot from SP.
     pub fn spillslotOffset(self: Self, spillslot: SpillSlot) i64 {
-        const islot: i64 = @intCast(spillslot.index);
+        const islot: i64 = @intCast(spillslot.index());
         const spill_off = islot * @as(i64, self.word_bytes);
         const sp_off = @as(i64, self.stackslots_size) + spill_off;
         return sp_off;
@@ -1058,7 +1058,7 @@ test "FrameLayout spillslotOffset" {
         .word_bytes = 8,
         .stackslots_size = 64,
     };
-    const slot = SpillSlot{ .index = 2 };
+    const slot = SpillSlot.new(2);
     try std.testing.expectEqual(@as(i64, 80), layout.spillslotOffset(slot));
 }
 

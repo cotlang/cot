@@ -509,13 +509,13 @@ pub const ProcessContext = struct {
         self: *const Self,
         bundle: LiveBundleIndex,
     ) error{Conflict}!Requirement {
-        var req = Requirement.any;
+        var req: Requirement = .any;
 
         for (self.bundles.items[bundle.index()].ranges.items) |entry| {
             const range_data = &self.ranges.items[entry.index.index()];
             for (range_data.uses.items) |u| {
                 const r = self.requirementFromOperand(u.operand);
-                req = req.merge(r) catch return error.Conflict;
+                req = merge_mod.mergeRequirements(req, r) catch return error.Conflict;
             }
         }
 
@@ -740,7 +740,7 @@ pub const ProcessContext = struct {
         // Remove all ranges from the preg's allocation map
         for (self.bundles.items[bundle.index()].ranges.items) |entry| {
             const key = LiveRangeKey.fromRange(entry.range);
-            self.pregs.items[preg_idx.index()].allocations.remove(key);
+            _ = self.pregs.items[preg_idx.index()].allocations.remove(key);
         }
 
         // Re-queue the bundle

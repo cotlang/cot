@@ -1449,6 +1449,34 @@ pub const Inst = union(enum) {
         return false;
     }
 
+    /// Machine instruction terminator type.
+    /// Ported from cranelift/codegen/src/machinst/mod.rs MachTerminator
+    pub const MachTerminator = enum {
+        /// Not a terminator.
+        none,
+        /// A return instruction.
+        ret,
+        /// A tail call instruction (returns from callee).
+        ret_call,
+        /// A branch instruction.
+        branch,
+    };
+
+    /// Check if this instruction is a terminator and what kind.
+    /// Ported from cranelift/codegen/src/isa/aarch64/inst/mod.rs is_term()
+    pub fn isTerm(self: Inst) MachTerminator {
+        return switch (self) {
+            .ret => .ret,
+            .jump => .branch,
+            .cond_br => .branch,
+            .jt_sequence => .branch,
+            // Indirect branch
+            .indirect_br => .branch,
+            // Everything else is not a terminator
+            else => .none,
+        };
+    }
+
     /// Stub: Get operands for register allocation.
     /// TODO: Implement proper operand collection via get_operands.zig
     pub fn getOperands(_: Inst) []const machinst_reg.Operand {

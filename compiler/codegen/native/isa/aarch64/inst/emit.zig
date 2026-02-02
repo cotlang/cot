@@ -407,7 +407,7 @@ fn finalizeOffset(off: i64, basereg: Reg, result: *MemFinalizeResult) AMode {
 pub fn machregToGpr(m: Reg) u32 {
     std.debug.assert(m.class() == .int);
     if (m.toRealReg()) |rreg| {
-        return @as(u32, rreg.hwEnc() & 31);
+        return @as(u32, @intCast(rreg.hwEnc())) & 31;
     }
     unreachable; // Virtual register not allowed here
 }
@@ -416,7 +416,7 @@ pub fn machregToGpr(m: Reg) u32 {
 pub fn machregToVec(m: Reg) u32 {
     std.debug.assert(m.class() == .float);
     if (m.toRealReg()) |rreg| {
-        return @as(u32, rreg.hwEnc());
+        return @as(u32, @intCast(rreg.hwEnc()));
     }
     unreachable;
 }
@@ -424,7 +424,7 @@ pub fn machregToVec(m: Reg) u32 {
 /// Convert a register to its encoding regardless of class.
 fn machregToGprOrVec(m: Reg) u32 {
     if (m.toRealReg()) |rreg| {
-        return @as(u32, rreg.hwEnc() & 31);
+        return @as(u32, @intCast(rreg.hwEnc())) & 31;
     }
     unreachable;
 }
@@ -1056,7 +1056,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, _:
         .mov_from_preg => |payload| {
             // This is a pseudo-op that should have been resolved to a real move.
             // If we get here, the preg should be directly usable.
-            const rm_enc = @as(u32, payload.rm.hwEnc()) & 31;
+            const rm_enc = @as(u32, @intCast(payload.rm.hwEnc())) & 31;
             const rd_enc = machregToGpr(payload.rd.toReg());
             // ORR rd, xzr, rm (64-bit move)
             try sink.put4(0xaa000000 | (rm_enc << 16) | rd_enc);
@@ -1065,7 +1065,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, _:
         // Move to physical register - used during regalloc
         .mov_to_preg => |payload| {
             // This is a pseudo-op for moving to a physical register.
-            const rd_enc = @as(u32, payload.rd.hwEnc()) & 31;
+            const rd_enc = @as(u32, @intCast(payload.rd.hwEnc())) & 31;
             const rm_enc = machregToGpr(payload.rm);
             // ORR rd, xzr, rm (64-bit move)
             try sink.put4(0xaa000000 | (rm_enc << 16) | rd_enc);

@@ -1214,7 +1214,7 @@ pub fn VCodeBuilder(comptime I: type) type {
             // Now sort debug value labels by VReg, as required by regalloc2.
             std.sort.pdq(DebugValueLabel, self.vcode.debug_value_labels.items, {}, struct {
                 fn lessThan(_: void, a: DebugValueLabel, b: DebugValueLabel) bool {
-                    return a.vreg.toU32() < b.vreg.toU32();
+                    return a.vreg.rawBits() < b.vreg.rawBits();
                 }
             }.lessThan);
         }
@@ -1231,18 +1231,20 @@ pub fn VCodeBuilder(comptime I: type) type {
                 const operands = insn.getOperands();
                 for (operands) |op| {
                     // Convert from reg.Operand to vcode.Operand
-                    const resolved_vreg = vregs.resolveVregAlias(op.vreg);
-                    const constraint: OperandConstraint = switch (op.constraint) {
+                    const resolved_vreg = vregs.resolveVregAlias(op.vreg());
+                    const constraint: OperandConstraint = switch (op.constraint()) {
                         .reg => .any,
                         .any => .any,
+                        .stack => .any,
                         .fixed_reg => |preg| .{ .fixed_reg = preg },
                         .reuse => |idx| .{ .reuse = idx },
+                        .limit => .any,
                     };
-                    const kind: OperandKind = switch (op.kind) {
+                    const kind: OperandKind = switch (op.kind()) {
                         .use => .use,
                         .def => .def,
                     };
-                    const pos: OperandPos = switch (op.pos) {
+                    const pos: OperandPos = switch (op.pos()) {
                         .early => .early,
                         .late => .late,
                     };
@@ -1288,8 +1290,8 @@ pub fn VCodeBuilder(comptime I: type) type {
             // Sort debug value labels
             std.sort.pdq(DebugValueLabel, self.vcode.debug_value_labels.items, {}, struct {
                 fn lessThan(_: void, a: DebugValueLabel, b: DebugValueLabel) bool {
-                    if (a.vreg.toU32() != b.vreg.toU32()) {
-                        return a.vreg.toU32() < b.vreg.toU32();
+                    if (a.vreg.rawBits() != b.vreg.rawBits()) {
+                        return a.vreg.rawBits() < b.vreg.rawBits();
                     }
                     if (a.start.index() != b.start.index()) {
                         return a.start.index() < b.start.index();
