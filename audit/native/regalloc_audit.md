@@ -16,7 +16,7 @@
 | 6.3 | Function Interface | lib.rs:1180-1330 | func.zig | ✅ Done | 2/2 |
 | 6.4 | Machine Environment | lib.rs:1500-1550 | env.zig | ✅ Done | 4/4 |
 | 6.5 | Output | lib.rs:1546-1650 | output.zig | ✅ Done | 6/6 |
-| 6.6 | CFG Analysis | cfg.rs, postorder.rs, domtree.rs | cfg.zig | ⏳ TODO | - |
+| 6.6 | CFG Analysis | cfg.rs, postorder.rs, domtree.rs | cfg.zig | ✅ Done | 5/5 |
 | 6.7 | SSA Validation | ssa.rs | ssa.zig | ⏳ TODO | - |
 | 6.8 | Index Set | indexset.rs | indexset.zig | ⏳ TODO | - |
 | 6.9 | Parallel Moves | moves.rs | moves.zig | ⏳ TODO | - |
@@ -328,13 +328,42 @@ Also provides `FunctionVTable` for runtime dispatch when needed.
 
 ---
 
-## Remaining Phases (TODO)
+## Phase 6.6: CFG Analysis (cfg.zig)
 
-### Phase 6.6: CFG Analysis (cfg.zig)
-- `CFGInfo` struct
-- Postorder traversal
-- Dominator tree
-- Loop detection
+**Source**: `src/cfg.rs`, `src/postorder.rs`, `src/domtree.rs`
+**Target**: `compiler/codegen/native/regalloc/cfg.zig`
+**Status**: ✅ Complete (~420 LOC, 5 tests)
+
+### Type Mapping
+
+| Rust Type/Function | Zig Type/Function | Source File | Notes |
+|--------------------|-------------------|-------------|-------|
+| `CFGInfoCtx` | `CFGInfoCtx` | cfg.rs:14 | Scratch space for reuse |
+| `CFGInfo` | `CFGInfo` | cfg.rs:21 | Combined CFG analysis |
+| `CFGInfo.postorder` | `CFGInfo.postorder` | cfg.rs:23 | ✅ |
+| `CFGInfo.domtree` | `CFGInfo.domtree` | cfg.rs:25 | ✅ |
+| `CFGInfo.insn_block` | `CFGInfo.insn_block` | cfg.rs:27 | ✅ |
+| `CFGInfo.block_entry` | `CFGInfo.block_entry` | cfg.rs:29 | ✅ |
+| `CFGInfo.block_exit` | `CFGInfo.block_exit` | cfg.rs:31 | ✅ |
+| `CFGInfo.approx_loop_depth` | `CFGInfo.approx_loop_depth` | cfg.rs:39 | ✅ |
+| `CFGInfo::init()` | `CFGInfo.compute()` | cfg.rs:50 | ✅ |
+| `CFGInfo::dominates()` | `CFGInfo.blockDominates()` | cfg.rs:152 | ✅ |
+| `postorder::calculate()` | `calculatePostorder()` | postorder.rs:12 | ✅ DFS with explicit stack |
+| `domtree::calculate()` | `calculateDomtree()` | domtree.rs:44 | ✅ Cooper-Harvey-Kennedy |
+| `domtree::dominates()` | `dominates()` | domtree.rs:109 | ✅ |
+| `merge_sets()` | `mergeSets()` | domtree.rs:22 | ✅ |
+
+### Algorithm Notes
+
+**Postorder**: Uses explicit stack-based DFS to avoid recursion. O(V+E).
+
+**Dominator Tree**: Cooper-Harvey-Kennedy algorithm from "A Simple, Fast Dominance Algorithm" (Rice University TR-06-33870). Iterates until convergence.
+
+**Loop Depth**: Approximate loop depth based on backedges (edges to lower-indexed blocks). Precise for reducible CFGs in RPO order.
+
+---
+
+## Remaining Phases (TODO)
 
 ### Phase 6.7: SSA Validation (ssa.zig)
 - `validate_ssa()` function
