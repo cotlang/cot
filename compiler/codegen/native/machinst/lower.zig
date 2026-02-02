@@ -1088,15 +1088,14 @@ pub fn Lower(comptime I: type) type {
                     }
                 }
 
-                // Skip terminators (branches, returns, traps - handled separately in lowerClifBranch).
-                if (inst_data.opcode.isTerminator()) {
+                // Skip branches (handled separately).
+                if (inst_data.opcode.isBranch()) {
                     continue;
                 }
 
                 // Codegen if side-effecting or any output is used.
                 if (has_side_effect or value_needed) {
                     const temp_regs = backend.lower(self, inst) orelse {
-                        std.debug.print("[lower] UnsupportedInstruction: opcode={s}\n", .{@tagName(inst_data.opcode)});
                         return error.UnsupportedInstruction;
                     };
 
@@ -1150,25 +1149,17 @@ pub fn Lower(comptime I: type) type {
             var branch_arg_vregs: abi_mod.BoundedArray(Reg, 16) = .{};
             const succs = self.block_order.succIndices(block).succs;
 
-            // Track which successors we've already added to avoid duplicates
-            // (important for br_table where the same target can appear multiple times)
-            var seen_succs: [128]bool = [_]bool{false} ** 128;
-
             for (0..succs.len) |succ_idx| {
                 branch_arg_vregs.len = 0;
                 const result = self.collectBlockCall(block, succ_idx, &branch_arg_vregs);
-                const succ_index = result.succ.index();
-                if (succ_index < 128 and !seen_succs[succ_index]) {
-                    seen_succs[succ_index] = true;
-                    try self.vcode.addSucc(result.succ, result.args);
-                }
+                try self.vcode.addSucc(result.succ, result.args);
             }
         }
 
         fn collectBranchAndTargets(
             self: *const Self,
             bindex: BlockIndex,
-            targets: *abi_mod.BoundedArray(MachLabel, 128),
+            targets: *abi_mod.BoundedArray(MachLabel, 2),
         ) ?Inst {
             targets.len = 0;
             const result = self.block_order.succIndices(bindex);
@@ -1234,8 +1225,7 @@ pub fn Lower(comptime I: type) type {
             self.vcode.setEntry(BlockIndex.new(0));
 
             // Reused vectors for branch lowering.
-            // Capacity 128 supports jump tables up to 127 entries + default
-            var targets: abi_mod.BoundedArray(MachLabel, 128) = .{};
+            var targets: abi_mod.BoundedArray(MachLabel, 2) = .{};
 
             // Get a copy of the lowered order.
             const lowered_order = self.block_order.loweredOrder();

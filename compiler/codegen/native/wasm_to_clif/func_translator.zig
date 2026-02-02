@@ -168,18 +168,8 @@ pub const WasmFuncTranslator = struct {
     }
 
     /// Translate a single Wasm operator.
-    /// Reference: Cranelift's code_translator.rs translate_operator()
     fn translateOperator(self: *Self, translator: *FuncTranslator, op: WasmOperator) !void {
         _ = self;
-
-        // Reference: Cranelift code_translator.rs lines 129-133
-        // If we're in unreachable code, only process control flow operators
-        // that can restore reachability (block, loop, if, else, end)
-        if (!translator.state.reachable) {
-            try translateUnreachableOperator(translator, op);
-            return;
-        }
-
         switch (op) {
             // Control flow
             .block => |data| try translator.translateBlock(data.params, data.results),
@@ -239,50 +229,6 @@ pub const WasmFuncTranslator = struct {
             // Parametric
             .drop => try translator.translateDrop(),
             .select => try translator.translateSelect(),
-        }
-    }
-
-    /// Handle operators in unreachable code.
-    /// Reference: Cranelift's code_translator.rs translate_unreachable_operator()
-    /// Only control flow operators are processed to track nesting and potentially
-    /// restore reachability.
-    fn translateUnreachableOperator(translator: *FuncTranslator, op: WasmOperator) !void {
-        // Import stack types
-        const stack = @import("stack.zig");
-
-        switch (op) {
-            // Control flow operators that affect nesting must be tracked
-            // Reference: Cranelift pushes placeholder frames for unreachable blocks
-            .block => |data| {
-                // Push placeholder block frame to track nesting
-                // Use RESERVED block since we're in unreachable code
-                try translator.state.pushBlock(stack.Block.RESERVED, data.params, data.results);
-            },
-            .loop => |data| {
-                // Push placeholder loop frame with RESERVED blocks
-                try translator.state.pushLoop(stack.Block.RESERVED, stack.Block.RESERVED, data.params, data.results);
-            },
-            .if_op => |data| {
-                // Push placeholder if frame - the if isn't reachable
-                // Reference: Cranelift code_translator.rs line 3311-3320
-                const placeholder = stack.Block.RESERVED;
-                // Use no_else with reserved values for unreachable code
-                const else_data = stack.ElseData{ .no_else = .{
-                    .branch_inst = stack.Inst.RESERVED,
-                    .placeholder = placeholder,
-                } };
-                try translator.state.pushIf(placeholder, else_data, data.params, data.results);
-            },
-            .else_op => {
-                // Else can restore reachability if the if head was reachable
-                try translator.translateElse();
-            },
-            .end => {
-                // End can restore reachability if the block was branched to
-                try translator.translateEnd();
-            },
-            // All other operators are skipped in unreachable code
-            else => {},
         }
     }
 };

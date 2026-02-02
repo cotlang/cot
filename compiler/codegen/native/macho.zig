@@ -168,11 +168,6 @@ pub const MachOWriter = struct {
     }
 
     pub fn deinit(self: *MachOWriter) void {
-        // Free owned symbol names (Cranelift pattern: writer owns the names)
-        for (self.symbols.items) |sym| {
-            self.allocator.free(sym.name);
-        }
-
         const lists = .{
             &self.text_data, &self.data, &self.cstring_data, &self.string_literals,
             &self.symbols, &self.relocations, &self.data_relocations, &self.strings,
@@ -190,13 +185,8 @@ pub const MachOWriter = struct {
         try self.data.appendSlice(self.allocator, bytes);
     }
 
-    /// Add a symbol to the object file.
-    /// Reference: Cranelift obj.rs line 133: `name: name.as_bytes().to_vec()`
-    /// The writer takes ownership of a copy of the name.
     pub fn addSymbol(self: *MachOWriter, name: []const u8, value: u64, section: u8, external: bool) !void {
-        // Copy the name so the writer owns it (Cranelift pattern)
-        const owned_name = try self.allocator.dupe(u8, name);
-        try self.symbols.append(self.allocator, .{ .name = owned_name, .value = value, .section = section, .external = external });
+        try self.symbols.append(self.allocator, .{ .name = name, .value = value, .section = section, .external = external });
     }
 
     pub fn addRelocation(self: *MachOWriter, offset: u32, target: []const u8) !void {

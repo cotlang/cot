@@ -292,119 +292,13 @@ pub fn runWithCtx(
     defer scratch.deinit(allocator);
     try ctx.cfginfo.compute(FuncType, func, &scratch, allocator);
 
-    // Phase 2-5: Trivial register allocation
-    // For now, we use a simple approach: assign each virtual register to a
-    // unique physical register. This works when vreg count < preg count.
-    // A proper allocator would do liveness analysis, live range building,
-    // and graph coloring/linear scan.
+    // Phase 2-5: Liveness, live ranges, merging, allocation
+    // These phases require the full Function interface.
+    // For now, we provide the infrastructure but the actual
+    // implementation would need the Function callbacks.
 
     // Initialize output with proper sizes
     try ctx.output.initForFunc(FuncType, func, allocator);
-
-    // Trivial allocation: iterate all instructions and collect operands
-    const num_insts = func.numInsts();
-    const num_blocks = func.numBlocks();
-
-    // Build a list of preferred registers for each class
-    var int_regs: [32]PReg = undefined;
-    var float_regs: [32]PReg = undefined;
-    var num_int_regs: u8 = 0;
-    var num_float_regs: u8 = 0;
-
-    // Collect preferred integer registers
-    const int_class_idx = @intFromEnum(RegClass.int);
-    var int_iter = env.preferred_regs_by_class[int_class_idx].iter();
-    while (int_iter.next()) |preg| {
-        if (num_int_regs < 32) {
-            int_regs[num_int_regs] = preg;
-            num_int_regs += 1;
-        }
-    }
-
-    // Collect preferred float registers
-    const float_class_idx = @intFromEnum(RegClass.float);
-    var float_iter = env.preferred_regs_by_class[float_class_idx].iter();
-    while (float_iter.next()) |preg| {
-        if (num_float_regs < 32) {
-            float_regs[num_float_regs] = preg;
-            num_float_regs += 1;
-        }
-    }
-
-    // Track next available physical register per class
-    var next_int_preg: u8 = 0;
-    var next_float_preg: u8 = 0;
-
-    // Map from virtual register index to allocated physical register
-    var vreg_to_preg = std.AutoHashMap(usize, PReg).init(allocator);
-    defer vreg_to_preg.deinit();
-
-    // Process each instruction and collect allocations
-    var block_idx: usize = 0;
-    while (block_idx < num_blocks) : (block_idx += 1) {
-        const block = Block.new(block_idx);
-        const inst_range = func.blockInsns(block);
-
-        var inst_idx = inst_range.from.idx();
-        while (inst_idx < inst_range.to.idx()) : (inst_idx += 1) {
-            const inst = Inst.new(inst_idx);
-            const operands = func.instOperands(inst);
-
-            // Record start of this instruction's allocations
-            ctx.output.inst_alloc_offsets.items[inst_idx] = @intCast(ctx.output.allocs.items.len);
-
-            // Process each operand
-            for (operands) |op| {
-                const vreg = op.vreg();
-                const rc = vreg.class();
-
-                // Check if this vreg is already allocated
-                var preg: PReg = undefined;
-                if (vreg_to_preg.get(vreg.vreg())) |existing| {
-                    preg = existing;
-                } else {
-                    // Check for fixed register constraint
-                    switch (op.constraint()) {
-                        .fixed_reg => |fixed_preg| {
-                            preg = fixed_preg;
-                        },
-                        else => {
-                            // Allocate next available register
-                            switch (rc) {
-                                .int => {
-                                    if (next_int_preg < num_int_regs) {
-                                        preg = int_regs[next_int_preg];
-                                        next_int_preg += 1;
-                                    } else {
-                                        // Out of registers - use x0 as fallback
-                                        preg = PReg.new(0, .int);
-                                    }
-                                },
-                                .float, .vector => {
-                                    if (next_float_preg < num_float_regs) {
-                                        preg = float_regs[next_float_preg];
-                                        next_float_preg += 1;
-                                    } else {
-                                        // Out of registers - use v0 as fallback
-                                        preg = PReg.new(0, .float);
-                                    }
-                                },
-                            }
-                        },
-                    }
-                    try vreg_to_preg.put(vreg.vreg(), preg);
-                }
-
-                // Store the allocation
-                try ctx.output.allocs.append(allocator, Allocation.reg(preg));
-            }
-        }
-    }
-
-    // Set the final offset for the sentinel
-    if (num_insts < ctx.output.inst_alloc_offsets.items.len) {
-        ctx.output.inst_alloc_offsets.items[num_insts] = @intCast(ctx.output.allocs.items.len);
-    }
 
     // Phase 6: Spillslot allocation
     var spill_ctx = SpillContext.init(

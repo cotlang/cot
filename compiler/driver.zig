@@ -337,26 +337,7 @@ pub const Driver = struct {
             .wasm32 => return error.InvalidTargetForNative,
         };
 
-        // Build set of exported function indices
-        // Reference: Cranelift only compiles functions that are actually needed
-        var exported_funcs = std.AutoHashMap(usize, void).init(self.allocator);
-        defer exported_funcs.deinit();
-        for (wasm_module.exports) |exp| {
-            if (exp.kind == .func) {
-                try exported_funcs.put(exp.index, {});
-            }
-        }
-
         for (wasm_module.code, 0..) |func_code, func_idx| {
-            // Only translate exported functions for now
-            // ARC runtime functions use operators (global_get, stores, etc.) not yet supported
-            if (!exported_funcs.contains(func_idx)) {
-                pipeline_debug.log(.codegen, "driver: skipping internal function {d}", .{func_idx});
-                // Add placeholder compiled code (empty)
-                try compiled_funcs.append(self.allocator, native_compile.CompiledCode.empty(self.allocator));
-                continue;
-            }
-
             pipeline_debug.log(.codegen, "driver: translating function {d}", .{func_idx});
 
             // Get function type from module
@@ -429,11 +410,6 @@ pub const Driver = struct {
                 // Skip unsupported ops for now (memory, calls, etc.)
             }
 
-            pipeline_debug.log(.codegen, "driver: {d} basic ops from {d} decoded ops", .{
-                basic_ops.items.len,
-                wasm_ops.len,
-            });
-
             // Translate to CLIF
             func_translator.translateFunction(
                 &clif_func,
@@ -485,108 +461,49 @@ pub const Driver = struct {
     }
 
     /// Generate Mach-O object file from compiled functions.
-    /// Reference: cranelift/object/src/backend.rs ObjectModule::define_function_inner
     fn generateMachO(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export) ![]u8 {
-        // Create Mach-O writer (like Cranelift's ObjectModule)
-        var writer = macho.MachOWriter.init(self.allocator);
-        defer writer.deinit();
+        _ = exports;
 
-        // Step 1: Add all code to text section, tracking offsets
-        // Reference: Cranelift's object.add_symbol_data() pattern
-        var func_offsets = try self.allocator.alloc(u32, compiled_funcs.len);
-        defer self.allocator.free(func_offsets);
+        // Collect all machine code into a single text section
+        var total_size: usize = 0;
+        for (compiled_funcs) |cf| {
+            total_size += cf.codeSize();
+        }
 
-        var current_offset: u32 = 0;
-        for (compiled_funcs, 0..) |cf, i| {
-            func_offsets[i] = current_offset;
+        var code = try self.allocator.alloc(u8, total_size);
+        var offset: usize = 0;
+        for (compiled_funcs) |cf| {
             const code_bytes = cf.code();
-            try writer.addCode(code_bytes);
-            current_offset += @intCast(code_bytes.len);
+            @memcpy(code[offset..][0..code_bytes.len], code_bytes);
+            offset += code_bytes.len;
         }
 
-        // Step 2: Add symbols for exported functions
-        // Reference: Cranelift's declare_function + define_function pattern
-        // Mach-O convention: external symbols start with underscore
-        for (exports) |exp| {
-            if (exp.kind == .func) {
-                const func_idx = exp.index;
-                if (func_idx < compiled_funcs.len) {
-                    // Create symbol name with underscore prefix (Mach-O convention)
-                    const sym_name = try std.fmt.allocPrint(self.allocator, "_{s}", .{exp.name});
-                    defer self.allocator.free(sym_name);
-
-                    // Section 1 = __text, external = true for exported symbols
-                    // MachOWriter.addSymbol duplicates the name (Cranelift pattern)
-                    try writer.addSymbol(sym_name, func_offsets[func_idx], 1, true);
-
-                    pipeline_debug.log(.codegen, "driver: added Mach-O symbol {s} at offset {d}", .{
-                        sym_name,
-                        func_offsets[func_idx],
-                    });
-                }
-            }
-        }
-
-        // Step 3: Serialize to Mach-O binary
-        // Reference: Cranelift's ObjectProduct::emit()
-        var output = std.ArrayListUnmanaged(u8){};
-        defer output.deinit(self.allocator);
-        try writer.write(output.writer(self.allocator));
-
-        // Return owned copy of the output
-        const result = try self.allocator.alloc(u8, output.items.len);
-        @memcpy(result, output.items);
-        return result;
+        // For now, return raw code - full Mach-O generation will use macho.zig
+        // TODO: Use macho.zig to wrap in proper Mach-O format
+        return code;
     }
 
     /// Generate ELF object file from compiled functions.
-    /// Reference: cranelift/object/src/backend.rs ObjectModule::define_function_inner
     fn generateElf(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export) ![]u8 {
-        // Create ELF writer (like Cranelift's ObjectModule)
-        var writer = elf.ElfWriter.init(self.allocator);
-        defer writer.deinit();
+        _ = exports;
 
-        // Step 1: Add all code to text section, tracking offsets
-        // Reference: Cranelift's object.add_symbol_data() pattern
-        var func_offsets = try self.allocator.alloc(u32, compiled_funcs.len);
-        defer self.allocator.free(func_offsets);
+        // Collect all machine code into a single text section
+        var total_size: usize = 0;
+        for (compiled_funcs) |cf| {
+            total_size += cf.codeSize();
+        }
 
-        var current_offset: u32 = 0;
-        for (compiled_funcs, 0..) |cf, i| {
-            func_offsets[i] = current_offset;
+        var code = try self.allocator.alloc(u8, total_size);
+        var offset: usize = 0;
+        for (compiled_funcs) |cf| {
             const code_bytes = cf.code();
-            try writer.addCode(code_bytes);
-            current_offset += @intCast(code_bytes.len);
+            @memcpy(code[offset..][0..code_bytes.len], code_bytes);
+            offset += code_bytes.len;
         }
 
-        // Step 2: Add symbols for exported functions
-        // Reference: Cranelift's declare_function + define_function pattern
-        // ELF convention: no underscore prefix (unlike Mach-O)
-        for (exports) |exp| {
-            if (exp.kind == .func) {
-                const func_idx = exp.index;
-                if (func_idx < compiled_funcs.len) {
-                    // Section 1 = .text, external = true for exported symbols
-                    try writer.addSymbol(exp.name, func_offsets[func_idx], 1, true);
-
-                    pipeline_debug.log(.codegen, "driver: added ELF symbol {s} at offset {d}", .{
-                        exp.name,
-                        func_offsets[func_idx],
-                    });
-                }
-            }
-        }
-
-        // Step 3: Serialize to ELF binary
-        // Reference: Cranelift's ObjectProduct::emit()
-        var output = std.ArrayListUnmanaged(u8){};
-        defer output.deinit(self.allocator);
-        try writer.write(output.writer(self.allocator));
-
-        // Return owned copy of the output
-        const result = try self.allocator.alloc(u8, output.items.len);
-        @memcpy(result, output.items);
-        return result;
+        // For now, return raw code - full ELF generation will use elf.zig
+        // TODO: Use elf.zig to wrap in proper ELF format
+        return code;
     }
 
     /// Generate WebAssembly binary.

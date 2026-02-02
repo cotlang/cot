@@ -177,16 +177,6 @@ pub const CompiledCode = struct {
 
     const Self = @This();
 
-    /// Create an empty CompiledCode (for skipped functions).
-    pub fn empty(allocator: Allocator) Self {
-        return .{
-            .buffer = MachBufferFinalized.empty(),
-            .frame_size = 0,
-            .bb_offsets = .{},
-            .allocator = allocator,
-        };
-    }
-
     /// Get the machine code bytes.
     pub fn code(self: *const Self) []const u8 {
         return self.buffer.getData();
@@ -283,14 +273,6 @@ fn compileAArch64(
     clif_func: *const ClifFunction,
     backend: AArch64Backend,
 ) !CompiledCode {
-    const debug = @import("../../pipeline_debug.zig");
-
-    // Debug: show CLIF function stats
-    debug.log(.codegen, "compile: CLIF function has {d} blocks, {d} values", .{
-        clif_func.dfg.blocks.items.len,
-        clif_func.dfg.values.items.len,
-    });
-
     // Phase 1: Compute CFG and dominator tree
     var cfg = ControlFlowGraph.init(allocator);
     defer cfg.deinit();
@@ -303,8 +285,6 @@ fn compileAArch64(
     // Phase 2: Compute block ordering
     var block_order = try BlockLoweringOrder.init(allocator, clif_func, &domtree);
     defer block_order.deinit();
-
-    debug.log(.codegen, "compile: block order computed", .{});
 
     // Phase 3: Lower CLIF to VCode
     var lower_ctx = try Lower(aarch64.Inst).init(
@@ -319,8 +299,6 @@ fn compileAArch64(
     var vcode = try lower_ctx.lower(aarch64.AArch64LowerBackend, &lower_backend);
     defer vcode.deinit();
 
-    debug.log(.codegen, "compile: VCode has {d} instructions", .{vcode.insts.items.len});
-
     // Phase 4: Run register allocation
     const regalloc_output_val = try runRegalloc(allocator, &vcode, &backend.machine_env);
     defer {
@@ -330,8 +308,6 @@ fn compileAArch64(
 
     // Phase 5: Emit machine code
     const emit_result = try emitCodeAArch64(allocator, &vcode, &regalloc_output_val, backend);
-
-    debug.log(.codegen, "compile: emitted {d} bytes", .{emit_result.buffer.totalSize()});
 
     return CompiledCode{
         .buffer = emit_result.buffer,

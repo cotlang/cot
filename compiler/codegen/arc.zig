@@ -191,7 +191,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         &[_]ValType{ .i64, .i64 },
         &[_]ValType{},
     );
-    const memset_zero_body = try generateVoidStubBody(allocator);
+    const memset_zero_body = try generateStubBody(allocator);
     const memset_zero_idx = try linker.addFunc(.{
         .name = MEMSET_ZERO_NAME,
         .type_idx = memset_zero_type,
@@ -211,26 +211,16 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
     };
 }
 
-/// Generates a stub function body that returns 0 (for i64 returns)
-/// Used for unimplemented functions with return values
+/// Generates a stub function body that returns 0 (for i64 returns) or does nothing (for void)
+/// Used for unimplemented functions
 fn generateStubBody(allocator: std.mem.Allocator) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
 
-    // Return 0 for i64 return type
+    // Return 0 for any return type (harmless for void returns)
     try code.emitI64Const(0);
     // Note: finish() adds the end opcode automatically
 
-    return try code.finish();
-}
-
-/// Generates a stub function body for void return (does nothing)
-/// Used for unimplemented functions with no return values
-fn generateVoidStubBody(allocator: std.mem.Allocator) ![]const u8 {
-    var code = wasm.CodeBuilder.init(allocator);
-    defer code.deinit();
-
-    // Empty body - just let finish() add the end opcode
     return try code.finish();
 }
 
