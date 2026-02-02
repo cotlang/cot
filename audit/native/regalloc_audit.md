@@ -19,7 +19,7 @@
 | 6.6 | CFG Analysis | cfg.rs, postorder.rs, domtree.rs | cfg.zig | ✅ Done | 5/5 |
 | 6.7 | SSA Validation | ssa.rs | ssa.zig | ✅ Done | 1/1 |
 | 6.8 | Index Set | indexset.rs | indexset.zig | ✅ Done | 7/7 |
-| 6.9 | Parallel Moves | moves.rs | moves.zig | ⏳ TODO | - |
+| 6.9 | Parallel Moves | moves.rs | moves.zig | ✅ Done | 7/7 |
 | 6.10 | Ion Data Structures | ion/data_structures.rs | ion/data.zig | ⏳ TODO | - |
 | 6.11 | Liveness Analysis | ion/liveranges.rs | ion/liveness.zig | ⏳ TODO | - |
 | 6.12 | Liverange Building | ion/liveranges.rs | ion/liveranges.zig | ⏳ TODO | - |
@@ -452,11 +452,54 @@ Also provides `FunctionVTable` for runtime dispatch when needed.
 
 ---
 
-## Remaining Phases (TODO)
+## Phase 6.9: Parallel Moves (moves.zig)
 
-### Phase 6.9: Parallel Moves (moves.zig)
-- Cycle detection in move graphs
-- Move serialization
+**Source**: `src/moves.rs`
+**Target**: `compiler/codegen/native/regalloc/moves.zig`
+**Status**: ✅ Complete (~450 LOC, 7 tests)
+
+### Type Mapping
+
+| Rust Type | Zig Type | Rust Location | Notes |
+|-----------|----------|---------------|-------|
+| `MoveVec<T>` | `MoveVec(T)` | moves.rs:12 | ArrayList of (from, to, data) tuples |
+| `Move` tuple | `Move(T)` | moves.rs:12 | Struct with from, to, data fields |
+| `MoveVecWithScratch<T>` | `MoveVecWithScratch(T)` | moves.rs:18 | Tagged union: no_scratch/scratch |
+| `MoveVecWithScratch::NoScratch` | `.no_scratch` | moves.rs:20 | ✅ |
+| `MoveVecWithScratch::Scratch` | `.scratch` | moves.rs:22 | ✅ |
+| `MoveVecWithScratch::with_scratch()` | `.withScratch()` | moves.rs:240 | ✅ |
+| `MoveVecWithScratch::without_scratch()` | `.withoutScratch()` | moves.rs:266 | ✅ |
+| `MoveVecWithScratch::needs_scratch()` | `.needsScratch()` | moves.rs:274 | ✅ |
+| `ParallelMoves<T>` | `ParallelMoves(T)` | moves.rs:31 | Main resolver struct |
+| `ParallelMoves::new()` | `.init()` | moves.rs:36 | ✅ |
+| `ParallelMoves::add()` | `.add()` | moves.rs:42 | ✅ |
+| `ParallelMoves::resolve()` | `.resolve()` | moves.rs:74 | ✅ |
+| `MoveAndScratchResolver` | `MoveAndScratchResolver(T)` | moves.rs:304 | Final resolution with scratch |
+| `MoveAndScratchResolver::compute()` | `.compute()` | moves.rs:330 | ✅ |
+
+### Algorithm Notes
+
+**Parallel Move Resolution**:
+1. Sort moves by (dst, src) for efficient lookup
+2. Remove duplicates and self-moves
+3. If no sources overlap destinations, return as-is
+4. Build `must_come_before` graph: move[i] must come before move[j] if src[i] == dst[j]
+5. DFS to emit moves in postorder (then reverse for correct order)
+6. When cycle detected, use scratch register:
+   - Emit: scratch := last_src
+   - Emit cycle moves normally
+   - Emit: last_dst := scratch
+
+**Key Property**: Each destination has only one writer, so cycles are simple rings (no complex SCCs).
+
+**Stack-to-Stack Resolution**:
+- No architecture supports direct stack-to-stack moves
+- Uses scratch register as intermediate: stack1 -> reg -> stack2
+- If no free register, borrows one and saves/restores via another stack slot
+
+---
+
+## Remaining Phases (TODO)
 
 ### Phase 6.10-6.18: Ion Allocator
 - Full backtracking register allocator
