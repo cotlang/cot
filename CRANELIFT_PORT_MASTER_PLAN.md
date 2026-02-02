@@ -779,7 +779,7 @@ After Task 4.10 integration is working, you MUST come back and complete every it
 **Cranelift Source**: `cranelift/codegen/src/isa/x64/`
 **Cot Target**: `compiler/codegen/native/isa/x64/`
 
-**STATUS**: Ready to start. ARM64 pattern established - follow same structure.
+**STATUS**: ✅ Core implementation complete (8,428 LOC, 140 tests passing). Minor features in progress.
 
 ### 5.0 AMD64 Porting Instructions
 
@@ -970,22 +970,25 @@ zig build test
 
 ### 5.6 Phase 5 Task Checklist
 
-- [ ] **5.1** Create `compiler/codegen/native/isa/x64/` directory structure
-- [ ] **5.2** Port `inst/args.rs` → `inst/args.zig` (stub types, addressing modes)
-- [ ] **5.3** Port `inst/regs.rs` → `inst/regs.zig` (GPR, XMM registers)
-- [ ] **5.4** Port `inst/mod.rs` → `inst/mod.zig` (instruction union, opcodes)
-- [ ] **5.5** Port `inst/emit.rs` encoding helpers (REX, ModRM, SIB)
-- [ ] **5.6** Port `inst/emit.rs` → `inst/emit.zig` (instruction emission)
-- [ ] **5.7** Create `inst/mod.zig` top-level (re-exports)
-- [ ] **5.8** Create `mod.zig` top-level (re-exports)
-- [ ] **5.9** Create `audit/clif/isa/x64/inst.md`
-- [ ] **5.10** Run tests, verify all pass
-- [ ] **5.11** Commit: "Add x86-64 instruction types and emission"
-- [ ] **5.12** Port `lower.rs` → `lower.zig` (deferred - needs integration)
-- [ ] **5.13** Port `abi.rs` → `abi.zig` (deferred - needs integration)
-- [ ] **5.14** Integration with machinst framework
+- [x] **5.1** Create `compiler/codegen/native/isa/x64/` directory structure ✅
+- [x] **5.2** Port `inst/args.rs` → `inst/args.zig` (1,241 LOC - stub types, addressing modes, CC) ✅
+- [x] **5.3** Port `inst/regs.rs` → `inst/regs.zig` (478 LOC - GPR, XMM, REX handling) ✅
+- [x] **5.4** Port `inst/mod.rs` → `inst/mod.zig` (1,353 LOC - instruction union, opcodes) ✅
+- [x] **5.5** Port `inst/emit.rs` encoding helpers (REX, ModRM, SIB - all in emit.zig) ✅
+- [x] **5.6** Port `inst/emit.rs` → `inst/emit.zig` (2,326 LOC - full instruction emission) ✅
+- [x] **5.7** Create `inst/get_operands.zig` (673 LOC - register allocation support) ✅
+- [x] **5.8** Create `mod.zig` top-level (126 LOC - re-exports) ✅
+- [x] **5.9** Create audit documents (5 files: inst.md, emit.md, args.md, regs.md, mod_inst.md) ✅
+- [x] **5.10** Run tests, verify all pass (140 tests passing) ✅
+- [x] **5.11** Commit: "Phase 5: Add x86-64 backend with Phase 4 parity" ✅
+- [x] **5.12** Port `lower.rs` → `lower.zig` (1,480 LOC - CLIF→x64 lowering) ✅
+- [x] **5.13** Port `abi.rs` → `abi.zig` (751 LOC - System V + Windows x64 ABI) ✅
+- [ ] **5.14** Integration with machinst framework - IN PROGRESS
 - [ ] **5.15** Test on x86-64 Linux
-- [ ] **5.16** Commit: "Port Cranelift x86-64 backend"
+- [ ] **5.16** Final verification and commit
+
+**Files completed**: 8,428 LOC total
+**Tests passing**: 140 (emit: 35, get_operands: 32, abi: 35, lower: 38)
 
 ---
 
