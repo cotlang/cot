@@ -15,7 +15,7 @@
 | 6.2 | Operands | lib.rs:600-1180 | operand.zig | ✅ Done | 7/7 |
 | 6.3 | Function Interface | lib.rs:1180-1330 | func.zig | ✅ Done | 2/2 |
 | 6.4 | Machine Environment | lib.rs:1500-1550 | env.zig | ✅ Done | 4/4 |
-| 6.5 | Output | lib.rs:1546-1650 | output.zig | ⏳ TODO | - |
+| 6.5 | Output | lib.rs:1546-1650 | output.zig | ✅ Done | 6/6 |
 | 6.6 | CFG Analysis | cfg.rs, postorder.rs, domtree.rs | cfg.zig | ⏳ TODO | - |
 | 6.7 | SSA Validation | ssa.rs | ssa.zig | ⏳ TODO | - |
 | 6.8 | Index Set | indexset.rs | indexset.zig | ⏳ TODO | - |
@@ -292,16 +292,43 @@ Also provides `FunctionVTable` for runtime dispatch when needed.
 
 ---
 
-## Remaining Phases (TODO)
+## Phase 6.5: Output (output.zig)
 
-### Phase 6.5: Output (output.zig)
-- `Output` struct
-- `num_spillslots`
-- `edits: Vec<(ProgPoint, Edit)>`
-- `allocs: Vec<Allocation>`
-- `inst_alloc_offsets: Vec<u32>`
-- `inst_allocs(Inst) -> &[Allocation]`
-- `RegAllocError` enum
+**Source**: `src/lib.rs` lines 1546-1710, `src/ion/data_structures.rs` lines 820-853
+**Target**: `compiler/codegen/native/regalloc/output.zig`
+**Status**: ✅ Complete (~310 LOC, 6 tests)
+
+### Type Mapping
+
+| Rust Type | Zig Type | Rust Location | Notes |
+|-----------|----------|---------------|-------|
+| `Output` | `Output` | lib.rs:1549 | ✅ |
+| `Output.num_spillslots` | `Output.num_spillslots` | lib.rs:1551 | ✅ |
+| `Output.edits` | `Output.edits` | lib.rs:1555 | `ArrayListUnmanaged(EditAtPoint)` |
+| `Output.allocs` | `Output.allocs` | lib.rs:1559 | `ArrayListUnmanaged(Allocation)` |
+| `Output.inst_alloc_offsets` | `Output.inst_alloc_offsets` | lib.rs:1562 | `ArrayListUnmanaged(u32)` |
+| `Output.debug_locations` | `Output.debug_locations` | lib.rs:1570 | `ArrayListUnmanaged(DebugLocation)` |
+| `Output.stats` | `Output.stats` | lib.rs:1573 | ✅ |
+| `Output::inst_allocs()` | `Output.instAllocs()` | lib.rs:1578 | ✅ |
+| `Output::block_insts_and_edits()` | `Output.blockInstsAndEdits()` | lib.rs:1590 | ✅ |
+| `InstOrEdit` | `InstOrEdit` | lib.rs:1459 | Tagged union |
+| `OutputIter` | `OutputIterator` | lib.rs:1465 | ✅ |
+| `Stats` | `Stats` | data_structures.rs:822 | 31 fields, all usize |
+| `RegAllocError` | `RegAllocError` | lib.rs:1616 | Tagged union |
+| `RegAllocError::CritEdge` | `.crit_edge` | lib.rs:1618 | ✅ |
+| `RegAllocError::SSA` | `.ssa` | lib.rs:1622 | ✅ |
+| `RegAllocError::BB` | `.bb` | lib.rs:1626 | ✅ |
+| `RegAllocError::Branch` | `.branch` | lib.rs:1630 | ✅ |
+| `RegAllocError::EntryLivein` | `.entry_livein` | lib.rs:1632 | ✅ |
+| `RegAllocError::DisallowedBranchArg` | `.disallowed_branch_arg` | lib.rs:1638 | ✅ |
+| `RegAllocError::TooManyLiveRegs` | `.too_many_live_regs` | lib.rs:1641 | ✅ |
+| `RegAllocError::TooManyOperands` | `.too_many_operands` | lib.rs:1644 | ✅ |
+| `Algorithm` | `Algorithm` | lib.rs:1692 | enum { ion, fastalloc } |
+| `RegallocOptions` | `RegallocOptions` | lib.rs:1700 | ✅ |
+
+---
+
+## Remaining Phases (TODO)
 
 ### Phase 6.6: CFG Analysis (cfg.zig)
 - `CFGInfo` struct
