@@ -21,7 +21,7 @@
 | 6.8 | Index Set | indexset.rs | indexset.zig | ✅ Done | 7/7 |
 | 6.9 | Parallel Moves | moves.rs | moves.zig | ✅ Done | 7/7 |
 | 6.10 | Ion Data Structures | ion/data_structures.rs | ion_data.zig | ✅ Done | 6/6 |
-| 6.11 | Liveness Analysis | ion/liveranges.rs | ion/liveness.zig | ⏳ TODO | - |
+| 6.11 | Liveness Analysis | ion/liveranges.rs | liveness.zig | ✅ Done | 6/6 |
 | 6.12 | Liverange Building | ion/liveranges.rs | ion/liveranges.zig | ⏳ TODO | - |
 | 6.13 | Bundle Merging | ion/merge.rs | ion/merge.zig | ⏳ TODO | - |
 | 6.14 | Allocation Loop | ion/process.rs | ion/process.zig | ⏳ TODO | - |
@@ -565,10 +565,67 @@ Also provides `FunctionVTable` for runtime dispatch when needed.
 
 ---
 
+## Phase 6.11: Liveness Analysis (liveness.zig)
+
+**Source**: `src/ion/liveranges.rs`
+**Target**: `compiler/codegen/native/regalloc/liveness.zig`
+**Status**: ✅ Complete (~400 LOC, 6 tests)
+
+### Type Mapping
+
+| Rust Type | Zig Type | Notes |
+|-----------|----------|-------|
+| `SpillWeight` | `SpillWeight` | f32 wrapper with bfloat16-like encoding |
+| `spill_weight_from_constraint()` | `spillWeightFromConstraint()` | Compute weight from constraint/loop/def |
+
+### LivenessContext Methods
+
+| Rust Method | Zig Method | Notes |
+|-------------|------------|-------|
+| `create_pregs_and_vregs()` | `createPregsAndVregs()` | Initialize PReg/VReg data |
+| `add_liverange_to_vreg()` | `addLiverangeToVreg()` | Add range, merge if contiguous |
+| `insert_use_into_liverange()` | `insertUseIntoLiverange()` | Add use with weight |
+| `find_vreg_liverange_for_pos()` | `findVregLiverangeForPos()` | Find range at position |
+| `add_liverange_to_preg()` | `addLiverangeToPreg()` | Mark PReg busy |
+| `is_live_in()` | `isLiveIn()` | Check livein |
+| `compute_liveness()` | `computeLiveness()` | Worklist algorithm |
+
+### SpillWeight Encoding
+
+Weights are stored as bfloat16-like format:
+- `toBits()`: Takes top 16 bits of f32
+- `fromBits()`: Shifts left by 15 to reconstruct f32
+- Some precision loss but compact storage in `Use.weight`
+
+### Spill Weight Formula
+
+```
+weight = hot_bonus + def_bonus + constraint_bonus
+where:
+  hot_bonus = 1000 * 4^loop_depth (capped at depth 10)
+  def_bonus = 2000 if def, else 0
+  constraint_bonus = 1000 (Any), 2000 (Reg/FixedReg), 0 (else)
+```
+
+### Algorithm: Compute Liveness
+
+1. Initialize livein/liveout sets for all blocks
+2. Add all blocks to worklist in postorder
+3. For each block:
+   - Start with liveout set
+   - Add outgoing blockparams
+   - Process instructions in reverse (Late then Early)
+   - Uses add to live, Defs remove from live
+   - Remove block params
+   - Propagate to predecessors (union with their liveouts)
+   - If changed, add predecessor to worklist
+4. Check entry block has no liveins
+
+---
+
 ## Remaining Phases (TODO)
 
-### Phase 6.11-6.18: Ion Allocator
-- Liveness analysis
+### Phase 6.12-6.18: Ion Allocator
 - Live range building
 - Bundle merging
 - Allocation loop
