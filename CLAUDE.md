@@ -106,14 +106,17 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 ### Known Gaps
 
 - **Struct-by-value params**: Not yet implemented (workaround: use field access directly)
-- **ARC**: SSA ops defined but gen.zig doesn't emit wasm
+- **ARC frontend insertion**: Runtime functions work, but frontend doesn't auto-insert retain/release yet (M17)
 
 ### AOT Native Progress
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| Phase 1-3 | ✅ Done | ARM64/AMD64 backends ported & refactored |
-| **Phase 4** | 🔄 Pending | Wire into driver, enable native binary output |
+| Phase 1-3 | ✅ Done | CLIF IR, Wasm translation, MachInst framework |
+| Phase 4 | ✅ Done | ARM64 backend (10,874 lines, all features) |
+| Phase 5 | ✅ Done | x86-64 backend (9,828 lines, 90% ARM64 parity) |
+| **Phase 6** | 🔄 In Progress | Register allocation (regalloc2 port) |
+| Phase 7 | Pending | Integration (wire into driver) |
 
 ---
 
