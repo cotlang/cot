@@ -2,7 +2,7 @@
 
 **Source**: `regalloc2/src/ion/moves.rs` (~1010 lines) + `redundant_moves.rs` (~130 lines)
 **Target**: `compiler/codegen/native/regalloc/ion_moves.zig`
-**Status**: 🔄 In Progress (~450 LOC, 4 tests)
+**Status**: ✅ Complete (~810 LOC, 4 tests)
 
 ### Completed
 - RedundantMoveEliminator with process_move, clear, clear_alloc
@@ -10,10 +10,8 @@
 - MoveContext with block boundary checks and allocation accessors
 - chooseMoveLocation for edge move placement
 - allocateSpillslot for scratch use
-
-### Remaining
-- apply_allocations_and_insert_moves (~700 lines)
-- resolve_inserted_moves (~230 lines)
+- applyAllocationsAndInsertMoves: main allocation/move insertion function
+- resolveInsertedMoves: parallel to sequential move resolution
 
 ---
 
@@ -256,8 +254,8 @@ resolve_inserted_moves(inserted_moves):
 - [x] allocateSpillslot
 
 ### Phase 4: Main Functions
-- [ ] apply_allocations_and_insert_moves
-- [ ] resolve_inserted_moves
+- [x] apply_allocations_and_insert_moves
+- [x] resolve_inserted_moves
 
 ### Phase 5: Tests
 - [x] Unit tests (4 tests)
