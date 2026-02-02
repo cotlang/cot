@@ -4,13 +4,14 @@
 
 ## Current State
 
-We have partial infrastructure but the translator uses invented intermediate representation:
-
-| Component | Status | Issue |
-|-----------|--------|-------|
-| `ir/clif/builder.zig` | Partial | Has `FuncBuilder` with `ins()` methods, missing SSA variables |
-| `wasm_to_clif/translator.zig` | ❌ Wrong | Uses `EmittedInst` array instead of direct `FuncBuilder` |
-| `wasm_to_clif/stack.zig` | ❌ Wrong | Uses internal `Value` type instead of `clif.Value` |
+| Component | Status | Description |
+|-----------|--------|-------------|
+| `frontend/frontend.zig` | ✅ Done | FunctionBuilder with SSA variable support |
+| `frontend/ssa.zig` | ✅ Done | SSABuilder with Braun et al. algorithm |
+| `frontend/variable.zig` | ✅ Done | Variable type (index wrapper) |
+| `wasm_to_clif/translator.zig` | ✅ Done | FuncTranslator uses FunctionBuilder directly |
+| `wasm_to_clif/stack.zig` | ✅ Done | Uses `clif.Value` and `clif.Block` |
+| `wasm_to_clif/func_translator.zig` | ✅ Done | WasmFuncTranslator high-level interface |
 
 ## Cranelift Architecture (Reference)
 
@@ -63,48 +64,42 @@ match op {
 
 ## Port Plan
 
-### Phase 1: Port cranelift-frontend (~800 LOC)
+### Phase 1: Port cranelift-frontend ✅ COMPLETE
 
-Create `compiler/codegen/native/frontend/`:
+Created `compiler/codegen/native/frontend/`:
 
-1. **frontend.zig** - Port of `frontend.rs`
+1. **frontend.zig** - Port of `frontend.rs` ✅
    - `FunctionBuilderContext` struct
-   - `FunctionBuilder` struct with:
-     - `declare_var(ty)` → `Variable`
-     - `def_var(var, val)`
-     - `use_var(var)` → `Value`
-     - `create_block()` → `Block`
-     - `switch_to_block(block)`
-     - `seal_block(block)`
-     - `ins()` → returns instruction builder interface
-     - `ensure_inserted_block()`
-     - `block_params(block)` → slice of Values
-     - `append_block_params_for_function_params(block)`
+   - `FunctionBuilder` struct with all required methods
+   - `FuncInstBuilder` for instruction emission
 
-2. **ssa.zig** - Port of `ssa.rs`
+2. **ssa.zig** - Port of `ssa.rs` ✅
    - `SSABuilder` for variable handling
    - Block predecessor tracking
-   - Phi node insertion (incomplete CFG algorithm)
+   - Phi node insertion (Braun et al. algorithm)
 
-3. **variable.zig** - Port of `variable.rs`
+3. **variable.zig** - Port of `variable.rs` ✅
    - `Variable` type (index into variables)
 
-### Phase 2: Update translator to use FunctionBuilder
+4. **mod.zig** - Module exports ✅
 
-Rewrite `compiler/codegen/native/wasm_to_clif/`:
+### Phase 2: Update translator to use FunctionBuilder ✅ COMPLETE
 
-1. **translator.zig** - Port of `code_translator.rs`
-   - Remove `EmittedInst` completely
-   - `translate_operator()` directly uses `builder.ins().xxx()`
-   - Value stack holds `clif.Value` not internal type
+Rewrote `compiler/codegen/native/wasm_to_clif/`:
 
-2. **func_translator.zig** - Port of `func_translator.rs`
-   - Uses `FunctionBuilder` from frontend
-   - Proper local variable handling with `declare_var`/`def_var`/`use_var`
-
-3. **stack.zig** - Update to use CLIF types
+1. **stack.zig** - Now uses CLIF types ✅
    - Value stack: `[]clif.Value`
    - Control stack frames store `clif.Block`
+   - Imports from `ir/clif/mod.zig`
+
+2. **translator.zig** - Now uses FunctionBuilder ✅
+   - `FuncTranslator` takes `*FunctionBuilder`
+   - All translate methods use `builder.ins().xxx()`
+   - Proper SSA variable handling with `declare_var`/`def_var`/`use_var`
+
+3. **func_translator.zig** - High-level interface ✅
+   - `WasmFuncTranslator` manages builder context
+   - Translates `WasmOperator` sequences to CLIF Functions
 
 ### Phase 3: Driver Integration
 

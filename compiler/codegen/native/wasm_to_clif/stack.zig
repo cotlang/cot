@@ -9,49 +9,13 @@
 const std = @import("std");
 
 // ============================================================================
-// Entity Types
-// These match the CLIF entity types but are defined locally for module
-// independence. They will be type-aliased when integrated with the full CLIF IR.
+// Entity Types - Import from CLIF module
 // ============================================================================
 
-/// CLIF Block reference (u32 index).
-pub const Block = struct {
-    index: u32,
-
-    pub fn fromIndex(idx: u32) Block {
-        return .{ .index = idx };
-    }
-
-    pub fn asU32(self: Block) u32 {
-        return self.index;
-    }
-};
-
-/// CLIF Value reference (u32 index).
-pub const Value = struct {
-    index: u32,
-
-    pub fn fromIndex(idx: u32) Value {
-        return .{ .index = idx };
-    }
-
-    pub fn asU32(self: Value) u32 {
-        return self.index;
-    }
-};
-
-/// CLIF Instruction reference (u32 index).
-pub const Inst = struct {
-    index: u32,
-
-    pub fn fromIndex(idx: u32) Inst {
-        return .{ .index = idx };
-    }
-
-    pub fn asU32(self: Inst) u32 {
-        return self.index;
-    }
-};
+pub const clif = @import("../../../ir/clif/mod.zig");
+pub const Block = clif.Block;
+pub const Value = clif.Value;
+pub const Inst = clif.Inst;
 
 // ============================================================================
 // ElseData
@@ -246,7 +210,7 @@ pub const ControlStackFrame = union(enum) {
 /// for each control frame.
 pub const TranslationState = struct {
     /// A stack of values corresponding to the active values in the input wasm function at this
-    /// point.
+    /// point. These are CLIF Values.
     stack: std.ArrayListUnmanaged(Value),
     /// A stack of active control flow operations at this point in the input wasm function.
     control_stack: std.ArrayListUnmanaged(ControlStackFrame),
@@ -488,15 +452,15 @@ test "value stack operations" {
     try state.push1(v2);
 
     try testing.expectEqual(@as(usize, 3), state.stackLen());
-    try testing.expectEqual(v2, state.peek1());
+    try testing.expectEqual(v2.asU32(), state.peek1().asU32());
 
     const popped = state.pop1();
-    try testing.expectEqual(v2, popped);
+    try testing.expectEqual(v2.asU32(), popped.asU32());
     try testing.expectEqual(@as(usize, 2), state.stackLen());
 
     const pop2_result = state.pop2();
-    try testing.expectEqual(v0, pop2_result[0]);
-    try testing.expectEqual(v1, pop2_result[1]);
+    try testing.expectEqual(v0.asU32(), pop2_result[0].asU32());
+    try testing.expectEqual(v1.asU32(), pop2_result[1].asU32());
     try testing.expectEqual(@as(usize, 0), state.stackLen());
 }
 
@@ -514,8 +478,8 @@ test "push multiple values" {
 
     const peeked = state.peekn(2);
     try testing.expectEqual(@as(usize, 2), peeked.len);
-    try testing.expectEqual(Value.fromIndex(1), peeked[0]);
-    try testing.expectEqual(Value.fromIndex(2), peeked[1]);
+    try testing.expectEqual(@as(u32, 1), peeked[0].asU32());
+    try testing.expectEqual(@as(u32, 2), peeked[1].asU32());
 
     state.popn(2);
     try testing.expectEqual(@as(usize, 1), state.stackLen());
@@ -534,8 +498,8 @@ test "control stack block" {
     try testing.expectEqual(@as(usize, 1), state.controlStackLen());
 
     const frame = state.getFrame(0);
-    try testing.expectEqual(block0, frame.followingCode());
-    try testing.expectEqual(block0, frame.brDestination());
+    try testing.expectEqual(block0.asU32(), frame.followingCode().asU32());
+    try testing.expectEqual(block0.asU32(), frame.brDestination().asU32());
     try testing.expectEqual(@as(usize, 1), frame.numReturnValues());
     try testing.expect(!frame.isLoop());
 
@@ -556,9 +520,9 @@ test "control stack loop - br_destination is header" {
     try state.pushLoop(header, exit, 0, 0);
 
     const frame = state.getFrame(0);
-    try testing.expectEqual(exit, frame.followingCode());
+    try testing.expectEqual(exit.asU32(), frame.followingCode().asU32());
     // CRITICAL: Loop's br_destination is the header, not destination
-    try testing.expectEqual(header, frame.brDestination());
+    try testing.expectEqual(header.asU32(), frame.brDestination().asU32());
     try testing.expect(frame.isLoop());
 }
 
@@ -584,7 +548,7 @@ test "control stack if with else data" {
     try testing.expectEqual(@as(usize, 1), state.controlStackLen());
 
     const frame = state.getFrame(0);
-    try testing.expectEqual(destination, frame.brDestination());
+    try testing.expectEqual(destination.asU32(), frame.brDestination().asU32());
     try testing.expectEqual(@as(usize, 2), frame.numParamValues());
     try testing.expectEqual(@as(usize, 1), frame.numReturnValues());
 }

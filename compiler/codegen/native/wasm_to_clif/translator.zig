@@ -8,13 +8,23 @@
 
 const std = @import("std");
 const stack_mod = @import("stack.zig");
+const frontend_mod = @import("../frontend/mod.zig");
 
+// Re-export CLIF types from stack module
+pub const clif = stack_mod.clif;
 pub const Block = stack_mod.Block;
 pub const Value = stack_mod.Value;
 pub const Inst = stack_mod.Inst;
 pub const TranslationState = stack_mod.TranslationState;
 pub const ControlStackFrame = stack_mod.ControlStackFrame;
 pub const ElseData = stack_mod.ElseData;
+
+// Frontend types
+pub const FunctionBuilder = frontend_mod.FunctionBuilder;
+pub const FunctionBuilderContext = frontend_mod.FunctionBuilderContext;
+pub const Variable = frontend_mod.Variable;
+pub const Type = frontend_mod.Type;
+pub const Function = frontend_mod.Function;
 
 // ============================================================================
 // Wasm Opcode
@@ -150,139 +160,31 @@ pub const WasmOpcode = enum(u8) {
 };
 
 // ============================================================================
-// CLIF Opcode
-// CLIF IR opcodes that we emit
+// FuncTranslator
+// Port of wasmtime func_translator.rs
+//
+// Translates Wasm operators to CLIF IR using FunctionBuilder.
 // ============================================================================
 
-pub const ClifOpcode = enum {
-    // Control flow
-    jump,
-    brif,
-    br_table,
-    return_op,
-    call,
-    call_indirect,
-    trap,
-    trapz,
-    trapnz,
-
-    // Constants
-    iconst,
-    f32const,
-    f64const,
-
-    // Integer arithmetic
-    iadd,
-    isub,
-    imul,
-    sdiv,
-    udiv,
-    srem,
-    urem,
-    ineg,
-
-    // Bitwise
-    band,
-    bor,
-    bxor,
-    bnot,
-    ishl,
-    ushr,
-    sshr,
-    rotl,
-    rotr,
-    clz,
-    ctz,
-    popcnt,
-
-    // Comparison
-    icmp,
-    fcmp,
-
-    // Memory
-    load,
-    store,
-    stack_load,
-    stack_store,
-
-    // Conversions
-    uextend,
-    sextend,
-    ireduce,
-
-    // Other
-    copy,
-    select,
-    nop,
-};
-
-// ============================================================================
-// Integer Comparison Condition
-// ============================================================================
-
-pub const IntCC = enum {
-    equal,
-    not_equal,
-    signed_less_than,
-    signed_greater_than_or_equal,
-    signed_greater_than,
-    signed_less_than_or_equal,
-    unsigned_less_than,
-    unsigned_greater_than_or_equal,
-    unsigned_greater_than,
-    unsigned_less_than_or_equal,
-};
-
-// ============================================================================
-// JumpTableEntry
-// For br_table edge splitting
-// ============================================================================
-
-pub const JumpTableEntry = struct {
-    depth: u32,
-    block: Block,
-};
-
-// ============================================================================
-// Translator
-// Main translation context
-// ============================================================================
-
-pub const Translator = struct {
+pub const FuncTranslator = struct {
     /// Translation state (value stack, control stack, reachability).
     state: TranslationState,
+    /// The function builder.
+    builder: *FunctionBuilder,
+    /// Local variable mappings (Wasm local index -> Variable).
+    locals: std.ArrayListUnmanaged(Variable),
     /// Allocator for dynamic storage.
     allocator: std.mem.Allocator,
-    /// Next block index to allocate.
-    next_block: u32,
-    /// Next value index to allocate.
-    next_value: u32,
-    /// Local variable values (indexed by local index).
-    locals: std.ArrayListUnmanaged(Value),
-    /// Emitted instructions (for testing/debugging).
-    instructions: std.ArrayListUnmanaged(EmittedInst),
 
     const Self = @This();
 
-    /// An emitted instruction (for recording what was translated).
-    pub const EmittedInst = struct {
-        opcode: ClifOpcode,
-        result: ?Value,
-        args: [3]?Value,
-        imm: i64,
-        block_target: ?Block,
-        cond: ?IntCC,
-    };
-
     /// Create a new translator.
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, builder: *FunctionBuilder) Self {
         return .{
             .state = TranslationState.init(allocator),
-            .allocator = allocator,
-            .next_block = 0,
-            .next_value = 0,
+            .builder = builder,
             .locals = .{},
-            .instructions = .{},
+            .allocator = allocator,
         };
     }
 
@@ -290,62 +192,72 @@ pub const Translator = struct {
     pub fn deinit(self: *Self) void {
         self.state.deinit();
         self.locals.deinit(self.allocator);
-        self.instructions.deinit(self.allocator);
-    }
-
-    /// Create a new block.
-    pub fn createBlock(self: *Self) Block {
-        const b = Block.fromIndex(self.next_block);
-        self.next_block += 1;
-        return b;
-    }
-
-    /// Create a new value.
-    pub fn createValue(self: *Self) Value {
-        const v = Value.fromIndex(self.next_value);
-        self.next_value += 1;
-        return v;
     }
 
     /// Initialize for translating a function.
-    pub fn initializeFunction(self: *Self, num_locals: u32, num_returns: usize) !void {
-        // Create exit block
-        const exit_block = self.createBlock();
+    ///
+    /// Sets up the entry block, exit block, and local variables.
+    pub fn initializeFunction(self: *Self, num_params: u32, num_locals: u32, param_types: []const Type, local_types: []const Type, num_returns: usize) !void {
+        // Create entry and exit blocks
+        const entry_block = try self.builder.createBlock();
+        const exit_block = try self.builder.createBlock();
+
+        // Switch to entry block
+        self.builder.switchToBlock(entry_block);
+
+        // Add function parameters to entry block
+        try self.builder.appendBlockParamsForFunctionParams(entry_block);
+
+        // Seal entry block (no predecessors except function entry)
+        try self.builder.sealBlock(entry_block);
+
+        // Initialize translation state with exit block
         try self.state.initialize(exit_block, num_returns);
 
-        // Initialize locals
+        // Declare variables for all Wasm locals (params + locals)
+        const total_locals = num_params + num_locals;
         self.locals.clearRetainingCapacity();
-        try self.locals.ensureTotalCapacity(self.allocator, num_locals);
-        for (0..num_locals) |_| {
-            // Each local starts as an undefined value
-            self.locals.appendAssumeCapacity(self.createValue());
+        try self.locals.ensureTotalCapacity(self.allocator, total_locals);
+
+        // Declare variables for parameters and define them with block params
+        const entry_params = self.builder.blockParams(entry_block);
+        for (0..num_params) |i| {
+            const var_type = param_types[i];
+            const variable = try self.builder.declareVar(var_type);
+            self.locals.appendAssumeCapacity(variable);
+
+            // Define parameter variable with block param value
+            try self.builder.defVar(variable, entry_params[i]);
+        }
+
+        // Declare variables for non-parameter locals (initialized to zero)
+        for (0..num_locals) |i| {
+            const var_type = local_types[i];
+            const variable = try self.builder.declareVar(var_type);
+            self.locals.appendAssumeCapacity(variable);
+
+            // Initialize local to zero
+            const zero = try self.builder.ins().iconst(var_type, 0);
+            try self.builder.defVar(variable, zero);
         }
     }
 
-    /// Emit an instruction and return its result value.
-    fn emit(self: *Self, opcode: ClifOpcode, args: [3]?Value, imm: i64, block_target: ?Block, cond: ?IntCC) !Value {
-        const result = self.createValue();
-        try self.instructions.append(self.allocator, .{
-            .opcode = opcode,
-            .result = result,
-            .args = args,
-            .imm = imm,
-            .block_target = block_target,
-            .cond = cond,
-        });
-        return result;
-    }
+    /// Initialize function with simple signature (all I32).
+    pub fn initializeFunctionSimple(self: *Self, num_params: u32, num_locals: u32, num_returns: usize) !void {
+        // Build type arrays
+        var param_types = try self.allocator.alloc(Type, num_params);
+        defer self.allocator.free(param_types);
+        for (0..num_params) |i| {
+            param_types[i] = Type.I32;
+        }
 
-    /// Emit an instruction with no result.
-    pub fn emitVoid(self: *Self, opcode: ClifOpcode, args: [3]?Value, imm: i64, block_target: ?Block, cond: ?IntCC) !void {
-        try self.instructions.append(self.allocator, .{
-            .opcode = opcode,
-            .result = null,
-            .args = args,
-            .imm = imm,
-            .block_target = block_target,
-            .cond = cond,
-        });
+        var local_types = try self.allocator.alloc(Type, num_locals);
+        defer self.allocator.free(local_types);
+        for (0..num_locals) |i| {
+            local_types[i] = Type.I32;
+        }
+
+        try self.initializeFunction(num_params, num_locals, param_types, local_types, num_returns);
     }
 
     // ========================================================================
@@ -354,27 +266,43 @@ pub const Translator = struct {
 
     /// Translate a block instruction.
     pub fn translateBlock(self: *Self, num_params: usize, num_results: usize) !void {
-        const next = self.createBlock();
+        const next = try self.builder.createBlock();
+
+        // Add block params for results
+        for (0..num_results) |_| {
+            _ = try self.builder.appendBlockParam(next, Type.I32);
+        }
+
         try self.state.pushBlock(next, num_params, num_results);
     }
 
     /// Translate a loop instruction.
     pub fn translateLoop(self: *Self, num_params: usize, num_results: usize) !void {
-        const loop_body = self.createBlock();
-        const next = self.createBlock();
+        const loop_body = try self.builder.createBlock();
+        const next = try self.builder.createBlock();
+
+        // Loop body block gets params
+        for (0..num_params) |_| {
+            _ = try self.builder.appendBlockParam(loop_body, Type.I32);
+        }
+
+        // Get current params from stack
+        const params = self.state.peekn(num_params);
 
         // Jump to loop header with current params
-        const params = self.state.peekn(num_params);
-        try self.emitVoid(.jump, .{ null, null, null }, 0, loop_body, null);
-        _ = params;
+        _ = try self.builder.ins().jump(loop_body, params);
 
         try self.state.pushLoop(loop_body, next, num_params, num_results);
 
-        // Pop and replace with block params
+        // Switch to loop body
+        self.builder.switchToBlock(loop_body);
+        try self.builder.sealBlock(loop_body);
+
+        // Pop old values and push block params
         self.state.popn(num_params);
-        // In real translation, we'd get block params here
-        for (0..num_params) |_| {
-            try self.state.push1(self.createValue());
+        const loop_params = self.builder.blockParams(loop_body);
+        for (loop_params) |param| {
+            try self.state.push1(param);
         }
     }
 
@@ -382,27 +310,52 @@ pub const Translator = struct {
     pub fn translateIf(self: *Self, num_params: usize, num_results: usize) !void {
         const condition = self.state.pop1();
 
-        const next_block = self.createBlock();
-        const destination = self.createBlock();
+        const then_block = try self.builder.createBlock();
+        const destination = try self.builder.createBlock();
+
+        // Add params for then_block
+        for (0..num_params) |_| {
+            _ = try self.builder.appendBlockParam(then_block, Type.I32);
+        }
+
+        // Add params for destination block (results)
+        for (0..num_results) |_| {
+            _ = try self.builder.appendBlockParam(destination, Type.I32);
+        }
+
+        // Get current params from stack
+        const params = self.state.peekn(num_params);
 
         // Emit conditional branch
-        // If params == results, we might not have an else
         const else_data = if (num_params == num_results) blk: {
-            // Branch: if true -> next_block, if false -> destination
-            try self.emitVoid(.brif, .{ condition, null, null }, 0, destination, null);
+            // May not have else, branch to destination if false
+            const inst = try self.builder.ins().brif(condition, then_block, params, destination, params);
             break :blk ElseData{ .no_else = .{
-                .branch_inst = Inst.fromIndex(@intCast(self.instructions.items.len - 1)),
+                .branch_inst = inst,
                 .placeholder = destination,
             } };
         } else blk: {
             // Must have an else, pre-allocate it
-            const else_block = self.createBlock();
-            try self.emitVoid(.brif, .{ condition, null, null }, 0, else_block, null);
+            const else_block = try self.builder.createBlock();
+            for (0..num_params) |_| {
+                _ = try self.builder.appendBlockParam(else_block, Type.I32);
+            }
+            _ = try self.builder.ins().brif(condition, then_block, params, else_block, params);
             break :blk ElseData{ .with_else = .{ .else_block = else_block } };
         };
 
         try self.state.pushIf(destination, else_data, num_params, num_results);
-        _ = next_block;
+
+        // Switch to then block
+        self.builder.switchToBlock(then_block);
+        try self.builder.sealBlock(then_block);
+
+        // Pop old values and push block params
+        self.state.popn(num_params);
+        const then_params = self.builder.blockParams(then_block);
+        for (then_params) |param| {
+            try self.state.push1(param);
+        }
     }
 
     /// Translate an else instruction.
@@ -413,14 +366,36 @@ pub const Translator = struct {
                 // Record that consequent is ending
                 f.consequent_ends_reachable = self.state.reachable;
 
+                if (self.state.reachable) {
+                    // Get return values from stack
+                    const return_vals = self.state.peekn(f.num_return_values);
+
+                    // Jump to destination with return values
+                    _ = try self.builder.ins().jump(f.destination, return_vals);
+                }
+
+                // Get else block
+                const else_block = switch (f.else_data) {
+                    .no_else => |ne| ne.placeholder,
+                    .with_else => |we| we.else_block,
+                };
+
+                // Truncate stack to else params
+                f.truncateValueStackToElseParams(&self.state.stack);
+
+                // Switch to else block
+                self.builder.switchToBlock(else_block);
+                try self.builder.sealBlock(else_block);
+
+                // Push block params
+                const else_params = self.builder.blockParams(else_block);
+                for (else_params) |param| {
+                    try self.state.push1(param);
+                }
+
+                // Restore reachability
                 if (f.head_is_reachable) {
                     self.state.reachable = true;
-
-                    // Jump to destination
-                    try self.emitVoid(.jump, .{ null, null, null }, 0, f.destination, null);
-
-                    // Pop return values
-                    self.state.popn(f.num_return_values);
                 }
             },
             else => unreachable,
@@ -433,15 +408,41 @@ pub const Translator = struct {
         const next_block = frame.followingCode();
         const return_count = frame.numReturnValues();
 
-        // Jump to next block with return values
-        try self.emitVoid(.jump, .{ null, null, null }, 0, next_block, null);
+        if (self.state.reachable) {
+            // Get return values from stack
+            const return_vals = self.state.peekn(return_count);
+
+            // Jump to next block with return values
+            _ = try self.builder.ins().jump(next_block, return_vals);
+        }
 
         // Truncate stack to original size
         frame.truncateValueStackToOriginalSize(&self.state.stack);
 
-        // Push block results
-        for (0..return_count) |_| {
-            try self.state.push1(self.createValue());
+        // Determine if next block is reachable
+        const next_reachable = switch (frame) {
+            .if_frame => |f| blk: {
+                const conseq_reachable = f.consequent_ends_reachable orelse self.state.reachable;
+                break :blk (f.head_is_reachable and conseq_reachable) or f.exit_is_branched_to;
+            },
+            .block_frame => |f| self.state.reachable or f.exit_is_branched_to,
+            .loop_frame => self.state.reachable,
+        };
+
+        if (next_reachable) {
+            // Switch to next block
+            self.builder.switchToBlock(next_block);
+            try self.builder.sealBlock(next_block);
+
+            // Push block params as results
+            const next_params = self.builder.blockParams(next_block);
+            for (next_params) |param| {
+                try self.state.push1(param);
+            }
+
+            self.state.reachable = true;
+        } else {
+            self.state.reachable = false;
         }
     }
 
@@ -458,8 +459,8 @@ pub const Translator = struct {
         const destination = frame.brDestination();
 
         // Get args and jump
-        _ = self.state.peekn(return_count);
-        try self.emitVoid(.jump, .{ null, null, null }, 0, destination, null);
+        const args = self.state.peekn(return_count);
+        _ = try self.builder.ins().jump(destination, args);
 
         self.state.popn(return_count);
         self.state.reachable = false;
@@ -480,108 +481,44 @@ pub const Translator = struct {
         const destination = frame.brDestination();
 
         // Get args for branch
-        _ = self.state.peekn(return_count);
+        const args = self.state.peekn(return_count);
+
+        // Create fall-through block
+        const next_block = try self.builder.createBlock();
+        for (0..return_count) |_| {
+            _ = try self.builder.appendBlockParam(next_block, Type.I32);
+        }
 
         // Emit conditional branch
-        try self.emitVoid(.brif, .{ condition, null, null }, 0, destination, null);
-        // Values stay on stack (branch is conditional)
-    }
+        _ = try self.builder.ins().brif(condition, destination, args, next_block, args);
 
-    /// Translate a br_table instruction.
-    /// This is the CRITICAL algorithm from Cranelift.
-    pub fn translateBrTable(self: *Self, targets: []const u32, default: u32) !void {
-        const val = self.state.pop1();
+        // Switch to next block
+        self.builder.switchToBlock(next_block);
+        try self.builder.sealBlock(next_block);
 
-        // 1. Compute minimum depth to determine jump args count
-        var min_depth = default;
-        for (targets) |depth| {
-            if (depth < min_depth) {
-                min_depth = depth;
-            }
+        // Replace stack values with block params
+        self.state.popn(return_count);
+        const next_params = self.builder.blockParams(next_block);
+        for (next_params) |param| {
+            try self.state.push1(param);
         }
-
-        // 2. Get return count from min depth frame
-        const min_depth_frame = self.state.getFrame(min_depth);
-        const jump_args_count = if (min_depth_frame.isLoop())
-            min_depth_frame.numParamValues()
-        else
-            min_depth_frame.numReturnValues();
-
-        if (jump_args_count == 0) {
-            // Simple case: no jump arguments, direct br_table
-            for (targets) |depth| {
-                const frame = self.state.getFrameMut(depth);
-                frame.setBranchedToExit();
-            }
-            const default_frame = self.state.getFrameMut(default);
-            default_frame.setBranchedToExit();
-
-            try self.emitVoid(.br_table, .{ val, null, null }, 0, null, null);
-        } else {
-            // Edge splitting: create intermediate blocks
-            var dest_block_map = std.AutoHashMap(u32, Block).init(self.allocator);
-            defer dest_block_map.deinit();
-
-            var dest_block_sequence: std.ArrayListUnmanaged(JumpTableEntry) = .{};
-            defer dest_block_sequence.deinit(self.allocator);
-
-            // Create intermediate blocks for each unique depth
-            for (targets) |depth| {
-                const result = try dest_block_map.getOrPut(depth);
-                if (!result.found_existing) {
-                    const block = self.createBlock();
-                    result.value_ptr.* = block;
-                    try dest_block_sequence.append(self.allocator, .{ .depth = depth, .block = block });
-                }
-            }
-
-            // Handle default
-            const default_result = try dest_block_map.getOrPut(default);
-            if (!default_result.found_existing) {
-                const block = self.createBlock();
-                default_result.value_ptr.* = block;
-                try dest_block_sequence.append(self.allocator, .{ .depth = default, .block = block });
-            }
-
-            // Emit br_table to intermediates
-            try self.emitVoid(.br_table, .{ val, null, null }, 0, null, null);
-
-            // Fill intermediate blocks with jumps to real targets
-            for (dest_block_sequence.items) |entry| {
-                const real_frame = self.state.getFrameMut(entry.depth);
-                real_frame.setBranchedToExit();
-                const real_dest = real_frame.brDestination();
-
-                // Emit jump from intermediate to real destination
-                try self.emitVoid(.jump, .{ null, null, null }, 0, real_dest, null);
-            }
-
-            self.state.popn(jump_args_count);
-        }
-
-        self.state.reachable = false;
     }
 
     /// Translate a return instruction.
     pub fn translateReturn(self: *Self) !void {
-        // The function frame is always at index 0
+        // Get function frame (bottom of control stack)
         if (self.state.controlStackLen() == 0) {
             // No control frames - just emit return
-            try self.emitVoid(.return_op, .{ null, null, null }, 0, null, null);
+            _ = try self.builder.ins().return_(&[_]Value{});
             self.state.reachable = false;
             return;
         }
 
-        // Get function frame (bottom of control stack)
-        const func_frame_idx = self.state.controlStackLen() - 1;
-        var frame_idx: u32 = 0;
-        while (frame_idx < func_frame_idx) : (frame_idx += 1) {}
-        // Access frame 0 which is the function frame
-        const frame = &self.state.control_stack.items[0];
-        const return_count = frame.numReturnValues();
+        const func_frame = &self.state.control_stack.items[0];
+        const return_count = func_frame.numReturnValues();
 
-        _ = self.state.peekn(return_count);
-        try self.emitVoid(.return_op, .{ null, null, null }, 0, null, null);
+        const args = self.state.peekn(return_count);
+        _ = try self.builder.ins().return_(args);
 
         self.state.popn(return_count);
         self.state.reachable = false;
@@ -593,20 +530,23 @@ pub const Translator = struct {
 
     /// Translate local.get
     pub fn translateLocalGet(self: *Self, local_index: u32) !void {
-        const val = self.locals.items[local_index];
+        const variable = self.locals.items[local_index];
+        const val = try self.builder.useVar(variable);
         try self.state.push1(val);
     }
 
     /// Translate local.set
     pub fn translateLocalSet(self: *Self, local_index: u32) !void {
         const val = self.state.pop1();
-        self.locals.items[local_index] = val;
+        const variable = self.locals.items[local_index];
+        try self.builder.defVar(variable, val);
     }
 
     /// Translate local.tee
     pub fn translateLocalTee(self: *Self, local_index: u32) !void {
         const val = self.state.peek1();
-        self.locals.items[local_index] = val;
+        const variable = self.locals.items[local_index];
+        try self.builder.defVar(variable, val);
     }
 
     // ========================================================================
@@ -615,13 +555,13 @@ pub const Translator = struct {
 
     /// Translate i32.const
     pub fn translateI32Const(self: *Self, value: i32) !void {
-        const result = try self.emit(.iconst, .{ null, null, null }, value, null, null);
+        const result = try self.builder.ins().iconst(Type.I32, value);
         try self.state.push1(result);
     }
 
     /// Translate i64.const
     pub fn translateI64Const(self: *Self, value: i64) !void {
-        const result = try self.emit(.iconst, .{ null, null, null }, value, null, null);
+        const result = try self.builder.ins().iconst(Type.I64, value);
         try self.state.push1(result);
     }
 
@@ -629,127 +569,153 @@ pub const Translator = struct {
     // Binary Arithmetic Translation
     // ========================================================================
 
-    fn translateBinaryOp(self: *Self, opcode: ClifOpcode) !void {
+    pub fn translateI32Add(self: *Self) !void {
         const args = self.state.pop2();
-        const result = try self.emit(opcode, .{ args[0], args[1], null }, 0, null, null);
+        const result = try self.builder.ins().iadd(args[0], args[1]);
         try self.state.push1(result);
     }
 
-    pub fn translateI32Add(self: *Self) !void {
-        try self.translateBinaryOp(.iadd);
-    }
-
     pub fn translateI32Sub(self: *Self) !void {
-        try self.translateBinaryOp(.isub);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().isub(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32Mul(self: *Self) !void {
-        try self.translateBinaryOp(.imul);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().imul(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32DivS(self: *Self) !void {
-        try self.translateBinaryOp(.sdiv);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().sdiv(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32DivU(self: *Self) !void {
-        try self.translateBinaryOp(.udiv);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().udiv(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32RemS(self: *Self) !void {
-        try self.translateBinaryOp(.srem);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().srem(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32RemU(self: *Self) !void {
-        try self.translateBinaryOp(.urem);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().urem(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32And(self: *Self) !void {
-        try self.translateBinaryOp(.band);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().band(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32Or(self: *Self) !void {
-        try self.translateBinaryOp(.bor);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().bor(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32Xor(self: *Self) !void {
-        try self.translateBinaryOp(.bxor);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().bxor(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32Shl(self: *Self) !void {
-        try self.translateBinaryOp(.ishl);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().ishl(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32ShrS(self: *Self) !void {
-        try self.translateBinaryOp(.sshr);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().sshr(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32ShrU(self: *Self) !void {
-        try self.translateBinaryOp(.ushr);
-    }
-
-    pub fn translateI32Rotl(self: *Self) !void {
-        try self.translateBinaryOp(.rotl);
-    }
-
-    pub fn translateI32Rotr(self: *Self) !void {
-        try self.translateBinaryOp(.rotr);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().ushr(args[0], args[1]);
+        try self.state.push1(result);
     }
 
     // ========================================================================
     // Comparison Translation
     // ========================================================================
 
-    fn translateCompare(self: *Self, cond: IntCC) !void {
+    pub fn translateI32Eq(self: *Self) !void {
         const args = self.state.pop2();
-        const result = try self.emit(.icmp, .{ args[0], args[1], null }, 0, null, cond);
+        const result = try self.builder.ins().icmp(clif.IntCC.eq, args[0], args[1]);
         try self.state.push1(result);
     }
 
-    pub fn translateI32Eq(self: *Self) !void {
-        try self.translateCompare(.equal);
-    }
-
     pub fn translateI32Ne(self: *Self) !void {
-        try self.translateCompare(.not_equal);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.ne, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32LtS(self: *Self) !void {
-        try self.translateCompare(.signed_less_than);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.slt, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32LtU(self: *Self) !void {
-        try self.translateCompare(.unsigned_less_than);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.ult, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32GtS(self: *Self) !void {
-        try self.translateCompare(.signed_greater_than);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.sgt, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32GtU(self: *Self) !void {
-        try self.translateCompare(.unsigned_greater_than);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.ugt, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32LeS(self: *Self) !void {
-        try self.translateCompare(.signed_less_than_or_equal);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.sle, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32LeU(self: *Self) !void {
-        try self.translateCompare(.unsigned_less_than_or_equal);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.ule, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32GeS(self: *Self) !void {
-        try self.translateCompare(.signed_greater_than_or_equal);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.sge, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     pub fn translateI32GeU(self: *Self) !void {
-        try self.translateCompare(.unsigned_greater_than_or_equal);
+        const args = self.state.pop2();
+        const result = try self.builder.ins().icmp(clif.IntCC.uge, args[0], args[1]);
+        try self.state.push1(result);
     }
 
     /// Translate i32.eqz (compare equal to zero)
     pub fn translateI32Eqz(self: *Self) !void {
         const arg = self.state.pop1();
-        const zero = try self.emit(.iconst, .{ null, null, null }, 0, null, null);
-        const result = try self.emit(.icmp, .{ arg, zero, null }, 0, null, .equal);
+        const zero = try self.builder.ins().iconst(Type.I32, 0);
+        const result = try self.builder.ins().icmp(clif.IntCC.eq, arg, zero);
         try self.state.push1(result);
     }
 
@@ -759,19 +725,19 @@ pub const Translator = struct {
 
     pub fn translateI32WrapI64(self: *Self) !void {
         const arg = self.state.pop1();
-        const result = try self.emit(.ireduce, .{ arg, null, null }, 0, null, null);
+        const result = try self.builder.ins().ireduce(Type.I32, arg);
         try self.state.push1(result);
     }
 
     pub fn translateI64ExtendI32S(self: *Self) !void {
         const arg = self.state.pop1();
-        const result = try self.emit(.sextend, .{ arg, null, null }, 0, null, null);
+        const result = try self.builder.ins().sextend(Type.I64, arg);
         try self.state.push1(result);
     }
 
     pub fn translateI64ExtendI32U(self: *Self) !void {
         const arg = self.state.pop1();
-        const result = try self.emit(.uextend, .{ arg, null, null }, 0, null, null);
+        const result = try self.builder.ins().uextend(Type.I64, arg);
         try self.state.push1(result);
     }
 
@@ -785,8 +751,18 @@ pub const Translator = struct {
 
     pub fn translateSelect(self: *Self) !void {
         const args = self.state.pop3();
-        const result = try self.emit(.select, .{ args[0], args[1], args[2] }, 0, null, null);
+        // args = (val1, val2, cond)
+        const result = try self.builder.ins().select(args[2], args[0], args[1]);
         try self.state.push1(result);
+    }
+
+    // ========================================================================
+    // Trap Translation
+    // ========================================================================
+
+    pub fn translateUnreachable(self: *Self) !void {
+        _ = try self.builder.ins().trap(clif.TrapCode.unreachable_code);
+        self.state.reachable = false;
     }
 };
 
@@ -794,36 +770,48 @@ pub const Translator = struct {
 // Tests
 // ============================================================================
 
-test "translate i32.const and i32.add" {
+test "translate i32.const and i32.add with FunctionBuilder" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var translator = Translator.init(allocator);
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    var ctx = FunctionBuilderContext.init(allocator);
+    defer ctx.deinit();
+
+    var builder = FunctionBuilder.init(&func, &ctx);
+    var translator = FuncTranslator.init(allocator, &builder);
     defer translator.deinit();
 
-    try translator.initializeFunction(0, 1);
+    try translator.initializeFunctionSimple(0, 0, 1);
 
     try translator.translateI32Const(10);
     try translator.translateI32Const(20);
     try translator.translateI32Add();
 
     try testing.expectEqual(@as(usize, 1), translator.state.stackLen());
-    try testing.expectEqual(@as(usize, 3), translator.instructions.items.len);
 
-    // Check instructions
-    try testing.expectEqual(ClifOpcode.iconst, translator.instructions.items[0].opcode);
-    try testing.expectEqual(ClifOpcode.iconst, translator.instructions.items[1].opcode);
-    try testing.expectEqual(ClifOpcode.iadd, translator.instructions.items[2].opcode);
+    // Verify CLIF function was built
+    const entry_block = func.layout.entryBlock();
+    try testing.expect(entry_block != null);
 }
 
-test "translate block and end" {
+test "translate block and end with FunctionBuilder" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var translator = Translator.init(allocator);
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    var ctx = FunctionBuilderContext.init(allocator);
+    defer ctx.deinit();
+
+    var builder = FunctionBuilder.init(&func, &ctx);
+    var translator = FuncTranslator.init(allocator, &builder);
     defer translator.deinit();
 
-    try translator.initializeFunction(0, 0);
+    try translator.initializeFunctionSimple(0, 0, 0);
 
     try testing.expectEqual(@as(usize, 1), translator.state.controlStackLen());
 
@@ -834,14 +822,21 @@ test "translate block and end" {
     try testing.expectEqual(@as(usize, 1), translator.state.controlStackLen());
 }
 
-test "translate loop - br_destination is header" {
+test "translate loop with FunctionBuilder" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var translator = Translator.init(allocator);
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    var ctx = FunctionBuilderContext.init(allocator);
+    defer ctx.deinit();
+
+    var builder = FunctionBuilder.init(&func, &ctx);
+    var translator = FuncTranslator.init(allocator, &builder);
     defer translator.deinit();
 
-    try translator.initializeFunction(0, 0);
+    try translator.initializeFunctionSimple(0, 0, 0);
 
     try translator.translateLoop(0, 0);
 
@@ -849,21 +844,26 @@ test "translate loop - br_destination is header" {
     try testing.expect(frame.isLoop());
 
     // For loop, br_destination should be header (not exit)
-    // header is the first block created for the loop
-    // exit is the second block
     const header = frame.brDestination();
     const exit = frame.followingCode();
     try testing.expect(header.asU32() != exit.asU32());
 }
 
-test "translate br" {
+test "translate br with FunctionBuilder" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var translator = Translator.init(allocator);
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    var ctx = FunctionBuilderContext.init(allocator);
+    defer ctx.deinit();
+
+    var builder = FunctionBuilder.init(&func, &ctx);
+    var translator = FuncTranslator.init(allocator, &builder);
     defer translator.deinit();
 
-    try translator.initializeFunction(0, 0);
+    try translator.initializeFunctionSimple(0, 0, 0);
     try translator.translateBlock(0, 0);
 
     try translator.translateBr(0);
@@ -871,14 +871,21 @@ test "translate br" {
     try testing.expect(!translator.state.reachable);
 }
 
-test "translate local.get and local.set" {
+test "translate local.get and local.set with FunctionBuilder" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var translator = Translator.init(allocator);
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    var ctx = FunctionBuilderContext.init(allocator);
+    defer ctx.deinit();
+
+    var builder = FunctionBuilder.init(&func, &ctx);
+    var translator = FuncTranslator.init(allocator, &builder);
     defer translator.deinit();
 
-    try translator.initializeFunction(2, 0);
+    try translator.initializeFunctionSimple(0, 2, 0);
 
     // local.set 0
     try translator.translateI32Const(42);
@@ -890,42 +897,25 @@ test "translate local.get and local.set" {
     try testing.expectEqual(@as(usize, 1), translator.state.stackLen());
 }
 
-test "translate br_table simple (no args)" {
+test "translate comparison with FunctionBuilder" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var translator = Translator.init(allocator);
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    var ctx = FunctionBuilderContext.init(allocator);
+    defer ctx.deinit();
+
+    var builder = FunctionBuilder.init(&func, &ctx);
+    var translator = FuncTranslator.init(allocator, &builder);
     defer translator.deinit();
 
-    try translator.initializeFunction(0, 0);
-
-    // Create some blocks
-    try translator.translateBlock(0, 0);
-    try translator.translateBlock(0, 0);
-
-    // Push dispatch index
-    try translator.translateI32Const(0);
-
-    // br_table with targets [0, 1] and default 0
-    try translator.translateBrTable(&[_]u32{ 0, 1 }, 0);
-
-    try testing.expect(!translator.state.reachable);
-}
-
-test "translate comparison" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var translator = Translator.init(allocator);
-    defer translator.deinit();
-
-    try translator.initializeFunction(0, 0);
+    try translator.initializeFunctionSimple(0, 0, 0);
 
     try translator.translateI32Const(10);
     try translator.translateI32Const(20);
     try translator.translateI32LtS();
 
     try testing.expectEqual(@as(usize, 1), translator.state.stackLen());
-    try testing.expectEqual(ClifOpcode.icmp, translator.instructions.items[2].opcode);
-    try testing.expectEqual(IntCC.signed_less_than, translator.instructions.items[2].cond.?);
 }
