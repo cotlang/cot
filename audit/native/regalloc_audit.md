@@ -20,7 +20,7 @@
 | 6.7 | SSA Validation | ssa.rs | ssa.zig | ✅ Done | 1/1 |
 | 6.8 | Index Set | indexset.rs | indexset.zig | ✅ Done | 7/7 |
 | 6.9 | Parallel Moves | moves.rs | moves.zig | ✅ Done | 7/7 |
-| 6.10 | Ion Data Structures | ion/data_structures.rs | ion/data.zig | ⏳ TODO | - |
+| 6.10 | Ion Data Structures | ion/data_structures.rs | ion_data.zig | ✅ Done | 6/6 |
 | 6.11 | Liveness Analysis | ion/liveranges.rs | ion/liveness.zig | ⏳ TODO | - |
 | 6.12 | Liverange Building | ion/liveranges.rs | ion/liveranges.zig | ⏳ TODO | - |
 | 6.13 | Bundle Merging | ion/merge.rs | ion/merge.zig | ⏳ TODO | - |
@@ -499,15 +499,83 @@ Also provides `FunctionVTable` for runtime dispatch when needed.
 
 ---
 
+## Phase 6.10: Ion Data Structures (ion_data.zig)
+
+**Source**: `src/ion/data_structures.rs`
+**Target**: `compiler/codegen/native/regalloc/ion_data.zig`
+**Status**: ✅ Complete (~750 LOC, 6 tests)
+
+### Index Types
+
+| Rust Type | Zig Type | Notes |
+|-----------|----------|-------|
+| `LiveRangeIndex` | `LiveRangeIndex` | Index into live ranges array |
+| `LiveBundleIndex` | `LiveBundleIndex` | Index into bundles array |
+| `SpillSetIndex` | `SpillSetIndex` | Index into spill sets array |
+| `UseIndex` | `UseIndex` | Index into uses array |
+| `VRegIndex` | `VRegIndex` | Index into vregs array |
+| `PRegIndex` | `PRegIndex` | Index into pregs array |
+| `SpillSlotIndex` | `SpillSlotIndex` | Index into spill slots array |
+
+### Core Types
+
+| Rust Type | Zig Type | Notes |
+|-----------|----------|-------|
+| `CodeRange` | `CodeRange` | Range [from, to) of ProgPoints |
+| `Use` | `Use` | Use of vreg at a position |
+| `LiveRange` | `LiveRange` | Contiguous live range of a vreg |
+| `LiveRangeFlag` | `LiveRangeFlag` | Flags: starts_at_def |
+| `SpillWeight` | `SpillWeight` | f32 stored as bits |
+| `LiveBundle` | `LiveBundle` | Bundle of ranges to allocate together |
+| `SpillSet` | `SpillSet` | Bundles sharing a spill slot |
+| `VRegData` | `VRegData` | Per-vreg data |
+| `PRegData` | `PRegData` | Per-preg allocation data |
+
+### Support Types
+
+| Rust Type | Zig Type | Notes |
+|-----------|----------|-------|
+| `LiveRangeKey` | `LiveRangeKey` | Key for overlap comparison |
+| `LiveRangeSet` | `LiveRangeSet` | Set of ranges (overlap check) |
+| `BlockparamOut` | `BlockparamOut` | Outgoing block param |
+| `BlockparamIn` | `BlockparamIn` | Incoming block param |
+| `MultiFixedRegFixup` | `MultiFixedRegFixup` | Multi-constraint fixup |
+| `FixedRegFixupLevel` | `FixedRegFixupLevel` | Initial/Secondary |
+| `PrioQueue` | `PrioQueue` | Bundle allocation queue |
+| `PrioQueueEntry` | `PrioQueueEntry` | Entry with prio/bundle/hint |
+| `InsertMovePrio` | `InsertMovePrio` | Move insertion priority |
+| `PosWithPrio` | `PosWithPrio` | Position + priority for sorting |
+| `InsertedMove` | `InsertedMove` | Move to insert |
+| `InsertedMoves` | `InsertedMoves` | List of moves |
+| `Edits` | `Edits` | List of edits with priority |
+| `SpillSetRanges` | `SpillSetRanges` | Ranges for spill set |
+| `SpillSlotData` | `SpillSlotData` | Data for a spill slot |
+| `SpillSlotList` | `SpillSlotList` | List of spill slots |
+
+### Constants
+
+| Constant | Value |
+|----------|-------|
+| `BUNDLE_MAX_SPILL_WEIGHT` | (1 << 28) - 1 |
+| `MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT` | BUNDLE_MAX_SPILL_WEIGHT |
+| `MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT` | BUNDLE_MAX_SPILL_WEIGHT - 1 |
+| `MINIMAL_BUNDLE_SPILL_WEIGHT` | MINIMAL_LIMITED - 256 |
+| `BUNDLE_MAX_NORMAL_SPILL_WEIGHT` | MINIMAL - 1 |
+| `MAX_SPLITS_PER_SPILLSET` | 2 |
+
+---
+
 ## Remaining Phases (TODO)
 
-### Phase 6.10-6.18: Ion Allocator
-- Full backtracking register allocator
-- Live range analysis
+### Phase 6.11-6.18: Ion Allocator
+- Liveness analysis
+- Live range building
 - Bundle merging
 - Allocation loop
 - Spill slot assignment
 - Move insertion
+- Requirements
+- Reg traversal
 
 ### Phase 6.19: Public API (lib.zig)
 - `run()` function
