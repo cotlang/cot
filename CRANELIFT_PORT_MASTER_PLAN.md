@@ -994,81 +994,149 @@ zig build test
 
 ## Phase 6: Register Allocation
 
-**Source**: `regalloc2` crate
+**Source**: `regalloc2` crate (https://github.com/bytecodealliance/regalloc2)
 **Cot Target**: `compiler/codegen/native/regalloc/`
+**Status**: ✅ Complete (~6,400 LOC, 75 tests)
 
-### 6.1 Core Allocator
+### 6.0 Architecture Overview
 
-**Target**: `compiler/codegen/native/regalloc/allocator.zig`
+Regalloc2 uses the Ion backtracking allocator pattern:
+1. Liveness analysis → compute live ranges
+2. Build live ranges → group into bundles
+3. Bundle merging → coalesce compatible bundles
+4. Allocation loop → assign registers, split/evict on conflict
+5. Spill allocation → assign stack slots to spilled bundles
+6. Move insertion → insert moves at block boundaries
 
-**Audit Document**: `audit/clif/regalloc/allocator.zig.md`
+### 6.1 Completed Modules
 
-### 6.2 Liveness Analysis
+| Module | File | LOC | Tests | Description |
+|--------|------|-----|-------|-------------|
+| Core Types | index.zig | ~200 | 7 | Block, Inst, VReg, PReg, PRegSet, SpillSlot |
+| Operands | operand.zig | ~350 | 9 | Operand, Allocation, ProgPoint, Edit |
+| Function Interface | func.zig | ~200 | 4 | Function trait for VCode integration |
+| Machine Environment | env.zig | ~230 | 5 | MachineEnv for ISA-specific registers |
+| Output | output.zig | ~180 | 4 | Output, Stats, RegAllocError |
+| CFG Analysis | cfg.zig | ~420 | 5 | CFGInfo, postorder, domtree |
+| SSA Validation | ssa.zig | ~150 | 1 | validateSsa() |
+| Index Set | indexset.zig | ~430 | 7 | Sparse bit sets, adaptive maps |
+| Parallel Moves | moves.zig | ~450 | 7 | Parallel move resolution |
+| Ion Data Structures | ion_data.zig | ~750 | 6 | LiveRange, LiveBundle, SpillSet |
+| Liveness Analysis | liveness.zig | ~625 | 3 | computeLiveness(), buildLiveranges() |
+| Bundle Merging | merge.zig | ~710 | 10 | mergeVregBundles(), queueBundles() |
+| Allocation Loop | process.zig | ~950 | 3 | tryAllocateBundle(), evict/split |
+| Spill Allocation | spill.zig | ~577 | 4 | allocateSpillslots() |
+| Move Insertion | ion_moves.zig | ~810 | 4 | applyAllocationsAndInsertMoves() |
+| Public API | regalloc.zig | ~384 | 2 | run(), runWithCtx(), reusable Ctx |
 
-**Target**: `compiler/codegen/native/regalloc/liveness.zig`
+### 6.2 Phase 6 Task Checklist
 
-**Audit Document**: `audit/clif/regalloc/liveness.zig.md`
+- [x] **6.1** Create `compiler/codegen/native/regalloc/` directory
+- [x] **6.2** Port core types (index.zig, operand.zig)
+- [x] **6.3** Port function interface (func.zig)
+- [x] **6.4** Port machine environment (env.zig)
+- [x] **6.5** Port output types (output.zig)
+- [x] **6.6** Port CFG analysis (cfg.zig)
+- [x] **6.7** Port SSA validation (ssa.zig)
+- [x] **6.8** Port index set (indexset.zig)
+- [x] **6.9** Port parallel moves (moves.zig)
+- [x] **6.10** Port ion data structures (ion_data.zig)
+- [x] **6.11** Port liveness analysis (liveness.zig)
+- [x] **6.12** Port bundle merging (merge.zig)
+- [x] **6.13** Port allocation loop (process.zig)
+- [x] **6.14** Port spill allocation (spill.zig)
+- [x] **6.15** Port move insertion (ion_moves.zig)
+- [x] **6.16** Port public API (regalloc.zig)
+- [x] **6.17** Create audit documents (17 files in audit/native/)
+- [x] **6.18** Run tests, verify all pass (75/75)
+- [x] **6.19** Commit: "Phase 6: Complete regalloc2 port"
 
-### 6.3 Interference Graph
+### 6.3 Audit Documents
 
-**Target**: `compiler/codegen/native/regalloc/interference.zig`
-
-**Audit Document**: `audit/clif/regalloc/interference.zig.md`
-
-### 6.4 Spill Code
-
-**Target**: `compiler/codegen/native/regalloc/spill.zig`
-
-**Audit Document**: `audit/clif/regalloc/spill.zig.md`
-
-### 6.5 Phase 6 Task Checklist
-
-- [ ] **6.1** Create `compiler/codegen/native/regalloc/` directory
-- [ ] **6.2** Port regalloc2 core → `allocator.zig`
-- [ ] **6.3** Create `audit/clif/regalloc/allocator.zig.md`
-- [ ] **6.4** Port liveness → `liveness.zig`
-- [ ] **6.5** Create `audit/clif/regalloc/liveness.zig.md`
-- [ ] **6.6** Port interference → `interference.zig`
-- [ ] **6.7** Create `audit/clif/regalloc/interference.zig.md`
-- [ ] **6.8** Port spill code → `spill.zig`
-- [ ] **6.9** Create `audit/clif/regalloc/spill.zig.md`
-- [ ] **6.10** Integration tests
-- [ ] **6.11** Commit: "Port regalloc2 register allocator"
+All audit documents are in `audit/native/`:
+- `regalloc_audit.md` - Master overview
+- `index_audit.md`, `operand_audit.md`, `func_audit.md`, `env_audit.md`
+- `output_audit.md`, `cfg_audit.md`, `ssa_audit.md`, `indexset_audit.md`
+- `moves_audit.md`, `ion_data_audit.md`, `liveranges_audit.md`
+- `merge_audit.md`, `process_audit.md`, `spill_audit.md`
+- `ion_moves_audit.md`, `regalloc_api_audit.md`
 
 ---
 
 ## Phase 7: Integration
 
-### 7.1 Driver Integration
+**STATUS**: 🟡 Ready to Start
 
-Update `compiler/driver.zig` to use new pipeline:
+### 7.0 Overview
 
-```zig
-// NEW native codegen path
-const clif = @import("ir/clif/clif.zig");
-const wasm_to_clif = @import("codegen/native/wasm_to_clif/wasm_to_clif.zig");
-const machinst = @import("codegen/native/machinst/machinst.zig");
-const aarch64 = @import("codegen/native/isa/aarch64/aarch64.zig");
-const x64 = @import("codegen/native/isa/x64/x64.zig");
-const regalloc = @import("codegen/native/regalloc/regalloc.zig");
+Phase 7 wires together all the ported components into a working native codegen pipeline.
+
+**Cranelift Pipeline** (what we're copying):
+```
+Context::compile()
+  └─ TargetIsa::compile_function()
+      └─ compile::<Backend>()
+          ├─ BlockLoweringOrder::new()
+          ├─ Lower::new()
+          ├─ Lower::lower()           → VCode with virtual registers
+          ├─ regalloc2::run()         → Physical register assignments
+          └─ VCode::emit()            → Binary machine code
 ```
 
-**Audit Document**: `audit/clif/integration/driver.zig.md`
+**Cot Target Pipeline**:
+```
+driver.zig: generateNativeCode()
+  ├─ wasm_parser: parse Wasm binary
+  ├─ wasm_to_clif: translate to CLIF IR
+  ├─ Lower::lower(): CLIF → VCode (MachInst with vregs)
+  ├─ regalloc::run(): VCode → regalloc output
+  ├─ VCode::emit(): Apply allocations, emit bytes
+  └─ macho/elf: Wrap in object file
+```
+
+### 7.1 Directory Structure
+
+```
+compiler/codegen/native/
+├── compile.zig          # NEW: Main compile orchestration (Phase 7.1)
+├── context.zig          # NEW: Compilation context (Phase 7.2)
+├── wasm_parser.zig      # EXISTING: Parse Wasm binary
+├── wasm_to_clif/        # EXISTING: Wasm → CLIF translation
+├── machinst/            # EXISTING: Machine instruction framework
+│   ├── vcode.zig        # VCode container
+│   ├── buffer.zig       # MachBuffer for emission
+│   └── lower.zig        # Lowering framework
+├── isa/
+│   ├── aarch64/         # EXISTING: ARM64 backend
+│   │   ├── lower.zig    # CLIF → ARM64 MachInst
+│   │   ├── emit.zig     # ARM64 MachInst → bytes
+│   │   └── abi.zig      # ARM64 ABI
+│   └── x64/             # EXISTING: x86-64 backend
+│       ├── lower.zig    # CLIF → x64 MachInst
+│       ├── emit.zig     # x64 MachInst → bytes
+│       └── abi.zig      # x64 ABI
+├── regalloc/            # EXISTING: Register allocator
+└── macho.zig, elf.zig   # EXISTING: Object file formats
+```
 
 ### 7.2 Phase 7 Task Checklist
 
-- [ ] **7.1** Wire CLIF IR into driver
-- [ ] **7.2** Wire Wasm→CLIF translator
-- [ ] **7.3** Wire lowering to MachInst
-- [ ] **7.4** Wire register allocation
-- [ ] **7.5** Wire code emission
-- [ ] **7.6** Wire object file generation
-- [ ] **7.7** End-to-end test: simple function
+See `PHASE7_EXECUTION_PLAN.md` for detailed implementation plan.
+
+Summary checklist:
+- [ ] **7.1** Create compile.zig - main orchestration
+- [ ] **7.2** Create context.zig - compilation context
+- [ ] **7.3** Implement VCode-to-regalloc2 adapter
+- [ ] **7.4** Implement emit with regalloc output
+- [ ] **7.5** Wire into driver.zig
+- [ ] **7.6** End-to-end test: return 42
+- [ ] **7.7** End-to-end test: arithmetic
 - [ ] **7.8** End-to-end test: control flow
 - [ ] **7.9** End-to-end test: function calls
 - [ ] **7.10** End-to-end test: memory operations
-- [ ] **7.11** Create `audit/clif/integration/driver.zig.md`
-- [ ] **7.12** Commit: "Integrate Cranelift-style native pipeline"
+- [ ] **7.11** Object file generation (Mach-O/ELF)
+- [ ] **7.12** Create audit documents
+- [ ] **7.13** Commit: "Phase 7: Integrate Cranelift-style native pipeline"
 
 ---
 
@@ -1087,43 +1155,53 @@ const regalloc = @import("codegen/native/regalloc/regalloc.zig");
 
 ### Current Status
 
-| Phase | Status | Progress |
-|-------|--------|----------|
-| 0: Removal | ✅ Complete | 28/28 |
-| 1: CLIF IR | ✅ Complete | 18/18 |
-| 2: Wasm Translation | ✅ Complete | 16/17 |
-| 3: MachInst | ✅ Complete | 16/16 |
-| 4: ARM64 | ✅ Core Complete | 23/23 core tasks, deferred: regalloc integration |
-| 5: x86-64 | 🟡 Ready to Start | 0/16 |
-| 6: Regalloc | Not Started | 0/11 |
-| 7: Integration | Not Started | 0/12 |
-| 8: Self-Hosting | Not Started | 0/4 |
-| **TOTAL** | | **88/136** |
+| Phase | Status | Progress | LOC |
+|-------|--------|----------|-----|
+| 0: Removal | ✅ Complete | 28/28 | -10,625 |
+| 1: CLIF IR | ✅ Complete | 18/18 | ~8,000 |
+| 2: Wasm Translation | ✅ Complete | 17/17 | ~4,500 |
+| 3: MachInst | ✅ Complete | 16/16 | ~9,000 |
+| 4: ARM64 | ✅ Complete | 23/23 | ~15,000 |
+| 5: x86-64 | ✅ Complete | 16/16 | ~8,400 |
+| 6: Regalloc | ✅ Complete | 19/19 | ~6,400 |
+| 7: Integration | 🟡 Ready | 0/13 | ~2,000 est |
+| 8: Self-Hosting | Not Started | 0/4 | TBD |
+| **TOTAL** | | **137/156** | **~43,300** |
 
-### Parallel Work Opportunity
+### What's Done
 
-**Phase 5 (x86-64) can be done in parallel with Phase 4 (ARM64)**.
+All infrastructure is in place:
+- **CLIF IR**: Complete type system, DFG, instructions, layout, builder
+- **Wasm→CLIF**: Complete translator with control flow, arithmetic, locals
+- **MachInst Framework**: VCode, buffer, ABI, lowering framework
+- **ARM64 Backend**: Full instruction set, emission, lowering, ABI
+- **x86-64 Backend**: Full instruction set, emission, lowering, ABI
+- **Register Allocator**: Complete Ion backtracking allocator from regalloc2
 
-The ARM64 pattern is now established:
-- `inst/args.zig` - Argument types with stub Reg/PReg/VReg
-- `inst/regs.zig` - Register utilities
-- `inst/mod.zig` - Instruction union and opcodes
-- `inst/emit.zig` - Encoding helpers and emission
+### What Remains
 
-Linux Claude can follow the same pattern for x64. See [Phase 5 section](#phase-5-x86-64-backend) for detailed instructions.
+**Phase 7: Integration** - Wire everything together:
+1. Create `compile.zig` orchestration module
+2. Implement VCode ↔ regalloc2 adapter
+3. Implement emission with physical registers
+4. Wire into driver.zig
+5. End-to-end tests
+6. Object file generation
 
-### Estimated LOC
+See `PHASE7_EXECUTION_PLAN.md` for detailed implementation plan.
 
-| Phase | Cranelift LOC | Cot Target LOC |
-|-------|---------------|----------------|
-| 1: CLIF IR | 10,500 | ~8,000 |
-| 2: Wasm Translation | 5,800 | ~4,500 |
-| 3: MachInst | 12,400 | ~9,000 |
-| 4: ARM64 | 20,700 | ~15,000 |
-| 5: x86-64 | 10,000 | ~7,500 |
-| 6: Regalloc | 5,000 | ~4,000 |
-| 7: Integration | - | ~1,000 |
-| **TOTAL** | **~64,400** | **~49,000** |
+### Estimated LOC Summary
+
+| Component | Cranelift LOC | Cot LOC | Status |
+|-----------|---------------|---------|--------|
+| CLIF IR | 10,500 | ~8,000 | ✅ |
+| Wasm Translation | 5,800 | ~4,500 | ✅ |
+| MachInst Framework | 12,400 | ~9,000 | ✅ |
+| ARM64 Backend | 20,700 | ~15,000 | ✅ |
+| x86-64 Backend | 10,000 | ~8,400 | ✅ |
+| Register Allocator | 12,631 | ~6,400 | ✅ |
+| Integration | ~2,000 | ~2,000 | 🟡 |
+| **TOTAL** | **~74,000** | **~53,300** | **92%** |
 
 ---
 
