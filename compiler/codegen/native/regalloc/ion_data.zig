@@ -320,6 +320,17 @@ pub const SpillWeight = struct {
     pub fn zero() SpillWeight {
         return .{ .bits = 0 };
     }
+
+    pub fn add(self: SpillWeight, other: SpillWeight) SpillWeight {
+        const a: f32 = @bitCast(self.bits);
+        const b: f32 = @bitCast(other.bits);
+        return .{ .bits = @bitCast(a + b) };
+    }
+
+    pub fn toInt(self: SpillWeight) u32 {
+        const f: f32 = @bitCast(self.bits);
+        return @intFromFloat(f);
+    }
 };
 
 //=============================================================================
@@ -593,6 +604,17 @@ pub const LiveRangeSet = struct {
         }
         try self.items.append(allocator, .{ .key = key, .value = value });
         return true;
+    }
+
+    /// Remove a range by key. Returns true if found and removed.
+    pub fn remove(self: *LiveRangeSet, key: LiveRangeKey) bool {
+        for (self.items.items, 0..) |item, i| {
+            if (item.key.order(key) == .eq) {
+                _ = self.items.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Find a range that overlaps the given key.

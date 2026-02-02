@@ -312,8 +312,8 @@ pub const PReg = struct {
 /// A set of physical registers, implemented as a bitset.
 /// Guaranteed to have constant, small size.
 pub const PRegSet = struct {
-    const BITS_PER_ELEMENT: usize = 64;
-    const LEN: usize = (PReg.NUM_INDEX + BITS_PER_ELEMENT - 1) / BITS_PER_ELEMENT;
+    pub const BITS_PER_ELEMENT: usize = 64;
+    pub const LEN: usize = (PReg.NUM_INDEX + BITS_PER_ELEMENT - 1) / BITS_PER_ELEMENT;
 
     bits: [LEN]u64,
 
