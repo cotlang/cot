@@ -31,7 +31,6 @@ const arc = @import("codegen/arc.zig"); // ARC runtime
 
 // Native codegen modules (Cranelift-style AOT compiler)
 const native_compile = @import("codegen/native/compile.zig");
-const native_compiler = @import("codegen/native/compiler.zig");
 const wasm_parser = @import("codegen/native/wasm_parser.zig");
 const wasm_to_clif = @import("codegen/native/wasm_to_clif/translator.zig");
 const macho = @import("codegen/native/macho.zig");
@@ -301,21 +300,10 @@ pub const Driver = struct {
         };
         pipeline_debug.log(.codegen, "driver: target: {s} / {s}", .{ arch_name, os_name });
 
-        // Step 2: Compile module using the Cranelift-style compiler
-        var compiler = native_compiler.Compiler.initNative(self.allocator);
-        defer compiler.deinit();
-
-        const object_code = compiler.compileModule(&wasm_module) catch |e| {
-            pipeline_debug.log(.codegen, "driver: native compilation error: {any}", .{e});
-            // Return specific error or fallback
-            return switch (e) {
-                error.NotImplemented => error.NativeCodegenNotImplemented,
-                else => error.NativeCodegenNotImplemented,
-            };
-        };
-
-        pipeline_debug.log(.codegen, "driver: generated {d} bytes of native code", .{object_code.len});
-        return object_code;
+        // Native AOT compilation not yet integrated.
+        // See CRANELIFT_PORT_MASTER_PLAN.md for implementation status.
+        // Integration requires: wasm_to_clif translation + native_compile pipeline.
+        return error.NativeCodegenNotImplemented;
     }
 
     /// Generate WebAssembly binary.

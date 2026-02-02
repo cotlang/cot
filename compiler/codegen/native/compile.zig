@@ -263,10 +263,7 @@ pub fn compile(
     // Each ISA has different VCode instruction types, so we need separate paths
     return switch (isa) {
         .aarch64 => |backend| try compileAArch64(allocator, clif_func, backend),
-        .x64 => {
-            // x64 backend has type mismatches that need fixing - TODO
-            return error.X64BackendNotYetIntegrated;
-        },
+        .x64 => |backend| try compileX64(allocator, clif_func, backend),
     };
 }
 

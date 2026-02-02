@@ -271,12 +271,12 @@ pub const X64LowerBackend = struct {
                 ctx.emit(Inst{
                     .jmp_cond = .{
                         .cc = .nz,
-                        .target = taken,
+                        .taken = taken,
+                        .not_taken = not_taken,
                     },
                 }) catch return null;
 
-                // Fallthrough or unconditional jump to not_taken
-                ctx.emit(Inst.genJump(not_taken)) catch return null;
+                // jmp_cond already handles both branches, no fallthrough needed
             },
             .br_table => {
                 // Jump table - not yet implemented
