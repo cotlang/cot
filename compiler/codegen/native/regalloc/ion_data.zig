@@ -852,6 +852,29 @@ pub const SpillSetRanges = struct {
     pub fn deinit(self: *SpillSetRanges, allocator: std.mem.Allocator) void {
         self.items.deinit(allocator);
     }
+
+    /// Check if any range overlaps the given key.
+    pub fn containsKey(self: *const SpillSetRanges, key: LiveRangeKey) bool {
+        for (self.items.items) |item| {
+            if (item.key.order(key) == .eq) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Insert a range. Returns the previous value if key overlapped.
+    pub fn insert(self: *SpillSetRanges, allocator: std.mem.Allocator, key: LiveRangeKey, value: SpillSetIndex) !?SpillSetIndex {
+        for (self.items.items) |*item| {
+            if (item.key.order(key) == .eq) {
+                const old = item.value;
+                item.value = value;
+                return old;
+            }
+        }
+        try self.items.append(allocator, .{ .key = key, .value = value });
+        return null;
+    }
 };
 
 pub const SpillSlotData = struct {
