@@ -304,7 +304,8 @@ pub const X64LowerBackend = struct {
 
         // Allocate destination register
         const dst = ctx.allocTmp(ty) catch return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // Emit MOV imm, dst
         ctx.emit(Inst{
@@ -315,7 +316,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================
@@ -337,8 +340,10 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // MOV src, dst
         ctx.emit(Inst{
@@ -359,7 +364,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerImul(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -371,8 +378,11 @@ pub const X64LowerBackend = struct {
         const rhs = ctx.putInputInRegs(ir_inst, 1);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const lhs_gpr = Gpr.unwrapNew(lhs.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const lhs_reg = lhs.onlyReg() orelse return null;
+        const rhs_reg = rhs.onlyReg() orelse return null;
+        const lhs_gpr = Gpr.unwrapNew(lhs_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // For IMUL r64, r/m64, the result goes to the first operand
         // MOV lhs, dst
@@ -387,7 +397,7 @@ pub const X64LowerBackend = struct {
         // IMUL dst, rhs (two-operand form: dst = dst * rhs)
         // This is represented as alu_rmi_r with a special opcode
         // Note: x86 IMUL is complex; we use the 2-operand form
-        const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs.only() } };
+        const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs_reg } };
 
         ctx.emit(Inst{
             .alu_rmi_r = .{
@@ -398,7 +408,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerUdiv(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -425,9 +437,12 @@ pub const X64LowerBackend = struct {
         const divisor = ctx.putInputInRegs(ir_inst, 1);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const dividend_gpr = Gpr.unwrapNew(dividend.only());
-        const divisor_gpr = Gpr.unwrapNew(divisor.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dividend_reg = dividend.onlyReg() orelse return null;
+        const divisor_reg = divisor.onlyReg() orelse return null;
+        const dividend_gpr = Gpr.unwrapNew(dividend_reg);
+        const divisor_gpr = Gpr.unwrapNew(divisor_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // Division uses RAX:RDX / divisor, quotient in RAX, remainder in RDX
         // For now, emit the div instruction with appropriate setup
@@ -448,7 +463,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================
@@ -474,8 +491,10 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // MOV src, dst
         ctx.emit(Inst{
@@ -496,7 +515,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerIshl(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -525,8 +546,10 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // MOV src, dst
         ctx.emit(Inst{
@@ -547,7 +570,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerClz(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -557,8 +582,10 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // LZCNT
         ctx.emit(Inst{
@@ -570,7 +597,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerCtz(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -580,8 +609,10 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // TZCNT
         ctx.emit(Inst{
@@ -593,7 +624,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerPopcnt(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -603,8 +636,10 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // POPCNT
         ctx.emit(Inst{
@@ -616,7 +651,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================
@@ -630,8 +667,10 @@ pub const X64LowerBackend = struct {
         const lhs = ctx.putInputInRegs(ir_inst, 0);
         const rhs = ctx.putInputInRegs(ir_inst, 1);
 
-        const lhs_gpr = Gpr.unwrapNew(lhs.only());
-        const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs.only() } };
+        const lhs_reg = lhs.onlyReg() orelse return null;
+        const rhs_reg = rhs.onlyReg() orelse return null;
+        const lhs_gpr = Gpr.unwrapNew(lhs_reg);
+        const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs_reg } };
 
         // CMP lhs, rhs
         ctx.emit(Inst{
@@ -644,7 +683,8 @@ pub const X64LowerBackend = struct {
 
         // Allocate result
         const dst = ctx.allocTmp(ClifType.I8) catch return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // SETCC
         ctx.emit(Inst{
@@ -654,7 +694,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================
@@ -664,10 +706,11 @@ pub const X64LowerBackend = struct {
     fn lowerFconst(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         const ty = ctx.outputTy(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
 
         // Floating-point constants need to be loaded from memory or materialized
         // This is a simplified version
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         // XOR the register with itself to zero it (for zero constant)
         const op: SseOpcode = if (ty.bytes() == 4) .movss else .movsd;
@@ -679,7 +722,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFadd(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -703,19 +748,23 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         const op: SseOpcode = if (ty.bytes() == 4) .xorps else .xorpd;
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         // XOR with sign bit mask
         ctx.emit(Inst{
             .xmm_rm_r = .{
                 .op = op,
-                .src = XmmMem{ .inner = RegMem{ .reg = src.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = src_reg } },
                 .dst = dst_xmm,
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFabs(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -724,19 +773,23 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         const op: SseOpcode = if (ty.bytes() == 4) .andps else .andpd;
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         // AND with abs mask (clear sign bit)
         ctx.emit(Inst{
             .xmm_rm_r = .{
                 .op = op,
-                .src = XmmMem{ .inner = RegMem{ .reg = src.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = src_reg } },
                 .dst = dst_xmm,
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerSqrt(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -745,18 +798,22 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(ty) catch return null;
 
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         const op: SseOpcode = if (ty.bytes() == 4) .sqrtss else .sqrtsd;
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .xmm_unary_rm_r = .{
                 .op = op,
-                .src = XmmMem{ .inner = RegMem{ .reg = src.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = src_reg } },
                 .dst = dst_xmm,
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFcmp(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -765,21 +822,24 @@ pub const X64LowerBackend = struct {
         const lhs = ctx.putInputInRegs(ir_inst, 0);
         const rhs = ctx.putInputInRegs(ir_inst, 1);
 
+        const lhs_reg = lhs.onlyReg() orelse return null;
+        const rhs_reg = rhs.onlyReg() orelse return null;
         const op: SseOpcode = if (ty.bytes() == 4) .ucomiss else .ucomisd;
-        const lhs_xmm = Xmm.unwrapNew(lhs.only());
+        const lhs_xmm = Xmm.unwrapNew(lhs_reg);
 
         // UCOMISS/UCOMISD
         ctx.emit(Inst{
             .xmm_cmp_rm_r = .{
                 .op = op,
-                .src = XmmMem{ .inner = RegMem{ .reg = rhs.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = rhs_reg } },
                 .dst = lhs_xmm,
             },
         }) catch return null;
 
         // Allocate result
         const dst = ctx.allocTmp(ClifType.I8) catch return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // SETCC
         ctx.emit(Inst{
@@ -789,7 +849,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFmin(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -812,8 +874,10 @@ pub const X64LowerBackend = struct {
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
         const ext_mode = ExtMode.fromBits(@intCast(src_ty.bits()), @intCast(dst_ty.bits())) orelse return null;
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .movzx_rm_r = .{
@@ -823,7 +887,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerSextend(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -834,8 +900,10 @@ pub const X64LowerBackend = struct {
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
         const ext_mode = ExtMode.fromBits(@intCast(src_ty.bits()), @intCast(dst_ty.bits())) orelse return null;
-        const src_gpr = Gpr.unwrapNew(src.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const src_gpr = Gpr.unwrapNew(src_reg);
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .movsx_rm_r = .{
@@ -845,14 +913,19 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerIreduce(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         // For reduce, we just use the lower bits
         _ = self;
         const src = ctx.putInputInRegs(ir_inst, 0);
-        return InstOutput{ .only = src.only() };
+        const src_reg = src.onlyReg() orelse return null;
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(src_reg)) catch return null;
+        return output;
     }
 
     fn lowerFcvtToSint(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -861,19 +934,23 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         const op: SseOpcode = if (src_ty.bytes() == 4) .cvttss2si else .cvttsd2si;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .xmm_to_gpr = .{
                 .op = op,
-                .src = Xmm.unwrapNew(src.only()),
+                .src = Xmm.unwrapNew(src_reg),
                 .dst = dst_gpr,
                 .dst_size = operandSizeFromType(dst_ty),
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFcvtToUint(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -881,20 +958,24 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         // Unsigned conversion needs special handling for large values
         // This is a simplified version
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .xmm_to_gpr = .{
                 .op = .cvttss2si,
-                .src = Xmm.unwrapNew(src.only()),
+                .src = Xmm.unwrapNew(src_reg),
                 .dst = dst_gpr,
                 .dst_size = operandSizeFromType(dst_ty),
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFcvtFromSint(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -903,19 +984,23 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         const op: SseOpcode = if (dst_ty.bytes() == 4) .cvtsi2ss else .cvtsi2sd;
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .gpr_to_xmm = .{
                 .op = op,
-                .src = GprMem{ .inner = RegMem{ .reg = src.only() } },
+                .src = GprMem{ .inner = RegMem{ .reg = src_reg } },
                 .src_size = operandSizeFromType(src_ty),
                 .dst = dst_xmm,
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFcvtFromUint(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -928,18 +1013,22 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         // CVTSS2SD
         ctx.emit(Inst{
             .xmm_unary_rm_r = .{
                 .op = .cvtss2sd,
-                .src = XmmMem{ .inner = RegMem{ .reg = src.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = src_reg } },
                 .dst = dst_xmm,
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerFdemote(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -947,18 +1036,22 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         // CVTSD2SS
         ctx.emit(Inst{
             .xmm_unary_rm_r = .{
                 .op = .cvtsd2ss,
-                .src = XmmMem{ .inner = RegMem{ .reg = src.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = src_reg } },
                 .dst = dst_xmm,
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerBitcast(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -966,39 +1059,45 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         // For same-size bitcast, just copy registers
         // May need GPR<->XMM move for int/float conversions
-        const src_class = src.only().class();
+        const src_class = src_reg.class();
         const dst_class = if (dst_ty.isFloat()) RegClass.float else RegClass.int;
 
         if (src_class == dst_class) {
             // Same class, just copy
-            return InstOutput{ .only = src.only() };
+            var output = InstOutput{};
+            output.append(ValueRegs(Reg).one(src_reg)) catch return null;
+            return output;
         }
 
         if (src_class == .int and dst_class == .float) {
-            const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+            const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
             ctx.emit(Inst{
                 .gpr_to_xmm = .{
                     .op = .movd,
-                    .src = GprMem{ .inner = RegMem{ .reg = src.only() } },
+                    .src = GprMem{ .inner = RegMem{ .reg = src_reg } },
                     .src_size = operandSizeFromType(dst_ty),
                     .dst = dst_xmm,
                 },
             }) catch return null;
         } else {
-            const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+            const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
             ctx.emit(Inst{
                 .xmm_to_gpr = .{
                     .op = .movd,
-                    .src = Xmm.unwrapNew(src.only()),
+                    .src = Xmm.unwrapNew(src_reg),
                     .dst = dst_gpr,
                     .dst_size = operandSizeFromType(dst_ty),
                 },
             }) catch return null;
         }
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================
@@ -1011,12 +1110,14 @@ pub const X64LowerBackend = struct {
         const addr = ctx.putInputInRegs(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
-        const addr_gpr = Gpr.unwrapNew(addr.only());
+        const addr_reg = addr.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const addr_gpr = Gpr.unwrapNew(addr_reg);
         const amode = SyntheticAmode.real(Amode.immReg(0, addr_gpr.toReg()));
 
         if (dst_ty.isFloat()) {
             const op: SseOpcode = if (dst_ty.bytes() == 4) .movss else .movsd;
-            const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+            const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
             ctx.emit(Inst{
                 .xmm_mov_m_r = .{
@@ -1026,7 +1127,7 @@ pub const X64LowerBackend = struct {
                 },
             }) catch return null;
         } else {
-            const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+            const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
             ctx.emit(Inst{
                 .mov_m_r = .{
@@ -1037,7 +1138,9 @@ pub const X64LowerBackend = struct {
             }) catch return null;
         }
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerStore(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -1046,12 +1149,14 @@ pub const X64LowerBackend = struct {
         const src = ctx.putInputInRegs(ir_inst, 0);
         const addr = ctx.putInputInRegs(ir_inst, 1);
 
-        const addr_gpr = Gpr.unwrapNew(addr.only());
+        const src_reg = src.onlyReg() orelse return null;
+        const addr_reg = addr.onlyReg() orelse return null;
+        const addr_gpr = Gpr.unwrapNew(addr_reg);
         const amode = SyntheticAmode.real(Amode.immReg(0, addr_gpr.toReg()));
 
         if (src_ty.isFloat()) {
             const op: SseOpcode = if (src_ty.bytes() == 4) .movss else .movsd;
-            const src_xmm = Xmm.unwrapNew(src.only());
+            const src_xmm = Xmm.unwrapNew(src_reg);
 
             ctx.emit(Inst{
                 .xmm_mov_r_m = .{
@@ -1061,7 +1166,7 @@ pub const X64LowerBackend = struct {
                 },
             }) catch return null;
         } else {
-            const src_gpr = Gpr.unwrapNew(src.only());
+            const src_gpr = Gpr.unwrapNew(src_reg);
 
             ctx.emit(Inst{
                 .mov_r_m = .{
@@ -1086,9 +1191,12 @@ pub const X64LowerBackend = struct {
         const alternative = ctx.putInputInRegs(ir_inst, 2);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
-        const cons_gpr = Gpr.unwrapNew(consequent.only());
-        const alt_gpr = Gpr.unwrapNew(alternative.only());
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const cons_reg = consequent.onlyReg() orelse return null;
+        const alt_reg = alternative.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const cons_gpr = Gpr.unwrapNew(cons_reg);
+        const alt_gpr = Gpr.unwrapNew(alt_reg);
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // MOV alternative, dst
         ctx.emit(Inst{
@@ -1109,13 +1217,18 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerCopy(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         _ = self;
         const src = ctx.putInputInRegs(ir_inst, 0);
-        return InstOutput{ .only = src.only() };
+        const src_reg = src.onlyReg() orelse return null;
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(src_reg)) catch return null;
+        return output;
     }
 
     // =========================================================================
@@ -1161,7 +1274,8 @@ pub const X64LowerBackend = struct {
     fn lowerFuncAddr(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .load_ext_name = .{
@@ -1171,13 +1285,16 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerStackAddr(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .lea = .{
@@ -1187,13 +1304,16 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerGlobalValue(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .load_ext_name = .{
@@ -1203,13 +1323,16 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerSymbolValue(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         ctx.emit(Inst{
             .load_ext_name = .{
@@ -1219,7 +1342,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================
@@ -1233,9 +1358,12 @@ pub const X64LowerBackend = struct {
         const rhs = ctx.putInputInRegs(ir_inst, 1);
         const dst = ctx.allocTmp(ty) catch return null;
 
-        const lhs_gpr = Gpr.unwrapNew(lhs.only());
-        const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs.only() } };
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst.only().toReg()));
+        const lhs_reg = lhs.onlyReg() orelse return null;
+        const rhs_reg = rhs.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const lhs_gpr = Gpr.unwrapNew(lhs_reg);
+        const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs_reg } };
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // MOV lhs, dst
         ctx.emit(Inst{
@@ -1256,7 +1384,9 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerBinaryFp(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst, op32: SseOpcode, op64: SseOpcode) ?InstOutput {
@@ -1265,14 +1395,17 @@ pub const X64LowerBackend = struct {
         const rhs = ctx.putInputInRegs(ir_inst, 1);
         const dst = ctx.allocTmp(ty) catch return null;
 
+        const lhs_reg = lhs.onlyReg() orelse return null;
+        const rhs_reg = rhs.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
         const op = if (ty.bytes() == 4) op32 else op64;
-        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst.only().toReg()));
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
 
         // For SSE, we need dst = lhs first
         ctx.emit(Inst{
             .xmm_unary_rm_r = .{
                 .op = if (ty.bytes() == 4) .movss else .movsd,
-                .src = XmmMem{ .inner = RegMem{ .reg = lhs.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = lhs_reg } },
                 .dst = dst_xmm,
             },
         }) catch return null;
@@ -1281,12 +1414,14 @@ pub const X64LowerBackend = struct {
         ctx.emit(Inst{
             .xmm_rm_r = .{
                 .op = op,
-                .src = XmmMem{ .inner = RegMem{ .reg = rhs.only() } },
+                .src = XmmMem{ .inner = RegMem{ .reg = rhs_reg } },
                 .dst = dst_xmm,
             },
         }) catch return null;
 
-        return InstOutput{ .only = dst.only() };
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 };
 
