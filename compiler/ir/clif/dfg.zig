@@ -135,6 +135,10 @@ pub const FuncRef = struct {
         return .{ .index = index };
     }
 
+    pub fn asU32(self: FuncRef) u32 {
+        return self.index;
+    }
+
     pub fn eql(self: FuncRef, other: FuncRef) bool {
         return self.index == other.index;
     }
@@ -148,6 +152,10 @@ pub const SigRef = struct {
 
     pub fn fromIndex(index: u32) SigRef {
         return .{ .index = index };
+    }
+
+    pub fn asU32(self: SigRef) u32 {
+        return self.index;
     }
 
     pub fn eql(self: SigRef, other: SigRef) bool {

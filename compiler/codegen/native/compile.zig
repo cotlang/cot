@@ -31,6 +31,9 @@ const regalloc_output = @import("regalloc/output.zig");
 const aarch64 = @import("isa/aarch64/mod.zig");
 const x64 = @import("isa/x64/mod.zig");
 
+// Import frontend for SSA building
+pub const frontend = @import("frontend/mod.zig");
+
 // Re-export key types
 pub const Lower = lower_mod.Lower;
 pub const VCode = vcode_mod.VCode;
