@@ -265,7 +265,66 @@ pub const AArch64LowerBackend = struct {
                 return null;
             },
             .@"return" => {
-                // Return from function
+                // Return from function - move return values to ABI registers
+                const num_inputs = ctx.numInputs(ir_inst);
+
+                // Move each return value to the appropriate return register
+                // ARM64 ABI: first integer return in x0, subsequent in x1, x2, ...
+                // First float return in v0, subsequent in v1, v2, ...
+                var int_ret_idx: u8 = 0;
+                var float_ret_idx: u8 = 0;
+
+                for (0..num_inputs) |i| {
+                    const ret_val = ctx.putInputInRegs(ir_inst, i);
+                    const ret_reg = ret_val.onlyReg() orelse continue;
+                    const ty = ctx.inputTy(ir_inst, i);
+
+                    // Determine if this is a float or integer return
+                    if (ty.isFloat()) {
+                        // Move to v0, v1, etc.
+                        // For now, just handle v0 (first float return)
+                        if (float_ret_idx == 0) {
+                            // Move to v0 - FPU move
+                            ctx.emit(Inst{
+                                .fpu_rr = .{
+                                    .fpu_op = .abs, // abs(x) = x for positive, use as nop move
+                                    .size = if (ty.bits() == 32) .size32 else .size64,
+                                    .rd = Writable(Reg).fromReg(regs.xreg(0)), // v0 = x0 encoding
+                                    .rn = ret_reg,
+                                },
+                            }) catch return null;
+                        }
+                        float_ret_idx += 1;
+                    } else {
+                        // Integer return - move to x0, x1, etc.
+                        const dest_reg = regs.xreg(int_ret_idx);
+
+                        // Only emit move if source != destination
+                        if (ret_reg.toRealReg()) |real| {
+                            if (real.hwEnc() != int_ret_idx) {
+                                ctx.emit(Inst{
+                                    .mov = .{
+                                        .size = .size64,
+                                        .rd = Writable(Reg).fromReg(dest_reg),
+                                        .rm = ret_reg,
+                                    },
+                                }) catch return null;
+                            }
+                        } else {
+                            // Virtual register - always emit move
+                            ctx.emit(Inst{
+                                .mov = .{
+                                    .size = .size64,
+                                    .rd = Writable(Reg).fromReg(dest_reg),
+                                    .rm = ret_reg,
+                                },
+                            }) catch return null;
+                        }
+                        int_ret_idx += 1;
+                    }
+                }
+
+                // Emit the actual return instruction
                 ctx.emit(.ret) catch return null;
             },
             else => return null,
