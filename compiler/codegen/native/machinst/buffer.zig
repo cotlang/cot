@@ -1118,6 +1118,21 @@ pub const MachBufferFinalized = struct {
     /// Required alignment.
     alignment: u32,
 
+    /// Create an empty finalized buffer.
+    pub fn empty() MachBufferFinalized {
+        return .{
+            .allocator = undefined, // Not needed for empty buffer
+            .data = .{},
+            .relocs = .{},
+            .traps = .{},
+            .call_sites = .{},
+            .exception_handlers = .{},
+            .srclocs = .{},
+            .patchable_call_sites = .{},
+            .alignment = 1,
+        };
+    }
+
     /// Free all resources.
     pub fn deinit(self: *MachBufferFinalized) void {
         self.data.deinit(self.allocator);

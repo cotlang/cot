@@ -921,8 +921,14 @@ pub const Inst = union(enum) {
         rtmp2: Writable(Reg),
         /// Default/out-of-bounds branch target.
         default: MachLabel,
-        /// Table of branch targets (one per case).
-        targets: []const MachLabel,
+        /// Table of branch targets (one per case), stored as bounded array.
+        /// Maximum 128 targets should be sufficient for most switch statements.
+        targets_buf: [128]MachLabel,
+        targets_len: u8,
+
+        pub fn targets(self: *const @This()) []const MachLabel {
+            return self.targets_buf[0..self.targets_len];
+        }
     },
 
     // Software breakpoint.
@@ -1449,10 +1455,54 @@ pub const Inst = union(enum) {
         return false;
     }
 
-    /// Stub: Get operands for register allocation.
-    /// TODO: Implement proper operand collection via get_operands.zig
-    pub fn getOperands(_: Inst) []const machinst_reg.Operand {
-        return &[_]machinst_reg.Operand{};
+    /// Get operands for register allocation.
+    /// Returns a slice of Operand structs containing register uses and defs.
+    /// Uses a static buffer for simplicity - not thread-safe.
+    pub fn getOperands(self: *const Inst) []const machinst_reg.Operand {
+        // Use a static buffer to avoid allocation
+        const S = struct {
+            var buffer: [32]machinst_reg.Operand = undefined;
+            var len: usize = 0;
+        };
+
+        S.len = 0;
+
+        // Use the visitor to collect operands
+        var visitor = get_operands.OperandVisitor.init(std.heap.page_allocator);
+        defer visitor.deinit();
+
+        get_operands.getOperands(self, &visitor);
+
+        // Combine defs and uses into the buffer (defs first, then uses)
+        for (visitor.defs.items) |def| {
+            if (S.len < S.buffer.len) {
+                // Convert Writable(Reg) to VReg
+                const def_reg = def.toReg();
+                const def_vreg = machinst_reg.VReg.init(@intCast(def_reg.bits & 0x3FFFFFFF), def_reg.class());
+                S.buffer[S.len] = machinst_reg.Operand.init(
+                    def_vreg,
+                    .reg,
+                    .def,
+                    .late,
+                );
+                S.len += 1;
+            }
+        }
+        for (visitor.uses.items) |use| {
+            if (S.len < S.buffer.len) {
+                // Convert Reg to VReg
+                const use_vreg = machinst_reg.VReg.init(@intCast(use.bits & 0x3FFFFFFF), use.class());
+                S.buffer[S.len] = machinst_reg.Operand.init(
+                    use_vreg,
+                    .reg,
+                    .use,
+                    .early,
+                );
+                S.len += 1;
+            }
+        }
+
+        return S.buffer[0..S.len];
     }
 
     /// Stub: Get clobbered registers.
@@ -1886,17 +1936,18 @@ pub const Inst = union(enum) {
             },
 
             // Jump table sequence: ridx (use), rtmp1 (def), rtmp2 (def)
+            // Order must match get_operands.zig
             .jt_sequence => |*p| {
+                if (alloc_idx < allocs.len) {
+                    p.ridx = applyAlloc(p.ridx, allocs[alloc_idx]);
+                    alloc_idx += 1;
+                }
                 if (alloc_idx < allocs.len) {
                     p.rtmp1 = applyAllocWritable(p.rtmp1, allocs[alloc_idx]);
                     alloc_idx += 1;
                 }
                 if (alloc_idx < allocs.len) {
                     p.rtmp2 = applyAllocWritable(p.rtmp2, allocs[alloc_idx]);
-                    alloc_idx += 1;
-                }
-                if (alloc_idx < allocs.len) {
-                    p.ridx = applyAlloc(p.ridx, allocs[alloc_idx]);
                     alloc_idx += 1;
                 }
             },

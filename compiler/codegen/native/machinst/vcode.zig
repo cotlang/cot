@@ -243,14 +243,71 @@ pub const Ranges = struct {
     }
 
     /// Reverse the index order (for backward-to-forward conversion).
+    /// This recomputes ends to maintain the invariant that ends are monotonically increasing.
+    /// The sizes of each range are preserved but in reversed order.
     pub fn reverseIndex(self: *Self) void {
+        const n = self.ends.items.len;
+        if (n == 0) return;
+
+        // First compute the sizes in original order
+        // sizes[i] = ends[i] - ends[i-1] (or ends[0] if i==0)
+        var prev: usize = 0;
+        for (self.ends.items) |*end| {
+            const size = end.* - prev;
+            prev = end.*;
+            end.* = size;
+        }
+
+        // Now ends contains sizes. Reverse them.
         std.mem.reverse(usize, self.ends.items);
+
+        // Re-accumulate to get new monotonic ends
+        var running: usize = 0;
+        for (self.ends.items) |*end| {
+            running += end.*;
+            end.* = running;
+        }
     }
 
     /// Reverse the target values (for backward-to-forward conversion).
+    /// NOTE: This should only be called on ranges that have NOT been processed
+    /// by reverseIndex yet, OR when using reverseIndexWithTarget.
     pub fn reverseTarget(self: *Self, n: usize) void {
         for (self.ends.items) |*end| {
             end.* = n - end.*;
+        }
+    }
+
+    /// Combined reverseIndex + reverseTarget for ranges whose values need translation.
+    /// This properly handles instruction index ranges that are in backward order.
+    pub fn reverseIndexWithTarget(self: *Self, n: usize) void {
+        _ = n;
+        const num_ends = self.ends.items.len;
+        if (num_ends == 0) return;
+
+        // The ends are instruction indices in backward order.
+        // We need to:
+        // 1. Extract the ranges (start, end) pairs
+        // 2. Translate each index: backward_idx -> n - backward_idx
+        // 3. Reverse the order of ranges
+        // 4. Re-encode as monotonic ends
+
+        // Step 1 & 2: Extract sizes (which don't change with translation)
+        var prev: usize = 0;
+        for (self.ends.items) |*end| {
+            const size = end.* - prev;
+            prev = end.*;
+            end.* = size;
+        }
+
+        // Step 3: Reverse sizes order
+        std.mem.reverse(usize, self.ends.items);
+
+        // Step 4: Re-accumulate
+        var running: usize = 0;
+        for (self.ends.items) |*end| {
+            running += end.*;
+            end.* = running;
         }
     }
 
@@ -672,8 +729,12 @@ pub fn VCode(comptime I: type) type {
         }
 
         /// Get the successors of a block.
+        /// NOTE: block_succ_range is stored in backward order (not reversed),
+        /// so we need to translate the block index.
         pub fn blockSuccs(self: *const Self, block: BlockIndex) []const BlockIndex {
-            const range = self.block_succ_range.get(block.index());
+            const num_blocks = self.block_succ_range.len();
+            const backward_idx = num_blocks - 1 - block.index();
+            const range = self.block_succ_range.get(backward_idx);
             return self.block_succs.items[range.start..range.end];
         }
 
@@ -1140,10 +1201,13 @@ pub fn VCodeBuilder(comptime I: type) type {
             try self.vcode.block_preds.resize(allocator, end_usize);
             @memset(self.vcode.block_preds.items, BlockIndex.invalid());
 
+            // block_succ_range is in backward order, so we translate indices
             var iter = self.vcode.block_succ_range.iter();
             while (iter.next()) |entry| {
-                const pred_idx, const range = entry;
-                const pred = BlockIndex.new(pred_idx);
+                const backward_idx, const range = entry;
+                // Convert backward index to forward index
+                const forward_idx = num_blocks - 1 - backward_idx;
+                const pred = BlockIndex.new(forward_idx);
                 for (self.vcode.block_succs.items[range.start..range.end]) |succ| {
                     const pos = &starts[succ.index()];
                     self.vcode.block_preds.items[pos.*] = pred;
@@ -1168,17 +1232,17 @@ pub fn VCodeBuilder(comptime I: type) type {
             }
 
             // Reverse the per-block and per-inst sequences.
+            // reverseIndex now properly preserves sizes in reversed order,
+            // so we don't need reverseTarget - the sizes are already correct.
             self.vcode.block_ranges.reverseIndex();
-            self.vcode.block_ranges.reverseTarget(n_insts);
             // block_params_range is indexed by block (and blocks were
             // traversed in reverse) so we reverse it; but block-param
             // sequences in the concatenated vec can remain in reverse
             // order (it is effectively an arena of arbitrarily-placed
             // referenced sequences).
             self.vcode.block_params_range.reverseIndex();
-            // Likewise, we reverse block_succ_range, but the block_succ
-            // concatenated array can remain as-is.
-            self.vcode.block_succ_range.reverseIndex();
+            // NOTE: block_succ_range is NOT reversed. blockSuccs() translates the index.
+            // This avoids the complex reordering of block_succs array.
             std.mem.reverse(I, self.vcode.insts.items);
             std.mem.reverse(RelSourceLoc, self.vcode.srclocs.items);
             // Likewise, branch_block_arg_succ_range is indexed by block

@@ -336,12 +336,17 @@ pub fn visitBlockSuccs(
         },
         .br_table => {
             // Branch table has default + table entries
-            if (inst_data.getBrTableData()) |table_data| {
-                // Default destination (not from table)
-                try context.call(last_inst, table_data.default, false);
-                // Table entries (from table)
-                for (table_data.targets) |target| {
-                    try context.call(last_inst, target, true);
+            // The jump table index is stored in the imm field by frontend.zig
+            if (inst_data.imm) |jt_index_signed| {
+                const jt_index: u32 = @intCast(jt_index_signed);
+                const jt = clif.JumpTable.fromIndex(jt_index);
+                if (func.dfg.jump_tables.get(jt)) |jt_data| {
+                    // Default destination (not from table)
+                    try context.call(last_inst, jt_data.default_block.block, false);
+                    // Table entries (from table)
+                    for (jt_data.entries.items) |entry| {
+                        try context.call(last_inst, entry.block, true);
+                    }
                 }
             }
         },
@@ -519,7 +524,9 @@ pub const LoweredBlock = union(enum) {
             },
             .critical_edge => |e| switch (other) {
                 .orig => false,
-                .critical_edge => |e2| e.pred.eql(e2.pred) and e.succ.eql(e2.succ) and e.succ_idx == e2.succ_idx,
+                // NOTE: succ_idx is NOT compared - all edges from same pred to same succ
+                // should map to the same critical edge block
+                .critical_edge => |e2| e.pred.eql(e2.pred) and e.succ.eql(e2.succ),
             },
         };
     }
@@ -535,7 +542,8 @@ pub const LoweredBlock = union(enum) {
                 hasher.update(&[_]u8{1});
                 hasher.update(std.mem.asBytes(&e.pred.index));
                 hasher.update(std.mem.asBytes(&e.succ.index));
-                hasher.update(std.mem.asBytes(&e.succ_idx));
+                // NOTE: succ_idx is NOT included - all edges from same pred to same succ
+                // should hash to the same value
             },
         }
         return hasher.final();
@@ -686,19 +694,31 @@ pub const BlockLoweringOrder = struct {
             if (block_out_count.get(block) > 1) {
                 const range = block_succ_range.get(block);
 
+                // Track which successors we've already created critical edge blocks for
+                // to avoid duplicates when the same target appears multiple times (e.g., in br_table)
+                var seen_critical = std.HashMapUnmanaged(u32, void, std.hash_map.AutoContext(u32), std.hash_map.default_max_load_percentage){};
+                defer seen_critical.deinit(allocator);
+
                 var succ_idx: u32 = 0;
                 for (block_succs.items[range.start..range.end]) |*lb| {
                     const succ = lb.origBlock().?;
-                    if (block_in_count.get(succ) > 1) {
+                    const in_count = block_in_count.get(succ);
+                    if (in_count > 1) {
                         // Critical edge - mutate to CriticalEdge
-                        lb.* = .{
+                        // But only add to lowered_order once per unique successor
+                        const edge = LoweredBlock{
                             .critical_edge = .{
                                 .pred = block,
                                 .succ = succ,
                                 .succ_idx = succ_idx,
                             },
                         };
-                        try self.lowered_order.append(allocator, lb.*);
+                        lb.* = edge;
+
+                        const gop = try seen_critical.getOrPut(allocator, succ.index);
+                        if (!gop.found_existing) {
+                            try self.lowered_order.append(allocator, edge);
+                        }
                     }
                     succ_idx += 1;
                 }

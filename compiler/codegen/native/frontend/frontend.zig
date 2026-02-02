@@ -438,10 +438,11 @@ pub const FuncInstBuilder = struct {
     // Helper for instruction insertion
     // ========================================================================
 
-    fn build(self: Self, result_type: ?Type) !struct { inst: Inst, result: ?Value } {
+    fn build(self: Self, data: clif.InstData, result_type: ?Type) !struct { inst: Inst, result: ?Value } {
         try self.builder.ensureInsertedBlock();
 
         const inst = self.builder.func.dfg.makeInst();
+        try self.builder.func.dfg.setInstData(inst, data);
         try self.builder.func.layout.appendInst(self.builder.func_ctx.allocator, inst, self.block);
 
         var result: ?Value = null;
@@ -452,10 +453,11 @@ pub const FuncInstBuilder = struct {
         return .{ .inst = inst, .result = result };
     }
 
-    fn buildTerminator(self: Self) !Inst {
+    fn buildTerminator(self: Self, data: clif.InstData) !Inst {
         try self.builder.ensureInsertedBlock();
 
         const inst = self.builder.func.dfg.makeInst();
+        try self.builder.func.dfg.setInstData(inst, data);
         try self.builder.func.layout.appendInst(self.builder.func_ctx.allocator, inst, self.block);
         try self.builder.fillCurrentBlock();
 
@@ -468,22 +470,38 @@ pub const FuncInstBuilder = struct {
 
     /// Integer constant.
     pub fn iconst(self: Self, ty: Type, imm: i64) !Value {
-        _ = imm;
-        const r = try self.build(ty);
+        const r = try self.build(.{
+            .opcode = .iconst,
+            .args = clif.ValueList.EMPTY,
+            .ctrl_type = ty,
+            .imm = imm,
+        }, ty);
         return r.result.?;
     }
 
     /// 32-bit float constant.
     pub fn f32const(self: Self, imm: f32) !Value {
-        _ = imm;
-        const r = try self.build(Type.F32);
+        // Store the float bits as an i64 immediate
+        const bits: u32 = @bitCast(imm);
+        const r = try self.build(.{
+            .opcode = .f32const,
+            .args = clif.ValueList.EMPTY,
+            .ctrl_type = Type.F32,
+            .imm = @intCast(bits),
+        }, Type.F32);
         return r.result.?;
     }
 
     /// 64-bit float constant.
     pub fn f64const(self: Self, imm: f64) !Value {
-        _ = imm;
-        const r = try self.build(Type.F64);
+        // Store the float bits as an i64 immediate
+        const bits: u64 = @bitCast(imm);
+        const r = try self.build(.{
+            .opcode = .f64const,
+            .args = clif.ValueList.EMPTY,
+            .ctrl_type = Type.F64,
+            .imm = @bitCast(bits),
+        }, Type.F64);
         return r.result.?;
     }
 
@@ -491,59 +509,95 @@ pub const FuncInstBuilder = struct {
     // Arithmetic
     // ========================================================================
 
+    /// Helper to create args list for binary operations.
+    fn makeArgs2(self: Self, a: Value, b: Value) !clif.ValueList {
+        var args = clif.ValueList.EMPTY;
+        args = try self.builder.func.dfg.value_lists.push(args, a);
+        args = try self.builder.func.dfg.value_lists.push(args, b);
+        return args;
+    }
+
     /// Integer addition.
     pub fn iadd(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .iadd,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Integer subtraction.
     pub fn isub(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .isub,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Integer multiplication.
     pub fn imul(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .imul,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Signed division.
     pub fn sdiv(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .sdiv,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Unsigned division.
     pub fn udiv(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .udiv,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Signed remainder.
     pub fn srem(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .srem,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Unsigned remainder.
     pub fn urem(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .urem,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
@@ -553,49 +607,73 @@ pub const FuncInstBuilder = struct {
 
     /// Bitwise AND.
     pub fn band(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .band,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Bitwise OR.
     pub fn bor(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .bor,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Bitwise XOR.
     pub fn bxor(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .bxor,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Shift left.
     pub fn ishl(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .ishl,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Unsigned shift right.
     pub fn ushr(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .ushr,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Signed shift right.
     pub fn sshr(self: Self, a: Value, b: Value) !Value {
-        _ = b;
         const ty = self.builder.func.dfg.valueType(a);
-        const r = try self.build(ty);
+        const args = try self.makeArgs2(a, b);
+        const r = try self.build(.{
+            .opcode = .sshr,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
@@ -605,10 +683,14 @@ pub const FuncInstBuilder = struct {
 
     /// Integer comparison.
     pub fn icmp(self: Self, cond: clif.IntCC, a: Value, b: Value) !Value {
-        _ = cond;
-        _ = a;
-        _ = b;
-        const r = try self.build(Type.I8);
+        const args = try self.makeArgs2(a, b);
+        // Store the condition code in imm (we can recover it during lowering)
+        const r = try self.build(.{
+            .opcode = .icmp,
+            .args = args,
+            .ctrl_type = Type.I8,
+            .imm = @intFromEnum(cond),
+        }, Type.I8);
         return r.result.?;
     }
 
@@ -616,24 +698,43 @@ pub const FuncInstBuilder = struct {
     // Conversions
     // ========================================================================
 
+    /// Helper to create args list for unary operations.
+    fn makeArgs1(self: Self, a: Value) !clif.ValueList {
+        var args = clif.ValueList.EMPTY;
+        args = try self.builder.func.dfg.value_lists.push(args, a);
+        return args;
+    }
+
     /// Zero extend.
     pub fn uextend(self: Self, ty: Type, arg: Value) !Value {
-        _ = arg;
-        const r = try self.build(ty);
+        const args = try self.makeArgs1(arg);
+        const r = try self.build(.{
+            .opcode = .uextend,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Sign extend.
     pub fn sextend(self: Self, ty: Type, arg: Value) !Value {
-        _ = arg;
-        const r = try self.build(ty);
+        const args = try self.makeArgs1(arg);
+        const r = try self.build(.{
+            .opcode = .sextend,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Reduce integer width.
     pub fn ireduce(self: Self, ty: Type, arg: Value) !Value {
-        _ = arg;
-        const r = try self.build(ty);
+        const args = try self.makeArgs1(arg);
+        const r = try self.build(.{
+            .opcode = .ireduce,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
@@ -644,36 +745,54 @@ pub const FuncInstBuilder = struct {
     /// Load from memory.
     pub fn load(self: Self, ty: Type, flags: clif.MemFlags, addr: Value, offset: i32) !Value {
         _ = flags;
-        _ = addr;
-        _ = offset;
-        const r = try self.build(ty);
+        const args = try self.makeArgs1(addr);
+        const r = try self.build(.{
+            .opcode = .load,
+            .args = args,
+            .ctrl_type = ty,
+            .imm = @intCast(offset),
+        }, ty);
         return r.result.?;
     }
 
     /// Store to memory.
     pub fn store(self: Self, flags: clif.MemFlags, val: Value, addr: Value, offset: i32) !Inst {
         _ = flags;
-        _ = val;
-        _ = addr;
-        _ = offset;
-        const r = try self.build(null);
+        const args = try self.makeArgs2(val, addr);
+        const r = try self.build(.{
+            .opcode = .store,
+            .args = args,
+            .ctrl_type = Type.INVALID,
+            .imm = @intCast(offset),
+        }, null);
         return r.inst;
     }
 
     /// Load from stack slot.
     pub fn stackLoad(self: Self, ty: Type, slot: StackSlot, offset: i32) !Value {
-        _ = slot;
-        _ = offset;
-        const r = try self.build(ty);
+        // Encode slot index and offset (slot in lower bits, offset in upper)
+        const slot_bits: i64 = @intCast(slot.index);
+        const offset_bits: i64 = @as(i64, offset) << 32;
+        const r = try self.build(.{
+            .opcode = .stack_load,
+            .args = clif.ValueList.EMPTY,
+            .ctrl_type = ty,
+            .imm = slot_bits | offset_bits,
+        }, ty);
         return r.result.?;
     }
 
     /// Store to stack slot.
     pub fn stackStore(self: Self, val: Value, slot: StackSlot, offset: i32) !Inst {
-        _ = val;
-        _ = slot;
-        _ = offset;
-        const r = try self.build(null);
+        const args = try self.makeArgs1(val);
+        const slot_bits: i64 = @intCast(slot.index);
+        const offset_bits: i64 = @as(i64, offset) << 32;
+        const r = try self.build(.{
+            .opcode = .stack_store,
+            .args = args,
+            .ctrl_type = Type.INVALID,
+            .imm = slot_bits | offset_bits,
+        }, null);
         return r.inst;
     }
 
@@ -683,18 +802,34 @@ pub const FuncInstBuilder = struct {
 
     /// Unconditional jump.
     pub fn jump(self: Self, destination: Block, args: []const Value) !Inst {
-        _ = args;
-        const inst = try self.buildTerminator();
+        // Build args list
+        var arg_list = clif.ValueList.EMPTY;
+        for (args) |v| {
+            arg_list = try self.builder.func.dfg.value_lists.push(arg_list, v);
+        }
+        const inst = try self.buildTerminator(.{
+            .opcode = .jump,
+            .args = arg_list,
+            .ctrl_type = Type.INVALID,
+            .dest = destination,
+        });
         try self.builder.declareSuccessor(destination, inst);
         return inst;
     }
 
     /// Conditional branch.
     pub fn brif(self: Self, cond: Value, then_block: Block, then_args: []const Value, else_block: Block, else_args: []const Value) !Inst {
-        _ = cond;
+        // For now, just store cond; args are part of block params in full implementation
         _ = then_args;
         _ = else_args;
-        const inst = try self.buildTerminator();
+        const args = try self.makeArgs1(cond);
+        const inst = try self.buildTerminator(.{
+            .opcode = .brif,
+            .args = args,
+            .ctrl_type = Type.INVALID,
+            .then_dest = then_block,
+            .else_dest = else_block,
+        });
         try self.builder.declareSuccessor(then_block, inst);
         if (!then_block.eql(else_block)) {
             try self.builder.declareSuccessor(else_block, inst);
@@ -704,21 +839,42 @@ pub const FuncInstBuilder = struct {
 
     /// Return from function.
     pub fn return_(self: Self, args: []const Value) !Inst {
-        _ = args;
-        return self.buildTerminator();
+        // Build args list (return values)
+        var arg_list = clif.ValueList.EMPTY;
+        for (args) |v| {
+            arg_list = try self.builder.func.dfg.value_lists.push(arg_list, v);
+        }
+        return self.buildTerminator(.{
+            .opcode = .@"return",
+            .args = arg_list,
+            .ctrl_type = Type.INVALID,
+        });
     }
 
     /// Call a function.
     pub fn call(self: Self, func_ref: FuncRef, args: []const Value) !struct { inst: Inst, results: []const Value } {
-        _ = args;
-
         // Get the signature to determine return types
         const ext_func = self.builder.func.getExtFunc(func_ref) orelse
             return error.InvalidFuncRef;
         const sig = self.builder.func.getSignature(ext_func.signature) orelse
             return error.InvalidSignature;
 
+        // Build args list
+        var arg_list = clif.ValueList.EMPTY;
+        for (args) |v| {
+            arg_list = try self.builder.func.dfg.value_lists.push(arg_list, v);
+        }
+
+        try self.builder.ensureInsertedBlock();
         const inst = self.builder.func.dfg.makeInst();
+
+        // Store func_ref index in imm field
+        try self.builder.func.dfg.setInstData(inst, .{
+            .opcode = .call,
+            .args = arg_list,
+            .ctrl_type = if (sig.returns.items.len > 0) sig.returns.items[0].value_type else Type.INVALID,
+            .imm = @intCast(func_ref.index),
+        });
         try self.builder.func.layout.appendInst(self.builder.func_ctx.allocator, inst, self.block);
 
         // Create result values for each return type
@@ -732,20 +888,29 @@ pub const FuncInstBuilder = struct {
 
     /// Trap unconditionally.
     pub fn trap(self: Self, code: clif.TrapCode) !Inst {
-        _ = code;
-        return self.buildTerminator();
+        return self.buildTerminator(.{
+            .opcode = .trap,
+            .args = clif.ValueList.EMPTY,
+            .ctrl_type = Type.INVALID,
+            .imm = @intFromEnum(code),
+        });
     }
 
     /// Branch table instruction.
     ///
     /// Port of cranelift/codegen/src/ir/instructions.rs br_table
     pub fn brTable(self: Self, selector: Value, jt: JumpTable) !Inst {
-        _ = selector;
+        const args = try self.makeArgs1(selector);
 
         // Get the jump table to declare successors
         if (self.builder.func.getJumpTable(jt)) |jt_data| {
-            // Declare default block as successor
-            const inst = try self.buildTerminator();
+            // Store jump table index in imm
+            const inst = try self.buildTerminator(.{
+                .opcode = .br_table,
+                .args = args,
+                .ctrl_type = Type.INVALID,
+                .imm = @intCast(jt.index),
+            });
             try self.builder.declareSuccessor(jt_data.default_block.block, inst);
 
             // Declare all target blocks as successors
@@ -755,7 +920,12 @@ pub const FuncInstBuilder = struct {
 
             return inst;
         } else {
-            return self.buildTerminator();
+            return self.buildTerminator(.{
+                .opcode = .br_table,
+                .args = args,
+                .ctrl_type = Type.INVALID,
+                .imm = @intCast(jt.index),
+            });
         }
     }
 
@@ -763,25 +933,46 @@ pub const FuncInstBuilder = struct {
     // Misc
     // ========================================================================
 
+    /// Helper to create args list for ternary operations.
+    fn makeArgs3(self: Self, a: Value, b: Value, c: Value) !clif.ValueList {
+        var args = clif.ValueList.EMPTY;
+        args = try self.builder.func.dfg.value_lists.push(args, a);
+        args = try self.builder.func.dfg.value_lists.push(args, b);
+        args = try self.builder.func.dfg.value_lists.push(args, c);
+        return args;
+    }
+
     /// No operation.
     pub fn nop(self: Self) !Inst {
-        const r = try self.build(null);
+        const r = try self.build(.{
+            .opcode = .nop,
+            .args = clif.ValueList.EMPTY,
+            .ctrl_type = Type.INVALID,
+        }, null);
         return r.inst;
     }
 
     /// Select between two values.
     pub fn select(self: Self, cond: Value, if_true: Value, if_false: Value) !Value {
-        _ = cond;
-        _ = if_false;
         const ty = self.builder.func.dfg.valueType(if_true);
-        const r = try self.build(ty);
+        const args = try self.makeArgs3(cond, if_true, if_false);
+        const r = try self.build(.{
+            .opcode = .select,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 
     /// Copy a value.
     pub fn copy(self: Self, arg: Value) !Value {
         const ty = self.builder.func.dfg.valueType(arg);
-        const r = try self.build(ty);
+        const args = try self.makeArgs1(arg);
+        const r = try self.build(.{
+            .opcode = .copy,
+            .args = args,
+            .ctrl_type = ty,
+        }, ty);
         return r.result.?;
     }
 };

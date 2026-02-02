@@ -261,8 +261,55 @@ pub const AArch64LowerBackend = struct {
                 }) catch return null;
             },
             .br_table => {
-                // Jump table - not yet implemented
-                return null;
+                // Jump table dispatch
+                // Cranelift: Uses JTSequence (compound instruction)
+                // See cranelift/codegen/src/isa/aarch64/inst.isle:JTSequence
+
+                // targets[0] is the default, targets[1..] are the table entries
+                if (targets.len < 2) return null;
+                const default = targets[0];
+                const table_targets = targets[1..];
+
+                // Get the index value (first input to br_table)
+                const idx_val = ctx.putInputInRegs(ir_inst, 0);
+                const ridx = idx_val.onlyReg() orelse return null;
+
+                // Allocate temp registers
+                const tmp1 = ctx.allocTmp(ClifType.I64) catch return null;
+                const rtmp1 = tmp1.onlyReg() orelse return null;
+                const tmp2 = ctx.allocTmp(ClifType.I64) catch return null;
+                const rtmp2 = tmp2.onlyReg() orelse return null;
+
+                // Emit CMP to check bounds - compare index against table size
+                // CMP ridx, #table_size (CMP is SUBS with discarded result)
+                const table_size = @as(u64, @intCast(table_targets.len));
+                ctx.emit(Inst{
+                    .alu_rr_imm12 = .{
+                        .alu_op = .subs, // SUBS sets flags (CMP is alias for SUBS with XZR dest)
+                        .size = .size64,
+                        .rd = Writable(Reg).fromReg(regs.zeroReg()), // XZR discards result
+                        .rn = ridx,
+                        .imm12 = Imm12.maybeFromU64(table_size) orelse return null,
+                    },
+                }) catch return null;
+
+                // Emit the jump table sequence - copy targets to owned storage
+                var jt_inst: Inst = .{
+                    .jt_sequence = .{
+                        .ridx = ridx,
+                        .rtmp1 = rtmp1,
+                        .rtmp2 = rtmp2,
+                        .default = default,
+                        .targets_buf = undefined,
+                        .targets_len = @intCast(@min(table_targets.len, 128)),
+                    },
+                };
+                // Copy targets to the bounded array
+                for (table_targets, 0..) |target, i| {
+                    if (i >= 128) break;
+                    jt_inst.jt_sequence.targets_buf[i] = target;
+                }
+                ctx.emit(jt_inst) catch return null;
             },
             .@"return" => {
                 // Return from function - move return values to ABI registers
@@ -330,6 +377,7 @@ pub const AArch64LowerBackend = struct {
             else => return null,
         }
         _ = self;
+        return {}; // Success
     }
 
     /// Get the pinned register, if any.

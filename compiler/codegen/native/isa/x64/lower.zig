@@ -284,6 +284,39 @@ pub const X64LowerBackend = struct {
             },
             .@"return" => {
                 // Return instruction
+                // Reference: Cranelift x64 ABI - return values go in rax (integer) or xmm0 (float)
+                const num_inputs = ctx.numInputs(ir_inst);
+
+                if (num_inputs > 0) {
+                    // Get the return value and move to rax
+                    const ret_val = ctx.putInputInRegs(ir_inst, 0);
+                    const ret_reg = ret_val.onlyReg() orelse return null;
+
+                    // Move to rax (System V ABI return register for integers)
+                    const rax_gpr = Gpr.unwrapNew(regs.rax());
+                    const rax_writable = WritableGpr.fromReg(rax_gpr);
+
+                    // Check if already in rax using hwEnc comparison
+                    var needs_move = true;
+                    if (ret_reg.toRealReg()) |real| {
+                        // Compare hardware encoding - rax is encoding 0
+                        if (real.hwEnc() == 0) {
+                            needs_move = false;
+                        }
+                    }
+
+                    if (needs_move) {
+                        ctx.emit(Inst{
+                            .mov_r_r = .{
+                                .size = .size64,
+                                .src = Gpr.unwrapNew(ret_reg),
+                                .dst = rax_writable,
+                            },
+                        }) catch return null;
+                    }
+                }
+
+                // Emit the actual return
                 ctx.emit(Inst{ .ret = .{ .stack_bytes_to_pop = 0 } }) catch return null;
             },
             else => return null,
@@ -299,8 +332,11 @@ pub const X64LowerBackend = struct {
         const ty = ctx.outputTy(ir_inst, 0);
         const size = operandSizeFromType(ty);
 
-        // Get the constant value
-        const imm: u64 = 42; // Placeholder
+        // Get the constant value from instruction data
+        // Reference: Cranelift extracts immediate from InstructionData::UnaryImm
+        const value: u64 = ctx.getConstant(ir_inst) orelse
+            ctx.data(ir_inst).getImmediate() orelse
+            return null;
 
         // Allocate destination register
         const dst = ctx.allocTmp(ty) catch return null;
@@ -311,7 +347,7 @@ pub const X64LowerBackend = struct {
         ctx.emit(Inst{
             .imm = .{
                 .dst_size = size,
-                .simm64 = imm,
+                .simm64 = value,
                 .dst = dst_gpr,
             },
         }) catch return null;

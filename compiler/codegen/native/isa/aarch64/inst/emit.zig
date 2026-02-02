@@ -2576,12 +2576,14 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, _:
 
             // 8. Jump table data - emit 32-bit offsets for each target
             const jt_start = sink.curOffset();
-            for (payload.targets) |target| {
+            for (payload.targets()) |target| {
                 const word_off = sink.curOffset();
                 // The offset is relative to the jump table start
                 const off_into_table = word_off - jt_start;
-                try sink.useLabelAtOffset(word_off, target, .pcRel32);
+                // First write placeholder data, then request label patching
+                // (useLabelAtOffset may patch immediately if label is bound)
                 try sink.put4(off_into_table);
+                try sink.useLabelAtOffset(word_off, target, .pcRel32);
             }
         },
     }
@@ -3223,13 +3225,18 @@ test "emit jt_sequence" {
 
     const targets = [_]MachLabel{ target0, target1, target2 };
 
-    const jt_inst = Inst{ .jt_sequence = .{
+    var jt_inst = Inst{ .jt_sequence = .{
         .ridx = x0,
         .rtmp1 = Writable(Reg).fromReg(x1),
         .rtmp2 = Writable(Reg).fromReg(x2),
         .default = default_label,
-        .targets = &targets,
+        .targets_buf = undefined,
+        .targets_len = 3,
     } };
+    // Copy targets
+    for (targets, 0..) |target, i| {
+        jt_inst.jt_sequence.targets_buf[i] = target;
+    }
     try emit(&jt_inst, &buf, &emit_info, &emit_state);
 
     // The sequence should emit:
