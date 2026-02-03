@@ -1200,6 +1200,79 @@ pub const FuncTranslator = struct {
 
         _ = try self.builder.ins().store(prepared.flags, truncated, prepared.addr, 0);
     }
+
+    // ========================================================================
+    // Call Translation
+    // Port of code_translator.rs:654-717 and func_environ.rs Call struct
+    // ========================================================================
+
+    /// Translate a direct function call.
+    ///
+    /// Port of code_translator.rs:654-676 (Operator::Call)
+    /// and func_environ.rs:1940-2040 (Call::direct_call)
+    ///
+    /// Wasm call ABI: real_call_args = [callee_vmctx, caller_vmctx, ...wasm_args]
+    pub fn translateCall(self: *Self, function_index: u32) !void {
+        // Get the function reference from the environment
+        const func_ref = try self.env.getOrCreateFuncRef(self.builder.func, function_index);
+
+        // Get function signature to determine number of params/returns
+        const ext_func = self.builder.func.getExtFunc(func_ref) orelse
+            return error.InvalidFuncRef;
+        const sig = self.builder.func.getSignature(ext_func.signature) orelse
+            return error.InvalidSignature;
+
+        // Wasm params don't include vmctx - calculate actual Wasm param count
+        // The sig includes callee_vmctx and caller_vmctx as first two params
+        const num_wasm_params = if (sig.params.items.len >= 2)
+            sig.params.items.len - 2
+        else
+            0;
+        const num_returns = sig.returns.items.len;
+
+        // Pop wasm args from stack
+        const wasm_args = self.state.peekn(num_wasm_params);
+
+        // Build real_call_args: [callee_vmctx, caller_vmctx, ...wasm_args]
+        // For local functions, callee_vmctx == caller_vmctx
+        const caller_vmctx = try self.env.vmctxVal(self.builder.func);
+        const vmctx_val = try self.builder.ins().globalValue(Type.I64, caller_vmctx);
+
+        // Allocate call args: 2 vmctx values + wasm args
+        var real_args = try self.allocator.alloc(Value, 2 + num_wasm_params);
+        defer self.allocator.free(real_args);
+        real_args[0] = vmctx_val; // callee_vmctx (same as caller for local funcs)
+        real_args[1] = vmctx_val; // caller_vmctx
+        for (wasm_args, 0..) |arg, i| {
+            real_args[2 + i] = arg;
+        }
+
+        // Emit call instruction
+        const call_result = try self.builder.ins().call(func_ref, real_args);
+
+        // Pop args, push results
+        self.state.popn(num_wasm_params);
+        for (call_result.results) |result| {
+            try self.state.push1(result);
+        }
+
+        _ = num_returns;
+    }
+
+    /// Translate an indirect function call.
+    ///
+    /// Port of code_translator.rs:677-717 (Operator::CallIndirect)
+    ///
+    /// NOTE: This is a stub - indirect calls require more infrastructure
+    /// (table access, signature checking, funcref layout)
+    pub fn translateCallIndirect(self: *Self, type_index: u32, table_index: u32) !void {
+        _ = self;
+        _ = type_index;
+        _ = table_index;
+        // TODO: Implement indirect calls
+        // For now, emit unreachable since we can't properly translate this
+        return error.IndirectCallNotImplemented;
+    }
 };
 
 // ============================================================================

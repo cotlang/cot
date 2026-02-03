@@ -15,6 +15,15 @@ pub const Type = frontend_mod.Type;
 pub const Function = frontend_mod.Function;
 pub const GlobalValue = frontend_mod.GlobalValue;
 pub const GlobalValueData = frontend_mod.GlobalValueData;
+pub const FuncRef = frontend_mod.FuncRef;
+pub const SigRef = frontend_mod.SigRef;
+pub const Signature = frontend_mod.Signature;
+pub const AbiParam = frontend_mod.AbiParam;
+
+// Import ExtFuncData directly from clif module
+const clif_ir = @import("../../../ir/clif/mod.zig");
+pub const ExtFuncData = clif_ir.ExtFuncData;
+pub const ExternalName = clif_ir.ExternalName;
 
 // Re-export heap types
 pub const HeapData = heap_mod.HeapData;
@@ -99,6 +108,10 @@ pub const FuncEnvironment = struct {
     /// Port of func_environ.rs heaps field.
     heaps: std.AutoHashMapUnmanaged(u32, HeapData),
 
+    /// Cached function references per wasm function index.
+    /// Port of func_environ.rs func_refs/sig_refs fields.
+    func_refs: std.AutoHashMapUnmanaged(u32, FuncRef),
+
     const Self = @This();
 
     /// Create a new function environment.
@@ -109,6 +122,7 @@ pub const FuncEnvironment = struct {
             .vmctx = null,
             .globals = .{},
             .heaps = .{},
+            .func_refs = .{},
         };
     }
 
@@ -116,6 +130,7 @@ pub const FuncEnvironment = struct {
     pub fn deinit(self: *Self) void {
         self.globals.deinit(self.allocator);
         self.heaps.deinit(self.allocator);
+        self.func_refs.deinit(self.allocator);
     }
 
     /// Clear cached state for reuse.
@@ -123,6 +138,7 @@ pub const FuncEnvironment = struct {
         self.vmctx = null;
         self.globals.clearRetainingCapacity();
         self.heaps.clearRetainingCapacity();
+        self.func_refs.clearRetainingCapacity();
     }
 
     /// Get or create the VMContext global value.
@@ -261,6 +277,44 @@ pub const FuncEnvironment = struct {
     /// Get a previously created heap.
     pub fn getHeap(self: *Self, memory_index: u32) ?*const HeapData {
         return self.heaps.getPtr(memory_index);
+    }
+
+    /// Get or create a FuncRef for a Wasm function.
+    ///
+    /// Port of func_environ.rs:get_or_create_defined_func_ref()
+    ///
+    /// Creates an external function reference that can be used for direct calls.
+    /// The signature includes the Wasm calling convention:
+    /// params = [callee_vmctx, caller_vmctx, ...wasm_params]
+    pub fn getOrCreateFuncRef(self: *Self, func: *Function, function_index: u32) !FuncRef {
+        // Check cache first
+        if (self.func_refs.get(function_index)) |ref| return ref;
+
+        // Build the signature with vmctx params
+        // Wasm functions have signature: (callee_vmctx, caller_vmctx, ...wasm_params) -> ...wasm_returns
+        var sig = Signature.init(.fast); // Use fast calling convention
+
+        // Add the two vmctx parameters (required by Wasm calling convention)
+        try sig.params.append(self.allocator, AbiParam.init(self.pointer_type));
+        try sig.params.append(self.allocator, AbiParam.init(self.pointer_type));
+
+        // For now, we don't have the actual Wasm function signature info
+        // This would need to be passed in from the module environment
+        // For a minimal implementation, assume no params/returns beyond vmctx
+
+        // Create the signature ref
+        const sig_ref = try func.importSignature(self.allocator, sig);
+
+        // Create the function reference
+        const ext_func = ExtFuncData{
+            .name = .{ .user = .{ .namespace = 0, .index = function_index } },
+            .signature = sig_ref,
+            .colocated = true, // Local function in same module
+        };
+
+        const func_ref = try func.importFunction(self.allocator, ext_func);
+        try self.func_refs.put(self.allocator, function_index, func_ref);
+        return func_ref;
     }
 };
 

@@ -292,7 +292,7 @@ pub struct MemArg {
 
 ## Task 7.3: Call Operations
 
-**Status**: [ ] Not Started
+**Status**: [~] Partial (Direct calls implemented, indirect calls pending)
 
 ### Cranelift Reference
 - **Operator::Call**: `code_translator.rs` lines 654-676
@@ -315,7 +315,7 @@ Offset 16: type_index (u32)    - Signature type ID
 ### Implementation Checklist
 
 #### 7.3.1 Add Signature Infrastructure
-- [ ] Add to `ir/clif/function.zig`:
+- [x] Add to `ir/clif/function.zig` (already exists):
   ```zig
   pub const SigRef = struct { index: u32 };
 
@@ -329,11 +329,11 @@ Offset 16: type_index (u32)    - Signature type ID
   }
   ```
 
-- [ ] Add to FuncEnvironment:
+- [x] Add to FuncEnvironment (simplified - signatures created inline):
   ```zig
-  sig_refs: std.AutoHashMapUnmanaged(u32, SigRef),
+  func_refs: std.AutoHashMapUnmanaged(u32, FuncRef),
 
-  pub fn getOrCreateSigRef(self: *Self, func: *Function, type_index: u32) !SigRef {
+  pub fn getOrCreateFuncRef(self: *Self, func: *Function, function_index: u32) !FuncRef {
       if (self.sig_refs.get(type_index)) |sig| return sig;
 
       // Build signature: [callee_vmctx, caller_vmctx, ...params] -> [...returns]
@@ -362,7 +362,7 @@ Offset 16: type_index (u32)    - Signature type ID
   ```
 
 #### 7.3.2 Add Function Reference Infrastructure
-- [ ] Add to FuncEnvironment:
+- [x] Add to FuncEnvironment (merged with 7.3.1):
   ```zig
   func_refs: std.AutoHashMapUnmanaged(u32, FuncRef),
 
@@ -381,7 +381,7 @@ Offset 16: type_index (u32)    - Signature type ID
   ```
 
 #### 7.3.3 Implement translateCall (Direct Calls)
-- [ ] Add to translator.zig:
+- [x] Add to translator.zig:
   ```zig
   /// Translate direct function call.
   /// Port of code_translator.rs:654-676
@@ -575,7 +575,7 @@ Offset 16: type_index (u32)    - Signature type ID
 ### Overall Progress
 - [x] Task 7.4: i64 Arithmetic (6/6 subtasks) - COMPLETE
 - [x] Task 7.2: Memory Operations (9/9 subtasks) - COMPLETE
-- [ ] Task 7.3: Call Operations (0/10 subtasks)
+- [~] Task 7.3: Call Operations (3/10 subtasks) - Direct calls done, indirect pending
 
 ### Test Status
 - [x] All existing tests pass

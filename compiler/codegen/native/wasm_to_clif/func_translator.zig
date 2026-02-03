@@ -298,6 +298,11 @@ pub const WasmFuncTranslator = struct {
             .i64_store8 => |m| try translator.translateTruncStore(m, 1),
             .i64_store16 => |m| try translator.translateTruncStore(m, 2),
             .i64_store32 => |m| try translator.translateTruncStore(m, 4),
+
+            // Calls
+            // Port of code_translator.rs:654-717
+            .call => |idx| try translator.translateCall(idx),
+            .call_indirect => |data| try translator.translateCallIndirect(data.type_index, data.table_index),
         }
     }
 };
@@ -437,6 +442,14 @@ pub const WasmOperator = union(enum) {
     i64_store8: MemArg,
     i64_store16: MemArg,
     i64_store32: MemArg,
+
+    // Calls
+    // Port of code_translator.rs:654-717
+    call: u32, // function_index
+    call_indirect: struct {
+        type_index: u32,
+        table_index: u32,
+    },
 };
 
 // ============================================================================
