@@ -10,6 +10,8 @@ const std = @import("std");
 const stack_mod = @import("stack.zig");
 const frontend_mod = @import("../frontend/mod.zig");
 const func_environ_mod = @import("func_environ.zig");
+const bounds_checks = @import("bounds_checks.zig");
+const heap_mod = @import("heap.zig");
 
 // Re-export CLIF types from stack module
 pub const clif = stack_mod.clif;
@@ -32,6 +34,10 @@ pub const GlobalValue = frontend_mod.GlobalValue;
 pub const FuncEnvironment = func_environ_mod.FuncEnvironment;
 pub const GlobalVariable = func_environ_mod.GlobalVariable;
 pub const ConstantValue = func_environ_mod.ConstantValue;
+
+// Heap/memory types
+pub const MemArg = heap_mod.MemArg;
+pub const HeapData = heap_mod.HeapData;
 
 // ============================================================================
 // Wasm Opcode
@@ -1075,6 +1081,124 @@ pub const FuncTranslator = struct {
     pub fn translateUnreachable(self: *Self) !void {
         _ = try self.builder.ins().trap(clif.TrapCode.unreachable_code_reached);
         self.state.reachable = false;
+    }
+
+    // ========================================================================
+    // Memory Translation
+    // Port of code_translator.rs:3680-3724 (translate_load/store)
+    // and code_translator.rs:3459-3628 (prepare_addr)
+    // ========================================================================
+
+    /// Prepare address for a memory access.
+    ///
+    /// Port of code_translator.rs:3459-3628 (prepare_addr)
+    ///
+    /// Pops the index from the stack, performs bounds checking, and returns
+    /// the native address for the memory access.
+    fn prepareAddr(self: *Self, memarg: MemArg, access_size: u8) !struct { flags: clif.MemFlags, addr: Value } {
+        const index = self.state.pop1();
+        const memory_index = memarg.memory;
+
+        // Get or create heap for this memory
+        const heap = try self.env.getOrCreateHeap(self.builder.func, memory_index);
+
+        // Compute address with bounds checking
+        const addr = try bounds_checks.boundsCheckAndComputeAddr(
+            self.builder,
+            heap,
+            index,
+            memarg.offset,
+            access_size,
+        );
+
+        // Set memory flags (little-endian for Wasm)
+        // Note: Cranelift sets endianness but our flags struct doesn't support it yet
+        const flags = clif.MemFlags.DEFAULT;
+
+        return .{ .flags = flags, .addr = addr };
+    }
+
+    /// Translate a load instruction.
+    ///
+    /// Port of code_translator.rs:3680-3700 (translate_load)
+    pub fn translateLoad(self: *Self, memarg: MemArg, result_ty: Type) !void {
+        const access_size: u8 = @intCast(result_ty.bytes());
+        const prepared = try self.prepareAddr(memarg, access_size);
+        const value = try self.builder.ins().load(result_ty, prepared.flags, prepared.addr, 0);
+        try self.state.push1(value);
+    }
+
+    /// Translate a store instruction.
+    ///
+    /// Port of code_translator.rs:3703-3724 (translate_store)
+    pub fn translateStore(self: *Self, memarg: MemArg, val_ty: Type) !void {
+        const value = self.state.pop1();
+        const access_size: u8 = @intCast(val_ty.bytes());
+        const prepared = try self.prepareAddr(memarg, access_size);
+        _ = try self.builder.ins().store(prepared.flags, value, prepared.addr, 0);
+    }
+
+    /// Translate a sign-extending load (load8_s, load16_s, load32_s).
+    ///
+    /// Loads a smaller value and sign-extends to the result type.
+    pub fn translateSLoad(self: *Self, memarg: MemArg, load_size: u8, result_ty: Type) !void {
+        const prepared = try self.prepareAddr(memarg, load_size);
+
+        // Determine the load type based on size
+        const load_ty = switch (load_size) {
+            1 => Type.I8,
+            2 => Type.I16,
+            4 => Type.I32,
+            else => unreachable,
+        };
+
+        const loaded = try self.builder.ins().load(load_ty, prepared.flags, prepared.addr, 0);
+        const extended = try self.builder.ins().sextend(result_ty, loaded);
+        try self.state.push1(extended);
+    }
+
+    /// Translate a zero-extending load (load8_u, load16_u, load32_u).
+    ///
+    /// Loads a smaller value and zero-extends to the result type.
+    pub fn translateULoad(self: *Self, memarg: MemArg, load_size: u8, result_ty: Type) !void {
+        const prepared = try self.prepareAddr(memarg, load_size);
+
+        // Determine the load type based on size
+        const load_ty = switch (load_size) {
+            1 => Type.I8,
+            2 => Type.I16,
+            4 => Type.I32,
+            else => unreachable,
+        };
+
+        const loaded = try self.builder.ins().load(load_ty, prepared.flags, prepared.addr, 0);
+        const extended = try self.builder.ins().uextend(result_ty, loaded);
+        try self.state.push1(extended);
+    }
+
+    /// Translate a truncating store (store8, store16, store32).
+    ///
+    /// Truncates the value and stores a smaller type.
+    pub fn translateTruncStore(self: *Self, memarg: MemArg, store_size: u8) !void {
+        const value = self.state.pop1();
+        const prepared = try self.prepareAddr(memarg, store_size);
+
+        // Determine the store type based on size
+        const store_ty = switch (store_size) {
+            1 => Type.I8,
+            2 => Type.I16,
+            4 => Type.I32,
+            else => unreachable,
+        };
+
+        // Truncate value if needed
+        const val_ty = self.builder.func.dfg.valueType(value);
+        const truncated = if (val_ty.bits() > store_ty.bits())
+            try self.builder.ins().ireduce(store_ty, value)
+        else
+            value;
+
+        _ = try self.builder.ins().store(prepared.flags, truncated, prepared.addr, 0);
     }
 };
 

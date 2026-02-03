@@ -9,6 +9,7 @@ const std = @import("std");
 const stack_mod = @import("stack.zig");
 const translator_mod = @import("translator.zig");
 const frontend_mod = @import("../frontend/mod.zig");
+const heap_mod = @import("heap.zig");
 
 // Re-export types
 pub const clif = stack_mod.clif;
@@ -22,6 +23,9 @@ pub const Type = frontend_mod.Type;
 pub const Function = frontend_mod.Function;
 pub const FunctionBuilder = frontend_mod.FunctionBuilder;
 pub const FunctionBuilderContext = frontend_mod.FunctionBuilderContext;
+
+// Heap/memory types
+pub const MemArg = heap_mod.MemArg;
 
 // ============================================================================
 // Wasm Value Type
@@ -265,6 +269,35 @@ pub const WasmFuncTranslator = struct {
             // Parametric
             .drop => try translator.translateDrop(),
             .select => try translator.translateSelect(),
+
+            // Memory loads
+            // Port of code_translator.rs:818-902
+            .i32_load => |m| try translator.translateLoad(m, Type.I32),
+            .i64_load => |m| try translator.translateLoad(m, Type.I64),
+            .f32_load => |m| try translator.translateLoad(m, Type.F32),
+            .f64_load => |m| try translator.translateLoad(m, Type.F64),
+            .i32_load8_s => |m| try translator.translateSLoad(m, 1, Type.I32),
+            .i32_load8_u => |m| try translator.translateULoad(m, 1, Type.I32),
+            .i32_load16_s => |m| try translator.translateSLoad(m, 2, Type.I32),
+            .i32_load16_u => |m| try translator.translateULoad(m, 2, Type.I32),
+            .i64_load8_s => |m| try translator.translateSLoad(m, 1, Type.I64),
+            .i64_load8_u => |m| try translator.translateULoad(m, 1, Type.I64),
+            .i64_load16_s => |m| try translator.translateSLoad(m, 2, Type.I64),
+            .i64_load16_u => |m| try translator.translateULoad(m, 2, Type.I64),
+            .i64_load32_s => |m| try translator.translateSLoad(m, 4, Type.I64),
+            .i64_load32_u => |m| try translator.translateULoad(m, 4, Type.I64),
+
+            // Memory stores
+            // Port of code_translator.rs:962-977
+            .i32_store => |m| try translator.translateStore(m, Type.I32),
+            .i64_store => |m| try translator.translateStore(m, Type.I64),
+            .f32_store => |m| try translator.translateStore(m, Type.F32),
+            .f64_store => |m| try translator.translateStore(m, Type.F64),
+            .i32_store8 => |m| try translator.translateTruncStore(m, 1),
+            .i32_store16 => |m| try translator.translateTruncStore(m, 2),
+            .i64_store8 => |m| try translator.translateTruncStore(m, 1),
+            .i64_store16 => |m| try translator.translateTruncStore(m, 2),
+            .i64_store32 => |m| try translator.translateTruncStore(m, 4),
         }
     }
 };
@@ -375,6 +408,35 @@ pub const WasmOperator = union(enum) {
     // Parametric
     drop,
     select,
+
+    // Memory (loads)
+    // Port of code_translator.rs:818-902
+    i32_load: MemArg,
+    i64_load: MemArg,
+    f32_load: MemArg,
+    f64_load: MemArg,
+    i32_load8_s: MemArg,
+    i32_load8_u: MemArg,
+    i32_load16_s: MemArg,
+    i32_load16_u: MemArg,
+    i64_load8_s: MemArg,
+    i64_load8_u: MemArg,
+    i64_load16_s: MemArg,
+    i64_load16_u: MemArg,
+    i64_load32_s: MemArg,
+    i64_load32_u: MemArg,
+
+    // Memory (stores)
+    // Port of code_translator.rs:962-977
+    i32_store: MemArg,
+    i64_store: MemArg,
+    f32_store: MemArg,
+    f64_store: MemArg,
+    i32_store8: MemArg,
+    i32_store16: MemArg,
+    i64_store8: MemArg,
+    i64_store16: MemArg,
+    i64_store32: MemArg,
 };
 
 // ============================================================================

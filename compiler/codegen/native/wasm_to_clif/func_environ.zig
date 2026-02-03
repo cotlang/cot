@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const frontend_mod = @import("../frontend/mod.zig");
+const heap_mod = @import("heap.zig");
 
 // Re-export CLIF types
 pub const clif = frontend_mod;
@@ -14,6 +15,10 @@ pub const Type = frontend_mod.Type;
 pub const Function = frontend_mod.Function;
 pub const GlobalValue = frontend_mod.GlobalValue;
 pub const GlobalValueData = frontend_mod.GlobalValueData;
+
+// Re-export heap types
+pub const HeapData = heap_mod.HeapData;
+pub const MemArg = heap_mod.MemArg;
 
 // ============================================================================
 // ConstantValue
@@ -90,6 +95,10 @@ pub const FuncEnvironment = struct {
     /// Avoids creating duplicate GlobalValue entries.
     globals: std.AutoHashMapUnmanaged(u32, GlobalVariable),
 
+    /// Cached heap info per wasm memory index.
+    /// Port of func_environ.rs heaps field.
+    heaps: std.AutoHashMapUnmanaged(u32, HeapData),
+
     const Self = @This();
 
     /// Create a new function environment.
@@ -99,18 +108,21 @@ pub const FuncEnvironment = struct {
             .pointer_type = Type.I64,
             .vmctx = null,
             .globals = .{},
+            .heaps = .{},
         };
     }
 
     /// Deallocate storage.
     pub fn deinit(self: *Self) void {
         self.globals.deinit(self.allocator);
+        self.heaps.deinit(self.allocator);
     }
 
     /// Clear cached state for reuse.
     pub fn clear(self: *Self) void {
         self.vmctx = null;
         self.globals.clearRetainingCapacity();
+        self.heaps.clearRetainingCapacity();
     }
 
     /// Get or create the VMContext global value.
@@ -192,6 +204,63 @@ pub const FuncEnvironment = struct {
         };
         try self.globals.put(self.allocator, global_index, var_info);
         return var_info;
+    }
+
+    /// Get or create HeapData for a Wasm memory.
+    ///
+    /// Port of func_environ.rs:get_or_create_heap()
+    ///
+    /// Creates GlobalValue references for the heap's base address and bound.
+    /// These are stored in the vmctx at known offsets.
+    pub fn getOrCreateHeap(self: *Self, func: *Function, memory_index: u32) !*HeapData {
+        // Check cache first
+        if (self.heaps.getPtr(memory_index)) |heap| return heap;
+
+        const vmctx = try self.vmctxVal(func);
+
+        // VMContext layout for heaps (simplified):
+        // Heap base is at vmctx + heap_data_offset + memory_index * heap_stride + 0
+        // Heap bound is at vmctx + heap_data_offset + memory_index * heap_stride + 8
+        const heap_data_offset: i64 = 0x20000; // After globals
+        const heap_stride: i64 = 24; // base (8) + bound (8) + flags (8)
+
+        const base_offset = heap_data_offset + @as(i64, memory_index) * heap_stride;
+        const bound_offset = base_offset + 8;
+
+        // Create GlobalValue for heap base address
+        const base_gv = try func.createGlobalValue(.{
+            .iadd_imm = .{
+                .base = vmctx,
+                .offset = base_offset,
+                .global_type = self.pointer_type,
+            },
+        });
+
+        // Create GlobalValue for heap bound address
+        const bound_gv = try func.createGlobalValue(.{
+            .iadd_imm = .{
+                .base = vmctx,
+                .offset = bound_offset,
+                .global_type = self.pointer_type,
+            },
+        });
+
+        const heap = HeapData{
+            .base = base_gv,
+            .bound = bound_gv,
+            .index_type = Type.I32, // Wasm32 uses i32 indices
+            .min_size = 0,
+            .max_size = null,
+            .offset_guard_size = 0, // No guard pages for now
+        };
+
+        try self.heaps.put(self.allocator, memory_index, heap);
+        return self.heaps.getPtr(memory_index).?;
+    }
+
+    /// Get a previously created heap.
+    pub fn getHeap(self: *Self, memory_index: u32) ?*const HeapData {
+        return self.heaps.getPtr(memory_index);
     }
 };
 

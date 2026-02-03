@@ -61,6 +61,11 @@ pub const BlockCall = frontend.BlockCall;
 pub const GlobalValue = frontend.GlobalValue;
 pub const GlobalValueData = frontend.GlobalValueData;
 
+// Additional CLIF types needed for memory operations
+pub const MemFlags = frontend.clif.MemFlags;
+pub const TrapCode = frontend.clif.TrapCode;
+pub const IntCC = frontend.clif.IntCC;
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = frontend;
