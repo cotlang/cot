@@ -726,11 +726,43 @@ fn main() i32 {
 ### Phase 5: End-to-End
 | Task | Status | Notes |
 |------|--------|-------|
-| E2E.1: return 42 | ⬜ | |
-| E2E.2: arithmetic | ⬜ | |
-| E2E.3: control flow | ⬜ | |
-| E2E.4: function calls | ⬜ | |
-| E2E.5: loops | ⬜ | |
+| E2E.1: return 42 | 🔴 BLOCKED | Pipeline produces 0 bytes - see below |
+| E2E.2: arithmetic | 🔴 BLOCKED | Pipeline produces 0 bytes |
+| E2E.3: control flow | 🔴 BLOCKED | Pipeline produces 0 bytes |
+| E2E.4: function calls | 🔴 BLOCKED | Pipeline produces 0 bytes |
+| E2E.5: loops | 🔴 BLOCKED | Pipeline produces 0 bytes |
+
+---
+
+## CRITICAL BUG: 0-Byte Emission
+
+**Discovery**: During E2E testing, compilation produces 0 bytes of machine code.
+
+**Debug output**:
+```
+[codegen] driver: translated function 0 to CLIF (2 blocks, 20 insts)
+[codegen] driver: compiled function 0: 0 bytes
+```
+
+**Symptoms**:
+- CLIF IR is populated correctly (2 blocks, 20 instructions)
+- Lowering completes without errors
+- VCode.emit() returns empty buffer
+- Native binary crashes with SIGILL (exit code 132)
+
+**Root Cause Investigation Needed**:
+1. BlockLoweringOrder may not be computing blocks correctly
+2. Lower phase may skip instructions (isAnyInstResultNeeded returns false)
+3. VCode.emit() iteration may skip all instructions
+4. Register allocation output may be empty
+
+**Files to investigate**:
+- `machinst/lower.zig` - instruction lowering
+- `machinst/blockorder.zig` - block ordering
+- `machinst/vcode.zig` - VCode emission
+- `regalloc/regalloc.zig` - register allocation
+
+This is a separate issue from B1-B5 and requires deep debugging of the native emission pipeline.
 
 ---
 
@@ -738,22 +770,20 @@ fn main() i32 {
 
 **Total Tasks**: 45
 **Completed**: 37
-**Remaining**: 8
+**Remaining**: 8 (all blocked by 0-byte emission bug)
 
-**Estimated Total Hours**: 10-15 (estimated 2-3 hours remaining for E2E tests)
-
-**Completed Blockers**:
+**Completed Blockers** (B1-B5):
 - ✅ B1: Loop back-edge translation
 - ✅ B2: SmallVec heap allocation
 - ✅ B3: genMove for aarch64/x64
 - ✅ B4: genSpill/genReload
 - ✅ B5: Wasm opcode gaps (global mutability, trap_if, indirect call)
 
-**Next Steps**: Phase 5 E2E tests
+**Critical Blocker**:
+- 🔴 **0-byte emission bug** - Prevents all E2E tests
 
-**Completed Phases**:
-- Phase 1 (B2): SmallVec heap allocation ✅
-- Phase 2 (B1): Loop back-edge translation ✅
-- Phase 3 (B3/B4): genMove, genSpill, genReload ✅
-
-**Next Action**: B5 (Wasm opcode gaps) - complete translation coverage.
+**Next Steps**:
+1. Debug the 0-byte emission issue in lower.zig/vcode.zig
+2. Verify BlockLoweringOrder computes correct blocks
+3. Verify instruction lowering produces VCode instructions
+4. Verify VCode.emit iterates over instructions correctly
