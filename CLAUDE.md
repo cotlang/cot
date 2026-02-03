@@ -112,11 +112,22 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| Phase 1-3 | ✅ Done | CLIF IR, Wasm translation, MachInst framework |
-| Phase 4 | ✅ Done | ARM64 backend (10,874 lines, all features) |
-| Phase 5 | ✅ Done | x86-64 backend (9,828 lines, 90% ARM64 parity) |
-| Phase 6 | ✅ Done | Register allocation (regalloc2 port, type unification complete) |
-| **Phase 7** | 🔄 In Progress | Integration (wire into driver) |
+| Phase 1 | ✅ Done | CLIF IR (types, DFG, instructions, layout) |
+| Phase 2 | ⚠️ 70% | Wasm translation (**loops broken** - back-edges disabled) |
+| Phase 3 | ⚠️ 80% | MachInst framework (**SmallVec panics, genMove stub**) |
+| Phase 4 | ✅ 85% | ARM64 backend (minor: float args, large frames) |
+| Phase 5 | ✅ 80% | x86-64 backend (minor: memory addressing) |
+| Phase 6 | ⚠️ 90% | Register allocation (**genSpill/genReload panic**) |
+| Phase 7 | ⚠️ 70% | Integration (blocked by above issues) |
+
+**5 Critical Blockers (will panic at runtime):**
+1. Loop back-edges disabled (`func_translator.zig:547`)
+2. SmallVec overflow panics (`inst.zig:536,542`)
+3. genMove is empty stub (`vcode.zig:900`)
+4. genSpill/genReload panic (`abi.zig:940,948`)
+5. Wasm opcode gaps (`translator.zig`)
+
+**See `CRANELIFT_PORT_MASTER_PLAN.md` for full details and fix estimates (~10-15 hrs).**
 
 ---
 
@@ -124,8 +135,7 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 
 | Document | Purpose |
 |----------|---------|
-| `CRANELIFT_PORT_MASTER_PLAN.md` | **Native AOT codegen - Cranelift port phases & tasks** |
-| `PHASE7_EXECUTION_PLAN.md` | **Phase 7 integration tasks (current work)** |
+| `CRANELIFT_PORT_MASTER_PLAN.md` | **Native AOT codegen - phases, status, and 5 critical blockers** |
 | `WASM_BACKEND.md` | Wasm milestones M1-M16, implementation details |
 | `ROADMAP_PHASE2.md` | M17-M24 detailed plan with Go/Swift research |
 | `TESTING.md` | Testing strategy and test organization |
@@ -246,7 +256,7 @@ COT_DEBUG=parse,lower,codegen zig build test
 ### DO
 
 - Run tests after every change: `zig build test`
-- Reference docs before implementing: check WASM_BACKEND.md or AOT_EXECUTION_PLAN.md
+- Reference docs before implementing: check WASM_BACKEND.md or CRANELIFT_PORT_MASTER_PLAN.md
 - Reference `bootstrap-0.2/` for working code examples
 - Make incremental changes, verify each one
 - Ask user for direction when uncertain
@@ -260,7 +270,7 @@ COT_DEBUG=parse,lower,codegen zig build test
 
 ### When Stuck
 
-1. Check the relevant planning doc (WASM_BACKEND.md or AOT_EXECUTION_PLAN.md)
+1. Check the relevant planning doc (WASM_BACKEND.md or CRANELIFT_PORT_MASTER_PLAN.md)
 2. Check if bootstrap-0.2 has working code for this
 3. **Study ~/learning/ reference implementations** (Go, Swift) to copy proven designs
 4. Reference DESIGN.md for intended architecture
@@ -305,7 +315,6 @@ The project succeeds through persistence and copying proven designs, not shortcu
 | Documentation | Purpose |
 |---------------|---------|
 | `WASM_BACKEND.md` | Wasm implementation status and Go references |
-| `AOT_EXECUTION_PLAN.md` | Native AOT compilation phases |
 | `audit/SUMMARY.md` | Test results and component status |
 
 ---
