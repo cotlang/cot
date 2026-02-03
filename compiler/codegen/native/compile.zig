@@ -510,36 +510,14 @@ fn emitCodeAArch64(
     regalloc_output_val: *const Output,
     backend: AArch64Backend,
 ) !VCodeAArch64.EmitResult {
+    _ = allocator;
     _ = backend;
-
-    // Convert regalloc Output to VCode's RegallocOutput format
-    // Build allocation ranges from inst_alloc_offsets
-    var alloc_ranges = try allocator.alloc(vcode_mod.Range, regalloc_output_val.inst_alloc_offsets.items.len);
-    defer allocator.free(alloc_ranges);
-
-    for (regalloc_output_val.inst_alloc_offsets.items, 0..) |offset, i| {
-        const next_offset = if (i + 1 < regalloc_output_val.inst_alloc_offsets.items.len)
-            regalloc_output_val.inst_alloc_offsets.items[i + 1]
-        else
-            @as(u32, @intCast(regalloc_output_val.allocs.items.len));
-
-        alloc_ranges[i] = .{
-            .start = offset,
-            .end = next_offset,
-        };
-    }
-
-    const vcode_regalloc = vcode_mod.RegallocOutput{
-        .num_spillslots = @intCast(regalloc_output_val.num_spillslots),
-        .allocs = regalloc_output_val.allocs.items,
-        .alloc_ranges = alloc_ranges,
-    };
 
     // Create emit info for AArch64 (use ISA-specific EmitInfo)
     const emit_info = aarch64.inst.emit.EmitInfo{};
 
-    // Emit using VCode's emit method
-    return try vcode.emit(&vcode_regalloc, &emit_info);
+    // Emit using VCode's emit method with real regalloc Output
+    return try vcode.emit(regalloc_output_val, &emit_info);
 }
 
 /// Emit machine code for x64.
@@ -550,36 +528,14 @@ fn emitCodeX64(
     regalloc_output_val: *const Output,
     backend: X64Backend,
 ) !VCodeX64.EmitResult {
+    _ = allocator;
     _ = backend;
-
-    // Convert regalloc Output to VCode's RegallocOutput format
-    // Build allocation ranges from inst_alloc_offsets
-    var alloc_ranges = try allocator.alloc(vcode_mod.Range, regalloc_output_val.inst_alloc_offsets.items.len);
-    defer allocator.free(alloc_ranges);
-
-    for (regalloc_output_val.inst_alloc_offsets.items, 0..) |offset, i| {
-        const next_offset = if (i + 1 < regalloc_output_val.inst_alloc_offsets.items.len)
-            regalloc_output_val.inst_alloc_offsets.items[i + 1]
-        else
-            @as(u32, @intCast(regalloc_output_val.allocs.items.len));
-
-        alloc_ranges[i] = .{
-            .start = offset,
-            .end = next_offset,
-        };
-    }
-
-    const vcode_regalloc = vcode_mod.RegallocOutput{
-        .num_spillslots = @intCast(regalloc_output_val.num_spillslots),
-        .allocs = regalloc_output_val.allocs.items,
-        .alloc_ranges = alloc_ranges,
-    };
 
     // Create emit info for x64 (use ISA-specific EmitInfo)
     const emit_info = x64.inst.emit.EmitInfo{};
 
-    // Emit using VCode's emit method
-    return try vcode.emit(&vcode_regalloc, &emit_info);
+    // Emit using VCode's emit method with real regalloc Output
+    return try vcode.emit(regalloc_output_val, &emit_info);
 }
 
 /// AArch64 label use type for branch fixups.

@@ -29,6 +29,8 @@ const clif = @import("../../../ir/clif/mod.zig");
 
 // Import regalloc types
 const regalloc_operand = @import("../regalloc/operand.zig");
+const regalloc_output = @import("../regalloc/output.zig");
+const regalloc_index = @import("../regalloc/index.zig");
 
 // Re-export key types from reg module
 pub const VReg = reg_mod.VReg;
@@ -799,7 +801,7 @@ pub fn VCode(comptime I: type) type {
         /// Reference: cranelift/codegen/src/machinst/vcode.rs emit()
         pub fn emit(
             self: *const Self,
-            regalloc_output: *const RegallocOutput,
+            output: *const regalloc_output.Output,
             emit_info: *const I.EmitInfo,
         ) !EmitResult {
             const alloc = self.allocator;
@@ -817,7 +819,7 @@ pub fn VCode(comptime I: type) type {
             try bb_offsets.ensureTotalCapacity(alloc, self.numBlocks());
 
             // Compute frame size from spillslots
-            const frame_size = regalloc_output.num_spillslots * 8; // 8 bytes per slot
+            const frame_size: u32 = @intCast(output.num_spillslots * 8); // 8 bytes per slot
 
             // Emit prologue (placeholder - actual implementation depends on ABI)
             // In a complete implementation, this would:
@@ -838,19 +840,36 @@ pub fn VCode(comptime I: type) type {
                 // Get instruction range for this block
                 const insn_range = self.blockInsns(block);
 
-                // Emit instructions with regalloc edits interleaved
-                var insn_idx = insn_range.start;
-                while (insn_idx.lessThan(insn_range.end)) {
-                    // Get allocations for this instruction
-                    const inst_allocs = regalloc_output.getInstAllocs(insn_idx);
+                // Convert to regalloc InstRange for the iterator
+                const regalloc_range = regalloc_index.InstRange.new(
+                    regalloc_index.Inst.new(insn_range.start.index()),
+                    regalloc_index.Inst.new(insn_range.end.index()),
+                );
 
-                    // Get the instruction
-                    const inst = self.getInst(insn_idx);
+                // Iterate over instructions and edits together
+                var iter = output.blockInstsAndEdits(regalloc_range);
+                while (iter.next()) |item| {
+                    switch (item) {
+                        .inst => |inst| {
+                            // Get allocations for this instruction
+                            const inst_allocs = output.instAllocs(inst);
+                            const vcode_inst_idx = InsnIndex.new(inst.idx());
 
-                    // Emit the instruction with physical registers
-                    try inst.emitWithAllocs(&buffer, inst_allocs, emit_info);
-
-                    insn_idx = insn_idx.next();
+                            // Get the instruction and emit with physical registers
+                            const vcode_inst = self.getInst(vcode_inst_idx);
+                            try vcode_inst.emitWithAllocs(&buffer, inst_allocs, emit_info);
+                        },
+                        .edit => |edit| {
+                            // Process regalloc edit (move insertion)
+                            switch (edit.*) {
+                                .move => |m| {
+                                    // Generate a move instruction from the ISA
+                                    // This is ISA-specific and requires I.genMove()
+                                    try emitMove(I, &buffer, m.from, m.to, emit_info);
+                                },
+                            }
+                        },
+                    }
                 }
             }
 
@@ -866,30 +885,33 @@ pub fn VCode(comptime I: type) type {
                 .bb_offsets = bb_offsets,
             };
         }
+
+        /// Emit a move instruction from one allocation to another.
+        /// This handles reg-reg, reg-stack, and stack-reg moves.
+        fn emitMove(
+            comptime _: type, // Inst type (for ISA-specific move generation)
+            buffer: *MachBufferType,
+            from: regalloc_operand.Allocation,
+            to: regalloc_operand.Allocation,
+            emit_info: anytype,
+        ) !void {
+            // Generate move based on allocation types
+            // Uses ISA-specific move generation via Inst.genMove
+            // TODO: Implement genMove for each ISA (aarch64/x64)
+            _ = buffer;
+            _ = from;
+            _ = to;
+            _ = emit_info;
+        }
     };
 }
 
-/// Regalloc output interface for emission.
-/// This provides access to the register allocation results.
-pub const RegallocOutput = struct {
-    /// Number of spill slots allocated.
-    num_spillslots: u32,
-    /// Allocations per instruction operand.
-    allocs: []const Allocation,
-    /// Allocation ranges per instruction.
-    alloc_ranges: []const Range,
-
-    const Self = @This();
-
-    /// Get allocations for an instruction.
-    pub fn getInstAllocs(self: *const Self, inst: InsnIndex) []const Allocation {
-        if (inst.index() < self.alloc_ranges.len) {
-            const range = self.alloc_ranges[inst.index()];
-            return self.allocs[range.start..range.end];
-        }
-        return &[_]Allocation{};
-    }
-};
+/// Regalloc output type re-exported from regalloc/output.zig.
+/// This contains the results of register allocation including:
+/// - num_spillslots: how many stack slots are needed
+/// - allocs: physical register assignments per operand
+/// - edits: move instructions to insert
+pub const RegallocOutput = regalloc_output.Output;
 
 /// Emit info passed to instruction emission.
 /// Contains target-specific settings for encoding.
