@@ -603,6 +603,12 @@ pub fn VCode(comptime I: type) type {
 
         pub fn deinit(self: *Self) void {
             self.vreg_types.deinit(self.allocator);
+            // Free instruction-owned memory (slices allocated during lowering)
+            if (@hasDecl(I, "deinit")) {
+                for (self.insts.items) |*inst| {
+                    inst.deinit(self.allocator);
+                }
+            }
             self.insts.deinit(self.allocator);
 
             var map_iter = self.user_stack_maps.valueIterator();
@@ -813,8 +819,10 @@ pub fn VCode(comptime I: type) type {
             const alloc = self.allocator;
 
             // Create machine buffer
+            // Note: defer (not errdefer) because finish() copies data, doesn't move it.
+            // The original buffer must be freed even on success.
             var buffer = MachBufferType.init(alloc);
-            errdefer buffer.deinit();
+            defer buffer.deinit();
 
             // Reserve labels for all blocks
             try buffer.reserveLabelsForBlocks(self.numBlocks());

@@ -1662,6 +1662,24 @@ pub const Inst = union(enum) {
 
     /// EmitState type for this instruction type (used for emission context).
     pub const EmitState = emit_mod.EmitState;
+
+    /// Free any heap-allocated memory owned by this instruction.
+    /// Must be called for each instruction before the containing VCode is freed.
+    ///
+    /// Instructions that own heap memory:
+    /// - rets: allocated RetPair slice for return value constraints
+    /// - args: allocated ArgPair slice for argument constraints
+    /// - indirect_br: allocated MachLabel slice for branch targets
+    /// - jt_sequence: allocated MachLabel slice for jump table targets
+    pub fn deinit(self: *const Inst, allocator: Allocator) void {
+        switch (self.*) {
+            .rets => |r| allocator.free(r.rets),
+            .args => |a| allocator.free(a.args),
+            .indirect_br => |b| allocator.free(b.targets),
+            .jt_sequence => |j| allocator.free(j.targets),
+            else => {},
+        }
+    }
 };
 
 //=============================================================================
