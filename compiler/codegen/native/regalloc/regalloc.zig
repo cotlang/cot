@@ -428,6 +428,11 @@ pub fn runWithCtx(
         .{},
     );
 
+    // Phase 9a: Try to allocate registers for spilled bundles (second chance)
+    // Ported from: self.try_allocating_regs_for_spilled_bundles() in spill.rs
+    try spill_ctx.tryAllocatingRegsForSpilledBundles();
+
+    // Phase 9b: Allocate spillslots for bundles that couldn't get registers
     try spill_ctx.allocateSpillslots();
 
     // Phase 10: Move insertion

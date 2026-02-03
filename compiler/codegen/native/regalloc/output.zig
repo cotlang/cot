@@ -114,6 +114,9 @@ pub const Output = struct {
     }
 
     /// Initialize Output with pre-allocated arrays based on function size.
+    ///
+    /// Ported from regalloc2's create_pregs_and_vregs() in liveranges.rs.
+    /// This creates the allocation slots for each instruction operand.
     pub fn initForFunc(
         self: *Output,
         comptime Func: type,
@@ -121,12 +124,27 @@ pub const Output = struct {
         allocator: std.mem.Allocator,
     ) !void {
         const num_insts = func.numInsts();
-        // Pre-allocate inst_alloc_offsets with enough space for all instructions + 1
-        try self.inst_alloc_offsets.resize(allocator, num_insts + 1);
-        // Initialize to 0 (will be filled in during allocation)
-        for (self.inst_alloc_offsets.items) |*offset| {
-            offset.* = 0;
+
+        // Clear any existing data
+        self.inst_alloc_offsets.clearRetainingCapacity();
+        self.allocs.clearRetainingCapacity();
+
+        // Create allocations for each instruction's operands
+        // Ported from regalloc2: for inst in 0..self.func.num_insts() { ... }
+        for (0..num_insts) |inst_idx| {
+            const inst = Inst.new(inst_idx);
+            const start: u32 = @intCast(self.allocs.items.len);
+            try self.inst_alloc_offsets.append(allocator, start);
+
+            // Get operand count for this instruction
+            const operands = func.instOperands(inst);
+            for (0..operands.len) |_| {
+                try self.allocs.append(allocator, Allocation.none());
+            }
         }
+        // Add final offset (for computing last instruction's operand count)
+        const final_offset: u32 = @intCast(self.allocs.items.len);
+        try self.inst_alloc_offsets.append(allocator, final_offset);
     }
 
     /// Free all allocated memory.
