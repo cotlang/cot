@@ -19,6 +19,8 @@ pub const TranslationState = stack_mod.TranslationState;
 pub const FuncTranslator = translator_mod.FuncTranslator;
 pub const WasmOpcode = translator_mod.WasmOpcode;
 pub const WasmGlobalType = translator_mod.WasmGlobalType;
+pub const WasmFuncType = translator_mod.WasmFuncType;
+pub const TranslatorWasmValType = translator_mod.WasmValType;
 pub const Type = frontend_mod.Type;
 pub const Function = frontend_mod.Function;
 pub const FunctionBuilder = frontend_mod.FunctionBuilder;
@@ -86,21 +88,28 @@ pub const WasmFuncTranslator = struct {
     builder_ctx: FunctionBuilderContext,
     /// Module-level globals (for type lookup during translation).
     globals: []const WasmGlobalType,
+    /// Module-level function types (for indirect call signature lookup).
+    func_types: []const WasmFuncType,
 
     const Self = @This();
 
-    /// Create a new translator with module-level globals.
-    pub fn init(allocator: std.mem.Allocator, globals: []const WasmGlobalType) Self {
+    /// Create a new translator with module-level information.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        globals: []const WasmGlobalType,
+        func_types: []const WasmFuncType,
+    ) Self {
         return .{
             .allocator = allocator,
             .builder_ctx = FunctionBuilderContext.init(allocator),
             .globals = globals,
+            .func_types = func_types,
         };
     }
 
-    /// Create a new translator without globals (backwards compatibility).
+    /// Create a new translator without module info (backwards compatibility).
     pub fn initWithoutGlobals(allocator: std.mem.Allocator) Self {
-        return init(allocator, &[_]WasmGlobalType{});
+        return init(allocator, &[_]WasmGlobalType{}, &[_]WasmFuncType{});
     }
 
     /// Deallocate storage.
@@ -134,8 +143,8 @@ pub const WasmFuncTranslator = struct {
         // 2. Set up function builder
         var builder = FunctionBuilder.init(func, &self.builder_ctx);
 
-        // 3. Create translator with globals for type lookup
-        var translator = FuncTranslator.init(self.allocator, &builder, self.globals);
+        // 3. Create translator with module info for type lookup
+        var translator = FuncTranslator.init(self.allocator, &builder, self.globals, self.func_types);
         defer translator.deinit();
 
         // 4. Calculate total number of locals (params + declared locals)

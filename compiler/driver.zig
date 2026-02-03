@@ -337,8 +337,32 @@ pub const Driver = struct {
             };
         }
 
-        // Create reusable translator context with globals
-        var func_translator = wasm_func_translator.WasmFuncTranslator.init(self.allocator, globals_converted);
+        // Convert module function types to translator format
+        var func_types_converted = try self.allocator.alloc(wasm_func_translator.WasmFuncType, wasm_module.types.len);
+        defer {
+            for (func_types_converted) |ft| {
+                self.allocator.free(ft.params);
+                self.allocator.free(ft.results);
+            }
+            self.allocator.free(func_types_converted);
+        }
+        for (wasm_module.types, 0..) |ft, i| {
+            const params = try self.allocator.alloc(wasm_func_translator.TranslatorWasmValType, ft.params.len);
+            for (ft.params, 0..) |p, j| {
+                params[j] = convertToTranslatorValType(p);
+            }
+            const results = try self.allocator.alloc(wasm_func_translator.TranslatorWasmValType, ft.results.len);
+            for (ft.results, 0..) |r, j| {
+                results[j] = convertToTranslatorValType(r);
+            }
+            func_types_converted[i] = .{
+                .params = params,
+                .results = results,
+            };
+        }
+
+        // Create reusable translator context with module info
+        var func_translator = wasm_func_translator.WasmFuncTranslator.init(self.allocator, globals_converted, func_types_converted);
         defer func_translator.deinit();
 
         // Select ISA based on target

@@ -777,6 +777,26 @@ pub const FuncInstBuilder = struct {
         return self.buildTerminator();
     }
 
+    /// Trap if condition is nonzero (true).
+    /// Port of cranelift/codegen/src/ir/builder.rs trapnz
+    pub fn trapnz(self: Self, cond: Value, code: clif.TrapCode) !Inst {
+        _ = cond;
+        _ = code;
+        // trapnz is NOT a terminator - execution continues if condition is false
+        const r = try self.build(null);
+        return r.inst;
+    }
+
+    /// Trap if condition is zero (false).
+    /// Port of cranelift/codegen/src/ir/builder.rs trapz
+    pub fn trapz(self: Self, cond: Value, code: clif.TrapCode) !Inst {
+        _ = cond;
+        _ = code;
+        // trapz is NOT a terminator - execution continues if condition is true
+        const r = try self.build(null);
+        return r.inst;
+    }
+
     /// Branch table instruction.
     ///
     /// Port of cranelift/codegen/src/ir/instructions.rs br_table

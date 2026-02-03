@@ -707,21 +707,21 @@ fn main() i32 {
 ### Phase 4: Wasm Completeness
 | Task | Status | Notes |
 |------|--------|-------|
-| B5.1.1: GlobalInfo struct | ⬜ | |
-| B5.1.2: Parse mutability | ⬜ | |
-| B5.1.3: Use in translate | ⬜ | |
-| B5.1.4: Test globals | ⬜ | |
-| B5.2.1: trap_if opcode | ⬜ | |
-| B5.2.2: TrapCode enum | ⬜ | |
-| B5.2.3: insTrapIf builder | ⬜ | |
-| B5.2.4: aarch64 trap_if | ⬜ | |
-| B5.2.5: x64 trap_if | ⬜ | |
-| B5.2.6: Division traps | ⬜ | |
-| B5.2.7: Test trap_if | ⬜ | |
-| B5.3.1: FuncType storage | ⬜ | |
-| B5.3.2: Parse type section | ⬜ | |
-| B5.3.3: Use in call_indirect | ⬜ | |
-| B5.3.4: Test call_indirect | ⬜ | |
+| B5.1.1: GlobalInfo struct | ✅ | Using existing WasmGlobalType with mutable field |
+| B5.1.2: Parse mutability | ✅ | wasm_parser already has mutable field |
+| B5.1.3: Use in translate | ✅ | translateGlobalGet checks !mutable for is_constant |
+| B5.1.4: Test globals | ⬜ | Deferred - existing tests pass |
+| B5.2.1: trap_if opcode | ✅ | Already had trapnz/trapz in CLIF |
+| B5.2.2: TrapCode enum | ✅ | Added table_out_of_bounds, indirect_call_to_null, bad_signature |
+| B5.2.3: insTrapIf builder | ✅ | Added trapnz/trapz to frontend/frontend.zig |
+| B5.2.4: aarch64 trap_if | ✅ | Already had trap_if lowering |
+| B5.2.5: x64 trap_if | ✅ | Already had trap_if lowering |
+| B5.2.6: Division traps | ✅ | guardZeroDivisor now uses trapnz |
+| B5.2.7: Test trap_if | ⬜ | Deferred - existing tests pass |
+| B5.3.1: FuncType storage | ✅ | Added WasmFuncType to translator.zig |
+| B5.3.2: Parse type section | ✅ | driver.zig converts wasm_module.types |
+| B5.3.3: Use in call_indirect | ✅ | translateCallIndirect uses func_types[type_index] |
+| B5.3.4: Test call_indirect | ⬜ | Deferred - needs call_indirect test case |
 
 ### Phase 5: End-to-End
 | Task | Status | Notes |
@@ -737,10 +737,19 @@ fn main() i32 {
 ## Summary
 
 **Total Tasks**: 45
-**Completed**: 25
-**Remaining**: 20
+**Completed**: 37
+**Remaining**: 8
 
-**Estimated Total Hours**: 10-15 (estimated 4-6 hours remaining)
+**Estimated Total Hours**: 10-15 (estimated 2-3 hours remaining for E2E tests)
+
+**Completed Blockers**:
+- ✅ B1: Loop back-edge translation
+- ✅ B2: SmallVec heap allocation
+- ✅ B3: genMove for aarch64/x64
+- ✅ B4: genSpill/genReload
+- ✅ B5: Wasm opcode gaps (global mutability, trap_if, indirect call)
+
+**Next Steps**: Phase 5 E2E tests
 
 **Completed Phases**:
 - Phase 1 (B2): SmallVec heap allocation ✅

@@ -259,6 +259,12 @@ pub const TrapCode = enum(u8) {
     user1 = 1,
     /// User-defined trap code 2.
     user2 = 2,
+    /// Table access out of bounds.
+    table_out_of_bounds = 3,
+    /// Indirect call to null funcref.
+    indirect_call_to_null = 4,
+    /// Indirect call signature mismatch.
+    bad_signature = 5,
 
     const Self = @This();
 
@@ -273,6 +279,9 @@ pub const TrapCode = enum(u8) {
             .unreachable_code_reached => "unreachable",
             .user1 => "user1",
             .user2 => "user2",
+            .table_out_of_bounds => "table_oob",
+            .indirect_call_to_null => "icall_null",
+            .bad_signature => "bad_sig",
         };
     }
 };

@@ -199,6 +199,12 @@ pub const WasmValType = enum {
     }
 };
 
+/// Wasm function type (matches wasm_parser.FuncType simplified)
+pub const WasmFuncType = struct {
+    params: []const WasmValType,
+    results: []const WasmValType,
+};
+
 // ============================================================================
 // FuncTranslator
 // Port of wasmtime func_translator.rs
@@ -215,6 +221,8 @@ pub const FuncTranslator = struct {
     locals: std.ArrayListUnmanaged(Variable),
     /// Module-level globals (for type lookup).
     globals: []const WasmGlobalType,
+    /// Module-level function types (for indirect call signature lookup).
+    func_types: []const WasmFuncType,
     /// Function environment for global variable management.
     /// Port of Cranelift's FuncEnvironment.
     env: FuncEnvironment,
@@ -223,21 +231,27 @@ pub const FuncTranslator = struct {
 
     const Self = @This();
 
-    /// Create a new translator with module-level globals information.
-    pub fn init(allocator: std.mem.Allocator, builder: *FunctionBuilder, globals: []const WasmGlobalType) Self {
+    /// Create a new translator with module-level information.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        builder: *FunctionBuilder,
+        globals: []const WasmGlobalType,
+        func_types: []const WasmFuncType,
+    ) Self {
         return .{
             .state = TranslationState.init(allocator),
             .builder = builder,
             .locals = .{},
             .globals = globals,
+            .func_types = func_types,
             .env = FuncEnvironment.init(allocator),
             .allocator = allocator,
         };
     }
 
-    /// Create a new translator without globals (backwards compatibility).
+    /// Create a new translator without module info (backwards compatibility).
     pub fn initWithoutGlobals(allocator: std.mem.Allocator, builder: *FunctionBuilder) Self {
-        return init(allocator, builder, &[_]WasmGlobalType{});
+        return init(allocator, builder, &[_]WasmGlobalType{}, &[_]WasmFuncType{});
     }
 
     /// Deallocate storage.
@@ -738,13 +752,18 @@ pub const FuncTranslator = struct {
         const global_type = global_val_type.toClifType();
 
         // Determine if constant (immutable) or memory-based
-        // For now, treat all as memory-based (future: check mutability from globals array)
+        // Immutable globals can be treated as constants
+        const is_constant = if (global_index < self.globals.len)
+            !self.globals[global_index].mutable
+        else
+            false; // Unknown globals treated as mutable for safety
+
         const var_info = try self.env.getOrCreateGlobal(
             self.builder.func,
             global_index,
             global_type,
-            false, // is_constant - TODO: check globals[index].mutable
-            null, // constant_value
+            is_constant,
+            null, // constant_value - could be populated from init expr
         );
 
         switch (var_info) {
@@ -915,10 +934,8 @@ pub const FuncTranslator = struct {
         const zero = try self.builder.ins().iconst(val_type, 0);
         const is_zero = try self.builder.ins().icmp(clif.IntCC.eq, divisor, zero);
 
-        // TODO: Emit trap_if when we have that instruction
-        // For now, we rely on the hardware trap for division by zero
-        // try self.builder.ins().trapIf(is_zero, TrapCode.INTEGER_DIVISION_BY_ZERO);
-        _ = is_zero;
+        // Trap if divisor is zero
+        _ = try self.builder.ins().trapnz(is_zero, clif.TrapCode.integer_division_by_zero);
     }
 
     pub fn translateBAnd(self: *Self) !void {
@@ -1301,10 +1318,13 @@ pub const FuncTranslator = struct {
         const callee_vmctx = code_and_vmctx.callee_vmctx;
 
         // Step 4: Build call args and emit indirect call
-        // For indirect calls, we need to get the signature to know param/return counts
-        // For now, assume 0 wasm params (just the vmctx args)
-        // TODO: Get actual signature from type_index
-        const num_wasm_params: usize = 0;
+        // Look up the function type from type_index to get proper signature
+        const func_type = if (type_index < self.func_types.len)
+            self.func_types[type_index]
+        else
+            WasmFuncType{ .params = &[_]WasmValType{}, .results = &[_]WasmValType{} };
+
+        const num_wasm_params = func_type.params.len;
         const wasm_args = self.state.peekn(num_wasm_params);
 
         // Build real_call_args: [callee_vmctx, caller_vmctx, ...wasm_args]
@@ -1319,11 +1339,20 @@ pub const FuncTranslator = struct {
             real_args[2 + i] = arg;
         }
 
-        // Get signature for indirect call
-        // For now, create a minimal signature with just vmctx params
+        // Build CLIF signature from Wasm function type
+        // Following Cranelift's calling convention: vmctx params first
         var sig = clif.Signature.init(.fast);
+        // Add callee vmctx and caller vmctx params
         try sig.params.append(self.allocator, clif.AbiParam.init(Type.I64));
         try sig.params.append(self.allocator, clif.AbiParam.init(Type.I64));
+        // Add wasm params
+        for (func_type.params) |p| {
+            try sig.params.append(self.allocator, clif.AbiParam.init(p.toClifType()));
+        }
+        // Add wasm returns
+        for (func_type.results) |r| {
+            try sig.returns.append(self.allocator, clif.AbiParam.init(r.toClifType()));
+        }
         const sig_ref = try self.builder.func.importSignature(self.allocator, sig);
 
         // Emit indirect call
@@ -1353,10 +1382,9 @@ pub const FuncTranslator = struct {
             extended_index = try self.builder.ins().uextend(pointer_type, index);
         }
 
-        // Bounds check: index < bound
+        // Bounds check: index < bound (trap if index >= bound)
         const oob = try self.builder.ins().icmp(clif.IntCC.uge, extended_index, bound);
-        // TODO: Emit trap_if when available
-        _ = oob;
+        _ = try self.builder.ins().trapnz(oob, clif.TrapCode.table_out_of_bounds);
 
         // Compute table element address: base + index * element_size
         const base_addr = try self.builder.ins().globalValue(pointer_type, table.base);
@@ -1392,8 +1420,7 @@ pub const FuncTranslator = struct {
 
         // Compare and trap if mismatch
         const mismatch = try self.builder.ins().icmp(clif.IntCC.ne, caller_type_id, callee_type_id);
-        // TODO: Emit trap_if when available
-        _ = mismatch;
+        _ = try self.builder.ins().trapnz(mismatch, clif.TrapCode.indirect_call_to_null);
     }
 
     /// Load code pointer and callee vmctx from a funcref.
