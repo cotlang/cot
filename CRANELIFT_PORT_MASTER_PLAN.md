@@ -1309,8 +1309,8 @@ All infrastructure is in place:
 | 7.2 | Memory instructions (load/store) | ✅ Complete |
 | 7.3 | Call instructions | ✅ Complete |
 | 7.4 | i64 arithmetic | ✅ Complete |
-| 7.5 | VCode-to-regalloc2 adapter | ❌ Not Started |
-| 7.6 | Emit with regalloc output | ❌ Not Started |
+| 7.5 | VCode-to-regalloc2 adapter | ✅ Complete |
+| 7.6 | Emit with regalloc output | ✅ Complete |
 | 7.7 | Object file generation (Mach-O/ELF) | ❌ Not Started |
 | 7.8 | End-to-end tests | ❌ Not Started |
 
