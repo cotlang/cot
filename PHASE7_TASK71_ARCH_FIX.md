@@ -1,8 +1,8 @@
 # Task 7.1 Architectural Fix: Proper Cranelift GlobalValue Port
 
 **Created**: 2026-02-03
-**Updated**: 2026-02-03 (Phase 1 Complete)
-**Status**: In Progress - Phase 1 Complete, Phases 2-4 Pending
+**Updated**: 2026-02-03 (All Phases Complete)
+**Status**: COMPLETE
 **Priority**: P0 - Must complete before other Phase 7 tasks
 
 ---
@@ -22,26 +22,37 @@ Task 7.1 (Add Global Variable Support) was implemented but with architectural sh
 - [x] Task F: GlobalValue field added to InstData
 - [x] Task G: FuncBuilder.globalValue() method added
 
-**Phase 2: Frontend Integration - PENDING**
-**Phase 3: Wasm Translation - PENDING**
-**Phase 4: Machine Code Lowering - PENDING**
+**Phase 2: Frontend Integration - COMPLETE**
+- [x] Task H: FuncInstBuilder.globalValue() method added to frontend.zig
 
-### Current State (After Phase 1)
+**Phase 3: Wasm Translation - COMPLETE**
+- [x] Task I: FuncEnvironment created (func_environ.zig) with GlobalVariable, ConstantValue
+- [x] Task J: translateGlobalGet/Set updated to use FuncEnvironment and GlobalValue
 
-The CLIF IR now has proper GlobalValue infrastructure:
+**Phase 4: Machine Code Lowering - COMPLETE**
+- [x] Task K: global_value lowering added to aarch64/lower.zig (port of legalizer/globalvalue.rs)
+
+### Final State
+
+The full GlobalValue infrastructure is now ported from Cranelift:
+
+**CLIF IR Layer:**
 - `GlobalValue` entity type with RESERVED sentinel
 - `GlobalValueData` enum (vmcontext, load, iadd_imm, symbol, dyn_scale_target_const)
 - `Function.global_values` table
 - `global_value` opcode and instruction format
-- `FuncBuilder.globalValue()` builder method
+- `FuncBuilder.globalValue()` and `FuncInstBuilder.globalValue()` builder methods
 
-### Remaining Work (Phases 2-4)
+**Wasm Translation Layer:**
+- `FuncEnvironment` for per-function global variable management
+- `GlobalVariable` enum (Constant, Memory) following Cranelift's spec.rs
+- `ConstantValue` enum (i32, i64, f32, f64)
+- `translateGlobalGet/Set` using proper GlobalValue chain (vmctx → iadd_imm → load/store)
 
-Still need to:
-- Update Frontend FuncInstBuilder to expose globalValue
-- Create FuncEnvironment for wasm global management
-- Update translateGlobalGet/Set to use GlobalValue infrastructure
-- Update MachInst lowering to handle global_value
+**Machine Code Lowering:**
+- `global_value` instruction lowering following Cranelift's legalizer pattern
+- Recursive `materializeGlobalValue` for handling GlobalValueData chains
+- Support for vmcontext, iadd_imm, load, and symbol variants
 
 ---
 

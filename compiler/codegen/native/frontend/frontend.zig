@@ -30,6 +30,8 @@ pub const AbiParam = clif.AbiParam;
 pub const JumpTable = clif.JumpTable;
 pub const JumpTableData = clif.JumpTableData;
 pub const BlockCall = clif.BlockCall;
+pub const GlobalValue = clif.GlobalValue;
+pub const GlobalValueData = clif.GlobalValueData;
 
 /// Block status for tracking construction progress.
 const BlockStatus = enum {
@@ -782,6 +784,32 @@ pub const FuncInstBuilder = struct {
     pub fn copy(self: Self, arg: Value) !Value {
         const ty = self.builder.func.dfg.valueType(arg);
         const r = try self.build(ty);
+        return r.result.?;
+    }
+
+    // ========================================================================
+    // Global Values
+    // Port of cranelift-frontend InstBuilder::global_value
+    // ========================================================================
+
+    /// Compute the value of a global variable.
+    ///
+    /// The `gv` argument must refer to a `GlobalValue` that has been declared
+    /// in the function using `Function.createGlobalValue()`. This instruction
+    /// produces a value containing the computed address of the global value.
+    ///
+    /// Port of cranelift InstBuilder::global_value
+    pub fn globalValue(self: Self, ty: Type, gv: GlobalValue) !Value {
+        const r = try self.build(ty);
+
+        // Store the global value reference in instruction data
+        try self.builder.func.dfg.setInstData(r.inst, .{
+            .opcode = .global_value,
+            .args = clif.ValueList.EMPTY,
+            .ctrl_type = ty,
+            .global_value = gv,
+        });
+
         return r.result.?;
     }
 };

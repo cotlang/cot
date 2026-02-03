@@ -9,6 +9,7 @@
 const std = @import("std");
 const stack_mod = @import("stack.zig");
 const frontend_mod = @import("../frontend/mod.zig");
+const func_environ_mod = @import("func_environ.zig");
 
 // Re-export CLIF types from stack module
 pub const clif = stack_mod.clif;
@@ -25,6 +26,12 @@ pub const FunctionBuilderContext = frontend_mod.FunctionBuilderContext;
 pub const Variable = frontend_mod.Variable;
 pub const Type = frontend_mod.Type;
 pub const Function = frontend_mod.Function;
+pub const GlobalValue = frontend_mod.GlobalValue;
+
+// FuncEnvironment types
+pub const FuncEnvironment = func_environ_mod.FuncEnvironment;
+pub const GlobalVariable = func_environ_mod.GlobalVariable;
+pub const ConstantValue = func_environ_mod.ConstantValue;
 
 // ============================================================================
 // Wasm Opcode
@@ -202,6 +209,9 @@ pub const FuncTranslator = struct {
     locals: std.ArrayListUnmanaged(Variable),
     /// Module-level globals (for type lookup).
     globals: []const WasmGlobalType,
+    /// Function environment for global variable management.
+    /// Port of Cranelift's FuncEnvironment.
+    env: FuncEnvironment,
     /// Allocator for dynamic storage.
     allocator: std.mem.Allocator,
 
@@ -214,6 +224,7 @@ pub const FuncTranslator = struct {
             .builder = builder,
             .locals = .{},
             .globals = globals,
+            .env = FuncEnvironment.init(allocator),
             .allocator = allocator,
         };
     }
@@ -227,6 +238,7 @@ pub const FuncTranslator = struct {
     pub fn deinit(self: *Self) void {
         self.state.deinit();
         self.locals.deinit(self.allocator);
+        self.env.deinit();
     }
 
     /// Initialize for translating a function.
@@ -692,14 +704,16 @@ pub const FuncTranslator = struct {
     //
     // Cranelift implementation (func_environ.rs:3134) handles globals via:
     // 1. Constant globals: emit iconst/fconst with the constant value
-    // 2. Memory globals: load from global_value address with proper type
+    // 2. Memory globals: use global_value instruction to get address, then load
     //
-    // We look up the actual global type from the module's globals array.
+    // We use FuncEnvironment to manage GlobalValue creation and caching.
     // ========================================================================
 
     /// Translate global.get
-    /// Globals are treated as memory locations at a fixed base address.
-    /// The type is determined from the module's globals array.
+    ///
+    /// Port of code_translator.rs Operator::GlobalGet handling.
+    /// Uses FuncEnvironment.getOrCreateGlobal() to get GlobalVariable info,
+    /// then emits either a constant or global_value + load.
     pub fn translateGlobalGet(self: *Self, global_index: u32) !void {
         // Get global type from module info (default to i64 for safety)
         const global_val_type: WasmValType = if (global_index < self.globals.len)
@@ -708,21 +722,42 @@ pub const FuncTranslator = struct {
             .i64;
         const global_type = global_val_type.toClifType();
 
-        // Compute stride based on type size
-        const stride: i64 = switch (global_val_type) {
-            .i32, .f32 => 4,
-            .i64, .f64 => 8,
-        };
+        // Determine if constant (immutable) or memory-based
+        // For now, treat all as memory-based (future: check mutability from globals array)
+        const var_info = try self.env.getOrCreateGlobal(
+            self.builder.func,
+            global_index,
+            global_type,
+            false, // is_constant - TODO: check globals[index].mutable
+            null, // constant_value
+        );
 
-        // Compute global address: global_base (0x10000) + global_index * stride
-        const global_base: i64 = 0x10000;
-        const global_addr_val: i64 = global_base + @as(i64, global_index) * stride;
-        const addr = try self.builder.ins().iconst(Type.I64, global_addr_val);
-        const value = try self.builder.ins().load(global_type, clif.MemFlags.DEFAULT, addr, 0);
-        try self.state.push1(value);
+        switch (var_info) {
+            .constant => |c| {
+                // Emit constant directly
+                const val = switch (c) {
+                    .i32 => |v| try self.builder.ins().iconst(Type.I32, v),
+                    .i64 => |v| try self.builder.ins().iconst(Type.I64, v),
+                    .f32 => |v| try self.builder.ins().f32const(v),
+                    .f64 => |v| try self.builder.ins().f64const(v),
+                };
+                try self.state.push1(val);
+            },
+            .memory => |m| {
+                // Use global_value instruction to compute address
+                const addr = try self.builder.ins().globalValue(self.env.pointer_type, m.gv);
+                // Load the value from memory
+                const value = try self.builder.ins().load(m.ty, clif.MemFlags.DEFAULT, addr, m.offset);
+                try self.state.push1(value);
+            },
+        }
     }
 
     /// Translate global.set
+    ///
+    /// Port of code_translator.rs Operator::GlobalSet handling.
+    /// Uses FuncEnvironment.getOrCreateGlobal() to get GlobalVariable info,
+    /// then emits global_value + store.
     pub fn translateGlobalSet(self: *Self, global_index: u32) !void {
         const value = self.state.pop1();
 
@@ -731,18 +766,25 @@ pub const FuncTranslator = struct {
             self.globals[global_index].val_type
         else
             .i64;
+        const global_type = global_val_type.toClifType();
 
-        // Compute stride based on type size
-        const stride: i64 = switch (global_val_type) {
-            .i32, .f32 => 4,
-            .i64, .f64 => 8,
-        };
+        const var_info = try self.env.getOrCreateGlobal(
+            self.builder.func,
+            global_index,
+            global_type,
+            false, // is_constant - constants can't be set
+            null,
+        );
 
-        // Compute global address: global_base (0x10000) + global_index * stride
-        const global_base: i64 = 0x10000;
-        const global_addr_val: i64 = global_base + @as(i64, global_index) * stride;
-        const addr = try self.builder.ins().iconst(Type.I64, global_addr_val);
-        _ = try self.builder.ins().store(clif.MemFlags.DEFAULT, value, addr, 0);
+        switch (var_info) {
+            .constant => unreachable, // Cannot set constant globals
+            .memory => |m| {
+                // Use global_value instruction to compute address
+                const addr = try self.builder.ins().globalValue(self.env.pointer_type, m.gv);
+                // Store the value to memory
+                _ = try self.builder.ins().store(clif.MemFlags.DEFAULT, value, addr, m.offset);
+            },
+        }
     }
 
     // ========================================================================

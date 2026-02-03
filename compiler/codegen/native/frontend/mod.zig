@@ -58,6 +58,8 @@ pub const AbiParam = frontend.AbiParam;
 pub const JumpTable = frontend.JumpTable;
 pub const JumpTableData = frontend.JumpTableData;
 pub const BlockCall = frontend.BlockCall;
+pub const GlobalValue = frontend.GlobalValue;
+pub const GlobalValueData = frontend.GlobalValueData;
 
 test {
     @import("std").testing.refAllDecls(@This());

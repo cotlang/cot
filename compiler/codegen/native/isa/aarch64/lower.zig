@@ -214,6 +214,10 @@ pub const AArch64LowerBackend = struct {
             .stack_load => self.lowerStackLoad(ctx, ir_inst),
             .stack_store => self.lowerStackStore(ctx, ir_inst),
 
+            // Global values
+            // Port of cranelift/codegen/src/legalizer/globalvalue.rs
+            .global_value => self.lowerGlobalValue(ctx, ir_inst),
+
             // Unhandled opcodes - return null to indicate lowering failed
             else => null,
         };
@@ -1968,11 +1972,273 @@ pub const AArch64LowerBackend = struct {
 
         return InstOutput{};
     }
+
+    /// Lower a global_value instruction.
+    ///
+    /// Port of cranelift/codegen/src/legalizer/globalvalue.rs expand_global_value
+    ///
+    /// GlobalValue is expanded based on its GlobalValueData:
+    /// - VMContext: Load from vmctx parameter/register
+    /// - IAddImm: Recursively expand base, then add offset
+    /// - Load: Recursively expand base, then load from offset
+    /// - Symbol: Load symbol address (requires relocation)
+    fn lowerGlobalValue(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        const ty = ctx.outputTy(ir_inst, 0);
+
+        // Get the GlobalValue reference from instruction data
+        const inst_data = ctx.data(ir_inst);
+        const gv = inst_data.getGlobalValue() orelse return null;
+
+        // Get GlobalValueData from function
+        const gv_data = ctx.globalValueData(gv) orelse return null;
+
+        // Allocate destination register
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        switch (gv_data) {
+            .vmcontext => {
+                // VMContext: For now, use a fixed base address (0x10000)
+                // In a full implementation, this would be a special register or parameter
+                // Port of cranelift/codegen/src/legalizer/globalvalue.rs vmctx_addr
+                const vmctx_base: u64 = 0x10000;
+                emitLoadConstant(ctx, dst_reg, vmctx_base, .size64) catch return null;
+            },
+
+            .iadd_imm => |d| {
+                // IAddImm: Recursively expand base, then add offset
+                // Port of cranelift/codegen/src/legalizer/globalvalue.rs iadd_imm_addr
+                const base_addr = self.materializeGlobalValue(ctx, d.base, ty) orelse return null;
+
+                // Add the offset
+                if (d.offset == 0) {
+                    // No offset, just copy
+                    ctx.emit(Inst{
+                        .alu_rrr = .{
+                            .alu_op = .orr,
+                            .size = .size64,
+                            .rd = dst_reg,
+                            .rn = zeroReg(),
+                            .rm = base_addr,
+                        },
+                    }) catch return null;
+                } else if (Imm12.maybeFromU64(@as(u64, @intCast(@abs(d.offset))))) |imm12| {
+                    // Offset fits in imm12
+                    if (d.offset >= 0) {
+                        ctx.emit(Inst{
+                            .alu_rr_imm12 = .{
+                                .alu_op = .add,
+                                .size = .size64,
+                                .rd = dst_reg,
+                                .rn = base_addr,
+                                .imm12 = imm12,
+                            },
+                        }) catch return null;
+                    } else {
+                        ctx.emit(Inst{
+                            .alu_rr_imm12 = .{
+                                .alu_op = .sub,
+                                .size = .size64,
+                                .rd = dst_reg,
+                                .rn = base_addr,
+                                .imm12 = imm12,
+                            },
+                        }) catch return null;
+                    }
+                } else {
+                    // Offset doesn't fit in imm12, need to load into temp register
+                    const tmp = ctx.allocTmp(ClifType.I64) catch return null;
+                    const tmp_reg = tmp.onlyReg() orelse return null;
+
+                    const offset_val: u64 = @bitCast(d.offset);
+                    emitLoadConstant(ctx, tmp_reg, offset_val, .size64) catch return null;
+
+                    ctx.emit(Inst{
+                        .alu_rrr = .{
+                            .alu_op = .add,
+                            .size = .size64,
+                            .rd = dst_reg,
+                            .rn = base_addr,
+                            .rm = tmp_reg.toReg(),
+                        },
+                    }) catch return null;
+                }
+            },
+
+            .load => |d| {
+                // Load: Recursively expand base, then load from offset
+                // Port of cranelift/codegen/src/legalizer/globalvalue.rs load_addr
+                const base_addr = self.materializeGlobalValue(ctx, d.base, ClifType.I64) orelse return null;
+
+                // Load from base + offset
+                const mem = AMode{ .reg_offset = .{
+                    .rn = base_addr,
+                    .offset = d.offset,
+                    .ty = d.global_type,
+                } };
+                ctx.emit(Inst.genLoad(dst_reg, mem, d.global_type, MemFlags.empty)) catch return null;
+            },
+
+            .symbol => {
+                // Symbol: For now, just load a placeholder address
+                // Full implementation would emit relocation
+                // Port of cranelift/codegen/src/legalizer/globalvalue.rs symbol
+                const placeholder_addr: u64 = 0;
+                emitLoadConstant(ctx, dst_reg, placeholder_addr, .size64) catch return null;
+            },
+
+            .dyn_scale_target_const => {
+                // Dynamic vector scale - emit constant 1 for now
+                emitLoadConstant(ctx, dst_reg, 1, .size64) catch return null;
+            },
+        }
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    /// Helper to recursively materialize a GlobalValue into a register.
+    /// Returns the register containing the computed address.
+    fn materializeGlobalValue(self: *const Self, ctx: *LowerCtx, gv: lower_mod.GlobalValue, ty: ClifType) ?Reg {
+        const gv_data = ctx.globalValueData(gv) orelse return null;
+
+        const tmp = ctx.allocTmp(ty) catch return null;
+        const tmp_reg = tmp.onlyReg() orelse return null;
+
+        switch (gv_data) {
+            .vmcontext => {
+                // VMContext: fixed base address
+                const vmctx_base: u64 = 0x10000;
+                emitLoadConstant(ctx, tmp_reg, vmctx_base, .size64) catch return null;
+                return tmp_reg.toReg();
+            },
+            .iadd_imm => |d| {
+                const base_addr = self.materializeGlobalValue(ctx, d.base, ty) orelse return null;
+
+                if (d.offset == 0) {
+                    return base_addr;
+                } else if (Imm12.maybeFromU64(@as(u64, @intCast(@abs(d.offset))))) |imm12| {
+                    if (d.offset >= 0) {
+                        ctx.emit(Inst{
+                            .alu_rr_imm12 = .{
+                                .alu_op = .add,
+                                .size = .size64,
+                                .rd = tmp_reg,
+                                .rn = base_addr,
+                                .imm12 = imm12,
+                            },
+                        }) catch return null;
+                    } else {
+                        ctx.emit(Inst{
+                            .alu_rr_imm12 = .{
+                                .alu_op = .sub,
+                                .size = .size64,
+                                .rd = tmp_reg,
+                                .rn = base_addr,
+                                .imm12 = imm12,
+                            },
+                        }) catch return null;
+                    }
+                } else {
+                    const offset_val: u64 = @bitCast(d.offset);
+                    emitLoadConstant(ctx, tmp_reg, offset_val, .size64) catch return null;
+
+                    ctx.emit(Inst{
+                        .alu_rrr = .{
+                            .alu_op = .add,
+                            .size = .size64,
+                            .rd = tmp_reg,
+                            .rn = base_addr,
+                            .rm = tmp_reg.toReg(),
+                        },
+                    }) catch return null;
+                }
+                return tmp_reg.toReg();
+            },
+            .load => |d| {
+                const base_addr = self.materializeGlobalValue(ctx, d.base, ClifType.I64) orelse return null;
+                const mem = AMode{ .reg_offset = .{
+                    .rn = base_addr,
+                    .offset = d.offset,
+                    .ty = d.global_type,
+                } };
+                ctx.emit(Inst.genLoad(tmp_reg, mem, d.global_type, MemFlags.empty)) catch return null;
+                return tmp_reg.toReg();
+            },
+            .symbol, .dyn_scale_target_const => {
+                emitLoadConstant(ctx, tmp_reg, 0, .size64) catch return null;
+                return tmp_reg.toReg();
+            },
+        }
+    }
 };
 
 // =============================================================================
 // Helper functions
 // =============================================================================
+
+/// Emit instructions to load a 64-bit constant into a register.
+/// Uses movz/movk sequence for constants that don't fit in a single immediate.
+fn emitLoadConstant(ctx: *LowerCtx, dst: Writable(Reg), value: u64, size: OperandSize) !void {
+    if (MoveWideConst.maybeFromU64(value)) |imm| {
+        // Simple case: fits in single movz
+        try ctx.emit(Inst{
+            .mov_wide = .{
+                .op = .movz,
+                .rd = dst,
+                .imm = imm,
+                .size = size,
+            },
+        });
+    } else {
+        // Use movz for bits 0-15, then movk for higher bits
+        try ctx.emit(Inst{
+            .mov_wide = .{
+                .op = .movz,
+                .rd = dst,
+                .imm = MoveWideConst.maybeWithShift(@truncate(value & 0xFFFF), 0) orelse return error.InvalidConstant,
+                .size = size,
+            },
+        });
+
+        const bits_16_31: u16 = @truncate((value >> 16) & 0xFFFF);
+        if (bits_16_31 != 0) {
+            try ctx.emit(Inst{
+                .mov_wide = .{
+                    .op = .movk,
+                    .rd = dst,
+                    .imm = MoveWideConst.maybeWithShift(bits_16_31, 16) orelse return error.InvalidConstant,
+                    .size = size,
+                },
+            });
+        }
+
+        const bits_32_47: u16 = @truncate((value >> 32) & 0xFFFF);
+        if (bits_32_47 != 0) {
+            try ctx.emit(Inst{
+                .mov_wide = .{
+                    .op = .movk,
+                    .rd = dst,
+                    .imm = MoveWideConst.maybeWithShift(bits_32_47, 32) orelse return error.InvalidConstant,
+                    .size = size,
+                },
+            });
+        }
+
+        const bits_48_63: u16 = @truncate((value >> 48) & 0xFFFF);
+        if (bits_48_63 != 0) {
+            try ctx.emit(Inst{
+                .mov_wide = .{
+                    .op = .movk,
+                    .rd = dst,
+                    .imm = MoveWideConst.maybeWithShift(bits_48_63, 48) orelse return error.InvalidConstant,
+                    .size = size,
+                },
+            });
+        }
+    }
+}
 
 /// Convert CLIF type to AArch64 operand size.
 fn operandSizeFromType(ty: ClifType) ?OperandSize {

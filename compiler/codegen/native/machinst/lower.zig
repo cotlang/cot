@@ -125,10 +125,10 @@ pub const JumpTables = clif.JumpTables;
 // External names
 pub const ExternalName = clif.ExternalName;
 
-/// Reference to a global value.
-pub const GlobalValue = struct {
-    index: u32,
-};
+// GlobalValue and GlobalValueData from CLIF IR
+// Port of cranelift/codegen/src/ir/entities.rs and globalvalue.rs
+pub const GlobalValue = clif.GlobalValue;
+pub const GlobalValueData = clif.GlobalValueData;
 
 /// Reference to a constant.
 pub const Constant = struct {
@@ -143,27 +143,6 @@ pub const Immediate = struct {
 /// Constant data storage.
 pub const ConstantData = struct {
     bytes: []const u8,
-};
-
-// MemFlags and ExternalName are now imported from CLIF above
-
-/// Global value data.
-pub const GlobalValueData = union(enum) {
-    symbol: struct {
-        name: ExternalName,
-        offset: i64,
-        colocated: bool,
-    },
-    load: struct {
-        base: GlobalValue,
-        offset: i32,
-        global_type: Type,
-    },
-    iadd_imm: struct {
-        base: GlobalValue,
-        offset: i64,
-        global_type: Type,
-    },
 };
 
 // ValueDef and Function are now imported from CLIF above
@@ -825,6 +804,33 @@ pub fn Lower(comptime I: type) type {
         /// Port of cranelift/codegen/src/machinst/lower.rs jump_table_data
         pub fn jumpTableData(self: *const Self, jt: JumpTable) ?*const JumpTableData {
             return self.f.getJumpTable(jt);
+        }
+
+        /// Get global value data for a given global value reference.
+        /// Port of cranelift/codegen/src/machinst/lower.rs global_values access
+        pub fn globalValueData(self: *const Self, gv: GlobalValue) ?GlobalValueData {
+            return self.f.getGlobalValueData(gv);
+        }
+
+        /// Get symbol information from a GlobalValue if it's a symbol.
+        /// Port of cranelift/codegen/src/machinst/lower.rs symbol_value_data
+        pub fn symbolValueData(self: *const Self, global_value: GlobalValue) ?struct {
+            name: *const ExternalName,
+            reloc_distance: RelocDistance,
+            offset: i64,
+        } {
+            const gv_data = self.globalValueData(global_value) orelse return null;
+            switch (gv_data) {
+                .symbol => |s| {
+                    const dist: RelocDistance = if (s.colocated) .near else .far;
+                    return .{
+                        .name = &s.name,
+                        .reloc_distance = dist,
+                        .offset = s.offset,
+                    };
+                },
+                else => return null,
+            }
         }
 
         /// Get stack slot data for a given stack slot reference.
