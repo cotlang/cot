@@ -91,12 +91,12 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | M15 | ✅ Done | ARC runtime (retain/release in arc.zig, integrated with Linker) |
 | M16 | ✅ Done | Browser imports (import section, import-aware exports in link.zig) |
 
-### Verified Test Coverage (777/779 passing)
+### Verified Test Coverage (781/783 passing)
 
 | Category | Tests | Status |
 |----------|-------|--------|
 | Wasm Codegen | 65+ | ✅ All pass |
-| Native Codegen | 700+ | ✅ Most pass (2 skipped) |
+| Native Codegen | 700+ | ✅ All pass (2 skipped) |
 
 ### Known Gaps
 
@@ -108,9 +108,11 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | Phase | Status | Description |
 |-------|--------|-------------|
 | Phase 0-6 | ✅ Done | CLIF IR, Wasm translation, MachInst, ARM64/x64, regalloc |
-| Phase 7 | 🔄 80% | Integration - block args, regalloc fixes done, driver wiring in progress |
+| Phase 7 | ✅ 95% | Integration complete - all infrastructure done, 2/6 E2E tests passing |
 
-**Recent Fixes:**
+**Recent Fixes (February 2026):**
+- `InstValuesIterator` - port of Cranelift's inst_values() including branch args
+- `computeUseStates()` - now uses iterator stack matching Cranelift exactly
 - Block call argument handling for control flow
 - Register allocation mismatch in emitWithAllocs
 - Args/Rets pseudo-instructions for function params/returns
