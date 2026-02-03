@@ -675,13 +675,13 @@ fn main() i32 {
 ### Phase 2: Loop Support
 | Task | Status | Notes |
 |------|--------|-------|
-| B1.1: Add header_sealed | ⬜ | |
-| B1.2: Update translateLoop | ⬜ | |
-| B1.3: Update translateEnd | ⬜ | |
-| B1.4: Update translateBr | ⬜ | |
-| B1.5: Enable loop test | ⬜ | |
-| B1.6: Add more loop tests | ⬜ | |
-| B1.7: Run test suite | ⬜ | |
+| B1.1: Add header_sealed | N/A | Not needed - using deferred seal pattern |
+| B1.2: Update translateLoop | ✅ | Removed sealBlock call, added comment |
+| B1.3: Update translateEnd | ✅ | Added loop header sealing |
+| B1.4: Update translateBr | ✅ | Already correct (uses brDestination) |
+| B1.5: Enable loop test | ✅ | Test now passes |
+| B1.6: Add more loop tests | ⬜ | Deferred |
+| B1.7: Run test suite | ✅ | All tests pass |
 
 ### Phase 3: Register Allocation Support
 | Task | Status | Notes |
@@ -737,13 +737,14 @@ fn main() i32 {
 ## Summary
 
 **Total Tasks**: 45
-**Completed**: 19
-**Remaining**: 26
+**Completed**: 25
+**Remaining**: 20
 
-**Estimated Total Hours**: 10-15 (estimated 6-8 hours remaining)
+**Estimated Total Hours**: 10-15 (estimated 4-6 hours remaining)
 
 **Completed Phases**:
 - Phase 1 (B2): SmallVec heap allocation ✅
+- Phase 2 (B1): Loop back-edge translation ✅
 - Phase 3 (B3/B4): genMove, genSpill, genReload ✅
 
-**Next Action**: B1 (Loop back-edge translation) - enables all loop code.
+**Next Action**: B5 (Wasm opcode gaps) - complete translation coverage.

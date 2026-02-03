@@ -544,34 +544,33 @@ test "translate function with block" {
     try testing.expect(func.layout.entryBlock() != null);
 }
 
-// TODO: Loop back-edge translation needs work - the block gets sealed before br can add predecessor
-// test "translate function with loop" {
-//     const testing = std.testing;
-//     const allocator = testing.allocator;
-//
-//     var func = Function.init(allocator);
-//     defer func.deinit();
-//
-//     var ft = WasmFuncTranslator.initWithoutGlobals(allocator);
-//     defer ft.deinit();
-//
-//     const signature = FuncSignature{
-//         .params = &[_]WasmValType{},
-//         .results = &[_]WasmValType{},
-//     };
-//
-//     const operators = [_]WasmOperator{
-//         .{ .loop = .{ .params = 0, .results = 0 } },
-//         .{ .br = 0 }, // branch back to loop header
-//         .end, // end loop
-//         .end, // end function
-//     };
-//
-//     try ft.translateFunction(&func, signature, &[_]LocalDecl{}, &operators);
-//
-//     // Should have created multiple blocks (entry, loop header, exit)
-//     try testing.expect(func.layout.entryBlock() != null);
-// }
+test "translate function with loop" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var func = Function.init(allocator);
+    defer func.deinit();
+
+    var ft = WasmFuncTranslator.initWithoutGlobals(allocator);
+    defer ft.deinit();
+
+    const signature = FuncSignature{
+        .params = &[_]WasmValType{},
+        .results = &[_]WasmValType{},
+    };
+
+    const operators = [_]WasmOperator{
+        .{ .loop = .{ .params = 0, .results = 0 } },
+        .{ .br = 0 }, // branch back to loop header
+        .end, // end loop
+        .end, // end function
+    };
+
+    try ft.translateFunction(&func, signature, &[_]LocalDecl{}, &operators);
+
+    // Should have created multiple blocks (entry, loop header, exit)
+    try testing.expect(func.layout.entryBlock() != null);
+}
 
 test "translate function with if-else" {
     const testing = std.testing;

@@ -369,8 +369,11 @@ pub const FuncTranslator = struct {
         try self.state.pushLoop(loop_body, next, num_params, num_results);
 
         // Switch to loop body
+        // NOTE: Do NOT seal the loop header here! It must remain unsealed until
+        // the End instruction so that back-edges (br to loop header) can add
+        // themselves as predecessors. This follows Cranelift's pattern from
+        // code_translator.rs lines 430-431.
         self.builder.switchToBlock(loop_body);
-        try self.builder.sealBlock(loop_body);
 
         // Pop old values and push block params
         self.state.popn(num_params);
@@ -492,6 +495,12 @@ pub const FuncTranslator = struct {
 
         // Truncate stack to original size
         frame.truncateValueStackToOriginalSize(&self.state.stack);
+
+        // For loops, seal the header block now that all back-edges have been added
+        // This follows Cranelift's pattern from code_translator.rs lines 430-431
+        if (frame == .loop_frame) {
+            try self.builder.sealBlock(frame.loop_frame.header);
+        }
 
         // Determine if next block is reachable
         const next_reachable = switch (frame) {
