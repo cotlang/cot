@@ -6,7 +6,7 @@ A Wasm-first language for full-stack web development.
 
 See **[VISION.md](VISION.md)** for the complete language vision and strategy.
 
-## Project Status (January 2026)
+## Project Status (February 2026)
 
 **This is the Cot compiler, written in Zig.** Like Deno (Rust) compiling TypeScript, this compiler is a permanent tool, not a bootstrap.
 
@@ -14,11 +14,10 @@ See **[VISION.md](VISION.md)** for the complete language vision and strategy.
 |-----------|--------|-------------|
 | Frontend | ✅ Done | Scanner, parser, type checker, IR lowering |
 | SSA Infrastructure | ✅ Done | Values, blocks, functions, passes |
-| Wasm Backend | ✅ M1-M14 Done | Constants, arithmetic, control flow, loops, calls, memory, pointers, structs, slices, strings |
-| Wasm Backend | 🔄 M15 Next | ARC basics (retain/release) |
-| Native AOT | ✅ Working | Wasm → SSA → ARM64/AMD64 → executable |
+| Wasm Backend | ✅ M1-M16 Done | Constants, arithmetic, control flow, loops, calls, memory, pointers, structs, slices, strings, ARC |
+| Native AOT | 🔄 80% Done | Cranelift port: CLIF IR, regalloc, ARM64/AMD64 backends (driver wiring in progress) |
 
-**Tests: 412/434 passed**
+**Tests: 777/779 passed**
 
 ## Quick Start
 
@@ -34,17 +33,11 @@ zig build
 wasmtime hello.wasm
 ```
 
-### Compile to Native (AOT)
+### Compile to Native (AOT - In Progress)
 ```bash
-# Compile to native ARM64 (macOS)
-./zig-out/bin/cot hello.cot --target=arm64-macos -o hello
-./hello
-
-# Compile to native AMD64 (Linux)
-./zig-out/bin/cot hello.cot --target=amd64-linux -o hello
-./hello
-
-# The AOT path: Cot → Wasm → SSA → Native → Executable
+# Native compilation is ~80% complete (Cranelift port)
+# Driver wiring is in progress - use Wasm target for now
+# Once complete, the AOT path will be: Cot → Wasm → CLIF → Native → Executable
 ```
 
 ### Run Tests
@@ -102,12 +95,6 @@ $ ./zig-out/bin/cot hello.cot -o hello.wasm
 $ wasmtime hello.wasm
 $ echo $?
 20
-
-# Native target
-$ ./zig-out/bin/cot hello.cot --target=arm64-macos -o hello
-$ ./hello
-$ echo $?
-20
 ```
 
 ## Key Documents
@@ -115,9 +102,9 @@ $ echo $?
 | Document | Purpose |
 |----------|---------|
 | [VISION.md](VISION.md) | Language vision and strategy |
-| [TESTING.md](TESTING.md) | Testing strategy and test organization |
 | [WASM_BACKEND.md](WASM_BACKEND.md) | Wasm backend milestones (M1-M16) |
-| [PARITY_PLAN.md](PARITY_PLAN.md) | Feature parity tracking with bootstrap-0.2 |
+| [CRANELIFT_PORT_MASTER_PLAN.md](CRANELIFT_PORT_MASTER_PLAN.md) | Native AOT compilation (Cranelift port) |
+| [TESTING.md](TESTING.md) | Testing strategy and test organization |
 | [CLAUDE.md](CLAUDE.md) | AI session instructions |
 
 ## Repository Structure
@@ -145,11 +132,10 @@ cot/
 
 ## Compilation Targets
 
-| Target | Flag | Output | Use Case |
-|--------|------|--------|----------|
-| Wasm32 | `--target=wasm32` (default) | `.wasm` | Browser, serverless, portable |
-| ARM64 macOS | `--target=arm64-macos` | executable | Native performance on Apple Silicon |
-| AMD64 Linux | `--target=amd64-linux` | executable | Native performance on x86-64 |
+| Target | Flag | Output | Status |
+|--------|------|--------|--------|
+| Wasm32 | `--target=wasm32` (default) | `.wasm` | ✅ Working |
+| Native | (in progress) | executable | 🔄 80% - Cranelift port |
 
 ## Design Decisions
 
@@ -168,7 +154,7 @@ cot/
 
 ## Current Capabilities
 
-### Working
+### Working (Wasm target)
 - ✅ Functions (parameters, return values, recursion)
 - ✅ Variables (let, const)
 - ✅ Arithmetic (+, -, *, /, %)
@@ -178,10 +164,10 @@ cot/
 - ✅ Pointers (address-of, dereference)
 - ✅ Arrays and slices
 - ✅ Strings (literals, length)
-- ✅ Native AOT compilation
+- ✅ ARC (retain/release)
 
 ### In Progress
-- 🔄 ARC (retain/release)
+- 🔄 Native AOT compilation (Cranelift port ~80%)
 - 🔄 Browser imports (console.log, fetch)
 
 ### Planned

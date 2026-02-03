@@ -91,43 +91,31 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | M15 | ✅ Done | ARC runtime (retain/release in arc.zig, integrated with Linker) |
 | M16 | ✅ Done | Browser imports (import section, import-aware exports in link.zig) |
 
-### Verified Test Coverage (58/58 passing)
+### Verified Test Coverage (777/779 passing)
 
 | Category | Tests | Status |
 |----------|-------|--------|
-| Arithmetic | 10 | ✅ All pass |
-| Control Flow | 14 | ✅ All pass |
-| Functions | 16 | ✅ All pass |
-| Memory | 5 | ✅ All pass |
-| Structs | 5 | ✅ All pass |
-| Arrays | 5 | ✅ All pass |
-| Strings | 3 | ✅ All pass |
+| Wasm Codegen | 65+ | ✅ All pass |
+| Native Codegen | 700+ | ✅ Most pass (2 skipped) |
 
 ### Known Gaps
 
 - **Struct-by-value params**: Not yet implemented (workaround: use field access directly)
-- **ARC frontend insertion**: Runtime functions work, but frontend doesn't auto-insert retain/release yet (M17)
+- **Native driver wiring**: Cranelift port ~80% complete, driver integration in progress
 
 ### AOT Native Progress
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| Phase 1 | ✅ Done | CLIF IR (types, DFG, instructions, layout) |
-| Phase 2 | ⚠️ 70% | Wasm translation (**loops broken** - back-edges disabled) |
-| Phase 3 | ⚠️ 80% | MachInst framework (**SmallVec panics, genMove stub**) |
-| Phase 4 | ✅ 85% | ARM64 backend (minor: float args, large frames) |
-| Phase 5 | ✅ 80% | x86-64 backend (minor: memory addressing) |
-| Phase 6 | ⚠️ 90% | Register allocation (**genSpill/genReload panic**) |
-| Phase 7 | ⚠️ 70% | Integration (blocked by above issues) |
+| Phase 0-6 | ✅ Done | CLIF IR, Wasm translation, MachInst, ARM64/x64, regalloc |
+| Phase 7 | 🔄 80% | Integration - block args, regalloc fixes done, driver wiring in progress |
 
-**5 Critical Blockers (will panic at runtime):**
-1. Loop back-edges disabled (`func_translator.zig:547`)
-2. SmallVec overflow panics (`inst.zig:536,542`)
-3. genMove is empty stub (`vcode.zig:900`)
-4. genSpill/genReload panic (`abi.zig:940,948`)
-5. Wasm opcode gaps (`translator.zig`)
+**Recent Fixes:**
+- Block call argument handling for control flow
+- Register allocation mismatch in emitWithAllocs
+- Args/Rets pseudo-instructions for function params/returns
 
-**See `CRANELIFT_PORT_MASTER_PLAN.md` for full details and fix estimates (~10-15 hrs).**
+**See `CRANELIFT_PORT_MASTER_PLAN.md` for full details.**
 
 ---
 
@@ -321,15 +309,14 @@ The project succeeds through persistence and copying proven designs, not shortcu
 
 ## Current Tasks
 
-**See `ROADMAP_PHASE2.md` for detailed implementation plans with Go/Swift research.**
+**See `CRANELIFT_PORT_MASTER_PLAN.md` for native AOT status.**
 
 ### Priority Order (Recommended)
 
-1. **M17: Frontend emits retain/release** - Make ARC runtime actually used
-2. **M18: Heap allocation (new keyword)** - Dynamic memory allocation
-3. **M19: Destructor calls on release** - Complete ARC lifecycle
-4. **M20-M22: Language features** - String ops, array append, for-range loops
-5. **M23-M24: Native AOT debugging** - Fix complex programs, enable skipped tests
+1. **Complete Phase 7** - Wire Cranelift port into driver.zig for native binary output
+2. **M21-M22: Language features** - String ops, array append, for-range loops
+3. **Browser imports** - Import section for JS interop (console.log, DOM access)
+4. **E2E testing** - Full end-to-end test programs combining all features
 
 ---
 
@@ -376,5 +363,5 @@ COT_DEBUG=codegen zig test compiler/codegen/wasm_gen.zig
 - **Root cause**: Native codegen complexity (register allocation, two ISAs, ABI edge cases)
 - **Solution**: Wasm as primary target (stack machine, single calling convention)
 - **Frontend cleanup** completed: 54% code reduction
-- **Wasm backend** M1-M9 complete: basic programs compile to .wasm
-- **Native codegen** ported and refactored: ready for AOT wiring
+- **Wasm backend** M1-M16 complete: full feature set compiles to .wasm
+- **Cranelift port** ~80% complete: CLIF IR, regalloc, ARM64/x64 backends working

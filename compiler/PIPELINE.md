@@ -5,7 +5,7 @@
 This document explains the compiler architecture. **There are TWO backends:**
 
 1. **Wasm Backend** (default) - Cot source → `.wasm`
-2. **Native Backend** (`--target=native`) - Cot source → Wasm → Native binary
+2. **Native Backend** - Cot source → Wasm → CLIF IR → Native binary (~80% complete)
 
 **Key Rule:** The Wasm backend does NOT use register allocation. Wasm is a stack machine.
 
@@ -56,22 +56,54 @@ compiler/
 │   ├── wasm.zig            # Old module builder (CodeBuilder)
 │   ├── wasm_gen.zig        # SSA → Wasm (main entry point)
 │   │
-│   └── native/             # NATIVE BACKEND: Wasm → Native (AOT)
-│       │                   # ⚠️ NOT YET IMPLEMENTED
-│       │                   # Will contain:
-│       ├── wasm_parser.zig     # (TODO) Parse .wasm binary
-│       ├── wasm_to_ssa.zig     # (TODO) Stack → SSA
-│       ├── liveness.zig        # (MOVED) Liveness analysis
-│       ├── regalloc.zig        # (MOVED) Register allocation
-│       ├── stackalloc.zig      # (MOVED) Stack slots
-│       ├── abi.zig             # (MOVED) Calling conventions
-│       ├── expand_calls.zig    # (MOVED) ABI call expansion
-│       ├── decompose.zig       # (MOVED) Break large values
-│       ├── arm64.zig           # (TODO) From bootstrap-0.2
-│       ├── amd64.zig           # (TODO) From bootstrap-0.2
-│       ├── elf.zig             # (MOVED) Linux executables
-│       ├── macho.zig           # (MOVED) macOS executables
-│       └── dwarf.zig           # (MOVED) Debug info
+│   └── native/             # NATIVE BACKEND: Wasm → Native (Cranelift port)
+│       │                   # ~80% complete - see CRANELIFT_PORT_MASTER_PLAN.md
+│       │
+│       ├── ir/clif/        # CLIF IR representation (from Cranelift)
+│       │   ├── mod.zig         # Package index
+│       │   ├── dfg.zig         # Data flow graph
+│       │   ├── layout.zig      # Block/instruction layout
+│       │   ├── function.zig    # Function representation
+│       │   └── instructions.zig # CLIF opcodes
+│       │
+│       ├── wasm_to_clif/   # Wasm → CLIF translation
+│       │   ├── translator.zig  # Main translator
+│       │   └── func_translator.zig # Per-function translation
+│       │
+│       ├── machinst/       # Machine instruction framework
+│       │   ├── lower.zig       # CLIF → MachInst lowering
+│       │   ├── vcode.zig       # Virtual code container
+│       │   ├── buffer.zig      # Code buffer
+│       │   ├── reg.zig         # Register types
+│       │   └── blockorder.zig  # Block ordering
+│       │
+│       ├── frontend/       # CLIF IR construction helpers
+│       │   ├── frontend.zig    # FunctionBuilder
+│       │   └── ssa.zig         # SSA construction
+│       │
+│       ├── regalloc/       # Register allocator (ion-based)
+│       │   ├── regalloc.zig    # Main entry point
+│       │   ├── liveranges.zig  # Live range computation
+│       │   ├── ion.zig         # Ion allocator core
+│       │   └── spill.zig       # Spill handling
+│       │
+│       ├── isa/aarch64/    # ARM64 backend
+│       │   ├── lower.zig       # CLIF → ARM64 MachInst
+│       │   ├── inst/           # ARM64 instruction types
+│       │   │   ├── mod.zig     # Instruction definitions
+│       │   │   ├── emit.zig    # Binary encoding
+│       │   │   └── get_operands.zig # Regalloc operands
+│       │   └── abi.zig         # ARM64 ABI
+│       │
+│       ├── isa/x64/        # AMD64 backend
+│       │   ├── lower.zig       # CLIF → x64 MachInst
+│       │   └── inst/           # x64 instruction types
+│       │
+│       ├── wasm_parser.zig     # Parse .wasm binary
+│       ├── compile.zig         # Main compilation entry
+│       ├── elf.zig             # Linux executables
+│       ├── macho.zig           # macOS executables
+│       └── dwarf.zig           # Debug info
 │
 ├── driver.zig              # Orchestrates compilation
 ├── main.zig                # CLI entry point
@@ -110,7 +142,7 @@ cot build app.cot -o app.wasm
                             .wasm file
 ```
 
-### Native Backend (--target=native)
+### Native Backend (Cranelift Architecture)
 
 ```
 cot build app.cot --target=native -o app
@@ -122,10 +154,32 @@ cot build app.cot --target=native -o app
                                   │ .wasm bytes
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  codegen/native/                        ⚠️ NOT YET IMPLEMENTED  │
-│  wasm_parser → wasm_to_ssa → liveness → regalloc → codegen     │
-│                                                                 │
-│  USES REGALLOC - native has real registers!                    │
+│  codegen/native/wasm_parser.zig                                 │
+│  Parse Wasm binary format                                       │
+└─────────────────────────────────┬───────────────────────────────┘
+                                  │ Wasm module
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  codegen/native/wasm_to_clif/                                   │
+│  Translate Wasm stack ops → CLIF IR (SSA form)                 │
+└─────────────────────────────────┬───────────────────────────────┘
+                                  │ CLIF IR
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  codegen/native/machinst/lower.zig                              │
+│  Lower CLIF IR → Machine Instructions (virtual registers)       │
+└─────────────────────────────────┬───────────────────────────────┘
+                                  │ MachInst (vregs)
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  codegen/native/regalloc/                                       │
+│  Register allocation (ion-based, from regalloc2)               │
+└─────────────────────────────────┬───────────────────────────────┘
+                                  │ MachInst (pregs)
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  codegen/native/isa/*/emit.zig                                  │
+│  Emit native machine code bytes                                 │
 └─────────────────────────────────┬───────────────────────────────┘
                                   │
                                   ▼
@@ -145,16 +199,15 @@ cot build app.cot --target=native -o app
 | lower_wasm | ssa/passes/lower_wasm.zig | Convert generic ops (add, mul) to wasm ops (wasm_i64_add) |
 | wasm_gen | codegen/wasm_gen.zig | Emit Wasm bytecode for each SSA value |
 
-### Native Backend Passes (TODO)
+### Native Backend Passes (Cranelift Port)
 
 | Pass | File | Purpose |
 |------|------|---------|
 | wasm_parser | codegen/native/wasm_parser.zig | Parse .wasm binary format |
-| wasm_to_ssa | codegen/native/wasm_to_ssa.zig | Convert Wasm stack ops to SSA |
-| liveness | codegen/native/liveness.zig | Compute live ranges for regalloc |
-| regalloc | codegen/native/regalloc.zig | Assign physical registers |
-| stackalloc | codegen/native/stackalloc.zig | Assign stack slots for spills |
-| arm64/amd64 | codegen/native/*.zig | Emit native instructions |
+| wasm_to_clif | codegen/native/wasm_to_clif/ | Convert Wasm stack ops to CLIF SSA |
+| machinst/lower | codegen/native/machinst/lower.zig | CLIF IR → MachInst with virtual registers |
+| regalloc | codegen/native/regalloc/ | Assign physical registers (ion-based) |
+| emit | codegen/native/isa/*/emit.zig | MachInst → native bytes |
 
 ---
 
@@ -180,19 +233,9 @@ if (target.isWasm()) {
     try lower_wasm.lower(ssa_func);
     return generateWasmCode(ssa_func);
 } else {
-    // Native path: use regalloc (via AOT)
+    // Native path: use Cranelift architecture
     return generateNativeCode(ssa_func, target);
 }
-```
-
-### ❌ DON'T import native-only modules in Wasm path
-
-```zig
-// These are for native backend ONLY:
-const regalloc = @import("codegen/native/regalloc.zig");      // Native only
-const liveness = @import("codegen/native/liveness.zig");      // Native only
-const stackalloc = @import("codegen/native/stackalloc.zig");  // Native only
-const abi = @import("codegen/native/abi.zig");                // Native only
 ```
 
 ---
@@ -205,7 +248,7 @@ const abi = @import("codegen/native/abi.zig");                // Native only
 | ssa/passes/layout.zig | WASM | Block ordering for structured control flow |
 | ssa/passes/lower_wasm.zig | WASM | Generic → Wasm ops |
 | codegen/wasm/* | WASM | Wasm bytecode emission |
-| codegen/native/* | NATIVE | AOT compilation (TODO) |
+| codegen/native/* | NATIVE | Cranelift-based AOT compilation |
 
 ---
 
@@ -218,20 +261,18 @@ zig test compiler/codegen/wasm_gen.zig      # Codegen tests
 zig test compiler/ssa/passes/lower_wasm.zig # Lowering tests
 ```
 
-### Native Backend Tests (when implemented)
+### Native Backend Tests
 ```bash
-zig test compiler/codegen/native/regalloc.zig
-zig test compiler/codegen/native/liveness.zig
-# etc.
+zig build test  # Includes 700+ native codegen tests
 ```
 
 ### E2E Tests
 ```bash
-# Wasm E2E (should pass)
-COT_TARGET=wasm32 zig build test
+# All tests (Wasm + Native)
+zig build test
 
-# Native E2E (will fail until native backend is implemented)
-COT_TARGET=native zig build test
+# With debug output
+COT_DEBUG=codegen zig build test
 ```
 
 ---
@@ -245,7 +286,8 @@ COT_TARGET=native zig build test
 4. Test with `zig test compiler/codegen/wasm_gen.zig`
 
 ### Adding native backend support
-1. Implement `codegen/native/wasm_parser.zig`
-2. Implement `codegen/native/wasm_to_ssa.zig`
-3. Copy arm64.zig, amd64.zig from bootstrap-0.2
-4. Wire up in driver.zig for `--target=native`
+1. Check `CRANELIFT_PORT_MASTER_PLAN.md` for current status
+2. Follow Cranelift's architecture exactly
+3. Add instruction lowering in `isa/aarch64/lower.zig` or `isa/x64/lower.zig`
+4. Add emission in `isa/*/emit.zig`
+5. Run tests with `zig build test`

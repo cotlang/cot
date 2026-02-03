@@ -219,33 +219,21 @@ open http://localhost:8080/runner.html
 
 ---
 
-## Parity Tracking
+## Current Test Status
 
-### Bootstrap-0.2 Reference
+**Total: 777/779 tests passing** (as of February 2026)
 
-| Category | bootstrap-0.2 Tests | Cot 0.3 Tests | Parity |
-|----------|---------------------|---------------|--------|
-| Arithmetic | 50+ | 20 | 40% |
-| Control Flow | 80+ | 30 | 37% |
-| Functions | 100+ | 25 | 25% |
-| Structs | 60+ | 15 | 25% |
-| Pointers | 40+ | 10 | 25% |
-| Arrays/Slices | 50+ | 10 | 20% |
-| Strings | 60+ | 15 | 25% |
-| Enums | 30+ | 0 | 0% |
-| Defer | 20+ | 0 | 0% |
-| ARC | 50+ | 5 | 10% |
-| **Total** | **754** | **130** | **17%** |
+| Category | Tests | Status |
+|----------|-------|--------|
+| Wasm Codegen | 65+ | ✅ All pass |
+| Native Codegen (Cranelift) | 700+ | ✅ Most pass |
 
-### Milestones
+### Test Breakdown
 
-| Milestone | Tests | Target Date |
-|-----------|-------|-------------|
-| M1: 200 tests | 200 | 2026-02-07 |
-| M2: 400 tests | 400 | 2026-02-14 |
-| M3: 600 tests | 600 | 2026-02-21 |
-| M4: 754 tests (parity) | 754 | 2026-02-28 |
-| M5: 1000 tests (surpass) | 1000 | 2026-03-15 |
+- **Frontend tests**: Scanner, parser, type checker
+- **SSA tests**: IR construction, passes
+- **Wasm tests**: Codegen, encoding, linking
+- **Native tests**: CLIF IR, regalloc, ARM64/x64 backends
 
 ---
 

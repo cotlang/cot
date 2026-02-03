@@ -70,7 +70,7 @@ Cot Source → Frontend → IR → SSA → lower_wasm.zig → wasm/ package → 
 
 ## Test Results
 
-**58/58 Wasm tests passing:**
+**65+ Wasm tests passing:**
 
 ```
 Arithmetic:    10/10 ✓
@@ -78,7 +78,9 @@ Control Flow:  14/14 ✓
 Functions:     16/16 ✓
 Memory:         5/5  ✓
 Structs:        5/5  ✓
+Arrays:         5/5  ✓
 Strings:        3/3  ✓
+ARC:            5/5  ✓
 ```
 
 ## Key Implementation Details
