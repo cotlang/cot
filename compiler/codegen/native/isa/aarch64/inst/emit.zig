@@ -1144,6 +1144,18 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, _:
             try sink.put4(0xd65f03c0);
         },
 
+        // Port of Cranelift: Inst::Rets emits as ret
+        // The register constraints are handled by regalloc; this just emits the return.
+        .rets => {
+            try sink.put4(0xd65f03c0);
+        },
+
+        // Port of Cranelift: Inst::Args emits nothing.
+        // It's a pseudo-instruction that defines function argument registers.
+        .args => {
+            // Emit nothing - this is purely for regalloc register constraints.
+        },
+
         .indirect_br => |payload| {
             try sink.put4(encBr(payload.rn));
         },

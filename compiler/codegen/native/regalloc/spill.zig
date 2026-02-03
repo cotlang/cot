@@ -160,9 +160,14 @@ pub const SpillContext = struct {
     pub fn tryAllocatingRegsForSpilledBundles(self: *Self) !void {
         // Don't borrow self during iteration - copy the length
         const len = self.spilled_bundles.items.len;
+        std.debug.print("DEBUG tryAllocRegsForSpilled: spilled_bundles.len={}\n", .{len});
 
         for (0..len) |i| {
             const bundle = self.spilled_bundles.items[i];
+            std.debug.print("DEBUG tryAlloc bundle={} ranges={}\n", .{
+                bundle.index(),
+                self.bundles.items[bundle.index()].ranges.items.len,
+            });
 
             // Skip empty bundles
             if (self.bundles.items[bundle.index()].ranges.items.len == 0) {
@@ -191,6 +196,17 @@ pub const SpillContext = struct {
                 null;
 
             // Try all registers via RegTraversalIter
+            std.debug.print("DEBUG RegTraversalIter: class={} hint_valid={} limit={?}\n", .{
+                @intFromEnum(class),
+                hint != null,
+                limit,
+            });
+            std.debug.print("DEBUG env preferred int regs: {}\n", .{
+                self.env.preferred_regs_by_class[@intFromEnum(RegClass.int)].isEmpty(),
+            });
+            std.debug.print("DEBUG env non_preferred int regs: {}\n", .{
+                self.env.non_preferred_regs_by_class[@intFromEnum(RegClass.int)].isEmpty(),
+            });
             var reg_iter = RegTraversalIter.init(
                 self.env,
                 class,
@@ -200,12 +216,15 @@ pub const SpillContext = struct {
                 limit,
             );
 
+            var reg_count: usize = 0;
             while (reg_iter.next()) |preg| {
+                reg_count += 1;
                 const preg_idx = PRegIndex.new(preg.index());
                 const result = try self.tryToAllocateBundleToReg(bundle, preg_idx);
 
                 switch (result) {
                     .allocated => {
+                        std.debug.print("DEBUG tryAlloc bundle={} SUCCESS preg={}\n", .{ bundle.index(), preg.hwEnc() });
                         self.stats.spill_bundle_reg_success += 1;
                         success = true;
                         break;
@@ -215,6 +234,7 @@ pub const SpillContext = struct {
                     },
                 }
             }
+            std.debug.print("DEBUG tryAlloc bundle={} regs_tried={} success={}\n", .{ bundle.index(), reg_count, success });
 
             if (!success) {
                 // Mark spillset as required - it needs an actual spillslot

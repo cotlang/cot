@@ -452,6 +452,24 @@ pub const MoveContext = struct {
     pub fn applyAllocationsAndInsertMoves(self: *Self) !InsertedMoves {
         var inserted_moves = InsertedMoves.init();
 
+        // DEBUG: Count vregs with ranges and total uses
+        var debug_vregs_with_ranges: usize = 0;
+        var debug_total_uses: usize = 0;
+        for (self.vregs.items) |vreg_data| {
+            if (vreg_data.ranges.items.len > 0) {
+                debug_vregs_with_ranges += 1;
+                for (vreg_data.ranges.items) |entry| {
+                    debug_total_uses += self.ranges.items[entry.index.index()].uses.items.len;
+                }
+            }
+        }
+        std.debug.print("DEBUG applyAllocs: vregs={} with_ranges={} total_uses={} ranges={}\n", .{
+            self.vregs.items.len,
+            debug_vregs_with_ranges,
+            debug_total_uses,
+            self.ranges.items.len,
+        });
+
         // Sort vreg range lists by start point
         for (self.vregs.items) |*vreg| {
             for (vreg.ranges.items) |*entry| {
@@ -474,6 +492,20 @@ pub const MoveContext = struct {
             for (vreg_data.ranges.items) |entry| {
                 const alloc = self.getAllocForRange(entry.index);
                 const range = entry.range;
+
+                // DEBUG: Print allocation details
+                const bundle_idx = self.ranges.items[entry.index.index()].bundle;
+                const bundledata = &self.bundles.items[bundle_idx.index()];
+                std.debug.print("DEBUG getAlloc: vreg={} bundle={} bundle.alloc.isNone={} bundle.spillset={}\n", .{
+                    vreg_idx,
+                    bundle_idx.index(),
+                    bundledata.allocation.isNone(),
+                    bundledata.spillset.index(),
+                });
+                if (bundledata.allocation.isNone()) {
+                    const ss = self.spillsets.items[bundledata.spillset.index()];
+                    std.debug.print("DEBUG spillset: slot={} required={}\n", .{ ss.slot.index(), ss.required });
+                }
 
                 prev.advance(entry);
 
@@ -502,6 +534,13 @@ pub const MoveContext = struct {
 
                 // Apply allocations to all uses in this range
                 for (self.ranges.items[entry.index.index()].uses.items) |usedata| {
+                    std.debug.print("DEBUG setAlloc: vreg={} inst={} slot={} alloc.isNone={} alloc.isReg={}\n", .{
+                        vreg_idx,
+                        usedata.pos.inst().idx(),
+                        usedata.slot,
+                        alloc.isNone(),
+                        alloc.asReg() != null,
+                    });
                     self.setAlloc(usedata.pos.inst(), usedata.slot, alloc);
                 }
             }

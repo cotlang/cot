@@ -440,6 +440,10 @@ pub const InstData = struct {
     then_dest: ?Block = null,
     /// Else destination (for brif).
     else_dest: ?Block = null,
+    /// Then block arguments (for brif).
+    then_args: ?ValueList = null,
+    /// Else block arguments (for brif).
+    else_args: ?ValueList = null,
     /// Immediate value (for iconst, iadd_imm, etc).
     imm: ?i64 = null,
     /// Integer comparison condition code (for icmp).
@@ -536,6 +540,16 @@ pub const InstData = struct {
             };
         }
         return null;
+    }
+
+    /// Get brif block arguments for a specific successor index.
+    /// succ_idx 0 = then branch args, succ_idx 1 = else branch args.
+    pub fn getBrifArgs(self: InstData, succ_idx: u32) ?ValueList {
+        return switch (succ_idx) {
+            0 => self.then_args,
+            1 => self.else_args,
+            else => null,
+        };
     }
 
     /// Get br_table data. Currently returns null (br_table not fully supported).

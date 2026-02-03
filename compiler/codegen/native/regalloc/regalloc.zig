@@ -435,6 +435,19 @@ pub fn runWithCtx(
     // Phase 9b: Allocate spillslots for bundles that couldn't get registers
     try spill_ctx.allocateSpillslots();
 
+    // DEBUG: Print instruction operand counts
+    std.debug.print("DEBUG regalloc: num_insts={} num_vregs={}\n", .{ func.numInsts(), func.numVregs() });
+    for (0..func.numInsts()) |i| {
+        const inst = Inst.new(i);
+        const ops = func.instOperands(inst);
+        std.debug.print("DEBUG inst {} has {} operands\n", .{ i, ops.len });
+    }
+    // Print output allocs info
+    std.debug.print("DEBUG output: allocs.len={} offsets.len={}\n", .{
+        ctx.output.allocs.items.len,
+        ctx.output.inst_alloc_offsets.items.len,
+    });
+
     // Phase 10: Move insertion
     // Ported from: self.apply_allocations_and_insert_moves() and
     //              self.resolve_inserted_moves() in moves.rs

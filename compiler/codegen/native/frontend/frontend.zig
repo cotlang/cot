@@ -648,15 +648,18 @@ pub const FuncInstBuilder = struct {
     /// Brif format: conditional branch
     fn BrifFmt(self: Self, opcode: clif.Opcode, cond: Value, then_block: Block, then_args: []const Value, else_block: Block, else_args: []const Value) !Inst {
         // For brif, we store condition in args, and then/else blocks in dest fields
-        _ = then_args; // TODO: handle block args
-        _ = else_args;
+        // Block args are stored in then_args/else_args fields
         const vlist = try self.builder.func.dfg.value_lists.alloc(&[_]Value{cond});
+        const then_vlist = try self.builder.func.dfg.value_lists.alloc(then_args);
+        const else_vlist = try self.builder.func.dfg.value_lists.alloc(else_args);
         return self.buildTerminatorWithInstData(.{
             .opcode = opcode,
             .args = vlist,
             .ctrl_type = Type.INVALID,
             .then_dest = then_block,
             .else_dest = else_block,
+            .then_args = then_vlist,
+            .else_args = else_vlist,
         });
     }
 

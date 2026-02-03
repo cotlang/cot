@@ -124,7 +124,7 @@ pub const AArch64Backend = struct {
     flags: lower_mod.Flags,
 
     pub const default = AArch64Backend{
-        .machine_env = createDefaultMachineEnv(),
+        .machine_env = regalloc_env.arm64MachineEnv(),
         .settings = aarch64.Settings.default,
         .flags = .{},
     };
@@ -137,17 +137,11 @@ pub const X64Backend = struct {
     flags: lower_mod.Flags,
 
     pub const default = X64Backend{
-        .machine_env = createDefaultMachineEnv(),
+        .machine_env = regalloc_env.x64MachineEnv(),
         .settings = x64.Settings.default,
         .flags = .{},
     };
 };
-
-/// Create a default machine environment.
-/// This provides the register allocation environment for both architectures.
-fn createDefaultMachineEnv() MachineEnv {
-    return MachineEnv.empty();
-}
 
 /// ABI selection.
 pub const Abi = enum {

@@ -90,7 +90,23 @@ pub const MemFlags = struct {
     pub const empty = MemFlags{};
 };
 
+/// Pair of virtual register and physical register for function arguments.
+/// Port of Cranelift's ArgPair from aarch64/inst/mod.rs.
+/// Uses Writable(Reg) for vreg because it's a def (the args instruction defines the vreg).
+pub const ArgPair = struct {
+    vreg: Writable(Reg),
+    preg: PReg,
+};
+
+/// For call arguments, pair of virtual register and physical register.
 pub const CallArgPair = struct {
+    vreg: Reg,
+    preg: PReg,
+};
+
+/// Pair of virtual register and physical register for return values.
+/// Port of Cranelift's RetPair from aarch64/inst/mod.rs.
+pub const RetPair = struct {
     vreg: Reg,
     preg: PReg,
 };
@@ -599,6 +615,12 @@ pub const Inst = union(enum) {
     // This allows generic code to access I.get_operands.getOperands() and I.get_operands.OperandVisitor.
     pub const get_operands = @import("get_operands.zig");
 
+    // Export the regs module for generic code to access register helpers.
+    // Generic code can use I.regs.PReg, I.regs.xregPreg(), etc.
+    // Note: ArgPair and RetPair must be accessed from the aarch64 module,
+    // not via I, to avoid ambiguity with their use in field definitions.
+    pub const regs = regs_mod;
+
     // Zero-length NOP (for alignment).
     nop0,
 
@@ -1010,6 +1032,22 @@ pub const Inst = union(enum) {
     // Return.
     ret,
 
+    /// Return with register constraints.
+    /// Port of Cranelift's Inst::Rets from aarch64/inst/mod.rs.
+    /// This is a pseudo-instruction that tells regalloc which vregs must be
+    /// in which return registers. It emits as just a `ret` instruction.
+    rets: struct {
+        rets: []const RetPair,
+    },
+
+    /// Function arguments with register constraints.
+    /// Port of Cranelift's Inst::Args from aarch64/inst/mod.rs.
+    /// This is a pseudo-instruction that tells regalloc which vregs are
+    /// defined by function arguments in which registers. Emits nothing.
+    args: struct {
+        args: []const ArgPair,
+    },
+
     // FPU compare.
     fpu_cmp: struct {
         size: ScalarSize,
@@ -1419,6 +1457,26 @@ pub const Inst = union(enum) {
         };
     }
 
+    /// Generate an Args instruction for function parameters.
+    /// Port of Cranelift's gen_args from abi.rs.
+    pub fn genArgs(args_pairs: []const ArgPair) Inst {
+        return Inst{
+            .args = .{
+                .args = args_pairs,
+            },
+        };
+    }
+
+    /// Generate a Rets instruction for return values.
+    /// Port of Cranelift's gen_rets from abi.rs.
+    pub fn genRets(ret_pairs: []const RetPair) Inst {
+        return Inst{
+            .rets = .{
+                .rets = ret_pairs,
+            },
+        };
+    }
+
     /// Generate a NOP.
     pub fn genNop(preferred_size: usize) Inst {
         if (preferred_size == 0) {
@@ -1484,7 +1542,7 @@ pub const Inst = union(enum) {
     /// Ported from cranelift/codegen/src/isa/aarch64/inst/mod.rs is_term()
     pub fn isTerm(self: Inst) MachTerminator {
         return switch (self) {
-            .ret => .ret,
+            .ret, .rets => .ret,
             .jump => .branch,
             .cond_br => .branch,
             .jt_sequence => .branch,
@@ -1525,8 +1583,8 @@ pub const Inst = union(enum) {
         var alloc_idx: usize = 0;
 
         switch (inst_copy) {
-            // Instructions with no register operands
-            .nop0, .nop4, .fence, .csdb, .brk, .ret => {},
+            // Instructions with no register operands (or fixed-reg only like args/rets)
+            .nop0, .nop4, .fence, .csdb, .brk, .ret, .rets, .args => {},
 
             .udf => {},
             .word4 => {},
@@ -1570,15 +1628,15 @@ pub const Inst = union(enum) {
             },
 
             // ALU with 12-bit immediate: rd (def), rn (use)
+            // Only consume allocations for virtual registers
             .alu_rr_imm12 => |*p| {
-                if (alloc_idx < allocs.len) {
-                    p.rd = applyAllocWritable(p.rd, allocs[alloc_idx]);
-                    alloc_idx += 1;
-                }
-                if (alloc_idx < allocs.len) {
-                    p.rn = applyAlloc(p.rn, allocs[alloc_idx]);
-                    alloc_idx += 1;
-                }
+                const rd_result = tryApplyAllocWritable(p.rd, allocs, alloc_idx);
+                p.rd = rd_result.reg;
+                if (rd_result.consumed) alloc_idx += 1;
+
+                const rn_result = tryApplyAlloc(p.rn, allocs, alloc_idx);
+                p.rn = rn_result.reg;
+                if (rn_result.consumed) alloc_idx += 1;
             },
 
             // ALU with logic immediate: rd (def), rn (use)
@@ -2576,6 +2634,25 @@ fn applyAlloc(reg: Reg, alloc: Allocation) Reg {
 /// Apply an allocation to a writable register.
 fn applyAllocWritable(reg: Writable(Reg), alloc: Allocation) Writable(Reg) {
     return Writable(Reg).fromReg(applyAlloc(reg.toReg(), alloc));
+}
+
+/// Try to apply an allocation to a register if it's virtual.
+/// Returns the (possibly updated) register and whether an allocation was consumed.
+fn tryApplyAlloc(reg: Reg, allocs: []const Allocation, idx: usize) struct { reg: Reg, consumed: bool } {
+    // Only virtual registers have allocations - physical registers stay as-is
+    if (reg.isVirtual()) {
+        if (idx < allocs.len) {
+            return .{ .reg = applyAlloc(reg, allocs[idx]), .consumed = true };
+        }
+    }
+    // Physical register or no allocation available - don't consume
+    return .{ .reg = reg, .consumed = false };
+}
+
+/// Try to apply an allocation to a writable register if it's virtual.
+fn tryApplyAllocWritable(reg: Writable(Reg), allocs: []const Allocation, idx: usize) struct { reg: Writable(Reg), consumed: bool } {
+    const result = tryApplyAlloc(reg.toReg(), allocs, idx);
+    return .{ .reg = Writable(Reg).fromReg(result.reg), .consumed = result.consumed };
 }
 
 /// Apply allocations to an addressing mode. Returns number of allocations consumed.

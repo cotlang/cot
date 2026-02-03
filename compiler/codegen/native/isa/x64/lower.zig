@@ -378,6 +378,13 @@ pub const X64LowerBackend = struct {
         }
     }
 
+    /// Generate the Args pseudo-instruction for function parameters.
+    /// TODO: Implement proper x64 ABI (rdi, rsi, rdx, rcx, r8, r9 for integers).
+    pub fn genArgSetup(_: *const Self, _: *LowerCtx) !void {
+        // Stub for x64 - not yet implemented.
+        // For now, tests mainly focus on aarch64.
+    }
+
     // =========================================================================
     // Integer constants
     // =========================================================================

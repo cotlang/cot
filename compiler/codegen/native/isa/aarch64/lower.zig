@@ -40,9 +40,14 @@ const Type = inst_mod.Type;
 // Import register types from local modules
 const regs = inst_mod.regs;
 const Reg = regs.Reg;
+const PReg = regs.PReg;
 const VReg = regs.VReg;
 const Writable = regs.Writable;
 const zeroReg = regs.zeroReg;
+
+// Import ArgPair and RetPair for argument/return value constraints
+const ArgPair = inst_mod.ArgPair;
+const RetPair = inst_mod.RetPair;
 
 // =============================================================================
 // CLIF IR Types
@@ -335,12 +340,18 @@ pub const AArch64LowerBackend = struct {
                 }) catch return null;
             },
             .@"return" => {
-                // Return from function - move return values to ABI registers
+                // Port of Cranelift's gen_return pattern from lower.rs.
+                // Instead of emitting explicit moves to return registers, we:
+                // 1. Collect RetPair entries mapping vregs to physical return registers
+                // 2. Emit Inst.rets with those pairs
+                // 3. regalloc2 sees the reg_fixed_use constraints and inserts moves as needed
+
                 const num_inputs = ctx.numInputs(ir_inst);
 
-                // Move each return value to the appropriate return register
-                // ARM64 ABI: first integer return in x0, subsequent in x1, x2, ...
-                // First float return in v0, subsequent in v1, v2, ...
+                // Allocate space for return pairs
+                // ARM64 ABI: integer returns in x0, x1, x2, ... ; float returns in v0, v1, ...
+                var ret_pairs = ctx.allocator.alloc(RetPair, num_inputs) catch return null;
+                var pair_idx: usize = 0;
                 var int_ret_idx: u8 = 0;
                 var float_ret_idx: u8 = 0;
 
@@ -349,53 +360,38 @@ pub const AArch64LowerBackend = struct {
                     const ret_reg = ret_val.onlyReg() orelse continue;
                     const ty = ctx.inputTy(ir_inst, i);
 
-                    // Determine if this is a float or integer return
-                    if (ty.isFloat()) {
-                        // Move to v0, v1, etc.
-                        // For now, just handle v0 (first float return)
-                        if (float_ret_idx == 0) {
-                            // Move to v0 - FPU move
-                            ctx.emit(Inst{
-                                .fpu_rr = .{
-                                    .fpu_op = .abs, // abs(x) = x for positive, use as nop move
-                                    .size = if (ty.bits() == 32) .size32 else .size64,
-                                    .rd = Writable(Reg).fromReg(regs.xreg(0)), // v0 = x0 encoding
-                                    .rn = ret_reg,
-                                },
-                            }) catch return null;
+                    // Determine the physical register for this return value
+                    const preg: PReg = if (ty.isFloat())
+                        blk: {
+                            const idx = float_ret_idx;
+                            float_ret_idx += 1;
+                            break :blk regs.vregPreg(idx);
                         }
-                        float_ret_idx += 1;
-                    } else {
-                        // Integer return - move to x0, x1, etc.
-                        const dest_reg = regs.xreg(int_ret_idx);
+                    else
+                        blk: {
+                            const idx = int_ret_idx;
+                            int_ret_idx += 1;
+                            break :blk regs.xregPreg(idx);
+                        };
 
-                        // Only emit move if source != destination
-                        if (ret_reg.toRealReg()) |real| {
-                            if (real.hwEnc() != int_ret_idx) {
-                                ctx.emit(Inst{
-                                    .mov = .{
-                                        .size = .size64,
-                                        .rd = Writable(Reg).fromReg(dest_reg),
-                                        .rm = ret_reg,
-                                    },
-                                }) catch return null;
-                            }
-                        } else {
-                            // Virtual register - always emit move
-                            ctx.emit(Inst{
-                                .mov = .{
-                                    .size = .size64,
-                                    .rd = Writable(Reg).fromReg(dest_reg),
-                                    .rm = ret_reg,
-                                },
-                            }) catch return null;
-                        }
-                        int_ret_idx += 1;
-                    }
+                    // Create RetPair mapping vreg to preg
+                    // regalloc2 will see reg_fixed_use(vreg, preg) from get_operands
+                    // and ensure vreg is in preg at this point, inserting moves as needed
+                    ret_pairs[pair_idx] = RetPair{
+                        .vreg = ret_reg,
+                        .preg = preg,
+                    };
+                    pair_idx += 1;
                 }
 
-                // Emit the actual return instruction
-                ctx.emit(.ret) catch return null;
+                // Emit the rets instruction with the return pairs
+                // This is a pseudo-instruction that tells regalloc about the constraints
+                // and emits as just a `ret` instruction
+                ctx.emit(Inst{
+                    .rets = .{
+                        .rets = ret_pairs[0..pair_idx],
+                    },
+                }) catch return null;
             },
             else => return null,
         }
@@ -406,6 +402,56 @@ pub const AArch64LowerBackend = struct {
     /// Returns machinst.Reg to match the lower.zig pinned_reg field type.
     pub fn maybePinnedReg(_: *const Self) ?machinst.Reg {
         return null;
+    }
+
+    /// Generate the Args pseudo-instruction for function parameters.
+    /// Port of Cranelift's gen_args pattern from abi.rs.
+    /// This creates fixed register constraints (x0, x1, etc.) for function params.
+    pub fn genArgSetup(_: *const Self, ctx: *LowerCtx) !void {
+        // Get the entry block
+        const entry_block = ctx.f.layout.entryBlock() orelse return;
+
+        // Get the entry block's params (which are function parameters)
+        const block_params = ctx.f.dfg.blockParams(entry_block);
+        if (block_params.len == 0) return;
+
+        // Allocate ArgPairs for each function parameter
+        var arg_pairs = try ctx.allocator.alloc(ArgPair, block_params.len);
+        var int_arg_idx: u8 = 0;
+        var float_arg_idx: u8 = 0;
+
+        for (block_params, 0..) |param, i| {
+            // Get the vreg assigned to this param
+            const value_regs = ctx.value_regs.get(param);
+            const vreg = value_regs.onlyReg() orelse continue;
+
+            // Get the type to determine if it's float or int
+            const ty = ctx.f.dfg.valueType(param);
+
+            // Determine the physical register for this argument
+            // ARM64 ABI: integers in x0-x7, floats in v0-v7
+            const preg: PReg = if (ty.isFloat())
+                blk: {
+                    const idx = float_arg_idx;
+                    float_arg_idx += 1;
+                    break :blk regs.vregPreg(idx);
+                }
+            else
+                blk: {
+                    const idx = int_arg_idx;
+                    int_arg_idx += 1;
+                    break :blk regs.xregPreg(idx);
+                };
+
+            // Create ArgPair: vreg (def) = preg (fixed physical register)
+            arg_pairs[i] = ArgPair{
+                .vreg = Writable(Reg).fromReg(vreg),
+                .preg = preg,
+            };
+        }
+
+        // Emit the Args instruction
+        try ctx.emit(Inst.genArgs(arg_pairs));
     }
 
     // =========================================================================

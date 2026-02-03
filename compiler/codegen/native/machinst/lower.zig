@@ -1293,9 +1293,28 @@ pub fn Lower(comptime I: type) type {
                 },
             };
 
-            // TODO: Implement block call argument handling once InstData has branchDestination
-            // For now, blocks are connected without arguments (simple CFG)
-            _ = branch_info;
+            // Get the instruction data to extract block args
+            const inst_data = self.f.dfg.getInstData(branch_info.branch_inst);
+            const opcode = inst_data.opcode;
+
+            // Get the args ValueList based on instruction type and successor index
+            const args_list: ?clif.ValueList = switch (opcode) {
+                .jump => inst_data.args, // Jump stores args directly
+                .brif => inst_data.getBrifArgs(branch_info.succ_idx), // Brif has separate then/else args
+                else => null,
+            };
+
+            // Convert Values to registers
+            if (args_list) |vlist| {
+                const values = self.f.dfg.value_lists.getSlice(vlist);
+                for (values) |val| {
+                    const regs = self.value_regs.get(val);
+                    for (regs.regs()) |r| {
+                        buffer.appendAssumeCapacity(r);
+                    }
+                }
+            }
+
             return .{ .succ = succ, .args = buffer.slice() };
         }
 
@@ -1349,8 +1368,9 @@ pub fn Lower(comptime I: type) type {
                 }
 
                 // Arg setup for entry block.
+                // Call the ISA-specific genArgSetup which emits the Args instruction.
                 if (bindex_iter == 0) {
-                    try self.genArgSetup();
+                    try backend.genArgSetup(self);
                     try self.finishIrInst(RelSourceLoc.default());
                 }
 
@@ -1361,11 +1381,8 @@ pub fn Lower(comptime I: type) type {
             return try self.vcode.build(&self.vregs);
         }
 
-        fn genArgSetup(self: *Self) !void {
-            // Generate argument setup instructions.
-            // This is a placeholder - full implementation would copy args from ABI locations.
-            _ = self;
-        }
+        // genArgSetup is implemented in ISA-specific code (e.g., aarch64/lower.zig)
+        // and called via backend.genArgSetup(self) from the lower() function.
 
         /// Generate list of registers to hold the output of a call.
         pub fn genCallOutput(self: *Self, sig: *const Signature) !InstOutput {

@@ -292,6 +292,29 @@ pub fn getOperands(inst: *const Inst, collector: *OperandVisitor) void {
         },
         .ret, .brk, .csdb, .fence, .nop0, .nop4 => {},
 
+        // Port of Cranelift: Inst::Rets { rets } => {
+        //     for RetPair { vreg, preg } in rets {
+        //         collector.reg_fixed_use(vreg, *preg);
+        //     }
+        // }
+        .rets => |p| {
+            for (p.rets) |ret_pair| {
+                collector.regFixedUse(ret_pair.vreg, ret_pair.preg);
+            }
+        },
+
+        // Port of Cranelift's Inst::Args operand collection from aarch64/inst/mod.rs:
+        // Inst::Args { args } => {
+        //     for ArgPair { vreg, preg } in args {
+        //         collector.reg_fixed_def(vreg, *preg);
+        //     }
+        // }
+        .args => |p| {
+            for (p.args) |arg_pair| {
+                collector.regFixedDef(arg_pair.vreg, arg_pair.preg);
+            }
+        },
+
         // FPU operations
         .fpu_cmp => |p| {
             collector.regUse(p.rn);
