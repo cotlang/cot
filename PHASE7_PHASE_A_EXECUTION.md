@@ -1,7 +1,7 @@
 # Phase 7 - Phase A: Wasm Translation Completion
 
 **Created**: 2026-02-03
-**Status**: In Progress
+**Status**: COMPLETE (2026-02-03)
 **Based On**: Cranelift source code study (code_translator.rs, bounds_checks.rs, func_environ.rs)
 
 ---
@@ -484,7 +484,7 @@ Offset 16: type_index (u32)    - Signature type ID
   ```
 
 #### 7.3.5 Add Table Access
-- [ ] Implement `loadFuncRefFromTable()`:
+- [x] Implement `loadFuncRefFromTable()`:
   ```zig
   fn loadFuncRefFromTable(self: *Self, table_index: u32, index: Value) !Value {
       // Get table base and bound from vmctx
@@ -508,7 +508,7 @@ Offset 16: type_index (u32)    - Signature type ID
   ```
 
 #### 7.3.6 Add Signature Checking
-- [ ] Implement `checkCallSignature()`:
+- [x] Implement `checkCallSignature()`:
   ```zig
   fn checkCallSignature(self: *Self, funcref: Value, type_index: u32) !void {
       // Load caller's type ID from vmctx
@@ -541,7 +541,7 @@ Offset 16: type_index (u32)    - Signature type ID
   ```
 
 #### 7.3.7 Add WasmOperator Variants
-- [ ] Add to WasmOperator:
+- [x] Add to WasmOperator:
   ```zig
   call: u32,           // function_index
   call_indirect: struct {
@@ -551,20 +551,20 @@ Offset 16: type_index (u32)    - Signature type ID
   ```
 
 #### 7.3.8 Add Dispatch
-- [ ] Add to `translateOperator()`:
+- [x] Add to `translateOperator()`:
   ```zig
   .call => |idx| try translator.translateCall(idx),
   .call_indirect => |data| try translator.translateCallIndirect(data.type_index, data.table_index),
   ```
 
 #### 7.3.9 Add CLIF Instructions
-- [ ] Add `call` instruction to builder
-- [ ] Add `call_indirect` instruction to builder
+- [x] Add `call` instruction to builder
+- [x] Add `call_indirect` instruction to builder
 
 #### 7.3.10 Testing
-- [ ] All existing tests still pass
-- [ ] Direct calls work
-- [ ] Indirect calls work with type checking
+- [x] All existing tests still pass
+- [x] Direct calls work
+- [x] Indirect calls work with type checking
 
 **Estimated LOC**: ~210 new
 
@@ -575,13 +575,13 @@ Offset 16: type_index (u32)    - Signature type ID
 ### Overall Progress
 - [x] Task 7.4: i64 Arithmetic (6/6 subtasks) - COMPLETE
 - [x] Task 7.2: Memory Operations (9/9 subtasks) - COMPLETE
-- [~] Task 7.3: Call Operations (3/10 subtasks) - Direct calls done, indirect pending
+- [x] Task 7.3: Call Operations (10/10 subtasks) - COMPLETE
 
 ### Test Status
 - [x] All existing tests pass
 - [x] i64 unified handlers work
 - [x] Memory operations infrastructure complete
-- [ ] New call tests pass
+- [x] New call tests pass
 
 ---
 
@@ -595,8 +595,8 @@ Offset 16: type_index (u32)    - Signature type ID
 | `wasm_to_clif/translator.zig` | [x] Modified | 7.2, 7.3, 7.4 |
 | `wasm_to_clif/func_translator.zig` | [x] Modified | 7.2, 7.3, 7.4 |
 | `frontend/mod.zig` | [x] Modified | 7.2 |
-| `ir/clif/function.zig` | [ ] Modify | 7.3 |
-| `ir/clif/builder.zig` | [ ] Modify | 7.3 |
+| `ir/clif/function.zig` | [x] Already has signatures | 7.3 |
+| `frontend/frontend.zig` | [x] Modified | 7.3 |
 
 ---
 
