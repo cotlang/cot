@@ -470,8 +470,14 @@ pub const SSABuilder = struct {
         if (unique_val) |val| {
             if (all_same) {
                 // All predecessors use the same value - remove block param and use that value
+                // Port of cranelift ssa.rs lines 555-556:
+                //   func.dfg.remove_block_param(sentinel);
+                //   func.dfg.change_to_alias(sentinel, pred_val);
                 // Truncate results first
                 self.results.shrinkRetainingCapacity(start_idx);
+                // CRITICAL: Must remove the block param before aliasing!
+                // This was the root cause of "branch args must match block params" error
+                try func.dfg.removeBlockParam(sentinel);
                 func.dfg.changeToAliasOf(sentinel, val);
                 return val;
             }
@@ -487,6 +493,8 @@ pub const SSABuilder = struct {
             try self.side_effects.instructions_added_to_blocks.append(self.allocator, dest_block);
 
             const zero = try emitZero(func, func.dfg.valueType(sentinel), dest_block);
+            // Also remove the block param for the unreachable case
+            try func.dfg.removeBlockParam(sentinel);
             func.dfg.changeToAliasOf(sentinel, zero);
             return zero;
         }

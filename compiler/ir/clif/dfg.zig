@@ -340,6 +340,25 @@ pub const ValueListPool = struct {
 
         return .{ .base = base };
     }
+
+    /// Remove a value at a specific index from a list (creates a new list).
+    /// Port of cranelift EntityList::remove.
+    pub fn remove(self: *Self, list: ValueList, index: usize) !ValueList {
+        const old_values = self.getSlice(list);
+        if (index >= old_values.len) return list;
+        if (old_values.len == 1) return ValueList.EMPTY;
+
+        const base: u32 = @intCast(self.data.items.len);
+        try self.data.append(self.allocator, @intCast(old_values.len - 1));
+
+        for (old_values, 0..) |v, i| {
+            if (i != index) {
+                try self.data.append(self.allocator, v.index);
+            }
+        }
+
+        return .{ .base = base };
+    }
 };
 
 // ============================================================================
@@ -648,6 +667,34 @@ pub const DataFlowGraph = struct {
         self.blocks.items[block.index].params = try self.value_lists.push(old_list, value);
 
         return value;
+    }
+
+    /// Remove a block parameter.
+    /// Port of cranelift/codegen/src/ir/dfg.rs remove_block_param.
+    ///
+    /// Removes the block parameter `val` from its block. The value must be a
+    /// block parameter. After removal, the `num` fields of subsequent parameters
+    /// are decremented to maintain correct indices.
+    pub fn removeBlockParam(self: *Self, val: Value) !void {
+        const def = self.valueDef(val);
+        const block = def.block() orelse @panic("removeBlockParam: value is not a block param");
+        const num = def.num();
+
+        // Remove from the block's params list
+        const old_list = self.blocks.items[block.index].params;
+        self.blocks.items[block.index].params = try self.value_lists.remove(old_list, num);
+
+        // Update the num field of remaining params that come after
+        const new_params = self.blockParams(block);
+        for (new_params, 0..) |param, i| {
+            if (i >= num) {
+                // This param needs its num decremented
+                const param_data = &self.values.items[param.index];
+                if (param_data.def == .param) {
+                    param_data.def.param.num = @intCast(i);
+                }
+            }
+        }
     }
 
     /// Make a BlockCall, bundling together the block and its arguments.
