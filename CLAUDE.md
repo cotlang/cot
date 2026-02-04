@@ -122,25 +122,26 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | Phase | Status | Description |
 |-------|--------|-------------|
 | Phase 0-6 | ✅ Done | CLIF IR, Wasm translation, MachInst, ARM64/x64, regalloc |
-| Phase 7 | ✅ Done | Integration complete - native executables working |
+| Phase 7 | 🔄 Partial | Basic expressions work, complex features broken |
 
-**🎉 NATIVE AOT IS WORKING (February 4, 2026)**
+**⚠️ NATIVE AOT STATUS (February 4, 2026)**
 
-Native compilation now produces working executables. Test with:
-```bash
-./zig-out/bin/cot test.cot -o test && ./test
-```
+E2E testing revealed native AOT only works for trivial cases:
 
-**Recent Fixes (February 2026):**
-- **Value alias resolution** - Port of Cranelift's `resolve_all_aliases()` before lowering
-- **Jump table relocation types** - Split `pcRel32` into `adr21` (ADR) and `pcRel32` (wrapping add for jump tables)
-- **CMP before jt_sequence** - Port of Cranelift's br_table bounds check
-- **Operand collection order** - Fixed mismatch between collectOperands and getOperands callback
-- E2E-4 memory operations: Fixed pseudo addressing modes via `memFinalize()`
-- `removeBlockParam()` - SSA construction port of ssa.rs:555-556
-- Block call argument handling for control flow
+| Feature | Native Status |
+|---------|---------------|
+| Return constant (`return 42`) | ✅ Works |
+| Simple expression (`return 10 + 5`) | ✅ Works |
+| Local variables | ❌ SIGSEGV |
+| Function calls | ❌ SIGSEGV or compiler panic |
+| If/else | ❌ SIGSEGV |
+| Loops, recursion, structs | ❌ Untested (likely broken) |
 
-**See `CRANELIFT_PORT_MASTER_PLAN.md` for full details.**
+**See `NATIVE_AOT_FIXES.md` for the detailed fix plan.**
+
+**Recent Infrastructure Fixes (February 2026):**
+- Value alias resolution, jump table relocations, operand order
+- These fixed `return 42` but more features need work
 
 ---
 
@@ -148,7 +149,9 @@ Native compilation now produces working executables. Test with:
 
 | Document | Purpose |
 |----------|---------|
-| `CRANELIFT_PORT_MASTER_PLAN.md` | **Native AOT codegen - phases, status, and 5 critical blockers** |
+| `NATIVE_AOT_FIXES.md` | **CURRENT WORK: Native AOT bugs and fix plan** |
+| `TROUBLESHOOTING.md` | **MUST READ: Debugging methodology - never invent, always copy reference** |
+| `CRANELIFT_PORT_MASTER_PLAN.md` | Native AOT codegen - phases and architecture |
 | `WASM_BACKEND.md` | Wasm milestones M1-M16, implementation details |
 | `ROADMAP_PHASE2.md` | M17-M24 detailed plan with Go/Swift research |
 | `TESTING.md` | Testing strategy and test organization |

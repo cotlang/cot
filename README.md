@@ -15,9 +15,9 @@ See **[VISION.md](VISION.md)** for the complete language vision and strategy.
 | Frontend | ✅ Done | Scanner, parser, type checker, IR lowering |
 | SSA Infrastructure | ✅ Done | Values, blocks, functions, passes |
 | Wasm Backend | ✅ M1-M16 Done | Constants, arithmetic, control flow, loops, calls, memory, pointers, structs, slices, strings, ARC |
-| Native AOT | ✅ Done | Cranelift port complete: CLIF IR, regalloc, ARM64/AMD64 backends, working executables |
+| Native AOT | 🔄 Partial | Infrastructure done, but only trivial programs work (see [NATIVE_AOT_FIXES.md](NATIVE_AOT_FIXES.md)) |
 
-**Tests: All passing**
+**Wasm Tests: All passing** | **Native Tests: Basic only**
 
 ## Quick Start
 
@@ -105,6 +105,8 @@ $ echo $?
 | [VISION.md](VISION.md) | Language vision and strategy |
 | [WASM_BACKEND.md](WASM_BACKEND.md) | Wasm backend milestones (M1-M16) |
 | [CRANELIFT_PORT_MASTER_PLAN.md](CRANELIFT_PORT_MASTER_PLAN.md) | Native AOT compilation (Cranelift port) |
+| [NATIVE_AOT_FIXES.md](NATIVE_AOT_FIXES.md) | **Current work: Native AOT bug fixes needed** |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Debugging methodology (MUST READ before fixing bugs) |
 | [TESTING.md](TESTING.md) | Testing strategy and test organization |
 | [CLAUDE.md](CLAUDE.md) | AI session instructions |
 

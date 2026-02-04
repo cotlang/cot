@@ -1065,11 +1065,20 @@ All audit documents are in `audit/native/`:
 
 ## Phase 7: Integration
 
-**STATUS**: ✅ Complete - Native AOT executables working!
+**STATUS**: 🔄 Partial - Infrastructure complete, but E2E testing reveals bugs
 
 **Audit Date**: February 4, 2026
 
-**🎉 MILESTONE: First working native executable produced on February 4, 2026.**
+**⚠️ UPDATE (February 4, 2026 PM):** E2E testing revealed that only trivial programs work.
+See `NATIVE_AOT_FIXES.md` for the detailed bug list and fix plan.
+
+| Feature | Status |
+|---------|--------|
+| Return constant | ✅ Works |
+| Simple expression | ✅ Works |
+| Local variables | ❌ SIGSEGV |
+| Function calls | ❌ SIGSEGV or panic |
+| Control flow | ❌ SIGSEGV |
 
 ### 7.0 Overview
 
@@ -1282,10 +1291,10 @@ compiler/codegen/native/
 | 4: ARM64 | ✅ Complete | 23/23 | ~15,000 | None |
 | 5: x86-64 | ✅ Complete | 16/16 | ~8,400 | None |
 | 6: Regalloc | ✅ Complete | 19/19 | ~6,400 | None |
-| 7: Integration | ✅ Complete | 8/8 | ~3,400 | None |
-| **TOTAL** | **✅ 100%** | **145/145** | **~56,075** | **None** |
+| 7: Integration | 🔄 Partial | 8/8 | ~3,400 | E2E bugs (see NATIVE_AOT_FIXES.md) |
+| **TOTAL** | **🔄 95%** | **145/145** | **~56,075** | **E2E bugs** |
 
-**🎉 Native AOT compilation is working! First executable produced February 4, 2026.**
+**⚠️ Infrastructure complete, but E2E testing reveals runtime bugs.**
 
 ### What's Done
 
@@ -1301,11 +1310,20 @@ All infrastructure is complete and tests pass:
 
 ### What Remains
 
-**✅ ALL PHASES COMPLETE - NATIVE AOT WORKING**
+**⚠️ INFRASTRUCTURE COMPLETE, BUT E2E BUGS FOUND**
 
-The native codegen pipeline is fully operational. Native executables can be produced:
+The native codegen pipeline infrastructure is complete, but E2E testing (February 4, 2026 PM)
+revealed that only trivial programs (`return 42`, `return 10 + 5`) work correctly.
 
+**See `NATIVE_AOT_FIXES.md` for:**
+- Detailed list of what works and what doesn't
+- Investigation steps for each bug
+- Reference files in Cranelift to copy from
+
+**What currently works:**
 ```bash
+# Simple constant return
+echo 'fn main() int { return 42; }' > test.cot
 ./zig-out/bin/cot test.cot -o test && ./test
 echo $?  # Returns 42
 ```
