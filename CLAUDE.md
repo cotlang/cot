@@ -111,6 +111,7 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 | Phase 7 | ✅ 95% | Integration complete - all infrastructure done, 2/6 E2E tests passing |
 
 **Recent Fixes (February 2026):**
+- `removeBlockParam()` - SSA construction must remove block params when all predecessors agree (port of ssa.rs:555-556)
 - `InstValuesIterator` - port of Cranelift's inst_values() including branch args
 - `computeUseStates()` - now uses iterator stack matching Cranelift exactly
 - Block call argument handling for control flow
