@@ -14,15 +14,14 @@ On February 4, 2026, E2E testing revealed that native AOT compilation only works
 | Function calls (no params) | ✅ **FIXED** (Feb 4, 2026) |
 | Nested function calls | ✅ **FIXED** (Feb 4, 2026) |
 | Function calls (2+ params) | ✅ **FIXED** (Feb 5, 2026) |
-| Function calls (1 param) | ❌ Compiler panic - index out of bounds |
+| Function calls (1 param) | ✅ **FIXED** (Feb 5, 2026) |
 | If/else control flow | ✅ **FIXED** (Feb 5, 2026) |
 | While loops | ✅ **FIXED** (Feb 5, 2026) |
 | Recursion | ❌ Returns base case immediately |
 | Structs | ❌ Untested |
 | Pointers | ❌ Untested |
 
-**Feb 5 update:** vmctx wrapper fix resolved most SIGSEGV issues. New bugs found:
-- Single-parameter functions crash compiler (index out of bounds in SSA)
+**Feb 5 update:** vmctx wrapper fix resolved most SIGSEGV issues, ValueListPool fix resolved single-param crash.
 - Recursion returns base case immediately (recursive call not working)
 
 ---
@@ -213,44 +212,54 @@ This requires changes at multiple levels:
 
 ---
 
-## Task 3: Fix Function Calls with Parameters ✅ MOSTLY FIXED
+## Task 3: Fix Function Calls with Parameters ✅ FIXED
 
-**Status (Feb 5, 2026):** Works for 2+ parameters, but **1-parameter functions crash compiler**.
+**Status (Feb 5, 2026):** ALL parameter counts now work (0, 1, 2+ params).
 
-### What works:
+### Test cases:
 ```cot
+fn get_five() i64 { return 5 }
+fn main() i64 { return get_five() }  // Returns 5 ✅
+
+fn identity(n: i64) i64 { return n }
+fn main() i64 { return identity(42) }  // Returns 42 ✅
+
 fn add(a: i64, b: i64) i64 { return a + b }
 fn main() i64 { return add(10, 5) }  // Returns 15 ✅
 ```
 
-### What's broken:
-```cot
-fn identity(n: i64) i64 { return n }
-fn main() i64 { return identity(42) }  // CRASH: index out of bounds
+### Root Cause (Single-param crash)
+
+The crash occurred in `ValueListPool.push()` when copying old values from the pool:
+
+```zig
+// BUG: getSlice() returns pointer to self.data.items
+const old_values = self.getSlice(list);
+// Then append() may reallocate, invalidating old_values!
+try self.data.append(self.allocator, ...);
+for (old_values) |v| {  // CRASH: old_values is stale pointer
+    try self.data.append(self.allocator, v.index);
+}
 ```
 
-**Error:**
+### Fix Applied (Following TROUBLESHOOTING.md methodology)
+
+1. **Found reference:** `~/learning/wasmtime/cranelift/entity/src/list.rs` (EntityList implementation)
+2. **Identified difference:** Cranelift modifies lists in-place and handles reallocation carefully
+3. **Applied fix:** Use indices instead of pointers to safely copy old values:
+
+```zig
+// Get old list data using INDICES, not pointers
+const old_len = if (list.isEmpty()) 0 else self.data.items[list.base];
+const old_start = list.base + 1;
+// Copy by re-reading from self.data.items each iteration (safe)
+for (0..old_len) |i| {
+    const old_value_index = self.data.items[old_start + i];
+    try self.data.append(self.allocator, old_value_index);
+}
 ```
-panic: index out of bounds: index 2863311530, len 47
-compiler/ir/clif/dfg.zig:614:33: in valueType
-compiler/codegen/native/frontend/ssa.zig:412:76: in sealOneBlock
-```
 
-### Investigation needed:
-- The crash is in `sealBlock` when getting the type of a value with garbage index
-- Likely an uninitialized Variable or Value being used
-- Check how single-parameter functions differ from multi-parameter
-
-**Reference files:**
-- `~/learning/wasmtime/crates/cranelift/src/translate/code_translator.rs` (Operator::Call)
-- `compiler/codegen/native/frontend/ssa.zig` (sealBlock)
-
-### Original Investigation Steps (Follow TROUBLESHOOTING.md)
-   - How does Cranelift push arguments?
-   - How do we push arguments?
-   - Are stack adjustments correct?
-
-5. **DO NOT invent fixes.** Copy the reference exactly.
+**File changed:** `compiler/ir/clif/dfg.zig` (ValueListPool.push and remove)
 
 ---
 

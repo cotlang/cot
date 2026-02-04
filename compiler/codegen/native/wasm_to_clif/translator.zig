@@ -544,20 +544,20 @@ pub const FuncTranslator = struct {
         // Truncate stack to original size
         frame.truncateValueStackToOriginalSize(&self.state.stack);
 
-        // For loops, seal the header block now that all back-edges have been added
-        // This follows Cranelift's pattern from code_translator.rs lines 430-431
-        if (frame == .loop_frame) {
-            try self.builder.sealBlock(frame.loop_frame.header);
-        }
-
-        // Determine if next block is reachable
+        // Determine if next block is reachable and seal loop headers if applicable
+        // Following Cranelift's pattern from code_translator.rs lines 3400-3413
         const next_reachable = switch (frame) {
             .if_frame => |f| blk: {
                 const conseq_reachable = f.consequent_ends_reachable orelse self.state.reachable;
                 break :blk (f.head_is_reachable and conseq_reachable) or f.exit_is_branched_to;
             },
             .block_frame => |f| self.state.reachable or f.exit_is_branched_to,
-            .loop_frame => self.state.reachable,
+            .loop_frame => |f| blk: {
+                // For loops, seal the header block now that all back-edges have been added
+                try self.builder.sealBlock(f.header);
+                // Loops can't have branches to the end
+                break :blk self.state.reachable;
+            },
         };
 
         if (next_reachable) {

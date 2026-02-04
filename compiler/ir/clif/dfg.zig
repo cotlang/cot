@@ -342,14 +342,25 @@ pub const ValueListPool = struct {
 
     /// Push a value to an existing list (creates a new list).
     pub fn push(self: *Self, list: ValueList, value: Value) !ValueList {
-        const old_values = self.getSlice(list);
+        // CRITICAL: Get old list data using INDICES, not pointers!
+        // The getSlice() returns a pointer to self.data.items which becomes
+        // invalid if append() causes reallocation. Use base indices instead.
+        const old_len = if (list.isEmpty()) 0 else self.data.items[list.base];
+        const old_start = list.base + 1;
+
         const base: u32 = @intCast(self.data.items.len);
 
-        try self.data.append(self.allocator, @intCast(old_values.len + 1));
+        // Store new length
+        try self.data.append(self.allocator, @intCast(old_len + 1));
 
-        for (old_values) |v| {
-            try self.data.append(self.allocator, v.index);
+        // Copy old values by index (safe even if reallocation occurs within loop
+        // since we re-read from self.data.items each iteration)
+        for (0..old_len) |i| {
+            const old_value_index = self.data.items[old_start + i];
+            try self.data.append(self.allocator, old_value_index);
         }
+
+        // Append new value
         try self.data.append(self.allocator, value.index);
 
         return .{ .base = base };
@@ -358,16 +369,19 @@ pub const ValueListPool = struct {
     /// Remove a value at a specific index from a list (creates a new list).
     /// Port of cranelift EntityList::remove.
     pub fn remove(self: *Self, list: ValueList, index: usize) !ValueList {
-        const old_values = self.getSlice(list);
-        if (index >= old_values.len) return list;
-        if (old_values.len == 1) return ValueList.EMPTY;
+        // CRITICAL: Use indices, not pointers, to avoid invalidation from reallocation
+        const old_len = if (list.isEmpty()) 0 else self.data.items[list.base];
+        if (index >= old_len) return list;
+        if (old_len == 1) return ValueList.EMPTY;
 
+        const old_start = list.base + 1;
         const base: u32 = @intCast(self.data.items.len);
-        try self.data.append(self.allocator, @intCast(old_values.len - 1));
+        try self.data.append(self.allocator, @intCast(old_len - 1));
 
-        for (old_values, 0..) |v, i| {
+        for (0..old_len) |i| {
             if (i != index) {
-                try self.data.append(self.allocator, v.index);
+                const old_value_index = self.data.items[old_start + i];
+                try self.data.append(self.allocator, old_value_index);
             }
         }
 
