@@ -1719,12 +1719,17 @@ pub const AArch64LowerBackend = struct {
 
     fn lowerCall(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         // Call lowering.
-        // Port of cranelift/codegen/src/isa/aarch64/lower.rs call lowering
+        // Port of cranelift/codegen/src/isa/aarch64/lower.isle:2533-2551
         //
         // AAPCS64 ABI:
         // - Integer/pointer arguments: X0-X7
         // - Float arguments: V0-V7
         // - Return value: X0 (integer), V0 (float)
+        // - Caller-saved (clobbered): X0-X17, V0-V31
+        //
+        // Cranelift pattern: NO explicit mov instructions for register args/returns.
+        // Instead, populate uses/defs with fixed register constraints.
+        // Regalloc will insert moves as needed to satisfy constraints.
         _ = self;
 
         const inst_data = ctx.data(ir_inst);
@@ -1732,75 +1737,104 @@ pub const AArch64LowerBackend = struct {
         // Get the function reference
         const func_ref = inst_data.getFuncRef() orelse return null;
 
-        // Get the external function data
+        // Get the external function data (contains the function name)
         const ext_func = ctx.extFuncData(func_ref) orelse return null;
-        _ = ext_func; // Will be used for the actual call target
 
         // Get arguments
         const num_args = ctx.numInputs(ir_inst);
 
-        // Move arguments to ABI registers (X0-X7 for integers)
+        // Create CallInfo structure with the external function destination
+        // Port of Cranelift's gen_call_info from aarch64/lower/isle.rs
+        const call_info = ctx.allocator.create(inst_mod.CallInfo) catch return null;
+        call_info.* = inst_mod.CallInfo.init(
+            ext_func.name,
+            .fast, // callee_conv
+            .fast, // caller_conv
+        );
+
+        // Build AAPCS64 clobber set: X0-X17 and V0-V31 are caller-saved
+        // Port of Cranelift's get_regs_clobbered_by_call
+        var clobbers = inst_mod.PRegSet.empty();
+        var i: u8 = 0;
+        while (i <= 17) : (i += 1) {
+            clobbers = clobbers.with(regs.xregPreg(i));
+        }
+        i = 0;
+        while (i < 32) : (i += 1) {
+            clobbers = clobbers.with(regs.vregPreg(i));
+        }
+        // NOTE: clobbers will be assigned to call_info AFTER removing return regs
+
+        // Build uses list: gen_call_args(abi, args)
+        // Each argument vreg is constrained to its ABI register (X0-X7 for integers)
+        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         var int_arg_idx: u8 = 0;
-        for (0..num_args) |i| {
-            const arg_val = ctx.putInputInRegs(ir_inst, i);
+        for (0..num_args) |idx| {
+            const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
-            const arg_ty = ctx.inputTy(ir_inst, i);
+            const arg_ty = ctx.inputTy(ir_inst, idx);
 
-            // Check if this is an integer or float argument
             if (!arg_ty.isFloat() and int_arg_idx < 8) {
-                // Move to integer ABI register (X0-X7)
-                const dst_reg = regs.xreg(int_arg_idx);
-                const size = operandSizeFromType(arg_ty) orelse .size64;
-
-                ctx.emit(Inst{
-                    .mov = .{
-                        .size = size,
-                        .rd = Writable(Reg).fromReg(dst_reg),
-                        .rm = arg_reg,
-                    },
+                // Add to uses: this vreg MUST be in this preg at the call
+                call_info.uses.append(ctx.allocator, .{
+                    .vreg = arg_reg,
+                    .preg = regs.xregPreg(int_arg_idx),
                 }) catch return null;
                 int_arg_idx += 1;
             }
-            // TODO: Handle float arguments and stack arguments
         }
 
-        // Emit the call instruction
-        // For now, emit a placeholder - full implementation would resolve the target
-        ctx.emit(Inst{
-            .call = .{
-                .dest = .{ .label = MachLabel.fromBlock(BlockIndex.new(0)) },
-            },
-        }) catch return null;
-
-        // Handle return value
+        // Build defs list: gen_call_rets(abi, output)
+        // Each return value vreg is defined in its ABI register
+        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         const num_outputs = ctx.numOutputs(ir_inst);
+        var output = InstOutput{};
         if (num_outputs > 0) {
-            // Return value is in X0
             const ret_ty = ctx.outputTy(ir_inst, 0);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
 
-            // Move X0 to destination
-            const ret_size = operandSizeFromType(ret_ty) orelse .size64;
-            ctx.emit(Inst{
-                .mov = .{
-                    .size = ret_size,
-                    .rd = dst_reg,
-                    .rm = regs.xreg(0),
-                },
+            // Add to defs: this vreg is DEFINED BY the call in X0
+            const ret_preg = regs.xregPreg(0);
+            call_info.defs.append(ctx.allocator, .{
+                .vreg = dst_reg,
+                .location = .{ .reg = ret_preg },
             }) catch return null;
 
-            var output = InstOutput{};
+            // Port of Cranelift's gen_call_info: remove return regs from clobbers.
+            // regalloc2 requires that clobbers and defs must not collide.
+            // See cranelift/codegen/src/machinst/abi.rs lines 2114-2119
+            clobbers.remove(ret_preg);
+
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
-            return output;
         }
 
-        return InstOutput{};
+        // Assign clobbers after removing return registers
+        call_info.clobbers = clobbers;
+
+        // Emit the call instruction with proper CallInfo
+        // Regalloc sees uses/defs/clobbers and inserts moves as needed
+        ctx.emit(Inst{
+            .call = .{ .info = call_info },
+        }) catch return null;
+
+        return output;
     }
 
     fn lowerCallIndirect(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         // Indirect call lowering.
+        // Port of cranelift/codegen/src/isa/aarch64/lower.isle:2542-2551
         // The callee address is the first input, remaining inputs are arguments.
+        //
+        // AAPCS64 ABI:
+        // - Integer/pointer arguments: X0-X7
+        // - Float arguments: V0-V7
+        // - Return value: X0 (integer), V0 (float)
+        // - Caller-saved (clobbered): X0-X17, V0-V31
+        //
+        // Cranelift pattern: NO explicit mov instructions for register args/returns.
+        // Instead, populate uses/defs with fixed register constraints.
+        // Regalloc will insert moves as needed to satisfy constraints.
         _ = self;
 
         const num_inputs = ctx.numInputs(ir_inst);
@@ -1810,58 +1844,85 @@ pub const AArch64LowerBackend = struct {
         const callee_val = ctx.putInputInRegs(ir_inst, 0);
         const callee_reg = callee_val.onlyReg() orelse return null;
 
-        // Move arguments to ABI registers (skip first input which is callee)
+        // Create CallIndInfo structure for indirect call
+        const call_ind_info = ctx.allocator.create(inst_mod.CallIndInfo) catch return null;
+        call_ind_info.* = .{
+            .dest = callee_reg,
+            .uses = .{},
+            .defs = .{},
+            .clobbers = inst_mod.PRegSet.empty(),
+            .callee_conv = .fast,
+            .caller_conv = .fast,
+            .try_call_info = null,
+        };
+
+        // Build AAPCS64 clobber set: X0-X17 and V0-V31 are caller-saved
+        // Port of Cranelift's get_regs_clobbered_by_call
+        var clobbers = inst_mod.PRegSet.empty();
+        var i: u8 = 0;
+        while (i <= 17) : (i += 1) {
+            clobbers = clobbers.with(regs.xregPreg(i));
+        }
+        i = 0;
+        while (i < 32) : (i += 1) {
+            clobbers = clobbers.with(regs.vregPreg(i));
+        }
+        // NOTE: clobbers will be assigned to call_ind_info AFTER removing return regs
+
+        // Build uses list: gen_call_args(abi, args)
+        // Skip first input which is callee, remaining inputs are arguments
+        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         var int_arg_idx: u8 = 0;
-        for (1..num_inputs) |i| {
-            const arg_val = ctx.putInputInRegs(ir_inst, i);
+        for (1..num_inputs) |idx| {
+            const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
-            const arg_ty = ctx.inputTy(ir_inst, i);
+            const arg_ty = ctx.inputTy(ir_inst, idx);
 
             if (!arg_ty.isFloat() and int_arg_idx < 8) {
-                const dst_reg = regs.xreg(int_arg_idx);
-                const arg_size = operandSizeFromType(arg_ty) orelse .size64;
-
-                ctx.emit(Inst{
-                    .mov = .{
-                        .size = arg_size,
-                        .rd = Writable(Reg).fromReg(dst_reg),
-                        .rm = arg_reg,
-                    },
+                // Add to uses: this vreg MUST be in this preg at the call
+                call_ind_info.uses.append(ctx.allocator, .{
+                    .vreg = arg_reg,
+                    .preg = regs.xregPreg(int_arg_idx),
                 }) catch return null;
-
                 int_arg_idx += 1;
             }
         }
 
-        // Emit indirect call through the callee register
-        ctx.emit(Inst{
-            .call_ind = .{
-                .rn = callee_reg,
-            },
-        }) catch return null;
-
-        // Handle return value
+        // Build defs list: gen_call_rets(abi, output)
+        // Each return value vreg is defined in its ABI register
+        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         const num_outputs = ctx.numOutputs(ir_inst);
+        var output = InstOutput{};
         if (num_outputs > 0) {
             const ret_ty = ctx.outputTy(ir_inst, 0);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
-            const ret_size = operandSizeFromType(ret_ty) orelse .size64;
 
-            ctx.emit(Inst{
-                .mov = .{
-                    .size = ret_size,
-                    .rd = dst_reg,
-                    .rm = regs.xreg(0),
-                },
+            // Add to defs: this vreg is DEFINED BY the call in X0
+            const ret_preg = regs.xregPreg(0);
+            call_ind_info.defs.append(ctx.allocator, .{
+                .vreg = dst_reg,
+                .location = .{ .reg = ret_preg },
             }) catch return null;
 
-            var output = InstOutput{};
+            // Port of Cranelift's gen_call_info: remove return regs from clobbers.
+            // regalloc2 requires that clobbers and defs must not collide.
+            // See cranelift/codegen/src/machinst/abi.rs lines 2114-2119
+            clobbers.remove(ret_preg);
+
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
-            return output;
         }
 
-        return InstOutput{};
+        // Assign clobbers after removing return registers
+        call_ind_info.clobbers = clobbers;
+
+        // Emit indirect call through the callee register
+        // Regalloc sees uses/defs/clobbers and inserts moves as needed
+        ctx.emit(Inst{
+            .call_ind = .{ .info = call_ind_info },
+        }) catch return null;
+
+        return output;
     }
 
     // =========================================================================

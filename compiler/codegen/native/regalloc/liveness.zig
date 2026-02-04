@@ -600,7 +600,12 @@ pub fn buildLiveranges(
         // Process instructions in reverse
         var inst_iter = insns.reverseIter();
         while (inst_iter.next()) |inst| {
-            // Mark clobbers
+            // Mark clobbers with CodeRanges on PRegs.
+            // Port of regalloc2 liveranges.rs: clobbers are at After point only.
+            // Note: regalloc2 requires that clobbers and defs must not collide -
+            // it is illegal to have the same register be both a clobber and a
+            // fixed def. The call lowering code must exclude return registers
+            // from the clobber set (see Cranelift's gen_call_info).
             var clobber_iter = func.instClobbers(inst).iterate();
             while (clobber_iter.next()) |clobber| {
                 const clobber_range = CodeRange{

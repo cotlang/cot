@@ -1656,20 +1656,41 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, _:
             try sink.put4(0xd503201f | (op2 << 6));
         },
 
-        // Call instruction
+        // Call instruction (direct call to external function)
+        // Port of Cranelift's emit for Inst::Call from aarch64/inst/emit.rs
         .call => |payload| {
-            const off = sink.curOffset();
-            if (payload.dest.asLabel()) |l| {
-                try sink.useLabelAtOffset(off, l, .branch26);
-            }
+            const info = payload.info;
+
+            // Convert CLIF ExternalName to buffer's ExternalName format
+            const buffer_ext_name: buffer.ExternalName = switch (info.dest) {
+                .user => |u| .{ .User = buffer.UserExternalNameRef.initFull(u.namespace, u.index) },
+                .libcall => @panic("libcall not yet supported in AArch64 call emission"),
+            };
+
+            // Add relocation for the external function.
+            // The linker will patch this BL instruction with the correct offset.
+            // Reloc::Arm64Call is a 26-bit PC-relative relocation.
+            try sink.addRelocExternalName(.Arm64Call, buffer_ext_name, 0);
+
+            // Emit BL with offset 0 (will be patched by linker)
             // BL encoding: 1 00101 imm26
-            try sink.put4(encJump26(0b100101, payload.dest.asOffset26OrZero()));
+            try sink.put4(encJump26(0b100101, 0));
+
+            // Register call site for unwinding/stack maps
+            try sink.addCallSite(null);
         },
 
-        // Call indirect
+        // Call indirect (through register)
+        // Port of Cranelift's emit for Inst::CallInd from aarch64/inst/emit.rs
         .call_ind => |payload| {
-            // BLR rn
-            try sink.put4(0b1101011_0001_11111_000000_00000_00000 | (machregToGpr(payload.rn) << 5));
+            const info = payload.info;
+
+            // BLR rn - branch with link to register
+            // Encoding: 1101011_0001_11111_000000_rrrrr_00000 where rrrrr is Rn
+            try sink.put4(0b1101011_0001_11111_000000_00000_00000 | (machregToGpr(info.dest) << 5));
+
+            // Register call site for unwinding/stack maps
+            try sink.addCallSite(null);
         },
 
         // ==========================================================================
@@ -2833,13 +2854,19 @@ test "emit function call" {
     var emit_state = EmitState{};
     const emit_info = EmitInfo.init(.{});
 
-    // Allocate label in the buffer before using it
-    const target = try buf.getLabel();
+    // Create CallInfo for direct call test
+    var call_info = mod.CallInfo.init(
+        .{ .user = .{ .namespace = 0, .index = 0 } }, // ExternalName
+        .fast,
+        .fast,
+    );
     const call_inst = Inst{ .call = .{
-        .dest = BranchTarget{ .label = target },
+        .info = &call_info,
     } };
     try emit(&call_inst, &buf, &emit_info, &emit_state);
     try testing.expectEqual(@as(u32, 4), buf.curOffset());
+    // Verify a relocation was added for the external call
+    try testing.expectEqual(@as(usize, 1), buf.relocs.items.len);
 }
 
 test "emit indirect call" {
@@ -2852,8 +2879,18 @@ test "emit indirect call" {
     const emit_info = EmitInfo.init(.{});
 
     const x8 = xreg(8);
+    // Create CallIndInfo for indirect call test
+    var call_ind_info = mod.CallIndInfo{
+        .dest = x8,
+        .uses = .{},
+        .defs = .{},
+        .clobbers = mod.PRegSet.empty(),
+        .callee_conv = .fast,
+        .caller_conv = .fast,
+        .try_call_info = null,
+    };
     const call_ind_inst = Inst{ .call_ind = .{
-        .rn = x8,
+        .info = &call_ind_info,
     } };
     try emit(&call_ind_inst, &buf, &emit_info, &emit_state);
     try testing.expectEqual(@as(u32, 4), buf.curOffset());

@@ -374,8 +374,14 @@ pub const MoveContext = struct {
         if (!bundledata.allocation.isNone()) {
             return bundledata.allocation;
         } else {
-            // Get from spillslot
-            const slot = self.spillsets.items[bundledata.spillset.index()].slot;
+            // Get from spillslot - bundle must have spillset.required = true
+            const spillset = bundledata.spillset;
+            const spillset_data = &self.spillsets.items[spillset.index()];
+
+            // Defensive check: this should never happen in correct operation
+            std.debug.assert(spillset_data.required);
+
+            const slot = spillset_data.slot;
             return self.spillslots.items[slot.index()].alloc;
         }
     }

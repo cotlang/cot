@@ -476,6 +476,7 @@ pub const ProcessContext = struct {
             try self.bundles.append(self.allocator, LiveBundle.init());
             self.spillsets.items[ssidx.index()].spill_bundle = new_idx;
             self.bundles.items[new_idx.index()].spillset = ssidx;
+            // Add to spilled_bundles - will be processed by tryAllocatingRegsForSpilledBundles
             try self.spilled_bundles.append(self.allocator, new_idx);
             return new_idx;
         } else {
@@ -947,7 +948,7 @@ pub const ProcessContext = struct {
             }
         }
 
-        // Requeue both bundles
+        // Requeue both bundles if they have ranges (matches regalloc2)
         if (self.bundles.items[bundle.index()].ranges.items.len > 0) {
             self.recomputeBundleProperties(bundle);
             const prio = self.bundles.items[bundle.index()].prio;
@@ -1123,11 +1124,13 @@ pub const ProcessContext = struct {
             },
         };
 
-        // Handle Any requirement with existing spill bundle
+        // Handle Any requirement with existing spill bundle (matches regalloc2)
+        // If a spill bundle already exists, move ranges to it and return
         switch (req) {
             .any => {
                 if (self.getOrCreateSpillBundle(bundle, false) catch return error.OutOfMemory) |spill| {
-                    // Move ranges to spill bundle
+                    // Move ranges to spill bundle - the original bundle becomes empty
+                    // and won't be re-queued (regalloc2 only queues non-empty bundles)
                     var list = self.bundles.items[bundle.index()].ranges;
                     self.bundles.items[bundle.index()].ranges = .{};
 
@@ -1163,6 +1166,8 @@ pub const ProcessContext = struct {
                     return;
                 },
                 .any => {
+                    // Add to spilled_bundles for later processing by tryAllocatingRegsForSpilledBundles
+                    // (matches regalloc2 - no flag needed, just add and break)
                     self.spilled_bundles.append(self.allocator, bundle) catch
                         return error.OutOfMemory;
                     break;
@@ -1273,17 +1278,36 @@ pub const ProcessContext = struct {
             }
 
             // Couldn't allocate - need to evict or split
+            //
+            // regalloc2 assertion: we *must* have an option either to split or evict.
+            // This assertion means the register iteration found at least one conflict.
+            // regalloc2 has debug_assert here that there's always a conflict option.
+            // If this fires, there's a bug in our conflict detection.
+            std.debug.assert(
+                lowest_cost_split_conflict_cost != null or
+                    lowest_cost_evict_conflict_cost != null,
+            );
+
             const our_spill_weight = self.bundleSpillWeight(bundle);
 
-            // Check for too-many-live-regs
+            // Check for too-many-live-regs (matches regalloc2 process.rs line ~1210)
+            // This handles the case where a minimal bundle cannot be allocated.
             if (self.minimalBundle(bundle) and
                 (attempts >= 2 or
                 lowest_cost_evict_conflict_cost == null or
                 lowest_cost_evict_conflict_cost.? >= our_spill_weight))
             {
+                // For Register and Limit requirements, return TooManyLiveRegs error
                 if (req == .register or req == .limit) {
                     return error.TooManyLiveRegs;
                 }
+                // For FixedReg and FixedStack, also return TooManyLiveRegs
+                // (regalloc2 panics here, but we prefer returning an error)
+                if (req == .fixed_reg or req == .fixed_stack) {
+                    return error.TooManyLiveRegs;
+                }
+                // For Stack requirement - this shouldn't happen as it's handled earlier
+                // For Any requirement - this shouldn't happen as it's handled earlier
             }
 
             // Decide: split or evict

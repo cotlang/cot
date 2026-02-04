@@ -427,6 +427,7 @@ pub fn runWithCtx(
         &ctx.spillsets,
         &ctx.spillslots,
         &ctx.slots_by_class,
+        &ctx.pregs,
         &ctx.spilled_bundles,
         env,
         &ctx.output.num_spillslots,

@@ -772,21 +772,19 @@ pub fn MachBuffer(comptime LabelUseType: type) type {
             return self.label_offsets.items[resolved.index];
         }
 
-        /// Use a label at a specific offset, creating a fixup if needed.
+        /// Use a label at a specific offset, creating a fixup.
+        /// Port of Cranelift's use_label_at_offset: always defers fixups to be
+        /// processed later during finish(). This is critical because the
+        /// instruction bytes may not have been emitted yet when this is called.
+        /// See cranelift/codegen/src/machinst/buffer.rs line 761.
         pub fn useLabelAtOffset(self: *Self, offset: CodeOffset, label: MachLabel, kind: LabelUseType) !void {
-            const label_offset = self.labelOffset(label);
-
-            if (label_offset != UNKNOWN_OFFSET) {
-                // Label is already bound - patch immediately.
-                kind.patch(self.data.items, offset, label_offset);
-            } else {
-                // Forward reference - create a fixup.
-                try self.pending_fixups.append(self.allocator, .{
-                    .label = label,
-                    .offset = offset,
-                    .kind = kind,
-                });
-            }
+            // Always add to pending_fixups - fixups are processed during finish()
+            // when all instructions have been emitted and all labels are bound.
+            try self.pending_fixups.append(self.allocator, .{
+                .label = label,
+                .offset = offset,
+                .kind = kind,
+            });
         }
 
         // =====================================================================

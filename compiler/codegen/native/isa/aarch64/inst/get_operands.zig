@@ -207,6 +207,32 @@ pub const OperandVisitor = union(enum) {
             .callback => {},
         }
     }
+
+    /// Add all clobbered registers from a PRegSet.
+    /// Port of Cranelift's call instruction clobber handling.
+    pub fn addClobbers(self: *OperandVisitor, clobbers: mod.PRegSet) void {
+        switch (self.*) {
+            .collector => |c| {
+                // Iterate through all possible integer registers (X0-X30)
+                var i: u8 = 0;
+                while (i < 31) : (i += 1) {
+                    const preg = regs.xregPreg(i);
+                    if (clobbers.contains(preg)) {
+                        c.clobbers.append(c.allocator, preg) catch unreachable;
+                    }
+                }
+                // Iterate through all possible vector registers (V0-V31)
+                i = 0;
+                while (i < 32) : (i += 1) {
+                    const preg = regs.vregPreg(i);
+                    if (clobbers.contains(preg)) {
+                        c.clobbers.append(c.allocator, preg) catch unreachable;
+                    }
+                }
+            },
+            .callback => {},
+        }
+    }
 };
 
 //=============================================================================
@@ -409,9 +435,47 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         },
 
         // Branches
-        .jump, .cond_br, .call => {},
-        .call_ind => |*p| {
-            visitor.regUse(&p.rn);
+        .jump, .cond_br => {},
+
+        // Direct call - operands are tracked via CallInfo.uses/defs/clobbers
+        // Port of Cranelift's call operand handling from aarch64/inst/mod.rs
+        .call => |p| {
+            const info = p.info;
+            // Add argument uses: each vreg must be in its designated preg
+            for (info.uses.items) |use| {
+                visitor.regFixedUse(use.vreg, use.preg);
+            }
+            // Add return value defs: each vreg is defined in its designated preg
+            for (info.defs.items) |def| {
+                switch (def.location) {
+                    .reg => |preg| visitor.regFixedDef(def.vreg, preg),
+                    .stack => {},
+                }
+            }
+            // Add clobbered registers
+            visitor.addClobbers(info.clobbers);
+        },
+
+        // Indirect call - register operand plus CallIndInfo tracking
+        // Port of Cranelift's call_ind operand handling from aarch64/inst/mod.rs
+        .call_ind => |p| {
+            const info = p.info;
+            // The destination register is a use
+            var dest_reg = info.dest;
+            visitor.regUse(&dest_reg);
+            // Add argument uses
+            for (info.uses.items) |use| {
+                visitor.regFixedUse(use.vreg, use.preg);
+            }
+            // Add return value defs
+            for (info.defs.items) |def| {
+                switch (def.location) {
+                    .reg => |preg| visitor.regFixedDef(def.vreg, preg),
+                    .stack => {},
+                }
+            }
+            // Add clobbered registers
+            visitor.addClobbers(info.clobbers);
         },
         .indirect_br => |*p| {
             visitor.regUse(&p.rn);

@@ -44,12 +44,12 @@ const PrioQueue = ion_data.PrioQueue;
 const Use = ion_data.Use;
 const SpillWeight = ion_data.SpillWeight;
 
-// Spill weight constants from regalloc2
-pub const BUNDLE_MAX_SPILL_WEIGHT: u32 = (1 << 28) - 1;
-pub const MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT: u32 = BUNDLE_MAX_SPILL_WEIGHT;
-pub const MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT: u32 = BUNDLE_MAX_SPILL_WEIGHT - 1;
-pub const MINIMAL_BUNDLE_SPILL_WEIGHT: u32 = MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT - 256;
-pub const BUNDLE_MAX_NORMAL_SPILL_WEIGHT: u32 = MINIMAL_BUNDLE_SPILL_WEIGHT - 1;
+// Import spill weight constants from ion_data (canonical source)
+const BUNDLE_MAX_SPILL_WEIGHT = ion_data.BUNDLE_MAX_SPILL_WEIGHT;
+const MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT = ion_data.MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT;
+const MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT = ion_data.MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT;
+const MINIMAL_BUNDLE_SPILL_WEIGHT = ion_data.MINIMAL_BUNDLE_SPILL_WEIGHT;
+const BUNDLE_MAX_NORMAL_SPILL_WEIGHT = ion_data.BUNDLE_MAX_NORMAL_SPILL_WEIGHT;
 
 //=============================================================================
 // RequirementConflict - Error type for requirement conflicts

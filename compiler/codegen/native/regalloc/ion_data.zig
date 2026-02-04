@@ -404,6 +404,7 @@ pub const LiveRange = struct {
 // LiveBundle - A bundle of live ranges that should be allocated together
 //=============================================================================
 
+/// Bits 0-27 = spill weight (28 bits), bits 28-31 = properties (matches regalloc2)
 pub const BUNDLE_MAX_SPILL_WEIGHT: u32 = (1 << 28) - 1;
 pub const MINIMAL_FIXED_BUNDLE_SPILL_WEIGHT: u32 = BUNDLE_MAX_SPILL_WEIGHT;
 pub const MINIMAL_LIMITED_BUNDLE_SPILL_WEIGHT: u32 = BUNDLE_MAX_SPILL_WEIGHT - 1;
@@ -443,6 +444,7 @@ pub const LiveBundle = struct {
         fixed_def: bool,
         stack: bool,
     ) void {
+        std.debug.assert(spill_weight <= BUNDLE_MAX_SPILL_WEIGHT);
         self.spill_weight_and_props = spill_weight |
             (if (minimal) @as(u32, 1) << 31 else 0) |
             (if (fixed) @as(u32, 1) << 30 else 0) |

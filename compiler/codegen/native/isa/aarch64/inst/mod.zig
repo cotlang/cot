@@ -111,6 +111,116 @@ pub const RetPair = struct {
     preg: PReg,
 };
 
+// =============================================================================
+// Call Instruction Types
+// Port of Cranelift's call-related types from aarch64/inst/mod.rs
+// =============================================================================
+
+/// Import ExternalName from CLIF for call destinations.
+const clif = @import("../../../../../ir/clif/mod.zig");
+pub const ExternalName = clif.ExternalName;
+
+/// Import PRegSet from machinst for clobber tracking.
+pub const PRegSet = machinst_reg.PRegSet;
+
+/// Calling convention for AArch64.
+pub const CallConv = enum {
+    /// Fast calling convention (caller-saved registers).
+    fast,
+    /// Apple AArch64 convention.
+    apple_aarch64,
+    /// System V AArch64 convention (Linux/BSD).
+    system_v,
+    /// Tail call convention.
+    tail,
+};
+
+/// Return value location for call defs.
+pub const RetLocation = union(enum) {
+    /// Return value in a register.
+    reg: PReg,
+    /// Return value on the stack.
+    stack: struct {
+        offset: i32,
+        size: u32,
+    },
+};
+
+/// Pair of virtual register and return location for call return values.
+pub const CallRetPair = struct {
+    vreg: Writable(Reg),
+    location: RetLocation,
+};
+
+/// List of return value pairs.
+pub const CallRetList = std.ArrayListUnmanaged(CallRetPair);
+
+/// Try-call info for exception handling (stub for now).
+pub const TryCallInfo = struct {
+    /// Continuation label on success.
+    continuation: MachLabel,
+};
+
+/// Information about a direct function call.
+/// Port of Cranelift's CallInfo from aarch64/inst/mod.rs.
+pub const CallInfo = struct {
+    /// The external function being called.
+    dest: ExternalName,
+    /// Arguments to the call (vregs constrained to pregs).
+    uses: CallArgList,
+    /// Return values from the call.
+    defs: CallRetList,
+    /// Registers clobbered by the call.
+    clobbers: PRegSet,
+    /// Callee's calling convention.
+    callee_conv: CallConv,
+    /// Caller's calling convention.
+    caller_conv: CallConv,
+    /// Try-call info for exception handling.
+    try_call_info: ?TryCallInfo,
+
+    /// Create an empty CallInfo with minimal fields.
+    pub fn init(dest: ExternalName, callee_conv: CallConv, caller_conv: CallConv) CallInfo {
+        return .{
+            .dest = dest,
+            .uses = .{},
+            .defs = .{},
+            .clobbers = PRegSet.empty(),
+            .callee_conv = callee_conv,
+            .caller_conv = caller_conv,
+            .try_call_info = null,
+        };
+    }
+
+    pub fn deinit(self: *CallInfo, allocator: std.mem.Allocator) void {
+        self.uses.deinit(allocator);
+        self.defs.deinit(allocator);
+    }
+};
+
+/// Information about an indirect function call.
+pub const CallIndInfo = struct {
+    /// The register containing the call target.
+    dest: Reg,
+    /// Arguments to the call.
+    uses: CallArgList,
+    /// Return values from the call.
+    defs: CallRetList,
+    /// Registers clobbered by the call.
+    clobbers: PRegSet,
+    /// Callee's calling convention.
+    callee_conv: CallConv,
+    /// Caller's calling convention.
+    caller_conv: CallConv,
+    /// Try-call info for exception handling.
+    try_call_info: ?TryCallInfo,
+
+    pub fn deinit(self: *CallIndInfo, allocator: std.mem.Allocator) void {
+        self.uses.deinit(allocator);
+        self.defs.deinit(allocator);
+    }
+};
+
 //=============================================================================
 // Instructions (top level): definition
 
@@ -1156,14 +1266,18 @@ pub const Inst = union(enum) {
         rd: Writable(Reg),
     },
 
-    // Call instruction.
+    // Call instruction (direct call to external function).
+    // Port of Cranelift's Inst::Call from aarch64/inst/mod.rs.
     call: struct {
-        dest: BranchTarget,
+        /// Call information including destination, uses, defs, clobbers.
+        info: *const CallInfo,
     },
 
-    // Call indirect.
+    // Call indirect (through register).
+    // Port of Cranelift's Inst::CallInd from aarch64/inst/mod.rs.
     call_ind: struct {
-        rn: Reg,
+        /// Call information including register target, uses, defs, clobbers.
+        info: *const CallIndInfo,
     },
 
     // ==========================================================================

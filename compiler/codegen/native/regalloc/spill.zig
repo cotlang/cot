@@ -37,6 +37,7 @@ const SpillSlotData = ion_data.SpillSlotData;
 const SpillSlotList = ion_data.SpillSlotList;
 const SpillSetRanges = ion_data.SpillSetRanges;
 const LiveRangeKey = ion_data.LiveRangeKey;
+const PRegData = ion_data.PRegData;
 const MachineEnv = env_mod.MachineEnv;
 const RegTraversalIter = process_mod.RegTraversalIter;
 const AllocRegResult = process_mod.AllocRegResult;
@@ -61,6 +62,7 @@ pub const SpillContext = struct {
     spillsets: *std.ArrayListUnmanaged(SpillSet),
     spillslots: *std.ArrayListUnmanaged(SpillSlotData),
     slots_by_class: *[3]SpillSlotList,
+    pregs: *std.ArrayListUnmanaged(PRegData),
 
     // === Spilled bundles ===
     spilled_bundles: *std.ArrayListUnmanaged(LiveBundleIndex),
@@ -110,6 +112,7 @@ pub const SpillContext = struct {
         spillsets: *std.ArrayListUnmanaged(SpillSet),
         spillslots: *std.ArrayListUnmanaged(SpillSlotData),
         slots_by_class: *[3]SpillSlotList,
+        pregs: *std.ArrayListUnmanaged(PRegData),
         spilled_bundles: *std.ArrayListUnmanaged(LiveBundleIndex),
         env: *const MachineEnv,
         num_spillslots: *usize,
@@ -125,6 +128,7 @@ pub const SpillContext = struct {
             .spillsets = spillsets,
             .spillslots = spillslots,
             .slots_by_class = slots_by_class,
+            .pregs = pregs,
             .spilled_bundles = spilled_bundles,
             .env = env,
             .num_spillslots = num_spillslots,
@@ -200,9 +204,7 @@ pub const SpillContext = struct {
                 limit,
             );
 
-            var reg_count: usize = 0;
             while (reg_iter.next()) |preg| {
-                reg_count += 1;
                 const preg_idx = PRegIndex.new(preg.index());
                 const result = try self.tryToAllocateBundleToReg(bundle, preg_idx);
 
@@ -226,7 +228,7 @@ pub const SpillContext = struct {
     }
 
     /// Try to allocate a bundle to a specific register.
-    /// Simplified version that just checks for conflicts (no eviction).
+    /// Uses the pregs btree for conflict detection, matching ProcessContext.
     fn tryToAllocateBundleToReg(
         self: *Self,
         bundle: LiveBundleIndex,
@@ -242,58 +244,58 @@ pub const SpillContext = struct {
             return AllocRegResult{ .allocated = Allocation.reg(preg) };
         }
 
-        var has_conflict = false;
         var first_conflict: ?ProgPoint = null;
 
-        // Check each bundle range against the preg's allocation set
+        // Check each bundle range against preg allocations using the btree
         for (bundle_ranges) |entry| {
             const key = LiveRangeKey.fromRange(entry.range);
 
-            // Check the preg's allocated ranges for overlap
-            const preg_ranges = &self.ranges.items[entry.index.index()];
-            _ = preg_ranges;
+            // Check for overlapping allocations in this preg's btree
+            const preg_allocs = &self.pregs.items[reg.index()].allocations;
+            for (preg_allocs.items.items) |item| {
+                // Check for overlap
+                if (item.key.order(key) != .eq) continue;
 
-            // For now, we need to check against all bundles allocated to this preg
-            // This is a simplified check - in process.zig we have the full PRegData btree
-            // For spill allocation, we mainly care about whether we succeed
-            // The full conflict detection is in ProcessContext.tryToAllocateBundleToReg
-
-            // Since we don't have access to PRegData here, we use a simplified approach:
-            // Check if any other bundle with the same allocation overlaps
-            for (self.bundles.items) |*other_bundle| {
-                if (other_bundle.allocation.asReg()) |other_preg| {
-                    if (other_preg.index() == reg.index()) {
-                        // Same register - check for overlap
-                        for (other_bundle.ranges.items) |other_entry| {
-                            const other_key = LiveRangeKey.fromRange(other_entry.range);
-                            if (key.order(other_key) == .eq) {
-                                // Overlap detected
-                                has_conflict = true;
-                                if (first_conflict == null) {
-                                    first_conflict = entry.range.from;
-                                }
-                                break;
-                            }
-                        }
+                // Overlap found
+                const preg_range = item.value;
+                if (preg_range.isValid()) {
+                    // Conflict with another bundle
+                    try self.scratch_conflicts.append(self.allocator, self.ranges.items[preg_range.index()].bundle);
+                    if (first_conflict == null) {
+                        first_conflict = ProgPoint{ .bits = @max(item.key.from, key.from) };
                     }
+                } else {
+                    // Conflict with fixed reservation
+                    return AllocRegResult{
+                        .conflict_with_fixed = .{
+                            .max_cost = 0,
+                            .point = ProgPoint{ .bits = item.key.from },
+                        },
+                    };
                 }
-                if (has_conflict) break;
             }
-            if (has_conflict) break;
         }
 
-        if (has_conflict) {
+        if (self.scratch_conflicts.items.len > 0) {
             return AllocRegResult{
                 .conflict = .{
                     .bundles = self.scratch_conflicts.items,
-                    .point = first_conflict orelse ProgPoint{ .bits = 0 },
+                    .point = first_conflict.?,
                 },
             };
         }
 
-        // Success - assign allocation
+        // Success - add our ranges to the preg's allocation map AND set allocation
         const preg = PReg.fromIndex(reg.index());
         self.bundles.items[bundle.index()].allocation = Allocation.reg(preg);
+        for (bundle_ranges) |entry| {
+            const alloc_key = LiveRangeKey.fromRange(entry.range);
+            _ = try self.pregs.items[reg.index()].allocations.insert(
+                self.allocator,
+                alloc_key,
+                entry.index,
+            );
+        }
 
         return AllocRegResult{ .allocated = Allocation.reg(preg) };
     }
@@ -477,6 +479,7 @@ test "allocateSpillslot alignment" {
     var ranges: std.ArrayListUnmanaged(LiveRange) = .{};
     var bundles: std.ArrayListUnmanaged(LiveBundle) = .{};
     var spillsets: std.ArrayListUnmanaged(SpillSet) = .{};
+    var pregs: std.ArrayListUnmanaged(PRegData) = .{};
     var spilled_bundles: std.ArrayListUnmanaged(LiveBundleIndex) = .{};
     var scratch_conflicts: std.ArrayListUnmanaged(LiveBundleIndex) = .{};
     var scratch_pool: std.ArrayListUnmanaged(SpillSetRanges) = .{};
@@ -491,6 +494,7 @@ test "allocateSpillslot alignment" {
         &spillsets,
         &spillslots,
         &slots_by_class,
+        &pregs,
         &spilled_bundles,
         &env,
         &num_spillslots,
@@ -529,6 +533,7 @@ test "allocateSpillslot multi_spillslot_named_by_last_slot" {
     var ranges: std.ArrayListUnmanaged(LiveRange) = .{};
     var bundles: std.ArrayListUnmanaged(LiveBundle) = .{};
     var spillsets: std.ArrayListUnmanaged(SpillSet) = .{};
+    var pregs: std.ArrayListUnmanaged(PRegData) = .{};
     var spilled_bundles: std.ArrayListUnmanaged(LiveBundleIndex) = .{};
     var scratch_conflicts: std.ArrayListUnmanaged(LiveBundleIndex) = .{};
     var scratch_pool: std.ArrayListUnmanaged(SpillSetRanges) = .{};
@@ -543,6 +548,7 @@ test "allocateSpillslot multi_spillslot_named_by_last_slot" {
         &spillsets,
         &spillslots,
         &slots_by_class,
+        &pregs,
         &spilled_bundles,
         &env,
         &num_spillslots,
