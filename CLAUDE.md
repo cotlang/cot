@@ -1,5 +1,20 @@
 # Claude AI Instructions
 
+## 🚨 BEFORE DEBUGGING ANYTHING, READ: `TROUBLESHOOTING.md`
+
+When you encounter ANY bug or error, **STOP** and follow `TROUBLESHOOTING.md`.
+
+**The #1 cause of project failure**: Claude tries to "figure out" fixes instead of copying the reference implementation. This document exists because this pattern has caused 5 rewrites.
+
+**The fix that works every time**:
+1. Find the reference implementation (Go or Cranelift)
+2. Do line-by-line comparison
+3. Copy exactly - don't invent, don't simplify, don't "improve"
+
+See `TROUBLESHOOTING.md` for the full methodology, reference map, and checklist.
+
+---
+
 ## CRITICAL WARNING - READ THIS FIRST
 
 ### 1. Standard Approach: Copy Go Exactly
