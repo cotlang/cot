@@ -10,18 +10,20 @@ On February 4, 2026, E2E testing revealed that native AOT compilation only works
 |---------|--------|
 | Return constant (`return 42`) | ✅ Works |
 | Return simple expression (`return 10 + 5`) | ✅ Works |
-| Local variables (`let x = 10`) | ❌ SIGSEGV - needs Wasm memory init |
+| Local variables (`let x = 10`) | ✅ **FIXED** (Feb 5, 2026) |
 | Function calls (no params) | ✅ **FIXED** (Feb 4, 2026) |
 | Nested function calls | ✅ **FIXED** (Feb 4, 2026) |
-| Function calls (with params) | ❌ SIGSEGV - needs Wasm memory init |
-| If/else control flow | ❌ SIGSEGV at runtime |
-| While loops | ❌ Untested (likely broken) |
-| Structs | ❌ Untested (likely broken) |
-| Pointers | ❌ Untested (likely broken) |
+| Function calls (2+ params) | ✅ **FIXED** (Feb 5, 2026) |
+| Function calls (1 param) | ❌ Compiler panic - index out of bounds |
+| If/else control flow | ✅ **FIXED** (Feb 5, 2026) |
+| While loops | ✅ **FIXED** (Feb 5, 2026) |
+| Recursion | ❌ Returns base case immediately |
+| Structs | ❌ Untested |
+| Pointers | ❌ Untested |
 
-**Root cause for SIGSEGV cases:** Generated code accesses Wasm linear memory at hardcoded addresses (0x10000, 0x20000) that don't exist in native process. Need to either:
-1. Initialize memory area before main (runtime support), OR
-2. Change codegen to use native stack for locals instead of Wasm memory
+**Feb 5 update:** vmctx wrapper fix resolved most SIGSEGV issues. New bugs found:
+- Single-parameter functions crash compiler (index out of bounds in SSA)
+- Recursion returns base case immediately (recursive call not working)
 
 ---
 
@@ -124,7 +126,7 @@ ldp x29, x30, [sp], #16     ; Restore FP and LR
 
 ---
 
-## Task 2: Fix Local Variables (SIGSEGV) - IN PROGRESS
+## Task 2: Fix Local Variables (SIGSEGV) ✅ FIXED
 
 **Error observed:**
 ```
@@ -194,58 +196,56 @@ This requires changes at multiple levels:
 
 **Complexity: HIGH** - Affects core memory model for native AOT
 
+### Fix Applied (February 5, 2026)
+
+**Solution:** Ported Cranelift vmctx pattern - generate _main wrapper that initializes static vmctx.
+
+**Changes:**
+| File | Change |
+|------|--------|
+| `compiler/driver.zig` | Generate _main wrapper with ADRP/ADD/BL, static vmctx buffer |
+| `compiler/codegen/native/wasm_to_clif/func_translator.zig` | Add vmctx params to wasm function signatures |
+| `compiler/codegen/native/wasm_to_clif/translator.zig` | Offset param indices by 2 for vmctx params |
+| `compiler/codegen/native/isa/aarch64/lower.zig` | VMContext GlobalValue uses vmctx parameter |
+| `compiler/codegen/native/macho.zig` | Fix extern bit for symbol-based relocations |
+
+**Test result:** `let x = 10; return x` returns 10 ✅
+
 ---
 
-## Task 3: Fix Function Calls with Parameters (SIGSEGV)
+## Task 3: Fix Function Calls with Parameters ✅ MOSTLY FIXED
 
-**Error observed:**
-```
-Exit: 139 (SIGSEGV)
-```
+**Status (Feb 5, 2026):** Works for 2+ parameters, but **1-parameter functions crash compiler**.
 
-**When:** Running native executable compiled from:
+### What works:
 ```cot
-fn add(a: int, b: int) int {
-    return a + b;
-}
-fn main() int {
-    return add(10, 5);
-}
+fn add(a: i64, b: i64) i64 { return a + b }
+fn main() i64 { return add(10, 5) }  // Returns 15 ✅
 ```
 
-**Pipeline stage:** Likely ABI handling or call instruction emission
+### What's broken:
+```cot
+fn identity(n: i64) i64 { return n }
+fn main() i64 { return identity(42) }  // CRASH: index out of bounds
+```
 
-**Our files:**
-- `compiler/codegen/native/wasm_to_clif/translator.zig` (call translation)
-- `compiler/codegen/native/isa/aarch64/abi.zig` (ABI handling)
-- `compiler/codegen/native/isa/aarch64/lower.zig` (call lowering)
+**Error:**
+```
+panic: index out of bounds: index 2863311530, len 47
+compiler/ir/clif/dfg.zig:614:33: in valueType
+compiler/codegen/native/frontend/ssa.zig:412:76: in sealOneBlock
+```
+
+### Investigation needed:
+- The crash is in `sealBlock` when getting the type of a value with garbage index
+- Likely an uninitialized Variable or Value being used
+- Check how single-parameter functions differ from multi-parameter
 
 **Reference files:**
 - `~/learning/wasmtime/crates/cranelift/src/translate/code_translator.rs` (Operator::Call)
-- `~/learning/wasmtime/cranelift/codegen/src/isa/aarch64/abi.rs`
-- `~/learning/wasmtime/cranelift/codegen/src/isa/aarch64/lower.isle`
+- `compiler/codegen/native/frontend/ssa.zig` (sealBlock)
 
-### Investigation Steps (Follow TROUBLESHOOTING.md)
-
-1. **Disassemble and find crash point:**
-   ```bash
-   lldb ./test
-   run
-   bt
-   disassemble
-   ```
-
-2. **Check calling convention:**
-   - ARM64 uses x0-x7 for arguments
-   - How does Cranelift set up the call?
-   - How do we set up the call?
-
-3. **Compare call instruction emission:**
-   - Find `Operator::Call` in Cranelift's code_translator.rs
-   - Compare with our `translateCall` function
-   - Look for ANY difference
-
-4. **Check argument passing:**
+### Original Investigation Steps (Follow TROUBLESHOOTING.md)
    - How does Cranelift push arguments?
    - How do we push arguments?
    - Are stack adjustments correct?
@@ -427,4 +427,6 @@ Before making ANY change, verify:
 
 - **Feb 4, 2026 (AM)**: Fixed value aliases, jump table relocs, operand order - `return 42` works
 - **Feb 4, 2026 (PM)**: E2E testing revealed most features still broken
-- Documentation was prematurely updated and needs correction
+- **Feb 5, 2026**: Fixed vmctx wrapper - local variables, if/else, while loops now work
+  - Single-param functions still crash (new bug)
+  - Recursion returns base case immediately (new bug)
