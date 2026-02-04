@@ -1257,6 +1257,19 @@ pub fn Lower(comptime I: type) type {
             const result = self.block_order.succIndices(bindex);
             const opt_inst = result.opt_inst;
             const succs = result.succs;
+
+            // For br_table, there can be many successors (more than 2).
+            // The targets for br_table are handled separately in lowerBranch via jump table data,
+            // so we don't collect them here. This avoids overflowing the BoundedArray(2).
+            // Same for trap/return which have no successors anyway.
+            if (opt_inst) |inst| {
+                const inst_data = self.f.dfg.getInst(inst);
+                const opcode = inst_data.opcode();
+                if (opcode == .br_table or opcode == .trap or opcode == .@"return") {
+                    return opt_inst;
+                }
+            }
+
             for (succs) |succ| {
                 targets.appendAssumeCapacity(MachLabel.fromBlock(succ));
             }

@@ -339,6 +339,15 @@ pub const AArch64LowerBackend = struct {
                     },
                 }) catch return null;
             },
+            .trap => {
+                // Trap instruction - emit undefined instruction.
+                // This is a terminator that causes a hardware trap.
+                ctx.emit(Inst{
+                    .udf = .{
+                        .trap_code = 0,
+                    },
+                }) catch return null;
+            },
             .@"return" => {
                 // Port of Cranelift's gen_return pattern from lower.rs.
                 // Instead of emitting explicit moves to return registers, we:
