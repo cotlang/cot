@@ -1785,12 +1785,28 @@ pub const Inst = union(enum) {
     /// - args: allocated ArgPair slice for argument constraints
     /// - indirect_br: allocated MachLabel slice for branch targets
     /// - jt_sequence: allocated MachLabel slice for jump table targets
+    /// - call: allocated CallInfo with uses/defs arrays
+    /// - call_ind: allocated CallIndInfo with uses/defs arrays
     pub fn deinit(self: *const Inst, allocator: Allocator) void {
         switch (self.*) {
             .rets => |r| allocator.free(r.rets),
             .args => |a| allocator.free(a.args),
             .indirect_br => |b| allocator.free(b.targets),
             .jt_sequence => |j| allocator.free(j.targets),
+            .call => |c| {
+                // Free the CallInfo's internal arrays, then the CallInfo itself
+                // Cast away const to call deinit (we own this memory)
+                const info_ptr = @constCast(c.info);
+                info_ptr.deinit(allocator);
+                allocator.destroy(info_ptr);
+            },
+            .call_ind => |c| {
+                // Free the CallIndInfo's internal arrays, then the CallIndInfo itself
+                // Cast away const to call deinit (we own this memory)
+                const info_ptr = @constCast(c.info);
+                info_ptr.deinit(allocator);
+                allocator.destroy(info_ptr);
+            },
             else => {},
         }
     }

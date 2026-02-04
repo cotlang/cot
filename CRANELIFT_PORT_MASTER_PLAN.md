@@ -1311,6 +1311,7 @@ The native codegen pipeline is fully operational. All end-to-end tests pass:
 | E2E-6 | Loops - while/for | ✅ PASS | Fixed in Feb 2026 - label fixup timing |
 
 **Recent Fixes (February 2026)**:
+- Fixed memory leak: `Inst.deinit` now frees CallInfo/CallIndInfo (matching Cranelift's Box<CallInfo> drop)
 - Fixed E2E-4: Pseudo addressing modes (`sp_offset`, `slot_offset`) now resolved via `memFinalize()` in emit.zig
 - Fixed clobber/def collision in call instructions by porting Cranelift's gen_call_info pattern
 - Fixed label fixup timing by deferring all fixups to finish() (matching Cranelift's use_label_at_offset)
