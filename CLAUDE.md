@@ -332,13 +332,13 @@ All 52 E2E tests pass (26 wasm + 26 native).
 
 ### Priority Order (Recommended)
 
-1. **M18: Heap Allocation** - `new` keyword support (partially done - syntax works, need full integration)
-2. **M19: Destructor Calls on Release** - Type-specific destructors
-3. **M20-M22: Language features** - String ops, array append, for-range loops
-4. **Browser imports** - Import section for JS interop (console.log, DOM access)
+1. **M19: Destructor Calls on Release** - Type-specific destructors (partially done - basic destructors work)
+2. **M20-M22: Language features** - String ops, array append, for-range loops
+3. **Browser imports** - Import section for JS interop (console.log, DOM access)
 
 **Completed:**
 - M17: Frontend Emits Retain/Release ✓ (retain on copy, release at scope exit, forward on return)
+- M18: Heap Allocation ✓ (`new` keyword, cot_alloc, field init, 7 tests pass)
 
 ---
 

@@ -1,0 +1,27 @@
+// Test nested scopes with new allocations
+// EXPECT: exit_code=3
+
+var release_count: i64 = 0
+
+struct Item {
+    value: i64,
+}
+
+impl Item {
+    fn deinit(self: *Item) {
+        release_count = release_count + 1
+    }
+}
+
+fn main() i64 {
+    {
+        let a = new Item { value: 1 }
+        {
+            let b = new Item { value: 2 }
+            {
+                let c = new Item { value: 3 }
+            }  // c released here
+        }  // b released here
+    }  // a released here
+    return release_count  // Should be 3
+}

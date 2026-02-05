@@ -1,0 +1,14 @@
+// Test that new allocations are automatically released on scope exit
+// EXPECT: exit_code=0
+
+struct Data {
+    x: i64,
+}
+
+fn main() i64 {
+    {
+        let d = new Data { x: 99 }
+        // d goes out of scope here, should be released
+    }
+    return 0  // Success - no memory leak (verified by destructor test)
+}

@@ -297,16 +297,16 @@ fn main() i64 {
 
 #### Checklist
 
-- [ ] Add `keyword_new` to scanner
-- [ ] Parse `new Type { ... }` expression
-- [ ] Add `alloc` SSA op
-- [ ] Generate `cot_alloc` call in IR lowering
-- [ ] Initialize struct fields after allocation
-- [ ] Register cleanup for automatic release
-- [ ] Add `cot_alloc` to arc.zig (already exists in legacy API)
-- [ ] Wire `cot_alloc` into Linker
-- [ ] Write 5+ test cases
-- [ ] Verify memory is freed on scope exit
+- [x] Add `keyword_new` to scanner
+- [x] Parse `new Type { ... }` expression
+- [x] ~~Add `alloc` SSA op~~ (Not needed - direct call is Go's pattern)
+- [x] Generate `cot_alloc` call in IR lowering
+- [x] Initialize struct fields after allocation
+- [x] Register cleanup for automatic release (M17)
+- [x] Add `cot_alloc` to arc.zig
+- [x] Wire `cot_alloc` into Linker (driver.zig:826)
+- [x] Write 5+ test cases (7 tests in test/cases/arc/)
+- [x] Verify memory is freed on scope exit (destructor_called, new_nested_scope)
 
 ---
 
