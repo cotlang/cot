@@ -27,6 +27,7 @@ pub const NEXTSLICECAP_NAME = "cot_nextslicecap";
 /// Go reference: runtime/slice.go
 pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker, heap_ptr_global: u32) !SliceFunctions {
     // nextslicecap: (newLen, oldCap) -> newCap
+    // Go reference: runtime/slice.go nextslicecap (lines 326-358)
     const nextslicecap_type = try linker.addType(
         &[_]ValType{ .i64, .i64 },
         &[_]ValType{.i64},
@@ -39,12 +40,15 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker, heap
         .exported = false,
     });
 
-    // growslice: (old_ptr, old_len, old_cap, elem_ptr, elem_size) -> new_ptr
+    // growslice: (old_ptr, old_len, new_cap, elem_size) -> new_ptr
+    // Go reference: runtime/slice.go growslice (lines 178-287)
+    // NOTE: Only handles allocation and copy. Capacity check and element
+    // storage are done by the compiler (like Go's walkAppend).
     const growslice_type = try linker.addType(
-        &[_]ValType{ .i64, .i64, .i64, .i64, .i64 },
+        &[_]ValType{ .i64, .i64, .i64, .i64 },
         &[_]ValType{.i64},
     );
-    const growslice_body = try generateGrowSliceBody(allocator, heap_ptr_global, nextslicecap_idx);
+    const growslice_body = try generateGrowSliceBody(allocator, heap_ptr_global);
     const growslice_idx = try linker.addFunc(.{
         .name = GROWSLICE_NAME,
         .type_idx = growslice_type,
@@ -59,20 +63,47 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker, heap
 }
 
 /// Go reference: runtime/slice.go nextslicecap (lines 326-358)
+///
+/// func nextslicecap(newLen, oldCap int) int {
+///     newcap := oldCap
+///     doublecap := newcap + newcap
+///     if newLen > doublecap {
+///         return newLen
+///     }
+///     const threshold = 256
+///     if oldCap < threshold {
+///         return doublecap
+///     }
+///     for {
+///         newcap += (newcap + 3*threshold) >> 2
+///         if uint(newcap) >= uint(newLen) {
+///             break
+///         }
+///     }
+///     if newcap <= 0 {
+///         return newLen
+///     }
+///     return newcap
+/// }
 fn generateNextSliceCapBody(allocator: std.mem.Allocator) ![]const u8 {
     var code = wasm_old.CodeBuilder.init(allocator);
     defer code.deinit();
 
+    // Parameters: local 0 = newLen, local 1 = oldCap
+    // Locals: local 2 = newcap, local 3 = doublecap
     _ = try code.declareLocals(&[_]wasm_old.ValType{ .i64, .i64 });
 
+    // newcap = oldCap
     try code.emitLocalGet(1);
     try code.emitLocalSet(2);
 
+    // doublecap = newcap + newcap
     try code.emitLocalGet(2);
     try code.emitLocalGet(2);
     try code.emitI64Add();
     try code.emitLocalSet(3);
 
+    // if (newLen > doublecap) return newLen
     try code.emitLocalGet(0);
     try code.emitLocalGet(3);
     try code.emitI64GtS();
@@ -80,6 +111,7 @@ fn generateNextSliceCapBody(allocator: std.mem.Allocator) ![]const u8 {
     try code.emitLocalGet(0);
     try code.emitElse();
 
+    // if (oldCap < 256) return doublecap
     try code.emitLocalGet(1);
     try code.emitI64Const(256);
     try code.emitI64LtS();
@@ -87,26 +119,32 @@ fn generateNextSliceCapBody(allocator: std.mem.Allocator) ![]const u8 {
     try code.emitLocalGet(3);
     try code.emitElse();
 
+    // Loop: grow by ~25% until newcap >= newLen
     try code.emitBlock(BLOCK_VOID);
     try code.emitLoop(BLOCK_VOID);
+
+    // newcap += (newcap + 3*256) >> 2
     try code.emitLocalGet(2);
     try code.emitLocalGet(2);
-    try code.emitI64Const(768);
+    try code.emitI64Const(768); // 3 * 256
     try code.emitI64Add();
     try code.emitI64Const(2);
     try code.emitI64ShrS();
     try code.emitI64Add();
     try code.emitLocalSet(2);
 
+    // if (uint(newcap) >= uint(newLen)) break
     try code.emitLocalGet(2);
     try code.emitLocalGet(0);
     try code.emitI64GeU();
     try code.emitBrIf(1);
 
+    // continue loop
     try code.emitBr(0);
-    try code.emitEnd();
-    try code.emitEnd();
+    try code.emitEnd(); // end loop
+    try code.emitEnd(); // end block
 
+    // if (newcap <= 0) return newLen else return newcap
     try code.emitLocalGet(2);
     try code.emitI64Const(0);
     try code.emitI64LeS();
@@ -116,95 +154,82 @@ fn generateNextSliceCapBody(allocator: std.mem.Allocator) ![]const u8 {
     try code.emitLocalGet(2);
     try code.emitEnd();
 
-    try code.emitEnd();
-    try code.emitEnd();
+    try code.emitEnd(); // end else (oldCap >= 256)
+    try code.emitEnd(); // end else (newLen <= doublecap)
 
     return code.finish();
 }
 
 /// Go reference: runtime/slice.go growslice (lines 178-287)
-fn generateGrowSliceBody(allocator: std.mem.Allocator, heap_ptr_global: u32, nextslicecap_idx: u32) ![]const u8 {
+///
+/// Simplified signature for Cot:
+///   growslice(old_ptr, old_len, new_cap, elem_size) -> new_ptr
+///
+/// Go's original:
+///   func growslice(oldPtr unsafe.Pointer, newLen, oldCap, num int, et *_type) slice
+///
+/// Key differences from Go:
+/// - We take new_cap directly (caller computes via nextslicecap)
+/// - We don't store the new element (caller does that)
+/// - We return just new_ptr (caller knows new_cap already)
+///
+/// This matches Go's division of labor:
+/// - Compiler (walkAppend): capacity check, element storage
+/// - Runtime (growslice): allocation, memcpy
+fn generateGrowSliceBody(allocator: std.mem.Allocator, heap_ptr_global: u32) ![]const u8 {
     var code = wasm_old.CodeBuilder.init(allocator);
     defer code.deinit();
 
-    _ = try code.declareLocals(&[_]wasm_old.ValType{ .i64, .i64, .i32, .i32, .i32 });
+    // Parameters:
+    //   local 0: old_ptr (i64)
+    //   local 1: old_len (i64)
+    //   local 2: new_cap (i64)
+    //   local 3: elem_size (i64)
+    // Locals:
+    //   local 4: new_ptr (i32)
+    //   local 5: old_size (i32) - bytes to copy
+    //   local 6: alloc_size (i32)
+    _ = try code.declareLocals(&[_]wasm_old.ValType{ .i32, .i32, .i32 });
 
-    try code.emitLocalGet(1);
-    try code.emitI64Const(1);
-    try code.emitI64Add();
+    // old_size = (i32)(old_len * elem_size)
+    try code.emitLocalGet(1); // old_len
+    try code.emitLocalGet(3); // elem_size
+    try code.emitI64Mul();
+    try code.emitI32WrapI64();
     try code.emitLocalSet(5);
 
-    try code.emitLocalGet(1);
-    try code.emitLocalGet(4);
-    try code.emitI64Mul();
-    try code.emitI32WrapI64();
-    try code.emitLocalSet(9);
-
-    try code.emitLocalGet(5);
-    try code.emitLocalGet(2);
-    try code.emitI64LeS();
-    try code.emitIf(BLOCK_I64);
-
-    try code.emitLocalGet(0);
-    try code.emitI32WrapI64();
-    try code.emitLocalGet(9);
-    try code.emitI32Add();
-    try code.emitLocalGet(3);
-    try code.emitI32WrapI64();
-    try code.emitLocalGet(4);
-    try code.emitI32WrapI64();
-    try code.emitMemoryCopy();
-
-    try code.emitLocalGet(0);
-
-    try code.emitElse();
-
-    try code.emitLocalGet(5);
-    try code.emitLocalGet(2);
-    try code.emitCall(nextslicecap_idx);
-    try code.emitLocalSet(6);
-
-    try code.emitLocalGet(1);
-    try code.emitLocalGet(4);
-    try code.emitI64Mul();
-    try code.emitI32WrapI64();
-    try code.emitLocalSet(8);
-
-    try code.emitGlobalGet(heap_ptr_global);
-    try code.emitLocalSet(7);
-
-    try code.emitLocalGet(6);
-    try code.emitLocalGet(4);
+    // alloc_size = (new_cap * elem_size + 7) & ~7  (8-byte aligned)
+    try code.emitLocalGet(2); // new_cap
+    try code.emitLocalGet(3); // elem_size
     try code.emitI64Mul();
     try code.emitI32WrapI64();
     try code.emitI32Const(7);
     try code.emitI32Add();
     try code.emitI32Const(-8);
     try code.emitI32And();
+    try code.emitLocalSet(6);
 
-    try code.emitLocalGet(7);
+    // new_ptr = heap_ptr (bump allocator)
+    try code.emitGlobalGet(heap_ptr_global);
+    try code.emitLocalSet(4);
+
+    // heap_ptr += alloc_size
+    try code.emitLocalGet(4);
+    try code.emitLocalGet(6);
     try code.emitI32Add();
     try code.emitGlobalSet(heap_ptr_global);
 
-    try code.emitLocalGet(7);
-    try code.emitLocalGet(0);
+    // memcpy(new_ptr, old_ptr, old_size)
+    // Go reference: memmove(p, oldPtr, lenmem) at line 284
+    try code.emitLocalGet(4); // dest = new_ptr
+    try code.emitLocalGet(0); // src = old_ptr
     try code.emitI32WrapI64();
-    try code.emitLocalGet(8);
+    try code.emitLocalGet(5); // len = old_size
     try code.emitMemoryCopy();
 
-    try code.emitLocalGet(7);
-    try code.emitLocalGet(9);
-    try code.emitI32Add();
-    try code.emitLocalGet(3);
-    try code.emitI32WrapI64();
+    // return (i64)new_ptr
     try code.emitLocalGet(4);
-    try code.emitI32WrapI64();
-    try code.emitMemoryCopy();
-
-    try code.emitLocalGet(7);
     try code.emitI64ExtendI32U();
-
-    try code.emitEnd();
 
     return code.finish();
 }
