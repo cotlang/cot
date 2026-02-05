@@ -760,6 +760,9 @@ pub const Driver = struct {
             }
         }
 
+        // Track if we need to generate a main wrapper
+        var main_func_index: ?usize = null;
+
         // Declare and define each function
         for (compiled_funcs, 0..) |*cf, i| {
             // Determine function name from exports, or generate one
@@ -777,12 +780,22 @@ pub const Driver = struct {
                 func_name = try std.fmt.allocPrint(self.allocator, "func_{d}", .{i});
             }
 
-            // ELF doesn't need underscore prefix (unlike Mach-O)
-            const mangled_name = func_name;
+            // For "main" export, rename to "__wasm_main" and generate a wrapper later
+            const is_main = std.mem.eql(u8, func_name, "main");
+            if (is_main) {
+                main_func_index = i;
+            }
 
-            // Determine linkage
-            const linkage: object_module.Linkage = if (std.mem.eql(u8, func_name, "main"))
-                .Export
+            // ELF doesn't need underscore prefix (unlike Mach-O)
+            // For main, use __wasm_main instead (wrapper will be main)
+            const mangled_name = if (is_main)
+                "__wasm_main"
+            else
+                func_name;
+
+            // Determine linkage - wasm main is local (called by wrapper)
+            const linkage: object_module.Linkage = if (is_main)
+                .Local
             else if (found_name)
                 .Export
             else
@@ -798,12 +811,145 @@ pub const Driver = struct {
             try module.defineFunction(func_id, cf);
         }
 
+        // If we have a main function, generate the wrapper and static vmctx
+        if (main_func_index != null) {
+            try self.generateMainWrapperElf(&module);
+        }
+
         // Write to memory buffer
         var output = std.ArrayListUnmanaged(u8){};
         defer output.deinit(self.allocator);
         try module.finish(output.writer(self.allocator));
 
         return output.toOwnedSlice(self.allocator);
+    }
+
+    /// Generate the main wrapper and static vmctx data for ELF (x86-64 Linux).
+    /// The wrapper initializes vmctx and calls __wasm_main.
+    fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule) !void {
+        // =================================================================
+        // Step 1: Declare and define static vmctx data section
+        // Layout (total 384KB = 0x60000):
+        //   0x00000 - 0x0FFFF: Padding/reserved
+        //   0x10000: Stack pointer global (i32) - initialized to 64KB
+        //   0x20000: Heap base pointer (i64) - to be filled by wrapper
+        //   0x20008: Heap bound (i64) - 128KB
+        //   0x40000 - 0x5FFFF: Linear memory (128KB heap)
+        // =================================================================
+        const vmctx_size: usize = 0x60000; // 384KB
+        const vmctx_data = try self.allocator.alloc(u8, vmctx_size);
+        defer self.allocator.free(vmctx_data);
+
+        // Zero initialize
+        @memset(vmctx_data, 0);
+
+        // Initialize stack pointer at offset 0x10000 = 64KB into linear memory
+        // This means SP starts at heap_base + 0x10000
+        const sp_value: u32 = 0x10000;
+        @memcpy(vmctx_data[0x10000..][0..4], std.mem.asBytes(&sp_value));
+
+        // Heap bound at offset 0x20008 = 128KB (size of linear memory)
+        const heap_bound: u64 = 0x20000;
+        @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
+
+        // Note: heap base pointer at 0x20000 will be patched by wrapper at runtime
+        // because we need the absolute address which isn't known until load time
+
+        const vmctx_data_id = try module.declareData("vmctx_data", .Local, true);
+        try module.defineData(vmctx_data_id, vmctx_data);
+
+        // =================================================================
+        // Step 2: Generate main wrapper function
+        // This wrapper:
+        //   1. Loads address of vmctx_data
+        //   2. Initializes heap base pointer (requires runtime address)
+        //   3. Calls __wasm_main(vmctx, vmctx)
+        //   4. Returns result
+        //
+        // x86-64 code (System V AMD64 ABI):
+        //   push   rbp
+        //   mov    rbp, rsp
+        //   lea    rdi, [rip + vmctx_data]    ; vmctx in rdi (first arg)
+        //   lea    rax, [rdi + 0x40000]       ; heap_base = vmctx + 0x40000
+        //   mov    [rdi + 0x20000], rax       ; store heap_base at vmctx+0x20000
+        //   mov    rsi, rdi                   ; caller_vmctx = vmctx (second arg)
+        //   call   __wasm_main
+        //   pop    rbp
+        //   ret
+        // =================================================================
+        var wrapper_code = std.ArrayListUnmanaged(u8){};
+        defer wrapper_code.deinit(self.allocator);
+
+        // push rbp (0x55)
+        try wrapper_code.append(self.allocator, 0x55);
+
+        // mov rbp, rsp (48 89 e5)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xe5 });
+
+        // lea rdi, [rip + vmctx_data] (48 8d 3d XX XX XX XX) - reloc at offset 4+3=7
+        // RIP-relative, displacement is at bytes 4-7 (offset 4)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x3d, 0x00, 0x00, 0x00, 0x00 });
+
+        // lea rax, [rdi + 0x40000] (48 8d 87 00 00 04 00)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x87, 0x00, 0x00, 0x04, 0x00 });
+
+        // mov [rdi + 0x20000], rax (48 89 87 00 00 02 00)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x00, 0x00, 0x02, 0x00 });
+
+        // mov rsi, rdi (48 89 fe)
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xfe });
+
+        // call __wasm_main (e8 XX XX XX XX) - reloc at offset 25+1=26
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0xe8, 0x00, 0x00, 0x00, 0x00 });
+
+        // pop rbp (5d)
+        try wrapper_code.append(self.allocator, 0x5d);
+
+        // ret (c3)
+        try wrapper_code.append(self.allocator, 0xc3);
+
+        // Declare main wrapper
+        const main_func_id = try module.declareFunction("main", .Export);
+
+        // Create relocations for the wrapper code
+        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
+        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
+        const Reloc = buffer_mod.Reloc;
+        const ExternalName = buffer_mod.ExternalName;
+
+        // Use indices 1000 and 1001 (high enough to avoid collision with function indices)
+        const vmctx_ext_idx: u32 = 1000;
+        const wasm_main_ext_idx: u32 = 1001;
+
+        // Create external name references for vmctx_data and __wasm_main
+        const vmctx_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = vmctx_ext_idx } };
+        const wasm_main_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = wasm_main_ext_idx } };
+
+        // Register external names for relocation resolution
+        try module.declareExternalName(vmctx_ext_idx, "vmctx_data");
+        try module.declareExternalName(wasm_main_ext_idx, "__wasm_main");
+
+        // Calculate relocation offsets based on instruction layout:
+        // push rbp (1) + mov rbp,rsp (3) + lea opcode (3) = 7 for lea displacement
+        // + lea (7) + lea (7) + mov (7) + mov (3) + call opcode (1) = 7+7+7+7+3+1 = 29 for call displacement
+        const relocs = [_]FinalizedMachReloc{
+            // lea rdi, [rip + vmctx_data] - displacement at offset 7
+            .{
+                .offset = 7,
+                .kind = Reloc.X86PCRel4,
+                .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+                .addend = -4, // RIP-relative adjustment
+            },
+            // call __wasm_main - displacement at offset 29
+            .{
+                .offset = 29,
+                .kind = Reloc.X86CallPCRel4,
+                .target = FinalizedRelocTarget{ .ExternalName = wasm_main_name_ref },
+                .addend = -4, // Call instruction adjustment
+            },
+        };
+
+        try module.defineFunctionBytes(main_func_id, wrapper_code.items, &relocs);
     }
 
     /// Generate WebAssembly binary.

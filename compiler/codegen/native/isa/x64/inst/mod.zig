@@ -53,7 +53,11 @@ const emit_mod = @import("emit.zig");
 
 // Import common types from machinst (following Cranelift's crate::ir pattern)
 const buffer_mod = @import("../../../machinst/buffer.zig");
-pub const ExternalName = buffer_mod.ExternalName;
+// Import ExternalName from CLIF for call destinations (like ARM64 does)
+const clif = @import("../../../../../ir/clif/mod.zig");
+pub const ExternalName = clif.ExternalName;
+// Also keep buffer's types for relocation emission
+pub const BufferExternalName = buffer_mod.ExternalName;
 pub const UserExternalNameRef = buffer_mod.UserExternalNameRef;
 pub const LibCall = buffer_mod.LibCall;
 pub const KnownSymbol = buffer_mod.KnownSymbol;
@@ -62,6 +66,9 @@ pub const Reloc = buffer_mod.Reloc;
 // Import regalloc types
 const regalloc_operand = @import("../../../regalloc/operand.zig");
 const Allocation = regalloc_operand.Allocation;
+
+// Import ABI module for prologue/epilogue generation
+const abi = @import("../abi.zig");
 
 // Re-export register functions
 pub const rax = regs.rax;
@@ -257,6 +264,10 @@ pub const PRegSet = struct {
 
     pub fn contains(self: PRegSet, preg: PReg) bool {
         return (self.bits & (@as(u64, 1) << @intCast(preg.index()))) != 0;
+    }
+
+    pub fn remove(self: *PRegSet, preg: PReg) void {
+        self.bits &= ~(@as(u64, 1) << @intCast(preg.index()));
     }
 };
 
@@ -620,6 +631,20 @@ pub const Inst = union(enum) {
     /// Indirect jump.
     jmp_unknown: struct {
         target: RegMem,
+    },
+
+    //=========================================================================
+    // Stack operations
+    //=========================================================================
+
+    /// Push register to stack (decrements rsp by 8, then writes).
+    push: struct {
+        src: Gpr,
+    },
+
+    /// Pop from stack to register (reads, then increments rsp by 8).
+    pop: struct {
+        dst: WritableGpr,
     },
 
     /// Return.
@@ -997,6 +1022,15 @@ pub const Inst = union(enum) {
             .return_call_known, .return_call_unknown => .ret_call,
             .jmp_known, .jmp_cond, .jmp_cond_or, .jmp_table_seq, .jmp_unknown => .branch,
             else => .none,
+        };
+    }
+
+    /// Check if this instruction is a return (rets pseudo-instruction).
+    /// Used by emit to insert epilogue before returns.
+    pub fn isRets(self: Inst) bool {
+        return switch (self) {
+            .rets => true,
+            else => false,
         };
     }
 
@@ -1473,6 +1507,12 @@ pub const Inst = union(enum) {
                     try writer.writeAll("ret");
                 }
             },
+            .push => |p| {
+                try writer.print("push {s}", .{regs.prettyPrintReg(p.src.toReg(), 8)});
+            },
+            .pop => |p| {
+                try writer.print("pop {s}", .{regs.prettyPrintReg(p.dst.toReg().toReg(), 8)});
+            },
 
             // Calls
             .call_known => |_| {
@@ -1730,6 +1770,102 @@ pub const Inst = union(enum) {
             },
             else => {},
         }
+    }
+
+    /// FrameLayout type used for prologue/epilogue generation.
+    /// Uses a simple struct with the fields needed for prologue/epilogue.
+    pub const FrameLayout = struct {
+        setup_area_size: u32 = 0,
+        clobber_size: u32 = 0,
+        fixed_frame_storage_size: u32 = 0,
+        outgoing_args_size: u32 = 0,
+        stackslots_size: u32 = 0,
+    };
+
+    /// Generate prologue instructions for stack frame setup.
+    /// Called at entry block to set up the stack frame.
+    /// Returns a bounded array of instructions that should be emitted.
+    ///
+    /// Following Cranelift pattern from abi.rs gen_prologue():
+    /// - Push rbp (save frame pointer)
+    /// - mov rbp, rsp (establish frame)
+    ///
+    /// Reference: cranelift/codegen/src/isa/x64/abi.rs gen_prologue_frame_setup()
+    pub fn genPrologue(frame_layout: *const FrameLayout) abi.BoundedArray(Inst, 16) {
+        var insts = abi.BoundedArray(Inst, 16){};
+        const setup_frame = frame_layout.setup_area_size > 0;
+
+        if (setup_frame) {
+            // push rbp
+            insts.appendAssumeCapacity(.{
+                .push = .{
+                    .src = Gpr.unwrapNew(rbp()),
+                },
+            });
+
+            // mov rbp, rsp
+            insts.appendAssumeCapacity(.{
+                .mov_r_r = .{
+                    .size = .size64,
+                    .src = Gpr.unwrapNew(rsp()),
+                    .dst = WritableGpr.fromReg(Gpr.unwrapNew(rbp())),
+                },
+            });
+        }
+
+        return insts;
+    }
+
+    /// Generate epilogue instructions for stack frame teardown.
+    /// Called before return instructions to restore the stack frame.
+    /// Returns a bounded array of instructions that should be emitted.
+    ///
+    /// Following Cranelift pattern from abi.rs gen_epilogue():
+    /// - mov rsp, rbp (restore stack pointer)
+    /// - pop rbp (restore frame pointer)
+    ///
+    /// Reference: cranelift/codegen/src/isa/x64/abi.rs gen_epilogue_frame_restore()
+    pub fn genEpilogue(frame_layout: *const FrameLayout) abi.BoundedArray(Inst, 8) {
+        var insts = abi.BoundedArray(Inst, 8){};
+        const setup_frame = frame_layout.setup_area_size > 0;
+
+        if (setup_frame) {
+            // mov rsp, rbp
+            insts.appendAssumeCapacity(.{
+                .mov_r_r = .{
+                    .size = .size64,
+                    .src = Gpr.unwrapNew(rbp()),
+                    .dst = WritableGpr.fromReg(Gpr.unwrapNew(rsp())),
+                },
+            });
+
+            // pop rbp
+            insts.appendAssumeCapacity(.{
+                .pop = .{
+                    .dst = WritableGpr.fromReg(Gpr.unwrapNew(rbp())),
+                },
+            });
+        }
+
+        return insts;
+    }
+
+    /// Generate stack allocation instruction.
+    /// Called after prologue to allocate space for local variables.
+    /// Returns sub rsp, size instruction or nop if size is 0.
+    pub fn genStackAlloc(size: u32) Inst {
+        if (size == 0) {
+            return .{ .nop = .{ .len = 0 } };
+        }
+        // sub rsp, size
+        return .{
+            .alu_rmi_r = .{
+                .size = .size64,
+                .op = .sub,
+                .src = GprMemImm{ .inner = .{ .imm = size } },
+                .dst = WritableGpr.fromReg(Gpr.unwrapNew(rsp())),
+            },
+        };
     }
 };
 

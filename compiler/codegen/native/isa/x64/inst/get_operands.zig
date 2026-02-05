@@ -569,6 +569,18 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         },
 
         //=====================================================================
+        // Push/Pop
+        //=====================================================================
+        .push => |p| {
+            // Push uses source register (reads the register value)
+            visitor.regUse(@constCast(&p.src.toReg()));
+        },
+        .pop => |*p| {
+            // Pop defines destination register (writes to it)
+            visitor.regDef(@ptrCast(&p.dst));
+        },
+
+        //=====================================================================
         // Return
         //=====================================================================
         .ret => {},

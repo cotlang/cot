@@ -210,6 +210,11 @@ pub const ElfWriter = struct {
         try self.relocations.append(self.allocator, .{ .offset = offset, .target = target, .rel_type = R_X86_64_PLT32, .addend = -4 });
     }
 
+    /// Add a relocation with a specified type.
+    pub fn addRelocationWithType(self: *ElfWriter, offset: u32, target: []const u8, rel_type: u32, addend: i64) !void {
+        try self.relocations.append(self.allocator, .{ .offset = offset, .target = target, .rel_type = rel_type, .addend = addend });
+    }
+
     pub fn addDataRelocation(self: *ElfWriter, offset: u32, target: []const u8) !void {
         try self.relocations.append(self.allocator, .{ .offset = offset, .target = target, .rel_type = R_X86_64_PC32, .addend = -4 });
     }

@@ -1429,6 +1429,29 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
         },
 
         //---------------------------------------------------------------------
+        // Push/Pop
+        //---------------------------------------------------------------------
+        .push => |p| {
+            // PUSH r64: 50+rd (with REX.B if r8-r15)
+            const enc = p.src.hwEnc();
+            if (enc >= 8) {
+                // REX.B prefix for r8-r15
+                try sink.put1(0x41);
+            }
+            try sink.put1(0x50 + (enc & 0x7));
+        },
+
+        .pop => |p| {
+            // POP r64: 58+rd (with REX.B if r8-r15)
+            const enc = p.dst.toReg().hwEnc();
+            if (enc >= 8) {
+                // REX.B prefix for r8-r15
+                try sink.put1(0x41);
+            }
+            try sink.put1(0x58 + (enc & 0x7));
+        },
+
+        //---------------------------------------------------------------------
         // Return
         //---------------------------------------------------------------------
         .ret => |ret| {
@@ -1444,11 +1467,18 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
         // Call
         //---------------------------------------------------------------------
         .call_known => |call| {
+            // Convert CLIF ExternalName to buffer's ExternalName format
+            // (same conversion as ARM64 does in its emit.zig)
+            const buffer_ext_name: buffer_mod.ExternalName = switch (call.info.dest) {
+                .user => |u| .{ .User = buffer_mod.UserExternalNameRef.initFull(u.namespace, u.index) },
+                .libcall => @panic("libcall not yet supported in x64 call emission"),
+            };
+
             try sink.put1(0xE8);
-            try sink.put4(0); // Placeholder for displacement
-            // Record relocation for the call target (after emitting the displacement)
-            // The addend adjusts for the difference between end of instruction and start of displacement
-            try sink.addRelocExternalName(buffer_mod.Reloc.X86CallPCRel4, call.info.dest, -4);
+            // Record relocation BEFORE emitting displacement (relocation uses current offset)
+            // Addend of -4 accounts for PC-relative addressing being relative to end of instruction
+            try sink.addRelocExternalName(buffer_mod.Reloc.X86CallPCRel4, buffer_ext_name, -4);
+            try sink.put4(0); // Placeholder for displacement (will be patched by linker)
         },
 
         .call_unknown => |call| {
@@ -1679,8 +1709,15 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             try sink.put1(0x8D);
             try sink.put1(encodeModrm(0b00, dst_enc & 7, 0b101));
             try sink.put4(0);
+
+            // Convert CLIF ExternalName to buffer's ExternalName format
+            const buffer_ext_name: buffer_mod.ExternalName = switch (load.name) {
+                .user => |u| .{ .User = buffer_mod.UserExternalNameRef.initFull(u.namespace, u.index) },
+                .libcall => @panic("libcall not yet supported in x64 load_ext_name emission"),
+            };
+
             // Record relocation for the displacement
-            try sink.addRelocExternalName(buffer_mod.Reloc.X86PCRel4, load.name, load.offset);
+            try sink.addRelocExternalName(buffer_mod.Reloc.X86PCRel4, buffer_ext_name, load.offset);
         },
 
         //---------------------------------------------------------------------

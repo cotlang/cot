@@ -48,6 +48,13 @@ const WritableXmm = inst_mod.args.WritableXmm;
 const GprEnc = regs.GprEnc;
 const PReg = inst_mod.PReg;
 const CallArgPair = inst_mod.CallArgPair;
+const CallInfo = inst_mod.CallInfo;
+const CallRetList = inst_mod.CallRetList;
+const CallRetPair = inst_mod.CallRetPair;
+const PRegSet = inst_mod.PRegSet;
+const RetLocation = inst_mod.RetLocation;
+const ExternalName = inst_mod.ExternalName;
+const CallArgList = inst_mod.args.CallArgList;
 
 // Import ABI module
 const abi = @import("abi.zig");
@@ -145,6 +152,15 @@ pub const X64LowerBackend = struct {
 
     pub fn init() Self {
         return .{};
+    }
+
+    /// Get the pinned register, if any.
+    /// Returns machinst.Reg to match the lower.zig pinned_reg field type.
+    /// Port of Cranelift's maybe_pinned_reg() which returns r15 for x64.
+    pub fn maybePinnedReg(_: *const Self) ?machinst.Reg {
+        // Return r15 as the pinned register for vmctx
+        // This tells the register allocator that get_pinned_reg results are in r15
+        return regs.pinnedReg();
     }
 
     /// Lower a single CLIF instruction to x86-64 machine instructions.
@@ -503,6 +519,25 @@ pub const X64LowerBackend = struct {
 
         // Emit the Args instruction
         ctx.emit(Inst.genArgs(arg_pairs)) catch return;
+
+        // Check if we have a vmctx parameter using Function.specialParam
+        // vmctx is typically the first integer parameter (rdi)
+        const has_vmctx = ctx.f.specialParam(.vmctx) != null;
+
+        // If we have a vmctx parameter, move it to the pinned register (r15)
+        // Port of Cranelift's set_pinned_reg pattern
+        // This ensures vmctx is always available in r15, which is excluded from allocation
+        if (has_vmctx) {
+            // vmctx is in rdi (first int arg), move to r15 (pinned reg)
+            // mov r15, rdi
+            ctx.emit(Inst{
+                .mov_r_r = .{
+                    .size = .size64,
+                    .src = Gpr.unwrapNew(regs.rdi()), // vmctx is in rdi
+                    .dst = WritableGpr.fromReg(Gpr.unwrapNew(regs.pinnedReg())),
+                },
+            }) catch return;
+        }
     }
 
     // =========================================================================
@@ -1565,89 +1600,116 @@ pub const X64LowerBackend = struct {
         // - Integer arguments: RDI, RSI, RDX, RCX, R8, R9
         // - Float arguments: XMM0-XMM7
         // - Return value: RAX (integer), XMM0 (float)
+        // - Caller-saved (clobbered): RAX, RCX, RDX, RSI, RDI, R8-R11, XMM0-XMM15
+        //
+        // Cranelift pattern: NO explicit mov instructions for register args/returns.
+        // Instead, populate uses/defs with fixed register constraints.
+        // Regalloc will insert moves as needed to satisfy constraints.
 
         const inst_data = ctx.data(ir_inst);
 
         // Get the function reference
         const func_ref = inst_data.getFuncRef() orelse return null;
 
-        // Get the external function data
+        // Get the external function data (contains the function name)
         const ext_func = ctx.extFuncData(func_ref) orelse return null;
 
         // Get arguments
         const num_args = ctx.numInputs(ir_inst);
 
-        // System V ABI integer argument registers
-        const int_arg_regs = [_]Reg{
-            regs.rdi(),
-            regs.rsi(),
-            regs.rdx(),
-            regs.rcx(),
-            regs.r8(),
-            regs.r9(),
+        // Create CallInfo structure with the external function destination
+        const call_info = ctx.allocator.create(CallInfo) catch return null;
+        call_info.* = CallInfo{
+            .dest = ext_func.name,
+            .uses = .{},
+            .defs = .{},
+            .clobbers = PRegSet.empty,
+            .callee_conv = .system_v,
+            .caller_conv = .system_v,
+            .opcode = null,
+            .try_call_info = null,
         };
 
-        // Move arguments to ABI registers
-        var int_arg_idx: usize = 0;
-        for (0..num_args) |i| {
-            const arg_val = ctx.putInputInRegs(ir_inst, i);
+        // Build System V AMD64 clobber set: RAX, RCX, RDX, RSI, RDI, R8-R11, XMM0-15
+        // Port of Cranelift's get_regs_clobbered_by_call
+        var clobbers = PRegSet.empty;
+        // Integer caller-saved: RAX(0), RCX(1), RDX(2), RSI(6), RDI(7), R8-R11(8-11)
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.RAX));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.RCX));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.RDX));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.RSI));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.RDI));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.R8));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.R9));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.R10));
+        clobbers = clobbers.add(regs.gprPreg(GprEnc.R11));
+        // TODO: Add float clobbers XMM0-XMM15 (requires fixing x64 PRegSet to use regalloc's PRegSet)
+        // For now, skip float clobbers since we don't use float values yet
+
+        // System V ABI integer argument registers (in order)
+        const int_arg_pregs = [_]PReg{
+            regs.gprPreg(GprEnc.RDI),
+            regs.gprPreg(GprEnc.RSI),
+            regs.gprPreg(GprEnc.RDX),
+            regs.gprPreg(GprEnc.RCX),
+            regs.gprPreg(GprEnc.R8),
+            regs.gprPreg(GprEnc.R9),
+        };
+
+        // Build uses list: gen_call_args(abi, args)
+        // Each argument vreg is constrained to its ABI register
+        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
+        var int_arg_idx: u8 = 0;
+        for (0..num_args) |idx| {
+            const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
-            const arg_ty = ctx.inputTy(ir_inst, i);
+            const arg_ty = ctx.inputTy(ir_inst, idx);
 
-            // Check if this is an integer or float argument
-            if (!arg_ty.isFloat() and int_arg_idx < int_arg_regs.len) {
-                // Move to integer ABI register
-                const dst_reg = int_arg_regs[int_arg_idx];
-                const src_gpr = Gpr.unwrapNew(arg_reg);
-                const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg));
-
-                ctx.emit(Inst{
-                    .mov_r_r = .{
-                        .size = operandSizeFromType(arg_ty),
-                        .src = src_gpr,
-                        .dst = dst_gpr,
-                    },
+            if (!arg_ty.isFloat() and int_arg_idx < int_arg_pregs.len) {
+                // Add to uses: this vreg MUST be in this preg at the call
+                call_info.uses.append(ctx.allocator, .{
+                    .vreg = arg_reg,
+                    .preg = int_arg_pregs[int_arg_idx],
                 }) catch return null;
-
                 int_arg_idx += 1;
             }
             // TODO: Handle float arguments and stack arguments
         }
 
-        // Emit the call instruction
-        // For now, use a simplified call that just jumps to a label
-        // Full implementation would use CallInfo with proper clobbers
-        _ = ext_func; // Will be used for the actual call target
-
-        // Emit a placeholder call (call to address 0 - will be fixed by linker)
-        ctx.emit(Inst{
-            .ud2 = .{ .trap_code = .unreachable_code_reached },
-        }) catch return null;
-
-        // Handle return value
+        // Build defs list: gen_call_rets(abi, output)
+        // Each return value vreg is defined in its ABI register
+        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         const num_outputs = ctx.numOutputs(ir_inst);
+        var output = InstOutput{};
         if (num_outputs > 0) {
-            // Return value is in RAX
             const ret_ty = ctx.outputTy(ir_inst, 0);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
-            const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
-            // Move RAX to destination
-            ctx.emit(Inst{
-                .mov_r_r = .{
-                    .size = operandSizeFromType(ret_ty),
-                    .src = Gpr.unwrapNew(regs.rax()),
-                    .dst = dst_gpr,
-                },
+            // Add to defs: this vreg is DEFINED BY the call in RAX
+            const ret_preg = regs.gprPreg(GprEnc.RAX);
+            call_info.defs.append(ctx.allocator, .{
+                .vreg = dst_reg,
+                .location = .{ .reg = ret_preg },
             }) catch return null;
 
-            var output = InstOutput{};
+            // Port of Cranelift's gen_call_info: remove return regs from clobbers.
+            // regalloc2 requires that clobbers and defs must not collide.
+            clobbers.remove(ret_preg);
+
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
-            return output;
         }
 
-        return InstOutput{};
+        // Assign clobbers after removing return registers
+        call_info.clobbers = clobbers;
+
+        // Emit the call instruction with proper CallInfo
+        // Regalloc sees uses/defs/clobbers and inserts moves as needed
+        ctx.emit(Inst{
+            .call_known = .{ .info = call_info },
+        }) catch return null;
+
+        return output;
     }
 
     fn lowerCallIndirect(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -1762,7 +1824,7 @@ pub const X64LowerBackend = struct {
         ctx.emit(Inst{
             .load_ext_name = .{
                 .dst = dst_gpr,
-                .name = .{ .User = inst_mod.UserExternalNameRef.initFull(0, 0) },
+                .name = ExternalName.initUser(0, 0),
                 .offset = 0,
             },
         }) catch return null;
@@ -1817,13 +1879,18 @@ pub const X64LowerBackend = struct {
 
         switch (gv_data) {
             .vmcontext => {
-                // VMContext: Load the vmctx base address.
-                // x64 doesn't have pinned register support enabled yet.
-                // Load immediate 0 as base address for now.
+                // VMContext: Return the pinned register (r15) directly.
+                // Port of Cranelift's get_pinned_reg pattern.
+                //
+                // At function entry, vmctx is moved from rdi into r15.
+                // r15 is excluded from register allocation, so it can't be clobbered.
+                // This ensures vmctx is always available regardless of control flow.
+                //
+                // Copy r15 to the destination register.
                 ctx.emit(Inst{
-                    .imm = .{
-                        .dst_size = .size64,
-                        .simm64 = 0,
+                    .mov_r_r = .{
+                        .size = .size64,
+                        .src = Gpr.unwrapNew(regs.pinnedReg()),
                         .dst = dst_gpr,
                     },
                 }) catch return null;
@@ -1928,13 +1995,12 @@ pub const X64LowerBackend = struct {
 
         switch (gv_data) {
             .vmcontext => {
-                // VMContext: Load vmctx base address.
-                // x64 doesn't have pinned register support enabled yet.
-                // Load immediate 0 as base address for now.
+                // VMContext: Copy from pinned register (r15).
+                // Port of Cranelift's get_pinned_reg pattern.
                 ctx.emit(Inst{
-                    .imm = .{
-                        .dst_size = .size64,
-                        .simm64 = 0,
+                    .mov_r_r = .{
+                        .size = .size64,
+                        .src = Gpr.unwrapNew(regs.pinnedReg()),
                         .dst = tmp_gpr,
                     },
                 }) catch return null;
@@ -2017,7 +2083,7 @@ pub const X64LowerBackend = struct {
         ctx.emit(Inst{
             .load_ext_name = .{
                 .dst = dst_gpr,
-                .name = .{ .User = inst_mod.UserExternalNameRef.initFull(0, 0) },
+                .name = ExternalName.initUser(0, 0),
                 .offset = 0,
             },
         }) catch return null;

@@ -848,17 +848,29 @@ pub fn VCode(comptime I: type) type {
 
             // ================================================================
             // Prologue/epilogue generation
-            // Note: This should call ISA-specific methods via I.genPrologue()
-            // For now, leaf functions without frame don't need prologue/epilogue
-            // Reference: cranelift/codegen/src/machinst/abi.rs gen_prologue()
+            // Port of Cranelift's gen_prologue/gen_epilogue from abi.rs
+            // Reference: cranelift/codegen/src/machinst/vcode.rs:868-876
             // ================================================================
-            // Proper implementation would:
-            // 1. Compute clobbered callee-saved registers (ISA-specific ranges)
-            // 2. Call I.genPrologue() to emit ISA-specific prologue
-            // 3. Call I.genEpilogue() before returns
-            // For simple leaf functions, no prologue/epilogue is needed
             const needs_frame = (function_calls != .None) or (frame_size > 0);
-            _ = needs_frame; // Will be used when ISA-specific prologue is wired up
+
+            // Debug output
+            std.debug.print("VCode.emit: frame_size={}, function_calls={}, needs_frame={}\n", .{
+                frame_size,
+                function_calls,
+                needs_frame,
+            });
+
+            // Compute frame layout following Cranelift x64 pattern:
+            // - setup_area_size: 16 bytes for saved RBP + return address
+            // - stackslots_size: space for spilled registers
+            // Reference: cranelift/codegen/src/isa/x64/abi.rs compute_frame_layout()
+            const frame_layout = if (@hasDecl(I, "FrameLayout")) I.FrameLayout{
+                .setup_area_size = if (needs_frame) 16 else 0, // RBP + return addr
+                .clobber_size = 0, // No callee-saved regs for now
+                .fixed_frame_storage_size = 0,
+                .outgoing_args_size = 0,
+                .stackslots_size = frame_size,
+            } else void{};
 
             // Emit each block
             for (0..self.numBlocks()) |block_idx| {
@@ -869,6 +881,28 @@ pub fn VCode(comptime I: type) type {
 
                 // Bind the block label
                 try buffer.bindLabel(MachLabel.fromBlock(block));
+
+                // ============================================================
+                // Prologue generation at entry block
+                // Port of Cranelift vcode.rs:868-876
+                // ============================================================
+                if (block.eql(self.entry) and needs_frame) {
+                    if (@hasDecl(I, "genPrologue")) {
+                        // Emit prologue: push rbp, mov rbp rsp
+                        const prologue_insts = I.genPrologue(&frame_layout);
+                        for (prologue_insts.constSlice()) |prologue_inst| {
+                            try prologue_inst.emit(&buffer, emit_info);
+                        }
+
+                        // Emit stack allocation: sub rsp, frame_size
+                        if (frame_size > 0) {
+                            if (@hasDecl(I, "genStackAlloc")) {
+                                const stack_alloc = I.genStackAlloc(frame_size);
+                                try stack_alloc.emit(&buffer, emit_info);
+                            }
+                        }
+                    }
+                }
 
                 // Get instruction range for this block
                 const insn_range = self.blockInsns(block);
@@ -891,9 +925,23 @@ pub fn VCode(comptime I: type) type {
                             // Get the instruction
                             const vcode_inst = self.getInst(vcode_inst_idx);
 
-                            // Note: Epilogue generation should call ISA-specific methods
-                            // For now, leaf functions without frame don't need epilogue
-                            // The 'rets' instruction handles return for simple functions
+                            // ================================================
+                            // Epilogue generation before return instructions
+                            // Port of Cranelift pattern: emit epilogue before rets
+                            // ================================================
+                            const is_ret = if (@hasDecl(I, "isRets"))
+                                vcode_inst.isRets()
+                            else
+                                false;
+                            if (needs_frame and is_ret) {
+                                if (@hasDecl(I, "genEpilogue")) {
+                                    // Emit epilogue: mov rsp rbp, pop rbp
+                                    const epilogue_insts = I.genEpilogue(&frame_layout);
+                                    for (epilogue_insts.constSlice()) |epilogue_inst| {
+                                        try epilogue_inst.emit(&buffer, emit_info);
+                                    }
+                                }
+                            }
 
                             // Emit the instruction with physical registers
                             try vcode_inst.emitWithAllocs(&buffer, inst_allocs, emit_info);

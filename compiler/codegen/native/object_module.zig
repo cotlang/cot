@@ -544,8 +544,9 @@ pub const ObjectModule = struct {
 
         // Add relocations (convert from internal format)
         for (self.relocations.items) |reloc| {
-            // ELF uses string-based relocation targets like MachO
-            try elf_writer.addRelocation(reloc.offset, reloc.target);
+            // Convert relocation kind to ELF relocation type
+            const elf_rel_type = elfRelocType(reloc.kind, self.target_arch);
+            try elf_writer.addRelocationWithType(reloc.offset, reloc.target, elf_rel_type, reloc.addend);
         }
 
         try elf_writer.write(writer);
