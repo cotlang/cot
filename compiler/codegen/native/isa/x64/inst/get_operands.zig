@@ -86,11 +86,15 @@ pub const OperandVisitor = union(enum) {
     },
 
     /// Collection state for regalloc input.
+    /// Reference: cranelift/codegen/src/machinst/reg.rs OperandCollector
     pub const CollectorState = struct {
-        /// Registers used (read from) by this instruction.
+        /// Registers used (read from) by this instruction (early position).
         uses: std.ArrayListUnmanaged(Reg),
-        /// Registers defined (written to) by this instruction.
+        /// Registers defined (written to) by this instruction (late position).
         defs: std.ArrayListUnmanaged(Writable(Reg)),
+        /// Early defs - written at instruction start, prevents overlap with uses.
+        /// Reference: reg.rs:425 reg_early_def
+        early_defs: std.ArrayListUnmanaged(Writable(Reg)),
         /// Fixed register constraints.
         fixed_uses: std.ArrayListUnmanaged(struct { vreg: Reg, preg: PReg }),
         fixed_defs: std.ArrayListUnmanaged(struct { vreg: Writable(Reg), preg: PReg }),
@@ -102,6 +106,7 @@ pub const OperandVisitor = union(enum) {
             return .{
                 .uses = .{},
                 .defs = .{},
+                .early_defs = .{},
                 .fixed_uses = .{},
                 .fixed_defs = .{},
                 .clobbers = .{},
@@ -112,6 +117,7 @@ pub const OperandVisitor = union(enum) {
         pub fn deinit(self: *CollectorState) void {
             self.uses.deinit(self.allocator);
             self.defs.deinit(self.allocator);
+            self.early_defs.deinit(self.allocator);
             self.fixed_uses.deinit(self.allocator);
             self.fixed_defs.deinit(self.allocator);
             self.clobbers.deinit(self.allocator);
@@ -120,6 +126,7 @@ pub const OperandVisitor = union(enum) {
         pub fn clear(self: *CollectorState) void {
             self.uses.clearRetainingCapacity();
             self.defs.clearRetainingCapacity();
+            self.early_defs.clearRetainingCapacity();
             self.fixed_uses.clearRetainingCapacity();
             self.fixed_defs.clearRetainingCapacity();
             self.clobbers.clearRetainingCapacity();
@@ -171,11 +178,12 @@ pub const OperandVisitor = union(enum) {
     }
 
     /// Mark a register as defined (written), at early position.
-    /// Use this for defs that must not overlap with late uses within the same instruction.
-    /// Reference: reg.rs:417 fn reg_def (with early position for special cases)
-    pub fn regDefEarly(self: *OperandVisitor, reg: *Writable(Reg)) void {
+    /// Use this when the def may be written before all uses are read;
+    /// the regalloc will ensure that it does not overwrite any uses.
+    /// Reference: cranelift/codegen/src/machinst/reg.rs:425 fn reg_early_def
+    pub fn regEarlyDef(self: *OperandVisitor, reg: *Writable(Reg)) void {
         switch (self.*) {
-            .collector => |c| c.defs.append(c.allocator, reg.*) catch unreachable,
+            .collector => |c| c.early_defs.append(c.allocator, reg.*) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, reg.regMut(), .any, .def, .early),
         }
     }
@@ -597,15 +605,18 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         .jmp_cond_or => {},
         .winch_jmp_if => {},
         .jmp_table_seq => |*p| {
-            // IMPORTANT: Visit order must match collectOperands order (defs first, then uses).
-            // collectOperands builds: [defs..., uses...], so we call defs first.
+            // Port of Cranelift's JmpTableSeq operand handling:
+            // Reference: cranelift/codegen/src/isa/x64/inst/mod.rs
             //
-            // tmp1/tmp2 use regDefEarly because they must NOT overlap with idx.
-            // idx must survive throughout the instruction (used in the MOVSXD SIB).
-            // By making tmp1/tmp2 early defs and idx a late use, we prevent overlap.
-            visitor.regDefEarly(&p.tmp1);
-            visitor.regDefEarly(&p.tmp2);
-            visitor.regUseLate(&p.idx);
+            // Visit order must match collectOperands order:
+            //   [early_defs..., defs..., uses...] = [tmp1, tmp2, idx]
+            //
+            // tmp1 is an early_def because it's written (by LEA) before idx is
+            // fully consumed (by MOVSXD's SIB addressing).
+            // tmp2 is a regular def - it's only written after idx is read.
+            visitor.regEarlyDef(&p.tmp1);
+            visitor.regDef(&p.tmp2);
+            visitor.regUse(&p.idx);
         },
 
         //=====================================================================

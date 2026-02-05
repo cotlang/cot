@@ -80,11 +80,15 @@ pub const OperandVisitor = union(enum) {
     },
 
     /// Collection state for regalloc input.
+    /// Reference: cranelift/codegen/src/machinst/reg.rs OperandCollector
     pub const CollectorState = struct {
-        /// Registers used (read from) by this instruction.
+        /// Registers used (read from) by this instruction (early position).
         uses: std.ArrayListUnmanaged(Reg),
-        /// Registers defined (written to) by this instruction.
+        /// Registers defined (written to) by this instruction (late position).
         defs: std.ArrayListUnmanaged(Writable(Reg)),
+        /// Early defs - written at instruction start, prevents overlap with uses.
+        /// Reference: reg.rs:425 reg_early_def
+        early_defs: std.ArrayListUnmanaged(Writable(Reg)),
         /// Fixed register constraints.
         fixed_uses: std.ArrayListUnmanaged(struct { vreg: Reg, preg: PReg }),
         fixed_defs: std.ArrayListUnmanaged(struct { vreg: Writable(Reg), preg: PReg }),
@@ -96,6 +100,7 @@ pub const OperandVisitor = union(enum) {
             return .{
                 .uses = .{},
                 .defs = .{},
+                .early_defs = .{},
                 .fixed_uses = .{},
                 .fixed_defs = .{},
                 .clobbers = .{},
@@ -106,6 +111,7 @@ pub const OperandVisitor = union(enum) {
         pub fn deinit(self: *CollectorState) void {
             self.uses.deinit(self.allocator);
             self.defs.deinit(self.allocator);
+            self.early_defs.deinit(self.allocator);
             self.fixed_uses.deinit(self.allocator);
             self.fixed_defs.deinit(self.allocator);
             self.clobbers.deinit(self.allocator);
@@ -114,6 +120,7 @@ pub const OperandVisitor = union(enum) {
         pub fn clear(self: *CollectorState) void {
             self.uses.clearRetainingCapacity();
             self.defs.clearRetainingCapacity();
+            self.early_defs.clearRetainingCapacity();
             self.fixed_uses.clearRetainingCapacity();
             self.fixed_defs.clearRetainingCapacity();
             self.clobbers.clearRetainingCapacity();

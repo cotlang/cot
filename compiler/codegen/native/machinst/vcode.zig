@@ -1350,7 +1350,17 @@ pub fn VCodeBuilder(comptime I: type) type {
                 // Collect operands using the visitor pattern
                 GetOperands.getOperands(insn, &visitor);
 
-                // Convert defs (definitions go first in operand order)
+                // Convert early defs first (at early position to prevent overlap with uses)
+                // Reference: cranelift/codegen/src/machinst/reg.rs:425 reg_early_def
+                for (collector_state.early_defs.items) |def_reg| {
+                    const reg = def_reg.toReg();
+                    if (reg.isVirtual()) {
+                        const vreg = vregs.resolveVregAlias(reg.toVReg());
+                        try self.vcode.operands.append(allocator, Operand.new(vreg, .any, .def, .early));
+                    }
+                }
+
+                // Convert defs (at late position)
                 // Only add virtual registers - physical registers don't need allocation
                 for (collector_state.defs.items) |def_reg| {
                     const reg = def_reg.toReg();
