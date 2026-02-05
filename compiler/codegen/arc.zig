@@ -46,6 +46,7 @@ pub const HEAP_START: u32 = 0x10000; // 64KB reserved for stack
 // =============================================================================
 
 /// Runtime function indices (new simplified API for Linker)
+/// Swift ARC functions only - slice functions are in slice_runtime.zig
 pub const RuntimeFunctions = struct {
     /// cot_alloc index
     alloc_idx: u32,
@@ -58,14 +59,6 @@ pub const RuntimeFunctions = struct {
 
     /// cot_string_concat index
     string_concat_idx: u32,
-
-    /// cot_growslice index: (old_ptr, old_len, old_cap, elem_ptr, elem_size) -> new_ptr
-    /// Go reference: runtime/slice.go growslice (lines 178-287)
-    growslice_idx: u32,
-
-    /// cot_nextslicecap index: (newLen, oldCap) -> newCap
-    /// Go reference: runtime/slice.go nextslicecap (lines 326-358)
-    nextslicecap_idx: u32,
 
     /// cot_memset_zero index (stub for now)
     memset_zero_idx: u32,
@@ -99,13 +92,11 @@ pub const LegacyRuntimeFunctions = struct {
     heap_ptr_global: u32,
 };
 
-/// ARC function names for lookup
+/// ARC function names for lookup (Swift ARC only)
 pub const ALLOC_NAME = "cot_alloc";
 pub const RETAIN_NAME = "cot_retain";
 pub const RELEASE_NAME = "cot_release";
 pub const STRING_CONCAT_NAME = "cot_string_concat";
-pub const GROWSLICE_NAME = "cot_growslice";  // Go reference: runtime/slice.go growslice
-pub const NEXTSLICECAP_NAME = "cot_nextslicecap";  // Go reference: runtime/slice.go nextslicecap
 pub const MEMSET_ZERO_NAME = "cot_memset_zero";
 
 // =============================================================================
@@ -177,37 +168,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         .exported = false,
     });
 
-    // Generate nextslicecap function: (newLen, oldCap) -> newCap
-    // Go reference: runtime/slice.go nextslicecap (lines 326-358)
-    // Growth policy: double if small, grow ~25% if large (threshold 256)
-    const nextslicecap_type = try linker.addType(
-        &[_]ValType{ .i64, .i64 },
-        &[_]ValType{.i64},
-    );
-    const nextslicecap_body = try generateNextSliceCapBody(allocator);
-    const nextslicecap_idx = try linker.addFunc(.{
-        .name = NEXTSLICECAP_NAME,
-        .type_idx = nextslicecap_type,
-        .code = nextslicecap_body,
-        .exported = false,
-    });
-
-    // Generate growslice function: (old_ptr, old_len, old_cap, elem_ptr, elem_size) -> new_ptr
-    // Go reference: runtime/slice.go growslice (lines 178-287)
-    // Handles capacity check, allocation with growth policy, copy old data, store new element
-    const growslice_type = try linker.addType(
-        &[_]ValType{ .i64, .i64, .i64, .i64, .i64 },
-        &[_]ValType{.i64},
-    );
-    const growslice_body = try generateGrowSliceBody(allocator, heap_ptr_global, nextslicecap_idx);
-    const growslice_idx = try linker.addFunc(.{
-        .name = GROWSLICE_NAME,
-        .type_idx = growslice_type,
-        .code = growslice_body,
-        .exported = false,
-    });
-
-    // Generate stub memset_zero function (TODO: implement properly)
+    // Generate stub memset_zero function
     // Takes (ptr, size) -> void
     const memset_zero_type = try linker.addType(
         &[_]ValType{ .i64, .i64 },
@@ -226,8 +187,6 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         .retain_idx = retain_idx,
         .release_idx = release_idx,
         .string_concat_idx = string_concat_idx,
-        .growslice_idx = growslice_idx,
-        .nextslicecap_idx = nextslicecap_idx,
         .memset_zero_idx = memset_zero_idx,
         .heap_ptr_global = heap_ptr_global,
         .destructor_type = destructor_type,
@@ -516,229 +475,6 @@ fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) 
     // Return (i64)new_ptr
     try code.emitLocalGet(5);
     try code.emitI64ExtendI32U();
-
-    return code.finish();
-}
-
-/// Generates bytecode for cot_slice_append(old_ptr, old_len, elem_ptr, elem_size) -> new_ptr
-/// Allocates new slice with len+1 elements, copies old data, copies new element.
-/// Go reference: runtime/slice.go growslice (simplified - no capacity tracking)
-/// Generate nextslicecap function body.
-/// Go reference: runtime/slice.go nextslicecap (lines 326-358)
-///
-/// Parameters:
-///   local 0: newLen (i64)
-///   local 1: oldCap (i64)
-/// Returns: newCap (i64)
-///
-/// Growth policy:
-///   - If newLen > 2*oldCap, return newLen
-///   - If oldCap < 256, return 2*oldCap (double)
-///   - Otherwise, grow by ~25%: newcap += (newcap + 3*256) >> 2
-fn generateNextSliceCapBody(allocator: std.mem.Allocator) ![]const u8 {
-    var code = wasm.CodeBuilder.init(allocator);
-    defer code.deinit();
-
-    // Locals:
-    //   local 2: newcap (i64)
-    //   local 3: doublecap (i64)
-    _ = try code.declareLocals(&[_]wasm.ValType{ .i64, .i64 });
-
-    // newcap = oldCap
-    try code.emitLocalGet(1);
-    try code.emitLocalSet(2);
-
-    // doublecap = newcap + newcap
-    try code.emitLocalGet(2);
-    try code.emitLocalGet(2);
-    try code.emitI64Add();
-    try code.emitLocalSet(3);
-
-    // if (newLen > doublecap) return newLen
-    try code.emitLocalGet(0); // newLen
-    try code.emitLocalGet(3); // doublecap
-    try code.emitI64GtS();
-    try code.emitIf(BLOCK_I64);
-    try code.emitLocalGet(0); // return newLen
-    try code.emitElse();
-
-    // if (oldCap < 256) return doublecap
-    try code.emitLocalGet(1); // oldCap
-    try code.emitI64Const(256);
-    try code.emitI64LtS();
-    try code.emitIf(BLOCK_I64);
-    try code.emitLocalGet(3); // return doublecap
-    try code.emitElse();
-
-    // Loop: grow by ~25% until newcap >= newLen
-    try code.emitBlock(BLOCK_VOID); // outer block for break
-    try code.emitLoop(BLOCK_VOID);
-    // newcap += (newcap + 3*256) >> 2
-    try code.emitLocalGet(2);
-    try code.emitLocalGet(2);
-    try code.emitI64Const(768); // 3 * 256
-    try code.emitI64Add();
-    try code.emitI64Const(2);
-    try code.emitI64ShrS(); // >> 2 (signed shift, same result for positive values)
-    try code.emitI64Add();
-    try code.emitLocalSet(2);
-
-    // if (newcap >= newLen) break
-    try code.emitLocalGet(2);
-    try code.emitLocalGet(0);
-    try code.emitI64GeU();
-    try code.emitBrIf(1); // break outer block
-
-    // continue loop
-    try code.emitBr(0);
-    try code.emitEnd(); // end loop
-    try code.emitEnd(); // end block
-
-    // return newcap (or newLen if newcap overflowed to <= 0)
-    try code.emitLocalGet(2);
-    try code.emitI64Const(0);
-    try code.emitI64LeS();
-    try code.emitIf(BLOCK_I64);
-    try code.emitLocalGet(0); // return newLen
-    try code.emitElse();
-    try code.emitLocalGet(2); // return newcap
-    try code.emitEnd();
-
-    try code.emitEnd(); // end else (oldCap >= 256)
-    try code.emitEnd(); // end else (newLen <= doublecap)
-
-    return code.finish();
-}
-
-/// Generate growslice function body.
-/// Go reference: runtime/slice.go growslice (lines 178-287)
-///
-/// Parameters:
-///   local 0: old_ptr (i64)
-///   local 1: old_len (i64)
-///   local 2: old_cap (i64)
-///   local 3: elem_ptr (i64)
-///   local 4: elem_size (i64)
-/// Returns: new_ptr (i64)
-///
-/// Logic:
-///   new_len = old_len + 1
-///   if (new_len <= old_cap) {
-///       // Fast path: capacity sufficient, just store element
-///       memory[old_ptr + old_len * elem_size] = elem
-///       return old_ptr
-///   } else {
-///       // Slow path: need to grow
-///       new_cap = nextslicecap(new_len, old_cap)
-///       new_ptr = alloc(new_cap * elem_size)
-///       memcpy(new_ptr, old_ptr, old_len * elem_size)
-///       memory[new_ptr + old_len * elem_size] = elem
-///       return new_ptr
-///   }
-fn generateGrowSliceBody(allocator: std.mem.Allocator, heap_ptr_global: u32, nextslicecap_idx: u32) ![]const u8 {
-    var code = wasm.CodeBuilder.init(allocator);
-    defer code.deinit();
-
-    // Locals:
-    //   local 5: new_len (i64)
-    //   local 6: new_cap (i64)
-    //   local 7: new_ptr (i32)
-    //   local 8: old_size (i32) - bytes to copy
-    //   local 9: elem_offset (i32) - where to store new element
-    _ = try code.declareLocals(&[_]wasm.ValType{ .i64, .i64, .i32, .i32, .i32 });
-
-    // new_len = old_len + 1
-    try code.emitLocalGet(1); // old_len
-    try code.emitI64Const(1);
-    try code.emitI64Add();
-    try code.emitLocalSet(5); // new_len
-
-    // elem_offset = (i32)(old_len * elem_size)
-    try code.emitLocalGet(1); // old_len
-    try code.emitLocalGet(4); // elem_size
-    try code.emitI64Mul();
-    try code.emitI32WrapI64();
-    try code.emitLocalSet(9); // elem_offset
-
-    // if (new_len <= old_cap)
-    try code.emitLocalGet(5); // new_len
-    try code.emitLocalGet(2); // old_cap
-    try code.emitI64LeS();
-    try code.emitIf(BLOCK_I64);
-
-    // Fast path: just store element at old_ptr + elem_offset
-    // memory.copy(old_ptr + elem_offset, elem_ptr, elem_size)
-    try code.emitLocalGet(0); // old_ptr
-    try code.emitI32WrapI64();
-    try code.emitLocalGet(9); // elem_offset
-    try code.emitI32Add(); // dest
-    try code.emitLocalGet(3); // elem_ptr
-    try code.emitI32WrapI64(); // src
-    try code.emitLocalGet(4); // elem_size
-    try code.emitI32WrapI64(); // len
-    try code.emitMemoryCopy();
-
-    // return old_ptr
-    try code.emitLocalGet(0);
-
-    try code.emitElse();
-
-    // Slow path: need to allocate new array
-    // new_cap = call nextslicecap(new_len, old_cap)
-    try code.emitLocalGet(5); // new_len
-    try code.emitLocalGet(2); // old_cap
-    try code.emitCall(nextslicecap_idx);
-    try code.emitLocalSet(6); // new_cap
-
-    // old_size = (i32)(old_len * elem_size)
-    try code.emitLocalGet(1); // old_len
-    try code.emitLocalGet(4); // elem_size
-    try code.emitI64Mul();
-    try code.emitI32WrapI64();
-    try code.emitLocalSet(8); // old_size
-
-    // Allocate: new_ptr = heap_ptr, heap_ptr += aligned(new_cap * elem_size)
-    // new_ptr = heap_ptr (before bump)
-    try code.emitGlobalGet(heap_ptr_global);
-    try code.emitLocalSet(7); // new_ptr = heap_ptr
-
-    // heap_ptr += aligned(new_cap * elem_size)
-    // alloc_size = (new_cap * elem_size + 7) & ~7
-    try code.emitLocalGet(6); // new_cap
-    try code.emitLocalGet(4); // elem_size
-    try code.emitI64Mul();
-    try code.emitI32WrapI64();
-    try code.emitI32Const(7);
-    try code.emitI32Add();
-    try code.emitI32Const(-8);
-    try code.emitI32And(); // alloc_size
-
-    try code.emitLocalGet(7); // new_ptr
-    try code.emitI32Add();
-    try code.emitGlobalSet(heap_ptr_global);
-
-    // memcpy(new_ptr, old_ptr, old_size)
-    try code.emitLocalGet(7); // dest = new_ptr
-    try code.emitLocalGet(0); // src = old_ptr
-    try code.emitI32WrapI64();
-    try code.emitLocalGet(8); // len = old_size
-    try code.emitMemoryCopy();
-
-    // Store new element at new_ptr + elem_offset
-    try code.emitLocalGet(7); // new_ptr
-    try code.emitLocalGet(9); // elem_offset
-    try code.emitI32Add(); // dest
-    try code.emitLocalGet(3); // elem_ptr
-    try code.emitI32WrapI64(); // src
-    try code.emitLocalGet(4); // elem_size
-    try code.emitI32WrapI64(); // len
-    try code.emitMemoryCopy();
-
-    // return (i64)new_ptr
-    try code.emitLocalGet(7);
-    try code.emitI64ExtendI32U();
-
-    try code.emitEnd(); // end if
 
     return code.finish();
 }
@@ -1064,8 +800,9 @@ test "addToLinker creates functions" {
     try std.testing.expect(funcs.retain_idx != funcs.release_idx);
     try std.testing.expect(funcs.release_idx != funcs.string_concat_idx);
 
-    // Verify functions were added (alloc, retain, release, string_concat, growslice, nextslicecap, memset_zero = 7)
-    try std.testing.expectEqual(@as(usize, 7), linker.funcs.items.len);
+    // Verify functions were added (alloc, retain, release, string_concat, memset_zero = 5)
+    // Slice functions (growslice, nextslicecap) are in slice_runtime.zig
+    try std.testing.expectEqual(@as(usize, 5), linker.funcs.items.len);
 
     // Verify global was added (heap_ptr)
     try std.testing.expectEqual(@as(usize, 1), linker.globals.items.len);

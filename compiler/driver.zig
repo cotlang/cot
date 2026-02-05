@@ -27,7 +27,8 @@ const pipeline_debug = @import("pipeline_debug.zig");
 const wasm_old = @import("codegen/wasm.zig"); // Old module builder (for CodeBuilder)
 const wasm = @import("codegen/wasm/wasm.zig"); // New Go-style package (for Linker)
 const wasm_gen = @import("codegen/wasm_gen.zig");
-const arc = @import("codegen/arc.zig"); // ARC runtime
+const arc = @import("codegen/arc.zig"); // ARC runtime (Swift)
+const slice_runtime = @import("codegen/slice_runtime.zig"); // Slice runtime (Go)
 
 // Native codegen modules (Cranelift-style AOT compiler)
 const native_compile = @import("codegen/native/compile.zig");
@@ -978,32 +979,42 @@ pub const Driver = struct {
 
         // ====================================================================
         // Add ARC runtime functions first (they get indices 0, 1, 2, ...)
+        // Reference: Swift stdlib HeapObject.cpp
         // ====================================================================
         const arc_funcs = try arc.addToLinker(self.allocator, &linker);
+
+        // ====================================================================
+        // Add slice runtime functions (Go style)
+        // Reference: Go runtime/slice.go
+        // ====================================================================
+        const slice_funcs = try slice_runtime.addToLinker(self.allocator, &linker, arc_funcs.heap_ptr_global);
+
         // Get actual count from linker - never hardcode (Go: len(hostImports))
-        const arc_func_count = linker.funcCount();
+        const runtime_func_count = linker.funcCount();
 
         // Set minimum table size of 1 for call_indirect (destructor calls)
         // Table entry 0 is reserved (null/no destructor)
         linker.setTableSize(1);
 
         // Build function name -> index mapping
-        // ARC functions come first, then user functions
+        // Runtime functions come first, then user functions
         var func_indices = wasm_gen.FuncIndexMap{};
         defer func_indices.deinit(self.allocator);
 
-        // Add ARC function names to index map
+        // Add ARC function names to index map (Swift)
         try func_indices.put(self.allocator, arc.ALLOC_NAME, arc_funcs.alloc_idx);
         try func_indices.put(self.allocator, arc.RETAIN_NAME, arc_funcs.retain_idx);
         try func_indices.put(self.allocator, arc.RELEASE_NAME, arc_funcs.release_idx);
         try func_indices.put(self.allocator, arc.STRING_CONCAT_NAME, arc_funcs.string_concat_idx);
-        try func_indices.put(self.allocator, arc.GROWSLICE_NAME, arc_funcs.growslice_idx);
-        try func_indices.put(self.allocator, arc.NEXTSLICECAP_NAME, arc_funcs.nextslicecap_idx);
         try func_indices.put(self.allocator, arc.MEMSET_ZERO_NAME, arc_funcs.memset_zero_idx);
+
+        // Add slice function names to index map (Go)
+        try func_indices.put(self.allocator, slice_runtime.GROWSLICE_NAME, slice_funcs.growslice_idx);
+        try func_indices.put(self.allocator, slice_runtime.NEXTSLICECAP_NAME, slice_funcs.nextslicecap_idx);
 
         // Add user function names (offset by ARC function count)
         for (funcs, 0..) |*ir_func, i| {
-            try func_indices.put(self.allocator, ir_func.name, @intCast(i + arc_func_count));
+            try func_indices.put(self.allocator, ir_func.name, @intCast(i + runtime_func_count));
         }
 
         // ====================================================================
@@ -1026,7 +1037,7 @@ pub const Driver = struct {
             if (std.mem.endsWith(u8, ir_func.name, "_deinit")) {
                 // Extract type name from "TypeName_deinit"
                 const type_name = ir_func.name[0 .. ir_func.name.len - 7]; // Remove "_deinit"
-                const func_idx: u32 = @intCast(i + arc_func_count);
+                const func_idx: u32 = @intCast(i + runtime_func_count);
 
                 // Add to table (table_index starts at 1, 0 is reserved for null)
                 const table_idx = try linker.addTableFunc(func_idx);
