@@ -195,6 +195,29 @@ Claude copies ALL of it, even parts that seem unnecessary
 Tests pass because edge cases are handled
 ```
 
+### Pattern 4: "Emitting ISA-specific instructions in shared code"
+
+**Wrong:**
+```
+Claude needs to emit ARM64 instructions (stp, ldp, etc.)
+Claude adds ARM64 machine code directly in vcode.zig
+This breaks x64 builds and creates merge conflicts
+```
+
+**Right:**
+```
+Claude needs to emit ARM64 instructions
+Claude adds them in compiler/codegen/native/isa/aarch64/ modules
+Claude uses hasDecl() checks in vcode.zig to call ISA-specific methods
+Shared code remains ISA-agnostic
+```
+
+**The rule:** `vcode.zig` and other `machinst/` files must NEVER contain hardcoded ARM64 or x64 instruction encodings. All ISA-specific code goes in:
+- `isa/aarch64/` for ARM64
+- `isa/x64/` for x64
+
+If you need to emit prologue/epilogue, use `I.genPrologue()` / `I.genEpilogue()` patterns that dispatch to ISA-specific implementations.
+
 ---
 
 ## Debug Output
