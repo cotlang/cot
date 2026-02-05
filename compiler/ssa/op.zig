@@ -64,7 +64,7 @@ pub const Op = enum(u16) {
     // === Control Flow ===
     phi, copy, fwd_ref, arg,
     select0, select1, make_tuple, select_n, cond_select,
-    string_len, string_ptr, string_make, slice_len, slice_ptr, slice_make, string_concat,
+    string_len, string_ptr, string_make, slice_len, slice_ptr, slice_cap, slice_make, string_concat,
 
     // === Function Calls ===
     call, tail_call, static_call, closure_call, inter_call,
@@ -357,7 +357,8 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.string_make)] = .{ .name = "StringMake", .arg_len = 2 };
     table[@intFromEnum(Op.slice_len)] = .{ .name = "SliceLen", .arg_len = 1 };
     table[@intFromEnum(Op.slice_ptr)] = .{ .name = "SlicePtr", .arg_len = 1 };
-    table[@intFromEnum(Op.slice_make)] = .{ .name = "SliceMake", .arg_len = 2 };
+    table[@intFromEnum(Op.slice_cap)] = .{ .name = "SliceCap", .arg_len = 1 };
+    table[@intFromEnum(Op.slice_make)] = .{ .name = "SliceMake", .arg_len = 3 };  // (ptr, len, cap) - matches Go's slice struct
     table[@intFromEnum(Op.string_concat)] = .{ .name = "StringConcat", .arg_len = 2, .has_side_effects = true, .call = true };
 
     // Calls

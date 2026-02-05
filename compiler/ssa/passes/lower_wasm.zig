@@ -214,7 +214,7 @@ fn lowerValue(v: *Value) bool {
 
         // Decomposed ops - should have been handled by decomposeValue above
         // If they reach here, the pattern didn't match (e.g., slice loaded from memory)
-        .slice_ptr, .slice_len, .string_ptr, .string_len => null,
+        .slice_ptr, .slice_len, .slice_cap, .string_ptr, .string_len => null,
 
         // Already Wasm-specific - leave as-is
         .wasm_i64_const, .wasm_i32_const, .wasm_f64_const, .wasm_f32_const,

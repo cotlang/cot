@@ -567,15 +567,17 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return;
         const slice_node = try self.lowerExprNode(value_idx);
         if (slice_node == ir.null_node) return;
-        // Slices have the same layout as strings: (ptr, len)
-        // Go reference: rewritedec.go Store of SliceMake decomposes to ptr+len stores
+        // Go slice layout: { array unsafe.Pointer; len int; cap int } = 24 bytes
+        // Reference: ~/learning/go/src/runtime/slice.go lines 16-20
         const slice_info = self.type_reg.get(slice_type);
         const elem_type = if (slice_info == .slice) slice_info.slice.elem else TypeRegistry.U8;
         const ptr_type = self.type_reg.makePointer(elem_type) catch TypeRegistry.VOID;
         const ptr_val = try fb.emitSlicePtr(slice_node, ptr_type, span);
         const len_val = try fb.emitSliceLen(slice_node, span);
-        _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span);
-        _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, span);
+        const cap_val = try fb.emitSliceCap(slice_node, span);
+        _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span);   // ptr at offset 0
+        _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, span);   // len at offset 8
+        _ = try fb.emitStoreLocalField(local_idx, 2, 16, cap_val, span);  // cap at offset 16
     }
 
     fn lowerAssign(self: *Lowerer, assign: ast.AssignStmt) !void {
@@ -1842,7 +1844,18 @@ pub const Lowerer = struct {
     }
 
     /// Lower append(slice, elem) builtin
-    /// Go reference: walk/builtin.go walkAppend (simplified - always reallocates)
+    /// Go reference: walk/builtin.go walkAppend (lines 44-128)
+    /// Go reference: runtime/slice.go growslice (lines 178-287)
+    ///
+    /// Go's append pattern:
+    ///   newLen := oldLen + 1
+    ///   if newLen > oldCap {
+    ///       slice = growslice(oldPtr, newLen, oldCap, 1, elemType)
+    ///   }
+    ///   slice[oldLen] = elem
+    ///   return slice{ptr, newLen, newCap}
+    ///
+    /// We call cot_growslice which handles the capacity check internally.
     fn lowerBuiltinAppend(self: *Lowerer, call: ast.Call) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
         if (call.args.len != 2) return ir.null_node;
@@ -1859,32 +1872,37 @@ pub const Lowerer = struct {
         const result_type = self.type_reg.makeSlice(elem_type_idx) catch return ir.null_node;
         const ptr_type = try self.type_reg.makePointer(elem_type_idx);
 
-        // Get ptr and len from source - different for arrays vs slices
+        // Get ptr, len, cap from source - different for arrays vs slices
         var old_ptr: ir.NodeIndex = ir.null_node;
         var old_len: ir.NodeIndex = ir.null_node;
+        var old_cap: ir.NodeIndex = ir.null_node;
 
         const arg_node = self.tree.getNode(call.args[0]) orelse return ir.null_node;
         const arg_expr = arg_node.asExpr() orelse return ir.null_node;
 
         if (slice_type == .array) {
-            // For arrays: ptr is address of the array, len is static length
+            // For arrays: ptr is address, len=cap=static length
             if (arg_expr == .ident) {
                 if (fb.lookupLocal(arg_expr.ident.name)) |local_idx| {
                     old_ptr = try fb.emitAddrLocal(local_idx, ptr_type, call.span);
-                    old_len = try fb.emitConstInt(@intCast(slice_type.array.length), TypeRegistry.I64, call.span);
+                    const arr_len = try fb.emitConstInt(@intCast(slice_type.array.length), TypeRegistry.I64, call.span);
+                    old_len = arr_len;
+                    old_cap = arr_len; // Arrays have len == cap
                 }
             }
         } else if (slice_type == .slice) {
-            // For slices: read ptr (field 0) and len (field 1) from the slice local
+            // For slices: read ptr (offset 0), len (offset 8), cap (offset 16)
+            // Go reference: runtime/slice.go lines 16-20
             if (arg_expr == .ident) {
                 if (fb.lookupLocal(arg_expr.ident.name)) |local_idx| {
                     old_ptr = try fb.emitFieldLocal(local_idx, 0, 0, ptr_type, call.span);
                     old_len = try fb.emitFieldLocal(local_idx, 1, 8, TypeRegistry.I64, call.span);
+                    old_cap = try fb.emitFieldLocal(local_idx, 2, 16, TypeRegistry.I64, call.span);
                 }
             }
         }
 
-        if (old_ptr == ir.null_node or old_len == ir.null_node) return ir.null_node;
+        if (old_ptr == ir.null_node or old_len == ir.null_node or old_cap == ir.null_node) return ir.null_node;
 
         // Lower element value
         const elem_val = try self.lowerExprNode(call.args[1]);
@@ -1895,17 +1913,26 @@ pub const Lowerer = struct {
         _ = try fb.emitStoreLocal(temp_idx, elem_val, call.span);
         const elem_ptr = try fb.emitAddrLocal(temp_idx, ptr_type, call.span);
 
-        // Call cot_slice_append(old_ptr, old_len, elem_ptr, elem_size) -> new_ptr
+        // Call cot_growslice(old_ptr, old_len, old_cap, elem_ptr, elem_size) -> (new_ptr, new_len, new_cap)
+        // Go reference: runtime/slice.go growslice (lines 178-287)
+        // The runtime handles: capacity check, nextslicecap growth policy, memcpy, element store
         const elem_size_val = try fb.emitConstInt(@intCast(elem_size), TypeRegistry.I64, call.span);
-        var args = [_]ir.NodeIndex{ old_ptr, old_len, elem_ptr, elem_size_val };
-        const new_ptr = try fb.emitCall("cot_slice_append", &args, false, TypeRegistry.I64, call.span);
+        var args = [_]ir.NodeIndex{ old_ptr, old_len, old_cap, elem_ptr, elem_size_val };
+        const new_ptr = try fb.emitCall("cot_growslice", &args, false, TypeRegistry.I64, call.span);
 
         // Compute new_len = old_len + 1
         const one = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
         const new_len = try fb.emitBinary(.add, old_len, one, TypeRegistry.I64, call.span);
 
-        // Return slice_header(new_ptr, new_len)
-        return try fb.emit(ir.Node.init(.{ .slice_header = .{ .ptr = new_ptr, .len = new_len } }, result_type, call.span));
+        // Compute new_cap - runtime returns it via second result, but for now we calculate
+        // If grew: new_cap = nextslicecap(new_len, old_cap)
+        // If not: new_cap = old_cap
+        // For simplicity, call cot_nextslicecap to get the capacity
+        var cap_args = [_]ir.NodeIndex{ new_len, old_cap };
+        const new_cap = try fb.emitCall("cot_nextslicecap", &cap_args, false, TypeRegistry.I64, call.span);
+
+        // Return slice_header(new_ptr, new_len, new_cap)
+        return try fb.emit(ir.Node.init(.{ .slice_header = .{ .ptr = new_ptr, .len = new_len, .cap = new_cap } }, result_type, call.span));
     }
 
     fn lowerBuiltinPrint(self: *Lowerer, call: ast.Call, is_println: bool, fd: i32) Error!ir.NodeIndex {

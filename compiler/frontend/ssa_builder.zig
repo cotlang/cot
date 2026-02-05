@@ -332,6 +332,7 @@ pub const SSABuilder = struct {
             .slice_value => |s| try self.convertSliceValue(s, node.type_idx, cur),
             .slice_ptr => |s| try self.convertSliceOp(.slice_ptr, s.slice, node.type_idx, cur),
             .slice_len => |s| try self.convertSliceOp(.slice_len, s.slice, node.type_idx, cur),
+            .slice_cap => |s| try self.convertSliceOp(.slice_cap, s.slice, node.type_idx, cur),
 
             .ptr_load => |p| try self.convertPtrLoad(p.ptr_local, node.type_idx, cur),
             .ptr_store => |p| try self.convertPtrStore(p, cur),

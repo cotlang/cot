@@ -246,7 +246,8 @@ pub const TypeRegistry = struct {
         return switch (self.get(idx)) {
             .basic => |k| k.size(),
             .pointer, .map, .list, .func => 8,
-            .optional, .error_union, .slice => 16,
+            .optional, .error_union => 16,
+            .slice => 24,  // Go's slice: (ptr=8, len=8, cap=8)
             .array => |a| @intCast(self.sizeOf(a.elem) * a.length),
             .struct_type => |s| s.size,
             .enum_type => |e| self.sizeOf(e.backing_type),
@@ -447,7 +448,7 @@ test "TypeRegistry sizeOf" {
     defer reg.deinit();
     try std.testing.expectEqual(@as(u32, 1), reg.sizeOf(TypeRegistry.BOOL));
     try std.testing.expectEqual(@as(u32, 8), reg.sizeOf(TypeRegistry.I64));
-    try std.testing.expectEqual(@as(u32, 16), reg.sizeOf(TypeRegistry.STRING));
+    try std.testing.expectEqual(@as(u32, 24), reg.sizeOf(TypeRegistry.STRING));  // Go slice: (ptr=8, len=8, cap=8)
 }
 
 test "invalid_type" {

@@ -56,6 +56,7 @@ pub const SliceLocal = struct { local_idx: LocalIdx, start: ?NodeIndex, end: ?No
 pub const SliceValue = struct { base: NodeIndex, start: ?NodeIndex, end: ?NodeIndex, elem_size: u32 };
 pub const SlicePtr = struct { slice: NodeIndex };
 pub const SliceLen = struct { slice: NodeIndex };
+pub const SliceCap = struct { slice: NodeIndex };  // Go's slice.cap field
 pub const PtrLoad = struct { ptr_local: LocalIdx };
 pub const PtrStore = struct { ptr_local: LocalIdx, value: NodeIndex };
 pub const PtrField = struct { ptr_local: LocalIdx, field_idx: u32, offset: i64 };
@@ -85,7 +86,7 @@ pub const MapGet = struct { handle: NodeIndex, key: NodeIndex };
 pub const MapHas = struct { handle: NodeIndex, key: NodeIndex };
 pub const StrConcat = struct { left: NodeIndex, right: NodeIndex };
 pub const StringHeader = struct { ptr: NodeIndex, len: NodeIndex };
-pub const SliceHeader = struct { ptr: NodeIndex, len: NodeIndex };
+pub const SliceHeader = struct { ptr: NodeIndex, len: NodeIndex, cap: NodeIndex };  // Matches Go's slice struct
 pub const UnionInit = struct { variant_idx: u32, payload: ?NodeIndex };
 pub const UnionTag = struct { value: NodeIndex };
 pub const UnionPayload = struct { variant_idx: u32, value: NodeIndex };
@@ -107,7 +108,7 @@ pub const Node = struct {
         binary: Binary, unary: Unary,
         field_local: FieldLocal, store_local_field: StoreLocalField, store_field: StoreField, field_value: FieldValue,
         index_local: IndexLocal, index_value: IndexValue, store_index_local: StoreIndexLocal, store_index_value: StoreIndexValue,
-        slice_local: SliceLocal, slice_value: SliceValue, slice_ptr: SlicePtr, slice_len: SliceLen,
+        slice_local: SliceLocal, slice_value: SliceValue, slice_ptr: SlicePtr, slice_len: SliceLen, slice_cap: SliceCap,
         ptr_load: PtrLoad, ptr_store: PtrStore, ptr_field: PtrField, ptr_field_store: PtrFieldStore,
         ptr_load_value: PtrLoadValue, ptr_store_value: PtrStoreValue,
         addr_offset: AddrOffset, addr_index: AddrIndex,
@@ -303,6 +304,7 @@ pub const FuncBuilder = struct {
     pub fn emitSliceValue(self: *FuncBuilder, base: NodeIndex, start: ?NodeIndex, end: ?NodeIndex, elem_size: u32, type_idx: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .slice_value = .{ .base = base, .start = start, .end = end, .elem_size = elem_size } }, type_idx, span)); }
     pub fn emitSlicePtr(self: *FuncBuilder, slice: NodeIndex, ptr_type: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .slice_ptr = .{ .slice = slice } }, ptr_type, span)); }
     pub fn emitSliceLen(self: *FuncBuilder, slice: NodeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .slice_len = .{ .slice = slice } }, TypeRegistry.I64, span)); }
+    pub fn emitSliceCap(self: *FuncBuilder, slice: NodeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .slice_cap = .{ .slice = slice } }, TypeRegistry.I64, span)); }
     pub fn emitPtrLoad(self: *FuncBuilder, ptr_local: LocalIdx, type_idx: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .ptr_load = .{ .ptr_local = ptr_local } }, type_idx, span)); }
     pub fn emitPtrStore(self: *FuncBuilder, ptr_local: LocalIdx, value: NodeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .ptr_store = .{ .ptr_local = ptr_local, .value = value } }, TypeRegistry.VOID, span)); }
     pub fn emitPtrLoadValue(self: *FuncBuilder, ptr: NodeIndex, type_idx: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .ptr_load_value = .{ .ptr = ptr } }, type_idx, span)); }

@@ -63,10 +63,12 @@ pub fn rewrite(allocator: std.mem.Allocator, f: *Func) !void {
 fn rewriteValue(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value) !bool {
     return switch (v.op) {
         // ====================================================================
-        // Slice decomposition (Go: rewriteValuedec_OpSlicePtr/Len)
+        // Slice decomposition (Go: rewriteValuedec_OpSlicePtr/Len/Cap)
+        // Go slice struct: { array unsafe.Pointer; len int; cap int }
         // ====================================================================
         .slice_ptr => rewriteSlicePtr(allocator, f, block, v),
         .slice_len => rewriteSliceLen(allocator, f, block, v),
+        .slice_cap => rewriteSliceCap(allocator, f, block, v),
 
         // ====================================================================
         // String decomposition (Go: rewriteValuedec_OpStringPtr/Len)
@@ -222,6 +224,54 @@ fn rewriteSliceLen(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Va
             load_val.addArg(off_ptr);
             if (v_0.args.len >= 2) {
                 load_val.addArg(v_0.args[1]);
+            }
+            try block.addValue(allocator, load_val);
+
+            copyOf(v, load_val);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Rewrite SliceCap extraction.
+/// Go reference: rewriteValuedec_OpSliceCap (lines 459-497)
+///
+/// Patterns:
+///   (SliceCap (SliceMake _ _ cap)) → cap
+///   (SliceCap (Load<slice> ptr mem)) → (Load<i64> (OffPtr ptr 16) mem)
+fn rewriteSliceCap(allocator: std.mem.Allocator, f: *Func, block: *Block, v: *Value) !bool {
+    if (v.args.len < 1) return false;
+    const v_0 = followCopy(v.args[0]);
+
+    // Pattern 1: SliceCap(SliceMake _ _ cap) → cap
+    // Go: lines 464-473
+    if (v_0.op == .slice_make and v_0.args.len >= 3) {
+        const cap = v_0.args[2];
+        debug.log(.codegen, "  v{d}: slice_cap(slice_make) -> copy v{d}", .{ v.id, cap.id });
+        copyOf(v, cap);
+        return true;
+    }
+
+    // Pattern 2: SliceCap(Load<slice> ptr mem) → Load<i64> (OffPtr ptr 16) mem
+    // Go: lines 474-496
+    if (v_0.op == .load and isSliceType(v_0.type_idx)) {
+        if (v_0.args.len >= 1) {
+            const ptr = v_0.args[0];
+            debug.log(.codegen, "  v{d}: slice_cap(load<slice>) -> load<i64>(off_ptr 16)", .{v.id});
+
+            // Create OffPtr to add 16 to ptr (offset to cap field)
+            const off_ptr = try f.newValue(.off_ptr, TypeRegistry.I64, block, v.pos);
+            off_ptr.aux_int = 16; // offset to capacity field
+            off_ptr.addArg(ptr);
+            try block.addValue(allocator, off_ptr);
+
+            // Create load from offset ptr
+            const load_val = try f.newValue(.load, TypeRegistry.I64, block, v.pos);
+            load_val.addArg(off_ptr);
+            if (v_0.args.len >= 2) {
+                load_val.addArg(v_0.args[1]); // mem
             }
             try block.addValue(allocator, load_val);
 
