@@ -377,6 +377,13 @@ pub const TypeRegistry = struct {
         // Named types
         if (from_t == .struct_type and to_t == .struct_type) return std.mem.eql(u8, from_t.struct_type.name, to_t.struct_type.name);
         if (from_t == .enum_type and to_t == .enum_type) return std.mem.eql(u8, from_t.enum_type.name, to_t.enum_type.name);
+
+        // Enum to backing type (implicit conversion)
+        // Go reference: Go enums are typed ints, implicit conversion allowed
+        if (from_t == .enum_type) return self.isAssignable(from_t.enum_type.backing_type, to);
+
+        // Union to tag type (implicit conversion for simple unions without payload)
+        if (from_t == .union_type) return self.isAssignable(from_t.union_type.tag_type, to);
         if (from_t == .pointer and to_t == .pointer) return self.equal(from_t.pointer.elem, to_t.pointer.elem);
         if (from_t == .array and to_t == .array) return from_t.array.length == to_t.array.length and self.isAssignable(from_t.array.elem, to_t.array.elem);
 

@@ -1,0 +1,19 @@
+// Switch on enum
+// EXPECT: exit_code=50
+
+enum Level {
+    Low = 10,
+    Medium = 50,
+    High = 100,
+}
+
+fn main() i64 {
+    let level = Level.Medium
+    let result = switch level {
+        Level.Low => 1,
+        Level.Medium => 50,
+        Level.High => 99,
+        else => 0,
+    }
+    return result
+}

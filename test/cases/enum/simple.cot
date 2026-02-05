@@ -1,0 +1,13 @@
+// Simple enum
+// EXPECT: exit_code=1
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn main() i64 {
+    let c = Color.Green
+    return c
+}

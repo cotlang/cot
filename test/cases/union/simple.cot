@@ -1,0 +1,13 @@
+// Simple tagged union (no payload)
+// EXPECT: exit_code=1
+
+union State {
+    Init,
+    Running,
+    Done,
+}
+
+fn main() i64 {
+    let s = State.Running
+    return s
+}

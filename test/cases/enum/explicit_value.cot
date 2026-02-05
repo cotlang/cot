@@ -1,0 +1,13 @@
+// Enum with explicit values
+// EXPECT: exit_code=100
+
+enum Status {
+    Ok = 0,
+    Warning = 50,
+    Error = 100,
+}
+
+fn main() i64 {
+    let s: i64 = Status.Error
+    return s
+}

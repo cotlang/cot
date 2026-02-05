@@ -1,0 +1,13 @@
+// Simple switch expression
+// EXPECT: exit_code=20
+
+fn main() i64 {
+    let x = 2
+    let result = switch x {
+        1 => 10,
+        2 => 20,
+        3 => 30,
+        else => 0,
+    }
+    return result
+}

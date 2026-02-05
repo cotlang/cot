@@ -1237,6 +1237,18 @@ pub const Lowerer = struct {
             return ir.null_node;
         }
 
+        // Union variant (simple, no payload)
+        // Go reference: tagged unions use tag value for variant discrimination
+        if (base_type == .union_type) {
+            for (base_type.union_type.variants, 0..) |variant, i| {
+                if (std.mem.eql(u8, variant.name, fa.field)) {
+                    // Return tag value (variant index)
+                    return try fb.emitConstInt(@intCast(i), base_type_idx, fa.span);
+                }
+            }
+            return ir.null_node;
+        }
+
         // Slice ptr/len
         if (base_type == .slice) {
             const base_val = try self.lowerExprNode(fa.base);

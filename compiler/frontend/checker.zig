@@ -331,7 +331,9 @@ pub const Checker = struct {
 
     fn checkIdentifier(self: *Checker, id: ast.Ident) TypeIndex {
         if (self.types.lookupByName(id.name)) |type_idx| {
-            if (self.types.get(type_idx) == .enum_type) return type_idx;
+            const t = self.types.get(type_idx);
+            // Allow enum and union types to be used as expressions (for variant access)
+            if (t == .enum_type or t == .union_type) return type_idx;
             self.err.errorWithCode(id.span.start, .e301, "type name cannot be used as expression");
             return invalid_type;
         }

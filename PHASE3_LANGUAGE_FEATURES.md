@@ -1004,9 +1004,9 @@ Update this table as features are completed:
 | Feature | Scanner | Parser | Checker | Lower | Wasm | Native | Tests |
 |---------|---------|--------|---------|-------|------|--------|-------|
 | F1: impl | ✅ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
-| F2: enum | ✅ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
-| F3: union | ✅ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
-| F4: switch | ✅ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
+| F2: enum | ✅ | ✅ | ✅ | ✅ | ✅ | ? | ✅ |
+| F3: union | ✅ | ✅ | ✅ | ✅ | ✅ | ? | ✅ |
+| F4: switch | ✅ | ✅ | ✅ | ✅ | ✅ | ? | ✅ |
 | F5: type | ✅ | ✅ | ✅ | ✅ | ✅ | ? | ✅ |
 | F6: import | ✅ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
 | F7: extern | ✅ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
