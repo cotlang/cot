@@ -138,6 +138,11 @@ pub const CallInfo = struct {
     opcode: ?CallOpcode,
     /// Try-call info for exception handling.
     try_call_info: ?TryCallInfo,
+
+    pub fn deinit(self: *CallInfo, allocator: std.mem.Allocator) void {
+        self.uses.deinit(allocator);
+        self.defs.deinit(allocator);
+    }
 };
 
 /// Information about a function call with an unknown target.
@@ -158,6 +163,11 @@ pub const CallInfoUnknown = struct {
     opcode: ?CallOpcode,
     /// Try-call info for exception handling.
     try_call_info: ?TryCallInfo,
+
+    pub fn deinit(self: *CallInfoUnknown, allocator: std.mem.Allocator) void {
+        self.uses.deinit(allocator);
+        self.defs.deinit(allocator);
+    }
 };
 
 /// Information about a return-call (tail call).
@@ -1691,6 +1701,36 @@ pub const Inst = union(enum) {
 
     /// EmitState type for this instruction type (used for emission context).
     pub const EmitState = emit_mod.EmitState;
+
+    /// Deinitialize the instruction, freeing any owned memory.
+    /// This must be called for instructions that own allocated slices:
+    /// - args: allocated CallArgPair slice for function arguments
+    /// - rets: allocated CallArgPair slice for return values
+    /// - jmp_table_seq: allocated MachLabel slice for jump table targets
+    /// - call_known: allocated CallInfo with uses/defs arrays
+    /// - call_unknown: allocated CallInfoUnknown with uses/defs arrays
+    pub fn deinit(self: *const Inst, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .rets => |r| allocator.free(r.rets_list),
+            .args => |a| allocator.free(a.args_list),
+            .jmp_table_seq => |j| allocator.free(j.targets),
+            .call_known => |c| {
+                // Free the CallInfo's internal arrays, then the CallInfo itself
+                // Cast away const to call deinit (we own this memory)
+                const info_ptr = @constCast(c.info);
+                info_ptr.deinit(allocator);
+                allocator.destroy(info_ptr);
+            },
+            .call_unknown => |c| {
+                // Free the CallInfoUnknown's internal arrays, then the CallInfoUnknown itself
+                // Cast away const to call deinit (we own this memory)
+                const info_ptr = @constCast(c.info);
+                info_ptr.deinit(allocator);
+                allocator.destroy(info_ptr);
+            },
+            else => {},
+        }
+    }
 };
 
 //=============================================================================
