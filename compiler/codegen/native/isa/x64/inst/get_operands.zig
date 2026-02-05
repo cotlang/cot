@@ -150,12 +150,33 @@ pub const OperandVisitor = union(enum) {
         }
     }
 
+    /// Mark a register as used (read), at late position.
+    /// Use this when the register must survive throughout the entire instruction,
+    /// preventing the regalloc from reusing it for defs within the same instruction.
+    /// Reference: reg.rs:405 fn reg_use (with late position for special cases)
+    pub fn regUseLate(self: *OperandVisitor, reg: *Reg) void {
+        switch (self.*) {
+            .collector => |c| c.uses.append(c.allocator, reg.*) catch unreachable,
+            .callback => |cb| cb.func(cb.ctx, reg, .any, .use, .late),
+        }
+    }
+
     /// Mark a register as defined (written), at late position.
     /// Reference: reg.rs:417 fn reg_def
     pub fn regDef(self: *OperandVisitor, reg: *Writable(Reg)) void {
         switch (self.*) {
             .collector => |c| c.defs.append(c.allocator, reg.*) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, reg.regMut(), .any, .def, .late),
+        }
+    }
+
+    /// Mark a register as defined (written), at early position.
+    /// Use this for defs that must not overlap with late uses within the same instruction.
+    /// Reference: reg.rs:417 fn reg_def (with early position for special cases)
+    pub fn regDefEarly(self: *OperandVisitor, reg: *Writable(Reg)) void {
+        switch (self.*) {
+            .collector => |c| c.defs.append(c.allocator, reg.*) catch unreachable,
+            .callback => |cb| cb.func(cb.ctx, reg.regMut(), .any, .def, .early),
         }
     }
 
@@ -576,9 +597,15 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         .jmp_cond_or => {},
         .winch_jmp_if => {},
         .jmp_table_seq => |*p| {
-            visitor.regUse(&p.idx);
-            visitor.regDef(&p.tmp1);
-            visitor.regDef(&p.tmp2);
+            // IMPORTANT: Visit order must match collectOperands order (defs first, then uses).
+            // collectOperands builds: [defs..., uses...], so we call defs first.
+            //
+            // tmp1/tmp2 use regDefEarly because they must NOT overlap with idx.
+            // idx must survive throughout the instruction (used in the MOVSXD SIB).
+            // By making tmp1/tmp2 early defs and idx a late use, we prevent overlap.
+            visitor.regDefEarly(&p.tmp1);
+            visitor.regDefEarly(&p.tmp2);
+            visitor.regUseLate(&p.idx);
         },
 
         //=====================================================================

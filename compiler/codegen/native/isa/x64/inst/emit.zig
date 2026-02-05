@@ -1867,8 +1867,54 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             // Get label for start of jump table
             const jt_label = try sink.getLabel();
 
-            if (tmp1_enc == tmp2_enc) {
-                // Alternative sequence when tmp1 == tmp2
+            if (tmp1_enc == idx_enc) {
+                // Case: tmp1 == idx (LEA would overwrite the index before we use it)
+                // Solution: Save idx to tmp2, then proceed with tmp2 as the index.
+                //
+                // mov %idx, %tmp2          ; save idx to tmp2
+                // lea table(%rip), %tmp1   ; tmp1 = table base (overwrites idx)
+                // movsxd (%tmp1, %tmp2, 4), %tmp2 ; tmp2 = table[saved_idx*4]
+                // add %tmp2, %tmp1         ; tmp1 = base + offset
+                // jmp *%tmp1
+
+                // mov %idx, %tmp2 (save idx before LEA overwrites it)
+                const mov_rex = RexPrefix.twoOp(idx_enc, tmp2_enc, true, false);
+                try mov_rex.encode(sink);
+                try sink.put1(0x89); // MOV r/m64, r64
+                try sink.put1(encodeModrm(0b11, idx_enc & 7, tmp2_enc & 7));
+
+                // lea start_of_jump_table(%rip), %tmp1
+                const lea_rex = RexPrefix.twoOp(tmp1_enc, 0, true, false);
+                try lea_rex.encode(sink);
+                try sink.put1(0x8D);
+                try sink.put1(encodeModrm(0b00, tmp1_enc & 7, 0b101));
+                const lea_disp_offset = sink.curOffset();
+                try sink.put4(@as(u32, @bitCast(@as(i32, -4))));
+                try sink.useLabelAtOffset(lea_disp_offset, jt_label, .pc_rel_32);
+
+                // movsxd (%tmp1, %tmp2, 4), %tmp2 (use saved idx from tmp2)
+                const movsx_rex = RexPrefix.threeOp(tmp2_enc, tmp2_enc, tmp1_enc, true, false);
+                try movsx_rex.encode(sink);
+                try sink.put1(0x63);
+                try sink.put1(encodeModrm(0b00, tmp2_enc & 7, 0b100));
+                try sink.put1(encodeSib(2, tmp2_enc & 7, tmp1_enc & 7));
+
+                // add %tmp2, %tmp1
+                const add_rex = RexPrefix.twoOp(tmp2_enc, tmp1_enc, true, false);
+                try add_rex.encode(sink);
+                try sink.put1(0x01);
+                try sink.put1(encodeModrm(0b11, tmp2_enc & 7, tmp1_enc & 7));
+            } else if (tmp1_enc == tmp2_enc or tmp2_enc == idx_enc) {
+                // Alternative sequence when tmp1 == tmp2 or tmp2 == idx
+                // (tmp1 != idx here, so we can safely use idx after LEA)
+                //
+                // lea start_of_jump_table(%rip), %tmp1
+                // shl $2, %idx           ; idx *= 4
+                // add %idx, %tmp1        ; tmp1 = table_base + idx*4
+                // movsxd (%tmp1), %idx   ; idx = offset (reuses idx since we're done with it)
+                // add %idx, %tmp1        ; tmp1 = base + idx*4 + offset = target
+                // jmp *%tmp1
+
                 // lea start_of_jump_table(%rip), %tmp1
                 const lea_rex = RexPrefix.twoOp(tmp1_enc, 0, true, false);
                 try lea_rex.encode(sink);
