@@ -904,7 +904,10 @@ test "getOperands div" {
 
     getOperands(&inst_val, &visitor);
 
-    // DIV uses dividend_lo, dividend_hi, divisor; defines quotient, remainder
-    try testing.expectEqual(@as(usize, 3), state.uses.items.len); // dividend_lo, dividend_hi, divisor
-    try testing.expectEqual(@as(usize, 2), state.defs.items.len); // dst_quotient, dst_remainder
+    // DIV uses dividend_lo, dividend_hi (fixed to RAX/RDX), divisor (regular use)
+    // defines quotient, remainder (fixed to RAX/RDX)
+    try testing.expectEqual(@as(usize, 1), state.uses.items.len); // divisor only
+    try testing.expectEqual(@as(usize, 2), state.fixed_uses.items.len); // dividend_lo (RAX), dividend_hi (RDX)
+    try testing.expectEqual(@as(usize, 0), state.defs.items.len); // none - results use fixed defs
+    try testing.expectEqual(@as(usize, 2), state.fixed_defs.items.len); // dst_quotient (RAX), dst_remainder (RDX)
 }

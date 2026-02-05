@@ -949,15 +949,6 @@ pub const X64LowerBackend = struct {
         const lhs_gpr = Gpr.unwrapNew(lhs_reg);
         const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs_reg } };
 
-        // CMP lhs, rhs
-        ctx.emit(Inst{
-            .cmp_rmi_r = .{
-                .size = size,
-                .src = rhs_rmi,
-                .dst = lhs_gpr,
-            },
-        }) catch return null;
-
         // Allocate result
         const dst = ctx.allocTmp(ClifType.I8) catch return null;
         const dst_reg = dst.onlyReg() orelse return null;
@@ -968,9 +959,11 @@ pub const X64LowerBackend = struct {
         const intcc = inst_data.getIntCC() orelse return null;
         const cc = ccFromIntCC(intcc);
 
-        // Zero the destination register first using MOV immediate 0.
-        // This is necessary because SETCC only writes the low byte.
-        // Using 32-bit move to zero the upper 32 bits.
+        // 1. Zero the destination register BEFORE the comparison.
+        //    This is necessary because SETCC only writes the low byte.
+        //    Using 32-bit move to zero the upper 32 bits.
+        //    CRITICAL: Must be before CMP because .imm with 0 emits XOR which
+        //    modifies flags. If we zero after CMP, the XOR clobbers the flags.
         ctx.emit(Inst{
             .imm = .{
                 .dst_size = .size32,
@@ -979,7 +972,16 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        // SETCC
+        // 2. CMP lhs, rhs - sets flags for the comparison
+        ctx.emit(Inst{
+            .cmp_rmi_r = .{
+                .size = size,
+                .src = rhs_rmi,
+                .dst = lhs_gpr,
+            },
+        }) catch return null;
+
+        // 3. SETCC - reads flags and sets result byte
         ctx.emit(Inst{
             .setcc = .{
                 .cc = cc,

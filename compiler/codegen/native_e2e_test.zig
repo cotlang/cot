@@ -224,109 +224,106 @@ test "native: complex expression" {
 }
 
 // ============================================================================
-// BROKEN TESTS - These are expected to fail and track NATIVE_AOT_FIXES.md bugs
-// Uncomment one at a time as you fix each bug.
+// WORKING TESTS - These were fixed and now pass
 // ============================================================================
 
-// Task 2: Local variables - SIGSEGV
-// test "native: local variable" {
-//     const code =
-//         \\fn main() int {
-//         \\    let x = 10;
-//         \\    let y = 5;
-//         \\    return x + y;
-//         \\}
-//     ;
-//     try expectExitCode(std.testing.allocator, code, 15, "local_var");
-// }
+test "native: local variable" {
+    const code =
+        \\fn main() int {
+        \\    let x = 10;
+        \\    let y = 5;
+        \\    return x + y;
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 15, "local_var");
+}
 
-// Task 1: Function call (no params) - compiler panic
-// test "native: function call no params" {
-//     const code =
-//         \\fn get_five() int {
-//         \\    return 5;
-//         \\}
-//         \\
-//         \\fn main() int {
-//         \\    return get_five();
-//         \\}
-//     ;
-//     try expectExitCode(std.testing.allocator, code, 5, "func_no_params");
-// }
+test "native: function call no params" {
+    const code =
+        \\fn get_five() int {
+        \\    return 5;
+        \\}
+        \\
+        \\fn main() int {
+        \\    return get_five();
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 5, "func_no_params");
+}
 
-// Task 3: Function call with params - SIGSEGV
-// test "native: function call one param" {
-//     const code =
-//         \\fn double(x: int) int {
-//         \\    return x + x;
-//         \\}
-//         \\
-//         \\fn main() int {
-//         \\    return double(10);
-//         \\}
-//     ;
-//     try expectExitCode(std.testing.allocator, code, 20, "func_one_param");
-// }
+test "native: function call one param" {
+    const code =
+        \\fn double(x: int) int {
+        \\    return x + x;
+        \\}
+        \\
+        \\fn main() int {
+        \\    return double(10);
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 20, "func_one_param");
+}
 
-// Task 3: Function call with two params - SIGSEGV
-// test "native: function call two params" {
-//     const code =
-//         \\fn add(a: int, b: int) int {
-//         \\    return a + b;
-//         \\}
-//         \\
-//         \\fn main() int {
-//         \\    return add(10, 5);
-//         \\}
-//     ;
-//     try expectExitCode(std.testing.allocator, code, 15, "func_two_params");
-// }
+test "native: function call two params" {
+    const code =
+        \\fn add(a: int, b: int) int {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn main() int {
+        \\    return add(10, 5);
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 15, "func_two_params");
+}
 
-// Task 4: If/else - SIGSEGV
-// test "native: if true branch" {
-//     const code =
-//         \\fn main() int {
-//         \\    if 10 > 5 {
-//         \\        return 1;
-//         \\    } else {
-//         \\        return 0;
-//         \\    }
-//         \\}
-//     ;
-//     try expectExitCode(std.testing.allocator, code, 1, "if_true");
-// }
+test "native: if true branch" {
+    const code =
+        \\fn main() int {
+        \\    if 10 > 5 {
+        \\        return 1;
+        \\    } else {
+        \\        return 0;
+        \\    }
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 1, "if_true");
+}
 
-// Task 4: If/else - SIGSEGV
-// test "native: if false branch" {
-//     const code =
-//         \\fn main() int {
-//         \\    if 5 > 10 {
-//         \\        return 1;
-//         \\    } else {
-//         \\        return 0;
-//         \\    }
-//         \\}
-//     ;
-//     try expectExitCode(std.testing.allocator, code, 0, "if_false");
-// }
+test "native: if false branch" {
+    const code =
+        \\fn main() int {
+        \\    if 5 > 10 {
+        \\        return 1;
+        \\    } else {
+        \\        return 0;
+        \\    }
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 0, "if_false");
+}
 
-// Task 5: While loop
-// test "native: while loop sum" {
-//     const code =
-//         \\fn main() int {
-//         \\    let sum = 0;
-//         \\    let i = 1;
-//         \\    while i <= 10 {
-//         \\        sum = sum + i;
-//         \\        i = i + 1;
-//         \\    }
-//         \\    return sum;
-//         \\}
-//     ;
-//     try expectExitCode(std.testing.allocator, code, 55, "while_sum");
-// }
+test "native: while loop sum" {
+    const code =
+        \\fn main() int {
+        \\    let sum = 0;
+        \\    let i = 1;
+        \\    while i <= 10 {
+        \\        sum = sum + i;
+        \\        i = i + 1;
+        \\    }
+        \\    return sum;
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 55, "while_sum");
+}
 
-// Task 6: Recursion
+// ============================================================================
+// BROKEN TESTS - Known issues that need fixing
+// ============================================================================
+
+// Recursion with values across calls - caller-saved registers clobbered
+// See MEMORY.md issue #14: values in RCX/RDX/etc are destroyed by recursive call
 // test "native: factorial recursive" {
 //     const code =
 //         \\fn factorial(n: int) int {

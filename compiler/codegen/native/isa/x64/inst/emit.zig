@@ -1413,13 +1413,23 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
         },
 
         .jmp_cond => |jmp| {
-            // Conditional jump (rel32)
+            // Two-way conditional branch - emit both jumps like ARM64's cond_br.
+            // This ensures correctness regardless of block ordering.
+
+            // 1. Conditional jump to taken (6 bytes: 0F 8x + rel32)
             try sink.put1(0x0F);
             try sink.put1(0x80 + jmp.cc.getEnc());
             try sink.useLabelAtOffset(sink.curOffset(), jmp.taken, .jmp_rel_32);
             // Addend of -4 accounts for PC being after the 4-byte displacement
             try sink.putSimm32(-4);
-            // Note: not_taken is typically fall-through
+
+            // 2. Unconditional jump to not_taken (5 bytes: E9 + rel32)
+            // This is essential when not_taken is NOT the fall-through block.
+            // If not_taken IS the fall-through, this emits a jmp +0 which is
+            // slightly wasteful but correct.
+            try sink.put1(0xE9);
+            try sink.useLabelAtOffset(sink.curOffset(), jmp.not_taken, .jmp_rel_32);
+            try sink.putSimm32(-4);
         },
 
         .winch_jmp_if => |jmp| {
