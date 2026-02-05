@@ -698,27 +698,12 @@ fn generateGrowSliceBody(allocator: std.mem.Allocator, heap_ptr_global: u32, nex
     try code.emitLocalSet(8); // old_size
 
     // Allocate: new_ptr = heap_ptr, heap_ptr += aligned(new_cap * elem_size)
-    // alloc_size = (new_cap * elem_size + 7) & ~7
-    try code.emitLocalGet(6); // new_cap
-    try code.emitLocalGet(4); // elem_size
-    try code.emitI64Mul();
-    try code.emitI32WrapI64();
-    try code.emitI32Const(7);
-    try code.emitI32Add();
-    try code.emitI32Const(-8);
-    try code.emitI32And(); // aligned size on stack
-
+    // new_ptr = heap_ptr (before bump)
     try code.emitGlobalGet(heap_ptr_global);
-    try code.emitLocalTee(7); // new_ptr = heap_ptr
+    try code.emitLocalSet(7); // new_ptr = heap_ptr
 
-    // heap_ptr += alloc_size (swap order: alloc_size is below new_ptr on stack)
-    // We need: heap_ptr = new_ptr + alloc_size
-    // Stack has: [alloc_size, new_ptr] after local.tee
-    // Actually local.tee leaves new_ptr on stack, alloc_size was consumed earlier
-    // Let me redo this...
-
-    // Stack is empty after local.set(8)
-    // Get alloc_size again
+    // heap_ptr += aligned(new_cap * elem_size)
+    // alloc_size = (new_cap * elem_size + 7) & ~7
     try code.emitLocalGet(6); // new_cap
     try code.emitLocalGet(4); // elem_size
     try code.emitI64Mul();

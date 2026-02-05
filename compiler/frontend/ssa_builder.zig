@@ -974,8 +974,12 @@ pub const SSABuilder = struct {
     fn convertSliceHeader(self: *SSABuilder, s: ir.SliceHeader, type_idx: TypeIndex, cur: *Block) !*Value {
         const ptr = try self.convertNode(s.ptr) orelse return error.MissingValue;
         const len = try self.convertNode(s.len) orelse return error.MissingValue;
+        const cap = try self.convertNode(s.cap) orelse return error.MissingValue;
         const val = try self.func.newValue(.slice_make, type_idx, cur, self.cur_pos);
-        val.addArg2(ptr, len);
+        // Go slice: (ptr, len, cap) - 3 arguments
+        val.addArg(ptr);
+        val.addArg(len);
+        val.addArg(cap);
         try cur.addValue(self.allocator, val);
         return val;
     }
