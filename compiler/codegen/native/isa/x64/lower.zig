@@ -621,7 +621,7 @@ pub const X64LowerBackend = struct {
         ctx.emit(Inst{
             .alu_rmi_r = .{
                 .size = size,
-                .op = .add, // Placeholder - need IMUL opcode
+                .op = .imul,
                 .src = rhs_rmi,
                 .dst = dst_gpr,
             },

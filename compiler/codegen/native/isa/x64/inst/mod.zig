@@ -1792,6 +1792,8 @@ pub const AluRmiROpcode = enum {
     adc,
     /// Subtract with borrow.
     sbb,
+    /// Signed multiply (two-operand form: dst = dst * src).
+    imul,
 
     pub fn name(self: AluRmiROpcode) []const u8 {
         return switch (self) {
@@ -1802,6 +1804,7 @@ pub const AluRmiROpcode = enum {
             .xor => "xor",
             .adc => "adc",
             .sbb => "sbb",
+            .imul => "imul",
         };
     }
 };

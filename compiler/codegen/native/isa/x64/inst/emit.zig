@@ -830,6 +830,7 @@ fn aluOpcodes(op: AluRmiROpcode, size: OperandSize) struct { prefix: ?u8, opcode
         .xor => 0x31,
         .adc => 0x11,
         .sbb => 0x19,
+        .imul => unreachable, // Handled specially in emit
     };
     const prefix: ?u8 = if (size == .size16) 0x66 else null;
     return .{ .prefix = prefix, .opcode = base };
@@ -845,6 +846,7 @@ fn aluImmOpcodeExt(op: AluRmiROpcode) u8 {
         .@"and" => 4,
         .sub => 5,
         .xor => 6,
+        .imul => unreachable, // Handled specially in emit
     };
 }
 
@@ -1049,6 +1051,61 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             const dst_enc = alu.dst.toReg().hwEnc();
             const size = alu.size;
             const op = alu.op;
+
+            // IMUL has a different encoding than standard ALU ops
+            if (op == .imul) {
+                switch (alu.src.inner) {
+                    .reg => |r| {
+                        const gpr = Gpr{ .reg = r };
+                        const src_enc = gpr.hwEnc();
+                        // IMUL r64, r/m64 : 0F AF /r (dst in reg, src in r/m)
+                        if (size == .size16) try sink.put1(0x66);
+                        const rex = RexPrefix.twoOp(dst_enc, src_enc, size == .size64, false);
+                        try rex.encode(sink);
+                        try sink.put1(0x0F);
+                        try sink.put1(0xAF);
+                        try emitModrmReg(sink, dst_enc, src_enc);
+                    },
+                    .mem => |amode| {
+                        const finalized = memFinalize(amode, state);
+                        if (size == .size16) try sink.put1(0x66);
+                        const rex = switch (finalized.amode) {
+                            .imm_reg => |m| RexPrefix.memOp(dst_enc, m.base.hwEnc(), size == .size64, false),
+                            .imm_reg_reg_shift => |m| RexPrefix.threeOp(dst_enc, m.index.hwEnc(), m.base.hwEnc(), size == .size64, false),
+                            .rip_relative => RexPrefix.twoOp(dst_enc, 0, size == .size64, false),
+                        };
+                        try rex.encode(sink);
+                        try sink.put1(0x0F);
+                        try sink.put1(0xAF);
+                        try emitModrmSibDisp(sink, dst_enc, finalized.amode, 0, null);
+                    },
+                    .imm => |imm_val| {
+                        // Three-operand form: IMUL r64, r/m64, imm8/32
+                        // For now, we'll load the immediate to a temp register
+                        // Actually, IMUL has a special form: 6B /r ib or 69 /r id
+                        // IMUL r64, r/m64, imm8: 6B /r ib
+                        // IMUL r64, r/m64, imm32: 69 /r id
+                        // But this requires the src to be in the r/m field, which is dst here.
+                        // This is complex - for now just emit a mov + imul sequence via separate instructions
+                        // Actually the pattern is: IMUL dst, dst, imm (dst = dst * imm)
+                        const imm_i32: i32 = @bitCast(imm_val);
+                        const use_short = imm_i32 >= -128 and imm_i32 <= 127;
+                        if (size == .size16) try sink.put1(0x66);
+                        const rex = RexPrefix.twoOp(dst_enc, dst_enc, size == .size64, false);
+                        try rex.encode(sink);
+                        if (use_short) {
+                            try sink.put1(0x6B); // IMUL r, r/m, imm8
+                            try emitModrmReg(sink, dst_enc, dst_enc);
+                            try sink.put1(@truncate(imm_val));
+                        } else {
+                            try sink.put1(0x69); // IMUL r, r/m, imm32
+                            try emitModrmReg(sink, dst_enc, dst_enc);
+                            try sink.put4(imm_val);
+                        }
+                    },
+                }
+                return;
+            }
 
             switch (alu.src.inner) {
                 .reg => |r| {
