@@ -148,6 +148,7 @@ pub const Checker = struct {
                 try self.scope.define(Symbol.init(u.name, .type_name, union_type, idx, false));
                 try self.types.registerNamed(u.name, union_type);
             },
+            // Go reference: types2/alias.go - Alias stores RHS and resolves through it
             .type_alias => |t| {
                 if (self.scope.isDefined(t.name)) { self.err.errorWithCode(t.span.start, .e302, "redefined identifier"); return; }
                 const target_type = self.resolveTypeExpr(t.target) catch invalid_type;

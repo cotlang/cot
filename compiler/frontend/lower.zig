@@ -586,6 +586,7 @@ pub const Lowerer = struct {
         const target_expr = target_node.asExpr() orelse return;
 
         // Handle compound assignment (+=, -=, etc.)
+        // Go reference: walk/assign.go:50-52 - Rewrite x op= y into x = x op y
         const value_node = if (assign.op != .assign) blk: {
             const target_val = try self.lowerExprNode(assign.target);
             const rhs_val = try self.lowerExprNode(assign.value);

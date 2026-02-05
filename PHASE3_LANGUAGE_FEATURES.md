@@ -703,8 +703,32 @@ x |= flag // x = x | flag
 **Reference Implementation:**
 
 Go compound assignment:
-- `~/learning/go/src/cmd/compile/internal/syntax/parser.go` - simpleStmt
-- `~/learning/go/src/cmd/compile/internal/walk/assign.go` - assignment lowering
+- `~/learning/go/src/cmd/compile/internal/syntax/parser.go:2164-2168` - parse AssignOp
+- `~/learning/go/src/cmd/compile/internal/walk/assign.go:50-52` - rewrite to x = x op y
+
+**Implementation Status:** ✅ COMPLETE (Wave 1)
+
+| Component | Reference | Cot File:Line | Evidence |
+|-----------|-----------|---------------|----------|
+| Desugar | Go `walk/assign.go:50-52` | `lower.zig:588-594` | Rewrite x op= y → x = x op y |
+
+**Go pattern (walk/assign.go:50-52):**
+```go
+if n.Op() == ir.OASOP {
+    // Rewrite x op= y into x = x op y.
+    n = ir.NewAssignStmt(left, ir.NewBinaryExpr(n.AsOp, left, right))
+}
+```
+
+**Cot port (lower.zig:588-594):**
+```zig
+// Go reference: walk/assign.go:50-52 - Rewrite x op= y into x = x op y
+const value_node = if (assign.op != .assign) blk: {
+    const target_val = try self.lowerExprNode(assign.target);
+    const rhs_val = try self.lowerExprNode(assign.value);
+    break :blk try fb.emitBinary(tokenToBinaryOp(assign.op), target_val, rhs_val, ...);
+} else try self.lowerExprNode(assign.value);
+```
 
 **Pipeline Changes:**
 
