@@ -157,17 +157,6 @@ pub const OperandVisitor = union(enum) {
         }
     }
 
-    /// Mark a register as used (read), at late position.
-    /// Use this when the register must survive throughout the entire instruction,
-    /// preventing the regalloc from reusing it for defs within the same instruction.
-    /// Reference: reg.rs:405 fn reg_use (with late position for special cases)
-    pub fn regUseLate(self: *OperandVisitor, reg: *Reg) void {
-        switch (self.*) {
-            .collector => |c| c.uses.append(c.allocator, reg.*) catch unreachable,
-            .callback => |cb| cb.func(cb.ctx, reg, .any, .use, .late),
-        }
-    }
-
     /// Mark a register as defined (written), at late position.
     /// Reference: reg.rs:417 fn reg_def
     pub fn regDef(self: *OperandVisitor, reg: *Writable(Reg)) void {
