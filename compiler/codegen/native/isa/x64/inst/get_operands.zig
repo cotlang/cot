@@ -201,8 +201,13 @@ pub const OperandVisitor = union(enum) {
     pub fn regFixedUse(self: *OperandVisitor, vreg: Reg, preg: PReg) void {
         switch (self.*) {
             .collector => |c| c.fixed_uses.append(c.allocator, .{ .vreg = vreg, .preg = preg }) catch unreachable,
-            .callback => {
-                // Fixed registers don't get allocation applied - they ARE the allocation
+            .callback => |cb| {
+                // Call callback to consume allocation and keep allocation index in sync.
+                // The register value in the instruction doesn't need updating for implicit
+                // operands (like dividend_lo/hi in division) - we just need to consume
+                // the allocation slot.
+                var reg_copy = vreg;
+                cb.func(cb.ctx, &reg_copy, .fixed_reg, .use, .early);
             },
         }
     }
@@ -213,8 +218,10 @@ pub const OperandVisitor = union(enum) {
     pub fn regFixedDef(self: *OperandVisitor, vreg: Writable(Reg), preg: PReg) void {
         switch (self.*) {
             .collector => |c| c.fixed_defs.append(c.allocator, .{ .vreg = vreg, .preg = preg }) catch unreachable,
-            .callback => {
-                // Fixed registers don't get allocation applied - they ARE the allocation
+            .callback => |cb| {
+                // Call callback to consume allocation and keep allocation index in sync.
+                var reg_copy = vreg.toReg();
+                cb.func(cb.ctx, &reg_copy, .fixed_reg, .def, .late);
             },
         }
     }
@@ -445,12 +452,14 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         // Division
         //=====================================================================
         .div => |*p| {
-            // DIV/IDIV: uses dividend_lo, dividend_hi, divisor; defines quotient, remainder
-            visitor.gprUse(&p.dividend_lo);
-            visitor.gprUse(&p.dividend_hi);
+            // DIV/IDIV: dividend_lo MUST be in RAX, dividend_hi MUST be in RDX
+            // Port of Cranelift inst/mod.rs:879-882
+            visitor.regFixedUse(p.dividend_lo.toReg(), regs.gprPreg(regs.GprEnc.RAX));
+            visitor.regFixedUse(p.dividend_hi.toReg(), regs.gprPreg(regs.GprEnc.RDX));
             gprMemOperands(&p.divisor, visitor);
-            visitor.gprDef(&p.dst_quotient);
-            visitor.gprDef(&p.dst_remainder);
+            // dst_quotient is defined in RAX, dst_remainder in RDX
+            visitor.regFixedDef(Writable(Reg).fromReg(p.dst_quotient.toReg().toReg()), regs.gprPreg(regs.GprEnc.RAX));
+            visitor.regFixedDef(Writable(Reg).fromReg(p.dst_remainder.toReg().toReg()), regs.gprPreg(regs.GprEnc.RDX));
         },
 
         //=====================================================================

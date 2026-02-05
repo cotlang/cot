@@ -1385,7 +1385,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             // Near jump (rel32)
             try sink.put1(0xE9);
             try sink.useLabelAtOffset(sink.curOffset(), jmp.dst, .jmp_rel_32);
-            try sink.put4(0); // Placeholder for displacement
+            // Addend of -4 accounts for PC being after the 4-byte displacement
+            try sink.putSimm32(-4);
         },
 
         .jmp_unknown => |jmp| {
@@ -1416,7 +1417,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             try sink.put1(0x0F);
             try sink.put1(0x80 + jmp.cc.getEnc());
             try sink.useLabelAtOffset(sink.curOffset(), jmp.taken, .jmp_rel_32);
-            try sink.put4(0); // Placeholder for displacement
+            // Addend of -4 accounts for PC being after the 4-byte displacement
+            try sink.putSimm32(-4);
             // Note: not_taken is typically fall-through
         },
 
@@ -1425,7 +1427,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             try sink.put1(0x0F);
             try sink.put1(0x80 + jmp.cc.getEnc());
             try sink.useLabelAtOffset(sink.curOffset(), jmp.taken, .jmp_rel_32);
-            try sink.put4(0);
+            // Addend of -4 accounts for PC being after the 4-byte displacement
+            try sink.putSimm32(-4);
         },
 
         //---------------------------------------------------------------------
@@ -2801,7 +2804,8 @@ fn emitCondJmp(sink: *MachBuffer, cc: CC, target: MachLabel) !void {
     try sink.put1(0x80 + @intFromEnum(cc));
     const offset = sink.curOffset();
     try sink.useLabelAtOffset(offset, target, .jmp_rel_32);
-    try sink.put4(0); // Placeholder for displacement
+    // Addend of -4 accounts for PC being after the 4-byte displacement
+    try sink.putSimm32(-4);
 }
 
 /// Emit an unconditional jump to a label.
@@ -2810,7 +2814,8 @@ fn emitUncondJmp(sink: *MachBuffer, target: MachLabel) !void {
     try sink.put1(0xE9);
     const offset = sink.curOffset();
     try sink.useLabelAtOffset(offset, target, .jmp_rel_32);
-    try sink.put4(0); // Placeholder for displacement
+    // Addend of -4 accounts for PC being after the 4-byte displacement
+    try sink.putSimm32(-4);
 }
 
 /// Emit a short conditional jump to a label (rel8).
@@ -2819,7 +2824,8 @@ fn emitCondJmpRel8(sink: *MachBuffer, cc: CC, target: MachLabel) !void {
     try sink.put1(0x70 + @intFromEnum(cc));
     const offset = sink.curOffset();
     try sink.useLabelAtOffset(offset, target, .jmp_rel_8);
-    try sink.put1(0xFE); // Placeholder for displacement
+    // Addend of -1 accounts for PC being after the 1-byte displacement
+    try sink.put1(@bitCast(@as(i8, -1)));
 }
 
 /// Emit a short unconditional jump to a label (rel8).
@@ -2828,7 +2834,8 @@ fn emitUncondJmpRel8(sink: *MachBuffer, target: MachLabel) !void {
     try sink.put1(0xEB);
     const offset = sink.curOffset();
     try sink.useLabelAtOffset(offset, target, .jmp_rel_8);
-    try sink.put1(0xFE); // Placeholder for displacement
+    // Addend of -1 accounts for PC being after the 1-byte displacement
+    try sink.put1(@bitCast(@as(i8, -1)));
 }
 
 //=============================================================================

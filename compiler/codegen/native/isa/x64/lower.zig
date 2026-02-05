@@ -699,10 +699,33 @@ pub const X64LowerBackend = struct {
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
         // Division uses RAX:RDX / divisor, quotient in RAX, remainder in RDX
-        // For now, emit the div instruction with appropriate setup
+        // First, we need to set up RDX appropriately:
+        // - For signed division: sign-extend RAX into RDX (CQO/CDQ)
+        // - For unsigned division: zero RDX (XOR RDX, RDX)
 
-        // Placeholder for high part of dividend
         const rdx_gpr = Gpr.unwrapNew(regs.rdx());
+        const writable_rdx = WritableGpr.fromReg(rdx_gpr);
+
+        if (is_signed) {
+            // Sign-extend RAX into RDX (CQO for 64-bit, CDQ for 32-bit)
+            ctx.emit(Inst{
+                .sign_extend_data = .{
+                    .size = size,
+                    .src = dividend_gpr,
+                    .dst = writable_rdx,
+                },
+            }) catch return null;
+        } else {
+            // Zero RDX for unsigned division (XOR RDX, RDX)
+            ctx.emit(Inst{
+                .alu_rmi_r = .{
+                    .size = size,
+                    .op = .xor,
+                    .src = GprMemImm{ .inner = RegMemImm{ .reg = rdx_gpr.toReg() } },
+                    .dst = writable_rdx,
+                },
+            }) catch return null;
+        }
 
         ctx.emit(Inst{
             .div = .{
@@ -944,6 +967,17 @@ pub const X64LowerBackend = struct {
         const inst_data = ctx.data(ir_inst);
         const intcc = inst_data.getIntCC() orelse return null;
         const cc = ccFromIntCC(intcc);
+
+        // Zero the destination register first using MOV immediate 0.
+        // This is necessary because SETCC only writes the low byte.
+        // Using 32-bit move to zero the upper 32 bits.
+        ctx.emit(Inst{
+            .imm = .{
+                .dst_size = .size32,
+                .simm64 = 0,
+                .dst = dst_gpr,
+            },
+        }) catch return null;
 
         // SETCC
         ctx.emit(Inst{
