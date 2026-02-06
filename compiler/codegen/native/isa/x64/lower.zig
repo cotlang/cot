@@ -1646,18 +1646,32 @@ pub const X64LowerBackend = struct {
     fn lowerSelect(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         _ = self;
         const dst_ty = ctx.outputTy(ir_inst, 0);
+        // CLIF select: args = [cond, if_true, if_false]
+        // Returns if_true when cond != 0, else if_false
+        const condition = ctx.putInputInRegs(ir_inst, 0);
         const consequent = ctx.putInputInRegs(ir_inst, 1);
         const alternative = ctx.putInputInRegs(ir_inst, 2);
         const dst = ctx.allocTmp(dst_ty) catch return null;
 
+        const cond_reg = condition.onlyReg() orelse return null;
         const cons_reg = consequent.onlyReg() orelse return null;
         const alt_reg = alternative.onlyReg() orelse return null;
         const dst_reg = dst.onlyReg() orelse return null;
+        const cond_gpr = Gpr.unwrapNew(cond_reg);
         const cons_gpr = Gpr.unwrapNew(cons_reg);
         const alt_gpr = Gpr.unwrapNew(alt_reg);
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
-        // MOV alternative, dst
+        // TEST condition, condition - sets ZF based on condition value
+        ctx.emit(Inst{
+            .test_rmi_r = .{
+                .size = .size64,
+                .src = GprMemImm.unwrapNew(RegMemImm.fromReg(cond_gpr.toReg())),
+                .dst = cond_gpr,
+            },
+        }) catch return null;
+
+        // MOV alternative, dst - prepare default value
         ctx.emit(Inst{
             .mov_r_r = .{
                 .size = operandSizeFromType(dst_ty),
@@ -1666,11 +1680,11 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        // CMOV consequent, dst
+        // CMOVNZ consequent, dst - if condition != 0, use consequent
         ctx.emit(Inst{
             .cmove = .{
                 .size = operandSizeFromType(dst_ty),
-                .cc = .nz, // Based on condition
+                .cc = .nz, // CMOVNZ: move if ZF=0 (i.e., condition != 0)
                 .src = GprMem{ .inner = RegMem{ .reg = cons_gpr.toReg() } },
                 .dst = dst_gpr,
             },
