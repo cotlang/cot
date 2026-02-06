@@ -68,6 +68,7 @@ pub const AddrOffset = struct { base: NodeIndex, offset: i64 };
 pub const AddrIndex = struct { base: NodeIndex, index: NodeIndex, elem_size: u32 };
 pub const Call = struct { func_name: []const u8, args: []const NodeIndex, is_builtin: bool };
 pub const CallIndirect = struct { callee: NodeIndex, args: []const NodeIndex };
+pub const ClosureCall = struct { callee: NodeIndex, context: NodeIndex, args: []const NodeIndex };
 pub const Return = struct { value: ?NodeIndex };
 pub const Jump = struct { target: BlockIndex };
 pub const Branch = struct { condition: NodeIndex, then_block: BlockIndex, else_block: BlockIndex };
@@ -94,6 +95,7 @@ pub const PtrCast = struct { operand: NodeIndex };
 pub const IntToPtr = struct { operand: NodeIndex };
 pub const PtrToInt = struct { operand: NodeIndex };
 pub const TypeMetadata = struct { type_name: []const u8 };
+pub const WasmGlobalRead = struct { global_idx: u32 };
 
 pub const Node = struct {
     type_idx: TypeIndex,
@@ -112,7 +114,7 @@ pub const Node = struct {
         ptr_load: PtrLoad, ptr_store: PtrStore, ptr_field: PtrField, ptr_field_store: PtrFieldStore,
         ptr_load_value: PtrLoadValue, ptr_store_value: PtrStoreValue,
         addr_offset: AddrOffset, addr_index: AddrIndex,
-        call: Call, call_indirect: CallIndirect, ret: Return, jump: Jump, branch: Branch, phi: Phi, select: Select,
+        call: Call, call_indirect: CallIndirect, closure_call: ClosureCall, ret: Return, jump: Jump, branch: Branch, phi: Phi, select: Select,
         convert: Convert,
         list_new: ListNew, list_push: ListPush, list_get: ListGet, list_set: ListSet, list_len: ListLen, list_free: ListLen,
         map_new: MapNew, map_set: MapSet, map_get: MapGet, map_has: MapHas, map_free: ListLen,
@@ -120,13 +122,14 @@ pub const Node = struct {
         union_init: UnionInit, union_tag: UnionTag, union_payload: UnionPayload,
         ptr_cast: PtrCast, int_to_ptr: IntToPtr, ptr_to_int: PtrToInt,
         type_metadata: TypeMetadata,
+        wasm_global_read: WasmGlobalRead,
         nop: void,
     };
 
     pub fn init(data: Data, type_idx: TypeIndex, span: Span) Node { return .{ .type_idx = type_idx, .span = span, .block = null_block, .data = data }; }
     pub fn withBlock(self: Node, block: BlockIndex) Node { var n = self; n.block = block; return n; }
     pub fn isTerminator(self: *const Node) bool { return switch (self.data) { .ret, .jump, .branch => true, else => false }; }
-    pub fn hasSideEffects(self: *const Node) bool { return switch (self.data) { .store_local, .ptr_store, .ptr_store_value, .ptr_field_store, .store_local_field, .call, .call_indirect, .ret, .jump, .branch, .list_new, .list_push, .list_set, .list_free, .map_new, .map_set, .map_free => true, else => false }; }
+    pub fn hasSideEffects(self: *const Node) bool { return switch (self.data) { .store_local, .ptr_store, .ptr_store_value, .ptr_field_store, .store_local_field, .call, .call_indirect, .closure_call, .ret, .jump, .branch, .list_new, .list_push, .list_set, .list_free, .map_new, .map_set, .map_free => true, else => false }; }
     pub fn isConstant(self: *const Node) bool { return switch (self.data) { .const_int, .const_float, .const_bool, .const_null, .const_slice => true, else => false }; }
 };
 
@@ -318,6 +321,10 @@ pub const FuncBuilder = struct {
         return self.emit(Node.init(.{ .call_indirect = .{ .callee = callee, .args = try self.allocator.dupe(NodeIndex, args) } }, type_idx, span));
     }
 
+    pub fn emitClosureCall(self: *FuncBuilder, callee: NodeIndex, context: NodeIndex, args: []const NodeIndex, type_idx: TypeIndex, span: Span) !NodeIndex {
+        return self.emit(Node.init(.{ .closure_call = .{ .callee = callee, .context = context, .args = try self.allocator.dupe(NodeIndex, args) } }, type_idx, span));
+    }
+
     pub fn emitRet(self: *FuncBuilder, value: ?NodeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .ret = .{ .value = value } }, TypeRegistry.VOID, span)); }
     pub fn emitJump(self: *FuncBuilder, target: BlockIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .jump = .{ .target = target } }, TypeRegistry.VOID, span)); }
     pub fn emitBranch(self: *FuncBuilder, condition: NodeIndex, then_block: BlockIndex, else_block: BlockIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .branch = .{ .condition = condition, .then_block = then_block, .else_block = else_block } }, TypeRegistry.VOID, span)); }
@@ -335,6 +342,7 @@ pub const FuncBuilder = struct {
     pub fn emitMakeSlice(self: *FuncBuilder, base_ptr: NodeIndex, start: ?NodeIndex, end: NodeIndex, elem_size: u32, type_idx: TypeIndex, span: Span) !NodeIndex { return self.emitSliceValue(base_ptr, start, end, elem_size, type_idx, span); }
     pub fn emitTypeMetadata(self: *FuncBuilder, type_name: []const u8, span: Span) !NodeIndex { return self.emit(Node.init(.{ .type_metadata = .{ .type_name = type_name } }, TypeRegistry.I64, span)); }
     pub fn emitUnionInit(self: *FuncBuilder, variant_idx: u32, payload: ?NodeIndex, type_idx: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .union_init = .{ .variant_idx = variant_idx, .payload = payload } }, type_idx, span)); }
+    pub fn emitWasmGlobalRead(self: *FuncBuilder, global_idx: u32, type_idx: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .wasm_global_read = .{ .global_idx = global_idx } }, type_idx, span)); }
 
     pub fn build(self: *FuncBuilder) !Func {
         var params = std.ArrayListUnmanaged(Local){};

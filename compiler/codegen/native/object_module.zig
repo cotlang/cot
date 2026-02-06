@@ -373,24 +373,29 @@ pub const ObjectModule = struct {
     // =========================================================================
 
     /// Process a relocation from MachBufferFinalized.
+    /// Mirrors Cranelift's process_reloc: stores the symbolic target without resolving.
+    /// Resolution happens later in writeMachO/writeELF (Cranelift: finish → get_symbol).
     fn processRelocation(self: *Self, code_base: u32, reloc: *const FinalizedMachReloc) !void {
-        const target_name = try self.resolveRelocTarget(reloc.target);
-
         try self.relocations.append(self.allocator, .{
             .offset = code_base + reloc.offset,
-            .target = target_name,
+            .target = reloc.target,
             .kind = reloc.kind,
             .addend = reloc.addend,
         });
     }
 
     /// Resolve a relocation target to a symbol name.
+    /// Mirrors Cranelift's get_symbol() in finish():
+    ///   - User → look up in external_names (Cranelift: self.functions[id].unwrap().0)
+    ///   - LibCall → well-known name
+    ///   - Func → find containing function by offset
     fn resolveRelocTarget(self: *Self, target: FinalizedRelocTarget) ![]const u8 {
         return switch (target) {
             .ExternalName => |name| switch (name) {
                 .User => |ref| blk: {
                     if (ref.index < self.external_names.items.len) {
-                        break :blk self.external_names.items[ref.index];
+                        const resolved = self.external_names.items[ref.index];
+                        if (resolved.len > 0) break :blk resolved;
                     }
                     // Fallback for unregistered external names
                     break :blk try std.fmt.allocPrint(self.allocator, "_func_{d}", .{ref.index});
@@ -492,13 +497,15 @@ pub const ObjectModule = struct {
             }
         }
 
-        // Add relocations (convert from internal format)
+        // Resolve and add relocations (Cranelift: finish() → get_symbol() → add_relocation())
+        // All functions are declared and defined before this point, so all targets resolve.
         for (self.relocations.items) |reloc| {
+            const target_name = try self.resolveRelocTarget(reloc.target);
             const mach_reloc_type = machORelocType(reloc.kind, self.target_arch);
             if (mach_reloc_type == macho.ARM64_RELOC_BRANCH26) {
-                try macho_writer.addRelocation(reloc.offset, reloc.target);
+                try macho_writer.addRelocation(reloc.offset, target_name);
             } else {
-                try macho_writer.addDataRelocation(reloc.offset, reloc.target, mach_reloc_type);
+                try macho_writer.addDataRelocation(reloc.offset, target_name, mach_reloc_type);
             }
         }
 
@@ -542,11 +549,11 @@ pub const ObjectModule = struct {
             }
         }
 
-        // Add relocations (convert from internal format)
+        // Resolve and add relocations (Cranelift: finish() → get_symbol() → add_relocation())
         for (self.relocations.items) |reloc| {
-            // Convert relocation kind to ELF relocation type
+            const target_name = try self.resolveRelocTarget(reloc.target);
             const elf_rel_type = elfRelocType(reloc.kind, self.target_arch);
-            try elf_writer.addRelocationWithType(reloc.offset, reloc.target, elf_rel_type, reloc.addend);
+            try elf_writer.addRelocationWithType(reloc.offset, target_name, elf_rel_type, reloc.addend);
         }
 
         try elf_writer.write(writer);
@@ -558,11 +565,15 @@ pub const ObjectModule = struct {
 // =============================================================================
 
 /// Internal relocation record.
+/// Internal relocation record.
+/// Mirrors Cranelift's ObjectRelocRecord: stores the symbolic target
+/// (not yet resolved to a name). Resolution happens in finish/write.
 const ObjectReloc = struct {
     /// Offset in the text section.
     offset: u32,
-    /// Target symbol name.
-    target: []const u8,
+    /// Symbolic relocation target (resolved to name in finish).
+    /// Mirrors Cranelift's ObjectRelocRecord.name: ModuleRelocTarget.
+    target: FinalizedRelocTarget,
     /// Relocation kind (from MachBuffer).
     kind: Reloc,
     /// Addend.

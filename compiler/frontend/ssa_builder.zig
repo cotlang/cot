@@ -285,11 +285,19 @@ pub const SSABuilder = struct {
                 break :blk val;
             },
 
+            .wasm_global_read => |g| blk: {
+                const val = try self.func.newValue(.wasm_global_get, node.type_idx, cur, self.cur_pos);
+                val.aux_int = @intCast(g.global_idx);
+                try cur.addValue(self.allocator, val);
+                break :blk val;
+            },
+
             .binary => |b| try self.convertBinary(b, node.type_idx, cur),
             .unary => |u| try self.convertUnary(u, node.type_idx, cur),
 
             .call => |c| try self.convertCall(c.func_name, c.args, node.type_idx, cur),
             .call_indirect => |c| try self.convertCallIndirect(c.callee, c.args, node.type_idx, cur),
+            .closure_call => |c| try self.convertClosureCall(c.callee, c.context, c.args, node.type_idx, cur),
 
             .ret => |r| blk: {
                 cur.kind = .ret;
@@ -645,8 +653,22 @@ pub const SSABuilder = struct {
 
     fn convertCallIndirect(self: *SSABuilder, callee_idx: ir.NodeIndex, args: []const ir.NodeIndex, type_idx: TypeIndex, cur: *Block) !*Value {
         const callee = try self.convertNode(callee_idx) orelse return error.MissingValue;
+        const call_val = try self.func.newValue(.inter_call, type_idx, cur, self.cur_pos);
+        try call_val.addArgAlloc(callee, self.allocator);
+        for (args) |arg_idx| {
+            const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
+            try call_val.addArgAlloc(arg_val, self.allocator);
+        }
+        try cur.addValue(self.allocator, call_val);
+        return call_val;
+    }
+
+    fn convertClosureCall(self: *SSABuilder, callee_idx: ir.NodeIndex, context_idx: ir.NodeIndex, args: []const ir.NodeIndex, type_idx: TypeIndex, cur: *Block) !*Value {
+        const callee = try self.convertNode(callee_idx) orelse return error.MissingValue;
+        const context = try self.convertNode(context_idx) orelse return error.MissingValue;
         const call_val = try self.func.newValue(.closure_call, type_idx, cur, self.cur_pos);
         try call_val.addArgAlloc(callee, self.allocator);
+        try call_val.addArgAlloc(context, self.allocator);
         for (args) |arg_idx| {
             const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
             try call_val.addArgAlloc(arg_val, self.allocator);

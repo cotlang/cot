@@ -93,6 +93,9 @@ pub const WasmFuncTranslator = struct {
     /// Mapping from function_index -> type_index.
     /// Port of wasmtime_environ module.functions[].signature.
     func_to_type: []const u32,
+    /// Table elements from the element section: table_index -> function_index.
+    /// Used for AOT call_indirect resolution.
+    table_elements: []const u32,
 
     const Self = @This();
 
@@ -103,6 +106,7 @@ pub const WasmFuncTranslator = struct {
         globals: []const WasmGlobalType,
         func_types: []const WasmFuncType,
         func_to_type: []const u32,
+        table_elements: []const u32,
     ) Self {
         return .{
             .allocator = allocator,
@@ -110,12 +114,13 @@ pub const WasmFuncTranslator = struct {
             .globals = globals,
             .func_types = func_types,
             .func_to_type = func_to_type,
+            .table_elements = table_elements,
         };
     }
 
     /// Create a new translator without module info (backwards compatibility).
     pub fn initWithoutGlobals(allocator: std.mem.Allocator) Self {
-        return init(allocator, &[_]WasmGlobalType{}, &[_]WasmFuncType{}, &[_]u32{});
+        return init(allocator, &[_]WasmGlobalType{}, &[_]WasmFuncType{}, &[_]u32{}, &[_]u32{});
     }
 
     /// Deallocate storage.
@@ -162,7 +167,7 @@ pub const WasmFuncTranslator = struct {
         var builder = FunctionBuilder.init(func, &self.builder_ctx);
 
         // 3. Create translator with module info for type lookup
-        var translator = FuncTranslator.init(self.allocator, &builder, self.globals, self.func_types, self.func_to_type);
+        var translator = FuncTranslator.init(self.allocator, &builder, self.globals, self.func_types, self.func_to_type, self.table_elements);
         defer translator.deinit();
 
         // 4. Calculate total number of locals (params + declared locals)

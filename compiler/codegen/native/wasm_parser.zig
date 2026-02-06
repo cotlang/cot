@@ -19,6 +19,9 @@ pub const WasmModule = struct {
     exports: []Export,
     code: []FuncCode,
     data_segments: []DataSegment,
+    /// Table element entries: table_index -> function_index mapping.
+    /// Populated from the element section. Used for AOT call_indirect.
+    table_elements: []u32,
 
     pub fn deinit(self: *WasmModule) void {
         for (self.types) |*t| {
@@ -34,6 +37,7 @@ pub const WasmModule = struct {
         self.allocator.free(self.code);
         for (self.data_segments) |*d| self.allocator.free(d.data);
         self.allocator.free(self.data_segments);
+        self.allocator.free(self.table_elements);
     }
 };
 
@@ -102,6 +106,7 @@ pub const Parser = struct {
     exports: std.ArrayListUnmanaged(Export),
     code: std.ArrayListUnmanaged(FuncCode),
     data_segments: std.ArrayListUnmanaged(DataSegment),
+    table_elements: std.ArrayListUnmanaged(u32),
 
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Parser {
         return .{
@@ -115,6 +120,7 @@ pub const Parser = struct {
             .exports = .{},
             .code = .{},
             .data_segments = .{},
+            .table_elements = .{},
         };
     }
 
@@ -132,6 +138,7 @@ pub const Parser = struct {
         self.code.deinit(self.allocator);
         for (self.data_segments.items) |*d| self.allocator.free(d.data);
         self.data_segments.deinit(self.allocator);
+        self.table_elements.deinit(self.allocator);
     }
 
     pub fn parse(self: *Parser) !WasmModule {
@@ -146,6 +153,7 @@ pub const Parser = struct {
             .exports = try self.exports.toOwnedSlice(self.allocator),
             .code = try self.code.toOwnedSlice(self.allocator),
             .data_segments = try self.data_segments.toOwnedSlice(self.allocator),
+            .table_elements = try self.table_elements.toOwnedSlice(self.allocator),
         };
     }
 
@@ -165,9 +173,11 @@ pub const Parser = struct {
             switch (section_id) {
                 @intFromEnum(wasm.Section.type) => try self.parseTypeSection(section_end),
                 @intFromEnum(wasm.Section.function) => try self.parseFunctionSection(section_end),
+                @intFromEnum(wasm.Section.table) => self.pos = section_end, // Table declaration (we only need element data)
                 @intFromEnum(wasm.Section.memory) => try self.parseMemorySection(section_end),
                 @intFromEnum(wasm.Section.global) => try self.parseGlobalSection(section_end),
                 @intFromEnum(wasm.Section.@"export") => try self.parseExportSection(section_end),
+                @intFromEnum(wasm.Section.element) => try self.parseElementSection(section_end),
                 @intFromEnum(wasm.Section.code) => try self.parseCodeSection(section_end),
                 @intFromEnum(wasm.Section.data) => try self.parseDataSection(section_end),
                 else => self.pos = section_end, // Skip unknown sections
@@ -328,6 +338,72 @@ pub const Parser = struct {
                 .offset = offset,
                 .data = data,
             });
+        }
+    }
+
+    /// Parse the element section (section 9).
+    /// Extracts function indices for active table initialization segments.
+    /// Reference: wasmparser readers/core/elements.rs — flag-based parsing
+    /// Wasm spec: flags encode kind (bit 0 = passive/declared, bit 1 = explicit table, bit 2 = expressions)
+    fn parseElementSection(self: *Parser, _: usize) !void {
+        const count = self.readULEB128();
+        for (0..@intCast(count)) |_| {
+            const flags: u32 = @intCast(self.readULEB128());
+
+            // wasmparser: bit 0 determines active vs passive/declared
+            const is_active = (flags & 0b001) == 0;
+            const has_explicit_table = (flags & 0b010) != 0;
+            const has_expressions = (flags & 0b100) != 0;
+
+            // Active segments have optional table index + offset expression
+            if (is_active) {
+                if (has_explicit_table) {
+                    _ = self.readULEB128(); // table_index (we only use table 0)
+                }
+                self.skipConstExpr(); // offset expression
+            }
+
+            // Non-kind-0 segments have an elemkind or reftype byte
+            // wasmparser: `if flags & 0b011 != 0` — covers kinds 1, 2, 3 (and 5, 6, 7)
+            if ((flags & 0b011) != 0) {
+                _ = self.readByte(); // elemkind (0x00 = funcref) or reftype
+            }
+
+            // Read element items
+            const num_elems = self.readULEB128();
+            if (has_expressions) {
+                // Expression items — skip const exprs (we don't need them for AOT)
+                for (0..@intCast(num_elems)) |_| {
+                    self.skipConstExpr();
+                }
+            } else {
+                // Function index items
+                for (0..@intCast(num_elems)) |_| {
+                    const func_idx: u32 = @intCast(self.readULEB128());
+                    // Only store entries from active segments (passive/declared don't initialize table)
+                    if (is_active) {
+                        try self.table_elements.append(self.allocator, func_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Skip a constant expression (instructions ending with 0x0B end opcode).
+    /// Reference: wasmparser ConstExpr parsing — reads opcodes with their operands
+    fn skipConstExpr(self: *Parser) void {
+        while (self.pos < self.bytes.len) {
+            const opcode = self.readByte() orelse return;
+            if (opcode == wasm.Op.end) return;
+            switch (opcode) {
+                wasm.Op.i32_const, wasm.Op.i64_const => _ = self.readSLEB128(),
+                wasm.Op.f32_const => self.pos += 4,
+                wasm.Op.f64_const => self.pos += 8,
+                wasm.Op.global_get => _ = self.readULEB128(),
+                0xD0 => _ = self.readByte(), // ref.null heaptype
+                0xD2 => _ = self.readULEB128(), // ref.func funcidx
+                else => {},
+            }
         }
     }
 

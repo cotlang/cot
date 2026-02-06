@@ -63,7 +63,10 @@ fn compileAndRun(allocator: std.mem.Allocator, code: []const u8, test_name: []co
     defer allocator.free(link_result.stdout);
     defer allocator.free(link_result.stderr);
 
-    if (link_result.term.Exited != 0) return NativeResult.linkErr("linker failed");
+    if (link_result.term.Exited != 0) {
+        if (link_result.stderr.len > 0) std.debug.print("LINKER STDERR: {s}\n", .{link_result.stderr});
+        return NativeResult.linkErr("linker failed");
+    }
 
     const run_result = std.process.Child.run(.{
         .allocator = allocator,
@@ -516,4 +519,106 @@ test "native: ARC return forwarding" {
         \\}
     ;
     try expectExitCode(std.testing.allocator, code, 77, "arc_return_forward");
+}
+
+// ============================================================================
+// Function pointer tests
+// ============================================================================
+
+test "native: function pointer basic" {
+    const code =
+        \\fn add(a: i64, b: i64) i64 {
+        \\    return a + b
+        \\}
+        \\fn main() i64 {
+        \\    let f = add
+        \\    return f(3, 4)
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 7, "fnptr_basic");
+}
+
+test "native: function pointer as parameter" {
+    const code =
+        \\fn double(x: i64) i64 {
+        \\    return x * 2
+        \\}
+        \\fn apply(f: fn(i64) -> i64, x: i64) i64 {
+        \\    return f(x)
+        \\}
+        \\fn main() i64 {
+        \\    return apply(double, 5)
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 10, "fnptr_param");
+}
+
+test "native: function pointer reassignment" {
+    const code =
+        \\fn inc(x: i64) i64 {
+        \\    return x + 1
+        \\}
+        \\fn dec(x: i64) i64 {
+        \\    return x - 1
+        \\}
+        \\fn main() i64 {
+        \\    var f = inc
+        \\    let a = f(10)
+        \\    f = dec
+        \\    let b = f(10)
+        \\    return a + b
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 20, "fnptr_reassign");
+}
+
+// ============================================================================
+// Closure tests
+// ============================================================================
+
+test "native: closure no capture" {
+    const code =
+        \\fn main() i64 {
+        \\    let f = fn(x: i64) i64 { return x * 2 }
+        \\    return f(21)
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 42, "closure_no_capture");
+}
+
+test "native: closure basic capture" {
+    const code =
+        \\fn main() i64 {
+        \\    let x: i64 = 10
+        \\    let f = fn(y: i64) i64 { return x + y }
+        \\    return f(5)
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 15, "closure_capture");
+}
+
+test "native: closure multiple captures" {
+    const code =
+        \\fn main() i64 {
+        \\    let a: i64 = 3
+        \\    let b: i64 = 7
+        \\    let f = fn(x: i64) i64 { return a + b + x }
+        \\    return f(10)
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 20, "closure_multi_capture");
+}
+
+test "native: closure passed to function" {
+    const code =
+        \\fn apply(f: fn(i64) -> i64, x: i64) i64 {
+        \\    return f(x)
+        \\}
+        \\fn main() i64 {
+        \\    let offset: i64 = 100
+        \\    let g = fn(x: i64) i64 { return x + offset }
+        \\    return apply(g, 5)
+        \\}
+    ;
+    try expectExitCode(std.testing.allocator, code, 105, "closure_passed");
 }

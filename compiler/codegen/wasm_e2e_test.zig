@@ -873,3 +873,146 @@ test "wasm e2e: ARC return forwarding" {
     try std.testing.expect(!result.has_errors);
     try std.testing.expect(result.wasm_bytes.len > 0);
 }
+
+// ============================================================================
+// Function pointer tests (via Driver path for full table support)
+// ============================================================================
+
+const Driver = @import("../driver.zig").Driver;
+const Target = @import("../core/target.zig").Target;
+
+fn compileToWasmViaDriver(backing_allocator: std.mem.Allocator, code: []const u8) !WasmResult {
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    const allocator = arena.allocator();
+    errdefer arena.deinit();
+
+    var driver = Driver.init(allocator);
+    driver.setTarget(.{ .arch = .wasm32, .os = .freestanding });
+    const wasm_bytes = driver.compileSource(code) catch |e| {
+        std.debug.print("compile error: {any}\n", .{e});
+        return .{ .arena = arena, .has_errors = true, .wasm_bytes = &.{} };
+    };
+    return .{ .arena = arena, .has_errors = false, .wasm_bytes = wasm_bytes };
+}
+
+test "wasm e2e: function pointer basic" {
+    const code =
+        \\fn add(a: i64, b: i64) i64 {
+        \\    return a + b
+        \\}
+        \\fn main() i64 {
+        \\    let f = add
+        \\    return f(3, 4)
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: function pointer as parameter" {
+    const code =
+        \\fn double(x: i64) i64 {
+        \\    return x * 2
+        \\}
+        \\fn apply(f: fn(i64) -> i64, x: i64) i64 {
+        \\    return f(x)
+        \\}
+        \\fn main() i64 {
+        \\    return apply(double, 5)
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: function pointer reassignment" {
+    const code =
+        \\fn inc(x: i64) i64 {
+        \\    return x + 1
+        \\}
+        \\fn dec(x: i64) i64 {
+        \\    return x - 1
+        \\}
+        \\fn main() i64 {
+        \\    var f = inc
+        \\    let a = f(10)
+        \\    f = dec
+        \\    let b = f(10)
+        \\    return a + b
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: closure no capture" {
+    const code =
+        \\fn main() i64 {
+        \\    let f = fn(x: i64) i64 { return x * 2 }
+        \\    return f(21)
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: closure basic capture" {
+    const code =
+        \\fn main() i64 {
+        \\    let x: i64 = 10
+        \\    let f = fn(y: i64) i64 { return x + y }
+        \\    return f(5)
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: closure multiple captures" {
+    const code =
+        \\fn main() i64 {
+        \\    let a: i64 = 3
+        \\    let b: i64 = 7
+        \\    let f = fn(x: i64) i64 { return a + b + x }
+        \\    return f(10)
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: closure passed to function" {
+    const code =
+        \\fn apply(f: fn(i64) -> i64, x: i64) i64 {
+        \\    return f(x)
+        \\}
+        \\fn main() i64 {
+        \\    let offset: i64 = 100
+        \\    let g = fn(x: i64) i64 { return x + offset }
+        \\    return apply(g, 5)
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}

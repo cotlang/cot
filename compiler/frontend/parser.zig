@@ -601,6 +601,23 @@ pub const Parser = struct {
                     .span = Span.init(start, self.pos()),
                 } });
             },
+            .kw_fn => {
+                // Anonymous function (closure): fn(params) rettype { body }
+                self.advance();
+                if (!self.expect(.lparen)) return null;
+                const params = try self.parseFieldList(.rparen);
+                if (!self.expect(.rparen)) return null;
+                var return_type: NodeIndex = null_node;
+                if (!self.check(.lbrace) and !self.check(.eof))
+                    return_type = try self.parseType() orelse null_node;
+                const body = try self.parseBlock() orelse return null;
+                return try self.tree.addExpr(.{ .closure_expr = .{
+                    .params = params,
+                    .return_type = return_type,
+                    .body = body,
+                    .span = Span.init(start, self.pos()),
+                } });
+            },
             .kw_error => {
                 // error.Variant
                 self.advance();

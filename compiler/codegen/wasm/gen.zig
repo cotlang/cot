@@ -81,6 +81,14 @@ pub const GenState = struct {
     /// Maps type names to metadata memory offsets
     metadata_offsets: ?*const std.StringHashMap(i32) = null,
 
+    /// Maps function names to element table indices (for addr → call_indirect)
+    /// Go reference: link/internal/wasm/asm.go:476 (funcValueOffset + func_index)
+    func_table_indices: ?*const std.StringHashMap(u32) = null,
+
+    /// Maps function names to Wasm type section indices (for call_indirect type)
+    /// Go reference: wasmobj.go:1286-1291 (type index from instruction)
+    func_type_indices: ?*const std.StringHashMap(u32) = null,
+
     pub fn init(allocator: std.mem.Allocator, func: *const SsaFunc) GenState {
         return .{
             .allocator = allocator,
@@ -102,6 +110,14 @@ pub const GenState = struct {
 
     pub fn setMetadataOffsets(self: *GenState, offsets: *const std.StringHashMap(i32)) void {
         self.metadata_offsets = offsets;
+    }
+
+    pub fn setFuncTableIndices(self: *GenState, indices: *const std.StringHashMap(u32)) void {
+        self.func_table_indices = indices;
+    }
+
+    pub fn setFuncTypeIndices(self: *GenState, indices: *const std.StringHashMap(u32)) void {
+        self.func_type_indices = indices;
     }
 
     pub fn deinit(self: *GenState) void {
@@ -620,6 +636,31 @@ pub const GenState = struct {
                 }
             },
 
+            // Function address: push element table index as i64
+            // Go reference: link/internal/wasm/asm.go R_ADDR resolves to table index
+            // We use a direct lookup: func_name → table_idx (assigned by linker)
+            .addr => {
+                const fn_name: ?[]const u8 = switch (v.aux) {
+                    .string => |s| s,
+                    else => null,
+                };
+                if (fn_name) |name| {
+                    if (self.func_table_indices) |indices| {
+                        if (indices.get(name)) |table_idx| {
+                            _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(@intCast(table_idx)));
+                        } else {
+                            debug.log(.codegen, "wasm/gen: addr op: function '{s}' not in func_table_indices", .{name});
+                            _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                        }
+                    } else {
+                        debug.log(.codegen, "wasm/gen: addr op: no func_table_indices available", .{});
+                        _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                    }
+                } else {
+                    _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(0));
+                }
+            },
+
             // Pointer offset (for struct field access)
             .off_ptr => {
                 // base_ptr + offset
@@ -699,6 +740,61 @@ pub const GenState = struct {
 
                 const p = try self.builder.append(.call);
                 p.to = prog_mod.constAddr(func_idx);
+            },
+
+            // Closure call via table with CTXT global
+            // Go reference: wasm/ssa.go:229-231 — set CTXT, then call
+            // Args[0] = table_idx, Args[1] = context_ptr, Args[2..] = function args
+            .wasm_lowered_closure_call => {
+                const args = v.args;
+                // Go: getValue64(s, v.Args[1]); setReg(s, wasm.REG_CTXT)
+                try self.getValue64(args[1]);
+                {
+                    const p = try self.builder.append(.global_set);
+                    p.to = prog_mod.constAddr(1); // CTXT = global 1
+                }
+                // Push function arguments (args[2..])
+                for (args[2..]) |arg| {
+                    try self.getValue64(arg);
+                }
+                // Push callee table index (args[0]) — must be i32 for call_indirect
+                try self.getValue64(args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+
+                // Go: type index comes from p.To.Offset (stored in instruction)
+                // We use aux_int which carries the Wasm type index set by the driver
+                const p = try self.builder.append(.call_indirect);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Plain indirect function call via table (function pointers, no CTXT)
+            // Go reference: wasm/ssa.go:219 — InterCall, no CTXT setup
+            // Args[0] = callee (table index), Args[1..] = function arguments
+            .wasm_lowered_inter_call => {
+                const args = v.args;
+                // Push function arguments (skip arg[0] which is the callee)
+                for (args[1..]) |arg| {
+                    try self.getValue64(arg);
+                }
+                // Push callee (table index) — must be i32 for call_indirect
+                try self.getValue64(args[0]);
+                _ = try self.builder.append(.i32_wrap_i64);
+
+                // Go: type index from p.To.Offset
+                const p = try self.builder.append(.call_indirect);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Wasm global get/set
+            .wasm_global_get => {
+                const p = try self.builder.append(.global_get);
+                p.from = prog_mod.constAddr(v.aux_int);
+            },
+
+            .wasm_global_set => {
+                try self.getValue64(v.args[0]);
+                const p = try self.builder.append(.global_set);
+                p.to = prog_mod.constAddr(v.aux_int);
             },
 
             .wasm_lowered_retain => {

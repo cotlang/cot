@@ -78,6 +78,7 @@ pub const Expr = union(enum) {
     try_expr: TryExpr,
     catch_expr: CatchExpr,
     error_literal: ErrorLiteral,
+    closure_expr: ClosureExpr,
     addr_of: AddrOf,
     deref: Deref,
     bad_expr: BadExpr,
@@ -129,6 +130,7 @@ pub const TypeKind = union(enum) {
 pub const TryExpr = struct { operand: NodeIndex, span: Span };
 pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, fallback: NodeIndex, span: Span };
 pub const ErrorLiteral = struct { error_name: []const u8, span: Span };
+pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, span: Span };
 pub const AddrOf = struct { operand: NodeIndex, span: Span };
 pub const Deref = struct { operand: NodeIndex, span: Span };
 pub const BadExpr = struct { span: Span };
@@ -241,6 +243,7 @@ pub const Ast = struct {
                         .function => |f| if (f.params.len > 0) self.allocator.free(f.params),
                         else => {},
                     },
+                    .closure_expr => |ce| if (ce.params.len > 0) self.allocator.free(ce.params),
                     .call => |c| if (c.args.len > 0) self.allocator.free(c.args),
                     .array_literal => |a| if (a.elements.len > 0) self.allocator.free(a.elements),
                     .block_expr => |b| if (b.stmts.len > 0) self.allocator.free(b.stmts),

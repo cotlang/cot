@@ -228,6 +228,9 @@ pub const FuncTranslator = struct {
     env: FuncEnvironment,
     /// Allocator for dynamic storage.
     allocator: std.mem.Allocator,
+    /// Table elements from element section: table_index -> function_index.
+    /// Used for AOT call_indirect resolution.
+    table_elements: []const u32,
 
     const Self = @This();
 
@@ -239,6 +242,7 @@ pub const FuncTranslator = struct {
         globals: []const WasmGlobalType,
         func_types: []const WasmFuncType,
         func_to_type: []const u32,
+        table_elements: []const u32,
     ) Self {
         // Convert func_types to FuncEnvironment format
         // Note: func_environ_mod.WasmFuncType uses the same structure
@@ -251,12 +255,13 @@ pub const FuncTranslator = struct {
             .func_types = func_types,
             .env = FuncEnvironment.initWithTypes(allocator, func_to_type, env_func_types),
             .allocator = allocator,
+            .table_elements = table_elements,
         };
     }
 
     /// Create a new translator without module info (backwards compatibility).
     pub fn initWithoutGlobals(allocator: std.mem.Allocator, builder: *FunctionBuilder) Self {
-        return init(allocator, builder, &[_]WasmGlobalType{}, &[_]WasmFuncType{}, &[_]u32{});
+        return init(allocator, builder, &[_]WasmGlobalType{}, &[_]WasmFuncType{}, &[_]u32{}, &[_]u32{});
     }
 
     /// Deallocate storage.
@@ -1395,168 +1400,133 @@ pub const FuncTranslator = struct {
         _ = num_returns;
     }
 
-    /// Translate an indirect function call.
+    /// Translate an indirect function call (AOT version).
     ///
-    /// Port of code_translator.rs:677-717 (Operator::CallIndirect)
-    /// and func_environ.rs:2042-2065 (Call::indirect_call)
+    /// For AOT compilation, we know the table contents at compile time from the
+    /// element section. Instead of using runtime funcref tables, we generate an
+    /// if-else dispatch chain that maps each table index to a direct call.
     ///
-    /// Steps:
-    /// 1. Pop callee index from stack
-    /// 2. Load funcref from table (with bounds checking)
-    /// 3. Check signature
-    /// 4. Load code_ptr and callee_vmctx from funcref
-    /// 5. Emit indirect call
+    /// For table_elements = [func_2, func_7, func_8]:
+    ///   if callee_index == 0: call func_2(args...)
+    ///   elif callee_index == 1: call func_7(args...)
+    ///   elif callee_index == 2: call func_8(args...)
+    ///   else: trap
     pub fn translateCallIndirect(self: *Self, type_index: u32, table_index: u32) !void {
-        // Pop callee index from stack
+        _ = table_index; // We only support table 0
+
+        // Pop callee index from stack (i32 table index)
         const callee_index = self.state.pop1();
 
-        // Get the table data
-        const table = try self.env.getOrCreateTable(self.builder.func, table_index);
-
-        // Step 1: Load funcref pointer from table with bounds checking
-        // Port of get_or_init_func_ref_table_elem (simplified - no lazy init)
-        const funcref_ptr = try self.loadFuncRefFromTable(table, callee_index);
-
-        // Step 2: Check signature
-        // Port of check_indirect_call_type_signature (simplified)
-        try self.checkCallSignature(funcref_ptr, type_index);
-
-        // Step 3: Load code pointer and callee vmctx from funcref
-        // Port of load_code_and_vmctx
-        const code_and_vmctx = try self.loadCodeAndVmctx(funcref_ptr);
-        const code_ptr = code_and_vmctx.code_ptr;
-        const callee_vmctx = code_and_vmctx.callee_vmctx;
-
-        // Step 4: Build call args and emit indirect call
-        // Look up the function type from type_index to get proper signature
+        // Look up function type to know how many params/results
         const func_type = if (type_index < self.func_types.len)
             self.func_types[type_index]
         else
             WasmFuncType{ .params = &[_]WasmValType{}, .results = &[_]WasmValType{} };
 
         const num_wasm_params = func_type.params.len;
+        const num_results = func_type.results.len;
+
+        // Pop wasm args from stack (we'll pass them to each branch)
         const wasm_args = self.state.peekn(num_wasm_params);
 
-        // Build real_call_args: [callee_vmctx, caller_vmctx, ...wasm_args]
-        const caller_vmctx_gv = try self.env.vmctxVal(self.builder.func);
-        const caller_vmctx = try self.builder.ins().globalValue(Type.I64, caller_vmctx_gv);
+        // Save args in a local array since we'll reference them in each branch
+        const saved_args = try self.allocator.alloc(Value, num_wasm_params);
+        defer self.allocator.free(saved_args);
+        @memcpy(saved_args, wasm_args);
 
-        var real_args = try self.allocator.alloc(Value, 2 + num_wasm_params);
-        defer self.allocator.free(real_args);
-        real_args[0] = callee_vmctx;
-        real_args[1] = caller_vmctx;
-        for (wasm_args, 0..) |arg, i| {
-            real_args[2 + i] = arg;
-        }
-
-        // Build CLIF signature from Wasm function type
-        // Following Cranelift's calling convention: vmctx params first
-        var sig = clif.Signature.init(.fast);
-        // Add callee vmctx and caller vmctx params
-        try sig.params.append(self.allocator, clif.AbiParam.init(Type.I64));
-        try sig.params.append(self.allocator, clif.AbiParam.init(Type.I64));
-        // Add wasm params
-        for (func_type.params) |p| {
-            try sig.params.append(self.allocator, clif.AbiParam.init(p.toClifType()));
-        }
-        // Add wasm returns
-        for (func_type.results) |r| {
-            try sig.returns.append(self.allocator, clif.AbiParam.init(r.toClifType()));
-        }
-        const sig_ref = try self.builder.func.importSignature(self.allocator, sig);
-
-        // Emit indirect call
-        const call_result = try self.builder.ins().callIndirect(sig_ref, code_ptr, real_args);
-
-        // Pop args, push results
+        // Pop args from state now (before branches)
         self.state.popn(num_wasm_params);
-        for (call_result.results) |result| {
-            try self.state.push1(result);
-        }
-    }
 
-    /// Load a funcref pointer from a table with bounds checking.
-    ///
-    /// Port of func_environ.rs:861-926 (get_or_init_func_ref_table_elem) - simplified
-    fn loadFuncRefFromTable(self: *Self, table: *const func_environ_mod.TableData, index: Value) !Value {
-        const pointer_type = Type.I64;
-
-        // Load table bound
-        const bound_addr = try self.builder.ins().globalValue(pointer_type, table.bound);
-        const bound = try self.builder.ins().load(pointer_type, clif.MemFlags.DEFAULT, bound_addr, 0);
-
-        // Extend index to pointer type if needed (Wasm table indices are i32)
-        const index_type = self.builder.func.dfg.valueType(index);
-        var extended_index = index;
-        if (index_type.bits() < pointer_type.bits()) {
-            extended_index = try self.builder.ins().uextend(pointer_type, index);
+        // Create merge block where all branches converge with the result
+        const merge_block = try self.builder.createBlock();
+        // Add block params for the result values
+        var merge_params = try self.allocator.alloc(Value, num_results);
+        defer self.allocator.free(merge_params);
+        for (0..num_results) |i| {
+            merge_params[i] = try self.builder.appendBlockParam(merge_block, func_type.results[i].toClifType());
         }
 
-        // Bounds check: index < bound (trap if index >= bound)
-        const oob = try self.builder.ins().icmp(clif.IntCC.uge, extended_index, bound);
-        _ = try self.builder.ins().trapnz(oob, clif.TrapCode.table_out_of_bounds);
+        const num_entries = self.table_elements.len;
 
-        // Compute table element address: base + index * element_size
-        const base_addr = try self.builder.ins().globalValue(pointer_type, table.base);
-        const base = try self.builder.ins().load(pointer_type, clif.MemFlags.DEFAULT, base_addr, 0);
+        if (num_entries == 0) {
+            // No table entries — always trap
+            _ = try self.builder.ins().trap(clif.TrapCode.table_out_of_bounds);
+            self.builder.switchToBlock(merge_block);
+            try self.builder.sealBlock(merge_block);
+            try self.builder.ensureInsertedBlock();
+            for (merge_params) |p| {
+                try self.state.push1(p);
+            }
+            return;
+        }
 
-        const element_size: i64 = @intCast(table.element_size);
-        const element_size_val = try self.builder.ins().iconst(pointer_type, element_size);
-        const offset = try self.builder.ins().imul(extended_index, element_size_val);
-        const elem_addr = try self.builder.ins().iadd(base, offset);
+        // Generate if-else chain for table entries whose signature matches type_index.
+        // Only entries with matching signatures are valid targets for this call_indirect.
+        // Non-matching entries (or out of bounds) trap, matching Wasm's runtime signature check.
+        for (0..num_entries) |i| {
+            const func_index = self.table_elements[i];
 
-        // Load funcref pointer from table
-        const funcref_ptr = try self.builder.ins().load(pointer_type, clif.MemFlags.DEFAULT, elem_addr, 0);
+            // Check if this function's signature matches the expected type_index
+            const func_type_idx: ?u32 = if (func_index < self.env.func_to_type.len)
+                self.env.func_to_type[func_index]
+            else
+                null;
+            if (func_type_idx == null or func_type_idx.? != type_index) continue;
 
-        return funcref_ptr;
-    }
+            // Compare callee_index with this table index
+            const table_idx_val = try self.builder.ins().iconst(Type.I32, @intCast(i));
+            const is_match = try self.builder.ins().icmp(clif.IntCC.eq, callee_index, table_idx_val);
 
-    /// Check that a funcref has the expected signature.
-    ///
-    /// Port of func_environ.rs:2117-2263 (check_indirect_call_type_signature) - simplified
-    fn checkCallSignature(self: *Self, funcref_ptr: Value, type_index: u32) !void {
-        // Load caller's expected type ID
-        const caller_type_gv = try self.env.getOrCreateTypeIdGV(self.builder.func, type_index);
-        const caller_type_addr = try self.builder.ins().globalValue(Type.I32, caller_type_gv);
-        const caller_type_id = try self.builder.ins().load(Type.I32, clif.MemFlags.DEFAULT, caller_type_addr, 0);
+            // Create blocks: match_block (for this entry), next_block (continue checking)
+            const match_block = try self.builder.createBlock();
+            const next_block = try self.builder.createBlock();
 
-        // Load callee's type ID from funcref (at VMFuncRefOffsets.type_index offset)
-        const callee_type_id = try self.builder.ins().load(
-            Type.I32,
-            clif.MemFlags.DEFAULT,
-            funcref_ptr,
-            func_environ_mod.VMFuncRefOffsets.type_index,
-        );
+            // Branch: if match, go to match_block; else go to next_block
+            _ = try self.builder.ins().brif(is_match, match_block, &[_]Value{}, next_block, &[_]Value{});
 
-        // Compare and trap if mismatch
-        const mismatch = try self.builder.ins().icmp(clif.IntCC.ne, caller_type_id, callee_type_id);
-        _ = try self.builder.ins().trapnz(mismatch, clif.TrapCode.indirect_call_to_null);
-    }
+            // === Match block: emit direct call ===
+            self.builder.switchToBlock(match_block);
+            try self.builder.sealBlock(match_block);
+            try self.builder.ensureInsertedBlock();
 
-    /// Load code pointer and callee vmctx from a funcref.
-    ///
-    /// Port of func_environ.rs:2299-2336 (load_code_and_vmctx)
-    fn loadCodeAndVmctx(self: *Self, funcref_ptr: Value) !struct { code_ptr: Value, callee_vmctx: Value } {
-        const pointer_type = Type.I64;
-        const mem_flags = clif.MemFlags.DEFAULT;
+            // Get function reference for the target function
+            const func_ref = try self.env.getOrCreateFuncRef(self.builder.func, func_index);
 
-        // Load wasm_call (code pointer) at offset 0
-        const code_ptr = try self.builder.ins().load(
-            pointer_type,
-            mem_flags,
-            funcref_ptr,
-            func_environ_mod.VMFuncRefOffsets.wasm_call,
-        );
+            // Build call args: [callee_vmctx, caller_vmctx, ...wasm_args]
+            const vmctx_gv = try self.env.vmctxVal(self.builder.func);
+            const vmctx_val = try self.builder.ins().globalValue(Type.I64, vmctx_gv);
 
-        // Load vmctx at offset 8
-        const callee_vmctx = try self.builder.ins().load(
-            pointer_type,
-            mem_flags,
-            funcref_ptr,
-            func_environ_mod.VMFuncRefOffsets.vmctx,
-        );
+            var real_args = try self.allocator.alloc(Value, 2 + num_wasm_params);
+            defer self.allocator.free(real_args);
+            real_args[0] = vmctx_val;
+            real_args[1] = vmctx_val;
+            for (saved_args, 0..) |arg, j| {
+                real_args[2 + j] = arg;
+            }
 
-        return .{ .code_ptr = code_ptr, .callee_vmctx = callee_vmctx };
+            // Emit direct call
+            const call_result = try self.builder.ins().call(func_ref, real_args);
+
+            // Jump to merge block with results
+            _ = try self.builder.ins().jump(merge_block, call_result.results);
+
+            // === Next block: continue checking ===
+            self.builder.switchToBlock(next_block);
+            try self.builder.sealBlock(next_block);
+            try self.builder.ensureInsertedBlock();
+        }
+
+        // After all entries: trap (out of bounds)
+        _ = try self.builder.ins().trap(clif.TrapCode.table_out_of_bounds);
+
+        // Switch to merge block and push results
+        self.builder.switchToBlock(merge_block);
+        try self.builder.sealBlock(merge_block);
+        try self.builder.ensureInsertedBlock();
+
+        for (merge_params) |p| {
+            try self.state.push1(p);
+        }
     }
 
     // ========================================================================

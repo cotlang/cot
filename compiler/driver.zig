@@ -365,7 +365,8 @@ pub const Driver = struct {
 
         // Create reusable translator context with module info
         // Pass func_to_type mapping (wasm_module.funcs maps function_index -> type_index)
-        var func_translator = wasm_func_translator.WasmFuncTranslator.init(self.allocator, globals_converted, func_types_converted, wasm_module.funcs);
+        // Pass table_elements for AOT call_indirect resolution
+        var func_translator = wasm_func_translator.WasmFuncTranslator.init(self.allocator, globals_converted, func_types_converted, wasm_module.funcs, wasm_module.table_elements);
         defer func_translator.deinit();
 
         // Select ISA based on target
@@ -552,8 +553,12 @@ pub const Driver = struct {
         // Track if we need to generate a main wrapper
         var main_func_index: ?usize = null;
 
-        // Declare and define each function
-        for (compiled_funcs, 0..) |*cf, i| {
+        // Pass 1: Declare all functions and external names (Cranelift pattern:
+        // separate declaration from definition so forward references resolve)
+        var func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
+        defer self.allocator.free(func_ids);
+
+        for (compiled_funcs, 0..) |_, i| {
             // Determine function name from exports, or generate one
             var func_name: []const u8 = "";
             var func_name_allocated = false;
@@ -564,42 +569,36 @@ pub const Driver = struct {
                 }
             }
             if (func_name.len == 0) {
-                // Generate internal name (not found in exports)
                 func_name = try std.fmt.allocPrint(self.allocator, "_func_{d}", .{i});
                 func_name_allocated = true;
             }
             defer if (func_name_allocated) self.allocator.free(func_name);
 
-            // For "main" export, rename to "__wasm_main" and generate a wrapper later
             const is_main = std.mem.eql(u8, func_name, "main");
             if (is_main) {
                 main_func_index = i;
             }
 
-            // Prefix with underscore for Mach-O convention
-            // For main, use __wasm_main instead of _main (wrapper will be _main)
             const mangled_name = if (is_main)
                 try self.allocator.dupe(u8, "__wasm_main")
             else
                 try std.fmt.allocPrint(self.allocator, "_{s}", .{func_name});
             defer self.allocator.free(mangled_name);
 
-            // Determine linkage - wasm main is local (called by wrapper)
             const linkage: object_module.Linkage = if (is_main)
                 .Local
             else if (func_name_allocated)
-                .Local // Internal generated names are local
+                .Local
             else
                 .Export;
 
-            // Declare the function
-            const func_id = try module.declareFunction(mangled_name, linkage);
-
-            // Register external name for relocation resolution
+            func_ids[i] = try module.declareFunction(mangled_name, linkage);
             try module.declareExternalName(@intCast(i), mangled_name);
+        }
 
-            // Define the function with its compiled code
-            try module.defineFunction(func_id, cf);
+        // Pass 2: Define all functions (relocations can now resolve forward references)
+        for (compiled_funcs, 0..) |*cf, i| {
+            try module.defineFunction(func_ids[i], cf);
         }
 
         // If we have a main function, generate the wrapper and static vmctx
@@ -784,9 +783,11 @@ pub const Driver = struct {
         // Track if we need to generate a main wrapper
         var main_func_index: ?usize = null;
 
-        // Declare and define each function
-        for (compiled_funcs, 0..) |*cf, i| {
-            // Determine function name from exports, or generate one
+        // Pass 1: Declare all functions and external names (Cranelift pattern)
+        var elf_func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
+        defer self.allocator.free(elf_func_ids);
+
+        for (compiled_funcs, 0..) |_, i| {
             var func_name: []const u8 = "";
             var func_name_allocated = false;
             for (exports) |exp| {
@@ -796,41 +797,35 @@ pub const Driver = struct {
                 }
             }
             if (func_name.len == 0) {
-                // Generate internal name (not found in exports)
                 func_name = try std.fmt.allocPrint(self.allocator, "func_{d}", .{i});
                 func_name_allocated = true;
             }
             defer if (func_name_allocated) self.allocator.free(func_name);
 
-            // For "main" export, rename to "__wasm_main" and generate a wrapper later
             const is_main = std.mem.eql(u8, func_name, "main");
             if (is_main) {
                 main_func_index = i;
             }
 
-            // ELF doesn't need underscore prefix (unlike Mach-O)
-            // For main, use __wasm_main instead (wrapper will be main)
             const mangled_name = if (is_main)
                 "__wasm_main"
             else
                 func_name;
 
-            // Determine linkage - wasm main is local (called by wrapper)
             const linkage: object_module.Linkage = if (is_main)
                 .Local
             else if (func_name_allocated)
-                .Local // Internal generated names are local
+                .Local
             else
                 .Export;
 
-            // Declare the function
-            const func_id = try module.declareFunction(mangled_name, linkage);
-
-            // Register external name for relocation resolution
+            elf_func_ids[i] = try module.declareFunction(mangled_name, linkage);
             try module.declareExternalName(@intCast(i), mangled_name);
+        }
 
-            // Define the function with its compiled code
-            try module.defineFunction(func_id, cf);
+        // Pass 2: Define all functions (relocations can now resolve forward references)
+        for (compiled_funcs, 0..) |*cf, i| {
+            try module.defineFunction(elf_func_ids[i], cf);
         }
 
         // If we have a main function, generate the wrapper and static vmctx
@@ -989,6 +984,13 @@ pub const Driver = struct {
         linker.setMemory(3, null);
 
         // ====================================================================
+        // Add CTXT global (closure context pointer, Go: REG_CTXT = Global 1)
+        // Must be before arc.addToLinker so heap_ptr shifts to global 2
+        // Layout: SP(0), CTXT(1), heap_ptr(2)
+        // ====================================================================
+        _ = try linker.addGlobal(.{ .val_type = .i64, .mutable = true, .init_i64 = 0 });
+
+        // ====================================================================
         // Add ARC runtime functions first (they get indices 0, 1, 2, ...)
         // Reference: Swift stdlib HeapObject.cpp
         // ====================================================================
@@ -1057,6 +1059,29 @@ pub const Driver = struct {
                 pipeline_debug.log(.codegen, "driver: destructor {s} at table[{d}] = func[{d}]", .{ ir_func.name, table_idx, func_idx });
             }
         }
+
+        // ====================================================================
+        // Build function table: ALL user functions get table entries
+        // Go reference: link/internal/wasm/asm.go:476-494
+        // Go uses: table[funcValueOffset + i] = function[i]
+        // We use a direct map: func_name → table_idx (assigned by linker)
+        // ====================================================================
+        var func_table_indices = std.StringHashMap(u32).init(self.allocator);
+        defer func_table_indices.deinit();
+
+        for (funcs, 0..) |*ir_func, i| {
+            const func_idx: u32 = @intCast(i + runtime_func_count);
+            const table_idx = try linker.addTableFunc(func_idx);
+            try func_table_indices.put(ir_func.name, table_idx);
+        }
+
+        // ====================================================================
+        // Build function type index map: func_name → Wasm type section index
+        // Go reference: wasmobj.go — type index from instruction's p.To.Offset
+        // Pre-register all function types for call_indirect resolution
+        // ====================================================================
+        var func_type_indices = std.StringHashMap(u32).init(self.allocator);
+        defer func_type_indices.deinit();
 
         // Generate metadata for each type with destructor
         // Metadata layout: type_id(4), size(4), destructor_ptr(4) = 12 bytes
@@ -1155,8 +1180,45 @@ pub const Driver = struct {
             // Add function type to linker
             const type_idx = try linker.addType(params[0..param_count], results);
 
+            // Register this function's Wasm type index for call_indirect resolution
+            try func_type_indices.put(ir_func.name, type_idx);
+
+            // Post-pass: resolve call_indirect type indices on SSA values
+            // Go: type index is stored in instruction by assembler (p.To.Offset)
+            // We set aux_int on wasm_lowered_closure_call/inter_call values
+            for (ssa_func.blocks.items) |block| {
+                for (block.values.items) |sv| {
+                    if (sv.op == .wasm_lowered_closure_call or sv.op == .wasm_lowered_inter_call) {
+                        // Determine actual param count and return type from the call's args
+                        const skip: usize = if (sv.op == .wasm_lowered_closure_call) 2 else 1;
+                        const n_params: u32 = @intCast(sv.args.len - skip);
+                        const has_res = sv.type_idx != types_mod.TypeRegistry.VOID and sv.type_idx != 0;
+
+                        // Build Wasm type signature and register with linker
+                        var cp: [16]wasm.ValType = undefined;
+                        for (0..n_params) |pi| {
+                            // Check if this arg is a float type
+                            const arg_val = sv.args[skip + pi];
+                            const is_f = arg_val.type_idx == types_mod.TypeRegistry.F64 or
+                                arg_val.type_idx == types_mod.TypeRegistry.F32;
+                            cp[pi] = if (is_f) .f64 else .i64;
+                        }
+                        const ret_f = sv.type_idx == types_mod.TypeRegistry.F64 or
+                            sv.type_idx == types_mod.TypeRegistry.F32;
+                        const res: []const wasm.ValType = if (!has_res)
+                            &[_]wasm.ValType{}
+                        else if (ret_f)
+                            &[_]wasm.ValType{.f64}
+                        else
+                            &[_]wasm.ValType{.i64};
+                        const call_type_idx = try linker.addType(cp[0..n_params], res);
+                        sv.aux_int = @intCast(call_type_idx);
+                    }
+                }
+            }
+
             // Generate function body code using Go-style two-pass architecture
-            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets, &metadata_addrs);
+            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets, &metadata_addrs, &func_table_indices);
             errdefer self.allocator.free(body);
 
             // Export all functions for AOT compatibility

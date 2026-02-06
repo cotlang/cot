@@ -332,6 +332,7 @@ pub const Checker = struct {
             .try_expr => |te| self.checkTryExpr(te),
             .catch_expr => |ce| self.checkCatchExpr(ce),
             .error_literal => |el| self.checkErrorLiteral(el),
+            .closure_expr => |ce| self.checkClosureExpr(ce),
             .addr_of => |ao| self.checkAddrOf(ao),
             .deref => |d| self.checkDeref(d),
             .type_expr, .bad_expr => invalid_type,
@@ -410,6 +411,27 @@ pub const Checker = struct {
             .question => { if (operand == .optional) return operand.optional.elem; self.err.errorWithCode(un.span.start, .e303, "'.?' requires optional operand"); return invalid_type; },
             else => return invalid_type,
         }
+    }
+
+    fn checkClosureExpr(self: *Checker, ce: ast.ClosureExpr) CheckError!TypeIndex {
+        // Build function type from params + return type
+        const func_type = try self.buildFuncType(ce.params, ce.return_type);
+        // Check body in a child scope with params defined
+        var func_scope = Scope.init(self.allocator, self.scope);
+        defer func_scope.deinit();
+        for (ce.params) |param| {
+            const param_type = try self.resolveTypeExpr(param.type_expr);
+            try func_scope.define(Symbol.init(param.name, .parameter, param_type, null_node, false));
+        }
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &func_scope;
+        const ret_type = if (self.types.get(func_type) == .func) self.types.get(func_type).func.return_type else TypeRegistry.VOID;
+        self.current_return_type = ret_type;
+        if (ce.body != null_node) try self.checkBlockExpr(ce.body);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+        return func_type;
     }
 
     fn checkCall(self: *Checker, c: ast.Call) CheckError!TypeIndex {

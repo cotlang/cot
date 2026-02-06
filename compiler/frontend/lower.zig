@@ -37,6 +37,7 @@ pub const Lowerer = struct {
     test_names: std.ArrayListUnmanaged([]const u8),
     test_display_names: std.ArrayListUnmanaged([]const u8),
     current_test_name: ?[]const u8 = null,
+    closure_counter: u32 = 0,
 
     pub const Error = error{OutOfMemory};
 
@@ -1249,6 +1250,7 @@ pub const Lowerer = struct {
             .switch_expr => |se| return try self.lowerSwitchExpr(se),
             .struct_init => |si| return try self.lowerStructInitExpr(si),
             .new_expr => |ne| return try self.lowerNewExpr(ne),
+            .closure_expr => |ce| return try self.lowerClosureExpr(ce),
             .block_expr => |block| {
                 const cleanup_depth = self.cleanup_stack.getScopeDepth();
                 const scope_depth = fb.markScopeEntry();
@@ -1294,7 +1296,7 @@ pub const Lowerer = struct {
             return try fb.emitLoadLocal(local_idx, local_type, ident.span);
         }
         if (self.chk.scope.lookup(ident.name)) |sym| {
-            if (sym.kind == .function) return try fb.emitFuncAddr(ident.name, sym.type_idx, ident.span);
+            if (sym.kind == .function) return try self.createFuncValue(ident.name, sym.type_idx, ident.span);
             if (sym.kind == .constant) if (sym.const_value) |value| return try fb.emitConstInt(value, TypeRegistry.I64, ident.span);
         }
         if (self.builder.lookupGlobal(ident.name)) |g| return try fb.emitGlobalRef(g.idx, ident.name, g.global.type_idx, ident.span);
@@ -1855,6 +1857,229 @@ pub const Lowerer = struct {
         return try fb.emitLoadLocal(temp_idx, ptr_type, ne.span);
     }
 
+    /// Create a 1-word closure struct for a named function used as a value.
+    /// Layout: { table_idx: i64 }
+    fn createFuncValue(self: *Lowerer, func_name: []const u8, type_idx: TypeIndex, span: Span) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const HEAP_HEADER_SIZE: u32 = 12;
+        const payload_size: u32 = 8; // one i64 for table_idx
+        const total_size = HEAP_HEADER_SIZE + payload_size;
+
+        // Allocate closure struct: cot_alloc(0, total_size)
+        const metadata_node = try fb.emitConstInt(0, TypeRegistry.I64, span);
+        const size_node = try fb.emitConstInt(@intCast(total_size), TypeRegistry.I64, span);
+        var alloc_args = [_]ir.NodeIndex{ metadata_node, size_node };
+        const alloc_result = try fb.emitCall("cot_alloc", &alloc_args, false, TypeRegistry.I64, span);
+
+        // Store result in temp
+        const temp_name = try std.fmt.allocPrint(self.allocator, "__closure_ptr_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const temp_idx = try fb.addLocalWithSize(temp_name, TypeRegistry.I64, true, 8);
+        _ = try fb.emitStoreLocal(temp_idx, alloc_result, span);
+        const ptr_node = try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, span);
+
+        // Store table_idx at offset 0
+        const table_idx_node = try fb.emitFuncAddr(func_name, type_idx, span);
+        _ = try fb.emitPtrStoreValue(ptr_node, table_idx_node, span);
+
+        return try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, span);
+    }
+
+    /// Lower a closure expression: detect captures, create body function, allocate struct.
+    fn lowerClosureExpr(self: *Lowerer, ce: ast.ClosureExpr) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Detect captured variables from parent scope
+        var captures = std.ArrayListUnmanaged(CaptureInfo){};
+        defer captures.deinit(self.allocator);
+        try self.detectCaptures(ce.body, fb, &captures);
+
+        // Generate a unique name for the closure body function
+        const closure_name = try std.fmt.allocPrint(self.allocator, "__closure_{d}", .{self.closure_counter});
+        self.closure_counter += 1;
+
+        // Save parent function builder state (by value)
+        const saved_builder_func = self.builder.current_func;
+
+        // Create the closure body function
+        const return_type = if (ce.return_type != null_node) self.resolveTypeNode(ce.return_type) else TypeRegistry.VOID;
+        self.builder.startFunc(closure_name, TypeRegistry.VOID, return_type, ce.span);
+        if (self.builder.func()) |closure_fb| {
+            self.current_func = closure_fb;
+            self.cleanup_stack.clear();
+
+            // Add declared params
+            for (ce.params) |param| {
+                const param_type = self.resolveTypeNode(param.type_expr);
+                _ = try closure_fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+
+            // At function start: read captures from CTXT global
+            // CTXT global is at Wasm index 1 (SP=0, CTXT=1)
+            if (captures.items.len > 0) {
+                const ctxt_ptr = try closure_fb.emitWasmGlobalRead(1, TypeRegistry.I64, ce.span);
+                for (captures.items, 0..) |cap, i| {
+                    // Load capture from offset (i+1)*8 (offset 0 = table_idx)
+                    const offset: i64 = @intCast((i + 1) * 8);
+                    const cap_addr = try closure_fb.emitAddrOffset(ctxt_ptr, offset, TypeRegistry.I64, ce.span);
+                    const cap_val = try closure_fb.emitPtrLoadValue(cap_addr, cap.type_idx, ce.span);
+                    // Store in local variable with the capture's name
+                    const local_idx = try closure_fb.addLocalWithSize(cap.name, cap.type_idx, true, 8);
+                    _ = try closure_fb.emitStoreLocal(local_idx, cap_val, ce.span);
+                }
+            }
+
+            // Lower body
+            if (ce.body != null_node) {
+                _ = try self.lowerBlockNode(ce.body);
+                if (return_type == TypeRegistry.VOID and closure_fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    _ = try closure_fb.emitRet(null, ce.span);
+                }
+            }
+
+            self.cleanup_stack.clear();
+        }
+        // endFunc builds and appends the closure, sets builder.current_func = null
+        try self.builder.endFunc();
+        // Restore parent function builder
+        self.builder.current_func = saved_builder_func;
+        self.current_func = if (self.builder.current_func) |*bfb| bfb else null;
+
+        // Now in parent function: allocate closure struct and fill it
+        const num_captures = captures.items.len;
+        const HEAP_HEADER_SIZE: u32 = 12;
+        const payload_size: u32 = @intCast((1 + num_captures) * 8); // table_idx + captures
+        const total_size = HEAP_HEADER_SIZE + payload_size;
+
+        // Allocate: cot_alloc(0, total_size) - metadata_ptr=0 (no destructor)
+        const metadata_node = try fb.emitConstInt(0, TypeRegistry.I64, ce.span);
+        const size_node = try fb.emitConstInt(@intCast(total_size), TypeRegistry.I64, ce.span);
+        var alloc_args = [_]ir.NodeIndex{ metadata_node, size_node };
+        const alloc_result = try fb.emitCall("cot_alloc", &alloc_args, false, TypeRegistry.I64, ce.span);
+
+        // Store in temp
+        const temp_name = try std.fmt.allocPrint(self.allocator, "__closure_ptr_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const temp_idx = try fb.addLocalWithSize(temp_name, TypeRegistry.I64, true, 8);
+        _ = try fb.emitStoreLocal(temp_idx, alloc_result, ce.span);
+        const ptr_node = try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, ce.span);
+
+        // Store table_idx at offset 0
+        // Build function type from closure params
+        const func_type = blk: {
+            var func_params = std.ArrayListUnmanaged(types.FuncParam){};
+            defer func_params.deinit(self.allocator);
+            for (ce.params) |param| {
+                const param_type = self.resolveTypeNode(param.type_expr);
+                try func_params.append(self.allocator, .{ .name = param.name, .type_idx = param_type });
+            }
+            const ret_type = if (ce.return_type != null_node) self.resolveTypeNode(ce.return_type) else TypeRegistry.VOID;
+            break :blk try self.type_reg.add(.{ .func = .{ .params = try self.allocator.dupe(types.FuncParam, func_params.items), .return_type = ret_type } });
+        };
+        const table_idx_node = try fb.emitFuncAddr(closure_name, func_type, ce.span);
+        _ = try fb.emitPtrStoreValue(ptr_node, table_idx_node, ce.span);
+
+        // Store each capture at offset 8, 16, ...
+        for (captures.items, 0..) |cap, i| {
+            const offset: i64 = @intCast((i + 1) * 8);
+            const reload_ptr = try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, ce.span);
+            const cap_addr = try fb.emitAddrOffset(reload_ptr, offset, TypeRegistry.I64, ce.span);
+            const cap_val = try fb.emitLoadLocal(cap.local_idx, cap.type_idx, ce.span);
+            _ = try fb.emitPtrStoreValue(cap_addr, cap_val, ce.span);
+        }
+
+        return try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, ce.span);
+    }
+
+    const CaptureInfo = struct {
+        name: []const u8,
+        local_idx: ir.LocalIdx,
+        type_idx: TypeIndex,
+    };
+
+    /// Walk AST to detect captured variables (idents that resolve to parent's locals).
+    fn detectCaptures(self: *Lowerer, body_idx: NodeIndex, parent_fb: *ir.FuncBuilder, captures: *std.ArrayListUnmanaged(CaptureInfo)) Error!void {
+        const node = self.tree.getNode(body_idx) orelse return;
+        switch (node) {
+            .expr => |expr| switch (expr) {
+                .ident => |id| {
+                    // Check if this ident is a local in the parent function
+                    if (parent_fb.lookupLocal(id.name)) |local_idx| {
+                        // Don't add duplicates
+                        for (captures.items) |cap| {
+                            if (std.mem.eql(u8, cap.name, id.name)) return;
+                        }
+                        try captures.append(self.allocator, .{
+                            .name = id.name,
+                            .local_idx = local_idx,
+                            .type_idx = parent_fb.locals.items[local_idx].type_idx,
+                        });
+                    }
+                },
+                .binary => |bin| {
+                    try self.detectCaptures(bin.left, parent_fb, captures);
+                    try self.detectCaptures(bin.right, parent_fb, captures);
+                },
+                .unary => |un| try self.detectCaptures(un.operand, parent_fb, captures),
+                .call => |c| {
+                    try self.detectCaptures(c.callee, parent_fb, captures);
+                    for (c.args) |arg| try self.detectCaptures(arg, parent_fb, captures);
+                },
+                .paren => |p| try self.detectCaptures(p.inner, parent_fb, captures),
+                .if_expr => |ie| {
+                    try self.detectCaptures(ie.condition, parent_fb, captures);
+                    try self.detectCaptures(ie.then_branch, parent_fb, captures);
+                    if (ie.else_branch != null_node) try self.detectCaptures(ie.else_branch, parent_fb, captures);
+                },
+                .index => |idx| {
+                    try self.detectCaptures(idx.base, parent_fb, captures);
+                    try self.detectCaptures(idx.idx, parent_fb, captures);
+                },
+                .field_access => |fa| {
+                    if (fa.base != null_node) try self.detectCaptures(fa.base, parent_fb, captures);
+                },
+                .block_expr => |b| {
+                    for (b.stmts) |s| try self.detectCaptures(s, parent_fb, captures);
+                    if (b.expr != null_node) try self.detectCaptures(b.expr, parent_fb, captures);
+                },
+                else => {},
+            },
+            .stmt => |stmt| switch (stmt) {
+                .expr_stmt => |es| try self.detectCaptures(es.expr, parent_fb, captures),
+                .return_stmt => |rs| {
+                    if (rs.value != null_node) try self.detectCaptures(rs.value, parent_fb, captures);
+                },
+                .var_stmt => |vs| {
+                    if (vs.value != null_node) try self.detectCaptures(vs.value, parent_fb, captures);
+                },
+                .assign_stmt => |as_stmt| {
+                    try self.detectCaptures(as_stmt.target, parent_fb, captures);
+                    try self.detectCaptures(as_stmt.value, parent_fb, captures);
+                },
+                .if_stmt => |is| {
+                    try self.detectCaptures(is.condition, parent_fb, captures);
+                    try self.detectCaptures(is.then_branch, parent_fb, captures);
+                    if (is.else_branch != null_node) try self.detectCaptures(is.else_branch, parent_fb, captures);
+                },
+                .while_stmt => |ws| {
+                    try self.detectCaptures(ws.condition, parent_fb, captures);
+                    try self.detectCaptures(ws.body, parent_fb, captures);
+                },
+                .for_stmt => |fs| {
+                    if (fs.iterable != null_node) try self.detectCaptures(fs.iterable, parent_fb, captures);
+                    try self.detectCaptures(fs.body, parent_fb, captures);
+                },
+                .block_stmt => |bs| {
+                    for (bs.stmts) |s| try self.detectCaptures(s, parent_fb, captures);
+                },
+                .defer_stmt => |ds| try self.detectCaptures(ds.expr, parent_fb, captures),
+                .break_stmt, .continue_stmt, .bad_stmt => {},
+            },
+            .decl => {},
+        }
+    }
+
     fn lowerIfExpr(self: *Lowerer, if_expr: ast.IfExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
         const cond = try self.lowerExprNode(if_expr.condition);
@@ -2122,11 +2347,27 @@ pub const Lowerer = struct {
 
         const return_type = if (func_type_info == .func) func_type_info.func.return_type else TypeRegistry.VOID;
         const func_name = if (callee_expr == .ident) callee_expr.ident.name else "";
-        const is_indirect = callee_expr != .ident;
+
+        // Determine if this is an indirect call (function pointer)
+        // Direct calls use function names; indirect calls use variables/expressions
+        // An ident is indirect if it's a local variable (not a function declaration)
+        const is_indirect = if (callee_expr != .ident)
+            true
+        else blk: {
+            // Check if the identifier is a local variable (function pointer)
+            // vs a function declaration (direct call)
+            if (fb.lookupLocal(func_name) != null) {
+                break :blk true; // Local variable → indirect call
+            }
+            break :blk false; // Function name → direct call
+        };
 
         if (is_indirect) {
-            const func_ptr = try self.lowerExprNode(call.callee);
-            return try fb.emitIndirectCall(func_ptr, args.items, return_type, call.span);
+            // Closure struct decomposition: load table_idx from offset 0
+            const closure_ptr = try self.lowerExprNode(call.callee);
+            const table_idx = try fb.emitPtrLoadValue(closure_ptr, TypeRegistry.I64, call.span);
+            // Use closure_call: callee=table_idx, context=closure_ptr, args
+            return try fb.emitClosureCall(table_idx, closure_ptr, args.items, return_type, call.span);
         }
         return try fb.emitCall(func_name, args.items, false, return_type, call.span);
     }
