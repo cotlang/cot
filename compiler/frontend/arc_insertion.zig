@@ -47,6 +47,9 @@ pub const CleanupKind = enum {
     release,
     /// End a borrow (not yet used, for future borrow checker).
     end_borrow,
+    /// Deferred expression to evaluate at scope exit.
+    /// Port of Swift's DeferCleanup subclass on the unified cleanup stack.
+    defer_expr,
 };
 
 /// A single cleanup entry.
@@ -140,6 +143,19 @@ pub const CleanupStack = struct {
     pub fn setLocalForHandle(self: *CleanupStack, handle: CleanupHandle, local_idx: ir.LocalIdx) void {
         if (handle.isValid() and handle.index < self.items.items.len) {
             self.items.items[handle.index].local_idx = local_idx;
+        }
+    }
+
+    /// Update the value node for a local's cleanup (called on reassignment).
+    /// Port of Swift's pattern: cleanup tracks current value, not original.
+    pub fn updateValueForLocal(self: *CleanupStack, local_idx: ir.LocalIdx, new_value: NodeIndex) void {
+        for (self.items.items) |*cleanup| {
+            if (cleanup.isActive() and cleanup.local_idx != null and
+                cleanup.local_idx.? == local_idx and cleanup.kind == .release)
+            {
+                cleanup.value = new_value;
+                return;
+            }
         }
     }
 

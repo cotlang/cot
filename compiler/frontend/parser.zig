@@ -777,7 +777,26 @@ pub const Parser = struct {
             },
             .kw_defer => {
                 self.advance();
+                // defer can take a block { ... } or a simple expression/assignment
+                if (self.check(.lbrace)) {
+                    const block = try self.parseBlock() orelse return null;
+                    return try self.tree.addStmt(.{ .defer_stmt = .{ .expr = block, .span = Span.init(start, self.pos()) } });
+                }
+                // Parse expression, then check for assignment operator
                 const e = try self.parseExpr() orelse return null;
+                if (self.tok.tok == .assign or self.tok.tok.isAssignment()) {
+                    const op = self.tok.tok;
+                    self.advance();
+                    const rhs = try self.parseExpr() orelse return null;
+                    _ = self.match(.semicolon);
+                    const assign_node = try self.tree.addStmt(.{ .assign_stmt = .{
+                        .target = e,
+                        .value = rhs,
+                        .op = op,
+                        .span = Span.init(start, self.pos()),
+                    } });
+                    return try self.tree.addStmt(.{ .defer_stmt = .{ .expr = assign_node, .span = Span.init(start, self.pos()) } });
+                }
                 _ = self.match(.semicolon);
                 return try self.tree.addStmt(.{ .defer_stmt = .{ .expr = e, .span = Span.init(start, self.pos()) } });
             },

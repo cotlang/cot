@@ -413,3 +413,53 @@ test "native: error union try propagation" {
     ;
     try expectExitCode(std.testing.allocator, code, 0, "error_union_try");
 }
+
+test "native: defer basic" {
+    // Defer runs after return value is captured
+    // x=10, return captures 10, then defer sets x=99 (but return value already captured)
+    const code =
+        \\fn main() i64 {
+        \\    var x: i64 = 10
+        \\    defer x = 99
+        \\    return x
+        \\}
+    ;
+    // return captures x=10 before defer runs, so exit code = 10
+    try expectExitCode(std.testing.allocator, code, 10, "defer_basic");
+}
+
+test "native: defer with loop break" {
+    // defer inside loop body runs on break
+    const code =
+        \\fn main() i64 {
+        \\    var sum: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 5 {
+        \\        defer sum = sum + 1
+        \\        i = i + 1
+        \\        if i == 3 { break }
+        \\    }
+        \\    return sum
+        \\}
+    ;
+    // Loop runs 3 times (i=1,2,3), defer runs each iteration.
+    // But break emits cleanup without pop, and the block exit also tries to emit.
+    // Actually: i=1 (no break, block exit emits defer → sum=1),
+    //          i=2 (no break, block exit emits defer → sum=2),
+    //          i=3 (break, emits defer NoPop → sum=3, jumps to exit)
+    try expectExitCode(std.testing.allocator, code, 3, "defer_loop_break");
+}
+
+test "native: defer LIFO ordering" {
+    // Multiple defers execute in LIFO order (last defer first)
+    const code =
+        \\fn main() i64 {
+        \\    var x: i64 = 2
+        \\    defer x = x + 1
+        \\    defer x = x * 10
+        \\    return x
+        \\}
+    ;
+    // return captures x=2 before defers run, so exit code = 2
+    try expectExitCode(std.testing.allocator, code, 2, "defer_lifo");
+}

@@ -31,7 +31,6 @@ pub const Lowerer = struct {
     current_func: ?*ir.FuncBuilder = null,
     temp_counter: u32 = 0,
     loop_stack: std.ArrayListUnmanaged(LoopContext),
-    defer_stack: std.ArrayListUnmanaged(NodeIndex),
     cleanup_stack: arc.CleanupStack,
     const_values: std.StringHashMap(i64),
     test_mode: bool = false,
@@ -44,7 +43,7 @@ pub const Lowerer = struct {
     const LoopContext = struct {
         cond_block: ir.BlockIndex,
         exit_block: ir.BlockIndex,
-        defer_depth: usize,
+        cleanup_depth: usize,
         label: ?[]const u8 = null,
     };
 
@@ -61,7 +60,6 @@ pub const Lowerer = struct {
             .builder = builder,
             .chk = chk,
             .loop_stack = .{},
-            .defer_stack = .{},
             .cleanup_stack = arc.CleanupStack.init(allocator),
             .const_values = std.StringHashMap(i64).init(allocator),
             .test_names = .{},
@@ -77,7 +75,6 @@ pub const Lowerer = struct {
 
     pub fn deinit(self: *Lowerer) void {
         self.loop_stack.deinit(self.allocator);
-        self.defer_stack.deinit(self.allocator);
         self.cleanup_stack.deinit();
         self.const_values.deinit();
         self.test_names.deinit(self.allocator);
@@ -87,7 +84,6 @@ pub const Lowerer = struct {
 
     pub fn deinitWithoutBuilder(self: *Lowerer) void {
         self.loop_stack.deinit(self.allocator);
-        self.defer_stack.deinit(self.allocator);
         self.const_values.deinit();
         self.test_names.deinit(self.allocator);
         self.test_display_names.deinit(self.allocator);
@@ -152,7 +148,7 @@ pub const Lowerer = struct {
         self.builder.startFunc(fn_decl.name, TypeRegistry.VOID, return_type, fn_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
-            self.defer_stack.clearRetainingCapacity();
+            self.cleanup_stack.clear();
             for (fn_decl.params) |param| {
                 const param_type = self.resolveTypeNode(param.type_expr);
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
@@ -160,7 +156,7 @@ pub const Lowerer = struct {
             if (fn_decl.body != null_node) {
                 _ = try self.lowerBlockNode(fn_decl.body);
                 if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
-                    try self.emitDeferredExprs(0);
+                    try self.emitCleanups(0);
                     _ = try fb.emitRet(null, fn_decl.span);
                 }
             }
@@ -209,7 +205,7 @@ pub const Lowerer = struct {
         self.builder.startFunc(synth_name, TypeRegistry.VOID, return_type, fn_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
-            self.defer_stack.clearRetainingCapacity();
+            self.cleanup_stack.clear();
             for (fn_decl.params) |param| {
                 const param_type = self.resolveTypeNode(param.type_expr);
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
@@ -217,7 +213,7 @@ pub const Lowerer = struct {
             if (fn_decl.body != null_node) {
                 _ = try self.lowerBlockNode(fn_decl.body);
                 if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
-                    try self.emitDeferredExprs(0);
+                    try self.emitCleanups(0);
                     _ = try fb.emitRet(null, fn_decl.span);
                 }
             }
@@ -234,11 +230,11 @@ pub const Lowerer = struct {
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             self.current_test_name = test_decl.name;
-            self.defer_stack.clearRetainingCapacity();
+            self.cleanup_stack.clear();
             if (test_decl.body != null_node) {
                 _ = try self.lowerBlockNode(test_decl.body);
                 if (fb.needsTerminator()) {
-                    try self.emitDeferredExprs(0);
+                    try self.emitCleanups(0);
                     _ = try fb.emitRet(null, test_decl.span);
                 }
             }
@@ -294,7 +290,6 @@ pub const Lowerer = struct {
             .for_stmt => |f| { try self.lowerFor(f); return false; },
             .block_stmt => |block| {
                 const fb = self.current_func orelse return false;
-                const defer_depth = self.defer_stack.items.len;
                 const cleanup_depth = self.cleanup_stack.getScopeDepth();
                 const scope_depth = fb.markScopeEntry();
                 for (block.stmts) |stmt_idx| {
@@ -303,7 +298,6 @@ pub const Lowerer = struct {
                         if (try self.lowerStmt(s)) { fb.restoreScope(scope_depth); return true; }
                     }
                 }
-                try self.emitDeferredExprs(defer_depth);
                 try self.emitCleanups(cleanup_depth);
                 fb.restoreScope(scope_depth);
                 return false;
@@ -311,7 +305,18 @@ pub const Lowerer = struct {
             .break_stmt => |bs| { try self.lowerBreak(bs.label); return true; },
             .continue_stmt => |cs| { try self.lowerContinue(cs.label); return true; },
             .expr_stmt => |es| { _ = try self.lowerExprNode(es.expr); return false; },
-            .defer_stmt => |ds| { try self.defer_stack.append(self.allocator, ds.expr); return false; },
+            .defer_stmt => |ds| {
+                // Push defer as cleanup entry on unified stack (Swift's DeferCleanup pattern)
+                const cleanup = arc.Cleanup{
+                    .kind = .defer_expr,
+                    .value = @intCast(ds.expr),
+                    .type_idx = TypeRegistry.VOID,
+                    .state = .active,
+                    .local_idx = null,
+                };
+                _ = try self.cleanup_stack.push(cleanup);
+                return false;
+            },
             .bad_stmt => return false,
         }
     }
@@ -362,41 +367,109 @@ pub const Lowerer = struct {
                     }
                 }
             }
+
+            // If there are defers on the cleanup stack, capture the return value into a temp
+            // local so defers can't modify it. Zig semantics: `return x` captures x, then
+            // defers run (but the captured value is returned, not the modified one).
+            if (value_node != null and self.hasDeferCleanups()) {
+                const ret_val = value_node.?;
+                const ret_size = self.type_reg.sizeOf(ret_type);
+                const tmp_local = try fb.addLocalWithSize("__ret_tmp", ret_type, false, ret_size);
+                _ = try fb.emitStoreLocal(tmp_local, ret_val, ret.span);
+                try self.emitCleanups(0);
+                value_node = try fb.emitLoadLocal(tmp_local, ret_type, ret.span);
+                _ = try fb.emitRet(value_node, ret.span);
+                return;
+            }
         }
-        try self.emitDeferredExprs(0);
         try self.emitCleanups(0);
         _ = try fb.emitRet(value_node, ret.span);
     }
 
-    fn emitDeferredExprs(self: *Lowerer, target_depth: usize) Error!void {
-        while (self.defer_stack.items.len > target_depth) {
-            const defer_expr = self.defer_stack.pop() orelse break;
-            _ = try self.lowerExprNode(defer_expr);
+    /// Check if there are any active defer cleanups on the stack.
+    fn hasDeferCleanups(self: *const Lowerer) bool {
+        for (self.cleanup_stack.items.items) |cleanup| {
+            if (cleanup.isActive() and cleanup.kind == .defer_expr) return true;
+        }
+        return false;
+    }
+
+    /// Evaluate a deferred AST node — may be an expression or a statement.
+    fn lowerDeferredNode(self: *Lowerer, node_idx: ast.NodeIndex) Error!void {
+        const node = self.tree.getNode(node_idx) orelse return;
+        if (node.asStmt()) |stmt| {
+            _ = try self.lowerStmt(stmt);
+        } else if (node.asExpr()) |_| {
+            _ = try self.lowerExprNode(node_idx);
         }
     }
 
-    /// Emit release calls for all active cleanups down to target_depth.
+    /// Emit all cleanups (releases + defers) down to target_depth.
     /// Called at scope exit (block end, return, break, etc.)
+    /// Unified stack handles both ARC releases and deferred expressions in LIFO order.
+    /// Port of Swift's CleanupManager pattern.
     fn emitCleanups(self: *Lowerer, target_depth: usize) Error!void {
         const fb = self.current_func orelse return;
         const items = self.cleanup_stack.getActiveCleanups();
 
-        // Process in reverse order (LIFO - last allocated, first released)
+        // Process in reverse order (LIFO - last registered, first emitted)
         var i = items.len;
         while (i > target_depth) {
             i -= 1;
             const cleanup = items[i];
             if (cleanup.isActive()) {
-                // Emit cot_release(value)
-                var args = [_]ir.NodeIndex{cleanup.value};
-                _ = try fb.emitCall("cot_release", &args, false, TypeRegistry.VOID, Span.zero);
+                switch (cleanup.kind) {
+                    .release => {
+                        // For locals: reload current value (may have been reassigned)
+                        const value = if (cleanup.local_idx) |lidx|
+                            try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
+                        else
+                            cleanup.value;
+                        var args = [_]ir.NodeIndex{value};
+                        _ = try fb.emitCall("cot_release", &args, false, TypeRegistry.VOID, Span.zero);
+                    },
+                    .defer_expr => {
+                        try self.lowerDeferredNode(@intCast(cleanup.value));
+                    },
+                    .end_borrow => {},
+                }
             }
         }
 
-        // Mark cleanups as dead (they've been emitted)
+        // Pop the cleanups we just emitted
         while (self.cleanup_stack.items.items.len > target_depth) {
             _ = self.cleanup_stack.items.pop();
         }
+    }
+
+    /// Emit cleanups from current depth to target WITHOUT popping.
+    /// Used for break/continue — other paths still need these cleanups.
+    /// Port of Swift's emitBranchAndCleanups pattern.
+    fn emitCleanupsNoPop(self: *Lowerer, target_depth: usize) Error!void {
+        const fb = self.current_func orelse return;
+        const items = self.cleanup_stack.getActiveCleanups();
+        var i = items.len;
+        while (i > target_depth) {
+            i -= 1;
+            const cleanup = items[i];
+            if (cleanup.isActive()) {
+                switch (cleanup.kind) {
+                    .release => {
+                        const value = if (cleanup.local_idx) |lidx|
+                            try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
+                        else
+                            cleanup.value;
+                        var args = [_]ir.NodeIndex{value};
+                        _ = try fb.emitCall("cot_release", &args, false, TypeRegistry.VOID, Span.zero);
+                    },
+                    .defer_expr => {
+                        try self.lowerDeferredNode(@intCast(cleanup.value));
+                    },
+                    .end_borrow => {},
+                }
+            }
+        }
+        // Do NOT pop — other code paths still need these cleanups
     }
 
     fn lowerLocalVarDecl(self: *Lowerer, var_stmt: ast.VarStmt) !void {
@@ -672,7 +745,21 @@ pub const Lowerer = struct {
         switch (target_expr) {
             .ident => |id| {
                 if (fb.lookupLocal(id.name)) |local_idx| {
-                    _ = try fb.emitStoreLocal(local_idx, value_node, assign.span);
+                    // Port of Swift's emitSemanticStore(IsNotInitialization):
+                    // Release old value before storing new if local has ARC cleanup
+                    if (self.cleanup_stack.hasCleanupForLocal(local_idx)) {
+                        const local_type = fb.locals.items[local_idx].type_idx;
+                        const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
+                        var release_args = [_]ir.NodeIndex{old_value};
+                        _ = try fb.emitCall("cot_release", &release_args, false, TypeRegistry.VOID, assign.span);
+                        // Retain new value (we're taking ownership)
+                        var retain_args = [_]ir.NodeIndex{value_node};
+                        const retained = try fb.emitCall("cot_retain", &retain_args, false, local_type, assign.span);
+                        _ = try fb.emitStoreLocal(local_idx, retained, assign.span);
+                        self.cleanup_stack.updateValueForLocal(local_idx, retained);
+                    } else {
+                        _ = try fb.emitStoreLocal(local_idx, value_node, assign.span);
+                    }
                 } else if (self.builder.lookupGlobal(id.name)) |g| {
                     _ = try fb.emitGlobalStore(g.idx, id.name, value_node, assign.span);
                 }
@@ -814,7 +901,7 @@ pub const Lowerer = struct {
         const cond_node = try self.lowerExprNode(while_stmt.condition);
         if (cond_node == ir.null_node) return;
         _ = try fb.emitBranch(cond_node, body_block, exit_block, while_stmt.span);
-        try self.loop_stack.append(self.allocator, .{ .cond_block = cond_block, .exit_block = exit_block, .defer_depth = self.defer_stack.items.len, .label = while_stmt.label });
+        try self.loop_stack.append(self.allocator, .{ .cond_block = cond_block, .exit_block = exit_block, .cleanup_depth = self.cleanup_stack.getScopeDepth(), .label = while_stmt.label });
         fb.setBlock(body_block);
         if (!try self.lowerBlockNode(while_stmt.body)) _ = try fb.emitJump(cond_block, while_stmt.span);
         _ = self.loop_stack.pop();
@@ -880,7 +967,7 @@ pub const Lowerer = struct {
         const cond = try fb.emitBinary(.lt, idx_val, len_val_cond, TypeRegistry.BOOL, for_stmt.span);
         _ = try fb.emitBranch(cond, body_block, exit_block, for_stmt.span);
 
-        try self.loop_stack.append(self.allocator, .{ .cond_block = incr_block, .exit_block = exit_block, .defer_depth = self.defer_stack.items.len });
+        try self.loop_stack.append(self.allocator, .{ .cond_block = incr_block, .exit_block = exit_block, .cleanup_depth = self.cleanup_stack.getScopeDepth() });
 
         fb.setBlock(body_block);
         const binding_local = try fb.addLocalWithSize(for_stmt.binding, elem_type, false, elem_size);
@@ -993,7 +1080,7 @@ pub const Lowerer = struct {
         try self.loop_stack.append(self.allocator, .{
             .cond_block = incr_block,
             .exit_block = exit_block,
-            .defer_depth = self.defer_stack.items.len,
+            .cleanup_depth = self.cleanup_stack.getScopeDepth(),
         });
 
         // Body
@@ -1019,7 +1106,8 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return;
         if (self.loop_stack.items.len == 0) return;
         const ctx = if (target_label) |label| self.findLabeledLoop(label) orelse self.loop_stack.items[self.loop_stack.items.len - 1] else self.loop_stack.items[self.loop_stack.items.len - 1];
-        try self.emitDeferredExprs(ctx.defer_depth);
+        // Emit ALL cleanups (defers + releases) without popping — Swift's emitBranchAndCleanups
+        try self.emitCleanupsNoPop(ctx.cleanup_depth);
         _ = try fb.emitJump(ctx.exit_block, Span.fromPos(Pos.zero));
     }
 
@@ -1027,7 +1115,8 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return;
         if (self.loop_stack.items.len == 0) return;
         const ctx = if (target_label) |label| self.findLabeledLoop(label) orelse self.loop_stack.items[self.loop_stack.items.len - 1] else self.loop_stack.items[self.loop_stack.items.len - 1];
-        try self.emitDeferredExprs(ctx.defer_depth);
+        // Emit ALL cleanups (defers + releases) without popping — Swift's emitBranchAndCleanups
+        try self.emitCleanupsNoPop(ctx.cleanup_depth);
         _ = try fb.emitJump(ctx.cond_block, Span.fromPos(Pos.zero));
     }
 
@@ -1081,13 +1170,13 @@ pub const Lowerer = struct {
             .struct_init => |si| return try self.lowerStructInitExpr(si),
             .new_expr => |ne| return try self.lowerNewExpr(ne),
             .block_expr => |block| {
-                const defer_depth = self.defer_stack.items.len;
+                const cleanup_depth = self.cleanup_stack.getScopeDepth();
                 const scope_depth = fb.markScopeEntry();
                 for (block.stmts) |stmt_idx| {
                     const stmt_node = self.tree.getNode(stmt_idx) orelse continue;
                     if (stmt_node.asStmt()) |s| if (try self.lowerStmt(s)) break;
                 }
-                try self.emitDeferredExprs(defer_depth);
+                try self.emitCleanups(cleanup_depth);
                 var result: ir.NodeIndex = ir.null_node;
                 if (block.expr != null_node) result = try self.lowerExprNode(block.expr);
                 fb.restoreScope(scope_depth);

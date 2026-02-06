@@ -743,3 +743,59 @@ test "wasm e2e: error union try propagation" {
     try std.testing.expect(!result.has_errors);
     try std.testing.expect(result.wasm_bytes.len > 0);
 }
+
+test "wasm e2e: defer basic" {
+    // Defer with variable mutation — return captures value before defer runs
+    const code =
+        \\fn main() i64 {
+        \\    var x: i64 = 10
+        \\    defer x = 99
+        \\    return x
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+test "wasm e2e: defer LIFO ordering" {
+    // Multiple defers execute in LIFO order
+    const code =
+        \\fn main() i64 {
+        \\    var x: i64 = 0
+        \\    defer x = x + 1
+        \\    defer x = x * 10
+        \\    return x
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
+
+test "wasm e2e: defer with loop break" {
+    const code =
+        \\fn main() i64 {
+        \\    var sum: i64 = 0
+        \\    var i: i64 = 0
+        \\    while i < 5 {
+        \\        defer sum = sum + 1
+        \\        i = i + 1
+        \\        if i == 3 { break }
+        \\    }
+        \\    return sum
+        \\}
+    ;
+
+    var result = try compileToWasm(std.testing.allocator, code);
+    defer result.deinit();
+
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+}
