@@ -1016,3 +1016,55 @@ test "wasm e2e: closure passed to function" {
     try std.testing.expect(result.wasm_bytes.len > 0);
     try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
 }
+
+test "wasm e2e: generic function basic" {
+    const code =
+        \\fn max(T)(a: T, b: T) T {
+        \\    if a > b { return a }
+        \\    return b
+        \\}
+        \\fn main() i64 {
+        \\    return max(i64)(3, 7)
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: generic struct basic" {
+    const code =
+        \\struct Pair(T, U) { first: T, second: U }
+        \\fn main() i64 {
+        \\    var p: Pair(i64, i64) = undefined
+        \\    p.first = 10
+        \\    p.second = 20
+        \\    return p.first + p.second
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: generic function multiple instantiations" {
+    const code =
+        \\fn add(T)(a: T, b: T) T {
+        \\    return a + b
+        \\}
+        \\fn main() i64 {
+        \\    let x: i64 = add(i64)(10, 20)
+        \\    let y: i32 = add(i32)(3, 4)
+        \\    return x + y
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}

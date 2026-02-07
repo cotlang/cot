@@ -662,3 +662,40 @@ test "parity: variables (40 tests)" {
     defer std.testing.allocator.free(code);
     try expectExitCode(std.testing.allocator, code, 0, "parity_variables");
 }
+
+test "generic function basic" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\fn max(T)(a: T, b: T) T {
+        \\    if a > b { return a }
+        \\    return b
+        \\}
+        \\fn main() i64 {
+        \\    return max(i64)(3, 7)
+        \\}
+    ), 7, "generic_fn_basic");
+}
+
+test "generic struct basic" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\struct Pair(T, U) { first: T, second: U }
+        \\fn main() i64 {
+        \\    var p: Pair(i64, i64) = undefined
+        \\    p.first = 10
+        \\    p.second = 20
+        \\    return p.first + p.second
+        \\}
+    ), 30, "generic_struct_basic");
+}
+
+test "generic function multiple instantiations" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\fn add(T)(a: T, b: T) T {
+        \\    return a + b
+        \\}
+        \\fn main() i64 {
+        \\    let x: i64 = add(i64)(10, 20)
+        \\    let y: i32 = add(i32)(3, 4)
+        \\    return x + y
+        \\}
+    ), 37, "generic_fn_multi_inst");
+}

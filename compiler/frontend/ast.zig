@@ -38,9 +38,9 @@ pub const Decl = union(enum) {
     }
 };
 
-pub const FnDecl = struct { name: []const u8, params: []const Field, return_type: NodeIndex, body: NodeIndex, is_extern: bool, span: Span };
+pub const FnDecl = struct { name: []const u8, type_params: []const []const u8 = &.{}, params: []const Field, return_type: NodeIndex, body: NodeIndex, is_extern: bool, span: Span };
 pub const VarDecl = struct { name: []const u8, type_expr: NodeIndex, value: NodeIndex, is_const: bool, span: Span };
-pub const StructDecl = struct { name: []const u8, fields: []const Field, span: Span };
+pub const StructDecl = struct { name: []const u8, type_params: []const []const u8 = &.{}, fields: []const Field, span: Span };
 pub const ImplBlock = struct { type_name: []const u8, methods: []const NodeIndex, span: Span };
 pub const TestDecl = struct { name: []const u8, body: NodeIndex, span: Span };
 pub const EnumDecl = struct { name: []const u8, backing_type: NodeIndex, variants: []const EnumVariant, span: Span };
@@ -116,6 +116,7 @@ pub const BuiltinCall = struct { name: []const u8, type_arg: NodeIndex, args: [2
 pub const StringSegment = union(enum) { text: []const u8, expr: NodeIndex };
 pub const StringInterp = struct { segments: []const StringSegment, span: Span };
 pub const TypeExpr = struct { kind: TypeKind, span: Span };
+pub const GenericInstance = struct { name: []const u8, type_args: []const NodeIndex };
 pub const TypeKind = union(enum) {
     named: []const u8,
     pointer: NodeIndex,
@@ -126,6 +127,7 @@ pub const TypeKind = union(enum) {
     map: struct { key: NodeIndex, value: NodeIndex },
     list: NodeIndex,
     function: struct { params: []const NodeIndex, ret: NodeIndex },
+    generic_instance: GenericInstance,
 };
 pub const TryExpr = struct { operand: NodeIndex, span: Span };
 pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, fallback: NodeIndex, span: Span };
@@ -231,8 +233,14 @@ pub const Ast = struct {
         for (self.nodes.items) |node| {
             switch (node) {
                 .decl => |decl| switch (decl) {
-                    .fn_decl => |fn_d| if (fn_d.params.len > 0) self.allocator.free(fn_d.params),
-                    .struct_decl => |s| if (s.fields.len > 0) self.allocator.free(s.fields),
+                    .fn_decl => |fn_d| {
+                        if (fn_d.params.len > 0) self.allocator.free(fn_d.params);
+                        if (fn_d.type_params.len > 0) self.allocator.free(fn_d.type_params);
+                    },
+                    .struct_decl => |s| {
+                        if (s.fields.len > 0) self.allocator.free(s.fields);
+                        if (s.type_params.len > 0) self.allocator.free(s.type_params);
+                    },
                     .enum_decl => |e| if (e.variants.len > 0) self.allocator.free(e.variants),
                     .union_decl => |u| if (u.variants.len > 0) self.allocator.free(u.variants),
                     .error_set_decl => |e| if (e.variants.len > 0) self.allocator.free(e.variants),
@@ -241,6 +249,7 @@ pub const Ast = struct {
                 .expr => |expr| switch (expr) {
                     .type_expr => |t| switch (t.kind) {
                         .function => |f| if (f.params.len > 0) self.allocator.free(f.params),
+                        .generic_instance => |gi| if (gi.type_args.len > 0) self.allocator.free(gi.type_args),
                         else => {},
                     },
                     .closure_expr => |ce| if (ce.params.len > 0) self.allocator.free(ce.params),

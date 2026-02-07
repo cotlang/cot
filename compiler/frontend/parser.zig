@@ -135,6 +135,27 @@ pub const Parser = struct {
         self.advance();
 
         if (!self.expect(.lparen)) return null;
+
+        // Zig-inspired syntax: fn max(T)(a: T, b: T) T
+        // Zig uses fn max(comptime T: type) with same paren syntax for comptime/runtime args.
+        // Go uses fn max[T comparable](a, b T) with bracket syntax.
+        // We use Zig's paren convention: bare idents (no ':') = type params.
+        var type_params: []const []const u8 = &.{};
+        if (self.check(.ident) and self.peekToken().tok != .colon) {
+            var tp = std.ArrayListUnmanaged([]const u8){};
+            defer tp.deinit(self.allocator);
+            while (!self.check(.rparen) and !self.check(.eof)) {
+                if (!self.check(.ident)) { self.syntaxError("expected type parameter name"); return null; }
+                try tp.append(self.allocator, self.tok.text);
+                self.advance();
+                if (!self.match(.comma)) break;
+            }
+            if (!self.expect(.rparen)) return null;
+            type_params = try self.allocator.dupe([]const u8, tp.items);
+            // Expect second ( for value parameters
+            if (!self.expect(.lparen)) return null;
+        }
+
         const params = try self.parseFieldList(.rparen);
         if (!self.expect(.rparen)) return null;
 
@@ -150,7 +171,7 @@ pub const Parser = struct {
             body = try self.parseBlock() orelse return null;
         }
 
-        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseFieldList(self: *Parser, end_tok: Token) ParseError![]const ast.Field {
@@ -217,10 +238,27 @@ pub const Parser = struct {
         if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected struct name"); return null; }
         const name = self.tok.text;
         self.advance();
+
+        // Parse optional type parameters: struct Pair(T, U) { ... }
+        var type_params: []const []const u8 = &.{};
+        if (self.check(.lparen)) {
+            self.advance();
+            var tp = std.ArrayListUnmanaged([]const u8){};
+            defer tp.deinit(self.allocator);
+            while (!self.check(.rparen) and !self.check(.eof)) {
+                if (!self.check(.ident)) { self.syntaxError("expected type parameter name"); return null; }
+                try tp.append(self.allocator, self.tok.text);
+                self.advance();
+                if (!self.match(.comma)) break;
+            }
+            if (!self.expect(.rparen)) return null;
+            type_params = try self.allocator.dupe([]const u8, tp.items);
+        }
+
         if (!self.expect(.lbrace)) return null;
         const fields = try self.parseFieldList(.rbrace);
         if (!self.expect(.rbrace)) return null;
-        return try self.tree.addDecl(.{ .struct_decl = .{ .name = name, .fields = fields, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .struct_decl = .{ .name = name, .type_params = type_params, .fields = fields, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseImplBlock(self: *Parser) ParseError!?NodeIndex {
@@ -357,7 +395,9 @@ pub const Parser = struct {
         if (self.check(.ident) or self.tok.tok.isTypeKeyword()) {
             const type_name = if (self.tok.text.len > 0) self.tok.text else self.tok.tok.string();
             self.advance();
+            // Generic type instantiation: Name(arg1, arg2, ...) or legacy Map<K,V> / List<T>
             if (self.match(.lss)) {
+                // Legacy angle bracket syntax for Map<K,V> and List<T>
                 if (std.mem.eql(u8, type_name, "Map")) {
                     const key = try self.parseType() orelse return null;
                     if (!self.expect(.comma)) return null;
@@ -369,6 +409,19 @@ pub const Parser = struct {
                     if (!self.expect(.gtr)) return null;
                     return try self.tree.addExpr(.{ .type_expr = .{ .kind = .{ .list = elem }, .span = Span.init(start, self.pos()) } });
                 } else { self.syntaxError("unknown generic type"); return null; }
+            }
+            // Paren syntax for generics: Name(T1, T2, ...)
+            if (self.check(.lparen)) {
+                self.advance();
+                var args = std.ArrayListUnmanaged(NodeIndex){};
+                defer args.deinit(self.allocator);
+                while (!self.check(.rparen) and !self.check(.eof)) {
+                    const arg = try self.parseType() orelse break;
+                    try args.append(self.allocator, arg);
+                    if (!self.match(.comma)) break;
+                }
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .type_expr = .{ .kind = .{ .generic_instance = .{ .name = type_name, .type_args = try self.allocator.dupe(NodeIndex, args.items) } }, .span = Span.init(start, self.pos()) } });
             }
             // Check for E!T (error union with named error set)
             if (self.match(.lnot)) {
@@ -637,7 +690,7 @@ pub const Parser = struct {
             .at => return self.parseBuiltinCall(start),
             else => {
                 if (self.tok.tok.isTypeKeyword()) {
-                    const n = self.tok.text;
+                    const n = self.tok.tok.string();
                     self.advance();
                     return try self.tree.addExpr(.{ .ident = .{ .name = n, .span = Span.init(start, self.pos()) } });
                 }

@@ -27,7 +27,7 @@ pub const Lowerer = struct {
     type_reg: *TypeRegistry,
     err: *ErrorReporter,
     builder: ir.Builder,
-    chk: *const checker.Checker,
+    chk: *checker.Checker,
     current_func: ?*ir.FuncBuilder = null,
     temp_counter: u32 = 0,
     loop_stack: std.ArrayListUnmanaged(LoopContext),
@@ -38,6 +38,8 @@ pub const Lowerer = struct {
     test_display_names: std.ArrayListUnmanaged([]const u8),
     current_test_name: ?[]const u8 = null,
     closure_counter: u32 = 0,
+    lowered_generics: std.StringHashMap(void),
+    type_substitution: ?std.StringHashMap(TypeIndex) = null,
 
     pub const Error = error{OutOfMemory};
 
@@ -48,11 +50,11 @@ pub const Lowerer = struct {
         label: ?[]const u8 = null,
     };
 
-    pub fn init(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *const checker.Checker) Lowerer {
+    pub fn init(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker) Lowerer {
         return initWithBuilder(allocator, tree, type_reg, err, chk, ir.Builder.init(allocator, type_reg));
     }
 
-    pub fn initWithBuilder(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *const checker.Checker, builder: ir.Builder) Lowerer {
+    pub fn initWithBuilder(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker, builder: ir.Builder) Lowerer {
         return .{
             .allocator = allocator,
             .tree = tree,
@@ -65,6 +67,7 @@ pub const Lowerer = struct {
             .const_values = std.StringHashMap(i64).init(allocator),
             .test_names = .{},
             .test_display_names = .{},
+            .lowered_generics = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -80,6 +83,7 @@ pub const Lowerer = struct {
         self.const_values.deinit();
         self.test_names.deinit(self.allocator);
         self.test_display_names.deinit(self.allocator);
+        self.lowered_generics.deinit();
         self.builder.deinit();
     }
 
@@ -88,6 +92,7 @@ pub const Lowerer = struct {
         self.const_values.deinit();
         self.test_names.deinit(self.allocator);
         self.test_display_names.deinit(self.allocator);
+        self.lowered_generics.deinit();
     }
 
     pub fn lower(self: *Lowerer) !ir.IR {
@@ -97,6 +102,9 @@ pub const Lowerer = struct {
 
     pub fn lowerToBuilder(self: *Lowerer) !void {
         for (self.tree.getRootDecls()) |decl_idx| try self.lowerDecl(decl_idx);
+        // Zig pattern: process queued generic instantiations as top-level functions
+        // (deferred, not inline — avoids corrupting builder state during nested lowering)
+        try self.lowerQueuedGenericFunctions();
     }
 
     pub fn generateTestRunner(self: *Lowerer) !void {
@@ -144,6 +152,7 @@ pub const Lowerer = struct {
 
     fn lowerFnDecl(self: *Lowerer, fn_decl: ast.FnDecl) !void {
         if (fn_decl.is_extern) return;
+        if (fn_decl.type_params.len > 0) return; // Skip generic fn defs — lowered on demand at call sites
         if (self.test_mode and std.mem.eql(u8, fn_decl.name, "main")) return;
         const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
         self.builder.startFunc(fn_decl.name, TypeRegistry.VOID, return_type, fn_decl.span);
@@ -186,6 +195,7 @@ pub const Lowerer = struct {
     }
 
     fn lowerStructDecl(self: *Lowerer, struct_decl: ast.StructDecl) !void {
+        if (struct_decl.type_params.len > 0) return; // Skip generic struct defs — instantiated on demand
         const struct_type_idx = self.type_reg.lookupByName(struct_decl.name) orelse TypeRegistry.VOID;
         try self.builder.addStruct(.{ .name = struct_decl.name, .type_idx = struct_type_idx, .span = struct_decl.span });
     }
@@ -2297,6 +2307,47 @@ pub const Lowerer = struct {
             }
         }
 
+        // Generic function call: max(i64)(3, 5) — callee is a call expr (the inner call)
+        if (callee_expr == .call) {
+            const inner_call = callee_expr.call;
+            if (self.chk.generic_instantiations.get(inner_call.callee)) |inst_info| {
+                try self.ensureGenericFnQueued(inst_info);
+                // Lower value arguments
+                var gen_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                defer gen_args.deinit(self.allocator);
+                // Get concrete func type for param checking
+                const concrete_func_type = self.type_reg.lookupByName(inst_info.concrete_name) orelse TypeRegistry.VOID;
+                const concrete_info = self.type_reg.get(concrete_func_type);
+                const cparam_types: ?[]const types.FuncParam = if (concrete_info == .func) concrete_info.func.params else null;
+                for (call.args, 0..) |arg_idx, arg_i| {
+                    const ast_node = self.tree.getNode(arg_idx) orelse continue;
+                    const ast_expr = ast_node.asExpr() orelse continue;
+                    var arg_node: ir.NodeIndex = ir.null_node;
+                    if (ast_expr == .literal and ast_expr.literal.kind == .string) {
+                        var param_is_pointer = false;
+                        if (cparam_types) |params| {
+                            if (arg_i < params.len) {
+                                const param_type = self.type_reg.get(params[arg_i].type_idx);
+                                param_is_pointer = (param_type == .pointer);
+                            }
+                        }
+                        if (param_is_pointer) {
+                            const str_node = try self.lowerLiteral(ast_expr.literal);
+                            arg_node = try fb.emitSlicePtr(str_node, TypeRegistry.I64, call.span);
+                        } else {
+                            arg_node = try self.lowerLiteral(ast_expr.literal);
+                        }
+                    } else {
+                        arg_node = try self.lowerExprNode(arg_idx);
+                    }
+                    if (arg_node == ir.null_node) continue;
+                    try gen_args.append(self.allocator, arg_node);
+                }
+                const ret_type = if (concrete_info == .func) concrete_info.func.return_type else TypeRegistry.VOID;
+                return try fb.emitCall(inst_info.concrete_name, gen_args.items, false, ret_type, call.span);
+            }
+        }
+
         // Check for builtins
         if (callee_expr == .ident) {
             const name = callee_expr.ident.name;
@@ -2370,6 +2421,78 @@ pub const Lowerer = struct {
             return try fb.emitClosureCall(table_idx, closure_ptr, args.items, return_type, call.span);
         }
         return try fb.emitCall(func_name, args.items, false, return_type, call.span);
+    }
+
+    /// Go pattern: check.later() (types2/call.go:152-166) defers verification to after
+    /// all instantiations are collected. We similarly defer lowering to after all regular
+    /// declarations, preventing builder state corruption from nested startFunc/endFunc.
+    fn ensureGenericFnQueued(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
+        if (self.lowered_generics.contains(inst_info.concrete_name)) return;
+        try self.lowered_generics.put(inst_info.concrete_name, {});
+    }
+
+    /// Go pattern: deferred actions run after all call sites processed (types2/call.go).
+    /// Zig pattern: ensureFuncBodyAnalysisQueued (Zcu.zig:3522) queues analysis jobs.
+    /// We process all queued generic instantiations as top-level functions.
+    fn lowerQueuedGenericFunctions(self: *Lowerer) !void {
+        var it = self.chk.generic_instantiations.valueIterator();
+        while (it.next()) |inst_info| {
+            if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
+            try self.lowerGenericFnInstance(inst_info.*);
+        }
+    }
+
+    /// Lower one concrete generic function as a top-level function.
+    fn lowerGenericFnInstance(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
+        const fn_node = self.tree.getNode(inst_info.generic_node) orelse return;
+        const fn_decl_node = fn_node.asDecl() orelse return;
+        if (fn_decl_node != .fn_decl) return;
+        const f = fn_decl_node.fn_decl;
+
+        // Build type substitution map: T -> i64, U -> f64, etc.
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (f.type_params, 0..) |param_name, i| {
+            if (i < inst_info.type_args.len) {
+                try sub_map.put(param_name, inst_info.type_args[i]);
+            }
+        }
+
+        // Zig pattern: ensureFuncBodyUpToDate (Zcu.zig:3522-3543) — re-analyze per instance.
+        // AST nodes are shared across instantiations, so expr_types must be refreshed
+        // before lowering each concrete instance (e.g., add(i64) vs add(i32) share the
+        // same body AST but need different expr_types). The checker already eagerly checked
+        // the body during instantiateGenericFunc; this re-check updates expr_types for the
+        // current instantiation's concrete types.
+        self.chk.type_substitution = sub_map;
+        self.chk.checkFnDeclWithName(f, inst_info.generic_node, inst_info.concrete_name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        self.chk.type_substitution = null;
+
+        // Lower the concrete function body with type substitution active
+        self.type_substitution = sub_map;
+        defer self.type_substitution = null;
+
+        const return_type = self.resolveTypeNode(f.return_type);
+        self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, return_type, f.span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            for (f.params) |param| {
+                const param_type = self.resolveTypeNode(param.type_expr);
+                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+            if (f.body != null_node) {
+                _ = try self.lowerBlockNode(f.body);
+                if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    _ = try fb.emitRet(null, f.span);
+                }
+            }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
     }
 
     fn lowerMethodCall(self: *Lowerer, call: ast.Call, fa: ast.FieldAccess, method_info: types.MethodInfo) Error!ir.NodeIndex {
@@ -2722,6 +2845,10 @@ pub const Lowerer = struct {
 
         switch (te.kind) {
             .named => |name| {
+                // Check type substitution first (active during generic instantiation)
+                if (self.type_substitution) |sub| {
+                    if (sub.get(name)) |substituted| return substituted;
+                }
                 if (std.mem.eql(u8, name, "void")) return TypeRegistry.VOID;
                 if (std.mem.eql(u8, name, "bool")) return TypeRegistry.BOOL;
                 if (std.mem.eql(u8, name, "i8")) return TypeRegistry.I8;
@@ -2777,6 +2904,21 @@ pub const Lowerer = struct {
                     }
                 }
                 return self.type_reg.makeErrorUnion(elem) catch TypeRegistry.VOID;
+            },
+            .generic_instance => |gi| {
+                // Look up the concrete monomorphized type by cache key
+                var buf = std.ArrayListUnmanaged(u8){};
+                defer buf.deinit(self.allocator);
+                const writer = buf.writer(self.allocator);
+                writer.writeAll(gi.name) catch return TypeRegistry.VOID;
+                writer.writeByte('(') catch return TypeRegistry.VOID;
+                for (gi.type_args, 0..) |arg_node, i| {
+                    if (i > 0) writer.writeByte(';') catch return TypeRegistry.VOID;
+                    const arg_type = self.resolveTypeNode(arg_node);
+                    std.fmt.format(writer, "{d}", .{arg_type}) catch return TypeRegistry.VOID;
+                }
+                writer.writeByte(')') catch return TypeRegistry.VOID;
+                return self.type_reg.lookupByName(buf.items) orelse TypeRegistry.VOID;
             },
             else => return TypeRegistry.VOID,
         }

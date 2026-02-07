@@ -72,6 +72,19 @@ pub const Scope = struct {
     pub fn isDefined(self: *const Scope, name: []const u8) bool { return self.symbols.contains(name); }
 };
 
+/// Info about a generic struct or function definition.
+pub const GenericInfo = struct {
+    type_params: []const []const u8,
+    node_idx: NodeIndex,
+};
+
+/// Info about a resolved generic function instantiation for the lowerer.
+pub const GenericInstInfo = struct {
+    concrete_name: []const u8,
+    generic_node: NodeIndex,
+    type_args: []const TypeIndex,
+};
+
 pub const Checker = struct {
     types: *TypeRegistry,
     scope: *Scope,
@@ -81,12 +94,36 @@ pub const Checker = struct {
     expr_types: std.AutoHashMap(NodeIndex, TypeIndex),
     current_return_type: TypeIndex = TypeRegistry.VOID,
     in_loop: bool = false,
+    // Generics support (Zig-style lazy monomorphization + Go checker flow)
+    generic_structs: std.StringHashMap(GenericInfo) = undefined,
+    generic_functions: std.StringHashMap(GenericInfo) = undefined,
+    instantiation_cache: std.StringHashMap(TypeIndex) = undefined,
+    generic_instantiations: std.AutoHashMap(NodeIndex, GenericInstInfo) = undefined,
+    /// Type substitution map, active during generic instantiation
+    type_substitution: ?std.StringHashMap(TypeIndex) = null,
 
     pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope) Checker {
-        return .{ .types = type_reg, .scope = global_scope, .err = reporter, .tree = tree, .allocator = allocator, .expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(allocator) };
+        return .{
+            .types = type_reg,
+            .scope = global_scope,
+            .err = reporter,
+            .tree = tree,
+            .allocator = allocator,
+            .expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(allocator),
+            .generic_structs = std.StringHashMap(GenericInfo).init(allocator),
+            .generic_functions = std.StringHashMap(GenericInfo).init(allocator),
+            .instantiation_cache = std.StringHashMap(TypeIndex).init(allocator),
+            .generic_instantiations = std.AutoHashMap(NodeIndex, GenericInstInfo).init(allocator),
+        };
     }
 
-    pub fn deinit(self: *Checker) void { self.expr_types.deinit(); }
+    pub fn deinit(self: *Checker) void {
+        self.expr_types.deinit();
+        self.generic_structs.deinit();
+        self.generic_functions.deinit();
+        self.instantiation_cache.deinit();
+        self.generic_instantiations.deinit();
+    }
     pub fn getExprType(self: *const Checker, node: NodeIndex) TypeIndex { return self.expr_types.get(node) orelse invalid_type; }
 
     pub fn checkFile(self: *Checker) CheckError!void {
@@ -121,6 +158,13 @@ pub const Checker = struct {
                     self.err.errorWithCode(f.span.start, .e302, "redefined identifier");
                     return;
                 }
+                // Generic functions: store definition, don't build concrete type yet
+                if (f.type_params.len > 0) {
+                    try self.generic_functions.put(f.name, .{ .type_params = f.type_params, .node_idx = idx });
+                    // Register as a type_name so checkIdentifier knows it's generic
+                    try self.scope.define(Symbol.init(f.name, .type_name, invalid_type, idx, false));
+                    return;
+                }
                 const func_type = try self.buildFuncType(f.params, f.return_type);
                 try self.scope.define(Symbol.initExtern(f.name, .function, func_type, idx, false, f.is_extern));
                 if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "self"))
@@ -132,6 +176,12 @@ pub const Checker = struct {
             },
             .struct_decl => |s| {
                 if (self.scope.isDefined(s.name)) { self.err.errorWithCode(s.span.start, .e302, "redefined identifier"); return; }
+                // Generic structs: store definition, don't build concrete type yet
+                if (s.type_params.len > 0) {
+                    try self.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx });
+                    try self.scope.define(Symbol.init(s.name, .type_name, invalid_type, idx, false));
+                    return;
+                }
                 const struct_type = try self.buildStructType(s.name, s.fields);
                 try self.scope.define(Symbol.init(s.name, .type_name, struct_type, idx, false));
                 try self.types.registerNamed(s.name, struct_type);
@@ -203,7 +253,11 @@ pub const Checker = struct {
     fn checkDecl(self: *Checker, idx: NodeIndex) CheckError!void {
         const decl = (self.tree.getNode(idx) orelse return).asDecl() orelse return;
         switch (decl) {
-            .fn_decl => |f| try self.checkFnDeclWithName(f, idx, f.name),
+            .fn_decl => |f| {
+                // Skip generic function definitions — they're checked at instantiation time
+                if (f.type_params.len > 0) return;
+                try self.checkFnDeclWithName(f, idx, f.name);
+            },
             .var_decl => |v| try self.checkVarDecl(v, idx),
             .impl_block => |impl_b| {
                 for (impl_b.methods) |method_idx| {
@@ -232,7 +286,7 @@ pub const Checker = struct {
         self.current_return_type = old_return;
     }
 
-    fn checkFnDeclWithName(self: *Checker, f: ast.FnDecl, idx: NodeIndex, lookup_name: []const u8) CheckError!void {
+    pub fn checkFnDeclWithName(self: *Checker, f: ast.FnDecl, idx: NodeIndex, lookup_name: []const u8) CheckError!void {
         const sym = self.scope.lookup(lookup_name) orelse return;
         const return_type = if (self.types.get(sym.type_idx) == .func) self.types.get(sym.type_idx).func.return_type else TypeRegistry.VOID;
         var func_scope = Scope.init(self.allocator, self.scope);
@@ -303,7 +357,12 @@ pub const Checker = struct {
 
     pub fn checkExpr(self: *Checker, idx: NodeIndex) CheckError!TypeIndex {
         if (idx == null_node) return invalid_type;
-        if (self.expr_types.get(idx)) |t| return t;
+        // During generic instantiation (type_substitution active), skip cache reads —
+        // shared AST nodes need fresh type checking with the current substitution.
+        // Go: each instantiation gets independent type checking (types2/instantiate.go).
+        if (self.type_substitution == null) {
+            if (self.expr_types.get(idx)) |t| return t;
+        }
         const result = try self.checkExprInner(idx);
         try self.expr_types.put(idx, result);
         return result;
@@ -347,7 +406,17 @@ pub const Checker = struct {
             self.err.errorWithCode(id.span.start, .e301, "type name cannot be used as expression");
             return invalid_type;
         }
+        // Go pattern: generic function names cannot be used without instantiation.
+        // Go types2/call.go:33 — funcInst() requires IndexExpr (explicit type args).
+        if (self.generic_functions.contains(id.name)) {
+            self.err.errorWithCode(id.span.start, .e300, "generic function requires type arguments");
+            return invalid_type;
+        }
         if (self.scope.lookup(id.name)) |sym| return sym.type_idx;
+        // Check type substitution (for type params used as values)
+        if (self.type_substitution) |sub| {
+            if (sub.get(id.name)) |_| return invalid_type;
+        }
         self.err.errorWithCode(id.span.start, .e301, "undefined identifier");
         return invalid_type;
     }
@@ -448,6 +517,10 @@ pub const Checker = struct {
                 _ = try self.checkExpr(c.args[0]);
                 _ = try self.checkExpr(c.args[1]);
                 return TypeRegistry.STRING;
+            }
+            // Generic function instantiation: max(i64) where max is generic
+            if (self.generic_functions.get(name)) |gen_info| {
+                return try self.instantiateGenericFunc(c, gen_info, name);
             }
         };
 
@@ -971,6 +1044,10 @@ pub const Checker = struct {
         if (idx == null_node) return invalid_type;
         const expr = (self.tree.getNode(idx) orelse return invalid_type).asExpr() orelse return invalid_type;
         if (expr == .ident) {
+            // Check type substitution first (active during generic instantiation)
+            if (self.type_substitution) |sub| {
+                if (sub.get(expr.ident.name)) |substituted| return substituted;
+            }
             if (self.types.lookupByName(expr.ident.name)) |tidx| return tidx;
             if (self.scope.lookup(expr.ident.name)) |sym| if (sym.kind == .type_name) return sym.type_idx;
             self.err.errorWithCode(expr.ident.span.start, .e301, "undefined type");
@@ -982,7 +1059,16 @@ pub const Checker = struct {
 
     fn resolveType(self: *Checker, te: ast.TypeExpr) CheckError!TypeIndex {
         return switch (te.kind) {
-            .named => |n| self.types.lookupByName(n) orelse if (self.scope.lookup(n)) |s| if (s.kind == .type_name) s.type_idx else invalid_type else { self.err.errorWithCode(te.span.start, .e301, "undefined type"); return invalid_type; },
+            .named => |n| blk: {
+                // Check type substitution first (active during generic instantiation)
+                if (self.type_substitution) |sub| {
+                    if (sub.get(n)) |substituted| break :blk substituted;
+                }
+                break :blk self.types.lookupByName(n) orelse if (self.scope.lookup(n)) |s| if (s.kind == .type_name) s.type_idx else invalid_type else {
+                    self.err.errorWithCode(te.span.start, .e301, "undefined type");
+                    return invalid_type;
+                };
+            },
             .pointer => |e| self.types.makePointer(try self.resolveTypeExpr(e)),
             .optional => |e| self.types.makeOptional(try self.resolveTypeExpr(e)),
             .error_union => |eu| blk: {
@@ -1009,7 +1095,146 @@ pub const Checker = struct {
                 const ret_type = if (f.ret != null_node) try self.resolveTypeExpr(f.ret) else TypeRegistry.VOID;
                 break :blk try self.types.makeFunc(func_params.items, ret_type);
             },
+            .generic_instance => |gi| try self.resolveGenericInstance(gi, te.span),
         };
+    }
+
+    /// Go pattern: types2/instantiate.go:87-125 — instance() for named types.
+    /// Creates concrete struct type with substituted fields, deduplicates via cache.
+    fn resolveGenericInstance(self: *Checker, gi: ast.GenericInstance, span: Span) CheckError!TypeIndex {
+        const gen_info = self.generic_structs.get(gi.name) orelse {
+            self.err.errorWithCode(span.start, .e301, "undefined generic type");
+            return invalid_type;
+        };
+
+        // Validate argument count
+        if (gi.type_args.len != gen_info.type_params.len) {
+            self.err.errorWithCode(span.start, .e300, "wrong number of type arguments");
+            return invalid_type;
+        }
+
+        // Resolve each type argument
+        var resolved_args = std.ArrayListUnmanaged(TypeIndex){};
+        defer resolved_args.deinit(self.allocator);
+        for (gi.type_args) |arg_node| {
+            const arg_type = try self.resolveTypeExpr(arg_node);
+            try resolved_args.append(self.allocator, arg_type);
+        }
+
+        // Build cache key for dedup: "Pair(5,17)" (TypeIndex values)
+        const cache_key = try self.buildGenericCacheKey(gi.name, resolved_args.items);
+
+        // Check instantiation cache
+        if (self.instantiation_cache.get(cache_key)) |cached| return cached;
+
+        // Create type substitution map
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (gen_info.type_params, 0..) |param_name, i| {
+            try sub_map.put(param_name, resolved_args.items[i]);
+        }
+
+        // Get the struct declaration AST node
+        const struct_decl = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
+        const s = struct_decl.struct_decl;
+
+        // Build concrete struct type with substituted fields
+        const old_sub = self.type_substitution;
+        self.type_substitution = sub_map;
+        const concrete_type = try self.buildStructType(cache_key, s.fields);
+        self.type_substitution = old_sub;
+
+        // Register and cache
+        try self.types.registerNamed(cache_key, concrete_type);
+        try self.instantiation_cache.put(cache_key, concrete_type);
+
+        return concrete_type;
+    }
+
+    /// Go pattern: types2/instantiate.go:87-125 — instance() creates concrete func,
+    /// then types2/call.go:152-166 — check.later() defers body verification.
+    /// We eagerly check the body here (simpler than Go's deferred queue for single-threaded).
+    fn instantiateGenericFunc(self: *Checker, c: ast.Call, gen_info: GenericInfo, name: []const u8) CheckError!TypeIndex {
+        // Validate argument count matches type params
+        if (c.args.len != gen_info.type_params.len) {
+            self.err.errorWithCode(c.span.start, .e300, "wrong number of type arguments");
+            return invalid_type;
+        }
+
+        // Resolve each type argument (Go: types2/call.go:46-82 resolves IndexExpr type args)
+        var resolved_args = std.ArrayListUnmanaged(TypeIndex){};
+        defer resolved_args.deinit(self.allocator);
+        for (c.args) |arg_node| {
+            const arg_type = try self.resolveTypeExpr(arg_node);
+            if (arg_type == invalid_type) {
+                const expr = (self.tree.getNode(arg_node) orelse return invalid_type).asExpr() orelse return invalid_type;
+                if (expr == .ident) {
+                    if (self.types.lookupByName(expr.ident.name)) |tidx| {
+                        try resolved_args.append(self.allocator, tidx);
+                        continue;
+                    }
+                }
+                self.err.errorWithCode(c.span.start, .e300, "expected type argument");
+                return invalid_type;
+            }
+            try resolved_args.append(self.allocator, arg_type);
+        }
+
+        // Go pattern: context.go:87-102 — hash-based dedup with identity verification
+        const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
+
+        // Get the fn_decl AST node
+        const fn_node = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
+        const f = fn_node.fn_decl;
+
+        // Go pattern: subst.go:13-24 — create substMap mapping TypeParam → concrete Type
+        var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
+        defer sub_map.deinit();
+        for (gen_info.type_params, 0..) |param_name, i| {
+            try sub_map.put(param_name, resolved_args.items[i]);
+        }
+
+        // Build concrete function type with substituted params and return type
+        const old_sub = self.type_substitution;
+        self.type_substitution = sub_map;
+        const func_type = try self.buildFuncType(f.params, f.return_type);
+
+        // Register the concrete function in scope before body check
+        if (!self.scope.isDefined(cache_key)) {
+            try self.scope.define(Symbol.init(cache_key, .function, func_type, gen_info.node_idx, false));
+        }
+
+        // Go pattern: check.later() defers body verification (call.go:152-166).
+        // We check eagerly here since we're single-threaded. This populates expr_types
+        // for the body nodes with concrete types (e.g., T→i64).
+        try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
+        self.type_substitution = old_sub;
+
+        // Record for the lowerer: this call node is a generic instantiation
+        try self.generic_instantiations.put(c.callee, .{
+            .concrete_name = cache_key,
+            .generic_node = gen_info.node_idx,
+            .type_args = try self.allocator.dupe(TypeIndex, resolved_args.items),
+        });
+
+        return func_type;
+    }
+
+    /// Go pattern: types2/context.go:65-83 — compute deterministic hash from origin + type args.
+    /// Go uses typeHasher with '#' separator; we use explicit delimiters to avoid collision.
+    /// Format: "Name(5;17)" — semicolons separate TypeIndex values (integers can't contain ';').
+    fn buildGenericCacheKey(self: *Checker, name: []const u8, type_args: []const TypeIndex) CheckError![]const u8 {
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        const writer = buf.writer(self.allocator);
+        writer.writeAll(name) catch return error.OutOfMemory;
+        writer.writeByte('(') catch return error.OutOfMemory;
+        for (type_args, 0..) |arg, i| {
+            if (i > 0) writer.writeByte(';') catch return error.OutOfMemory;
+            std.fmt.format(writer, "{d}", .{arg}) catch return error.OutOfMemory;
+        }
+        writer.writeByte(')') catch return error.OutOfMemory;
+        return try self.allocator.dupe(u8, buf.items);
     }
 
     fn buildFuncType(self: *Checker, params: []const ast.Field, return_type_idx: NodeIndex) CheckError!TypeIndex {
