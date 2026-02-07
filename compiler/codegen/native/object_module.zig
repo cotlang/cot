@@ -479,7 +479,7 @@ pub const ObjectModule = struct {
                 try macho_writer.addSymbol(
                     func.name,
                     func.code_offset,
-                    1, // section 1 = __text
+                    macho.SECT_TEXT,
                     func.linkage == .Export,
                 );
             }
@@ -491,7 +491,7 @@ pub const ObjectModule = struct {
                 try macho_writer.addSymbol(
                     data.name,
                     data.data_offset,
-                    2, // section 2 = __data
+                    macho.SECT_DATA,
                     data.linkage == .Export,
                 );
             }
@@ -531,7 +531,7 @@ pub const ObjectModule = struct {
                 try elf_writer.addSymbol(
                     func.name,
                     func.code_offset,
-                    1, // section 1 = .text
+                    elf.SHIDX_TEXT,
                     func.linkage == .Export,
                 );
             }
@@ -543,7 +543,7 @@ pub const ObjectModule = struct {
                 try elf_writer.addSymbol(
                     data.name,
                     data.data_offset,
-                    2, // section 2 = .data
+                    elf.SHIDX_DATA,
                     data.linkage == .Export,
                 );
             }

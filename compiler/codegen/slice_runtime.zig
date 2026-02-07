@@ -7,11 +7,13 @@ const std = @import("std");
 const wasm_old = @import("wasm.zig"); // Old module with CodeBuilder
 const wasm = @import("wasm/wasm.zig"); // New Go-style module for Linker
 const wasm_link = @import("wasm/link.zig");
+const wasm_op = @import("wasm_opcodes.zig");
+const arc = @import("arc.zig");
 const ValType = wasm.ValType;
 
 // Wasm block types (from spec)
-const BLOCK_VOID: u8 = wasm_old.CodeBuilder.BLOCK_VOID;
-const BLOCK_I64: u8 = 0x7E;
+const BLOCK_VOID: u8 = wasm_op.BLOCK_VOID;
+const BLOCK_I64: u8 = @intFromEnum(wasm_op.ValType.i64);
 
 /// Slice runtime function indices
 pub const SliceFunctions = struct {
@@ -200,14 +202,14 @@ fn generateGrowSliceBody(allocator: std.mem.Allocator, heap_ptr_global: u32) ![]
     try code.emitI32WrapI64();
     try code.emitLocalSet(5);
 
-    // alloc_size = (new_cap * elem_size + 7) & ~7  (8-byte aligned)
+    // alloc_size = (new_cap * elem_size + ALIGN_MINUS_ONE) & ALIGN_MASK
     try code.emitLocalGet(2); // new_cap
     try code.emitLocalGet(3); // elem_size
     try code.emitI64Mul();
     try code.emitI32WrapI64();
-    try code.emitI32Const(7);
+    try code.emitI32Const(arc.ALIGN_MINUS_ONE);
     try code.emitI32Add();
-    try code.emitI32Const(-8);
+    try code.emitI32Const(arc.ALIGN_MASK);
     try code.emitI32And();
     try code.emitLocalSet(6);
 

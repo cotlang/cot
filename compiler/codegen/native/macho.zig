@@ -5,6 +5,17 @@ const std = @import("std");
 const dwarf = @import("dwarf.zig");
 
 // Mach-O Constants
+// VM protection flags (mach/vm_prot.h)
+pub const VM_PROT_READ: u32 = 0x1;
+pub const VM_PROT_WRITE: u32 = 0x2;
+pub const VM_PROT_EXECUTE: u32 = 0x4;
+pub const VM_PROT_ALL: u32 = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+
+// Section indices (Mach-O sections are 1-based; 0 = undefined)
+pub const NO_SECT: u8 = 0;
+pub const SECT_TEXT: u8 = 1;
+pub const SECT_DATA: u8 = 2;
+
 pub const MH_MAGIC_64: u32 = 0xFEEDFACF;
 pub const CPU_TYPE_ARM64: u32 = 0x0100000C;
 pub const CPU_SUBTYPE_ARM64_ALL: u32 = 0x00000000;
@@ -49,8 +60,8 @@ pub const SegmentCommand64 = extern struct {
     vmsize: u64 = 0,
     fileoff: u64 = 0,
     filesize: u64 = 0,
-    maxprot: u32 = 0x7,
-    initprot: u32 = 0x7,
+    maxprot: u32 = VM_PROT_ALL,
+    initprot: u32 = VM_PROT_ALL,
     nsects: u32 = 0,
     flags: u32 = 0,
 };
@@ -211,7 +222,7 @@ pub const MachOWriter = struct {
         while (self.data.items.len % 8 != 0) try self.data.append(self.allocator, 0);
 
         try self.string_literals.append(self.allocator, .{ .data = str, .symbol = sym_name });
-        try self.symbols.append(self.allocator, .{ .name = sym_name, .value = offset, .section = 2, .external = true });
+        try self.symbols.append(self.allocator, .{ .name = sym_name, .value = offset, .section = SECT_DATA, .external = true });
         return sym_name;
     }
 
@@ -230,7 +241,7 @@ pub const MachOWriter = struct {
         const offset: u32 = @intCast(self.data.items.len);
         for (0..size) |_| try self.data.append(self.allocator, 0);
         const sym_name = try std.fmt.allocPrint(self.allocator, "_{s}", .{name});
-        try self.symbols.append(self.allocator, .{ .name = sym_name, .value = offset, .section = 2, .external = true });
+        try self.symbols.append(self.allocator, .{ .name = sym_name, .value = offset, .section = SECT_DATA, .external = true });
     }
 
     pub fn setDebugInfo(self: *MachOWriter, source_file: []const u8, source_text: []const u8) void {
@@ -269,7 +280,7 @@ pub const MachOWriter = struct {
         for (self.relocations.items) |reloc| {
             if (!sym_name_to_idx.contains(reloc.target)) {
                 try sym_name_to_idx.put(reloc.target, base_sym_count + extern_sym_count);
-                try self.symbols.append(self.allocator, .{ .name = reloc.target, .value = 0, .section = 0, .external = true });
+                try self.symbols.append(self.allocator, .{ .name = reloc.target, .value = 0, .section = NO_SECT, .external = true });
                 extern_sym_count += 1;
             }
         }
@@ -277,7 +288,7 @@ pub const MachOWriter = struct {
         for (self.data_relocations.items) |reloc| {
             if (!sym_name_to_idx.contains(reloc.target)) {
                 try sym_name_to_idx.put(reloc.target, @intCast(self.symbols.items.len));
-                try self.symbols.append(self.allocator, .{ .name = reloc.target, .value = 0, .section = 0, .external = true });
+                try self.symbols.append(self.allocator, .{ .name = reloc.target, .value = 0, .section = NO_SECT, .external = true });
             }
         }
 
@@ -429,7 +440,7 @@ pub const MachOWriter = struct {
         for (self.symbols.items, 0..) |sym, i| {
             try writer.writeAll(std.mem.asBytes(&Nlist64{
                 .n_strx = symbol_strx.items[i],
-                .n_type = if (sym.section == 0) N_EXT else (N_SECT | (if (sym.external) N_EXT else 0)),
+                .n_type = if (sym.section == NO_SECT) N_EXT else (N_SECT | (if (sym.external) N_EXT else 0)),
                 .n_sect = sym.section,
                 .n_value = sym.value,
             }));
@@ -476,7 +487,7 @@ pub const MachOWriter = struct {
         var text_symbol_idx: u32 = 0;
         var lowest_addr: u64 = std.math.maxInt(u64);
         for (self.symbols.items, 0..) |sym, i| {
-            if (sym.section == 1 and sym.value < lowest_addr) {
+            if (sym.section == SECT_TEXT and sym.value < lowest_addr) {
                 lowest_addr = sym.value;
                 text_symbol_idx = @intCast(i);
             }

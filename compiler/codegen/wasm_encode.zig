@@ -8,17 +8,22 @@ const wasm = @import("wasm_opcodes.zig");
 // LEB128 Encoding
 // ============================================================================
 
+/// LEB128 encoding constants (WebAssembly spec, binary encoding)
+pub const LEB128_LOW_BITS_MASK: u8 = 0x7F; // Extract low 7 data bits
+pub const LEB128_CONTINUATION_BIT: u8 = 0x80; // High bit = more bytes follow
+pub const LEB128_SIGN_BIT: u8 = 0x40; // Bit 6 = sign extension for SLEB128
+
 /// Encode unsigned LEB128 integer.
 pub fn encodeULEB128(writer: anytype, value: u64) !void {
     var v = value;
     while (true) {
-        const byte: u8 = @truncate(v & 0x7F);
+        const byte: u8 = @truncate(v & LEB128_LOW_BITS_MASK);
         v >>= 7;
         if (v == 0) {
             try writer.writeByte(byte);
             return;
         }
-        try writer.writeByte(byte | 0x80);
+        try writer.writeByte(byte | LEB128_CONTINUATION_BIT);
     }
 }
 
@@ -26,17 +31,17 @@ pub fn encodeULEB128(writer: anytype, value: u64) !void {
 pub fn encodeSLEB128(writer: anytype, value: i64) !void {
     var v = value;
     while (true) {
-        const byte: u8 = @truncate(@as(u64, @bitCast(v)) & 0x7F);
+        const byte: u8 = @truncate(@as(u64, @bitCast(v)) & LEB128_LOW_BITS_MASK);
         v >>= 7;
 
         // Check if we're done: remaining bits are all sign extension
-        const done = (v == 0 and (byte & 0x40) == 0) or (v == -1 and (byte & 0x40) != 0);
+        const done = (v == 0 and (byte & LEB128_SIGN_BIT) == 0) or (v == -1 and (byte & LEB128_SIGN_BIT) != 0);
 
         if (done) {
             try writer.writeByte(byte);
             return;
         }
-        try writer.writeByte(byte | 0x80);
+        try writer.writeByte(byte | LEB128_CONTINUATION_BIT);
     }
 }
 

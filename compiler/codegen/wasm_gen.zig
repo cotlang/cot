@@ -28,10 +28,12 @@ const Op = wasm.Op;
 const ValType = wasm.ValType;
 const debug = @import("../pipeline_debug.zig");
 
-// Block type constants for Wasm structured control flow
-const BLOCK_TYPE_VOID: u8 = 0x40;
-const BLOCK_TYPE_I32: u8 = 0x7F;
-const BLOCK_TYPE_I64: u8 = 0x7E;
+const wasm_op = @import("wasm_opcodes.zig");
+
+// Block type constants for Wasm structured control flow (derived from wasm_opcodes)
+const BLOCK_TYPE_VOID: u8 = wasm_op.BLOCK_VOID;
+const BLOCK_TYPE_I32: u8 = @intFromEnum(wasm_op.ValType.i32);
+const BLOCK_TYPE_I64: u8 = @intFromEnum(wasm_op.ValType.i64);
 
 // Memory layout constants
 // SP is global 0, initialized to 65536 by the linker
@@ -782,7 +784,7 @@ pub const FuncGen = struct {
                     try self.getValue64(v.args[0]); // index
                     try self.getValue64(v.args[1]); // length
                     try self.code.emitI64GeU(); // idx >= len (unsigned)
-                    try self.code.emitIf(0x40); // if (out of bounds)
+                    try self.code.emitIf(BLOCK_TYPE_VOID); // if (out of bounds)
                     try self.code.emitUnreachable(); // trap
                     try self.code.emitEnd();
                 }

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const wasm = @import("../wasm_opcodes.zig");
+const leb = @import("../wasm_encode.zig");
 
 // ============================================================================
 // Parsed Module Structures
@@ -220,7 +221,7 @@ pub const Parser = struct {
         if (count > 0) {
             const flags = self.readByte() orelse return ParseError.UnexpectedEnd;
             const min = self.readULEB128();
-            const max: ?u32 = if (flags & 0x01 != 0) @intCast(self.readULEB128()) else null;
+            const max: ?u32 = if (flags & wasm.LIMITS_WITH_MAX != 0) @intCast(self.readULEB128()) else null;
             self.memory = .{ .min = @intCast(min), .max = max };
         }
     }
@@ -400,8 +401,8 @@ pub const Parser = struct {
                 wasm.Op.f32_const => self.pos += 4,
                 wasm.Op.f64_const => self.pos += 8,
                 wasm.Op.global_get => _ = self.readULEB128(),
-                0xD0 => _ = self.readByte(), // ref.null heaptype
-                0xD2 => _ = self.readULEB128(), // ref.func funcidx
+                wasm.REF_NULL => _ = self.readByte(), // ref.null heaptype
+                wasm.REF_FUNC => _ = self.readULEB128(), // ref.func funcidx
                 else => {},
             }
         }
@@ -423,8 +424,8 @@ pub const Parser = struct {
         var shift: u6 = 0;
         while (true) {
             const byte = self.readByte() orelse return result;
-            result |= @as(u64, byte & 0x7F) << shift;
-            if (byte & 0x80 == 0) return result;
+            result |= @as(u64, byte & leb.LEB128_LOW_BITS_MASK) << shift;
+            if (byte & leb.LEB128_CONTINUATION_BIT == 0) return result;
             shift +|= 7;
         }
     }
@@ -438,10 +439,10 @@ pub const Parser = struct {
             const low7: u7 = @truncate(byte);
             result |= @as(i64, low7) << shift;
             shift +|= 7;
-            if (byte & 0x80 == 0) break;
+            if (byte & leb.LEB128_CONTINUATION_BIT == 0) break;
         }
         // Sign extend
-        if (shift < 64 and (byte & 0x40) != 0) {
+        if (shift < 64 and (byte & leb.LEB128_SIGN_BIT) != 0) {
             result |= ~@as(i64, 0) << shift;
         }
         return result;

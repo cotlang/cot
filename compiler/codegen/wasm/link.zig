@@ -220,7 +220,8 @@ pub const Linker = struct {
             if (seg_end > offset) offset = seg_end;
         }
         // Align to 8 bytes
-        offset = (offset + 7) & ~@as(i32, 7);
+        const arc = @import("../arc.zig");
+        offset = (offset + arc.ALIGN_MINUS_ONE) & arc.ALIGN_MASK;
 
         try self.data_segments.append(self.allocator, .{
             .offset = offset,
@@ -279,8 +280,8 @@ pub const Linker = struct {
                 // Function name
                 try assemble.writeULEB128(self.allocator, &import_buf, imp.name.len);
                 try import_buf.appendSlice(self.allocator, imp.name);
-                // Import kind: 0x00 for function
-                try import_buf.append(self.allocator, 0x00);
+                // Import kind: function
+                try import_buf.append(self.allocator, c.IMPORT_KIND_FUNC);
                 // Function type index
                 try assemble.writeULEB128(self.allocator, &import_buf, imp.type_idx);
             }
@@ -309,8 +310,8 @@ pub const Linker = struct {
             defer table_buf.deinit(self.allocator);
 
             try assemble.writeULEB128(self.allocator, &table_buf, 1); // 1 table
-            try table_buf.append(self.allocator, 0x70); // funcref type
-            try table_buf.append(self.allocator, 0x00); // limits without max
+            try table_buf.append(self.allocator, @intFromEnum(c.ValType.funcref)); // funcref type
+            try table_buf.append(self.allocator, c.LIMITS_NO_MAX);
             try assemble.writeULEB128(self.allocator, &table_buf, self.table_size);
             try writeSection(writer, self.allocator, .table, table_buf.items);
         }
@@ -324,11 +325,11 @@ pub const Linker = struct {
 
             try assemble.writeULEB128(self.allocator, &mem_buf, 1); // 1 memory
             if (self.memory_max_pages) |max| {
-                try mem_buf.append(self.allocator, 0x01); // limits with max
+                try mem_buf.append(self.allocator, c.LIMITS_WITH_MAX);
                 try assemble.writeULEB128(self.allocator, &mem_buf, self.memory_min_pages);
                 try assemble.writeULEB128(self.allocator, &mem_buf, max);
             } else {
-                try mem_buf.append(self.allocator, 0x00); // limits without max
+                try mem_buf.append(self.allocator, c.LIMITS_NO_MAX);
                 try assemble.writeULEB128(self.allocator, &mem_buf, self.memory_min_pages);
             }
             try writeSection(writer, self.allocator, .memory, mem_buf.items);
@@ -349,24 +350,24 @@ pub const Linker = struct {
 
             // Global 0: SP (stack pointer) - always present
             try global_buf.append(self.allocator, @intFromEnum(c.ValType.i32));
-            try global_buf.append(self.allocator, 0x01); // mutable
-            try global_buf.append(self.allocator, 0x41); // i32.const
-            try assemble.writeSLEB128(self.allocator, &global_buf, 65536); // 64KB
-            try global_buf.append(self.allocator, 0x0B); // end
+            try global_buf.append(self.allocator, c.GLOBAL_MUTABLE);
+            try global_buf.append(self.allocator, c.As.i32_const.opcode().?);
+            try assemble.writeSLEB128(self.allocator, &global_buf, c.STACK_SIZE);
+            try global_buf.append(self.allocator, c.As.end.opcode().?);
 
             // Dynamic globals (heap_ptr, etc.)
             for (self.globals.items) |g| {
                 try global_buf.append(self.allocator, @intFromEnum(g.val_type));
-                try global_buf.append(self.allocator, if (g.mutable) 0x01 else 0x00);
+                try global_buf.append(self.allocator, if (g.mutable) c.GLOBAL_MUTABLE else c.GLOBAL_IMMUTABLE);
                 // Init expression
                 if (g.val_type == .i32) {
-                    try global_buf.append(self.allocator, 0x41); // i32.const
+                    try global_buf.append(self.allocator, c.As.i32_const.opcode().?);
                     try assemble.writeSLEB128(self.allocator, &global_buf, g.init_i32);
                 } else {
-                    try global_buf.append(self.allocator, 0x42); // i64.const
+                    try global_buf.append(self.allocator, c.As.i64_const.opcode().?);
                     try assemble.writeSLEB128(self.allocator, &global_buf, g.init_i64);
                 }
-                try global_buf.append(self.allocator, 0x0B); // end
+                try global_buf.append(self.allocator, c.As.end.opcode().?);
             }
             try writeSection(writer, self.allocator, .global, global_buf.items);
         }
@@ -419,9 +420,9 @@ pub const Linker = struct {
             // Table index 0
             try assemble.writeULEB128(self.allocator, &elem_buf, 0);
             // Offset expression: i32.const 0, end
-            try elem_buf.append(self.allocator, 0x41); // i32.const
+            try elem_buf.append(self.allocator, c.As.i32_const.opcode().?);
             try assemble.writeSLEB128(self.allocator, &elem_buf, 0);
-            try elem_buf.append(self.allocator, 0x0B); // end
+            try elem_buf.append(self.allocator, c.As.end.opcode().?);
             // Function indices
             try assemble.writeULEB128(self.allocator, &elem_buf, self.table_funcs.items.len);
             const import_count = self.imports.items.len;
@@ -459,10 +460,10 @@ pub const Linker = struct {
                 // Memory index (always 0)
                 try assemble.writeULEB128(self.allocator, &data_buf, 0);
                 // i32.const offset
-                try data_buf.append(self.allocator, 0x41); // i32.const
+                try data_buf.append(self.allocator, c.As.i32_const.opcode().?);
                 try assemble.writeSLEB128(self.allocator, &data_buf, seg.offset);
                 // end
-                try data_buf.append(self.allocator, 0x0B);
+                try data_buf.append(self.allocator, c.As.end.opcode().?);
                 // data
                 try assemble.writeULEB128(self.allocator, &data_buf, seg.data.len);
                 try data_buf.appendSlice(self.allocator, seg.data);

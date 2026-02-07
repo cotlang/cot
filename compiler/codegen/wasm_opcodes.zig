@@ -264,14 +264,17 @@ pub const Op = struct {
 // Block Types
 // ============================================================================
 
+/// Block type for void blocks (no result)
+pub const BLOCK_VOID: u8 = 0x40;
+
 pub const BlockType = union(enum) {
-    empty: void, // 0x40
+    empty: void, // BLOCK_VOID
     val_type: ValType,
     type_idx: u32,
 
     pub fn encode(self: BlockType) u8 {
         return switch (self) {
-            .empty => 0x40,
+            .empty => BLOCK_VOID,
             .val_type => |v| @intFromEnum(v),
             .type_idx => unreachable, // requires s33 LEB128
         };
@@ -279,13 +282,38 @@ pub const BlockType = union(enum) {
 };
 
 // ============================================================================
-// Module Constants
+// Module Encoding Constants
 // ============================================================================
 
 pub const MAGIC: [4]u8 = .{ 0x00, 0x61, 0x73, 0x6D }; // \0asm
 pub const VERSION: [4]u8 = .{ 0x01, 0x00, 0x00, 0x00 }; // version 1
 
 pub const FUNC_TYPE_TAG: u8 = 0x60;
+
+/// Limits encoding (Wasm spec §5.3.5)
+pub const LIMITS_NO_MAX: u8 = 0x00;
+pub const LIMITS_WITH_MAX: u8 = 0x01;
+
+/// Global mutability (Wasm spec §5.3.6)
+pub const GLOBAL_IMMUTABLE: u8 = 0x00;
+pub const GLOBAL_MUTABLE: u8 = 0x01;
+
+/// Import/export descriptor kinds (Wasm spec §5.4.1/§5.4.2)
+pub const IMPORT_KIND_FUNC: u8 = 0x00;
+
+/// FC-prefixed opcode prefix (bulk memory, saturating truncation)
+pub const FC_PREFIX: u8 = 0xFC;
+pub const FC_MEMORY_COPY: u8 = 0x0A;
+
+/// Reserved memory index (always 0 for single-memory modules)
+pub const MEMORY_IDX_ZERO: u8 = 0x00;
+
+/// Reserved table index (always 0 for single-table modules)
+pub const TABLE_IDX_ZERO: u8 = 0x00;
+
+/// Reference type opcodes (Wasm reference types proposal)
+pub const REF_NULL: u8 = 0xD0;
+pub const REF_FUNC: u8 = 0xD2;
 
 // ============================================================================
 // Tests

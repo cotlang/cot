@@ -11,9 +11,10 @@ const wasm_link = @import("wasm/wasm.zig");
 const ValType = wasm_link.ValType;
 
 // Block type constants for Wasm control flow (from spec)
-const BLOCK_VOID: u8 = wasm.CodeBuilder.BLOCK_VOID;
-const BLOCK_I32: u8 = 0x7F;
-const BLOCK_I64: u8 = 0x7E;
+const wasm_op = @import("wasm_opcodes.zig");
+const BLOCK_VOID: u8 = wasm_op.BLOCK_VOID;
+const BLOCK_I32: u8 = @intFromEnum(wasm_op.ValType.i32);
+const BLOCK_I64: u8 = @intFromEnum(wasm_op.ValType.i64);
 
 // =============================================================================
 // Memory Layout Constants (matching Swift's patterns)
@@ -48,6 +49,35 @@ pub const INITIAL_REFCOUNT: i64 = 1;
 
 /// Memory layout globals
 pub const HEAP_START: u32 = 0x10000; // 64KB reserved for stack
+
+// =============================================================================
+// Alignment Constants (used by alloc, realloc, growslice, string_concat)
+// =============================================================================
+
+/// Alignment for heap allocations (8 bytes)
+pub const ALIGNMENT: u32 = 8;
+
+/// Alignment - 1 (for rounding up: (size + ALIGN_MINUS_ONE) & ALIGN_MASK)
+pub const ALIGN_MINUS_ONE: i32 = @as(i32, @intCast(ALIGNMENT)) - 1;
+
+/// Alignment mask (~(ALIGNMENT-1) in two's complement, for: size & ALIGN_MASK)
+pub const ALIGN_MASK: i32 = -@as(i32, @intCast(ALIGNMENT));
+
+// =============================================================================
+// Wasm Page Constants (for memory.grow)
+// =============================================================================
+
+/// Wasm linear memory page size in bytes
+pub const WASM_PAGE_SIZE: u32 = 65536;
+
+/// log2(WASM_PAGE_SIZE) — used with shl/shr to convert pages ↔ bytes
+pub const WASM_PAGE_SIZE_LOG2: i32 = 16;
+
+/// WASM_PAGE_SIZE - 1 (for rounding up pages)
+pub const WASM_PAGE_SIZE_MINUS_ONE: i32 = @as(i32, @intCast(WASM_PAGE_SIZE)) - 1;
+
+/// OOM indicator from memory.grow (-1 = failure)
+pub const MEMORY_GROW_FAILED: i32 = -1;
 
 // =============================================================================
 // Runtime Function Info
@@ -335,10 +365,10 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     try code.emitI32Const(@intCast(HEAP_OBJECT_HEADER_SIZE));
     try code.emitI32Add();
 
-    // Align to 8 bytes: (total_size + 7) & ~7
-    try code.emitI32Const(7);
+    // Align to 8 bytes: (total_size + ALIGN_MINUS_ONE) & ALIGN_MASK
+    try code.emitI32Const(ALIGN_MINUS_ONE);
     try code.emitI32Add();
-    try code.emitI32Const(-8); // ~7 = -8 in two's complement
+    try code.emitI32Const(ALIGN_MASK);
     try code.emitI32And();
     try code.emitLocalSet(3); // total_size
 
@@ -380,36 +410,36 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     try code.emitGlobalGet(heap_ptr_global);
     try code.emitLocalSet(2); // ptr = heap_ptr
 
-    // Check bounds: heap_ptr + total_size > memory.size * 65536
+    // Check bounds: heap_ptr + total_size > memory.size * WASM_PAGE_SIZE
     // Reference: Go sbrk: if bl+n > blocMax
     try code.emitLocalGet(2); // heap_ptr
     try code.emitLocalGet(3); // total_size
     try code.emitI32Add(); // new_top
     try code.emitMemorySize(); // current pages (i32)
-    try code.emitI32Const(16); // log2(65536) = 16
-    try code.emitI32Shl(); // current_bytes = pages << 16
+    try code.emitI32Const(WASM_PAGE_SIZE_LOG2);
+    try code.emitI32Shl(); // current_bytes = pages << WASM_PAGE_SIZE_LOG2
     try code.emitI32GtU(); // new_top > current_bytes?
     try code.emitIf(BLOCK_VOID);
 
     // Need more memory. Compute pages needed:
-    // grow = (new_top - current_bytes + 65535) / 65536
+    // grow = (new_top - current_bytes + WASM_PAGE_SIZE_MINUS_ONE) / WASM_PAGE_SIZE
     // Reference: Go sbrk: grow := divRoundUp(bl+n-blocMax, physPageSize)
     try code.emitLocalGet(2); // heap_ptr
     try code.emitLocalGet(3); // total_size
     try code.emitI32Add(); // new_top
     try code.emitMemorySize(); // current pages
-    try code.emitI32Const(16);
+    try code.emitI32Const(WASM_PAGE_SIZE_LOG2);
     try code.emitI32Shl(); // current_bytes
     try code.emitI32Sub(); // new_top - current_bytes
-    try code.emitI32Const(65535);
-    try code.emitI32Add(); // + 65535 (round up)
-    try code.emitI32Const(16);
-    try code.emitI32ShrU(); // / 65536 = pages needed
+    try code.emitI32Const(WASM_PAGE_SIZE_MINUS_ONE);
+    try code.emitI32Add(); // round up
+    try code.emitI32Const(WASM_PAGE_SIZE_LOG2);
+    try code.emitI32ShrU(); // / WASM_PAGE_SIZE = pages needed
 
     // memory.grow(pages)
     // Reference: Go sbrk: if growMemory(grow) < 0 { return nil }
     try code.emitMemoryGrow();
-    try code.emitI32Const(-1);
+    try code.emitI32Const(MEMORY_GROW_FAILED);
     try code.emitI32Eq();
     try code.emitIf(BLOCK_VOID);
     // OOM: trap (Swift: swift_abortAllocationFailure)
@@ -529,14 +559,14 @@ fn generateReallocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freel
     try code.emitI32Load(2, SIZE_OFFSET);
     try code.emitLocalSet(3);
 
-    // new_total = (new_size + HEADER_SIZE + 7) & ~7
+    // new_total = (new_size + HEADER_SIZE + ALIGN_MINUS_ONE) & ALIGN_MASK
     try code.emitLocalGet(1); // new_size (i64)
     try code.emitI32WrapI64();
     try code.emitI32Const(@intCast(HEAP_OBJECT_HEADER_SIZE));
     try code.emitI32Add();
-    try code.emitI32Const(7);
+    try code.emitI32Const(ALIGN_MINUS_ONE);
     try code.emitI32Add();
-    try code.emitI32Const(-8);
+    try code.emitI32Const(ALIGN_MASK);
     try code.emitI32And();
     try code.emitLocalSet(4);
 
@@ -779,11 +809,11 @@ fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) 
     try code.emitGlobalGet(heap_ptr_global);
     try code.emitLocalTee(5); // new_ptr
 
-    // heap_ptr = heap_ptr + ((new_len + 7) & ~7)  // 8-byte aligned
+    // heap_ptr = heap_ptr + ((new_len + ALIGN_MINUS_ONE) & ALIGN_MASK)
     try code.emitLocalGet(4); // new_len
-    try code.emitI32Const(7);
+    try code.emitI32Const(ALIGN_MINUS_ONE);
     try code.emitI32Add();
-    try code.emitI32Const(-8);
+    try code.emitI32Const(ALIGN_MASK);
     try code.emitI32And();
     try code.emitI32Add();
     try code.emitGlobalSet(heap_ptr_global);
@@ -866,10 +896,10 @@ fn generateLegacyAllocFunction(module: *wasm.Module, heap_ptr_global: u32) !u32 
     try code.emitI32Const(@intCast(HEAP_OBJECT_HEADER_SIZE));
     try code.emitI32Add();
 
-    // Align to 8 bytes: (total_size + 7) & ~7
-    try code.emitI32Const(7);
+    // Align to 8 bytes: (total_size + ALIGN_MINUS_ONE) & ALIGN_MASK
+    try code.emitI32Const(ALIGN_MINUS_ONE);
     try code.emitI32Add();
-    try code.emitI32Const(-8); // ~7 = -8 in two's complement
+    try code.emitI32Const(ALIGN_MASK);
     try code.emitI32And();
     try code.emitLocalSet(3); // total_size
 

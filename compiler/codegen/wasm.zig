@@ -104,7 +104,7 @@ pub const Module = struct {
 
         // Global type: valtype + mutability
         try writer.writeByte(@intFromEnum(val_type));
-        try writer.writeByte(if (mutable) 0x01 else 0x00);
+        try writer.writeByte(if (mutable) wasm_op.GLOBAL_MUTABLE else wasm_op.GLOBAL_IMMUTABLE);
 
         // Init expression: type.const value, end
         switch (val_type) {
@@ -195,11 +195,11 @@ pub const Module = struct {
             const mem_writer = mem_section.writer(self.allocator);
             try enc.encodeULEB128(mem_writer, 1); // 1 memory
             if (self.memory_max_pages) |max| {
-                try mem_writer.writeByte(0x01); // limits with max
+                try mem_writer.writeByte(wasm_op.LIMITS_WITH_MAX);
                 try enc.encodeULEB128(mem_writer, self.memory_min_pages);
                 try enc.encodeULEB128(mem_writer, max);
             } else {
-                try mem_writer.writeByte(0x00); // limits without max
+                try mem_writer.writeByte(wasm_op.LIMITS_NO_MAX);
                 try enc.encodeULEB128(mem_writer, self.memory_min_pages);
             }
             try enc.writeSection(output, .memory, mem_section.items);
@@ -687,11 +687,11 @@ pub const CodeBuilder = struct {
     /// Stack: [dest (i32), src (i32), len (i32)] → []
     /// Go reference: Wasm bulk memory proposal
     pub fn emitMemoryCopy(self: *CodeBuilder) !void {
-        // memory.copy is a two-byte opcode: 0xFC 0x0A
-        try self.buf.append(self.allocator, 0xFC); // misc prefix
-        try self.buf.append(self.allocator, 0x0A); // memory.copy
-        try self.buf.append(self.allocator, 0x00); // dest memory index
-        try self.buf.append(self.allocator, 0x00); // src memory index
+        // memory.copy is FC-prefixed: FC_PREFIX + FC_MEMORY_COPY
+        try self.buf.append(self.allocator, wasm_op.FC_PREFIX);
+        try self.buf.append(self.allocator, wasm_op.FC_MEMORY_COPY);
+        try self.buf.append(self.allocator, wasm_op.MEMORY_IDX_ZERO); // dest memory index
+        try self.buf.append(self.allocator, wasm_op.MEMORY_IDX_ZERO); // src memory index
     }
 
     /// Emit a byte-copy loop that copies `len` bytes from `src` to `dest`.
@@ -735,7 +735,7 @@ pub const CodeBuilder = struct {
     /// Reference: Go runtime/mem_wasm.go
     pub fn emitMemorySize(self: *CodeBuilder) !void {
         try self.buf.append(self.allocator, Op.memory_size);
-        try self.buf.append(self.allocator, 0x00); // memory index
+        try self.buf.append(self.allocator, wasm_op.MEMORY_IDX_ZERO);
     }
 
     /// Emit memory.grow instruction.
@@ -743,7 +743,7 @@ pub const CodeBuilder = struct {
     /// Reference: Go runtime/mem_wasm.go sbrk()
     pub fn emitMemoryGrow(self: *CodeBuilder) !void {
         try self.buf.append(self.allocator, Op.memory_grow);
-        try self.buf.append(self.allocator, 0x00); // memory index
+        try self.buf.append(self.allocator, wasm_op.MEMORY_IDX_ZERO);
     }
 
     /// Set the number of locals (beyond parameters).

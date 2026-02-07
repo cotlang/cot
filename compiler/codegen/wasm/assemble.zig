@@ -162,7 +162,7 @@ pub fn assemble(allocator: std.mem.Allocator, sym: *Symbol) !AssembledFunc {
     // End opcode
     // ========================================================================
 
-    try w.append(allocator, 0x0B); // end
+    try w.append(allocator, c.As.end.opcode().?);
 
     debugLog( "  assembled {d} bytes", .{w.items.len});
 
@@ -249,7 +249,7 @@ fn encodeInstruction(
                 const block_type: u8 = @truncate(@as(u64, @bitCast(0x80 - p.from.offset)));
                 try w.append(allocator, block_type);
             } else {
-                try w.append(allocator, 0x40); // void block type
+                try w.append(allocator, c.BLOCK_VOID);
             }
         },
 
@@ -297,7 +297,7 @@ fn encodeInstruction(
             // Go: wasmobj.go lines 1286-1292
             try writeOpcode(allocator, w, .call_indirect);
             try writeULEB128(allocator, w, @as(u64, @intCast(p.to.offset)));
-            try w.append(allocator, 0x00); // reserved
+            try w.append(allocator, c.TABLE_IDX_ZERO); // table index
         },
 
         // ====================================================================
@@ -363,14 +363,14 @@ fn encodeInstruction(
         .memory_size, .memory_grow, .memory_fill => {
             // Go: wasmobj.go lines 1340-1341
             try writeOpcode(allocator, w, p.as);
-            try w.append(allocator, 0x00);
+            try w.append(allocator, c.MEMORY_IDX_ZERO);
         },
 
         .memory_copy => {
             // Go: wasmobj.go lines 1343-1345
             try writeOpcode(allocator, w, p.as);
-            try w.append(allocator, 0x00);
-            try w.append(allocator, 0x00);
+            try w.append(allocator, c.MEMORY_IDX_ZERO); // dest memory
+            try w.append(allocator, c.MEMORY_IDX_ZERO); // src memory
         },
 
         // ====================================================================
@@ -449,25 +449,30 @@ fn alignment(as: c.As) u64 {
 /// Write opcode byte(s)
 fn writeOpcode(allocator: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), as: c.As) !void {
     if (as.isFcPrefixed()) {
-        try w.append(allocator, 0xFC);
+        try w.append(allocator, c.FC_PREFIX);
         try w.append(allocator, as.fcOpcode().?);
     } else if (as.opcode()) |op| {
         try w.append(allocator, op);
     }
 }
 
+/// LEB128 encoding constants (WebAssembly spec, binary encoding)
+const LEB128_LOW_BITS_MASK: u8 = 0x7F; // Extract low 7 data bits
+const LEB128_CONTINUATION_BIT: u8 = 0x80; // High bit = more bytes follow
+const LEB128_SIGN_BIT: u8 = 0x40; // Bit 6 = sign extension for SLEB128
+
 /// Unsigned LEB128 encoding
 /// Go: wasmobj.go lines 1423-1437
 pub fn writeULEB128(allocator: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), value: u64) !void {
     var v = value;
     while (true) {
-        const b: u8 = @truncate(v & 0x7F);
+        const b: u8 = @truncate(v & LEB128_LOW_BITS_MASK);
         v >>= 7;
         if (v == 0) {
             try w.append(allocator, b);
             return;
         }
-        try w.append(allocator, b | 0x80);
+        try w.append(allocator, b | LEB128_CONTINUATION_BIT);
     }
 }
 
@@ -476,15 +481,15 @@ pub fn writeULEB128(allocator: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8)
 pub fn writeSLEB128(allocator: std.mem.Allocator, w: *std.ArrayListUnmanaged(u8), value: i64) !void {
     var v = value;
     while (true) {
-        const b: u8 = @truncate(@as(u64, @bitCast(v)) & 0x7F);
-        const s: u8 = @truncate(@as(u64, @bitCast(v)) & 0x40);
+        const b: u8 = @truncate(@as(u64, @bitCast(v)) & LEB128_LOW_BITS_MASK);
+        const s: u8 = @truncate(@as(u64, @bitCast(v)) & LEB128_SIGN_BIT);
         v >>= 7;
         const done = (v == 0 and s == 0) or (v == -1 and s != 0);
         if (done) {
             try w.append(allocator, b);
             return;
         }
-        try w.append(allocator, b | 0x80);
+        try w.append(allocator, b | LEB128_CONTINUATION_BIT);
     }
 }
 

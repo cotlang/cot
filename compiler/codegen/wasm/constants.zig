@@ -18,6 +18,7 @@ pub const ValType = enum(u8) {
     i64 = 0x7E,
     f32 = 0x7D,
     f64 = 0x7C,
+    funcref = 0x70,
 };
 
 // ============================================================================
@@ -682,6 +683,35 @@ pub const FUNC_TYPE_TAG: u8 = 0x60;
 // Go's funcValueOffset (asm.go line 45)
 // Offset between PC_F value and WebAssembly function index
 pub const FUNC_VALUE_OFFSET: u32 = 0x1000;
+
+/// Block type for void blocks (no result)
+pub const BLOCK_VOID: u8 = 0x40;
+
+/// Limits encoding (Wasm spec §5.3.5)
+pub const LIMITS_NO_MAX: u8 = 0x00;
+pub const LIMITS_WITH_MAX: u8 = 0x01;
+
+/// Global mutability (Wasm spec §5.3.6)
+pub const GLOBAL_IMMUTABLE: u8 = 0x00;
+pub const GLOBAL_MUTABLE: u8 = 0x01;
+
+/// Import descriptor kinds (Wasm spec §5.4.1)
+pub const IMPORT_KIND_FUNC: u8 = 0x00;
+
+/// FC-prefixed opcode prefix (bulk memory, saturating truncation)
+pub const FC_PREFIX: u8 = 0xFC;
+
+/// Reserved memory index (always 0 for single-memory modules)
+pub const MEMORY_IDX_ZERO: u8 = 0x00;
+
+/// Reserved table index (always 0 for single-table modules)
+pub const TABLE_IDX_ZERO: u8 = 0x00;
+
+/// Wasm linear memory page size
+pub const WASM_PAGE_SIZE: u32 = 65536;
+
+/// Default stack size (64KB = 1 Wasm page)
+pub const STACK_SIZE: u32 = WASM_PAGE_SIZE;
 
 // ============================================================================
 // Tests

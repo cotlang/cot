@@ -36,6 +36,18 @@ pub const SHN_UNDEF: u16 = 0;
 pub const R_X86_64_PC32: u32 = 2;
 pub const R_X86_64_PLT32: u32 = 4;
 
+// Section indices (layout-dependent, matches write() section order)
+pub const SHIDX_TEXT: u16 = 1;
+pub const SHIDX_DATA: u16 = 2;
+pub const SHIDX_SYMTAB: u16 = 3;
+pub const SHIDX_STRTAB: u16 = 4;
+pub const SHIDX_SHSTRTAB: u16 = 5;
+pub const SHIDX_RELA_TEXT: u16 = 6;
+
+// Symbol info bit layout (ELF spec: binding << 4 | type & 0xF)
+pub const SYM_INFO_TYPE_MASK: u8 = 0xF;
+pub const SYM_INFO_BIND_SHIFT: u3 = 4;
+
 // ELF Structures
 
 pub const Elf64_Ehdr = extern struct {
@@ -77,15 +89,15 @@ pub const Elf64_Sym = extern struct {
     st_size: u64 = 0,
 
     pub fn makeInfo(binding: u8, sym_type: u8) u8 {
-        return (binding << 4) | (sym_type & 0xF);
+        return (binding << SYM_INFO_BIND_SHIFT) | (sym_type & SYM_INFO_TYPE_MASK);
     }
 
     pub fn getBinding(info: u8) u8 {
-        return info >> 4;
+        return info >> SYM_INFO_BIND_SHIFT;
     }
 
     pub fn getType(info: u8) u8 {
-        return info & 0xF;
+        return info & SYM_INFO_TYPE_MASK;
     }
 };
 
@@ -206,7 +218,7 @@ pub const ElfWriter = struct {
             .value = value,
             .section = section,
             .binding = if (external) STB_GLOBAL else STB_LOCAL,
-            .sym_type = if (section == 1) STT_FUNC else STT_OBJECT,
+            .sym_type = if (section == SHIDX_TEXT) STT_FUNC else STT_OBJECT,
         });
     }
 
@@ -237,7 +249,7 @@ pub const ElfWriter = struct {
         while (self.data.items.len % 8 != 0) try self.data.append(self.allocator, 0);
 
         try self.string_literals.append(self.allocator, .{ .data = str, .symbol = sym_name });
-        try self.symbols.append(self.allocator, .{ .name = sym_name, .value = offset, .section = 2, .binding = STB_LOCAL, .sym_type = STT_OBJECT });
+        try self.symbols.append(self.allocator, .{ .name = sym_name, .value = offset, .section = SHIDX_DATA, .binding = STB_LOCAL, .sym_type = STT_OBJECT });
         return sym_name;
     }
 
@@ -245,7 +257,7 @@ pub const ElfWriter = struct {
         while (self.data.items.len % 8 != 0) try self.data.append(self.allocator, 0);
         const offset: u32 = @intCast(self.data.items.len);
         for (0..size) |_| try self.data.append(self.allocator, 0);
-        try self.symbols.append(self.allocator, .{ .name = name, .value = offset, .size = size, .section = 2, .binding = STB_GLOBAL, .sym_type = STT_OBJECT });
+        try self.symbols.append(self.allocator, .{ .name = name, .value = offset, .size = size, .section = SHIDX_DATA, .binding = STB_GLOBAL, .sym_type = STT_OBJECT });
     }
 
     fn alignTo(offset: u64, alignment: u64) u64 {
@@ -341,7 +353,7 @@ pub const ElfWriter = struct {
         const shdr_offset = offset;
 
         // Write ELF header
-        var ehdr = Elf64_Ehdr{ .e_shoff = shdr_offset, .e_shnum = num_sections, .e_shstrndx = 5 };
+        var ehdr = Elf64_Ehdr{ .e_shoff = shdr_offset, .e_shnum = num_sections, .e_shstrndx = SHIDX_SHSTRTAB };
         try writer.writeAll(std.mem.asBytes(&ehdr));
 
         // Write sections
@@ -431,7 +443,7 @@ pub const ElfWriter = struct {
             .sh_type = SHT_SYMTAB,
             .sh_offset = symtab_offset,
             .sh_size = symtab_size,
-            .sh_link = 4,
+            .sh_link = SHIDX_STRTAB,
             .sh_info = num_local,
             .sh_addralign = 8,
             .sh_entsize = @sizeOf(Elf64_Sym),
@@ -460,8 +472,8 @@ pub const ElfWriter = struct {
                 .sh_flags = SHF_INFO_LINK,
                 .sh_offset = rela_text_offset,
                 .sh_size = rela_text_size,
-                .sh_link = 3,
-                .sh_info = 1,
+                .sh_link = SHIDX_SYMTAB,
+                .sh_info = SHIDX_TEXT,
                 .sh_addralign = 8,
                 .sh_entsize = @sizeOf(Elf64_Rela),
             }));
