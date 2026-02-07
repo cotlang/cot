@@ -1,0 +1,987 @@
+// Combined native E2E test program.
+// Each test area returns 0 on success, non-zero on internal failure.
+// main() dispatches all tests and returns the index of the first failure (0 = all pass).
+
+// ============================================================================
+// Shared type declarations
+// ============================================================================
+
+struct Foo { x: i64 }
+struct Bar { y: i64 }
+struct Point { x: i64, y: i64 }
+type Coord = Point;
+
+enum Color { Red, Green, Blue }
+enum Status { Ok = 0, Warning = 50, Error = 100 }
+enum Level { Low = 10, Medium = 50, High = 100 }
+
+union State { Init, Running, Done }
+union Result { Ok: i64, Err: i32 }
+union Event { Click: i64, Hover, KeyPress: i64 }
+
+const MyError = error { Fail, NotFound }
+
+// DFoo: Foo variant with deinit (deinit tests need Foo_deinit but ARC tests must NOT have it)
+struct DFoo { x: i64 }
+fn DFoo_deinit(self: *DFoo) void { return }
+
+// ============================================================================
+// Shared helper functions
+// ============================================================================
+
+fn double(x: i64) i64 { return x + x }
+
+fn createFoo(val: i64) *Foo {
+    return new Foo { x: val }
+}
+
+fn makeFoo(v: i64) *Foo {
+    return new Foo { x: v }
+}
+
+fn add(a: i64, b: i64) i64 { return a + b }
+
+fn dbl(x: i64) i64 { return x * 2 }
+
+fn apply_fn(f: fn(i64) -> i64, x: i64) i64 {
+    return f(x)
+}
+
+fn inc(x: i64) i64 { return x + 1 }
+fn dec(x: i64) i64 { return x - 1 }
+
+fn mayFail(x: i64) MyError!i64 {
+    if x < 0 { return error.Fail }
+    return x * 2
+}
+
+fn inner() MyError!i64 {
+    return error.Fail
+}
+
+fn outer() MyError!i64 {
+    let x = try inner()
+    return x + 1
+}
+
+fn createDFoo(val: i64) *DFoo {
+    return new DFoo { x: val }
+}
+
+// ============================================================================
+// Generic type declarations
+// ============================================================================
+
+struct Pair(T, U) { first: T, second: U }
+struct Box(T) { value: T }
+struct BoxC(T) { value: T, count: i64 }
+struct Counter(T) { value: T }
+struct CounterM(T) { value: T, count: i64 }
+
+struct List(T) {
+    items: i64,
+    count: i64,
+    capacity: i64,
+}
+
+// ============================================================================
+// Generic helper functions (free function pattern)
+// ============================================================================
+
+fn max(T)(a: T, b: T) T {
+    if a > b { return a }
+    return b
+}
+
+fn generic_add(T)(a: T, b: T) T {
+    return a + b
+}
+
+fn Box_getValue(T)(self: *Box(T)) T {
+    return self.value
+}
+
+fn getSize(T)() i64 {
+    return @sizeOf(T)
+}
+
+fn allocOne(T)(value: T) *T {
+    let ptr = @intToPtr(*T, @alloc(@sizeOf(T)))
+    ptr.* = value
+    return ptr
+}
+
+fn CounterM_increment(T)(self: *CounterM(T)) void {
+    self.count = self.count + 1
+}
+
+// List free functions
+fn List_ensureCapacity(T)(self: *List(T), needed: i64) void {
+    if self.capacity >= needed { return }
+    var new_cap: i64 = 8
+    if self.capacity > 0 { new_cap = self.capacity * 2 }
+    let bytes = new_cap * @sizeOf(T)
+    if self.capacity == 0 {
+        self.items = @alloc(bytes)
+    } else {
+        self.items = @realloc(self.items, bytes)
+    }
+    self.capacity = new_cap
+}
+
+fn List_append(T)(self: *List(T), value: T) void {
+    List_ensureCapacity(T)(self, self.count + 1)
+    let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+    ptr.* = value
+    self.count = self.count + 1
+}
+
+fn List_get(T)(self: *List(T), index: i64) T {
+    let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+    return ptr.*
+}
+
+fn List_set(T)(self: *List(T), index: i64, value: T) void {
+    let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+    ptr.* = value
+}
+
+fn List_pop(T)(self: *List(T)) T {
+    self.count = self.count - 1
+    let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+    return ptr.*
+}
+
+// ============================================================================
+// Generic impl blocks
+// ============================================================================
+
+impl Counter(T) {
+    fn get(self: *Counter(T)) T {
+        return self.value
+    }
+}
+
+impl BoxC(T) {
+    fn getCount(self: *BoxC(T)) i64 {
+        return self.count
+    }
+    fn increment(self: *BoxC(T)) void {
+        self.count = self.getCount() + 1
+    }
+}
+
+impl Box(T) {
+    fn get(self: *Box(T)) T {
+        return self.value
+    }
+}
+
+impl Pair(T, U) {
+    fn sum(self: *Pair(T, U)) i64 {
+        return self.first + self.second
+    }
+}
+
+impl List(T) {
+    fn ensureCapacity(self: *List(T), needed: i64) void {
+        if self.capacity >= needed { return }
+        var new_cap: i64 = 8
+        if self.capacity > 0 { new_cap = self.capacity * 2 }
+        let bytes = new_cap * @sizeOf(T)
+        if self.capacity == 0 {
+            self.items = @alloc(bytes)
+        } else {
+            self.items = @realloc(self.items, bytes)
+        }
+        self.capacity = new_cap
+    }
+    fn append(self: *List(T), value: T) void {
+        self.ensureCapacity(self.count + 1)
+        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+        ptr.* = value
+        self.count = self.count + 1
+    }
+    fn iget(self: *List(T), index: i64) T {
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        return ptr.*
+    }
+    fn iset(self: *List(T), index: i64, value: T) void {
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        ptr.* = value
+    }
+    fn ipop(self: *List(T)) T {
+        self.count = self.count - 1
+        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+        return ptr.*
+    }
+}
+
+// ============================================================================
+// Test functions: Baseline
+// ============================================================================
+
+fn test_baseline() i64 {
+    // Constants
+    if 42 != 42 { return 1 }
+    if 10 + 5 != 15 { return 2 }
+    if 20 - 8 != 12 { return 3 }
+    if 6 * 7 != 42 { return 4 }
+    if 2 + 3 * 4 != 14 { return 5 }
+
+    // Variables
+    let x = 10
+    let y = 5
+    if x + y != 15 { return 10 }
+
+    // If/else
+    if 10 > 5 {
+        let ok = 1
+        if ok != 1 { return 30 }
+    } else {
+        return 31
+    }
+
+    // While loop
+    var sum: i64 = 0
+    var i: i64 = 1
+    while i <= 10 {
+        sum = sum + i
+        i = i + 1
+    }
+    if sum != 55 { return 40 }
+
+    return 0
+}
+
+// ============================================================================
+// Test functions: Phase 3 language features
+// ============================================================================
+
+fn test_phase3() i64 {
+    // Char literals
+    let c1 = 'A'
+    if c1 != 65 { return 100 }
+    let c2 = '\n'
+    if c2 != 10 { return 101 }
+
+    // Type alias + struct
+    let coord: Coord = Coord { .x = 10, .y = 20 }
+    if coord.x + coord.y != 30 { return 102 }
+
+    // Builtins
+    if @sizeOf(i64) != 8 { return 103 }
+    if @sizeOf(Point) != 16 { return 104 }
+    if @alignOf(i64) != 8 { return 105 }
+    let big: i64 = 42
+    let small = @intCast(i32, big)
+    if small != 42 { return 106 }
+
+    // Enums
+    let color: i64 = Color.Green
+    if color != 1 { return 107 }
+    let status: i64 = Status.Error
+    if status != 100 { return 108 }
+
+    // Union
+    let state: i64 = State.Running
+    if state != 1 { return 109 }
+
+    // Bitwise ops
+    let a = 255
+    let b = 15
+    if (a & b) != 15 { return 110 }
+    if ((240 | 15) - 200) != 55 { return 111 }
+    if ((a ^ b) & 255) != 240 { return 112 }
+    if ((~0) & 255) != 255 { return 113 }
+    if (1 << 4) != 16 { return 114 }
+    if (64 >> 2) != 16 { return 115 }
+
+    // Compound assignment
+    var x = 10
+    x += 5
+    if x != 15 { return 120 }
+    x -= 3
+    if x != 12 { return 121 }
+    x *= 2
+    if x != 24 { return 122 }
+    var y = 255
+    y &= 15
+    if y != 15 { return 123 }
+
+    // Optional types
+    let opt1: ?i64 = 42
+    if opt1.? != 42 { return 140 }
+    let opt2: ?i64 = null
+    if (opt2 ?? 99) != 99 { return 141 }
+    let opt3: ?i64 = 42
+    if (opt3 ?? 99) != 42 { return 142 }
+
+    // Switch
+    let sw1 = switch 2 {
+        1 => 10,
+        2 => 20,
+        3 => 30,
+        else => 0,
+    }
+    if sw1 != 20 { return 150 }
+
+    let level = Level.Medium
+    let sw2 = switch level {
+        Level.Low => 1,
+        Level.Medium => 50,
+        Level.High => 99,
+        else => 0,
+    }
+    if sw2 != 50 { return 151 }
+
+    return 0
+}
+
+// ============================================================================
+// Test functions: Function call + float
+// ============================================================================
+
+fn test_func_call() i64 {
+    if double(10) != 20 { return 1 }
+    return 0
+}
+
+fn test_float_locals() i64 {
+    let x: f64 = 3.14
+    let y: f64 = 0.0
+    return 0
+}
+
+// ============================================================================
+// Test functions: Union payloads
+// ============================================================================
+
+fn test_union_payload() i64 {
+    let r: Result = Result.Ok(42)
+    if r.tag != 0 { return 1 }
+    let val = r.Ok
+    if val != 42 { return 2 }
+    let e: Result = Result.Err(99)
+    if e.tag != 1 { return 3 }
+    return 0
+}
+
+fn test_union_mixed() i64 {
+    let e1: Event = Event.Hover
+    if e1.tag != 1 { return 1 }
+    let e2: Event = Event.Click(100)
+    if e2.tag != 0 { return 2 }
+    let clicks = e2.Click
+    if clicks != 100 { return 3 }
+    return 0
+}
+
+fn test_union_switch_no_capture() i64 {
+    let r: Result = Result.Ok(42)
+    switch r {
+        Result.Ok => { return 0 },
+        Result.Err => { return 1 },
+    }
+    return 99
+}
+
+fn test_union_switch_capture() i64 {
+    let r: Result = Result.Ok(42)
+    switch r {
+        Result.Ok |val| => {
+            if val != 42 { return 1 }
+            return 0
+        },
+        Result.Err |e| => { return 2 },
+    }
+    return 99
+}
+
+// ============================================================================
+// Test functions: Error unions
+// ============================================================================
+
+fn test_error_union_catch() i64 {
+    let result = mayFail(-1) catch 99
+    if result != 99 { return 1 }
+    let success = mayFail(5) catch 99
+    if success != 10 { return 2 }
+    return 0
+}
+
+fn test_error_union_try() i64 {
+    let result = outer() catch 42
+    if result != 42 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Test functions: Defer
+// ============================================================================
+
+fn test_defer_basic() i64 {
+    var x: i64 = 10
+    defer x = 99
+    return x
+}
+
+fn test_defer_loop_break() i64 {
+    var sum: i64 = 0
+    var i: i64 = 0
+    while i < 5 {
+        defer sum = sum + 1
+        i = i + 1
+        if i == 3 { break }
+    }
+    return sum
+}
+
+fn test_defer_lifo() i64 {
+    var x: i64 = 2
+    defer x = x + 1
+    defer x = x * 10
+    return x
+}
+
+// ============================================================================
+// Test functions: ARC
+// ============================================================================
+
+fn test_arc_func_return_new() i64 {
+    let p = createFoo(42)
+    return p.x
+}
+
+fn test_arc_copy_local() i64 {
+    let p = new Foo { x: 10 }
+    let q = p
+    return q.x
+}
+
+fn test_arc_reassignment() i64 {
+    var p = new Foo { x: 1 }
+    let q = new Foo { x: 2 }
+    p = q
+    return p.x
+}
+
+fn test_arc_return_forward() i64 {
+    let f = makeFoo(77)
+    return f.x
+}
+
+fn test_arc_dealloc_basic() i64 {
+    let p = new Foo { x: 42 }
+    return p.x
+}
+
+fn test_arc_dealloc_multi() i64 {
+    let a = makeFoo(10)
+    let b = makeFoo(20)
+    let c = makeFoo(12)
+    return a.x + b.x + c.x
+}
+
+// ============================================================================
+// Test functions: Builtins (@alloc, @dealloc, @realloc)
+// ============================================================================
+
+fn test_builtin_alloc_dealloc() i64 {
+    let ptr = @alloc(8)
+    @dealloc(ptr)
+    return 0
+}
+
+fn test_builtin_realloc() i64 {
+    let ptr = @alloc(8)
+    let ptr2 = @realloc(ptr, 16)
+    @dealloc(ptr2)
+    return 0
+}
+
+fn test_freelist_reuse() i64 {
+    let p1 = @alloc(8)
+    @dealloc(p1)
+    let p2 = @alloc(8)
+    @dealloc(p2)
+    let p3 = @alloc(8)
+    @dealloc(p3)
+    return 0
+}
+
+// ============================================================================
+// Test functions: Deinit (uses DFoo with DFoo_deinit)
+// ============================================================================
+
+fn test_deinit_basic() i64 {
+    let p = new DFoo { x: 42 }
+    return p.x
+}
+
+fn test_deinit_no_use() i64 {
+    let p = new DFoo { x: 42 }
+    return 0
+}
+
+fn test_deinit_mixed() i64 {
+    let f = new DFoo { x: 10 }
+    let b = new Bar { y: 20 }
+    return f.x + b.y
+}
+
+fn test_deinit_alloc_reuse() i64 {
+    let p1 = createDFoo(10)
+    let v1 = p1.x
+    let p2 = createDFoo(20)
+    return v1 + p2.x
+}
+
+// ============================================================================
+// Test functions: Function pointers
+// ============================================================================
+
+fn test_fnptr_basic() i64 {
+    let f = add
+    if f(3, 4) != 7 { return 1 }
+    return 0
+}
+
+fn test_fnptr_param() i64 {
+    if apply_fn(dbl, 5) != 10 { return 1 }
+    return 0
+}
+
+fn test_fnptr_reassign() i64 {
+    var f = inc
+    let a = f(10)
+    f = dec
+    let b = f(10)
+    if a + b != 20 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Test functions: Closures
+// ============================================================================
+
+fn test_closure_no_capture() i64 {
+    let f = fn(x: i64) i64 { return x * 2 }
+    if f(21) != 42 { return 1 }
+    return 0
+}
+
+fn test_closure_capture() i64 {
+    let x: i64 = 10
+    let f = fn(y: i64) i64 { return x + y }
+    if f(5) != 15 { return 1 }
+    return 0
+}
+
+fn test_closure_multi_capture() i64 {
+    let a: i64 = 3
+    let b: i64 = 7
+    let f = fn(x: i64) i64 { return a + b + x }
+    if f(10) != 20 { return 1 }
+    return 0
+}
+
+fn test_closure_passed() i64 {
+    let offset: i64 = 100
+    let g = fn(x: i64) i64 { return x + offset }
+    if apply_fn(g, 5) != 105 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Test functions: Generics (plain functions)
+// ============================================================================
+
+fn test_generic_fn_basic() i64 {
+    if max(i64)(3, 7) != 7 { return 1 }
+    return 0
+}
+
+fn test_generic_struct_basic() i64 {
+    var p: Pair(i64, i64) = undefined
+    p.first = 10
+    p.second = 20
+    if p.first + p.second != 30 { return 1 }
+    return 0
+}
+
+fn test_generic_fn_multi_inst() i64 {
+    let x: i64 = generic_add(i64)(10, 20)
+    let y: i32 = generic_add(i32)(3, 4)
+    if x + y != 37 { return 1 }
+    return 0
+}
+
+fn test_generic_struct_param() i64 {
+    var b: Box(i64) = undefined
+    b.value = 42
+    if Box_getValue(i64)(&b) != 42 { return 1 }
+    return 0
+}
+
+fn test_sizeof_generic() i64 {
+    if getSize(i64)() != 8 { return 1 }
+    return 0
+}
+
+fn test_alloc_inttoptr_generic() i64 {
+    let p = allocOne(i64)(42)
+    let result = p.*
+    @dealloc(@ptrToInt(p))
+    if result != 42 { return 1 }
+    return 0
+}
+
+fn test_generic_field_mutation() i64 {
+    var c: CounterM(i64) = undefined
+    c.value = 10
+    c.count = 0
+    CounterM_increment(i64)(&c)
+    CounterM_increment(i64)(&c)
+    if c.count != 2 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Test functions: List(T) free function pattern
+// ============================================================================
+
+fn test_list_basic() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    List_append(i64)(&list, 10)
+    List_append(i64)(&list, 20)
+    List_append(i64)(&list, 30)
+    let a = List_get(i64)(&list, 0)
+    let b = List_get(i64)(&list, 1)
+    let c = List_get(i64)(&list, 2)
+    if a + b + c != 60 { return 1 }
+    return 0
+}
+
+fn test_list_growth() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    var i: i64 = 0
+    while i < 20 {
+        List_append(i64)(&list, i)
+        i = i + 1
+    }
+    let first = List_get(i64)(&list, 0)
+    let last = List_get(i64)(&list, 19)
+    if first + last + list.count != 39 { return 1 }
+    return 0
+}
+
+fn test_list_pop() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    List_append(i64)(&list, 10)
+    List_append(i64)(&list, 20)
+    List_append(i64)(&list, 30)
+    let popped = List_pop(i64)(&list)
+    if popped + list.count != 32 { return 1 }
+    return 0
+}
+
+fn test_list_set() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    List_append(i64)(&list, 10)
+    List_append(i64)(&list, 20)
+    List_append(i64)(&list, 30)
+    List_set(i64)(&list, 1, 50)
+    if List_get(i64)(&list, 0) + List_get(i64)(&list, 1) + List_get(i64)(&list, 2) != 90 { return 1 }
+    return 0
+}
+
+fn test_list_multi_type() i64 {
+    var a: List(i64) = undefined
+    a.items = 0
+    a.count = 0
+    a.capacity = 0
+    var b: List(i32) = undefined
+    b.items = 0
+    b.count = 0
+    b.capacity = 0
+    List_append(i64)(&a, 100)
+    List_append(i32)(&b, 5)
+    let x = List_get(i64)(&a, 0)
+    let y: i64 = List_get(i32)(&b, 0)
+    if x + y != 105 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Test functions: List(T) impl pattern (dot-call syntax)
+// ============================================================================
+
+fn test_list_impl_basic() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    let a = list.iget(0)
+    let b = list.iget(1)
+    let c = list.iget(2)
+    if a + b + c != 60 { return 1 }
+    return 0
+}
+
+fn test_list_impl_growth() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    var i: i64 = 0
+    while i < 20 {
+        list.append(i)
+        i = i + 1
+    }
+    let first = list.iget(0)
+    let last = list.iget(19)
+    if first + last + list.count != 39 { return 1 }
+    return 0
+}
+
+fn test_list_impl_pop() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    let popped = list.ipop()
+    if popped + list.count != 32 { return 1 }
+    return 0
+}
+
+fn test_list_impl_set() i64 {
+    var list: List(i64) = undefined
+    list.items = 0
+    list.count = 0
+    list.capacity = 0
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    list.iset(1, 50)
+    if list.iget(0) + list.iget(1) + list.iget(2) != 90 { return 1 }
+    return 0
+}
+
+fn test_list_impl_multi_type() i64 {
+    var a: List(i64) = undefined
+    a.items = 0
+    a.count = 0
+    a.capacity = 0
+    var b: List(i32) = undefined
+    b.items = 0
+    b.count = 0
+    b.capacity = 0
+    a.append(100)
+    b.append(5)
+    let x = a.iget(0)
+    let y: i64 = b.iget(0)
+    if x + y != 105 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Test functions: Generic impl blocks
+// ============================================================================
+
+fn test_generic_impl_basic() i64 {
+    var c: Counter(i64) = undefined
+    c.value = 42
+    if c.get() != 42 { return 1 }
+    return 0
+}
+
+fn test_generic_impl_self_call() i64 {
+    var b: BoxC(i64) = undefined
+    b.value = 10
+    b.count = 0
+    b.increment()
+    b.increment()
+    b.increment()
+    if b.count + b.value != 13 { return 1 }
+    return 0
+}
+
+fn test_generic_impl_multi_inst() i64 {
+    var a: Box(i64) = undefined
+    a.value = 30
+    var b: Box(i32) = undefined
+    b.value = 12
+    let x: i64 = a.get()
+    let y: i64 = b.get()
+    if x + y != 42 { return 1 }
+    return 0
+}
+
+fn test_generic_impl_forward_ref() i64 {
+    var b: BoxC(i64) = undefined
+    b.value = 10
+    b.count = 0
+    b.increment()
+    b.increment()
+    if b.count + b.value != 12 { return 1 }
+    return 0
+}
+
+fn test_generic_impl_two_params() i64 {
+    var p: Pair(i64, i64) = undefined
+    p.first = 30
+    p.second = 12
+    if p.sum() != 42 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Test functions: Struct literals, zero init, new for generics
+// ============================================================================
+
+fn test_generic_struct_literal() i64 {
+    var p = Pair(i64, i64) { .first = 10, .second = 32 }
+    if p.first + p.second != 42 { return 1 }
+    return 0
+}
+
+fn test_generic_struct_literal_methods() i64 {
+    var p = Pair(i64, i64) { .first = 30, .second = 12 }
+    if p.sum() != 42 { return 1 }
+    return 0
+}
+
+fn test_zero_init_basic() i64 {
+    var p: Point = .{}
+    if p.x + p.y != 0 { return 1 }
+    return 0
+}
+
+fn test_zero_init_generic() i64 {
+    var p: Pair(i64, i64) = .{}
+    if p.first + p.second != 0 { return 1 }
+    return 0
+}
+
+fn test_new_generic() i64 {
+    let p = new Pair(i64, i64) { first: 30, second: 12 }
+    if p.first + p.second != 42 { return 1 }
+    return 0
+}
+
+// ============================================================================
+// main() dispatcher
+// ============================================================================
+
+fn main() i64 {
+    // Baseline + Phase 3
+    if test_baseline() != 0 { return 1 }
+    if test_phase3() != 0 { return 2 }
+
+    // Function call + float
+    if test_func_call() != 0 { return 3 }
+    if test_float_locals() != 0 { return 4 }
+
+    // Union payloads
+    if test_union_payload() != 0 { return 5 }
+    if test_union_mixed() != 0 { return 6 }
+    if test_union_switch_no_capture() != 0 { return 7 }
+    if test_union_switch_capture() != 0 { return 8 }
+
+    // Error unions
+    if test_error_union_catch() != 0 { return 9 }
+    if test_error_union_try() != 0 { return 10 }
+
+    // Defer (special return values)
+    if test_defer_basic() != 10 { return 11 }
+    if test_defer_loop_break() != 3 { return 12 }
+    if test_defer_lifo() != 2 { return 13 }
+
+    // ARC
+    if test_arc_func_return_new() != 42 { return 14 }
+    if test_arc_copy_local() != 10 { return 15 }
+    if test_arc_reassignment() != 2 { return 16 }
+    if test_arc_return_forward() != 77 { return 17 }
+    if test_arc_dealloc_basic() != 42 { return 18 }
+    if test_arc_dealloc_multi() != 42 { return 19 }
+
+    // Builtins
+    if test_builtin_alloc_dealloc() != 0 { return 20 }
+    if test_builtin_realloc() != 0 { return 21 }
+    if test_freelist_reuse() != 0 { return 22 }
+
+    // Deinit
+    if test_deinit_basic() != 42 { return 23 }
+    if test_deinit_no_use() != 0 { return 24 }
+    if test_deinit_mixed() != 30 { return 25 }
+    if test_deinit_alloc_reuse() != 30 { return 26 }
+
+    // Function pointers
+    if test_fnptr_basic() != 0 { return 27 }
+    if test_fnptr_param() != 0 { return 28 }
+    if test_fnptr_reassign() != 0 { return 29 }
+
+    // Closures
+    if test_closure_no_capture() != 0 { return 30 }
+    if test_closure_capture() != 0 { return 31 }
+    if test_closure_multi_capture() != 0 { return 32 }
+    if test_closure_passed() != 0 { return 33 }
+
+    // Generics (plain functions)
+    if test_generic_fn_basic() != 0 { return 34 }
+    if test_generic_struct_basic() != 0 { return 35 }
+    if test_generic_fn_multi_inst() != 0 { return 36 }
+    if test_generic_struct_param() != 0 { return 37 }
+    if test_sizeof_generic() != 0 { return 38 }
+    if test_alloc_inttoptr_generic() != 0 { return 39 }
+    if test_generic_field_mutation() != 0 { return 40 }
+
+    // List(T) free function pattern
+    if test_list_basic() != 0 { return 41 }
+    if test_list_growth() != 0 { return 42 }
+    if test_list_pop() != 0 { return 43 }
+    if test_list_set() != 0 { return 44 }
+    if test_list_multi_type() != 0 { return 45 }
+
+    // List(T) impl pattern
+    if test_list_impl_basic() != 0 { return 46 }
+    if test_list_impl_growth() != 0 { return 47 }
+    if test_list_impl_pop() != 0 { return 48 }
+    if test_list_impl_set() != 0 { return 49 }
+    if test_list_impl_multi_type() != 0 { return 50 }
+
+    // Generic impl blocks
+    if test_generic_impl_basic() != 0 { return 51 }
+    if test_generic_impl_self_call() != 0 { return 52 }
+    if test_generic_impl_multi_inst() != 0 { return 53 }
+    if test_generic_impl_forward_ref() != 0 { return 54 }
+    if test_generic_impl_two_params() != 0 { return 55 }
+
+    // Struct literals, zero init, new for generics
+    if test_generic_struct_literal() != 0 { return 56 }
+    if test_generic_struct_literal_methods() != 0 { return 57 }
+    if test_zero_init_basic() != 0 { return 58 }
+    if test_zero_init_generic() != 0 { return 59 }
+    if test_new_generic() != 0 { return 60 }
+
+    return 0
+}

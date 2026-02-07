@@ -535,7 +535,7 @@ pub const Lowerer = struct {
                 const local_addr = try fb.emitAddrLocal(local_idx, ptr_type, var_stmt.span);
                 const size_node = try fb.emitConstInt(@intCast(size), TypeRegistry.I64, var_stmt.span);
                 var args = [_]ir.NodeIndex{ local_addr, size_node };
-                _ = try fb.emitCall("memset_zero", &args, false, TypeRegistry.VOID, var_stmt.span);
+                _ = try fb.emitCall("cot_memset_zero", &args, false, TypeRegistry.VOID, var_stmt.span);
                 return;
             }
 
@@ -632,7 +632,7 @@ pub const Lowerer = struct {
                     const local_addr = try fb.emitAddrLocal(local_idx, ptr_type, span);
                     const size_node = try fb.emitConstInt(@intCast(type_size), TypeRegistry.I64, span);
                     var args = [_]ir.NodeIndex{ local_addr, size_node };
-                    _ = try fb.emitCall("memset_zero", &args, false, TypeRegistry.VOID, span);
+                    _ = try fb.emitCall("cot_memset_zero", &args, false, TypeRegistry.VOID, span);
                     return;
                 }
                 const value_node_ir = try self.lowerExprNode(value_idx);

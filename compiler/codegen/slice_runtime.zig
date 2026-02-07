@@ -10,7 +10,7 @@ const wasm_link = @import("wasm/link.zig");
 const ValType = wasm.ValType;
 
 // Wasm block types (from spec)
-const BLOCK_VOID: u8 = 0x40;
+const BLOCK_VOID: u8 = wasm_old.CodeBuilder.BLOCK_VOID;
 const BLOCK_I64: u8 = 0x7E;
 
 /// Slice runtime function indices
@@ -189,7 +189,9 @@ fn generateGrowSliceBody(allocator: std.mem.Allocator, heap_ptr_global: u32) ![]
     //   local 4: new_ptr (i32)
     //   local 5: old_size (i32) - bytes to copy
     //   local 6: alloc_size (i32)
-    _ = try code.declareLocals(&[_]wasm_old.ValType{ .i32, .i32, .i32 });
+    //   local 7: src_i32 (i32) - for byte-copy loop
+    //   local 8: counter (i32) - byte-copy loop counter
+    _ = try code.declareLocals(&[_]wasm_old.ValType{ .i32, .i32, .i32, .i32, .i32 });
 
     // old_size = (i32)(old_len * elem_size)
     try code.emitLocalGet(1); // old_len
@@ -221,11 +223,11 @@ fn generateGrowSliceBody(allocator: std.mem.Allocator, heap_ptr_global: u32) ![]
 
     // memcpy(new_ptr, old_ptr, old_size)
     // Go reference: memmove(p, oldPtr, lenmem) at line 284
-    try code.emitLocalGet(4); // dest = new_ptr
-    try code.emitLocalGet(0); // src = old_ptr
+    try code.emitLocalGet(0); // old_ptr (i64)
     try code.emitI32WrapI64();
-    try code.emitLocalGet(5); // len = old_size
-    try code.emitMemoryCopy();
+    try code.emitLocalSet(7); // src_i32
+    // dest=local 4 (new_ptr), src=local 7, len=local 5, counter=local 8
+    try code.emitByteCopyLoop(4, 7, 5, 8);
 
     // return (i64)new_ptr
     try code.emitLocalGet(4);

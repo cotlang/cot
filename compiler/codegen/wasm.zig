@@ -249,6 +249,9 @@ pub const Module = struct {
 // ============================================================================
 
 pub const CodeBuilder = struct {
+    /// Wasm block type constants for emitBlock/emitLoop/emitIf.
+    pub const BLOCK_VOID: u8 = 0x40;
+
     allocator: std.mem.Allocator,
     buf: std.ArrayListUnmanaged(u8) = .{},
     local_count: u32 = 0,
@@ -689,6 +692,42 @@ pub const CodeBuilder = struct {
         try self.buf.append(self.allocator, 0x0A); // memory.copy
         try self.buf.append(self.allocator, 0x00); // dest memory index
         try self.buf.append(self.allocator, 0x00); // src memory index
+    }
+
+    /// Emit a byte-copy loop that copies `len` bytes from `src` to `dest`.
+    /// Same stack signature as memory.copy: [dest (i32), src (i32), len (i32)] → []
+    /// Uses a dedicated local as the loop counter.
+    /// This avoids the memory.copy opcode which native AOT doesn't support.
+    pub fn emitByteCopyLoop(self: *CodeBuilder, dest_local: u32, src_local: u32, len_local: u32, counter_local: u32) !void {
+        // counter = 0
+        try self.emitI32Const(0);
+        try self.emitLocalSet(counter_local);
+        // block { loop {
+        try self.emitBlock(BLOCK_VOID);
+        try self.emitLoop(BLOCK_VOID);
+        //   br_if (counter >= len) → break
+        try self.emitLocalGet(counter_local);
+        try self.emitLocalGet(len_local);
+        try self.emitI32GeU();
+        try self.emitBrIf(1);
+        //   store8(dest + counter, load8_u(src + counter))
+        try self.emitLocalGet(dest_local);
+        try self.emitLocalGet(counter_local);
+        try self.emitI32Add();
+        try self.emitLocalGet(src_local);
+        try self.emitLocalGet(counter_local);
+        try self.emitI32Add();
+        try self.emitI64Load8U(0);
+        try self.emitI64Store8(0);
+        //   counter++
+        try self.emitLocalGet(counter_local);
+        try self.emitI32Const(1);
+        try self.emitI32Add();
+        try self.emitLocalSet(counter_local);
+        try self.emitBr(0); // continue loop
+        // } }
+        try self.emitEnd();
+        try self.emitEnd();
     }
 
     /// Emit memory.size instruction.

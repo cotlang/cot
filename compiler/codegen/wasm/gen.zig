@@ -1046,10 +1046,14 @@ pub const GenState = struct {
             // Fallback: assume 8 bytes per slot
             return @intCast(local_idx * 8);
         }
+        // Go pattern: all stack slots are 8-byte aligned.
+        // Wasm uses i64.store/i64.load for all values (8 bytes),
+        // so each slot must be at least 8 bytes to prevent overlap.
         var offset: i64 = 0;
         const count = @min(local_idx, self.func.local_sizes.len);
         for (0..count) |i| {
-            offset += @intCast(self.func.local_sizes[i]);
+            const size: i64 = @intCast(self.func.local_sizes[i]);
+            offset += if (size < 8) 8 else size;
         }
         return offset;
     }
@@ -1058,10 +1062,11 @@ pub const GenState = struct {
     /// Go reference: This matches how Go computes frame layout in obj/link.go
     fn computeFrameSize(self: *const GenState) i32 {
         // Use actual local sizes from IR (populated by ssa_builder.zig)
+        // Go pattern: all stack slots are at least 8 bytes (i64.store/load alignment)
         if (self.func.local_sizes.len > 0) {
             var total: i32 = 0;
             for (self.func.local_sizes) |size| {
-                total += @intCast(size);
+                total += if (size < 8) 8 else @as(i32, @intCast(size));
             }
             // Align to 16 bytes
             return @divTrunc((total + 15), 16) * 16;

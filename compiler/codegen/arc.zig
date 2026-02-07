@@ -11,7 +11,7 @@ const wasm_link = @import("wasm/wasm.zig");
 const ValType = wasm_link.ValType;
 
 // Block type constants for Wasm control flow (from spec)
-const BLOCK_VOID: u8 = 0x40;
+const BLOCK_VOID: u8 = wasm.CodeBuilder.BLOCK_VOID;
 const BLOCK_I32: u8 = 0x7F;
 const BLOCK_I64: u8 = 0x7E;
 
@@ -74,7 +74,7 @@ pub const RuntimeFunctions = struct {
     /// cot_string_concat index
     string_concat_idx: u32,
 
-    /// cot_memset_zero index (stub for now)
+    /// cot_memset_zero index
     memset_zero_idx: u32,
 
     /// heap_ptr global index
@@ -218,13 +218,13 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         .exported = false,
     });
 
-    // Generate stub memset_zero function
-    // Takes (ptr, size) -> void
+    // Generate memset_zero function
+    // Takes (ptr: i64, size: i64) -> void — zeros `size` bytes starting at `ptr`
     const memset_zero_type = try linker.addType(
         &[_]ValType{ .i64, .i64 },
         &[_]ValType{},
     );
-    const memset_zero_body = try generateVoidStubBody(allocator);
+    const memset_zero_body = try generateMemsetZeroBody(allocator);
     const memset_zero_idx = try linker.addFunc(.{
         .name = MEMSET_ZERO_NAME,
         .type_idx = memset_zero_type,
@@ -254,6 +254,56 @@ fn generateVoidStubBody(allocator: std.mem.Allocator) ![]const u8 {
     defer code.deinit();
     // Empty body - finish() adds the end opcode automatically
     return try code.finish();
+}
+
+/// Generates bytecode for cot_memset_zero(ptr: i64, size: i64) -> void
+/// Zeros `size` bytes starting at `ptr` using a byte-store loop.
+/// Reference: Go's memclrNoHeapPointers / C's memset(p, 0, n)
+fn generateMemsetZeroBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // Parameters: ptr (local 0, i64), size (local 1, i64)
+    // Local 2: addr_i32 (i32) - ptr as i32 for memory access
+    // Local 3: len_i32 (i32) - size as i32
+    // Local 4: counter (i32) - loop counter
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32 });
+
+    // addr_i32 = (i32)ptr
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(2);
+    // len_i32 = (i32)size
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(3);
+
+    // Byte-zero loop: i=0; while(i < len) { store8(addr+i, 0); i++ }
+    try code.emitI32Const(0);
+    try code.emitLocalSet(4);
+    try code.emitBlock(BLOCK_VOID);
+    try code.emitLoop(BLOCK_VOID);
+    // if (counter >= len) break
+    try code.emitLocalGet(4);
+    try code.emitLocalGet(3);
+    try code.emitI32GeU();
+    try code.emitBrIf(1);
+    // store8(addr + counter, 0)
+    try code.emitLocalGet(2);
+    try code.emitLocalGet(4);
+    try code.emitI32Add();
+    try code.emitI64Const(0);
+    try code.emitI64Store8(0);
+    // counter++
+    try code.emitLocalGet(4);
+    try code.emitI32Const(1);
+    try code.emitI32Add();
+    try code.emitLocalSet(4);
+    try code.emitBr(0);
+    try code.emitEnd();
+    try code.emitEnd();
+
+    return code.finish();
 }
 
 /// Generates a stub function body that returns 0 (for i64 returns).
@@ -454,7 +504,8 @@ fn generateReallocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freel
     // Local 4: new_total (i32)
     // Local 5: new_obj (i64)
     // Local 6: copy_size (i32)
-    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32, .i64, .i32 });
+    // Local 7: i (i32) - byte-copy loop counter
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32, .i64, .i32, .i32 });
 
     // if (obj == 0) return cot_alloc(0, new_size)
     try code.emitLocalGet(0);
@@ -514,13 +565,18 @@ fn generateReallocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freel
     try code.emitI32Sub();
     try code.emitLocalSet(6);
 
-    // memory.copy(new_obj_i32, obj_i32, copy_size)
+    // Byte-copy: copy old payload into new allocation
+    // Store dest/src as i32 into temp locals for the byte-copy loop
+    // Reuse local 2 (header_ptr, no longer needed) as dest_i32
+    // Reuse local 4 (new_total, no longer needed) as src_i32
     try code.emitLocalGet(5); // new_obj (i64)
-    try code.emitI32WrapI64(); // dest (i32)
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(2); // dest_i32
     try code.emitLocalGet(0); // obj (i64)
-    try code.emitI32WrapI64(); // src (i32)
-    try code.emitLocalGet(6); // len (i32)
-    try code.emitMemoryCopy();
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(4); // src_i32
+    // copy_size is in local 6, loop counter in local 7
+    try code.emitByteCopyLoop(2, 4, 6, 7);
 
     // cot_dealloc(obj)
     try code.emitLocalGet(0);
@@ -698,7 +754,11 @@ fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) 
     // Locals:
     //   local 4: new_len (i32)
     //   local 5: new_ptr (i32)
-    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32 });
+    //   local 6: tmp_src (i32) - for byte-copy loop
+    //   local 7: tmp_len (i32) - for byte-copy loop
+    //   local 8: tmp_dest (i32) - for byte-copy loop (2nd copy)
+    //   local 9: counter (i32) - byte-copy loop counter
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32, .i32, .i32, .i32 });
 
     // new_len = (i32)s1_len + (i32)s2_len
     try code.emitLocalGet(1); // s1_len (i64)
@@ -728,25 +788,29 @@ fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) 
     try code.emitI32Add();
     try code.emitGlobalSet(heap_ptr_global);
 
-    // memory.copy(new_ptr, s1_ptr, s1_len)
-    // Stack: [dest, src, len] all i32
-    try code.emitLocalGet(5); // dest = new_ptr (i32)
-    try code.emitLocalGet(0); // src = s1_ptr (i64)
+    // Copy s1 into new buffer: byte_copy(dest=new_ptr, src=s1_ptr, len=s1_len)
+    try code.emitLocalGet(0); // s1_ptr (i64)
     try code.emitI32WrapI64();
-    try code.emitLocalGet(1); // len = s1_len (i64)
+    try code.emitLocalSet(6); // tmp_src = s1_ptr as i32
+    try code.emitLocalGet(1); // s1_len (i64)
     try code.emitI32WrapI64();
-    try code.emitMemoryCopy();
+    try code.emitLocalSet(7); // tmp_len = s1_len as i32
+    // dest is local 5 (new_ptr), already i32
+    try code.emitByteCopyLoop(5, 6, 7, 9);
 
-    // memory.copy(new_ptr + s1_len, s2_ptr, s2_len)
+    // Copy s2 into new buffer: byte_copy(dest=new_ptr+s1_len, src=s2_ptr, len=s2_len)
     try code.emitLocalGet(5); // new_ptr
     try code.emitLocalGet(1); // s1_len (i64)
     try code.emitI32WrapI64();
-    try code.emitI32Add(); // dest = new_ptr + s1_len
-    try code.emitLocalGet(2); // src = s2_ptr (i64)
+    try code.emitI32Add();
+    try code.emitLocalSet(8); // tmp_dest = new_ptr + s1_len
+    try code.emitLocalGet(2); // s2_ptr (i64)
     try code.emitI32WrapI64();
-    try code.emitLocalGet(3); // len = s2_len (i64)
+    try code.emitLocalSet(6); // tmp_src = s2_ptr as i32
+    try code.emitLocalGet(3); // s2_len (i64)
     try code.emitI32WrapI64();
-    try code.emitMemoryCopy();
+    try code.emitLocalSet(7); // tmp_len = s2_len as i32
+    try code.emitByteCopyLoop(8, 6, 7, 9);
 
     // Return (i64)new_ptr
     try code.emitLocalGet(5);
