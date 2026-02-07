@@ -86,7 +86,25 @@ fn compileAndRun(allocator: std.mem.Allocator, code: []const u8, test_name: []co
 }
 
 fn expectExitCode(backing_allocator: std.mem.Allocator, code: []const u8, expected: u32, test_name: []const u8) !void {
+    var timer = std.time.Timer.start() catch {
+        std.debug.print("[native] {s}...", .{test_name});
+        return expectExitCodeInner(backing_allocator, code, expected, test_name);
+    };
+
     std.debug.print("[native] {s}...", .{test_name});
+
+    try expectExitCodeInner(backing_allocator, code, expected, test_name);
+
+    const elapsed_ns = timer.read();
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+    if (elapsed_ms >= 1000.0) {
+        std.debug.print("ok ({d:.0}ms) SLOW\n", .{elapsed_ms});
+    } else {
+        std.debug.print("ok ({d:.0}ms)\n", .{elapsed_ms});
+    }
+}
+
+fn expectExitCodeInner(backing_allocator: std.mem.Allocator, code: []const u8, expected: u32, test_name: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(backing_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -111,7 +129,6 @@ fn expectExitCode(backing_allocator: std.mem.Allocator, code: []const u8, expect
         std.debug.print("WRONG EXIT CODE: expected {d}, got {d}\n", .{ expected, actual });
         return error.WrongExitCode;
     }
-    std.debug.print("ok\n", .{});
 }
 
 // ============================================================================
