@@ -91,8 +91,8 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
     const runtime_funcs = try arc.addRuntimeFunctions(&module);
 
     // Count runtime functions for index offset
-    // Runtime functions: alloc, retain, release, retain_count, is_unique = 5 functions
-    const runtime_func_count: u32 = 5;
+    // Runtime functions: alloc, retain, dealloc, release, retain_count, is_unique = 6 functions
+    const runtime_func_count: u32 = 6;
 
     // First pass: build function name -> index mapping (offset by runtime functions)
     var func_indices = wasm_gen.FuncIndexMap{};
@@ -1062,6 +1062,104 @@ test "wasm e2e: generic function multiple instantiations" {
         \\    return x + y
         \\}
     ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+// ============================================================================
+// ARC deallocation tests
+// ============================================================================
+
+test "wasm e2e: ARC dealloc after release" {
+    const code =
+        \\struct Foo { x: i64 }
+        \\fn main() i64 {
+        \\    let p = new Foo { x: 42 }
+        \\    return p.x
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: ARC dealloc multiple objects" {
+    const code =
+        \\struct Foo { x: i64 }
+        \\fn makeFoo(v: i64) *Foo {
+        \\    return new Foo { x: v }
+        \\}
+        \\fn main() i64 {
+        \\    let a = makeFoo(10)
+        \\    let b = makeFoo(20)
+        \\    let c = makeFoo(12)
+        \\    return a.x + b.x + c.x
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+// ============================================================================
+// Builtin @alloc, @dealloc, @realloc tests
+// ============================================================================
+
+test "wasm e2e: builtin alloc and dealloc" {
+    const code =
+        \\fn main() i64 {
+        \\    let ptr = @alloc(8)
+        \\    @dealloc(ptr)
+        \\    return 42
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: builtin realloc" {
+    const code =
+        \\fn main() i64 {
+        \\    let ptr = @alloc(8)
+        \\    let ptr2 = @realloc(ptr, 16)
+        \\    @dealloc(ptr2)
+        \\    return 99
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: freelist reuse cycle" {
+    const code =
+        \\fn main() i64 {
+        \\    let p1 = @alloc(8)
+        \\    @dealloc(p1)
+        \\    let p2 = @alloc(8)
+        \\    @dealloc(p2)
+        \\    let p3 = @alloc(8)
+        \\    @dealloc(p3)
+        \\    return 77
+        \\}
+    ;
+
     var result = try compileToWasmViaDriver(std.testing.allocator, code);
     defer result.deinit();
     try std.testing.expect(!result.has_errors);

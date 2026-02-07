@@ -619,14 +619,14 @@ pub const Driver = struct {
     fn generateMainWrapperMachO(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment) !void {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
-        // Layout (total 384KB = 0x60000):
+        // Layout (total 16MB = 0x1000000):
         //   0x00000 - 0x0FFFF: Padding/reserved
         //   0x10000: Stack pointer global (i32) - initialized to 64KB
         //   0x20000: Heap base pointer (i64) - to be filled by wrapper
-        //   0x20008: Heap bound (i64) - 128KB
-        //   0x40000 - 0x5FFFF: Linear memory (128KB heap)
+        //   0x20008: Heap bound (i64) - ~15.7MB
+        //   0x40000 - 0xFFFFFF: Linear memory (~15.7MB heap)
         // =================================================================
-        const vmctx_size: usize = 0x60000; // 384KB
+        const vmctx_size: usize = 0x1000000; // 16MB
         const vmctx_data = try self.allocator.alloc(u8, vmctx_size);
         defer self.allocator.free(vmctx_data);
 
@@ -647,8 +647,8 @@ pub const Driver = struct {
         const sp_value: u32 = 0x10000;
         @memcpy(vmctx_data[0x10000..][0..4], std.mem.asBytes(&sp_value));
 
-        // Heap bound at offset 0x20008 = 128KB (size of linear memory)
-        const heap_bound: u64 = 0x20000;
+        // Heap bound at offset 0x20008 = ~15.7MB (size of linear memory)
+        const heap_bound: u64 = 0x1000000 - 0x40000; // vmctx_size - linear_memory_base
         @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
 
         // Note: heap base pointer at 0x20000 will be patched by wrapper at runtime
@@ -846,14 +846,14 @@ pub const Driver = struct {
     fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule) !void {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
-        // Layout (total 384KB = 0x60000):
+        // Layout (total 16MB = 0x1000000):
         //   0x00000 - 0x0FFFF: Padding/reserved
         //   0x10000: Stack pointer global (i32) - initialized to 64KB
         //   0x20000: Heap base pointer (i64) - to be filled by wrapper
-        //   0x20008: Heap bound (i64) - 128KB
-        //   0x40000 - 0x5FFFF: Linear memory (128KB heap)
+        //   0x20008: Heap bound (i64) - ~15.7MB
+        //   0x40000 - 0xFFFFFF: Linear memory (~15.7MB heap)
         // =================================================================
-        const vmctx_size: usize = 0x60000; // 384KB
+        const vmctx_size: usize = 0x1000000; // 16MB
         const vmctx_data = try self.allocator.alloc(u8, vmctx_size);
         defer self.allocator.free(vmctx_data);
 
@@ -865,8 +865,8 @@ pub const Driver = struct {
         const sp_value: u32 = 0x10000;
         @memcpy(vmctx_data[0x10000..][0..4], std.mem.asBytes(&sp_value));
 
-        // Heap bound at offset 0x20008 = 128KB (size of linear memory)
-        const heap_bound: u64 = 0x20000;
+        // Heap bound at offset 0x20008 = ~15.7MB (size of linear memory)
+        const heap_bound: u64 = 0x1000000 - 0x40000; // vmctx_size - linear_memory_base
         @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
 
         // Note: heap base pointer at 0x20000 will be patched by wrapper at runtime
@@ -1018,6 +1018,8 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, arc.ALLOC_NAME, arc_funcs.alloc_idx);
         try func_indices.put(self.allocator, arc.RETAIN_NAME, arc_funcs.retain_idx);
         try func_indices.put(self.allocator, arc.RELEASE_NAME, arc_funcs.release_idx);
+        try func_indices.put(self.allocator, arc.DEALLOC_NAME, arc_funcs.dealloc_idx);
+        try func_indices.put(self.allocator, arc.REALLOC_NAME, arc_funcs.realloc_idx);
         try func_indices.put(self.allocator, arc.STRING_CONCAT_NAME, arc_funcs.string_concat_idx);
         try func_indices.put(self.allocator, arc.MEMSET_ZERO_NAME, arc_funcs.memset_zero_idx);
 

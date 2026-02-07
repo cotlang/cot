@@ -1809,9 +1809,9 @@ pub const Lowerer = struct {
         const type_info = self.type_reg.get(struct_type_idx);
         const struct_type = if (type_info == .struct_type) type_info.struct_type else return ir.null_node;
 
-        // Calculate size including heap object header (12 bytes for 32-bit Wasm)
-        // Header: metadata ptr (4), refcount (8) = 12 bytes
-        const HEAP_HEADER_SIZE: u32 = 12;
+        // Calculate size including heap object header (16 bytes for 32-bit Wasm)
+        // Header: total_size (4) + metadata ptr (4) + refcount (8) = 16 bytes
+        const HEAP_HEADER_SIZE: u32 = 16;
         const payload_size = self.type_reg.sizeOf(struct_type_idx);
         const total_size = HEAP_HEADER_SIZE + payload_size;
 
@@ -1871,7 +1871,7 @@ pub const Lowerer = struct {
     /// Layout: { table_idx: i64 }
     fn createFuncValue(self: *Lowerer, func_name: []const u8, type_idx: TypeIndex, span: Span) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
-        const HEAP_HEADER_SIZE: u32 = 12;
+        const HEAP_HEADER_SIZE: u32 = 16;
         const payload_size: u32 = 8; // one i64 for table_idx
         const total_size = HEAP_HEADER_SIZE + payload_size;
 
@@ -1958,7 +1958,7 @@ pub const Lowerer = struct {
 
         // Now in parent function: allocate closure struct and fill it
         const num_captures = captures.items.len;
-        const HEAP_HEADER_SIZE: u32 = 12;
+        const HEAP_HEADER_SIZE: u32 = 16;
         const payload_size: u32 = @intCast((1 + num_captures) * 8); // table_idx + captures
         const total_size = HEAP_HEADER_SIZE + payload_size;
 
@@ -2829,6 +2829,24 @@ pub const Lowerer = struct {
             _ = try fb.emitJump(then_block, bc.span);
             fb.setBlock(then_block);
             return ir.null_node;
+        }
+        if (std.mem.eql(u8, bc.name, "alloc")) {
+            const size = try self.lowerExprNode(bc.args[0]);
+            const metadata_node = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+            var alloc_args = [_]ir.NodeIndex{ metadata_node, size };
+            return try fb.emitCall("cot_alloc", &alloc_args, false, TypeRegistry.I64, bc.span);
+        }
+        if (std.mem.eql(u8, bc.name, "dealloc")) {
+            const ptr = try self.lowerExprNode(bc.args[0]);
+            var dealloc_args = [_]ir.NodeIndex{ptr};
+            _ = try fb.emitCall("cot_dealloc", &dealloc_args, false, TypeRegistry.VOID, bc.span);
+            return ir.null_node;
+        }
+        if (std.mem.eql(u8, bc.name, "realloc")) {
+            const ptr = try self.lowerExprNode(bc.args[0]);
+            const new_size = try self.lowerExprNode(bc.args[1]);
+            var realloc_args = [_]ir.NodeIndex{ ptr, new_size };
+            return try fb.emitCall("cot_realloc", &realloc_args, false, TypeRegistry.I64, bc.span);
         }
         return ir.null_node;
     }

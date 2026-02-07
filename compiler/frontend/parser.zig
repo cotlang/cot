@@ -720,10 +720,16 @@ pub const Parser = struct {
             const v = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = t, .args = .{ v, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert")) {
+        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc")) {
             const arg = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node }, .span = Span.init(start, self.pos()) } });
+        } else if (std.mem.eql(u8, name, "realloc")) {
+            const ptr_arg = try self.parseExpr() orelse return null;
+            if (!self.expect(.comma)) return null;
+            const size_arg = try self.parseExpr() orelse return null;
+            if (!self.expect(.rparen)) return null;
+            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ ptr_arg, size_arg }, .span = Span.init(start, self.pos()) } });
         } else {
             const t = try self.parseType() orelse return null;
             if (!self.expect(.rparen)) return null;

@@ -512,6 +512,21 @@ pub const CodeBuilder = struct {
         try self.buf.append(self.allocator, Op.i32_or);
     }
 
+    /// Emit i32.ge_u instruction (unsigned greater than or equal).
+    pub fn emitI32GeU(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_ge_u);
+    }
+
+    /// Emit i32.le_u instruction (unsigned less than or equal).
+    pub fn emitI32LeU(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_le_u);
+    }
+
+    /// Emit i32.gt_u instruction (unsigned greater than).
+    pub fn emitI32GtU(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_gt_u);
+    }
+
     /// Emit local.tee instruction.
     pub fn emitLocalTee(self: *CodeBuilder, idx: u32) !void {
         try self.buf.append(self.allocator, Op.local_tee);
@@ -659,6 +674,22 @@ pub const CodeBuilder = struct {
         try self.buf.append(self.allocator, 0x0A); // memory.copy
         try self.buf.append(self.allocator, 0x00); // dest memory index
         try self.buf.append(self.allocator, 0x00); // src memory index
+    }
+
+    /// Emit memory.size instruction.
+    /// Stack: [] → [i32 (current memory size in pages)]
+    /// Reference: Go runtime/mem_wasm.go
+    pub fn emitMemorySize(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.memory_size);
+        try self.buf.append(self.allocator, 0x00); // memory index
+    }
+
+    /// Emit memory.grow instruction.
+    /// Stack: [delta (i32, pages to grow)] → [i32 (previous size or -1 on failure)]
+    /// Reference: Go runtime/mem_wasm.go sbrk()
+    pub fn emitMemoryGrow(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.memory_grow);
+        try self.buf.append(self.allocator, 0x00); // memory index
     }
 
     /// Set the number of locals (beyond parameters).

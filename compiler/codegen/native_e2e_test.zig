@@ -699,3 +699,71 @@ test "generic function multiple instantiations" {
         \\}
     ), 37, "generic_fn_multi_inst");
 }
+
+// ============================================================================
+// ARC deallocation tests (verify memory freed on release)
+// ============================================================================
+
+test "native: ARC dealloc after release" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\struct Foo { x: i64 }
+        \\fn main() i64 {
+        \\    let p = new Foo { x: 42 }
+        \\    return p.x
+        \\}
+    ), 42, "arc_dealloc_basic");
+}
+
+test "native: ARC dealloc multiple objects" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\struct Foo { x: i64 }
+        \\fn makeFoo(v: i64) *Foo {
+        \\    return new Foo { x: v }
+        \\}
+        \\fn main() i64 {
+        \\    let a = makeFoo(10)
+        \\    let b = makeFoo(20)
+        \\    let c = makeFoo(12)
+        \\    return a.x + b.x + c.x
+        \\}
+    ), 42, "arc_dealloc_multi");
+}
+
+// ============================================================================
+// Builtin @alloc, @dealloc, @realloc tests
+// ============================================================================
+
+test "native: builtin alloc and dealloc" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\fn main() i64 {
+        \\    let ptr = @alloc(8)
+        \\    @dealloc(ptr)
+        \\    return 42
+        \\}
+    ), 42, "builtin_alloc_dealloc");
+}
+
+test "native: builtin realloc" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\fn main() i64 {
+        \\    let ptr = @alloc(8)
+        \\    let ptr2 = @realloc(ptr, 16)
+        \\    @dealloc(ptr2)
+        \\    return 99
+        \\}
+    ), 99, "builtin_realloc");
+}
+
+test "native: freelist reuse cycle" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\fn main() i64 {
+        \\    let p1 = @alloc(8)
+        \\    @dealloc(p1)
+        \\    let p2 = @alloc(8)
+        \\    @dealloc(p2)
+        \\    let p3 = @alloc(8)
+        \\    @dealloc(p3)
+        \\    return 77
+        \\}
+    ), 77, "freelist_reuse");
+}

@@ -608,6 +608,16 @@ pub const Checker = struct {
         } else if (std.mem.eql(u8, bc.name, "assert")) {
             _ = try self.checkExpr(bc.args[0]);
             return TypeRegistry.VOID;
+        } else if (std.mem.eql(u8, bc.name, "alloc")) {
+            _ = try self.checkExpr(bc.args[0]); // size: i64
+            return TypeRegistry.I64; // raw pointer as i64
+        } else if (std.mem.eql(u8, bc.name, "dealloc")) {
+            _ = try self.checkExpr(bc.args[0]); // ptr: i64
+            return TypeRegistry.VOID;
+        } else if (std.mem.eql(u8, bc.name, "realloc")) {
+            _ = try self.checkExpr(bc.args[0]); // ptr: i64
+            _ = try self.checkExpr(bc.args[1]); // new_size: i64
+            return TypeRegistry.I64; // new pointer as i64
         }
         self.err.errorWithCode(bc.span.start, .e300, "unknown builtin");
         return invalid_type;
