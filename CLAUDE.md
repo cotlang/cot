@@ -131,6 +131,7 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 |----------|---------|
 | `GAP_ANALYSIS.md` | **PROJECT PRIORITY: Feature + test gap vs bootstrap-0.2, recommended path** |
 | `TROUBLESHOOTING.md` | **MUST READ: Debugging methodology - never invent, always copy reference** |
+| `docs/PIPELINE_ARCHITECTURE.md` | **MUST READ: Full pipeline, reference map for every stage, extern fn, allocator** |
 | `VISION.md` | Language vision, Phase 3 TODO list, execution roadmap |
 
 ### Reference (read when needed)

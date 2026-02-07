@@ -4,9 +4,9 @@
 
 **Bootstrap-0.2** was a working compiler with **619 test cases** covering expressions, control flow, functions, types, arrays, memory, and variables. It compiled to native (AMD64/ARM64) directly.
 
-**Current Cot** is a Wasm-first rewrite with **114 test case files**, **42 Wasm E2E tests**, **24 native E2E tests**, and **832 total tests** (including unit tests). It has surpassed bootstrap-0.2 in language features and architecture quality, but still has a test coverage gap.
+**Current Cot** is a Wasm-first rewrite with **120 test case files**, **45 Wasm E2E tests**, **30 native E2E tests**, and **842 total tests** (including unit tests). It has surpassed bootstrap-0.2 in language features and architecture quality, but still has a test coverage gap.
 
-**The gap: ~493 missing test cases. Most language features are now complete.**
+**The gap: ~480 missing test cases. All core language features are complete, including generics.**
 
 ---
 
@@ -27,7 +27,7 @@
 | Integration | 1 | Full pipeline test |
 | Golden | 2 | Reference SSA/codegen output |
 
-### Current Cot: 114 test files + 66 E2E tests
+### Current Cot: 120 test files + 75 E2E tests
 
 | Category | Files | E2E | What It Covers |
 |----------|-------|-----|----------------|
@@ -56,8 +56,10 @@
 | Defer | - | 3+3 | basic, loop_break, lifo (Wasm+native E2E) |
 | Function ptrs | - | 3+3 | basic, param, reassign (Wasm+native E2E) |
 | Closures | - | 4+4 | no_capture, capture, multi_capture, passed (Wasm+native E2E) |
+| Generics | - | 3+3 | fn basic, struct basic, multi instantiation (Wasm+native E2E) |
 | Global vars | - | 3 | read, write, multi-function (Wasm E2E) |
 | Native baseline | - | 1+1 | baseline + phase3_all + func_call (native E2E) |
+| Parity | - | 4 | expressions, functions, control_flow, variables (native E2E) |
 
 ### Gap by Category
 
@@ -70,9 +72,9 @@
 | Arrays | 60 | 6 | **~54 missing** |
 | Memory | 53 | 5 | **~48 missing** |
 | Variables | 47 | 0 (inline in others) | **~47 missing** |
-| **Total** | **600 parity** | **114 files** | **~486 missing** |
+| **Total** | **600 parity** | **120 files** | **~480 missing** |
 
-**Note:** Current Cot has many features bootstrap-0.2 never had (closures, error unions, defer, ARC, etc.), so the test gap is purely about breadth of edge-case coverage, not missing functionality.
+**Note:** Current Cot has many features bootstrap-0.2 never had (closures, error unions, defer, generics, ARC, etc.), so the test gap is purely about breadth of edge-case coverage, not missing functionality.
 
 ---
 
@@ -89,6 +91,7 @@
 | **Closures** | ✅ COMPLETE | 4W+4N | Captures, higher-order functions, uniform repr |
 | **Defer** | ✅ COMPLETE | 3W+3N | `defer expr`, `defer { block }`, unified cleanup stack |
 | **ARC coverage** | ✅ COMPLETE | 4W+4N | call→+1, copy retain, reassignment, field assign |
+| **Generics** | ✅ COMPLETE | 3W+3N | `fn max(T)(a: T, b: T) T`, `struct Pair(T, U)`, monomorphization |
 | **Global variables** | ✅ Wasm only | 3W | read, write, multi-function. Native stubs exist |
 | **Sized integers** | ✅ COMPLETE | - | i8-u64 in type system, @intCast works |
 | **Slice syntax** | ✅ COMPLETE | - | `arr[start:end]`, decomposition passes (Go port) |
@@ -109,13 +112,16 @@
 | **String ops** | ✅ COMPLETE | - | concat, indexing, bounds checks |
 | **Array append** | ✅ COMPLETE | - | Dynamic append builtin |
 
-### Missing (blocking standard library)
+### Next: Standard Library (written in Cot)
+
+Generics are complete. The next unlock is a **Cot-written standard library**, starting with `List(T)`.
+
+Bootstrap-0.2 already had `list.cot` and `strmap.cot` written in Cot using extern allocators. The current compiler can do the same with generics.
 
 | Feature | Description | Priority | Blocks |
 |---------|-------------|----------|--------|
-| **Generics** | `fn max(T)(a: T, b: T) T` | HIGH | Standard library, `List(T)`, `Map(K,V)` |
-| **Dynamic lists** | `List(T)` with push/pop/get/set | HIGH | Real applications |
-| **Maps/dictionaries** | `Map(K,V)` with set/get/has/delete | HIGH | Real applications |
+| **`List(T)`** | Generic dynamic list (Cot source) | HIGH | Real applications, self-hosting |
+| **`Map(K,V)`** | Generic hash map (Cot source) | HIGH | Real applications, self-hosting |
 | **String interpolation** | `"Hello, {name}"` | MEDIUM | Developer experience |
 | **Traits/Interfaces** | Abstract type contracts | MEDIUM | Polymorphism |
 | **Test runner** | `test "name" {}` blocks parsed, no runner | MEDIUM | Testing framework |
@@ -145,6 +151,7 @@
 | **Function pointers** | First-class, indirect calls, reassignment |
 | **Union payloads** | Payload capture in switch |
 | **Float types** | f32/f64 on both Wasm and native |
+| **Generics** | `fn max(T)(a: T, b: T) T`, `struct Pair(T, U)`, monomorphization |
 | **For-range loops** | `for x in arr`, `for i in 0..n`, `for i, x in arr` |
 | **File imports** | `import "other.cot"` with cycle detection |
 | **Browser imports** | Wasm import section for JS interop |
@@ -160,18 +167,17 @@
 
 ## Recommended Priority Order
 
-### Next: Generics + Collections
+### Next: Standard Library in Cot
 
-The single biggest unlock is **generics**. Once generics work, `List(T)` and `Map(K,V)` become possible, which enables the standard library.
+With generics complete, the path to self-hosting requires a **Cot-written standard library**. Bootstrap-0.2 proved this works — `list.cot` and `strmap.cot` were pure Cot with extern allocators.
 
 | # | Feature | Effort | Why Now |
 |---|---------|--------|---------|
-| 1 | **Generics** | Large | Blocks everything: collections, std lib, real apps |
-| 2 | **Dynamic lists** | Medium | Requires generics; was in bootstrap-0.2 |
-| 3 | **Maps/dictionaries** | Medium | Requires generics; was in bootstrap-0.2 |
-| 4 | **String interpolation** | Small | Developer experience |
-| 5 | **Traits/Interfaces** | Medium | Polymorphism for std lib |
-| 6 | **Test runner** | Small | Enable proper testing framework |
+| 1 | **`List(T)` in Cot** | Medium | First stdlib module; validates generics end-to-end |
+| 2 | **`Map(K,V)` in Cot** | Medium | Second stdlib module; needed for compiler data structures |
+| 3 | **String interpolation** | Small | Developer experience |
+| 4 | **Traits/Interfaces** | Medium | Polymorphism for stdlib APIs |
+| 5 | **Test runner** | Small | Enable `test "name" {}` execution |
 
 ### Test Parity
 
@@ -186,17 +192,20 @@ Port bootstrap-0.2's 619 test cases to verify edge case coverage.
 | 5 | Types | ~57 (sized ints, structs, booleans) | MEDIUM |
 | 6 | Variables | ~47 (scope, mutability, constants) | LOW |
 
-### Phase 5: Standard Library (After Generics)
+### Phase 5: Standard Library Modules
+
+All written in Cot, compiled alongside user code via imports.
 
 | Module | Depends On | Description |
 |--------|-----------|-------------|
-| `std.core` | Generics | Primitives, math, string utils |
-| `std.collections` | Generics | List, Map, Set, Queue |
-| `std.fmt` | String interpolation | Formatting and printing |
-| `std.fs` | Extern | File system (server only) |
-| `std.net` | Extern | HTTP, WebSocket |
-| `std.json` | Generics, string ops | JSON serialization |
-| `std.dom` | Extern | Browser DOM API (client only) |
+| `std/list.cot` | Generics, extern alloc | `List(T)` — dynamic array |
+| `std/map.cot` | Generics, extern alloc | `Map(K,V)` — hash map |
+| `std/core.cot` | Generics | Primitives, math, string utils |
+| `std/fmt.cot` | String interpolation | Formatting and printing |
+| `std/fs.cot` | Extern | File system (server only) |
+| `std/net.cot` | Extern | HTTP, WebSocket |
+| `std/json.cot` | Generics, string ops | JSON serialization |
+| `std/dom.cot` | Extern | Browser DOM API (client only) |
 
 ---
 
@@ -204,11 +213,11 @@ Port bootstrap-0.2's 619 test cases to verify edge case coverage.
 
 | Metric | Bootstrap-0.2 | Current Cot | Target |
 |--------|--------------|-------------|--------|
-| Test case files | 619 | 114 | 600+ |
-| Total tests (incl. unit) | ~619 | 832 | 1000+ |
-| Wasm E2E tests | 0 | 42 | 60+ |
-| Native E2E tests | 0 | 24 | 40+ |
-| Language features | ~25 | ~35 | 40+ |
+| Test case files | 619 | 120 | 600+ |
+| Total tests (incl. unit) | ~619 | 842 | 1000+ |
+| Wasm E2E tests | 0 | 45 | 60+ |
+| Native E2E tests | 0 | 30 | 40+ |
+| Language features | ~25 | ~37 | 40+ |
 | Sized int types | 10 (i8-u64) | 10 (i8-u64) | 10 |
 | Collection types | 3 (array, list, map) | 1 (array + append) | 3+ |
 | Float support | Yes | Yes | Yes |
@@ -216,20 +225,19 @@ Port bootstrap-0.2's 619 test cases to verify edge case coverage.
 | Function pointers | No | **Yes** | Yes |
 | Error unions (!T) | No | **Yes** | Yes |
 | Defer | No | **Yes** | Yes |
-| Generics | No | No | Yes |
+| Generics | No | **Yes** | Yes |
 | Standard library | No | No | Yes |
 
 ---
 
 ## Bottom Line
 
-**Current Cot has surpassed bootstrap-0.2 in both architecture and language features.** The Wasm-first pipeline with Cranelift-port native AOT is production-grade. The language now has closures, error unions, defer, function pointers, ARC, floats, and union payloads - none of which bootstrap-0.2 had.
+**Current Cot has surpassed bootstrap-0.2 in both architecture and language features.** The Wasm-first pipeline with Cranelift-port native AOT is production-grade. The language now has generics, closures, error unions, defer, function pointers, ARC, floats, and union payloads — none of which bootstrap-0.2 had.
 
 **The remaining gaps are:**
-1. **Generics** - The single biggest unlock, blocks standard library
-2. **Collections** - `List(T)` and `Map(K,V)` (requires generics)
-3. **Test breadth** - ~486 edge-case tests to port from bootstrap-0.2
-4. **String interpolation** - Developer experience
-5. **Native parity** - Globals, imports, extern on native AOT
+1. **Standard library** — `List(T)` and `Map(K,V)` written in Cot (generics now unlocks this)
+2. **Test breadth** — ~480 edge-case tests to port from bootstrap-0.2
+3. **String interpolation** — Developer experience
+4. **Native parity** — Globals, imports, extern on native AOT
 
-The architecture is proven. The language is functional. The next phase is generics → standard library → ecosystem.
+The architecture is proven. All core language features are complete. The next phase is **Cot-written standard library → test parity → ecosystem**.
