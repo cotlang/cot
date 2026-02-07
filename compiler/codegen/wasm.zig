@@ -527,6 +527,21 @@ pub const CodeBuilder = struct {
         try self.buf.append(self.allocator, Op.i32_gt_u);
     }
 
+    /// Emit i32.eq instruction.
+    pub fn emitI32Eq(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_eq);
+    }
+
+    /// Emit i32.shl instruction (shift left).
+    pub fn emitI32Shl(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_shl);
+    }
+
+    /// Emit i32.shr_u instruction (unsigned shift right).
+    pub fn emitI32ShrU(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i32_shr_u);
+    }
+
     /// Emit local.tee instruction.
     pub fn emitLocalTee(self: *CodeBuilder, idx: u32) !void {
         try self.buf.append(self.allocator, Op.local_tee);

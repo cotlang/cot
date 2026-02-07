@@ -319,16 +319,60 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     try code.emitEnd(); // end freelist_head != 0
 
     // --- Bump allocation fallback ---
-    // if (!found) bump allocate
+    // if (!found) bump allocate with bounds check + memory.grow
+    // Reference: Go runtime/mem_wasm.go sbrk():
+    //   if bl+n > blocMax { grow := (bl+n-blocMax)/pageSize; growMemory(grow) }
     try code.emitLocalGet(4);
     try code.emitI32Eqz();
     try code.emitIf(BLOCK_VOID);
 
+    // ptr = heap_ptr (save current position)
     try code.emitGlobalGet(heap_ptr_global);
-    try code.emitLocalTee(2); // ptr = heap_ptr
+    try code.emitLocalSet(2); // ptr = heap_ptr
+
+    // Check bounds: heap_ptr + total_size > memory.size * 65536
+    // Reference: Go sbrk: if bl+n > blocMax
+    try code.emitLocalGet(2); // heap_ptr
+    try code.emitLocalGet(3); // total_size
+    try code.emitI32Add(); // new_top
+    try code.emitMemorySize(); // current pages (i32)
+    try code.emitI32Const(16); // log2(65536) = 16
+    try code.emitI32Shl(); // current_bytes = pages << 16
+    try code.emitI32GtU(); // new_top > current_bytes?
+    try code.emitIf(BLOCK_VOID);
+
+    // Need more memory. Compute pages needed:
+    // grow = (new_top - current_bytes + 65535) / 65536
+    // Reference: Go sbrk: grow := divRoundUp(bl+n-blocMax, physPageSize)
+    try code.emitLocalGet(2); // heap_ptr
+    try code.emitLocalGet(3); // total_size
+    try code.emitI32Add(); // new_top
+    try code.emitMemorySize(); // current pages
+    try code.emitI32Const(16);
+    try code.emitI32Shl(); // current_bytes
+    try code.emitI32Sub(); // new_top - current_bytes
+    try code.emitI32Const(65535);
+    try code.emitI32Add(); // + 65535 (round up)
+    try code.emitI32Const(16);
+    try code.emitI32ShrU(); // / 65536 = pages needed
+
+    // memory.grow(pages)
+    // Reference: Go sbrk: if growMemory(grow) < 0 { return nil }
+    try code.emitMemoryGrow();
+    try code.emitI32Const(-1);
+    try code.emitI32Eq();
+    try code.emitIf(BLOCK_VOID);
+    // OOM: trap (Swift: swift_abortAllocationFailure)
+    try code.emitUnreachable();
+    try code.emitEnd(); // end OOM check
+
+    try code.emitEnd(); // end memory.grow needed
+
+    // Bump: heap_ptr += total_size
+    try code.emitLocalGet(2); // ptr = old heap_ptr
     try code.emitLocalGet(3); // total_size
     try code.emitI32Add();
-    try code.emitGlobalSet(heap_ptr_global); // heap_ptr += total_size
+    try code.emitGlobalSet(heap_ptr_global); // heap_ptr = ptr + total_size
 
     try code.emitEnd(); // end bump allocation
 

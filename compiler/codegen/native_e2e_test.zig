@@ -767,3 +767,65 @@ test "native: freelist reuse cycle" {
         \\}
     ), 77, "freelist_reuse");
 }
+
+test "native: deinit basic" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\struct Foo { x: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn main() i64 {
+        \\    let p = new Foo { x: 42 }
+        \\    return p.x
+        \\}
+    ), 42, "deinit_basic");
+}
+
+test "native: deinit no use" {
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\struct Foo { x: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn main() i64 {
+        \\    let p = new Foo { x: 42 }
+        \\    return 99
+        \\}
+    ), 99, "deinit_no_use");
+}
+
+test "native: deinit with no-deinit struct" {
+    // Mix: Foo has deinit, Bar does not. Both should work correctly.
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\struct Foo { x: i64 }
+        \\struct Bar { y: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn main() i64 {
+        \\    let f = new Foo { x: 10 }
+        \\    let b = new Bar { y: 20 }
+        \\    return f.x + b.y
+        \\}
+    ), 30, "deinit_mixed_structs");
+}
+
+test "native: deinit alloc reuse after release" {
+    // After deinit+dealloc, memory is returned to freelist and reusable.
+    // Alloc Foo, release it (deinit runs, memory freed), alloc again (reuses).
+    try expectExitCode(std.testing.allocator, @constCast(
+        \\struct Foo { x: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn createFoo(val: i64) *Foo {
+        \\    return new Foo { x: val }
+        \\}
+        \\fn main() i64 {
+        \\    let p1 = createFoo(10)
+        \\    let v1 = p1.x
+        \\    let p2 = createFoo(20)
+        \\    return v1 + p2.x
+        \\}
+    ), 30, "deinit_alloc_reuse");
+}

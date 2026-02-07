@@ -296,14 +296,15 @@ See **[WASM_BACKEND.md](WASM_BACKEND.md)** for implementation details.
 ├── ✅ ARC coverage - call→+1, copy retain, reassignment, field assign
 ├── ✅ Global variables - read, write, multi-function (Wasm)
 ├── ✅ Sized integers - i8-u64, full type system, @intCast
-└── ✅ Slice syntax - arr[start:end], Go-style decomposition
+├── ✅ Slice syntax - arr[start:end], Go-style decomposition
+├── ✅ Generics - fn(T), struct(T,U), pure monomorphization (Zig pattern)
+└── ✅ ARC runtime upgrade - freelist allocator, cot_dealloc/realloc, memory.grow, deinit/destructors
 ```
 
 **Phase 3 features TODO (blocking standard library):**
 ```
-├── Generics - blocks collections, standard library
-├── Dynamic lists - List(T) with push/pop/get/set (requires generics)
-├── Maps/dictionaries - Map(K,V) with set/get/has/delete (requires generics)
+├── Dynamic lists - List(T) with push/pop/get/set (generics ready)
+├── Maps/dictionaries - Map(K,V) with set/get/has/delete (generics ready)
 ├── String interpolation - blocks developer experience
 ├── Traits/Interfaces - blocks polymorphism
 ├── Test runner - blocks testing framework
@@ -374,13 +375,15 @@ std/
 - ARC memory management works (Phase 2)
 - Phase 3 Wave 1-4 language features (methods, enums, unions, switch, imports, extern, bitwise, optionals, etc.)
 - Phase 3 Wave 5 language features (floats, closures, function pointers, error unions, defer, ARC coverage, union payloads)
-- AOT native compilation works (Phase 4) - 24 native E2E tests pass
-- 832 tests pass, 0 failures, 0 skipped
+- Generics with pure monomorphization (Zig pattern: lazy, deferred, deduplicated)
+- ARC runtime upgrade: freelist allocator, cot_dealloc/realloc, memory.grow, deinit/destructors, @alloc/@dealloc/@realloc builtins
+- AOT native compilation works (Phase 4) - 39 native E2E tests pass
+- 867 tests pass, 0 failures, 0 skipped
 
-### Current Focus (Generics + Standard Library)
-- **Feature gap:** Generics, dynamic collections, string interpolation, traits
-- **Test gap:** 114 test files vs bootstrap-0.2's 619 (see [GAP_ANALYSIS.md](GAP_ANALYSIS.md))
-- **Priority:** Generics (blocks standard library)
+### Current Focus (Standard Library)
+- **Feature gap:** Dynamic collections (List(T), Map(K,V)), string interpolation, traits
+- **Test gap:** 120 test files vs bootstrap-0.2's 619 (see [GAP_ANALYSIS.md](GAP_ANALYSIS.md))
+- **Priority:** Standard library in Cot (generics + ARC runtime now complete)
 
 ### Next (Phase 5-6)
 - Standard library written in Cot (requires Phase 3 complete)

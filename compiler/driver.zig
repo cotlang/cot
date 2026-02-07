@@ -523,8 +523,8 @@ pub const Driver = struct {
         pipeline_debug.log(.codegen, "driver: generating object file for {d} functions", .{compiled_funcs.items.len});
 
         const object_bytes = switch (self.target.os) {
-            .macos => try self.generateMachO(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments),
-            .linux => try self.generateElf(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments),
+            .macos => try self.generateMachO(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals),
+            .linux => try self.generateElf(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals),
             .freestanding => return error.UnsupportedObjectFormat,
         };
 
@@ -533,7 +533,7 @@ pub const Driver = struct {
 
     /// Generate Mach-O object file from compiled functions.
     /// Uses ObjectModule to bridge CompiledCode to Mach-O format.
-    fn generateMachO(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment) ![]u8 {
+    fn generateMachO(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType) ![]u8 {
         var module = object_module.ObjectModule.initWithTarget(
             self.allocator,
             .macos,
@@ -603,7 +603,7 @@ pub const Driver = struct {
 
         // If we have a main function, generate the wrapper and static vmctx
         if (main_func_index != null) {
-            try self.generateMainWrapperMachO(&module, data_segments);
+            try self.generateMainWrapperMachO(&module, data_segments, globals);
         }
 
         // Write to memory buffer
@@ -616,7 +616,7 @@ pub const Driver = struct {
 
     /// Generate the _main wrapper and static vmctx data for Mach-O.
     /// The wrapper initializes vmctx and calls __wasm_main.
-    fn generateMainWrapperMachO(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment) !void {
+    fn generateMainWrapperMachO(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType) !void {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
         // Layout (total 16MB = 0x1000000):
@@ -642,10 +642,37 @@ pub const Driver = struct {
             }
         }
 
-        // Initialize stack pointer at offset 0x10000 = 64KB into linear memory
-        // This means SP starts at heap_base + 0x10000
-        const sp_value: u32 = 0x10000;
-        @memcpy(vmctx_data[0x10000..][0..4], std.mem.asBytes(&sp_value));
+        // Initialize globals at offset 0x10000 with fixed 16-byte stride.
+        // Reference: Cranelift vmoffsets.rs — VMGlobalDefinition is 16 bytes,
+        // and initialize_globals (allocator.rs:754-808) writes init values
+        // to vmctx before execution starts.
+        // Global 0 (SP) init_value comes from Wasm global section.
+        const global_base: usize = 0x10000;
+        const global_stride: usize = 16;
+        for (globals, 0..) |g, i| {
+            const offset = global_base + i * global_stride;
+            if (offset + 8 <= vmctx_size) {
+                switch (g.val_type) {
+                    .i32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .i64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    .f32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .f64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    else => {},
+                }
+            }
+        }
 
         // Heap bound at offset 0x20008 = ~15.7MB (size of linear memory)
         const heap_bound: u64 = 0x1000000 - 0x40000; // vmctx_size - linear_memory_base
@@ -762,8 +789,9 @@ pub const Driver = struct {
 
     /// Generate ELF object file from compiled functions.
     /// Uses ObjectModule to bridge CompiledCode to ELF format.
-    fn generateElf(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment) ![]u8 {
+    fn generateElf(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType) ![]u8 {
         _ = data_segments; // TODO: Copy data segments to ELF data section
+        _ = globals; // TODO: Write global init values to ELF vmctx data section
         var module = object_module.ObjectModule.initWithTarget(
             self.allocator,
             .linux,
@@ -1084,6 +1112,11 @@ pub const Driver = struct {
         // ====================================================================
         var func_type_indices = std.StringHashMap(u32).init(self.allocator);
         defer func_type_indices.deinit();
+
+        // Reserve offset 0 as null sentinel. cot_release checks
+        // "if (metadata_ptr != 0)" to skip destructor lookup — so metadata must
+        // never live at offset 0. This matches C's convention (address 0 = NULL).
+        _ = try linker.addData(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
 
         // Generate metadata for each type with destructor
         // Metadata layout: type_id(4), size(4), destructor_ptr(4) = 12 bytes

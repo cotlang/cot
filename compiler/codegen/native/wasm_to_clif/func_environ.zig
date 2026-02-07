@@ -293,14 +293,12 @@ pub const FuncEnvironment = struct {
 
         // Calculate offset: globals are stored at a base offset from vmctx.
         // Global base is at offset 0x10000 from vmctx, then each global
-        // is at its index * stride.
+        // is at its index * fixed stride.
+        // Reference: Cranelift vmoffsets.rs — VMGlobalDefinition is ALWAYS 16 bytes
+        // regardless of type (i32/i64/f32/f64 all padded to 16).
+        // vmctx_vmglobal_definition(index) = globals_begin + index * 16
         const global_base_offset: i64 = 0x10000;
-        const stride: i64 = if (global_type.eql(Type.I32) or global_type.eql(Type.F32))
-            4
-        else if (global_type.eql(Type.I64) or global_type.eql(Type.F64))
-            8
-        else
-            8; // Default to 8 for unknown types
+        const stride: i64 = 16; // Fixed 16-byte stride per Cranelift
         const offset = global_base_offset + @as(i64, global_index) * stride;
 
         // Create iadd_imm GlobalValue: vmctx + offset

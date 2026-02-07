@@ -1166,3 +1166,89 @@ test "wasm e2e: freelist reuse cycle" {
     try std.testing.expect(result.wasm_bytes.len > 0);
     try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
 }
+
+test "wasm e2e: deinit basic" {
+    // Struct with deinit — destructor called on release, returns p.x
+    const code =
+        \\struct Foo { x: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn main() i64 {
+        \\    let p = new Foo { x: 42 }
+        \\    return p.x
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: deinit no use after new" {
+    // Struct with deinit — release without using the value
+    const code =
+        \\struct Foo { x: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn main() i64 {
+        \\    let p = new Foo { x: 42 }
+        \\    return 99
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: deinit with no-deinit struct" {
+    // Mix: Foo has deinit, Bar does not
+    const code =
+        \\struct Foo { x: i64 }
+        \\struct Bar { y: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn main() i64 {
+        \\    let f = new Foo { x: 10 }
+        \\    let b = new Bar { y: 20 }
+        \\    return f.x + b.y
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: deinit alloc reuse after release" {
+    const code =
+        \\struct Foo { x: i64 }
+        \\fn Foo_deinit(self: *Foo) void {
+        \\    return
+        \\}
+        \\fn createFoo(val: i64) *Foo {
+        \\    return new Foo { x: val }
+        \\}
+        \\fn main() i64 {
+        \\    let p1 = createFoo(10)
+        \\    let v1 = p1.x
+        \\    let p2 = createFoo(20)
+        \\    return v1 + p2.x
+        \\}
+    ;
+
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}

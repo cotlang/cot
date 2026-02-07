@@ -121,11 +121,13 @@ This document maps **every stage of the Cot compilation pipeline** to its refere
 
 **ARC runtime functions** (`cot_alloc`, `cot_retain`, `cot_release`) are generated as Wasm bytecode at this stage by `arc.zig`. They become regular Wasm functions in the module. The ARC pattern is ported from **Swift** (`HeapObject.cpp`), but the implementation is Wasm bytecode using Go's codegen patterns.
 
-| ARC Function | Swift Reference | What It Does |
-|-------------|-----------------|--------------|
-| `cot_alloc` | `swift_allocObject` (HeapObject.cpp:247) | Bump-allocate with header (metadata + refcount) |
-| `cot_retain` | `swift_retain` (HeapObject.cpp:476) | Increment refcount |
-| `cot_release` | `swift_release` (HeapObject.cpp:835) | Decrement refcount, call destructor at zero |
+| ARC Function | Reference | What It Does |
+|-------------|-----------|--------------|
+| `cot_alloc` | Swift `swift_allocObject` + Go `sbrk` | Freelist-first allocator with memory.grow fallback. 16-byte header: `[total_size:i32][metadata:i32][refcount:i64]`. Null sentinel at data offset 0 |
+| `cot_dealloc` | Swift `swift_deallocObject` | Return freed block to freelist for reuse |
+| `cot_realloc` | C `realloc` semantics | Shrink in-place or alloc+copy+dealloc. Used by growable containers |
+| `cot_retain` | Swift `swift_retain` (HeapObject.cpp:476) | Increment refcount (null-safe, immortal-safe) |
+| `cot_release` | Swift `swift_release` (HeapObject.cpp:835) | Decrement refcount, call destructor via `call_indirect` at zero, then dealloc |
 
 ### Stage 3: Wasm Parse (native path only)
 
@@ -369,21 +371,30 @@ Linker resolves "_write" against libc → linked into executable
 
 **Reference: Swift's `swift_allocObject` (simplified)**
 
-`cot_alloc` is a **bump allocator** generated as Wasm bytecode by `arc.zig`. It:
-1. Bumps a global heap pointer forward
-2. Writes a header (metadata pointer + refcount)
-3. Returns pointer to user data after the header
-4. **Never frees memory** — when `cot_release` hits refcount 0, it calls the destructor but doesn't reclaim the allocation
+`cot_alloc` is a **freelist allocator** generated as Wasm bytecode by `arc.zig`. It:
+1. Checks the freelist for a reusable block (first-fit)
+2. If no block found, bumps the heap pointer (with `memory.grow` if needed — Go's `sbrk` pattern)
+3. Writes a 16-byte header: `[total_size:i32][metadata:i32][refcount:i64]`
+4. Returns pointer to user data after the header
+5. On dealloc, pushes block onto freelist for reuse
 
 **Memory layout:**
 ```
 Wasm linear memory:
-┌──────────────┬───────────────────┬──────────────────────────┐
-│  Stack       │   Data segments   │   Heap (bump allocator)  │
-│  (grows ↓)   │   (strings, etc)  │   (grows →)              │
-└──────────────┴───────────────────┴──────────────────────────┘
+┌──────────────┬───────────────────┬─────────────────────────────┐
+│  Stack       │   Data segments   │   Heap (freelist + bump)    │
+│  (grows ↓)   │   (null sentinel) │   (grows via memory.grow)   │
+└──────────────┴───────────────────┴─────────────────────────────┘
                                     ^
-                                    heap_ptr global (bumps forward)
+                                    heap_ptr + freelist_head globals
+
+Allocation header (16 bytes):
+┌─────────────┬─────────────┬──────────────┐
+│ total_size  │ metadata    │   refcount   │
+│   (i32)     │   (i32)     │    (i64)     │
+│ offset 0    │ offset 4    │   offset 8   │
+└─────────────┴─────────────┴──────────────┘
+│← USER_DATA_OFFSET = 16 →│
 ```
 
 ### Why this works on native
@@ -393,28 +404,21 @@ The Wasm bytecode (including `cot_alloc`) goes through the same AOT pipeline:
 cot_alloc Wasm bytecode → CLIF IR → ARM64 → machine code in .o file
 ```
 
-The native binary has a large `.bss` section (zeroed memory) that serves as "linear memory." The heap pointer is a global variable. `cot_alloc` is just a regular function in the binary that bumps this pointer.
+The native binary has a 16MB pre-allocated vmctx region that serves as "linear memory." Global variables use a fixed 16-byte stride (Cranelift's `VMGlobalDefinition` pattern). Init values are written to vmctx_data before execution (Cranelift's `initialize_globals` pattern).
 
-### What needs to change for List(T)
+### ARC Runtime (COMPLETE)
 
-The bump allocator cannot `free` or `realloc`. A `List(T)` that grows needs both.
+The allocator supports full memory management:
 
-**Two upgrade paths:**
+- **Freelist**: Freed blocks added to singly-linked list for reuse (first-fit)
+- **`cot_dealloc`**: Returns blocks to freelist (Swift's `swift_deallocObject` pattern)
+- **`cot_realloc`**: Shrink in-place or alloc+copy+dealloc (C `realloc` semantics)
+- **`memory.grow`**: Go's `sbrk` pattern on Wasm (pages), Cranelift inline pattern on native (bounds check against pre-allocated 16MB)
+- **`@alloc(size)`/`@dealloc(ptr)`/`@realloc(ptr, size)`**: Builtins for manual memory control
+- **Null sentinel**: 8 bytes of zeros at data offset 0 (C convention — metadata_ptr=0 is distinguishable from valid metadata)
+- **Deinit/destructors**: `TypeName_deinit` functions called via `call_indirect` when refcount reaches 0
 
-**Path 1: Add `cot_realloc` and `cot_free` to the ARC runtime**
-- Port from Go's `sbrk()` pattern (`runtime/mem_wasm.go`)
-- Add a freelist for reclaiming memory
-- Reference: Zig's `WasmAllocator.zig` for a complete Wasm allocator with freelists
-
-**Path 2: Use `memory.grow` for expansion (Wasm path), mmap/brk for native**
-- Wasm: `memory.grow` adds pages, allocator manages freelists within pages
-- Native: The .bss section is fixed at compile time, so growth needs `mmap` or similar
-
-**Current gap on native:** `memory.grow` is translated as "return -1 (failure)" in `translator.zig:1774`. This means any code path that tries to grow memory will silently fail on native.
-
-**To fix:** Translate `memory.grow` to an actual memory growth mechanism on native:
-- Cranelift/Wasmtime uses `mmap` via a runtime function
-- Reference: `~/learning/wasmtime/crates/runtime/src/memory.rs`
+This enables `List(T)`, `Map(K,V)`, and all dynamic data structures.
 
 ### Why NOT `extern fn malloc`
 
@@ -429,7 +433,7 @@ The allocator runs INSIDE the module. No host imports needed. This ensures:
 - **Sandboxing:** Wasm memory is self-contained
 - **Performance:** No host function call overhead
 
-On the **native path**, the AOT-compiled allocator becomes regular native code. It's the same allocator, just compiled to ARM64/x64 instead of running as Wasm. For native, `memory.grow` must be translated to actual OS-level memory growth (mmap or similar).
+On the **native path**, the AOT-compiled allocator becomes regular native code. It's the same allocator, just compiled to ARM64/x64 instead of running as Wasm. Native uses a pre-allocated 16MB vmctx with bounds-checked inline `memory.grow`.
 
 ---
 

@@ -1757,24 +1757,119 @@ pub const FuncTranslator = struct {
     // Port of code_translator.rs:795-808
     // ========================================================================
 
+    /// Translate Wasm memory.size instruction.
+    ///
+    /// Port of Cranelift func_environ.rs:3443-3525 (translate_memory_size)
+    ///
+    /// Loads current memory length in bytes from vmctx heap bound,
+    /// then divides by page size (right-shift by 16) to get pages.
     pub fn translateMemorySize(self: *Self, mem_index: u32) !void {
-        _ = mem_index; // Currently single-memory model
-        // Memory size in pages is stored in a global or needs runtime support
-        // For now, return a constant (1 page = 64KB is typical initial size)
-        // TODO: Implement proper memory size tracking
-        const result = try self.builder.ins().iconst(Type.I32, 1);
-        try self.state.push1(result);
+        // Get or create heap to access the bound GlobalValue
+        const heap = try self.env.getOrCreateHeap(self.builder.func, mem_index);
+
+        // Load current_length_in_bytes from vmctx heap bound
+        // Reference: Cranelift loads VMMemoryDefinition.current_length
+        const bound_addr = try self.builder.ins().globalValue(self.env.pointer_type, heap.bound);
+        const current_length = try self.builder.ins().load(
+            Type.I64,
+            clif.MemFlags.DEFAULT,
+            bound_addr,
+            0,
+        );
+
+        // Divide by page size: ushr_imm by page_size_log2 (16 for 64KB pages)
+        // Reference: Cranelift: pos.ins().ushr_imm(current_length_in_bytes, page_size_log2)
+        const shift = try self.builder.ins().iconst(Type.I64, 16);
+        const pages_i64 = try self.builder.ins().ushr(current_length, shift);
+
+        // Truncate to i32 (Wasm32 memory.size returns i32)
+        // Reference: Cranelift: convert_pointer_to_index_type → ireduce
+        const pages_i32 = try self.builder.ins().ireduce(Type.I32, pages_i64);
+        try self.state.push1(pages_i32);
     }
 
+    /// Translate Wasm memory.grow instruction.
+    ///
+    /// Port of Cranelift func_environ.rs:3412-3441 (translate_memory_grow)
+    ///
+    /// For AOT with pre-allocated memory:
+    /// - Load current bound from vmctx
+    /// - Check if new_bound <= max_heap_size (pre-allocated limit)
+    /// - If ok: store new bound, return old page count
+    /// - If fail: return -1
+    ///
+    /// Cranelift uses a libcall to wasmtime's memory_grow runtime function.
+    /// We inline the logic since our AOT model has fixed pre-allocated memory.
+    /// The semantics are identical: return old pages on success, -1 on failure.
     pub fn translateMemoryGrow(self: *Self, mem_index: u32) !void {
-        _ = mem_index;
-        const delta = self.state.pop1();
-        _ = delta;
-        // Memory grow requires runtime support to actually grow memory
-        // Return -1 (failure) as we don't support dynamic memory growth yet
-        // TODO: Implement proper memory grow with runtime support
-        const result = try self.builder.ins().iconst(Type.I32, @as(i32, -1));
-        try self.state.push1(result);
+        const delta_i32 = self.state.pop1();
+
+        // Get or create heap for bound access
+        const heap = try self.env.getOrCreateHeap(self.builder.func, mem_index);
+
+        // Extend delta to i64 (Wasm i32 -> internal i64)
+        // Reference: Cranelift: cast_index_to_i64 → uextend
+        const delta = try self.builder.ins().uextend(Type.I64, delta_i32);
+
+        // Load current heap bound (bytes) from vmctx
+        const bound_addr = try self.builder.ins().globalValue(self.env.pointer_type, heap.bound);
+        const current_bound = try self.builder.ins().load(
+            Type.I64,
+            clif.MemFlags.DEFAULT,
+            bound_addr,
+            0,
+        );
+
+        // delta_bytes = delta * 65536 (delta << 16)
+        const page_shift = try self.builder.ins().iconst(Type.I64, 16);
+        const delta_bytes = try self.builder.ins().ishl(delta, page_shift);
+
+        // new_bound = current_bound + delta_bytes
+        const new_bound = try self.builder.ins().iadd(current_bound, delta_bytes);
+
+        // max_heap = pre-allocated limit (vmctx_size - linear_memory_base)
+        // vmctx is 16MB (0x1000000), linear_memory_base is 0x40000
+        const max_heap: i64 = 0x1000000 - 0x40000; // ~15.7MB
+        const max_heap_val = try self.builder.ins().iconst(Type.I64, max_heap);
+
+        // cond = new_bound > max_heap (unsigned)
+        const cond = try self.builder.ins().icmp(clif.IntCC.ugt, new_bound, max_heap_val);
+
+        // Create success and failure blocks, plus merge block
+        const success_block = try self.builder.createBlock();
+        const fail_block = try self.builder.createBlock();
+        const merge_block = try self.builder.createBlock();
+        const merge_param = try self.builder.appendBlockParam(merge_block, Type.I32);
+
+        // brif cond -> fail_block, else -> success_block
+        _ = try self.builder.ins().brif(cond, fail_block, &[_]Value{}, success_block, &[_]Value{});
+
+        // --- Fail block: return -1 ---
+        self.builder.switchToBlock(fail_block);
+        try self.builder.sealBlock(fail_block);
+        try self.builder.ensureInsertedBlock();
+        const neg_one = try self.builder.ins().iconst(Type.I32, @as(i32, -1));
+        _ = try self.builder.ins().jump(merge_block, &[_]Value{neg_one});
+
+        // --- Success block: store new bound, return old pages ---
+        self.builder.switchToBlock(success_block);
+        try self.builder.sealBlock(success_block);
+        try self.builder.ensureInsertedBlock();
+
+        // Store new bound to vmctx
+        const bound_addr2 = try self.builder.ins().globalValue(self.env.pointer_type, heap.bound);
+        _ = try self.builder.ins().store(clif.MemFlags.DEFAULT, new_bound, bound_addr2, 0);
+
+        // old_pages = current_bound >> 16 (divide by page size)
+        const old_pages_i64 = try self.builder.ins().ushr(current_bound, page_shift);
+        const old_pages = try self.builder.ins().ireduce(Type.I32, old_pages_i64);
+        _ = try self.builder.ins().jump(merge_block, &[_]Value{old_pages});
+
+        // --- Merge block: result is the block param ---
+        self.builder.switchToBlock(merge_block);
+        try self.builder.sealBlock(merge_block);
+        try self.builder.ensureInsertedBlock();
+        try self.state.push1(merge_param);
     }
 };
 

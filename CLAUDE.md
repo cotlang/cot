@@ -94,20 +94,21 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 
 ## Current State (February 2026)
 
-**832 tests pass (0 failures, 0 skipped)** across Wasm and native targets.
-**114 test case files, 42 Wasm E2E tests, 24 native E2E tests.**
+**867 tests pass (0 failures, 0 skipped)** across Wasm and native targets.
+**54 Wasm E2E tests, 39 native E2E tests, 26 test case files.**
 
 ### What's Done
 
 - **Wasm backend (M1-M16):** Complete. Arithmetic, control flow, functions, memory, structs, arrays, strings, ARC, browser imports.
 - **Native AOT (Phase 0-7):** Complete. Cranelift-style CLIF IR, regalloc2, ARM64/x64 backends, Mach-O/ELF output.
-- **ARC runtime (M17-M19):** Complete. Retain/release, heap allocation, destructors.
+- **ARC runtime (M17-M19):** Complete. Freelist allocator, cot_alloc/dealloc/realloc, retain/release, destructors (deinit), 16-byte headers, memory.grow, @alloc/@dealloc/@realloc builtins.
 - **Language features (M20-M23):** Complete. String ops, array append, for-range loops.
 - **Phase 3 Wave 1-4:** Methods, enums, unions, switch, type aliases, imports, extern, bitwise, compound assign, optionals, chars, builtins - all verified on both Wasm and native.
 - **Phase 3 Wave 5:** Floats (f32/f64), union payloads, error unions (`!T`, `try`, `catch`), function pointers, closures, defer, ARC coverage - all verified on both Wasm and native.
 - **Sized integers:** Full pipeline (i8-u64, f32-f64), type system, @intCast.
 - **Global variables:** Complete on Wasm (read, write, multi-function).
 - **Slice syntax:** `arr[start:end]` with Go-style decomposition passes.
+- **Generics:** Pure monomorphization (Zig pattern). `fn max(T)(a: T, b: T) T`, `struct Pair(T, U)`, lazy deferred instantiation, deduplication.
 
 ### What's Missing
 
@@ -115,8 +116,7 @@ The Go compiler is at `~/learning/go/src/cmd/`. Key files:
 
 | Feature | Priority | Why |
 |---------|----------|-----|
-| Generics | HIGH | Blocks typed collections, standard library |
-| Dynamic lists + maps | HIGH | Requires generics, needed for real apps |
+| Dynamic lists + maps | HIGH | List(T), Map(K,V) needed for real apps |
 | String interpolation | MEDIUM | Developer experience |
 | Traits/Interfaces | MEDIUM | Polymorphism for std lib |
 | ~486 test cases | MEDIUM | Edge case coverage vs bootstrap-0.2 |
@@ -337,7 +337,7 @@ Every new feature must:
 | Wave | Features | Status |
 |------|----------|--------|
 | **A (Fundamentals)** | Floats, defer, union payloads, error unions, function pointers | ✅ COMPLETE |
-| **B (Expressiveness)** | Closures ✅, generics, string interpolation, dynamic collections | IN PROGRESS |
+| **B (Expressiveness)** | Closures ✅, generics ✅, string interpolation, dynamic collections | IN PROGRESS |
 | **C (Test Parity)** | Port ~486 test cases from bootstrap-0.2 | TODO |
 
 ### Reference Implementations
