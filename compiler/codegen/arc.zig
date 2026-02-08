@@ -104,6 +104,9 @@ pub const RuntimeFunctions = struct {
     /// cot_string_concat index
     string_concat_idx: u32,
 
+    /// cot_string_eq index
+    string_eq_idx: u32,
+
     /// cot_memset_zero index
     memset_zero_idx: u32,
 
@@ -149,6 +152,7 @@ pub const RELEASE_NAME = "cot_release";
 pub const DEALLOC_NAME = "cot_dealloc";
 pub const REALLOC_NAME = "cot_realloc";
 pub const STRING_CONCAT_NAME = "cot_string_concat";
+pub const STRING_EQ_NAME = "cot_string_eq";
 pub const MEMSET_ZERO_NAME = "cot_memset_zero";
 pub const MEMCPY_NAME = "memcpy";
 
@@ -252,6 +256,18 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         .exported = false,
     });
 
+    // Generate string_eq function: (i64, i64, i64, i64) -> i64
+    // Takes (s1_ptr, s1_len, s2_ptr, s2_len), returns 1 if equal, 0 if not
+    // Reference: Go runtime/string.go stringEqual
+    const string_eq_type = string_concat_type; // Same signature: (i64, i64, i64, i64) -> i64
+    const string_eq_body = try generateStringEqBody(allocator);
+    const string_eq_idx = try linker.addFunc(.{
+        .name = STRING_EQ_NAME,
+        .type_idx = string_eq_type,
+        .code = string_eq_body,
+        .exported = false,
+    });
+
     // Generate memset_zero function
     // Takes (ptr: i64, size: i64) -> void — zeros `size` bytes starting at `ptr`
     const memset_zero_type = try linker.addType(
@@ -290,6 +306,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         .dealloc_idx = dealloc_idx,
         .realloc_idx = realloc_idx,
         .string_concat_idx = string_concat_idx,
+        .string_eq_idx = string_eq_idx,
         .memset_zero_idx = memset_zero_idx,
         .memcpy_idx = memcpy_idx,
         .heap_ptr_global = heap_ptr_global,
@@ -897,6 +914,105 @@ fn generateReleaseBody(allocator: std.mem.Allocator, destructor_type_idx: u32, d
     return code.finish();
 }
 
+/// Generates bytecode for cot_string_eq(s1_ptr, s1_len, s2_ptr, s2_len) -> i64
+/// Returns 1 if strings are equal, 0 if not.
+/// Reference: Go runtime/string.go stringEqual
+fn generateStringEqBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // Parameters:
+    //   local 0: s1_ptr (i64)
+    //   local 1: s1_len (i64)
+    //   local 2: s2_ptr (i64)
+    //   local 3: s2_len (i64)
+    // Locals:
+    //   local 4: len_i32 (i32) - length as i32
+    //   local 5: p1_i32 (i32) - ptr1 as i32
+    //   local 6: p2_i32 (i32) - ptr2 as i32
+    //   local 7: counter (i32) - byte-compare loop counter
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32, .i32 });
+
+    // if (s1_len != s2_len) return 0
+    try code.emitLocalGet(1); // s1_len
+    try code.emitLocalGet(3); // s2_len
+    try code.emitI64Ne();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitI64Const(0);
+    try code.emitReturn();
+    try code.emitEnd();
+
+    // Pointer equality fast path (Go memeqbody: if ptrs equal, return 1)
+    try code.emitLocalGet(0); // s1_ptr
+    try code.emitLocalGet(2); // s2_ptr
+    try code.emitI64Eq();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitI64Const(1);
+    try code.emitReturn();
+    try code.emitEnd();
+
+    // len_i32 = (i32)s1_len
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(4);
+
+    // if (len == 0) return 1  (both empty)
+    try code.emitLocalGet(4);
+    try code.emitI32Eqz();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitI64Const(1);
+    try code.emitReturn();
+    try code.emitEnd();
+
+    // p1_i32 = (i32)s1_ptr, p2_i32 = (i32)s2_ptr
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(5);
+    try code.emitLocalGet(2);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(6);
+
+    // Byte-compare loop: counter=0; while(counter < len) { if(p1[c] != p2[c]) return 0; c++ }
+    try code.emitI32Const(0);
+    try code.emitLocalSet(7);
+    try code.emitBlock(BLOCK_VOID);
+    try code.emitLoop(BLOCK_VOID);
+    // if (counter >= len) break
+    try code.emitLocalGet(7);
+    try code.emitLocalGet(4);
+    try code.emitI32GeU();
+    try code.emitBrIf(1);
+    // load byte from p1[counter]
+    try code.emitLocalGet(5);
+    try code.emitLocalGet(7);
+    try code.emitI32Add();
+    try code.emitI64Load8U(0); // byte1 (i64)
+    // load byte from p2[counter]
+    try code.emitLocalGet(6);
+    try code.emitLocalGet(7);
+    try code.emitI32Add();
+    try code.emitI64Load8U(0); // byte2 (i64)
+    // if (byte1 != byte2) return 0
+    try code.emitI64Ne();
+    try code.emitIf(BLOCK_VOID);
+    try code.emitI64Const(0);
+    try code.emitReturn();
+    try code.emitEnd();
+    // counter++
+    try code.emitLocalGet(7);
+    try code.emitI32Const(1);
+    try code.emitI32Add();
+    try code.emitLocalSet(7);
+    try code.emitBr(0);
+    try code.emitEnd(); // end loop
+    try code.emitEnd(); // end block
+
+    // All bytes matched, return 1
+    try code.emitI64Const(1);
+
+    return code.finish();
+}
+
 /// Generates bytecode for cot_string_concat(s1_ptr, s1_len, s2_ptr, s2_len) -> new_ptr
 /// Allocates a new buffer on the heap and copies both strings into it.
 /// Reference: Go's runtime/string.go concatstrings
@@ -1355,8 +1471,8 @@ test "addToLinker creates functions" {
     try std.testing.expect(funcs.dealloc_idx != funcs.alloc_idx);
     try std.testing.expect(funcs.realloc_idx != funcs.alloc_idx);
 
-    // Verify functions were added (alloc, retain, dealloc, release, realloc, string_concat, memset_zero, memcpy = 8)
-    try std.testing.expectEqual(@as(usize, 8), linker.funcs.items.len);
+    // Verify functions were added (alloc, retain, dealloc, release, realloc, string_concat, string_eq, memset_zero, memcpy = 9)
+    try std.testing.expectEqual(@as(usize, 9), linker.funcs.items.len);
 
     // Verify globals were added (heap_ptr, freelist_head)
     try std.testing.expectEqual(@as(usize, 2), linker.globals.items.len);

@@ -91,17 +91,30 @@ Basic LSP with diagnostics, hover, goto definition, and document symbols.
 
 | What | Status | Depends On |
 |------|--------|------------|
-| Map(K,V) | Not started | Hash function, `Hash + Eq` trait impls |
-| Set(T) | Not started | Map(K,V) |
+| Map(K,V) | **Done** — open addressing, linear probing, splitmix64 hash, 75% load factor | Hash function, `Hash + Eq` trait impls |
+| Set(T) | **Done** — thin wrapper over Map(T, i64), auto-free support | Map(K,V) |
 
 **Reference:** Go `runtime/map.go` (bucket-based hash map), Zig `std/hash_map.zig`
+
+### 2D. Auto scope-exit cleanup
+
+**Was:** Structs with `free()` methods required manual cleanup at every return point.
+
+**Fix:** Compiler detects structs with a `free()` method and inserts scope-exit cleanup calls automatically, like Zig's `defer`. Works with `Map(K,V)` and any user-defined struct with `free()`.
+
+### 2E. Field/method name collision fix
+
+**Was:** `checker.zig:checkFieldAccess()` checked fields before methods. If a struct had field `keys: i64` AND method `fn keys()`, calling `m.keys()` returned the field type (i64), not the method.
+
+**Fix:** `checkCall()` now uses `resolveMethodCall()` to prefer methods in call position. `m.keys` is the field, `m.keys()` calls the method.
 
 ### Type System
 
 | What | Status |
 |------|--------|
 | Trait bounds on generics (`where T: Trait`) | **Done** — working with monomorphized dispatch |
-| String interpolation (`"Hello, {name}"`) | Not started |
+| String interpolation (`"Hello, ${name}"`) | **Done** — `${expr}` syntax, integer auto-conversion |
+| String equality (`@assert_eq` for strings) | **Done** — byte-compare via `cot_string_eq` runtime |
 | Iterator protocol (`for x in collection`) | Not started |
 | Pattern matching (`match` expressions) | Not started |
 | Multiple return values | Not started |
@@ -123,9 +136,9 @@ Basic LSP with diagnostics, hover, goto definition, and document symbols.
 
 | What | Status |
 |------|--------|
+| Syntax highlighting (VS Code/Cursor) | **Done** — TextMate grammar + LSP client extension |
 | Project manifest (cot.toml) | Not started |
 | `cot fmt` — auto-formatter | Not started |
-| Syntax highlighting (VS Code, tree-sitter) | Not started |
 | Error messages with source locations | Partial |
 
 ---
@@ -144,8 +157,9 @@ Basic LSP with diagnostics, hover, goto definition, and document symbols.
 
 | Step | What | Unblocks | Effort |
 |------|------|----------|--------|
-| **1** | Map(K,V) in stdlib | Real applications | Large — needs hash function |
-| **3** | String interpolation | Readable output | Medium |
+| **1** | ~~Map(K,V) in stdlib~~ | ~~Real applications~~ | **Done** |
+| **2** | ~~Set(T) in stdlib~~ | ~~Convenience~~ | **Done** |
+| **3** | ~~String interpolation~~ | ~~Readable output~~ | **Done** |
 | **4** | `std/fs` — file I/O | Real applications | Medium — syscall wrappers |
 | **5** | Iterator protocol | Ergonomic loops | Medium |
 | **6** | `std/os` — args, env | CLI tools | Small |
@@ -180,7 +194,7 @@ fn main() i64 {
     var names: List([]u8) = scores.keys()
     var i: i64 = 0
     while i < names.len() {
-        println("{}: {}", names.get(i), scores.get(names.get(i)))
+        println("${names.get(i)}: ${scores.get(names.get(i))}")
         i = i + 1
     }
 
@@ -196,4 +210,4 @@ alice: 95
 bob: 87
 ```
 
-That's the next bar. We need Map(K,V), trait bounds, and string interpolation to get there.
+Map(K,V), trait bounds, and string interpolation are now **done**. The next bar is file I/O and iterators.

@@ -1,0 +1,113 @@
+import "std/set"
+
+test "set add and has" {
+    var s: Set(i64) = .{}
+    s.add(10)
+    s.add(20)
+    s.add(30)
+    @assert_eq(s.has(10), 1)
+    @assert_eq(s.has(20), 1)
+    @assert_eq(s.has(30), 1)
+    @assert_eq(s.has(40), 0)
+    s.free()
+}
+
+test "set len" {
+    var s: Set(i64) = .{}
+    @assert_eq(s.len(), 0)
+    s.add(1)
+    @assert_eq(s.len(), 1)
+    s.add(2)
+    @assert_eq(s.len(), 2)
+    s.free()
+}
+
+test "set isEmpty" {
+    var s: Set(i64) = .{}
+    @assert_eq(s.isEmpty(), 1)
+    s.add(1)
+    @assert_eq(s.isEmpty(), 0)
+    s.free()
+}
+
+test "set duplicates ignored" {
+    var s: Set(i64) = .{}
+    s.add(42)
+    s.add(42)
+    s.add(42)
+    @assert_eq(s.len(), 1)
+    s.free()
+}
+
+test "set remove" {
+    var s: Set(i64) = .{}
+    s.add(10)
+    s.add(20)
+    s.add(30)
+    @assert_eq(s.len(), 3)
+    s.remove(20)
+    @assert_eq(s.len(), 2)
+    @assert_eq(s.has(20), 0)
+    @assert_eq(s.has(10), 1)
+    @assert_eq(s.has(30), 1)
+    s.free()
+}
+
+test "set clear" {
+    var s: Set(i64) = .{}
+    s.add(1)
+    s.add(2)
+    s.add(3)
+    @assert_eq(s.len(), 3)
+    s.clear()
+    @assert_eq(s.len(), 0)
+    @assert_eq(s.has(1), 0)
+    s.free()
+}
+
+test "set toList" {
+    var s: Set(i64) = .{}
+    s.add(100)
+    s.add(200)
+    var items = s.toList()
+    @assert_eq(items.len(), 2)
+    // Items may be in any order, but both should be present
+    let a = items.get(0)
+    let b = items.get(1)
+    @assert_eq(a + b, 300)
+    items.free()
+    s.free()
+}
+
+test "set many elements" {
+    var s: Set(i64) = .{}
+    var i: i64 = 0
+    while i < 20 {
+        s.add(i)
+        i = i + 1
+    }
+    @assert_eq(s.len(), 20)
+    @assert_eq(s.has(0), 1)
+    @assert_eq(s.has(19), 1)
+    @assert_eq(s.has(20), 0)
+    s.free()
+}
+
+test "set add after remove" {
+    var s: Set(i64) = .{}
+    s.add(5)
+    s.remove(5)
+    @assert_eq(s.has(5), 0)
+    s.add(5)
+    @assert_eq(s.has(5), 1)
+    @assert_eq(s.len(), 1)
+    s.free()
+}
+
+test "set auto-free" {
+    var s: Set(i64) = .{}
+    s.add(1)
+    s.add(2)
+    // auto-free triggers at scope exit since Set has free()
+    @assert_eq(s.len(), 2)
+}

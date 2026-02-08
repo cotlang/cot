@@ -25,6 +25,7 @@ const BLOCK_I64: u8 = @intFromEnum(wasm_op.ValType.i64);
 pub const WRITE_NAME = "cot_write";
 pub const PRINT_INT_NAME = "cot_print_int";
 pub const EPRINT_INT_NAME = "cot_eprint_int";
+pub const INT_TO_STRING_NAME = "cot_int_to_string";
 
 // =============================================================================
 // Return Type
@@ -34,6 +35,7 @@ pub const PrintFunctions = struct {
     write_idx: u32,
     print_int_idx: u32,
     eprint_int_idx: u32,
+    int_to_string_idx: u32,
 };
 
 // =============================================================================
@@ -77,10 +79,25 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .exported = false,
     });
 
+    // cot_int_to_string: (value: i64, buf_ptr: i64) -> i64 (returns length)
+    // Caller provides a 21-byte buffer. Same divmod as print_int.
+    const int_to_string_type = try linker.addType(
+        &[_]ValType{ .i64, .i64 },
+        &[_]ValType{.i64},
+    );
+    const int_to_string_body = try generateIntToStringBody(allocator);
+    const int_to_string_idx = try linker.addFunc(.{
+        .name = INT_TO_STRING_NAME,
+        .type_idx = int_to_string_type,
+        .code = int_to_string_body,
+        .exported = false,
+    });
+
     return PrintFunctions{
         .write_idx = write_idx,
         .print_int_idx = print_int_idx,
         .eprint_int_idx = eprint_int_idx,
+        .int_to_string_idx = int_to_string_idx,
     };
 }
 
@@ -88,6 +105,142 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
 // cot_write stub — drops args, returns 0
 // Pure Wasm can't do I/O; native overrides this with ARM64 syscall
 // =============================================================================
+
+// =============================================================================
+// cot_int_to_string — same divmod as print_int, writes to caller buffer
+//
+// Signature: (value: i64, buf_ptr: i64) -> i64 (returns string length)
+// Caller provides a 21-byte buffer (max i64 decimal = 20 digits + sign).
+// Writes digits right-to-left into buffer, returns number of bytes written.
+// The string starts at (buf_ptr + 21 - result_len).
+//
+// Algorithm: same as Go printint (see above), but writes to caller buffer
+// instead of calling cot_write.
+//
+// Wasm locals layout:
+//   param 0: value (i64)
+//   param 1: buf_ptr (i64) — pointer to 21-byte buffer
+//   local 2: buf_i32 (i32) — buf_ptr as i32
+//   local 3: idx (i32) — current write position (starts at 20)
+//   local 4: u (i64) — unsigned absolute value
+//   local 5: is_neg (i32) — 1 if negative, 0 otherwise
+// =============================================================================
+
+fn generateIntToStringBody(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // Declare 4 locals: buf_i32 (i32), idx (i32), u (i64), is_neg (i32)
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i64, .i32 });
+
+    // buf_i32 = (i32)buf_ptr
+    try code.emitLocalGet(1); // buf_ptr (i64)
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(2);
+
+    // idx = 20 (last byte of 21-byte buffer)
+    try code.emitI32Const(20);
+    try code.emitLocalSet(3);
+
+    // is_neg = 0
+    try code.emitI32Const(0);
+    try code.emitLocalSet(5);
+
+    // u = value
+    try code.emitLocalGet(0);
+    try code.emitLocalSet(4);
+
+    // --- Handle negative ---
+    try code.emitLocalGet(0);
+    try code.emitI64Const(0);
+    try code.emitI64LtS();
+    try code.emitIf(BLOCK_VOID);
+    {
+        try code.emitI32Const(1);
+        try code.emitLocalSet(5);
+        try code.emitI64Const(0);
+        try code.emitLocalGet(0);
+        try code.emitI64Sub();
+        try code.emitLocalSet(4);
+    }
+    try code.emitEnd();
+
+    // --- Handle zero ---
+    try code.emitLocalGet(4);
+    try code.emitI64Eqz();
+    try code.emitIf(BLOCK_VOID);
+    {
+        try code.emitLocalGet(2);
+        try code.emitLocalGet(3);
+        try code.emitI32Add();
+        try code.emitI64Const('0');
+        try code.emitI64Store8(0);
+        try code.emitLocalGet(3);
+        try code.emitI32Const(1);
+        try code.emitI32Sub();
+        try code.emitLocalSet(3);
+    }
+    try code.emitElse();
+    {
+        // --- Digit loop ---
+        try code.emitBlock(BLOCK_VOID);
+        try code.emitLoop(BLOCK_VOID);
+        {
+            try code.emitLocalGet(4);
+            try code.emitI64Eqz();
+            try code.emitBrIf(1);
+
+            try code.emitLocalGet(2);
+            try code.emitLocalGet(3);
+            try code.emitI32Add();
+            try code.emitI64Const('0');
+            try code.emitLocalGet(4);
+            try code.emitI64Const(10);
+            try code.emitI64RemU();
+            try code.emitI64Add();
+            try code.emitI64Store8(0);
+
+            try code.emitLocalGet(4);
+            try code.emitI64Const(10);
+            try code.emitI64DivU();
+            try code.emitLocalSet(4);
+
+            try code.emitLocalGet(3);
+            try code.emitI32Const(1);
+            try code.emitI32Sub();
+            try code.emitLocalSet(3);
+
+            try code.emitBr(0);
+        }
+        try code.emitEnd(); // end loop
+        try code.emitEnd(); // end block
+    }
+    try code.emitEnd(); // end if/else
+
+    // --- Prepend '-' if negative ---
+    try code.emitLocalGet(5);
+    try code.emitIf(BLOCK_VOID);
+    {
+        try code.emitLocalGet(2);
+        try code.emitLocalGet(3);
+        try code.emitI32Add();
+        try code.emitI64Const('-');
+        try code.emitI64Store8(0);
+        try code.emitLocalGet(3);
+        try code.emitI32Const(1);
+        try code.emitI32Sub();
+        try code.emitLocalSet(3);
+    }
+    try code.emitEnd();
+
+    // Return length: 20 - idx (as i64)
+    try code.emitI32Const(20);
+    try code.emitLocalGet(3);
+    try code.emitI32Sub();
+    try code.emitI64ExtendI32U();
+
+    return try code.finish();
+}
 
 fn generateWriteStubBody(allocator: std.mem.Allocator) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);

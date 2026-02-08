@@ -7,16 +7,19 @@ The compiler handles a real programming language — generics, closures, ARC, er
 ### What 0.3 Has Achieved
 
 - **Working I/O** — `print`, `println`, `eprint`, `eprintln` with native syscalls
-- **Standard library** — `List(T)` with ~20 methods via `import "std/list"`
+- **Standard library** — `List(T)` with ~35 methods, `Map(K,V)` with splitmix64 hash via `import "std/map"`
 - **Cross-file generics** — `SharedGenericContext` enables multi-file programs with generics
 - **CLI** — `cot build`, `cot run`, `cot test`, `cot version`, `cot help`
 - **Test framework** — inline `test "name" { }` blocks with `@assert`/`@assert_eq`, summary output
 - **Basic LSP** — diagnostics, hover, goto definition, document symbols
+- **VS Code/Cursor extension** — TextMate syntax highlighting + LSP client
+- **Auto scope-exit cleanup** — structs with `free()` get automatic cleanup
+- **Traits with bounds** — `where T: Hashable` with monomorphized dispatch
 
 ### What 0.3 Still Lacks for Real Use
 
-1. **No collections beyond List(T)** — no Map(K,V), no Set(T)
-2. **No string interpolation** — `"Hello, " + name` works but `"Hello, {name}"` doesn't
+1. ~~**No collections beyond List(T)**~~ — **Done**: Map(K,V) with splitmix64 hash, Set(T) wrapping Map
+2. ~~**No string interpolation**~~ — **Done**: `"Hello, ${name}"` with integer auto-conversion
 3. **No file I/O** — can't read files, make HTTP requests
 4. **No package manager** — can't install libraries
 5. **No async** — can't write a web server that handles concurrent connections
@@ -199,9 +202,10 @@ Zig is 10+ years of development and still on 0.15. Each version represents a mea
 - Basic LSP server (diagnostics, hover, goto definition, document symbols)
 
 **Remaining:**
-- Map(K,V) — hash map with set/get/has/delete/keys/values
-- Set(T) — built on Map(K,V)
-- String interpolation — `"Hello, {name}"`
+- ~~Map(K,V)~~ — **Done** — hash map with set/get/has/delete/keys/values, auto-free
+- ~~Set(T)~~ — **Done** — wraps Map(T, i64), add/has/remove/len/toList, auto-free
+- ~~String interpolation~~ — **Done** — `"Hello, ${name}"` with integer auto-conversion
+- ~~String equality~~ — **Done** — `@assert_eq("hello", "hello")` via `cot_string_eq`
 - StringBuilder — efficient append-based string building
 - `for key, value in map` — iterator protocol
 - `match` expressions — full pattern matching

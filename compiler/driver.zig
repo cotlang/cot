@@ -1134,6 +1134,7 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, arc.DEALLOC_NAME, arc_funcs.dealloc_idx);
         try func_indices.put(self.allocator, arc.REALLOC_NAME, arc_funcs.realloc_idx);
         try func_indices.put(self.allocator, arc.STRING_CONCAT_NAME, arc_funcs.string_concat_idx);
+        try func_indices.put(self.allocator, arc.STRING_EQ_NAME, arc_funcs.string_eq_idx);
         try func_indices.put(self.allocator, arc.MEMSET_ZERO_NAME, arc_funcs.memset_zero_idx);
         try func_indices.put(self.allocator, arc.MEMCPY_NAME, arc_funcs.memcpy_idx);
 
@@ -1145,6 +1146,7 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, print_runtime.WRITE_NAME, print_funcs.write_idx);
         try func_indices.put(self.allocator, print_runtime.PRINT_INT_NAME, print_funcs.print_int_idx);
         try func_indices.put(self.allocator, print_runtime.EPRINT_INT_NAME, print_funcs.eprint_int_idx);
+        try func_indices.put(self.allocator, print_runtime.INT_TO_STRING_NAME, print_funcs.int_to_string_idx);
 
         // Add test function names to index map (Zig)
         try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx);

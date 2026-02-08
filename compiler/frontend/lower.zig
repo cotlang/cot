@@ -968,6 +968,80 @@ pub const Lowerer = struct {
         if (val != ir.null_node) _ = try fb.emitStoreLocal(local_idx, val, span);
     }
 
+    /// Lower string interpolation: "text${expr}text${expr}text"
+    /// Each text segment becomes a const string, each expr segment is evaluated.
+    /// Integer expressions are converted via cot_int_to_string.
+    /// All segments are chained with cot_string_concat.
+    fn lowerStringInterp(self: *Lowerer, si: ast.StringInterp) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+
+        // Convert each segment to a string IR node
+        var parts = std.ArrayListUnmanaged(ir.NodeIndex){};
+        defer parts.deinit(self.allocator);
+
+        for (si.segments) |seg| {
+            switch (seg) {
+                .text => |text| {
+                    // Process escape sequences in text
+                    var buf: [4096]u8 = undefined;
+                    const unescaped = unescapeString(text, &buf);
+                    if (unescaped.len == 0) continue;
+                    const copied = try self.allocator.dupe(u8, unescaped);
+                    const str_idx = try fb.addStringLiteral(copied);
+                    const str_node = try fb.emitConstSlice(str_idx, si.span);
+                    try parts.append(self.allocator, str_node);
+                },
+                .expr => |expr_idx| {
+                    const expr_type = self.inferExprType(expr_idx);
+                    const expr_val = try self.lowerExprNode(expr_idx);
+
+                    if (expr_type == TypeRegistry.STRING) {
+                        // String expression: use directly
+                        try parts.append(self.allocator, expr_val);
+                    } else {
+                        // Integer expression: convert via cot_int_to_string
+                        // Allocate 21-byte stack buffer for digit conversion
+                        const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 24); // 24 bytes (aligned)
+                        const buf_addr = try fb.emitAddrLocal(buf_local, TypeRegistry.I64, si.span);
+                        var its_args = [_]ir.NodeIndex{ expr_val, buf_addr };
+                        const str_len = try fb.emitCall("cot_int_to_string", &its_args, false, TypeRegistry.I64, si.span);
+                        // String starts at buf_addr + 21 - str_len
+                        // str_ptr = buf_addr + 21 - str_len
+                        const twenty_one = try fb.emitConstInt(21, TypeRegistry.I64, si.span);
+                        const offset = try fb.emitBinary(.sub, twenty_one, str_len, TypeRegistry.I64, si.span);
+                        const str_ptr = try fb.emitBinary(.add, buf_addr, offset, TypeRegistry.I64, si.span);
+                        // Build string_header(str_ptr, str_len)
+                        const str_node = try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = str_ptr, .len = str_len } }, TypeRegistry.STRING, si.span));
+                        try parts.append(self.allocator, str_node);
+                    }
+                },
+            }
+        }
+
+        if (parts.items.len == 0) {
+            // Empty interpolation — return empty string
+            const empty = try self.allocator.dupe(u8, "");
+            const str_idx = try fb.addStringLiteral(empty);
+            return try fb.emitConstSlice(str_idx, si.span);
+        }
+
+        // Chain all parts with cot_string_concat
+        var result = parts.items[0];
+        for (parts.items[1..]) |part| {
+            const r_ptr = try fb.emitSlicePtr(result, ptr_type, si.span);
+            const r_len = try fb.emitSliceLen(result, si.span);
+            const p_ptr = try fb.emitSlicePtr(part, ptr_type, si.span);
+            const p_len = try fb.emitSliceLen(part, si.span);
+            var concat_args = [_]ir.NodeIndex{ r_ptr, r_len, p_ptr, p_len };
+            const new_ptr = try fb.emitCall("cot_string_concat", &concat_args, false, TypeRegistry.I64, si.span);
+            const new_len = try fb.emitBinary(.add, r_len, p_len, TypeRegistry.I64, si.span);
+            result = try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = new_ptr, .len = new_len } }, TypeRegistry.STRING, si.span));
+        }
+
+        return result;
+    }
+
     fn lowerStringInit(self: *Lowerer, local_idx: ir.LocalIdx, value_idx: NodeIndex, span: Span) !void {
         const fb = self.current_func orelse return;
         const str_node = try self.lowerExprNode(value_idx);
@@ -1562,6 +1636,7 @@ pub const Lowerer = struct {
             .tuple_literal => |tl| return try self.lowerTupleLiteral(tl),
             .new_expr => |ne| return try self.lowerNewExpr(ne),
             .closure_expr => |ce| return try self.lowerClosureExpr(ce),
+            .string_interp => |si| return try self.lowerStringInterp(si),
             .block_expr => |block| {
                 const cleanup_depth = self.cleanup_stack.getScopeDepth();
                 const scope_depth = fb.markScopeEntry();
@@ -3428,8 +3503,18 @@ pub const Lowerer = struct {
         if (std.mem.eql(u8, bc.name, "assert_eq")) {
             const left = try self.lowerExprNode(bc.args[0]);
             const right = try self.lowerExprNode(bc.args[1]);
-            // cond = (left == right)
-            const cond = try fb.emitBinary(.eq, left, right, TypeRegistry.BOOL, bc.span);
+            // For strings: decompose to ptr/len and call cot_string_eq
+            const left_type = self.inferExprType(bc.args[0]);
+            const cond = if (left_type == TypeRegistry.STRING) blk: {
+                const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                const l_ptr = try fb.emitSlicePtr(left, ptr_type, bc.span);
+                const l_len = try fb.emitSliceLen(left, bc.span);
+                const r_ptr = try fb.emitSlicePtr(right, ptr_type, bc.span);
+                const r_len = try fb.emitSliceLen(right, bc.span);
+                var eq_args = [_]ir.NodeIndex{ l_ptr, l_len, r_ptr, r_len };
+                const eq_result = try fb.emitCall("cot_string_eq", &eq_args, false, TypeRegistry.I64, bc.span);
+                break :blk try fb.emitBinary(.ne, eq_result, try fb.emitConstInt(0, TypeRegistry.I64, bc.span), TypeRegistry.BOOL, bc.span);
+            } else try fb.emitBinary(.eq, left, right, TypeRegistry.BOOL, bc.span);
             const then_block = try fb.newBlock("assert_eq.ok");
             const fail_block = try fb.newBlock("assert_eq.fail");
             _ = try fb.emitBranch(cond, then_block, fail_block, bc.span);
@@ -3855,6 +3940,43 @@ fn parseCharLiteral(text: []const u8) u8 {
         'x' => if (inner.len >= 4) std.fmt.parseInt(u8, inner[2..4], 16) catch 0 else 0,
         else => inner[1],
     };
+}
+
+/// Process escape sequences in a raw string (no surrounding quotes).
+/// Used for string interpolation text segments.
+fn unescapeString(text: []const u8, out_buf: []u8) []const u8 {
+    var out_idx: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and out_idx < out_buf.len) {
+        if (text[i] == '\\' and i + 1 < text.len) {
+            const escaped = switch (text[i + 1]) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                '0' => @as(u8, 0),
+                'x' => blk: {
+                    if (i + 3 < text.len) {
+                        const val = std.fmt.parseInt(u8, text[i + 2 .. i + 4], 16) catch 0;
+                        i += 2;
+                        break :blk val;
+                    }
+                    break :blk text[i + 1];
+                },
+                else => text[i + 1],
+            };
+            out_buf[out_idx] = escaped;
+            out_idx += 1;
+            i += 2;
+        } else {
+            out_buf[out_idx] = text[i];
+            out_idx += 1;
+            i += 1;
+        }
+    }
+    return out_buf[0..out_idx];
 }
 
 fn parseStringLiteral(text: []const u8, out_buf: []u8) []const u8 {

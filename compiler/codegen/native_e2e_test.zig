@@ -403,6 +403,14 @@ test "e2e: auto_free (5 tests)" {
     try expectTestModeFile(std.testing.allocator, "test/e2e/auto_free.cot", 5, "e2e_auto_free");
 }
 
+test "e2e: set (10 tests)" {
+    try expectTestModeFile(std.testing.allocator, "test/e2e/set.cot", 10, "e2e_set");
+}
+
+test "e2e: string_interp (10 tests)" {
+    try expectTestModeFile(std.testing.allocator, "test/e2e/string_interp.cot", 10, "e2e_string_interp");
+}
+
 // ============================================================================
 // Print tests: verify print/println produce correct stdout output
 // ============================================================================
@@ -841,8 +849,8 @@ test "cases: optional (3 tests)" {
     try expectTestModeFile(std.testing.allocator, "test/cases/optional.cot", 3, "cases_optional");
 }
 
-test "cases: strings (9 tests)" {
-    try expectTestModeFile(std.testing.allocator, "test/cases/strings.cot", 9, "cases_strings");
+test "cases: strings (13 tests)" {
+    try expectTestModeFile(std.testing.allocator, "test/cases/strings.cot", 13, "cases_strings");
 }
 
 test "cases: structs (5 tests)" {

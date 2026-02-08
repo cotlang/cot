@@ -41,3 +41,22 @@ test "concat var direct" {
 test "concat direct len" {
     @assert_eq(len("hello" + " world"), 11)
 }
+
+test "string eq literals" {
+    @assert_eq("hello", "hello")
+}
+
+test "string eq vars" {
+    let a = "world"
+    let b = "world"
+    @assert_eq(a, b)
+}
+
+test "string eq concat" {
+    let s = "hello" + " world"
+    @assert_eq(s, "hello world")
+}
+
+test "string eq empty" {
+    @assert_eq("", "")
+}

@@ -1,0 +1,48 @@
+// Set(T) — Generic hash set built on Map(T, i64).
+//
+// Design: Thin wrapper over Map(T, i64) with dummy value 0.
+// Auto-free works automatically since Set has free().
+//
+// References:
+//   Go:     map[K]struct{} pattern (idiomatic Go set)
+//   Python: set API (add, has/in, remove, len)
+
+import "std/map"
+
+struct Set(T) {
+    inner: Map(T, i64),
+}
+
+impl Set(T) {
+    fn add(self: *Set(T), value: T) void {
+        self.inner.set(value, 0)
+    }
+
+    fn has(self: *Set(T), value: T) i64 {
+        return self.inner.has(value)
+    }
+
+    fn remove(self: *Set(T), value: T) void {
+        self.inner.delete(value)
+    }
+
+    fn len(self: *Set(T)) i64 {
+        return self.inner.len()
+    }
+
+    fn isEmpty(self: *Set(T)) i64 {
+        return self.inner.isEmpty()
+    }
+
+    fn clear(self: *Set(T)) void {
+        self.inner.clear()
+    }
+
+    fn toList(self: *Set(T)) List(T) {
+        return self.inner.keys()
+    }
+
+    fn free(self: *Set(T)) void {
+        self.inner.free()
+    }
+}

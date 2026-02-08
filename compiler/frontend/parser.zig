@@ -755,6 +755,7 @@ pub const Parser = struct {
             .int_lit => { const v = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .int, .value = v, .span = Span.init(start, self.pos()) } }); },
             .float_lit => { const v = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .float, .value = v, .span = Span.init(start, self.pos()) } }); },
             .string_lit => { const v = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .string, .value = v, .span = Span.init(start, self.pos()) } }); },
+            .string_interp_start => return try self.parseStringInterp(),
             .char_lit => { const v = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .char, .value = v, .span = Span.init(start, self.pos()) } }); },
             .kw_true => { self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .true_lit, .value = "true", .span = Span.init(start, self.pos()) } }); },
             .kw_false => { self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .false_lit, .value = "false", .span = Span.init(start, self.pos()) } }); },
@@ -893,6 +894,68 @@ pub const Parser = struct {
                 return null;
             },
         }
+    }
+
+    /// Parse string interpolation: "text${expr}text${expr}text"
+    /// Scanner produces: string_interp_start, <expr tokens>, string_interp_mid|end, ...
+    /// Token text format:
+    ///   start: "text${     (includes leading " and trailing ${)
+    ///   mid:   }text${     (includes leading } and trailing ${)
+    ///   end:   }text"      (includes leading } and trailing ")
+    fn parseStringInterp(self: *Parser) ParseError!?NodeIndex {
+        const start = self.pos();
+        var segments = std.ArrayListUnmanaged(ast.StringSegment){};
+        defer segments.deinit(self.allocator);
+
+        // First token is string_interp_start: "text${
+        const start_text = self.tok.text;
+        // Strip leading " and trailing ${
+        if (start_text.len >= 3) {
+            const text_part = start_text[1 .. start_text.len - 2]; // skip " prefix and ${ suffix
+            if (text_part.len > 0)
+                try segments.append(self.allocator, .{ .text = text_part });
+        }
+        self.advance(); // consume string_interp_start
+
+        // Now parse the expression
+        const expr = try self.parseExpr() orelse return null;
+        try segments.append(self.allocator, .{ .expr = expr });
+
+        // Loop: next token is either string_interp_mid or string_interp_end
+        while (true) {
+            if (self.check(.string_interp_mid)) {
+                // mid token: }text${
+                const mid_text = self.tok.text;
+                if (mid_text.len >= 3) {
+                    const text_part = mid_text[1 .. mid_text.len - 2]; // skip } prefix and ${ suffix
+                    if (text_part.len > 0)
+                        try segments.append(self.allocator, .{ .text = text_part });
+                }
+                self.advance(); // consume string_interp_mid
+
+                // Parse the next expression
+                const next_expr = try self.parseExpr() orelse return null;
+                try segments.append(self.allocator, .{ .expr = next_expr });
+            } else if (self.check(.string_interp_end)) {
+                // end token: }text"
+                const end_text = self.tok.text;
+                if (end_text.len >= 2) {
+                    const text_part = end_text[1 .. end_text.len - 1]; // skip } prefix and " suffix
+                    if (text_part.len > 0)
+                        try segments.append(self.allocator, .{ .text = text_part });
+                }
+                self.advance(); // consume string_interp_end
+                break;
+            } else {
+                self.syntaxError("expected string interpolation continuation");
+                return null;
+            }
+        }
+
+        return try self.tree.addExpr(.{ .string_interp = .{
+            .segments = try self.allocator.dupe(ast.StringSegment, segments.items),
+            .span = Span.init(start, self.pos()),
+        } });
     }
 
     fn parseBuiltinCall(self: *Parser, start: Pos) ParseError!?NodeIndex {
