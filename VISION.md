@@ -2,9 +2,36 @@
 
 ## What is Cot?
 
-Cot is a compiled programming language for full-stack web development.
+Cot is a compiled full-stack language that directly competes with TypeScript + Next.js.
 
 **The pitch:** Write like TypeScript, run like Rust, deploy anywhere, never think about memory.
+
+**The problem Cot solves:** TypeScript dominates full-stack development not because developers love it, but because it's the only language that works in both browser and server with shared types and logic. Developers tolerate TypeScript's weak type system, runtime errors, and performance overhead because no alternative offers the same full-stack story.
+
+Cot is that alternative — a real compiled language with ARC memory management, native Wasm support, and a framework that handles client/server compilation transparently.
+
+---
+
+## Why TypeScript Wins (And Shouldn't)
+
+TypeScript's dominance comes from one architectural accident: JavaScript runs in browsers, and Node.js brought it to servers. This means:
+
+- Same language on client and server
+- Shared types across the boundary (via Next.js RSC, tRPC, etc.)
+- One ecosystem (npm) for everything
+- Low friction — write code, it runs
+
+But TypeScript has fundamental weaknesses:
+
+| Problem | Impact |
+|---------|--------|
+| No real compilation | JIT overhead, cold starts, bundle size |
+| Structural typing | Type safety is an illusion — runtime errors leak through |
+| GC pauses | Unpredictable latency in server and client |
+| node_modules | 200MB+ for a hello world |
+| Not really one language | Server needs Node APIs, client needs DOM APIs, they're different worlds shimmed together |
+
+**Cot takes what makes TypeScript win (full-stack, shared types, low friction) and rebuilds it on a real foundation.**
 
 ---
 
@@ -13,34 +40,25 @@ Cot is a compiled programming language for full-stack web development.
 ```
                     Simple ←────────────────→ Complex
                        │                         │
-     TypeScript ───────┼─────────────────────────┤  GC, slow
+     TypeScript ───────┼─────────────────────────┤  GC, slow, not really compiled
                        │                         │
-            Go ────────┼─────────────────────────┤  GC, backend only
+     Bun + Next.js ────┼─────────────────────────┤  Still TypeScript underneath
                        │                         │
-           Cot ────────┼──────■                  │  ARC, Wasm-native
+           Cot ────────┼──────■                  │  ARC, compiled, Wasm-native
                        │                         │
-         Swift ────────┼───────────■             │  ARC, no Wasm
+         Swift ────────┼───────────■             │  ARC, no Wasm, Apple-only
                        │                         │
           Rust ────────┼─────────────────────────■  Borrow checker
 ```
 
-### Comparison
-
-| Language | Memory | Wasm Support | Full-stack | Learning Curve |
-|----------|--------|--------------|------------|----------------|
-| TypeScript | GC | Via tooling | Yes | Low |
-| Go | GC | Poor | Backend only | Low |
-| Rust | Borrow checker | Excellent | Yes | High |
-| Swift | ARC | Experimental | No | Medium |
-| **Cot** | **ARC** | **Native** | **Yes** | **Low-Medium** |
-
 ### The Gap Cot Fills
 
-No existing language offers:
-- Systems-language performance
-- No manual memory management (ARC, not GC)
-- Full-stack via Wasm (browser + server)
-- Modern, approachable syntax
+No existing language offers all of:
+- **Full-stack** — browser + server, shared types, one framework
+- **Compiled** — real AOT compilation, not JIT
+- **ARC** — no GC pauses, no manual memory, no borrow checker
+- **Wasm-native** — browser target is first-class, not bolted on
+- **Approachable** — if you know TypeScript, you can write Cot
 
 ---
 
@@ -49,26 +67,23 @@ No existing language offers:
 ### 1. Zig-Inspired Syntax, Simplified
 
 ```cot
-// No semicolons
-// Traits and impl blocks
-// Type inference
-// No allocator parameters
-
-fn greet(name: string) string {
-    return "Hello, " + name
-}
-
 struct User {
-    name: string
-    email: string
+    name: []u8
+    email: []u8
 }
 
 impl User {
-    fn display(self) string {
+    fn display(self) []u8 {
         return self.name + " <" + self.email + ">"
     }
 }
+
+fn greet(name: []u8) []u8 {
+    return "Hello, " + name
+}
 ```
+
+Familiar syntax. No semicolons. Traits and impl blocks. Type inference. No allocator parameters.
 
 ### 2. ARC Memory Management
 
@@ -84,55 +99,91 @@ fn example() {
 // No manual free, no GC pauses, no borrow checker fights
 ```
 
-### 3. Wasm as Primary Target
+### 3. Wasm as Compilation Target AND Internal IR
+
+Cot uses Wasm in two ways:
+
+**As internal IR:** All code compiles through Wasm bytecode before AOT compilation to native. This simplifies the compiler — one backend, consistent semantics, every feature works on both targets automatically.
+
+**As deployment format:** `--target=wasm32` outputs `.wasm` files that run directly in browsers. The same code runs natively on the server and as Wasm in the browser.
+
+**The key differentiator:** Other languages that target Wasm (Rust, Go, C) require an external Wasm runtime (wasmtime, wasmer) to run on the server. Cot doesn't — the compiler itself AOT-compiles Wasm to native. No runtime dependency. You get a regular native binary.
 
 ```
-Cot Source → Compiler → .wasm → Runs in browser
-                              → Runs on server (via AOT or runtime)
+Other languages:  Source → Wasm → wasmtime REQUIRED to run on server
+Cot:              Source → Wasm → native binary (runs directly)
+                              └──→ .wasm (for browser, or optionally WASI runtimes)
 ```
 
-Single language, single binary format, multiple deployment targets.
+### 4. WASI-Modeled I/O
 
-### 4. Full-Stack by Default
+Cot uses [WASI](https://wasi.dev/) as the design blueprint for system I/O — not because Cot requires a WASI runtime, but because WASI is a well-designed, standardized interface for the operations every program needs (files, sockets, clocks, random).
+
+The compiler translates WASI-modeled I/O to the appropriate target:
+
+| Target | I/O becomes |
+|--------|-------------|
+| Native (default) | libc/syscalls directly |
+| `--target=wasm32` (browser) | Web API imports (fetch, DOM, etc.) |
+| `--target=wasm32-wasi` | WASI imports (for edge/serverless runtimes) |
+
+This means the same Cot source code can produce:
+- A native server binary (no external runtime)
+- A `.wasm` file for the browser
+- A `.wasm` file for Cloudflare Workers / Fermyon Spin / wasmCloud
+
+No other language does all three from the same source without third-party tooling.
+
+### 5. Full-Stack by Default
+
+The Cot framework handles client/server compilation transparently, like Next.js but without the JavaScript:
 
 ```cot
-// shared/models.cot - runs on BOTH client and server
+// shared — compiled for both targets automatically
 struct User {
     id: i64
-    name: string
+    name: []u8
 }
 
-fn validate_email(email: string) bool {
+fn validate_email(email: []u8) bool {
     return email.contains("@")
 }
 
-// server/main.cot
+// server — compiled to native
 @server
-fn get_user(id: i64) User {
+fn get_user(id: i64) !User {
     return db.query("SELECT * FROM users WHERE id = ?", id)
 }
 
-// client/main.cot
+// client — compiled to Wasm for browser
 @client
 fn render_user(user: User) {
     dom.set_text("#name", user.name)
 }
 ```
 
+The framework's build step calls the compiler twice — once for native (server), once for Wasm (client) — and wires up the boundary automatically (serialization, HTTP transport, etc.). Developers don't think about compilation targets.
+
+For standalone use (CLI tools, libraries, Wasm modules), the `cot` compiler CLI accepts explicit targets. The framework is optional.
+
 ---
 
 ## Target Audience
 
-Web developers who:
-- Are frustrated with JavaScript's performance and type system
-- Want to use a compiled language but find Rust too hard
-- Want to write server + client in the same language
-- Care about performance but don't want to manage memory manually
+**Primary:** Web developers currently using TypeScript + Next.js / Bun who want:
+- A real compiled language without TypeScript's runtime surprises
+- Better performance without Rust's complexity
+- One language for browser and server that actually compiles
+
+**Secondary:** Backend developers using Go/Python/Java who want:
+- Browser deployment without learning a second language
+- Modern syntax without legacy baggage
+- ARC instead of GC
 
 **Not for:**
 - Operating system development
 - Embedded systems with extreme memory constraints
-- Developers who want fine-grained memory control
+- Developers who want fine-grained memory control (use Zig or Rust)
 
 ---
 
@@ -141,259 +192,66 @@ Web developers who:
 ### Compilation Pipeline
 
 ```
-Cot Source
-    │
-    ▼
-┌─────────────────────────────────┐
-│         Cot Compiler            │
-│  (Written in Zig - permanent)   │
-├─────────────────────────────────┤
-│  Scanner → Parser → Checker     │
-│  → Lowerer → IR → Wasm Codegen  │
-└─────────────────────────────────┘
-    │
-    ▼
-.wasm file
-    │
-    ├──────────────────┬──────────────────┐
-    ▼                  ▼                  ▼
-Browser            Wasm Runtime        AOT Compiler
-(V8, SpiderMonkey)  (Development)     (Production)
-                                          │
-                                          ▼
-                                    Native Binary
-                                    (ELF, Mach-O)
+                      ┌─────────────────────────────────┐
+                      │         Cot Source Code          │
+                      └─────────────────────────────────┘
+                                       │
+                                       ▼
+                      ┌─────────────────────────────────┐
+                      │         Cot Compiler (Zig)      │
+                      │  Scanner → Parser → Checker     │
+                      │  → Lowerer → SSA → Wasm Codegen │
+                      └─────────────────────────────────┘
+                                       │
+                              Wasm bytecode (internal)
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    ▼                  ▼                  ▼
+              Native (default)    Wasm (browser)    Wasm (WASI)
+              AOT → ARM64/x64    Runs in V8,       Runs on edge,
+              No runtime needed   SpiderMonkey      Cloudflare, etc.
 ```
 
 ### Why Zig for the Compiler?
 
-Following the **Deno model**: Deno is written in Rust and runs JavaScript/TypeScript. It's not self-hosted, and that's fine.
-
-Similarly, Cot's compiler is written in Zig. This is a **permanent** dependency, not a bootstrap.
-
-| Aspect | Decision | Rationale |
-|--------|----------|-----------|
-| Compiler language | Zig | Simple, fast compilation, good Wasm support |
-| Self-hosting | Future goal | Focus on language quality first |
-| Zig dependency | Permanent (for now) | Like Deno's Rust dependency |
+Following the Deno model: Deno is written in Rust and runs TypeScript. It's not self-hosted, and that's fine. Cot's compiler is written in Zig — a permanent tool, not a bootstrap.
 
 ### Self-Hosting Strategy
 
-Self-hosting is a **future goal**, not a prerequisite for shipping.
+Self-hosting is a future goal, not a prerequisite. The plan:
 
-**Why defer self-hosting:**
-- 5 previous attempts failed due to complexity
-- Self-hosting proves "compiler complexity", not "web app capability"
-- Better to prove the language with real applications first
-
-**The plan:**
-1. Ship Cot with Zig compiler
-2. Build real applications in Cot
+1. Ship Cot with the Zig compiler
+2. Build real applications in Cot (cot.land, cot.dev)
 3. Stabilize the language
 4. Attempt self-hosting when the language is mature
 
-**When to attempt self-hosting:**
-- Language syntax is frozen
-- Standard library is complete
-- Multiple real applications built successfully
-- Compiler architecture is stable
+Self-hosting is the graduation ceremony, not the entrance exam.
 
-Self-hosting becomes the "final exam" that proves language maturity, not the first test.
+### Dogfooding: Build the Ecosystem in Cot
 
-### Dogfooding Strategy
+Since self-hosting is deferred, we prove the language by building its own ecosystem:
 
-Since self-hosting is deferred, we need another way to prove the language works for real applications. The strategy: **build the Cot ecosystem in Cot**.
+**cot.land** — Package registry and manager (server-side Cot, HTTP, database, JSON). Proves the server story.
 
-**cot.land - Package Manager**
+**cot.dev** — Documentation site + interactive playground (client-side Cot, Wasm in browser, DOM). Proves the browser story.
 
-Like deno.land, this is the official package registry and manager:
-- Server-side Cot application
-- API endpoints (package publish, search, download)
-- Database integration (user accounts, package metadata)
-- Authentication and authorization
-- Proves: server-side Cot, HTTP, database, JSON handling
-
-**cot.dev - Documentation & Playground**
-
-The official Cot website:
-- Documentation site (static generation)
-- Interactive playground (Cot running in browser via Wasm)
-- Marketing and community pages
-- Proves: client-side Cot, DOM manipulation, Wasm in browser
-
-**Why this approach:**
-- Web framework is the target use case (proves what we're selling)
-- More practical than compiler (serves the community)
-- Exercises both client and server code paths
-- Provides immediate value to users
-
-**Self-hosting remains a long-term goal** for proving full language maturity. Once cot.land and cot.dev are running in production, and the language syntax is frozen, self-hosting becomes achievable and meaningful.
+Both together prove the full-stack story — the same language, shared types, client and server.
 
 ---
 
 ## Execution Roadmap
 
-### Phase 1: Wasm Backend ✅ COMPLETE
+See [docs/ROADMAP_1_0.md](docs/ROADMAP_1_0.md) for the detailed roadmap.
 
-**Goal:** Cot emits valid Wasm
+**Approach:** Zig-style versioning. Versions mark architectural milestones, not feature checklists. 1.0 will take multiple years, but Cot should be viable for projects well before 1.0.
 
-See **[WASM_BACKEND.md](WASM_BACKEND.md)** for implementation details.
-
-```
-├── Wasm binary format (sections, types, code)
-├── IR → Wasm stack machine translation
-├── Function calls and control flow
-└── All 26 wasm E2E tests pass
-```
-
-### Phase 2: Runtime & Memory ✅ COMPLETE
-
-**Goal:** ARC memory management works in Wasm
-
-```
-├── Linear memory allocator (cot_alloc)
-├── ARC retain/release runtime
-├── Destructor calls on release to zero
-├── String concat, indexing, bounds checks
-├── Array literals, append builtin
-└── For-range loops (for x in arr, for i in 0..n)
-```
-
-### Phase 3: Language Features (CURRENT)
-
-**Goal:** Reach feature parity with bootstrap-0.2 (619 test cases) and add features needed for standard library.
-
-**See [GAP_ANALYSIS.md](GAP_ANALYSIS.md) for detailed comparison with bootstrap-0.2.**
-
-**Phase 3 features DONE (verified on both Wasm and native):**
-```
-├── ✅ impl     - Methods on structs
-├── ✅ enum     - Enumeration types (simple + explicit values)
-├── ✅ union    - Tagged unions (without payloads)
-├── ✅ type     - Type aliases
-├── ✅ import   - File imports (with cycle detection)
-├── ✅ extern   - External function declarations
-├── ✅ switch   - Switch expressions
-├── ✅ Optional types (?T, .?, ??)
-├── ✅ Bitwise operators (&, |, ^, ~, <<, >>)
-├── ✅ Compound assignment (+=, -=, *=, /=, %=, &=, |=, ^=)
-├── ✅ Character literals ('a', '\n')
-├── ✅ Builtins (@sizeOf, @alignOf, @intCast)
-├── ✅ For-range loops (for x in arr, for i in 0..n)
-├── ✅ ARC (retain/release, destructors, heap allocation)
-├── ✅ String ops (concat, indexing, bounds checks)
-└── ✅ Array literals and append
-```
-
-**Phase 3 Wave 5 DONE (verified on both Wasm and native):**
-```
-├── ✅ Float types (f32, f64) - arithmetic, comparison, native FPU
-├── ✅ Union payloads - switch with payload capture
-├── ✅ Error unions (Zig-style !T, try, catch) - error sets, error propagation
-├── ✅ Function pointers - first-class, indirect calls, reassignment
-├── ✅ Closures - captured variables, higher-order functions, uniform representation
-├── ✅ Defer - unified cleanup stack (Swift's CleanupManager pattern)
-├── ✅ ARC coverage - call→+1, copy retain, reassignment, field assign
-├── ✅ Global variables - read, write, multi-function (Wasm)
-├── ✅ Sized integers - i8-u64, full type system, @intCast
-├── ✅ Slice syntax - arr[start:end], Go-style decomposition
-├── ✅ Generics - fn(T), struct(T,U), pure monomorphization (Zig pattern)
-├── ✅ ARC runtime upgrade - freelist allocator, cot_dealloc/realloc, memory.grow, deinit/destructors
-└── ✅ List(T) stdlib - append, get, set, pop, growth, multi-type (free generic functions pattern)
-```
-
-**Phase 3 features TODO (blocking standard library):**
-```
-├── Maps/dictionaries - Map(K,V) with set/get/has/delete (generics ready)
-├── String interpolation - blocks developer experience
-├── Traits/Interfaces - blocks polymorphism
-├── Test runner - blocks testing framework
-└── ~486 test cases to port from bootstrap-0.2
-```
-
-### Phase 4: AOT Native Compiler ✅ COMPLETE
-
-**Goal:** Wasm → Native for production performance
-
-See **[CRANELIFT_PORT_MASTER_PLAN.md](CRANELIFT_PORT_MASTER_PLAN.md)** for details.
-
-```
-├── Wasm parser (with element section for call_indirect)
-├── Wasm → CLIF IR translation
-├── CLIF → MachInst lowering
-├── Register allocation (regalloc2 port)
-├── ARM64 and AMD64 backends
-├── Output ELF/Mach-O (Cranelift 3-phase: declare/define/finish)
-└── All 24 native E2E tests pass
-```
-
-### Phase 5: Standard Library
-
-**Goal:** Useful standard library written in mature Cot
-
-```
-std/
-├── core (strings, arrays, math)
-├── fs (file system - server only)
-├── net (HTTP, WebSocket)
-├── json (serialization)
-└── dom (browser API - client only)
-```
-
-**Requires:** Phase 3 complete (language must be mature first)
-
-### Phase 6: Ecosystem
-
-**Goal:** Make Cot usable for real projects
-
-```
-├── Package manager (cot.land)
-├── Build system
-├── LSP (editor support)
-├── Documentation generator
-└── Example applications
-```
-
-### Phase 7: Self-Hosting (Future)
-
-**Goal:** Prove language maturity
-
-```
-├── Compiler written in Cot
-├── Compiles to Wasm
-├── AOT compiles to native
-├── Compiler compiles itself
-└── Zig dependency becomes optional
-```
-
----
-
-## What Success Looks Like
-
-### Completed ✅
-- Cot compiles to Wasm (Phase 1)
-- ARC memory management works (Phase 2)
-- Phase 3 Wave 1-4 language features (methods, enums, unions, switch, imports, extern, bitwise, optionals, etc.)
-- Phase 3 Wave 5 language features (floats, closures, function pointers, error unions, defer, ARC coverage, union payloads)
-- Generics with pure monomorphization (Zig pattern: lazy, deferred, deduplicated)
-- ARC runtime upgrade: freelist allocator, cot_dealloc/realloc, memory.grow, deinit/destructors, @alloc/@dealloc/@realloc builtins
-- AOT native compilation works (Phase 4) - 39 native E2E tests pass
-- 867 tests pass, 0 failures, 0 skipped
-
-### Current Focus (Standard Library)
-- **Feature gap:** Dynamic collections (List(T), Map(K,V)), string interpolation, traits
-- **Test gap:** 120 test files vs bootstrap-0.2's 619 (see [GAP_ANALYSIS.md](GAP_ANALYSIS.md))
-- **Priority:** Standard library in Cot (generics + ARC runtime now complete)
-
-### Next (Phase 5-6)
-- Standard library written in Cot (requires Phase 3 complete)
-- Package manager (cot.land)
-- Editor support (LSP)
-
-### Long Term (Phase 7)
-- Self-hosting achieved
-- Production applications in the wild
-- Ecosystem of libraries
+| Version | Theme | Key Deliverables |
+|---------|-------|-----------------|
+| 0.3 | Make the language real | All language features, stdlib, I/O |
+| 0.4 | Make it pleasant to use | LSP, formatter, test runner, error messages |
+| 0.5 | Make it production-capable | Async, concurrency, web framework |
+| 0.6+ | Make it community-ready | Package manager, registry, cot.land |
+| 1.0 | Public release | Stable syntax, documentation, ecosystem |
 
 ---
 
@@ -401,21 +259,15 @@ std/
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Primary target | Wasm | Universal, simpler than native |
-| Memory management | ARC | No GC pauses, no borrow checker |
+| Primary competitor | TypeScript + Next.js | Only full-stack web language; Cot does it better |
+| Primary target | Wasm | Universal — browser, server, edge from same source |
+| Memory management | ARC | No GC pauses, no borrow checker, fits Wasm perfectly |
+| I/O model | WASI-designed | Standardized, portable, maps to libc on native |
 | Compiler language | Zig | Simple, fast, good Wasm support |
 | Self-hosting | Deferred | Ship first, prove later |
-| Syntax base | Zig-like | Familiar, readable, minimal |
-| Niche | Full-stack web | Clear use case, underserved market |
-
----
-
-## Reference Material
-
-- `DESIGN.md` in bootstrap-0.2: Full technical architecture
-- `README.md`: Current project status
-- `CLAUDE.md`: Instructions for AI sessions
-- `REFACTOR_PLAN.md`: Detailed progress tracking
+| Syntax | Zig-inspired | Familiar, readable, minimal |
+| Server deployment | Native binary (default) | No Wasm runtime required — AOT compiles directly |
+| Framework model | Next.js-style | @server/@client annotations, transparent compilation |
 
 ---
 
@@ -423,8 +275,9 @@ std/
 
 Cot is a pragmatic language for web developers who want:
 - Performance without complexity
-- One language for browser and server
-- Modern syntax without legacy baggage
-- Memory safety without mental overhead
+- One language for browser and server, with shared types
+- A real type system, not TypeScript's structural typing
+- Memory safety without mental overhead (ARC)
+- Native server performance without requiring an external Wasm runtime
 
-The compiler stays in Zig until the language proves itself. Self-hosting is the graduation ceremony, not the entrance exam.
+The compiler stays in Zig until the language proves itself through real applications (cot.land, cot.dev). Self-hosting is the final exam, not the entrance exam.
