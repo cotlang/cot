@@ -5,7 +5,7 @@ var destructor_called: i64 = 0
 var destructor_count: i64 = 0
 var release_count: i64 = 0
 
-struct Point {
+struct CaPoint {
     x: i64,
     y: i64
 }
@@ -20,42 +20,42 @@ impl Tracer {
     }
 }
 
-struct Box {
+struct CaBox {
     value: i64
 }
 
-fn createBox() *Box {
-    let box = new Box { value: 42 }
+fn ca_createBox() *CaBox {
+    var box = new CaBox { value: 42 }
     return box
 }
 
 test "new simple" {
-    let p = new Point { x: 40, y: 2 }
+    var p = new CaPoint { x: 40, y: 2 }
     @assert_eq(p.x + p.y, 42)
 }
 
 test "destructor called" {
     destructor_called = 0
     {
-        let t = new Tracer { value: 1 }
+        var t = new Tracer { value: 1 }
     }
     @assert_eq(destructor_called, 99)
 }
 
 test "new auto release" {
     {
-        let p = new Point { x: 99, y: 1 }
+        var p = new CaPoint { x: 99, y: 1 }
     }
     @assert(1 == 1)
 }
 
 test "retain on copy" {
-    let box = new Box { value: 42 }
-    let box2 = box
+    var box = new CaBox { value: 42 }
+    var box2 = box
     @assert_eq(box2.value, 42)
 }
 
 test "return ownership" {
-    let box = createBox()
+    var box = ca_createBox()
     @assert_eq(box.value, 42)
 }

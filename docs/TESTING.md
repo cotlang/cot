@@ -92,27 +92,31 @@ test/
     compound.cot         8 tests
     control_flow.cot    14 tests
     enum.cot             2 tests
-    extern.cot           1 test (placeholder)
-    float.cot            1 test (placeholder — f64 broken in test mode)
+    extern.cot           1 test
+    float.cot            1 test
     functions.cot       16 tests
     loops.cot            3 tests
     memory.cot           5 tests
     methods.cot          1 test
     optional.cot         3 tests
-    strings.cot          9 tests
+    strings.cot         13 tests
     structs.cot          5 tests
     switch.cot           2 tests
     types.cot            2 tests
     union.cot            4 tests
-  e2e/                # Comprehensive feature tests (8 files, ~560 tests)
+  e2e/                # Comprehensive feature tests (12 files, ~614 tests)
     features.cot       107 tests (structs, generics, traits, enums, unions, etc.)
     expressions.cot    160 tests
     functions.cot      107 tests
     control_flow.cot    82 tests
     variables.cot       40 tests
-    types.cot           42 tests
+    types.cot           46 tests
     memory.cot          17 tests
     stdlib.cot           5 tests (cross-file generic imports)
+    map.cot             25 tests
+    auto_free.cot        5 tests
+    set.cot             10 tests
+    string_interp.cot   10 tests
   test_inline.cot     # Manual smoke test
   browser/            # Pre-compiled Wasm for manual browser testing
 ```
@@ -132,10 +136,13 @@ cot test file.cot              # Compile in test mode, run, print results
 
 ## CI Integration
 
-`zig build test` runs all Zig-level tests including `native_e2e_test.zig`, which:
-1. Compiles each test file in test mode
-2. Runs the resulting executable
-3. Verifies exit code 0 and expected pass count in stderr summary
+`zig build test` runs all Zig-level tests including `native_e2e_test.zig`, which uses a batch architecture:
+
+**Batch test** (1 test): All 33 `.cot` files from `test/e2e/` and `test/cases/` are concatenated into one combined source (imports deduplicated), compiled once, linked once, and run once. Verifies exit code 0 and that all ~720 tests pass.
+
+**8 special tests** (remain isolated):
+- 5 print tests (non-test-mode, verify specific stdout output)
+- 3 inline test-mode tests (verify test runner output format, including failure isolation)
 
 ## File Map
 

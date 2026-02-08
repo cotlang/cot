@@ -5,23 +5,23 @@
 // === Helper functions ===
 
 fn cf01_check(x: i64) i64 { if x > 0 { return 1; } return 0; }
-fn cf02_sum(n: i64) i64 { let s: i64 = 0; let i: i64 = 0; while i < n { s = s + i; i = i + 1; } return s; }
+fn cf02_sum(n: i64) i64 { var s: i64 = 0; var i: i64 = 0; while i < n { s = s + i; i = i + 1; } return s; }
 fn cf03_classify(x: i64) i64 { if x > 0 { if x > 10 { return 2; } return 1; } return 0; }
 fn cf04_test_else(x: i64) i64 { if x > 0 { return 1; } else { return 0; } }
 fn cf05_classify(x: i64) i64 { if x < 0 { return 0; } else if x == 0 { return 1; } else { return 2; } }
 fn cf06_find_first_gt(limit: i64) i64 {
-    let i: i64 = 0;
+    var i: i64 = 0;
     while i < 100 { if i > limit { break; } i = i + 1; }
     return i;
 }
 fn cf07_sum_odd(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 0;
+    var sum: i64 = 0; var i: i64 = 0;
     while i < n { i = i + 1; if (i % 2) == 0 { continue; } sum = sum + i; }
     return sum;
 }
 fn cf08_mul_table_sum(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 1;
-    while i <= n { let j: i64 = 1; while j <= n { sum = sum + (i * j); j = j + 1; } i = i + 1; }
+    var sum: i64 = 0; var i: i64 = 1;
+    while i <= n { var j: i64 = 1; while j <= n { sum = sum + (i * j); j = j + 1; } i = i + 1; }
     return sum;
 }
 fn cf09_find_zero(a: i64, b: i64, c: i64) i64 {
@@ -34,18 +34,18 @@ fn cf11_deep_nest(x: i64) i64 {
     if x > 0 { if x > 5 { if x > 10 { if x > 15 { return 4; } return 3; } return 2; } return 1; } return 0;
 }
 fn cf12_sum_even(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 0;
+    var sum: i64 = 0; var i: i64 = 0;
     while i <= n { if (i % 2) == 0 { sum = sum + i; } i = i + 1; }
     return sum;
 }
 fn cf13_conditional_sum(do_sum: i64, n: i64) i64 {
-    if do_sum != 0 { let sum: i64 = 0; let i: i64 = 1; while i <= n { sum = sum + i; i = i + 1; } return sum; }
+    if do_sum != 0 { var sum: i64 = 0; var i: i64 = 1; while i <= n { sum = sum + i; i = i + 1; } return sum; }
     return 0;
 }
 fn cf14_find_product(limit: i64) i64 {
-    let result: i64 = 0; let i: i64 = 1;
+    var result: i64 = 0; var i: i64 = 1;
     while i < 10 {
-        let j: i64 = 1;
+        var j: i64 = 1;
         while j < 10 { if i * j > limit { result = i * j; break; } j = j + 1; }
         if result > 0 { break; }
         i = i + 1;
@@ -56,34 +56,34 @@ fn cf15_multi_return(x: i64) i64 {
     if x < 0 { return 0 - 1; } if x == 0 { return 0; } if x < 10 { return 1; } if x < 100 { return 2; } return 3;
 }
 fn cf16_count_down(n: i64) i64 {
-    let count: i64 = 0; let i: i64 = n; while i > 0 { count = count + 1; i = i - 1; } return count;
+    var count: i64 = 0; var i: i64 = n; while i > 0 { count = count + 1; i = i - 1; } return count;
 }
 fn cf17_gcd(a_in: i64, b_in: i64) i64 {
-    let a: i64 = a_in; let b: i64 = b_in;
-    while b != 0 { let t: i64 = b; b = a % b; a = t; }
+    var a: i64 = a_in; var b: i64 = b_in;
+    while b != 0 { var t: i64 = b; b = a % b; a = t; }
     return a;
 }
 fn cf18_count_fizzbuzz(n: i64) i64 {
-    let count: i64 = 0; let i: i64 = 1;
+    var count: i64 = 0; var i: i64 = 1;
     while i <= n { if (i % 3) == 0 { if (i % 5) == 0 { count = count + 1; } } i = i + 1; }
     return count;
 }
 fn cf19_find_first_divisible(n: i64, divisor: i64) i64 {
-    let i: i64 = 1; while i <= n { if (i % divisor) == 0 { return i; } i = i + 1; } return 0;
+    var i: i64 = 1; while i <= n { if (i % divisor) == 0 { return i; } i = i + 1; } return 0;
 }
 fn cf20_sum_digits(n: i64) i64 {
-    let sum: i64 = 0; let x: i64 = n; while x > 0 { sum = sum + (x % 10); x = x / 10; } return sum;
+    var sum: i64 = 0; var x: i64 = n; while x > 0 { sum = sum + (x % 10); x = x / 10; } return sum;
 }
-fn cf26_count_to(n: i64) i64 { let i: i64 = 0; while i < n { i = i + 1; } return i; }
+fn cf26_count_to(n: i64) i64 { var i: i64 = 0; while i < n { i = i + 1; } return i; }
 fn cf27_false_cond() i64 { if 0 != 0 { return 1; } return 0; }
 fn cf28_true_cond() i64 { if 1 == 1 { return 42; } return 0; }
 fn cf29_find_sum_gt(limit: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 1;
+    var sum: i64 = 0; var i: i64 = 1;
     while i < 100 { sum = sum + i; if sum > limit { break; } i = i + 1; }
     return sum;
 }
 fn cf30_first_divisible(n: i64, d1: i64, d2: i64) i64 {
-    let i: i64 = 1;
+    var i: i64 = 1;
     while i <= n { if (i % d1) == 0 { break; } if (i % d2) == 0 { break; } i = i + 1; }
     return i;
 }
@@ -91,28 +91,28 @@ fn cf31_classify(x: i64) i64 {
     if x < 10 { return 0; } else if x < 20 { return 1; } else if x < 30 { return 2; }
     else if x < 40 { return 3; } else if x < 50 { return 4; } else { return 5; }
 }
-fn cf32_while_zero() i64 { let count: i64 = 0; while 0 != 0 { count = count + 1; } return count; }
+fn cf32_while_zero() i64 { var count: i64 = 0; while 0 != 0 { count = count + 1; } return count; }
 fn cf33_nested_else(a: i64, b: i64) i64 {
     if a > 0 { if b > 0 { return 1; } else { return 2; } } else { if b > 0 { return 3; } else { return 4; } }
 }
 fn cf34_count_matches(limit: i64, mod_val: i64) i64 {
-    let count: i64 = 0; let i: i64 = 1;
+    var count: i64 = 0; var i: i64 = 1;
     while i <= limit { if (i % mod_val) == 0 { count = count + 1; } i = i + 1; }
     return count;
 }
 fn cf35_sum_alternating(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 1; let sign: i64 = 1;
+    var sum: i64 = 0; var i: i64 = 1; var sign: i64 = 1;
     while i <= n { sum = sum + sign * i; sign = 0 - sign; i = i + 1; }
     return sum;
 }
 fn cf36_count_odd_in_range(lo: i64, hi: i64) i64 {
-    let count: i64 = 0; let i: i64 = lo;
+    var count: i64 = 0; var i: i64 = lo;
     while i <= hi { if (i % 2) == 0 { i = i + 1; continue; } count = count + 1; i = i + 1; }
     return count;
 }
 fn cf37_sum_matrix(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 1;
-    while i <= n { let j: i64 = 1; while j <= n { sum = sum + i * j; j = j + 1; } i = i + 1; }
+    var sum: i64 = 0; var i: i64 = 1;
+    while i <= n { var j: i64 = 1; while j <= n { sum = sum + i * j; j = j + 1; } i = i + 1; }
     return sum;
 }
 fn cf45_check(x: i64) i64 {
@@ -126,30 +126,30 @@ fn cf49_classify(n: i64) i64 {
     if n < 0 { return 0 - 1; } if n == 0 { return 0; } if n < 10 { return 1; } if n < 100 { return 2; } return 3;
 }
 fn cf50_sum_until_threshold() i64 {
-    let sum: i64 = 0; let i: i64 = 0;
+    var sum: i64 = 0; var i: i64 = 0;
     while i < 100 { sum = sum + i; if sum > 20 { i = i + 1; if i > 0 { return sum; } } i = i + 1; }
     return 0;
 }
 fn cf51_find_div3(start: i64, end_val: i64) i64 {
-    let i: i64 = start; while i <= end_val { if i % 3 == 0 { return i; } i = i + 1; } return 0 - 1;
+    var i: i64 = start; while i <= end_val { if i % 3 == 0 { return i; } i = i + 1; } return 0 - 1;
 }
 fn cf52_count_in_range(start: i64, end_val: i64, divisor: i64) i64 {
-    let count: i64 = 0; let i: i64 = start;
+    var count: i64 = 0; var i: i64 = start;
     while i <= end_val { if i % divisor == 0 { count = count + 1; } i = i + 1; }
     return count;
 }
 fn cf53_sum_range(start: i64, end_val: i64) i64 {
-    let sum: i64 = 0; let i: i64 = start;
+    var sum: i64 = 0; var i: i64 = start;
     while i <= end_val { sum = sum + i; i = i + 1; }
     return sum;
 }
 fn cf54_product_range(start: i64, end_val: i64) i64 {
-    let prod: i64 = 1; let i: i64 = start;
+    var prod: i64 = 1; var i: i64 = start;
     while i <= end_val { prod = prod * i; i = i + 1; }
     return prod;
 }
 fn cf55_sum_odds(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 1;
+    var sum: i64 = 0; var i: i64 = 1;
     while i <= n { if i % 2 == 1 { sum = sum + i; } i = i + 1; }
     return sum;
 }
@@ -158,7 +158,7 @@ fn cf56_check(x: i64, y: i64) i64 {
 }
 fn cf70_is_prime(n: i64) i64 {
     if n <= 1 { return 0; } if n <= 3 { return 1; } if n % 2 == 0 { return 0; }
-    let i: i64 = 3; while i * i <= n { if n % i == 0 { return 0; } i = i + 2; }
+    var i: i64 = 3; while i * i <= n { if n % i == 0 { return 0; } i = i + 2; }
     return 1;
 }
 fn cf71_day_of_week(d: i64) i64 {
@@ -187,23 +187,23 @@ fn cf78_any_true(a: i64, b: i64, c: i64) i64 {
     if a != 0 { return 1; } if b != 0 { return 1; } if c != 0 { return 1; } return 0;
 }
 fn cf79_count_divisible(n: i64, d: i64) i64 {
-    let count: i64 = 0; let i: i64 = 1;
+    var count: i64 = 0; var i: i64 = 1;
     while i <= n { if i % d == 0 { count = count + 1; } i = i + 1; }
     return count;
 }
 fn cf80_sum_divisible(n: i64, d: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 1;
+    var sum: i64 = 0; var i: i64 = 1;
     while i <= n { if i % d == 0 { sum = sum + i; } i = i + 1; }
     return sum;
 }
 fn cf81_countdown(n: i64) i64 {
-    let result: i64 = 0; let i: i64 = n; while i > 0 { result = result + i; i = i - 1; } return result;
+    var result: i64 = 0; var i: i64 = n; while i > 0 { result = result + i; i = i - 1; } return result;
 }
 fn cf82_even_sum(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 2; while i <= n { sum = sum + i; i = i + 2; } return sum;
+    var sum: i64 = 0; var i: i64 = 2; while i <= n { sum = sum + i; i = i + 2; } return sum;
 }
 fn cf83_odd_sum(n: i64) i64 {
-    let sum: i64 = 0; let i: i64 = 1; while i <= n { sum = sum + i; i = i + 2; } return sum;
+    var sum: i64 = 0; var i: i64 = 1; while i <= n { sum = sum + i; i = i + 2; } return sum;
 }
 fn cf87_classify(x: i64) i64 {
     if x < 0 { return 0 - 1; } if x == 0 { return 0; } if x < 10 { return 1; } if x < 100 { return 2; } return 3;
@@ -220,7 +220,7 @@ fn cf92_classify_char(c: i64) i64 {
     if c >= 97 { if c <= 122 { return 2; } } return 0;
 }
 fn cf93_find_divisor(n: i64) i64 {
-    let i: i64 = 2; while i < n { if n % i == 0 { return i; } i = i + 1; } return 0 - 1;
+    var i: i64 = 2; while i < n { if n % i == 0 { return i; } i = i + 1; } return 0 - 1;
 }
 fn cf97_fizzbuzz(n: i64) i64 {
     if n % 15 == 0 { return 3; } if n % 5 == 0 { return 2; } if n % 3 == 0 { return 1; } return 0;
@@ -359,32 +359,32 @@ test "037: matrix sum" {
 }
 
 test "038: nested loop count" {
-    let sum: i64 = 0; let i: i64 = 0;
-    while i < 5 { let j: i64 = 0; while j < 5 { sum = sum + 1; j = j + 1; } i = i + 1; }
+    var sum: i64 = 0; var i: i64 = 0;
+    while i < 5 { var j: i64 = 0; while j < 5 { sum = sum + 1; j = j + 1; } i = i + 1; }
     @assert_eq(sum, 25)
 }
 
 test "039: triple nested loop" {
-    let sum: i64 = 0; let i: i64 = 0;
-    while i < 3 { let j: i64 = 0; while j < 3 { let k: i64 = 0; while k < 3 { sum = sum + 1; k = k + 1; } j = j + 1; } i = i + 1; }
+    var sum: i64 = 0; var i: i64 = 0;
+    while i < 3 { var j: i64 = 0; while j < 3 { var k: i64 = 0; while k < 3 { sum = sum + 1; k = k + 1; } j = j + 1; } i = i + 1; }
     @assert_eq(sum, 27)
 }
 
 // 040,041: skipped (malformed)
 
 test "042: and in condition" {
-    let a: i64 = 5; let b: i64 = 10; let c: i64 = 15;
+    var a: i64 = 5; var b: i64 = 10; var c: i64 = 15;
     @assert(a < b and b < c)
     @assert(a + b == c)
 }
 
 test "043: or in condition" {
-    let x: i64 = 5;
+    var x: i64 = 5;
     @assert(x == 3 or x == 5 or x == 7)
 }
 
 test "044: and or combined" {
-    let a: i64 = 1; let b: i64 = 2; let c: i64 = 3;
+    var a: i64 = 1; var b: i64 = 2; var c: i64 = 3;
     @assert((a < b and b < c) or (a == 1 and c == 3))
 }
 
@@ -406,7 +406,7 @@ test "046: grade classification" {
 // 047: skipped (malformed)
 
 test "048: deep nesting true" {
-    let x: i64 = 100;
+    var x: i64 = 100;
     @assert(x > 0)
     @assert(x > 10)
     @assert(x > 50)
@@ -453,7 +453,7 @@ test "056: two-arg classify" {
 }
 
 test "057: while with and" {
-    let i: i64 = 0; let sum: i64 = 0;
+    var i: i64 = 0; var sum: i64 = 0;
     while i < 10 and sum < 20 { sum = sum + i; i = i + 1; }
     @assert_eq(sum, 21)
 }
@@ -461,58 +461,58 @@ test "057: while with and" {
 // 058: skipped (malformed)
 
 test "059: infinite loop break" {
-    let i: i64 = 0;
+    var i: i64 = 0;
     while 1 == 1 { i = i + 1; if i >= 10 { break; } }
     @assert_eq(i, 10)
 }
 
 test "060: countdown to zero" {
-    let n: i64 = 10; while n > 0 { n = n - 1; }
+    var n: i64 = 10; while n > 0 { n = n - 1; }
     @assert_eq(n, 0)
 }
 
 test "061: step by two sum" {
-    let sum: i64 = 0; let i: i64 = 0;
+    var sum: i64 = 0; var i: i64 = 0;
     while i < 10 { sum = sum + i; i = i + 2; }
     @assert_eq(sum, 20)
 }
 
 test "062: power of two loop" {
-    let x: i64 = 1; let i: i64 = 0;
+    var x: i64 = 1; var i: i64 = 0;
     while i < 10 { x = x * 2; i = i + 1; }
     @assert_eq(x, 1024)
 }
 
 test "063: harmonic sum check" {
-    let sum: i64 = 0; let i: i64 = 1;
+    var sum: i64 = 0; var i: i64 = 1;
     while i <= 100 { sum = sum + 1000 / i; i = i + 1; }
     @assert(sum > 5000)
 }
 
 test "064: nested loop counter" {
-    let outer: i64 = 0; let i: i64 = 0;
-    while i < 5 { let j: i64 = 0; while j < 5 { outer = outer + 1; j = j + 1; } i = i + 1; }
+    var outer: i64 = 0; var i: i64 = 0;
+    while i < 5 { var j: i64 = 0; while j < 5 { outer = outer + 1; j = j + 1; } i = i + 1; }
     @assert_eq(outer, 25)
 }
 
 // 065,066: skipped (extern/malformed)
 
 test "067: alternating sign sum" {
-    let sum: i64 = 0; let i: i64 = 1; let sign: i64 = 1;
+    var sum: i64 = 0; var i: i64 = 1; var sign: i64 = 1;
     while i <= 10 { sum = sum + sign * i; sign = 0 - sign; i = i + 1; }
     @assert_eq(sum, 0 - 5)
 }
 
 test "068: fibonacci loop" {
-    let a: i64 = 0; let b: i64 = 1; let i: i64 = 0;
-    while i < 10 { let t: i64 = a + b; a = b; b = t; i = i + 1; }
+    var a: i64 = 0; var b: i64 = 1; var i: i64 = 0;
+    while i < 10 { var t: i64 = a + b; a = b; b = t; i = i + 1; }
     @assert_eq(a, 55)
 }
 
 // 069: skipped (malformed)
 
 test "070: count primes to 100" {
-    let count: i64 = 0; let n: i64 = 2;
+    var count: i64 = 0; var n: i64 = 2;
     while n <= 100 { count = count + cf70_is_prime(n); n = n + 1; }
     @assert_eq(count, 25)
 }
@@ -580,14 +580,14 @@ test "083: odd sum" {
 }
 
 test "084: nested loop 3x4" {
-    let sum: i64 = 0; let i: i64 = 0;
-    while i < 3 { let j: i64 = 0; while j < 4 { sum = sum + 1; j = j + 1; } i = i + 1; }
+    var sum: i64 = 0; var i: i64 = 0;
+    while i < 3 { var j: i64 = 0; while j < 4 { sum = sum + 1; j = j + 1; } i = i + 1; }
     @assert_eq(sum, 12)
 }
 
 test "085: triple nested 2x3x4" {
-    let sum: i64 = 0; let i: i64 = 0;
-    while i < 2 { let j: i64 = 0; while j < 3 { let k: i64 = 0; while k < 4 { sum = sum + 1; k = k + 1; } j = j + 1; } i = i + 1; }
+    var sum: i64 = 0; var i: i64 = 0;
+    while i < 2 { var j: i64 = 0; while j < 3 { var k: i64 = 0; while k < 4 { sum = sum + 1; k = k + 1; } j = j + 1; } i = i + 1; }
     @assert_eq(sum, 24)
 }
 
@@ -618,15 +618,15 @@ test "093: find divisor" {
 }
 
 test "094: triangular loop sum" {
-    let sum: i64 = 0; let i: i64 = 1;
-    while i <= 5 { let j: i64 = 1; while j <= i { sum = sum + j; j = j + 1; } i = i + 1; }
+    var sum: i64 = 0; var i: i64 = 1;
+    while i <= 5 { var j: i64 = 1; while j <= i { sum = sum + j; j = j + 1; } i = i + 1; }
     @assert_eq(sum, 35)
 }
 
 // 095: skipped (extern/malloc)
 
 test "096: multiple divisibility" {
-    let n: i64 = 24;
+    var n: i64 = 24;
     @assert(n % 2 == 0)
     @assert(n % 3 == 0)
     @assert(n % 4 == 0)
@@ -640,7 +640,7 @@ test "097: fizzbuzz classify" {
 }
 
 test "098: factorial loop" {
-    let product: i64 = 1; let i: i64 = 1;
+    var product: i64 = 1; var i: i64 = 1;
     while i <= 5 { product = product * i; i = i + 1; }
     @assert_eq(product, 120)
 }

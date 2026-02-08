@@ -11,30 +11,30 @@ test "len long" {
 }
 
 test "index first" {
-    let s = "hello"
+    var s = "hello"
     @assert_eq(s[0], 104)
 }
 
 test "index last" {
-    let s = "hello"
+    var s = "hello"
     @assert_eq(s[4], 111)
 }
 
 test "concat simple" {
-    let s1 = "hello"
-    let s2 = " world"
-    let s3 = s1 + s2
+    var s1 = "hello"
+    var s2 = " world"
+    var s3 = s1 + s2
     @assert_eq(len(s3), 11)
 }
 
 test "concat two vars" {
-    let s1 = "hello"
-    let s2 = " world"
+    var s1 = "hello"
+    var s2 = " world"
     @assert_eq(len(s1) + len(s2), 11)
 }
 
 test "concat var direct" {
-    let s = "hello!"
+    var s = "hello!"
     @assert_eq(len(s), 6)
 }
 
@@ -47,13 +47,13 @@ test "string eq literals" {
 }
 
 test "string eq vars" {
-    let a = "world"
-    let b = "world"
+    var a = "world"
+    var b = "world"
     @assert_eq(a, b)
 }
 
 test "string eq concat" {
-    let s = "hello" + " world"
+    var s = "hello" + " world"
     @assert_eq(s, "hello world")
 }
 

@@ -227,6 +227,8 @@ pub const Lowerer = struct {
         if (self.builder.func()) |fb| {
             // Store the original return type for lowerReturn to use
             if (uses_sret) fb.sret_return_type = return_type;
+            // Free-function-style destructors: fn TypeName_deinit(self: *TypeName) void
+            fb.is_destructor = std.mem.endsWith(u8, fn_decl.name, "_deinit");
             self.current_func = fb;
             self.cleanup_stack.clear();
             // SRET: add hidden first parameter (Zig firstParamSRet pattern)
@@ -282,7 +284,8 @@ pub const Lowerer = struct {
             const decl = node.asDecl() orelse continue;
             if (decl == .fn_decl) {
                 const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_block.type_name, decl.fn_decl.name });
-                try self.lowerMethodWithName(decl.fn_decl, synth_name);
+                const is_dtor = std.mem.eql(u8, decl.fn_decl.name, "deinit");
+                try self.lowerMethodWithName(decl.fn_decl, synth_name, is_dtor);
             }
         }
     }
@@ -293,17 +296,19 @@ pub const Lowerer = struct {
             const decl = node.asDecl() orelse continue;
             if (decl == .fn_decl) {
                 const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_trait.target_type, decl.fn_decl.name });
-                try self.lowerMethodWithName(decl.fn_decl, synth_name);
+                const is_dtor = std.mem.eql(u8, decl.fn_decl.name, "deinit");
+                try self.lowerMethodWithName(decl.fn_decl, synth_name, is_dtor);
             }
         }
     }
 
-    fn lowerMethodWithName(self: *Lowerer, fn_decl: ast.FnDecl, synth_name: []const u8) !void {
+    fn lowerMethodWithName(self: *Lowerer, fn_decl: ast.FnDecl, synth_name: []const u8, is_destructor: bool) !void {
         const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
         const uses_sret = self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
         self.builder.startFunc(synth_name, TypeRegistry.VOID, wasm_return_type, fn_decl.span);
         if (self.builder.func()) |fb| {
+            fb.is_destructor = is_destructor;
             if (uses_sret) fb.sret_return_type = return_type;
             self.current_func = fb;
             self.cleanup_stack.clear();
@@ -3114,6 +3119,7 @@ pub const Lowerer = struct {
         self.builder.startFunc(inst_info.concrete_name, TypeRegistry.VOID, wasm_return_type, f.span);
         if (self.builder.func()) |fb| {
             if (uses_sret) fb.sret_return_type = return_type;
+            fb.is_destructor = std.mem.eql(u8, f.name, "deinit");
             self.current_func = fb;
             self.cleanup_stack.clear();
             if (uses_sret) {

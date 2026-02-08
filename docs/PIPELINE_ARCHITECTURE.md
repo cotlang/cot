@@ -491,7 +491,7 @@ extern fn read(fd: i32, buf: *u8, count: i64) i64
 extern fn write(fd: i32, buf: *u8, count: i64) i64
 
 fn main() i64 {
-    let fd = socket(2, 1, 0)    // AF_INET, SOCK_STREAM
+    var fd = socket(2, 1, 0)    // AF_INET, SOCK_STREAM
     // ... bind, listen, accept loop ...
 }
 ```

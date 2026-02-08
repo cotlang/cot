@@ -2,11 +2,11 @@ fn get_value() i64 {
     return 42
 }
 
-fn double(x: i64) i64 {
+fn cf_double(x: i64) i64 {
     return x * 2
 }
 
-fn add(a: i64, b: i64) i64 {
+fn cf_add(a: i64, b: i64) i64 {
     return a + b
 }
 
@@ -58,11 +58,11 @@ test "simple call" {
 }
 
 test "one param" {
-    @assert_eq(double(5), 10)
+    @assert_eq(cf_double(5), 10)
 }
 
 test "two params" {
-    @assert_eq(add(3, 4), 7)
+    @assert_eq(cf_add(3, 4), 7)
 }
 
 test "three params" {
@@ -71,23 +71,23 @@ test "three params" {
 
 test "call in if" {
     var result: i64 = 0
-    if double(5) == 10 {
+    if cf_double(5) == 10 {
         result = 10
     }
     @assert_eq(result, 10)
 }
 
 test "call then return" {
-    let result: i64 = double(5)
+    var result: i64 = cf_double(5)
     @assert_eq(result, 10)
 }
 
 test "chained calls" {
-    @assert_eq(triple(add(2, 2)), 12)
+    @assert_eq(triple(cf_add(2, 2)), 12)
 }
 
 test "two calls" {
-    @assert_eq(double(2) + identity(3), 7)
+    @assert_eq(cf_double(2) + identity(3), 7)
 }
 
 test "fibonacci small" {

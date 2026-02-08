@@ -1,4 +1,4 @@
-struct Point {
+struct CbPoint {
     x: i64,
     y: i64
 }
@@ -8,7 +8,7 @@ test "sizeof basic" {
 }
 
 test "sizeof struct" {
-    @assert_eq(@sizeOf(Point), 16)
+    @assert_eq(@sizeOf(CbPoint), 16)
 }
 
 test "alignof basic" {
@@ -16,7 +16,7 @@ test "alignof basic" {
 }
 
 test "intcast basic" {
-    let big: i64 = 42
-    let small = @intCast(i32, big)
+    var big: i64 = 42
+    var small = @intCast(i32, big)
     @assert_eq(small, 42)
 }

@@ -1,14 +1,14 @@
 test "basic" {
-    let x: ?i64 = 42
+    var x: ?i64 = 42
     @assert_eq(x.?, 42)
 }
 
 test "null coalesce" {
-    let x: ?i64 = null
+    var x: ?i64 = null
     @assert_eq(x ?? 99, 99)
 }
 
 test "coalesce value" {
-    let x: ?i64 = 42
+    var x: ?i64 = 42
     @assert_eq(x ?? 99, 42)
 }

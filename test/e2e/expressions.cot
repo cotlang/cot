@@ -535,9 +535,9 @@ test "087: very large numbers" {
 }
 
 test "088: max i64" {
-    var max: i64 = 9223372036854775807;
+    var max_val: i64 = 9223372036854775807;
     var one: i64 = 1;
-    @assert(max > max - one)
+    @assert(max_val > max_val - one)
 }
 
 test "089: min i64" {

@@ -1,6 +1,8 @@
 // Combined native E2E test program — inline test format.
 // Each `test "name" { ... }` block runs independently.
 
+import "std/list"
+
 // ============================================================================
 // Shared type declarations
 // ============================================================================
@@ -59,7 +61,7 @@ fn inner() MyError!i64 {
 }
 
 fn outer() MyError!i64 {
-    let x = try inner()
+    var x = try inner()
     return x + 1
 }
 
@@ -77,11 +79,7 @@ struct BoxC(T) { value: T, count: i64 }
 struct Counter(T) { value: T }
 struct CounterM(T) { value: T, count: i64 }
 
-struct List(T) {
-    items: i64,
-    count: i64,
-    capacity: i64,
-}
+// List(T) imported from std/list
 
 // ============================================================================
 // Generic helper functions (free function pattern)
@@ -105,7 +103,7 @@ fn getSize(T)() i64 {
 }
 
 fn allocOne(T)(value: T) *T {
-    let ptr = @intToPtr(*T, @alloc(@sizeOf(T)))
+    var ptr = @intToPtr(*T, @alloc(@sizeOf(T)))
     ptr.* = value
     return ptr
 }
@@ -119,7 +117,7 @@ fn List_ensureCapacity(T)(self: *List(T), needed: i64) void {
     if self.capacity >= needed { return }
     var new_cap: i64 = 8
     if self.capacity > 0 { new_cap = self.capacity * 2 }
-    let bytes = new_cap * @sizeOf(T)
+    var bytes = new_cap * @sizeOf(T)
     if self.capacity == 0 {
         self.items = @alloc(bytes)
     } else {
@@ -130,24 +128,24 @@ fn List_ensureCapacity(T)(self: *List(T), needed: i64) void {
 
 fn List_append(T)(self: *List(T), value: T) void {
     List_ensureCapacity(T)(self, self.count + 1)
-    let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+    var ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
     ptr.* = value
     self.count = self.count + 1
 }
 
 fn List_get(T)(self: *List(T), index: i64) T {
-    let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+    var ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
     return ptr.*
 }
 
 fn List_set(T)(self: *List(T), index: i64, value: T) void {
-    let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+    var ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
     ptr.* = value
 }
 
 fn List_pop(T)(self: *List(T)) T {
     self.count = self.count - 1
-    let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+    var ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
     return ptr.*
 }
 
@@ -182,343 +180,7 @@ impl Pair(T, U) {
     }
 }
 
-impl List(T) {
-    // Go's nextslicecap: 2x for small, ~1.25x for large
-    fn ensureCapacity(self: *List(T), needed: i64) void {
-        if self.capacity >= needed { return }
-        var new_cap = self.capacity
-        var double_cap = new_cap + new_cap
-        if needed > double_cap {
-            new_cap = needed
-        } else if self.capacity < 256 {
-            new_cap = double_cap
-        } else {
-            while new_cap < needed {
-                new_cap = new_cap + (new_cap + 768) / 4
-            }
-        }
-        if new_cap < 8 { new_cap = 8 }
-        let bytes = new_cap * @sizeOf(T)
-        if self.capacity == 0 {
-            self.items = @alloc(bytes)
-        } else {
-            self.items = @realloc(self.items, bytes)
-        }
-        self.capacity = new_cap
-    }
-
-    fn append(self: *List(T), value: T) void {
-        self.ensureCapacity(self.count + 1)
-        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
-        ptr.* = value
-        self.count = self.count + 1
-    }
-
-    fn get(self: *List(T), index: i64) T {
-        if index < 0 { @trap() }
-        if index >= self.count { @trap() }
-        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
-        return ptr.*
-    }
-
-    fn set(self: *List(T), index: i64, value: T) void {
-        if index < 0 { @trap() }
-        if index >= self.count { @trap() }
-        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
-        ptr.* = value
-    }
-
-    fn pop(self: *List(T)) T {
-        if self.count == 0 { @trap() }
-        self.count = self.count - 1
-        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
-        return ptr.*
-    }
-
-    fn len(self: *List(T)) i64 { return self.count }
-    fn cap(self: *List(T)) i64 { return self.capacity }
-
-    fn last(self: *List(T)) T {
-        if self.count == 0 { @trap() }
-        let ptr = @intToPtr(*T, self.items + (self.count - 1) * @sizeOf(T))
-        return ptr.*
-    }
-
-    fn free(self: *List(T)) void {
-        if self.capacity > 0 {
-            @dealloc(self.items)
-        }
-        self.items = 0
-        self.count = 0
-        self.capacity = 0
-    }
-
-    fn clear(self: *List(T)) void {
-        self.count = 0
-    }
-
-    fn clearAndFree(self: *List(T)) void {
-        self.free()
-    }
-
-    fn insert(self: *List(T), index: i64, value: T) void {
-        if index < 0 { @trap() }
-        if index > self.count { @trap() }
-        self.ensureCapacity(self.count + 1)
-        if index < self.count {
-            let src = self.items + index * @sizeOf(T)
-            let dst = src + @sizeOf(T)
-            let bytes = (self.count - index) * @sizeOf(T)
-            @memcpy(dst, src, bytes)
-        }
-        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
-        ptr.* = value
-        self.count = self.count + 1
-    }
-
-    fn orderedRemove(self: *List(T), index: i64) T {
-        if index < 0 { @trap() }
-        if index >= self.count { @trap() }
-        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
-        let value = ptr.*
-        if index < self.count - 1 {
-            let dst = self.items + index * @sizeOf(T)
-            let src = dst + @sizeOf(T)
-            let bytes = (self.count - index - 1) * @sizeOf(T)
-            @memcpy(dst, src, bytes)
-        }
-        self.count = self.count - 1
-        return value
-    }
-
-    fn swapRemove(self: *List(T), index: i64) T {
-        if index < 0 { @trap() }
-        if index >= self.count { @trap() }
-        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
-        let value = ptr.*
-        self.count = self.count - 1
-        if index < self.count {
-            let last_ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
-            ptr.* = last_ptr.*
-        }
-        return value
-    }
-
-    fn appendSlice(self: *List(T), source: i64, num: i64) void {
-        self.ensureCapacity(self.count + num)
-        let dst = self.items + self.count * @sizeOf(T)
-        @memcpy(dst, source, num * @sizeOf(T))
-        self.count = self.count + num
-    }
-
-    fn reverse(self: *List(T)) void {
-        var i: i64 = 0
-        var j: i64 = self.count - 1
-        while i < j {
-            let pi = @intToPtr(*T, self.items + i * @sizeOf(T))
-            let pj = @intToPtr(*T, self.items + j * @sizeOf(T))
-            let tmp = pi.*
-            pi.* = pj.*
-            pj.* = tmp
-            i = i + 1
-            j = j - 1
-        }
-    }
-
-    fn clone(self: *List(T)) List(T) {
-        var new_list: List(T) = .{}
-        if self.count > 0 {
-            let bytes = self.count * @sizeOf(T)
-            new_list.items = @alloc(bytes)
-            @memcpy(new_list.items, self.items, bytes)
-            new_list.count = self.count
-            new_list.capacity = self.count
-        }
-        return new_list
-    }
-
-    // --- Tier 1: Search / comparison ---
-
-    // Go: slices.Index — linear scan, return first matching index or -1
-    fn indexOf(self: *List(T), value: T) i64 {
-        var i: i64 = 0
-        while i < self.count {
-            let ptr = @intToPtr(*T, self.items + i * @sizeOf(T))
-            if ptr.* == value { return i }
-            i = i + 1
-        }
-        return 0 - 1
-    }
-
-    // Go: slices.Contains — linear scan (inlined, not delegating to indexOf)
-    fn contains(self: *List(T), value: T) i64 {
-        var i: i64 = 0
-        while i < self.count {
-            let ptr = @intToPtr(*T, self.items + i * @sizeOf(T))
-            if ptr.* == value { return 1 }
-            i = i + 1
-        }
-        return 0
-    }
-
-    // Go: slices.Equal — element-wise comparison
-    fn equal(self: *List(T), other: *List(T)) i64 {
-        if self.count != other.count { return 0 }
-        var i: i64 = 0
-        while i < self.count {
-            let pa = @intToPtr(*T, self.items + i * @sizeOf(T))
-            let pb = @intToPtr(*T, other.items + i * @sizeOf(T))
-            if pa.* != pb.* { return 0 }
-            i = i + 1
-        }
-        return 1
-    }
-
-    // Go: s[0] — get first element, trap if empty
-    fn first(self: *List(T)) T {
-        if self.count == 0 { @trap() }
-        let ptr = @intToPtr(*T, self.items)
-        return ptr.*
-    }
-
-    // --- Tier 1: Resize / capacity ---
-
-    // Zig: resize — set length, ensure capacity if growing. New elements are undefined.
-    fn resize(self: *List(T), new_len: i64) void {
-        if new_len < 0 { @trap() }
-        if new_len > self.count {
-            self.ensureCapacity(new_len)
-        }
-        self.count = new_len
-    }
-
-    // Zig: shrinkAndFree — reduce length and realloc to release excess memory
-    fn shrinkAndFree(self: *List(T), new_len: i64) void {
-        if new_len < 0 { @trap() }
-        if new_len > self.count { @trap() }
-        self.count = new_len
-        if new_len == 0 {
-            self.free()
-        } else {
-            let bytes = new_len * @sizeOf(T)
-            self.items = @realloc(self.items, bytes)
-            self.capacity = new_len
-        }
-    }
-
-    // Zig: ensureUnusedCapacity — ensure N more elements fit
-    fn ensureUnusedCapacity(self: *List(T), n: i64) void {
-        self.ensureCapacity(self.count + n)
-    }
-
-    // --- Tier 1: Bulk write ---
-
-    // Zig: appendNTimes — append value n times
-    fn appendNTimes(self: *List(T), value: T, n: i64) void {
-        self.ensureCapacity(self.count + n)
-        var i: i64 = 0
-        while i < n {
-            let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
-            ptr.* = value
-            self.count = self.count + 1
-            i = i + 1
-        }
-    }
-
-    // Zig: insertSlice — shift right then copy block in
-    fn insertSlice(self: *List(T), index: i64, source: i64, num: i64) void {
-        if index < 0 { @trap() }
-        if index > self.count { @trap() }
-        if num <= 0 { return }
-        self.ensureCapacity(self.count + num)
-        if index < self.count {
-            let src = self.items + index * @sizeOf(T)
-            let dst = src + num * @sizeOf(T)
-            let bytes = (self.count - index) * @sizeOf(T)
-            @memcpy(dst, src, bytes)
-        }
-        let dst = self.items + index * @sizeOf(T)
-        @memcpy(dst, source, num * @sizeOf(T))
-        self.count = self.count + num
-    }
-
-    // Zig: replaceRange / Go: slices.Replace
-    fn replaceRange(self: *List(T), start: i64, range_len: i64, source: i64, num: i64) void {
-        if start < 0 { @trap() }
-        if range_len < 0 { @trap() }
-        if start + range_len > self.count { @trap() }
-        let tail_start = start + range_len
-        let tail_len = self.count - tail_start
-        let new_count = self.count - range_len + num
-        if num > range_len {
-            // Growing: need more space, shift tail right
-            self.ensureCapacity(new_count)
-            if tail_len > 0 {
-                let src = self.items + tail_start * @sizeOf(T)
-                let dst = self.items + (start + num) * @sizeOf(T)
-                let bytes = tail_len * @sizeOf(T)
-                @memcpy(dst, src, bytes)
-            }
-        } else if num < range_len {
-            // Shrinking: shift tail left
-            if tail_len > 0 {
-                let src = self.items + tail_start * @sizeOf(T)
-                let dst = self.items + (start + num) * @sizeOf(T)
-                let bytes = tail_len * @sizeOf(T)
-                @memcpy(dst, src, bytes)
-            }
-        }
-        // Copy new elements into place
-        if num > 0 {
-            let dst = self.items + start * @sizeOf(T)
-            @memcpy(dst, source, num * @sizeOf(T))
-        }
-        self.count = new_count
-    }
-
-    // --- Tier 2 ---
-
-    // Go: slices.Delete(s, i, j) — remove range [start, end), preserve order
-    fn deleteRange(self: *List(T), start: i64, end: i64) void {
-        if start < 0 { @trap() }
-        if end > self.count { @trap() }
-        if start > end { @trap() }
-        let removed = end - start
-        if removed == 0 { return }
-        if end < self.count {
-            let src = self.items + end * @sizeOf(T)
-            let dst = self.items + start * @sizeOf(T)
-            let bytes = (self.count - end) * @sizeOf(T)
-            @memcpy(dst, src, bytes)
-        }
-        self.count = self.count - removed
-    }
-
-    fn isEmpty(self: *List(T)) i64 {
-        if self.count == 0 { return 1 }
-        return 0
-    }
-
-    // Go: slices.Compact — remove consecutive duplicate elements in-place
-    fn compact(self: *List(T)) void {
-        if self.count < 2 { return }
-        var write: i64 = 1
-        var read: i64 = 1
-        while read < self.count {
-            let curr = @intToPtr(*T, self.items + read * @sizeOf(T))
-            let prev = @intToPtr(*T, self.items + (write - 1) * @sizeOf(T))
-            if curr.* != prev.* {
-                if write != read {
-                    let dst = @intToPtr(*T, self.items + write * @sizeOf(T))
-                    dst.* = curr.*
-                }
-                write = write + 1
-            }
-            read = read + 1
-        }
-        self.count = write
-    }
-}
+// List(T) impl imported from std/list
 
 // ============================================================================
 // Tests: Baseline
@@ -533,13 +195,13 @@ test "baseline" {
     @assert_eq(2 + 3 * 4, 14)
 
     // Variables
-    let x = 10
-    let y = 5
+    var x = 10
+    var y = 5
     @assert_eq(x + y, 15)
 
     // If/else
     if 10 > 5 {
-        let ok = 1
+        var ok = 1
         @assert_eq(ok, 1)
     } else {
         @assert(1 == 0)
@@ -561,36 +223,36 @@ test "baseline" {
 
 test "phase3" {
     // Char literals
-    let c1 = 'A'
+    var c1 = 'A'
     @assert_eq(c1, 65)
-    let c2 = '\n'
+    var c2 = '\n'
     @assert_eq(c2, 10)
 
     // Type alias + struct
-    let coord: Coord = Coord { .x = 10, .y = 20 }
+    var coord: Coord = Coord { .x = 10, .y = 20 }
     @assert_eq(coord.x + coord.y, 30)
 
     // Builtins
     @assert_eq(@sizeOf(i64), 8)
     @assert_eq(@sizeOf(Point), 16)
     @assert_eq(@alignOf(i64), 8)
-    let big: i64 = 42
-    let small = @intCast(i32, big)
+    var big: i64 = 42
+    var small = @intCast(i32, big)
     @assert_eq(small, 42)
 
     // Enums
-    let color: i64 = Color.Green
+    var color: i64 = Color.Green
     @assert_eq(color, 1)
-    let status: i64 = Status.Error
+    var status: i64 = Status.Error
     @assert_eq(status, 100)
 
     // Union
-    let state: i64 = State.Running
+    var state: i64 = State.Running
     @assert_eq(state, 1)
 
     // Bitwise ops
-    let a = 255
-    let b = 15
+    var a = 255
+    var b = 15
     @assert_eq(a & b, 15)
     @assert_eq((240 | 15) - 200, 55)
     @assert_eq((a ^ b) & 255, 240)
@@ -611,15 +273,15 @@ test "phase3" {
     @assert_eq(y, 15)
 
     // Optional types
-    let opt1: ?i64 = 42
+    var opt1: ?i64 = 42
     @assert_eq(opt1.?, 42)
-    let opt2: ?i64 = null
+    var opt2: ?i64 = null
     @assert_eq(opt2 ?? 99, 99)
-    let opt3: ?i64 = 42
+    var opt3: ?i64 = 42
     @assert_eq(opt3 ?? 99, 42)
 
     // Switch
-    let sw1 = switch 2 {
+    var sw1 = switch 2 {
         1 => 10,
         2 => 20,
         3 => 30,
@@ -627,8 +289,8 @@ test "phase3" {
     }
     @assert_eq(sw1, 20)
 
-    let level = Level.Medium
-    let sw2 = switch level {
+    var level = Level.Medium
+    var sw2 = switch level {
         Level.Low => 1,
         Level.Medium => 50,
         Level.High => 99,
@@ -646,8 +308,8 @@ test "func_call" {
 }
 
 test "float_locals" {
-    let x: f64 = 3.14
-    let y: f64 = 0.0
+    var x: f64 = 3.14
+    var y: f64 = 0.0
 }
 
 // ============================================================================
@@ -655,25 +317,25 @@ test "float_locals" {
 // ============================================================================
 
 test "union_payload" {
-    let r: Result = Result.Ok(42)
+    var r: Result = Result.Ok(42)
     @assert_eq(r.tag, 0)
-    let val = r.Ok
+    var val = r.Ok
     @assert_eq(val, 42)
-    let e: Result = Result.Err(99)
+    var e: Result = Result.Err(99)
     @assert_eq(e.tag, 1)
 }
 
 test "union_mixed" {
-    let e1: Event = Event.Hover
+    var e1: Event = Event.Hover
     @assert_eq(e1.tag, 1)
-    let e2: Event = Event.Click(100)
+    var e2: Event = Event.Click(100)
     @assert_eq(e2.tag, 0)
-    let clicks = e2.Click
+    var clicks = e2.Click
     @assert_eq(clicks, 100)
 }
 
 test "union_switch_no_capture" {
-    let r: Result = Result.Ok(42)
+    var r: Result = Result.Ok(42)
     var matched: i64 = 0
     switch r {
         Result.Ok => { matched = 1 },
@@ -683,7 +345,7 @@ test "union_switch_no_capture" {
 }
 
 test "union_switch_capture" {
-    let r: Result = Result.Ok(42)
+    var r: Result = Result.Ok(42)
     var matched: i64 = 0
     var captured: i64 = 0
     switch r {
@@ -702,14 +364,14 @@ test "union_switch_capture" {
 // ============================================================================
 
 test "error_union_catch" {
-    let result = mayFail(-1) catch 99
+    var result = mayFail(-1) catch 99
     @assert_eq(result, 99)
-    let success = mayFail(5) catch 99
+    var success = mayFail(5) catch 99
     @assert_eq(success, 10)
 }
 
 test "error_union_try" {
-    let result = outer() catch 42
+    var result = outer() catch 42
     @assert_eq(result, 42)
 }
 
@@ -746,37 +408,37 @@ test "defer_lifo" {
 // ============================================================================
 
 test "arc_func_return_new" {
-    let p = createFoo(42)
+    var p = createFoo(42)
     @assert_eq(p.x, 42)
 }
 
 test "arc_copy_local" {
-    let p = new Foo { x: 10 }
-    let q = p
+    var p = new Foo { x: 10 }
+    var q = p
     @assert_eq(q.x, 10)
 }
 
 test "arc_reassignment" {
     var p = new Foo { x: 1 }
-    let q = new Foo { x: 2 }
+    var q = new Foo { x: 2 }
     p = q
     @assert_eq(p.x, 2)
 }
 
 test "arc_return_forward" {
-    let f = makeFoo(77)
+    var f = makeFoo(77)
     @assert_eq(f.x, 77)
 }
 
 test "arc_dealloc_basic" {
-    let p = new Foo { x: 42 }
+    var p = new Foo { x: 42 }
     @assert_eq(p.x, 42)
 }
 
 test "arc_dealloc_multi" {
-    let a = makeFoo(10)
-    let b = makeFoo(20)
-    let c = makeFoo(12)
+    var a = makeFoo(10)
+    var b = makeFoo(20)
+    var c = makeFoo(12)
     @assert_eq(a.x + b.x + c.x, 42)
 }
 
@@ -785,22 +447,22 @@ test "arc_dealloc_multi" {
 // ============================================================================
 
 test "builtin_alloc_dealloc" {
-    let ptr = @alloc(8)
+    var ptr = @alloc(8)
     @dealloc(ptr)
 }
 
 test "builtin_realloc" {
-    let ptr = @alloc(8)
-    let ptr2 = @realloc(ptr, 16)
+    var ptr = @alloc(8)
+    var ptr2 = @realloc(ptr, 16)
     @dealloc(ptr2)
 }
 
 test "freelist_reuse" {
-    let p1 = @alloc(8)
+    var p1 = @alloc(8)
     @dealloc(p1)
-    let p2 = @alloc(8)
+    var p2 = @alloc(8)
     @dealloc(p2)
-    let p3 = @alloc(8)
+    var p3 = @alloc(8)
     @dealloc(p3)
 }
 
@@ -809,24 +471,24 @@ test "freelist_reuse" {
 // ============================================================================
 
 test "deinit_basic" {
-    let p = new DFoo { x: 42 }
+    var p = new DFoo { x: 42 }
     @assert_eq(p.x, 42)
 }
 
 test "deinit_no_use" {
-    let p = new DFoo { x: 42 }
+    var p = new DFoo { x: 42 }
 }
 
 test "deinit_mixed" {
-    let f = new DFoo { x: 10 }
-    let b = new Bar { y: 20 }
+    var f = new DFoo { x: 10 }
+    var b = new Bar { y: 20 }
     @assert_eq(f.x + b.y, 30)
 }
 
 test "deinit_alloc_reuse" {
-    let p1 = createDFoo(10)
-    let v1 = p1.x
-    let p2 = createDFoo(20)
+    var p1 = createDFoo(10)
+    var v1 = p1.x
+    var p2 = createDFoo(20)
     @assert_eq(v1 + p2.x, 30)
 }
 
@@ -835,7 +497,7 @@ test "deinit_alloc_reuse" {
 // ============================================================================
 
 test "fnptr_basic" {
-    let f = add
+    var f = add
     @assert_eq(f(3, 4), 7)
 }
 
@@ -845,9 +507,9 @@ test "fnptr_param" {
 
 test "fnptr_reassign" {
     var f = inc
-    let a = f(10)
+    var a = f(10)
     f = dec
-    let b = f(10)
+    var b = f(10)
     @assert_eq(a + b, 20)
 }
 
@@ -856,26 +518,26 @@ test "fnptr_reassign" {
 // ============================================================================
 
 test "closure_no_capture" {
-    let f = fn(x: i64) i64 { return x * 2 }
+    var f = fn(x: i64) i64 { return x * 2 }
     @assert_eq(f(21), 42)
 }
 
 test "closure_capture" {
-    let x: i64 = 10
-    let f = fn(y: i64) i64 { return x + y }
+    var x: i64 = 10
+    var f = fn(y: i64) i64 { return x + y }
     @assert_eq(f(5), 15)
 }
 
 test "closure_multi_capture" {
-    let a: i64 = 3
-    let b: i64 = 7
-    let f = fn(x: i64) i64 { return a + b + x }
+    var a: i64 = 3
+    var b: i64 = 7
+    var f = fn(x: i64) i64 { return a + b + x }
     @assert_eq(f(10), 20)
 }
 
 test "closure_passed" {
-    let offset: i64 = 100
-    let g = fn(x: i64) i64 { return x + offset }
+    var offset: i64 = 100
+    var g = fn(x: i64) i64 { return x + offset }
     @assert_eq(apply_fn(g, 5), 105)
 }
 
@@ -895,8 +557,8 @@ test "generic_struct_basic" {
 }
 
 test "generic_fn_multi_inst" {
-    let x: i64 = generic_add(i64)(10, 20)
-    let y: i32 = generic_add(i32)(3, 4)
+    var x: i64 = generic_add(i64)(10, 20)
+    var y: i32 = generic_add(i32)(3, 4)
     @assert_eq(x + y, 37)
 }
 
@@ -911,8 +573,8 @@ test "sizeof_generic" {
 }
 
 test "alloc_inttoptr_generic" {
-    let p = allocOne(i64)(42)
-    let result = p.*
+    var p = allocOne(i64)(42)
+    var result = p.*
     @dealloc(@ptrToInt(p))
     @assert_eq(result, 42)
 }
@@ -938,9 +600,9 @@ test "list_basic" {
     List_append(i64)(&list, 10)
     List_append(i64)(&list, 20)
     List_append(i64)(&list, 30)
-    let a = List_get(i64)(&list, 0)
-    let b = List_get(i64)(&list, 1)
-    let c = List_get(i64)(&list, 2)
+    var a = List_get(i64)(&list, 0)
+    var b = List_get(i64)(&list, 1)
+    var c = List_get(i64)(&list, 2)
     @assert_eq(a + b + c, 60)
 }
 
@@ -954,8 +616,8 @@ test "list_growth" {
         List_append(i64)(&list, i)
         i = i + 1
     }
-    let first = List_get(i64)(&list, 0)
-    let last = List_get(i64)(&list, 19)
+    var first = List_get(i64)(&list, 0)
+    var last = List_get(i64)(&list, 19)
     @assert_eq(first + last + list.count, 39)
 }
 
@@ -967,7 +629,7 @@ test "list_pop" {
     List_append(i64)(&list, 10)
     List_append(i64)(&list, 20)
     List_append(i64)(&list, 30)
-    let popped = List_pop(i64)(&list)
+    var popped = List_pop(i64)(&list)
     @assert_eq(popped + list.count, 32)
 }
 
@@ -994,8 +656,8 @@ test "list_multi_type" {
     b.capacity = 0
     List_append(i64)(&a, 100)
     List_append(i32)(&b, 5)
-    let x = List_get(i64)(&a, 0)
-    let y: i64 = List_get(i32)(&b, 0)
+    var x = List_get(i64)(&a, 0)
+    var y: i64 = List_get(i32)(&b, 0)
     @assert_eq(x + y, 105)
 }
 
@@ -1011,9 +673,9 @@ test "list_impl_basic" {
     list.append(10)
     list.append(20)
     list.append(30)
-    let a = list.get(0)
-    let b = list.get(1)
-    let c = list.get(2)
+    var a = list.get(0)
+    var b = list.get(1)
+    var c = list.get(2)
     @assert_eq(a + b + c, 60)
 }
 
@@ -1027,8 +689,8 @@ test "list_impl_growth" {
         list.append(i)
         i = i + 1
     }
-    let first = list.get(0)
-    let last = list.get(19)
+    var first = list.get(0)
+    var last = list.get(19)
     @assert_eq(first + last + list.count, 39)
 }
 
@@ -1040,7 +702,7 @@ test "list_impl_pop" {
     list.append(10)
     list.append(20)
     list.append(30)
-    let popped = list.pop()
+    var popped = list.pop()
     @assert_eq(popped + list.count, 32)
 }
 
@@ -1067,8 +729,8 @@ test "list_impl_multi_type" {
     b.capacity = 0
     a.append(100)
     b.append(5)
-    let x = a.get(0)
-    let y: i64 = b.get(0)
+    var x = a.get(0)
+    var y: i64 = b.get(0)
     @assert_eq(x + y, 105)
 }
 
@@ -1097,8 +759,8 @@ test "generic_impl_multi_inst" {
     a.value = 30
     var b: Box(i32) = undefined
     b.value = 12
-    let x: i64 = a.get()
-    let y: i64 = b.get()
+    var x: i64 = a.get()
+    var y: i64 = b.get()
     @assert_eq(x + y, 42)
 }
 
@@ -1143,7 +805,7 @@ test "zero_init_generic" {
 }
 
 test "new_generic" {
-    let p = new Pair(i64, i64) { first: 30, second: 12 }
+    var p = new Pair(i64, i64) { first: 30, second: 12 }
     @assert_eq(p.first + p.second, 42)
 }
 
@@ -1152,18 +814,18 @@ test "new_generic" {
 // ============================================================================
 
 test "memcpy_basic" {
-    let src = @alloc(24)
-    let dst = @alloc(24)
-    let p0 = @intToPtr(*i64, src)
+    var src = @alloc(24)
+    var dst = @alloc(24)
+    var p0 = @intToPtr(*i64, src)
     p0.* = 10
-    let p1 = @intToPtr(*i64, src + 8)
+    var p1 = @intToPtr(*i64, src + 8)
     p1.* = 20
-    let p2 = @intToPtr(*i64, src + 16)
+    var p2 = @intToPtr(*i64, src + 16)
     p2.* = 30
     @memcpy(dst, src, 24)
-    let d0 = @intToPtr(*i64, dst)
-    let d1 = @intToPtr(*i64, dst + 8)
-    let d2 = @intToPtr(*i64, dst + 16)
+    var d0 = @intToPtr(*i64, dst)
+    var d1 = @intToPtr(*i64, dst + 8)
+    var d2 = @intToPtr(*i64, dst + 16)
     @assert_eq(d0.*, 10)
     @assert_eq(d1.*, 20)
     @assert_eq(d2.*, 30)
@@ -1172,7 +834,7 @@ test "memcpy_basic" {
 }
 
 test "memcpy_zero_length" {
-    let buf = @alloc(8)
+    var buf = @alloc(8)
     @intToPtr(*i64, buf).* = 42
     @memcpy(buf, buf, 0)
     @assert_eq(@intToPtr(*i64, buf).*, 42)
@@ -1184,7 +846,7 @@ test "memcpy_zero_length" {
 // ============================================================================
 
 test "trap_not_reached" {
-    let x: i64 = 42
+    var x: i64 = 42
     if x == 0 { @trap() }
 }
 
@@ -1208,13 +870,13 @@ fn slice_sum(items: []i64) i64 {
 
 test "slice_param_basic" {
     var arr = [10, 20, 30]
-    let s = arr[0:3]
+    var s = arr[0:3]
     @assert_eq(get_slice_len(s), 3)
 }
 
 test "slice_param_iteration" {
     var arr = [10, 20, 30, 40, 50]
-    let s = arr[1:4]
+    var s = arr[1:4]
     @assert_eq(slice_sum(s), 90)
 }
 
@@ -1471,7 +1133,7 @@ fn make_pair() (i64, i64) {
 }
 
 test "sret_tuple_return" {
-    let p = make_pair()
+    var p = make_pair()
     @assert_eq(p.0, 10)
     @assert_eq(p.1, 20)
     @assert_eq(p.0 + p.1, 30)
@@ -1482,19 +1144,19 @@ fn make_point() Point {
 }
 
 test "sret_struct_return" {
-    let p = make_point()
+    var p = make_point()
     @assert_eq(p.x, 10)
     @assert_eq(p.y, 20)
     @assert_eq(p.x + p.y, 30)
 }
 
 fn double_pair() (i64, i64) {
-    let p = make_pair()
+    var p = make_pair()
     return (p.0 * 2, p.1 * 2)
 }
 
 test "sret_chain" {
-    let d = double_pair()
+    var d = double_pair()
     @assert_eq(d.0, 20)
     @assert_eq(d.1, 40)
     @assert_eq(d.0 + d.1, 60)
@@ -1557,7 +1219,7 @@ test "list_clear" {
     list.append(10)
     list.append(20)
     list.append(30)
-    let cap_before = list.cap()
+    var cap_before = list.cap()
     list.clear()
     @assert_eq(list.len(), 0)
     // Capacity retained after clear
@@ -1598,13 +1260,13 @@ test "list_ordered_remove" {
     list.append(40)
     list.append(50)
     // Remove from beginning
-    let first = list.orderedRemove(0)
+    var first = list.orderedRemove(0)
     @assert_eq(first, 10)
     // Now: [20, 30, 40, 50]
     @assert_eq(list.len(), 4)
     @assert_eq(list.get(0), 20)
     // Remove from middle
-    let mid = list.orderedRemove(1)
+    var mid = list.orderedRemove(1)
     @assert_eq(mid, 30)
     // Now: [20, 40, 50]
     @assert_eq(list.len(), 3)
@@ -1621,7 +1283,7 @@ test "list_swap_remove" {
     list.append(30)
     list.append(40)
     // SwapRemove index 1 (value 20): last element (40) moves to index 1
-    let removed = list.swapRemove(1)
+    var removed = list.swapRemove(1)
     @assert_eq(removed, 20)
     // Now: [10, 40, 30]
     @assert_eq(list.len(), 3)
@@ -1629,7 +1291,7 @@ test "list_swap_remove" {
     @assert_eq(list.get(1), 40)
     @assert_eq(list.get(2), 30)
     // SwapRemove last element (no swap needed)
-    let last = list.swapRemove(2)
+    var last = list.swapRemove(2)
     @assert_eq(last, 30)
     @assert_eq(list.len(), 2)
     list.free()
@@ -1677,14 +1339,14 @@ test "list_last" {
     @assert_eq(list.last(), 20)
     list.append(30)
     @assert_eq(list.last(), 30)
-    let popped = list.pop()
+    var popped = list.pop()
     @assert_eq(list.last(), 20)
     list.free()
 }
 
 test "memcpy_overlap" {
     // Test overlapping @memcpy (memmove semantics) — used by insert/orderedRemove
-    let buf = @alloc(40)
+    var buf = @alloc(40)
     // Write [10, 20, 30, 40, 50] at positions 0-4
     @intToPtr(*i64, buf).* = 10
     @intToPtr(*i64, buf + 8).* = 20
@@ -1814,7 +1476,7 @@ test "list_insert_slice" {
     list.append(1)
     list.append(5)
     // Prepare source buffer [2, 3, 4]
-    let src = @alloc(24)
+    var src = @alloc(24)
     @intToPtr(*i64, src).* = 2
     @intToPtr(*i64, src + 8).* = 3
     @intToPtr(*i64, src + 16).* = 4
@@ -1839,7 +1501,7 @@ test "list_replace_range" {
     list.append(4)
     list.append(5)
     // Replace [1..3) (elements 2,3) with [20, 30, 40] — growing
-    let src1 = @alloc(24)
+    var src1 = @alloc(24)
     @intToPtr(*i64, src1).* = 20
     @intToPtr(*i64, src1 + 8).* = 30
     @intToPtr(*i64, src1 + 16).* = 40
@@ -1854,7 +1516,7 @@ test "list_replace_range" {
     @assert_eq(list.get(4), 4)
     @assert_eq(list.get(5), 5)
     // Replace [1..4) (elements 20,30,40) with [99] — shrinking
-    let src2 = @alloc(8)
+    var src2 = @alloc(8)
     @intToPtr(*i64, src2).* = 99
     list.replaceRange(1, 3, src2, 1)
     @dealloc(src2)
@@ -1875,7 +1537,7 @@ test "list_shrink_and_free" {
     list.append(30)
     list.append(40)
     list.append(50)
-    let old_cap = list.cap()
+    var old_cap = list.cap()
     list.shrinkAndFree(3)
     @assert_eq(list.len(), 3)
     @assert_eq(list.cap(), 3)

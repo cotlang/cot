@@ -1,9 +1,9 @@
 test "char simple" {
-    let c: i64 = 'A'
+    var c: i64 = 'A'
     @assert_eq(c, 65)
 }
 
 test "char escape" {
-    let c: i64 = '\n'
+    var c: i64 = '\n'
     @assert_eq(c, 10)
 }

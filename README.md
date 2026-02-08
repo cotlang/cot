@@ -37,8 +37,8 @@ import "std/list"
 struct Point { x: i64, y: i64 }
 
 fn distance_sq(a: *Point, b: *Point) i64 {
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
+    var dx = b.x - a.x;
+    var dy = b.y - a.y;
     return dx * dx + dy * dy;
 }
 

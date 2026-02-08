@@ -49,7 +49,7 @@ test "if else" {
 }
 
 test "nested if" {
-    let x: i64 = 15
+    var x: i64 = 15
     var result: i64 = 0
     if x > 10 {
         if x > 20 {

@@ -1,17 +1,17 @@
-struct Point {
+struct CtPoint {
     x: i64,
     y: i64
 }
 
-type Int = i64
-type Coord = Point
+type CtInt = i64
+type CtCoord = CtPoint
 
 test "type alias" {
-    let x: Int = 42
+    var x: CtInt = 42
     @assert_eq(x, 42)
 }
 
 test "struct alias" {
-    let pt = Coord { .x = 10, .y = 20 }
+    var pt = CtCoord { .x = 10, .y = 20 }
     @assert_eq(pt.x + pt.y, 30)
 }

@@ -1,12 +1,12 @@
-enum Level {
+enum CswLevel {
     Low = 10,
     Medium = 50,
     High = 100
 }
 
-test "simple" {
-    let x: i64 = 2
-    let result = switch x {
+test "switch simple" {
+    var x: i64 = 2
+    var result = switch x {
         1 => 10,
         2 => 20,
         3 => 30,
@@ -15,12 +15,12 @@ test "simple" {
     @assert_eq(result, 20)
 }
 
-test "enum switch" {
-    let lvl = Level.Medium
-    let val = switch lvl {
-        Level.Low => 1,
-        Level.Medium => 50,
-        Level.High => 99,
+test "switch enum" {
+    var lvl = CswLevel.Medium
+    var val = switch lvl {
+        CswLevel.Low => 1,
+        CswLevel.Medium => 50,
+        CswLevel.High => 99,
         else => 0,
     }
     @assert_eq(val, 50)

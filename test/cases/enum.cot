@@ -1,21 +1,21 @@
-enum Color {
+enum CeColor {
     Red,
     Green,
     Blue
 }
 
-enum Status {
+enum CeStatus {
     Ok = 0,
     Warning = 50,
     Error = 100
 }
 
-test "simple" {
-    let c = Color.Green
+test "enum simple" {
+    var c = CeColor.Green
     @assert_eq(c, 1)
 }
 
-test "explicit value" {
-    let s = Status.Error
+test "enum explicit value" {
+    var s = CeStatus.Error
     @assert_eq(s, 100)
 }

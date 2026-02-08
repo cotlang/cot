@@ -171,6 +171,7 @@ pub const Func = struct {
     span: Span,
     frame_size: i32 = 0,
     string_literals: []const []const u8 = &.{},
+    is_destructor: bool = false,
 
     pub fn getNode(self: *const Func, idx: NodeIndex) *const Node { return &self.nodes[idx]; }
     pub fn getLocal(self: *const Func, idx: LocalIdx) *const Local { return &self.locals[idx]; }
@@ -193,6 +194,9 @@ pub const FuncBuilder = struct {
     /// Original return type for SRET functions (callee uses this to know
     /// what type to write to the __sret pointer). null if not SRET.
     sret_return_type: ?TypeIndex = null,
+    /// Set for impl methods named "deinit" — used by driver.zig to register ARC destructors
+    /// without scanning function names (which false-positives on generic methods).
+    is_destructor: bool = false,
 
     const ShadowEntry = struct { name: []const u8, old_idx: ?LocalIdx };
 
@@ -373,6 +377,7 @@ pub const FuncBuilder = struct {
             .span = self.span,
             .frame_size = (frame_offset + 96 + 15) & ~@as(i32, 15),
             .string_literals = try self.string_literals.toOwnedSlice(self.allocator),
+            .is_destructor = self.is_destructor,
         };
     }
 };

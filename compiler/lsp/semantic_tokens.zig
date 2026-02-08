@@ -630,7 +630,7 @@ pub fn getSemanticTokens(allocator: Allocator, result: *AnalysisResult) ![]const
 // ============================================================================
 
 test "semantic tokens: struct init with field access" {
-    // Use page_allocator since analysis.zig's deinit order doesn't work with GPA's strict checking
+    // Use page_allocator since analysis arena deinit doesn't work with GPA's strict checking
     const allocator = std.heap.page_allocator;
 
     const src =
@@ -643,7 +643,6 @@ test "semantic tokens: struct init with field access" {
     ;
 
     var result = analysis_mod.analyze(allocator, src, "test.cot") orelse return error.AnalysisFailed;
-    // Note: don't deinit since analysis arena deinit has issues in test context
 
     // Collect raw tokens (not delta-encoded) so we can inspect them
     var collector = TokenCollector{
@@ -656,28 +655,55 @@ test "semantic tokens: struct init with field access" {
         .allocator = allocator,
         .param_names = .{},
     };
-    defer collector.tokens.deinit(allocator);
 
     for (result.tree.getRootDecls()) |decl_idx| {
         collector.walkNode(decl_idx);
     }
 
-    // Sort by offset
     std.sort.block(RawToken, collector.tokens.items, {}, struct {
         fn f(_: void, a: RawToken, b: RawToken) bool {
             return a.offset < b.offset;
         }
     }.f);
 
-    // Print all tokens unconditionally for debugging
     const tokens = collector.tokens.items;
-    std.debug.print("\n=== Semantic Tokens ({d} total) ===\n", .{tokens.len});
+
+    // Verify key tokens exist
+    var found_struct_p_decl = false;
+    var found_field_x_decl = false;
+    var found_fn_add = false;
+    var found_param_self_decl = false;
+    var found_param_other_decl = false;
+    var found_field_init_x = false;
+    var found_self_in_body = false;
+    var found_field_access_x = false;
+
     for (tokens) |tok| {
         const text = src[tok.offset .. tok.offset + tok.length];
-        const type_name = if (tok.token_type < token_type_legend.len) token_type_legend[tok.token_type] else "?";
-        std.debug.print("  [{d}..{d}] \"{s}\" → {s} (mods={d})\n", .{ tok.offset, tok.offset + tok.length, text, type_name, tok.modifiers });
+        // struct P declaration
+        if (std.mem.eql(u8, text, "P") and tok.token_type == @intFromEnum(TokenType.@"struct") and tok.modifiers & MOD_DECLARATION != 0) found_struct_p_decl = true;
+        // field x declaration
+        if (std.mem.eql(u8, text, "x") and tok.token_type == @intFromEnum(TokenType.property) and tok.modifiers & MOD_DECLARATION != 0) found_field_x_decl = true;
+        // fn add
+        if (std.mem.eql(u8, text, "add") and tok.token_type == @intFromEnum(TokenType.function)) found_fn_add = true;
+        // self param declaration
+        if (std.mem.eql(u8, text, "self") and tok.token_type == @intFromEnum(TokenType.parameter) and tok.modifiers & MOD_DECLARATION != 0) found_param_self_decl = true;
+        // other param declaration
+        if (std.mem.eql(u8, text, "other") and tok.token_type == @intFromEnum(TokenType.parameter) and tok.modifiers & MOD_DECLARATION != 0) found_param_other_decl = true;
+        // field init name "x" (property, no declaration flag)
+        if (std.mem.eql(u8, text, "x") and tok.token_type == @intFromEnum(TokenType.property) and tok.modifiers == 0) found_field_init_x = true;
+        // self used in body as parameter (no declaration flag)
+        if (std.mem.eql(u8, text, "self") and tok.token_type == @intFromEnum(TokenType.parameter) and tok.modifiers == 0) found_self_in_body = true;
+        // field access .x → property
+        if (std.mem.eql(u8, text, "x") and tok.token_type == @intFromEnum(TokenType.property)) found_field_access_x = true;
     }
-    std.debug.print("=================================\n", .{});
 
-    try std.testing.expect(tokens.len > 0);
+    try std.testing.expect(found_struct_p_decl);
+    try std.testing.expect(found_field_x_decl);
+    try std.testing.expect(found_fn_add);
+    try std.testing.expect(found_param_self_decl);
+    try std.testing.expect(found_param_other_decl);
+    try std.testing.expect(found_field_init_x);
+    try std.testing.expect(found_self_in_body);
+    try std.testing.expect(found_field_access_x);
 }

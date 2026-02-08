@@ -125,14 +125,14 @@ Two categories:
 ## Testing
 
 ```bash
-zig build test              # All tests (~660 Cot tests via native_e2e_test.zig)
+zig build test              # All tests (~720 Cot tests via native_e2e_test.zig)
 cot test file.cot           # Run inline tests in a single file
 COT_DEBUG=codegen zig build test  # With debug output
 ```
 
 **Test directories:**
-- `test/cases/` — Category unit tests (21 files, ~100 tests)
-- `test/e2e/` — Comprehensive feature tests (8 files, ~560 tests)
+- `test/cases/` — Category unit tests (21 files, ~106 tests)
+- `test/e2e/` — Comprehensive feature tests (12 files, ~614 tests)
 - All tests use inline `test "name" { @assert_eq(...) }` format
 - See `docs/TESTING.md` for full details
 
@@ -169,7 +169,9 @@ try list.append(allocator, 42);
 
 **DO:**
 - Run `zig build test` after every change
-- Reinstall editor extensions after modifying anything in `editors/` (see Editor Extensions section)
+- After changing `compiler/lsp/`: run `zig build` to update the LSP binary
+- After changing `editors/vscode/`: rebuild + reinstall extension (see Editor Extensions & LSP section)
+- After changing either: do BOTH — `zig build` AND reinstall extension
 - Check `docs/specs/WASM_3_0_REFERENCE.md` when touching Wasm codegen
 - Check `docs/PIPELINE_ARCHITECTURE.md` for full pipeline reference map
 - Reference `bootstrap-0.2/` for working code examples
@@ -186,24 +188,29 @@ try list.append(allocator, 42);
 
 ---
 
-## Editor Extensions
+## Editor Extensions & LSP
 
-**Location:** `editors/vscode/` — VS Code / Cursor extension (syntax highlighting + LSP client)
+**The LSP binary IS the `cot` binary** (`cot lsp`). Any change to `compiler/lsp/` requires rebuilding the compiler.
 
-**After any change to the extension** (grammar, extension.ts, package.json), reinstall to Cursor:
+**After ANY change to `compiler/lsp/` or `editors/vscode/`**, run the full rebuild+reinstall:
 
 ```bash
+# 1. Rebuild the cot binary (includes LSP server)
+zig build
+
+# 2. Rebuild and reinstall the VS Code/Cursor extension
 cd editors/vscode && npm install && npm run compile && npx @vscode/vsce package --allow-missing-repository
 cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-extension cot-lang-0.1.0.vsix --force
 ```
 
-This includes changes to:
-- `syntaxes/cot.tmLanguage.json` — syntax highlighting rules
-- `src/extension.ts` — LSP client code
-- `language-configuration.json` — bracket matching, comments, indentation
-- `package.json` — capabilities, settings, dependencies
+**Triggers for rebuild:**
+- `compiler/lsp/*.zig` — LSP server code (diagnostics, hover, goto-def, semantic tokens, etc.) → **must `zig build`**
+- `editors/vscode/syntaxes/cot.tmLanguage.json` — TextMate grammar → **must reinstall extension**
+- `editors/vscode/src/extension.ts` — LSP client → **must reinstall extension**
+- `editors/vscode/package.json` — extension manifest → **must reinstall extension**
+- `editors/vscode/language-configuration.json` — brackets, comments → **must reinstall extension**
 
-**Always reinstall after modifying any extension file.** Cursor caches extensions aggressively.
+**If LSP behavior seems stale:** The most common cause is forgetting to run `zig build` after changing `compiler/lsp/`. The extension just spawns whatever `cot` binary is on PATH — if you didn't rebuild, Cursor is running the old LSP.
 
 ---
 
@@ -217,5 +224,7 @@ This includes changes to:
 | `docs/BR_TABLE_ARCHITECTURE.md` | Why br_table appears in generated code |
 | `docs/specs/WASM_3_0_REFERENCE.md` | Wasm 3.0 opcodes and adoption plan |
 | `docs/ROADMAP_1_0.md` | Road to 1.0: versioning, feature waves, Wasm IR analysis |
+| `docs/VERSION_TRAJECTORY.md` | Version plan benchmarked against Zig's history (self-hosting at 0.11) |
+| `docs/COT_SYNTAX.md` | Complete language syntax reference with examples |
 | `VISION.md` | Language vision, design principles, execution roadmap |
 | `docs/archive/` | Historical: completed milestones, past bug fixes, postmortems |

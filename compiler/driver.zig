@@ -676,7 +676,7 @@ pub const Driver = struct {
 
         // If we have a main function, generate the wrapper and static vmctx
         if (main_func_index != null) {
-            try self.generateMainWrapperMachO(&module, data_segments, globals);
+            try self.generateMainWrapperMachO(&module, data_segments, globals, @intCast(compiled_funcs.len));
         }
 
         // Write to memory buffer
@@ -689,7 +689,7 @@ pub const Driver = struct {
 
     /// Generate the _main wrapper and static vmctx data for Mach-O.
     /// The wrapper initializes vmctx and calls __wasm_main.
-    fn generateMainWrapperMachO(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType) !void {
+    fn generateMainWrapperMachO(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, num_funcs: u32) !void {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
         // Layout (total 16MB = 0x1000000):
@@ -821,9 +821,10 @@ pub const Driver = struct {
         const Reloc = buffer_mod.Reloc;
         const ExternalName = buffer_mod.ExternalName;
 
-        // Use indices 1000 and 1001 (high enough to avoid collision with function indices)
-        const vmctx_ext_idx: u32 = 1000;
-        const wasm_main_ext_idx: u32 = 1001;
+        // Use indices after all function indices to avoid collision
+        // (functions are indexed 0..num_funcs-1)
+        const vmctx_ext_idx: u32 = num_funcs;
+        const wasm_main_ext_idx: u32 = num_funcs + 1;
 
         // Create external name references for _vmctx_data and __wasm_main
         const vmctx_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = vmctx_ext_idx } };
@@ -931,7 +932,7 @@ pub const Driver = struct {
 
         // If we have a main function, generate the wrapper and static vmctx
         if (main_func_index != null) {
-            try self.generateMainWrapperElf(&module);
+            try self.generateMainWrapperElf(&module, @intCast(compiled_funcs.len));
         }
 
         // Write to memory buffer
@@ -944,7 +945,7 @@ pub const Driver = struct {
 
     /// Generate the main wrapper and static vmctx data for ELF (x86-64 Linux).
     /// The wrapper initializes vmctx and calls __wasm_main.
-    fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule) !void {
+    fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule, num_funcs: u32) !void {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
         // Layout (total 16MB = 0x1000000):
@@ -1035,9 +1036,9 @@ pub const Driver = struct {
         const Reloc = buffer_mod.Reloc;
         const ExternalName = buffer_mod.ExternalName;
 
-        // Use indices 1000 and 1001 (high enough to avoid collision with function indices)
-        const vmctx_ext_idx: u32 = 1000;
-        const wasm_main_ext_idx: u32 = 1001;
+        // Use indices after all function indices to avoid collision
+        const vmctx_ext_idx: u32 = num_funcs;
+        const wasm_main_ext_idx: u32 = num_funcs + 1;
 
         // Create external name references for vmctx_data and __wasm_main
         const vmctx_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = vmctx_ext_idx } };
@@ -1174,18 +1175,22 @@ pub const Driver = struct {
         // This ensures actual destructors start at index 1+
         _ = try linker.addTableFunc(arc_funcs.release_idx); // Placeholder at index 0
 
-        // Find all *_deinit functions and add them to the table
+        // Find all destructor functions (marked by is_destructor flag during lowering)
+        // and add them to the table. Uses semantic metadata instead of name scanning
+        // to avoid false positives on generic methods like "List(i64)_deinit".
         for (funcs, 0..) |*ir_func, i| {
-            if (std.mem.endsWith(u8, ir_func.name, "_deinit")) {
-                // Extract type name from "TypeName_deinit"
-                const type_name = ir_func.name[0 .. ir_func.name.len - 7]; // Remove "_deinit"
-                const func_idx: u32 = @intCast(i + runtime_func_count);
+            if (ir_func.is_destructor) {
+                // Extract type name: "TypeName_deinit" → "TypeName"
+                if (std.mem.lastIndexOf(u8, ir_func.name, "_")) |sep| {
+                    const type_name = ir_func.name[0..sep];
+                    const func_idx: u32 = @intCast(i + runtime_func_count);
 
-                // Add to table (table_index starts at 1, 0 is reserved for null)
-                const table_idx = try linker.addTableFunc(func_idx);
-                try destructor_table.put(type_name, table_idx);
+                    // Add to table (table_index starts at 1, 0 is reserved for null)
+                    const table_idx = try linker.addTableFunc(func_idx);
+                    try destructor_table.put(type_name, table_idx);
 
-                pipeline_debug.log(.codegen, "driver: destructor {s} at table[{d}] = func[{d}]", .{ ir_func.name, table_idx, func_idx });
+                    pipeline_debug.log(.codegen, "driver: destructor {s} at table[{d}] = func[{d}]", .{ ir_func.name, table_idx, func_idx });
+                }
             }
         }
 

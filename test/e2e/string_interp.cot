@@ -1,63 +1,63 @@
 test "simple variable" {
-    let name = "world"
-    let s = "Hello ${name}"
+    var name = "world"
+    var s = "Hello ${name}"
     @assert_eq(s, "Hello world")
 }
 
 test "integer interpolation" {
-    let x: i64 = 42
-    let s = "x = ${x}"
+    var x: i64 = 42
+    var s = "x = ${x}"
     @assert_eq(s, "x = 42")
 }
 
 test "expression" {
-    let a: i64 = 3
-    let b: i64 = 4
-    let s = "sum = ${a + b}"
+    var a: i64 = 3
+    var b: i64 = 4
+    var s = "sum = ${a + b}"
     @assert_eq(s, "sum = 7")
 }
 
 test "multiple interpolations" {
-    let a: i64 = 1
-    let b: i64 = 2
-    let s = "${a} + ${b}"
+    var a: i64 = 1
+    var b: i64 = 2
+    var s = "${a} + ${b}"
     @assert_eq(s, "1 + 2")
 }
 
 test "adjacent expressions" {
-    let x: i64 = 10
-    let y: i64 = 20
-    let s = "${x}${y}"
+    var x: i64 = 10
+    var y: i64 = 20
+    var s = "${x}${y}"
     @assert_eq(s, "1020")
 }
 
 test "only expression" {
-    let name = "hello"
-    let s = "${name}"
+    var name = "hello"
+    var s = "${name}"
     @assert_eq(s, "hello")
 }
 
 test "negative integer" {
-    let x: i64 = 0 - 5
-    let s = "val=${x}"
+    var x: i64 = 0 - 5
+    var s = "val=${x}"
     @assert_eq(s, "val=-5")
 }
 
 test "zero" {
-    let x: i64 = 0
-    let s = "n=${x}"
+    var x: i64 = 0
+    var s = "n=${x}"
     @assert_eq(s, "n=0")
 }
 
 test "string concat in interp" {
-    let a = "he"
-    let b = "llo"
-    let s = "say: ${a + b}"
+    var a = "he"
+    var b = "llo"
+    var s = "say: ${a + b}"
     @assert_eq(s, "say: hello")
 }
 
 test "empty text segments" {
-    let x: i64 = 99
-    let s = "${x}"
+    var x: i64 = 99
+    var s = "${x}"
     @assert_eq(s, "99")
 }

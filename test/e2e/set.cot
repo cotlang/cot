@@ -72,8 +72,8 @@ test "set toList" {
     var items = s.toList()
     @assert_eq(items.len(), 2)
     // Items may be in any order, but both should be present
-    let a = items.get(0)
-    let b = items.get(1)
+    var a = items.get(0)
+    var b = items.get(1)
     @assert_eq(a + b, 300)
     items.free()
     s.free()

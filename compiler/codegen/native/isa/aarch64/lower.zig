@@ -333,29 +333,49 @@ pub const AArch64LowerBackend = struct {
                 const tmp2_wreg = tmp2_regs.onlyReg() orelse return null;
 
                 // CRITICAL: Emit CMP instruction before jt_sequence to set flags
-                // Port of Cranelift: (cmp_imm (OperandSize.Size32) ridx jt_size)
-                // CMP is encoded as SUBS with XZR as destination
-                const imm12 = Imm12.maybeFromU64(@intCast(table_size)) orelse {
-                    // Table too large for immediate - would need to use register compare
-                    // For now, just emit default jump for large tables
+                // Port of Cranelift's two-rule pattern:
+                //   Rule 1 (priority 0): imm12_from_u64 succeeds → CMP immediate
+                //   Rule 2 (priority -1): fallback → load into register, CMP register
+                if (Imm12.maybeFromU64(@intCast(table_size))) |imm12| {
+                    // Fast path: table size fits in Imm12 (≤4095)
+                    // Emit: CMP Widx, #table_size (SUBS WZR, Widx, #table_size)
                     ctx.emit(Inst{
-                        .jump = .{
-                            .dest = .{ .label = default_label },
+                        .alu_rr_imm12 = .{
+                            .alu_op = .subs,
+                            .size = .size32,
+                            .rd = writableZeroReg(),
+                            .rn = idx_reg,
+                            .imm12 = imm12,
                         },
                     }) catch return null;
-                    return;
-                };
+                } else {
+                    // Fallback: table size doesn't fit in Imm12
+                    // Load table_size into a temp register, then CMP register-register
+                    // Port of Cranelift: (cmp (OperandSize.Size32) ridx (imm $I64 jt_size))
+                    const size_reg_pair = ctx.allocTmp(.I64) catch return null;
+                    const size_wreg = size_reg_pair.onlyReg() orelse return null;
 
-                // Emit: CMP Widx, #table_size (which is SUBS WZR, Widx, #table_size)
-                ctx.emit(Inst{
-                    .alu_rr_imm12 = .{
-                        .alu_op = .subs,
-                        .size = .size32,
-                        .rd = writableZeroReg(),
-                        .rn = idx_reg,
-                        .imm12 = imm12,
-                    },
-                }) catch return null;
+                    const mwc = MoveWideConst.maybeFromU64(@intCast(table_size)) orelse return null;
+                    ctx.emit(Inst{
+                        .mov_wide = .{
+                            .op = .movz,
+                            .rd = size_wreg,
+                            .imm = mwc,
+                            .size = .size32,
+                        },
+                    }) catch return null;
+
+                    // Emit: CMP Widx, Wsize (SUBS WZR, Widx, Wsize)
+                    ctx.emit(Inst{
+                        .alu_rrr = .{
+                            .alu_op = .subs,
+                            .size = .size32,
+                            .rd = writableZeroReg(),
+                            .rn = idx_reg,
+                            .rm = size_wreg.toReg(),
+                        },
+                    }) catch return null;
+                }
 
                 // Emit the jump table sequence (uses flags set by CMP above)
                 ctx.emit(Inst{

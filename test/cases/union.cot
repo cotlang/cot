@@ -1,43 +1,43 @@
-union State {
+union CuState {
     Init,
     Running,
     Done
 }
 
-union Value {
+union CuValue {
     Integer: i64,
     Small: i32
 }
 
-union Event {
+union CuEvent {
     Click: i64,
     Hover,
     KeyPress: i64
 }
 
-test "simple" {
-    let s = State.Running
+test "union simple" {
+    var s = CuState.Running
     @assert_eq(s.tag, 1)
 }
 
-test "payload" {
-    let v = Value.Integer(42)
+test "union payload" {
+    var v = CuValue.Integer(42)
     @assert_eq(v.tag, 0)
     @assert_eq(v.Integer, 42)
 }
 
-test "mixed" {
-    let e = Event.Click(100)
+test "union mixed" {
+    var e = CuEvent.Click(100)
     @assert_eq(e.tag, 0)
     @assert_eq(e.Click, 100)
 }
 
-test "switch capture" {
-    let v = Value.Integer(42)
+test "union switch capture" {
+    var v = CuValue.Integer(42)
     var result: i64 = 0
     switch v {
-        Value.Integer |val| => { result = val },
-        Value.Small |val| => { result = 0 }
+        CuValue.Integer |val| => { result = val },
+        CuValue.Small |val| => { result = 0 }
     }
     @assert_eq(result, 42)
 }

@@ -64,10 +64,10 @@ impl Map(K, V) {
     }
 
     fn rehash(self: *Map(K, V), new_cap: i64) void {
-        let old_keys = self.keys
-        let old_values = self.values
-        let old_states = self.states
-        let old_capacity = self.capacity
+        var old_keys = self.keys
+        var old_values = self.values
+        var old_states = self.states
+        var old_capacity = self.capacity
 
         // Allocate new arrays
         self.keys = @alloc(new_cap * @sizeOf(K))
@@ -79,7 +79,7 @@ impl Map(K, V) {
         // Initialize all states to 0 (empty)
         var si: i64 = 0
         while si < new_cap {
-            let sp = @intToPtr(*i64, self.states + si * @sizeOf(i64))
+            var sp = @intToPtr(*i64, self.states + si * @sizeOf(i64))
             sp.* = 0
             si = si + 1
         }
@@ -88,30 +88,11 @@ impl Map(K, V) {
         // Fresh table has no tombstones, so only check for empty (state=0).
         var oi: i64 = 0
         while oi < old_capacity {
-            let os = @intToPtr(*i64, old_states + oi * @sizeOf(i64))
+            var os = @intToPtr(*i64, old_states + oi * @sizeOf(i64))
             if os.* == 1 {
-                let ok = @intToPtr(*K, old_keys + oi * @sizeOf(K))
-                let ov = @intToPtr(*V, old_values + oi * @sizeOf(V))
-                // Inline set logic to avoid sibling method call issue
-                var key = ok.*
-                var h = key.hash()
-                var idx = h & (new_cap - 1)
-                var loop_i: i64 = 0
-                while loop_i < new_cap {
-                    let st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
-                    if st.* == 0 {
-                        let kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
-                        let vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
-                        kp.* = ok.*
-                        vp.* = ov.*
-                        st.* = 1
-                        self.count = self.count + 1
-                        loop_i = new_cap
-                    } else {
-                        idx = (idx + 1) & (new_cap - 1)
-                        loop_i = loop_i + 1
-                    }
-                }
+                var ok = @intToPtr(*K, old_keys + oi * @sizeOf(K))
+                var ov = @intToPtr(*V, old_values + oi * @sizeOf(V))
+                self.set(ok.*, ov.*)
             }
             oi = oi + 1
         }
@@ -143,14 +124,14 @@ impl Map(K, V) {
 
         var i: i64 = 0
         while i < self.capacity {
-            let st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
+            var st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
             if st.* == 0 {
                 // Empty slot — use tombstone slot if we found one, else this slot
                 var target = idx
                 if first_tombstone >= 0 { target = first_tombstone }
-                let kp = @intToPtr(*K, self.keys + target * @sizeOf(K))
-                let vp = @intToPtr(*V, self.values + target * @sizeOf(V))
-                let tp = @intToPtr(*i64, self.states + target * @sizeOf(i64))
+                var kp = @intToPtr(*K, self.keys + target * @sizeOf(K))
+                var vp = @intToPtr(*V, self.values + target * @sizeOf(V))
+                var tp = @intToPtr(*i64, self.states + target * @sizeOf(i64))
                 kp.* = key
                 vp.* = value
                 tp.* = 1
@@ -158,10 +139,10 @@ impl Map(K, V) {
                 return
             }
             if st.* == 1 {
-                let kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
+                var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if kp.* == key {
                     // Key exists — update value
-                    let vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
+                    var vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
                     vp.* = value
                     return
                 }
@@ -186,12 +167,12 @@ impl Map(K, V) {
 
         var i: i64 = 0
         while i < self.capacity {
-            let st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
+            var st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
             if st.* == 0 { @trap() }
             if st.* == 1 {
-                let kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
+                var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if kp.* == key {
-                    let vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
+                    var vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
                     return vp.*
                 }
             }
@@ -210,12 +191,12 @@ impl Map(K, V) {
 
         var i: i64 = 0
         while i < self.capacity {
-            let st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
+            var st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
             if st.* == 0 { return default }
             if st.* == 1 {
-                let kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
+                var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if kp.* == key {
-                    let vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
+                    var vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
                     return vp.*
                 }
             }
@@ -233,10 +214,10 @@ impl Map(K, V) {
 
         var i: i64 = 0
         while i < self.capacity {
-            let st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
+            var st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
             if st.* == 0 { return 0 }
             if st.* == 1 {
-                let kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
+                var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if kp.* == key { return 1 }
             }
             idx = (idx + 1) & (self.capacity - 1)
@@ -253,10 +234,10 @@ impl Map(K, V) {
 
         var i: i64 = 0
         while i < self.capacity {
-            let st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
+            var st = @intToPtr(*i64, self.states + idx * @sizeOf(i64))
             if st.* == 0 { return }
             if st.* == 1 {
-                let kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
+                var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if kp.* == key {
                     st.* = 2
                     self.count = self.count - 1
@@ -295,7 +276,7 @@ impl Map(K, V) {
     fn clear(self: *Map(K, V)) void {
         var i: i64 = 0
         while i < self.capacity {
-            let sp = @intToPtr(*i64, self.states + i * @sizeOf(i64))
+            var sp = @intToPtr(*i64, self.states + i * @sizeOf(i64))
             sp.* = 0
             i = i + 1
         }
@@ -312,9 +293,9 @@ impl Map(K, V) {
         var result: List(K) = .{}
         var i: i64 = 0
         while i < self.capacity {
-            let st = @intToPtr(*i64, self.states + i * @sizeOf(i64))
+            var st = @intToPtr(*i64, self.states + i * @sizeOf(i64))
             if st.* == 1 {
-                let kp = @intToPtr(*K, self.keys + i * @sizeOf(K))
+                var kp = @intToPtr(*K, self.keys + i * @sizeOf(K))
                 result.append(kp.*)
             }
             i = i + 1
@@ -326,9 +307,9 @@ impl Map(K, V) {
         var result: List(V) = .{}
         var i: i64 = 0
         while i < self.capacity {
-            let st = @intToPtr(*i64, self.states + i * @sizeOf(i64))
+            var st = @intToPtr(*i64, self.states + i * @sizeOf(i64))
             if st.* == 1 {
-                let vp = @intToPtr(*V, self.values + i * @sizeOf(V))
+                var vp = @intToPtr(*V, self.values + i * @sizeOf(V))
                 result.append(vp.*)
             }
             i = i + 1

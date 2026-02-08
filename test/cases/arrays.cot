@@ -1,4 +1,4 @@
-test "simple" {
+test "array simple" {
     var arr = [42]
     @assert_eq(arr[0], 42)
 }
@@ -26,6 +26,6 @@ test "update" {
 
 test "append one" {
     var arr = [1, 2, 3]
-    let arr2 = append(arr, 4)
+    var arr2 = append(arr, 4)
     @assert_eq(len(arr2), 4)
 }

@@ -1,11 +1,11 @@
 test "local var" {
-    let x: i64 = 42
+    var x: i64 = 42
     @assert_eq(x, 42)
 }
 
 test "multiple locals" {
-    let a: i64 = 10
-    let b: i64 = 20
+    var a: i64 = 10
+    var b: i64 = 20
     @assert_eq(a + b, 30)
 }
 
@@ -18,7 +18,7 @@ test "reassign" {
 test "swap" {
     var a: i64 = 5
     var b: i64 = 10
-    let temp: i64 = a
+    var temp: i64 = a
     a = b
     b = temp
     @assert_eq(b, 5)

@@ -4,8 +4,8 @@
 //          031,032 (variable shadowing with block scopes)
 // Converted to inline test format.
 
-test "001: let declaration" {
-    let x: i64 = 42;
+test "001: var declaration" {
+    var x: i64 = 42;
     @assert_eq(x, 42)
 }
 
@@ -17,78 +17,78 @@ test "002: var reassignment" {
 }
 
 test "003: eight variables sum" {
-    let a: i64 = 1;
-    let b: i64 = 2;
-    let c: i64 = 3;
-    let d: i64 = 4;
-    let e: i64 = 5;
-    let f: i64 = 6;
-    let g: i64 = 7;
-    let h: i64 = 8;
-    let sum: i64 = a + b + c + d + e + f + g + h;
+    var a: i64 = 1;
+    var b: i64 = 2;
+    var c: i64 = 3;
+    var d: i64 = 4;
+    var e: i64 = 5;
+    var f: i64 = 6;
+    var g: i64 = 7;
+    var h: i64 = 8;
+    var sum: i64 = a + b + c + d + e + f + g + h;
     @assert_eq(sum, 36)
 }
 
 test "004: twelve variables sum" {
-    let v1: i64 = 1;
-    let v2: i64 = 2;
-    let v3: i64 = 3;
-    let v4: i64 = 4;
-    let v5: i64 = 5;
-    let v6: i64 = 6;
-    let v7: i64 = 7;
-    let v8: i64 = 8;
-    let v9: i64 = 9;
-    let v10: i64 = 10;
-    let v11: i64 = 11;
-    let v12: i64 = 12;
-    let sum: i64 = v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12;
+    var v1: i64 = 1;
+    var v2: i64 = 2;
+    var v3: i64 = 3;
+    var v4: i64 = 4;
+    var v5: i64 = 5;
+    var v6: i64 = 6;
+    var v7: i64 = 7;
+    var v8: i64 = 8;
+    var v9: i64 = 9;
+    var v10: i64 = 10;
+    var v11: i64 = 11;
+    var v12: i64 = 12;
+    var sum: i64 = v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12;
     @assert_eq(sum, 78)
 }
 
 test "005: sixteen variables sum" {
-    let v1: i64 = 1;
-    let v2: i64 = 2;
-    let v3: i64 = 3;
-    let v4: i64 = 4;
-    let v5: i64 = 5;
-    let v6: i64 = 6;
-    let v7: i64 = 7;
-    let v8: i64 = 8;
-    let v9: i64 = 9;
-    let v10: i64 = 10;
-    let v11: i64 = 11;
-    let v12: i64 = 12;
-    let v13: i64 = 13;
-    let v14: i64 = 14;
-    let v15: i64 = 15;
-    let v16: i64 = 16;
+    var v1: i64 = 1;
+    var v2: i64 = 2;
+    var v3: i64 = 3;
+    var v4: i64 = 4;
+    var v5: i64 = 5;
+    var v6: i64 = 6;
+    var v7: i64 = 7;
+    var v8: i64 = 8;
+    var v9: i64 = 9;
+    var v10: i64 = 10;
+    var v11: i64 = 11;
+    var v12: i64 = 12;
+    var v13: i64 = 13;
+    var v14: i64 = 14;
+    var v15: i64 = 15;
+    var v16: i64 = 16;
     var sum: i64 = v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8;
     sum = sum + v9 + v10 + v11 + v12 + v13 + v14 + v15 + v16;
     @assert_eq(sum, 136)
 }
 
 test "006: twenty variables sum" {
-    let v1: i64 = 1;
-    let v2: i64 = 2;
-    let v3: i64 = 3;
-    let v4: i64 = 4;
-    let v5: i64 = 5;
-    let v6: i64 = 6;
-    let v7: i64 = 7;
-    let v8: i64 = 8;
-    let v9: i64 = 9;
-    let v10: i64 = 10;
-    let v11: i64 = 11;
-    let v12: i64 = 12;
-    let v13: i64 = 13;
-    let v14: i64 = 14;
-    let v15: i64 = 15;
-    let v16: i64 = 16;
-    let v17: i64 = 17;
-    let v18: i64 = 18;
-    let v19: i64 = 19;
-    let v20: i64 = 20;
+    var v1: i64 = 1;
+    var v2: i64 = 2;
+    var v3: i64 = 3;
+    var v4: i64 = 4;
+    var v5: i64 = 5;
+    var v6: i64 = 6;
+    var v7: i64 = 7;
+    var v8: i64 = 8;
+    var v9: i64 = 9;
+    var v10: i64 = 10;
+    var v11: i64 = 11;
+    var v12: i64 = 12;
+    var v13: i64 = 13;
+    var v14: i64 = 14;
+    var v15: i64 = 15;
+    var v16: i64 = 16;
+    var v17: i64 = 17;
+    var v18: i64 = 18;
+    var v19: i64 = 19;
+    var v20: i64 = 20;
     var sum: i64 = v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10;
     sum = sum + v11 + v12 + v13 + v14 + v15 + v16 + v17 + v18 + v19 + v20;
     @assert_eq(sum, 210)
@@ -98,7 +98,7 @@ test "008: loop with local var" {
     var sum: i64 = 0;
     var i: i64 = 0;
     while i < 5 {
-        let term: i64 = i * 2;
+        var term: i64 = i * 2;
         sum = sum + term;
         i = i + 1;
     }
@@ -106,17 +106,17 @@ test "008: loop with local var" {
 }
 
 test "010: copy chain" {
-    let a: i64 = 5;
-    let b: i64 = a;
-    let c: i64 = b;
-    let d: i64 = c;
+    var a: i64 = 5;
+    var b: i64 = a;
+    var c: i64 = b;
+    var d: i64 = c;
     @assert_eq(d, 5)
 }
 
 test "011: variable swap" {
     var a: i64 = 10;
     var b: i64 = 20;
-    let tmp: i64 = a;
+    var tmp: i64 = a;
     a = b;
     b = tmp;
     @assert_eq(a, 20)
@@ -142,18 +142,18 @@ test "013: accumulate product" {
 }
 
 test "014: negation via subtraction" {
-    let x: i64 = 0 - 42;
-    let y: i64 = 0 - x;
+    var x: i64 = 0 - 42;
+    var y: i64 = 0 - x;
     @assert_eq(y, 42)
 }
 
 test "015: four arithmetic ops" {
-    let a: i64 = 10;
-    let b: i64 = 5;
-    let c: i64 = a + b;
-    let d: i64 = a - b;
-    let e: i64 = a * b;
-    let f: i64 = a / b;
+    var a: i64 = 10;
+    var b: i64 = 5;
+    var c: i64 = a + b;
+    var d: i64 = a - b;
+    var e: i64 = a * b;
+    var f: i64 = a / b;
     @assert_eq(c, 15)
     @assert_eq(d, 5)
     @assert_eq(e, 50)
@@ -161,28 +161,28 @@ test "015: four arithmetic ops" {
 }
 
 test "016: dependent chain" {
-    let a: i64 = 1;
-    let b: i64 = a + 1;
-    let c: i64 = b + 1;
-    let d: i64 = c + 1;
-    let e: i64 = d + 1;
-    let f: i64 = e + 1;
-    let g: i64 = f + 1;
-    let h: i64 = g + 1;
-    let i: i64 = h + 1;
-    let j: i64 = i + 1;
+    var a: i64 = 1;
+    var b: i64 = a + 1;
+    var c: i64 = b + 1;
+    var d: i64 = c + 1;
+    var e: i64 = d + 1;
+    var f: i64 = e + 1;
+    var g: i64 = f + 1;
+    var h: i64 = g + 1;
+    var i: i64 = h + 1;
+    var j: i64 = i + 1;
     @assert_eq(j, 10)
 }
 
 test "017: doubling chain" {
-    let a: i64 = 1;
-    let b: i64 = a * 2;
-    let c: i64 = b * 2;
-    let d: i64 = c * 2;
-    let e: i64 = d * 2;
-    let f: i64 = e * 2;
-    let g: i64 = f * 2;
-    let h: i64 = g * 2;
+    var a: i64 = 1;
+    var b: i64 = a * 2;
+    var c: i64 = b * 2;
+    var d: i64 = c * 2;
+    var e: i64 = d * 2;
+    var f: i64 = e * 2;
+    var g: i64 = f * 2;
+    var h: i64 = g * 2;
     @assert_eq(h, 128)
 }
 
@@ -196,19 +196,19 @@ test "018: self doubling" {
 }
 
 test "019: complex expression" {
-    let a: i64 = 15;
-    let b: i64 = 5;
-    let c: i64 = 4;
-    let result: i64 = (a + b) * c / (a + b - c);
+    var a: i64 = 15;
+    var b: i64 = 5;
+    var c: i64 = 4;
+    var result: i64 = (a + b) * c / (a + b - c);
     @assert_eq(result, 5)
 }
 
 test "020: division identity" {
-    let a: i64 = 100;
-    let b: i64 = 7;
-    let q: i64 = a / b;
-    let r: i64 = a % b;
-    let check: i64 = q * b + r;
+    var a: i64 = 100;
+    var b: i64 = 7;
+    var q: i64 = a / b;
+    var r: i64 = a % b;
+    var check: i64 = q * b + r;
     @assert_eq(check, a)
 }
 
@@ -224,7 +224,7 @@ test "022: three-way rotate" {
     var a: i64 = 1;
     var b: i64 = 2;
     var c: i64 = 3;
-    let t: i64 = a;
+    var t: i64 = a;
     a = b;
     b = c;
     c = t;
@@ -262,9 +262,9 @@ test "026: cyclic rotate" {
     var a: i64 = 1;
     var b: i64 = 2;
     var c: i64 = 3;
-    let ta: i64 = a;
-    let tb: i64 = b;
-    let tc: i64 = c;
+    var ta: i64 = a;
+    var tb: i64 = b;
+    var tc: i64 = c;
     a = tc;
     b = ta;
     c = tb;
@@ -310,7 +310,7 @@ test "034: flag toggle loop" {
 test "035: swap two vars" {
     var a: i64 = 10;
     var b: i64 = 20;
-    let t: i64 = a;
+    var t: i64 = a;
     a = b;
     b = t;
     @assert_eq(a, 20)
@@ -322,7 +322,7 @@ test "036: fibonacci" {
     var b: i64 = 1;
     var i: i64 = 0;
     while i < 10 {
-        let t: i64 = a + b;
+        var t: i64 = a + b;
         a = b;
         b = t;
         i = i + 1;
@@ -344,7 +344,7 @@ test "038: gcd" {
     var a: i64 = 48;
     var b: i64 = 18;
     while b != 0 {
-        let t: i64 = b;
+        var t: i64 = b;
         b = a % b;
         a = t;
     }
@@ -352,11 +352,11 @@ test "038: gcd" {
 }
 
 test "039: binary search" {
-    let target: i64 = 37;
+    var target: i64 = 37;
     var lo: i64 = 0;
     var hi: i64 = 100;
     while lo < hi {
-        let mid: i64 = (lo + hi) / 2;
+        var mid: i64 = (lo + hi) / 2;
         if mid < target {
             lo = mid + 1;
         } else {
@@ -393,7 +393,7 @@ test "041: popcount loop" {
 test "042: bit reverse" {
     var n: i64 = 12;
     var rev: i64 = 0;
-    let bits: i64 = 4;
+    var bits: i64 = 4;
     var i: i64 = 0;
     while i < bits {
         rev = rev << 1;
@@ -405,7 +405,7 @@ test "042: bit reverse" {
 }
 
 test "043: prime check" {
-    let n: i64 = 17;
+    var n: i64 = 17;
     var is_prime: i64 = 1;
     var i: i64 = 2;
     while i < n {
@@ -418,7 +418,7 @@ test "043: prime check" {
 }
 
 test "044: perfect number" {
-    let n: i64 = 6;
+    var n: i64 = 6;
     var sum: i64 = 0;
     var i: i64 = 1;
     while i < n {

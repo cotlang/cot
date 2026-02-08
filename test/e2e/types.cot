@@ -5,18 +5,18 @@
 
 // === Struct definitions ===
 
-struct Point { x: i64, y: i64 }
-struct Pair { a: i64, b: i64 }
-struct Inner { val: i64 }
-struct Outer { inner: Inner, extra: i64 }
-struct Triple { a: i64, b: i64, c: i64 }
-struct Quad { a: i64, b: i64, c: i64, d: i64 }
-struct Data5 { a: i64, b: i64, c: i64, d: i64, e: i64 }
-struct Vec2 { x: i64, y: i64 }
-struct Vec3 { x: i64, y: i64, z: i64 }
-struct Rect { x: i64, y: i64, w: i64, h: i64 }
-struct Line { start: Point, end: Point }
-struct DataAB { a: i64, b: i64 }
+struct TyPoint { x: i64, y: i64 }
+struct TyPair { a: i64, b: i64 }
+struct TyInner { val: i64 }
+struct TyOuter { inner: TyInner, extra: i64 }
+struct TyTriple { a: i64, b: i64, c: i64 }
+struct TyQuad { a: i64, b: i64, c: i64, d: i64 }
+struct TyData5 { a: i64, b: i64, c: i64, d: i64, e: i64 }
+struct TyVec2 { x: i64, y: i64 }
+struct TyVec3 { x: i64, y: i64, z: i64 }
+struct TyRect { x: i64, y: i64, w: i64, h: i64 }
+struct TyLine { start: TyPoint, end: TyPoint }
+struct TyDataAB { a: i64, b: i64 }
 
 const MAGIC: i64 = 42;
 const WIDTH: i64 = 80;
@@ -44,23 +44,23 @@ fn ty03_to_bool(x: i64) i64 {
     return 0;
 }
 
-fn ty06_sum_pair(p: *Pair) i64 { return p.a + p.b; }
+fn ty06_sum_pair(p: *TyPair) i64 { return p.a + p.b; }
 fn ty08_set_value(ptr: *i64, val: i64) void { ptr.* = val; }
-fn ty11_make_pair(a: i64, b: i64, out: *Pair) void { out.a = a; out.b = b; }
-fn ty18_get_value(p: *DataAB) i64 { return p.a; }
-fn ty18_set_value(p: *DataAB, v: i64) void { p.a = v; }
-fn ty20_make_vec(x: i64, y: i64, out: *Vec2) void { out.x = x; out.y = y; }
-fn ty23_add_points(a: *Point, b: *Point, out: *Point) void { out.x = a.x + b.x; out.y = a.y + b.y; }
-fn ty27_distance_sq(p: *Point) i64 { return p.x * p.x + p.y * p.y; }
-fn ty28_translate(p: *Point, dx: i64, dy: i64) void { p.x = p.x + dx; p.y = p.y + dy; }
-fn ty30_area(r: *Rect) i64 { return r.w * r.h; }
-fn ty37_copy_point(src: *Point, dst: *Point) void { dst.x = src.x; dst.y = src.y; }
-fn ty38_points_equal(a: *Point, b: *Point) i64 {
+fn ty11_make_pair(a: i64, b: i64, out: *TyPair) void { out.a = a; out.b = b; }
+fn ty18_get_value(p: *TyDataAB) i64 { return p.a; }
+fn ty18_set_value(p: *TyDataAB, v: i64) void { p.a = v; }
+fn ty20_make_vec(x: i64, y: i64, out: *TyVec2) void { out.x = x; out.y = y; }
+fn ty23_add_points(a: *TyPoint, b: *TyPoint, out: *TyPoint) void { out.x = a.x + b.x; out.y = a.y + b.y; }
+fn ty27_distance_sq(p: *TyPoint) i64 { return p.x * p.x + p.y * p.y; }
+fn ty28_translate(p: *TyPoint, dx: i64, dy: i64) void { p.x = p.x + dx; p.y = p.y + dy; }
+fn ty30_area(r: *TyRect) i64 { return r.w * r.h; }
+fn ty37_copy_point(src: *TyPoint, dst: *TyPoint) void { dst.x = src.x; dst.y = src.y; }
+fn ty38_points_equal(a: *TyPoint, b: *TyPoint) i64 {
     if a.x == b.x and a.y == b.y { return 1; }
     return 0;
 }
-fn ty41_sum_triple(t: *Triple) i64 { return t.a + t.b + t.c; }
-fn ty44_make_pair2(a: i64, b: i64, p: *Pair) void { p.a = a; p.b = b; }
+fn ty41_sum_triple(t: *TyTriple) i64 { return t.a + t.b + t.c; }
+fn ty44_make_pair2(a: i64, b: i64, p: *TyPair) void { p.a = a; p.b = b; }
 
 // === Tests ===
 
@@ -68,7 +68,7 @@ test "001: local variables" {
     @assert_eq(ty01_test_locals(), 30)
 }
 
-test "002: var reassignment" {
+test "ty002: var reassignment" {
     @assert_eq(ty02_test_reassign(), 30)
 }
 
@@ -81,21 +81,21 @@ test "004: const value" {
 }
 
 test "005: struct basic" {
-    var p: Point = undefined;
+    var p: TyPoint = undefined;
     p.x = 10;
     p.y = 20;
     @assert_eq(p.x + p.y, 30)
 }
 
 test "006: struct pass" {
-    var p: Pair = undefined;
+    var p: TyPair = undefined;
     p.a = 5;
     p.b = 7;
     @assert_eq(ty06_sum_pair(&p), 12)
 }
 
 test "007: nested struct" {
-    var o: Outer = undefined;
+    var o: TyOuter = undefined;
     o.inner.val = 100;
     o.extra = 5;
     @assert_eq(o.inner.val + o.extra, 105)
@@ -108,13 +108,13 @@ test "008: ptr deref" {
 }
 
 test "011: struct out param" {
-    var p: Pair = undefined;
+    var p: TyPair = undefined;
     ty11_make_pair(10, 20, &p);
     @assert_eq(p.a + p.b, 30)
 }
 
 test "013: nested struct fields" {
-    var r: Line = undefined;
+    var r: TyLine = undefined;
     r.start.x = 10;
     r.start.y = 20;
     r.end.x = 100;
@@ -123,7 +123,7 @@ test "013: nested struct fields" {
 }
 
 test "014: five field struct" {
-    var d: Data5 = undefined;
+    var d: TyData5 = undefined;
     d.a = 1;
     d.b = 2;
     d.c = 3;
@@ -137,20 +137,20 @@ test "017: const expressions" {
 }
 
 test "018: ptr to struct" {
-    var d: DataAB = undefined;
+    var d: TyDataAB = undefined;
     ty18_set_value(&d, 42);
     @assert_eq(ty18_get_value(&d), 42)
 }
 
 test "020: struct init pattern" {
-    var v: Vec2 = undefined;
+    var v: TyVec2 = undefined;
     ty20_make_vec(3, 4, &v);
     var len_sq: i64 = v.x * v.x + v.y * v.y;
     @assert_eq(len_sq, 25)
 }
 
 test "021: three field struct" {
-    var t: Triple = undefined;
+    var t: TyTriple = undefined;
     t.a = 1;
     t.b = 2;
     t.c = 3;
@@ -158,7 +158,7 @@ test "021: three field struct" {
 }
 
 test "022: four field struct" {
-    var q: Quad = undefined;
+    var q: TyQuad = undefined;
     q.a = 1;
     q.b = 2;
     q.c = 3;
@@ -167,9 +167,9 @@ test "022: four field struct" {
 }
 
 test "023: add two points" {
-    var p1: Point = undefined;
-    var p2: Point = undefined;
-    var p3: Point = undefined;
+    var p1: TyPoint = undefined;
+    var p2: TyPoint = undefined;
+    var p3: TyPoint = undefined;
     p1.x = 1;
     p1.y = 2;
     p2.x = 3;
@@ -179,26 +179,26 @@ test "023: add two points" {
 }
 
 test "024: struct field sum" {
-    var p: Point = undefined;
+    var p: TyPoint = undefined;
     p.x = 10;
     p.y = 20;
     @assert_eq(p.x + p.y, 30)
 }
 
 test "025: struct ptr access" {
-    var p: Point = undefined;
+    var p: TyPoint = undefined;
     p.x = 5;
     p.y = 10;
-    var ptr: *Point = &p;
+    var ptr: *TyPoint = &p;
     @assert_eq(ptr.x, 5)
     @assert_eq(ptr.y, 10)
 }
 
 test "026: modify via ptr" {
-    var p: Point = undefined;
+    var p: TyPoint = undefined;
     p.x = 1;
     p.y = 2;
-    var ptr: *Point = &p;
+    var ptr: *TyPoint = &p;
     ptr.x = 100;
     ptr.y = 200;
     @assert_eq(p.x, 100)
@@ -206,14 +206,14 @@ test "026: modify via ptr" {
 }
 
 test "027: distance squared" {
-    var p: Point = undefined;
+    var p: TyPoint = undefined;
     p.x = 3;
     p.y = 4;
     @assert_eq(ty27_distance_sq(&p), 25)
 }
 
 test "028: translate point" {
-    var p: Point = undefined;
+    var p: TyPoint = undefined;
     p.x = 10;
     p.y = 20;
     ty28_translate(&p, 5, 10);
@@ -222,7 +222,7 @@ test "028: translate point" {
 }
 
 test "029: vec3 field sum" {
-    var v: Vec3 = undefined;
+    var v: TyVec3 = undefined;
     v.x = 1;
     v.y = 2;
     v.z = 3;
@@ -230,7 +230,7 @@ test "029: vec3 field sum" {
 }
 
 test "030: rect area" {
-    var r: Rect = undefined;
+    var r: TyRect = undefined;
     r.x = 0;
     r.y = 0;
     r.w = 10;
@@ -254,7 +254,7 @@ test "032: ptr to ptr modify" {
 }
 
 test "033: line struct deltas" {
-    var l: Line = undefined;
+    var l: TyLine = undefined;
     l.start.x = 0;
     l.start.y = 0;
     l.end.x = 10;
@@ -266,7 +266,7 @@ test "033: line struct deltas" {
 }
 
 test "035: five field sum" {
-    var d: Data5 = undefined;
+    var d: TyData5 = undefined;
     d.a = 1;
     d.b = 2;
     d.c = 3;
@@ -276,8 +276,8 @@ test "035: five field sum" {
 }
 
 test "037: struct copy" {
-    var p1: Point = undefined;
-    var p2: Point = undefined;
+    var p1: TyPoint = undefined;
+    var p2: TyPoint = undefined;
     p1.x = 10;
     p1.y = 20;
     ty37_copy_point(&p1, &p2);
@@ -286,8 +286,8 @@ test "037: struct copy" {
 }
 
 test "038: struct compare" {
-    var p1: Point = undefined;
-    var p2: Point = undefined;
+    var p1: TyPoint = undefined;
+    var p2: TyPoint = undefined;
     p1.x = 5;
     p1.y = 10;
     p2.x = 5;
@@ -296,7 +296,7 @@ test "038: struct compare" {
 }
 
 test "039: nested field access" {
-    var o: Outer = undefined;
+    var o: TyOuter = undefined;
     o.inner.val = 42;
     o.extra = 10;
     @assert_eq(o.inner.val, 42)
@@ -304,7 +304,7 @@ test "039: nested field access" {
 }
 
 test "041: triple sum fn" {
-    var t: Triple = undefined;
+    var t: TyTriple = undefined;
     t.a = 10;
     t.b = 20;
     t.c = 30;
@@ -312,14 +312,14 @@ test "041: triple sum fn" {
 }
 
 test "044: make pair" {
-    var p: Pair = undefined;
+    var p: TyPair = undefined;
     ty44_make_pair2(10, 20, &p);
     @assert_eq(p.a, 10)
     @assert_eq(p.b, 20)
 }
 
 test "045: triple sum and product" {
-    var t: Triple = undefined;
+    var t: TyTriple = undefined;
     t.a = 1;
     t.b = 2;
     t.c = 3;
@@ -330,8 +330,8 @@ test "045: triple sum and product" {
 }
 
 test "046: i64 max value" {
-    var max: i64 = 9223372036854775807;
-    @assert(max > 0)
+    var max_val: i64 = 9223372036854775807;
+    @assert(max_val > 0)
 }
 
 test "047: large multiply" {

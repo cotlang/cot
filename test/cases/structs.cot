@@ -1,4 +1,4 @@
-struct Point {
+struct CsPoint {
     x: i64,
     y: i64
 }
@@ -8,42 +8,42 @@ struct Data {
     flag: i64
 }
 
-struct Counter {
+struct CsCounter {
     count: i64
 }
 
-struct Inner {
+struct CsInner {
     value: i64
 }
 
-struct Outer {
-    inner: Inner,
+struct CsOuter {
+    inner: CsInner,
     extra: i64
 }
 
-test "simple" {
-    let pt = Point { .x = 5, .y = 10 }
+test "struct simple" {
+    var pt = CsPoint { .x = 5, .y = 10 }
     @assert_eq(pt.x + pt.y, 15)
 }
 
 test "field access" {
-    let d = Data { .value = 42, .flag = 1 }
+    var d = Data { .value = 42, .flag = 1 }
     @assert_eq(d.value, 42)
 }
 
 test "field update" {
-    var c = Counter { .count = 50 }
+    var c = CsCounter { .count = 50 }
     c.count *= 2
     @assert_eq(c.count, 100)
 }
 
 test "pass to fn" {
-    let pt = Point { .x = 10, .y = 16 }
+    var pt = CsPoint { .x = 10, .y = 16 }
     @assert_eq(pt.x + pt.y, 26)
 }
 
 test "nested" {
-    let inner = Inner { .value = 6 }
-    let o = Outer { .inner = inner, .extra = 10 }
+    var inner = CsInner { .value = 6 }
+    var o = CsOuter { .inner = inner, .extra = 10 }
     @assert_eq(o.inner.value, 6)
 }

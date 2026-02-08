@@ -77,7 +77,7 @@ test "name" {
 }
 ```
 
-Summary output: `N passed, M failed`. Wired into `zig build test` for CI. ~812 tests converted to inline format.
+Summary output: `N passed, M failed`. Wired into `zig build test` for CI. ~730 tests in inline format.
 
 ### 2C. LSP server
 
@@ -115,9 +115,9 @@ Basic LSP with diagnostics, hover, goto definition, and document symbols.
 | Trait bounds on generics (`where T: Trait`) | **Done** — working with monomorphized dispatch |
 | String interpolation (`"Hello, ${name}"`) | **Done** — `${expr}` syntax, integer auto-conversion |
 | String equality (`@assert_eq` for strings) | **Done** — byte-compare via `cot_string_eq` runtime |
-| Iterator protocol (`for x in collection`) | Not started |
-| Pattern matching (`match` expressions) | Not started |
-| Multiple return values | Not started |
+| Iterator protocol (`for x in collection`) | **Done** — `for x in collection`, `for i, x in arr`, `for i in start..end` |
+| Pattern matching (`match` expressions) | **Done** — wildcards (`_`), guards (`if`), ranges (`1..10`) via `switch` |
+| Multiple return values (tuples) | **Done** — tuples with `.0`/`.1` access, SRET for multi-word returns |
 | `weak` references (ARC cycle breaker) | Not started |
 
 ### I/O and Standard Library
@@ -143,13 +143,13 @@ Basic LSP with diagnostics, hover, goto definition, and document symbols.
 
 ---
 
-## Known Compiler Bugs
+## Known Compiler Bugs (Fixed)
 
-| Bug | Impact | Root Cause |
-|-----|--------|------------|
-| Non-void sibling method calls in generic impl fail on native | Forces inlining workarounds | Unknown codegen issue in monomorphized method dispatch |
-| `_deinit` suffix hijacked by ARC scanner | Can't name methods `deinit` | `driver.zig` scans ALL function names, not just struct-level ones |
-| `sort()` in generic impl produces wrong results on native | sort() doesn't work | Unknown — likely codegen issue with `var` mutation in nested loops inside generic impl |
+| Bug | Status | Fix |
+|-----|--------|-----|
+| Non-void sibling method calls in generic impl fail on native | **Fixed** | Root cause was stale expr_types during cross-file generic re-checking. Fixed by fresh expr_types per instantiation + global scope for generic instance symbols. |
+| `_deinit` suffix hijacked by ARC scanner | **Fixed** | `driver.zig` now uses semantic `is_destructor` flag (set during lowering) instead of scanning function names for `_deinit` suffix. No false positives on generic methods. |
+| `sort()` in generic impl produces wrong results on native | **Fixed** | Same root cause as sibling method calls — function pointer calls (`call_indirect`) in generic impl methods now work correctly after the expr_types isolation fix. |
 
 ---
 
@@ -160,9 +160,11 @@ Basic LSP with diagnostics, hover, goto definition, and document symbols.
 | **1** | ~~Map(K,V) in stdlib~~ | ~~Real applications~~ | **Done** |
 | **2** | ~~Set(T) in stdlib~~ | ~~Convenience~~ | **Done** |
 | **3** | ~~String interpolation~~ | ~~Readable output~~ | **Done** |
-| **4** | `std/fs` — file I/O | Real applications | Medium — syscall wrappers |
-| **5** | Iterator protocol | Ergonomic loops | Medium |
-| **6** | `std/os` — args, env | CLI tools | Small |
+| **4** | ~~Iterator protocol~~ | ~~Ergonomic loops~~ | **Done** |
+| **5** | ~~Pattern matching~~ | ~~Exhaustive switch~~ | **Done** |
+| **6** | ~~Tuples / multiple return~~ | ~~Multi-value returns~~ | **Done** |
+| **7** | `std/fs` — file I/O | Real applications | Medium — syscall wrappers |
+| **8** | `std/os` — args, env | CLI tools | Small |
 
 ---
 

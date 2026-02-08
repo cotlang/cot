@@ -1,15 +1,15 @@
-struct Point {
+struct CmPoint {
     x: i64,
     y: i64
 }
 
-impl Point {
-    fn sum(self: *Point) i64 {
+impl CmPoint {
+    fn sum(self: *CmPoint) i64 {
         return self.x + self.y
     }
 }
 
-test "simple" {
-    let p = Point { .x = 10, .y = 20 }
+test "methods simple" {
+    var p = CmPoint { .x = 10, .y = 20 }
     @assert_eq(p.sum(), 30)
 }
