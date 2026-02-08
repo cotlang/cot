@@ -184,10 +184,21 @@ impl Pair(T, U) {
 }
 
 impl List(T) {
+    // Go's nextslicecap: 2x for small, ~1.25x for large
     fn ensureCapacity(self: *List(T), needed: i64) void {
         if self.capacity >= needed { return }
-        var new_cap: i64 = 8
-        if self.capacity > 0 { new_cap = self.capacity * 2 }
+        var new_cap = self.capacity
+        var double_cap = new_cap + new_cap
+        if needed > double_cap {
+            new_cap = needed
+        } else if self.capacity < 256 {
+            new_cap = double_cap
+        } else {
+            while new_cap < needed {
+                new_cap = new_cap + (new_cap + 768) / 4
+            }
+        }
+        if new_cap < 8 { new_cap = 8 }
         let bytes = new_cap * @sizeOf(T)
         if self.capacity == 0 {
             self.items = @alloc(bytes)
@@ -196,24 +207,135 @@ impl List(T) {
         }
         self.capacity = new_cap
     }
+
     fn append(self: *List(T), value: T) void {
         self.ensureCapacity(self.count + 1)
         let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
         ptr.* = value
         self.count = self.count + 1
     }
-    fn iget(self: *List(T), index: i64) T {
+
+    fn get(self: *List(T), index: i64) T {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
         let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
         return ptr.*
     }
-    fn iset(self: *List(T), index: i64, value: T) void {
+
+    fn set(self: *List(T), index: i64, value: T) void {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
         let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
         ptr.* = value
     }
-    fn ipop(self: *List(T)) T {
+
+    fn pop(self: *List(T)) T {
+        if self.count == 0 { @trap() }
         self.count = self.count - 1
         let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
         return ptr.*
+    }
+
+    fn len(self: *List(T)) i64 { return self.count }
+    fn cap(self: *List(T)) i64 { return self.capacity }
+
+    fn last(self: *List(T)) T {
+        if self.count == 0 { @trap() }
+        let ptr = @intToPtr(*T, self.items + (self.count - 1) * @sizeOf(T))
+        return ptr.*
+    }
+
+    fn free(self: *List(T)) void {
+        if self.capacity > 0 {
+            @dealloc(self.items)
+        }
+        self.items = 0
+        self.count = 0
+        self.capacity = 0
+    }
+
+    fn clear(self: *List(T)) void {
+        self.count = 0
+    }
+
+    fn clearAndFree(self: *List(T)) void {
+        self.free()
+    }
+
+    fn insert(self: *List(T), index: i64, value: T) void {
+        if index < 0 { @trap() }
+        if index > self.count { @trap() }
+        self.ensureCapacity(self.count + 1)
+        if index < self.count {
+            let src = self.items + index * @sizeOf(T)
+            let dst = src + @sizeOf(T)
+            let bytes = (self.count - index) * @sizeOf(T)
+            @memcpy(dst, src, bytes)
+        }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        ptr.* = value
+        self.count = self.count + 1
+    }
+
+    fn orderedRemove(self: *List(T), index: i64) T {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        let value = ptr.*
+        if index < self.count - 1 {
+            let dst = self.items + index * @sizeOf(T)
+            let src = dst + @sizeOf(T)
+            let bytes = (self.count - index - 1) * @sizeOf(T)
+            @memcpy(dst, src, bytes)
+        }
+        self.count = self.count - 1
+        return value
+    }
+
+    fn swapRemove(self: *List(T), index: i64) T {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        let value = ptr.*
+        self.count = self.count - 1
+        if index < self.count {
+            let last_ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+            ptr.* = last_ptr.*
+        }
+        return value
+    }
+
+    fn appendSlice(self: *List(T), source: i64, num: i64) void {
+        self.ensureCapacity(self.count + num)
+        let dst = self.items + self.count * @sizeOf(T)
+        @memcpy(dst, source, num * @sizeOf(T))
+        self.count = self.count + num
+    }
+
+    fn reverse(self: *List(T)) void {
+        var i: i64 = 0
+        var j: i64 = self.count - 1
+        while i < j {
+            let pi = @intToPtr(*T, self.items + i * @sizeOf(T))
+            let pj = @intToPtr(*T, self.items + j * @sizeOf(T))
+            let tmp = pi.*
+            pi.* = pj.*
+            pj.* = tmp
+            i = i + 1
+            j = j - 1
+        }
+    }
+
+    fn clone(self: *List(T)) List(T) {
+        var new_list: List(T) = .{}
+        if self.count > 0 {
+            let bytes = self.count * @sizeOf(T)
+            new_list.items = @alloc(bytes)
+            @memcpy(new_list.items, self.items, bytes)
+            new_list.count = self.count
+            new_list.capacity = self.count
+        }
+        return new_list
     }
 }
 
@@ -737,9 +859,9 @@ fn test_list_impl_basic() i64 {
     list.append(10)
     list.append(20)
     list.append(30)
-    let a = list.iget(0)
-    let b = list.iget(1)
-    let c = list.iget(2)
+    let a = list.get(0)
+    let b = list.get(1)
+    let c = list.get(2)
     if a + b + c != 60 { return 1 }
     return 0
 }
@@ -754,8 +876,8 @@ fn test_list_impl_growth() i64 {
         list.append(i)
         i = i + 1
     }
-    let first = list.iget(0)
-    let last = list.iget(19)
+    let first = list.get(0)
+    let last = list.get(19)
     if first + last + list.count != 39 { return 1 }
     return 0
 }
@@ -768,7 +890,7 @@ fn test_list_impl_pop() i64 {
     list.append(10)
     list.append(20)
     list.append(30)
-    let popped = list.ipop()
+    let popped = list.pop()
     if popped + list.count != 32 { return 1 }
     return 0
 }
@@ -781,8 +903,8 @@ fn test_list_impl_set() i64 {
     list.append(10)
     list.append(20)
     list.append(30)
-    list.iset(1, 50)
-    if list.iget(0) + list.iget(1) + list.iget(2) != 90 { return 1 }
+    list.set(1, 50)
+    if list.get(0) + list.get(1) + list.get(2) != 90 { return 1 }
     return 0
 }
 
@@ -797,8 +919,8 @@ fn test_list_impl_multi_type() i64 {
     b.capacity = 0
     a.append(100)
     b.append(5)
-    let x = a.iget(0)
-    let y: i64 = b.iget(0)
+    let x = a.get(0)
+    let y: i64 = b.get(0)
     if x + y != 105 { return 1 }
     return 0
 }
@@ -1267,6 +1389,219 @@ fn test_sret_chain() i64 {
 }
 
 // ============================================================================
+// Test functions: Production List(T) — bounds, growth, deinit, insert, remove
+// ============================================================================
+
+fn test_list_bounds_get() i64 {
+    // Verify valid boundary indices work (can't test traps from within same program)
+    var list: List(i64) = .{}
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    // get(0) and get(count-1) must succeed
+    if list.get(0) != 10 { return 1 }
+    if list.get(2) != 30 { return 2 }
+    // set boundary
+    list.set(0, 99)
+    if list.get(0) != 99 { return 3 }
+    list.set(2, 88)
+    if list.get(2) != 88 { return 4 }
+    list.free()
+    return 0
+}
+
+fn test_list_growth_go() i64 {
+    // Go's nextslicecap: 2x for cap<256, ~1.25x for larger
+    var list: List(i64) = .{}
+    var i: i64 = 0
+    while i < 300 {
+        list.append(i)
+        i = i + 1
+    }
+    if list.len() != 300 { return 1 }
+    // Verify first and last elements survive growth
+    if list.get(0) != 0 { return 2 }
+    if list.get(299) != 299 { return 3 }
+    // After 256 elements, growth should be ~1.25x, so capacity < 512 (which 2x would give)
+    // With Go's formula: after 256, next cap = 256 + (256+768)/4 = 256 + 256 = 512
+    // Then 512 is enough for 300, so cap should be 512
+    // But the key test: capacity >= 300 and the data is correct
+    if list.cap() < 300 { return 4 }
+    list.free()
+    return 0
+}
+
+fn test_list_free() i64 {
+    var list: List(i64) = .{}
+    list.append(1)
+    list.append(2)
+    list.append(3)
+    list.free()
+    if list.count != 0 { return 1 }
+    if list.capacity != 0 { return 2 }
+    if list.items != 0 { return 3 }
+    return 0
+}
+
+fn test_list_clear() i64 {
+    var list: List(i64) = .{}
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    let cap_before = list.cap()
+    list.clear()
+    if list.len() != 0 { return 1 }
+    // Capacity retained after clear
+    if list.cap() != cap_before { return 2 }
+    // Can reuse after clear
+    list.append(99)
+    if list.get(0) != 99 { return 3 }
+    list.free()
+    return 0
+}
+
+fn test_list_insert() i64 {
+    var list: List(i64) = .{}
+    list.append(10)
+    list.append(30)
+    list.append(40)
+    // Insert at beginning
+    list.insert(0, 5)
+    // Insert in middle (between 10 and 30)
+    list.insert(2, 20)
+    // Insert at end
+    list.insert(5, 50)
+    // Expected: [5, 10, 20, 30, 40, 50]
+    if list.len() != 6 { return 1 }
+    if list.get(0) != 5 { return 2 }
+    if list.get(1) != 10 { return 3 }
+    if list.get(2) != 20 { return 4 }
+    if list.get(3) != 30 { return 5 }
+    if list.get(4) != 40 { return 6 }
+    if list.get(5) != 50 { return 7 }
+    list.free()
+    return 0
+}
+
+fn test_list_ordered_remove() i64 {
+    var list: List(i64) = .{}
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    list.append(40)
+    list.append(50)
+    // Remove from beginning
+    let first = list.orderedRemove(0)
+    if first != 10 { return 1 }
+    // Now: [20, 30, 40, 50]
+    if list.len() != 4 { return 2 }
+    if list.get(0) != 20 { return 3 }
+    // Remove from middle
+    let mid = list.orderedRemove(1)
+    if mid != 30 { return 4 }
+    // Now: [20, 40, 50]
+    if list.len() != 3 { return 5 }
+    if list.get(0) != 20 { return 6 }
+    if list.get(1) != 40 { return 7 }
+    if list.get(2) != 50 { return 8 }
+    list.free()
+    return 0
+}
+
+fn test_list_swap_remove() i64 {
+    var list: List(i64) = .{}
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    list.append(40)
+    // SwapRemove index 1 (value 20): last element (40) moves to index 1
+    let removed = list.swapRemove(1)
+    if removed != 20 { return 1 }
+    // Now: [10, 40, 30]
+    if list.len() != 3 { return 2 }
+    if list.get(0) != 10 { return 3 }
+    if list.get(1) != 40 { return 4 }
+    if list.get(2) != 30 { return 5 }
+    // SwapRemove last element (no swap needed)
+    let last = list.swapRemove(2)
+    if last != 30 { return 6 }
+    if list.len() != 2 { return 7 }
+    list.free()
+    return 0
+}
+
+fn test_list_reverse() i64 {
+    var list: List(i64) = .{}
+    list.append(1)
+    list.append(2)
+    list.append(3)
+    list.append(4)
+    list.append(5)
+    list.reverse()
+    if list.get(0) != 5 { return 1 }
+    if list.get(1) != 4 { return 2 }
+    if list.get(2) != 3 { return 3 }
+    if list.get(3) != 2 { return 4 }
+    if list.get(4) != 1 { return 5 }
+    list.free()
+    return 0
+}
+
+fn test_list_clone() i64 {
+    var list: List(i64) = .{}
+    list.append(10)
+    list.append(20)
+    list.append(30)
+    var copy = list.clone()
+    // Verify clone has same data
+    if copy.len() != 3 { return 1 }
+    if copy.get(0) != 10 { return 2 }
+    if copy.get(1) != 20 { return 3 }
+    if copy.get(2) != 30 { return 4 }
+    // Mutate original, verify clone unaffected
+    list.set(0, 99)
+    if copy.get(0) != 10 { return 5 }
+    list.free()
+    copy.free()
+    return 0
+}
+
+fn test_list_last() i64 {
+    var list: List(i64) = .{}
+    list.append(10)
+    if list.last() != 10 { return 1 }
+    list.append(20)
+    if list.last() != 20 { return 2 }
+    list.append(30)
+    if list.last() != 30 { return 3 }
+    let popped = list.pop()
+    if list.last() != 20 { return 4 }
+    list.free()
+    return 0
+}
+
+fn test_memcpy_overlap() i64 {
+    // Test overlapping @memcpy (memmove semantics) — used by insert/orderedRemove
+    let buf = @alloc(40)
+    // Write [10, 20, 30, 40, 50] at positions 0-4
+    @intToPtr(*i64, buf).* = 10
+    @intToPtr(*i64, buf + 8).* = 20
+    @intToPtr(*i64, buf + 16).* = 30
+    @intToPtr(*i64, buf + 24).* = 40
+    @intToPtr(*i64, buf + 32).* = 0
+    // Shift right: copy [0..3] to [1..4] (dst > src, backward copy path)
+    @memcpy(buf + 8, buf, 32)
+    // Expected: [10, 10, 20, 30, 40]
+    if @intToPtr(*i64, buf).* != 10 { return 1 }
+    if @intToPtr(*i64, buf + 8).* != 10 { return 2 }
+    if @intToPtr(*i64, buf + 16).* != 20 { return 3 }
+    if @intToPtr(*i64, buf + 24).* != 30 { return 4 }
+    if @intToPtr(*i64, buf + 32).* != 40 { return 5 }
+    @dealloc(buf)
+    return 0
+}
+
+// ============================================================================
 // main() dispatcher
 // ============================================================================
 
@@ -1401,6 +1736,19 @@ fn main() i64 {
     if test_sret_tuple_return() != 0 { return 81 }
     if test_sret_struct_return() != 0 { return 82 }
     if test_sret_chain() != 0 { return 83 }
+
+    // Production List(T): bounds, growth, deinit, insert, remove, bulk ops
+    if test_list_bounds_get() != 0 { return 84 }
+    if test_list_growth_go() != 0 { return 85 }
+    if test_list_free() != 0 { return 86 }
+    if test_list_clear() != 0 { return 87 }
+    if test_list_insert() != 0 { return 88 }
+    if test_list_ordered_remove() != 0 { return 89 }
+    if test_list_swap_remove() != 0 { return 90 }
+    if test_list_reverse() != 0 { return 91 }
+    if test_list_clone() != 0 { return 92 }
+    if test_list_last() != 0 { return 93 }
+    if test_memcpy_overlap() != 0 { return 94 }
 
     return 0
 }

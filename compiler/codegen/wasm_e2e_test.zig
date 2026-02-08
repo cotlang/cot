@@ -2592,3 +2592,288 @@ test "wasm e2e: sret chain" {
     try std.testing.expect(result.wasm_bytes.len > 0);
     try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
 }
+
+// ============================================================================
+// Production List(T): bounds, growth, deinit, insert, remove, bulk ops
+// ============================================================================
+
+test "wasm e2e: list bounds checking" {
+    const code =
+        \\struct List(T) {
+        \\    items: i64,
+        \\    count: i64,
+        \\    capacity: i64,
+        \\}
+        \\impl List(T) {
+        \\    fn ensureCapacity(self: *List(T), needed: i64) void {
+        \\        if self.capacity >= needed { return }
+        \\        var new_cap = self.capacity
+        \\        var double_cap = new_cap + new_cap
+        \\        if needed > double_cap {
+        \\            new_cap = needed
+        \\        } else if self.capacity < 256 {
+        \\            new_cap = double_cap
+        \\        } else {
+        \\            while new_cap < needed {
+        \\                new_cap = new_cap + (new_cap + 768) / 4
+        \\            }
+        \\        }
+        \\        if new_cap < 8 { new_cap = 8 }
+        \\        let bytes = new_cap * @sizeOf(T)
+        \\        if self.capacity == 0 {
+        \\            self.items = @alloc(bytes)
+        \\        } else {
+        \\            self.items = @realloc(self.items, bytes)
+        \\        }
+        \\        self.capacity = new_cap
+        \\    }
+        \\    fn append(self: *List(T), value: T) void {
+        \\        self.ensureCapacity(self.count + 1)
+        \\        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+        \\        ptr.* = value
+        \\        self.count = self.count + 1
+        \\    }
+        \\    fn get(self: *List(T), index: i64) T {
+        \\        if index < 0 { @trap() }
+        \\        if index >= self.count { @trap() }
+        \\        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        \\        return ptr.*
+        \\    }
+        \\    fn set(self: *List(T), index: i64, value: T) void {
+        \\        if index < 0 { @trap() }
+        \\        if index >= self.count { @trap() }
+        \\        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        \\        ptr.* = value
+        \\    }
+        \\    fn free(self: *List(T)) void {
+        \\        if self.capacity > 0 {
+        \\            @dealloc(self.items)
+        \\        }
+        \\        self.items = 0
+        \\        self.count = 0
+        \\        self.capacity = 0
+        \\    }
+        \\}
+        \\fn main() i64 {
+        \\    var list: List(i64) = .{}
+        \\    list.append(10)
+        \\    list.append(20)
+        \\    list.append(30)
+        \\    list.set(0, 99)
+        \\    let v = list.get(0)
+        \\    list.free()
+        \\    if v != 99 { return 1 }
+        \\    return 0
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: list insert remove" {
+    const code =
+        \\struct List(T) {
+        \\    items: i64,
+        \\    count: i64,
+        \\    capacity: i64,
+        \\}
+        \\impl List(T) {
+        \\    fn ensureCapacity(self: *List(T), needed: i64) void {
+        \\        if self.capacity >= needed { return }
+        \\        var new_cap = self.capacity
+        \\        var double_cap = new_cap + new_cap
+        \\        if needed > double_cap {
+        \\            new_cap = needed
+        \\        } else if self.capacity < 256 {
+        \\            new_cap = double_cap
+        \\        } else {
+        \\            while new_cap < needed {
+        \\                new_cap = new_cap + (new_cap + 768) / 4
+        \\            }
+        \\        }
+        \\        if new_cap < 8 { new_cap = 8 }
+        \\        let bytes = new_cap * @sizeOf(T)
+        \\        if self.capacity == 0 {
+        \\            self.items = @alloc(bytes)
+        \\        } else {
+        \\            self.items = @realloc(self.items, bytes)
+        \\        }
+        \\        self.capacity = new_cap
+        \\    }
+        \\    fn append(self: *List(T), value: T) void {
+        \\        self.ensureCapacity(self.count + 1)
+        \\        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+        \\        ptr.* = value
+        \\        self.count = self.count + 1
+        \\    }
+        \\    fn get(self: *List(T), index: i64) T {
+        \\        if index < 0 { @trap() }
+        \\        if index >= self.count { @trap() }
+        \\        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        \\        return ptr.*
+        \\    }
+        \\    fn insert(self: *List(T), index: i64, value: T) void {
+        \\        if index < 0 { @trap() }
+        \\        if index > self.count { @trap() }
+        \\        self.ensureCapacity(self.count + 1)
+        \\        if index < self.count {
+        \\            let src = self.items + index * @sizeOf(T)
+        \\            let dst = src + @sizeOf(T)
+        \\            let bytes = (self.count - index) * @sizeOf(T)
+        \\            @memcpy(dst, src, bytes)
+        \\        }
+        \\        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        \\        ptr.* = value
+        \\        self.count = self.count + 1
+        \\    }
+        \\    fn orderedRemove(self: *List(T), index: i64) T {
+        \\        if index < 0 { @trap() }
+        \\        if index >= self.count { @trap() }
+        \\        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        \\        let value = ptr.*
+        \\        if index < self.count - 1 {
+        \\            let dst = self.items + index * @sizeOf(T)
+        \\            let src = dst + @sizeOf(T)
+        \\            let bytes = (self.count - index - 1) * @sizeOf(T)
+        \\            @memcpy(dst, src, bytes)
+        \\        }
+        \\        self.count = self.count - 1
+        \\        return value
+        \\    }
+        \\    fn free(self: *List(T)) void {
+        \\        if self.capacity > 0 {
+        \\            @dealloc(self.items)
+        \\        }
+        \\        self.items = 0
+        \\        self.count = 0
+        \\        self.capacity = 0
+        \\    }
+        \\}
+        \\fn main() i64 {
+        \\    var list: List(i64) = .{}
+        \\    list.append(10)
+        \\    list.append(30)
+        \\    list.insert(1, 20)
+        \\    if list.get(0) != 10 { return 1 }
+        \\    if list.get(1) != 20 { return 2 }
+        \\    if list.get(2) != 30 { return 3 }
+        \\    let removed = list.orderedRemove(0)
+        \\    if removed != 10 { return 4 }
+        \\    if list.count != 2 { return 5 }
+        \\    list.free()
+        \\    return 0
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
+
+test "wasm e2e: list reverse clone" {
+    const code =
+        \\struct List(T) {
+        \\    items: i64,
+        \\    count: i64,
+        \\    capacity: i64,
+        \\}
+        \\impl List(T) {
+        \\    fn ensureCapacity(self: *List(T), needed: i64) void {
+        \\        if self.capacity >= needed { return }
+        \\        var new_cap = self.capacity
+        \\        var double_cap = new_cap + new_cap
+        \\        if needed > double_cap {
+        \\            new_cap = needed
+        \\        } else if self.capacity < 256 {
+        \\            new_cap = double_cap
+        \\        } else {
+        \\            while new_cap < needed {
+        \\                new_cap = new_cap + (new_cap + 768) / 4
+        \\            }
+        \\        }
+        \\        if new_cap < 8 { new_cap = 8 }
+        \\        let bytes = new_cap * @sizeOf(T)
+        \\        if self.capacity == 0 {
+        \\            self.items = @alloc(bytes)
+        \\        } else {
+        \\            self.items = @realloc(self.items, bytes)
+        \\        }
+        \\        self.capacity = new_cap
+        \\    }
+        \\    fn append(self: *List(T), value: T) void {
+        \\        self.ensureCapacity(self.count + 1)
+        \\        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+        \\        ptr.* = value
+        \\        self.count = self.count + 1
+        \\    }
+        \\    fn get(self: *List(T), index: i64) T {
+        \\        if index < 0 { @trap() }
+        \\        if index >= self.count { @trap() }
+        \\        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        \\        return ptr.*
+        \\    }
+        \\    fn set(self: *List(T), index: i64, value: T) void {
+        \\        if index < 0 { @trap() }
+        \\        if index >= self.count { @trap() }
+        \\        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        \\        ptr.* = value
+        \\    }
+        \\    fn reverse(self: *List(T)) void {
+        \\        var i: i64 = 0
+        \\        var j: i64 = self.count - 1
+        \\        while i < j {
+        \\            let pi = @intToPtr(*T, self.items + i * @sizeOf(T))
+        \\            let pj = @intToPtr(*T, self.items + j * @sizeOf(T))
+        \\            let tmp = pi.*
+        \\            pi.* = pj.*
+        \\            pj.* = tmp
+        \\            i = i + 1
+        \\            j = j - 1
+        \\        }
+        \\    }
+        \\    fn clone(self: *List(T)) List(T) {
+        \\        var new_list: List(T) = .{}
+        \\        if self.count > 0 {
+        \\            let bytes = self.count * @sizeOf(T)
+        \\            new_list.items = @alloc(bytes)
+        \\            @memcpy(new_list.items, self.items, bytes)
+        \\            new_list.count = self.count
+        \\            new_list.capacity = self.count
+        \\        }
+        \\        return new_list
+        \\    }
+        \\    fn free(self: *List(T)) void {
+        \\        if self.capacity > 0 {
+        \\            @dealloc(self.items)
+        \\        }
+        \\        self.items = 0
+        \\        self.count = 0
+        \\        self.capacity = 0
+        \\    }
+        \\}
+        \\fn main() i64 {
+        \\    var list: List(i64) = .{}
+        \\    list.append(1)
+        \\    list.append(2)
+        \\    list.append(3)
+        \\    list.reverse()
+        \\    if list.get(0) != 3 { return 1 }
+        \\    if list.get(2) != 1 { return 2 }
+        \\    var copy = list.clone()
+        \\    list.set(0, 99)
+        \\    if copy.get(0) != 3 { return 3 }
+        \\    list.free()
+        \\    copy.free()
+        \\    return 0
+        \\}
+    ;
+    var result = try compileToWasmViaDriver(std.testing.allocator, code);
+    defer result.deinit();
+    try std.testing.expect(!result.has_errors);
+    try std.testing.expect(result.wasm_bytes.len > 0);
+    try std.testing.expectEqualSlices(u8, "\x00asm", result.wasm_bytes[0..4]);
+}
