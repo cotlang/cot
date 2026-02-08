@@ -37,6 +37,7 @@ pub const ssa_layout = @import("ssa/passes/layout.zig");
 pub const pipeline_debug = @import("pipeline_debug.zig");
 pub const driver = @import("driver.zig");
 pub const cli = @import("cli.zig");
+pub const lsp_main = @import("lsp/main.zig");
 
 // Native codegen (AOT compiler path)
 // Cranelift-style pipeline: Wasm → CLIF IR → MachInst → ARM64/x64
@@ -51,6 +52,7 @@ pub const wasm = @import("codegen/wasm.zig");
 pub const wasm_opcodes = @import("codegen/wasm_opcodes.zig");
 pub const wasm_encode = @import("codegen/wasm_encode.zig");
 pub const wasm_gen = @import("codegen/wasm_gen.zig");
+pub const test_runtime = @import("codegen/test_runtime.zig");
 
 const Target = core_target.Target;
 const Driver = driver.Driver;
@@ -100,6 +102,7 @@ pub fn main() !void {
         .build => |opts| buildCommand(allocator, opts),
         .run => |opts| runCommand(allocator, opts),
         .@"test" => |opts| testCommand(allocator, opts),
+        .lsp => lsp_main.run(allocator),
         .version => cli.printVersion(),
         .help => |opts| cli.printHelp(opts.subcommand),
     }

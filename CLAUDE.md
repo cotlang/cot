@@ -34,6 +34,40 @@ Read `docs/BR_TABLE_ARCHITECTURE.md` if confused. br_table is copied from Go's d
 
 ---
 
+## CLI
+
+```
+cot <file.cot>                  # Implicit build (shorthand for cot build)
+cot build <file.cot> [-o name]  # Compile to executable (or .wasm)
+cot run <file.cot> [-- args]    # Compile, run in /tmp, clean up, forward exit code
+cot test <file.cot>             # Compile + run in test mode
+cot lsp                         # Start language server (LSP over stdio)
+cot version                     # Print version: cot 0.3.1 (arm64-macos)
+cot help [command]              # Print help (per-subcommand help available)
+```
+
+**Key files:** `compiler/cli.zig` (arg parsing, help text), `compiler/main.zig` (command dispatch + compileAndLink).
+
+**Output naming:** Strip path, strip `.cot`, append `.wasm` for wasm targets. `app.cot` → `./app` (native) or `./app.wasm` (wasm). Override with `-o`.
+
+---
+
+## Versioning
+
+**Single source of truth:** `VERSION` file at repo root (plain text, e.g. `0.3.1`).
+
+**Flow:** `VERSION` → `build.zig` reads via `@embedFile` → injected as `build_options` → `compiler/cli.zig` imports `@import("build_options").version`.
+
+**To bump the version:** Edit `VERSION`, rebuild. That's it.
+
+**Design (audited from Go/Zig/Rust/Deno):**
+- Rust pattern: plain text VERSION file (simplest, CI-friendly)
+- Zig pattern: `@import("build_options")` comptime injection
+- SemVer `0.X.Y` (standard for pre-1.0)
+- Help banner shows major.minor only (`Cot 0.3`), `cot version` shows full (`cot 0.3.1 (arm64-macos)`)
+
+---
+
 ## Architecture
 
 **ALL code goes through Wasm first.** Native is AOT-compiled FROM Wasm via Cranelift-port.
@@ -50,6 +84,8 @@ Cot Source → Scanner → Parser → Checker → IR → SSA
 **Key directories:**
 | Path | Purpose | Reference |
 |------|---------|-----------|
+| `compiler/cli.zig` | CLI arg parsing, help text, version | — |
+| `compiler/main.zig` | Command dispatch, compileAndLink | — |
 | `compiler/frontend/` | Scanner, parser, checker, lowerer | — |
 | `compiler/ssa/passes/` | rewritegeneric, decompose, rewritedec, schedule, layout, lower_wasm | Go `ssa/*.go` |
 | `compiler/codegen/wasm/` | Wasm bytecode generation + linking | Go `wasm/ssa.go`, `wasmobj.go` |
@@ -59,6 +95,7 @@ Cot Source → Scanner → Parser → Checker → IR → SSA
 | `compiler/codegen/native/isa/x64/` | x64 backend | Cranelift `isa/x64/` |
 | `compiler/codegen/native/regalloc/` | Register allocator (regalloc2 port) | `~/learning/regalloc2/src/` |
 | `compiler/driver.zig` | Pipeline orchestrator | — |
+| `compiler/lsp/` | Language server (LSP over stdio) | ZLS (Zig Language Server) |
 
 **Reference implementations (copy, don't invent):**
 | Component | Reference Location |
@@ -144,6 +181,7 @@ try list.append(allocator, 42);
 
 | Document | Purpose |
 |----------|---------|
+| `VERSION` | **Version single source of truth** (edit to bump) |
 | `TROUBLESHOOTING.md` | **Debugging methodology — read before any debugging** |
 | `docs/PIPELINE_ARCHITECTURE.md` | **Full pipeline map, reference for every stage** |
 | `docs/BR_TABLE_ARCHITECTURE.md` | Why br_table appears in generated code |

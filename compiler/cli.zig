@@ -44,6 +44,7 @@ pub const Command = union(enum) {
     build: BuildOptions,
     run: RunOptions,
     @"test": TestOptions,
+    lsp,
     version,
     help: HelpOptions,
 };
@@ -58,6 +59,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) ?Command {
     if (std.mem.eql(u8, first, "build")) return parseBuild(&args);
     if (std.mem.eql(u8, first, "run")) return parseRun(allocator, &args);
     if (std.mem.eql(u8, first, "test")) return parseTest(&args);
+    if (std.mem.eql(u8, first, "lsp")) return .lsp;
     if (std.mem.eql(u8, first, "version")) return .version;
     if (std.mem.eql(u8, first, "help")) {
         const sub = args.next();
@@ -289,6 +291,7 @@ fn printUsage() void {
         \\  cot build <file.cot> [-o name]  Compile with options
         \\  cot run <file.cot> [-- args]    Compile and run
         \\  cot test <file.cot>             Run tests
+        \\  cot lsp                         Start language server (LSP)
         \\  cot version                     Print version
         \\  cot help [command]              Print help
         \\
