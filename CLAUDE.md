@@ -96,6 +96,7 @@ Cot Source → Scanner → Parser → Checker → IR → SSA
 | `compiler/codegen/native/regalloc/` | Register allocator (regalloc2 port) | `references/regalloc2/src/` |
 | `compiler/driver.zig` | Pipeline orchestrator | — |
 | `compiler/lsp/` | Language server (LSP over stdio) | ZLS (Zig Language Server) |
+| `editors/vscode/` | VS Code/Cursor extension (syntax + LSP client) | — |
 
 **Reference implementations (copy, don't invent):**
 | Component | Reference Location |
@@ -168,6 +169,7 @@ try list.append(allocator, 42);
 
 **DO:**
 - Run `zig build test` after every change
+- Reinstall editor extensions after modifying anything in `editors/` (see Editor Extensions section)
 - Check `docs/specs/WASM_3_0_REFERENCE.md` when touching Wasm codegen
 - Check `docs/PIPELINE_ARCHITECTURE.md` for full pipeline reference map
 - Reference `bootstrap-0.2/` for working code examples
@@ -181,6 +183,27 @@ try list.append(allocator, 42);
 - Give up on difficult code — study the reference until you understand it
 
 **When stuck:** Read reference implementation → copy pattern → iterate until tests pass.
+
+---
+
+## Editor Extensions
+
+**Location:** `editors/vscode/` — VS Code / Cursor extension (syntax highlighting + LSP client)
+
+**After any change to the extension** (grammar, extension.ts, package.json), reinstall to Cursor:
+
+```bash
+cd editors/vscode && npm install && npm run compile && npx @vscode/vsce package --allow-missing-repository
+cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-extension cot-lang-0.1.0.vsix --force
+```
+
+This includes changes to:
+- `syntaxes/cot.tmLanguage.json` — syntax highlighting rules
+- `src/extension.ts` — LSP client code
+- `language-configuration.json` — bracket matching, comments, indentation
+- `package.json` — capabilities, settings, dependencies
+
+**Always reinstall after modifying any extension file.** Cursor caches extensions aggressively.
 
 ---
 

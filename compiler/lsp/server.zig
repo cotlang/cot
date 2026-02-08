@@ -6,6 +6,7 @@ const diagnostics_mod = @import("diagnostics.zig");
 const hover_mod = @import("hover.zig");
 const goto_mod = @import("goto.zig");
 const doc_symbol = @import("document_symbol.zig");
+const semantic_tokens = @import("semantic_tokens.zig");
 const lsp_types = @import("types.zig");
 
 const DocumentStore = document_store.DocumentStore;
@@ -78,6 +79,8 @@ pub const Server = struct {
             return try self.handleDefinition(arena, id, params);
         } else if (std.mem.eql(u8, method, "textDocument/documentSymbol")) {
             return try self.handleDocumentSymbol(arena, id, params);
+        } else if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) {
+            return try self.handleSemanticTokensFull(arena, id, params);
         } else {
             // Unknown method — if it has an id, send MethodNotFound
             if (id != null) {
@@ -93,9 +96,28 @@ pub const Server = struct {
 
     fn handleInitialize(self: *Server, arena: std.mem.Allocator, id: ?std.json.Value) ![]const u8 {
         self.status = .initializing;
-        const result =
-            \\{"capabilities":{"textDocumentSync":{"openClose":true,"change":1},"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true},"serverInfo":{"name":"cot-lsp","version":"0.1.0"}}
-        ;
+
+        // Build semanticTokensProvider legend JSON
+        var legend = std.ArrayListUnmanaged(u8){};
+        try legend.appendSlice(arena, "\"tokenTypes\":[");
+        for (semantic_tokens.token_type_legend, 0..) |name, i| {
+            if (i > 0) try legend.append(arena, ',');
+            try legend.append(arena, '"');
+            try legend.appendSlice(arena, name);
+            try legend.append(arena, '"');
+        }
+        try legend.appendSlice(arena, "],\"tokenModifiers\":[");
+        for (semantic_tokens.token_modifier_legend, 0..) |name, i| {
+            if (i > 0) try legend.append(arena, ',');
+            try legend.append(arena, '"');
+            try legend.appendSlice(arena, name);
+            try legend.append(arena, '"');
+        }
+        try legend.append(arena, ']');
+
+        const result = try std.fmt.allocPrint(arena,
+            \\{{"capabilities":{{"textDocumentSync":{{"openClose":true,"change":1}},"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true,"semanticTokensProvider":{{"legend":{{{s}}},"full":true}}}},"serverInfo":{{"name":"cot-lsp","version":"0.1.0"}}}}
+        , .{legend.items});
         return try self.successResponse(arena, id, result);
     }
 
@@ -211,6 +233,31 @@ pub const Server = struct {
             try serializeSymbol(arena, &json, sym);
         }
         try json.append(arena, ']');
+
+        return try self.successResponse(arena, id, json.items);
+    }
+
+    fn handleSemanticTokensFull(self: *Server, arena: std.mem.Allocator, id: ?std.json.Value, params: ?std.json.Value) ![]const u8 {
+        const p = params orelse return try self.nullResponse(arena, id);
+        const td = p.object.get("textDocument") orelse return try self.nullResponse(arena, id);
+        const uri = (td.object.get("uri") orelse return try self.nullResponse(arena, id)).string;
+
+        const handle = self.store.get(uri) orelse return try self.successResponse(arena, id, "{\"data\":[]}");
+        var result = handle.result orelse return try self.successResponse(arena, id, "{\"data\":[]}");
+
+        const data = semantic_tokens.getSemanticTokens(arena, &result) catch return try self.successResponse(arena, id, "{\"data\":[]}");
+
+        if (data.len == 0) return try self.successResponse(arena, id, "{\"data\":[]}");
+
+        // Build JSON array of u32 values
+        var json = std.ArrayListUnmanaged(u8){};
+        try json.appendSlice(arena, "{\"data\":[");
+        for (data, 0..) |val, i| {
+            if (i > 0) try json.append(arena, ',');
+            const num_str = try std.fmt.allocPrint(arena, "{d}", .{val});
+            try json.appendSlice(arena, num_str);
+        }
+        try json.appendSlice(arena, "]}");
 
         return try self.successResponse(arena, id, json.items);
     }
