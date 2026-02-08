@@ -78,6 +78,7 @@ pub const GenericInfo = struct {
     type_params: []const []const u8,
     type_param_bounds: []const ?[]const u8 = &.{}, // parallel array, null = unbounded
     node_idx: NodeIndex,
+    tree: *const Ast, // which file's AST this node_idx belongs to (for cross-file generics)
 };
 
 /// Info about a resolved generic function instantiation for the lowerer.
@@ -86,6 +87,7 @@ pub const GenericInstInfo = struct {
     generic_node: NodeIndex,
     type_args: []const TypeIndex,
     type_param_names: []const []const u8 = &.{}, // For impl block methods (type params come from impl, not fn)
+    tree: *const Ast, // which file's AST this generic_node belongs to (for cross-file generics)
 };
 
 /// Info about a trait definition.
@@ -94,49 +96,23 @@ pub const TraitDef = struct {
     method_names: []const []const u8,
 };
 
-/// Info about a generic impl block definition.
-pub const GenericImplInfo = struct {
-    type_params: []const []const u8,
-    methods: []const NodeIndex,
-};
+/// Shared generic context — lives across all checkers in multi-file mode.
+/// Created once in the driver, passed to all Checker instances so that
+/// File B can see generic definitions from File A.
+pub const SharedGenericContext = struct {
+    generic_structs: std.StringHashMap(GenericInfo),
+    generic_functions: std.StringHashMap(GenericInfo),
+    instantiation_cache: std.StringHashMap(TypeIndex),
+    generic_inst_by_name: std.StringHashMap(GenericInstInfo),
+    generic_impl_blocks: std.StringHashMap(std.ArrayListUnmanaged(GenericImplInfo)),
+    trait_defs: std.StringHashMap(TraitDef),
+    trait_impls: std.StringHashMap([]const u8),
 
-pub const Checker = struct {
-    types: *TypeRegistry,
-    scope: *Scope,
-    err: *ErrorReporter,
-    tree: *const Ast,
-    allocator: std.mem.Allocator,
-    expr_types: std.AutoHashMap(NodeIndex, TypeIndex),
-    current_return_type: TypeIndex = TypeRegistry.VOID,
-    in_loop: bool = false,
-    // Generics support (Zig-style lazy monomorphization + Go checker flow)
-    generic_structs: std.StringHashMap(GenericInfo) = undefined,
-    generic_functions: std.StringHashMap(GenericInfo) = undefined,
-    instantiation_cache: std.StringHashMap(TypeIndex) = undefined,
-    generic_instantiations: std.AutoHashMap(NodeIndex, GenericInstInfo) = undefined,
-    /// All generic instantiations by concrete name (never overwritten, unlike generic_instantiations).
-    generic_inst_by_name: std.StringHashMap(GenericInstInfo) = undefined,
-    /// Generic impl blocks keyed by base struct name (e.g., "List" -> impl List(T) { ... })
-    generic_impl_blocks: std.StringHashMap(std.ArrayListUnmanaged(GenericImplInfo)) = undefined,
-    /// Trait definitions: "Eq" -> TraitDef
-    trait_defs: std.StringHashMap(TraitDef) = undefined,
-    /// Trait implementations: "Eq:Point" -> trait_name (for validation)
-    trait_impls: std.StringHashMap([]const u8) = undefined,
-    /// Type substitution map, active during generic instantiation
-    type_substitution: ?std.StringHashMap(TypeIndex) = null,
-
-    pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope) Checker {
+    pub fn init(allocator: std.mem.Allocator) SharedGenericContext {
         return .{
-            .types = type_reg,
-            .scope = global_scope,
-            .err = reporter,
-            .tree = tree,
-            .allocator = allocator,
-            .expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(allocator),
             .generic_structs = std.StringHashMap(GenericInfo).init(allocator),
             .generic_functions = std.StringHashMap(GenericInfo).init(allocator),
             .instantiation_cache = std.StringHashMap(TypeIndex).init(allocator),
-            .generic_instantiations = std.AutoHashMap(NodeIndex, GenericInstInfo).init(allocator),
             .generic_inst_by_name = std.StringHashMap(GenericInstInfo).init(allocator),
             .generic_impl_blocks = std.StringHashMap(std.ArrayListUnmanaged(GenericImplInfo)).init(allocator),
             .trait_defs = std.StringHashMap(TraitDef).init(allocator),
@@ -144,18 +120,65 @@ pub const Checker = struct {
         };
     }
 
-    pub fn deinit(self: *Checker) void {
-        self.expr_types.deinit();
+    pub fn deinit(self: *SharedGenericContext, allocator: std.mem.Allocator) void {
         self.generic_structs.deinit();
         self.generic_functions.deinit();
         self.instantiation_cache.deinit();
-        self.generic_instantiations.deinit();
         self.generic_inst_by_name.deinit();
         var gib_it = self.generic_impl_blocks.valueIterator();
-        while (gib_it.next()) |list| list.deinit(self.allocator);
+        while (gib_it.next()) |list| list.deinit(allocator);
         self.generic_impl_blocks.deinit();
         self.trait_defs.deinit();
         self.trait_impls.deinit();
+    }
+};
+
+/// Info about a generic impl block definition.
+pub const GenericImplInfo = struct {
+    type_params: []const []const u8,
+    methods: []const NodeIndex,
+    tree: *const Ast, // which file's AST these method NodeIndexes belong to (for cross-file generics)
+};
+
+pub const Checker = struct {
+    types: *TypeRegistry,
+    scope: *Scope,
+    /// Zig pattern: generic instances belong in the declaring module's namespace.
+    /// We store the global scope so generic instance symbols (e.g. List_append(5))
+    /// survive function scope destruction and remain accessible during lowering.
+    global_scope: *Scope,
+    err: *ErrorReporter,
+    tree: *const Ast,
+    allocator: std.mem.Allocator,
+    expr_types: std.AutoHashMap(NodeIndex, TypeIndex),
+    current_return_type: TypeIndex = TypeRegistry.VOID,
+    in_loop: bool = false,
+    // Generics support (Zig-style lazy monomorphization + Go checker flow)
+    // Shared across all checkers in multi-file mode (owned by driver)
+    generics: *SharedGenericContext,
+    // Per-checker: keyed by call-site NodeIndex (file-specific)
+    generic_instantiations: std.AutoHashMap(NodeIndex, GenericInstInfo) = undefined,
+    /// Type substitution map, active during generic instantiation
+    type_substitution: ?std.StringHashMap(TypeIndex) = null,
+
+    pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope, generic_ctx: *SharedGenericContext) Checker {
+        return .{
+            .types = type_reg,
+            .scope = global_scope,
+            .global_scope = global_scope,
+            .err = reporter,
+            .tree = tree,
+            .allocator = allocator,
+            .expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(allocator),
+            .generics = generic_ctx,
+            .generic_instantiations = std.AutoHashMap(NodeIndex, GenericInstInfo).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Checker) void {
+        self.expr_types.deinit();
+        self.generic_instantiations.deinit();
+        // SharedGenericContext is owned by the driver, not the checker
     }
     pub fn checkFile(self: *Checker) CheckError!void {
         const file = self.tree.file orelse return;
@@ -191,7 +214,7 @@ pub const Checker = struct {
                 }
                 // Generic functions: store definition, don't build concrete type yet
                 if (f.type_params.len > 0) {
-                    try self.generic_functions.put(f.name, .{ .type_params = f.type_params, .type_param_bounds = f.type_param_bounds, .node_idx = idx });
+                    try self.generics.generic_functions.put(f.name, .{ .type_params = f.type_params, .type_param_bounds = f.type_param_bounds, .node_idx = idx, .tree = self.tree });
                     // Register as a type_name so checkIdentifier knows it's generic
                     try self.scope.define(Symbol.init(f.name, .type_name, invalid_type, idx, false));
                     return;
@@ -209,7 +232,7 @@ pub const Checker = struct {
                 if (self.scope.isDefined(s.name)) { self.err.errorWithCode(s.span.start, .e302, "redefined identifier"); return; }
                 // Generic structs: store definition, don't build concrete type yet
                 if (s.type_params.len > 0) {
-                    try self.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx });
+                    try self.generics.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx, .tree = self.tree });
                     try self.scope.define(Symbol.init(s.name, .type_name, invalid_type, idx, false));
                     return;
                 }
@@ -245,9 +268,9 @@ pub const Checker = struct {
             .impl_block => |impl_b| {
                 // Generic impl blocks: store definition, instantiate when struct is instantiated
                 if (impl_b.type_params.len > 0) {
-                    const gop = try self.generic_impl_blocks.getOrPut(impl_b.type_name);
+                    const gop = try self.generics.generic_impl_blocks.getOrPut(impl_b.type_name);
                     if (!gop.found_existing) gop.value_ptr.* = .{};
-                    try gop.value_ptr.append(self.allocator, .{ .type_params = impl_b.type_params, .methods = impl_b.methods });
+                    try gop.value_ptr.append(self.allocator, .{ .type_params = impl_b.type_params, .methods = impl_b.methods, .tree = self.tree });
                     return;
                 }
                 for (impl_b.methods) |method_idx| {
@@ -269,11 +292,11 @@ pub const Checker = struct {
                     const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
                     if (method_decl == .fn_decl) try method_names.append(self.allocator, method_decl.fn_decl.name);
                 }
-                try self.trait_defs.put(td.name, .{ .name = td.name, .method_names = try self.allocator.dupe([]const u8, method_names.items) });
+                try self.generics.trait_defs.put(td.name, .{ .name = td.name, .method_names = try self.allocator.dupe([]const u8, method_names.items) });
             },
             .impl_trait => |it| {
                 // Validate trait exists
-                const trait_def = self.trait_defs.get(it.trait_name) orelse {
+                const trait_def = self.generics.trait_defs.get(it.trait_name) orelse {
                     self.err.errorWithCode(it.span.start, .e301, "undefined trait");
                     return;
                 };
@@ -298,7 +321,7 @@ pub const Checker = struct {
                     }
                 }
                 const impl_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ it.trait_name, it.target_type });
-                try self.trait_impls.put(impl_key, it.trait_name);
+                try self.generics.trait_impls.put(impl_key, it.trait_name);
             },
             else => {},
         }
@@ -514,7 +537,7 @@ pub const Checker = struct {
         }
         // Go pattern: generic function names cannot be used without instantiation.
         // Go types2/call.go:33 — funcInst() requires IndexExpr (explicit type args).
-        if (self.generic_functions.contains(id.name)) {
+        if (self.generics.generic_functions.contains(id.name)) {
             self.err.errorWithCode(id.span.start, .e300, "generic function requires type arguments");
             return invalid_type;
         }
@@ -625,7 +648,7 @@ pub const Checker = struct {
                 return TypeRegistry.STRING;
             }
             // Generic function instantiation: max(i64) where max is generic
-            if (self.generic_functions.get(name)) |gen_info| {
+            if (self.generics.generic_functions.get(name)) |gen_info| {
                 return try self.instantiateGenericFunc(c, gen_info, name);
             }
         };
@@ -1276,7 +1299,7 @@ pub const Checker = struct {
     /// Go pattern: types2/instantiate.go:87-125 — instance() for named types.
     /// Creates concrete struct type with substituted fields, deduplicates via cache.
     fn resolveGenericInstance(self: *Checker, gi: ast.GenericInstance, span: Span) CheckError!TypeIndex {
-        const gen_info = self.generic_structs.get(gi.name) orelse {
+        const gen_info = self.generics.generic_structs.get(gi.name) orelse {
             self.err.errorWithCode(span.start, .e301, "undefined generic type");
             return invalid_type;
         };
@@ -1299,7 +1322,7 @@ pub const Checker = struct {
         const cache_key = try self.buildGenericCacheKey(gi.name, resolved_args.items);
 
         // Check instantiation cache
-        if (self.instantiation_cache.get(cache_key)) |cached| return cached;
+        if (self.generics.instantiation_cache.get(cache_key)) |cached| return cached;
 
         // Create type substitution map
         var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
@@ -1307,6 +1330,11 @@ pub const Checker = struct {
         for (gen_info.type_params, 0..) |param_name, i| {
             try sub_map.put(param_name, resolved_args.items[i]);
         }
+
+        // Swap to the defining file's AST for cross-file generic resolution
+        const saved_tree = self.tree;
+        self.tree = gen_info.tree;
+        defer self.tree = saved_tree;
 
         // Get the struct declaration AST node
         const struct_decl = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
@@ -1320,10 +1348,11 @@ pub const Checker = struct {
 
         // Register and cache
         try self.types.registerNamed(cache_key, concrete_type);
-        try self.instantiation_cache.put(cache_key, concrete_type);
+        try self.generics.instantiation_cache.put(cache_key, concrete_type);
 
         // Instantiate generic impl block methods for this concrete struct
-        try self.instantiateGenericImplMethods(gi.name, cache_key, resolved_args.items);
+        // Pass the host tree (saved before swap) so cross-file detection works correctly
+        try self.instantiateGenericImplMethods(gi.name, cache_key, resolved_args.items, saved_tree);
 
         return concrete_type;
     }
@@ -1342,11 +1371,17 @@ pub const Checker = struct {
         base_name: []const u8,
         concrete_name: []const u8,
         resolved_args: []const TypeIndex,
+        host_tree: *const Ast,
     ) CheckError!void {
-        const impl_list = self.generic_impl_blocks.get(base_name) orelse return;
+        const impl_list = self.generics.generic_impl_blocks.get(base_name) orelse return;
         for (impl_list.items) |impl_info| {
             // Validate type param count matches (Go: named.go:489 checks RecvTypeParams.Len == targs.Len)
             if (impl_info.type_params.len != resolved_args.len) continue;
+
+            // Swap to the defining file's AST for cross-file generic resolution
+            const saved_tree = self.tree;
+            self.tree = impl_info.tree;
+            defer self.tree = saved_tree;
 
             // Build type substitution map: T -> concrete type
             var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
@@ -1368,8 +1403,8 @@ pub const Checker = struct {
                 const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ concrete_name, f.name });
                 const func_type = try self.buildFuncType(f.params, f.return_type);
 
-                if (!self.scope.isDefined(synth_name)) {
-                    try self.scope.define(Symbol.init(synth_name, .function, func_type, method_idx, false));
+                if (!self.global_scope.isDefined(synth_name)) {
+                    try self.global_scope.define(Symbol.init(synth_name, .function, func_type, method_idx, false));
                 }
                 try self.types.registerMethod(concrete_name, types.MethodInfo{
                     .name = f.name,
@@ -1384,11 +1419,24 @@ pub const Checker = struct {
                     .generic_node = method_idx,
                     .type_args = try self.allocator.dupe(TypeIndex, resolved_args),
                     .type_param_names = impl_info.type_params,
+                    .tree = impl_info.tree,
                 };
-                try self.generic_inst_by_name.put(synth_name, inst);
+                try self.generics.generic_inst_by_name.put(synth_name, inst);
             }
 
             // Pass 2: Check all method bodies (all sibling methods now visible in scope)
+            // Cross-file only: save/restore expr_types because foreign AST NodeIndexes
+            // collide with the host file's NodeIndex space (both start from 0).
+            const is_cross_file = (impl_info.tree != host_tree);
+            var saved_expr_types_2: std.AutoHashMap(NodeIndex, TypeIndex) = undefined;
+            if (is_cross_file) {
+                saved_expr_types_2 = self.expr_types;
+                self.expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
+            }
+            defer if (is_cross_file) {
+                self.expr_types.deinit();
+                self.expr_types = saved_expr_types_2;
+            };
             for (impl_info.methods) |method_idx| {
                 const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
                 if (method_decl != .fn_decl) continue;
@@ -1437,7 +1485,7 @@ pub const Checker = struct {
                     const type_name = self.types.typeName(resolved_args.items[i]);
                     const impl_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ trait_name, type_name });
                     defer self.allocator.free(impl_key);
-                    if (self.trait_impls.get(impl_key) == null) {
+                    if (self.generics.trait_impls.get(impl_key) == null) {
                         self.err.errorWithCode(c.span.start, .e300, "type does not satisfy trait bound");
                         return invalid_type;
                     }
@@ -1447,6 +1495,11 @@ pub const Checker = struct {
 
         // Go pattern: context.go:87-102 — hash-based dedup with identity verification
         const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
+
+        // Swap to the defining file's AST for cross-file generic resolution
+        const saved_tree = self.tree;
+        self.tree = gen_info.tree;
+        defer self.tree = saved_tree;
 
         // Get the fn_decl AST node
         const fn_node = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
@@ -1464,15 +1517,24 @@ pub const Checker = struct {
         self.type_substitution = sub_map;
         const func_type = try self.buildFuncType(f.params, f.return_type);
 
-        // Register the concrete function in scope before body check
-        if (!self.scope.isDefined(cache_key)) {
-            try self.scope.define(Symbol.init(cache_key, .function, func_type, gen_info.node_idx, false));
+        // Zig pattern: generic instances belong in the global namespace (not function-local scope)
+        if (!self.global_scope.isDefined(cache_key)) {
+            try self.global_scope.define(Symbol.init(cache_key, .function, func_type, gen_info.node_idx, false));
         }
 
         // Go pattern: check.later() defers body verification (call.go:152-166).
-        // We check eagerly here since we're single-threaded. This populates expr_types
-        // for the body nodes with concrete types (e.g., T→i64).
-        try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
+        // We check eagerly here since we're single-threaded.
+        // Cross-file only: save/restore expr_types to avoid NodeIndex collision.
+        const is_cross_file = (gen_info.tree != saved_tree);
+        if (is_cross_file) {
+            const saved_et = self.expr_types;
+            self.expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
+            try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
+            self.expr_types.deinit();
+            self.expr_types = saved_et;
+        } else {
+            try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
+        }
         self.type_substitution = old_sub;
 
         // Record for the lowerer: this call node is a generic instantiation
@@ -1480,10 +1542,11 @@ pub const Checker = struct {
             .concrete_name = cache_key,
             .generic_node = gen_info.node_idx,
             .type_args = try self.allocator.dupe(TypeIndex, resolved_args.items),
+            .tree = gen_info.tree,
         };
         try self.generic_instantiations.put(c.callee, inst);
         // Also store by concrete name (never overwritten, for nested generic calls)
-        try self.generic_inst_by_name.put(cache_key, inst);
+        try self.generics.generic_inst_by_name.put(cache_key, inst);
 
         return func_type;
     }

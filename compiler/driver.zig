@@ -88,7 +88,9 @@ pub const Driver = struct {
         defer type_reg.deinit();
         var global_scope = checker_mod.Scope.init(self.allocator, null);
         defer global_scope.deinit();
-        var chk = checker_mod.Checker.init(self.allocator, &tree, &type_reg, &err_reporter, &global_scope);
+        var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
+        defer generic_ctx.deinit(self.allocator);
+        var chk = checker_mod.Checker.init(self.allocator, &tree, &type_reg, &err_reporter, &global_scope, &generic_ctx);
         defer chk.deinit();
         try chk.checkFile();
         if (err_reporter.hasErrors()) return error.TypeCheckError;
@@ -126,6 +128,8 @@ pub const Driver = struct {
         defer type_reg.deinit();
         var global_scope = checker_mod.Scope.init(self.allocator, null);
         defer global_scope.deinit();
+        var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
+        defer generic_ctx.deinit(self.allocator);
 
         var checkers = std.ArrayListUnmanaged(checker_mod.Checker){};
         defer {
@@ -135,7 +139,7 @@ pub const Driver = struct {
 
         for (parsed_files.items) |*pf| {
             var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
-            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, &global_scope);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, &global_scope, &generic_ctx);
             chk.checkFile() catch |e| {
                 chk.deinit();
                 return e;
@@ -237,12 +241,45 @@ pub const Driver = struct {
         defer self.allocator.free(imports);
         const file_dir = std.fs.path.dirname(canonical_path) orelse ".";
         for (imports) |import_path| {
-            const full_path = try std.fs.path.join(self.allocator, &.{ file_dir, import_path });
+            const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
+                try self.resolveStdImport(import_path, file_dir)
+            else
+                try std.fs.path.join(self.allocator, &.{ file_dir, import_path });
             defer self.allocator.free(full_path);
             try self.parseFileRecursive(full_path, parsed_files, seen_files);
         }
 
         try parsed_files.append(self.allocator, .{ .path = path_copy, .source_text = source_text, .source = src, .tree = tree });
+    }
+
+    /// Resolve stdlib imports: "std/list" → "<stdlib_dir>/list.cot"
+    /// Discovery order (like Zig's findZigLibDirFromSelfExe):
+    /// 1. COT_STDLIB env var (explicit override)
+    /// 2. Walk up from source file looking for stdlib/ directory
+    /// 3. CWD fallback (./stdlib/)
+    fn resolveStdImport(self: *Driver, import_path: []const u8, source_dir: []const u8) ![]const u8 {
+        const module = import_path["std/".len..];
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.cot", .{module});
+        defer self.allocator.free(filename);
+
+        // Tier 1: COT_STDLIB env var
+        if (std.posix.getenv("COT_STDLIB")) |stdlib_dir| {
+            return std.fs.path.join(self.allocator, &.{ stdlib_dir, filename });
+        }
+
+        // Tier 2: Walk up from source directory looking for stdlib/
+        var dir: []const u8 = source_dir;
+        while (true) {
+            const candidate = try std.fs.path.join(self.allocator, &.{ dir, "stdlib", filename });
+            if (std.fs.cwd().access(candidate, .{})) |_| {
+                return candidate;
+            } else |_| {}
+            self.allocator.free(candidate);
+            dir = std.fs.path.dirname(dir) orelse break;
+        }
+
+        // Tier 3: CWD fallback
+        return std.fs.path.join(self.allocator, &.{ "stdlib", filename });
     }
 
     /// Unified code generation for all architectures.

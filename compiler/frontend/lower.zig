@@ -110,16 +110,9 @@ pub const Lowerer = struct {
 
     pub fn lowerToBuilder(self: *Lowerer) !void {
         for (self.tree.getRootDecls()) |decl_idx| try self.lowerDecl(decl_idx);
-        // Queue all generic impl block method instances for lowering.
-        // Unlike regular generic functions (queued at call site via ensureGenericFnQueued),
-        // impl block methods are registered by the checker during struct instantiation and
-        // need to be pre-queued here so lowerQueuedGenericFunctions picks them up.
-        var inst_it = self.chk.generic_inst_by_name.valueIterator();
-        while (inst_it.next()) |inst_info| {
-            if (inst_info.type_param_names.len > 0) {
-                try self.lowered_generics.put(inst_info.concrete_name, {});
-            }
-        }
+        // Generic impl block methods are now queued on-demand via lowerMethodCall
+        // (which calls ensureGenericFnQueued when it encounters a call to a method
+        // in generic_inst_by_name). This avoids lowering unused methods.
         // Zig pattern: process queued generic instantiations as top-level functions
         // (deferred, not inline — avoids corrupting builder state during nested lowering)
         try self.lowerQueuedGenericFunctions();
@@ -2537,7 +2530,7 @@ pub const Lowerer = struct {
                     const gen_name = inner_callee_expr.ident.name;
 
                     // Look up generic function info to get the generic_node
-                    const gen_info = self.chk.generic_functions.get(gen_name) orelse {
+                    const gen_info = self.chk.generics.generic_functions.get(gen_name) orelse {
                         break :blk self.chk.generic_instantiations.get(inner_call.callee);
                     };
 
@@ -2581,6 +2574,7 @@ pub const Lowerer = struct {
                         .concrete_name = concrete_name,
                         .generic_node = gen_info.node_idx,
                         .type_args = try self.allocator.dupe(TypeIndex, resolved_type_args.items),
+                        .tree = gen_info.tree,
                     });
                 } else {
                     break :blk self.chk.generic_instantiations.get(inner_call.callee);
@@ -2762,17 +2756,29 @@ pub const Lowerer = struct {
         //
         // We must loop until no new instantiations are queued, because lowering one
         // generic body may queue new ones (e.g., List_append calls List_ensureCapacity).
+        // Zig pattern: collect-then-process to avoid iterator invalidation.
+        // lowerGenericFnInstance's re-check can trigger new instantiations that
+        // modify generic_inst_by_name, so we snapshot pending names each iteration.
         var emitted = std.StringHashMap(void).init(self.allocator);
         defer emitted.deinit();
+        var pending = std.ArrayListUnmanaged(checker.GenericInstInfo){};
+        defer pending.deinit(self.allocator);
         var made_progress = true;
         while (made_progress) {
             made_progress = false;
-            var it = self.chk.generic_inst_by_name.valueIterator();
+            pending.clearRetainingCapacity();
+            // Snapshot: collect all inst_infos that need lowering
+            var it = self.chk.generics.generic_inst_by_name.valueIterator();
             while (it.next()) |inst_info| {
                 if (!self.lowered_generics.contains(inst_info.concrete_name)) continue;
                 if (emitted.contains(inst_info.concrete_name)) continue;
+                try pending.append(self.allocator, inst_info.*);
+            }
+            // Process collected snapshot (safe — no iterator active)
+            for (pending.items) |inst_info| {
+                if (emitted.contains(inst_info.concrete_name)) continue;
                 try emitted.put(inst_info.concrete_name, {});
-                try self.lowerGenericFnInstance(inst_info.*);
+                try self.lowerGenericFnInstance(inst_info);
                 made_progress = true;
             }
         }
@@ -2780,6 +2786,16 @@ pub const Lowerer = struct {
 
     /// Lower one concrete generic function as a top-level function.
     fn lowerGenericFnInstance(self: *Lowerer, inst_info: checker.GenericInstInfo) !void {
+        // Swap to the defining file's AST for cross-file generic resolution
+        const saved_tree = self.tree;
+        const saved_chk_tree = self.chk.tree;
+        self.tree = inst_info.tree;
+        self.chk.tree = inst_info.tree;
+        defer {
+            self.tree = saved_tree;
+            self.chk.tree = saved_chk_tree;
+        }
+
         const fn_node = self.tree.getNode(inst_info.generic_node) orelse return;
         const fn_decl_node = fn_node.asDecl() orelse return;
         if (fn_decl_node != .fn_decl) return;
@@ -2803,6 +2819,16 @@ pub const Lowerer = struct {
         // same body AST but need different expr_types). The checker already eagerly checked
         // the body during instantiateGenericFunc; this re-check updates expr_types for the
         // current instantiation's concrete types.
+        //
+        // Zig pattern: each instantiation gets completely fresh analysis state.
+        // Fresh Sema per analysis (Zig: Zcu/PerThread.zig:2856-2883).
+        // Shared ZIR (our AST) is read-only. Analysis results are per-instance.
+        const saved_expr_types = self.chk.expr_types;
+        self.chk.expr_types = std.AutoHashMap(ir.NodeIndex, TypeIndex).init(self.allocator);
+        defer {
+            self.chk.expr_types.deinit();
+            self.chk.expr_types = saved_expr_types;
+        }
         self.chk.type_substitution = sub_map;
         self.chk.checkFnDeclWithName(f, inst_info.generic_node, inst_info.concrete_name) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2842,6 +2868,12 @@ pub const Lowerer = struct {
 
     fn lowerMethodCall(self: *Lowerer, call: ast.Call, fa: ast.FieldAccess, method_info: types.MethodInfo) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
+
+        // Queue generic impl method for deferred lowering (like ensureGenericFnQueued for regular generics)
+        if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |inst_info| {
+            try self.ensureGenericFnQueued(inst_info);
+        }
+
         var args = std.ArrayListUnmanaged(ir.NodeIndex){};
         defer args.deinit(self.allocator);
 
@@ -3636,7 +3668,9 @@ test "Lowerer basic init" {
     var err = ErrorReporter.init(&src, null);
     var scope = checker.Scope.init(allocator, null);
     defer scope.deinit();
-    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &scope);
+    var generic_ctx = checker.SharedGenericContext.init(allocator);
+    defer generic_ctx.deinit(allocator);
+    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &scope, &generic_ctx);
     defer chk.deinit();
     var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &chk);
     defer lowerer.deinit();
@@ -3679,7 +3713,8 @@ fn testPipeline(backing: std.mem.Allocator, code: []const u8) !TestResult {
 
     var type_reg = try TypeRegistry.init(allocator);
     var global_scope = checker.Scope.init(allocator, null);
-    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope);
+    var generic_ctx = checker.SharedGenericContext.init(allocator);
+    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx);
 
     chk.checkFile() catch |e| {
         std.debug.print("Check error: {}\n", .{e});

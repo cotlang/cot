@@ -33,6 +33,60 @@ const NativeResult = struct {
     }
 };
 
+/// Compile a .cot file (supports imports) and run the resulting executable.
+fn compileAndRunFile(allocator: std.mem.Allocator, file_path: []const u8, test_name: []const u8) NativeResult {
+    const tmp_dir = "/tmp/cot_native_test";
+    std.fs.cwd().makePath(tmp_dir) catch {};
+
+    const obj_path = std.fmt.allocPrint(allocator, "{s}/{s}.o", .{ tmp_dir, test_name }) catch
+        return NativeResult.compileErr("allocPrint failed");
+    defer allocator.free(obj_path);
+
+    const exe_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, test_name }) catch
+        return NativeResult.compileErr("allocPrint failed");
+    defer allocator.free(exe_path);
+
+    var driver = Driver.init(allocator);
+    driver.setTarget(Target.native());
+
+    const obj_code = driver.compileFile(file_path) catch |e| {
+        const msg = std.fmt.allocPrint(allocator, "compile error: {any}", .{e}) catch "compile error";
+        return NativeResult.compileErr(msg);
+    };
+    defer allocator.free(obj_code);
+
+    std.fs.cwd().writeFile(.{ .sub_path = obj_path, .data = obj_code }) catch
+        return NativeResult.compileErr("failed to write .o file");
+
+    const link_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "zig", "cc", "-o", exe_path, obj_path },
+    }) catch return NativeResult.linkErr("failed to spawn linker");
+    defer allocator.free(link_result.stdout);
+    defer allocator.free(link_result.stderr);
+
+    if (link_result.term.Exited != 0) {
+        if (link_result.stderr.len > 0) std.debug.print("LINKER STDERR: {s}\n", .{link_result.stderr});
+        return NativeResult.linkErr("linker failed");
+    }
+
+    const run_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{exe_path},
+    }) catch return NativeResult.runErr("failed to spawn executable");
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    return switch (run_result.term) {
+        .Exited => |exit_code| NativeResult.success(exit_code),
+        .Signal => |sig| blk: {
+            const msg = std.fmt.allocPrint(allocator, "signal {d}", .{sig}) catch "signal";
+            break :blk NativeResult.runErr(msg);
+        },
+        else => NativeResult.runErr("unknown termination"),
+    };
+}
+
 fn compileAndRun(allocator: std.mem.Allocator, code: []const u8, test_name: []const u8) NativeResult {
     const tmp_dir = "/tmp/cot_native_test";
     std.fs.cwd().makePath(tmp_dir) catch {};
@@ -84,6 +138,52 @@ fn compileAndRun(allocator: std.mem.Allocator, code: []const u8, test_name: []co
         },
         else => NativeResult.runErr("unknown termination"),
     };
+}
+
+fn expectFileExitCode(backing_allocator: std.mem.Allocator, file_path: []const u8, expected: u32, test_name: []const u8) !void {
+    var timer = std.time.Timer.start() catch {
+        std.debug.print("[native] {s}...", .{test_name});
+        return expectFileExitCodeInner(backing_allocator, file_path, expected, test_name);
+    };
+
+    std.debug.print("[native] {s}...", .{test_name});
+
+    try expectFileExitCodeInner(backing_allocator, file_path, expected, test_name);
+
+    const elapsed_ns = timer.read();
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+    if (elapsed_ms >= 1000.0) {
+        std.debug.print("ok ({d:.0}ms) SLOW\n", .{elapsed_ms});
+    } else {
+        std.debug.print("ok ({d:.0}ms)\n", .{elapsed_ms});
+    }
+}
+
+fn expectFileExitCodeInner(backing_allocator: std.mem.Allocator, file_path: []const u8, expected: u32, test_name: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const result = compileAndRunFile(allocator, file_path, test_name);
+
+    if (result.compile_error) {
+        std.debug.print("COMPILE ERROR: {s}\n", .{result.error_msg});
+        return error.CompileError;
+    }
+    if (result.link_error) {
+        std.debug.print("LINK ERROR: {s}\n", .{result.error_msg});
+        return error.LinkError;
+    }
+    if (result.run_error) {
+        std.debug.print("RUN ERROR: {s}\n", .{result.error_msg});
+        return error.RunError;
+    }
+
+    const actual = result.exit_code orelse return error.NoExitCode;
+    if (actual != expected) {
+        std.debug.print("WRONG EXIT CODE: expected {d}, got {d}\n", .{ expected, actual });
+        return error.WrongExitCode;
+    }
 }
 
 fn expectExitCode(backing_allocator: std.mem.Allocator, code: []const u8, expected: u32, test_name: []const u8) !void {
@@ -301,4 +401,12 @@ test "parity: variables (40 tests)" {
     }));
     defer std.testing.allocator.free(code);
     try expectExitCode(std.testing.allocator, code, 0, "parity_variables");
+}
+
+// ============================================================================
+// Cross-file import tests: verify generics work across file boundaries
+// ============================================================================
+
+test "native: import List(T) from stdlib (48 sub-tests)" {
+    try expectFileExitCode(std.testing.allocator, "test/native/import_list_test.cot", 0, "import_list");
 }

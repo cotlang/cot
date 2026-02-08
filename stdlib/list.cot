@@ -1,0 +1,436 @@
+// List(T) — Production-quality generic dynamic array.
+//
+// Growth: Go's nextslicecap (2x for small, ~1.25x for large).
+// Bounds: All access is bounds-checked via @trap().
+// Memory: Manual via @alloc/@realloc/@dealloc.
+//
+// References:
+//   Go:  runtime/slice.go (growth), slices/ (API)
+//   Zig: std/array_list.zig (API)
+
+struct List(T) {
+    items: i64,
+    count: i64,
+    capacity: i64,
+}
+
+impl List(T) {
+    // ===== Core =====
+
+    // Go's nextslicecap: 2x for small, ~1.25x for large
+    fn ensureCapacity(self: *List(T), needed: i64) void {
+        if self.capacity >= needed { return }
+        var new_cap = self.capacity
+        var double_cap = new_cap + new_cap
+        if needed > double_cap {
+            new_cap = needed
+        } else if self.capacity < 256 {
+            new_cap = double_cap
+        } else {
+            while new_cap < needed {
+                new_cap = new_cap + (new_cap + 768) / 4
+            }
+        }
+        if new_cap < 8 { new_cap = 8 }
+        let bytes = new_cap * @sizeOf(T)
+        if self.capacity == 0 {
+            self.items = @alloc(bytes)
+        } else {
+            self.items = @realloc(self.items, bytes)
+        }
+        self.capacity = new_cap
+    }
+
+    fn append(self: *List(T), value: T) void {
+        self.ensureCapacity(self.count + 1)
+        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+        ptr.* = value
+        self.count = self.count + 1
+    }
+
+    fn get(self: *List(T), index: i64) T {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        return ptr.*
+    }
+
+    fn set(self: *List(T), index: i64, value: T) void {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        ptr.* = value
+    }
+
+    fn pop(self: *List(T)) T {
+        if self.count == 0 { @trap() }
+        self.count = self.count - 1
+        let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+        return ptr.*
+    }
+
+    fn len(self: *List(T)) i64 { return self.count }
+    fn cap(self: *List(T)) i64 { return self.capacity }
+
+    fn last(self: *List(T)) T {
+        if self.count == 0 { @trap() }
+        let ptr = @intToPtr(*T, self.items + (self.count - 1) * @sizeOf(T))
+        return ptr.*
+    }
+
+    fn first(self: *List(T)) T {
+        if self.count == 0 { @trap() }
+        let ptr = @intToPtr(*T, self.items)
+        return ptr.*
+    }
+
+    // ===== Lifecycle =====
+
+    fn free(self: *List(T)) void {
+        if self.capacity > 0 {
+            @dealloc(self.items)
+        }
+        self.items = 0
+        self.count = 0
+        self.capacity = 0
+    }
+
+    fn clear(self: *List(T)) void {
+        self.count = 0
+    }
+
+    fn clearAndFree(self: *List(T)) void {
+        self.free()
+    }
+
+    // ===== Insert / Remove =====
+
+    fn insert(self: *List(T), index: i64, value: T) void {
+        if index < 0 { @trap() }
+        if index > self.count { @trap() }
+        self.ensureCapacity(self.count + 1)
+        if index < self.count {
+            let src = self.items + index * @sizeOf(T)
+            let dst = src + @sizeOf(T)
+            let bytes = (self.count - index) * @sizeOf(T)
+            @memcpy(dst, src, bytes)
+        }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        ptr.* = value
+        self.count = self.count + 1
+    }
+
+    fn orderedRemove(self: *List(T), index: i64) T {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        let value = ptr.*
+        if index < self.count - 1 {
+            let dst = self.items + index * @sizeOf(T)
+            let src = dst + @sizeOf(T)
+            let bytes = (self.count - index - 1) * @sizeOf(T)
+            @memcpy(dst, src, bytes)
+        }
+        self.count = self.count - 1
+        return value
+    }
+
+    fn swapRemove(self: *List(T), index: i64) T {
+        if index < 0 { @trap() }
+        if index >= self.count { @trap() }
+        let ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        let value = ptr.*
+        self.count = self.count - 1
+        if index < self.count {
+            let last_ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+            ptr.* = last_ptr.*
+        }
+        return value
+    }
+
+    // ===== Bulk Operations =====
+
+    fn appendSlice(self: *List(T), source: i64, num: i64) void {
+        self.ensureCapacity(self.count + num)
+        let dst = self.items + self.count * @sizeOf(T)
+        @memcpy(dst, source, num * @sizeOf(T))
+        self.count = self.count + num
+    }
+
+    fn reverse(self: *List(T)) void {
+        var i: i64 = 0
+        var j: i64 = self.count - 1
+        while i < j {
+            let pi = @intToPtr(*T, self.items + i * @sizeOf(T))
+            let pj = @intToPtr(*T, self.items + j * @sizeOf(T))
+            let tmp = pi.*
+            pi.* = pj.*
+            pj.* = tmp
+            i = i + 1
+            j = j - 1
+        }
+    }
+
+    fn clone(self: *List(T)) List(T) {
+        var new_list: List(T) = .{}
+        if self.count > 0 {
+            let bytes = self.count * @sizeOf(T)
+            new_list.items = @alloc(bytes)
+            @memcpy(new_list.items, self.items, bytes)
+            new_list.count = self.count
+            new_list.capacity = self.count
+        }
+        return new_list
+    }
+
+    // ===== Search / Comparison =====
+
+    // Go: slices.Index
+    fn indexOf(self: *List(T), value: T) i64 {
+        var i: i64 = 0
+        while i < self.count {
+            let ptr = @intToPtr(*T, self.items + i * @sizeOf(T))
+            if ptr.* == value { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // Go: slices.Contains (inlined — sibling calls returning non-void fail on native)
+    fn contains(self: *List(T), value: T) i64 {
+        var i: i64 = 0
+        while i < self.count {
+            let ptr = @intToPtr(*T, self.items + i * @sizeOf(T))
+            if ptr.* == value { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+
+    // Go: slices.Equal
+    fn equal(self: *List(T), other: *List(T)) i64 {
+        if self.count != other.count { return 0 }
+        var i: i64 = 0
+        while i < self.count {
+            let pa = @intToPtr(*T, self.items + i * @sizeOf(T))
+            let pb = @intToPtr(*T, other.items + i * @sizeOf(T))
+            if pa.* != pb.* { return 0 }
+            i = i + 1
+        }
+        return 1
+    }
+
+    fn isEmpty(self: *List(T)) i64 {
+        if self.count == 0 { return 1 }
+        return 0
+    }
+
+    // ===== Resize / Capacity =====
+
+    // Zig: resize
+    fn resize(self: *List(T), new_len: i64) void {
+        if new_len < 0 { @trap() }
+        if new_len > self.count {
+            self.ensureCapacity(new_len)
+        }
+        self.count = new_len
+    }
+
+    // Zig: shrinkAndFree
+    fn shrinkAndFree(self: *List(T), new_len: i64) void {
+        if new_len < 0 { @trap() }
+        if new_len > self.count { @trap() }
+        self.count = new_len
+        if new_len == 0 {
+            self.free()
+        } else {
+            let bytes = new_len * @sizeOf(T)
+            self.items = @realloc(self.items, bytes)
+            self.capacity = new_len
+        }
+    }
+
+    // Zig: ensureUnusedCapacity
+    fn ensureUnusedCapacity(self: *List(T), n: i64) void {
+        self.ensureCapacity(self.count + n)
+    }
+
+    // ===== Bulk Write =====
+
+    // Zig: appendNTimes
+    fn appendNTimes(self: *List(T), value: T, n: i64) void {
+        self.ensureCapacity(self.count + n)
+        var i: i64 = 0
+        while i < n {
+            let ptr = @intToPtr(*T, self.items + self.count * @sizeOf(T))
+            ptr.* = value
+            self.count = self.count + 1
+            i = i + 1
+        }
+    }
+
+    // Zig: insertSlice
+    fn insertSlice(self: *List(T), index: i64, source: i64, num: i64) void {
+        if index < 0 { @trap() }
+        if index > self.count { @trap() }
+        if num <= 0 { return }
+        self.ensureCapacity(self.count + num)
+        if index < self.count {
+            let src = self.items + index * @sizeOf(T)
+            let dst = src + num * @sizeOf(T)
+            let bytes = (self.count - index) * @sizeOf(T)
+            @memcpy(dst, src, bytes)
+        }
+        let dst = self.items + index * @sizeOf(T)
+        @memcpy(dst, source, num * @sizeOf(T))
+        self.count = self.count + num
+    }
+
+    // Zig: replaceRange / Go: slices.Replace
+    fn replaceRange(self: *List(T), start: i64, range_len: i64, source: i64, num: i64) void {
+        if start < 0 { @trap() }
+        if range_len < 0 { @trap() }
+        if start + range_len > self.count { @trap() }
+        let tail_start = start + range_len
+        let tail_len = self.count - tail_start
+        let new_count = self.count - range_len + num
+        if num > range_len {
+            self.ensureCapacity(new_count)
+            if tail_len > 0 {
+                let src = self.items + tail_start * @sizeOf(T)
+                let dst = self.items + (start + num) * @sizeOf(T)
+                let bytes = tail_len * @sizeOf(T)
+                @memcpy(dst, src, bytes)
+            }
+        } else if num < range_len {
+            if tail_len > 0 {
+                let src = self.items + tail_start * @sizeOf(T)
+                let dst = self.items + (start + num) * @sizeOf(T)
+                let bytes = tail_len * @sizeOf(T)
+                @memcpy(dst, src, bytes)
+            }
+        }
+        if num > 0 {
+            let dst = self.items + start * @sizeOf(T)
+            @memcpy(dst, source, num * @sizeOf(T))
+        }
+        self.count = new_count
+    }
+
+    // Go: slices.Delete — remove range [start, end)
+    fn deleteRange(self: *List(T), start: i64, end: i64) void {
+        if start < 0 { @trap() }
+        if end > self.count { @trap() }
+        if start > end { @trap() }
+        let removed = end - start
+        if removed == 0 { return }
+        if end < self.count {
+            let src = self.items + end * @sizeOf(T)
+            let dst = self.items + start * @sizeOf(T)
+            let bytes = (self.count - end) * @sizeOf(T)
+            @memcpy(dst, src, bytes)
+        }
+        self.count = self.count - removed
+    }
+
+    // Go: slices.Compact — remove consecutive duplicates
+    fn compact(self: *List(T)) void {
+        if self.count < 2 { return }
+        var write: i64 = 1
+        var read: i64 = 1
+        while read < self.count {
+            let curr = @intToPtr(*T, self.items + read * @sizeOf(T))
+            let prev = @intToPtr(*T, self.items + (write - 1) * @sizeOf(T))
+            if curr.* != prev.* {
+                if write != read {
+                    let dst = @intToPtr(*T, self.items + write * @sizeOf(T))
+                    dst.* = curr.*
+                }
+                write = write + 1
+            }
+            read = read + 1
+        }
+        self.count = write
+    }
+
+    // ===== Higher-Order Methods =====
+
+    // Go: slices.ContainsFunc
+    fn containsFunc(self: *List(T), predicate: fn(T) -> i64) i64 {
+        var i: i64 = 0
+        while i < self.count {
+            let ptr = @intToPtr(*T, self.items + i * @sizeOf(T))
+            if predicate(ptr.*) != 0 { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+
+    // Go: slices.IndexFunc
+    fn indexOfFunc(self: *List(T), predicate: fn(T) -> i64) i64 {
+        var i: i64 = 0
+        while i < self.count {
+            let ptr = @intToPtr(*T, self.items + i * @sizeOf(T))
+            if predicate(ptr.*) != 0 { return i }
+            i = i + 1
+        }
+        return 0 - 1
+    }
+
+    // Go: slices.DeleteFunc
+    fn removeIf(self: *List(T), predicate: fn(T) -> i64) void {
+        var write: i64 = 0
+        var read: i64 = 0
+        while read < self.count {
+            let ptr = @intToPtr(*T, self.items + read * @sizeOf(T))
+            if predicate(ptr.*) == 0 {
+                if write != read {
+                    let dst = @intToPtr(*T, self.items + write * @sizeOf(T))
+                    dst.* = ptr.*
+                }
+                write = write + 1
+            }
+            read = read + 1
+        }
+        self.count = write
+    }
+
+    // Go: slices.IsSortedFunc
+    // cmp(a, b): negative if a < b, 0 if equal, positive if a > b
+    fn isSorted(self: *List(T), cmp: fn(T, T) -> i64) i64 {
+        if self.count < 2 { return 1 }
+        var i: i64 = 1
+        while i < self.count {
+            let prev = @intToPtr(*T, self.items + (i - 1) * @sizeOf(T))
+            let curr = @intToPtr(*T, self.items + i * @sizeOf(T))
+            if cmp(prev.*, curr.*) > 0 { return 0 }
+            i = i + 1
+        }
+        return 1
+    }
+
+    // Selection sort: O(n^2), in-place
+    // cmp(a, b): negative if a < b, 0 if equal, positive if a > b
+    fn sort(self: *List(T), cmp: fn(T, T) -> i64) void {
+        if self.count < 2 { return }
+        var si: i64 = 0
+        while si < self.count - 1 {
+            var smin: i64 = si
+            var sj: i64 = si + 1
+            while sj < self.count {
+                let sjp = @intToPtr(*T, self.items + sj * @sizeOf(T))
+                let smp = @intToPtr(*T, self.items + smin * @sizeOf(T))
+                if cmp(sjp.*, smp.*) < 0 { smin = sj }
+                sj = sj + 1
+            }
+            if smin != si {
+                let sip = @intToPtr(*T, self.items + si * @sizeOf(T))
+                let smip = @intToPtr(*T, self.items + smin * @sizeOf(T))
+                let stmp = sip.*
+                sip.* = smip.*
+                smip.* = stmp
+            }
+            si = si + 1
+        }
+    }
+}

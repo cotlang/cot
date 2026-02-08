@@ -1,0 +1,40 @@
+// Cross-file generic import test.
+// Imports List(T) from stdlib and exercises it across file boundaries.
+
+import "std/list"
+
+fn main() i64 {
+    // Cross-file generic: create, append, get, set, len, pop, insert, remove, free
+    var list: List(i64) = .{}
+    list.append(10)
+    list.append(20)
+    list.append(30)
+
+    // len + get
+    if list.len() != 3 { return 1 }
+    if list.get(0) != 10 { return 2 }
+    if list.get(1) != 20 { return 3 }
+    if list.get(2) != 30 { return 4 }
+
+    // set
+    list.set(1, 42)
+    if list.get(1) != 42 { return 5 }
+
+    // pop
+    let popped = list.pop()
+    if popped != 30 { return 6 }
+    if list.len() != 2 { return 7 }
+
+    // insert
+    list.insert(0, 99)
+    if list.get(0) != 99 { return 8 }
+    if list.get(1) != 10 { return 9 }
+    if list.len() != 3 { return 10 }
+
+    // clear
+    list.clear()
+    if list.len() != 0 { return 11 }
+
+    list.free()
+    return 0
+}
