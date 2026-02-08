@@ -569,16 +569,72 @@ fn readFile(path: []u8) List(u8) { ... }
 
 ---
 
-## Current Gaps for the Self-Hosting Path
+## Non-Obvious Patterns (Things That Look Wrong But Aren't)
 
-| Gap | Blocks | Reference to Port | Effort |
-|-----|--------|-------------------|--------|
-| **Allocator upgrade** (free/realloc) | List(T), Map(K,V), real apps | Go `runtime/mem_wasm.go`, Zig `WasmAllocator.zig` | Medium |
-| **`memory.grow` on native** | Allocator growth on native target | Wasmtime `runtime/src/memory.rs` | Medium |
-| **Extern fn Wasm imports** | Host interop on Wasm target | Go `link/internal/wasm/asm.go:154-334` | Small |
-| **Extern fn native symbols** | Host interop on native target | Cranelift-object `backend.rs` (colocated=false) | Small |
-| **Imports on native** | Multi-file compilation on native | N/A (frontend concern) | Medium |
-| **Built-in linker** (optional) | Remove `zig cc` dependency | Go `cmd/link` or Zig's linker | Very Large |
+These patterns have confused Claude repeatedly. Read before debugging.
+
+### Frontend & SSA
+
+1. **STRING is internally a slice.** `type_registry.get(STRING)` returns `.slice { .elem = U8 }` (16 bytes: ptr + len). String loads produce `slice_make`, not `string_make`. Both `rewritedec.zig` and `decompose.zig` must check BOTH `string_make` AND `slice_make` when extracting ptr/len.
+
+2. **SSA pass ordering matters.** The correct order is: `rewritegeneric` → `decompose` → `rewritedec` → `schedule` → `layout` → `lower_wasm`. Rewritegeneric must run before decompose (const_string → string_make). Decompose must run before rewritedec (phi decomposition before extraction).
+
+3. **Cleanup stack is unified (Swift's CleanupManager).** ARC releases and defers share one LIFO stack. Scope depth marks the boundary. Break/continue emit cleanups without popping (other paths still need them). Return captures value into `__ret_tmp` BEFORE running cleanups (Zig semantics).
+
+4. **`_deinit` suffix is reserved.** `driver.zig` scans ALL function names ending in `_deinit` and registers them as ARC destructors. Generic impl methods like `List(i64)_deinit` will be falsely detected. Use `free()` instead of `deinit()` for collection cleanup methods.
+
+5. **Multi-file generics need fresh expr_types.** Each generic instantiation's re-check needs isolated `expr_types` because NodeIndex spaces from different ASTs collide. Generic instance symbols must be defined in `global_scope` (not function-local scope). `lowerQueuedGenericFunctions` must snapshot the map before processing (re-check can trigger new instantiations).
+
+### Wasm Codegen
+
+6. **br_table dispatch loop is intentional.** Go wraps functions with calls in: `loop $entryPointLoop { block $b0 { ... br_table } }`. All block-to-block jumps route through a single dispatch loop. This is NOT a bug. Read `docs/BR_TABLE_ARCHITECTURE.md`.
+
+7. **Local variable offsets sum actual sizes.** `getLocalOffset()` sums `local_sizes` array entries — it does NOT multiply slot index by 8. String locals are 16 bytes. Two strings at slots 0,1 have offsets 0 and 16, not 0 and 8.
+
+8. **OnWasmStack optimization.** Values with a single use as block control skip local allocation and are generated inline. Go's `wasm/ssa.go:299-304` does the same. Stack balance tracking must stay in sync between allocation and generation.
+
+9. **Function indices offset by import count.** Import functions occupy indices 0..N-1. Native function indices start at N. Export section and element table must add import_count to the native function index.
+
+10. **Metadata address resolution.** `metadata_addr` SSA op stores a symbolic type name in `aux.string`. Resolved to a memory address during Wasm codegen via `metadata_offsets` map lookup. Returns 0 (null sentinel) if no destructor exists.
+
+### Native AOT
+
+11. **VCode builds backward.** CLIF → MachInst lowering emits instructions in reverse order (use-before-def pattern, matching Cranelift). `VCodeBuilder` builds backward, then `reverseAndFinalize()` flips arrays and adjusts block range indices by `n_insts`.
+
+12. **vmctx save MUST precede Args instruction.** `genArgSetup` must emit `mov x21, x0` BEFORE the `Args` pseudo-instruction, not after. Regalloc inserts edits around `Args` that move params to VRegs — if param is moved to x0, it clobbers vmctx.
+
+13. **br_table requires edge splitting.** br_table cannot carry arguments in CLIF IR. When targets need block params: create intermediate blocks, emit br_table to intermediates, then jump to real targets with args. Also must deduplicate predecessor blocks (Cranelift's `EntitySet<Block>` pattern).
+
+14. **Clobbered register class check.** When collecting callee-saved clobbers from regalloc output, must check `preg.class() == .int`. Float PReg d22 (class=float, hw_enc=22) is NOT the same as int x22 (class=int, hw_enc=22). Without this check: stack corruption.
+
+15. **Two-pass function declaration.** Object file generation must declare ALL functions first, then define ALL functions. Forward references (function A calls function B at higher index) fail if B isn't declared when A's relocations are processed. Matches Cranelift's `declare_function` / `define_function` separation.
+
+16. **AOT call_indirect filters by type_index.** The element table may contain functions with different signatures. When generating the if-else dispatch chain, only emit branches for entries where `func_to_type[func_idx] == expected_type_index`. Otherwise: branch argument count mismatch → regalloc panic.
+
+### Regalloc (regalloc2 Port)
+
+17. **Bit-packed types must match exactly.** PReg = 8 bits (class:2 | hw_enc:6). VReg = 32 bits (vreg:21 | class:2). Operand = 32 bits (constraint:7 | kind:1 | pos:1 | class:2 | vreg:21). ProgPoint = 32 bits (inst:31 | pos:1). Any mismatch causes silent corruption.
+
+18. **`observeVregClass` must be called for every VReg.** Without this, `VRegData.class` stays null and `merge.zig` defaults ALL VRegs to `.int`. Float VRegs silently become int → wrong physical registers assigned → crash on emit.
+
+19. **Spill weight uses bfloat16 encoding.** `toBits()` takes top 16 bits of f32. Precision loss is acceptable — enables compact 16-bit storage in `Use.weight`.
+
+20. **Live ranges must be reversed after building.** Built in reverse block order (matching backward VCode). Must reverse per-VReg ranges before allocation. Non-contiguous ranges are merged if adjacent.
+
+---
+
+## Rust → Zig Type Mappings (regalloc2 / Cranelift Port)
+
+| Rust | Zig |
+|------|-----|
+| `Vec<T>` | `std.ArrayListUnmanaged(T)` |
+| `FxHashMap<K,V>` | `std.AutoHashMapUnmanaged(K,V)` |
+| `FxHashSet<T>` | `std.AutoHashMapUnmanaged(T, void)` |
+| `SmallVec<[T; N]>` | `std.ArrayListUnmanaged(T)` |
+| `EntityMap<E,T>` (sparse) | `SecondaryMap(E,T)` (dense, with default) |
+| `u64` bitset | `u64` (manual bit ops) |
+| `trait VCodeInst` | `comptime type I` |
+| `trait LowerBackend` | `isLowerBackend(T: type)` with `@hasDecl` |
 
 ---
 
