@@ -2007,8 +2007,14 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             const movsx_rex = RexPrefix.threeOp(tmp2_enc, idx_enc, tmp1_enc, true, false);
             try movsx_rex.encode(sink);
             try sink.put1(0x63);
-            try sink.put1(encodeModrm(0b00, tmp2_enc & 7, 0b100));
+            // x64 encoding special case: SIB with base & 7 == 5 (RBP/R13) and mod=00
+            // means "no base + disp32" instead of "[base + index*scale]".
+            // Use mod=01 with disp8=0 to correctly encode the base register.
+            // Reference: emitModrmSibDisp() imm_reg_reg_shift case (line 714).
+            const modrm_mod: u2 = if (tmp1_enc & 7 == GprEnc.RBP) 0b01 else 0b00;
+            try sink.put1(encodeModrm(modrm_mod, tmp2_enc & 7, 0b100));
             try sink.put1(encodeSib(2, idx_enc & 7, tmp1_enc & 7));
+            if (tmp1_enc & 7 == GprEnc.RBP) try sink.put1(0x00);
 
             // add %tmp2, %tmp1
             const add_rex = RexPrefix.twoOp(tmp2_enc, tmp1_enc, true, false);
