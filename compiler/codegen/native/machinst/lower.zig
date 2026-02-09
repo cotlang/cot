@@ -1249,28 +1249,22 @@ pub fn Lower(comptime I: type) type {
             }
         }
 
+        /// Port of Cranelift collect_branch_and_targets (lower.rs:1059-1069).
+        /// Maps ALL successor blocks to MachLabels, including br_table targets.
+        /// Uses growable list (Cranelift uses SmallVec) to support br_table's many successors.
         fn collectBranchAndTargets(
             self: *const Self,
             bindex: BlockIndex,
-            targets: *abi_mod.BoundedArray(MachLabel, 2),
-        ) ?Inst {
-            targets.len = 0;
+            targets: *std.ArrayListUnmanaged(MachLabel),
+        ) !?Inst {
+            targets.clearRetainingCapacity();
             const result = self.block_order.succIndices(bindex);
             const opt_inst = result.opt_inst;
             const succs = result.succs;
 
-            // For br_table, there can be many successors (more than 2).
-            // The targets for br_table are handled separately in lowerBranch via jump table data,
-            // so we don't collect them here. This avoids overflowing the BoundedArray(2).
-            // Same for trap/return which have no successors anyway.
-            if (opt_inst) |inst| {
-                const inst_data = self.f.dfg.getInst(inst);
-                const opcode = inst_data.opcode();
-                if (opcode == .br_table or opcode == .trap or opcode == .@"return") {
-                    return opt_inst;
-                }
-            }
-
+            // Map all successors to labels. This includes critical-edge split blocks
+            // which contain the regalloc edge moves needed for correct register values.
+            try targets.ensureTotalCapacity(self.allocator, succs.len);
             for (succs) |succ| {
                 targets.appendAssumeCapacity(MachLabel.fromBlock(succ));
             }
@@ -1354,7 +1348,9 @@ pub fn Lower(comptime I: type) type {
             self.vcode.setEntry(BlockIndex.new(0));
 
             // Reused vectors for branch lowering.
-            var targets: abi_mod.BoundedArray(MachLabel, 2) = .{};
+            // Port of Cranelift: SmallVec<[MachLabel; 2]> — growable to support br_table.
+            var targets = std.ArrayListUnmanaged(MachLabel){};
+            defer targets.deinit(self.allocator);
 
             // Get a copy of the lowered order.
             const lowered_order = self.block_order.loweredOrder();
@@ -1368,8 +1364,8 @@ pub fn Lower(comptime I: type) type {
 
                 // End branch.
                 if (lb.origBlock()) |bb| {
-                    if (self.collectBranchAndTargets(bindex, &targets)) |branch| {
-                        try self.lowerClifBranch(B, backend, bindex, bb, branch, targets.slice());
+                    if (try self.collectBranchAndTargets(bindex, &targets)) |branch| {
+                        try self.lowerClifBranch(B, backend, bindex, bb, branch, targets.items);
                         try self.finishIrInst(self.srcloc(branch));
                     }
                 } else {

@@ -318,31 +318,24 @@ pub const X64LowerBackend = struct {
             },
             .br_table => {
                 // Jump table lowering.
-                // Port of cranelift/codegen/src/isa/x64/lower.rs br_table lowering
+                // Port of cranelift/codegen/src/isa/x64/lower.isle:3600-3609
                 //
-                // The br_table instruction implements an indirect branch using a jump table.
-                // We emit:
-                //   cmp idx, table_size
-                //   jae default_label
-                //   jmp_table_seq idx, targets, default
+                // Uses targets from collectBranchAndTargets (critical-edge-aware labels).
+                // Cranelift: (lower_branch (br_table idx _) (jump_table_targets default jt_targets))
+                // targets[0] = default label, targets[1..] = jump table entry labels.
 
                 // Get the index operand (input 0)
                 const idx_val = ctx.putInputInRegs(ir_inst, 0);
                 const idx_reg = idx_val.onlyReg() orelse return null;
 
-                // Get the jump table reference
-                const jt_ref = inst_data.getJumpTable() orelse return null;
+                // targets[0] = default, targets[1..] = table entries
+                // Port of Cranelift jump_table_targets (isle.rs:759-769)
+                if (targets.len == 0) return null;
+                const default_label = targets[0];
+                const table_size = targets.len - 1;
 
-                // Look up the jump table data
-                const jt_data = ctx.jumpTableData(jt_ref) orelse return null;
-
-                // Get default target label
-                const default_block = jt_data.getDefaultBlock().getBlock();
-                const default_label = ctx.blockLabel(default_block) orelse return null;
-
-                // Get table size
-                const table_entries = jt_data.asSlice();
-                const table_size = table_entries.len;
+                // Allocate a copy of the target labels (ArrayList backing may be reallocated later)
+                const jt_targets = ctx.allocator.dupe(MachLabel, targets[1..]) catch return null;
 
                 // If table is empty, just jump to default
                 if (table_size == 0) {
@@ -350,15 +343,7 @@ pub const X64LowerBackend = struct {
                     return;
                 }
 
-                // Allocate and populate targets array
-                const target_labels = ctx.allocator.alloc(MachLabel, table_size) catch return null;
-                for (table_entries, 0..) |entry, i| {
-                    const target_block = entry.getBlock();
-                    target_labels[i] = ctx.blockLabel(target_block) orelse return null;
-                }
-
                 // Allocate temp registers
-                // allocTmp returns ValueRegs(Writable(Reg)), onlyReg returns Writable(Reg)
                 const tmp1_regs = ctx.allocTmp(.I64) catch return null;
                 const tmp1_wreg = tmp1_regs.onlyReg() orelse return null;
 
@@ -376,8 +361,6 @@ pub const X64LowerBackend = struct {
                 }) catch return null;
 
                 // Emit conditional jump to default if out of bounds: jae default
-                // Using winch_jmp_if which is a one-way conditional jump (no not_taken)
-                // Note: .nb = "not below" = CF=0 = unsigned >= (same as jae)
                 ctx.emit(Inst{
                     .winch_jmp_if = .{
                         .cc = .nb, // jae = jnb: jump if not below (unsigned >=)
@@ -385,14 +368,14 @@ pub const X64LowerBackend = struct {
                     },
                 }) catch return null;
 
-                // Emit the jump table sequence
+                // Emit the jump table sequence using critical-edge-aware labels
                 ctx.emit(Inst{
                     .jmp_table_seq = .{
                         .idx = idx_reg,
                         .tmp1 = tmp1_wreg,
                         .tmp2 = tmp2_wreg,
                         .default = default_label,
-                        .targets = target_labels,
+                        .targets = jt_targets,
                     },
                 }) catch return null;
             },

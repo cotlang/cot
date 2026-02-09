@@ -283,29 +283,21 @@ pub const AArch64LowerBackend = struct {
                 // Jump table lowering.
                 // Port of cranelift/codegen/src/isa/aarch64/lower.rs br_table lowering
                 //
-                // The jt_sequence pseudo-instruction handles:
-                // - Bounds check
-                // - Spectre mitigation
-                // - Table lookup
-                // - Indirect branch
+                // Uses targets from collectBranchAndTargets (critical-edge-aware labels).
+                // targets[0] = default label, targets[1..] = jump table entry labels.
 
                 // Get the index operand (input 0)
                 const idx_val = ctx.putInputInRegs(ir_inst, 0);
                 const idx_reg = idx_val.onlyReg() orelse return null;
 
-                // Get the jump table reference
-                const jt_ref = inst_data.getJumpTable() orelse return null;
+                // targets[0] = default, targets[1..] = table entries
+                // Port of Cranelift jump_table_targets (isle.rs:759-769)
+                if (targets.len == 0) return null;
+                const default_label = targets[0];
+                const table_size = targets.len - 1;
 
-                // Look up the jump table data
-                const jt_data = ctx.jumpTableData(jt_ref) orelse return null;
-
-                // Get default target label
-                const default_block = jt_data.getDefaultBlock().getBlock();
-                const default_label = ctx.blockLabel(default_block) orelse return null;
-
-                // Get table entries
-                const table_entries = jt_data.asSlice();
-                const table_size = table_entries.len;
+                // Allocate a copy of the target labels (ArrayList backing may be reallocated later)
+                const jt_targets = ctx.allocator.dupe(MachLabel, targets[1..]) catch return null;
 
                 // If table is empty, just jump to default
                 if (table_size == 0) {
@@ -315,13 +307,6 @@ pub const AArch64LowerBackend = struct {
                         },
                     }) catch return null;
                     return;
-                }
-
-                // Allocate and populate targets array
-                const target_labels = ctx.allocator.alloc(MachLabel, table_size) catch return null;
-                for (table_entries, 0..) |entry, i| {
-                    const target_block = entry.getBlock();
-                    target_labels[i] = ctx.blockLabel(target_block) orelse return null;
                 }
 
                 // Allocate temp registers
@@ -377,14 +362,14 @@ pub const AArch64LowerBackend = struct {
                     }) catch return null;
                 }
 
-                // Emit the jump table sequence (uses flags set by CMP above)
+                // Emit the jump table sequence using critical-edge-aware labels
                 ctx.emit(Inst{
                     .jt_sequence = .{
                         .ridx = idx_reg,
                         .rtmp1 = tmp1_wreg,
                         .rtmp2 = tmp2_wreg,
                         .default = default_label,
-                        .targets = target_labels,
+                        .targets = jt_targets,
                     },
                 }) catch return null;
             },

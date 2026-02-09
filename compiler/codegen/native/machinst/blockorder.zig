@@ -335,13 +335,19 @@ pub fn visitBlockSuccs(
             }
         },
         .br_table => {
-            // Branch table has default + table entries from jump table
+            // Branch table has default + table entries from jump table.
+            // Port of Cranelift inst_predicates.rs:183-201:
+            //   default is visited with from_table=false (reached via conditional branch),
+            //   table entries are visited with from_table=true.
             if (inst_data.getJumpTable()) |jt| {
                 if (func.dfg.jump_tables.get(jt)) |table_data| {
-                    // All branches from the jump table
-                    const branches = table_data.allBranches();
-                    for (branches) |branch| {
-                        try context.call(last_inst, branch.block, true);
+                    // Default block first, from_table=false (matches Cranelift)
+                    const default_block = table_data.getDefaultBlock();
+                    try context.call(last_inst, default_block.block, false);
+                    // Table entries, from_table=true
+                    const entries = table_data.asSlice();
+                    for (entries) |entry| {
+                        try context.call(last_inst, entry.block, true);
                     }
                 }
             }
