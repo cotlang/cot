@@ -851,7 +851,14 @@ pub fn VCode(comptime I: type) type {
             // Port of Cranelift's gen_prologue/gen_epilogue from abi.rs
             // Reference: cranelift/codegen/src/machinst/vcode.rs:868-876
             // ================================================================
-            var needs_frame = (function_calls != .None) or (frame_size > 0);
+            // Port of Cranelift: preserve_frame_pointers() is always true for Wasm.
+            // All functions need a frame pointer for:
+            // 1. incoming_arg amode (uses rbp-relative addressing)
+            // 2. Consistent stack unwinding
+            // 3. Debugger support
+            // Previously only set when function_calls or frame_size > 0, but this
+            // missed leaf functions with incoming stack args (e.g., 5+ param funcs).
+            var needs_frame = true;
 
             // ISA detection for architecture-specific code
             const is_aarch64 = @hasDecl(I, "is_aarch64");
@@ -917,12 +924,32 @@ pub fn VCode(comptime I: type) type {
                 }
             }
 
+            // Compute max outgoing args size from call instructions
+            // Port of Cranelift's accumulate_outgoing_args_size pattern
+            var max_outgoing_args_size: u32 = 0;
+            if (!is_aarch64) {
+                for (self.insts.items) |*inst_item| {
+                    if (@hasField(I, "call_known")) {
+                        switch (inst_item.*) {
+                            .call_known => |ck| {
+                                if (ck.info.stack_args_size > max_outgoing_args_size) {
+                                    max_outgoing_args_size = ck.info.stack_args_size;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                // Align to 16 bytes for ABI compliance
+                max_outgoing_args_size = (max_outgoing_args_size + 15) & ~@as(u32, 15);
+            }
+
             // Compute frame layout for x64 (not needed for ARM64 direct emit)
             var frame_layout = if (!is_aarch64 and @hasDecl(I, "FrameLayout")) I.FrameLayout{
                 .setup_area_size = if (needs_frame) 16 else 0, // RBP + return addr
                 .clobber_size = x64_clobber_size,
                 .fixed_frame_storage_size = 0,
-                .outgoing_args_size = 0,
+                .outgoing_args_size = max_outgoing_args_size,
                 .stackslots_size = frame_size,
                 .num_clobbered_callee_saves = x64_num_clobbered,
             } else void{};
@@ -1015,6 +1042,22 @@ pub fn VCode(comptime I: type) type {
                 }
             }
 
+            // Create shared EmitState with frame_layout for all instruction emissions.
+            // Port of Cranelift: EmitState is created once and shared across all emissions.
+            // This carries frame_layout needed for incoming_arg and slot_offset resolution.
+            var emit_state = I.EmitState{};
+            if (!is_aarch64 and @hasDecl(I, "FrameLayout")) {
+                // Copy frame layout fields to EmitState's FrameLayout.
+                // The two FrameLayout types are structurally compatible but distinct types:
+                // I.FrameLayout (mod.zig) has extra callee-save fields for prologue/epilogue,
+                // EmitState.FrameLayout (emit.zig) has the core fields for address resolution.
+                emit_state.frame_layout.setup_area_size = frame_layout.setup_area_size;
+                emit_state.frame_layout.clobber_size = frame_layout.clobber_size;
+                emit_state.frame_layout.fixed_frame_storage_size = frame_layout.fixed_frame_storage_size;
+                emit_state.frame_layout.outgoing_args_size = frame_layout.outgoing_args_size;
+                emit_state.frame_layout.stackslots_size = frame_layout.stackslots_size;
+            }
+
             // Emit each block
             for (0..self.numBlocks()) |block_idx| {
                 const block = BlockIndex.new(block_idx);
@@ -1034,14 +1077,17 @@ pub fn VCode(comptime I: type) type {
                         // Emit prologue: push rbp, mov rbp rsp
                         const prologue_insts = I.genPrologue(&frame_layout);
                         for (prologue_insts.constSlice()) |prologue_inst| {
-                            try prologue_inst.emit(&buffer, emit_info);
+                            try prologue_inst.emit(&buffer, emit_info, &emit_state);
                         }
 
-                        // Emit stack allocation: sub rsp, frame_size
-                        if (frame_size > 0) {
+                        // Emit stack allocation: sub rsp, total_stack_size
+                        // Includes spill slots + outgoing args area
+                        // Port of Cranelift's gen_clobber_save stack allocation
+                        const total_stack_size = frame_size + max_outgoing_args_size;
+                        if (total_stack_size > 0) {
                             if (@hasDecl(I, "genStackAlloc")) {
-                                const stack_alloc = I.genStackAlloc(frame_size);
-                                try stack_alloc.emit(&buffer, emit_info);
+                                const stack_alloc = I.genStackAlloc(total_stack_size);
+                                try stack_alloc.emit(&buffer, emit_info, &emit_state);
                             }
                         }
                     }
@@ -1102,13 +1148,13 @@ pub fn VCode(comptime I: type) type {
                                     // x64: use generic epilogue generation
                                     const epilogue_insts = I.genEpilogue(&frame_layout);
                                     for (epilogue_insts.constSlice()) |epilogue_inst| {
-                                        try epilogue_inst.emit(&buffer, emit_info);
+                                        try epilogue_inst.emit(&buffer, emit_info, &emit_state);
                                     }
                                 }
                             }
 
                             // Emit the instruction with physical registers
-                            try vcode_inst.emitWithAllocs(&buffer, inst_allocs, emit_info);
+                            try vcode_inst.emitWithAllocs(&buffer, inst_allocs, emit_info, &emit_state);
                         },
                         .edit => |edit| {
                             // Process regalloc edit (move insertion)
@@ -1116,7 +1162,7 @@ pub fn VCode(comptime I: type) type {
                                 .move => |m| {
                                     // Generate a move instruction from the ISA
                                     // This is ISA-specific and requires I.genMove()
-                                    try emitMove(I, &buffer, m.from, m.to, emit_info);
+                                    try emitMove(I, &buffer, m.from, m.to, emit_info, &emit_state);
                                 },
                             }
                         },
@@ -1147,6 +1193,7 @@ pub fn VCode(comptime I: type) type {
             from: regalloc_operand.Allocation,
             to: regalloc_operand.Allocation,
             emit_info: *const Inst.EmitInfo,
+            state: *const Inst.EmitState,
         ) !void {
             const from_kind = from.kind();
             const to_kind = to.kind();
@@ -1169,7 +1216,7 @@ pub fn VCode(comptime I: type) type {
                 const move_inst = Inst.genMove(to_reg, from_reg, ty);
 
                 // Use Inst.emit method which wraps the ISA-specific emit function
-                try move_inst.emit(buffer, emit_info);
+                try move_inst.emit(buffer, emit_info, state);
             } else if (from_kind == .stack and to_kind == .reg) {
                 // Stack-to-reg (reload)
                 const from_slot = from.asStack() orelse return;
@@ -1186,7 +1233,7 @@ pub fn VCode(comptime I: type) type {
 
                 // Generate and emit the load instruction
                 const load_inst = Inst.genLoadStack(to_reg, slot_offset, ty);
-                try load_inst.emit(buffer, emit_info);
+                try load_inst.emit(buffer, emit_info, state);
             } else if (from_kind == .reg and to_kind == .stack) {
                 // Reg-to-stack (spill)
                 const from_preg = from.asReg() orelse return;
@@ -1203,7 +1250,7 @@ pub fn VCode(comptime I: type) type {
 
                 // Generate and emit the store instruction
                 const store_inst = Inst.genStoreStack(from_reg, slot_offset, ty);
-                try store_inst.emit(buffer, emit_info);
+                try store_inst.emit(buffer, emit_info, state);
             }
             // Note: stack-to-stack moves should not occur (regalloc doesn't generate them)
         }
@@ -1562,48 +1609,31 @@ pub fn VCodeBuilder(comptime I: type) type {
                 // Collect operands using the visitor pattern
                 GetOperands.getOperands(insn, &visitor);
 
-                // Convert early defs first (at early position to prevent overlap with uses)
-                // Reference: cranelift/codegen/src/machinst/reg.rs:425 reg_early_def
-                for (collector_state.early_defs.items) |def_reg| {
-                    const reg = def_reg.toReg();
-                    if (reg.isVirtual()) {
-                        const vreg = vregs.resolveVregAlias(reg.toVReg());
-                        try self.vcode.operands.append(allocator, Operand.new(vreg, .any, .def, .early));
-                    }
-                }
-
-                // Convert defs (at late position)
-                // Only add virtual registers - physical registers don't need allocation
-                for (collector_state.defs.items) |def_reg| {
-                    const reg = def_reg.toReg();
-                    if (reg.isVirtual()) {
-                        const vreg = vregs.resolveVregAlias(reg.toVReg());
-                        try self.vcode.operands.append(allocator, Operand.new(vreg, .any, .def, .late));
-                    }
-                }
-
-                // Convert fixed defs (virtual regs with fixed physical register constraints)
-                for (collector_state.fixed_defs.items) |fixed_def| {
-                    const reg = fixed_def.vreg.toReg();
-                    if (reg.isVirtual()) {
-                        const vreg = vregs.resolveVregAlias(reg.toVReg());
-                        try self.vcode.operands.append(allocator, Operand.new(vreg, .{ .fixed_reg = fixed_def.preg }, .def, .late));
-                    }
-                }
-
-                // Convert uses - only virtual registers need allocation
-                for (collector_state.uses.items) |use_reg| {
-                    if (use_reg.isVirtual()) {
-                        const vreg = vregs.resolveVregAlias(use_reg.toVReg());
-                        try self.vcode.operands.append(allocator, Operand.new(vreg, .any, .use, .early));
-                    }
-                }
-
-                // Convert fixed uses (virtual regs with fixed physical register constraints)
-                for (collector_state.fixed_uses.items) |fixed_use| {
-                    if (fixed_use.vreg.isVirtual()) {
-                        const vreg = vregs.resolveVregAlias(fixed_use.vreg.toVReg());
-                        try self.vcode.operands.append(allocator, Operand.new(vreg, .{ .fixed_reg = fixed_use.preg }, .use, .early));
+                // Iterate the flat operands list in source order.
+                // Port of Cranelift vcode.rs:530-540: operands are in source order,
+                // matching the callback visit order in emitWithAllocs.
+                for (collector_state.operands.items) |op| {
+                    if (op.reg.isVirtual()) {
+                        const vreg = vregs.resolveVregAlias(op.reg.toVReg());
+                        // Port of Cranelift reg.rs:449 regMaybeFixed: uses .reg (not .any)
+                        // .reg = operand MUST be in a register (not on the stack).
+                        // .any would allow stack allocation which x64/aarch64 can't use.
+                        const constraint: OperandConstraint = if (op.preg) |p|
+                            .{ .fixed_reg = p }
+                        else
+                            .reg;
+                        try self.vcode.operands.append(allocator, Operand.new(
+                            vreg,
+                            constraint,
+                            switch (op.kind) {
+                                .use => .use,
+                                .def => .def,
+                            },
+                            switch (op.pos) {
+                                .early => .early,
+                                .late => .late,
+                            },
+                        ));
                     }
                 }
 

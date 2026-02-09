@@ -848,8 +848,6 @@ pub const MachineEnv = struct {
 /// Create the register environment for x64.
 /// This is used by the register allocator to know which registers are available.
 pub fn createRegEnv(enable_pinned_reg: bool) MachineEnv {
-    _ = enable_pinned_reg; // x64 doesn't use pinned registers like ARM64
-
     var env = MachineEnv{
         .preferred_regs_by_class = .{
             BoundedArray(PReg, 32){}, // int
@@ -883,12 +881,16 @@ pub fn createRegEnv(enable_pinned_reg: bool) MachineEnv {
         env.preferred_regs_by_class[1].appendAssumeCapacity(fprPreg(i));
     }
 
-    // Non-preferred integer registers: callee-saved (rbx, r12-r15)
+    // Non-preferred integer registers: callee-saved (rbx, r12-r14)
+    // When enable_pinned_reg is true, R15 is excluded (used as vmctx pinned register).
+    // Port of ARM64 pattern: cranelift/codegen/src/isa/x64/abi.rs
     env.non_preferred_regs_by_class[0].appendAssumeCapacity(gprPreg(GprEnc.RBX));
     env.non_preferred_regs_by_class[0].appendAssumeCapacity(gprPreg(GprEnc.R12));
     env.non_preferred_regs_by_class[0].appendAssumeCapacity(gprPreg(GprEnc.R13));
     env.non_preferred_regs_by_class[0].appendAssumeCapacity(gprPreg(GprEnc.R14));
-    env.non_preferred_regs_by_class[0].appendAssumeCapacity(gprPreg(GprEnc.R15));
+    if (!enable_pinned_reg) {
+        env.non_preferred_regs_by_class[0].appendAssumeCapacity(gprPreg(GprEnc.R15));
+    }
 
     // Set r11 as scratch register
     env.scratch_by_class[0] = gprPreg(GprEnc.R11);

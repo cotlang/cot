@@ -734,40 +734,46 @@ pub const X64LowerBackend = struct {
 
         const dividend = ctx.putInputInRegs(ir_inst, 0);
         const divisor = ctx.putInputInRegs(ir_inst, 1);
-        const dst = ctx.allocTmp(ty) catch return null;
 
         const dividend_reg = dividend.onlyReg() orelse return null;
         const divisor_reg = divisor.onlyReg() orelse return null;
         const dividend_gpr = Gpr.unwrapNew(dividend_reg);
         const divisor_gpr = Gpr.unwrapNew(divisor_reg);
-        const dst_reg = dst.onlyReg() orelse return null;
-        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
+
+        // Cranelift pattern: allocate VIRTUAL registers for all div operands.
+        // The div instruction constrains them to RAX/RDX via regFixedUse/regFixedDef.
+        // This lets regalloc properly track dataflow and avoid conflicts.
+        const dividend_hi_tmp = ctx.allocTmp(ty) catch return null;
+        const dst_quotient_tmp = ctx.allocTmp(ty) catch return null;
+        const dst_remainder_tmp = ctx.allocTmp(ty) catch return null;
+
+        const dividend_hi_reg = dividend_hi_tmp.onlyReg() orelse return null;
+        const dividend_hi_gpr = Gpr.unwrapNew(dividend_hi_reg.toReg());
+        const writable_dividend_hi = WritableGpr.fromReg(dividend_hi_gpr);
+        const dst_q_reg = dst_quotient_tmp.onlyReg() orelse return null;
+        const dst_q_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_q_reg.toReg()));
+        const dst_r_reg = dst_remainder_tmp.onlyReg() orelse return null;
+        const dst_r_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_r_reg.toReg()));
 
         // Division uses RAX:RDX / divisor, quotient in RAX, remainder in RDX
-        // First, we need to set up RDX appropriately:
-        // - For signed division: sign-extend RAX into RDX (CQO/CDQ)
-        // - For unsigned division: zero RDX (XOR RDX, RDX)
-
-        const rdx_gpr = Gpr.unwrapNew(regs.rdx());
-        const writable_rdx = WritableGpr.fromReg(rdx_gpr);
-
+        // Set up dividend_hi (RDX) appropriately:
+        // - For signed: sign-extend dividend into dividend_hi (CQO/CDQ)
+        // - For unsigned: zero dividend_hi (imm 0)
         if (is_signed) {
-            // Sign-extend RAX into RDX (CQO for 64-bit, CDQ for 32-bit)
             ctx.emit(Inst{
                 .sign_extend_data = .{
                     .size = size,
                     .src = dividend_gpr,
-                    .dst = writable_rdx,
+                    .dst = writable_dividend_hi,
                 },
             }) catch return null;
         } else {
-            // Zero RDX for unsigned division (XOR RDX, RDX)
+            // Use .imm with 0 which emits XOR (pure def, no read dependency)
             ctx.emit(Inst{
-                .alu_rmi_r = .{
-                    .size = size,
-                    .op = .xor,
-                    .src = GprMemImm{ .inner = RegMemImm{ .reg = rdx_gpr.toReg() } },
-                    .dst = writable_rdx,
+                .imm = .{
+                    .dst_size = size,
+                    .simm64 = 0,
+                    .dst = writable_dividend_hi,
                 },
             }) catch return null;
         }
@@ -778,15 +784,17 @@ pub const X64LowerBackend = struct {
                 .signed = is_signed,
                 .divisor = GprMem{ .inner = RegMem{ .reg = divisor_gpr.toReg() } },
                 .dividend_lo = dividend_gpr,
-                .dividend_hi = rdx_gpr,
-                .dst_quotient = if (want_remainder) WritableGpr.fromReg(Gpr.unwrapNew(regs.rax())) else dst_gpr,
-                .dst_remainder = if (want_remainder) dst_gpr else WritableGpr.fromReg(Gpr.unwrapNew(regs.rdx())),
+                .dividend_hi = dividend_hi_gpr,
+                .dst_quotient = dst_q_gpr,
+                .dst_remainder = dst_r_gpr,
                 .trap_code = .integer_division_by_zero,
             },
         }) catch return null;
 
+        // Return quotient or remainder based on what was requested
+        const result_reg = if (want_remainder) dst_r_reg else dst_q_reg;
         var output = InstOutput{};
-        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        output.append(ValueRegs(Reg).one(result_reg.toReg())) catch return null;
         return output;
     }
 
@@ -865,15 +873,22 @@ pub const X64LowerBackend = struct {
     fn lowerShift(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst, kind: ShiftKind) ?InstOutput {
         const ty = ctx.outputTy(ir_inst, 0);
         const size = operandSizeFromType(ty);
-        const src = ctx.putInputInRegs(ir_inst, 0);
-        const dst = ctx.allocTmp(ty) catch return null;
 
+        // Input 0: value to shift
+        const src = ctx.putInputInRegs(ir_inst, 0);
         const src_reg = src.onlyReg() orelse return null;
         const src_gpr = Gpr.unwrapNew(src_reg);
+
+        // Input 1: shift amount (must go into RCX/CL on x64)
+        const shift_amt = ctx.putInputInRegs(ir_inst, 1);
+        const shift_reg = shift_amt.onlyReg() orelse return null;
+        const shift_gpr = Gpr.unwrapNew(shift_reg);
+
+        const dst = ctx.allocTmp(ty) catch return null;
         const dst_reg = dst.onlyReg() orelse return null;
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
-        // MOV src, dst
+        // MOV src to dst (shift operates in-place)
         ctx.emit(Inst{
             .mov_r_r = .{
                 .size = size,
@@ -882,13 +897,15 @@ pub const X64LowerBackend = struct {
             },
         }) catch return null;
 
-        // For now, assume shift by CL
+        // Shift by CL - shift_amt vreg is constrained to RCX by regalloc.
+        // Port of Cranelift's x64 shift lowering pattern.
         ctx.emit(Inst{
             .shift_r = .{
                 .size = size,
                 .kind = kind,
                 .shift_by = .cl,
                 .dst = dst_gpr,
+                .src = shift_gpr,
             },
         }) catch return null;
 
@@ -1779,22 +1796,42 @@ pub const X64LowerBackend = struct {
         // Build uses list: gen_call_args(abi, args)
         // Each argument vreg is constrained to its ABI register
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
+        // Port of Cranelift's gen_call_args from abi.rs
         var int_arg_idx: u8 = 0;
+        var stack_offset: u32 = 0;
         for (0..num_args) |idx| {
             const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
             const arg_ty = ctx.inputTy(ir_inst, idx);
 
             if (!arg_ty.isFloat() and int_arg_idx < int_arg_pregs.len) {
-                // Add to uses: this vreg MUST be in this preg at the call
+                // Register argument: constrain vreg to its ABI register
                 call_info.uses.append(ctx.allocator, .{
                     .vreg = arg_reg,
                     .preg = int_arg_pregs[int_arg_idx],
                 }) catch return null;
                 int_arg_idx += 1;
+            } else if (!arg_ty.isFloat()) {
+                // Stack argument: store to outgoing args area [rsp + offset].
+                // The outgoing args area is at the bottom of the stack frame,
+                // pre-allocated in the prologue.
+                // Port of Cranelift's StackAMode::OutgoingArg pattern.
+                const amode = SyntheticAmode.real_amode(Amode{ .imm_reg = .{
+                    .simm32 = @intCast(stack_offset),
+                    .base = regs.rsp(),
+                    .flags = MemFlags.empty,
+                } });
+                ctx.emit(Inst{
+                    .mov_r_m = .{
+                        .size = .size64,
+                        .src = Gpr.unwrapNew(arg_reg),
+                        .dst = amode,
+                    },
+                }) catch return null;
+                stack_offset += 8;
             }
-            // TODO: Handle float arguments and stack arguments
         }
+        call_info.stack_args_size = stack_offset;
 
         // Build defs list: gen_call_rets(abi, output)
         // Each return value vreg is defined in its ABI register
@@ -1915,21 +1952,55 @@ pub const X64LowerBackend = struct {
         return InstOutput{};
     }
 
-    fn lowerTrapnz(_: *const Self, ctx: *LowerCtx, _: ClifInst) ?InstOutput {
+    fn lowerTrapnz(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        // Port of Cranelift x64 trapnz and ARM64 lowerTrapnz:
+        // Must consume input and emit TEST reg, reg before trap_if.
+        // Without this, the regalloc doesn't see the input use, and
+        // trap_if checks stale flags from a previous instruction.
+        const cond = ctx.putInputInRegs(ir_inst, 0);
+        const cond_reg = cond.onlyReg() orelse return null;
+        const cond_gpr = Gpr.unwrapNew(cond_reg);
+
+        // TEST reg, reg - AND reg with itself, sets ZF=1 if reg==0, ZF=0 if reg!=0
+        // Cranelift: (x64_test_gpr val val) before (trap_if NZ)
+        ctx.emit(Inst{
+            .test_rmi_r = .{
+                .size = .size64,
+                .src = GprMemImm{ .inner = RegMemImm{ .reg = cond_reg } },
+                .dst = cond_gpr,
+            },
+        }) catch return null;
+
+        // Trap if not zero (ZF=0 means value was non-zero)
         ctx.emit(Inst{
             .trap_if = .{
                 .cc = .nz,
-                .trap_code = .unreachable_code_reached,
+                .trap_code = .integer_division_by_zero,
             },
         }) catch return null;
         return InstOutput{};
     }
 
-    fn lowerTrapz(_: *const Self, ctx: *LowerCtx, _: ClifInst) ?InstOutput {
+    fn lowerTrapz(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        // Port of ARM64 lowerTrapz: consume input, test, then trap if zero.
+        const cond = ctx.putInputInRegs(ir_inst, 0);
+        const cond_reg = cond.onlyReg() orelse return null;
+        const cond_gpr = Gpr.unwrapNew(cond_reg);
+
+        // TEST reg, reg - AND reg with itself, sets ZF=1 if reg==0, ZF=0 if reg!=0
+        ctx.emit(Inst{
+            .test_rmi_r = .{
+                .size = .size64,
+                .src = GprMemImm{ .inner = RegMemImm{ .reg = cond_reg } },
+                .dst = cond_gpr,
+            },
+        }) catch return null;
+
+        // Trap if zero (ZF=1 means value was zero)
         ctx.emit(Inst{
             .trap_if = .{
                 .cc = .z,
-                .trap_code = .unreachable_code_reached,
+                .trap_code = .integer_division_by_zero,
             },
         }) catch return null;
         return InstOutput{};

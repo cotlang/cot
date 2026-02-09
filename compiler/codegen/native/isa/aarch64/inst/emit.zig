@@ -1006,7 +1006,7 @@ fn emitStore(sink: *MachBuffer, rd: Reg, mem: AMode, op: u32, state: *const Emit
 //=============================================================================
 
 /// Emit an instruction to the buffer.
-pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, state: *EmitState) !void {
+pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, state: *const EmitState) !void {
     _ = emit_info;
 
     switch (inst.*) {

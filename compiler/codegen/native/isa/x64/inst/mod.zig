@@ -137,6 +137,9 @@ pub const CallInfo = struct {
     defs: CallRetList,
     /// Registers clobbered by the call.
     clobbers: PRegSet,
+    /// Bytes of stack space needed for stack arguments.
+    /// Port of Cranelift's sized_stack_arg_space pattern.
+    stack_args_size: u32 = 0,
     /// Calling convention.
     callee_conv: CallConv,
     /// Caller's calling convention.
@@ -454,12 +457,16 @@ pub const Inst = union(enum) {
     },
 
     /// Shift/rotate: dst = dst op cl/imm8.
+    /// When shift_by == .cl, src holds the shift amount vreg constrained to RCX.
+    /// Port of Cranelift's ShiftR with num_shift_uses pattern.
     shift_r: struct {
         size: OperandSize,
         kind: ShiftKind,
         /// Shift amount: either an immediate or CL register.
         shift_by: ShiftBy,
         dst: WritableGpr,
+        /// Shift amount source vreg (used when shift_by == .cl, constrained to RCX).
+        src: Gpr = Gpr.unwrapNew(regs.rcx()),
     },
 
     /// Multiply (widening): (rdx, rax) = rax * src.
@@ -1151,6 +1158,7 @@ pub const Inst = union(enum) {
         sink: *emit_mod.MachBuffer,
         allocs: []const Allocation,
         emit_info: *const emit_mod.EmitInfo,
+        state: *const emit_mod.EmitState,
     ) !void {
         // Create a mutable copy of the instruction
         var inst_copy = self.*;
@@ -1213,9 +1221,9 @@ pub const Inst = union(enum) {
         // Apply allocations by visiting all operands
         Inst.get_operands.getOperands(&inst_copy, &visitor);
 
-        // Emit the instruction with resolved registers
-        var state = emit_mod.EmitState{};
-        try emit_mod.emit(&inst_copy, sink, emit_info, &state);
+        // Emit the instruction with the shared EmitState (contains frame_layout).
+        // Port of Cranelift: state is shared across all emissions in a function.
+        try emit_mod.emit(&inst_copy, sink, emit_info, state);
     }
 
 
@@ -1725,14 +1733,16 @@ pub const Inst = union(enum) {
     }
 
     /// Emit this instruction directly (with physical registers already in place).
-    /// Used for regalloc-inserted moves where registers are already physical.
+    /// Used for prologue/epilogue and regalloc-inserted moves.
+    /// Port of Cranelift: EmitState is passed through from vcode emission,
+    /// carrying frame_layout needed for incoming_arg and slot_offset resolution.
     pub fn emit(
         self: *const Inst,
         sink: *emit_mod.MachBuffer,
         emit_info: *const emit_mod.EmitInfo,
+        state: *const emit_mod.EmitState,
     ) !void {
-        var state = emit_mod.EmitState{};
-        try emit_mod.emit(self, sink, emit_info, &state);
+        try emit_mod.emit(self, sink, emit_info, state);
     }
 
     /// EmitState type for this instruction type (used for emission context).

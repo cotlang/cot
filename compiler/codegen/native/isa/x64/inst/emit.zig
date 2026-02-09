@@ -773,13 +773,13 @@ pub fn memFinalize(mem: SyntheticAmode, state: *const EmitState) MemFinalizeResu
             result.amode = amode;
         },
         .incoming_arg => |m| {
-            // Incoming args are above the saved RBP and return address
+            // Incoming args are above the saved RBP and return address.
+            // Port of Cranelift args.rs: IncomingArg finalize uses
+            // setup_area_size (16 = saved RBP + return addr), NOT the
+            // full frame size. Clobbers, fixed frame, and outgoing args
+            // are BELOW rbp and do not affect incoming arg offsets.
             const fl = state.frame_layout;
-            const total_frame: i64 = @as(i64, fl.setup_area_size) +
-                @as(i64, fl.clobber_size) +
-                @as(i64, fl.fixed_frame_storage_size) +
-                @as(i64, fl.outgoing_args_size);
-            const off: i32 = @intCast(total_frame + @as(i64, m.offset_val));
+            const off: i32 = @intCast(@as(i64, fl.setup_area_size) + @as(i64, m.offset_val));
             result.amode = .{ .imm_reg = .{
                 .simm32 = off,
                 .base = rbp(),
@@ -966,32 +966,56 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             const src = mov.src;
             const ext_mode = mov.ext_mode;
 
-            // Determine if we need 64-bit operand (for movzx to 64-bit dest)
-            // Note: movzx from byte/word to dword automatically zero-extends to qword
-            const need_rex_w = false;
+            // x86-64 MOVZX only supports 8-bit and 16-bit sources.
+            // For 32->64 zero extension (ExtMode.lq), use MOV r32, r/m32
+            // which automatically zeros the upper 32 bits.
+            // Reference: Cranelift x64 emit.rs — MovzxRmR with ExtMode::LQ
+            const is_lq = ext_mode == .lq;
             const uses_8bit = ext_mode == .bl or ext_mode == .bq;
 
             switch (src.inner) {
                 .reg => |r| {
                     const gpr = Gpr{ .reg = r };
                     const src_enc = gpr.hwEnc();
-                    const rex = RexPrefix.twoOp(dst_enc, src_enc, need_rex_w, uses_8bit);
-                    try rex.encode(sink);
-                    try sink.put1(0x0F);
-                    try sink.put1(if (uses_8bit) 0xB6 else 0xB7);
-                    try emitModrmReg(sink, dst_enc, src_enc);
+                    if (is_lq) {
+                        // MOV r32, r/m32 (opcode 0x8B) — zeros upper 32 bits
+                        const rex = RexPrefix.twoOp(dst_enc, src_enc, false, false);
+                        try rex.encode(sink);
+                        try sink.put1(0x8B);
+                        try emitModrmReg(sink, dst_enc, src_enc);
+                    } else {
+                        // MOVZX r32/r64, r/m8 (0F B6) or r/m16 (0F B7)
+                        const rex = RexPrefix.twoOp(dst_enc, src_enc, false, uses_8bit);
+                        try rex.encode(sink);
+                        try sink.put1(0x0F);
+                        try sink.put1(if (uses_8bit) 0xB6 else 0xB7);
+                        try emitModrmReg(sink, dst_enc, src_enc);
+                    }
                 },
                 .mem => |amode| {
                     const finalized = memFinalize(amode, state);
-                    const rex = switch (finalized.amode) {
-                        .imm_reg => |m| RexPrefix.memOp(dst_enc, m.base.hwEnc(), need_rex_w, uses_8bit),
-                        .imm_reg_reg_shift => |m| RexPrefix.threeOp(dst_enc, m.index.hwEnc(), m.base.hwEnc(), need_rex_w, uses_8bit),
-                        .rip_relative => RexPrefix.twoOp(dst_enc, 0, need_rex_w, uses_8bit),
-                    };
-                    try rex.encode(sink);
-                    try sink.put1(0x0F);
-                    try sink.put1(if (uses_8bit) 0xB6 else 0xB7);
-                    try emitModrmSibDisp(sink, dst_enc, finalized.amode, 0, null);
+                    if (is_lq) {
+                        // MOV r32, m32 (opcode 0x8B) — zeros upper 32 bits
+                        const rex = switch (finalized.amode) {
+                            .imm_reg => |m| RexPrefix.memOp(dst_enc, m.base.hwEnc(), false, false),
+                            .imm_reg_reg_shift => |m| RexPrefix.threeOp(dst_enc, m.index.hwEnc(), m.base.hwEnc(), false, false),
+                            .rip_relative => RexPrefix.twoOp(dst_enc, 0, false, false),
+                        };
+                        try rex.encode(sink);
+                        try sink.put1(0x8B);
+                        try emitModrmSibDisp(sink, dst_enc, finalized.amode, 0, null);
+                    } else {
+                        // MOVZX from mem
+                        const rex = switch (finalized.amode) {
+                            .imm_reg => |m| RexPrefix.memOp(dst_enc, m.base.hwEnc(), false, uses_8bit),
+                            .imm_reg_reg_shift => |m| RexPrefix.threeOp(dst_enc, m.index.hwEnc(), m.base.hwEnc(), false, uses_8bit),
+                            .rip_relative => RexPrefix.twoOp(dst_enc, 0, false, uses_8bit),
+                        };
+                        try rex.encode(sink);
+                        try sink.put1(0x0F);
+                        try sink.put1(if (uses_8bit) 0xB6 else 0xB7);
+                        try emitModrmSibDisp(sink, dst_enc, finalized.amode, 0, null);
+                    }
                 },
             }
         },

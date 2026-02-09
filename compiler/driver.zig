@@ -1154,8 +1154,6 @@ pub const Driver = struct {
     /// Generate ELF object file from compiled functions.
     /// Uses ObjectModule to bridge CompiledCode to ELF format.
     fn generateElf(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType) ![]u8 {
-        _ = data_segments; // TODO: Copy data segments to ELF data section
-        _ = globals; // TODO: Write global init values to ELF vmctx data section
         var module = object_module.ObjectModule.initWithTarget(
             self.allocator,
             .linux,
@@ -1217,12 +1215,39 @@ pub const Driver = struct {
 
         // Pass 2: Define all functions (relocations can now resolve forward references)
         for (compiled_funcs, 0..) |*cf, i| {
-            try module.defineFunction(elf_func_ids[i], cf);
+            // Check if this is cot_write — replace with x86-64 Linux syscall
+            var is_cot_write = false;
+            for (exports) |exp| {
+                if (exp.kind == .func and exp.index == i and std.mem.eql(u8, exp.name, "cot_write")) {
+                    is_cot_write = true;
+                    break;
+                }
+            }
+            if (is_cot_write) {
+                // x86-64 Linux syscall for write(fd, ptr, len)
+                // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=ptr(wasm), r8=len
+                // Linux write: rax=1(SYS_write), rdi=fd, rsi=buf, rdx=count
+                const x64_write = [_]u8{
+                    0x55, // push rbp
+                    0x48, 0x89, 0xE5, // mov rbp, rsp
+                    0x48, 0x8D, 0xB7, 0x00, 0x00, 0x04, 0x00, // lea rsi, [rdi + 0x40000]  (linmem base)
+                    0x48, 0x01, 0xCE, // add rsi, rcx              (real_ptr = linmem + wasm_ptr)
+                    0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                    0x4C, 0x89, 0xC2, // mov rdx, r8               (len)
+                    0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1  (SYS_write)
+                    0x0F, 0x05, // syscall
+                    0x5D, // pop rbp
+                    0xC3, // ret
+                };
+                try module.defineFunctionBytes(elf_func_ids[i], &x64_write, &.{});
+            } else {
+                try module.defineFunction(elf_func_ids[i], cf);
+            }
         }
 
         // If we have a main function, generate the wrapper and static vmctx
         if (main_func_index != null) {
-            try self.generateMainWrapperElf(&module, @intCast(compiled_funcs.len));
+            try self.generateMainWrapperElf(&module, data_segments, globals, @intCast(compiled_funcs.len));
         }
 
         // Write to memory buffer
@@ -1235,12 +1260,12 @@ pub const Driver = struct {
 
     /// Generate the main wrapper and static vmctx data for ELF (x86-64 Linux).
     /// The wrapper initializes vmctx and calls __wasm_main.
-    fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule, num_funcs: u32) !void {
+    fn generateMainWrapperElf(self: *Driver, module: *object_module.ObjectModule, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, num_funcs: u32) !void {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
         // Layout (total 16MB = 0x1000000):
         //   0x00000 - 0x0FFFF: Padding/reserved
-        //   0x10000: Stack pointer global (i32) - initialized to 64KB
+        //   0x10000: Globals area (16-byte stride per global)
         //   0x20000: Heap base pointer (i64) - to be filled by wrapper
         //   0x20008: Heap bound (i64) - ~15.7MB
         //   0x30000: argc (i64) - set by _main wrapper from OS
@@ -1255,10 +1280,43 @@ pub const Driver = struct {
         // Zero initialize
         @memset(vmctx_data, 0);
 
-        // Initialize stack pointer at offset 0x10000 = 64KB into linear memory
-        // This means SP starts at heap_base + 0x10000
-        const sp_value: u32 = 0x10000;
-        @memcpy(vmctx_data[0x10000..][0..4], std.mem.asBytes(&sp_value));
+        // Copy Wasm data segments into linear memory (starts at 0x40000)
+        const linear_memory_base: usize = 0x40000;
+        for (data_segments) |segment| {
+            const dest_offset = linear_memory_base + segment.offset;
+            if (dest_offset + segment.data.len <= vmctx_size) {
+                @memcpy(vmctx_data[dest_offset..][0..segment.data.len], segment.data);
+            }
+        }
+
+        // Initialize globals at offset 0x10000 with fixed 16-byte stride.
+        // Reference: Cranelift vmoffsets.rs — VMGlobalDefinition is 16 bytes.
+        const global_base: usize = 0x10000;
+        const global_stride: usize = 16;
+        for (globals, 0..) |g, i| {
+            const offset = global_base + i * global_stride;
+            if (offset + 8 <= vmctx_size) {
+                switch (g.val_type) {
+                    .i32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .i64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    .f32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .f64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    else => {},
+                }
+            }
+        }
 
         // Heap bound at offset 0x20008 = ~15.7MB (size of linear memory)
         const heap_bound: u64 = 0x1000000 - 0x40000; // vmctx_size - linear_memory_base

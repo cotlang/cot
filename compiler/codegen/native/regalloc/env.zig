@@ -110,7 +110,11 @@ pub const MachineEnv = struct {
 
 /// The pinned register for vmctx on ARM64 (x21).
 /// Port of Cranelift's PINNED_REG from cranelift/codegen/src/isa/aarch64/inst/regs.rs
-const PINNED_REG: usize = 21;
+const PINNED_REG_ARM64: usize = 21;
+
+/// The pinned register for vmctx on x64 (r15).
+/// Port of Cranelift's PINNED_REG from cranelift/codegen/src/isa/x64/inst/regs.rs
+const PINNED_REG_X64: usize = 15;
 
 /// Create a MachineEnv for ARM64 (AArch64).
 ///
@@ -130,7 +134,7 @@ pub fn arm64MachineEnv() MachineEnv {
     // Add x19-x28 but skip x21 (pinned register)
     // Port of Cranelift's create_reg_env(enable_pinned_reg: true) from abi.rs
     for (19..29) |i| {
-        if (i != PINNED_REG) {
+        if (i != PINNED_REG_ARM64) {
             env.non_preferred_regs_by_class[@intFromEnum(RegClass.int)].add(PReg.new(i, .int));
         }
     }
@@ -180,11 +184,15 @@ pub fn x64MachineEnv() MachineEnv {
         env.preferred_regs_by_class[@intFromEnum(RegClass.int)].add(PReg.new(i, .int));
     }
 
-    // Callee-saved (non-preferred): rbx, r12-r15
+    // Callee-saved (non-preferred): rbx, r12-r14
     // rbp (5) and rsp (4) are not allocatable
+    // r15 is excluded (pinned register for vmctx)
+    // Port of Cranelift's create_reg_env(enable_pinned_reg: true) from abi.rs
     env.non_preferred_regs_by_class[@intFromEnum(RegClass.int)].add(PReg.new(3, .int)); // rbx
     for (12..16) |i| {
-        env.non_preferred_regs_by_class[@intFromEnum(RegClass.int)].add(PReg.new(i, .int));
+        if (i != PINNED_REG_X64) {
+            env.non_preferred_regs_by_class[@intFromEnum(RegClass.int)].add(PReg.new(i, .int));
+        }
     }
 
     // Float/SSE: xmm0-xmm5 caller-saved (preferred), xmm6-xmm15 callee-saved on Windows

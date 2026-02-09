@@ -86,49 +86,38 @@ pub const OperandVisitor = union(enum) {
     },
 
     /// Collection state for regalloc input.
-    /// Reference: cranelift/codegen/src/machinst/reg.rs OperandCollector
+    /// Port of Cranelift's single flat operands Vec (reg.rs:343).
+    /// All operands are stored in SOURCE ORDER to match callback visit order.
     pub const CollectorState = struct {
-        /// Registers used (read from) by this instruction (early position).
-        uses: std.ArrayListUnmanaged(Reg),
-        /// Registers defined (written to) by this instruction (late position).
-        defs: std.ArrayListUnmanaged(Writable(Reg)),
-        /// Early defs - written at instruction start, prevents overlap with uses.
-        /// Reference: reg.rs:425 reg_early_def
-        early_defs: std.ArrayListUnmanaged(Writable(Reg)),
-        /// Fixed register constraints.
-        fixed_uses: std.ArrayListUnmanaged(struct { vreg: Reg, preg: PReg }),
-        fixed_defs: std.ArrayListUnmanaged(struct { vreg: Writable(Reg), preg: PReg }),
-        /// Clobbered registers.
+        /// Flat list of operands in source order (matching callback visit order).
+        operands: std.ArrayListUnmanaged(CollectedOperand),
+        /// Clobbered registers (separate, not regalloc operands).
         clobbers: std.ArrayListUnmanaged(PReg),
         allocator: std.mem.Allocator,
 
+        /// A single collected operand entry, preserving source order.
+        pub const CollectedOperand = struct {
+            reg: Reg,
+            preg: ?PReg, // non-null for fixed register constraints
+            kind: OperandKind,
+            pos: OperandPos,
+        };
+
         pub fn init(allocator: std.mem.Allocator) CollectorState {
             return .{
-                .uses = .{},
-                .defs = .{},
-                .early_defs = .{},
-                .fixed_uses = .{},
-                .fixed_defs = .{},
+                .operands = .{},
                 .clobbers = .{},
                 .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *CollectorState) void {
-            self.uses.deinit(self.allocator);
-            self.defs.deinit(self.allocator);
-            self.early_defs.deinit(self.allocator);
-            self.fixed_uses.deinit(self.allocator);
-            self.fixed_defs.deinit(self.allocator);
+            self.operands.deinit(self.allocator);
             self.clobbers.deinit(self.allocator);
         }
 
         pub fn clear(self: *CollectorState) void {
-            self.uses.clearRetainingCapacity();
-            self.defs.clearRetainingCapacity();
-            self.early_defs.clearRetainingCapacity();
-            self.fixed_uses.clearRetainingCapacity();
-            self.fixed_defs.clearRetainingCapacity();
+            self.operands.clearRetainingCapacity();
             self.clobbers.clearRetainingCapacity();
         }
     };
@@ -152,7 +141,9 @@ pub const OperandVisitor = union(enum) {
     /// Reference: reg.rs:405 fn reg_use
     pub fn regUse(self: *OperandVisitor, reg: *Reg) void {
         switch (self.*) {
-            .collector => |c| c.uses.append(c.allocator, reg.*) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = reg.*, .preg = null, .kind = .use, .pos = .early,
+            }) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, reg, .any, .use, .early),
         }
     }
@@ -161,7 +152,9 @@ pub const OperandVisitor = union(enum) {
     /// Reference: reg.rs:417 fn reg_def
     pub fn regDef(self: *OperandVisitor, reg: *Writable(Reg)) void {
         switch (self.*) {
-            .collector => |c| c.defs.append(c.allocator, reg.*) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = reg.toReg(), .preg = null, .kind = .def, .pos = .late,
+            }) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, reg.regMut(), .any, .def, .late),
         }
     }
@@ -172,7 +165,9 @@ pub const OperandVisitor = union(enum) {
     /// Reference: cranelift/codegen/src/machinst/reg.rs:425 fn reg_early_def
     pub fn regEarlyDef(self: *OperandVisitor, reg: *Writable(Reg)) void {
         switch (self.*) {
-            .collector => |c| c.early_defs.append(c.allocator, reg.*) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = reg.toReg(), .preg = null, .kind = .def, .pos = .early,
+            }) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, reg.regMut(), .any, .def, .early),
         }
     }
@@ -182,13 +177,18 @@ pub const OperandVisitor = union(enum) {
     pub fn regReuseDef(self: *OperandVisitor, reg: *Writable(Reg), _: usize) void {
         switch (self.*) {
             .collector => |c| {
-                c.uses.append(c.allocator, reg.toReg()) catch unreachable;
-                c.defs.append(c.allocator, reg.*) catch unreachable;
+                // Append def then use in source order, matching callback order.
+                // Both entries refer to the same register (read-modify-write pattern).
+                c.operands.append(c.allocator, .{
+                    .reg = reg.toReg(), .preg = null, .kind = .def, .pos = .late,
+                }) catch unreachable;
+                c.operands.append(c.allocator, .{
+                    .reg = reg.toReg(), .preg = null, .kind = .use, .pos = .early,
+                }) catch unreachable;
             },
             .callback => |cb| {
-                // IMPORTANT: Callback order must match collectOperands order (defs first, then uses).
-                // collectOperands builds: [defs..., uses...], so we call def first, then use.
                 // Both refer to the same register (reuse pattern).
+                // Order: def first, then use (matching collector order).
                 cb.func(cb.ctx, reg.regMut(), .reuse, .def, .late);
                 cb.func(cb.ctx, reg.regMut(), .reuse, .use, .early);
             },
@@ -200,12 +200,11 @@ pub const OperandVisitor = union(enum) {
     /// Reference: reg.rs:468 fn reg_fixed_use
     pub fn regFixedUse(self: *OperandVisitor, vreg: Reg, preg: PReg) void {
         switch (self.*) {
-            .collector => |c| c.fixed_uses.append(c.allocator, .{ .vreg = vreg, .preg = preg }) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = vreg, .preg = preg, .kind = .use, .pos = .early,
+            }) catch unreachable,
             .callback => |cb| {
                 // Call callback to consume allocation and keep allocation index in sync.
-                // The register value in the instruction doesn't need updating for implicit
-                // operands (like dividend_lo/hi in division) - we just need to consume
-                // the allocation slot.
                 var reg_copy = vreg;
                 cb.func(cb.ctx, &reg_copy, .fixed_reg, .use, .early);
             },
@@ -217,7 +216,9 @@ pub const OperandVisitor = union(enum) {
     /// Reference: reg.rs:476 fn reg_fixed_def
     pub fn regFixedDef(self: *OperandVisitor, vreg: Writable(Reg), preg: PReg) void {
         switch (self.*) {
-            .collector => |c| c.fixed_defs.append(c.allocator, .{ .vreg = vreg, .preg = preg }) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = vreg.toReg(), .preg = preg, .kind = .def, .pos = .late,
+            }) catch unreachable,
             .callback => |cb| {
                 // Call callback to consume allocation and keep allocation index in sync.
                 var reg_copy = vreg.toReg();
@@ -278,7 +279,9 @@ pub const OperandVisitor = union(enum) {
     /// Mark a GPR as used.
     pub fn gprUse(self: *OperandVisitor, gpr: *Gpr) void {
         switch (self.*) {
-            .collector => |c| c.uses.append(c.allocator, gpr.toReg()) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = gpr.toReg(), .preg = null, .kind = .use, .pos = .early,
+            }) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, gpr.regMut(), .any, .use, .early),
         }
     }
@@ -286,8 +289,9 @@ pub const OperandVisitor = union(enum) {
     /// Mark a GPR as defined.
     pub fn gprDef(self: *OperandVisitor, wgpr: *args.WritableGpr) void {
         switch (self.*) {
-            .collector => |c| c.defs.append(c.allocator, Writable(Reg).fromReg(wgpr.toReg().toReg())) catch unreachable,
-            // Navigate through nested structure: wgpr.reg is Gpr, wgpr.reg.reg is Reg
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = wgpr.toReg().toReg(), .preg = null, .kind = .def, .pos = .late,
+            }) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, wgpr.regMut().regMut(), .any, .def, .late),
         }
     }
@@ -297,13 +301,15 @@ pub const OperandVisitor = union(enum) {
         switch (self.*) {
             .collector => |c| {
                 const reg = wgpr.toReg().toReg();
-                c.uses.append(c.allocator, reg) catch unreachable;
-                c.defs.append(c.allocator, Writable(Reg).fromReg(reg)) catch unreachable;
+                // Append def then use in source order, matching callback order.
+                c.operands.append(c.allocator, .{
+                    .reg = reg, .preg = null, .kind = .def, .pos = .late,
+                }) catch unreachable;
+                c.operands.append(c.allocator, .{
+                    .reg = reg, .preg = null, .kind = .use, .pos = .early,
+                }) catch unreachable;
             },
             .callback => |cb| {
-                // IMPORTANT: Callback order must match collectOperands order (defs first, then uses).
-                // collectOperands builds: [defs..., uses...], so we call def first, then use.
-                // Both refer to the same register (reuse pattern).
                 const reg_ptr = wgpr.regMut().regMut();
                 cb.func(cb.ctx, reg_ptr, .reuse, .def, .late);
                 cb.func(cb.ctx, reg_ptr, .reuse, .use, .early);
@@ -314,7 +320,9 @@ pub const OperandVisitor = union(enum) {
     /// Mark an XMM as used.
     pub fn xmmUse(self: *OperandVisitor, xmm: *Xmm) void {
         switch (self.*) {
-            .collector => |c| c.uses.append(c.allocator, xmm.toReg()) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = xmm.toReg(), .preg = null, .kind = .use, .pos = .early,
+            }) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, xmm.regMut(), .any, .use, .early),
         }
     }
@@ -322,7 +330,9 @@ pub const OperandVisitor = union(enum) {
     /// Mark an XMM as defined.
     pub fn xmmDef(self: *OperandVisitor, wxmm: *args.WritableXmm) void {
         switch (self.*) {
-            .collector => |c| c.defs.append(c.allocator, Writable(Reg).fromReg(wxmm.toReg().toReg())) catch unreachable,
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = wxmm.toReg().toReg(), .preg = null, .kind = .def, .pos = .late,
+            }) catch unreachable,
             .callback => |cb| cb.func(cb.ctx, wxmm.regMut().regMut(), .any, .def, .late),
         }
     }
@@ -332,13 +342,14 @@ pub const OperandVisitor = union(enum) {
         switch (self.*) {
             .collector => |c| {
                 const reg = wxmm.toReg().toReg();
-                c.uses.append(c.allocator, reg) catch unreachable;
-                c.defs.append(c.allocator, Writable(Reg).fromReg(reg)) catch unreachable;
+                c.operands.append(c.allocator, .{
+                    .reg = reg, .preg = null, .kind = .def, .pos = .late,
+                }) catch unreachable;
+                c.operands.append(c.allocator, .{
+                    .reg = reg, .preg = null, .kind = .use, .pos = .early,
+                }) catch unreachable;
             },
             .callback => |cb| {
-                // IMPORTANT: Callback order must match collectOperands order (defs first, then uses).
-                // collectOperands builds: [defs..., uses...], so we call def first, then use.
-                // Both refer to the same register (reuse pattern).
                 const reg_ptr = wxmm.regMut().regMut();
                 cb.func(cb.ctx, reg_ptr, .reuse, .def, .late);
                 cb.func(cb.ctx, reg_ptr, .reuse, .use, .early);
@@ -450,8 +461,9 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
             visitor.gprReuseDef(&p.dst, 0);
             switch (p.shift_by) {
                 .cl => {
-                    // CL register is implicitly used
-                    visitor.regFixedUse(regs.rcx(), regs.gprPreg(regs.GprEnc.RCX));
+                    // Shift amount vreg must be in RCX (CL is low byte of RCX).
+                    // Port of Cranelift's ShiftR get_operands pattern.
+                    visitor.regFixedUse(p.src.toReg(), regs.gprPreg(regs.GprEnc.RCX));
                 },
                 .imm => {},
             }
@@ -494,9 +506,11 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         // Sign extension for division
         //=====================================================================
         .sign_extend_data => |*p| {
-            // CDQ/CQO: sign-extend src into dst
-            visitor.gprUse(&p.src);
-            visitor.gprDef(&p.dst);
+            // CDQ/CQO: sign-extend RAX into RDX (implicit fixed registers).
+            // Port of Cranelift: cqto uses implicit(rax) read, implicit(rdx) write.
+            // These MUST be fixed constraints because the hardware always uses RAX/RDX.
+            visitor.regFixedUse(p.src.toReg(), regs.gprPreg(regs.GprEnc.RAX));
+            visitor.regFixedDef(Writable(Reg).fromReg(p.dst.toReg().toReg()), regs.gprPreg(regs.GprEnc.RDX));
         },
 
         //=====================================================================
@@ -882,8 +896,8 @@ test "CollectorState basic usage" {
     visitor.regUse(&reg1);
     visitor.regDef(&def_reg);
 
-    try testing.expectEqual(@as(usize, 2), state.uses.items.len);
-    try testing.expectEqual(@as(usize, 1), state.defs.items.len);
+    // All operands in flat list in source order: use, use, def
+    try testing.expectEqual(@as(usize, 3), state.operands.items.len);
 }
 
 test "getOperands alu_rmi_r" {
@@ -907,9 +921,8 @@ test "getOperands alu_rmi_r" {
 
     getOperands(&inst_val, &visitor);
 
-    // ALU uses src and reuses dst (use + def)
-    try testing.expectEqual(@as(usize, 2), state.uses.items.len); // dst reuse + src
-    try testing.expectEqual(@as(usize, 1), state.defs.items.len); // dst def
+    // ALU: gprReuseDef(dst) → 2 entries (def + use), gprMemImm(src) → 1 entry (use)
+    try testing.expectEqual(@as(usize, 3), state.operands.items.len);
 }
 
 test "getOperands div" {
@@ -939,10 +952,7 @@ test "getOperands div" {
 
     getOperands(&inst_val, &visitor);
 
-    // DIV uses dividend_lo, dividend_hi (fixed to RAX/RDX), divisor (regular use)
-    // defines quotient, remainder (fixed to RAX/RDX)
-    try testing.expectEqual(@as(usize, 1), state.uses.items.len); // divisor only
-    try testing.expectEqual(@as(usize, 2), state.fixed_uses.items.len); // dividend_lo (RAX), dividend_hi (RDX)
-    try testing.expectEqual(@as(usize, 0), state.defs.items.len); // none - results use fixed defs
-    try testing.expectEqual(@as(usize, 2), state.fixed_defs.items.len); // dst_quotient (RAX), dst_remainder (RDX)
+    // DIV: 2 fixed uses (dividend_lo, dividend_hi) + 1 use (divisor) + 2 fixed defs (quotient, remainder)
+    // All in flat list in source order
+    try testing.expectEqual(@as(usize, 5), state.operands.items.len);
 }

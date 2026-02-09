@@ -1740,6 +1740,7 @@ pub const Inst = union(enum) {
         sink: *emit_mod.MachBuffer,
         allocs: []const Allocation,
         emit_info: *const emit_mod.EmitInfo,
+        state: *const emit_mod.EmitState,
     ) !void {
         // Create a mutable copy of the instruction
         var inst_copy = self.*;
@@ -1798,9 +1799,8 @@ pub const Inst = union(enum) {
         // Apply allocations by visiting all operands
         Inst.get_operands.getOperands(&inst_copy, &visitor);
 
-        // Emit the instruction with resolved registers
-        var state = emit_mod.EmitState{};
-        try emit_mod.emit(&inst_copy, sink, emit_info, &state);
+        // Emit the instruction with the shared EmitState.
+        try emit_mod.emit(&inst_copy, sink, emit_info, state);
     }
 
     /// Classify the type of call instruction this is.
@@ -1815,14 +1815,14 @@ pub const Inst = union(enum) {
     }
 
     /// Emit this instruction directly (with physical registers already in place).
-    /// Used for regalloc-inserted moves where registers are already physical.
+    /// Used for prologue/epilogue and regalloc-inserted moves.
     pub fn emit(
         self: *const Inst,
         sink: *emit_mod.MachBuffer,
         emit_info: *const emit_mod.EmitInfo,
+        state: *const emit_mod.EmitState,
     ) !void {
-        var state = emit_mod.EmitState{};
-        try emit_mod.emit(self, sink, emit_info, &state);
+        try emit_mod.emit(self, sink, emit_info, state);
     }
 
     /// EmitState type for this instruction type (used for emission context).
