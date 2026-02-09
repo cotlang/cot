@@ -758,6 +758,13 @@ pub const Driver = struct {
                         0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
                         0x09, 0x01, 0x02, 0x8B, // add x9, x8, x2  (real path = linmem + path_ptr)
                         0xE5, 0x03, 0x04, 0xAA, // mov x5, x4  (save flags before clobbering)
+                        // Bounds check: reject paths > 1024 bytes with -ENAMETOOLONG
+                        0x7F, 0x00, 0x10, 0xF1, // cmp x3, #1024  (path_len vs PATH_MAX)
+                        0x89, 0x00, 0x00, 0x54, // b.ls +4  (path_len <= 1024 → .copy_start)
+                        0xC0, 0x07, 0x80, 0x92, // movn x0, #62  (x0 = -63 = -ENAMETOOLONG on macOS)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                        // .copy_start:
                         0xFF, 0x43, 0x10, 0xD1, // sub sp, sp, #1040  (stack buf: 1024 + 16 align)
                         0xEB, 0x03, 0x00, 0x91, // mov x11, sp  (dst = stack buffer)
                         0xEC, 0x03, 0x03, 0xAA, // mov x12, x3  (counter = path_len)
@@ -811,18 +818,34 @@ pub const Driver = struct {
                 } else if (std.mem.eql(u8, name, "cot_random")) {
                     // ARM64 macOS: getentropy(buf, len) — fill buffer with random bytes
                     // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=buf(wasm ptr), x3=len
-                    // Reference: Go syscall1 on Darwin ARM64 — BCC/NEG pattern
+                    // Reference: Go rand_getrandom.go chunk loop pattern
+                    // getentropy has 256-byte kernel limit; loop in chunks
                     // On success: x0 = 0. On error: x0 = -errno.
                     const arm64_random = [_]u8{
                         0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
                         0xFD, 0x03, 0x00, 0x91, // mov x29, sp
                         0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
-                        0x00, 0x01, 0x02, 0x8B, // add x0, x8, x2              (real buf = linmem + wasm_ptr)
-                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3                  (len)
-                        0x90, 0x3E, 0x80, 0xD2, // movz x16, #500              (SYS_getentropy)
+                        0x09, 0x01, 0x02, 0x8B, // add x9, x8, x2              (real buf = linmem + wasm_ptr)
+                        0xEA, 0x03, 0x03, 0xAA, // mov x10, x3                 (remaining = len)
+                        0x0B, 0x20, 0x80, 0xD2, // movz x11, #256              (chunk size constant)
+                        // .loop:
+                        0x6A, 0x01, 0x00, 0xB4, // cbz x10, +11  (remaining == 0 → .success)
+                        0x5F, 0x01, 0x04, 0xF1, // cmp x10, #256
+                        0x4C, 0x31, 0x8B, 0x9A, // csel x12, x10, x11, lo  (x12 = min(remaining, 256))
+                        0xE0, 0x03, 0x09, 0xAA, // mov x0, x9               (buf arg)
+                        0xE1, 0x03, 0x0C, 0xAA, // mov x1, x12              (len arg)
+                        0x90, 0x3E, 0x80, 0xD2, // movz x16, #500           (SYS_getentropy)
                         0x01, 0x10, 0x00, 0xD4, // svc #0x80
-                        0x43, 0x00, 0x00, 0x54, // b.cc +2     (carry clear = success, skip neg)
-                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: negate errno)
+                        0xE2, 0x00, 0x00, 0x54, // b.cs +7   (carry set → .error)
+                        0x29, 0x01, 0x0C, 0x8B, // add x9, x9, x12          (buf += chunk)
+                        0x4A, 0x01, 0x0C, 0xCB, // sub x10, x10, x12        (remaining -= chunk)
+                        0xF6, 0xFF, 0xFF, 0x17, // b -10                    (→ .loop)
+                        // .success:
+                        0xE0, 0x03, 0x1F, 0xAA, // mov x0, xzr              (return 0)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                        // .error:
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0               (negate errno)
                         0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };
@@ -855,12 +878,15 @@ pub const Driver = struct {
                         0xE2, 0x03, 0x0B, 0x2A, // mov w2, w11           (len = buf_len, zero-ext)
                         0x90, 0x00, 0x80, 0xD2, // mov x16, #4           (SYS_write)
                         0x01, 0x10, 0x00, 0xD4, // svc #0x80
-                        0x82, 0x00, 0x00, 0x54, // b.cs +4     (carry set = error, skip store, ret errno)
+                        0xA2, 0x00, 0x00, 0x54, // b.cs +5     (carry set = error, skip to .error)
                         // Success: store bytes_written, return ESUCCESS
                         0x09, 0x01, 0x25, 0x8B, // add x9, x8, w5, uxtw  (linmem + nwritten)
                         0x20, 0x01, 0x00, 0xB9, // str w0, [x9]          (store result as i32)
                         0xE0, 0x03, 0x1F, 0xAA, // mov x0, xzr           (return 0)
-                        // Error: x0 = macOS errno (falls through to epilogue)
+                        0x02, 0x00, 0x00, 0x14, // b +2                   (skip to .done)
+                        // .error: negate errno (Go NEG R0,R0 pattern)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        // .done:
                         0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };
@@ -901,11 +927,11 @@ pub const Driver = struct {
                     };
                     try module.defineFunctionBytes(func_ids[i], &arm64_arg_len, &.{});
                 } else if (std.mem.eql(u8, name, "cot_arg_ptr")) {
-                    // ARM64: copy argv[n] into linear memory at wasm offset 0xAF000, with bounds check
+                    // ARM64: copy argv[n] into linear memory at wasm offset 0xAF000 + n*4096
                     // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=n
-                    // Reference: Go goenvs() validates argc before accessing argv
+                    // Reference: Go goenvs() validates argc; Wasmtime uses caller-allocated buffers
+                    // Each arg gets a 4096-byte slot; copy limited to 4095 bytes + NUL
                     // Returns 0 if n >= argc (out of bounds).
-                    // Dest: vmctx + 0x40000 (linmem) + 0xAF000 = vmctx + 0xEF000
                     const arm64_arg_ptr = [_]u8{
                         0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
                         0xFD, 0x03, 0x00, 0x91, // mov x29, sp
@@ -919,15 +945,24 @@ pub const Driver = struct {
                         // .valid:
                         0x09, 0x05, 0x40, 0xF9, // ldr x9, [x8, #8]            (x9 = argv)
                         0x29, 0x79, 0x62, 0xF8, // ldr x9, [x9, x2, lsl #3]    (x9 = argv[n], src)
+                        0x4C, 0xCC, 0x74, 0xD3, // lsl x12, x2, #12            (x12 = n * 4096)
                         0x0A, 0x00, 0x41, 0x91, // add x10, x0, #0x40, lsl #12 (linmem base)
-                        0x4A, 0xBD, 0x42, 0x91, // add x10, x10, #0xAF, lsl #12 (+ 0xAF000 = dest)
+                        0x4A, 0xBD, 0x42, 0x91, // add x10, x10, #0xAF, lsl #12 (+ 0xAF000)
+                        0x4A, 0x01, 0x0C, 0x8B, // add x10, x10, x12           (+ n*4096 = dest)
+                        0xED, 0xFF, 0x81, 0xD2, // movz x13, #4095             (max copy bytes)
                         // .copy_loop:
+                        0xCD, 0x00, 0x00, 0xB4, // cbz x13, +6                 (limit hit → .truncate)
                         0x2B, 0x15, 0x40, 0x38, // ldrb w11, [x9], #1          (load byte, post-inc)
                         0x4B, 0x15, 0x00, 0x38, // strb w11, [x10], #1         (store byte, post-inc)
-                        0xCB, 0xFF, 0xFF, 0x35, // cbnz w11, -2                (→ .copy_loop)
-                        // .done: return wasm offset 0xAF000
+                        0xAB, 0x00, 0x00, 0x34, // cbz w11, +5                 (NUL found → .done)
+                        0xAD, 0x05, 0x00, 0xD1, // sub x13, x13, #1            (remaining--)
+                        0xFB, 0xFF, 0xFF, 0x17, // b -5                         (→ .copy_loop)
+                        // .truncate:
+                        0x5F, 0x01, 0x00, 0x39, // strb wzr, [x10]             (NUL-terminate at limit)
+                        // .done: return wasm offset 0xAF000 + n*4096
                         0x00, 0x00, 0x9E, 0xD2, // movz x0, #0xF000
                         0x40, 0x01, 0xA0, 0xF2, // movk x0, #0xA, lsl #16     (x0 = 0xAF000)
+                        0x00, 0x00, 0x0C, 0x8B, // add x0, x0, x12             (+ n*4096)
                         0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };

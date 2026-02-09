@@ -1,4 +1,6 @@
 // WASI I/O tests — @fd_write, @fd_read, @fd_close builtins
+// Note: flags 1537 = O_WRONLY|O_CREAT|O_TRUNC on macOS.
+// On Linux these flags are 577. Platform-conditional when x64 port lands.
 
 test "fd_write returns bytes written" {
     var msg = "hello"
