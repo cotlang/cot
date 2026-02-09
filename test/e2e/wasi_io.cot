@@ -102,3 +102,36 @@ test "fd_open write and read back" {
     @fd_close(fd2)
     @dealloc(buf)
 }
+
+// @time() tests
+// Reference: Go runtime/sys_darwin_arm64.s walltime_trampoline
+// SYS_gettimeofday(116) → nanoseconds since epoch
+
+test "time returns positive nanoseconds" {
+    var t = @time()
+    @assert(t > 1000000000)
+}
+
+test "time is monotonically increasing" {
+    var t1 = @time()
+    var t2 = @time()
+    @assert(t2 >= t1)
+}
+
+// @random(buf, len) tests
+// Reference: Go runtime/sys_darwin_arm64.s arc4random_buf_trampoline
+// SYS_getentropy(244) — fill buffer with cryptographic random bytes
+
+test "random returns success" {
+    var buf = @alloc(16)
+    var result = @random(buf, 16)
+    @assert_eq(result, 0)
+    @dealloc(buf)
+}
+
+test "random with zero length succeeds" {
+    var buf = @alloc(1)
+    var result = @random(buf, 0)
+    @assert_eq(result, 0)
+    @dealloc(buf)
+}

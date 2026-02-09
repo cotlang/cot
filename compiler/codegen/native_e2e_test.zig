@@ -64,7 +64,7 @@ const batch_files = [_]TestFileSpec{
     .{ .path = "test/e2e/auto_free.cot", .test_count = 5 },
     .{ .path = "test/e2e/set.cot", .test_count = 10 },
     .{ .path = "test/e2e/string_interp.cot", .test_count = 10 },
-    .{ .path = "test/e2e/wasi_io.cot", .test_count = 11 },
+    .{ .path = "test/e2e/wasi_io.cot", .test_count = 15 },
     // cases/
     .{ .path = "test/cases/arithmetic.cot", .test_count = 10 },
     .{ .path = "test/cases/arrays.cot", .test_count = 6 },
@@ -593,6 +593,31 @@ test "native: fd_open dev null" {
         \\    return fd
         \\}
     , 3, "", "fd_open_devnull");
+}
+
+// @time() — verify it returns a positive value (nanoseconds since epoch)
+test "native: time returns positive" {
+    try expectOutput(std.testing.allocator,
+        \\fn main() i64 {
+        \\    var t = @time()
+        \\    if t > 0 {
+        \\        return 42
+        \\    }
+        \\    return 1
+        \\}
+    , 42, "", "time_positive");
+}
+
+// @random(buf, len) — verify it fills buffer and returns 0
+test "native: random returns success" {
+    try expectOutput(std.testing.allocator,
+        \\fn main() i64 {
+        \\    var buf = @alloc(16)
+        \\    var result = @random(buf, 16)
+        \\    @dealloc(buf)
+        \\    return result
+        \\}
+    , 0, "", "random_success");
 }
 
 // ============================================================================

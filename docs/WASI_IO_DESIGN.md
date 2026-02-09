@@ -336,7 +336,7 @@ Syscall convention: `x16` = syscall number, `svc #0x80`, args in `x0-x5`, return
 | `path_open` | `SYS_openat` | 463 | `openat(dirfd, path, flags, mode)` — prefer over `SYS_open` (5) |
 | `proc_exit` | `SYS_exit` | 1 | `exit(status)` |
 | `clock_time_get` | `SYS_clock_gettime` | — | Not available on macOS; use `mach_absolute_time` or `SYS_gettimeofday` (116) |
-| `random_get` | `SYS_getentropy` | 244 | `getentropy(buf, buflen)` — max 256 bytes per call |
+| `random_get` | `SYS_getentropy` | 500 | `getentropy(buf, buflen)` — max 256 bytes per call |
 
 ### Linux x64
 

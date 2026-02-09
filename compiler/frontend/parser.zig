@@ -978,15 +978,16 @@ pub const Parser = struct {
             const v = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = t, .args = .{ v, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "trap")) {
+        } else if (std.mem.eql(u8, name, "trap") or std.mem.eql(u8, name, "time")) {
             // @trap() — 0 args, Wasm unreachable / ARM64 brk #1
+            // @time() — 0 args, returns nanoseconds since epoch
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
         } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf") or std.mem.eql(u8, name, "fd_close")) {
             const arg = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "realloc")) {
+        } else if (std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "realloc") or std.mem.eql(u8, name, "random")) {
             const ptr_arg = try self.parseExpr() orelse return null;
             if (!self.expect(.comma)) return null;
             const size_arg = try self.parseExpr() orelse return null;

@@ -815,6 +815,16 @@ pub const Checker = struct {
         } else if (std.mem.eql(u8, bc.name, "trap")) {
             // @trap() — Wasm unreachable / ARM64 brk #1 / x64 ud2
             return TypeRegistry.VOID;
+        } else if (std.mem.eql(u8, bc.name, "time")) {
+            // @time() — returns nanoseconds since epoch as i64
+            // Reference: Go runtime/sys_darwin_arm64.s walltime_trampoline → clock_gettime(CLOCK_REALTIME)
+            return TypeRegistry.I64;
+        } else if (std.mem.eql(u8, bc.name, "random")) {
+            // @random(buf, len) — fill buffer with cryptographic random bytes
+            // Reference: Go runtime/sys_darwin_arm64.s arc4random_buf_trampoline
+            _ = try self.checkExpr(bc.args[0]); // buf: i64 (pointer into linear memory)
+            _ = try self.checkExpr(bc.args[1]); // len: i64
+            return TypeRegistry.I64; // returns 0 on success, errno on error
         }
         self.err.errorWithCode(bc.span.start, .e300, "unknown builtin");
         return invalid_type;

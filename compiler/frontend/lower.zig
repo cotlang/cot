@@ -3646,6 +3646,19 @@ pub const Lowerer = struct {
             fb.setBlock(dead_block);
             return ir.null_node;
         }
+        // @time() — get current wall-clock time in nanoseconds since epoch
+        // Reference: Go runtime/sys_darwin_arm64.s walltime_trampoline
+        if (std.mem.eql(u8, bc.name, "time")) {
+            return try fb.emitCall("cot_time", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
+        }
+        // @random(buf, len) — fill buffer with cryptographic random bytes
+        // Reference: Go runtime/sys_darwin_arm64.s arc4random_buf_trampoline
+        if (std.mem.eql(u8, bc.name, "random")) {
+            const buf_arg = try self.lowerExprNode(bc.args[0]);
+            const len_arg = try self.lowerExprNode(bc.args[1]);
+            var args = [_]ir.NodeIndex{ buf_arg, len_arg };
+            return try fb.emitCall("cot_random", &args, false, TypeRegistry.I64, bc.span);
+        }
         return ir.null_node;
     }
 
