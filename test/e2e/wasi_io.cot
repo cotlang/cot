@@ -1,0 +1,19 @@
+// WASI I/O tests — @fd_write builtin
+
+test "fd_write returns bytes written" {
+    var msg = "hello"
+    var n = @fd_write(1, @ptrOf(msg), @lenOf(msg))
+    @assert_eq(n, 5)
+}
+
+test "fd_write writes to stdout" {
+    var msg = "OK"
+    var n = @fd_write(1, @ptrOf(msg), @lenOf(msg))
+    @assert_eq(n, 2)
+}
+
+test "fd_write single byte" {
+    var msg = "X"
+    var n = @fd_write(1, @ptrOf(msg), @lenOf(msg))
+    @assert_eq(n, 1)
+}

@@ -3580,6 +3580,26 @@ pub const Lowerer = struct {
             _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, bc.span);
             return ir.null_node;
         }
+        // @fd_write(fd, ptr, len) — WASI fd_write via cot_fd_write_simple adapter
+        if (std.mem.eql(u8, bc.name, "fd_write")) {
+            const fd_arg = try self.lowerExprNode(bc.args[0]);
+            const ptr_arg = try self.lowerExprNode(bc.args[1]);
+            const len_arg = try self.lowerExprNode(bc.args[2]);
+            var args = [_]ir.NodeIndex{ fd_arg, ptr_arg, len_arg };
+            return try fb.emitCall("cot_fd_write_simple", &args, false, TypeRegistry.I64, bc.span);
+        }
+        // @ptrOf(string_expr) — extract raw pointer from string as i64
+        if (std.mem.eql(u8, bc.name, "ptrOf")) {
+            const str_val = try self.lowerExprNode(bc.args[0]);
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            const ptr_val = try fb.emitSlicePtr(str_val, ptr_type, bc.span);
+            return try fb.emitPtrToInt(ptr_val, TypeRegistry.I64, bc.span);
+        }
+        // @lenOf(string_expr) — extract length from string as i64
+        if (std.mem.eql(u8, bc.name, "lenOf")) {
+            const str_val = try self.lowerExprNode(bc.args[0]);
+            return try fb.emitSliceLen(str_val, bc.span);
+        }
         // @trap() — Wasm unreachable instruction / ARM64 brk #1 / x64 ud2
         // Zig: unreachable → trap instruction. Go: no equivalent (uses panic).
         // Wasm: opcode 0x00 (unreachable). Terminates the block.

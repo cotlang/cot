@@ -769,6 +769,22 @@ pub const Checker = struct {
             _ = try self.checkExpr(bc.args[1]); // src: i64 (raw pointer)
             _ = try self.checkExpr(bc.args[2]); // num_bytes: i64
             return TypeRegistry.VOID;
+        } else if (std.mem.eql(u8, bc.name, "fd_write")) {
+            // @fd_write(fd, ptr, len) — WASI fd_write via adapter
+            _ = try self.checkExpr(bc.args[0]); // fd: i64
+            _ = try self.checkExpr(bc.args[1]); // ptr: i64
+            _ = try self.checkExpr(bc.args[2]); // len: i64
+            return TypeRegistry.I64; // returns bytes written
+        } else if (std.mem.eql(u8, bc.name, "ptrOf")) {
+            // @ptrOf(string_expr) — get raw pointer of a string as i64
+            const arg_type = try self.checkExpr(bc.args[0]);
+            if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@ptrOf requires string argument"); return invalid_type; }
+            return TypeRegistry.I64;
+        } else if (std.mem.eql(u8, bc.name, "lenOf")) {
+            // @lenOf(string_expr) — get length of a string as i64
+            const arg_type = try self.checkExpr(bc.args[0]);
+            if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@lenOf requires string argument"); return invalid_type; }
+            return TypeRegistry.I64;
         } else if (std.mem.eql(u8, bc.name, "trap")) {
             // @trap() — Wasm unreachable / ARM64 brk #1 / x64 ud2
             return TypeRegistry.VOID;

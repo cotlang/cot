@@ -30,6 +30,7 @@ const wasm_gen = @import("codegen/wasm_gen.zig");
 const arc = @import("codegen/arc.zig"); // ARC runtime (Swift)
 const slice_runtime = @import("codegen/slice_runtime.zig"); // Slice runtime (Go)
 const print_runtime = @import("codegen/print_runtime.zig"); // Print runtime (Go)
+const wasi_runtime = @import("codegen/wasi_runtime.zig"); // WASI runtime (fd_write)
 const test_runtime = @import("codegen/test_runtime.zig"); // Test runtime (Zig)
 
 // Native codegen modules (Cranelift-style AOT compiler)
@@ -645,30 +646,61 @@ pub const Driver = struct {
 
         // Pass 2: Define all functions (relocations can now resolve forward references)
         for (compiled_funcs, 0..) |*cf, i| {
-            // Check if this is cot_write — replace with ARM64 syscall
-            var is_cot_write = false;
+            // Check for native overrides (exported runtime stubs replaced with ARM64 syscalls)
+            var override_name: ?[]const u8 = null;
             for (exports) |exp| {
-                if (exp.kind == .func and exp.index == i and std.mem.eql(u8, exp.name, "cot_write")) {
-                    is_cot_write = true;
-                    break;
+                if (exp.kind == .func and exp.index == i) {
+                    if (std.mem.eql(u8, exp.name, "cot_write") or std.mem.eql(u8, exp.name, "cot_fd_write_simple") or std.mem.eql(u8, exp.name, "wasi_fd_write")) {
+                        override_name = exp.name;
+                        break;
+                    }
                 }
             }
-            if (is_cot_write) {
-                // ARM64 macOS syscall for write(fd, ptr, len)
-                // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=ptr, x4=len
-                const arm64_write = [_]u8{
-                    0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
-                    0xFD, 0x03, 0x00, 0x91, // mov x29, sp
-                    0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (vmctx + 0x40000)
-                    0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real_ptr = linmem + wasm_ptr)
-                    0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
-                    0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (len)
-                    0x90, 0x00, 0x80, 0xD2, // mov x16, #4  (SYS_write on macOS ARM64)
-                    0x01, 0x10, 0x00, 0xD4, // svc #0x80
-                    0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
-                    0xC0, 0x03, 0x5F, 0xD6, // ret
-                };
-                try module.defineFunctionBytes(func_ids[i], &arm64_write, &.{});
+            if (override_name) |name| {
+                if (std.mem.eql(u8, name, "cot_write") or std.mem.eql(u8, name, "cot_fd_write_simple")) {
+                    // ARM64 macOS syscall for write(fd, ptr, len)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=ptr, x4=len
+                    const arm64_write = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (vmctx + 0x40000)
+                        0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real_ptr = linmem + wasm_ptr)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (len)
+                        0x90, 0x00, 0x80, 0xD2, // mov x16, #4  (SYS_write on macOS ARM64)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_write, &.{});
+                } else if (std.mem.eql(u8, name, "wasi_fd_write")) {
+                    // ARM64 macOS syscall for WASI fd_write(fd, iovs, iovs_len, nwritten)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=iovs, x4=iovs_len, x5=nwritten
+                    // Reads iovec[0] from linear memory, calls SYS_write, stores result at nwritten
+                    const arm64_fd_write = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (x8 = linmem base)
+                        // Read iovec[0] from linmem (fast path: adapter always sends 1 iovec)
+                        0x09, 0x01, 0x23, 0x8B, // add x9, x8, w3, uxtw  (x9 = linmem + iovs)
+                        0x2A, 0x01, 0x40, 0xB9, // ldr w10, [x9]         (w10 = iovec.buf)
+                        0x2B, 0x05, 0x40, 0xB9, // ldr w11, [x9, #4]     (w11 = iovec.buf_len)
+                        // SYS_write(fd, real_ptr, len)
+                        0xE0, 0x03, 0x02, 0x2A, // mov w0, w2            (fd, truncate to i32)
+                        0x01, 0x01, 0x2A, 0x8B, // add x1, x8, w10, uxtw (real_ptr = linmem + buf)
+                        0xE2, 0x03, 0x0B, 0x2A, // mov w2, w11           (len = buf_len, zero-ext)
+                        0x90, 0x00, 0x80, 0xD2, // mov x16, #4           (SYS_write on macOS ARM64)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        // Store bytes_written at linmem + nwritten
+                        0x09, 0x01, 0x25, 0x8B, // add x9, x8, w5, uxtw  (linmem + nwritten)
+                        0x20, 0x01, 0x00, 0xB9, // str w0, [x9]          (store result as i32)
+                        // Return 0 (WASI ESUCCESS)
+                        0xE0, 0x03, 0x1F, 0xAA, // mov x0, xzr           (return 0)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_fd_write, &.{});
+                }
             } else {
                 try module.defineFunction(func_ids[i], cf);
             }
@@ -1111,6 +1143,12 @@ pub const Driver = struct {
         const print_funcs = try print_runtime.addToLinker(self.allocator, &linker);
 
         // ====================================================================
+        // Add WASI runtime functions (fd_write)
+        // Reference: WASI preview1 fd_write
+        // ====================================================================
+        const wasi_funcs = try wasi_runtime.addToLinker(self.allocator, &linker);
+
+        // ====================================================================
         // Add test runtime functions (Zig test runner pattern)
         // Reference: Zig test runner output format
         // ====================================================================
@@ -1148,6 +1186,10 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, print_runtime.PRINT_INT_NAME, print_funcs.print_int_idx);
         try func_indices.put(self.allocator, print_runtime.EPRINT_INT_NAME, print_funcs.eprint_int_idx);
         try func_indices.put(self.allocator, print_runtime.INT_TO_STRING_NAME, print_funcs.int_to_string_idx);
+
+        // Add WASI function names to index map
+        try func_indices.put(self.allocator, wasi_runtime.FD_WRITE_NAME, wasi_funcs.fd_write_idx);
+        try func_indices.put(self.allocator, wasi_runtime.FD_WRITE_SIMPLE_NAME, wasi_funcs.fd_write_simple_idx);
 
         // Add test function names to index map (Zig)
         try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx);

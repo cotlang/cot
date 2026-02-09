@@ -225,6 +225,7 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 | `docs/specs/WASM_3_0_REFERENCE.md` | Wasm 3.0 opcodes and adoption plan |
 | `docs/ROADMAP_1_0.md` | Road to 1.0: versioning, feature waves, Wasm IR analysis |
 | `docs/VERSION_TRAJECTORY.md` | Version plan benchmarked against Zig's history (self-hosting at 0.11) |
+| `docs/WASI_IO_DESIGN.md` | WASI I/O standard library design spec (fd_write, fd_read, path_open, etc.) |
 | `docs/COT_SYNTAX.md` | Complete language syntax reference with examples |
 | `VISION.md` | Language vision, design principles, execution roadmap |
 | `docs/archive/` | Historical: completed milestones, past bug fixes, postmortems |

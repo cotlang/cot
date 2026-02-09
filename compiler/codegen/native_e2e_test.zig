@@ -64,6 +64,7 @@ const batch_files = [_]TestFileSpec{
     .{ .path = "test/e2e/auto_free.cot", .test_count = 5 },
     .{ .path = "test/e2e/set.cot", .test_count = 10 },
     .{ .path = "test/e2e/string_interp.cot", .test_count = 10 },
+    .{ .path = "test/e2e/wasi_io.cot", .test_count = 3 },
     // cases/
     .{ .path = "test/cases/arithmetic.cot", .test_count = 10 },
     .{ .path = "test/cases/arrays.cot", .test_count = 6 },
@@ -413,6 +414,16 @@ test "native: print does not corrupt return value" {
         \\    return 7
         \\}
     , 7, "42", "print_ret");
+}
+
+test "native: fd_write to stdout" {
+    try expectOutput(std.testing.allocator,
+        \\fn main() i64 {
+        \\    var msg = "OK"
+        \\    var n = @fd_write(1, @ptrOf(msg), @lenOf(msg))
+        \\    return 0
+        \\}
+    , 0, "OK", "fd_write_stdout");
 }
 
 // ============================================================================

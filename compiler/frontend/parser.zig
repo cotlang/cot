@@ -982,7 +982,7 @@ pub const Parser = struct {
             // @trap() — 0 args, Wasm unreachable / ARM64 brk #1
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc")) {
+        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf")) {
             const arg = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
@@ -992,8 +992,9 @@ pub const Parser = struct {
             const size_arg = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ ptr_arg, size_arg, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "memcpy")) {
-            // @memcpy(dst, src, num_bytes) — 3 args, memmove semantics (Go copy / Wasm memory.copy)
+        } else if (std.mem.eql(u8, name, "memcpy") or std.mem.eql(u8, name, "fd_write")) {
+            // @memcpy(dst, src, num_bytes) — 3 args
+            // @fd_write(fd, ptr, len) — 3 args
             const dst_arg = try self.parseExpr() orelse return null;
             if (!self.expect(.comma)) return null;
             const src_arg = try self.parseExpr() orelse return null;
