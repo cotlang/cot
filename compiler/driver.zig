@@ -1250,31 +1250,318 @@ pub const Driver = struct {
 
         // Pass 2: Define all functions (relocations can now resolve forward references)
         for (compiled_funcs, 0..) |*cf, i| {
-            // Check if this is cot_write — replace with x86-64 Linux syscall
-            var is_cot_write = false;
+            // Check for native overrides (exported runtime stubs replaced with x86-64 syscalls)
+            var override_name: ?[]const u8 = null;
             for (exports) |exp| {
-                if (exp.kind == .func and exp.index == i and std.mem.eql(u8, exp.name, "cot_write")) {
-                    is_cot_write = true;
-                    break;
+                if (exp.kind == .func and exp.index == i) {
+                    if (std.mem.eql(u8, exp.name, "cot_write") or
+                        std.mem.eql(u8, exp.name, "cot_fd_write_simple") or
+                        std.mem.eql(u8, exp.name, "cot_fd_read_simple") or
+                        std.mem.eql(u8, exp.name, "cot_fd_close") or
+                        std.mem.eql(u8, exp.name, "cot_fd_seek") or
+                        std.mem.eql(u8, exp.name, "cot_fd_open") or
+                        std.mem.eql(u8, exp.name, "cot_time") or
+                        std.mem.eql(u8, exp.name, "cot_random") or
+                        std.mem.eql(u8, exp.name, "cot_exit") or
+                        std.mem.eql(u8, exp.name, "wasi_fd_write") or
+                        std.mem.eql(u8, exp.name, "cot_args_count") or
+                        std.mem.eql(u8, exp.name, "cot_arg_len") or
+                        std.mem.eql(u8, exp.name, "cot_arg_ptr"))
+                    {
+                        override_name = exp.name;
+                        break;
+                    }
                 }
             }
-            if (is_cot_write) {
-                // x86-64 Linux syscall for write(fd, ptr, len)
-                // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=ptr(wasm), r8=len
-                // Linux write: rax=1(SYS_write), rdi=fd, rsi=buf, rdx=count
-                const x64_write = [_]u8{
-                    0x55, // push rbp
-                    0x48, 0x89, 0xE5, // mov rbp, rsp
-                    0x48, 0x8D, 0xB7, 0x00, 0x00, 0x04, 0x00, // lea rsi, [rdi + 0x40000]  (linmem base)
-                    0x48, 0x01, 0xCE, // add rsi, rcx              (real_ptr = linmem + wasm_ptr)
-                    0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
-                    0x4C, 0x89, 0xC2, // mov rdx, r8               (len)
-                    0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1  (SYS_write)
-                    0x0F, 0x05, // syscall
-                    0x5D, // pop rbp
-                    0xC3, // ret
-                };
-                try module.defineFunctionBytes(elf_func_ids[i], &x64_write, &.{});
+            if (override_name) |name| {
+                if (std.mem.eql(u8, name, "cot_write") or std.mem.eql(u8, name, "cot_fd_write_simple")) {
+                    // x86-64 Linux syscall for write(fd, ptr, len)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=ptr(wasm), r8=len
+                    // Linux write: rax=1(SYS_write), rdi=fd, rsi=buf, rdx=count
+                    const x64_write = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x8D, 0xB7, 0x00, 0x00, 0x04, 0x00, // lea rsi, [rdi + 0x40000]  (linmem base)
+                        0x48, 0x01, 0xCE, // add rsi, rcx              (real_ptr = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8               (len)
+                        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1  (SYS_write)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_write, &.{});
+                } else if (std.mem.eql(u8, name, "cot_fd_read_simple")) {
+                    // x86-64 Linux syscall for read(fd, buf, count)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=buf(wasm), r8=len
+                    // Linux read: rax=0(SYS_read), rdi=fd, rsi=buf, rdx=count
+                    // Returns bytes read on success, -errno on error.
+                    const x64_read = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x8D, 0xB7, 0x00, 0x00, 0x04, 0x00, // lea rsi, [rdi + 0x40000]  (linmem base)
+                        0x48, 0x01, 0xCE, // add rsi, rcx              (real_buf = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8               (count)
+                        0x48, 0x31, 0xC0, // xor rax, rax              (SYS_read = 0)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_read, &.{});
+                } else if (std.mem.eql(u8, name, "cot_fd_close")) {
+                    // x86-64 Linux syscall for close(fd)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd
+                    // Linux close: rax=3(SYS_close), rdi=fd
+                    // Returns 0 on success, -errno on error.
+                    const x64_close = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3  (SYS_close)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_close, &.{});
+                } else if (std.mem.eql(u8, name, "cot_fd_seek")) {
+                    // x86-64 Linux syscall for lseek(fd, offset, whence)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=offset, r8=whence
+                    // Linux lseek: rax=8(SYS_lseek), rdi=fd, rsi=offset, rdx=whence
+                    // Returns new offset on success, -errno on error.
+                    const x64_seek = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (fd)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx              (offset)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8               (whence)
+                        0x48, 0xC7, 0xC0, 0x08, 0x00, 0x00, 0x00, // mov rax, 8  (SYS_lseek)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_seek, &.{});
+                } else if (std.mem.eql(u8, name, "cot_fd_open")) {
+                    // x86-64 Linux syscall for openat(AT_FDCWD, path, flags, mode)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=path_ptr(wasm), rcx=path_len, r8=flags
+                    // Must null-terminate path: copy to stack buffer, append \0
+                    // Returns fd on success, -errno on error.
+                    const x64_open = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8D, 0x87, 0x00, 0x00, 0x04, 0x00, //  4: lea rax, [rdi + 0x40000]  (linmem base)
+                        0x48, 0x01, 0xD0, // 11: add rax, rdx              (real path src)
+                        0x49, 0x89, 0xCA, // 14: mov r10, rcx              (save path_len)
+                        0x48, 0x81, 0xF9, 0x00, 0x04, 0x00, 0x00, // 17: cmp rcx, 1024
+                        0x76, 0x0C, // 24: jbe +12                  (→ .copy_start at 38)
+                        0x48, 0xC7, 0xC0, 0xDC, 0xFF, 0xFF, 0xFF, // 26: mov rax, -36  (-ENAMETOOLONG)
+                        0x5D, // 33: pop rbp
+                        0xC3, // 34: ret
+                        0x90, 0x90, 0x90, // 35: nop nop nop (padding to .copy_start)
+                        // .copy_start (offset 38):
+                        0x48, 0x81, 0xEC, 0x10, 0x04, 0x00, 0x00, // 38: sub rsp, 1040
+                        0x49, 0x89, 0xE3, // 45: mov r11, rsp              (dest)
+                        // .copy_loop (offset 48):
+                        0x4D, 0x85, 0xD2, // 48: test r10, r10
+                        0x74, 0x12, // 51: jz +18                  (→ .null_term at 71)
+                        0x44, 0x0F, 0xB6, 0x08, // 53: movzx r9d, byte [rax]
+                        0x45, 0x88, 0x0B, // 57: mov [r11], r9b
+                        0x48, 0xFF, 0xC0, // 60: inc rax
+                        0x49, 0xFF, 0xC3, // 63: inc r11
+                        0x49, 0xFF, 0xCA, // 66: dec r10
+                        0xEB, 0xE9, // 69: jmp -23                 (→ .copy_loop at 48)
+                        // .null_term (offset 71):
+                        0x41, 0xC6, 0x03, 0x00, // 71: mov byte [r11], 0
+                        // openat(AT_FDCWD, path, flags, mode)
+                        0x48, 0xC7, 0xC7, 0x9C, 0xFF, 0xFF, 0xFF, // 75: mov rdi, -100  (AT_FDCWD)
+                        0x48, 0x89, 0xE6, // 82: mov rsi, rsp              (path on stack)
+                        0x4C, 0x89, 0xC2, // 85: mov rdx, r8               (flags)
+                        0x49, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00, // 88: mov r10, 420  (mode 0644, arg4=r10 for syscall)
+                        0x48, 0xC7, 0xC0, 0x01, 0x01, 0x00, 0x00, // 95: mov rax, 257  (SYS_openat)
+                        0x0F, 0x05, //102: syscall
+                        0x48, 0x89, 0xEC, //104: mov rsp, rbp  (restore stack)
+                        0x5D, //107: pop rbp
+                        0xC3, //108: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_open, &.{});
+                } else if (std.mem.eql(u8, name, "cot_time")) {
+                    // x86-64 Linux: clock_gettime(CLOCK_REALTIME, &timespec) → nanoseconds
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx (no user args)
+                    // Returns: i64 nanoseconds = tv_sec * 1_000_000_000 + tv_nsec
+                    const x64_time = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16            (timespec on stack)
+                        0x31, 0xFF, //  8: xor edi, edi            (CLOCK_REALTIME = 0)
+                        0x48, 0x89, 0xE6, // 10: mov rsi, rsp             (&timespec)
+                        0x48, 0xC7, 0xC0, 0xE4, 0x00, 0x00, 0x00, // 13: mov rax, 228  (SYS_clock_gettime)
+                        0x0F, 0x05, // 20: syscall
+                        0x48, 0x8B, 0x04, 0x24, // 22: mov rax, [rsp]         (tv_sec)
+                        0x48, 0x69, 0xC0, 0x00, 0xCA, 0x9A, 0x3B, // 26: imul rax, 1000000000
+                        0x48, 0x03, 0x44, 0x24, 0x08, // 33: add rax, [rsp+8]     (+ tv_nsec)
+                        0x48, 0x83, 0xC4, 0x10, // 38: add rsp, 16
+                        0x5D, // 42: pop rbp
+                        0xC3, // 43: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_time, &.{});
+                } else if (std.mem.eql(u8, name, "cot_random")) {
+                    // x86-64 Linux: getrandom(buf, count, flags) — fill buffer with random bytes
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=buf(wasm ptr), rcx=len
+                    // SYS_getrandom=318, no chunk limit needed but loop handles partial reads
+                    // Returns 0 on success, -errno on error.
+                    const x64_random = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, //  4: lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x01, 0xD1, // 11: add r9, rdx               (real buf)
+                        0x49, 0x89, 0xCA, // 14: mov r10, rcx              (remaining len)
+                        // .loop (offset 17):
+                        0x4D, 0x85, 0xD2, // 17: test r10, r10
+                        0x74, 0x1E, // 20: jz +30                  (→ .success at 52)
+                        0x4C, 0x89, 0xCF, // 22: mov rdi, r9               (buf)
+                        0x4C, 0x89, 0xD6, // 25: mov rsi, r10              (count)
+                        0x31, 0xD2, // 28: xor edx, edx             (flags = 0)
+                        0x48, 0xC7, 0xC0, 0x3E, 0x01, 0x00, 0x00, // 30: mov rax, 318  (SYS_getrandom)
+                        0x0F, 0x05, // 37: syscall
+                        0x48, 0x85, 0xC0, // 39: test rax, rax
+                        0x78, 0x0C, // 42: js +12                  (→ .error at 56)
+                        0x49, 0x01, 0xC1, // 44: add r9, rax               (buf += bytes)
+                        0x49, 0x29, 0xC2, // 47: sub r10, rax              (remaining -= bytes)
+                        0xEB, 0xDD, // 50: jmp -35                 (→ .loop at 17)
+                        // .success (offset 52):
+                        0x31, 0xC0, // 52: xor eax, eax             (return 0)
+                        0x5D, // 54: pop rbp
+                        0xC3, // 55: ret
+                        // .error (offset 56):
+                        0x5D, // 56: pop rbp                    (rax already negative)
+                        0xC3, // 57: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_random, &.{});
+                } else if (std.mem.eql(u8, name, "cot_exit")) {
+                    // x86-64 Linux: exit_group(code) — never returns
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=code
+                    // SYS_exit_group=231 (kills all threads)
+                    const x64_exit = [_]u8{
+                        0x48, 0x89, 0xD7, // mov rdi, rdx              (exit code)
+                        0x48, 0xC7, 0xC0, 0xE7, 0x00, 0x00, 0x00, // mov rax, 231  (SYS_exit_group)
+                        0x0F, 0x05, // syscall
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_exit, &.{});
+                } else if (std.mem.eql(u8, name, "wasi_fd_write")) {
+                    // x86-64 Linux syscall for WASI fd_write(fd, iovs, iovs_len, nwritten)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=iovs, r8=iovs_len, r9=nwritten
+                    // Fast path: adapter always sends 1 iovec
+                    // Returns 0 (ESUCCESS) on success, -errno on error.
+                    // Register plan: r10=linmem, r11=iovs addr (then reused),
+                    // ecx=iovec.buf, r8d=iovec.buf_len (all caller-saved)
+                    const x64_wasi_write = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x4C, 0x8D, 0x97, 0x00, 0x00, 0x04, 0x00, //  4: lea r10, [rdi + 0x40000]  (r10 = linmem base)
+                        0x4D, 0x8D, 0x1C, 0x0A, // 11: lea r11, [r10 + rcx]    (r11 = linmem + iovs)
+                        0x41, 0x8B, 0x0B, // 15: mov ecx, [r11]            (ecx = iovec.buf offset, i32)
+                        0x45, 0x8B, 0x43, 0x04, // 18: mov r8d, [r11 + 4]      (r8d = iovec.buf_len, i32)
+                        // SYS_write(fd, buf, len)
+                        0x48, 0x89, 0xD7, // 22: mov rdi, rdx              (fd)
+                        0x49, 0x8D, 0x34, 0x0A, // 25: lea rsi, [r10 + rcx]    (real buf = linmem + buf_offset)
+                        0x44, 0x89, 0xC2, // 29: mov edx, r8d              (len = buf_len)
+                        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // 32: mov rax, 1  (SYS_write)
+                        0x0F, 0x05, // 39: syscall
+                        // Check result
+                        0x48, 0x85, 0xC0, // 41: test rax, rax
+                        0x78, 0x0A, // 44: js +10                  (→ .error at 56)
+                        // Success: store bytes_written at linmem+nwritten
+                        0x4B, 0x8D, 0x0C, 0x0A, // 46: lea rcx, [r10 + r9]    (linmem + nwritten)
+                        0x89, 0x01, // 50: mov [rcx], eax           (store result as i32)
+                        0x31, 0xC0, // 52: xor eax, eax             (return 0 = ESUCCESS)
+                        0x5D, // 54: pop rbp
+                        0xC3, // 55: ret
+                        // .error (offset 56): rax already has -errno from Linux
+                        0x5D, // 56: pop rbp
+                        0xC3, // 57: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_wasi_write, &.{});
+                } else if (std.mem.eql(u8, name, "cot_args_count")) {
+                    // x86-64: read argc from vmctx+0x30000
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx (no user args)
+                    const x64_args_count = [_]u8{
+                        0x48, 0x8B, 0x87, 0x00, 0x00, 0x03, 0x00, // mov rax, [rdi + 0x30000]  (argc)
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_args_count, &.{});
+                } else if (std.mem.eql(u8, name, "cot_arg_len")) {
+                    // x86-64: strlen(argv[n]) with bounds check
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    // Returns strlen or 0 if n >= argc.
+                    const x64_arg_len = [_]u8{
+                        0x48, 0x8B, 0x87, 0x00, 0x00, 0x03, 0x00, //  0: mov rax, [rdi + 0x30000]  (argc)
+                        0x48, 0x39, 0xC2, //  7: cmp rdx, rax              (n vs argc)
+                        0x72, 0x04, // 10: jb +4                   (n < argc → .valid at 16)
+                        0x31, 0xC0, // 12: xor eax, eax             (return 0)
+                        0xC3, // 14: ret
+                        0x90, // 15: nop padding
+                        // .valid (offset 16):
+                        0x48, 0x8B, 0x87, 0x08, 0x00, 0x03, 0x00, // 16: mov rax, [rdi + 0x30008]  (argv)
+                        0x48, 0x8B, 0x04, 0xD0, // 23: mov rax, [rax + rdx*8]  (argv[n])
+                        0x31, 0xC9, // 27: xor ecx, ecx             (len = 0)
+                        // .strlen_loop (offset 29):
+                        0x80, 0x3C, 0x08, 0x00, // 29: cmp byte [rax + rcx], 0
+                        0x74, 0x05, // 33: je +5                   (→ .done at 40)
+                        0x48, 0xFF, 0xC1, // 35: inc rcx
+                        0xEB, 0xF5, // 38: jmp -11                 (→ .strlen_loop at 29)
+                        // .done (offset 40):
+                        0x48, 0x89, 0xC8, // 40: mov rax, rcx             (return len)
+                        0xC3, // 43: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_arg_len, &.{});
+                } else if (std.mem.eql(u8, name, "cot_arg_ptr")) {
+                    // x86-64: copy argv[n] into linear memory at wasm offset 0xAF000 + n*4096
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    // Each arg gets a 4096-byte slot; copy limited to 4095 bytes + NUL
+                    // Returns wasm offset (0xAF000 + n*4096) or 0 if n >= argc.
+                    const x64_arg_ptr = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x00, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30000]  (argc)
+                        0x48, 0x39, 0xC2, // 11: cmp rdx, rax              (n vs argc)
+                        0x72, 0x05, // 14: jb +5                   (n < argc → .valid at 21)
+                        0x31, 0xC0, // 16: xor eax, eax             (return 0)
+                        0x5D, // 18: pop rbp
+                        0xC3, // 19: ret
+                        0x90, // 20: nop padding
+                        // .valid (offset 21):
+                        0x48, 0x8B, 0x87, 0x08, 0x00, 0x03, 0x00, // 21: mov rax, [rdi + 0x30008]  (argv)
+                        0x4C, 0x8B, 0x04, 0xD0, // 28: mov r8, [rax + rdx*8]   (r8 = argv[n], src)
+                        // dest = linmem + 0xAF000 + n*4096
+                        0x48, 0x89, 0xD0, // 32: mov rax, rdx              (n)
+                        0x48, 0xC1, 0xE0, 0x0C, // 35: shl rax, 12             (n * 4096)
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // 39: lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x81, 0xC1, 0x00, 0xF0, 0x0A, 0x00, // 46: add r9, 0xAF000
+                        0x49, 0x01, 0xC1, // 53: add r9, rax               (dest = linmem + 0xAF000 + n*4096)
+                        0x48, 0x89, 0xD1, // 56: mov rcx, rdx              (save n for return value)
+                        0x41, 0xBA, 0xFF, 0x0F, 0x00, 0x00, // 59: mov r10d, 4095          (max copy)
+                        // .copy_loop (offset 65):
+                        0x4D, 0x85, 0xD2, // 65: test r10, r10
+                        0x74, 0x16, // 68: jz +22                  (→ .truncate at 92)
+                        0x41, 0x0F, 0xB6, 0x00, // 70: movzx eax, byte [r8]
+                        0x41, 0x88, 0x01, // 74: mov [r9], al
+                        0x85, 0xC0, // 77: test eax, eax
+                        0x74, 0x0F, // 79: jz +15                  (NUL found → .done at 96)
+                        0x49, 0xFF, 0xC0, // 81: inc r8
+                        0x49, 0xFF, 0xC1, // 84: inc r9
+                        0x49, 0xFF, 0xCA, // 87: dec r10
+                        0xEB, 0xE5, // 90: jmp -27                 (→ .copy_loop at 65)
+                        // .truncate (offset 92):
+                        0x41, 0xC6, 0x01, 0x00, // 92: mov byte [r9], 0  (NUL-terminate)
+                        // .done (offset 96): return wasm offset 0xAF000 + n*4096
+                        0x48, 0xC7, 0xC0, 0x00, 0xF0, 0x0A, 0x00, // 96: mov rax, 0xAF000
+                        0x48, 0xC1, 0xE1, 0x0C, //103: shl rcx, 12  (n * 4096)
+                        0x48, 0x01, 0xC8, //107: add rax, rcx  (0xAF000 + n*4096)
+                        0x5D, //110: pop rbp
+                        0xC3, //111: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_arg_ptr, &.{});
+                }
             } else {
                 try module.defineFunction(elf_func_ids[i], cf);
             }
@@ -1366,51 +1653,83 @@ pub const Driver = struct {
         // =================================================================
         // Step 2: Generate main wrapper function
         // This wrapper:
-        //   1. Loads address of vmctx_data
-        //   2. Initializes heap base pointer (requires runtime address)
-        //   3. Calls __wasm_main(vmctx, vmctx)
-        //   4. Returns result
+        //   1. Saves argc/argv (before lea rdi clobbers them)
+        //   2. Loads address of vmctx_data
+        //   3. Initializes heap base pointer (requires runtime address)
+        //   4. Stores argc/argv into vmctx+0x30000/0x30008
+        //   5. Calls __wasm_main(vmctx, vmctx)
+        //   6. Returns result
+        //
+        // On Linux, main(int argc, char **argv): edi=argc, rsi=argv
         //
         // x86-64 code (System V AMD64 ABI):
-        //   push   rbp
-        //   mov    rbp, rsp
-        //   lea    rdi, [rip + vmctx_data]    ; vmctx in rdi (first arg)
-        //   lea    rax, [rdi + 0x40000]       ; heap_base = vmctx + 0x40000
-        //   mov    [rdi + 0x20000], rax       ; store heap_base at vmctx+0x20000
-        //   mov    rsi, rdi                   ; caller_vmctx = vmctx (second arg)
-        //   call   __wasm_main
-        //   pop    rbp
-        //   ret
+        //   push   rbp                        ; 1  byte  (offset 0)
+        //   mov    rbp, rsp                   ; 3  bytes (offset 1)
+        //   push   rdi                        ; 1  byte  (offset 4)  save argc
+        //   push   rsi                        ; 1  byte  (offset 5)  save argv
+        //   lea    rdi, [rip + vmctx_data]    ; 7  bytes (offset 6, reloc at 9)
+        //   lea    rax, [rdi + 0x40000]       ; 7  bytes (offset 13)
+        //   mov    [rdi + 0x20000], rax       ; 7  bytes (offset 20)
+        //   pop    rax                        ; 1  byte  (offset 27) restore argv
+        //   mov    [rdi + 0x30008], rax       ; 7  bytes (offset 28) store argv
+        //   pop    rax                        ; 1  byte  (offset 35) restore argc
+        //   cdqe                              ; 2  bytes (offset 36) sign-extend eax→rax
+        //   mov    [rdi + 0x30000], rax       ; 7  bytes (offset 38) store argc
+        //   mov    rsi, rdi                   ; 3  bytes (offset 45)
+        //   call   __wasm_main                ; 5  bytes (offset 48, reloc at 49)
+        //   pop    rbp                        ; 1  byte  (offset 53)
+        //   ret                               ; 1  byte  (offset 54)
+        // Total: 55 bytes
         // =================================================================
         var wrapper_code = std.ArrayListUnmanaged(u8){};
         defer wrapper_code.deinit(self.allocator);
 
-        // push rbp (0x55)
+        // push rbp (0x55)                                     offset 0
         try wrapper_code.append(self.allocator, 0x55);
 
-        // mov rbp, rsp (48 89 e5)
+        // mov rbp, rsp (48 89 e5)                             offset 1
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xe5 });
 
-        // lea rdi, [rip + vmctx_data] (48 8d 3d XX XX XX XX) - reloc at offset 4+3=7
-        // RIP-relative, displacement is at bytes 4-7 (offset 4)
+        // push rdi (0x57) — save argc before lea overwrites rdi   offset 4
+        try wrapper_code.append(self.allocator, 0x57);
+
+        // push rsi (0x56) — save argv before mov rsi,rdi      offset 5
+        try wrapper_code.append(self.allocator, 0x56);
+
+        // lea rdi, [rip + vmctx_data] (48 8d 3d XX XX XX XX)  offset 6, reloc disp at 9
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x3d, 0x00, 0x00, 0x00, 0x00 });
 
-        // lea rax, [rdi + 0x40000] (48 8d 87 00 00 04 00)
+        // lea rax, [rdi + 0x40000] (48 8d 87 00 00 04 00)     offset 13
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x87, 0x00, 0x00, 0x04, 0x00 });
 
-        // mov [rdi + 0x20000], rax (48 89 87 00 00 02 00)
+        // mov [rdi + 0x20000], rax (48 89 87 00 00 02 00)     offset 20
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x00, 0x00, 0x02, 0x00 });
 
-        // mov rsi, rdi (48 89 fe)
+        // pop rax (0x58) — restore argv                        offset 27
+        try wrapper_code.append(self.allocator, 0x58);
+
+        // mov [rdi + 0x30008], rax (48 89 87 08 00 03 00)     offset 28
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x08, 0x00, 0x03, 0x00 });
+
+        // pop rax (0x58) — restore argc                        offset 35
+        try wrapper_code.append(self.allocator, 0x58);
+
+        // cdqe (48 98) — sign-extend eax to rax                offset 36
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x98 });
+
+        // mov [rdi + 0x30000], rax (48 89 87 00 00 03 00)     offset 38
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x00, 0x00, 0x03, 0x00 });
+
+        // mov rsi, rdi (48 89 fe)                              offset 45
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xfe });
 
-        // call __wasm_main (e8 XX XX XX XX) - reloc at offset 25+1=26
+        // call __wasm_main (e8 XX XX XX XX)                    offset 48, reloc disp at 49
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0xe8, 0x00, 0x00, 0x00, 0x00 });
 
-        // pop rbp (5d)
+        // pop rbp (5d)                                         offset 53
         try wrapper_code.append(self.allocator, 0x5d);
 
-        // ret (c3)
+        // ret (c3)                                             offset 54
         try wrapper_code.append(self.allocator, 0xc3);
 
         // Declare main wrapper
@@ -1434,20 +1753,20 @@ pub const Driver = struct {
         try module.declareExternalName(vmctx_ext_idx, "vmctx_data");
         try module.declareExternalName(wasm_main_ext_idx, "__wasm_main");
 
-        // Calculate relocation offsets based on instruction layout:
-        // push rbp (1) + mov rbp,rsp (3) + lea opcode (3) = 7 for lea displacement
-        // + lea (7) + lea (7) + mov (7) + mov (3) + call opcode (1) = 7+7+7+7+3+1 = 29 for call displacement
+        // Calculate relocation offsets:
+        // push rbp(1) + mov rbp,rsp(3) + push rdi(1) + push rsi(1) + lea opcode(3) = 9 for lea displacement
+        // lea(7) + lea(7) + mov(7) + pop(1) + mov(7) + pop(1) + cdqe(2) + mov(7) + mov(3) + call opcode(1) = 49 for call displacement
         const relocs = [_]FinalizedMachReloc{
-            // lea rdi, [rip + vmctx_data] - displacement at offset 7
+            // lea rdi, [rip + vmctx_data] - displacement at offset 9
             .{
-                .offset = 7,
+                .offset = 9,
                 .kind = Reloc.X86PCRel4,
                 .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
                 .addend = -4, // RIP-relative adjustment
             },
-            // call __wasm_main - displacement at offset 29
+            // call __wasm_main - displacement at offset 49
             .{
-                .offset = 29,
+                .offset = 49,
                 .kind = Reloc.X86CallPCRel4,
                 .target = FinalizedRelocTarget{ .ExternalName = wasm_main_name_ref },
                 .addend = -4, // Call instruction adjustment
