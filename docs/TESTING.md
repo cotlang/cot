@@ -4,6 +4,41 @@
 
 Cot uses inline test blocks (Zig syntax) with error-union-based test isolation. Tests are compiled and run as native executables via `cot test`.
 
+## Two-Tier Strategy
+
+| Tier | Command | What it runs | Speed |
+|------|---------|-------------|-------|
+| **Zig compiler tests** | `zig build test` | ~163 Zig-level tests with inline Cot snippets | Fast (<10s) |
+| **Cot language tests** | `./test/run_all.sh` | ~785 Cot tests across 35 `.cot` files | Slower (~60s) |
+| **Single file** | `cot test file.cot` | Tests in one file | Fast |
+
+### `zig build test` — Compiler internals
+
+Runs Zig test blocks across the compiler:
+- `native_e2e_test.zig` — 12 tests: print/println output, fd_write, fd_read, @exit, test-mode formatting
+- `wasm_e2e_test.zig` — 106 tests: Wasm codegen pipeline with inline Cot
+- `frontend/e2e_test.zig` — 34 tests: parser/checker/IR/SSA
+- `frontend/integration_test.zig` — 10 tests: parser+checker integration
+- `lsp/semantic_tokens.zig` — 1 test: LSP semantic token generation
+
+These use small inline Cot snippets (3-5 lines) to test specific Zig codegen behavior.
+
+### `./test/run_all.sh` — All Cot language tests
+
+Discovers all `.cot` files in `test/e2e/` and `test/cases/`, runs each with `cot test`, reports per-file pass/fail. No hardcoded file lists — uses glob discovery.
+
+```bash
+./test/run_all.sh
+# Running 35 Cot test files...
+#
+# test/cases/arithmetic.cot                    ok  10 passed
+# test/cases/arrays.cot                        ok  6 passed
+# ...
+# test/e2e/features.cot                        ok  114 passed
+# ...
+# 35/35 files passed
+```
+
 ## Syntax
 
 ```cot
@@ -82,78 +117,66 @@ Exit code = number of failures (0 = all pass).
 
 ```
 test/
-  cases/              # Category unit tests (21 files, ~100 tests)
-    arithmetic.cot      10 tests
-    arrays.cot           6 tests
-    arc.cot              5 tests
-    bitwise.cot          6 tests
-    builtins.cot         4 tests
-    chars.cot            2 tests
-    compound.cot         8 tests
-    control_flow.cot    14 tests
-    enum.cot             2 tests
-    extern.cot           1 test
-    float.cot            1 test
-    functions.cot       16 tests
-    loops.cot            3 tests
-    memory.cot           5 tests
-    methods.cot          1 test
-    optional.cot         3 tests
-    strings.cot         13 tests
-    structs.cot          5 tests
-    switch.cot           2 tests
-    types.cot            2 tests
-    union.cot            4 tests
-  e2e/                # Comprehensive feature tests (12 files, ~614 tests)
-    features.cot       107 tests (structs, generics, traits, enums, unions, etc.)
-    expressions.cot    160 tests
-    functions.cot      107 tests
-    control_flow.cot    82 tests
-    variables.cot       40 tests
-    types.cot           46 tests
-    memory.cot          17 tests
-    stdlib.cot           5 tests (cross-file generic imports)
-    map.cot             25 tests
-    auto_free.cot        5 tests
-    set.cot             10 tests
-    string_interp.cot   10 tests
-  test_inline.cot     # Manual smoke test
-  browser/            # Pre-compiled Wasm for manual browser testing
+  run_all.sh            # Run all Cot tests (glob discovery, no hardcoded lists)
+  cases/                # Category unit tests (21 files, ~106 tests)
+    arithmetic.cot        10 tests
+    arrays.cot             6 tests
+    arc.cot                5 tests
+    bitwise.cot            6 tests
+    builtins.cot           4 tests
+    chars.cot              2 tests
+    compound.cot           8 tests
+    control_flow.cot      14 tests
+    enum.cot               2 tests
+    extern.cot             1 test
+    float.cot              1 test
+    functions.cot         16 tests
+    loops.cot              3 tests
+    memory.cot             5 tests
+    methods.cot            1 test
+    optional.cot           3 tests
+    strings.cot           13 tests
+    structs.cot            5 tests
+    switch.cot             2 tests
+    types.cot              2 tests
+    union.cot              4 tests
+  e2e/                  # Comprehensive feature tests (14 files, ~679 tests)
+    features.cot         114 tests
+    expressions.cot      160 tests
+    functions.cot        107 tests
+    control_flow.cot      82 tests
+    variables.cot         40 tests
+    types.cot             46 tests
+    memory.cot            17 tests
+    stdlib.cot             8 tests
+    map.cot               25 tests
+    auto_free.cot          5 tests
+    set.cot               10 tests
+    string_interp.cot     10 tests
+    wasi_io.cot           19 tests
+    std_io.cot            30 tests
+  test_inline.cot       # Manual smoke test
+  browser/              # Pre-compiled Wasm for manual browser testing
 ```
 
 ## Adding New Tests
 
-1. Add `test "name" { ... }` blocks to the appropriate file
+1. Add `test "name" { ... }` blocks to the appropriate `.cot` file
 2. Use `@assert(cond)` or `@assert_eq(actual, expected)`
 3. Run `cot test <file>` to verify
-4. Tests are automatically wired into `zig build test` via `native_e2e_test.zig`
-
-## CLI
-
-```bash
-cot test file.cot              # Compile in test mode, run, print results
-```
-
-## CI Integration
-
-`zig build test` runs all Zig-level tests including `native_e2e_test.zig`, which uses a batch architecture:
-
-**Batch test** (1 test): All 33 `.cot` files from `test/e2e/` and `test/cases/` are concatenated into one combined source (imports deduplicated), compiled once, linked once, and run once. Verifies exit code 0 and that all ~720 tests pass.
-
-**8 special tests** (remain isolated):
-- 5 print tests (non-test-mode, verify specific stdout output)
-- 3 inline test-mode tests (verify test runner output format, including failure isolation)
+4. Run `./test/run_all.sh` to verify all tests still pass
 
 ## File Map
 
 | File | Purpose |
 |------|---------|
+| `test/run_all.sh` | Runs all Cot test files via `cot test` |
 | `compiler/codegen/test_runtime.zig` | `__test_print_name`, `__test_pass`, `__test_fail`, `__test_summary` |
+| `compiler/codegen/native_e2e_test.zig` | 12 Zig-level codegen tests (inline Cot snippets) |
 | `compiler/driver.zig` | Wires test_runtime into linker + func_indices |
 | `compiler/frontend/parser.zig` | Parses `@assert`, `@assert_eq` builtins |
 | `compiler/frontend/checker.zig` | Type-checks `@assert`, `@assert_eq` builtins |
 | `compiler/frontend/lower.zig` | `lowerTestDecl`, `generateTestRunner`, assert lowering |
-| `compiler/codegen/native_e2e_test.zig` | E2E tests: compiles + runs all test files |
 
 ## Known Limitations
 

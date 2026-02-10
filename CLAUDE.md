@@ -124,15 +124,20 @@ Two categories:
 
 ## Testing
 
+**Two tiers:**
 ```bash
-zig build test              # All tests (~720 Cot tests via native_e2e_test.zig)
-cot test file.cot           # Run inline tests in a single file
-COT_DEBUG=codegen zig build test  # With debug output
+zig build test              # Zig compiler tests only (~163 tests, fast)
+./test/run_all.sh           # All Cot language tests (~785 tests across 35 files)
+cot test file.cot           # Run a single Cot test file
 ```
+
+**Adding Cot tests:** Add `test "name" { }` blocks to `.cot` files. Run `cot test <file>`.
+**Adding compiler tests:** Add `test "..." { }` blocks in Zig source with inline Cot snippets.
+**Never embed `.cot` test files in Zig code.** Use `cot test` for that.
 
 **Test directories:**
 - `test/cases/` — Category unit tests (21 files, ~106 tests)
-- `test/e2e/` — Comprehensive feature tests (12 files, ~614 tests)
+- `test/e2e/` — Comprehensive feature tests (14 files, ~679 tests)
 - All tests use inline `test "name" { @assert_eq(...) }` format
 - See `docs/TESTING.md` for full details
 

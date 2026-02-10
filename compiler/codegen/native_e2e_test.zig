@@ -1,12 +1,12 @@
-//! End-to-end Native AOT compilation tests.
+//! Native AOT compilation tests (Zig-level).
 //!
 //! Tests the full pipeline: Cot source -> Wasm -> CLIF -> Machine Code -> Executable -> Run
 //!
-//! Architecture: One batch test compiles ALL test files together (1 compile, 1 link, 1 run),
-//! plus 8 special tests that must remain isolated (print tests, test-mode format tests).
+//! These are Zig codegen tests using small inline Cot snippets (3-5 lines each).
+//! They verify print/println output, fd_write/fd_read, @exit, and test-mode formatting.
 //!
-//! All test files use inline `test "name" { }` format with error-union isolation.
-//! Test files live in test/e2e/ (comprehensive) and test/cases/ (category unit tests).
+//! For comprehensive Cot language tests, use `cot test` on files in test/e2e/ and test/cases/.
+//! See test/run_all.sh for running all Cot tests.
 
 const std = @import("std");
 const Driver = @import("../driver.zig").Driver;
@@ -40,223 +40,6 @@ const NativeResult = struct {
         return .{ .exit_code = null, .compile_error = false, .link_error = false, .run_error = true, .error_msg = msg, .stdout = "" };
     }
 };
-
-// ============================================================================
-// Test file paths and expected counts
-// ============================================================================
-
-const TestFileSpec = struct {
-    path: []const u8,
-    test_count: u32,
-};
-
-const batch_files = [_]TestFileSpec{
-    // e2e/
-    .{ .path = "test/e2e/features.cot", .test_count = 107 },
-    .{ .path = "test/e2e/expressions.cot", .test_count = 160 },
-    .{ .path = "test/e2e/functions.cot", .test_count = 107 },
-    .{ .path = "test/e2e/control_flow.cot", .test_count = 82 },
-    .{ .path = "test/e2e/variables.cot", .test_count = 40 },
-    .{ .path = "test/e2e/types.cot", .test_count = 46 },
-    .{ .path = "test/e2e/memory.cot", .test_count = 17 },
-    .{ .path = "test/e2e/stdlib.cot", .test_count = 8 },
-    .{ .path = "test/e2e/map.cot", .test_count = 25 },
-    .{ .path = "test/e2e/auto_free.cot", .test_count = 5 },
-    .{ .path = "test/e2e/set.cot", .test_count = 10 },
-    .{ .path = "test/e2e/string_interp.cot", .test_count = 10 },
-    .{ .path = "test/e2e/wasi_io.cot", .test_count = 19 },
-    .{ .path = "test/e2e/std_io.cot", .test_count = 30 },
-    // cases/
-    .{ .path = "test/cases/arithmetic.cot", .test_count = 10 },
-    .{ .path = "test/cases/arrays.cot", .test_count = 6 },
-    .{ .path = "test/cases/bitwise.cot", .test_count = 6 },
-    .{ .path = "test/cases/builtins.cot", .test_count = 4 },
-    .{ .path = "test/cases/chars.cot", .test_count = 2 },
-    .{ .path = "test/cases/compound.cot", .test_count = 8 },
-    .{ .path = "test/cases/control_flow.cot", .test_count = 14 },
-    .{ .path = "test/cases/enum.cot", .test_count = 2 },
-    .{ .path = "test/cases/extern.cot", .test_count = 1 },
-    .{ .path = "test/cases/float.cot", .test_count = 1 },
-    .{ .path = "test/cases/functions.cot", .test_count = 16 },
-    .{ .path = "test/cases/loops.cot", .test_count = 3 },
-    .{ .path = "test/cases/memory.cot", .test_count = 5 },
-    .{ .path = "test/cases/methods.cot", .test_count = 1 },
-    .{ .path = "test/cases/optional.cot", .test_count = 3 },
-    .{ .path = "test/cases/strings.cot", .test_count = 13 },
-    .{ .path = "test/cases/structs.cot", .test_count = 5 },
-    .{ .path = "test/cases/switch.cot", .test_count = 2 },
-    .{ .path = "test/cases/types.cot", .test_count = 2 },
-    .{ .path = "test/cases/union.cot", .test_count = 4 },
-    .{ .path = "test/cases/arc.cot", .test_count = 5 },
-};
-
-const total_test_count: u32 = blk: {
-    var sum: u32 = 0;
-    for (batch_files) |f| sum += f.test_count;
-    break :blk sum;
-};
-
-// ============================================================================
-// Combined source builder
-// ============================================================================
-
-/// Build combined source from all test files.
-/// Reads files from disk, strips import lines, deduplicates them, prepends at top, concatenates all bodies.
-fn buildCombinedSource(allocator: std.mem.Allocator) ![]const u8 {
-    var result = std.ArrayListUnmanaged(u8){};
-    errdefer result.deinit(allocator);
-
-    // Read all file contents
-    var contents = std.ArrayListUnmanaged([]const u8){};
-    defer contents.deinit(allocator);
-
-    for (batch_files) |spec| {
-        const content = std.fs.cwd().readFileAlloc(allocator, spec.path, 1024 * 1024) catch |e| {
-            std.debug.print("Failed to read {s}: {any}\n", .{ spec.path, e });
-            return error.CompileError;
-        };
-        try contents.append(allocator, content);
-    }
-
-    // Collect unique imports
-    var imports = std.StringHashMap(void).init(allocator);
-    defer imports.deinit();
-
-    for (contents.items) |content| {
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trimLeft(u8, line, " \t");
-            if (std.mem.startsWith(u8, trimmed, "import ")) {
-                try imports.put(trimmed, {});
-            }
-        }
-    }
-
-    // Write imports at top
-    var import_iter = imports.keyIterator();
-    while (import_iter.next()) |key| {
-        try result.appendSlice(allocator, key.*);
-        try result.append(allocator, '\n');
-    }
-    try result.append(allocator, '\n');
-
-    // Write file bodies (without import lines)
-    for (contents.items) |content| {
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trimLeft(u8, line, " \t");
-            if (std.mem.startsWith(u8, trimmed, "import ")) continue;
-            try result.appendSlice(allocator, line);
-            try result.append(allocator, '\n');
-        }
-        try result.append(allocator, '\n');
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-// ============================================================================
-// Batch test: ALL test files compiled together (1 compile, 1 link, 1 run)
-// ============================================================================
-
-test "all native tests (765 tests)" {
-    var timer = std.time.Timer.start() catch {
-        std.debug.print("[native] all tests (batch)...", .{});
-        return runBatchTest(std.testing.allocator);
-    };
-
-    std.debug.print("[native] all tests (batch)...", .{});
-
-    try runBatchTest(std.testing.allocator);
-
-    const elapsed_ns = timer.read();
-    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
-    if (elapsed_ms >= 1000.0) {
-        std.debug.print("ok ({d:.0}ms) SLOW\n", .{elapsed_ms});
-    } else {
-        std.debug.print("ok ({d:.0}ms)\n", .{elapsed_ms});
-    }
-}
-
-fn runBatchTest(backing_allocator: std.mem.Allocator) !void {
-    var arena = std.heap.ArenaAllocator.init(backing_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const tmp_dir = "/tmp/cot_native_test";
-    std.fs.cwd().makePath(tmp_dir) catch {};
-
-    // Build combined source
-    const combined = try buildCombinedSource(allocator);
-    const cot_path = "/tmp/cot_native_test/batch.cot";
-    std.fs.cwd().writeFile(.{ .sub_path = cot_path, .data = combined }) catch
-        return error.CompileError;
-
-    // Compile
-    const obj_path = "/tmp/cot_native_test/batch.o";
-    const exe_path = "/tmp/cot_native_test/batch";
-
-    var driver = Driver.init(allocator);
-    driver.setTarget(Target.native());
-    driver.setTestMode(true);
-
-    const obj_code = driver.compileFile(cot_path) catch |e| {
-        std.debug.print("COMPILE ERROR: {any}\n", .{e});
-        return error.CompileError;
-    };
-    defer allocator.free(obj_code);
-
-    std.fs.cwd().writeFile(.{ .sub_path = obj_path, .data = obj_code }) catch
-        return error.CompileError;
-
-    // Link
-    const link_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "zig", "cc", "-o", exe_path, obj_path },
-    }) catch return error.LinkError;
-    defer allocator.free(link_result.stdout);
-    defer allocator.free(link_result.stderr);
-
-    if (link_result.term.Exited != 0) {
-        if (link_result.stderr.len > 0) std.debug.print("LINKER STDERR: {s}\n", .{link_result.stderr});
-        return error.LinkError;
-    }
-
-    // Run
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{exe_path},
-        .max_output_bytes = 256 * 1024,
-    }) catch return error.RunError;
-
-    switch (run_result.term) {
-        .Exited => |exit_code| {
-            if (exit_code != 0) {
-                std.debug.print("WRONG EXIT CODE: expected 0, got {d}\nSTDERR (last 2000 chars):\n{s}\n", .{
-                    exit_code,
-                    if (run_result.stderr.len > 2000) run_result.stderr[run_result.stderr.len - 2000 ..] else run_result.stderr,
-                });
-                return error.WrongExitCode;
-            }
-
-            // Verify pass count
-            const expected_summary = std.fmt.allocPrint(allocator, "\n{d} passed\n", .{total_test_count}) catch
-                return error.CompileError;
-            if (!std.mem.containsAtLeast(u8, run_result.stderr, 1, expected_summary)) {
-                std.debug.print("WRONG SUMMARY: expected \"{s}\" in stderr\nSTDERR (last 2000 chars):\n{s}\n", .{
-                    expected_summary,
-                    if (run_result.stderr.len > 2000) run_result.stderr[run_result.stderr.len - 2000 ..] else run_result.stderr,
-                });
-                return error.WrongOutput;
-            }
-        },
-        .Signal => |sig| {
-            std.debug.print("SIGNAL: {d}\n", .{sig});
-            return error.RunError;
-        },
-        else => return error.RunError,
-    }
-}
 
 // ============================================================================
 // Print tests: verify print/println produce correct stdout output
@@ -571,7 +354,7 @@ test "native: fd_read from stdin" {
 }
 
 // fd_close, fd_open, time, random, exit, args_count, arg_len, arg_ptr
-// are all tested via the batch test (wasi_io.cot). No individual tests needed.
+// are tested via `cot test test/e2e/wasi_io.cot`. No individual Zig tests needed.
 
 // ============================================================================
 // Test Mode (cot test) E2E Tests -- inline code, verify output format
