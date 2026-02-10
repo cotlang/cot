@@ -112,6 +112,26 @@ pub const ClifType = lower_mod.Type;
 /// Instruction data from dfg - the struct stored in dfg.insts.
 pub const InstData = lower_mod.InstData;
 
+/// CLIF IR trap code (distinct from x64 backend TrapCode).
+const ClifTrapCode = lower_mod.TrapCode;
+
+/// Map CLIF IR trap code to x64 backend trap code.
+fn clifToX64TrapCode(clif_tc: ClifTrapCode) TrapCode {
+    return switch (clif_tc) {
+        .heap_out_of_bounds => .heap_out_of_bounds,
+        .integer_division_by_zero => .integer_division_by_zero,
+        .integer_overflow => .integer_overflow,
+        .stack_overflow => .stack_overflow,
+        .bad_conversion_to_integer => .bad_conversion_to_integer,
+        .unreachable_code_reached => .unreachable_code_reached,
+        .table_out_of_bounds => .table_out_of_bounds,
+        .indirect_call_to_null => .indirect_call_to_null,
+        .bad_signature => .bad_signature,
+        .user1 => .user0,
+        .user2 => .user1,
+    };
+}
+
 // =============================================================================
 // Lower context
 // This is the actual Lower(Inst) type from machinst/lower.zig.
@@ -381,12 +401,15 @@ pub const X64LowerBackend = struct {
                 }) catch return null;
             },
             .@"return" => {
-                // Use ret_value_copy with regFixedDef to move return values
-                // into ABI return registers. This works around a regalloc bug
-                // where regFixedUse on rets doesn't properly spill/reload when
-                // the return register is clobbered between definition and use.
+                // Port of Cranelift's gen_return pattern from lower.rs.
+                // Collect CallArgPair entries mapping vregs to physical return registers,
+                // then emit Inst.rets with those pairs. regalloc2 sees the reg_fixed_use
+                // constraints and inserts moves as needed.
 
                 const num_inputs = ctx.numInputs(ir_inst);
+
+                var ret_pairs = ctx.allocator.alloc(CallArgPair, num_inputs) catch return null;
+                var pair_idx: usize = 0;
                 var int_ret_idx: usize = 0;
                 var float_ret_idx: usize = 0;
 
@@ -399,35 +422,25 @@ pub const X64LowerBackend = struct {
                         if (float_ret_idx >= abi.SYSV_RET_FPRS.len) continue;
                         const enc = abi.SYSV_RET_FPRS[float_ret_idx];
                         float_ret_idx += 1;
-                        // Float returns: use xmm_unary_rm_r with movsd
-                        // (regFixedDef bug doesn't affect floats - short live ranges)
-                        ctx.emit(Inst{
-                            .xmm_unary_rm_r = .{
-                                .op = .movsd,
-                                .src = XmmMem{ .inner = RegMem{ .reg = ret_reg } },
-                                .dst = WritableXmm.fromReg(Xmm.unwrapNew(regs.fpr(enc))),
-                            },
-                        }) catch return null;
+                        ret_pairs[pair_idx] = CallArgPair{
+                            .vreg = ret_reg,
+                            .preg = PReg.init(enc, .float),
+                        };
+                        pair_idx += 1;
                     } else {
                         if (int_ret_idx >= abi.SYSV_RET_GPRS.len) continue;
                         const enc = abi.SYSV_RET_GPRS[int_ret_idx];
                         int_ret_idx += 1;
-                        // Use ret_value_copy: regFixedDef forces regalloc to
-                        // properly allocate the destination to the ABI register
-                        const dst_tmp = ctx.allocTmp(.I64) catch return null;
-                        const dst_wreg = dst_tmp.onlyReg() orelse return null;
-                        ctx.emit(Inst{
-                            .ret_value_copy = .{
-                                .src = Gpr.unwrapNew(ret_reg),
-                                .dst = WritableGpr.fromReg(Gpr.unwrapNew(dst_wreg.toReg())),
-                                .preg = PReg.init(enc, .int),
-                            },
-                        }) catch return null;
+                        ret_pairs[pair_idx] = CallArgPair{
+                            .vreg = ret_reg,
+                            .preg = PReg.init(enc, .int),
+                        };
+                        pair_idx += 1;
                     }
                 }
 
-                // Emit bare rets - ret_value_copy already set return registers
-                ctx.emit(Inst.genRets(&[_]CallArgPair{})) catch return null;
+                // Emit rets with return pairs — regalloc handles the moves
+                ctx.emit(Inst.genRets(ret_pairs[0..pair_idx])) catch return null;
             },
             .trap => {
                 // Trap instruction - emit undefined instruction (UD2).
@@ -1915,15 +1928,16 @@ pub const X64LowerBackend = struct {
         return InstOutput{};
     }
 
-    fn lowerTrap(_: *const Self, ctx: *LowerCtx, _: ClifInst) ?InstOutput {
+    fn lowerTrap(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        const trap_code = clifToX64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .unreachable_code_reached);
         ctx.emit(Inst{
-            .ud2 = .{ .trap_code = .unreachable_code_reached },
+            .ud2 = .{ .trap_code = trap_code },
         }) catch return null;
         return InstOutput{};
     }
 
     fn lowerTrapnz(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
-        // Port of Cranelift x64 trapnz and ARM64 lowerTrapnz:
+        // Port of Cranelift x64 trapnz:
         // Must consume input and emit TEST reg, reg before trap_if.
         // Without this, the regalloc doesn't see the input use, and
         // trap_if checks stale flags from a previous instruction.
@@ -1931,8 +1945,9 @@ pub const X64LowerBackend = struct {
         const cond_reg = cond.onlyReg() orelse return null;
         const cond_gpr = Gpr.unwrapNew(cond_reg);
 
+        const trap_code = clifToX64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .heap_out_of_bounds);
+
         // TEST reg, reg - AND reg with itself, sets ZF=1 if reg==0, ZF=0 if reg!=0
-        // Cranelift: (x64_test_gpr val val) before (trap_if NZ)
         ctx.emit(Inst{
             .test_rmi_r = .{
                 .size = .size64,
@@ -1945,17 +1960,19 @@ pub const X64LowerBackend = struct {
         ctx.emit(Inst{
             .trap_if = .{
                 .cc = .nz,
-                .trap_code = .integer_division_by_zero,
+                .trap_code = trap_code,
             },
         }) catch return null;
         return InstOutput{};
     }
 
     fn lowerTrapz(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
-        // Port of ARM64 lowerTrapz: consume input, test, then trap if zero.
+        // Port of Cranelift x64 trapz: consume input, test, then trap if zero.
         const cond = ctx.putInputInRegs(ir_inst, 0);
         const cond_reg = cond.onlyReg() orelse return null;
         const cond_gpr = Gpr.unwrapNew(cond_reg);
+
+        const trap_code = clifToX64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .heap_out_of_bounds);
 
         // TEST reg, reg - AND reg with itself, sets ZF=1 if reg==0, ZF=0 if reg!=0
         ctx.emit(Inst{
@@ -1970,7 +1987,7 @@ pub const X64LowerBackend = struct {
         ctx.emit(Inst{
             .trap_if = .{
                 .cc = .z,
-                .trap_code = .integer_division_by_zero,
+                .trap_code = trap_code,
             },
         }) catch return null;
         return InstOutput{};

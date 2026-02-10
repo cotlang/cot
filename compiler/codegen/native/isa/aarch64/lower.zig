@@ -98,6 +98,15 @@ pub const StackSlotData = lower_mod.StackSlotData;
 /// Argument purpose - for identifying special parameters like vmctx.
 pub const ArgumentPurpose = lower_mod.ArgumentPurpose;
 
+/// CLIF IR trap code (distinct from ARM64 backend u16 trap code).
+const ClifTrapCode = lower_mod.TrapCode;
+
+/// Map CLIF IR trap code to ARM64 backend u16 trap code.
+/// Uses the CLIF enum's integer value directly.
+fn clifToArm64TrapCode(clif_tc: ClifTrapCode) u16 {
+    return @intFromEnum(clif_tc);
+}
+
 // =============================================================================
 // Lower context
 // This is the actual Lower(Inst) type from machinst/lower.zig.
@@ -2077,11 +2086,12 @@ pub const AArch64LowerBackend = struct {
 
     fn lowerTrap(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         _ = self;
-        _ = ir_inst;
+
+        const trap_code = clifToArm64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .unreachable_code_reached);
 
         ctx.emit(Inst{
             .udf = .{
-                .trap_code = 0,
+                .trap_code = trap_code,
             },
         }) catch return null;
 
@@ -2093,6 +2103,8 @@ pub const AArch64LowerBackend = struct {
 
         const cond = ctx.putInputInRegs(ir_inst, 0);
         const cond_reg = cond.onlyReg() orelse return null;
+
+        const trap_code = clifToArm64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .heap_out_of_bounds);
 
         // Compare with zero
         ctx.emit(Inst{
@@ -2109,7 +2121,7 @@ pub const AArch64LowerBackend = struct {
         ctx.emit(Inst{
             .trap_if = .{
                 .kind = .{ .cond = .ne },
-                .trap_code = 0,
+                .trap_code = trap_code,
             },
         }) catch return null;
 
@@ -2121,6 +2133,8 @@ pub const AArch64LowerBackend = struct {
 
         const cond = ctx.putInputInRegs(ir_inst, 0);
         const cond_reg = cond.onlyReg() orelse return null;
+
+        const trap_code = clifToArm64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .heap_out_of_bounds);
 
         // Compare with zero
         ctx.emit(Inst{
@@ -2137,7 +2151,7 @@ pub const AArch64LowerBackend = struct {
         ctx.emit(Inst{
             .trap_if = .{
                 .kind = .{ .cond = .eq },
-                .trap_code = 0,
+                .trap_code = trap_code,
             },
         }) catch return null;
 

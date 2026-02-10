@@ -1774,16 +1774,6 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             // The register constraints are handled by regalloc; this just emits the return.
             try sink.put1(0xC3); // RET
         },
-        .ret_value_copy => |p| {
-            // Move src vreg (after regalloc) to fixed ABI return register.
-            const src_enc = p.src.hwEnc();
-            const dst_enc: u8 = @intCast(p.preg.hwEnc());
-            // Always emit the move (even if src==dst, to keep code simple)
-            const rex = RexPrefix.twoOp(src_enc, dst_enc, true, false);
-            try rex.encode(sink);
-            try sink.put1(0x89); // MOV r/m64, r64
-            try emitModrmReg(sink, src_enc, dst_enc);
-        },
 
         //---------------------------------------------------------------------
         // XMM instructions (SSE/AVX)

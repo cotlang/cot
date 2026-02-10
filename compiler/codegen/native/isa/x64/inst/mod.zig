@@ -868,16 +868,6 @@ pub const Inst = union(enum) {
         rets_list: []const CallArgPair,
     },
 
-    /// Return value copy: moves a vreg into a fixed physical return register.
-    /// Uses regFixedDef (which regalloc handles correctly) instead of
-    /// regFixedUse (which has a bug with long live ranges).
-    /// Emits as: mov src, dst (where dst is the fixed ABI return register).
-    ret_value_copy: struct {
-        src: Gpr,
-        dst: WritableGpr,
-        preg: PReg,
-    },
-
     /// Stack switch (for fibers/coroutines).
     stack_switch_basic: struct {
         store_context_ptr: Gpr,
@@ -1705,12 +1695,6 @@ pub const Inst = union(enum) {
             },
             .rets => |_| {
                 try writer.writeAll("rets <...>");
-            },
-            .ret_value_copy => |p| {
-                try writer.print("ret_value_copy {s} -> {s}", .{
-                    regs.prettyPrintReg(p.src.toReg(), 8),
-                    regs.prettyPrintReg(p.dst.toReg().toReg(), 8),
-                });
             },
             .stack_switch_basic => |_| {
                 try writer.writeAll("stack_switch_basic");

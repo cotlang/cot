@@ -53,8 +53,13 @@ pub const BoundsCheckResult = struct {
 
 /// Compute address and perform bounds check for a memory access.
 ///
-/// Simplified version of Cranelift's bounds_check_and_compute_addr.
-/// Does not include guard page optimizations or Spectre mitigations.
+/// Port of Cranelift's explicit_check_oob_condition_and_compute_addr
+/// (bounds_checks.rs:745-762) with the general case (bounds_checks.rs:565-607).
+///
+/// Emits: effective_end = index + offset + access_size
+///        oob = icmp(uge, effective_end, bound)
+///        trapnz(oob, heap_out_of_bounds)
+///        addr = base + index + offset
 ///
 /// Parameters:
 /// - builder: Function builder for emitting IR
@@ -64,7 +69,6 @@ pub const BoundsCheckResult = struct {
 /// - access_size: Size of the memory access in bytes
 ///
 /// Returns the native address to use for the load/store.
-/// Emits bounds checking code if needed.
 pub fn boundsCheckAndComputeAddr(
     builder: *FunctionBuilder,
     heap: *const HeapData,
@@ -81,20 +85,28 @@ pub fn boundsCheckAndComputeAddr(
         addr_index = try builder.ins().uextend(pointer_type, index);
     }
 
-    // Bounds checking is deferred (TODO: implement trapIf).
-    // Do NOT emit dead bounds-check instructions here — they create CLIF iadd
-    // instructions whose regalloc clobbers addr_index, corrupting the final address.
-    _ = access_size;
+    // Bounds check: emit icmp + trapnz to prevent OOB memory access.
+    // Port of Cranelift bounds_checks.rs:565-607 (general case).
+    //
+    // Load the dynamic bound from vmctx (supports memory.grow).
+    // The globalValue+load pattern is required — using iconst triggers a
+    // CLIF value aliasing bug in large programs (0xAAAAAAAA in resolveAllAliases).
+    const offset_and_size = offset + @as(u64, access_size);
+    const oas_val = try builder.ins().iconst(pointer_type, @as(i64, @intCast(offset_and_size)));
+    const effective_end = try builder.ins().iadd(addr_index, oas_val);
 
-    // Compute final address: base + index + offset
+    const bound_gv_addr = try builder.ins().globalValue(pointer_type, heap.bound);
+    const bound = try builder.ins().load(pointer_type, clif.MemFlags.DEFAULT, bound_gv_addr, 0);
+
+    const oob = try builder.ins().icmp(clif.IntCC.uge, effective_end, bound);
+    _ = try builder.ins().trapnz(oob, clif.TrapCode.heap_out_of_bounds);
+
+    // Step 5: Compute final address: base + index + offset
     const base_gv_addr = try builder.ins().globalValue(pointer_type, heap.base);
     const base = try builder.ins().load(pointer_type, clif.MemFlags.DEFAULT, base_gv_addr, 0);
 
-    // Final address = base + index (offset is applied in load/store)
     var final_addr = try builder.ins().iadd(base, addr_index);
 
-    // If we have an offset, add it to the address
-    // (This is the static offset from the memarg)
     if (offset > 0) {
         const offset_val = try builder.ins().iconst(pointer_type, @as(i64, @intCast(offset)));
         final_addr = try builder.ins().iadd(final_addr, offset_val);

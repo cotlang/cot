@@ -727,12 +727,6 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
                 visitor.regFixedUse(ret.vreg, ret.preg);
             }
         },
-        .ret_value_copy => |*p| {
-            visitor.gprUse(&p.src);
-            // No regFixedDef - the emit code reads preg directly for the
-            // destination. This avoids confusing the regalloc with a fixed def
-            // on the same instruction as the use.
-        },
 
         //=====================================================================
         // SSE/XMM operations

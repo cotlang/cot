@@ -1620,17 +1620,6 @@ pub fn VCodeBuilder(comptime I: type) type {
                 // Iterate the flat operands list in source order.
                 // Port of Cranelift vcode.rs:530-540: operands are in source order,
                 // matching the callback visit order in emitWithAllocs.
-                const is_rets_inst = insn.isTerm() == .ret;
-                // Log ret_value_copy operands
-                if (@hasField(@TypeOf(insn.*), "ret_value_copy") and insn.* == .ret_value_copy) {
-                    pipeline_debug.log(.codegen, "collectOps: ret_value_copy at inst {d}, operands count={d}", .{ i, collector_state.operands.items.len });
-                    for (collector_state.operands.items, 0..) |dbg_op, di| {
-                        if (dbg_op.reg.isVirtual()) {
-                            const dbg_vreg = vregs.resolveVregAlias(dbg_op.reg.toVReg());
-                            pipeline_debug.log(.codegen, "collectOps: ret_value_copy op[{d}]: vreg={d} kind={s}", .{ di, dbg_vreg.vreg(), @tagName(dbg_op.kind) });
-                        }
-                    }
-                }
                 for (collector_state.operands.items) |op| {
                     if (op.reg.isVirtual()) {
                         const vreg = vregs.resolveVregAlias(op.reg.toVReg());
@@ -1641,24 +1630,6 @@ pub fn VCodeBuilder(comptime I: type) type {
                             .{ .fixed_reg = p }
                         else
                             .reg;
-                        if (is_rets_inst) {
-                            pipeline_debug.log(.codegen, "collectOps: rets inst {d}: vreg={d} class={d} constraint={s} kind={s}", .{
-                                i,
-                                vreg.vreg(),
-                                @intFromEnum(vreg.class()),
-                                @tagName(constraint),
-                                @tagName(op.kind),
-                            });
-                        }
-                        // Track return value vreg in __wasm_main
-                        if (vreg.vreg() == 440) {
-                            pipeline_debug.log(.codegen, "collectOps: vreg440 at inst {d}: constraint={s} kind={s} preg={any}", .{
-                                i,
-                                @tagName(constraint),
-                                @tagName(op.kind),
-                                op.preg,
-                            });
-                        }
                         try self.vcode.operands.append(allocator, Operand.new(
                             vreg,
                             constraint,
