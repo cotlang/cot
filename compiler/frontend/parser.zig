@@ -978,10 +978,11 @@ pub const Parser = struct {
             const v = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = t, .args = .{ v, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "trap") or std.mem.eql(u8, name, "time") or std.mem.eql(u8, name, "args_count") or std.mem.eql(u8, name, "environ_count")) {
+        } else if (std.mem.eql(u8, name, "trap") or std.mem.eql(u8, name, "time") or std.mem.eql(u8, name, "args_count") or std.mem.eql(u8, name, "environ_count") or std.mem.eql(u8, name, "target_os") or std.mem.eql(u8, name, "target_arch") or std.mem.eql(u8, name, "target")) {
             // @trap() — 0 args, Wasm unreachable / ARM64 brk #1
             // @time() — 0 args, returns nanoseconds since epoch
             // @args_count() — 0 args, returns number of CLI arguments
+            // @target_os(), @target_arch(), @target() — 0 args, comptime string constants
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
         } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf") or std.mem.eql(u8, name, "fd_close") or std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "arg_len") or std.mem.eql(u8, name, "arg_ptr") or std.mem.eql(u8, name, "environ_len") or std.mem.eql(u8, name, "environ_ptr")) {
@@ -1023,7 +1024,21 @@ pub const Parser = struct {
             if (try self.parseStmt()) |s| try stmts.append(self.allocator, s) else self.advance();
         }
         if (!self.expect(.rbrace)) return null;
-        return try self.tree.addExpr(.{ .block_expr = .{ .stmts = try self.allocator.dupe(NodeIndex, stmts.items), .expr = null_node, .span = Span.init(start, self.pos()) } });
+        // Rust/Zig pattern: last expression in a block is the block's value.
+        // If the last item is an expr_stmt, extract it as the block's result expr.
+        var result_expr: NodeIndex = null_node;
+        if (stmts.items.len > 0) {
+            const last = stmts.items[stmts.items.len - 1];
+            if (self.tree.getNode(last)) |node| {
+                if (node.asStmt()) |stmt| {
+                    if (stmt == .expr_stmt) {
+                        result_expr = stmt.expr_stmt.expr;
+                        stmts.items.len -= 1;
+                    }
+                }
+            }
+        }
+        return try self.tree.addExpr(.{ .block_expr = .{ .stmts = try self.allocator.dupe(NodeIndex, stmts.items), .expr = result_expr, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseIfExpr(self: *Parser) ParseError!?NodeIndex {

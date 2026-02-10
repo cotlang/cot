@@ -117,7 +117,8 @@ pub fn analyze(parent_allocator: std.mem.Allocator, text: []const u8, filename: 
 
     var checker: ?Checker = null;
     if (parse_ok) {
-        var c = Checker.init(allocator, &tree, &type_reg, &err_reporter, &global_scope, &generics);
+        const target = @import("../core/target.zig").Target.native();
+        var c = Checker.init(allocator, &tree, &type_reg, &err_reporter, &global_scope, &generics, target);
         c.checkFile() catch {};
         checker = c;
     }

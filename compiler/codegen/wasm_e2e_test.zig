@@ -60,7 +60,8 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
     var type_reg = try TypeRegistry.init(allocator);
     var global_scope = checker.Scope.init(allocator, null);
     var generic_ctx = checker.SharedGenericContext.init(allocator);
-    var check = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx);
+    const target = @import("../core/target.zig").Target.native();
+    var check = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx, target);
     check.checkFile() catch {
         return .{ .arena = arena, .has_errors = true, .wasm_bytes = &.{} };
     };
@@ -69,7 +70,7 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
     }
 
     // Lower to IR
-    var lowering = lower.Lowerer.init(allocator, &tree, &type_reg, &err, &check);
+    var lowering = lower.Lowerer.init(allocator, &tree, &type_reg, &err, &check, target);
     const ir_data = lowering.lower() catch {
         return .{ .arena = arena, .has_errors = true, .wasm_bytes = &.{} };
     };

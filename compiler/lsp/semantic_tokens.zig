@@ -149,6 +149,10 @@ const TokenCollector = struct {
             .fn_decl => |f| {
                 self.emitName(f.span, f.name, .function, MOD_DECLARATION | MOD_DEFINITION);
                 for (f.type_params) |tp| self.emitName(f.span, tp, .type_parameter, MOD_DECLARATION);
+                // Emit where clause trait bounds (e.g., `where T: Comparable`)
+                for (f.type_param_bounds) |bound| {
+                    if (bound) |b| self.emitName(f.span, b, .interface, 0);
+                }
                 // Collect param names for classifying references in the body
                 var pnames = std.ArrayListUnmanaged([]const u8){};
                 for (f.params) |p| {
@@ -313,6 +317,9 @@ const TokenCollector = struct {
                 self.walkNode(s.subject);
                 for (s.cases) |c| {
                     for (c.patterns) |p| self.walkNode(p);
+                    // Emit capture variable (e.g., |val| in `Result.Ok |val| =>`)
+                    if (c.capture.len > 0)
+                        self.emitName(c.span, c.capture, .variable, MOD_DECLARATION);
                     self.walkNode(c.guard);
                     self.walkNode(c.body);
                 }

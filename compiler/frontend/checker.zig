@@ -7,6 +7,8 @@ const errors = @import("errors.zig");
 const source = @import("source.zig");
 const token = @import("token.zig");
 
+const target_mod = @import("../core/target.zig");
+
 const Ast = ast.Ast;
 const Node = ast.Node;
 const NodeIndex = ast.NodeIndex;
@@ -160,8 +162,10 @@ pub const Checker = struct {
     generic_instantiations: std.AutoHashMap(NodeIndex, GenericInstInfo) = undefined,
     /// Type substitution map, active during generic instantiation
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
+    /// Compilation target — used for @target_os(), @target_arch(), @target() comptime builtins
+    target: target_mod.Target = target_mod.Target.native(),
 
-    pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope, generic_ctx: *SharedGenericContext) Checker {
+    pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope, generic_ctx: *SharedGenericContext, target: target_mod.Target) Checker {
         return .{
             .types = type_reg,
             .scope = global_scope,
@@ -172,6 +176,7 @@ pub const Checker = struct {
             .expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(allocator),
             .generics = generic_ctx,
             .generic_instantiations = std.AutoHashMap(NodeIndex, GenericInstInfo).init(allocator),
+            .target = target,
         };
     }
 
@@ -442,7 +447,7 @@ pub const Checker = struct {
         return expr == .zero_init;
     }
 
-    fn evalConstExpr(self: *Checker, idx: NodeIndex) ?i64 {
+    pub fn evalConstExpr(self: *Checker, idx: NodeIndex) ?i64 {
         const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
         return switch (expr) {
             .literal => |lit| switch (lit.kind) {
@@ -452,20 +457,40 @@ pub const Checker = struct {
             .unary => |un| if (self.evalConstExpr(un.operand)) |op| switch (un.op) {
                 .sub => -op, .not => ~op, .lnot => if (op == 0) @as(i64, 1) else @as(i64, 0), else => null,
             } else null,
-            .binary => |bin| if (self.evalConstExpr(bin.left)) |l| if (self.evalConstExpr(bin.right)) |r| switch (bin.op) {
-                .add => l + r, .sub => l - r, .mul => l * r,
-                .quo => if (r != 0) @divTrunc(l, r) else null,
-                .rem => if (r != 0) @rem(l, r) else null,
-                .@"and" => l & r, .@"or" => l | r, .xor => l ^ r,
-                .shl => l << @intCast(r), .shr => l >> @intCast(r),
-                .eql => if (l == r) @as(i64, 1) else @as(i64, 0),
-                .neq => if (l != r) @as(i64, 1) else @as(i64, 0),
-                .lss => if (l < r) @as(i64, 1) else @as(i64, 0),
-                .leq => if (l <= r) @as(i64, 1) else @as(i64, 0),
-                .gtr => if (l > r) @as(i64, 1) else @as(i64, 0),
-                .geq => if (l >= r) @as(i64, 1) else @as(i64, 0),
-                else => null,
-            } else null else null,
+            .binary => |bin| {
+                // Try integer const-fold first
+                if (self.evalConstExpr(bin.left)) |l| {
+                    if (self.evalConstExpr(bin.right)) |r| {
+                        return switch (bin.op) {
+                            .add => l + r, .sub => l - r, .mul => l * r,
+                            .quo => if (r != 0) @divTrunc(l, r) else null,
+                            .rem => if (r != 0) @rem(l, r) else null,
+                            .@"and" => l & r, .@"or" => l | r, .xor => l ^ r,
+                            .shl => l << @intCast(r), .shr => l >> @intCast(r),
+                            .eql => if (l == r) @as(i64, 1) else @as(i64, 0),
+                            .neq => if (l != r) @as(i64, 1) else @as(i64, 0),
+                            .lss => if (l < r) @as(i64, 1) else @as(i64, 0),
+                            .leq => if (l <= r) @as(i64, 1) else @as(i64, 0),
+                            .gtr => if (l > r) @as(i64, 1) else @as(i64, 0),
+                            .geq => if (l >= r) @as(i64, 1) else @as(i64, 0),
+                            else => null,
+                        };
+                    }
+                }
+                // Fallback: comptime string equality (for @target_os() == "linux" etc.)
+                if (bin.op == .eql or bin.op == .neq) {
+                    if (self.evalConstString(bin.left)) |ls| {
+                        if (self.evalConstString(bin.right)) |rs| {
+                            const equal = std.mem.eql(u8, ls, rs);
+                            return if (bin.op == .eql)
+                                (if (equal) @as(i64, 1) else @as(i64, 0))
+                            else
+                                (if (!equal) @as(i64, 1) else @as(i64, 0));
+                        }
+                    }
+                }
+                return null;
+            },
             .paren => |p| self.evalConstExpr(p.inner),
             .ident => |id| if (self.scope.lookup(id.name)) |sym| if (sym.kind == .constant) sym.const_value else null else null,
             // Go: cmd/compile/internal/ir/const.go — const folding includes sizeof.
@@ -476,6 +501,34 @@ pub const Checker = struct {
                     if (type_idx == invalid_type) return null;
                     return @as(i64, @intCast(self.types.sizeOf(type_idx)));
                 }
+                return null;
+            },
+            // Comptime if-expression: fold when condition is comptime-known
+            .if_expr => |ie| {
+                const cond_val = self.evalConstExpr(ie.condition) orelse return null;
+                if (cond_val != 0) return self.evalConstExpr(ie.then_branch);
+                if (ie.else_branch != null_node) return self.evalConstExpr(ie.else_branch);
+                return null;
+            },
+            // Block expression: { stmts; expr } — evaluate final expr if no stmts
+            .block_expr => |blk| {
+                if (blk.stmts.len == 0) return self.evalConstExpr(blk.expr);
+                return null;
+            },
+            else => null,
+        };
+    }
+
+    /// Evaluate a comptime string expression. Returns the string value or null.
+    fn evalConstString(self: *Checker, idx: NodeIndex) ?[]const u8 {
+        const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
+        return switch (expr) {
+            .literal => |lit| if (lit.kind == .string) lit.value else null,
+            .paren => |p| self.evalConstString(p.inner),
+            .builtin_call => |bc| {
+                if (std.mem.eql(u8, bc.name, "target_os")) return self.target.os.name();
+                if (std.mem.eql(u8, bc.name, "target_arch")) return self.target.arch.name();
+                if (std.mem.eql(u8, bc.name, "target")) return self.target.name();
                 return null;
             },
             else => null,
@@ -852,6 +905,9 @@ pub const Checker = struct {
             // @environ_ptr(n) — copies env var n into linear memory, returns wasm pointer
             _ = try self.checkExpr(bc.args[0]);
             return TypeRegistry.I64;
+        } else if (std.mem.eql(u8, bc.name, "target_os") or std.mem.eql(u8, bc.name, "target_arch") or std.mem.eql(u8, bc.name, "target")) {
+            // Comptime builtins — resolve to string constants at compile time
+            return TypeRegistry.STRING;
         }
         self.err.errorWithCode(bc.span.start, .e300, "unknown builtin");
         return invalid_type;

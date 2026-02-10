@@ -93,13 +93,13 @@ pub const Driver = struct {
         defer global_scope.deinit();
         var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
         defer generic_ctx.deinit(self.allocator);
-        var chk = checker_mod.Checker.init(self.allocator, &tree, &type_reg, &err_reporter, &global_scope, &generic_ctx);
+        var chk = checker_mod.Checker.init(self.allocator, &tree, &type_reg, &err_reporter, &global_scope, &generic_ctx, self.target);
         defer chk.deinit();
         try chk.checkFile();
         if (err_reporter.hasErrors()) return error.TypeCheckError;
 
         // Lower to IR
-        var lowerer = lower_mod.Lowerer.init(self.allocator, &tree, &type_reg, &err_reporter, &chk);
+        var lowerer = lower_mod.Lowerer.init(self.allocator, &tree, &type_reg, &err_reporter, &chk, self.target);
         defer lowerer.deinit();
         if (self.test_mode) lowerer.setTestMode(true);
         try lowerer.lowerToBuilder();
@@ -150,7 +150,7 @@ pub const Driver = struct {
 
         for (parsed_files.items) |*pf| {
             var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
-            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, &global_scope, &generic_ctx);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, &global_scope, &generic_ctx, self.target);
             chk.checkFile() catch |e| {
                 chk.deinit();
                 return e;
@@ -173,7 +173,7 @@ pub const Driver = struct {
 
         for (parsed_files.items, 0..) |*pf, i| {
             var lower_err = errors_mod.ErrorReporter.init(&pf.source, null);
-            var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder);
+            var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder, self.target);
             if (self.test_mode) lowerer.setTestMode(true);
 
             lowerer.lowerToBuilder() catch |e| {
@@ -196,7 +196,7 @@ pub const Driver = struct {
         // Generate test runner if in test mode
         if (self.test_mode and all_test_names.items.len > 0) {
             var dummy_err = errors_mod.ErrorReporter.init(&parsed_files.items[0].source, null);
-            var runner = lower_mod.Lowerer.initWithBuilder(self.allocator, &parsed_files.items[0].tree, &type_reg, &dummy_err, &checkers.items[0], shared_builder);
+            var runner = lower_mod.Lowerer.initWithBuilder(self.allocator, &parsed_files.items[0].tree, &type_reg, &dummy_err, &checkers.items[0], shared_builder, self.target);
             for (all_test_names.items) |n| try runner.addTestName(n);
             for (all_test_display_names.items) |n| try runner.addTestDisplayName(n);
             try runner.generateTestRunner();

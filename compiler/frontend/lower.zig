@@ -9,6 +9,7 @@ const errors = @import("errors.zig");
 const checker = @import("checker.zig");
 const token = @import("token.zig");
 const arc = @import("arc_insertion.zig");
+const target_mod = @import("../core/target.zig");
 
 const Allocator = std.mem.Allocator;
 const Ast = ast.Ast;
@@ -40,6 +41,8 @@ pub const Lowerer = struct {
     closure_counter: u32 = 0,
     lowered_generics: std.StringHashMap(void),
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
+    /// Compilation target — used for @target_os(), @target_arch(), @target() comptime builtins
+    target: target_mod.Target = target_mod.Target.native(),
 
     pub const Error = error{OutOfMemory};
 
@@ -58,11 +61,11 @@ pub const Lowerer = struct {
         label: ?[]const u8 = null,
     };
 
-    pub fn init(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker) Lowerer {
-        return initWithBuilder(allocator, tree, type_reg, err, chk, ir.Builder.init(allocator, type_reg));
+    pub fn init(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker, target: target_mod.Target) Lowerer {
+        return initWithBuilder(allocator, tree, type_reg, err, chk, ir.Builder.init(allocator, type_reg), target);
     }
 
-    pub fn initWithBuilder(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker, builder: ir.Builder) Lowerer {
+    pub fn initWithBuilder(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker, builder: ir.Builder, target: target_mod.Target) Lowerer {
         return .{
             .allocator = allocator,
             .tree = tree,
@@ -76,6 +79,7 @@ pub const Lowerer = struct {
             .test_names = .{},
             .test_display_names = .{},
             .lowered_generics = std.StringHashMap(void).init(allocator),
+            .target = target,
         };
     }
 
@@ -1345,6 +1349,15 @@ pub const Lowerer = struct {
     }
 
     fn lowerIf(self: *Lowerer, if_stmt: ast.IfStmt) !void {
+        // Comptime const-fold: eliminate dead branches for platform conditionals
+        if (self.chk.evalConstExpr(if_stmt.condition)) |cond_val| {
+            if (cond_val != 0) {
+                _ = try self.lowerBlockNode(if_stmt.then_branch);
+            } else if (if_stmt.else_branch != null_node) {
+                _ = try self.lowerBlockNode(if_stmt.else_branch);
+            }
+            return;
+        }
         const fb = self.current_func orelse return;
         const then_block = try fb.newBlock("then");
         const else_block = if (if_stmt.else_branch != null_node) try fb.newBlock("else") else null;
@@ -2551,6 +2564,13 @@ pub const Lowerer = struct {
     }
 
     fn lowerIfExpr(self: *Lowerer, if_expr: ast.IfExpr) Error!ir.NodeIndex {
+        // Comptime const-fold: if condition is known at compile time, only emit the taken branch.
+        // This eliminates dead branches for @target_os() == "linux" etc.
+        if (self.chk.evalConstExpr(if_expr.condition)) |cond_val| {
+            if (cond_val != 0) return self.lowerExprNode(if_expr.then_branch);
+            if (if_expr.else_branch != null_node) return self.lowerExprNode(if_expr.else_branch);
+            return ir.null_node;
+        }
         const fb = self.current_func orelse return ir.null_node;
         const cond = try self.lowerExprNode(if_expr.condition);
         if (cond == ir.null_node) return ir.null_node;
@@ -3733,6 +3753,22 @@ pub const Lowerer = struct {
             var args = [_]ir.NodeIndex{n_arg};
             return try fb.emitCall("cot_environ_ptr", &args, false, TypeRegistry.I64, bc.span);
         }
+        // @target_os(), @target_arch(), @target() — comptime string constants
+        if (std.mem.eql(u8, bc.name, "target_os")) {
+            const str = try self.allocator.dupe(u8, self.target.os.name());
+            const str_idx = try fb.addStringLiteral(str);
+            return try fb.emitConstSlice(str_idx, bc.span);
+        }
+        if (std.mem.eql(u8, bc.name, "target_arch")) {
+            const str = try self.allocator.dupe(u8, self.target.arch.name());
+            const str_idx = try fb.addStringLiteral(str);
+            return try fb.emitConstSlice(str_idx, bc.span);
+        }
+        if (std.mem.eql(u8, bc.name, "target")) {
+            const str = try self.allocator.dupe(u8, self.target.name());
+            const str_idx = try fb.addStringLiteral(str);
+            return try fb.emitConstSlice(str_idx, bc.span);
+        }
         return ir.null_node;
     }
 
@@ -4181,9 +4217,10 @@ test "Lowerer basic init" {
     defer scope.deinit();
     var generic_ctx = checker.SharedGenericContext.init(allocator);
     defer generic_ctx.deinit(allocator);
-    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &scope, &generic_ctx);
+    const target = target_mod.Target.native();
+    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &scope, &generic_ctx, target);
     defer chk.deinit();
-    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &chk);
+    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &chk, target);
     defer lowerer.deinit();
     var ir_result = try lowerer.lower();
     defer ir_result.deinit();
@@ -4225,7 +4262,8 @@ fn testPipeline(backing: std.mem.Allocator, code: []const u8) !TestResult {
     var type_reg = try TypeRegistry.init(allocator);
     var global_scope = checker.Scope.init(allocator, null);
     var generic_ctx = checker.SharedGenericContext.init(allocator);
-    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx);
+    const target = target_mod.Target.native();
+    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx, target);
 
     chk.checkFile() catch |e| {
         std.debug.print("Check error: {}\n", .{e});
@@ -4233,7 +4271,7 @@ fn testPipeline(backing: std.mem.Allocator, code: []const u8) !TestResult {
     };
     if (err.hasErrors()) return error.CheckErrors;
 
-    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &chk);
+    var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &chk, target);
     const ir_data = try lowerer.lower();
     return .{ .ir_data = ir_data, .type_reg = type_reg, .has_errors = err.hasErrors(), .arena = arena };
 }

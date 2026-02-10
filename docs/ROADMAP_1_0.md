@@ -20,7 +20,7 @@ The compiler handles a real programming language — generics, closures, ARC, er
 
 1. ~~**No collections beyond List(T)**~~ — **Done**: Map(K,V) with splitmix64 hash, Set(T) wrapping Map
 2. ~~**No string interpolation**~~ — **Done**: `"Hello, ${name}"` with integer auto-conversion
-3. **No file I/O** — can't read files, make HTTP requests
+3. ~~**No file I/O**~~ — **Done**: `std/fs` (File struct, openFile, createFile, 10 methods), `std/os` (args, environ, exit), `std/time`, `std/random`
 4. **No package manager** — can't install libraries
 5. **No async** — can't write a web server that handles concurrent connections
 6. **No framework** — the full-stack client/server story doesn't exist yet
@@ -206,13 +206,16 @@ Zig is 10+ years of development and still on 0.15. Each version represents a mea
 - ~~Set(T)~~ — **Done** — wraps Map(T, i64), add/has/remove/len/toList, auto-free
 - ~~String interpolation~~ — **Done** — `"Hello, ${name}"` with integer auto-conversion
 - ~~String equality~~ — **Done** — `@assert_eq("hello", "hello")` via `cot_string_eq`
+- ~~`std/fs`~~ — **Done** — File struct, openFile, createFile, stdin/stdout/stderr, read/write/seek/close
+- ~~`std/os`~~ — **Done** — argsCount, argLen, argPtr, environCount, environLen, environPtr, exit
+- ~~`std/time`~~ — **Done** — nanoTimestamp, milliTimestamp, timestamp, Timer struct
+- ~~`std/random`~~ — **Done** — fillBytes, randomInt, randomRange (via getentropy)
 - StringBuilder — efficient append-based string building
+- String methods — split, trim, indexOf, contains, startsWith, endsWith, replace
 - `for key, value in map` — iterator protocol
 - `match` expressions — full pattern matching
 - Multiple return values — `fn divmod(a, b: i64) (i64, i64)`
 - `weak` references — ARC cycle breaker
-- `std/fs` — file I/O (open, read, write, readFile, writeFile)
-- `std/os` — process args, env vars, exit
 - `std/fmt` — string formatting
 - `std/math` — math functions
 - `std/json` — JSON parse/serialize
@@ -271,6 +274,101 @@ Zig is 10+ years of development and still on 0.15. Each version represents a mea
 | **Zig** | Performance, simplicity | Manual memory, no full-stack story |
 
 **Cot's unique position:** The only language where server = native binary (no runtime), browser = Wasm (first-class), types and logic are shared across the boundary, and the framework handles compilation targets transparently.
+
+---
+
+## Dogfooding: MCP Server in Cot
+
+### The Goal
+
+Write a Model Context Protocol (MCP) server **in Cot itself** — a stdio-based tool that Claude Code connects to for Cot syntax validation, type checking, and language reference. This is the first real dogfooding exercise: if Cot can't write a useful tool for its own development, it's not ready for users.
+
+### Why MCP
+
+MCP (Model Context Protocol) is the standard for extending AI coding assistants. An MCP server for Cot would:
+- **Validate syntax** before committing — no more `let` vs `var` mistakes
+- **Expose language reference** — Claude queries the server instead of guessing syntax
+- **Type check code** — catch errors without running `zig build test`
+- **Provide stdlib docs** — function signatures and examples on demand
+
+The server communicates via JSON-RPC over stdin/stdout — a protocol Cot can handle once `std/json` exists.
+
+### What Already Works
+
+| Capability | Status | Notes |
+|-----------|--------|-------|
+| Stdin/stdout I/O | **Done** | `@fd_read`/`@fd_write`, `File` struct, `stdin()`/`stdout()` |
+| Error handling | **Done** | Error unions, try/catch, error propagation |
+| Data structures | **Done** | `List(T)`, `Map(K,V)`, `Set(T)` — all production-quality |
+| Process args/env | **Done** | `std/os` — read CLI args, environment variables |
+| Memory management | **Done** | ARC, defer, `new`/`@alloc`/`@dealloc` |
+| Generics + traits | **Done** | Monomorphized dispatch for tool routing |
+| File I/O | **Done** | `std/fs` — openFile, read, write, seek, close |
+
+### What's Missing (Blockers)
+
+| Feature | Blocker Level | Needed For |
+|---------|--------------|------------|
+| **`std/json`** | **Critical** | MCP uses JSON-RPC — must parse and serialize JSON |
+| **String methods** | **Critical** | Parsing `Content-Length:` headers, splitting on `\n`, trimming whitespace |
+| **StringBuilder** | **High** | Building JSON responses efficiently (currently no append-based string building) |
+| **String iteration** | **High** | Walking input character-by-character for JSON parsing |
+| **Buffered I/O** | **Medium** | Each `@fd_read` is a raw syscall — need line-buffered stdin reading |
+
+### What's Not Needed (stdio transport only)
+
+| Feature | Status | Why not needed |
+|---------|--------|---------------|
+| TCP sockets (`std/net`) | Not started (0.5) | MCP stdio transport uses stdin/stdout, no network |
+| HTTP parsing | Not started (0.5) | SSE/HTTP transport is optional, stdio is primary |
+| Async/await | Not started (0.5) | Single-threaded request/response loop is fine |
+| Multi-file modules | Not started (0.6) | Can write in a single file initially |
+
+### Implementation Path
+
+**Phase 1 — Prerequisites (0.3 remaining):**
+1. `std/json` — hand-rolled recursive descent JSON parser + serializer
+2. String methods — `split()`, `trim()`, `indexOf()`, `startsWith()`, `contains()`
+3. `StringBuilder` — `List(u8)` with `.toString()` method
+
+**Phase 2 — Minimal MCP server:**
+1. Read JSON-RPC messages from stdin (parse `Content-Length:` header + JSON body)
+2. Route `initialize`, `tools/list`, `tools/call` methods
+3. Implement `validate_syntax` tool — shell out to `cot check --stdin`
+4. Implement `get_syntax_reference` tool — return embedded docs
+5. Write JSON-RPC responses to stdout
+
+**Phase 3 — Full language tools:**
+1. `check_types` — run checker, return diagnostics
+2. `format_code` — auto-format Cot source
+3. `suggest_fix` — common error → fix mapping
+4. `get_stdlib_docs` — query function signatures
+
+### Configuration
+
+Once built, the MCP server is registered via `.mcp.json` at the repo root:
+
+```json
+{
+  "mcpServers": {
+    "cot-tools": {
+      "type": "stdio",
+      "command": "./zig-out/bin/cot-mcp"
+    }
+  }
+}
+```
+
+Or added per-machine: `claude mcp add --transport stdio cot-tools -- ./zig-out/bin/cot-mcp`
+
+### Success Criteria
+
+The MCP server is "done" when a fresh Claude Code session can:
+1. Write valid Cot code on the first attempt (validated by the MCP server)
+2. Look up any Cot syntax without guessing wrong
+3. Get meaningful error explanations when code fails to compile
+
+This is the first program where Cot proves it can build a real, useful tool — and the tool makes Cot development itself faster.
 
 ---
 

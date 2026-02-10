@@ -1,6 +1,6 @@
 # Cot Language Syntax Reference
 
-Complete reference for every language feature. All examples from `test/e2e/features.cot`.
+Complete reference for every language feature. Examples from `test/e2e/features.cot`.
 
 ## Variables & Constants
 
@@ -13,6 +13,81 @@ var z = 30                // mutable, inferred
 var w: i64 = 40           // mutable, typed
 let a = 50                // alias for var (for devs used to JS/Rust) — avoid in examples
 const MyError = error { Fail, NotFound }
+```
+
+## Types
+
+### Primitive Types
+
+```cot
+// Signed integers
+i8  i16  i32  i64
+
+// Unsigned integers
+u8  u16  u32  u64
+
+// Floating point
+f32  f64
+
+// Other primitives
+bool                       // true or false
+void                       // no value / no return
+```
+
+### Type Aliases (keywords)
+
+```cot
+int                        // alias for i64
+float                      // alias for f64
+byte                       // alias for u8
+string                     // alias for []u8 (ptr + len pair at ABI level)
+```
+
+### Composite Types
+
+```cot
+*T                         // pointer to T
+?T                         // optional T (can be null)
+E!T                        // error union (E = error set, T = value type)
+[]T                        // slice of T (ptr + len)
+[N]T                       // fixed-size array of N elements of type T
+[K]V                       // map type (key K, value V)
+[T]                        // list type (dynamic array of T)
+fn(T1, T2) -> R            // function type
+(T1, T2, T3)               // tuple type
+```
+
+## Literals
+
+```cot
+// Integers
+42                         // decimal
+0xFF                       // hexadecimal
+0b1010                     // binary
+0o777                      // octal
+1_000_000                  // underscores for readability
+
+// Floats
+3.14                       // decimal
+1e-5                       // scientific notation
+1_000.5                    // underscores
+
+// Strings
+"hello"                    // string literal
+"Value is ${x}"            // string interpolation
+
+// Characters
+'A'                        // character literal (i64 value)
+'\n'                       // escape sequences
+
+// Other
+true                       // boolean true
+false                      // boolean false
+null                       // null value (for optionals)
+undefined                  // undefined value
+error.Fail                 // error literal
+[1, 2, 3]                 // array literal
+(10, 20)                   // tuple literal
 ```
 
 ## Functions
@@ -199,24 +274,6 @@ apply_fn(fn(x: i64) i64 { return x + 1 }, 5)
 var msg = "Value is ${x}, next is ${y + 1}"
 ```
 
-## Types
-
-```cot
-i64                    // signed 64-bit integer
-i32                    // signed 32-bit integer
-f64                    // 64-bit float
-f32                    // 32-bit float
-bool                   // boolean
-void                   // no value
-*T                     // pointer to T
-?T                     // optional T
-E!T                    // error union (E = error set, T = value type)
-[]T                    // slice of T
-[N]T                   // fixed-size array
-fn(T1, T2) -> R        // function type
-(T1, T2, T3)           // tuple type
-```
-
 ## Operators
 
 ### Arithmetic
@@ -225,25 +282,37 @@ fn(T1, T2) -> R        // function type
 ### Comparison
 `<` `<=` `>` `>=` `==` `!=`
 
-### Logical (keywords, not symbols)
-`and` `or` `not`
+### Logical
+`and` `or` `not` (keywords)
+`&&` `||` `!` (symbol alternatives)
 
 ### Bitwise
 `&` `|` `^` `<<` `>>` `~` (unary NOT)
 
 ### Assignment
-`=` `+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=` `<<=` `>>=`
+`=` `+=` `-=` `*=` `/=` `%=` `&=` `|=` `^=`
 
 ### Unary
 `-x` (negate) `~x` (bitwise NOT) `!x` / `not x` (logical NOT) `try expr` `&x` (address of)
 
 ### Postfix
-`ptr.*` (dereference) `opt.?` (unwrap optional) `.field` (field access) `[i]` (index) `[start:end]` (slice) `(args)` (call)
+`ptr.*` (dereference) `opt.?` (unwrap optional) `?.` (optional chain) `.field` (field access) `[i]` (index) `[start:end]` (slice) `(args)` (call)
 
 ### Nullish Coalesce
 `opt ?? default_value`
 
-## Operator Semantics
+### Operator Precedence (low to high)
+
+| Precedence | Operators |
+|------------|-----------|
+| 1 (lowest) | `??` |
+| 2 | `\|\|`, `or` |
+| 3 | `&&`, `and` |
+| 4 | `==`, `!=`, `<`, `<=`, `>`, `>=` |
+| 5 | `+`, `-`, `\|`, `^` |
+| 6 (highest) | `*`, `/`, `%`, `&`, `<<`, `>>` |
+
+### Operator Semantics
 
 - `>>` is **unsigned shift** (logical, zero-fills) — like C's `>>` on `uint64_t`
 - `and` / `or` **short-circuit**
@@ -259,21 +328,6 @@ arr[:end]            // slice from start
 arr[start:]          // slice to end
 ```
 
-## Literals
-
-```cot
-42                   // integer
-0xFF                 // hex
-3.14                 // float
-"hello"              // string
-'A'                  // character (i64)
-true / false         // boolean
-null                 // null/nil
-error.Fail           // error literal
-[1, 2, 3]            // array literal
-(10, 20)             // tuple literal
-```
-
 ## Memory & Pointers
 
 ```cot
@@ -282,24 +336,102 @@ ptr.* = 42                          // dereference assign
 var val = ptr.*                     // dereference read
 var addr = @ptrToInt(ptr)
 @dealloc(addr, @sizeOf(i64))
+&expr                               // address-of
 ```
 
 ## Builtins
 
+### Type Intrinsics
+
 | Builtin | Purpose |
 |---------|---------|
-| `@alloc(size)` | Allocate bytes |
-| `@dealloc(ptr, size)` | Free memory |
-| `@realloc(ptr, new_size)` | Reallocate |
-| `@memcpy(dst, src, len)` | Copy memory |
 | `@sizeOf(T)` | Size of type in bytes |
+| `@alignOf(T)` | Alignment of type |
 | `@intCast(T, value)` | Cast integer to type T |
+| `@ptrCast(*T, ptr)` | Cast pointer type |
 | `@intToPtr(*T, addr)` | Cast integer to pointer |
 | `@ptrToInt(ptr)` | Cast pointer to integer |
-| `@ptrCast(*T, ptr)` | Cast pointer type |
+
+### Memory
+
+| Builtin | Purpose |
+|---------|---------|
+| `@alloc(size)` | Allocate bytes on heap |
+| `@dealloc(ptr)` | Free memory |
+| `@realloc(ptr, new_size)` | Reallocate |
+| `@memcpy(dst, src, len)` | Copy memory |
+
+### String
+
+| Builtin | Purpose |
+|---------|---------|
+| `@string(ptr, len)` | Construct string from ptr and len |
+| `@ptrOf(s)` | Extract raw pointer from string |
+| `@lenOf(s)` | Extract length from string |
+
+### Math
+
+| Builtin | Purpose |
+|---------|---------|
 | `@sqrt(value)` | Square root |
-| `@assert(cond)` | Runtime assertion |
-| `@trap()` | Unreachable/abort |
+
+### File I/O (WASI)
+
+| Builtin | Purpose |
+|---------|---------|
+| `@fd_write(fd, ptr, len)` | Write to file descriptor |
+| `@fd_read(fd, buf, len)` | Read from file descriptor |
+| `@fd_close(fd)` | Close file descriptor |
+| `@fd_seek(fd, offset, whence)` | Seek in file |
+| `@fd_open(path_ptr, path_len, flags)` | Open file |
+
+### Process
+
+| Builtin | Purpose |
+|---------|---------|
+| `@exit(code)` | Exit process |
+| `@args_count()` | Number of CLI arguments |
+| `@arg_len(n)` | Length of argument n |
+| `@arg_ptr(n)` | Pointer to argument n |
+| `@environ_count()` | Number of environment variables |
+| `@environ_len(n)` | Length of env var n |
+| `@environ_ptr(n)` | Pointer to env var n |
+
+### System
+
+| Builtin | Purpose |
+|---------|---------|
+| `@time()` | Wall clock time in nanoseconds |
+| `@random(buf, len)` | Fill buffer with random bytes |
+| `@trap()` | Unconditional trap / unreachable |
+
+### Comptime
+
+| Builtin | Purpose |
+|---------|---------|
+| `@target_os()` | Target OS as string ("darwin", "linux") |
+| `@target_arch()` | Target arch as string ("arm64", "x86_64") |
+| `@target()` | Full target description |
+
+### Testing
+
+| Builtin | Purpose |
+|---------|---------|
+| `@assert(cond)` | Assert condition is true |
+| `@assert_eq(a, b)` | Assert values are equal |
+
+## Print Functions
+
+Built-in functions (not regular functions, handled specially by the compiler):
+
+```cot
+print(42)              // print to stdout, no newline
+println(42)            // print to stdout with newline
+eprint(42)             // print to stderr, no newline
+eprintln(42)           // print to stderr with newline
+```
+
+All accept `i64`, `f64`, or `string` arguments.
 
 ## ARC (Automatic Reference Counting)
 
@@ -319,7 +451,7 @@ fn DFoo_deinit(self: *DFoo) void { ... }
 
 ```cot
 test "my test" {
-    assert_eq(1 + 1, 2)
+    @assert_eq(1 + 1, 2)
 }
 ```
 
@@ -329,16 +461,20 @@ Run with: `cot test file.cot`
 
 ```cot
 import "module/path"
+import "std/list"          // stdlib modules
 ```
 
-## Print
+## Stdlib Modules
 
-```cot
-print(42)
-println(42)
-eprint(42)
-eprintln(42)
-```
+| Module | Import | Contents |
+|--------|--------|----------|
+| `fs` | `import "fs"` | File struct, openFile, createFile, stdin/stdout/stderr, read/write/close |
+| `os` | `import "os"` | exit, argsCount, argLen, argPtr, environCount, environLen, environPtr |
+| `time` | `import "time"` | Timer struct, nanoTimestamp, milliTimestamp, timestamp |
+| `random` | `import "random"` | fillBytes, randomInt, randomRange |
+| `list` | `import "std/list"` | List(T) with ~35 methods |
+| `map` | `import "std/map"` | Map(K,V) with splitmix64 hash |
+| `set` | `import "std/set"` | Set(T) wrapping Map(T, i64) |
 
 ## No Semicolons
 

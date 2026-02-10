@@ -1613,3 +1613,46 @@ test "list_compact" {
     @assert_eq(list.get(3), 1)
     list.free()
 }
+
+// ============================================================================
+// Comptime target builtins
+// ============================================================================
+
+test "target_os returns string" {
+    var os = @target_os()
+    var len = @lenOf(os)
+    @assert(len > 0)
+}
+
+test "target_arch returns string" {
+    var arch = @target_arch()
+    var len = @lenOf(arch)
+    @assert(len > 0)
+}
+
+test "target returns string" {
+    var t = @target()
+    var len = @lenOf(t)
+    @assert(len > 0)
+}
+
+test "comptime if folds integer" {
+    const val: i64 = if 1 == 1 { 42 } else { 99 }
+    @assert_eq(val, 42)
+}
+
+test "comptime if folds else branch" {
+    const val: i64 = if 1 == 2 { 42 } else { 99 }
+    @assert_eq(val, 99)
+}
+
+test "comptime if target_os string compare" {
+    const flag: i64 = if @target_os() == "linux" { 64 } else { 512 }
+    // On macOS this should be 512, on linux 64
+    @assert(flag > 0)
+}
+
+test "comptime if target_os neq" {
+    const flag: i64 = if @target_os() != "nonexistent_os" { 1 } else { 0 }
+    @assert_eq(flag, 1)
+}
