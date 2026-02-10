@@ -1,0 +1,294 @@
+// String methods and StringBuilder tests.
+
+import "std/string"
+import "std/list"
+
+// ============================================================================
+// charAt
+// ============================================================================
+
+test "charAt basic" {
+    var s = "hello"
+    @assert_eq(charAt(s, 0), 104)
+    @assert_eq(charAt(s, 1), 101)
+    @assert_eq(charAt(s, 4), 111)
+}
+
+// ============================================================================
+// indexOf / lastIndexOf / contains
+// ============================================================================
+
+test "indexOf found" {
+    @assert_eq(indexOf("hello world", "world"), 6)
+    @assert_eq(indexOf("hello world", "hello"), 0)
+    @assert_eq(indexOf("hello world", "o"), 4)
+}
+
+test "indexOf not found" {
+    @assert_eq(indexOf("hello", "xyz"), 0 - 1)
+    @assert_eq(indexOf("abc", "abcd"), 0 - 1)
+}
+
+test "indexOf empty needle" {
+    @assert_eq(indexOf("hello", ""), 0)
+}
+
+test "lastIndexOf" {
+    @assert_eq(lastIndexOf("hello world hello", "hello"), 12)
+    @assert_eq(lastIndexOf("aaa", "a"), 2)
+    @assert_eq(lastIndexOf("abc", "xyz"), 0 - 1)
+}
+
+test "contains" {
+    @assert(contains("hello world", "world"))
+    @assert(contains("hello", "ello"))
+    @assert(!contains("hello", "xyz"))
+}
+
+// ============================================================================
+// startsWith / endsWith
+// ============================================================================
+
+test "startsWith" {
+    @assert(startsWith("hello world", "hello"))
+    @assert(startsWith("hello", "hello"))
+    @assert(!startsWith("hello", "world"))
+    @assert(startsWith("hello", ""))
+}
+
+test "endsWith" {
+    @assert(endsWith("hello world", "world"))
+    @assert(endsWith("hello", "hello"))
+    @assert(!endsWith("hello", "xyz"))
+    @assert(endsWith("hello", ""))
+}
+
+// ============================================================================
+// count
+// ============================================================================
+
+test "count" {
+    @assert_eq(count("aabbaab", "aa"), 2)
+    @assert_eq(count("hello", "l"), 2)
+    @assert_eq(count("hello", "xyz"), 0)
+}
+
+// ============================================================================
+// substring
+// ============================================================================
+
+test "substring" {
+    @assert_eq(substring("hello world", 0, 5), "hello")
+    @assert_eq(substring("hello world", 6, 11), "world")
+    @assert_eq(substring("hello", 1, 4), "ell")
+}
+
+test "substring clamp" {
+    @assert_eq(substring("hello", 0, 100), "hello")
+    @assert_eq(substring("hello", 3, 3), "")
+}
+
+// ============================================================================
+// trim / trimLeft / trimRight
+// ============================================================================
+
+test "trim" {
+    @assert_eq(trim("  hello  "), "hello")
+    @assert_eq(trim("hello"), "hello")
+    @assert_eq(trim("  "), "")
+}
+
+test "trimLeft" {
+    @assert_eq(trimLeft("  hello"), "hello")
+    @assert_eq(trimLeft("hello  "), "hello  ")
+}
+
+test "trimRight" {
+    @assert_eq(trimRight("hello  "), "hello")
+    @assert_eq(trimRight("  hello"), "  hello")
+}
+
+// ============================================================================
+// toUpper / toLower
+// ============================================================================
+
+test "toUpper" {
+    @assert_eq(toUpper("hello"), "HELLO")
+    @assert_eq(toUpper("Hello World"), "HELLO WORLD")
+    @assert_eq(toUpper("123"), "123")
+}
+
+test "toLower" {
+    @assert_eq(toLower("HELLO"), "hello")
+    @assert_eq(toLower("Hello World"), "hello world")
+    @assert_eq(toLower("123"), "123")
+}
+
+// ============================================================================
+// replace
+// ============================================================================
+
+test "replace" {
+    @assert_eq(replace("hello world", "world", "earth"), "hello earth")
+    @assert_eq(replace("aabbcc", "bb", "xx"), "aaxxcc")
+    @assert_eq(replace("aaa", "a", "bb"), "bbbbbb")
+}
+
+test "replace no match" {
+    @assert_eq(replace("hello", "xyz", "abc"), "hello")
+}
+
+// ============================================================================
+// repeat
+// ============================================================================
+
+test "repeat" {
+    @assert_eq(repeat("ab", 3), "ababab")
+    @assert_eq(repeat("x", 5), "xxxxx")
+    @assert_eq(repeat("hello", 0), "")
+}
+
+// ============================================================================
+// split
+// ============================================================================
+
+test "split basic" {
+    var parts: List(string) = .{}
+    splitInto("a,b,c", ",", &parts)
+    @assert_eq(parts.count, 3)
+    @assert_eq(parts.get(0), "a")
+    @assert_eq(parts.get(1), "b")
+    @assert_eq(parts.get(2), "c")
+    parts.free()
+}
+
+test "split no separator found" {
+    var parts: List(string) = .{}
+    splitInto("hello", ",", &parts)
+    @assert_eq(parts.count, 1)
+    @assert_eq(parts.get(0), "hello")
+    parts.free()
+}
+
+test "split multi-char separator" {
+    var parts: List(string) = .{}
+    splitInto("a::b::c", "::", &parts)
+    @assert_eq(parts.count, 3)
+    @assert_eq(parts.get(0), "a")
+    @assert_eq(parts.get(1), "b")
+    @assert_eq(parts.get(2), "c")
+    parts.free()
+}
+
+// ============================================================================
+// parseInt / parseIntOr
+// ============================================================================
+
+test "parseInt" {
+    @assert_eq(parseInt("123"), 123)
+    @assert_eq(parseInt("-456"), 0 - 456)
+    @assert_eq(parseInt("0"), 0)
+}
+
+test "parseIntOr" {
+    @assert_eq(parseIntOr("42", 0), 42)
+    @assert_eq(parseIntOr("abc", 99), 99)
+    @assert_eq(parseIntOr("", 0 - 1), 0 - 1)
+}
+
+// ============================================================================
+// compare
+// ============================================================================
+
+test "compare" {
+    @assert_eq(compare("abc", "abc"), 0)
+    @assert_eq(compare("abc", "abd"), 0 - 1)
+    @assert_eq(compare("abd", "abc"), 1)
+    @assert_eq(compare("ab", "abc"), 0 - 1)
+    @assert_eq(compare("abc", "ab"), 1)
+}
+
+// ============================================================================
+// intToString
+// ============================================================================
+
+test "intToString" {
+    @assert_eq(intToString(0), "0")
+    @assert_eq(intToString(42), "42")
+    @assert_eq(intToString(12345), "12345")
+    @assert_eq(intToString(0 - 7), "-7")
+}
+
+// ============================================================================
+// utility functions
+// ============================================================================
+
+test "isDigit" {
+    @assert(isDigit(48))
+    @assert(isDigit(57))
+    @assert(!isDigit(65))
+}
+
+test "isAlpha" {
+    @assert(isAlpha(65))
+    @assert(isAlpha(122))
+    @assert(!isAlpha(48))
+}
+
+test "isWhitespace" {
+    @assert(isWhitespace(32))
+    @assert(isWhitespace(10))
+    @assert(!isWhitespace(65))
+}
+
+// ============================================================================
+// StringBuilder
+// ============================================================================
+
+test "StringBuilder basic" {
+    var sb: StringBuilder = .{}
+    sb.append("hello")
+    sb.append(" ")
+    sb.append("world")
+    @assert_eq(sb.toString(), "hello world")
+    @assert_eq(sb.length(), 11)
+    sb.free()
+}
+
+test "StringBuilder appendByte" {
+    var sb: StringBuilder = .{}
+    sb.appendByte(72)
+    sb.appendByte(105)
+    @assert_eq(sb.toString(), "Hi")
+    sb.free()
+}
+
+test "StringBuilder appendInt" {
+    var sb: StringBuilder = .{}
+    sb.append("count: ")
+    sb.appendInt(42)
+    @assert_eq(sb.toString(), "count: 42")
+    sb.free()
+}
+
+test "StringBuilder clear" {
+    var sb: StringBuilder = .{}
+    sb.append("hello")
+    @assert_eq(sb.length(), 5)
+    sb.clear()
+    @assert_eq(sb.length(), 0)
+    sb.append("world")
+    @assert_eq(sb.toString(), "world")
+    sb.free()
+}
+
+test "StringBuilder grow" {
+    var sb: StringBuilder = .{}
+    var i: i64 = 0
+    while i < 100 {
+        sb.append("x")
+        i = i + 1
+    }
+    @assert_eq(sb.length(), 100)
+    sb.free()
+}

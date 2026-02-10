@@ -1,0 +1,527 @@
+// string — String methods and StringBuilder.
+//
+// All functions operate on Cot's string type (ptr + len pair).
+// Byte access via @intToPtr(*u8, @ptrOf(s) + offset).* — proven pattern from List/Map.
+//
+// References:
+//   Go:  strings/strings.go (API, algorithms)
+//   Zig: std/mem.zig (byte scanning)
+
+// ============================================================================
+// Byte Access
+// ============================================================================
+
+fn charAt(s: string, index: i64) i64 {
+    if index < 0 { @trap() }
+    if index >= @lenOf(s) { @trap() }
+    var ptr = @intToPtr(*u8, @ptrOf(s) + index)
+    return ptr.*
+}
+
+// ============================================================================
+// Search
+// ============================================================================
+
+fn indexOf(s: string, needle: string) i64 {
+    var slen = @lenOf(s)
+    var nlen = @lenOf(needle)
+    if nlen == 0 { return 0 }
+    if nlen > slen { return 0 - 1 }
+    var limit = slen - nlen
+    var i: i64 = 0
+    while i <= limit {
+        var found = true
+        var j: i64 = 0
+        while j < nlen {
+            var a = @intToPtr(*u8, @ptrOf(s) + i + j)
+            var b = @intToPtr(*u8, @ptrOf(needle) + j)
+            if a.* != b.* {
+                found = false
+                j = nlen
+            } else {
+                j = j + 1
+            }
+        }
+        if found { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn lastIndexOf(s: string, needle: string) i64 {
+    var slen = @lenOf(s)
+    var nlen = @lenOf(needle)
+    if nlen == 0 { return slen }
+    if nlen > slen { return 0 - 1 }
+    var i = slen - nlen
+    while i >= 0 {
+        var found = true
+        var j: i64 = 0
+        while j < nlen {
+            var a = @intToPtr(*u8, @ptrOf(s) + i + j)
+            var b = @intToPtr(*u8, @ptrOf(needle) + j)
+            if a.* != b.* {
+                found = false
+                j = nlen
+            } else {
+                j = j + 1
+            }
+        }
+        if found { return i }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn contains(s: string, needle: string) bool {
+    return indexOf(s, needle) >= 0
+}
+
+fn startsWith(s: string, prefix: string) bool {
+    var slen = @lenOf(s)
+    var plen = @lenOf(prefix)
+    if plen > slen { return false }
+    var i: i64 = 0
+    while i < plen {
+        var a = @intToPtr(*u8, @ptrOf(s) + i)
+        var b = @intToPtr(*u8, @ptrOf(prefix) + i)
+        if a.* != b.* { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn endsWith(s: string, suffix: string) bool {
+    var slen = @lenOf(s)
+    var xlen = @lenOf(suffix)
+    if xlen > slen { return false }
+    var offset = slen - xlen
+    var i: i64 = 0
+    while i < xlen {
+        var a = @intToPtr(*u8, @ptrOf(s) + offset + i)
+        var b = @intToPtr(*u8, @ptrOf(suffix) + i)
+        if a.* != b.* { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn count(s: string, needle: string) i64 {
+    var nlen = @lenOf(needle)
+    if nlen == 0 { return @lenOf(s) + 1 }
+    var n: i64 = 0
+    var i: i64 = 0
+    var slen = @lenOf(s)
+    while i <= slen - nlen {
+        var found = true
+        var j: i64 = 0
+        while j < nlen {
+            var a = @intToPtr(*u8, @ptrOf(s) + i + j)
+            var b = @intToPtr(*u8, @ptrOf(needle) + j)
+            if a.* != b.* {
+                found = false
+                j = nlen
+            } else {
+                j = j + 1
+            }
+        }
+        if found {
+            n = n + 1
+            i = i + nlen
+        } else {
+            i = i + 1
+        }
+    }
+    return n
+}
+
+// ============================================================================
+// Extraction
+// ============================================================================
+
+fn substring(s: string, start: i64, end: i64) string {
+    var slen = @lenOf(s)
+    var st = start
+    var en = end
+    if st < 0 { st = 0 }
+    if en > slen { en = slen }
+    if st >= en { return "" }
+    return @string(@ptrOf(s) + st, en - st)
+}
+
+fn trimLeft(s: string) string {
+    var slen = @lenOf(s)
+    var i: i64 = 0
+    while i < slen {
+        var c = @intToPtr(*u8, @ptrOf(s) + i)
+        if c.* != 32 and c.* != 9 and c.* != 10 and c.* != 13 {
+            return @string(@ptrOf(s) + i, slen - i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn trimRight(s: string) string {
+    var slen = @lenOf(s)
+    var i = slen - 1
+    while i >= 0 {
+        var c = @intToPtr(*u8, @ptrOf(s) + i)
+        if c.* != 32 and c.* != 9 and c.* != 10 and c.* != 13 {
+            return @string(@ptrOf(s), i + 1)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn trim(s: string) string {
+    return trimRight(trimLeft(s))
+}
+
+// ============================================================================
+// Transformation
+// ============================================================================
+
+fn toUpper(s: string) string {
+    var slen = @lenOf(s)
+    if slen == 0 { return "" }
+    var buf = @alloc(slen)
+    var i: i64 = 0
+    while i < slen {
+        var c = @intToPtr(*u8, @ptrOf(s) + i)
+        var dst = @intToPtr(*u8, buf + i)
+        var ch = c.*
+        if ch >= 97 and ch <= 122 {
+            dst.* = ch - 32
+        } else {
+            dst.* = ch
+        }
+        i = i + 1
+    }
+    return @string(buf, slen)
+}
+
+fn toLower(s: string) string {
+    var slen = @lenOf(s)
+    if slen == 0 { return "" }
+    var buf = @alloc(slen)
+    var i: i64 = 0
+    while i < slen {
+        var c = @intToPtr(*u8, @ptrOf(s) + i)
+        var dst = @intToPtr(*u8, buf + i)
+        var ch = c.*
+        if ch >= 65 and ch <= 90 {
+            dst.* = ch + 32
+        } else {
+            dst.* = ch
+        }
+        i = i + 1
+    }
+    return @string(buf, slen)
+}
+
+fn replace(s: string, old: string, new_s: string) string {
+    var oldlen = @lenOf(old)
+    var newlen = @lenOf(new_s)
+    var slen = @lenOf(s)
+    if oldlen == 0 { return s }
+
+    // Count occurrences to compute result size
+    var n = count(s, old)
+    if n == 0 { return s }
+
+    var result_len = slen + n * (newlen - oldlen)
+    var buf = @alloc(result_len)
+    var wi: i64 = 0
+    var ri: i64 = 0
+
+    while ri <= slen - oldlen {
+        var found = true
+        var j: i64 = 0
+        while j < oldlen {
+            var a = @intToPtr(*u8, @ptrOf(s) + ri + j)
+            var b = @intToPtr(*u8, @ptrOf(old) + j)
+            if a.* != b.* {
+                found = false
+                j = oldlen
+            } else {
+                j = j + 1
+            }
+        }
+        if found {
+            // Copy new_s into buf
+            if newlen > 0 {
+                @memcpy(buf + wi, @ptrOf(new_s), newlen)
+            }
+            wi = wi + newlen
+            ri = ri + oldlen
+        } else {
+            var src = @intToPtr(*u8, @ptrOf(s) + ri)
+            var dst = @intToPtr(*u8, buf + wi)
+            dst.* = src.*
+            wi = wi + 1
+            ri = ri + 1
+        }
+    }
+    // Copy remaining bytes
+    while ri < slen {
+        var src = @intToPtr(*u8, @ptrOf(s) + ri)
+        var dst = @intToPtr(*u8, buf + wi)
+        dst.* = src.*
+        wi = wi + 1
+        ri = ri + 1
+    }
+    return @string(buf, result_len)
+}
+
+fn repeat(s: string, n: i64) string {
+    var slen = @lenOf(s)
+    if n <= 0 { return "" }
+    if slen == 0 { return "" }
+    var total = slen * n
+    var buf = @alloc(total)
+    var i: i64 = 0
+    while i < n {
+        @memcpy(buf + i * slen, @ptrOf(s), slen)
+        i = i + 1
+    }
+    return @string(buf, total)
+}
+
+// ============================================================================
+// Splitting
+// ============================================================================
+
+import "std/list"
+
+fn splitInto(s: string, sep: string, result: *List(string)) void {
+    var slen = @lenOf(s)
+    var seplen = @lenOf(sep)
+
+    if seplen == 0 {
+        // Split into individual characters
+        var i: i64 = 0
+        while i < slen {
+            result.append(@string(@ptrOf(s) + i, 1))
+            i = i + 1
+        }
+        return
+    }
+
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= slen - seplen {
+        var found = true
+        var j: i64 = 0
+        while j < seplen {
+            var a = @intToPtr(*u8, @ptrOf(s) + i + j)
+            var b = @intToPtr(*u8, @ptrOf(sep) + j)
+            if a.* != b.* {
+                found = false
+                j = seplen
+            } else {
+                j = j + 1
+            }
+        }
+        if found {
+            result.append(@string(@ptrOf(s) + start, i - start))
+            i = i + seplen
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    // Append remaining
+    result.append(@string(@ptrOf(s) + start, slen - start))
+}
+
+// ============================================================================
+// Conversion
+// ============================================================================
+
+fn parseInt(s: string) i64 {
+    var slen = @lenOf(s)
+    if slen == 0 { return 0 }
+    var result: i64 = 0
+    var i: i64 = 0
+    var negative = false
+    var first = @intToPtr(*u8, @ptrOf(s))
+    if first.* == 45 {
+        negative = true
+        i = 1
+    }
+    while i < slen {
+        var c = @intToPtr(*u8, @ptrOf(s) + i)
+        var digit = c.* - 48
+        if digit < 0 { return 0 }
+        if digit > 9 { return 0 }
+        result = result * 10 + digit
+        i = i + 1
+    }
+    if negative { return 0 - result }
+    return result
+}
+
+fn parseIntOr(s: string, default: i64) i64 {
+    var slen = @lenOf(s)
+    if slen == 0 { return default }
+    var result: i64 = 0
+    var i: i64 = 0
+    var negative = false
+    var first = @intToPtr(*u8, @ptrOf(s))
+    if first.* == 45 {
+        negative = true
+        i = 1
+    }
+    if i >= slen { return default }
+    while i < slen {
+        var c = @intToPtr(*u8, @ptrOf(s) + i)
+        var digit = c.* - 48
+        if digit < 0 { return default }
+        if digit > 9 { return default }
+        result = result * 10 + digit
+        i = i + 1
+    }
+    if negative { return 0 - result }
+    return result
+}
+
+// ============================================================================
+// Comparison
+// ============================================================================
+
+fn strEqual(a: string, b: string) bool {
+    return a == b
+}
+
+fn compare(a: string, b: string) i64 {
+    var alen = @lenOf(a)
+    var blen = @lenOf(b)
+    var minlen = alen
+    if blen < minlen { minlen = blen }
+    var i: i64 = 0
+    while i < minlen {
+        var ca = @intToPtr(*u8, @ptrOf(a) + i)
+        var cb = @intToPtr(*u8, @ptrOf(b) + i)
+        if ca.* < cb.* { return 0 - 1 }
+        if ca.* > cb.* { return 1 }
+        i = i + 1
+    }
+    if alen < blen { return 0 - 1 }
+    if alen > blen { return 1 }
+    return 0
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+fn intToString(n: i64) string {
+    if n == 0 { return "0" }
+    var val = n
+    var negative = false
+    if val < 0 {
+        negative = true
+        val = 0 - val
+    }
+    // Max i64 is 19 digits + sign
+    var buf = @alloc(21)
+    var pos: i64 = 20
+    while val > 0 {
+        var digit = val % 10
+        val = val / 10
+        var p = @intToPtr(*u8, buf + pos)
+        p.* = @intCast(u8, digit + 48)
+        pos = pos - 1
+    }
+    if negative {
+        var p = @intToPtr(*u8, buf + pos)
+        p.* = @intCast(u8, 45)
+        pos = pos - 1
+    }
+    var start = pos + 1
+    var slen = 21 - start
+    return @string(buf + start, slen)
+}
+
+fn isDigit(c: i64) bool {
+    return c >= 48 and c <= 57
+}
+
+fn isAlpha(c: i64) bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+}
+
+fn isWhitespace(c: i64) bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
+// ============================================================================
+// StringBuilder
+// ============================================================================
+
+struct StringBuilder {
+    buf: i64,
+    len: i64,
+    cap: i64,
+}
+
+impl StringBuilder {
+    fn grow(self: *StringBuilder, needed: i64) void {
+        if self.cap >= needed { return }
+        var new_cap = self.cap
+        if new_cap == 0 { new_cap = 64 }
+        while new_cap < needed {
+            new_cap = new_cap * 2
+        }
+        if self.cap == 0 {
+            self.buf = @alloc(new_cap)
+        } else {
+            self.buf = @realloc(self.buf, new_cap)
+        }
+        self.cap = new_cap
+    }
+
+    fn append(self: *StringBuilder, s: string) void {
+        var slen = @lenOf(s)
+        if slen == 0 { return }
+        self.grow(self.len + slen)
+        @memcpy(self.buf + self.len, @ptrOf(s), slen)
+        self.len = self.len + slen
+    }
+
+    fn appendByte(self: *StringBuilder, b: i64) void {
+        self.grow(self.len + 1)
+        var p = @intToPtr(*u8, self.buf + self.len)
+        p.* = @intCast(u8, b)
+        self.len = self.len + 1
+    }
+
+    fn appendInt(self: *StringBuilder, n: i64) void {
+        var s = intToString(n)
+        self.append(s)
+    }
+
+    fn toString(self: *StringBuilder) string {
+        if self.len == 0 { return "" }
+        return @string(self.buf, self.len)
+    }
+
+    fn length(self: *StringBuilder) i64 {
+        return self.len
+    }
+
+    fn clear(self: *StringBuilder) void {
+        self.len = 0
+    }
+
+    fn free(self: *StringBuilder) void {
+        if self.cap > 0 {
+            @dealloc(self.buf)
+        }
+        self.buf = 0
+        self.len = 0
+        self.cap = 0
+    }
+}

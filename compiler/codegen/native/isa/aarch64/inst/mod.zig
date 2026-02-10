@@ -951,6 +951,15 @@ pub const Inst = union(enum) {
         cond: Cond,
     },
 
+    // Floating-point conditional select: rd = cond ? rn : rm
+    fcsel: struct {
+        rd: Writable(Reg),
+        rn: Reg,
+        rm: Reg,
+        cond: Cond,
+        size: ScalarSize,
+    },
+
     // Conditional select negate: rd = cond ? rn : -rm
     csneg: struct {
         rd: Writable(Reg),

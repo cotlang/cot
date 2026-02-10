@@ -800,6 +800,30 @@ pub const FuncInstBuilder = struct {
         return r.result.?;
     }
 
+    /// Float ceil (round toward positive infinity).
+    pub fn ceil(self: Self, ty: Type, arg: Value) !Value {
+        const r = try self.Unary(.ceil, ty, arg);
+        return r.result.?;
+    }
+
+    /// Float floor (round toward negative infinity).
+    pub fn floor(self: Self, ty: Type, arg: Value) !Value {
+        const r = try self.Unary(.floor, ty, arg);
+        return r.result.?;
+    }
+
+    /// Float trunc (round toward zero).
+    pub fn ftrunc(self: Self, ty: Type, arg: Value) !Value {
+        const r = try self.Unary(.trunc, ty, arg);
+        return r.result.?;
+    }
+
+    /// Float nearest (round to nearest even).
+    pub fn nearest(self: Self, ty: Type, arg: Value) !Value {
+        const r = try self.Unary(.nearest, ty, arg);
+        return r.result.?;
+    }
+
     // ========================================================================
     // Comparisons
     // ========================================================================

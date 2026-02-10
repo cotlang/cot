@@ -1,0 +1,252 @@
+import "std/json"
+import "std/string"
+
+// ============================================================================
+// Constructor + accessor tests
+// ============================================================================
+
+test "null value" {
+    var v = jsonNull()
+    @assert_eq(jsonTag(v), JSON_NULL)
+    @assert(jsonIsNull(v))
+}
+
+test "bool true" {
+    var v = jsonBool(true)
+    @assert_eq(jsonTag(v), JSON_BOOL)
+    @assert(jsonGetBool(v))
+}
+
+test "bool false" {
+    var v = jsonBool(false)
+    @assert_eq(jsonTag(v), JSON_BOOL)
+    @assert(not jsonGetBool(v))
+}
+
+test "integer" {
+    var v = jsonInt(42)
+    @assert_eq(jsonTag(v), JSON_INT)
+    @assert_eq(jsonGetInt(v), 42)
+}
+
+test "negative integer" {
+    var v = jsonInt(0 - 99)
+    @assert_eq(jsonGetInt(v), 0 - 99)
+}
+
+test "string value" {
+    var v = jsonString("hello")
+    @assert_eq(jsonTag(v), JSON_STRING)
+    @assert_eq(jsonGetString(v), "hello")
+}
+
+// ============================================================================
+// Array tests
+// ============================================================================
+
+test "empty array" {
+    var arr = jsonArray()
+    @assert_eq(jsonArrayLen(arr), 0)
+}
+
+test "array push and get" {
+    var arr = jsonArray()
+    jsonArrayPush(arr, jsonInt(1))
+    jsonArrayPush(arr, jsonInt(2))
+    jsonArrayPush(arr, jsonInt(3))
+    @assert_eq(jsonArrayLen(arr), 3)
+    @assert_eq(jsonGetInt(jsonArrayGet(arr, 0)), 1)
+    @assert_eq(jsonGetInt(jsonArrayGet(arr, 1)), 2)
+    @assert_eq(jsonGetInt(jsonArrayGet(arr, 2)), 3)
+}
+
+// ============================================================================
+// Object tests
+// ============================================================================
+
+test "empty object" {
+    var obj = jsonObject()
+    @assert_eq(jsonObjectLen(obj), 0)
+}
+
+test "object put and get" {
+    var obj = jsonObject()
+    jsonObjectPut(obj, "name", jsonString("alice"))
+    jsonObjectPut(obj, "age", jsonInt(30))
+    @assert_eq(jsonObjectLen(obj), 2)
+    @assert_eq(jsonObjectGetString(obj, "name"), "alice")
+    @assert_eq(jsonObjectGetInt(obj, "age"), 30)
+}
+
+test "object missing key" {
+    var obj = jsonObject()
+    jsonObjectPut(obj, "x", jsonInt(1))
+    var val = jsonObjectGet(obj, "y")
+    @assert_eq(val, 0)
+}
+
+// ============================================================================
+// Parse tests
+// ============================================================================
+
+test "parse null" {
+    var v = parse("null")
+    @assert(jsonIsNull(v))
+}
+
+test "parse true" {
+    var v = parse("true")
+    @assert_eq(jsonTag(v), JSON_BOOL)
+    @assert(jsonGetBool(v))
+}
+
+test "parse false" {
+    var v = parse("false")
+    @assert_eq(jsonTag(v), JSON_BOOL)
+    @assert(not jsonGetBool(v))
+}
+
+test "parse integer" {
+    var v = parse("42")
+    @assert_eq(jsonGetInt(v), 42)
+}
+
+test "parse negative" {
+    var v = parse("-7")
+    @assert_eq(jsonGetInt(v), 0 - 7)
+}
+
+test "parse string" {
+    var v = parse("\"hello\"")
+    @assert_eq(jsonGetString(v), "hello")
+}
+
+test "parse empty array" {
+    var v = parse("[]")
+    @assert_eq(jsonTag(v), JSON_ARRAY)
+    @assert_eq(jsonArrayLen(v), 0)
+}
+
+test "parse array" {
+    var v = parse("[1, 2, 3]")
+    @assert_eq(jsonArrayLen(v), 3)
+    @assert_eq(jsonGetInt(jsonArrayGet(v, 0)), 1)
+    @assert_eq(jsonGetInt(jsonArrayGet(v, 1)), 2)
+    @assert_eq(jsonGetInt(jsonArrayGet(v, 2)), 3)
+}
+
+test "parse empty object" {
+    var v = parse("{}")
+    @assert_eq(jsonTag(v), JSON_OBJECT)
+    @assert_eq(jsonObjectLen(v), 0)
+}
+
+test "parse object" {
+    var v = parse("{\"name\": \"bob\", \"age\": 25}")
+    @assert_eq(jsonObjectGetString(v, "name"), "bob")
+    @assert_eq(jsonObjectGetInt(v, "age"), 25)
+}
+
+test "parse nested" {
+    var v = parse("{\"data\": [1, 2], \"ok\": true}")
+    var arr = jsonObjectGet(v, "data")
+    @assert_eq(jsonArrayLen(arr), 2)
+    @assert_eq(jsonGetInt(jsonArrayGet(arr, 0)), 1)
+    @assert(jsonObjectGetBool(v, "ok"))
+}
+
+// ============================================================================
+// Encode tests
+// ============================================================================
+
+test "encode null" {
+    @assert_eq(encode(jsonNull()), "null")
+}
+
+test "encode bool" {
+    @assert_eq(encode(jsonBool(true)), "true")
+    @assert_eq(encode(jsonBool(false)), "false")
+}
+
+test "encode int" {
+    @assert_eq(encode(jsonInt(42)), "42")
+}
+
+test "encode string" {
+    @assert_eq(encode(jsonString("hello")), "\"hello\"")
+}
+
+test "encode array" {
+    var arr = jsonArray()
+    jsonArrayPush(arr, jsonInt(1))
+    jsonArrayPush(arr, jsonInt(2))
+    @assert_eq(encode(arr), "[1,2]")
+}
+
+test "encode object" {
+    var obj = jsonObject()
+    jsonObjectPut(obj, "x", jsonInt(1))
+    @assert_eq(encode(obj), "{\"x\":1}")
+}
+
+test "roundtrip" {
+    var input = "{\"name\":\"test\",\"val\":42}"
+    var v = parse(input)
+    var output = encode(v)
+    @assert_eq(output, input)
+}
+
+// ============================================================================
+// Escape handling tests (Go encoding/json reference compliance)
+// ============================================================================
+
+test "parse string with newline escape" {
+    var v = parse("\"hello\\nworld\"")
+    var s = jsonGetString(v)
+    @assert_eq(@lenOf(s), 11)
+    // byte 5 should be newline (10)
+    @assert_eq(@intToPtr(*u8, @ptrOf(s) + 5).*, 10)
+}
+
+test "parse string with unicode escape" {
+    // \u0041 = 'A' (codepoint 65)
+    var v = parse("\"\\u0041\"")
+    @assert_eq(jsonGetString(v), "A")
+}
+
+test "parse string with unicode escape multibyte" {
+    // \u00E9 = 'e' with acute accent (U+00E9, 2 bytes in UTF-8: 0xC3 0xA9)
+    var v = parse("\"\\u00e9\"")
+    var s = jsonGetString(v)
+    @assert_eq(@lenOf(s), 2)
+}
+
+test "parse number zero" {
+    var v = parse("0")
+    @assert_eq(jsonGetInt(v), 0)
+}
+
+test "parse number with exponent" {
+    // 1e2 is valid JSON — parseInt returns 1 (V1: integer value only)
+    var v = parse("1e2")
+    @assert_eq(jsonTag(v), JSON_INT)
+}
+
+test "parse number with decimal and exponent" {
+    // 3.14e0 is valid JSON
+    var v = parse("3.14e0")
+    @assert_eq(jsonTag(v), JSON_INT)
+}
+
+test "parse object with escaped key" {
+    var v = parse("{\"hello\\nworld\": 42}")
+    @assert_eq(jsonObjectLen(v), 1)
+}
+
+test "encode string with backslash" {
+    @assert_eq(encode(jsonString("a\\b")), "\"a\\\\b\"")
+}
+
+test "encode string with quote" {
+    @assert_eq(encode(jsonString("say \"hi\"")), "\"say \\\"hi\\\"\"")
+}

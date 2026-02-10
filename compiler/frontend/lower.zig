@@ -34,6 +34,8 @@ pub const Lowerer = struct {
     loop_stack: std.ArrayListUnmanaged(LoopContext),
     cleanup_stack: arc.CleanupStack,
     const_values: std.StringHashMap(i64),
+    float_const_values: std.StringHashMap(f64),
+    float_const_types: std.StringHashMap(TypeIndex),
     test_mode: bool = false,
     test_names: std.ArrayListUnmanaged([]const u8),
     test_display_names: std.ArrayListUnmanaged([]const u8),
@@ -76,6 +78,8 @@ pub const Lowerer = struct {
             .loop_stack = .{},
             .cleanup_stack = arc.CleanupStack.init(allocator),
             .const_values = std.StringHashMap(i64).init(allocator),
+            .float_const_values = std.StringHashMap(f64).init(allocator),
+            .float_const_types = std.StringHashMap(TypeIndex).init(allocator),
             .test_names = .{},
             .test_display_names = .{},
             .lowered_generics = std.StringHashMap(void).init(allocator),
@@ -93,6 +97,8 @@ pub const Lowerer = struct {
         self.loop_stack.deinit(self.allocator);
         self.cleanup_stack.deinit();
         self.const_values.deinit();
+        self.float_const_values.deinit();
+        self.float_const_types.deinit();
         self.test_names.deinit(self.allocator);
         self.test_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
@@ -102,6 +108,8 @@ pub const Lowerer = struct {
     pub fn deinitWithoutBuilder(self: *Lowerer) void {
         self.loop_stack.deinit(self.allocator);
         self.const_values.deinit();
+        self.float_const_values.deinit();
+        self.float_const_types.deinit();
         self.test_names.deinit(self.allocator);
         self.test_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
@@ -269,10 +277,51 @@ pub const Lowerer = struct {
                     try self.const_values.put(var_decl.name, value);
                     return;
                 }
+                if (sym.float_const_value) |fvalue| {
+                    try self.float_const_values.put(var_decl.name, fvalue);
+                    try self.float_const_types.put(var_decl.name, sym.type_idx);
+                    return;
+                }
+            }
+            // Float consts: parse literal value and store in float_const_values
+            if ((type_idx == TypeRegistry.F32 or type_idx == TypeRegistry.F64) and var_decl.value != null_node) {
+                if (self.evalFloatLiteral(var_decl.value)) |fval| {
+                    try self.float_const_values.put(var_decl.name, fval);
+                    try self.float_const_types.put(var_decl.name, type_idx);
+                    return;
+                }
             }
         }
         const type_size: u32 = @intCast(self.type_reg.sizeOf(type_idx));
         try self.builder.addGlobal(ir.Global.initWithSize(var_decl.name, type_idx, var_decl.is_const, var_decl.span, type_size));
+    }
+
+    fn evalFloatLiteral(self: *Lowerer, idx: NodeIndex) ?f64 {
+        const node = self.tree.getNode(idx) orelse return null;
+        const expr = node.asExpr() orelse return null;
+        return switch (expr) {
+            .literal => |lit| switch (lit.kind) {
+                .float => std.fmt.parseFloat(f64, lit.value) catch null,
+                else => null,
+            },
+            .paren => |p| self.evalFloatLiteral(p.inner),
+            .unary => |un| if (un.op == .sub) blk: {
+                const v = self.evalFloatLiteral(un.operand) orelse break :blk null;
+                break :blk -v;
+            } else null,
+            .binary => |bin| blk: {
+                const l = self.evalFloatLiteral(bin.left) orelse break :blk null;
+                const r = self.evalFloatLiteral(bin.right) orelse break :blk null;
+                break :blk switch (bin.op) {
+                    .add => l + r,
+                    .sub => l - r,
+                    .mul => l * r,
+                    .quo => l / r,
+                    else => null,
+                };
+            },
+            else => null,
+        };
     }
 
     fn lowerStructDecl(self: *Lowerer, struct_decl: ast.StructDecl) !void {
@@ -1712,6 +1761,10 @@ pub const Lowerer = struct {
     fn lowerIdent(self: *Lowerer, ident: ast.Ident) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
         if (self.const_values.get(ident.name)) |value| return try fb.emitConstInt(value, TypeRegistry.I64, ident.span);
+        if (self.float_const_values.get(ident.name)) |fvalue| {
+            const ftype = self.float_const_types.get(ident.name) orelse TypeRegistry.F64;
+            return try fb.emitConstFloat(fvalue, ftype, ident.span);
+        }
         if (fb.lookupLocal(ident.name)) |local_idx| {
             const local_type = fb.locals.items[local_idx].type_idx;
             if (self.type_reg.isArray(local_type)) return try fb.emitAddrLocal(local_idx, local_type, ident.span);
@@ -1719,7 +1772,10 @@ pub const Lowerer = struct {
         }
         if (self.chk.scope.lookup(ident.name)) |sym| {
             if (sym.kind == .function) return try self.createFuncValue(ident.name, sym.type_idx, ident.span);
-            if (sym.kind == .constant) if (sym.const_value) |value| return try fb.emitConstInt(value, TypeRegistry.I64, ident.span);
+            if (sym.kind == .constant) {
+                if (sym.const_value) |value| return try fb.emitConstInt(value, TypeRegistry.I64, ident.span);
+                if (sym.float_const_value) |fvalue| return try fb.emitConstFloat(fvalue, sym.type_idx, ident.span);
+            }
         }
         if (self.builder.lookupGlobal(ident.name)) |g| return try fb.emitGlobalRef(g.idx, ident.name, g.global.type_idx, ident.span);
         return ir.null_node;
@@ -3797,6 +3853,41 @@ pub const Lowerer = struct {
             const str = try self.allocator.dupe(u8, self.target.name());
             const str_idx = try fb.addStringLiteral(str);
             return try fb.emitConstSlice(str_idx, bc.span);
+        }
+        // Math builtins — emit as IR Unary/Binary ops, converted to Wasm f64 ops in SSA builder
+        if (std.mem.eql(u8, bc.name, "abs")) {
+            const arg = try self.lowerExprNode(bc.args[0]);
+            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .abs, .operand = arg } }, TypeRegistry.F64, bc.span));
+        }
+        if (std.mem.eql(u8, bc.name, "ceil")) {
+            const arg = try self.lowerExprNode(bc.args[0]);
+            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .ceil, .operand = arg } }, TypeRegistry.F64, bc.span));
+        }
+        if (std.mem.eql(u8, bc.name, "floor")) {
+            const arg = try self.lowerExprNode(bc.args[0]);
+            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .floor, .operand = arg } }, TypeRegistry.F64, bc.span));
+        }
+        if (std.mem.eql(u8, bc.name, "trunc")) {
+            const arg = try self.lowerExprNode(bc.args[0]);
+            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .trunc_float, .operand = arg } }, TypeRegistry.F64, bc.span));
+        }
+        if (std.mem.eql(u8, bc.name, "round")) {
+            const arg = try self.lowerExprNode(bc.args[0]);
+            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .nearest, .operand = arg } }, TypeRegistry.F64, bc.span));
+        }
+        if (std.mem.eql(u8, bc.name, "sqrt")) {
+            const arg = try self.lowerExprNode(bc.args[0]);
+            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .sqrt, .operand = arg } }, TypeRegistry.F64, bc.span));
+        }
+        if (std.mem.eql(u8, bc.name, "fmin")) {
+            const a = try self.lowerExprNode(bc.args[0]);
+            const b = try self.lowerExprNode(bc.args[1]);
+            return fb.emit(ir.Node.init(.{ .binary = .{ .op = .fmin, .left = a, .right = b } }, TypeRegistry.F64, bc.span));
+        }
+        if (std.mem.eql(u8, bc.name, "fmax")) {
+            const a = try self.lowerExprNode(bc.args[0]);
+            const b = try self.lowerExprNode(bc.args[1]);
+            return fb.emit(ir.Node.init(.{ .binary = .{ .op = .fmax, .left = a, .right = b } }, TypeRegistry.F64, bc.span));
         }
         return ir.null_node;
     }

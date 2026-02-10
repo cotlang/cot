@@ -1645,31 +1645,31 @@ pub const FuncTranslator = struct {
     }
 
     pub fn translateFCeil(self: *Self) !void {
-        // ceil not directly available - stub implementation
         const arg = self.state.pop1();
-        // TODO: Implement using library call or custom lowering
-        try self.state.push1(arg);
+        const ty = self.builder.func.dfg.valueType(arg);
+        const result = try self.builder.ins().ceil(ty, arg);
+        try self.state.push1(result);
     }
 
     pub fn translateFFloor(self: *Self) !void {
-        // floor not directly available - stub implementation
         const arg = self.state.pop1();
-        // TODO: Implement using library call or custom lowering
-        try self.state.push1(arg);
+        const ty = self.builder.func.dfg.valueType(arg);
+        const result = try self.builder.ins().floor(ty, arg);
+        try self.state.push1(result);
     }
 
     pub fn translateFTrunc(self: *Self) !void {
-        // trunc not directly available - stub implementation
         const arg = self.state.pop1();
-        // TODO: Implement using library call or custom lowering
-        try self.state.push1(arg);
+        const ty = self.builder.func.dfg.valueType(arg);
+        const result = try self.builder.ins().ftrunc(ty, arg);
+        try self.state.push1(result);
     }
 
     pub fn translateFNearest(self: *Self) !void {
-        // nearest not directly available - stub implementation
         const arg = self.state.pop1();
-        // TODO: Implement using library call or custom lowering
-        try self.state.push1(arg);
+        const ty = self.builder.func.dfg.valueType(arg);
+        const result = try self.builder.ins().nearest(ty, arg);
+        try self.state.push1(result);
     }
 
     pub fn translateFSqrt(self: *Self) !void {

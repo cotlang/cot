@@ -73,7 +73,7 @@ pub const SSABuilder = struct {
             const local_type = type_registry.get(param.type_idx);
             const is_string_or_slice = param.type_idx == TypeRegistry.STRING or local_type == .slice;
             const type_size = type_registry.sizeOf(param.type_idx);
-            const is_large_struct = local_type == .struct_type and type_size > 8 and type_size <= 16;
+            const is_large_struct = local_type == .struct_type and type_size > 8;
 
             if (is_string_or_slice) {
                 // String/slice: two registers (ptr, len)
@@ -111,30 +111,32 @@ pub const SSABuilder = struct {
                 len_store.addArg2(len_addr, len_val);
                 try entry.addValue(allocator, len_store);
             } else if (is_large_struct) {
-                // Large struct: two registers
-                const lo_val = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
-                lo_val.aux_int = phys_reg_idx;
-                try entry.addValue(allocator, lo_val);
-                phys_reg_idx += 1;
+                // Large struct: N i64 registers (one per 8-byte chunk)
+                const num_slots: u32 = @intCast((type_size + 7) / 8);
+                const base_addr = try func.newValue(.local_addr, TypeRegistry.VOID, entry, .{});
+                base_addr.aux_int = @intCast(slot_offsets[i]);
+                try entry.addValue(allocator, base_addr);
 
-                const hi_val = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
-                hi_val.aux_int = phys_reg_idx;
-                try entry.addValue(allocator, hi_val);
-                phys_reg_idx += 1;
+                for (0..num_slots) |slot| {
+                    const chunk_val = try func.newValue(.arg, TypeRegistry.I64, entry, .{});
+                    chunk_val.aux_int = phys_reg_idx;
+                    try entry.addValue(allocator, chunk_val);
+                    phys_reg_idx += 1;
 
-                const addr = try func.newValue(.local_addr, TypeRegistry.VOID, entry, .{});
-                addr.aux_int = @intCast(slot_offsets[i]);
-                try entry.addValue(allocator, addr);
-                const lo_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                lo_store.addArg2(addr, lo_val);
-                try entry.addValue(allocator, lo_store);
-                const hi_addr = try func.newValue(.off_ptr, TypeRegistry.VOID, entry, .{});
-                hi_addr.aux_int = 8;
-                hi_addr.addArg(addr);
-                try entry.addValue(allocator, hi_addr);
-                const hi_store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
-                hi_store.addArg2(hi_addr, hi_val);
-                try entry.addValue(allocator, hi_store);
+                    if (slot == 0) {
+                        const store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
+                        store.addArg2(base_addr, chunk_val);
+                        try entry.addValue(allocator, store);
+                    } else {
+                        const off_addr = try func.newValue(.off_ptr, TypeRegistry.VOID, entry, .{});
+                        off_addr.aux_int = @intCast(slot * 8);
+                        off_addr.addArg(base_addr);
+                        try entry.addValue(allocator, off_addr);
+                        const store = try func.newValue(.store, TypeRegistry.VOID, entry, .{});
+                        store.addArg2(off_addr, chunk_val);
+                        try entry.addValue(allocator, store);
+                    }
+                }
             } else {
                 // Regular param: single register
                 const arg_val = try func.newValue(.arg, param.type_idx, entry, .{});
@@ -646,6 +648,7 @@ pub const SSABuilder = struct {
         const op_kind: Op = if (is_float) switch (b.op) {
             .add => .add64f, .sub => .sub64f, .mul => .mul64f, .div => .div64f,
             .eq => .eq64f, .ne => .ne64f, .lt => .lt64f, .le => .le64f, .gt => .gt64f, .ge => .ge64f,
+            .fmin => .wasm_f64_min, .fmax => .wasm_f64_max,
             .mod => return error.MissingValue, // No float modulo in Wasm
             .bit_and, .bit_or, .bit_xor, .shl, .shr => return error.MissingValue, // Bitwise ops don't apply to floats
             .@"and", .@"or" => unreachable,
@@ -653,6 +656,7 @@ pub const SSABuilder = struct {
             .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod,
             .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
             .bit_and => .and_, .bit_or => .or_, .bit_xor => .xor, .shl => .shl, .shr => .shr,
+            .fmin => .wasm_f64_min, .fmax => .wasm_f64_max, // Always float ops
             .@"and", .@"or" => unreachable, // Handled by convertLogicalOp
         };
 
@@ -668,6 +672,13 @@ pub const SSABuilder = struct {
         const op_kind: Op = switch (u.op) {
             .neg => if (is_float) .neg64f else .neg,
             .not => .not, .bit_not => .not, .optional_unwrap => .copy,
+            // Math builtins — emit Wasm f64 ops directly (already in lower_wasm pass-through)
+            .abs => .wasm_f64_abs,
+            .ceil => .wasm_f64_ceil,
+            .floor => .wasm_f64_floor,
+            .trunc_float => .wasm_f64_trunc,
+            .nearest => .wasm_f64_nearest,
+            .sqrt => .wasm_f64_sqrt,
         };
         const val = try self.func.newValue(op_kind, type_idx, cur, self.cur_pos);
         val.addArg(operand);
@@ -680,57 +691,65 @@ pub const SSABuilder = struct {
         call_val.aux = .{ .string = func_name };
         for (args) |arg_idx| {
             const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
-            const arg_type = self.type_registry.get(arg_val.type_idx);
-            const type_size = self.type_registry.sizeOf(arg_val.type_idx);
-
-            // String/slice decomposition: compound types are passed as 2 i64 values (ptr, len)
-            // Must match the callee's param decomposition in buildSSA (line 78).
-            // Go reference: ssagen/ssa.go uses OSPTR()/OLEN() to decompose slice args at call sites.
-            const is_string_or_slice = arg_val.type_idx == TypeRegistry.STRING or arg_type == .slice;
-            if (is_string_or_slice) {
-                // Extract ptr component
-                const ptr_val = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
-                ptr_val.addArg(arg_val);
-                try cur.addValue(self.allocator, ptr_val);
-                try call_val.addArgAlloc(ptr_val, self.allocator);
-
-                // Extract len component
-                const len_val = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
-                len_val.addArg(arg_val);
-                try cur.addValue(self.allocator, len_val);
-                try call_val.addArgAlloc(len_val, self.allocator);
-            } else {
-            // Large struct decomposition (matching param handling in buildSSA)
-            // Structs >8 and <=16 bytes are passed as two i64 values
-            const is_large_struct = arg_type == .struct_type and type_size > 8 and type_size <= 16;
-            if (is_large_struct) {
-                // Struct is in memory, load low and high parts
-                // First, get the address of the struct
-                const addr = try self.getStructAddr(arg_val, cur);
-
-                // Load low part (first 8 bytes)
-                const lo_val = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                lo_val.addArg(addr);
-                try cur.addValue(self.allocator, lo_val);
-                try call_val.addArgAlloc(lo_val, self.allocator);
-
-                // Load high part (bytes 8-15)
-                const hi_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
-                hi_addr.aux_int = 8;
-                hi_addr.addArg(addr);
-                try cur.addValue(self.allocator, hi_addr);
-
-                const hi_val = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
-                hi_val.addArg(hi_addr);
-                try cur.addValue(self.allocator, hi_val);
-                try call_val.addArgAlloc(hi_val, self.allocator);
-            } else {
-                try call_val.addArgAlloc(arg_val, self.allocator);
-            }
-            }
+            try self.addCallArg(call_val, arg_val, cur);
         }
         try cur.addValue(self.allocator, call_val);
         return call_val;
+    }
+
+    /// Decompose compound call arguments (string/slice → ptr+len, large struct → lo+hi).
+    /// Must match callee param decomposition in buildSSA.
+    /// Go reference: ssagen/ssa.go uses OSPTR()/OLEN() to decompose slice args at call sites.
+    fn addCallArg(self: *SSABuilder, call_val: *Value, arg_val: *Value, cur: *Block) !void {
+        const arg_type = self.type_registry.get(arg_val.type_idx);
+        const type_size = self.type_registry.sizeOf(arg_val.type_idx);
+
+        // String/slice decomposition: compound types are passed as 2 i64 values (ptr, len)
+        const is_string_or_slice = arg_val.type_idx == TypeRegistry.STRING or arg_type == .slice;
+        if (is_string_or_slice) {
+            // Extract ptr component
+            const ptr_val = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+            ptr_val.addArg(arg_val);
+            try cur.addValue(self.allocator, ptr_val);
+            try call_val.addArgAlloc(ptr_val, self.allocator);
+
+            // Extract len component
+            const len_val = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+            len_val.addArg(arg_val);
+            try cur.addValue(self.allocator, len_val);
+            try call_val.addArgAlloc(len_val, self.allocator);
+            return;
+        }
+
+        // Large struct decomposition: structs >8 bytes passed as N i64 values
+        const is_large_struct = arg_type == .struct_type and type_size > 8;
+        if (is_large_struct) {
+            const addr = try self.getStructAddr(arg_val, cur);
+            const num_slots: u32 = @intCast((type_size + 7) / 8);
+
+            for (0..num_slots) |slot| {
+                if (slot == 0) {
+                    const chunk_val = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                    chunk_val.addArg(addr);
+                    try cur.addValue(self.allocator, chunk_val);
+                    try call_val.addArgAlloc(chunk_val, self.allocator);
+                } else {
+                    const off_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                    off_addr.aux_int = @intCast(slot * 8);
+                    off_addr.addArg(addr);
+                    try cur.addValue(self.allocator, off_addr);
+
+                    const chunk_val = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+                    chunk_val.addArg(off_addr);
+                    try cur.addValue(self.allocator, chunk_val);
+                    try call_val.addArgAlloc(chunk_val, self.allocator);
+                }
+            }
+            return;
+        }
+
+        // Regular arg: single value
+        try call_val.addArgAlloc(arg_val, self.allocator);
     }
 
     /// Get the address of a struct value (for decomposition)
@@ -762,7 +781,7 @@ pub const SSABuilder = struct {
         try call_val.addArgAlloc(callee, self.allocator);
         for (args) |arg_idx| {
             const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
-            try call_val.addArgAlloc(arg_val, self.allocator);
+            try self.addCallArg(call_val, arg_val, cur);
         }
         try cur.addValue(self.allocator, call_val);
         return call_val;
@@ -776,7 +795,7 @@ pub const SSABuilder = struct {
         try call_val.addArgAlloc(context, self.allocator);
         for (args) |arg_idx| {
             const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
-            try call_val.addArgAlloc(arg_val, self.allocator);
+            try self.addCallArg(call_val, arg_val, cur);
         }
         try cur.addValue(self.allocator, call_val);
         return call_val;
@@ -1022,8 +1041,38 @@ pub const SSABuilder = struct {
         return store_val;
     }
 
+    /// Convert ptr.* load — dereference a pointer to get its value.
+    /// Go reference: ssagen/ssa.go ODEREF loads — compound types decompose to ptr@0, len@8.
     fn convertPtrLoadValue(self: *SSABuilder, ptr_idx: ir.NodeIndex, type_idx: TypeIndex, cur: *Block) !*Value {
         const ptr_val = try self.convertNode(ptr_idx) orelse return error.MissingValue;
+
+        // String/slice compound load: load ptr@0 and len@8, create string_make/slice_make
+        const value_type = self.type_registry.get(type_idx);
+        const is_string_or_slice = type_idx == TypeRegistry.STRING or value_type == .slice;
+        if (is_string_or_slice) {
+            // Load ptr component from base address
+            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            ptr_load.addArg(ptr_val);
+            try cur.addValue(self.allocator, ptr_load);
+
+            // Load len component from base + 8
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(ptr_val);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            len_load.addArg(len_addr);
+            try cur.addValue(self.allocator, len_load);
+
+            // Create string_make/slice_make to bundle the components
+            const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
+            const make_val = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
+            make_val.addArg2(ptr_load, len_load);
+            try cur.addValue(self.allocator, make_val);
+            return make_val;
+        }
+
         const load_op = self.getLoadOp(type_idx);
         const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load_val.addArg(ptr_val);
@@ -1031,12 +1080,68 @@ pub const SSABuilder = struct {
         return load_val;
     }
 
+    /// Convert ptr.* = value store.
+    /// Go reference: ssagen/ssa.go ODEREF stores — compound types decomposed to separate stores.
     fn convertPtrStoreValue(self: *SSABuilder, p: ir.PtrStoreValue, cur: *Block) !*Value {
         const ptr_val = try self.convertNode(p.ptr) orelse return error.MissingValue;
         const value = try self.convertNode(p.value) orelse return error.MissingValue;
 
         const value_type = self.type_registry.get(value.type_idx);
         const type_size = self.type_registry.sizeOf(value.type_idx);
+
+        // String/slice compound store: decompose into ptr@0, len@8 (and cap@16 for slices)
+        // Must match convertStoreLocal's compound handling pattern.
+        const is_string_or_slice = value.type_idx == TypeRegistry.STRING or value_type == .slice;
+        if (is_string_or_slice) {
+            // Extract ptr and len components
+            var ptr_component: *Value = undefined;
+            var len_component: *Value = undefined;
+
+            if ((value.op == .string_make or value.op == .slice_make) and value.args.len >= 2) {
+                // Direct string_make/slice_make: components are args
+                ptr_component = value.args[0];
+                len_component = value.args[1];
+            } else {
+                // Value from local/param: use slice_ptr/slice_len extraction ops
+                ptr_component = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+                ptr_component.addArg(value);
+                try cur.addValue(self.allocator, ptr_component);
+
+                len_component = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+                len_component.addArg(value);
+                try cur.addValue(self.allocator, len_component);
+            }
+
+            // Store ptr at base address
+            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            ptr_store.addArg2(ptr_val, ptr_component);
+            try cur.addValue(self.allocator, ptr_store);
+
+            // Store len at base + 8
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(ptr_val);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            len_store.addArg2(len_addr, len_component);
+            try cur.addValue(self.allocator, len_store);
+
+            // Store cap at base + 16 for slices
+            if (value.op == .slice_make and value.args.len >= 3) {
+                const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                cap_addr.aux_int = 16;
+                cap_addr.addArg(ptr_val);
+                try cur.addValue(self.allocator, cap_addr);
+
+                const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                cap_store.addArg2(cap_addr, value.args[2]);
+                try cur.addValue(self.allocator, cap_store);
+            }
+
+            return len_store;
+        }
+
         const is_large_struct = (value_type == .struct_type or value_type == .tuple) and type_size > 8;
 
         if (is_large_struct) {

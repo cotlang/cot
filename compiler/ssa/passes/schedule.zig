@@ -86,14 +86,33 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
         }
     }
 
-    // Memory ordering: chain stores, store→load dependencies
-    var last_store: ?*Value = null;
+    // Memory ordering: chain stores, loads, and calls.
+    // Calls are memory barriers: they may read/write any memory (via pointers).
+    // Go reference: schedule.go treats calls as both reads and writes.
+    var last_mem: ?*Value = null;
     for (values) |v| {
-        if (v.op == .store or v.op == .store_reg) {
-            if (last_store) |ls| try edges.append(allocator, .{ .x = ls, .y = v });
-            last_store = v;
-        } else if (v.op == .load or v.op == .load_reg) {
-            if (last_store) |ls| try edges.append(allocator, .{ .x = ls, .y = v });
+        if (v.op == .store or v.op == .store_reg or
+            v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
+            v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32)
+        {
+            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
+            last_mem = v;
+        } else if (v.op == .load or v.op == .load_reg or
+            v.op == .wasm_i64_load or v.op == .wasm_i64_load8_u or
+            v.op == .wasm_i64_load16_u or v.op == .wasm_i64_load32_u or
+            v.op == .wasm_i64_load8_s or v.op == .wasm_i64_load16_s or
+            v.op == .wasm_i64_load32_s)
+        {
+            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
+        } else if (v.op == .static_call or v.op == .wasm_lowered_static_call or
+            v.op == .call or v.op == .wasm_call or
+            v.op == .closure_call or v.op == .wasm_lowered_closure_call or
+            v.op == .inter_call or v.op == .wasm_lowered_inter_call)
+        {
+            // Calls are memory barriers: must order after prior stores/loads
+            // and before subsequent loads/stores
+            if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
+            last_mem = v;
         }
     }
 

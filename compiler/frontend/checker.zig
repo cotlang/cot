@@ -40,6 +40,7 @@ pub const Symbol = struct {
     mutable: bool,
     is_extern: bool = false,
     const_value: ?i64 = null,
+    float_const_value: ?f64 = null,
 
     pub fn init(name: []const u8, kind: SymbolKind, type_idx: TypeIndex, node: NodeIndex, mutable: bool) Symbol {
         return .{ .name = name, .kind = kind, .type_idx = type_idx, .node = node, .mutable = mutable };
@@ -51,6 +52,10 @@ pub const Symbol = struct {
 
     pub fn initConst(name: []const u8, type_idx: TypeIndex, node: NodeIndex, value: i64) Symbol {
         return .{ .name = name, .kind = .constant, .type_idx = type_idx, .node = node, .mutable = false, .const_value = value };
+    }
+
+    pub fn initFloatConst(name: []const u8, type_idx: TypeIndex, node: NodeIndex, value: f64) Symbol {
+        return .{ .name = name, .kind = .constant, .type_idx = type_idx, .node = node, .mutable = false, .float_const_value = value };
     }
 };
 
@@ -433,10 +438,16 @@ pub const Checker = struct {
             else if (!self.types.isAssignable(val_type, var_type)) self.err.errorWithCode(v.span.start, .e300, "type mismatch");
         }
         if (self.scope.lookupLocal(v.name) != null) {
-            if (v.is_const and v.value != null_node) if (self.evalConstExpr(v.value)) |cv| {
-                try self.scope.define(Symbol.initConst(v.name, var_type, idx, cv));
-                return;
-            };
+            if (v.is_const and v.value != null_node) {
+                if (self.evalConstExpr(v.value)) |cv| {
+                    try self.scope.define(Symbol.initConst(v.name, var_type, idx, cv));
+                    return;
+                }
+                if (self.isFloatType(var_type)) if (self.evalConstFloat(v.value)) |fv| {
+                    try self.scope.define(Symbol.initFloatConst(v.name, var_type, idx, fv));
+                    return;
+                };
+            }
             try self.scope.define(Symbol.init(v.name, if (v.is_const) .constant else .variable, var_type, idx, !v.is_const));
         }
     }
@@ -523,6 +534,43 @@ pub const Checker = struct {
             .comptime_block => |cb| self.evalConstExpr(cb.body),
             else => null,
         };
+    }
+
+    /// Evaluate a comptime float expression. Returns the f64 value or null.
+    pub fn evalConstFloat(self: *Checker, idx: NodeIndex) ?f64 {
+        const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
+        return switch (expr) {
+            .literal => |lit| switch (lit.kind) {
+                .float => std.fmt.parseFloat(f64, lit.value) catch null,
+                .int => blk: {
+                    const iv = std.fmt.parseInt(i64, lit.value, 0) catch break :blk null;
+                    break :blk @floatFromInt(iv);
+                },
+                else => null,
+            },
+            .unary => |un| if (un.op == .sub) blk: {
+                const v = self.evalConstFloat(un.operand) orelse break :blk null;
+                break :blk -v;
+            } else null,
+            .binary => |bin| blk: {
+                const l = self.evalConstFloat(bin.left) orelse break :blk null;
+                const r = self.evalConstFloat(bin.right) orelse break :blk null;
+                break :blk switch (bin.op) {
+                    .add => l + r,
+                    .sub => l - r,
+                    .mul => l * r,
+                    .quo => l / r,
+                    else => null,
+                };
+            },
+            .paren => |p| self.evalConstFloat(p.inner),
+            .ident => |id| if (self.scope.lookup(id.name)) |sym| if (sym.kind == .constant) sym.float_const_value else null else null,
+            else => null,
+        };
+    }
+
+    fn isFloatType(_: *Checker, type_idx: TypeIndex) bool {
+        return type_idx == TypeRegistry.F32 or type_idx == TypeRegistry.F64;
     }
 
     /// Evaluate a comptime string expression. Returns the string value or null.
@@ -802,7 +850,7 @@ pub const Checker = struct {
             return TypeRegistry.STRING;
         } else if (std.mem.eql(u8, bc.name, "intCast")) {
             const target_type = try self.resolveTypeExpr(bc.type_arg);
-            if (!types.isInteger(self.types.get(target_type))) { self.err.errorWithCode(bc.span.start, .e300, "@intCast target must be integer"); return invalid_type; }
+            if (!types.isNumeric(self.types.get(target_type))) { self.err.errorWithCode(bc.span.start, .e300, "@intCast target must be numeric"); return invalid_type; }
             _ = try self.checkExpr(bc.args[0]);
             return target_type;
         } else if (std.mem.eql(u8, bc.name, "ptrCast")) {
@@ -933,6 +981,30 @@ pub const Checker = struct {
             const msg = self.evalConstString(bc.args[0]) orelse "compile error";
             self.err.errorWithCode(bc.span.start, .e300, msg);
             return TypeRegistry.VOID;
+        } else if (std.mem.eql(u8, bc.name, "abs") or std.mem.eql(u8, bc.name, "ceil") or
+            std.mem.eql(u8, bc.name, "floor") or std.mem.eql(u8, bc.name, "trunc") or
+            std.mem.eql(u8, bc.name, "round") or std.mem.eql(u8, bc.name, "sqrt"))
+        {
+            // @abs/@ceil/@floor/@trunc/@round/@sqrt(x: f64) -> f64
+            // Wasm f64 unary ops: f64.abs, f64.ceil, f64.floor, f64.trunc, f64.nearest, f64.sqrt
+            const arg_type = try self.checkExpr(bc.args[0]);
+            if (arg_type != TypeRegistry.F64 and arg_type != TypeRegistry.F32 and arg_type != TypeRegistry.UNTYPED_FLOAT) {
+                self.err.errorWithCode(bc.span.start, .e300, "math builtin requires float argument");
+                return invalid_type;
+            }
+            return TypeRegistry.F64;
+        } else if (std.mem.eql(u8, bc.name, "fmin") or std.mem.eql(u8, bc.name, "fmax")) {
+            // @fmin/@fmax(a: f64, b: f64) -> f64
+            // Wasm f64 binary ops: f64.min, f64.max
+            const arg1_type = try self.checkExpr(bc.args[0]);
+            const arg2_type = try self.checkExpr(bc.args[1]);
+            const a1_float = arg1_type == TypeRegistry.F64 or arg1_type == TypeRegistry.F32 or arg1_type == TypeRegistry.UNTYPED_FLOAT;
+            const a2_float = arg2_type == TypeRegistry.F64 or arg2_type == TypeRegistry.F32 or arg2_type == TypeRegistry.UNTYPED_FLOAT;
+            if (!a1_float or !a2_float) {
+                self.err.errorWithCode(bc.span.start, .e300, "@fmin/@fmax require float arguments");
+                return invalid_type;
+            }
+            return TypeRegistry.F64;
         }
         self.err.errorWithCode(bc.span.start, .e300, "unknown builtin");
         return invalid_type;

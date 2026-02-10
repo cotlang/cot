@@ -405,6 +405,14 @@ pub const Opcode = enum {
     fabs,
     /// Floating point square root.
     sqrt,
+    /// Floating point ceil (round toward positive infinity).
+    ceil,
+    /// Floating point floor (round toward negative infinity).
+    floor,
+    /// Floating point trunc (round toward zero).
+    trunc,
+    /// Floating point nearest (round to nearest even).
+    nearest,
     /// Floating point comparison.
     fcmp,
 

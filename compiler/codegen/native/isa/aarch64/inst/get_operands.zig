@@ -430,6 +430,11 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
             visitor.regUse(&p.rn);
             visitor.regUse(&p.rm);
         },
+        .fcsel => |*p| {
+            visitor.regDef(&p.rd);
+            visitor.regUse(&p.rn);
+            visitor.regUse(&p.rm);
+        },
         .csneg => |*p| {
             visitor.regDef(&p.rd);
             visitor.regUse(&p.rn);

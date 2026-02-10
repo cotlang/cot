@@ -23,6 +23,7 @@ pub const GlobalIdx = u32;
 
 pub const BinaryOp = enum(u8) {
     add, sub, mul, div, mod, eq, ne, lt, le, gt, ge, @"and", @"or", bit_and, bit_or, bit_xor, shl, shr,
+    fmin, fmax,
 
     pub fn isComparison(self: BinaryOp) bool { return switch (self) { .eq, .ne, .lt, .le, .gt, .ge => true, else => false }; }
     pub fn isArithmetic(self: BinaryOp) bool { return switch (self) { .add, .sub, .mul, .div, .mod => true, else => false }; }
@@ -30,7 +31,7 @@ pub const BinaryOp = enum(u8) {
     pub fn isBitwise(self: BinaryOp) bool { return switch (self) { .bit_and, .bit_or, .bit_xor, .shl, .shr => true, else => false }; }
 };
 
-pub const UnaryOp = enum(u8) { neg, not, bit_not, optional_unwrap };
+pub const UnaryOp = enum(u8) { neg, not, bit_not, optional_unwrap, abs, ceil, floor, trunc_float, nearest, sqrt };
 
 // Typed operation payloads
 pub const ConstInt = struct { value: i64 };
@@ -344,7 +345,10 @@ pub const FuncBuilder = struct {
     // Aliases and additional helpers
     pub fn emitIndirectCall(self: *FuncBuilder, callee: NodeIndex, args: []const NodeIndex, type_idx: TypeIndex, span: Span) !NodeIndex { return self.emitCallIndirect(callee, args, type_idx, span); }
     pub fn emitStoreFieldValue(self: *FuncBuilder, base: NodeIndex, field_idx: u32, offset: i64, value: NodeIndex, span: Span) !NodeIndex { return self.emitStoreField(base, field_idx, offset, value, span); }
-    pub fn emitIntCast(self: *FuncBuilder, operand: NodeIndex, target_type: TypeIndex, span: Span) !NodeIndex { return self.emitConvert(operand, TypeRegistry.I64, target_type, span); }
+    pub fn emitIntCast(self: *FuncBuilder, operand: NodeIndex, target_type: TypeIndex, span: Span) !NodeIndex {
+        const from_type = self.nodes.items[operand].type_idx;
+        return self.emitConvert(operand, from_type, target_type, span);
+    }
     pub fn emitPtrCast(self: *FuncBuilder, operand: NodeIndex, target_type: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .ptr_cast = .{ .operand = operand } }, target_type, span)); }
     pub fn emitIntToPtr(self: *FuncBuilder, operand: NodeIndex, target_type: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .int_to_ptr = .{ .operand = operand } }, target_type, span)); }
     pub fn emitPtrToInt(self: *FuncBuilder, operand: NodeIndex, target_type: TypeIndex, span: Span) !NodeIndex { return self.emit(Node.init(.{ .ptr_to_int = .{ .operand = operand } }, target_type, span)); }

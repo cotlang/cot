@@ -1,0 +1,111 @@
+import "std/math"
+
+// =========================================================================
+// Integer math tests
+// =========================================================================
+
+test "abs" {
+    @assert_eq(abs(5), 5)
+    @assert_eq(abs(0 - 5), 5)
+    @assert_eq(abs(0), 0)
+}
+
+test "min" {
+    @assert_eq(min(3, 7), 3)
+    @assert_eq(min(7, 3), 3)
+    @assert_eq(min(5, 5), 5)
+    @assert_eq(min(0 - 1, 1), 0 - 1)
+}
+
+test "max" {
+    @assert_eq(max(3, 7), 7)
+    @assert_eq(max(7, 3), 7)
+    @assert_eq(max(5, 5), 5)
+    @assert_eq(max(0 - 1, 1), 1)
+}
+
+test "clamp" {
+    @assert_eq(clamp(5, 0, 10), 5)
+    @assert_eq(clamp(0 - 5, 0, 10), 0)
+    @assert_eq(clamp(15, 0, 10), 10)
+}
+
+// =========================================================================
+// Float wrapper tests (convert to i64 to avoid float comparison issues)
+// =========================================================================
+
+test "fabs" {
+    @assert_eq(@intCast(i64, fabs(0.0 - 3.5) * 1000.0), 3500)
+    @assert_eq(@intCast(i64, fabs(3.5) * 1000.0), 3500)
+}
+
+test "ceil" {
+    @assert_eq(@intCast(i64, ceil(2.3)), 3)
+    @assert_eq(@intCast(i64, ceil(0.0 - 2.3)), 0 - 2)
+}
+
+test "floor" {
+    @assert_eq(@intCast(i64, floor(2.7)), 2)
+    @assert_eq(@intCast(i64, floor(0.0 - 2.3)), 0 - 3)
+}
+
+test "trunc" {
+    @assert_eq(@intCast(i64, trunc(2.7)), 2)
+    @assert_eq(@intCast(i64, trunc(0.0 - 2.7)), 0 - 2)
+}
+
+test "round" {
+    @assert_eq(@intCast(i64, round(2.3)), 2)
+    @assert_eq(@intCast(i64, round(2.7)), 3)
+}
+
+test "sqrt" {
+    @assert_eq(@intCast(i64, sqrt(4.0)), 2)
+    @assert_eq(@intCast(i64, sqrt(9.0)), 3)
+}
+
+test "fmin fmax" {
+    @assert_eq(@intCast(i64, fmin(2.0, 3.0)), 2)
+    @assert_eq(@intCast(i64, fmax(2.0, 3.0)), 3)
+}
+
+// =========================================================================
+// Conversion tests
+// =========================================================================
+
+test "toInt" {
+    @assert_eq(toInt(3.7), 3)
+    @assert_eq(toInt(0.0 - 2.1), 0 - 2)
+}
+
+test "toFloat" {
+    @assert_eq(@intCast(i64, toFloat(42) * 10.0), 420)
+}
+
+// =========================================================================
+// Power tests
+// =========================================================================
+
+test "ipow" {
+    @assert_eq(ipow(2, 10), 1024)
+    @assert_eq(ipow(3, 3), 27)
+    @assert_eq(ipow(5, 0), 1)
+    @assert_eq(ipow(2, 0), 1)
+    @assert_eq(ipow(7, 1), 7)
+}
+
+test "fpow" {
+    @assert_eq(@intCast(i64, fpow(2.0, 10) * 10.0), 10240)
+    @assert_eq(@intCast(i64, fpow(3.0, 3) * 10.0), 270)
+    @assert_eq(@intCast(i64, fpow(5.0, 0) * 10.0), 10)
+}
+
+// =========================================================================
+// Constants tests
+// =========================================================================
+
+test "constants" {
+    @assert_eq(@intCast(i64, PI * 1000.0), 3141)
+    @assert_eq(@intCast(i64, E * 1000.0), 2718)
+    @assert_eq(MAX_I64, 9223372036854775807)
+}

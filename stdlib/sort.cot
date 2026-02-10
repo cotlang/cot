@@ -1,0 +1,44 @@
+// sort — Sorting utilities for List(T).
+//
+// sort(T)(data, count): in-place sort via raw pointer + count
+// reverse(T)(data, count): reverse elements in-place
+//
+// Algorithm: insertion sort (simple, correct, good for small arrays).
+// Reference: Go sort/sort.go (insertionSort)
+
+import "std/list"
+
+// Sort a List(T) in ascending order using insertion sort.
+// Works for any T that supports the > operator (i64, f64, etc.)
+fn sort(T)(list: List(T)) void {
+    var i: i64 = 1
+    while i < list.count {
+        var j = i
+        while j > 0 {
+            var a = @intToPtr(*T, list.items + (j - 1) * @sizeOf(T)).*
+            var b = @intToPtr(*T, list.items + j * @sizeOf(T)).*
+            if a > b {
+                @intToPtr(*T, list.items + (j - 1) * @sizeOf(T)).* = b
+                @intToPtr(*T, list.items + j * @sizeOf(T)).* = a
+                j -= 1
+            } else {
+                break
+            }
+        }
+        i += 1
+    }
+}
+
+// Reverse elements in a List(T) in-place.
+fn reverse(T)(list: List(T)) void {
+    var lo: i64 = 0
+    var hi = list.count - 1
+    while lo < hi {
+        var a = @intToPtr(*T, list.items + lo * @sizeOf(T)).*
+        var b = @intToPtr(*T, list.items + hi * @sizeOf(T)).*
+        @intToPtr(*T, list.items + lo * @sizeOf(T)).* = b
+        @intToPtr(*T, list.items + hi * @sizeOf(T)).* = a
+        lo += 1
+        hi -= 1
+    }
+}

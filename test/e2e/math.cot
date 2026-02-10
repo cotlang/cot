@@ -1,0 +1,45 @@
+// Math builtins E2E tests
+// Convert f64 results to i64 via integer scaling to test precise values
+
+test "abs" {
+    var x: f64 = -3.5
+    var result = @abs(x)
+    @assert_eq(@intCast(i64, result * 1000.0), 3500)
+    @assert_eq(@intCast(i64, @abs(2.0) * 1000.0), 2000)
+}
+
+test "ceil" {
+    @assert_eq(@intCast(i64, @ceil(2.3) * 1000.0), 3000)
+    @assert_eq(@intCast(i64, @ceil(-2.3) * 1000.0), -2000)
+}
+
+test "floor" {
+    @assert_eq(@intCast(i64, @floor(2.7) * 1000.0), 2000)
+    @assert_eq(@intCast(i64, @floor(-2.3) * 1000.0), -3000)
+}
+
+test "trunc" {
+    @assert_eq(@intCast(i64, @trunc(2.7) * 1000.0), 2000)
+    @assert_eq(@intCast(i64, @trunc(-2.7) * 1000.0), -2000)
+}
+
+test "round" {
+    @assert_eq(@intCast(i64, @round(2.3) * 1000.0), 2000)
+    @assert_eq(@intCast(i64, @round(2.7) * 1000.0), 3000)
+}
+
+test "sqrt" {
+    @assert_eq(@intCast(i64, @sqrt(4.0) * 1000.0), 2000)
+    @assert_eq(@intCast(i64, @sqrt(9.0) * 1000.0), 3000)
+    @assert_eq(@intCast(i64, @sqrt(1.0) * 1000.0), 1000)
+}
+
+test "fmin" {
+    @assert_eq(@intCast(i64, @fmin(2.0, 3.0) * 1000.0), 2000)
+    @assert_eq(@intCast(i64, @fmin(-1.0, 1.0) * 1000.0), -1000)
+}
+
+test "fmax" {
+    @assert_eq(@intCast(i64, @fmax(2.0, 3.0) * 1000.0), 3000)
+    @assert_eq(@intCast(i64, @fmax(-1.0, 1.0) * 1000.0), 1000)
+}

@@ -1009,11 +1009,13 @@ pub const Parser = struct {
             // @target_os(), @target_arch(), @target() — 0 args, comptime string constants
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf") or std.mem.eql(u8, name, "fd_close") or std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "arg_len") or std.mem.eql(u8, name, "arg_ptr") or std.mem.eql(u8, name, "environ_len") or std.mem.eql(u8, name, "environ_ptr")) {
+        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf") or std.mem.eql(u8, name, "fd_close") or std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "arg_len") or std.mem.eql(u8, name, "arg_ptr") or std.mem.eql(u8, name, "environ_len") or std.mem.eql(u8, name, "environ_ptr") or
+            std.mem.eql(u8, name, "abs") or std.mem.eql(u8, name, "ceil") or std.mem.eql(u8, name, "floor") or std.mem.eql(u8, name, "trunc") or std.mem.eql(u8, name, "round") or std.mem.eql(u8, name, "sqrt")) {
             const arg = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "realloc") or std.mem.eql(u8, name, "random")) {
+        } else if (std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "realloc") or std.mem.eql(u8, name, "random") or
+            std.mem.eql(u8, name, "fmin") or std.mem.eql(u8, name, "fmax")) {
             const ptr_arg = try self.parseExpr() orelse return null;
             if (!self.expect(.comma)) return null;
             const size_arg = try self.parseExpr() orelse return null;

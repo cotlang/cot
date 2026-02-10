@@ -1171,6 +1171,10 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
             try sink.put4(encCsel(payload.rd, payload.rn, payload.rm, payload.cond, 0, 0));
         },
 
+        .fcsel => |payload| {
+            try sink.put4(encFcsel(payload.rd, payload.rn, payload.rm, payload.cond, payload.size));
+        },
+
         .csneg => |payload| {
             try sink.put4(encCsel(payload.rd, payload.rn, payload.rm, payload.cond, 1, 1));
         },
@@ -1364,19 +1368,21 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
         },
 
         // FPU rounding
-        // ARM64: 000 11110 ftype 1 001 rmode 0 10000 Rn Rd
+        // ARM64: 000 11110 ftype 1 001 opcode2[2:0] 10000 Rn Rd
+        // opcode2 is 3-bit field at bits [17:15]:
+        //   000=FRINTN, 001=FRINTP, 010=FRINTM, 011=FRINTZ
         .fpu_round => |payload| {
             const ftype = @as(u32, payload.size.ftype());
-            const rmode: u32 = switch (payload.mode) {
-                .nearest => 0b00, // FRINTN
-                .plus_infinity => 0b01, // FRINTP
-                .minus_infinity => 0b10, // FRINTM
-                .zero => 0b11, // FRINTZ
+            const opcode2: u32 = switch (payload.mode) {
+                .nearest => 0b000, // FRINTN
+                .plus_infinity => 0b001, // FRINTP (ceil)
+                .minus_infinity => 0b010, // FRINTM (floor)
+                .zero => 0b011, // FRINTZ (trunc)
             };
             try sink.put4(
-                0b000_11110_00_1_001_00_0_10000_00000_00000 |
+                0b000_11110_00_1_001_000_10000_00000_00000 |
                     (ftype << 22) |
-                    (rmode << 16) |
+                    (opcode2 << 15) |
                     (machregToVec(payload.rn) << 5) |
                     machregToVec(payload.rd.toReg()),
             );

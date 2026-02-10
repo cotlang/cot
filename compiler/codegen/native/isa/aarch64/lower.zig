@@ -20,6 +20,7 @@ const ALUOp = inst_mod.ALUOp;
 const ALUOp3 = inst_mod.ALUOp3;
 const BitOp = inst_mod.BitOp;
 const FPUOp1 = inst_mod.FPUOp1;
+const FpuRoundMode = inst_mod.FpuRoundMode;
 const FPUOp2 = inst_mod.FPUOp2;
 const FpuToIntOp = inst_mod.FpuToIntOp;
 const IntToFpuOp = inst_mod.IntToFpuOp;
@@ -182,6 +183,10 @@ pub const AArch64LowerBackend = struct {
             .fneg => self.lowerFneg(ctx, ir_inst),
             .fabs => self.lowerFabs(ctx, ir_inst),
             .sqrt => self.lowerSqrt(ctx, ir_inst),
+            .ceil => self.lowerFpuRound(ctx, ir_inst, .plus_infinity),
+            .floor => self.lowerFpuRound(ctx, ir_inst, .minus_infinity),
+            .trunc => self.lowerFpuRound(ctx, ir_inst, .zero),
+            .nearest => self.lowerFpuRound(ctx, ir_inst, .nearest),
             .fcmp => self.lowerFcmp(ctx, ir_inst),
 
             // Conversions
@@ -1452,6 +1457,31 @@ pub const AArch64LowerBackend = struct {
         return self.lowerFpuUnaryOp(ctx, ir_inst, .sqrt);
     }
 
+    fn lowerFpuRound(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst, mode: FpuRoundMode) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        const size = scalarSizeFromType(ty) orelse return null;
+
+        const src = ctx.putInputInRegs(ir_inst, 0);
+        const src_reg = src.onlyReg() orelse return null;
+
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        ctx.emit(Inst{
+            .fpu_round = .{
+                .mode = mode,
+                .size = size,
+                .rd = dst_reg,
+                .rn = src_reg,
+            },
+        }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
     fn lowerFpuUnaryOp(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst, op: FPUOp1) ?InstOutput {
         _ = self;
         const ty = ctx.outputTy(ir_inst, 0);
@@ -1829,14 +1859,28 @@ pub const AArch64LowerBackend = struct {
         }) catch return null;
 
         // Conditional select: dst = (cond != 0) ? if_true : if_false
-        ctx.emit(Inst{
-            .csel = .{
-                .rd = dst_reg,
-                .rn = if_true_reg,
-                .rm = if_false_reg,
-                .cond = .ne,
-            },
-        }) catch return null;
+        // Use fcsel for float types, csel for integer types (Cranelift: lower_select)
+        if (ty.isFloat()) {
+            const size = scalarSizeFromType(ty) orelse return null;
+            ctx.emit(Inst{
+                .fcsel = .{
+                    .rd = dst_reg,
+                    .rn = if_true_reg,
+                    .rm = if_false_reg,
+                    .cond = .ne,
+                    .size = size,
+                },
+            }) catch return null;
+        } else {
+            ctx.emit(Inst{
+                .csel = .{
+                    .rd = dst_reg,
+                    .rn = if_true_reg,
+                    .rm = if_false_reg,
+                    .cond = .ne,
+                },
+            }) catch return null;
+        }
 
         var output = InstOutput{};
         output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
@@ -1917,19 +1961,25 @@ pub const AArch64LowerBackend = struct {
         // NOTE: clobbers will be assigned to call_info AFTER removing return regs
 
         // Build uses list: gen_call_args(abi, args)
-        // Each argument vreg is constrained to its ABI register (X0-X7 for integers)
+        // Each argument vreg is constrained to its ABI register
+        // AAPCS64: integers in X0-X15, floats in V0-V7
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         var int_arg_idx: u8 = 0;
+        var float_arg_idx: u8 = 0;
         for (0..num_args) |idx| {
             const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
             const arg_ty = ctx.inputTy(ir_inst, idx);
 
-            if (!arg_ty.isFloat() and int_arg_idx < 16) {
-                // Add to uses: this vreg MUST be in this preg at the call
-                // Internal CC uses x0-x15 for integer args (x0-x7 standard AAPCS64,
-                // x8-x15 extended for our Wasm-internal calling convention).
-                // All x0-x15 are caller-saved and in clobber set.
+            if (arg_ty.isFloat()) {
+                if (float_arg_idx < 8) {
+                    call_info.uses.append(ctx.allocator, .{
+                        .vreg = arg_reg,
+                        .preg = regs.vregPreg(float_arg_idx),
+                    }) catch return null;
+                    float_arg_idx += 1;
+                }
+            } else if (int_arg_idx < 16) {
                 call_info.uses.append(ctx.allocator, .{
                     .vreg = arg_reg,
                     .preg = regs.xregPreg(int_arg_idx),
@@ -1939,19 +1989,28 @@ pub const AArch64LowerBackend = struct {
         }
 
         // Build defs list: gen_call_rets(abi, output)
-        // Each return value vreg is defined in its ABI register (X0, X1, ...)
+        // Each return value vreg is defined in its ABI register
+        // Integers in X0, X1, ...; floats in V0, V1, ...
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
-        // Port of Cranelift's gen_call_rets: loop over all return values
         const num_outputs = ctx.numOutputs(ir_inst);
         var output = InstOutput{};
         var int_ret_idx: u8 = 0;
+        var float_ret_idx: u8 = 0;
         for (0..num_outputs) |out_idx| {
             const ret_ty = ctx.outputTy(ir_inst, out_idx);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
 
-            // Each integer return goes to X0, X1, X2, ...
-            const ret_preg = regs.xregPreg(int_ret_idx);
+            // Float returns go to V0, V1, ...; integer returns to X0, X1, ...
+            const ret_preg = if (ret_ty.isFloat()) blk: {
+                const idx = float_ret_idx;
+                float_ret_idx += 1;
+                break :blk regs.vregPreg(idx);
+            } else blk: {
+                const idx = int_ret_idx;
+                int_ret_idx += 1;
+                break :blk regs.xregPreg(idx);
+            };
             call_info.defs.append(ctx.allocator, .{
                 .vreg = dst_reg,
                 .location = .{ .reg = ret_preg },
@@ -1959,11 +2018,9 @@ pub const AArch64LowerBackend = struct {
 
             // Port of Cranelift's gen_call_info: remove return regs from clobbers.
             // regalloc2 requires that clobbers and defs must not collide.
-            // See cranelift/codegen/src/machinst/abi.rs lines 2114-2119
             clobbers.remove(ret_preg);
 
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
-            int_ret_idx += 1;
         }
 
         // Assign clobbers after removing return registers
@@ -2028,16 +2085,24 @@ pub const AArch64LowerBackend = struct {
 
         // Build uses list: gen_call_args(abi, args)
         // Skip first input which is callee, remaining inputs are arguments
+        // AAPCS64: integers in X0-X15, floats in V0-V7
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         var int_arg_idx: u8 = 0;
+        var float_arg_idx: u8 = 0;
         for (1..num_inputs) |idx| {
             const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
             const arg_ty = ctx.inputTy(ir_inst, idx);
 
-            if (!arg_ty.isFloat() and int_arg_idx < 16) {
-                // Add to uses: this vreg MUST be in this preg at the call
-                // Internal CC uses x0-x15 for integer args.
+            if (arg_ty.isFloat()) {
+                if (float_arg_idx < 8) {
+                    call_ind_info.uses.append(ctx.allocator, .{
+                        .vreg = arg_reg,
+                        .preg = regs.vregPreg(float_arg_idx),
+                    }) catch return null;
+                    float_arg_idx += 1;
+                }
+            } else if (int_arg_idx < 16) {
                 call_ind_info.uses.append(ctx.allocator, .{
                     .vreg = arg_reg,
                     .preg = regs.xregPreg(int_arg_idx),
@@ -2048,24 +2113,32 @@ pub const AArch64LowerBackend = struct {
 
         // Build defs list: gen_call_rets(abi, output)
         // Each return value vreg is defined in its ABI register
+        // Integers in X0, X1, ...; floats in V0, V1, ...
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
         const num_outputs = ctx.numOutputs(ir_inst);
         var output = InstOutput{};
-        if (num_outputs > 0) {
-            const ret_ty = ctx.outputTy(ir_inst, 0);
+        var int_ret_idx: u8 = 0;
+        var float_ret_idx: u8 = 0;
+        for (0..num_outputs) |out_idx| {
+            const ret_ty = ctx.outputTy(ir_inst, out_idx);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
 
-            // Add to defs: this vreg is DEFINED BY the call in X0
-            const ret_preg = regs.xregPreg(0);
+            const ret_preg = if (ret_ty.isFloat()) blk: {
+                const idx = float_ret_idx;
+                float_ret_idx += 1;
+                break :blk regs.vregPreg(idx);
+            } else blk: {
+                const idx = int_ret_idx;
+                int_ret_idx += 1;
+                break :blk regs.xregPreg(idx);
+            };
             call_ind_info.defs.append(ctx.allocator, .{
                 .vreg = dst_reg,
                 .location = .{ .reg = ret_preg },
             }) catch return null;
 
-            // Port of Cranelift's gen_call_info: remove return regs from clobbers.
-            // regalloc2 requires that clobbers and defs must not collide.
-            // See cranelift/codegen/src/machinst/abi.rs lines 2114-2119
+            // Remove return regs from clobbers (regalloc2 requirement)
             clobbers.remove(ret_preg);
 
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;

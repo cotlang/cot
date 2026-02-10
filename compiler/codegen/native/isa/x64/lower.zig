@@ -35,6 +35,7 @@ const XmmMem = inst_mod.args.XmmMem;
 const RegMem = inst_mod.args.RegMem;
 const RegMemImm = inst_mod.args.RegMemImm;
 const SseOpcode = inst_mod.SseOpcode;
+const RoundImm = inst_mod.args.RoundImm;
 const TrapCode = inst_mod.TrapCode;
 
 // Import register types from local modules
@@ -229,6 +230,10 @@ pub const X64LowerBackend = struct {
             .fneg => self.lowerFneg(ctx, ir_inst),
             .fabs => self.lowerFabs(ctx, ir_inst),
             .sqrt => self.lowerSqrt(ctx, ir_inst),
+            .ceil => self.lowerFpuRound(ctx, ir_inst, .round_up),
+            .floor => self.lowerFpuRound(ctx, ir_inst, .round_down),
+            .trunc => self.lowerFpuRound(ctx, ir_inst, .round_zero),
+            .nearest => self.lowerFpuRound(ctx, ir_inst, .round_nearest),
             .fcmp => self.lowerFcmp(ctx, ir_inst),
 
             // Conversions
@@ -1179,6 +1184,31 @@ pub const X64LowerBackend = struct {
         return output;
     }
 
+    fn lowerFpuRound(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst, imm: RoundImm) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        const src = ctx.putInputInRegs(ir_inst, 0);
+        const dst = ctx.allocTmp(ty) catch return null;
+
+        const src_reg = src.onlyReg() orelse return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const op: SseOpcode = if (ty.bytes() == 4) .roundss else .roundsd;
+        const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
+
+        ctx.emit(Inst{
+            .xmm_round = .{
+                .op = op,
+                .src = XmmMem{ .inner = RegMem{ .reg = src_reg } },
+                .dst = dst_xmm,
+                .imm = imm,
+            },
+        }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
     fn lowerFcmp(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         _ = self;
         const ty = ctx.inputTy(ir_inst, 0);
@@ -1778,27 +1808,33 @@ pub const X64LowerBackend = struct {
 
         // Build uses list: gen_call_args(abi, args)
         // Each argument vreg is constrained to its ABI register
+        // System V: integers in RDI,RSI,RDX,RCX,R8,R9; floats in XMM0-XMM7
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
-        // Port of Cranelift's gen_call_args from abi.rs
         var int_arg_idx: u8 = 0;
+        var float_arg_idx: u8 = 0;
         var stack_offset: u32 = 0;
         for (0..num_args) |idx| {
             const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
             const arg_ty = ctx.inputTy(ir_inst, idx);
 
-            if (!arg_ty.isFloat() and int_arg_idx < int_arg_pregs.len) {
+            if (arg_ty.isFloat()) {
+                if (float_arg_idx < 8) {
+                    call_info.uses.append(ctx.allocator, .{
+                        .vreg = arg_reg,
+                        .preg = regs.fprPreg(float_arg_idx),
+                    }) catch return null;
+                    float_arg_idx += 1;
+                }
+            } else if (int_arg_idx < int_arg_pregs.len) {
                 // Register argument: constrain vreg to its ABI register
                 call_info.uses.append(ctx.allocator, .{
                     .vreg = arg_reg,
                     .preg = int_arg_pregs[int_arg_idx],
                 }) catch return null;
                 int_arg_idx += 1;
-            } else if (!arg_ty.isFloat()) {
+            } else {
                 // Stack argument: store to outgoing args area [rsp + offset].
-                // The outgoing args area is at the bottom of the stack frame,
-                // pre-allocated in the prologue.
-                // Port of Cranelift's StackAMode::OutgoingArg pattern.
                 const amode = SyntheticAmode.real_amode(Amode{ .imm_reg = .{
                     .simm32 = @intCast(stack_offset),
                     .base = regs.rsp(),
@@ -1817,27 +1853,34 @@ pub const X64LowerBackend = struct {
         call_info.stack_args_size = stack_offset;
 
         // Build defs list: gen_call_rets(abi, output)
-        // Each return value vreg is defined in its ABI register (RAX, RDX, ...)
+        // Integers in RAX, RDX; floats in XMM0, XMM1
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
-        // Port of Cranelift's gen_call_rets: loop over all return values
-        // x64 ABI: first return in RAX, second in RDX
         const x64_ret_regs = [_]u8{ GprEnc.RAX, GprEnc.RDX };
         const num_outputs = ctx.numOutputs(ir_inst);
         var output = InstOutput{};
+        var int_ret_idx: u8 = 0;
+        var float_ret_idx: u8 = 0;
         for (0..num_outputs) |out_idx| {
             const ret_ty = ctx.outputTy(ir_inst, out_idx);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
 
-            // Each integer return goes to RAX, RDX, ...
-            const ret_preg = regs.gprPreg(x64_ret_regs[out_idx]);
+            // Float returns in XMM0, XMM1; integer returns in RAX, RDX
+            const ret_preg = if (ret_ty.isFloat()) blk: {
+                const idx = float_ret_idx;
+                float_ret_idx += 1;
+                break :blk regs.fprPreg(idx);
+            } else blk: {
+                const idx = int_ret_idx;
+                int_ret_idx += 1;
+                break :blk regs.gprPreg(x64_ret_regs[idx]);
+            };
             call_info.defs.append(ctx.allocator, .{
                 .vreg = dst_reg,
                 .location = .{ .reg = ret_preg },
             }) catch return null;
 
-            // Port of Cranelift's gen_call_info: remove return regs from clobbers.
-            // regalloc2 requires that clobbers and defs must not collide.
+            // Remove return regs from clobbers (regalloc2 requirement)
             clobbers.remove(ret_preg);
 
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
@@ -1877,13 +1920,28 @@ pub const X64LowerBackend = struct {
         };
 
         // Move arguments to ABI registers (skip first input which is callee)
+        // System V: integers in RDI,RSI,...; floats in XMM0-XMM7
         var int_arg_idx: usize = 0;
+        var float_arg_idx: usize = 0;
         for (1..num_inputs) |i| {
             const arg_val = ctx.putInputInRegs(ir_inst, i);
             const arg_reg = arg_val.onlyReg() orelse continue;
             const arg_ty = ctx.inputTy(ir_inst, i);
 
-            if (!arg_ty.isFloat() and int_arg_idx < int_arg_regs.len) {
+            if (arg_ty.isFloat()) {
+                if (float_arg_idx < 8) {
+                    // Move float arg to XMM register
+                    const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(regs.fpr(@intCast(float_arg_idx))));
+                    ctx.emit(Inst{
+                        .xmm_unary_rm_r = .{
+                            .op = if (arg_ty.bytes() == 4) SseOpcode.movss else SseOpcode.movsd,
+                            .src = XmmMem{ .inner = RegMem.fromReg(arg_reg) },
+                            .dst = dst_xmm,
+                        },
+                    }) catch return null;
+                    float_arg_idx += 1;
+                }
+            } else if (int_arg_idx < int_arg_regs.len) {
                 const dst_reg = int_arg_regs[int_arg_idx];
                 const src_gpr = Gpr.unwrapNew(arg_reg);
                 const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg));
@@ -1913,15 +1971,28 @@ pub const X64LowerBackend = struct {
             const ret_ty = ctx.outputTy(ir_inst, 0);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
-            const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
-            ctx.emit(Inst{
-                .mov_r_r = .{
-                    .size = operandSizeFromType(ret_ty),
-                    .src = Gpr.unwrapNew(regs.rax()),
-                    .dst = dst_gpr,
-                },
-            }) catch return null;
+            if (ret_ty.isFloat()) {
+                // Float return in XMM0
+                const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
+                ctx.emit(Inst{
+                    .xmm_unary_rm_r = .{
+                        .op = if (ret_ty.bytes() == 4) SseOpcode.movss else SseOpcode.movsd,
+                        .src = XmmMem{ .inner = RegMem.fromReg(regs.xmm0()) },
+                        .dst = dst_xmm,
+                    },
+                }) catch return null;
+            } else {
+                // Integer return in RAX
+                const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
+                ctx.emit(Inst{
+                    .mov_r_r = .{
+                        .size = operandSizeFromType(ret_ty),
+                        .src = Gpr.unwrapNew(regs.rax()),
+                        .dst = dst_gpr,
+                    },
+                }) catch return null;
+            }
 
             var output = InstOutput{};
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;

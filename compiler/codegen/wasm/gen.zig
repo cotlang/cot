@@ -545,6 +545,42 @@ pub const GenState = struct {
                 try self.getValue64(v.args[0]);
                 _ = try self.builder.append(.f64_neg);
             },
+            // Float math unary ops (f64)
+            .wasm_f64_abs => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_abs);
+            },
+            .wasm_f64_ceil => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_ceil);
+            },
+            .wasm_f64_floor => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_floor);
+            },
+            .wasm_f64_trunc => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_trunc);
+            },
+            .wasm_f64_nearest => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_nearest);
+            },
+            .wasm_f64_sqrt => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.f64_sqrt);
+            },
+            // Float math binary ops (f64)
+            .wasm_f64_min => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_min);
+            },
+            .wasm_f64_max => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.f64_max);
+            },
 
             // Integer negation: 0 - x (Wasm has no i64.neg)
             .neg => {
@@ -922,23 +958,34 @@ pub const GenState = struct {
                 // No result (void function)
             },
 
-            // Integer conversion (int cast)
+            // Type conversion (int cast, float-to-int, int-to-float)
             // Go reference: cmd/compile/internal/wasm/ssa.go:479-501
             .convert => {
                 const from_type = v.aux.type_ref;
                 const to_type = v.type_idx;
 
-                // Get the value to convert (always as i64)
+                // Get the value onto stack
                 try self.getValue64(v.args[0]);
 
-                // Determine sizes based on type indices
-                // TypeRegistry: I32=4, I64=5
+                // TypeRegistry: I32=4, I64=5, F32=10, F64=11, UNTYPED_FLOAT=14
+                const from_is_float = (from_type == 10 or from_type == 11 or from_type == 14);
+                const to_is_float = (to_type == 10 or to_type == 11 or to_type == 14);
                 const from_is_32 = (from_type == 4); // I32
                 const to_is_32 = (to_type == 4); // I32
 
-                if (!from_is_32 and to_is_32) {
+                if (from_is_float and !to_is_float) {
+                    // f64 -> i64: truncate float to signed integer
+                    if (to_is_32) {
+                        _ = try self.builder.append(.i32_trunc_f64_s);
+                        _ = try self.builder.append(.i64_extend_i32_s);
+                    } else {
+                        _ = try self.builder.append(.i64_trunc_f64_s);
+                    }
+                } else if (!from_is_float and to_is_float) {
+                    // i64 -> f64: convert signed integer to float
+                    _ = try self.builder.append(.f64_convert_i64_s);
+                } else if (!from_is_32 and to_is_32) {
                     // i64 -> i32: wrap then extend back to i64 for stack consistency
-                    // Go: s.Prog(wasm.AI32WrapI64)
                     _ = try self.builder.append(.i32_wrap_i64);
                     _ = try self.builder.append(.i64_extend_i32_s);
                 } else if (from_is_32 and !to_is_32) {

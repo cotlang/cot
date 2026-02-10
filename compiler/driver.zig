@@ -1995,9 +1995,6 @@ pub const Driver = struct {
     /// Uses Go-style Linker for module structure with proper SP globals.
     fn generateWasmCode(self: *Driver, funcs: []const ir_mod.Func, type_reg: *types_mod.TypeRegistry) ![]u8 {
         pipeline_debug.log(.codegen, "driver: generating Wasm for {d} functions", .{funcs.len});
-        for (funcs) |*ir_func| {
-            pipeline_debug.log(.codegen, "driver: IR func: '{s}' params={d} ret={d}", .{ ir_func.name, ir_func.params.len, ir_func.return_type });
-        }
 
         var linker = wasm.Linker.init(self.allocator);
         defer linker.deinit();
@@ -2246,7 +2243,7 @@ pub const Driver = struct {
                     }
                 }
             }
-            var params: [16]wasm.ValType = undefined;
+            var params: [32]wasm.ValType = undefined;
             {
                 // Build Wasm param types, decomposing compound types (slice, string)
                 // into 2 separate i64 entries (ptr, len). This must match the SSA
@@ -2256,14 +2253,21 @@ pub const Driver = struct {
                     const param_type = type_reg.get(param.type_idx);
                     const is_string_or_slice = param.type_idx == types_mod.TypeRegistry.STRING or param_type == .slice;
                     const type_size = type_reg.sizeOf(param.type_idx);
-                    const is_large_struct = param_type == .struct_type and type_size > 8 and type_size <= 16;
+                    const is_large_struct = param_type == .struct_type and type_size > 8;
 
-                    if (is_string_or_slice or is_large_struct) {
-                        // Compound type: 2 i64 params (ptr+len or lo+hi)
+                    if (is_string_or_slice) {
+                        // String/slice: 2 i64 params (ptr+len)
                         params[wasm_param_idx] = .i64;
                         wasm_param_idx += 1;
                         params[wasm_param_idx] = .i64;
                         wasm_param_idx += 1;
+                    } else if (is_large_struct) {
+                        // Large struct: N i64 params (one per 8-byte chunk)
+                        const num_slots = (type_size + 7) / 8;
+                        for (0..num_slots) |_| {
+                            params[wasm_param_idx] = .i64;
+                            wasm_param_idx += 1;
+                        }
                     } else {
                         const is_float = param.type_idx == types_mod.TypeRegistry.F64 or
                             param.type_idx == types_mod.TypeRegistry.F32;
