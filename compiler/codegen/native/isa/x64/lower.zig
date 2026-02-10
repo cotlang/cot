@@ -1817,17 +1817,20 @@ pub const X64LowerBackend = struct {
         call_info.stack_args_size = stack_offset;
 
         // Build defs list: gen_call_rets(abi, output)
-        // Each return value vreg is defined in its ABI register
+        // Each return value vreg is defined in its ABI register (RAX, RDX, ...)
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
+        // Port of Cranelift's gen_call_rets: loop over all return values
+        // x64 ABI: first return in RAX, second in RDX
+        const x64_ret_regs = [_]u8{ GprEnc.RAX, GprEnc.RDX };
         const num_outputs = ctx.numOutputs(ir_inst);
         var output = InstOutput{};
-        if (num_outputs > 0) {
-            const ret_ty = ctx.outputTy(ir_inst, 0);
+        for (0..num_outputs) |out_idx| {
+            const ret_ty = ctx.outputTy(ir_inst, out_idx);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
 
-            // Add to defs: this vreg is DEFINED BY the call in RAX
-            const ret_preg = regs.gprPreg(GprEnc.RAX);
+            // Each integer return goes to RAX, RDX, ...
+            const ret_preg = regs.gprPreg(x64_ret_regs[out_idx]);
             call_info.defs.append(ctx.allocator, .{
                 .vreg = dst_reg,
                 .location = .{ .reg = ret_preg },

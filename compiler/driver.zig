@@ -2034,7 +2034,7 @@ pub const Driver = struct {
         // Add WASI runtime functions (fd_write)
         // Reference: WASI preview1 fd_write
         // ====================================================================
-        const wasi_funcs = try wasi_runtime.addToLinker(self.allocator, &linker);
+        const wasi_funcs = try wasi_runtime.addToLinker(self.allocator, &linker, self.target);
 
         // ====================================================================
         // Add test runtime functions (Zig test runner pattern)
@@ -2272,8 +2272,14 @@ pub const Driver = struct {
             const has_return = ir_func.return_type != types_mod.TypeRegistry.VOID;
             const ret_is_float = ir_func.return_type == types_mod.TypeRegistry.F64 or
                 ir_func.return_type == types_mod.TypeRegistry.F32;
+            // Decompose compound return types (string, slice) into 2 i64 values
+            // to match the param decomposition pattern above.
+            const ret_type_info = type_reg.get(ir_func.return_type);
+            const ret_is_compound = ir_func.return_type == types_mod.TypeRegistry.STRING or ret_type_info == .slice;
             const results: []const wasm.ValType = if (!has_return)
                 &[_]wasm.ValType{}
+            else if (ret_is_compound)
+                &[_]wasm.ValType{ .i64, .i64 }
             else if (ret_is_float)
                 &[_]wasm.ValType{.f64}
             else

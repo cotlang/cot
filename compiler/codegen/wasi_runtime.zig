@@ -3,21 +3,20 @@
 //! Provides WASI-compatible I/O functions.
 //! Reference: WASI preview1 (Go: syscall/fs_wasip1.go, Wasmtime: wasi-common)
 //!
-//! Functions:
-//!   wasi_fd_write(fd, iovs, iovs_len, nwritten) -> i64  — WASI fd_write (stub, ARM64 override)
-//!   cot_fd_write_simple(fd, ptr, len) -> i64             — simple write (stub, ARM64 override)
-//!   cot_fd_read_simple(fd, buf, len) -> i64              — simple read (stub, ARM64 override)
-//!   cot_fd_close(fd) -> i64                              — close fd (stub, ARM64 override)
-//!   cot_fd_seek(fd, offset, whence) -> i64               — seek (stub, ARM64 override)
-//!   cot_fd_open(path_ptr, path_len, flags) -> i64        — open file (stub, ARM64 override)
-//!   cot_time() -> i64                                    — wall clock nanos (stub, ARM64 override)
-//!   cot_random(buf, len) -> i64                          — random bytes (stub, ARM64 override)
-//!   cot_exit(code) -> void                               — exit process (trap stub, ARM64 override)
+//! Two modes:
+//!   - Native/freestanding: Wasm stub functions (return 0 or trap). ARM64/x64 overrides in driver.zig.
+//!   - WASI target: Real WASI host imports + adapter shim functions that translate
+//!     Cot's i64 calling convention to WASI's i32 iov-pointer convention.
+//!
+//! Reference for WASI ABI:
+//!   wasmtime/crates/wasi-common/witx/preview1/wasi_snapshot_preview1.witx
 
 const std = @import("std");
 const wasm = @import("wasm.zig");
 const wasm_link = @import("wasm/wasm.zig");
 const ValType = wasm_link.ValType;
+const WasmImport = wasm_link.WasmImport;
+const Target = @import("../core/target.zig").Target;
 
 const wasm_op = @import("wasm_opcodes.zig");
 
@@ -40,6 +39,16 @@ pub const ARG_PTR_NAME = "cot_arg_ptr";
 pub const ENVIRON_COUNT_NAME = "cot_environ_count";
 pub const ENVIRON_LEN_NAME = "cot_environ_len";
 pub const ENVIRON_PTR_NAME = "cot_environ_ptr";
+
+// WASI scratch memory addresses in linear memory
+// Used by adapter shims to build iov structs and read WASI output params
+const SCRATCH_BASE: i32 = 0xE0000; // iov struct: 8 bytes (ptr + len)
+const SCRATCH_NWRITTEN: i32 = 0xE0008; // nwritten/nread output: 4 bytes
+const SCRATCH_RESULT: i32 = 0xE000C; // generic i32/i64 result output: 8 bytes
+const SCRATCH_ARGV: i32 = 0xE1000; // argv pointer array (1024 entries * 4 bytes)
+const SCRATCH_ARGV_BUF: i32 = 0xE2000; // argv string buffer (8KB)
+const SCRATCH_ENVIRON: i32 = 0xE4000; // environ pointer array
+const SCRATCH_ENVIRON_BUF: i32 = 0xE5000; // environ string buffer (8KB)
 
 // =============================================================================
 // Return Type
@@ -67,9 +76,339 @@ pub const WasiFunctions = struct {
 // addToLinker — register all WASI runtime functions
 // =============================================================================
 
-pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker) !WasiFunctions {
+pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker, target: Target) !WasiFunctions {
+    if (target.isWasi()) {
+        return addWasiImports(allocator, linker);
+    } else {
+        return addNativeStubs(allocator, linker);
+    }
+}
+
+// =============================================================================
+// WASI target: import real WASI functions + create adapter shims
+// Reference: WASI snapshot_preview1 ABI
+// =============================================================================
+
+fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker) !WasiFunctions {
+    const WASI_MODULE = "wasi_snapshot_preview1";
+
+    // --- Import real WASI host functions ---
+
+    // fd_write(fd: i32, iovs: i32, iovs_len: i32, nwritten: i32) -> i32
+    const wasi_fd_write_type = try linker.addType(
+        &[_]ValType{ .i32, .i32, .i32, .i32 },
+        &[_]ValType{.i32},
+    );
+    const wasi_fd_write_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "fd_write",
+        .type_idx = wasi_fd_write_type,
+    });
+
+    // fd_read(fd: i32, iovs: i32, iovs_len: i32, nread: i32) -> i32
+    const wasi_fd_read_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "fd_read",
+        .type_idx = wasi_fd_write_type, // Same signature
+    });
+
+    // fd_close(fd: i32) -> i32
+    const wasi_fd_close_type = try linker.addType(
+        &[_]ValType{.i32},
+        &[_]ValType{.i32},
+    );
+    const wasi_fd_close_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "fd_close",
+        .type_idx = wasi_fd_close_type,
+    });
+
+    // fd_seek(fd: i32, offset: i64, whence: i32, newoffset_ptr: i32) -> i32
+    const wasi_fd_seek_type = try linker.addType(
+        &[_]ValType{ .i32, .i64, .i32, .i32 },
+        &[_]ValType{.i32},
+    );
+    const wasi_fd_seek_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "fd_seek",
+        .type_idx = wasi_fd_seek_type,
+    });
+
+    // path_open(dirfd:i32, dirflags:i32, path:i32, path_len:i32, oflags:i32,
+    //           fs_rights_base:i64, fs_rights_inheriting:i64, fdflags:i32, opened_fd:i32) -> i32
+    const wasi_path_open_type = try linker.addType(
+        &[_]ValType{ .i32, .i32, .i32, .i32, .i32, .i64, .i64, .i32, .i32 },
+        &[_]ValType{.i32},
+    );
+    const wasi_path_open_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "path_open",
+        .type_idx = wasi_path_open_type,
+    });
+
+    // proc_exit(code: i32) -> noreturn
+    const wasi_proc_exit_type = try linker.addType(
+        &[_]ValType{.i32},
+        &[_]ValType{},
+    );
+    const wasi_proc_exit_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "proc_exit",
+        .type_idx = wasi_proc_exit_type,
+    });
+
+    // args_sizes_get(argc_ptr: i32, argv_buf_size_ptr: i32) -> i32
+    const wasi_args_sizes_get_type = try linker.addType(
+        &[_]ValType{ .i32, .i32 },
+        &[_]ValType{.i32},
+    );
+    const wasi_args_sizes_get_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "args_sizes_get",
+        .type_idx = wasi_args_sizes_get_type,
+    });
+
+    // args_get(argv: i32, argv_buf: i32) -> i32
+    const wasi_args_get_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "args_get",
+        .type_idx = wasi_args_sizes_get_type, // Same type: (i32, i32) -> i32
+    });
+
+    // clock_time_get(clock_id: i32, precision: i64, time_ptr: i32) -> i32
+    const wasi_clock_time_get_type = try linker.addType(
+        &[_]ValType{ .i32, .i64, .i32 },
+        &[_]ValType{.i32},
+    );
+    const wasi_clock_time_get_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "clock_time_get",
+        .type_idx = wasi_clock_time_get_type,
+    });
+
+    // random_get(buf: i32, buf_len: i32) -> i32
+    const wasi_random_get_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "random_get",
+        .type_idx = wasi_args_sizes_get_type, // Same type: (i32, i32) -> i32
+    });
+
+    // environ_sizes_get(count_ptr: i32, buf_size_ptr: i32) -> i32
+    const wasi_environ_sizes_get_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "environ_sizes_get",
+        .type_idx = wasi_args_sizes_get_type, // Same type: (i32, i32) -> i32
+    });
+
+    // environ_get(environ: i32, environ_buf: i32) -> i32
+    const wasi_environ_get_idx = try linker.addImport(.{
+        .module = WASI_MODULE,
+        .name = "environ_get",
+        .type_idx = wasi_args_sizes_get_type, // Same type: (i32, i32) -> i32
+    });
+
+    // --- Import count for function index offset ---
+    // In Wasm binary: imports get indices 0..N-1, module functions get N, N+1, ...
+    // addImport returns the import's LOCAL index (0-based within imports).
+    // The actual Wasm function index = import local index (they're 0-based in order).
+    // Module functions returned by addFunc are 0-based within funcs.
+    // Their actual Wasm function index = import_count + func_local_index.
+    const import_count = linker.numImports();
+
+    // --- Create adapter shim functions ---
+    // These have Cot's i64 signatures and call the imported WASI functions.
+    // Import function indices are 0..import_count-1 (directly usable in call).
+
+    // wasi_fd_write shim: (fd:i64, iovs:i64, iovs_len:i64, nwritten:i64) -> i64
+    const fd_write_cot_type = try linker.addType(
+        &[_]ValType{ .i64, .i64, .i64, .i64 },
+        &[_]ValType{.i64},
+    );
+    const fd_write_body = try generateWasiFdWriteShim(allocator, wasi_fd_write_idx);
+    const fd_write_idx = try linker.addFunc(.{
+        .name = FD_WRITE_NAME,
+        .type_idx = fd_write_cot_type,
+        .code = fd_write_body,
+        .exported = false,
+    });
+
+    // cot_fd_write_simple shim: (fd:i64, ptr:i64, len:i64) -> i64
+    const fd_write_simple_type = try linker.addType(
+        &[_]ValType{ .i64, .i64, .i64 },
+        &[_]ValType{.i64},
+    );
+    const fd_write_simple_body = try generateWasiWriteSimpleShim(allocator, wasi_fd_write_idx);
+    const fd_write_simple_idx = try linker.addFunc(.{
+        .name = FD_WRITE_SIMPLE_NAME,
+        .type_idx = fd_write_simple_type,
+        .code = fd_write_simple_body,
+        .exported = false,
+    });
+
+    // cot_fd_read_simple shim: (fd:i64, buf:i64, len:i64) -> i64
+    const fd_read_simple_body = try generateWasiReadSimpleShim(allocator, wasi_fd_read_idx);
+    const fd_read_simple_idx = try linker.addFunc(.{
+        .name = FD_READ_SIMPLE_NAME,
+        .type_idx = fd_write_simple_type,
+        .code = fd_read_simple_body,
+        .exported = false,
+    });
+
+    // cot_fd_close shim: (fd:i64) -> i64
+    const fd_close_cot_type = try linker.addType(
+        &[_]ValType{.i64},
+        &[_]ValType{.i64},
+    );
+    const fd_close_body = try generateWasiFdCloseShim(allocator, wasi_fd_close_idx);
+    const fd_close_idx = try linker.addFunc(.{
+        .name = FD_CLOSE_NAME,
+        .type_idx = fd_close_cot_type,
+        .code = fd_close_body,
+        .exported = false,
+    });
+
+    // cot_fd_seek shim: (fd:i64, offset:i64, whence:i64) -> i64
+    const fd_seek_body = try generateWasiFdSeekShim(allocator, wasi_fd_seek_idx);
+    const fd_seek_idx = try linker.addFunc(.{
+        .name = FD_SEEK_NAME,
+        .type_idx = fd_write_simple_type,
+        .code = fd_seek_body,
+        .exported = false,
+    });
+
+    // cot_fd_open shim: (path_ptr:i64, path_len:i64, flags:i64) -> i64
+    const fd_open_body = try generateWasiPathOpenShim(allocator, wasi_path_open_idx);
+    const fd_open_idx = try linker.addFunc(.{
+        .name = FD_OPEN_NAME,
+        .type_idx = fd_write_simple_type,
+        .code = fd_open_body,
+        .exported = false,
+    });
+
+    // cot_time shim: () -> i64
+    const time_type = try linker.addType(
+        &[_]ValType{},
+        &[_]ValType{.i64},
+    );
+    const time_body = try generateWasiTimeShim(allocator, wasi_clock_time_get_idx);
+    const time_idx = try linker.addFunc(.{
+        .name = TIME_NAME,
+        .type_idx = time_type,
+        .code = time_body,
+        .exported = false,
+    });
+
+    // cot_random shim: (buf:i64, len:i64) -> i64
+    const random_type = try linker.addType(
+        &[_]ValType{ .i64, .i64 },
+        &[_]ValType{.i64},
+    );
+    const random_body = try generateWasiRandomShim(allocator, wasi_random_get_idx);
+    const random_idx = try linker.addFunc(.{
+        .name = RANDOM_NAME,
+        .type_idx = random_type,
+        .code = random_body,
+        .exported = false,
+    });
+
+    // cot_exit shim: (code:i64) -> void
+    const exit_type = try linker.addType(
+        &[_]ValType{.i64},
+        &[_]ValType{},
+    );
+    const exit_body = try generateWasiExitShim(allocator, wasi_proc_exit_idx);
+    const exit_idx = try linker.addFunc(.{
+        .name = EXIT_NAME,
+        .type_idx = exit_type,
+        .code = exit_body,
+        .exported = false,
+    });
+
+    // cot_args_count shim: () -> i64
+    const args_count_body = try generateWasiArgsCountShim(allocator, wasi_args_sizes_get_idx);
+    const args_count_idx = try linker.addFunc(.{
+        .name = ARGS_COUNT_NAME,
+        .type_idx = time_type,
+        .code = args_count_body,
+        .exported = false,
+    });
+
+    // cot_arg_len shim: (n:i64) -> i64
+    const arg_one_type = try linker.addType(
+        &[_]ValType{.i64},
+        &[_]ValType{.i64},
+    );
+    const arg_len_body = try generateWasiArgLenShim(allocator, wasi_args_sizes_get_idx, wasi_args_get_idx);
+    const arg_len_idx = try linker.addFunc(.{
+        .name = ARG_LEN_NAME,
+        .type_idx = arg_one_type,
+        .code = arg_len_body,
+        .exported = false,
+    });
+
+    // cot_arg_ptr shim: (n:i64) -> i64
+    const arg_ptr_body = try generateWasiArgPtrShim(allocator, wasi_args_sizes_get_idx, wasi_args_get_idx);
+    const arg_ptr_idx = try linker.addFunc(.{
+        .name = ARG_PTR_NAME,
+        .type_idx = arg_one_type,
+        .code = arg_ptr_body,
+        .exported = false,
+    });
+
+    // cot_environ_count shim: () -> i64
+    const environ_count_body = try generateWasiEnvironCountShim(allocator, wasi_environ_sizes_get_idx);
+    const environ_count_idx = try linker.addFunc(.{
+        .name = ENVIRON_COUNT_NAME,
+        .type_idx = time_type,
+        .code = environ_count_body,
+        .exported = false,
+    });
+
+    // cot_environ_len shim: (n:i64) -> i64
+    const environ_len_body = try generateWasiEnvironLenShim(allocator, wasi_environ_sizes_get_idx, wasi_environ_get_idx);
+    const environ_len_idx = try linker.addFunc(.{
+        .name = ENVIRON_LEN_NAME,
+        .type_idx = arg_one_type,
+        .code = environ_len_body,
+        .exported = false,
+    });
+
+    // cot_environ_ptr shim: (n:i64) -> i64
+    const environ_ptr_body = try generateWasiEnvironPtrShim(allocator, wasi_environ_sizes_get_idx, wasi_environ_get_idx);
+    const environ_ptr_idx = try linker.addFunc(.{
+        .name = ENVIRON_PTR_NAME,
+        .type_idx = arg_one_type,
+        .code = environ_ptr_body,
+        .exported = false,
+    });
+
+    // Return indices: addFunc returns 0-based func indices.
+    // Actual Wasm function index = import_count + func_local_index.
+    return WasiFunctions{
+        .fd_write_idx = fd_write_idx + import_count,
+        .fd_write_simple_idx = fd_write_simple_idx + import_count,
+        .fd_read_simple_idx = fd_read_simple_idx + import_count,
+        .fd_close_idx = fd_close_idx + import_count,
+        .fd_seek_idx = fd_seek_idx + import_count,
+        .fd_open_idx = fd_open_idx + import_count,
+        .time_idx = time_idx + import_count,
+        .random_idx = random_idx + import_count,
+        .exit_idx = exit_idx + import_count,
+        .args_count_idx = args_count_idx + import_count,
+        .arg_len_idx = arg_len_idx + import_count,
+        .arg_ptr_idx = arg_ptr_idx + import_count,
+        .environ_count_idx = environ_count_idx + import_count,
+        .environ_len_idx = environ_len_idx + import_count,
+        .environ_ptr_idx = environ_ptr_idx + import_count,
+    };
+}
+
+// =============================================================================
+// Native/freestanding: stub functions (existing behavior)
+// =============================================================================
+
+fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig").Linker) !WasiFunctions {
     // wasi_fd_write: (fd: i64, iovs: i64, iovs_len: i64, nwritten: i64) -> i64
-    // Returns WASI errno (0 = success)
     const fd_write_type = try linker.addType(
         &[_]ValType{ .i64, .i64, .i64, .i64 },
         &[_]ValType{.i64},
@@ -79,12 +418,9 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .name = FD_WRITE_NAME,
         .type_idx = fd_write_type,
         .code = fd_write_body,
-        .exported = true, // So generateMachO can find it by name for ARM64 override
+        .exported = true,
     });
 
-    // cot_fd_write_simple: (fd: i64, ptr: i64, len: i64) -> i64
-    // Same signature as cot_write. Exported so native can override with ARM64 syscall.
-    // Wasm stub returns 0. On native, ARM64 override does real SYS_write.
     const fd_write_simple_type = try linker.addType(
         &[_]ValType{ .i64, .i64, .i64 },
         &[_]ValType{.i64},
@@ -94,24 +430,17 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .name = FD_WRITE_SIMPLE_NAME,
         .type_idx = fd_write_simple_type,
         .code = fd_write_simple_body,
-        .exported = true, // So generateMachO can find it for ARM64 override
+        .exported = true,
     });
 
-    // cot_fd_read_simple: (fd: i64, buf: i64, len: i64) -> i64
-    // Reference: Go syscall/fs_wasip1.go:900 Read() — builds 1-element iovec, calls fd_read
-    // Same pattern as cot_fd_write_simple: stub on Wasm, ARM64 SYS_read override on native.
-    // Returns bytes read (0 = EOF).
     const fd_read_simple_body = try generateStubReturnsZero(allocator);
     const fd_read_simple_idx = try linker.addFunc(.{
         .name = FD_READ_SIMPLE_NAME,
-        .type_idx = fd_write_simple_type, // Same type: (i64, i64, i64) -> i64
+        .type_idx = fd_write_simple_type,
         .code = fd_read_simple_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_fd_close: (fd: i64) -> i64
-    // Reference: Go syscall/fs_wasip1.go:203 fd_close(fd int32) Errno
-    // Returns 0 on success, WASI errno on error.
     const fd_close_type = try linker.addType(
         &[_]ValType{.i64},
         &[_]ValType{.i64},
@@ -121,34 +450,25 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .name = FD_CLOSE_NAME,
         .type_idx = fd_close_type,
         .code = fd_close_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_fd_seek: (fd: i64, offset: i64, whence: i64) -> i64
-    // Reference: Go syscall/fs_wasip1.go:928 Seek() — lseek(fd, offset, whence) -> newoffset
-    // Returns new offset on success. On native, ARM64 override does SYS_lseek.
     const fd_seek_body = try generateStubReturnsZero(allocator);
     const fd_seek_idx = try linker.addFunc(.{
         .name = FD_SEEK_NAME,
-        .type_idx = fd_write_simple_type, // Same type: (i64, i64, i64) -> i64
+        .type_idx = fd_write_simple_type,
         .code = fd_seek_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_fd_open: (path_ptr: i64, path_len: i64, flags: i64) -> i64
-    // Reference: Go syscall/zsyscall_darwin_arm64.go openat() — openat(AT_FDCWD, path, flags, mode)
-    // Returns fd on success, errno on error. On native, ARM64 override does SYS_openat.
     const fd_open_body = try generateStubReturnsZero(allocator);
     const fd_open_idx = try linker.addFunc(.{
         .name = FD_OPEN_NAME,
-        .type_idx = fd_write_simple_type, // Same type: (i64, i64, i64) -> i64
+        .type_idx = fd_write_simple_type,
         .code = fd_open_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_time: () -> i64
-    // Reference: Go runtime/sys_darwin_arm64.s walltime_trampoline → clock_gettime(CLOCK_REALTIME)
-    // Returns nanoseconds since epoch. On native, ARM64 override does SYS_gettimeofday.
     const time_type = try linker.addType(
         &[_]ValType{},
         &[_]ValType{.i64},
@@ -158,12 +478,9 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .name = TIME_NAME,
         .type_idx = time_type,
         .code = time_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_random: (buf: i64, len: i64) -> i64
-    // Reference: Go runtime/sys_darwin_arm64.s arc4random_buf_trampoline
-    // Fills buf with len random bytes. On native, ARM64 override does SYS_getentropy.
     const random_type = try linker.addType(
         &[_]ValType{ .i64, .i64 },
         &[_]ValType{.i64},
@@ -173,12 +490,9 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .name = RANDOM_NAME,
         .type_idx = random_type,
         .code = random_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_exit: (code: i64) -> void
-    // Reference: WASI proc_exit(rval), macOS SYS_exit(1)
-    // Exits the process. Never returns. On native, ARM64 override does SYS_exit.
     const exit_type = try linker.addType(
         &[_]ValType{.i64},
         &[_]ValType{},
@@ -188,68 +502,55 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .name = EXIT_NAME,
         .type_idx = exit_type,
         .code = exit_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_args_count: () -> i64
-    // Returns number of CLI arguments (argc). On native, reads from vmctx+0x30000.
     const args_count_body = try generateStubReturnsZero(allocator);
     const args_count_idx = try linker.addFunc(.{
         .name = ARGS_COUNT_NAME,
-        .type_idx = time_type, // Same type: () -> i64
+        .type_idx = time_type,
         .code = args_count_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_arg_len: (n: i64) -> i64
-    // Returns length of CLI argument n (strlen(argv[n])). On native, walks argv array.
     const arg_len_body = try generateStubReturnsZero(allocator);
     const arg_len_idx = try linker.addFunc(.{
         .name = ARG_LEN_NAME,
-        .type_idx = fd_close_type, // Same type: (i64) -> i64
+        .type_idx = fd_close_type,
         .code = arg_len_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_arg_ptr: (n: i64) -> i64
-    // Copies CLI argument n into linear memory at reserved offset 0xF0000, returns wasm pointer.
-    // On native, copies from real argv[n] into linmem.
     const arg_ptr_body = try generateStubReturnsZero(allocator);
     const arg_ptr_idx = try linker.addFunc(.{
         .name = ARG_PTR_NAME,
-        .type_idx = fd_close_type, // Same type: (i64) -> i64
+        .type_idx = fd_close_type,
         .code = arg_ptr_body,
-        .exported = true, // ARM64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_environ_count: () -> i64
-    // Returns number of environment variables. On native, walks envp from vmctx+0x30010.
     const environ_count_body = try generateStubReturnsZero(allocator);
     const environ_count_idx = try linker.addFunc(.{
         .name = ENVIRON_COUNT_NAME,
-        .type_idx = time_type, // Same type: () -> i64
+        .type_idx = time_type,
         .code = environ_count_body,
-        .exported = true, // ARM64/x64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_environ_len: (n: i64) -> i64
-    // Returns length of environment variable n (strlen(envp[n])). On native, walks envp array.
     const environ_len_body = try generateStubReturnsZero(allocator);
     const environ_len_idx = try linker.addFunc(.{
         .name = ENVIRON_LEN_NAME,
-        .type_idx = fd_close_type, // Same type: (i64) -> i64
+        .type_idx = fd_close_type,
         .code = environ_len_body,
-        .exported = true, // ARM64/x64 override in driver.zig
+        .exported = true,
     });
 
-    // cot_environ_ptr: (n: i64) -> i64
-    // Copies env var n into linear memory at 0x7F000 + n*4096, returns wasm pointer.
     const environ_ptr_body = try generateStubReturnsZero(allocator);
     const environ_ptr_idx = try linker.addFunc(.{
         .name = ENVIRON_PTR_NAME,
-        .type_idx = fd_close_type, // Same type: (i64) -> i64
+        .type_idx = fd_close_type,
         .code = environ_ptr_body,
-        .exported = true, // ARM64/x64 override in driver.zig
+        .exported = true,
     });
 
     return WasiFunctions{
@@ -272,44 +573,434 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
 }
 
 // =============================================================================
-// wasi_fd_write stub — returns ENOSYS (52)
-// Pure Wasm can't do I/O; native overrides this with ARM64 syscall
+// WASI adapter shim generators
+// Each takes Cot's i64 params, wraps to i32, calls WASI import, returns i64
+// =============================================================================
+
+/// wasi_fd_write shim: wraps legacy 4-arg Cot signature to WASI fd_write
+fn generateWasiFdWriteShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // params: fd(0), iovs(1), iovs_len(2), nwritten(3) — all i64
+    // Call WASI fd_write(i32.wrap(fd), i32.wrap(iovs), i32.wrap(iovs_len), i32.wrap(nwritten))
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(1);
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(2);
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(3);
+    try code.emitI32WrapI64();
+    try code.emitCall(wasi_func_idx);
+    try code.emitI64ExtendI32U(); // result: i32 -> i64
+    return try code.finish();
+}
+
+/// cot_fd_write_simple shim: (fd:i64, ptr:i64, len:i64) -> i64
+/// Builds a 1-element iov at SCRATCH_BASE, calls WASI fd_write, returns bytes written
+fn generateWasiWriteSimpleShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // params: fd(0), ptr(1), len(2)
+
+    // Build iov at SCRATCH_BASE: { .buf = i32(ptr), .buf_len = i32(len) }
+    try code.emitI32Const(SCRATCH_BASE); // addr for iov[0].buf
+    try code.emitLocalGet(1); // ptr
+    try code.emitI32WrapI64();
+    try code.emitI32Store(2, 0); // store buf ptr at SCRATCH_BASE+0
+
+    try code.emitI32Const(SCRATCH_BASE); // addr for iov[0].buf_len
+    try code.emitLocalGet(2); // len
+    try code.emitI32WrapI64();
+    try code.emitI32Store(2, 4); // store buf len at SCRATCH_BASE+4
+
+    // Call WASI fd_write(i32(fd), SCRATCH_BASE, 1, SCRATCH_NWRITTEN)
+    try code.emitLocalGet(0); // fd
+    try code.emitI32WrapI64();
+    try code.emitI32Const(SCRATCH_BASE); // iovs ptr
+    try code.emitI32Const(1); // iovs_len = 1
+    try code.emitI32Const(SCRATCH_NWRITTEN); // nwritten output ptr
+    try code.emitCall(wasi_func_idx);
+    try code.emitDrop(); // drop errno
+
+    // Load nwritten from SCRATCH_NWRITTEN, extend to i64
+    try code.emitI32Const(SCRATCH_NWRITTEN);
+    try code.emitI32Load(2, 0);
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_fd_read_simple shim: (fd:i64, buf:i64, len:i64) -> i64
+fn generateWasiReadSimpleShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // Same pattern as write: build iov, call fd_read, return nread
+
+    try code.emitI32Const(SCRATCH_BASE);
+    try code.emitLocalGet(1); // buf
+    try code.emitI32WrapI64();
+    try code.emitI32Store(2, 0);
+
+    try code.emitI32Const(SCRATCH_BASE);
+    try code.emitLocalGet(2); // len
+    try code.emitI32WrapI64();
+    try code.emitI32Store(2, 4);
+
+    try code.emitLocalGet(0); // fd
+    try code.emitI32WrapI64();
+    try code.emitI32Const(SCRATCH_BASE);
+    try code.emitI32Const(1);
+    try code.emitI32Const(SCRATCH_NWRITTEN); // nread output
+    try code.emitCall(wasi_func_idx);
+    try code.emitDrop();
+
+    try code.emitI32Const(SCRATCH_NWRITTEN);
+    try code.emitI32Load(2, 0);
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_fd_close shim: (fd:i64) -> i64
+fn generateWasiFdCloseShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitCall(wasi_func_idx);
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_fd_seek shim: (fd:i64, offset:i64, whence:i64) -> i64
+fn generateWasiFdSeekShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // WASI fd_seek(fd:i32, offset:i64, whence:i32, newoffset_ptr:i32) -> i32
+    try code.emitLocalGet(0); // fd
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(1); // offset (already i64 in WASI)
+    try code.emitLocalGet(2); // whence
+    try code.emitI32WrapI64();
+    try code.emitI32Const(SCRATCH_RESULT); // newoffset output ptr
+    try code.emitCall(wasi_func_idx);
+    try code.emitDrop(); // drop errno
+
+    // Load new offset (i64) from SCRATCH_RESULT
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI64Load(3, 0);
+    return try code.finish();
+}
+
+/// cot_fd_open shim: (path_ptr:i64, path_len:i64, flags:i64) -> i64
+/// Maps to WASI path_open with sensible defaults
+fn generateWasiPathOpenShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // WASI path_open(dirfd, dirflags, path, path_len, oflags, rights_base, rights_inheriting, fdflags, opened_fd_ptr)
+    // We use: dirfd=3 (preopened dir), dirflags=1 (SYMLINK_FOLLOW), oflags from flags param
+    // rights = all bits set, fdflags = 0
+
+    try code.emitI32Const(3); // dirfd = preopened dir (fd 3 is conventional in WASI)
+    try code.emitI32Const(1); // dirflags = LOOKUPFLAGS_SYMLINK_FOLLOW
+    try code.emitLocalGet(0); // path_ptr
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(1); // path_len
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(2); // oflags (from Cot flags param)
+    try code.emitI32WrapI64();
+    try code.emitI64Const(0x1FFFFFFF); // fs_rights_base = all read/write rights
+    try code.emitI64Const(0x1FFFFFFF); // fs_rights_inheriting = all
+    try code.emitI32Const(0); // fdflags = 0
+    try code.emitI32Const(SCRATCH_RESULT); // opened_fd output ptr
+    try code.emitCall(wasi_func_idx);
+    try code.emitDrop(); // drop errno
+
+    // Load opened fd from SCRATCH_RESULT
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Load(2, 0);
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_time shim: () -> i64
+fn generateWasiTimeShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // WASI clock_time_get(clock_id=0 [REALTIME], precision=1, time_ptr) -> i32
+    try code.emitI32Const(0); // CLOCK_REALTIME
+    try code.emitI64Const(1); // precision = 1ns
+    try code.emitI32Const(SCRATCH_RESULT); // time output ptr
+    try code.emitCall(wasi_func_idx);
+    try code.emitDrop(); // drop errno
+
+    // Load timestamp (i64) from SCRATCH_RESULT
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI64Load(3, 0);
+    return try code.finish();
+}
+
+/// cot_random shim: (buf:i64, len:i64) -> i64
+fn generateWasiRandomShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // WASI random_get(buf:i32, buf_len:i32) -> i32
+    try code.emitLocalGet(0); // buf
+    try code.emitI32WrapI64();
+    try code.emitLocalGet(1); // len
+    try code.emitI32WrapI64();
+    try code.emitCall(wasi_func_idx);
+    try code.emitI64ExtendI32U(); // return errno as i64 (0 = success)
+    return try code.finish();
+}
+
+/// cot_exit shim: (code:i64) -> void
+fn generateWasiExitShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // WASI proc_exit(code:i32) -> noreturn
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitCall(wasi_func_idx);
+    try code.emitUnreachable();
+    return try code.finish();
+}
+
+/// cot_args_count shim: () -> i64
+fn generateWasiArgsCountShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    // WASI args_sizes_get(argc_ptr:i32, argv_buf_size_ptr:i32) -> i32
+    try code.emitI32Const(SCRATCH_RESULT); // argc output
+    try code.emitI32Const(SCRATCH_RESULT + 4); // argv_buf_size output
+    try code.emitCall(wasi_func_idx);
+    try code.emitDrop(); // drop errno
+
+    // Load argc from SCRATCH_RESULT
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Load(2, 0);
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_arg_len shim: (n:i64) -> i64
+/// Calls args_sizes_get + args_get to populate argv, then computes strlen(argv[n])
+fn generateWasiArgLenShim(allocator: std.mem.Allocator, wasi_args_sizes_get_idx: u32, wasi_args_get_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // Declare locals: counter(1)
+    _ = try code.declareLocals(&[_]wasm.ValType{.i32});
+    // param 0 = n (i64), local 1 = counter (i32)
+
+    // 1. args_sizes_get to get counts
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Const(SCRATCH_RESULT + 4);
+    try code.emitCall(wasi_args_sizes_get_idx);
+    try code.emitDrop();
+
+    // 2. args_get to populate argv array and string buffer
+    try code.emitI32Const(SCRATCH_ARGV);
+    try code.emitI32Const(SCRATCH_ARGV_BUF);
+    try code.emitCall(wasi_args_get_idx);
+    try code.emitDrop();
+
+    // 3. Load argv[n] pointer
+    // argv[n] is at SCRATCH_ARGV + n * 4
+    try code.emitI32Const(SCRATCH_ARGV);
+    try code.emitLocalGet(0); // n
+    try code.emitI32WrapI64();
+    try code.emitI32Const(4);
+    try code.emitI32Mul();
+    try code.emitI32Add();
+    try code.emitI32Load(2, 0); // argv[n] = pointer to string
+    try code.emitLocalSet(1); // counter = argv[n] (reuse as string ptr)
+
+    // 4. strlen: count bytes until null terminator
+    // Use counter(1) as pointer, walk until *ptr == 0
+    // Save base pointer
+    _ = try code.declareLocals(&[_]wasm.ValType{.i32}); // local 2 = base_ptr
+    try code.emitLocalGet(1);
+    try code.emitLocalSet(2); // base_ptr = argv[n]
+
+    // Loop: while (*counter != 0) counter++
+    try code.emitBlock(wasm_op.BLOCK_VOID); // block (break target)
+    try code.emitLoop(wasm_op.BLOCK_VOID); // loop
+    {
+        // Load byte at counter
+        try code.emitLocalGet(1);
+        try code.emitI32Load(0, 0); // load byte (will load 4 bytes but we mask)
+        try code.emitI32Const(0xFF);
+        try code.emitI32And(); // mask to single byte
+        try code.emitI32Eqz(); // == 0?
+        try code.emitBrIf(1); // if zero, break out of block
+
+        // counter++
+        try code.emitLocalGet(1);
+        try code.emitI32Const(1);
+        try code.emitI32Add();
+        try code.emitLocalSet(1);
+
+        try code.emitBr(0); // continue loop
+    }
+    try code.emitEnd(); // end loop
+    try code.emitEnd(); // end block
+
+    // Return counter - base_ptr (= strlen)
+    try code.emitLocalGet(1);
+    try code.emitLocalGet(2);
+    try code.emitI32Sub();
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_arg_ptr shim: (n:i64) -> i64
+/// Returns the wasm pointer to argv[n] string data
+fn generateWasiArgPtrShim(allocator: std.mem.Allocator, wasi_args_sizes_get_idx: u32, wasi_args_get_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    // 1. args_sizes_get
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Const(SCRATCH_RESULT + 4);
+    try code.emitCall(wasi_args_sizes_get_idx);
+    try code.emitDrop();
+
+    // 2. args_get
+    try code.emitI32Const(SCRATCH_ARGV);
+    try code.emitI32Const(SCRATCH_ARGV_BUF);
+    try code.emitCall(wasi_args_get_idx);
+    try code.emitDrop();
+
+    // 3. Return argv[n] pointer as i64
+    try code.emitI32Const(SCRATCH_ARGV);
+    try code.emitLocalGet(0); // n
+    try code.emitI32WrapI64();
+    try code.emitI32Const(4);
+    try code.emitI32Mul();
+    try code.emitI32Add();
+    try code.emitI32Load(2, 0); // argv[n]
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_environ_count shim: () -> i64
+fn generateWasiEnvironCountShim(allocator: std.mem.Allocator, wasi_func_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Const(SCRATCH_RESULT + 4);
+    try code.emitCall(wasi_func_idx);
+    try code.emitDrop();
+
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Load(2, 0);
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_environ_len shim: (n:i64) -> i64
+fn generateWasiEnvironLenShim(allocator: std.mem.Allocator, wasi_environ_sizes_get_idx: u32, wasi_environ_get_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32 });
+    // param 0 = n, local 1 = ptr, local 2 = base
+
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Const(SCRATCH_RESULT + 4);
+    try code.emitCall(wasi_environ_sizes_get_idx);
+    try code.emitDrop();
+
+    try code.emitI32Const(SCRATCH_ENVIRON);
+    try code.emitI32Const(SCRATCH_ENVIRON_BUF);
+    try code.emitCall(wasi_environ_get_idx);
+    try code.emitDrop();
+
+    // Load environ[n] pointer
+    try code.emitI32Const(SCRATCH_ENVIRON);
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitI32Const(4);
+    try code.emitI32Mul();
+    try code.emitI32Add();
+    try code.emitI32Load(2, 0);
+    try code.emitLocalTee(1);
+    try code.emitLocalSet(2); // base = ptr
+
+    // strlen loop
+    try code.emitBlock(wasm_op.BLOCK_VOID);
+    try code.emitLoop(wasm_op.BLOCK_VOID);
+    {
+        try code.emitLocalGet(1);
+        try code.emitI32Load(0, 0);
+        try code.emitI32Const(0xFF);
+        try code.emitI32And();
+        try code.emitI32Eqz();
+        try code.emitBrIf(1);
+
+        try code.emitLocalGet(1);
+        try code.emitI32Const(1);
+        try code.emitI32Add();
+        try code.emitLocalSet(1);
+        try code.emitBr(0);
+    }
+    try code.emitEnd();
+    try code.emitEnd();
+
+    try code.emitLocalGet(1);
+    try code.emitLocalGet(2);
+    try code.emitI32Sub();
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+/// cot_environ_ptr shim: (n:i64) -> i64
+fn generateWasiEnvironPtrShim(allocator: std.mem.Allocator, wasi_environ_sizes_get_idx: u32, wasi_environ_get_idx: u32) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+
+    try code.emitI32Const(SCRATCH_RESULT);
+    try code.emitI32Const(SCRATCH_RESULT + 4);
+    try code.emitCall(wasi_environ_sizes_get_idx);
+    try code.emitDrop();
+
+    try code.emitI32Const(SCRATCH_ENVIRON);
+    try code.emitI32Const(SCRATCH_ENVIRON_BUF);
+    try code.emitCall(wasi_environ_get_idx);
+    try code.emitDrop();
+
+    try code.emitI32Const(SCRATCH_ENVIRON);
+    try code.emitLocalGet(0);
+    try code.emitI32WrapI64();
+    try code.emitI32Const(4);
+    try code.emitI32Mul();
+    try code.emitI32Add();
+    try code.emitI32Load(2, 0);
+    try code.emitI64ExtendI32U();
+    return try code.finish();
+}
+
+// =============================================================================
+// Native stub bodies
 // =============================================================================
 
 fn generateFdWriteStubBody(allocator: std.mem.Allocator) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
-
-    // Parameters: fd (local 0), iovs (local 1), iovs_len (local 2), nwritten (local 3)
-    // Stub: return 52 (WASI ENOSYS)
-    try code.emitI64Const(52);
+    try code.emitI64Const(52); // ENOSYS
     return try code.finish();
 }
-
-// =============================================================================
-// Shared stub — drops args, returns i64(0)
-// Used by cot_fd_write_simple, cot_fd_read_simple, cot_fd_close.
-// Same pattern as cot_write: Wasm can't do I/O, native overrides with ARM64 syscall.
-// Reference: print_runtime.zig generateWriteStubBody
-// =============================================================================
 
 fn generateStubReturnsZero(allocator: std.mem.Allocator) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
-
     try code.emitI64Const(0);
     return try code.finish();
 }
 
-// =============================================================================
-// Stub that traps — for functions that should never return (e.g., cot_exit)
-// On Wasm: emits unreachable. On native: ARM64 override does real SYS_exit.
-// =============================================================================
-
 fn generateStubTrap(allocator: std.mem.Allocator) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
-
     try code.emitUnreachable();
     return try code.finish();
 }

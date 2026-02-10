@@ -515,15 +515,21 @@ pub const Checker = struct {
                 if (blk.stmts.len == 0) return self.evalConstExpr(blk.expr);
                 return null;
             },
+            // comptime { body } — evaluate body at compile time
+            .comptime_block => |cb| self.evalConstExpr(cb.body),
             else => null,
         };
     }
 
     /// Evaluate a comptime string expression. Returns the string value or null.
-    fn evalConstString(self: *Checker, idx: NodeIndex) ?[]const u8 {
+    pub fn evalConstString(self: *Checker, idx: NodeIndex) ?[]const u8 {
         const expr = (self.tree.getNode(idx) orelse return null).asExpr() orelse return null;
         return switch (expr) {
-            .literal => |lit| if (lit.kind == .string) lit.value else null,
+            .literal => |lit| if (lit.kind == .string) blk: {
+                // Strip surrounding quotes from string literal (scanner includes them)
+                const v = lit.value;
+                break :blk if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
+            } else null,
             .paren => |p| self.evalConstString(p.inner),
             .builtin_call => |bc| {
                 if (std.mem.eql(u8, bc.name, "target_os")) return self.target.os.name();
@@ -575,6 +581,15 @@ pub const Checker = struct {
             .addr_of => |ao| self.checkAddrOf(ao),
             .deref => |d| self.checkDeref(d),
             .tuple_literal => |tl| self.checkTupleLiteral(tl),
+            .comptime_block => |cb| {
+                // Zig Sema pattern: comptime {} body must be comptime-evaluable.
+                // Check the body for type errors, then verify it produces a comptime value.
+                const body_type = try self.checkExpr(cb.body);
+                if (self.evalConstExpr(cb.body) == null and self.evalConstString(cb.body) == null) {
+                    self.err.errorWithCode(cb.span.start, .e300, "unable to evaluate comptime expression");
+                }
+                return body_type;
+            },
             .zero_init => TypeRegistry.VOID, // Type inferred from var decl context
             .type_expr, .bad_expr => invalid_type,
         };
@@ -908,6 +923,12 @@ pub const Checker = struct {
         } else if (std.mem.eql(u8, bc.name, "target_os") or std.mem.eql(u8, bc.name, "target_arch") or std.mem.eql(u8, bc.name, "target")) {
             // Comptime builtins — resolve to string constants at compile time
             return TypeRegistry.STRING;
+        } else if (std.mem.eql(u8, bc.name, "compileError")) {
+            // @compileError("message") — emit compile error with user message
+            // Only reached if the branch wasn't eliminated by comptime const-fold
+            const msg = self.evalConstString(bc.args[0]) orelse "compile error";
+            self.err.errorWithCode(bc.span.start, .e300, msg);
+            return TypeRegistry.VOID;
         }
         self.err.errorWithCode(bc.span.start, .e300, "unknown builtin");
         return invalid_type;
@@ -1130,6 +1151,13 @@ pub const Checker = struct {
     fn checkIfExpr(self: *Checker, ie: ast.IfExpr) CheckError!TypeIndex {
         const cond_type = try self.checkExpr(ie.condition);
         if (!types.isBool(self.types.get(cond_type))) self.err.errorWithCode(ie.span.start, .e300, "condition must be bool");
+        // Comptime dead branch elimination: only check the taken branch when condition is comptime-known.
+        // This allows @compileError in dead branches (Zig Sema pattern).
+        if (self.evalConstExpr(ie.condition)) |cond_val| {
+            if (cond_val != 0) return try self.checkExpr(ie.then_branch);
+            if (ie.else_branch != null_node) return try self.checkExpr(ie.else_branch);
+            return TypeRegistry.VOID;
+        }
         const then_type = try self.checkExpr(ie.then_branch);
         if (ie.else_branch != null_node) {
             const else_type = try self.checkExpr(ie.else_branch);
@@ -1303,6 +1331,13 @@ pub const Checker = struct {
         if (self.isZeroInitLit(vs.value) and var_type == invalid_type) {
             self.err.errorWithCode(vs.span.start, .e300, "zero init requires type annotation");
         }
+        // Store const_value for comptime const-folding (Zig Sema pattern: local const propagation)
+        if (vs.is_const and vs.value != null_node) {
+            if (self.evalConstExpr(vs.value)) |cv| {
+                try self.scope.define(Symbol.initConst(vs.name, var_type, idx, cv));
+                return;
+            }
+        }
         try self.scope.define(Symbol.init(vs.name, if (vs.is_const) .constant else .variable, var_type, idx, !vs.is_const));
     }
 
@@ -1321,6 +1356,13 @@ pub const Checker = struct {
     fn checkIfStmt(self: *Checker, is: ast.IfStmt) CheckError!void {
         const cond_type = try self.checkExpr(is.condition);
         if (!types.isBool(self.types.get(cond_type))) self.err.errorWithCode(is.span.start, .e300, "condition must be bool");
+        // Comptime dead branch elimination: only check the taken branch when condition is comptime-known.
+        // This allows @compileError in dead branches (Zig Sema pattern).
+        if (self.evalConstExpr(is.condition)) |cond_val| {
+            if (cond_val != 0) { try self.checkStmt(is.then_branch); return; }
+            if (is.else_branch != null_node) { try self.checkStmt(is.else_branch); return; }
+            return;
+        }
         try self.checkStmt(is.then_branch);
         if (is.else_branch != null_node) try self.checkStmt(is.else_branch);
     }

@@ -89,6 +89,11 @@ pub const GenState = struct {
     /// Go reference: wasmobj.go:1286-1291 (type index from instruction)
     func_type_indices: ?*const std.StringHashMap(u32) = null,
 
+    /// Maps SSA value IDs to their compound "len" local index.
+    /// For calls returning compound types (string, slice), the call pushes 2 values.
+    /// The main local (value_to_local) stores ptr, this stores len.
+    compound_len_locals: std.AutoHashMapUnmanaged(u32, u32) = .{},
+
     pub fn init(allocator: std.mem.Allocator, func: *const SsaFunc) GenState {
         return .{
             .allocator = allocator,
@@ -123,6 +128,7 @@ pub const GenState = struct {
     pub fn deinit(self: *GenState) void {
         self.builder.deinit();
         self.value_to_local.deinit(self.allocator);
+        self.compound_len_locals.deinit(self.allocator);
         self.branches.deinit(self.allocator);
         self.bstart.deinit(self.allocator);
     }
@@ -196,7 +202,16 @@ pub const GenState = struct {
             .ret => {
                 // Get return value if any
                 if (b.controls[0]) |ret_val| {
-                    try self.getValue64(ret_val);
+                    if (ret_val.op == .string_make or ret_val.op == .slice_make) {
+                        // Compound return: push both components (ptr, len)
+                        // string_make/slice_make are conceptual — push args directly
+                        if (ret_val.args.len >= 2) {
+                            try self.getValue64(ret_val.args[0]); // ptr
+                            try self.getValue64(ret_val.args[1]); // len
+                        }
+                    } else {
+                        try self.getValue64(ret_val);
+                    }
                 }
                 // Emit ARET pseudo-instruction, NOT real wasm return
                 // Go: s.Prog(obj.ARET) - transformed by preprocess
@@ -327,11 +342,21 @@ pub const GenState = struct {
                 debug.log(.codegen, "wasm/gen: skip compound type op {s}", .{@tagName(v.op)});
             },
 
-            // Extraction ops for compound types - should be decomposed by rewritedec
-            // If they reach here, they're on values that couldn't be decomposed (e.g., loaded from memory)
-            .string_ptr, .string_len, .slice_ptr, .slice_len => {
-                // These should have been decomposed - log warning
-                debug.log(.codegen, "wasm/gen: undecomposed extraction op {s}", .{@tagName(v.op)});
+            // Extraction ops for compound types - should be decomposed by rewritedec.
+            // If they reach here, the arg is a call returning compound type (not string_make).
+            .string_ptr, .slice_ptr => {
+                // Get ptr component: stored in arg's main local (value_to_local)
+                try self.getValue64(v.args[0]);
+            },
+            .string_len, .slice_len => {
+                // Get len component: stored in arg's compound len local
+                if (self.compound_len_locals.get(v.args[0].id)) |len_local| {
+                    _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(len_local));
+                } else {
+                    // Fallback: try the main local (shouldn't happen for correctly compiled code)
+                    debug.log(.codegen, "wasm/gen: string_len without compound local for v{d}", .{v.args[0].id});
+                    try self.getValue64(v.args[0]);
+                }
             },
 
             // Arithmetic (i64)
@@ -1006,7 +1031,21 @@ pub const GenState = struct {
 
         // Generate value and store to local
         try self.ssaGenValueOnStack(v);
-        if (v.uses > 0) {
+
+        // Compound return handling: calls returning string/slice push 2 values (ptr, len).
+        // Store len to a separate local, then ptr to the value's main local.
+        const is_call = v.op == .wasm_call or v.op == .wasm_lowered_static_call;
+        const is_compound_ret = is_call and (v.type_idx == TypeRegistry.STRING);
+        if (is_compound_ret) {
+            // Stack: [ptr, len] — store len first (top of stack), then ptr
+            const len_local = self.next_local;
+            self.next_local += 1;
+            _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(len_local));
+            try self.compound_len_locals.put(self.allocator, v.id, len_local);
+            if (v.uses > 0) {
+                try self.setReg(v); // stores ptr to v's main local
+            }
+        } else if (v.uses > 0) {
             try self.setReg(v);
         }
     }

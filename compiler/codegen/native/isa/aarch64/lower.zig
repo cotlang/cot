@@ -1939,17 +1939,19 @@ pub const AArch64LowerBackend = struct {
         }
 
         // Build defs list: gen_call_rets(abi, output)
-        // Each return value vreg is defined in its ABI register
+        // Each return value vreg is defined in its ABI register (X0, X1, ...)
         // Cranelift does NOT emit explicit mov instructions - regalloc handles it
+        // Port of Cranelift's gen_call_rets: loop over all return values
         const num_outputs = ctx.numOutputs(ir_inst);
         var output = InstOutput{};
-        if (num_outputs > 0) {
-            const ret_ty = ctx.outputTy(ir_inst, 0);
+        var int_ret_idx: u8 = 0;
+        for (0..num_outputs) |out_idx| {
+            const ret_ty = ctx.outputTy(ir_inst, out_idx);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
 
-            // Add to defs: this vreg is DEFINED BY the call in X0
-            const ret_preg = regs.xregPreg(0);
+            // Each integer return goes to X0, X1, X2, ...
+            const ret_preg = regs.xregPreg(int_ret_idx);
             call_info.defs.append(ctx.allocator, .{
                 .vreg = dst_reg,
                 .location = .{ .reg = ret_preg },
@@ -1961,6 +1963,7 @@ pub const AArch64LowerBackend = struct {
             clobbers.remove(ret_preg);
 
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+            int_ret_idx += 1;
         }
 
         // Assign clobbers after removing return registers

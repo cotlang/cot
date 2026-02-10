@@ -85,3 +85,21 @@ fn createFile(path: string) File {
 fn stdin() File { return File { .fd = 0 } }
 fn stdout() File { return File { .fd = 1 } }
 fn stderr() File { return File { .fd = 2 } }
+
+// ===== High-level APIs =====
+
+fn readFile(path: string) string {
+    var fd = @fd_open(@ptrOf(path), @lenOf(path), O_RDONLY)
+    var size = @fd_seek(fd, 0, 2)
+    @fd_seek(fd, 0, 0)
+    var buf = @alloc(size)
+    var n = @fd_read(fd, buf, size)
+    @fd_close(fd)
+    return @string(buf, n)
+}
+
+fn writeFile(path: string, data: string) void {
+    var fd = @fd_open(@ptrOf(path), @lenOf(path), O_CREATE)
+    @fd_write(fd, @ptrOf(data), @lenOf(data))
+    @fd_close(fd)
+}

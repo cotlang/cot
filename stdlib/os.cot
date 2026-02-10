@@ -30,3 +30,13 @@ fn environLen(n: i64) i64 {
 fn environPtr(n: i64) i64 {
     return @environ_ptr(n)
 }
+
+// ===== High-level APIs =====
+
+fn arg(n: i64) string {
+    return @string(@arg_ptr(n), @arg_len(n))
+}
+
+fn environ(n: i64) string {
+    return @string(@environ_ptr(n), @environ_len(n))
+}

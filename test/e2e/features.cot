@@ -1656,3 +1656,59 @@ test "comptime if target_os neq" {
     const flag: i64 = if @target_os() != "nonexistent_os" { 1 } else { 0 }
     @assert_eq(flag, 1)
 }
+
+// ============================================================================
+// Tests: @string builtin — construct string from raw (ptr, len)
+// ============================================================================
+
+test "string builtin constructs from ptr and len" {
+    var s = "hello"
+    var ptr = @ptrOf(s)
+    var len = @lenOf(s)
+    var s2 = @string(ptr, len)
+    @assert_eq(@lenOf(s2), 5)
+}
+
+test "string builtin roundtrip" {
+    var s = "world"
+    var s2 = @string(@ptrOf(s), @lenOf(s))
+    @assert(s == s2)
+}
+
+// ============================================================
+// comptime blocks and @compileError
+// ============================================================
+
+test "comptime block evaluates simple expression" {
+    const x = comptime { 40 + 2 }
+    @assert_eq(x, 42)
+}
+
+test "comptime block with nested arithmetic" {
+    const y = comptime { 10 * 3 + 7 }
+    @assert_eq(y, 37)
+}
+
+test "comptime block used in expression" {
+    var a = 10 + comptime { 5 * 6 }
+    @assert_eq(a, 40)
+}
+
+test "compileError in dead branch is not triggered" {
+    const mode = 1
+    if mode == 1 {
+        @assert(true)
+    } else {
+        @compileError("this should never be reached")
+    }
+}
+
+test "compileError in dead else with target check" {
+    if @target_os() == "macos" {
+        @assert(true)
+    } else if @target_os() == "linux" {
+        @assert(true)
+    } else {
+        @compileError("unsupported OS")
+    }
+}

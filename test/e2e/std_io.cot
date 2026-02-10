@@ -204,3 +204,29 @@ test "random: randomRange bounds" {
 test "random: randomRange(1) == 0" {
     @assert_eq(randomRange(1), 0)
 }
+
+// ===== high-level os tests =====
+
+test "os: arg(0) is non-empty string" {
+    var a = arg(0)
+    @assert(@lenOf(a) > 0)
+}
+
+test "os: environ(0) is non-empty string" {
+    var e = environ(0)
+    @assert(@lenOf(e) > 0)
+}
+
+// ===== high-level fs tests =====
+
+test "fs: writeFile and readFile" {
+    writeFile("/tmp/cot_std_readwrite.txt", "hello world")
+    var content = readFile("/tmp/cot_std_readwrite.txt")
+    @assert_eq(@lenOf(content), 11)
+}
+
+test "fs: readFile reads correct content" {
+    writeFile("/tmp/cot_std_readback.txt", "abc")
+    var content = readFile("/tmp/cot_std_readback.txt")
+    @assert(content == "abc")
+}

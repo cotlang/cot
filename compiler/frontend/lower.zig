@@ -409,7 +409,7 @@ pub const Lowerer = struct {
             .return_stmt => |ret| { try self.lowerReturn(ret); return true; },
             .var_stmt => |v| { try self.lowerLocalVarDecl(v); return false; },
             .assign_stmt => |a| { try self.lowerAssign(a); return false; },
-            .if_stmt => |i| { try self.lowerIf(i); return false; },
+            .if_stmt => |i| { return try self.lowerIf(i); },
             .while_stmt => |w| { try self.lowerWhile(w); return false; },
             .for_stmt => |f| { try self.lowerFor(f); return false; },
             .block_stmt => |block| {
@@ -1348,22 +1348,22 @@ pub const Lowerer = struct {
         }
     }
 
-    fn lowerIf(self: *Lowerer, if_stmt: ast.IfStmt) !void {
+    fn lowerIf(self: *Lowerer, if_stmt: ast.IfStmt) !bool {
         // Comptime const-fold: eliminate dead branches for platform conditionals
         if (self.chk.evalConstExpr(if_stmt.condition)) |cond_val| {
             if (cond_val != 0) {
-                _ = try self.lowerBlockNode(if_stmt.then_branch);
+                return try self.lowerBlockNode(if_stmt.then_branch);
             } else if (if_stmt.else_branch != null_node) {
-                _ = try self.lowerBlockNode(if_stmt.else_branch);
+                return try self.lowerBlockNode(if_stmt.else_branch);
             }
-            return;
+            return false;
         }
-        const fb = self.current_func orelse return;
+        const fb = self.current_func orelse return false;
         const then_block = try fb.newBlock("then");
         const else_block = if (if_stmt.else_branch != null_node) try fb.newBlock("else") else null;
         const merge_block = try fb.newBlock("if.end");
         const cond_node = try self.lowerExprNode(if_stmt.condition);
-        if (cond_node == ir.null_node) return;
+        if (cond_node == ir.null_node) return false;
         _ = try fb.emitBranch(cond_node, then_block, else_block orelse merge_block, if_stmt.span);
         fb.setBlock(then_block);
         if (!try self.lowerBlockNode(if_stmt.then_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
@@ -1372,6 +1372,7 @@ pub const Lowerer = struct {
             if (!try self.lowerBlockNode(if_stmt.else_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
         }
         fb.setBlock(merge_block);
+        return false;
     }
 
     fn lowerWhile(self: *Lowerer, while_stmt: ast.WhileStmt) !void {
@@ -1655,6 +1656,21 @@ pub const Lowerer = struct {
             .new_expr => |ne| return try self.lowerNewExpr(ne),
             .closure_expr => |ce| return try self.lowerClosureExpr(ce),
             .string_interp => |si| return try self.lowerStringInterp(si),
+            .comptime_block => |cb| {
+                // Zig Sema pattern: comptime { body } must evaluate at compile time.
+                // If evalConstExpr succeeds, emit as integer constant.
+                // If not, try comptime string. Otherwise the checker already reported the error.
+                if (self.chk.evalConstExpr(cb.body)) |val| {
+                    return try fb.emitConstInt(val, TypeRegistry.I64, cb.span);
+                }
+                if (self.chk.evalConstString(cb.body)) |str| {
+                    const copied = try self.allocator.dupe(u8, str);
+                    const str_idx = try fb.addStringLiteral(copied);
+                    return try fb.emitConstSlice(str_idx, cb.span);
+                }
+                // Checker should have caught this; emit trap as defensive fallback
+                return try fb.emitTrap(cb.span);
+            },
             .block_expr => |block| {
                 const cleanup_depth = self.cleanup_stack.getScopeDepth();
                 const scope_depth = fb.markScopeEntry();
@@ -3752,6 +3768,11 @@ pub const Lowerer = struct {
             const n_arg = try self.lowerExprNode(bc.args[0]);
             var args = [_]ir.NodeIndex{n_arg};
             return try fb.emitCall("cot_environ_ptr", &args, false, TypeRegistry.I64, bc.span);
+        }
+        // @compileError("message") — should never be reached in lowering (dead branch eliminated)
+        // If reached, the checker already reported the error. Emit trap as fallback.
+        if (std.mem.eql(u8, bc.name, "compileError")) {
+            return try fb.emitTrap(bc.span);
         }
         // @target_os(), @target_arch(), @target() — comptime string constants
         if (std.mem.eql(u8, bc.name, "target_os")) {

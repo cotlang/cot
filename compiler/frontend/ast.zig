@@ -95,6 +95,7 @@ pub const Expr = union(enum) {
     error_literal: ErrorLiteral,
     closure_expr: ClosureExpr,
     tuple_literal: TupleLiteral,
+    comptime_block: ComptimeBlock,
     zero_init: ZeroInit,
     addr_of: AddrOf,
     deref: Deref,
@@ -163,6 +164,7 @@ pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, fallback
 pub const ErrorLiteral = struct { error_name: []const u8, span: Span };
 pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, span: Span };
 pub const TupleLiteral = struct { elements: []const NodeIndex, span: Span };
+pub const ComptimeBlock = struct { body: NodeIndex, span: Span };
 pub const ZeroInit = struct { span: Span };
 pub const AddrOf = struct { operand: NodeIndex, span: Span };
 pub const Deref = struct { operand: NodeIndex, span: Span };

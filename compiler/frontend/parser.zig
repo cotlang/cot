@@ -795,6 +795,13 @@ pub const Parser = struct {
             .lbrace => return self.parseBlockExpr(),
             .kw_if => return self.parseIfExpr(),
             .kw_switch => return self.parseSwitchExpr(),
+            .kw_comptime => {
+                // comptime { ... } — compile-time evaluated block expression
+                self.advance();
+                if (!self.check(.lbrace)) { self.syntaxError("expected '{' after 'comptime'"); return null; }
+                const body = try self.parseBlockExpr() orelse return null;
+                return try self.tree.addExpr(.{ .comptime_block = .{ .body = body, .span = Span.init(start, self.pos()) } });
+            },
             .kw_new => {
                 // new Type { field: value, ... }
                 // new List(i64) { field: value, ... } (generic)
@@ -978,6 +985,11 @@ pub const Parser = struct {
             const v = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = t, .args = .{ v, null_node, null_node }, .span = Span.init(start, self.pos()) } });
+        } else if (std.mem.eql(u8, name, "compileError")) {
+            // @compileError("message") — 1 string arg, triggers compile error
+            const arg = try self.parseExpr() orelse return null;
+            if (!self.expect(.rparen)) return null;
+            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
         } else if (std.mem.eql(u8, name, "trap") or std.mem.eql(u8, name, "time") or std.mem.eql(u8, name, "args_count") or std.mem.eql(u8, name, "environ_count") or std.mem.eql(u8, name, "target_os") or std.mem.eql(u8, name, "target_arch") or std.mem.eql(u8, name, "target")) {
             // @trap() — 0 args, Wasm unreachable / ARM64 brk #1
             // @time() — 0 args, returns nanoseconds since epoch

@@ -344,6 +344,11 @@ const TokenCollector = struct {
             },
             .addr_of => |a| self.walkNode(a.operand),
             .deref => |d| self.walkNode(d.operand),
+            .comptime_block => |cb| {
+                // Emit "comptime" keyword token, then walk body
+                self.emitName(cb.span, "comptime", .keyword, 0);
+                self.walkNode(cb.body);
+            },
             .literal, .zero_init, .bad_expr => {},
         }
     }
