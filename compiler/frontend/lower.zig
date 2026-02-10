@@ -3570,326 +3570,284 @@ pub const Lowerer = struct {
 
     fn lowerBuiltinCall(self: *Lowerer, bc: ast.BuiltinCall) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
-        if (std.mem.eql(u8, bc.name, "sizeOf")) {
-            const type_idx = self.resolveTypeNode(bc.type_arg);
-            return try fb.emitConstInt(@intCast(self.type_reg.sizeOf(type_idx)), TypeRegistry.I64, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "alignOf")) {
-            const type_idx = self.resolveTypeNode(bc.type_arg);
-            return try fb.emitConstInt(@intCast(self.type_reg.alignOf(type_idx)), TypeRegistry.I64, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "intCast")) {
-            const target_type = self.resolveTypeNode(bc.type_arg);
-            const value = try self.lowerExprNode(bc.args[0]);
-            return try fb.emitIntCast(value, target_type, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "ptrCast")) {
-            const target_type = self.resolveTypeNode(bc.type_arg);
-            const value = try self.lowerExprNode(bc.args[0]);
-            return try fb.emitPtrCast(value, target_type, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "intToPtr")) {
-            const target_type = self.resolveTypeNode(bc.type_arg);
-            const value = try self.lowerExprNode(bc.args[0]);
-            return try fb.emitIntToPtr(value, target_type, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "ptrToInt")) {
-            const value = try self.lowerExprNode(bc.args[0]);
-            return try fb.emitPtrToInt(value, TypeRegistry.I64, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "string")) {
-            const ptr_val = try self.lowerExprNode(bc.args[0]);
-            const len_val = try self.lowerExprNode(bc.args[1]);
-            return try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = ptr_val, .len = len_val } }, TypeRegistry.STRING, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "assert")) {
-            const cond = try self.lowerExprNode(bc.args[0]);
-            const then_block = try fb.newBlock("assert.ok");
-            const fail_block = try fb.newBlock("assert.fail");
-            _ = try fb.emitBranch(cond, then_block, fail_block, bc.span);
-            fb.setBlock(fail_block);
-            if (self.current_test_name != null) {
-                // In test context: return error (Zig pattern — test functions return !void)
-                // Construct error union with tag=1 (error) and return pointer
-                const ret_type = fb.return_type;
-                const eu_size = self.type_reg.sizeOf(ret_type);
-                const tmp_local = try fb.addLocalWithSize("__assert_err", ret_type, false, eu_size);
-                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
-                _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_one, bc.span);
-                const payload = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
-                _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload, bc.span);
-                const err_ret = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, bc.span);
-                _ = try fb.emitRet(err_ret, bc.span);
-            } else {
-                // Outside test context: print message to stderr + trap
-                const msg = try self.allocator.dupe(u8, "assertion failed\n");
-                const msg_idx = try fb.addStringLiteral(msg);
-                const msg_str = try fb.emitConstSlice(msg_idx, bc.span);
+        switch (bc.kind) {
+            .size_of => {
+                const type_idx = self.resolveTypeNode(bc.type_arg);
+                return try fb.emitConstInt(@intCast(self.type_reg.sizeOf(type_idx)), TypeRegistry.I64, bc.span);
+            },
+            .align_of => {
+                const type_idx = self.resolveTypeNode(bc.type_arg);
+                return try fb.emitConstInt(@intCast(self.type_reg.alignOf(type_idx)), TypeRegistry.I64, bc.span);
+            },
+            .int_cast => {
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitIntCast(value, target_type, bc.span);
+            },
+            .ptr_cast => {
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitPtrCast(value, target_type, bc.span);
+            },
+            .int_to_ptr => {
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitIntToPtr(value, target_type, bc.span);
+            },
+            .ptr_to_int => {
+                const value = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitPtrToInt(value, TypeRegistry.I64, bc.span);
+            },
+            .string => {
+                const ptr_val = try self.lowerExprNode(bc.args[0]);
+                const len_val = try self.lowerExprNode(bc.args[1]);
+                return try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = ptr_val, .len = len_val } }, TypeRegistry.STRING, bc.span));
+            },
+            .assert => {
+                const cond = try self.lowerExprNode(bc.args[0]);
+                const then_block = try fb.newBlock("assert.ok");
+                const fail_block = try fb.newBlock("assert.fail");
+                _ = try fb.emitBranch(cond, then_block, fail_block, bc.span);
+                fb.setBlock(fail_block);
+                if (self.current_test_name != null) {
+                    const ret_type = fb.return_type;
+                    const eu_size = self.type_reg.sizeOf(ret_type);
+                    const tmp_local = try fb.addLocalWithSize("__assert_err", ret_type, false, eu_size);
+                    const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_one, bc.span);
+                    const payload = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload, bc.span);
+                    const err_ret = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitRet(err_ret, bc.span);
+                } else {
+                    const msg = try self.allocator.dupe(u8, "assertion failed\n");
+                    const msg_idx = try fb.addStringLiteral(msg);
+                    const msg_str = try fb.emitConstSlice(msg_idx, bc.span);
+                    const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                    const msg_ptr = try fb.emitSlicePtr(msg_str, ptr_type, bc.span);
+                    const msg_len = try fb.emitSliceLen(msg_str, bc.span);
+                    const fd_val = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
+                    var write_args = [_]ir.NodeIndex{ fd_val, msg_ptr, msg_len };
+                    _ = try fb.emitCall("cot_write", &write_args, false, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitTrap(bc.span);
+                }
+                fb.setBlock(then_block);
+                return ir.null_node;
+            },
+            .assert_eq => {
+                const left = try self.lowerExprNode(bc.args[0]);
+                const right = try self.lowerExprNode(bc.args[1]);
+                const left_type = self.inferExprType(bc.args[0]);
+                const cond = if (left_type == TypeRegistry.STRING) blk: {
+                    const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                    const l_ptr = try fb.emitSlicePtr(left, ptr_type, bc.span);
+                    const l_len = try fb.emitSliceLen(left, bc.span);
+                    const r_ptr = try fb.emitSlicePtr(right, ptr_type, bc.span);
+                    const r_len = try fb.emitSliceLen(right, bc.span);
+                    var eq_args = [_]ir.NodeIndex{ l_ptr, l_len, r_ptr, r_len };
+                    const eq_result = try fb.emitCall("cot_string_eq", &eq_args, false, TypeRegistry.I64, bc.span);
+                    break :blk try fb.emitBinary(.ne, eq_result, try fb.emitConstInt(0, TypeRegistry.I64, bc.span), TypeRegistry.BOOL, bc.span);
+                } else try fb.emitBinary(.eq, left, right, TypeRegistry.BOOL, bc.span);
+                const then_block = try fb.newBlock("assert_eq.ok");
+                const fail_block = try fb.newBlock("assert_eq.fail");
+                _ = try fb.emitBranch(cond, then_block, fail_block, bc.span);
+                fb.setBlock(fail_block);
+                if (self.current_test_name != null) {
+                    const ret_type = fb.return_type;
+                    const eu_size = self.type_reg.sizeOf(ret_type);
+                    const tmp_local = try fb.addLocalWithSize("__assert_eq_err", ret_type, false, eu_size);
+                    const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_one, bc.span);
+                    const payload = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload, bc.span);
+                    const err_ret = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitRet(err_ret, bc.span);
+                } else {
+                    const msg = try self.allocator.dupe(u8, "assert_eq failed\n");
+                    const msg_idx = try fb.addStringLiteral(msg);
+                    const msg_str = try fb.emitConstSlice(msg_idx, bc.span);
+                    const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                    const msg_ptr = try fb.emitSlicePtr(msg_str, ptr_type, bc.span);
+                    const msg_len = try fb.emitSliceLen(msg_str, bc.span);
+                    const fd_val = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
+                    var write_args = [_]ir.NodeIndex{ fd_val, msg_ptr, msg_len };
+                    _ = try fb.emitCall("cot_write", &write_args, false, TypeRegistry.I64, bc.span);
+                    _ = try fb.emitTrap(bc.span);
+                }
+                fb.setBlock(then_block);
+                return ir.null_node;
+            },
+            .alloc => {
+                const size = try self.lowerExprNode(bc.args[0]);
+                const metadata_node = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+                var alloc_args = [_]ir.NodeIndex{ metadata_node, size };
+                return try fb.emitCall("cot_alloc", &alloc_args, false, TypeRegistry.I64, bc.span);
+            },
+            .dealloc => {
+                const ptr = try self.lowerExprNode(bc.args[0]);
+                var dealloc_args = [_]ir.NodeIndex{ptr};
+                _ = try fb.emitCall("cot_dealloc", &dealloc_args, false, TypeRegistry.VOID, bc.span);
+                return ir.null_node;
+            },
+            .realloc => {
+                const ptr = try self.lowerExprNode(bc.args[0]);
+                const new_size = try self.lowerExprNode(bc.args[1]);
+                var realloc_args = [_]ir.NodeIndex{ ptr, new_size };
+                return try fb.emitCall("cot_realloc", &realloc_args, false, TypeRegistry.I64, bc.span);
+            },
+            .memcpy => {
+                const dst = try self.lowerExprNode(bc.args[0]);
+                const src = try self.lowerExprNode(bc.args[1]);
+                const len = try self.lowerExprNode(bc.args[2]);
+                var memcpy_args = [_]ir.NodeIndex{ dst, src, len };
+                _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, bc.span);
+                return ir.null_node;
+            },
+            .fd_write => {
+                const fd_arg = try self.lowerExprNode(bc.args[0]);
+                const ptr_arg = try self.lowerExprNode(bc.args[1]);
+                const len_arg = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ fd_arg, ptr_arg, len_arg };
+                return try fb.emitCall("cot_fd_write_simple", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .fd_read => {
+                const fd_arg = try self.lowerExprNode(bc.args[0]);
+                const buf_arg = try self.lowerExprNode(bc.args[1]);
+                const len_arg = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ fd_arg, buf_arg, len_arg };
+                return try fb.emitCall("cot_fd_read_simple", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .fd_close => {
+                const fd_arg = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{fd_arg};
+                return try fb.emitCall("cot_fd_close", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .fd_seek => {
+                const fd_arg = try self.lowerExprNode(bc.args[0]);
+                const offset_arg = try self.lowerExprNode(bc.args[1]);
+                const whence_arg = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ fd_arg, offset_arg, whence_arg };
+                return try fb.emitCall("cot_fd_seek", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .fd_open => {
+                const path_ptr_arg = try self.lowerExprNode(bc.args[0]);
+                const path_len_arg = try self.lowerExprNode(bc.args[1]);
+                const flags_arg = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ path_ptr_arg, path_len_arg, flags_arg };
+                return try fb.emitCall("cot_fd_open", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .ptr_of => {
+                const str_val = try self.lowerExprNode(bc.args[0]);
                 const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
-                const msg_ptr = try fb.emitSlicePtr(msg_str, ptr_type, bc.span);
-                const msg_len = try fb.emitSliceLen(msg_str, bc.span);
-                const fd_val = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
-                var write_args = [_]ir.NodeIndex{ fd_val, msg_ptr, msg_len };
-                _ = try fb.emitCall("cot_write", &write_args, false, TypeRegistry.I64, bc.span);
+                const ptr_val = try fb.emitSlicePtr(str_val, ptr_type, bc.span);
+                return try fb.emitPtrToInt(ptr_val, TypeRegistry.I64, bc.span);
+            },
+            .len_of => {
+                const str_val = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitSliceLen(str_val, bc.span);
+            },
+            .trap => {
                 _ = try fb.emitTrap(bc.span);
-            }
-            // Both paths terminate (ret or trap), no jump needed — set continue block
-            fb.setBlock(then_block);
-            return ir.null_node;
+                const dead_block = try fb.newBlock("trap.dead");
+                fb.setBlock(dead_block);
+                return ir.null_node;
+            },
+            .exit => {
+                const code_arg = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{code_arg};
+                _ = try fb.emitCall("cot_exit", &args, false, TypeRegistry.VOID, bc.span);
+                const dead_block = try fb.newBlock("exit.dead");
+                fb.setBlock(dead_block);
+                return ir.null_node;
+            },
+            .time => {
+                return try fb.emitCall("cot_time", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
+            },
+            .random => {
+                const buf_arg = try self.lowerExprNode(bc.args[0]);
+                const len_arg = try self.lowerExprNode(bc.args[1]);
+                var args = [_]ir.NodeIndex{ buf_arg, len_arg };
+                return try fb.emitCall("cot_random", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .args_count => {
+                return try fb.emitCall("cot_args_count", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
+            },
+            .arg_len => {
+                const n_arg = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{n_arg};
+                return try fb.emitCall("cot_arg_len", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .arg_ptr => {
+                const n_arg = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{n_arg};
+                return try fb.emitCall("cot_arg_ptr", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .environ_count => {
+                return try fb.emitCall("cot_environ_count", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
+            },
+            .environ_len => {
+                const n_arg = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{n_arg};
+                return try fb.emitCall("cot_environ_len", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .environ_ptr => {
+                const n_arg = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{n_arg};
+                return try fb.emitCall("cot_environ_ptr", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .compile_error => {
+                return try fb.emitTrap(bc.span);
+            },
+            .target_os => {
+                const str = try self.allocator.dupe(u8, self.target.os.name());
+                const str_idx = try fb.addStringLiteral(str);
+                return try fb.emitConstSlice(str_idx, bc.span);
+            },
+            .target_arch => {
+                const str = try self.allocator.dupe(u8, self.target.arch.name());
+                const str_idx = try fb.addStringLiteral(str);
+                return try fb.emitConstSlice(str_idx, bc.span);
+            },
+            .target => {
+                const str = try self.allocator.dupe(u8, self.target.name());
+                const str_idx = try fb.addStringLiteral(str);
+                return try fb.emitConstSlice(str_idx, bc.span);
+            },
+            .abs => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                return fb.emit(ir.Node.init(.{ .unary = .{ .op = .abs, .operand = arg } }, TypeRegistry.F64, bc.span));
+            },
+            .ceil => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                return fb.emit(ir.Node.init(.{ .unary = .{ .op = .ceil, .operand = arg } }, TypeRegistry.F64, bc.span));
+            },
+            .floor => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                return fb.emit(ir.Node.init(.{ .unary = .{ .op = .floor, .operand = arg } }, TypeRegistry.F64, bc.span));
+            },
+            .trunc => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                return fb.emit(ir.Node.init(.{ .unary = .{ .op = .trunc_float, .operand = arg } }, TypeRegistry.F64, bc.span));
+            },
+            .round => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                return fb.emit(ir.Node.init(.{ .unary = .{ .op = .nearest, .operand = arg } }, TypeRegistry.F64, bc.span));
+            },
+            .sqrt => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                return fb.emit(ir.Node.init(.{ .unary = .{ .op = .sqrt, .operand = arg } }, TypeRegistry.F64, bc.span));
+            },
+            .fmin => {
+                const a = try self.lowerExprNode(bc.args[0]);
+                const b = try self.lowerExprNode(bc.args[1]);
+                return fb.emit(ir.Node.init(.{ .binary = .{ .op = .fmin, .left = a, .right = b } }, TypeRegistry.F64, bc.span));
+            },
+            .fmax => {
+                const a = try self.lowerExprNode(bc.args[0]);
+                const b = try self.lowerExprNode(bc.args[1]);
+                return fb.emit(ir.Node.init(.{ .binary = .{ .op = .fmax, .left = a, .right = b } }, TypeRegistry.F64, bc.span));
+            },
         }
-        if (std.mem.eql(u8, bc.name, "assert_eq")) {
-            const left = try self.lowerExprNode(bc.args[0]);
-            const right = try self.lowerExprNode(bc.args[1]);
-            // For strings: decompose to ptr/len and call cot_string_eq
-            const left_type = self.inferExprType(bc.args[0]);
-            const cond = if (left_type == TypeRegistry.STRING) blk: {
-                const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
-                const l_ptr = try fb.emitSlicePtr(left, ptr_type, bc.span);
-                const l_len = try fb.emitSliceLen(left, bc.span);
-                const r_ptr = try fb.emitSlicePtr(right, ptr_type, bc.span);
-                const r_len = try fb.emitSliceLen(right, bc.span);
-                var eq_args = [_]ir.NodeIndex{ l_ptr, l_len, r_ptr, r_len };
-                const eq_result = try fb.emitCall("cot_string_eq", &eq_args, false, TypeRegistry.I64, bc.span);
-                break :blk try fb.emitBinary(.ne, eq_result, try fb.emitConstInt(0, TypeRegistry.I64, bc.span), TypeRegistry.BOOL, bc.span);
-            } else try fb.emitBinary(.eq, left, right, TypeRegistry.BOOL, bc.span);
-            const then_block = try fb.newBlock("assert_eq.ok");
-            const fail_block = try fb.newBlock("assert_eq.fail");
-            _ = try fb.emitBranch(cond, then_block, fail_block, bc.span);
-            fb.setBlock(fail_block);
-            if (self.current_test_name != null) {
-                const ret_type = fb.return_type;
-                const eu_size = self.type_reg.sizeOf(ret_type);
-                const tmp_local = try fb.addLocalWithSize("__assert_eq_err", ret_type, false, eu_size);
-                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, bc.span);
-                _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_one, bc.span);
-                const payload = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
-                _ = try fb.emitStoreLocalField(tmp_local, 1, 8, payload, bc.span);
-                const err_ret = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, bc.span);
-                _ = try fb.emitRet(err_ret, bc.span);
-            } else {
-                const msg = try self.allocator.dupe(u8, "assert_eq failed\n");
-                const msg_idx = try fb.addStringLiteral(msg);
-                const msg_str = try fb.emitConstSlice(msg_idx, bc.span);
-                const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
-                const msg_ptr = try fb.emitSlicePtr(msg_str, ptr_type, bc.span);
-                const msg_len = try fb.emitSliceLen(msg_str, bc.span);
-                const fd_val = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
-                var write_args = [_]ir.NodeIndex{ fd_val, msg_ptr, msg_len };
-                _ = try fb.emitCall("cot_write", &write_args, false, TypeRegistry.I64, bc.span);
-                _ = try fb.emitTrap(bc.span);
-            }
-            // Both paths terminate (ret or trap), no jump needed — set continue block
-            fb.setBlock(then_block);
-            return ir.null_node;
-        }
-        if (std.mem.eql(u8, bc.name, "alloc")) {
-            const size = try self.lowerExprNode(bc.args[0]);
-            const metadata_node = try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
-            var alloc_args = [_]ir.NodeIndex{ metadata_node, size };
-            return try fb.emitCall("cot_alloc", &alloc_args, false, TypeRegistry.I64, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "dealloc")) {
-            const ptr = try self.lowerExprNode(bc.args[0]);
-            var dealloc_args = [_]ir.NodeIndex{ptr};
-            _ = try fb.emitCall("cot_dealloc", &dealloc_args, false, TypeRegistry.VOID, bc.span);
-            return ir.null_node;
-        }
-        if (std.mem.eql(u8, bc.name, "realloc")) {
-            const ptr = try self.lowerExprNode(bc.args[0]);
-            const new_size = try self.lowerExprNode(bc.args[1]);
-            var realloc_args = [_]ir.NodeIndex{ ptr, new_size };
-            return try fb.emitCall("cot_realloc", &realloc_args, false, TypeRegistry.I64, bc.span);
-        }
-        // @memcpy(dst, src, num_bytes) — Go's memmove / Zig's @memcpy pattern
-        // Lowerer already calls memcpy internally (e.g. struct copies at line 567).
-        // This exposes it to user code.
-        if (std.mem.eql(u8, bc.name, "memcpy")) {
-            const dst = try self.lowerExprNode(bc.args[0]);
-            const src = try self.lowerExprNode(bc.args[1]);
-            const len = try self.lowerExprNode(bc.args[2]);
-            var memcpy_args = [_]ir.NodeIndex{ dst, src, len };
-            _ = try fb.emitCall("memcpy", &memcpy_args, false, TypeRegistry.VOID, bc.span);
-            return ir.null_node;
-        }
-        // @fd_write(fd, ptr, len) — WASI fd_write via cot_fd_write_simple
-        // Reference: Go syscall/fs_wasip1.go Write() pattern
-        if (std.mem.eql(u8, bc.name, "fd_write")) {
-            const fd_arg = try self.lowerExprNode(bc.args[0]);
-            const ptr_arg = try self.lowerExprNode(bc.args[1]);
-            const len_arg = try self.lowerExprNode(bc.args[2]);
-            var args = [_]ir.NodeIndex{ fd_arg, ptr_arg, len_arg };
-            return try fb.emitCall("cot_fd_write_simple", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @fd_read(fd, buf, len) — read from fd via cot_fd_read_simple
-        // Reference: Go syscall/fs_wasip1.go:900 Read() — same pattern as Write()
-        if (std.mem.eql(u8, bc.name, "fd_read")) {
-            const fd_arg = try self.lowerExprNode(bc.args[0]);
-            const buf_arg = try self.lowerExprNode(bc.args[1]);
-            const len_arg = try self.lowerExprNode(bc.args[2]);
-            var args = [_]ir.NodeIndex{ fd_arg, buf_arg, len_arg };
-            return try fb.emitCall("cot_fd_read_simple", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @fd_close(fd) — close file descriptor via cot_fd_close
-        // Reference: Go syscall/fs_wasip1.go fd_close(fd int32)
-        if (std.mem.eql(u8, bc.name, "fd_close")) {
-            const fd_arg = try self.lowerExprNode(bc.args[0]);
-            var args = [_]ir.NodeIndex{fd_arg};
-            return try fb.emitCall("cot_fd_close", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @fd_seek(fd, offset, whence) — seek via cot_fd_seek
-        // Reference: Go syscall/fs_wasip1.go:928 Seek()
-        if (std.mem.eql(u8, bc.name, "fd_seek")) {
-            const fd_arg = try self.lowerExprNode(bc.args[0]);
-            const offset_arg = try self.lowerExprNode(bc.args[1]);
-            const whence_arg = try self.lowerExprNode(bc.args[2]);
-            var args = [_]ir.NodeIndex{ fd_arg, offset_arg, whence_arg };
-            return try fb.emitCall("cot_fd_seek", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @fd_open(path_ptr, path_len, flags) — open file via cot_fd_open
-        // Reference: Go zsyscall_darwin_arm64.go openat(AT_FDCWD, path, flags, mode)
-        if (std.mem.eql(u8, bc.name, "fd_open")) {
-            const path_ptr_arg = try self.lowerExprNode(bc.args[0]);
-            const path_len_arg = try self.lowerExprNode(bc.args[1]);
-            const flags_arg = try self.lowerExprNode(bc.args[2]);
-            var args = [_]ir.NodeIndex{ path_ptr_arg, path_len_arg, flags_arg };
-            return try fb.emitCall("cot_fd_open", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @ptrOf(string_expr) — extract raw pointer from string as i64
-        if (std.mem.eql(u8, bc.name, "ptrOf")) {
-            const str_val = try self.lowerExprNode(bc.args[0]);
-            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
-            const ptr_val = try fb.emitSlicePtr(str_val, ptr_type, bc.span);
-            return try fb.emitPtrToInt(ptr_val, TypeRegistry.I64, bc.span);
-        }
-        // @lenOf(string_expr) — extract length from string as i64
-        if (std.mem.eql(u8, bc.name, "lenOf")) {
-            const str_val = try self.lowerExprNode(bc.args[0]);
-            return try fb.emitSliceLen(str_val, bc.span);
-        }
-        // @trap() — Wasm unreachable instruction / ARM64 brk #1 / x64 ud2
-        // Zig: unreachable → trap instruction. Go: no equivalent (uses panic).
-        // Wasm: opcode 0x00 (unreachable). Terminates the block.
-        // After trap, switch to a dead block so the lowerer can continue emitting
-        // subsequent code (which is unreachable but may exist syntactically).
-        if (std.mem.eql(u8, bc.name, "trap")) {
-            _ = try fb.emitTrap(bc.span);
-            const dead_block = try fb.newBlock("trap.dead");
-            fb.setBlock(dead_block);
-            return ir.null_node;
-        }
-        // @exit(code) — exit the process (no return)
-        // Reference: WASI proc_exit(rval), macOS SYS_exit(1)
-        if (std.mem.eql(u8, bc.name, "exit")) {
-            const code_arg = try self.lowerExprNode(bc.args[0]);
-            var args = [_]ir.NodeIndex{code_arg};
-            _ = try fb.emitCall("cot_exit", &args, false, TypeRegistry.VOID, bc.span);
-            // After exit, switch to dead block (exit never returns)
-            const dead_block = try fb.newBlock("exit.dead");
-            fb.setBlock(dead_block);
-            return ir.null_node;
-        }
-        // @time() — get current wall-clock time in nanoseconds since epoch
-        // Reference: Go runtime/sys_darwin_arm64.s walltime_trampoline
-        if (std.mem.eql(u8, bc.name, "time")) {
-            return try fb.emitCall("cot_time", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
-        }
-        // @random(buf, len) — fill buffer with cryptographic random bytes
-        // Reference: Go runtime/sys_darwin_arm64.s arc4random_buf_trampoline
-        if (std.mem.eql(u8, bc.name, "random")) {
-            const buf_arg = try self.lowerExprNode(bc.args[0]);
-            const len_arg = try self.lowerExprNode(bc.args[1]);
-            var args = [_]ir.NodeIndex{ buf_arg, len_arg };
-            return try fb.emitCall("cot_random", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @args_count() — returns number of CLI arguments (argc)
-        if (std.mem.eql(u8, bc.name, "args_count")) {
-            return try fb.emitCall("cot_args_count", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
-        }
-        // @arg_len(n) — returns length of CLI argument n
-        if (std.mem.eql(u8, bc.name, "arg_len")) {
-            const n_arg = try self.lowerExprNode(bc.args[0]);
-            var args = [_]ir.NodeIndex{n_arg};
-            return try fb.emitCall("cot_arg_len", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @arg_ptr(n) — copies CLI argument n into linear memory, returns wasm pointer
-        if (std.mem.eql(u8, bc.name, "arg_ptr")) {
-            const n_arg = try self.lowerExprNode(bc.args[0]);
-            var args = [_]ir.NodeIndex{n_arg};
-            return try fb.emitCall("cot_arg_ptr", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @environ_count() — returns number of environment variables
-        if (std.mem.eql(u8, bc.name, "environ_count")) {
-            return try fb.emitCall("cot_environ_count", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
-        }
-        // @environ_len(n) — returns length of env var n
-        if (std.mem.eql(u8, bc.name, "environ_len")) {
-            const n_arg = try self.lowerExprNode(bc.args[0]);
-            var args = [_]ir.NodeIndex{n_arg};
-            return try fb.emitCall("cot_environ_len", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @environ_ptr(n) — copies env var n into linear memory, returns wasm pointer
-        if (std.mem.eql(u8, bc.name, "environ_ptr")) {
-            const n_arg = try self.lowerExprNode(bc.args[0]);
-            var args = [_]ir.NodeIndex{n_arg};
-            return try fb.emitCall("cot_environ_ptr", &args, false, TypeRegistry.I64, bc.span);
-        }
-        // @compileError("message") — should never be reached in lowering (dead branch eliminated)
-        // If reached, the checker already reported the error. Emit trap as fallback.
-        if (std.mem.eql(u8, bc.name, "compileError")) {
-            return try fb.emitTrap(bc.span);
-        }
-        // @target_os(), @target_arch(), @target() — comptime string constants
-        if (std.mem.eql(u8, bc.name, "target_os")) {
-            const str = try self.allocator.dupe(u8, self.target.os.name());
-            const str_idx = try fb.addStringLiteral(str);
-            return try fb.emitConstSlice(str_idx, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "target_arch")) {
-            const str = try self.allocator.dupe(u8, self.target.arch.name());
-            const str_idx = try fb.addStringLiteral(str);
-            return try fb.emitConstSlice(str_idx, bc.span);
-        }
-        if (std.mem.eql(u8, bc.name, "target")) {
-            const str = try self.allocator.dupe(u8, self.target.name());
-            const str_idx = try fb.addStringLiteral(str);
-            return try fb.emitConstSlice(str_idx, bc.span);
-        }
-        // Math builtins — emit as IR Unary/Binary ops, converted to Wasm f64 ops in SSA builder
-        if (std.mem.eql(u8, bc.name, "abs")) {
-            const arg = try self.lowerExprNode(bc.args[0]);
-            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .abs, .operand = arg } }, TypeRegistry.F64, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "ceil")) {
-            const arg = try self.lowerExprNode(bc.args[0]);
-            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .ceil, .operand = arg } }, TypeRegistry.F64, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "floor")) {
-            const arg = try self.lowerExprNode(bc.args[0]);
-            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .floor, .operand = arg } }, TypeRegistry.F64, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "trunc")) {
-            const arg = try self.lowerExprNode(bc.args[0]);
-            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .trunc_float, .operand = arg } }, TypeRegistry.F64, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "round")) {
-            const arg = try self.lowerExprNode(bc.args[0]);
-            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .nearest, .operand = arg } }, TypeRegistry.F64, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "sqrt")) {
-            const arg = try self.lowerExprNode(bc.args[0]);
-            return fb.emit(ir.Node.init(.{ .unary = .{ .op = .sqrt, .operand = arg } }, TypeRegistry.F64, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "fmin")) {
-            const a = try self.lowerExprNode(bc.args[0]);
-            const b = try self.lowerExprNode(bc.args[1]);
-            return fb.emit(ir.Node.init(.{ .binary = .{ .op = .fmin, .left = a, .right = b } }, TypeRegistry.F64, bc.span));
-        }
-        if (std.mem.eql(u8, bc.name, "fmax")) {
-            const a = try self.lowerExprNode(bc.args[0]);
-            const b = try self.lowerExprNode(bc.args[1]);
-            return fb.emit(ir.Node.init(.{ .binary = .{ .op = .fmax, .left = a, .right = b } }, TypeRegistry.F64, bc.span));
-        }
-        return ir.null_node;
     }
 
     // ============================================================================

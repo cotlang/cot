@@ -980,64 +980,63 @@ pub const Parser = struct {
     fn parseBuiltinCall(self: *Parser, start: Pos) ParseError!?NodeIndex {
         self.advance(); // @
         if (!self.check(.ident) and !self.check(.kw_string)) { self.syntaxError("expected builtin name after '@'"); return null; }
-        const is_string = self.check(.kw_string);
-        const name = if (is_string) "string" else self.tok.text;
+        const name_str = if (self.check(.kw_string)) "string" else self.tok.text;
         self.advance();
         if (!self.expect(.lparen)) return null;
 
-        if (is_string) {
-            const ptr = try self.parseExpr() orelse return null;
-            if (!self.expect(.comma)) return null;
-            const len = try self.parseExpr() orelse return null;
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ ptr, len, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "intCast") or std.mem.eql(u8, name, "ptrCast") or std.mem.eql(u8, name, "intToPtr")) {
-            const t = try self.parseType() orelse return null;
-            if (!self.expect(.comma)) return null;
-            const v = try self.parseExpr() orelse return null;
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = t, .args = .{ v, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "compileError")) {
-            // @compileError("message") — 1 string arg, triggers compile error
-            const arg = try self.parseExpr() orelse return null;
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "trap") or std.mem.eql(u8, name, "time") or std.mem.eql(u8, name, "args_count") or std.mem.eql(u8, name, "environ_count") or std.mem.eql(u8, name, "target_os") or std.mem.eql(u8, name, "target_arch") or std.mem.eql(u8, name, "target")) {
-            // @trap() — 0 args, Wasm unreachable / ARM64 brk #1
-            // @time() — 0 args, returns nanoseconds since epoch
-            // @args_count() — 0 args, returns number of CLI arguments
-            // @target_os(), @target_arch(), @target() — 0 args, comptime string constants
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf") or std.mem.eql(u8, name, "fd_close") or std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "arg_len") or std.mem.eql(u8, name, "arg_ptr") or std.mem.eql(u8, name, "environ_len") or std.mem.eql(u8, name, "environ_ptr") or
-            std.mem.eql(u8, name, "abs") or std.mem.eql(u8, name, "ceil") or std.mem.eql(u8, name, "floor") or std.mem.eql(u8, name, "trunc") or std.mem.eql(u8, name, "round") or std.mem.eql(u8, name, "sqrt")) {
-            const arg = try self.parseExpr() orelse return null;
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "realloc") or std.mem.eql(u8, name, "random") or
-            std.mem.eql(u8, name, "fmin") or std.mem.eql(u8, name, "fmax")) {
-            const ptr_arg = try self.parseExpr() orelse return null;
-            if (!self.expect(.comma)) return null;
-            const size_arg = try self.parseExpr() orelse return null;
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ ptr_arg, size_arg, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "memcpy") or std.mem.eql(u8, name, "fd_write") or std.mem.eql(u8, name, "fd_read") or std.mem.eql(u8, name, "fd_seek") or std.mem.eql(u8, name, "fd_open")) {
-            // @memcpy(dst, src, num_bytes) — 3 args
-            // @fd_write(fd, ptr, len) — 3 args
-            // @fd_read(fd, buf, len) — 3 args
-            // @fd_seek(fd, offset, whence) — 3 args
-            // @fd_open(path_ptr, path_len, flags) — 3 args
-            const dst_arg = try self.parseExpr() orelse return null;
-            if (!self.expect(.comma)) return null;
-            const src_arg = try self.parseExpr() orelse return null;
-            if (!self.expect(.comma)) return null;
-            const len_arg = try self.parseExpr() orelse return null;
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ dst_arg, src_arg, len_arg }, .span = Span.init(start, self.pos()) } });
-        } else {
-            const t = try self.parseType() orelse return null;
-            if (!self.expect(.rparen)) return null;
-            return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = t, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
+        const kind = ast.BuiltinKind.fromString(name_str) orelse {
+            self.syntaxError("unknown builtin");
+            return null;
+        };
+
+        switch (kind) {
+            // 0 args
+            .trap, .time, .args_count, .environ_count, .target_os, .target_arch, .target => {
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
+            },
+            // 1 type arg (no value)
+            .size_of, .align_of => {
+                const t = try self.parseType() orelse return null;
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = t, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
+            },
+            // 1 type + 1 value arg
+            .int_cast, .ptr_cast, .int_to_ptr => {
+                const t = try self.parseType() orelse return null;
+                if (!self.expect(.comma)) return null;
+                const v = try self.parseExpr() orelse return null;
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = t, .args = .{ v, null_node, null_node }, .span = Span.init(start, self.pos()) } });
+            },
+            // 1 value arg
+            .ptr_to_int, .assert, .alloc, .dealloc, .ptr_of, .len_of,
+            .fd_close, .exit, .arg_len, .arg_ptr, .environ_len, .environ_ptr,
+            .compile_error,
+            .abs, .ceil, .floor, .trunc, .round, .sqrt,
+            => {
+                const arg = try self.parseExpr() orelse return null;
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
+            },
+            // 2 value args
+            .string, .assert_eq, .realloc, .random, .fmin, .fmax => {
+                const a1 = try self.parseExpr() orelse return null;
+                if (!self.expect(.comma)) return null;
+                const a2 = try self.parseExpr() orelse return null;
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ a1, a2, null_node }, .span = Span.init(start, self.pos()) } });
+            },
+            // 3 value args
+            .memcpy, .fd_write, .fd_read, .fd_seek, .fd_open => {
+                const a1 = try self.parseExpr() orelse return null;
+                if (!self.expect(.comma)) return null;
+                const a2 = try self.parseExpr() orelse return null;
+                if (!self.expect(.comma)) return null;
+                const a3 = try self.parseExpr() orelse return null;
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ a1, a2, a3 }, .span = Span.init(start, self.pos()) } });
+            },
         }
     }
 

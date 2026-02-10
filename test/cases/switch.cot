@@ -25,3 +25,40 @@ test "switch enum" {
     }
     @assert_eq(val, 50)
 }
+
+test "exhaustive enum switch without else" {
+    var lvl = CswLevel.High
+    var val = switch lvl {
+        CswLevel.Low => 1,
+        CswLevel.Medium => 2,
+        CswLevel.High => 3,
+    }
+    @assert_eq(val, 3)
+}
+
+test "exhaustive enum switch all paths" {
+    var lvl = CswLevel.Low
+    var r1 = switch lvl {
+        CswLevel.Low => 10,
+        CswLevel.Medium => 50,
+        CswLevel.High => 100,
+    }
+    @assert_eq(r1, 10)
+
+    lvl = CswLevel.Medium
+    var r2 = switch lvl {
+        CswLevel.Low => 10,
+        CswLevel.Medium => 50,
+        CswLevel.High => 100,
+    }
+    @assert_eq(r2, 50)
+}
+
+test "non-exhaustive enum switch with else" {
+    var lvl = CswLevel.Low
+    var val = switch lvl {
+        CswLevel.High => 100,
+        else => 0,
+    }
+    @assert_eq(val, 0)
+}

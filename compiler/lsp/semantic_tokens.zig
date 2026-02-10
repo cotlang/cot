@@ -247,8 +247,8 @@ const TokenCollector = struct {
             },
             .builtin_call => |b| {
                 // @name — emit the whole @name as macro
-                const at_prefix: u32 = if (b.name.len > 0 and b.name[0] == '@') 0 else 1;
-                self.emit(b.span.start.offset, @as(u32, @intCast(b.name.len)) + at_prefix, .macro, MOD_DEFAULT_LIBRARY);
+                const src_name = b.kind.sourceName();
+                self.emit(b.span.start.offset, @as(u32, @intCast(src_name.len)) + 1, .macro, MOD_DEFAULT_LIBRARY);
                 self.walkNode(b.type_arg);
                 for (b.args) |arg| self.walkNode(arg);
             },

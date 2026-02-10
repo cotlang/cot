@@ -142,7 +142,162 @@ pub const NewExpr = struct {
     fields: []const FieldInit,
     span: Span,
 };
-pub const BuiltinCall = struct { name: []const u8, type_arg: NodeIndex, args: [3]NodeIndex, span: Span };
+pub const BuiltinKind = enum {
+    // Type intrinsics
+    size_of,
+    align_of,
+    // Casts
+    int_cast,
+    ptr_cast,
+    int_to_ptr,
+    ptr_to_int,
+    // String construction
+    string,
+    // Assertions
+    assert,
+    assert_eq,
+    // Memory
+    alloc,
+    dealloc,
+    realloc,
+    memcpy,
+    // WASI file I/O
+    fd_write,
+    fd_read,
+    fd_close,
+    fd_seek,
+    fd_open,
+    // String decomposition
+    ptr_of,
+    len_of,
+    // Process control
+    trap,
+    exit,
+    // Time/random
+    time,
+    random,
+    // CLI args
+    args_count,
+    arg_len,
+    arg_ptr,
+    // Environment
+    environ_count,
+    environ_len,
+    environ_ptr,
+    // Comptime targets
+    target_os,
+    target_arch,
+    target,
+    // Compile-time
+    compile_error,
+    // Math (float unary)
+    abs,
+    ceil,
+    floor,
+    trunc,
+    round,
+    sqrt,
+    // Math (float binary)
+    fmin,
+    fmax,
+
+    const map = std.StaticStringMap(BuiltinKind).initComptime(.{
+        .{ "sizeOf", .size_of },
+        .{ "alignOf", .align_of },
+        .{ "intCast", .int_cast },
+        .{ "ptrCast", .ptr_cast },
+        .{ "intToPtr", .int_to_ptr },
+        .{ "ptrToInt", .ptr_to_int },
+        .{ "string", .string },
+        .{ "assert", .assert },
+        .{ "assert_eq", .assert_eq },
+        .{ "alloc", .alloc },
+        .{ "dealloc", .dealloc },
+        .{ "realloc", .realloc },
+        .{ "memcpy", .memcpy },
+        .{ "fd_write", .fd_write },
+        .{ "fd_read", .fd_read },
+        .{ "fd_close", .fd_close },
+        .{ "fd_seek", .fd_seek },
+        .{ "fd_open", .fd_open },
+        .{ "ptrOf", .ptr_of },
+        .{ "lenOf", .len_of },
+        .{ "trap", .trap },
+        .{ "exit", .exit },
+        .{ "time", .time },
+        .{ "random", .random },
+        .{ "args_count", .args_count },
+        .{ "arg_len", .arg_len },
+        .{ "arg_ptr", .arg_ptr },
+        .{ "environ_count", .environ_count },
+        .{ "environ_len", .environ_len },
+        .{ "environ_ptr", .environ_ptr },
+        .{ "target_os", .target_os },
+        .{ "target_arch", .target_arch },
+        .{ "target", .target },
+        .{ "compileError", .compile_error },
+        .{ "abs", .abs },
+        .{ "ceil", .ceil },
+        .{ "floor", .floor },
+        .{ "trunc", .trunc },
+        .{ "round", .round },
+        .{ "sqrt", .sqrt },
+        .{ "fmin", .fmin },
+        .{ "fmax", .fmax },
+    });
+
+    pub fn fromString(s: []const u8) ?BuiltinKind {
+        return map.get(s);
+    }
+
+    pub fn sourceName(self: BuiltinKind) []const u8 {
+        return switch (self) {
+            .size_of => "sizeOf",
+            .align_of => "alignOf",
+            .int_cast => "intCast",
+            .ptr_cast => "ptrCast",
+            .int_to_ptr => "intToPtr",
+            .ptr_to_int => "ptrToInt",
+            .string => "string",
+            .assert => "assert",
+            .assert_eq => "assert_eq",
+            .alloc => "alloc",
+            .dealloc => "dealloc",
+            .realloc => "realloc",
+            .memcpy => "memcpy",
+            .fd_write => "fd_write",
+            .fd_read => "fd_read",
+            .fd_close => "fd_close",
+            .fd_seek => "fd_seek",
+            .fd_open => "fd_open",
+            .ptr_of => "ptrOf",
+            .len_of => "lenOf",
+            .trap => "trap",
+            .exit => "exit",
+            .time => "time",
+            .random => "random",
+            .args_count => "args_count",
+            .arg_len => "arg_len",
+            .arg_ptr => "arg_ptr",
+            .environ_count => "environ_count",
+            .environ_len => "environ_len",
+            .environ_ptr => "environ_ptr",
+            .target_os => "target_os",
+            .target_arch => "target_arch",
+            .target => "target",
+            .compile_error => "compileError",
+            .abs => "abs",
+            .ceil => "ceil",
+            .floor => "floor",
+            .trunc => "trunc",
+            .round => "round",
+            .sqrt => "sqrt",
+            .fmin => "fmin",
+            .fmax => "fmax",
+        };
+    }
+};
+pub const BuiltinCall = struct { kind: BuiltinKind, type_arg: NodeIndex, args: [3]NodeIndex, span: Span };
 pub const StringSegment = union(enum) { text: []const u8, expr: NodeIndex };
 pub const StringInterp = struct { segments: []const StringSegment, span: Span };
 pub const TypeExpr = struct { kind: TypeKind, span: Span };

@@ -511,7 +511,7 @@ pub const Checker = struct {
             // Go: cmd/compile/internal/ir/const.go — const folding includes sizeof.
             // Zig: Sema.zig resolves @sizeOf at comptime. We follow Go's limited approach.
             .builtin_call => |bc| {
-                if (std.mem.eql(u8, bc.name, "sizeOf")) {
+                if (bc.kind == .size_of) {
                     const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
                     if (type_idx == invalid_type) return null;
                     return @as(i64, @intCast(self.types.sizeOf(type_idx)));
@@ -584,10 +584,12 @@ pub const Checker = struct {
             } else null,
             .paren => |p| self.evalConstString(p.inner),
             .builtin_call => |bc| {
-                if (std.mem.eql(u8, bc.name, "target_os")) return self.target.os.name();
-                if (std.mem.eql(u8, bc.name, "target_arch")) return self.target.arch.name();
-                if (std.mem.eql(u8, bc.name, "target")) return self.target.name();
-                return null;
+                return switch (bc.kind) {
+                    .target_os => self.target.os.name(),
+                    .target_arch => self.target.arch.name(),
+                    .target => self.target.name(),
+                    else => null,
+                };
             },
             else => null,
         };
@@ -840,174 +842,134 @@ pub const Checker = struct {
     }
 
     fn checkBuiltinCall(self: *Checker, bc: ast.BuiltinCall) CheckError!TypeIndex {
-        if (std.mem.eql(u8, bc.name, "sizeOf") or std.mem.eql(u8, bc.name, "alignOf")) {
-            const type_idx = try self.resolveTypeExpr(bc.type_arg);
-            if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "requires valid type"); return invalid_type; }
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "string")) {
-            _ = try self.checkExpr(bc.args[0]);
-            _ = try self.checkExpr(bc.args[1]);
-            return TypeRegistry.STRING;
-        } else if (std.mem.eql(u8, bc.name, "intCast")) {
-            const target_type = try self.resolveTypeExpr(bc.type_arg);
-            if (!types.isNumeric(self.types.get(target_type))) { self.err.errorWithCode(bc.span.start, .e300, "@intCast target must be numeric"); return invalid_type; }
-            _ = try self.checkExpr(bc.args[0]);
-            return target_type;
-        } else if (std.mem.eql(u8, bc.name, "ptrCast")) {
-            const target_type = try self.resolveTypeExpr(bc.type_arg);
-            if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@ptrCast target must be pointer"); return invalid_type; }
-            _ = try self.checkExpr(bc.args[0]);
-            return target_type;
-        } else if (std.mem.eql(u8, bc.name, "ptrToInt")) {
-            _ = try self.checkExpr(bc.args[0]);
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "intToPtr")) {
-            const target_type = try self.resolveTypeExpr(bc.type_arg);
-            if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@intToPtr target must be pointer"); return invalid_type; }
-            _ = try self.checkExpr(bc.args[0]);
-            return target_type;
-        } else if (std.mem.eql(u8, bc.name, "assert")) {
-            _ = try self.checkExpr(bc.args[0]);
-            return TypeRegistry.VOID;
-        } else if (std.mem.eql(u8, bc.name, "assert_eq")) {
-            _ = try self.checkExpr(bc.args[0]);
-            _ = try self.checkExpr(bc.args[1]);
-            return TypeRegistry.VOID;
-        } else if (std.mem.eql(u8, bc.name, "alloc")) {
-            _ = try self.checkExpr(bc.args[0]); // size: i64
-            return TypeRegistry.I64; // raw pointer as i64
-        } else if (std.mem.eql(u8, bc.name, "dealloc")) {
-            _ = try self.checkExpr(bc.args[0]); // ptr: i64
-            return TypeRegistry.VOID;
-        } else if (std.mem.eql(u8, bc.name, "realloc")) {
-            _ = try self.checkExpr(bc.args[0]); // ptr: i64
-            _ = try self.checkExpr(bc.args[1]); // new_size: i64
-            return TypeRegistry.I64; // new pointer as i64
-        } else if (std.mem.eql(u8, bc.name, "memcpy")) {
-            // @memcpy(dst, src, num_bytes) — Go's memmove / Wasm memory.copy pattern
-            _ = try self.checkExpr(bc.args[0]); // dst: i64 (raw pointer)
-            _ = try self.checkExpr(bc.args[1]); // src: i64 (raw pointer)
-            _ = try self.checkExpr(bc.args[2]); // num_bytes: i64
-            return TypeRegistry.VOID;
-        } else if (std.mem.eql(u8, bc.name, "fd_write")) {
-            // @fd_write(fd, ptr, len) — WASI fd_write via adapter
-            _ = try self.checkExpr(bc.args[0]); // fd: i64
-            _ = try self.checkExpr(bc.args[1]); // ptr: i64
-            _ = try self.checkExpr(bc.args[2]); // len: i64
-            return TypeRegistry.I64; // returns bytes written
-        } else if (std.mem.eql(u8, bc.name, "fd_read")) {
-            // @fd_read(fd, buf, len) — read from fd into buffer
-            // Reference: Go syscall/fs_wasip1.go:900 Read()
-            _ = try self.checkExpr(bc.args[0]); // fd: i64
-            _ = try self.checkExpr(bc.args[1]); // buf: i64 (pointer into linear memory)
-            _ = try self.checkExpr(bc.args[2]); // len: i64 (max bytes to read)
-            return TypeRegistry.I64; // returns bytes read (0 = EOF)
-        } else if (std.mem.eql(u8, bc.name, "fd_close")) {
-            // @fd_close(fd) — close a file descriptor
-            // Reference: Go syscall/fs_wasip1.go fd_close(fd int32) Errno
-            _ = try self.checkExpr(bc.args[0]); // fd: i64
-            return TypeRegistry.I64; // returns 0 on success
-        } else if (std.mem.eql(u8, bc.name, "fd_seek")) {
-            // @fd_seek(fd, offset, whence) — seek in file descriptor
-            // Reference: Go syscall/fs_wasip1.go:928 Seek() — lseek(fd, offset, whence)
-            // Whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END
-            _ = try self.checkExpr(bc.args[0]); // fd: i64
-            _ = try self.checkExpr(bc.args[1]); // offset: i64 (signed)
-            _ = try self.checkExpr(bc.args[2]); // whence: i64 (0=SET, 1=CUR, 2=END)
-            return TypeRegistry.I64; // returns new offset
-        } else if (std.mem.eql(u8, bc.name, "fd_open")) {
-            // @fd_open(path_ptr, path_len, flags) — open file by path
-            // Reference: Go zsyscall_darwin_arm64.go openat(AT_FDCWD, path, flags, mode)
-            _ = try self.checkExpr(bc.args[0]); // path_ptr: i64 (pointer into linear memory)
-            _ = try self.checkExpr(bc.args[1]); // path_len: i64
-            _ = try self.checkExpr(bc.args[2]); // flags: i64 (O_RDONLY=0, O_WRONLY=1, O_RDWR=2, +O_CREAT, etc.)
-            return TypeRegistry.I64; // returns fd on success, errno on error
-        } else if (std.mem.eql(u8, bc.name, "ptrOf")) {
-            // @ptrOf(string_expr) — get raw pointer of a string as i64
-            const arg_type = try self.checkExpr(bc.args[0]);
-            if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@ptrOf requires string argument"); return invalid_type; }
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "lenOf")) {
-            // @lenOf(string_expr) — get length of a string as i64
-            const arg_type = try self.checkExpr(bc.args[0]);
-            if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@lenOf requires string argument"); return invalid_type; }
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "trap")) {
-            // @trap() — Wasm unreachable / ARM64 brk #1 / x64 ud2
-            return TypeRegistry.VOID;
-        } else if (std.mem.eql(u8, bc.name, "exit")) {
-            // @exit(code) — exit the process with given exit code (no return)
-            // Reference: WASI proc_exit(rval), macOS SYS_exit(1)
-            _ = try self.checkExpr(bc.args[0]); // code: i64
-            return TypeRegistry.VOID;
-        } else if (std.mem.eql(u8, bc.name, "time")) {
-            // @time() — returns nanoseconds since epoch as i64
-            // Reference: Go runtime/sys_darwin_arm64.s walltime_trampoline → clock_gettime(CLOCK_REALTIME)
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "random")) {
-            // @random(buf, len) — fill buffer with cryptographic random bytes
-            // Reference: Go runtime/sys_darwin_arm64.s arc4random_buf_trampoline
-            _ = try self.checkExpr(bc.args[0]); // buf: i64 (pointer into linear memory)
-            _ = try self.checkExpr(bc.args[1]); // len: i64
-            return TypeRegistry.I64; // returns 0 on success, errno on error
-        } else if (std.mem.eql(u8, bc.name, "args_count")) {
-            // @args_count() — returns number of CLI arguments (argc)
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "arg_len")) {
-            // @arg_len(n) — returns length of CLI argument n (strlen(argv[n]))
-            _ = try self.checkExpr(bc.args[0]); // n: i64 (argument index)
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "arg_ptr")) {
-            // @arg_ptr(n) — copies CLI argument n into linear memory, returns wasm pointer
-            _ = try self.checkExpr(bc.args[0]); // n: i64 (argument index)
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "environ_count")) {
-            // @environ_count() — returns number of environment variables
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "environ_len")) {
-            // @environ_len(n) — returns length of env var n
-            _ = try self.checkExpr(bc.args[0]);
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "environ_ptr")) {
-            // @environ_ptr(n) — copies env var n into linear memory, returns wasm pointer
-            _ = try self.checkExpr(bc.args[0]);
-            return TypeRegistry.I64;
-        } else if (std.mem.eql(u8, bc.name, "target_os") or std.mem.eql(u8, bc.name, "target_arch") or std.mem.eql(u8, bc.name, "target")) {
-            // Comptime builtins — resolve to string constants at compile time
-            return TypeRegistry.STRING;
-        } else if (std.mem.eql(u8, bc.name, "compileError")) {
-            // @compileError("message") — emit compile error with user message
-            // Only reached if the branch wasn't eliminated by comptime const-fold
-            const msg = self.evalConstString(bc.args[0]) orelse "compile error";
-            self.err.errorWithCode(bc.span.start, .e300, msg);
-            return TypeRegistry.VOID;
-        } else if (std.mem.eql(u8, bc.name, "abs") or std.mem.eql(u8, bc.name, "ceil") or
-            std.mem.eql(u8, bc.name, "floor") or std.mem.eql(u8, bc.name, "trunc") or
-            std.mem.eql(u8, bc.name, "round") or std.mem.eql(u8, bc.name, "sqrt"))
-        {
-            // @abs/@ceil/@floor/@trunc/@round/@sqrt(x: f64) -> f64
-            // Wasm f64 unary ops: f64.abs, f64.ceil, f64.floor, f64.trunc, f64.nearest, f64.sqrt
-            const arg_type = try self.checkExpr(bc.args[0]);
-            if (arg_type != TypeRegistry.F64 and arg_type != TypeRegistry.F32 and arg_type != TypeRegistry.UNTYPED_FLOAT) {
-                self.err.errorWithCode(bc.span.start, .e300, "math builtin requires float argument");
-                return invalid_type;
-            }
-            return TypeRegistry.F64;
-        } else if (std.mem.eql(u8, bc.name, "fmin") or std.mem.eql(u8, bc.name, "fmax")) {
-            // @fmin/@fmax(a: f64, b: f64) -> f64
-            // Wasm f64 binary ops: f64.min, f64.max
-            const arg1_type = try self.checkExpr(bc.args[0]);
-            const arg2_type = try self.checkExpr(bc.args[1]);
-            const a1_float = arg1_type == TypeRegistry.F64 or arg1_type == TypeRegistry.F32 or arg1_type == TypeRegistry.UNTYPED_FLOAT;
-            const a2_float = arg2_type == TypeRegistry.F64 or arg2_type == TypeRegistry.F32 or arg2_type == TypeRegistry.UNTYPED_FLOAT;
-            if (!a1_float or !a2_float) {
-                self.err.errorWithCode(bc.span.start, .e300, "@fmin/@fmax require float arguments");
-                return invalid_type;
-            }
-            return TypeRegistry.F64;
+        switch (bc.kind) {
+            .size_of, .align_of => {
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "requires valid type"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .string => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.STRING;
+            },
+            .int_cast => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (!types.isNumeric(self.types.get(target_type))) { self.err.errorWithCode(bc.span.start, .e300, "@intCast target must be numeric"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .ptr_cast => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@ptrCast target must be pointer"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .ptr_to_int => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            .int_to_ptr => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (self.types.get(target_type) != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@intToPtr target must be pointer"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .assert => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.VOID;
+            },
+            .assert_eq => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.VOID;
+            },
+            .alloc => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            .dealloc => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.VOID;
+            },
+            .realloc => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
+            .memcpy => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                _ = try self.checkExpr(bc.args[2]);
+                return TypeRegistry.VOID;
+            },
+            .fd_write, .fd_read, .fd_seek, .fd_open => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                _ = try self.checkExpr(bc.args[2]);
+                return TypeRegistry.I64;
+            },
+            .fd_close => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            .ptr_of => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@ptrOf requires string argument"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .len_of => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@lenOf requires string argument"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .trap => return TypeRegistry.VOID,
+            .exit => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.VOID;
+            },
+            .time => return TypeRegistry.I64,
+            .random => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
+            .args_count => return TypeRegistry.I64,
+            .arg_len, .arg_ptr => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            .environ_count => return TypeRegistry.I64,
+            .environ_len, .environ_ptr => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            .target_os, .target_arch, .target => return TypeRegistry.STRING,
+            .compile_error => {
+                const msg = self.evalConstString(bc.args[0]) orelse "compile error";
+                self.err.errorWithCode(bc.span.start, .e300, msg);
+                return TypeRegistry.VOID;
+            },
+            .abs, .ceil, .floor, .trunc, .round, .sqrt => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.F64 and arg_type != TypeRegistry.F32 and arg_type != TypeRegistry.UNTYPED_FLOAT) {
+                    self.err.errorWithCode(bc.span.start, .e300, "math builtin requires float argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.F64;
+            },
+            .fmin, .fmax => {
+                const arg1_type = try self.checkExpr(bc.args[0]);
+                const arg2_type = try self.checkExpr(bc.args[1]);
+                const a1_float = arg1_type == TypeRegistry.F64 or arg1_type == TypeRegistry.F32 or arg1_type == TypeRegistry.UNTYPED_FLOAT;
+                const a2_float = arg2_type == TypeRegistry.F64 or arg2_type == TypeRegistry.F32 or arg2_type == TypeRegistry.UNTYPED_FLOAT;
+                if (!a1_float or !a2_float) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@fmin/@fmax require float arguments");
+                    return invalid_type;
+                }
+                return TypeRegistry.F64;
+            },
         }
-        self.err.errorWithCode(bc.span.start, .e300, "unknown builtin");
-        return invalid_type;
     }
 
     fn checkIndex(self: *Checker, i: ast.Index) CheckError!TypeIndex {
@@ -1249,6 +1211,7 @@ pub const Checker = struct {
         const subject_type = try self.checkExpr(se.subject);
         const subject_info = self.types.get(subject_type);
         const is_union = subject_info == .union_type;
+        const is_enum = subject_info == .enum_type;
         var result_type: TypeIndex = TypeRegistry.VOID;
         var first = true;
         for (se.cases) |case| {
@@ -1274,6 +1237,42 @@ pub const Checker = struct {
             }
         }
         if (se.else_body != null_node) _ = try self.checkExpr(se.else_body);
+
+        // Enum switch exhaustiveness check (Zig pattern: switch on enum must be exhaustive or have else)
+        if (is_enum and se.else_body == null_node) {
+            const et = subject_info.enum_type;
+            // Build coverage set: track which variants are covered by unguarded cases
+            var covered = std.StringHashMap(void).init(self.allocator);
+            defer covered.deinit();
+            for (se.cases) |case| {
+                // Cases with guards don't guarantee coverage
+                if (case.guard != ast.null_node) continue;
+                for (case.patterns) |pat_idx| {
+                    const pat_node = self.tree.getNode(pat_idx) orelse continue;
+                    const pat_expr = pat_node.asExpr() orelse continue;
+                    if (pat_expr == .field_access) {
+                        covered.put(pat_expr.field_access.field, {}) catch {};
+                    }
+                }
+            }
+            // Check if all variants are covered
+            if (covered.count() < et.variants.len) {
+                // Build list of missing variant names
+                var missing = std.ArrayListUnmanaged(u8){};
+                defer missing.deinit(self.allocator);
+                var missing_count: usize = 0;
+                for (et.variants) |v| {
+                    if (!covered.contains(v.name)) {
+                        if (missing_count > 0) missing.appendSlice(self.allocator, ", ") catch {};
+                        missing.appendSlice(self.allocator, v.name) catch {};
+                        missing_count += 1;
+                    }
+                }
+                const msg = std.fmt.allocPrint(self.allocator, "switch on enum '{s}' must be exhaustive or have else branch; missing: {s}", .{ et.name, missing.items }) catch "non-exhaustive enum switch";
+                self.err.errorWithCode(se.span.start, .e300, msg);
+            }
+        }
+
         return result_type;
     }
 
