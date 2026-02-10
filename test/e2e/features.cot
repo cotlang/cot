@@ -1712,3 +1712,43 @@ test "compileError in dead else with target check" {
         @compileError("unsupported OS")
     }
 }
+
+// ============================================================================
+// Auto-deref (pointer.field auto-inserts pointer.*.field)
+// ============================================================================
+
+test "auto-deref struct field read" {
+    var p = new Point { x: 10, y: 20 }
+    @assert_eq(p.x, 10)
+    @assert_eq(p.y, 20)
+}
+
+test "auto-deref struct field write" {
+    var p = new Point { x: 0, y: 0 }
+    p.x = 42
+    p.y = 99
+    @assert_eq(p.x, 42)
+    @assert_eq(p.y, 99)
+}
+
+test "auto-deref method call" {
+    var b = new Box(i64) { value: 77 }
+    @assert_eq(b.get(), 77)
+}
+
+test "auto-deref explicit deref still works" {
+    var p = new Foo { x: 5 }
+    @assert_eq(p.*.x, 5)
+    @assert_eq(p.x, 5)
+}
+
+test "auto-deref compound assignment" {
+    var p = new Point { x: 10, y: 20 }
+    p.x = p.x + 5
+    @assert_eq(p.x, 15)
+}
+
+test "auto-deref returned pointer" {
+    var f = createFoo(33)
+    @assert_eq(f.x, 33)
+}

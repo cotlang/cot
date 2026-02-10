@@ -209,6 +209,13 @@ pub const GenState = struct {
                             try self.getValue64(ret_val.args[0]); // ptr
                             try self.getValue64(ret_val.args[1]); // len
                         }
+                    } else if (ret_val.type_idx == TypeRegistry.STRING and
+                        self.compound_len_locals.get(ret_val.id) != null)
+                    {
+                        // Compound return from a call result — push ptr then len
+                        try self.getValue64(ret_val); // ptr (main local)
+                        const len_local = self.compound_len_locals.get(ret_val.id).?;
+                        _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(len_local)); // len
                     } else {
                         try self.getValue64(ret_val);
                     }
@@ -644,6 +651,29 @@ pub const GenState = struct {
                 _ = try self.builder.append(.i32_wrap_i64);
                 const p = try self.builder.append(.i64_load32_s);
                 p.from = prog_mod.constAddr(v.aux_int);
+            },
+
+            // Sized memory stores - Go reference: wasm/ssa.go storeOp()
+            .wasm_i64_store8 => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.i64_store8);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_store16 => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.i64_store16);
+                p.to = prog_mod.constAddr(v.aux_int);
+            },
+            .wasm_i64_store32 => {
+                try self.getValue64(v.args[0]); // address
+                _ = try self.builder.append(.i32_wrap_i64);
+                try self.getValue64(v.args[1]); // value
+                const p = try self.builder.append(.i64_store32);
+                p.to = prog_mod.constAddr(v.aux_int);
             },
 
             // Local address

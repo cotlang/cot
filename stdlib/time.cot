@@ -1,3 +1,5 @@
+@safe
+
 // time — Clock utilities.
 //
 // Wraps @time() builtin (nanoseconds since epoch).
@@ -29,11 +31,11 @@ fn startTimer() Timer {
 }
 
 impl Timer {
-    fn elapsed(self: *Timer) i64 {
+    fn elapsed(self: Timer) i64 {
         return @time() - self.start_time
     }
 
-    fn reset(self: *Timer) void {
+    fn reset(self: Timer) void {
         self.start_time = @time()
     }
 }

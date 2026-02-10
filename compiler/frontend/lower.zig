@@ -240,7 +240,8 @@ pub const Lowerer = struct {
                 _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
             }
             for (fn_decl.params) |param| {
-                const param_type = self.resolveTypeNode(param.type_expr);
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
             }
             if (fn_decl.body != null_node) {
@@ -320,7 +321,8 @@ pub const Lowerer = struct {
                 _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
             }
             for (fn_decl.params) |param| {
-                const param_type = self.resolveTypeNode(param.type_expr);
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
             }
             if (fn_decl.body != null_node) {
@@ -2087,7 +2089,8 @@ pub const Lowerer = struct {
 
     fn lowerIndex(self: *Lowerer, idx: ast.Index) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
-        const base_type_idx = self.inferExprType(idx.base);
+        var base_type_idx = self.inferExprType(idx.base);
+        while (self.type_reg.get(base_type_idx) == .pointer) base_type_idx = self.type_reg.get(base_type_idx).pointer.elem;
         const base_type = self.type_reg.get(base_type_idx);
         const elem_type: TypeIndex = if (base_type_idx == TypeRegistry.STRING) TypeRegistry.U8 else switch (base_type) {
             .array => |a| a.elem,
@@ -3116,11 +3119,15 @@ pub const Lowerer = struct {
         // Swap to the defining file's AST for cross-file generic resolution
         const saved_tree = self.tree;
         const saved_chk_tree = self.chk.tree;
+        const saved_safe_mode = self.chk.safe_mode;
         self.tree = inst_info.tree;
         self.chk.tree = inst_info.tree;
+        // Use the defining file's @safe mode, not the calling file's
+        if (inst_info.tree.file) |file| self.chk.safe_mode = file.safe_mode;
         defer {
             self.tree = saved_tree;
             self.chk.tree = saved_chk_tree;
+            self.chk.safe_mode = saved_safe_mode;
         }
 
         const fn_node = self.tree.getNode(inst_info.generic_node) orelse return;
@@ -3179,7 +3186,8 @@ pub const Lowerer = struct {
                 _ = try fb.addParam("__sret", TypeRegistry.I64, 8);
             }
             for (f.params) |param| {
-                const param_type = self.resolveTypeNode(param.type_expr);
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
             }
             if (f.body != null_node) {

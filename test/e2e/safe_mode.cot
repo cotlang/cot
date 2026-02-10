@@ -1,0 +1,64 @@
+@safe
+
+struct SafePoint { x: i64, y: i64 }
+
+impl SafePoint {
+    fn getX(self: SafePoint) i64 { return self.x }
+    fn sum(self: SafePoint) i64 { return self.x + self.y }
+    fn setX(self: SafePoint, val: i64) void { self.x = val }
+}
+
+fn createPoint(x: i64, y: i64) *SafePoint {
+    return new SafePoint { x: x, y: y }
+}
+
+fn acceptPoint(p: SafePoint) i64 {
+    return p.x + p.y
+}
+
+test "safe self param" {
+    var p = new SafePoint { x: 10, y: 20 }
+    @assert_eq(p.getX(), 10)
+    @assert_eq(p.sum(), 30)
+}
+
+test "safe return type" {
+    var p = createPoint(3, 4)
+    @assert_eq(p.x, 3)
+    @assert_eq(p.y, 4)
+}
+
+test "safe function param" {
+    var p = new SafePoint { x: 5, y: 6 }
+    @assert_eq(acceptPoint(p), 11)
+}
+
+test "safe var annotation coercion" {
+    var p: SafePoint = new SafePoint { x: 5, y: 6 }
+    @assert_eq(p.x, 5)
+}
+
+test "safe explicit pointer still works" {
+    var p: *SafePoint = new SafePoint { x: 7, y: 8 }
+    @assert_eq(p.x, 7)
+}
+
+test "safe stack value unchanged" {
+    var p = SafePoint { .x = 1, .y = 2 }
+    @assert_eq(p.x + p.y, 3)
+}
+
+test "safe mutation via method" {
+    var p = new SafePoint { x: 10, y: 20 }
+    p.setX(99)
+    @assert_eq(p.getX(), 99)
+}
+
+test "safe scalars unchanged" {
+    var x: i64 = 42
+    var s: string = "hello"
+    var b: bool = true
+    @assert_eq(x, 42)
+    @assert_eq(s, "hello")
+    @assert_eq(b, true)
+}

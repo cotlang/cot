@@ -164,6 +164,8 @@ pub const Checker = struct {
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
     /// Compilation target — used for @target_os(), @target_arch(), @target() comptime builtins
     target: target_mod.Target = target_mod.Target.native(),
+    /// @safe file annotation: auto-wrap struct types with pointer in function signatures
+    safe_mode: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope, generic_ctx: *SharedGenericContext, target: target_mod.Target) Checker {
         return .{
@@ -187,6 +189,7 @@ pub const Checker = struct {
     }
     pub fn checkFile(self: *Checker) CheckError!void {
         const file = self.tree.file orelse return;
+        self.safe_mode = file.safe_mode;
         for (file.decls) |idx| try self.collectTypeDecl(idx);
         for (file.decls) |idx| try self.collectNonTypeDecl(idx);
         for (file.decls) |idx| try self.checkDecl(idx);
@@ -409,7 +412,8 @@ pub const Checker = struct {
         var func_scope = Scope.init(self.allocator, self.scope);
         defer func_scope.deinit();
         for (f.params) |param| {
-            const param_type = try self.resolveTypeExpr(param.type_expr);
+            var param_type = try self.resolveTypeExpr(param.type_expr);
+            param_type = try self.safeWrapType(param_type);
             try func_scope.define(Symbol.init(param.name, .parameter, param_type, idx, false));
         }
         const old_scope = self.scope;
@@ -935,25 +939,36 @@ pub const Checker = struct {
     }
 
     fn checkIndex(self: *Checker, i: ast.Index) CheckError!TypeIndex {
-        const base_type = try self.checkExpr(i.base);
+        var base_type = try self.checkExpr(i.base);
         const index_type = try self.checkExpr(i.idx);
         if (!types.isInteger(self.types.get(index_type))) { self.err.errorWithCode(i.span.start, .e300, "index must be integer"); return invalid_type; }
+        while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
         if (base_type == TypeRegistry.STRING) return TypeRegistry.U8;
         const base = self.types.get(base_type);
         return switch (base) { .array => |a| a.elem, .slice => |s| s.elem, .list => |l| l.elem, else => blk: { self.err.errorWithCode(i.span.start, .e300, "cannot index this type"); break :blk invalid_type; } };
     }
 
     fn checkSliceExpr(self: *Checker, se: ast.SliceExpr) CheckError!TypeIndex {
-        const base_type = try self.checkExpr(se.base);
+        var base_type = try self.checkExpr(se.base);
         if (se.start != null_node) _ = try self.checkExpr(se.start);
         if (se.end != null_node) _ = try self.checkExpr(se.end);
+        while (self.types.get(base_type) == .pointer) base_type = self.types.get(base_type).pointer.elem;
         const base = self.types.get(base_type);
         return switch (base) { .array => |a| self.types.makeSlice(a.elem), .slice => base_type, else => blk: { self.err.errorWithCode(se.span.start, .e300, "cannot slice this type"); break :blk invalid_type; } };
     }
 
     fn checkFieldAccess(self: *Checker, f: ast.FieldAccess) CheckError!TypeIndex {
         if (f.base == null_node) return invalid_type;
-        const base_type = try self.checkExpr(f.base);
+        var base_type = try self.checkExpr(f.base);
+
+        // Auto-deref: unwrap pointer(s) before field lookup (Zig pattern)
+        while (true) {
+            switch (self.types.get(base_type)) {
+                .pointer => |ptr| base_type = ptr.elem,
+                else => break,
+            }
+        }
+
         const base = self.types.get(base_type);
 
         switch (base) {
@@ -996,15 +1011,6 @@ pub const Checker = struct {
                     return try self.types.add(.{ .func = .{ .params = params, .return_type = base_type } });
                 };
                 self.err.errorWithCode(f.span.start, .e301, "undefined variant");
-                return invalid_type;
-            },
-            .pointer => |ptr| {
-                const elem = self.types.get(ptr.elem);
-                if (elem == .struct_type) {
-                    for (elem.struct_type.fields) |field| if (std.mem.eql(u8, field.name, f.field)) return field.type_idx;
-                    if (self.lookupMethod(elem.struct_type.name, f.field)) |m| return m.func_type;
-                }
-                self.err.errorWithCode(f.span.start, .e300, "cannot access field on this type");
                 return invalid_type;
             },
             .map => |mt| {
@@ -1326,7 +1332,17 @@ pub const Checker = struct {
         if (vs.value != null_node and !self.isUndefinedLit(vs.value) and !self.isZeroInitLit(vs.value)) {
             const val_type = try self.checkExpr(vs.value);
             if (var_type == invalid_type) var_type = self.materializeType(val_type)
-            else if (!self.types.isAssignable(val_type, var_type)) self.err.errorWithCode(vs.span.start, .e300, "type mismatch");
+            else if (!self.types.isAssignable(val_type, var_type)) {
+                // @safe coercion: Foo annotation accepts *Foo value (e.g. var f: Foo = new Foo{...})
+                if (self.safe_mode and self.types.get(var_type) == .struct_type and self.types.get(val_type) == .pointer and
+                    self.types.get(self.types.get(val_type).pointer.elem) == .struct_type and
+                    self.types.isAssignable(self.types.get(val_type).pointer.elem, var_type))
+                {
+                    var_type = val_type; // upgrade to *Foo
+                } else {
+                    self.err.errorWithCode(vs.span.start, .e300, "type mismatch");
+                }
+            }
         }
         if (self.isZeroInitLit(vs.value) and var_type == invalid_type) {
             self.err.errorWithCode(vs.span.start, .e300, "zero init requires type annotation");
@@ -1571,10 +1587,15 @@ pub const Checker = struct {
             // Validate type param count matches (Go: named.go:489 checks RecvTypeParams.Len == targs.Len)
             if (impl_info.type_params.len != resolved_args.len) continue;
 
-            // Swap to the defining file's AST for cross-file generic resolution
+            // Swap to the defining file's AST and safe_mode for cross-file generic resolution
             const saved_tree = self.tree;
+            const saved_safe_mode = self.safe_mode;
             self.tree = impl_info.tree;
-            defer self.tree = saved_tree;
+            if (impl_info.tree.file) |file| self.safe_mode = file.safe_mode;
+            defer {
+                self.tree = saved_tree;
+                self.safe_mode = saved_safe_mode;
+            }
 
             // Build type substitution map: T -> concrete type
             var sub_map = std.StringHashMap(TypeIndex).init(self.allocator);
@@ -1761,10 +1782,29 @@ pub const Checker = struct {
         return try self.allocator.dupe(u8, buf.items);
     }
 
+    /// In @safe mode, wrap struct types with pointer (C#-style reference semantics).
+    /// Handles: Foo → *Foo, Error!Foo → Error!*Foo. Leaves non-struct types unchanged.
+    pub fn safeWrapType(self: *Checker, type_idx: TypeIndex) !TypeIndex {
+        if (!self.safe_mode) return type_idx;
+        const t = self.types.get(type_idx);
+        if (t == .struct_type) return try self.types.makePointer(type_idx);
+        if (t == .error_union) {
+            if (self.types.get(t.error_union.elem) == .struct_type) {
+                const wrapped = try self.types.makePointer(t.error_union.elem);
+                return try self.types.makeErrorUnionWithSet(wrapped, t.error_union.error_set);
+            }
+        }
+        return type_idx;
+    }
+
     fn buildFuncType(self: *Checker, params: []const ast.Field, return_type_idx: NodeIndex) CheckError!TypeIndex {
         var func_params = std.ArrayListUnmanaged(types.FuncParam){};
         defer func_params.deinit(self.allocator);
-        for (params) |param| try func_params.append(self.allocator, .{ .name = param.name, .type_idx = try self.resolveTypeExpr(param.type_expr) });
+        for (params) |param| {
+            var type_idx = try self.resolveTypeExpr(param.type_expr);
+            type_idx = try self.safeWrapType(type_idx);
+            try func_params.append(self.allocator, .{ .name = param.name, .type_idx = type_idx });
+        }
         const ret_type = if (return_type_idx != null_node) try self.resolveTypeExpr(return_type_idx) else TypeRegistry.VOID;
         return try self.types.add(.{ .func = .{ .params = try self.allocator.dupe(types.FuncParam, func_params.items), .return_type = ret_type } });
     }

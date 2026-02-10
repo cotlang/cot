@@ -16,6 +16,7 @@ pub const File = struct {
     filename: []const u8,
     decls: []const NodeIndex,
     span: Span,
+    safe_mode: bool = false,
 };
 
 // Declarations

@@ -1995,6 +1995,9 @@ pub const Driver = struct {
     /// Uses Go-style Linker for module structure with proper SP globals.
     fn generateWasmCode(self: *Driver, funcs: []const ir_mod.Func, type_reg: *types_mod.TypeRegistry) ![]u8 {
         pipeline_debug.log(.codegen, "driver: generating Wasm for {d} functions", .{funcs.len});
+        for (funcs) |*ir_func| {
+            pipeline_debug.log(.codegen, "driver: IR func: '{s}' params={d} ret={d}", .{ ir_func.name, ir_func.params.len, ir_func.return_type });
+        }
 
         var linker = wasm.Linker.init(self.allocator);
         defer linker.deinit();

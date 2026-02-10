@@ -1,3 +1,5 @@
+@safe
+
 // fs — File I/O.
 //
 // Wraps @fd_open, @fd_read, @fd_write, @fd_seek, @fd_close builtins.
@@ -26,47 +28,47 @@ struct File {
 }
 
 impl File {
-    fn read(self: *File, buf: i64, len: i64) FsError!i64 {
+    fn read(self: File, buf: i64, len: i64) FsError!i64 {
         var result = @fd_read(self.fd, buf, len)
         if result < 0 { return error.IoError }
         return result
     }
 
-    fn write(self: *File, buf: i64, len: i64) FsError!i64 {
+    fn write(self: File, buf: i64, len: i64) FsError!i64 {
         var result = @fd_write(self.fd, buf, len)
         if result < 0 { return error.IoError }
         return result
     }
 
-    fn writeAll(self: *File, s: string) FsError!i64 {
+    fn writeAll(self: File, s: string) FsError!i64 {
         var result = @fd_write(self.fd, @ptrOf(s), @lenOf(s))
         if result < 0 { return error.IoError }
         return result
     }
 
-    fn seekTo(self: *File, pos: i64) FsError!i64 {
+    fn seekTo(self: File, pos: i64) FsError!i64 {
         var result = @fd_seek(self.fd, pos, 0)
         if result < 0 { return error.IoError }
         return result
     }
 
-    fn seekBy(self: *File, delta: i64) FsError!i64 {
+    fn seekBy(self: File, delta: i64) FsError!i64 {
         var result = @fd_seek(self.fd, delta, 1)
         if result < 0 { return error.IoError }
         return result
     }
 
-    fn getPos(self: *File) FsError!i64 {
+    fn getPos(self: File) FsError!i64 {
         var result = @fd_seek(self.fd, 0, 1)
         if result < 0 { return error.IoError }
         return result
     }
 
-    fn close(self: *File) void {
+    fn close(self: File) void {
         @fd_close(self.fd)
     }
 
-    fn isValid(self: *File) i64 {
+    fn isValid(self: File) i64 {
         if self.fd >= 0 { return 1 }
         return 0
     }

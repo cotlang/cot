@@ -1,3 +1,5 @@
+@safe
+
 // Map(K, V) — Production-quality generic hash map.
 //
 // Design: Open addressing with linear probing, power-of-2 capacity, 75% load factor.
@@ -48,7 +50,7 @@ struct Map(K, V) {
 impl Map(K, V) {
     // ===== Internal =====
 
-    fn ensureCapacity(self: *Map(K, V), needed: i64) void {
+    fn ensureCapacity(self: Map(K, V), needed: i64) void {
         // Check if we need to grow: count * 4 >= capacity * 3 (75% load factor)
         if self.capacity > 0 {
             if needed * 4 < self.capacity * 3 {
@@ -58,12 +60,12 @@ impl Map(K, V) {
         var new_cap = self.capacity
         if new_cap == 0 { new_cap = 8 }
         while needed * 4 >= new_cap * 3 {
-            new_cap = new_cap * 2
+            new_cap *= 2
         }
         self.rehash(new_cap)
     }
 
-    fn rehash(self: *Map(K, V), new_cap: i64) void {
+    fn rehash(self: Map(K, V), new_cap: i64) void {
         var old_keys = self.keys
         var old_values = self.values
         var old_states = self.states
@@ -81,7 +83,7 @@ impl Map(K, V) {
         while si < new_cap {
             var sp = @intToPtr(*i64, self.states + si * @sizeOf(i64))
             sp.* = 0
-            si = si + 1
+            si += 1
         }
 
         // Reinsert all occupied entries from old table.
@@ -94,7 +96,7 @@ impl Map(K, V) {
                 var ov = @intToPtr(*V, old_values + oi * @sizeOf(V))
                 self.set(ok.*, ov.*)
             }
-            oi = oi + 1
+            oi += 1
         }
 
         // Free old arrays
@@ -107,7 +109,7 @@ impl Map(K, V) {
 
     // ===== Core =====
 
-    fn set(self: *Map(K, V), key: K, value: V) void {
+    fn set(self: Map(K, V), key: K, value: V) void {
         // Ensure we have capacity (75% load factor)
         if self.capacity == 0 {
             self.rehash(8)
@@ -135,7 +137,7 @@ impl Map(K, V) {
                 kp.* = key
                 vp.* = value
                 tp.* = 1
-                self.count = self.count + 1
+                self.count += 1
                 return
             }
             if st.* == 1 {
@@ -153,13 +155,13 @@ impl Map(K, V) {
                 }
             }
             idx = (idx + 1) & (self.capacity - 1)
-            i = i + 1
+            i += 1
         }
         // Unreachable: 75% load factor guarantees an empty slot exists.
         @trap()
     }
 
-    fn get(self: *Map(K, V), key: K) V {
+    fn get(self: Map(K, V), key: K) V {
         if self.capacity == 0 { @trap() }
         var k = key
         var h = k.hash()
@@ -177,13 +179,13 @@ impl Map(K, V) {
                 }
             }
             idx = (idx + 1) & (self.capacity - 1)
-            i = i + 1
+            i += 1
         }
         @trap()
         return @intToPtr(*V, 0).*
     }
 
-    fn getOrDefault(self: *Map(K, V), key: K, default: V) V {
+    fn getOrDefault(self: Map(K, V), key: K, default: V) V {
         if self.capacity == 0 { return default }
         var k = key
         var h = k.hash()
@@ -201,12 +203,12 @@ impl Map(K, V) {
                 }
             }
             idx = (idx + 1) & (self.capacity - 1)
-            i = i + 1
+            i += 1
         }
         return default
     }
 
-    fn has(self: *Map(K, V), key: K) i64 {
+    fn has(self: Map(K, V), key: K) i64 {
         if self.capacity == 0 { return 0 }
         var k = key
         var h = k.hash()
@@ -221,12 +223,12 @@ impl Map(K, V) {
                 if kp.* == key { return 1 }
             }
             idx = (idx + 1) & (self.capacity - 1)
-            i = i + 1
+            i += 1
         }
         return 0
     }
 
-    fn delete(self: *Map(K, V), key: K) void {
+    fn delete(self: Map(K, V), key: K) void {
         if self.capacity == 0 { return }
         var k = key
         var h = k.hash()
@@ -240,27 +242,27 @@ impl Map(K, V) {
                 var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if kp.* == key {
                     st.* = 2
-                    self.count = self.count - 1
+                    self.count -= 1
                     return
                 }
             }
             idx = (idx + 1) & (self.capacity - 1)
-            i = i + 1
+            i += 1
         }
     }
 
     // ===== Info =====
 
-    fn len(self: *Map(K, V)) i64 { return self.count }
+    fn len(self: Map(K, V)) i64 { return self.count }
 
-    fn isEmpty(self: *Map(K, V)) i64 {
+    fn isEmpty(self: Map(K, V)) i64 {
         if self.count == 0 { return 1 }
         return 0
     }
 
     // ===== Lifecycle =====
 
-    fn free(self: *Map(K, V)) void {
+    fn free(self: Map(K, V)) void {
         if self.capacity > 0 {
             @dealloc(self.keys)
             @dealloc(self.values)
@@ -273,23 +275,23 @@ impl Map(K, V) {
         self.capacity = 0
     }
 
-    fn clear(self: *Map(K, V)) void {
+    fn clear(self: Map(K, V)) void {
         var i: i64 = 0
         while i < self.capacity {
             var sp = @intToPtr(*i64, self.states + i * @sizeOf(i64))
             sp.* = 0
-            i = i + 1
+            i += 1
         }
         self.count = 0
     }
 
-    fn clearAndFree(self: *Map(K, V)) void {
+    fn clearAndFree(self: Map(K, V)) void {
         self.free()
     }
 
     // ===== Bulk =====
 
-    fn keys(self: *Map(K, V)) List(K) {
+    fn keys(self: Map(K, V)) List(K) {
         var result: List(K) = .{}
         var i: i64 = 0
         while i < self.capacity {
@@ -298,12 +300,12 @@ impl Map(K, V) {
                 var kp = @intToPtr(*K, self.keys + i * @sizeOf(K))
                 result.append(kp.*)
             }
-            i = i + 1
+            i += 1
         }
         return result
     }
 
-    fn values(self: *Map(K, V)) List(V) {
+    fn values(self: Map(K, V)) List(V) {
         var result: List(V) = .{}
         var i: i64 = 0
         while i < self.capacity {
@@ -312,7 +314,7 @@ impl Map(K, V) {
                 var vp = @intToPtr(*V, self.values + i * @sizeOf(V))
                 result.append(vp.*)
             }
-            i = i + 1
+            i += 1
         }
         return result
     }

@@ -91,6 +91,17 @@ pub const Parser = struct {
         var decls = std.ArrayListUnmanaged(NodeIndex){};
         defer decls.deinit(self.allocator);
 
+        // Check for @safe file annotation
+        var safe_mode = false;
+        if (self.check(.at)) {
+            const peek = self.peekToken();
+            if (peek.tok == .ident and std.mem.eql(u8, peek.text, "safe")) {
+                self.advance(); // consume @
+                self.advance(); // consume safe
+                safe_mode = true;
+            }
+        }
+
         while (!self.check(.eof)) {
             if (try self.parseDecl()) |decl_idx| try decls.append(self.allocator, decl_idx) else self.advance();
         }
@@ -99,6 +110,7 @@ pub const Parser = struct {
             .filename = self.scan.src.filename,
             .decls = try self.allocator.dupe(NodeIndex, decls.items),
             .span = Span.init(start, self.pos()),
+            .safe_mode = safe_mode,
         };
     }
 

@@ -683,6 +683,23 @@ pub const SSABuilder = struct {
             const arg_type = self.type_registry.get(arg_val.type_idx);
             const type_size = self.type_registry.sizeOf(arg_val.type_idx);
 
+            // String/slice decomposition: compound types are passed as 2 i64 values (ptr, len)
+            // Must match the callee's param decomposition in buildSSA (line 78).
+            // Go reference: ssagen/ssa.go uses OSPTR()/OLEN() to decompose slice args at call sites.
+            const is_string_or_slice = arg_val.type_idx == TypeRegistry.STRING or arg_type == .slice;
+            if (is_string_or_slice) {
+                // Extract ptr component
+                const ptr_val = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+                ptr_val.addArg(arg_val);
+                try cur.addValue(self.allocator, ptr_val);
+                try call_val.addArgAlloc(ptr_val, self.allocator);
+
+                // Extract len component
+                const len_val = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+                len_val.addArg(arg_val);
+                try cur.addValue(self.allocator, len_val);
+                try call_val.addArgAlloc(len_val, self.allocator);
+            } else {
             // Large struct decomposition (matching param handling in buildSSA)
             // Structs >8 and <=16 bytes are passed as two i64 values
             const is_large_struct = arg_type == .struct_type and type_size > 8 and type_size <= 16;
@@ -709,6 +726,7 @@ pub const SSABuilder = struct {
                 try call_val.addArgAlloc(hi_val, self.allocator);
             } else {
                 try call_val.addArgAlloc(arg_val, self.allocator);
+            }
             }
         }
         try cur.addValue(self.allocator, call_val);
@@ -1030,7 +1048,8 @@ pub const SSABuilder = struct {
             return move_val;
         }
 
-        const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+        const store_op = self.getStoreOp(value.type_idx);
+        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(ptr_val, value);
         try cur.addValue(self.allocator, store_val);
         return store_val;
