@@ -440,10 +440,14 @@ pub const Inst = union(enum) {
 
     /// ALU operation: dst = dst op src (reg/mem/imm).
     /// Covers ADD, SUB, AND, OR, XOR, CMP, TEST.
+    /// ALU operation: dst = src1 OP src2.
+    /// 3-operand form matching Cranelift's AluRmiR.
+    /// Emit code handles `mov src1, dst` then `OP src2, dst`.
     alu_rmi_r: struct {
         size: OperandSize,
         op: AluRmiROpcode,
-        src: GprMemImm,
+        src1: Gpr,
+        src2: GprMemImm,
         dst: WritableGpr,
     },
 
@@ -862,6 +866,16 @@ pub const Inst = union(enum) {
     /// Returns pseudo-instruction.
     rets: struct {
         rets_list: []const CallArgPair,
+    },
+
+    /// Return value copy: moves a vreg into a fixed physical return register.
+    /// Uses regFixedDef (which regalloc handles correctly) instead of
+    /// regFixedUse (which has a bug with long live ranges).
+    /// Emits as: mov src, dst (where dst is the fixed ABI return register).
+    ret_value_copy: struct {
+        src: Gpr,
+        dst: WritableGpr,
+        preg: PReg,
     },
 
     /// Stack switch (for fibers/coroutines).
@@ -1323,10 +1337,11 @@ pub const Inst = union(enum) {
 
             // ALU instructions
             .alu_rmi_r => |p| {
-                try writer.print("{s}{s} {s}, {s}", .{
+                try writer.print("{s}{s} {s}, {s} -> {s}", .{
                     p.op.name(),
                     p.size.suffix(),
-                    p.src.inner.prettyPrint(p.size.bytes()),
+                    regs.prettyPrintReg(p.src1.toReg(), p.size.bytes()),
+                    p.src2.inner.prettyPrint(p.size.bytes()),
                     regs.prettyPrintReg(p.dst.toReg().toReg(), p.size.bytes()),
                 });
             },
@@ -1691,6 +1706,12 @@ pub const Inst = union(enum) {
             .rets => |_| {
                 try writer.writeAll("rets <...>");
             },
+            .ret_value_copy => |p| {
+                try writer.print("ret_value_copy {s} -> {s}", .{
+                    regs.prettyPrintReg(p.src.toReg(), 8),
+                    regs.prettyPrintReg(p.dst.toReg().toReg(), 8),
+                });
+            },
             .stack_switch_basic => |_| {
                 try writer.writeAll("stack_switch_basic");
             },
@@ -1893,12 +1914,14 @@ pub const Inst = union(enum) {
             return .{ .nop = .{ .len = 0 } };
         }
         // sub rsp, size
+        const rsp_gpr = Gpr.unwrapNew(rsp());
         return .{
             .alu_rmi_r = .{
                 .size = .size64,
                 .op = .sub,
-                .src = GprMemImm{ .inner = .{ .imm = size } },
-                .dst = WritableGpr.fromReg(Gpr.unwrapNew(rsp())),
+                .src1 = rsp_gpr,
+                .src2 = GprMemImm{ .inner = .{ .imm = size } },
+                .dst = WritableGpr.fromReg(rsp_gpr),
             },
         };
     }

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const debug = @import("../../../../pipeline_debug.zig");
 
 // Import CLIF IR types from machinst (which imports from compiler/ir/clif/)
 // Must be imported early so MachLabel can be used below
@@ -380,18 +381,12 @@ pub const X64LowerBackend = struct {
                 }) catch return null;
             },
             .@"return" => {
-                // Port of Cranelift's gen_return pattern from lower.rs.
-                // Instead of emitting explicit moves to return registers, we:
-                // 1. Collect CallArgPair entries mapping vregs to physical return registers
-                // 2. Emit Inst.rets with those pairs
-                // 3. regalloc2 sees the reg_fixed_use constraints and inserts moves as needed
+                // Use ret_value_copy with regFixedDef to move return values
+                // into ABI return registers. This works around a regalloc bug
+                // where regFixedUse on rets doesn't properly spill/reload when
+                // the return register is clobbered between definition and use.
 
                 const num_inputs = ctx.numInputs(ir_inst);
-
-                // Allocate space for return pairs
-                // System V AMD64 ABI: integer returns in RAX, RDX; float returns in XMM0, XMM1
-                var ret_pairs = ctx.allocator.alloc(CallArgPair, num_inputs) catch return null;
-                var pair_idx: usize = 0;
                 var int_ret_idx: usize = 0;
                 var float_ret_idx: usize = 0;
 
@@ -400,36 +395,39 @@ pub const X64LowerBackend = struct {
                     const ret_reg = ret_val.onlyReg() orelse continue;
                     const ty = ctx.inputTy(ir_inst, i);
 
-                    // Determine the physical register for this return value
-                    const preg: PReg = if (ty.isFloat())
-                        blk: {
-                            if (float_ret_idx >= abi.SYSV_RET_FPRS.len) continue;
-                            const enc = abi.SYSV_RET_FPRS[float_ret_idx];
-                            float_ret_idx += 1;
-                            break :blk regs.fprPreg(enc);
-                        }
-                    else
-                        blk: {
-                            if (int_ret_idx >= abi.SYSV_RET_GPRS.len) continue;
-                            const enc = abi.SYSV_RET_GPRS[int_ret_idx];
-                            int_ret_idx += 1;
-                            break :blk regs.gprPreg(enc);
-                        };
-
-                    // Create CallArgPair mapping vreg to preg
-                    // regalloc2 will see reg_fixed_use(vreg, preg) from get_operands
-                    // and ensure vreg is in preg at this point, inserting moves as needed
-                    ret_pairs[pair_idx] = CallArgPair{
-                        .vreg = ret_reg,
-                        .preg = preg,
-                    };
-                    pair_idx += 1;
+                    if (ty.isFloat()) {
+                        if (float_ret_idx >= abi.SYSV_RET_FPRS.len) continue;
+                        const enc = abi.SYSV_RET_FPRS[float_ret_idx];
+                        float_ret_idx += 1;
+                        // Float returns: use xmm_unary_rm_r with movsd
+                        // (regFixedDef bug doesn't affect floats - short live ranges)
+                        ctx.emit(Inst{
+                            .xmm_unary_rm_r = .{
+                                .op = .movsd,
+                                .src = XmmMem{ .inner = RegMem{ .reg = ret_reg } },
+                                .dst = WritableXmm.fromReg(Xmm.unwrapNew(regs.fpr(enc))),
+                            },
+                        }) catch return null;
+                    } else {
+                        if (int_ret_idx >= abi.SYSV_RET_GPRS.len) continue;
+                        const enc = abi.SYSV_RET_GPRS[int_ret_idx];
+                        int_ret_idx += 1;
+                        // Use ret_value_copy: regFixedDef forces regalloc to
+                        // properly allocate the destination to the ABI register
+                        const dst_tmp = ctx.allocTmp(.I64) catch return null;
+                        const dst_wreg = dst_tmp.onlyReg() orelse return null;
+                        ctx.emit(Inst{
+                            .ret_value_copy = .{
+                                .src = Gpr.unwrapNew(ret_reg),
+                                .dst = WritableGpr.fromReg(Gpr.unwrapNew(dst_wreg.toReg())),
+                                .preg = PReg.init(enc, .int),
+                            },
+                        }) catch return null;
+                    }
                 }
 
-                // Emit the rets instruction with the return pairs
-                // This is a pseudo-instruction that tells regalloc about the constraints
-                // and emits as just a `ret` instruction
-                ctx.emit(Inst.genRets(ret_pairs[0..pair_idx])) catch return null;
+                // Emit bare rets - ret_value_copy already set return registers
+                ctx.emit(Inst.genRets(&[_]CallArgPair{})) catch return null;
             },
             .trap => {
                 // Trap instruction - emit undefined instruction (UD2).
@@ -666,26 +664,15 @@ pub const X64LowerBackend = struct {
         const dst_reg = dst.onlyReg() orelse return null;
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
-        // For IMUL r64, r/m64, the result goes to the first operand
-        // MOV lhs, dst
-        ctx.emit(Inst{
-            .mov_r_r = .{
-                .size = size,
-                .src = lhs_gpr,
-                .dst = dst_gpr,
-            },
-        }) catch return null;
-
-        // IMUL dst, rhs (two-operand form: dst = dst * rhs)
-        // This is represented as alu_rmi_r with a special opcode
-        // Note: x86 IMUL is complex; we use the 2-operand form
+        // 3-operand IMUL: dst = lhs * rhs
         const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs_reg } };
 
         ctx.emit(Inst{
             .alu_rmi_r = .{
                 .size = size,
                 .op = .imul,
-                .src = rhs_rmi,
+                .src1 = lhs_gpr,
+                .src2 = rhs_rmi,
                 .dst = dst_gpr,
             },
         }) catch return null;
@@ -2087,20 +2074,13 @@ pub const X64LowerBackend = struct {
                     }) catch return null;
                 } else {
                     // lea dst, [base + offset]
-                    ctx.emit(Inst{
-                        .mov_r_r = .{
-                            .size = .size64,
-                            .src = Gpr.unwrapNew(base_addr),
-                            .dst = dst_gpr,
-                        },
-                    }) catch return null;
-
-                    // add dst, offset
+                    // 3-operand add: dst = base_addr + offset
                     ctx.emit(Inst{
                         .alu_rmi_r = .{
                             .size = .size64,
                             .op = .add,
-                            .src = GprMemImm{ .inner = RegMemImm{ .imm = @as(u32, @intCast(d.offset)) } },
+                            .src1 = Gpr.unwrapNew(base_addr),
+                            .src2 = GprMemImm{ .inner = RegMemImm{ .imm = @as(u32, @intCast(d.offset)) } },
                             .dst = dst_gpr,
                         },
                     }) catch return null;
@@ -2187,21 +2167,13 @@ pub const X64LowerBackend = struct {
                     return base_addr;
                 }
 
-                // mov tmp, base
-                ctx.emit(Inst{
-                    .mov_r_r = .{
-                        .size = .size64,
-                        .src = Gpr.unwrapNew(base_addr),
-                        .dst = tmp_gpr,
-                    },
-                }) catch return null;
-
-                // add tmp, offset
+                // 3-operand add: tmp = base + offset
                 ctx.emit(Inst{
                     .alu_rmi_r = .{
                         .size = .size64,
                         .op = .add,
-                        .src = GprMemImm{ .inner = RegMemImm{ .imm = @as(u32, @intCast(d.offset)) } },
+                        .src1 = Gpr.unwrapNew(base_addr),
+                        .src2 = GprMemImm{ .inner = RegMemImm{ .imm = @as(u32, @intCast(d.offset)) } },
                         .dst = tmp_gpr,
                     },
                 }) catch return null;
@@ -2285,21 +2257,14 @@ pub const X64LowerBackend = struct {
         const rhs_rmi = GprMemImm{ .inner = RegMemImm{ .reg = rhs_reg } };
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
-        // MOV lhs, dst
-        ctx.emit(Inst{
-            .mov_r_r = .{
-                .size = size,
-                .src = lhs_gpr,
-                .dst = dst_gpr,
-            },
-        }) catch return null;
-
-        // OP rhs, dst
+        // 3-operand ALU: dst = lhs OP rhs
+        // Emit code handles mov lhs→dst internally if needed.
         ctx.emit(Inst{
             .alu_rmi_r = .{
                 .size = size,
                 .op = op,
-                .src = rhs_rmi,
+                .src1 = lhs_gpr,
+                .src2 = rhs_rmi,
                 .dst = dst_gpr,
             },
         }) catch return null;

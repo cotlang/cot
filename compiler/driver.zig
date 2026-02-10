@@ -1440,6 +1440,10 @@ pub const Driver = struct {
                     // x86-64 Linux syscall for openat(AT_FDCWD, path, flags, mode)
                     // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=path_ptr(wasm), rcx=path_len, r8=flags
                     // Must null-terminate path: copy to stack buffer, append \0
+                    // Flags use macOS values (stdlib canonical), translated to Linux here:
+                    //   macOS O_CREAT(0x200) → Linux(0x40)
+                    //   macOS O_TRUNC(0x400) → Linux(0x200)
+                    //   macOS O_APPEND(0x8)  → Linux(0x400)
                     // Returns fd on success, -errno on error.
                     const x64_open = [_]u8{
                         0x55, //  0: push rbp
@@ -1467,16 +1471,29 @@ pub const Driver = struct {
                         0xEB, 0xE9, // 69: jmp -23                 (→ .copy_loop at 48)
                         // .null_term (offset 71):
                         0x41, 0xC6, 0x03, 0x00, // 71: mov byte [r11], 0
-                        // openat(AT_FDCWD, path, flags, mode)
+                        // openat(AT_FDCWD, path, translated_flags, mode)
                         0x48, 0xC7, 0xC7, 0x9C, 0xFF, 0xFF, 0xFF, // 75: mov rdi, -100  (AT_FDCWD)
                         0x48, 0x89, 0xE6, // 82: mov rsi, rsp              (path on stack)
-                        0x4C, 0x89, 0xC2, // 85: mov rdx, r8               (flags)
-                        0x49, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00, // 88: mov r10, 420  (mode 0644, arg4=r10 for syscall)
-                        0x48, 0xC7, 0xC0, 0x01, 0x01, 0x00, 0x00, // 95: mov rax, 257  (SYS_openat)
-                        0x0F, 0x05, //102: syscall
-                        0x48, 0x89, 0xEC, //104: mov rsp, rbp  (restore stack)
-                        0x5D, //107: pop rbp
-                        0xC3, //108: ret
+                        // --- Flag translation: macOS canonical → Linux ---
+                        0x44, 0x89, 0xC0, // 85: mov eax, r8d              (copy macOS flags)
+                        0x83, 0xE0, 0x03, // 88: and eax, 3                (keep access mode O_RDONLY/O_WRONLY/O_RDWR)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x09, // 91: bt r8d, 9     (test macOS O_CREAT 0x200)
+                        0x73, 0x03, // 96: jnc +3                  (skip if not set)
+                        0x83, 0xC8, 0x40, // 98: or eax, 0x40              (Linux O_CREAT)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x0A, //101: bt r8d, 10    (test macOS O_TRUNC 0x400)
+                        0x73, 0x05, //106: jnc +5                  (skip 5-byte or eax,imm32)
+                        0x0D, 0x00, 0x02, 0x00, 0x00, //108: or eax, 0x200 (Linux O_TRUNC)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x03, //113: bt r8d, 3     (test macOS O_APPEND 0x8)
+                        0x73, 0x05, //118: jnc +5                  (skip 5-byte or eax,imm32)
+                        0x0D, 0x00, 0x04, 0x00, 0x00, //120: or eax, 0x400 (Linux O_APPEND)
+                        0x89, 0xC2, //125: mov edx, eax             (Linux flags → rdx)
+                        // --- End flag translation ---
+                        0x49, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00, //127: mov r10, 420  (mode 0644, arg4=r10 for syscall)
+                        0x48, 0xC7, 0xC0, 0x01, 0x01, 0x00, 0x00, //134: mov rax, 257  (SYS_openat)
+                        0x0F, 0x05, //141: syscall
+                        0x48, 0x89, 0xEC, //143: mov rsp, rbp  (restore stack)
+                        0x5D, //146: pop rbp
+                        0xC3, //147: ret
                     };
                     try module.defineFunctionBytes(elf_func_ids[i], &x64_open, &.{});
                 } else if (std.mem.eql(u8, name, "cot_time")) {

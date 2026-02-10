@@ -81,33 +81,12 @@ pub fn boundsCheckAndComputeAddr(
         addr_index = try builder.ins().uextend(pointer_type, index);
     }
 
-    // Step 2: Compute offset + access_size (cannot overflow in u64)
-    const effective_offset: u64 = offset +| @as(u64, access_size);
+    // Bounds checking is deferred (TODO: implement trapIf).
+    // Do NOT emit dead bounds-check instructions here — they create CLIF iadd
+    // instructions whose regalloc clobbers addr_index, corrupting the final address.
+    _ = access_size;
 
-    // Step 3: Add offset to index
-    // Note: We use saturating add to compute the offset constant
-    // but emit a regular iadd since overflow means out of bounds
-    var effective_addr = addr_index;
-    if (effective_offset > 0) {
-        const offset_val = try builder.ins().iconst(pointer_type, @as(i64, @intCast(effective_offset)));
-        effective_addr = try builder.ins().iadd(addr_index, offset_val);
-    }
-
-    // Step 4: Load bound from heap
-    const bound_gv_addr = try builder.ins().globalValue(pointer_type, heap.bound);
-    const bound = try builder.ins().load(pointer_type, clif.MemFlags.DEFAULT, bound_gv_addr, 0);
-
-    // Step 5: Compare effective_addr < bound
-    // If effective_addr >= bound, we're out of bounds
-    const oob = try builder.ins().icmp(clif.IntCC.uge, effective_addr, bound);
-
-    // Step 6: Trap if out of bounds
-    // For now we emit a conditional branch to a trap block
-    // TODO: Use trapIf instruction when available
-    _ = oob; // Deferred: emit actual trap
-
-    // Step 7: Compute final address: base + index + offset
-    // We compute base + index, then the load/store uses the offset
+    // Compute final address: base + index + offset
     const base_gv_addr = try builder.ins().globalValue(pointer_type, heap.base);
     const base = try builder.ins().load(pointer_type, clif.MemFlags.DEFAULT, base_gv_addr, 0);
 

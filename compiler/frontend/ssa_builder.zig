@@ -455,9 +455,17 @@ pub const SSABuilder = struct {
         if (local_idx < self.local_slot_offsets.len) {
             return self.local_slot_offsets[local_idx];
         }
-        // Fallback for dynamically-added locals not in original IR
-        // This shouldn't happen in normal flow, but be safe
-        return local_idx;
+        // Dynamically-added locals (e.g., __interp_buf from string interpolation):
+        // Compute offset by summing sizes of all preceding locals.
+        // Cannot use local_idx directly — multi-slot locals (strings=2, buffers=3)
+        // would overlap.
+        var next_slot: u32 = 0;
+        for (0..self.ir_func.locals.len) |i| {
+            if (i == local_idx) return next_slot;
+            const num_slots = @max(1, (self.ir_func.locals[i].size + 7) / 8);
+            next_slot += num_slots;
+        }
+        return next_slot;
     }
 
     fn convertLoadLocal(self: *SSABuilder, local_idx: ir.LocalIdx, type_idx: TypeIndex, cur: *Block) !*Value {

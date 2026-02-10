@@ -296,6 +296,18 @@ pub const OperandVisitor = union(enum) {
         }
     }
 
+    /// Mark a GPR as defined at early position.
+    /// Use when the def may be written before all uses are read;
+    /// the regalloc will ensure it does not overwrite any uses.
+    pub fn gprEarlyDef(self: *OperandVisitor, wgpr: *args.WritableGpr) void {
+        switch (self.*) {
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = wgpr.toReg().toReg(), .preg = null, .kind = .def, .pos = .early,
+            }) catch unreachable,
+            .callback => |cb| cb.func(cb.ctx, wgpr.regMut().regMut(), .any, .def, .early),
+        }
+    }
+
     /// Mark a GPR as reused (read-modify-write).
     pub fn gprReuseDef(self: *OperandVisitor, wgpr: *args.WritableGpr, _: usize) void {
         switch (self.*) {
@@ -450,8 +462,12 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         // ALU operations
         //=====================================================================
         .alu_rmi_r => |*p| {
-            visitor.gprReuseDef(&p.dst, 0);
-            gprMemImmOperands(&p.src, visitor);
+            // 3-operand model: dst is early def (safe from overlapping uses),
+            // src1 is the value to modify, src2 is the operand.
+            // Emit code handles: mov src1→dst, then OP src2, dst.
+            visitor.gprEarlyDef(&p.dst);
+            visitor.gprUse(&p.src1);
+            gprMemImmOperands(&p.src2, visitor);
         },
 
         //=====================================================================
@@ -711,6 +727,12 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
                 visitor.regFixedUse(ret.vreg, ret.preg);
             }
         },
+        .ret_value_copy => |*p| {
+            visitor.gprUse(&p.src);
+            // No regFixedDef - the emit code reads preg directly for the
+            // destination. This avoids confusing the regalloc with a fixed def
+            // on the same instruction as the use.
+        },
 
         //=====================================================================
         // SSE/XMM operations
@@ -911,17 +933,20 @@ test "getOperands alu_rmi_r" {
     const rcx_reg = regs.rcx();
 
     const gpr_rax = args.Gpr.new(rax_reg) orelse unreachable;
+    const gpr_rcx = args.Gpr.new(rcx_reg) orelse unreachable;
+    const rdx_reg = regs.rdx();
 
     var inst_val = Inst{ .alu_rmi_r = .{
         .size = .size64,
         .op = .add,
-        .src = args.GprMemImm{ .inner = .{ .reg = rcx_reg } },
-        .dst = args.WritableGpr.fromReg(gpr_rax),
+        .src1 = gpr_rax,
+        .src2 = args.GprMemImm{ .inner = .{ .reg = rdx_reg } },
+        .dst = args.WritableGpr.fromReg(gpr_rcx),
     } };
 
     getOperands(&inst_val, &visitor);
 
-    // ALU: gprReuseDef(dst) → 2 entries (def + use), gprMemImm(src) → 1 entry (use)
+    // ALU 3-operand: gprEarlyDef(dst) → 1 entry, gprUse(src1) → 1 entry, gprMemImm(src2) → 1 entry
     try testing.expectEqual(@as(usize, 3), state.operands.items.len);
 }
 

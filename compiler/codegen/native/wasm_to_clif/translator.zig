@@ -12,6 +12,7 @@ const frontend_mod = @import("../frontend/mod.zig");
 const func_environ_mod = @import("func_environ.zig");
 const bounds_checks = @import("bounds_checks.zig");
 const heap_mod = @import("heap.zig");
+const debug = @import("../../../pipeline_debug.zig");
 
 // Re-export CLIF types from stack module
 pub const clif = stack_mod.clif;
@@ -814,6 +815,7 @@ pub const FuncTranslator = struct {
         // Get function frame (bottom of control stack)
         if (self.state.controlStackLen() == 0) {
             // No control frames - just emit return
+            debug.log(.codegen, "translateReturn: no control frames, emitting empty return", .{});
             _ = try self.builder.ins().return_(&[_]Value{});
             self.state.reachable = false;
             return;
@@ -822,7 +824,13 @@ pub const FuncTranslator = struct {
         const func_frame = &self.state.control_stack.items[0];
         const return_count = func_frame.numReturnValues();
 
+        debug.log(.codegen, "translateReturn: control_stack_len={d}, return_count={d}, stack_size={d}", .{ self.state.controlStackLen(), return_count, self.state.stack.items.len });
+
         const args = self.state.peekn(return_count);
+        debug.log(.codegen, "translateReturn: emitting return with {d} args", .{args.len});
+        for (args, 0..) |arg, i| {
+            debug.log(.codegen, "translateReturn: arg[{d}] = v{d}", .{ i, arg.asU32() });
+        }
         _ = try self.builder.ins().return_(args);
 
         self.state.popn(return_count);

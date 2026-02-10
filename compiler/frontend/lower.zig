@@ -1725,6 +1725,23 @@ pub const Lowerer = struct {
             // Create string_header(new_ptr, new_len) - this creates a string_make in SSA
             return try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = new_ptr, .len = new_len } }, TypeRegistry.STRING, bin.span));
         }
+        // String equality: decompose to ptr/len and call cot_string_eq
+        // Same pattern as @assert_eq string handling (line 3528)
+        if ((bin.op == .eql or bin.op == .neq) and self.inferExprType(bin.left) == TypeRegistry.STRING) {
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            const l_ptr = try fb.emitSlicePtr(left, ptr_type, bin.span);
+            const l_len = try fb.emitSliceLen(left, bin.span);
+            const r_ptr = try fb.emitSlicePtr(right, ptr_type, bin.span);
+            const r_len = try fb.emitSliceLen(right, bin.span);
+            var eq_args = [_]ir.NodeIndex{ l_ptr, l_len, r_ptr, r_len };
+            const eq_result = try fb.emitCall("cot_string_eq", &eq_args, false, TypeRegistry.I64, bin.span);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+            if (bin.op == .eql) {
+                return try fb.emitBinary(.ne, eq_result, zero, TypeRegistry.BOOL, bin.span);
+            } else {
+                return try fb.emitBinary(.eq, eq_result, zero, TypeRegistry.BOOL, bin.span);
+            }
+        }
         if (bin.op == .coalesce) {
             const left_type_idx = self.inferExprType(bin.left);
             const left_type = self.type_reg.get(left_type_idx);

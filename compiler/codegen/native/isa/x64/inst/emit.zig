@@ -1073,12 +1073,25 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
         //---------------------------------------------------------------------
         .alu_rmi_r => |alu| {
             const dst_enc = alu.dst.toReg().hwEnc();
+            const src1_enc = alu.src1.hwEnc();
             const size = alu.size;
             const op = alu.op;
 
+            // Step 1: If src1 != dst, emit MOV src1 → dst
+            if (src1_enc != dst_enc) {
+                if (size == .size16) try sink.put1(0x66);
+                const mov_rex = RexPrefix.twoOp(src1_enc, dst_enc, size == .size64, size == .size8);
+                try mov_rex.encode(sink);
+                const mov_opcode: u8 = if (size == .size8) 0x88 else 0x89;
+                try sink.put1(mov_opcode);
+                try emitModrmReg(sink, src1_enc, dst_enc);
+            }
+
+            // Step 2: Emit the ALU operation: OP src2, dst
+
             // IMUL has a different encoding than standard ALU ops
             if (op == .imul) {
-                switch (alu.src.inner) {
+                switch (alu.src2.inner) {
                     .reg => |r| {
                         const gpr = Gpr{ .reg = r };
                         const src_enc = gpr.hwEnc();
@@ -1104,14 +1117,6 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
                         try emitModrmSibDisp(sink, dst_enc, finalized.amode, 0, null);
                     },
                     .imm => |imm_val| {
-                        // Three-operand form: IMUL r64, r/m64, imm8/32
-                        // For now, we'll load the immediate to a temp register
-                        // Actually, IMUL has a special form: 6B /r ib or 69 /r id
-                        // IMUL r64, r/m64, imm8: 6B /r ib
-                        // IMUL r64, r/m64, imm32: 69 /r id
-                        // But this requires the src to be in the r/m field, which is dst here.
-                        // This is complex - for now just emit a mov + imul sequence via separate instructions
-                        // Actually the pattern is: IMUL dst, dst, imm (dst = dst * imm)
                         const imm_i32: i32 = @bitCast(imm_val);
                         const use_short = imm_i32 >= -128 and imm_i32 <= 127;
                         if (size == .size16) try sink.put1(0x66);
@@ -1131,7 +1136,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
                 return;
             }
 
-            switch (alu.src.inner) {
+            switch (alu.src2.inner) {
                 .reg => |r| {
                     const gpr = Gpr{ .reg = r };
                     const src_enc = gpr.hwEnc();
@@ -1768,6 +1773,16 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             // Port of Cranelift: Inst::Rets emits as ret.
             // The register constraints are handled by regalloc; this just emits the return.
             try sink.put1(0xC3); // RET
+        },
+        .ret_value_copy => |p| {
+            // Move src vreg (after regalloc) to fixed ABI return register.
+            const src_enc = p.src.hwEnc();
+            const dst_enc: u8 = @intCast(p.preg.hwEnc());
+            // Always emit the move (even if src==dst, to keep code simple)
+            const rex = RexPrefix.twoOp(src_enc, dst_enc, true, false);
+            try rex.encode(sink);
+            try sink.put1(0x89); // MOV r/m64, r64
+            try emitModrmReg(sink, src_enc, dst_enc);
         },
 
         //---------------------------------------------------------------------
