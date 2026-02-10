@@ -1,0 +1,206 @@
+// std_io — Tests for stdlib modules: fs, os, time, random
+// Zig-familiar API: error unions, catch, defer
+
+import "std/fs"
+import "std/os"
+import "std/time"
+import "std/random"
+
+// ===== fs tests =====
+
+test "fs: openFile and close" {
+    var f = openFile("/dev/null", O_RDONLY)
+    @assert(f.fd > 2)
+    defer f.close()
+    @assert_eq(f.isValid(), 1)
+}
+
+test "fs: write and read back" {
+    var f = createFile("/tmp/cot_std_fs_test")
+    @assert(f.fd > 2)
+    defer f.close()
+    var n = f.writeAll("hello") catch 0 - 1
+    @assert_eq(n, 5)
+
+    var f2 = openFile("/tmp/cot_std_fs_test", O_RDONLY)
+    @assert(f2.fd > 2)
+    defer f2.close()
+    var buf = @alloc(16)
+    defer @dealloc(buf)
+    var nr = f2.read(buf, 5) catch 0 - 1
+    @assert_eq(nr, 5)
+}
+
+test "fs: writeAll" {
+    var f = createFile("/tmp/cot_std_fs_writeall")
+    @assert(f.fd > 2)
+    defer f.close()
+    var n = f.writeAll("hi") catch 0 - 1
+    @assert_eq(n, 2)
+}
+
+test "fs: seekTo" {
+    var f = createFile("/tmp/cot_std_fs_seekto")
+    @assert(f.fd > 2)
+    defer f.close()
+    var n = f.writeAll("abcde") catch 0 - 1
+    @assert_eq(n, 5)
+    var pos = f.seekTo(0) catch 0 - 1
+    @assert_eq(pos, 0)
+}
+
+test "fs: getPos" {
+    var f = createFile("/tmp/cot_std_fs_getpos")
+    @assert(f.fd > 2)
+    defer f.close()
+    var n = f.writeAll("abcde") catch 0 - 1
+    @assert_eq(n, 5)
+    var pos = f.getPos() catch 0 - 1
+    @assert_eq(pos, 5)
+}
+
+test "fs: seekBy" {
+    var f = createFile("/tmp/cot_std_fs_seekby")
+    @assert(f.fd > 2)
+    defer f.close()
+    var n = f.writeAll("abcdefgh") catch 0 - 1
+    @assert_eq(n, 8)
+    f.seekTo(2) catch 0 - 1
+    var pos = f.seekBy(3) catch 0 - 1
+    @assert_eq(pos, 5)
+}
+
+test "fs: isValid for good fd" {
+    var f = openFile("/dev/null", O_RDONLY)
+    @assert(f.fd > 2)
+    defer f.close()
+    @assert_eq(f.isValid(), 1)
+}
+
+test "fs: isValid for bad fd" {
+    var f = File { .fd = 0 - 2 }
+    @assert_eq(f.isValid(), 0)
+}
+
+test "fs: constants are correct" {
+    @assert_eq(O_RDONLY, 0)
+    @assert_eq(O_WRONLY, 1)
+    @assert_eq(O_RDWR, 2)
+    @assert_eq(SEEK_SET, 0)
+    @assert_eq(SEEK_CUR, 1)
+    @assert_eq(SEEK_END, 2)
+}
+
+test "fs: createFile convenience" {
+    var f = createFile("/tmp/cot_std_fs_create")
+    @assert(f.fd > 2)
+    defer f.close()
+    var n = f.writeAll("test") catch 0 - 1
+    @assert_eq(n, 4)
+}
+
+test "fs: stdin fd is 0" {
+    var f = stdin()
+    @assert_eq(f.fd, 0)
+}
+
+test "fs: stdout fd is 1" {
+    var f = stdout()
+    @assert_eq(f.fd, 1)
+}
+
+test "fs: stderr fd is 2" {
+    var f = stderr()
+    @assert_eq(f.fd, 2)
+}
+
+// ===== os tests =====
+
+test "os: argsCount >= 1" {
+    @assert(argsCount() >= 1)
+}
+
+test "os: argLen(0) > 0" {
+    @assert(argLen(0) > 0)
+}
+
+test "os: argPtr(0) > 0" {
+    @assert(argPtr(0) > 0)
+}
+
+test "os: environCount >= 1" {
+    @assert(environCount() >= 1)
+}
+
+test "os: environLen(0) > 0" {
+    @assert(environLen(0) > 0)
+}
+
+test "os: environPtr(0) > 0" {
+    @assert(environPtr(0) > 0)
+}
+
+// ===== time tests =====
+
+test "time: constants" {
+    @assert_eq(ns_per_ms, 1000000)
+    @assert_eq(ns_per_s, 1000000000)
+    @assert_eq(ms_per_s, 1000)
+}
+
+test "time: nanoTimestamp > epoch" {
+    @assert(nanoTimestamp() > 1000000000)
+}
+
+test "time: milliTimestamp > 0" {
+    @assert(milliTimestamp() > 0)
+}
+
+test "time: timestamp > 0" {
+    @assert(timestamp() > 0)
+}
+
+test "time: monotonic increasing" {
+    var t1 = nanoTimestamp()
+    var t2 = nanoTimestamp()
+    @assert(t2 >= t1)
+}
+
+test "time: Timer elapsed" {
+    var now = nanoTimestamp()
+    var t = Timer { .start_time = now }
+    var e = t.elapsed()
+    @assert(e >= 0)
+}
+
+test "time: Timer reset" {
+    var now = nanoTimestamp()
+    var t = Timer { .start_time = now }
+    t.reset()
+    var e = t.elapsed()
+    @assert(e >= 0)
+}
+
+// ===== random tests =====
+
+test "random: fillBytes success" {
+    var buf = @alloc(16)
+    defer @dealloc(buf)
+    var result = fillBytes(buf, 16)
+    @assert_eq(result, 0)
+}
+
+test "random: randomInt runs" {
+    var val = randomInt()
+    @assert(val == val)
+}
+
+test "random: randomRange bounds" {
+    var val = randomRange(10)
+    @assert(val >= 0)
+    @assert(val < 10)
+}
+
+test "random: randomRange(1) == 0" {
+    @assert_eq(randomRange(1), 0)
+}

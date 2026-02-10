@@ -37,6 +37,9 @@ pub const EXIT_NAME = "cot_exit";
 pub const ARGS_COUNT_NAME = "cot_args_count";
 pub const ARG_LEN_NAME = "cot_arg_len";
 pub const ARG_PTR_NAME = "cot_arg_ptr";
+pub const ENVIRON_COUNT_NAME = "cot_environ_count";
+pub const ENVIRON_LEN_NAME = "cot_environ_len";
+pub const ENVIRON_PTR_NAME = "cot_environ_ptr";
 
 // =============================================================================
 // Return Type
@@ -55,6 +58,9 @@ pub const WasiFunctions = struct {
     args_count_idx: u32,
     arg_len_idx: u32,
     arg_ptr_idx: u32,
+    environ_count_idx: u32,
+    environ_len_idx: u32,
+    environ_ptr_idx: u32,
 };
 
 // =============================================================================
@@ -216,6 +222,36 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .exported = true, // ARM64 override in driver.zig
     });
 
+    // cot_environ_count: () -> i64
+    // Returns number of environment variables. On native, walks envp from vmctx+0x30010.
+    const environ_count_body = try generateStubReturnsZero(allocator);
+    const environ_count_idx = try linker.addFunc(.{
+        .name = ENVIRON_COUNT_NAME,
+        .type_idx = time_type, // Same type: () -> i64
+        .code = environ_count_body,
+        .exported = true, // ARM64/x64 override in driver.zig
+    });
+
+    // cot_environ_len: (n: i64) -> i64
+    // Returns length of environment variable n (strlen(envp[n])). On native, walks envp array.
+    const environ_len_body = try generateStubReturnsZero(allocator);
+    const environ_len_idx = try linker.addFunc(.{
+        .name = ENVIRON_LEN_NAME,
+        .type_idx = fd_close_type, // Same type: (i64) -> i64
+        .code = environ_len_body,
+        .exported = true, // ARM64/x64 override in driver.zig
+    });
+
+    // cot_environ_ptr: (n: i64) -> i64
+    // Copies env var n into linear memory at 0x7F000 + n*4096, returns wasm pointer.
+    const environ_ptr_body = try generateStubReturnsZero(allocator);
+    const environ_ptr_idx = try linker.addFunc(.{
+        .name = ENVIRON_PTR_NAME,
+        .type_idx = fd_close_type, // Same type: (i64) -> i64
+        .code = environ_ptr_body,
+        .exported = true, // ARM64/x64 override in driver.zig
+    });
+
     return WasiFunctions{
         .fd_write_idx = fd_write_idx,
         .fd_write_simple_idx = fd_write_simple_idx,
@@ -229,6 +265,9 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig
         .args_count_idx = args_count_idx,
         .arg_len_idx = arg_len_idx,
         .arg_ptr_idx = arg_ptr_idx,
+        .environ_count_idx = environ_count_idx,
+        .environ_len_idx = environ_len_idx,
+        .environ_ptr_idx = environ_ptr_idx,
     };
 }
 

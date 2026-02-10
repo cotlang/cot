@@ -841,6 +841,17 @@ pub const Checker = struct {
             // @arg_ptr(n) — copies CLI argument n into linear memory, returns wasm pointer
             _ = try self.checkExpr(bc.args[0]); // n: i64 (argument index)
             return TypeRegistry.I64;
+        } else if (std.mem.eql(u8, bc.name, "environ_count")) {
+            // @environ_count() — returns number of environment variables
+            return TypeRegistry.I64;
+        } else if (std.mem.eql(u8, bc.name, "environ_len")) {
+            // @environ_len(n) — returns length of env var n
+            _ = try self.checkExpr(bc.args[0]);
+            return TypeRegistry.I64;
+        } else if (std.mem.eql(u8, bc.name, "environ_ptr")) {
+            // @environ_ptr(n) — copies env var n into linear memory, returns wasm pointer
+            _ = try self.checkExpr(bc.args[0]);
+            return TypeRegistry.I64;
         }
         self.err.errorWithCode(bc.span.start, .e300, "unknown builtin");
         return invalid_type;

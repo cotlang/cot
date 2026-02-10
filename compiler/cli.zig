@@ -219,7 +219,7 @@ fn parseTarget(arg: []const u8, args: *std.process.ArgIterator) ?Target {
     if (std.mem.startsWith(u8, arg, "--target=")) {
         const val = arg[9..];
         return Target.parse(val) orelse {
-            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, arm64-macos, amd64-linux\n", .{val});
+            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, wasm32-wasi, arm64-macos, amd64-linux\n", .{val});
             return null;
         };
     }
@@ -229,7 +229,7 @@ fn parseTarget(arg: []const u8, args: *std.process.ArgIterator) ?Target {
             return null;
         };
         return Target.parse(val) orelse {
-            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, arm64-macos, amd64-linux\n", .{val});
+            std.debug.print("Error: Unknown target '{s}'. Use: wasm32, wasm32-wasi, arm64-macos, amd64-linux\n", .{val});
             return null;
         };
     }
@@ -297,7 +297,7 @@ fn printUsage() void {
         \\
         \\Flags:
         \\  -o <name>       Output name (default: input filename without .cot)
-        \\  --target=<t>    Target: native, wasm32, arm64-macos, amd64-linux
+        \\  --target=<t>    Target: native, wasm32, wasm32-wasi, arm64-macos, amd64-linux
         \\
     , .{version_short});
 }
@@ -310,12 +310,13 @@ fn printBuildHelp() void {
         \\
         \\Flags:
         \\  -o <name>       Output name (default: input filename without .cot)
-        \\  --target=<t>    Target: wasm32, arm64-macos, amd64-linux
+        \\  --target=<t>    Target: wasm32, wasm32-wasi, arm64-macos, amd64-linux
         \\
         \\Examples:
         \\  cot build app.cot               Produces ./app
         \\  cot build app.cot -o myapp      Produces ./myapp
         \\  cot build app.cot --target=wasm32  Produces ./app.wasm
+        \\  cot build app.cot --target=wasm32-wasi  Produces ./app.wasm (with WASI imports)
         \\
     , .{});
 }

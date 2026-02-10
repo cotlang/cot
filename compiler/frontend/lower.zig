@@ -3199,15 +3199,19 @@ pub const Lowerer = struct {
             const ast_expr = ast_node.asExpr() orelse continue;
             var arg_node: ir.NodeIndex = ir.null_node;
 
-            if (ast_expr == .literal and ast_expr.literal.kind == .string) {
-                var param_is_pointer = false;
-                if (param_types) |params| {
-                    const param_idx = arg_i + 1;
-                    if (param_idx < params.len) {
-                        const param_type = self.type_reg.get(params[param_idx].type_idx);
-                        param_is_pointer = (param_type == .pointer);
-                    }
+            // Determine parameter type for ABI decomposition (offset by 1 for self)
+            var param_is_pointer = false;
+            var param_is_compound = false; // slice or string — passed as (ptr, len)
+            if (param_types) |params| {
+                const param_idx = arg_i + 1; // +1 for self receiver
+                if (param_idx < params.len) {
+                    const param_type = self.type_reg.get(params[param_idx].type_idx);
+                    param_is_pointer = (param_type == .pointer);
+                    param_is_compound = (param_type == .slice) or (params[param_idx].type_idx == TypeRegistry.STRING);
                 }
+            }
+
+            if (ast_expr == .literal and ast_expr.literal.kind == .string) {
                 if (param_is_pointer) {
                     const str_node = try self.lowerLiteral(ast_expr.literal);
                     arg_node = try fb.emitSlicePtr(str_node, TypeRegistry.I64, call.span);
@@ -3218,7 +3222,17 @@ pub const Lowerer = struct {
                 arg_node = try self.lowerExprNode(arg_idx);
             }
             if (arg_node == ir.null_node) continue;
-            try args.append(self.allocator, arg_node);
+
+            // Go pattern: decompose compound types (slice/string) into (ptr, len)
+            // at call sites. Reference: Go's OSPTR()/OLEN() in walk/builtin.go
+            if (param_is_compound) {
+                const ptr_val = try fb.emitSlicePtr(arg_node, TypeRegistry.I64, call.span);
+                const len_val = try fb.emitSliceLen(arg_node, call.span);
+                try args.append(self.allocator, ptr_val);
+                try args.append(self.allocator, len_val);
+            } else {
+                try args.append(self.allocator, arg_node);
+            }
         }
 
         const func_type = self.type_reg.get(method_info.func_type);
@@ -3685,6 +3699,22 @@ pub const Lowerer = struct {
             const n_arg = try self.lowerExprNode(bc.args[0]);
             var args = [_]ir.NodeIndex{n_arg};
             return try fb.emitCall("cot_arg_ptr", &args, false, TypeRegistry.I64, bc.span);
+        }
+        // @environ_count() — returns number of environment variables
+        if (std.mem.eql(u8, bc.name, "environ_count")) {
+            return try fb.emitCall("cot_environ_count", &[_]ir.NodeIndex{}, false, TypeRegistry.I64, bc.span);
+        }
+        // @environ_len(n) — returns length of env var n
+        if (std.mem.eql(u8, bc.name, "environ_len")) {
+            const n_arg = try self.lowerExprNode(bc.args[0]);
+            var args = [_]ir.NodeIndex{n_arg};
+            return try fb.emitCall("cot_environ_len", &args, false, TypeRegistry.I64, bc.span);
+        }
+        // @environ_ptr(n) — copies env var n into linear memory, returns wasm pointer
+        if (std.mem.eql(u8, bc.name, "environ_ptr")) {
+            const n_arg = try self.lowerExprNode(bc.args[0]);
+            var args = [_]ir.NodeIndex{n_arg};
+            return try fb.emitCall("cot_environ_ptr", &args, false, TypeRegistry.I64, bc.span);
         }
         return ir.null_node;
     }

@@ -362,6 +362,7 @@ pub const Driver = struct {
             .macos => "macOS",
             .linux => "Linux",
             .freestanding => "freestanding",
+            .wasi => "WASI",
         };
         pipeline_debug.log(.codegen, "driver: target: {s} / {s}", .{ arch_name, os_name });
 
@@ -573,7 +574,7 @@ pub const Driver = struct {
         const object_bytes = switch (self.target.os) {
             .macos => try self.generateMachO(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals),
             .linux => try self.generateElf(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals),
-            .freestanding => return error.UnsupportedObjectFormat,
+            .freestanding, .wasi => return error.UnsupportedObjectFormat,
         };
 
         return object_bytes;
@@ -662,7 +663,10 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "wasi_fd_write") or
                         std.mem.eql(u8, exp.name, "cot_args_count") or
                         std.mem.eql(u8, exp.name, "cot_arg_len") or
-                        std.mem.eql(u8, exp.name, "cot_arg_ptr"))
+                        std.mem.eql(u8, exp.name, "cot_arg_ptr") or
+                        std.mem.eql(u8, exp.name, "cot_environ_count") or
+                        std.mem.eql(u8, exp.name, "cot_environ_len") or
+                        std.mem.eql(u8, exp.name, "cot_environ_ptr"))
                     {
                         override_name = exp.name;
                         break;
@@ -954,7 +958,7 @@ pub const Driver = struct {
                         0xCD, 0x00, 0x00, 0xB4, // cbz x13, +6                 (limit hit → .truncate)
                         0x2B, 0x15, 0x40, 0x38, // ldrb w11, [x9], #1          (load byte, post-inc)
                         0x4B, 0x15, 0x00, 0x38, // strb w11, [x10], #1         (store byte, post-inc)
-                        0xAB, 0x00, 0x00, 0x34, // cbz w11, +5                 (NUL found → .done)
+                        0x8B, 0x00, 0x00, 0x34, // cbz w11, +4                 (NUL found → .done)
                         0xAD, 0x05, 0x00, 0xD1, // sub x13, x13, #1            (remaining--)
                         0xFB, 0xFF, 0xFF, 0x17, // b -5                         (→ .copy_loop)
                         // .truncate:
@@ -967,6 +971,80 @@ pub const Driver = struct {
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };
                     try module.defineFunctionBytes(func_ids[i], &arm64_arg_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "cot_environ_count")) {
+                    // ARM64: walk envp array counting until NULL pointer
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no user args)
+                    // envp at vmctx+0x30010
+                    const arm64_environ_count = [_]u8{
+                        0x08, 0xC0, 0x40, 0x91, // add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x09, 0x40, 0xF9, // ldr x9, [x8, #16]           (x9 = envp)
+                        0x00, 0x00, 0x80, 0xD2, // movz x0, #0                 (count = 0)
+                        // .loop:
+                        0x2A, 0x79, 0x60, 0xF8, // ldr x10, [x9, x0, lsl #3]   (x10 = envp[count])
+                        0x6A, 0x00, 0x00, 0xB4, // cbz x10, +3                 (NULL → .done)
+                        0x00, 0x04, 0x00, 0x91, // add x0, x0, #1              (count++)
+                        0xFD, 0xFF, 0xFF, 0x17, // b -3                         (→ .loop)
+                        // .done:
+                        0xC0, 0x03, 0x5F, 0xD6, // ret                         (return count in x0)
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_environ_count, &.{});
+                } else if (std.mem.eql(u8, name, "cot_environ_len")) {
+                    // ARM64: strlen(envp[n])
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=n
+                    const arm64_environ_len = [_]u8{
+                        0x08, 0xC0, 0x40, 0x91, // add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x09, 0x40, 0xF9, // ldr x9, [x8, #16]           (x9 = envp)
+                        0x29, 0x79, 0x62, 0xF8, // ldr x9, [x9, x2, lsl #3]    (x9 = envp[n])
+                        0xE9, 0x00, 0x00, 0xB4, // cbz x9, +7                  (NULL → .null)
+                        0x00, 0x00, 0x80, 0xD2, // movz x0, #0                 (len = 0)
+                        // .loop:
+                        0x2A, 0x69, 0x60, 0x38, // ldrb w10, [x9, x0]          (byte = envp[n][len])
+                        0x6A, 0x00, 0x00, 0x34, // cbz w10, +3                 (NUL → .done, return len)
+                        0x00, 0x04, 0x00, 0x91, // add x0, x0, #1              (len++)
+                        0xFD, 0xFF, 0xFF, 0x17, // b -3                         (→ .loop)
+                        // .done:
+                        0xC0, 0x03, 0x5F, 0xD6, // ret                         (return len in x0)
+                        // .null:
+                        0x00, 0x00, 0x80, 0xD2, // movz x0, #0
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_environ_len, &.{});
+                } else if (std.mem.eql(u8, name, "cot_environ_ptr")) {
+                    // ARM64: copy envp[n] into linmem at 0x7F000 + n*4096, return wasm offset
+                    // Reference: arm64_arg_ptr (same pattern, offset 0xAF000→0x7F000, argv→envp)
+                    const arm64_environ_ptr = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0xC0, 0x40, 0x91, // add x8, x0, #0x30, lsl #12  (vmctx + 0x30000)
+                        0x09, 0x09, 0x40, 0xF9, // ldr x9, [x8, #16]           (x9 = envp)
+                        0x29, 0x79, 0x62, 0xF8, // ldr x9, [x9, x2, lsl #3]    (x9 = envp[n], src)
+                        0x49, 0x02, 0x00, 0xB4, // cbz x9, +18                 (NULL → .null)
+                        0x4C, 0xCC, 0x74, 0xD3, // lsl x12, x2, #12            (x12 = n * 4096)
+                        0x0A, 0x00, 0x41, 0x91, // add x10, x0, #0x40, lsl #12 (linmem base)
+                        0x4A, 0xFD, 0x41, 0x91, // add x10, x10, #0x7F, lsl #12 (+ 0x7F000)
+                        0x4A, 0x01, 0x0C, 0x8B, // add x10, x10, x12           (+ n*4096 = dest)
+                        0xED, 0xFF, 0x81, 0xD2, // movz x13, #4095             (max copy bytes)
+                        // .copy_loop:
+                        0xCD, 0x00, 0x00, 0xB4, // cbz x13, +6                 (limit hit → .truncate)
+                        0x2B, 0x15, 0x40, 0x38, // ldrb w11, [x9], #1          (load byte, post-inc)
+                        0x4B, 0x15, 0x00, 0x38, // strb w11, [x10], #1         (store byte, post-inc)
+                        0x8B, 0x00, 0x00, 0x34, // cbz w11, +4                 (NUL found → .done)
+                        0xAD, 0x05, 0x00, 0xD1, // sub x13, x13, #1            (remaining--)
+                        0xFB, 0xFF, 0xFF, 0x17, // b -5                         (→ .copy_loop)
+                        // .truncate:
+                        0x5F, 0x01, 0x00, 0x39, // strb wzr, [x10]             (NUL-terminate at limit)
+                        // .done: return wasm offset 0x7F000 + n*4096
+                        0x00, 0x00, 0x9E, 0xD2, // movz x0, #0xF000
+                        0xE0, 0x00, 0xA0, 0xF2, // movk x0, #0x7, lsl #16     (x0 = 0x7F000)
+                        0x00, 0x00, 0x0C, 0x8B, // add x0, x0, x12             (+ n*4096)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                        // .null: return 0
+                        0x00, 0x00, 0x80, 0xD2, // movz x0, #0
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_environ_ptr, &.{});
                 }
             } else {
                 try module.defineFunction(func_ids[i], cf);
@@ -998,8 +1076,10 @@ pub const Driver = struct {
         //   0x20008: Heap bound (i64) - ~15.7MB
         //   0x30000: argc (i64) - set by _main wrapper from OS
         //   0x30008: argv (i64, char**) - set by _main wrapper from OS
+        //   0x30010: envp (i64, char**) - set by _main wrapper from OS
         //   0x40000 - 0xFFFFFF: Linear memory (~15.7MB heap)
         //     0xEF000 (linmem+0xAF000): arg string buffer for @arg_ptr
+        //     0xBF000 (linmem+0x7F000): environ string buffer for @environ_ptr
         // =================================================================
         const vmctx_size: usize = 0x1000000; // 16MB
         const vmctx_data = try self.allocator.alloc(u8, vmctx_size);
@@ -1062,31 +1142,35 @@ pub const Driver = struct {
         // =================================================================
         // Step 2: Generate _main wrapper function
         // This wrapper:
-        //   1. Saves argc (x0) and argv (x1) from macOS C runtime
+        //   1. Saves argc (x0), argv (x1), envp (x2) from macOS C runtime
         //   2. Loads address of _vmctx_data
         //   3. Initializes heap base pointer (requires runtime address)
-        //   4. Stores argc/argv at vmctx+0x30000/0x30008
+        //   4. Stores argc/argv/envp at vmctx+0x30000/0x30008/0x30010
         //   5. Calls __wasm_main(vmctx, vmctx)
         //   6. Returns result
         //
-        // ARM64 code (18 instructions, 72 bytes):
-        //   stp     x29, x30, [sp, #-32]!
+        // ARM64 code (22 instructions, 88 bytes):
+        //   stp     x29, x30, [sp, #-48]!
         //   mov     x29, sp
         //   stp     x19, x20, [sp, #16]     ; save callee-saved regs
+        //   str     x21, [sp, #32]          ; save x21
         //   mov     x19, x0                 ; save argc
         //   mov     x20, x1                 ; save argv
-        //   adrp    x0, _vmctx_data@PAGE    (reloc at offset 20)
-        //   add     x0, x0, _vmctx_data@PAGEOFF (reloc at offset 24)
+        //   mov     x21, x2                 ; save envp
+        //   adrp    x0, _vmctx_data@PAGE    (reloc at offset 28)
+        //   add     x0, x0, _vmctx_data@PAGEOFF (reloc at offset 32)
         //   add     x8, x0, #0x20, lsl #12  ; x8 = vmctx + 0x20000
         //   add     x9, x0, #0x40, lsl #12  ; x9 = vmctx + 0x40000 (heap base)
         //   str     x9, [x8]                ; Store heap base ptr
         //   add     x10, x0, #0x30, lsl #12 ; x10 = vmctx + 0x30000 (args area)
         //   str     x19, [x10]              ; Store argc
         //   str     x20, [x10, #8]          ; Store argv
+        //   str     x21, [x10, #16]         ; Store envp
         //   mov     x1, x0                  ; caller_vmctx = vmctx
-        //   bl      __wasm_main             (reloc at offset 56)
+        //   bl      __wasm_main             (reloc at offset 68)
         //   ldp     x19, x20, [sp, #16]     ; restore callee-saved regs
-        //   ldp     x29, x30, [sp], #32
+        //   ldr     x21, [sp, #32]          ; restore x21
+        //   ldp     x29, x30, [sp], #48
         //   ret
         // =================================================================
         var wrapper_code = std.ArrayListUnmanaged(u8){};
@@ -1099,19 +1183,23 @@ pub const Driver = struct {
             }
         }.f;
 
-        // stp x29, x30, [sp, #-32]! (save frame, 32 bytes for x19/x20)
-        try appendInst(&wrapper_code, self.allocator, 0xA9BE7BFD);
+        // stp x29, x30, [sp, #-48]! (save frame, 48 bytes for x19/x20/x21)
+        try appendInst(&wrapper_code, self.allocator, 0xA9BD7BFD);
         // mov x29, sp
         try appendInst(&wrapper_code, self.allocator, 0x910003FD);
         // stp x19, x20, [sp, #16] (save callee-saved regs)
         try appendInst(&wrapper_code, self.allocator, 0xA90153F3);
+        // str x21, [sp, #32] (save x21)
+        try appendInst(&wrapper_code, self.allocator, 0xF90013F5);
         // mov x19, x0 (save argc from OS)
         try appendInst(&wrapper_code, self.allocator, 0xAA0003F3);
         // mov x20, x1 (save argv from OS)
         try appendInst(&wrapper_code, self.allocator, 0xAA0103F4);
-        // adrp x0, _vmctx_data@PAGE (reloc at offset 20)
+        // mov x21, x2 (save envp from OS)
+        try appendInst(&wrapper_code, self.allocator, 0xAA0203F5);
+        // adrp x0, _vmctx_data@PAGE (reloc at offset 28)
         try appendInst(&wrapper_code, self.allocator, 0x90000000);
-        // add x0, x0, _vmctx_data@PAGEOFF (reloc at offset 24)
+        // add x0, x0, _vmctx_data@PAGEOFF (reloc at offset 32)
         try appendInst(&wrapper_code, self.allocator, 0x91000000);
         // add x8, x0, #0x20, lsl #12 (x8 = vmctx + 0x20000)
         try appendInst(&wrapper_code, self.allocator, 0x91408008);
@@ -1125,14 +1213,18 @@ pub const Driver = struct {
         try appendInst(&wrapper_code, self.allocator, 0xF9000153);
         // str x20, [x10, #8] (store argv)
         try appendInst(&wrapper_code, self.allocator, 0xF9000554);
+        // str x21, [x10, #16] (store envp)
+        try appendInst(&wrapper_code, self.allocator, 0xF9000955);
         // mov x1, x0 (caller_vmctx = vmctx)
         try appendInst(&wrapper_code, self.allocator, 0xAA0003E1);
-        // bl __wasm_main (reloc at offset 56)
+        // bl __wasm_main (reloc at offset 68)
         try appendInst(&wrapper_code, self.allocator, 0x94000000);
         // ldp x19, x20, [sp, #16] (restore callee-saved regs)
         try appendInst(&wrapper_code, self.allocator, 0xA94153F3);
-        // ldp x29, x30, [sp], #32
-        try appendInst(&wrapper_code, self.allocator, 0xA8C27BFD);
+        // ldr x21, [sp, #32] (restore x21)
+        try appendInst(&wrapper_code, self.allocator, 0xF94013F5);
+        // ldp x29, x30, [sp], #48
+        try appendInst(&wrapper_code, self.allocator, 0xA8C37BFD);
         // ret
         try appendInst(&wrapper_code, self.allocator, 0xD65F03C0);
 
@@ -1160,23 +1252,23 @@ pub const Driver = struct {
         try module.declareExternalName(wasm_main_ext_idx, "__wasm_main");
 
         const relocs = [_]FinalizedMachReloc{
-            // ADRP x0, _vmctx_data@PAGE at offset 20 (after 5 setup instrs)
+            // ADRP x0, _vmctx_data@PAGE at offset 28 (after 7 setup instrs)
             .{
-                .offset = 20,
+                .offset = 28,
                 .kind = Reloc.Aarch64AdrPrelPgHi21,
                 .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
                 .addend = 0,
             },
-            // ADD x0, x0, _vmctx_data@PAGEOFF at offset 24
+            // ADD x0, x0, _vmctx_data@PAGEOFF at offset 32
             .{
-                .offset = 24,
+                .offset = 32,
                 .kind = Reloc.Aarch64AddAbsLo12Nc,
                 .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
                 .addend = 0,
             },
-            // BL __wasm_main at offset 56
+            // BL __wasm_main at offset 68
             .{
-                .offset = 56,
+                .offset = 68,
                 .kind = Reloc.Arm64Call,
                 .target = FinalizedRelocTarget{ .ExternalName = wasm_main_name_ref },
                 .addend = 0,
@@ -1266,7 +1358,10 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "wasi_fd_write") or
                         std.mem.eql(u8, exp.name, "cot_args_count") or
                         std.mem.eql(u8, exp.name, "cot_arg_len") or
-                        std.mem.eql(u8, exp.name, "cot_arg_ptr"))
+                        std.mem.eql(u8, exp.name, "cot_arg_ptr") or
+                        std.mem.eql(u8, exp.name, "cot_environ_count") or
+                        std.mem.eql(u8, exp.name, "cot_environ_len") or
+                        std.mem.eql(u8, exp.name, "cot_environ_ptr"))
                     {
                         override_name = exp.name;
                         break;
@@ -1561,6 +1656,98 @@ pub const Driver = struct {
                         0xC3, //111: ret
                     };
                     try module.defineFunctionBytes(elf_func_ids[i], &x64_arg_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "cot_environ_count")) {
+                    // x86-64: count envp entries by walking until NULL pointer
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx (no user args)
+                    // vmctx+0x30010 = envp (stored by main wrapper)
+                    const x64_environ_count = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x10, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30010]  (envp)
+                        0x31, 0xC9, // 11: xor ecx, ecx             (count = 0)
+                        // .loop (offset 13):
+                        0x48, 0x8B, 0x14, 0xC8, // 13: mov rdx, [rax + rcx*8]  (*envp++)
+                        0x48, 0x85, 0xD2, // 17: test rdx, rdx
+                        0x74, 0x05, // 20: jz +5                    (NULL → .done at 27)
+                        0x48, 0xFF, 0xC1, // 22: inc rcx                (count++)
+                        0xEB, 0xF2, // 25: jmp -14                  (→ .loop at 13)
+                        // .done (offset 27):
+                        0x48, 0x89, 0xC8, // 27: mov rax, rcx          (return count)
+                        0x5D, // 30: pop rbp
+                        0xC3, // 31: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_environ_count, &.{});
+                } else if (std.mem.eql(u8, name, "cot_environ_len")) {
+                    // x86-64: strlen(envp[n])
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    const x64_environ_len = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x10, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30010]  (envp)
+                        0x4C, 0x8B, 0x04, 0xD0, // 11: mov r8, [rax + rdx*8]   (r8 = envp[n])
+                        0x4D, 0x85, 0xC0, // 15: test r8, r8
+                        0x75, 0x04, // 18: jnz +4                   (non-NULL → .valid at 24)
+                        0x31, 0xC0, // 20: xor eax, eax             (return 0)
+                        0x5D, // 22: pop rbp
+                        0xC3, // 23: ret
+                        // .valid (offset 24):
+                        0x31, 0xC0, // 24: xor eax, eax             (len = 0)
+                        // .strlen_loop (offset 26):
+                        0x41, 0x0F, 0xB6, 0x0C, 0x00, // 26: movzx ecx, byte [r8 + rax]
+                        0x85, 0xC9, // 31: test ecx, ecx
+                        0x74, 0x05, // 33: jz +5                    (NUL → .done at 40)
+                        0x48, 0xFF, 0xC0, // 35: inc rax                (len++)
+                        0xEB, 0xF2, // 38: jmp -14                  (→ .strlen_loop at 26)
+                        // .done (offset 40):
+                        0x5D, // 40: pop rbp
+                        0xC3, // 41: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_environ_len, &.{});
+                } else if (std.mem.eql(u8, name, "cot_environ_ptr")) {
+                    // x86-64: copy envp[n] into linear memory at wasm offset 0x7F000 + n*4096
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=n
+                    // Same pattern as x64_arg_ptr but uses envp from vmctx+0x30010
+                    // and writes to 0x7F000 instead of 0xAF000
+                    const x64_environ_ptr = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x8B, 0x87, 0x10, 0x00, 0x03, 0x00, //  4: mov rax, [rdi + 0x30010]  (envp)
+                        0x4C, 0x8B, 0x04, 0xD0, // 11: mov r8, [rax + rdx*8]   (r8 = envp[n], src)
+                        0x4D, 0x85, 0xC0, // 15: test r8, r8
+                        0x75, 0x04, // 18: jnz +4                   (non-NULL → .valid at 24)
+                        0x31, 0xC0, // 20: xor eax, eax             (return 0)
+                        0x5D, // 22: pop rbp
+                        0xC3, // 23: ret
+                        // .valid (offset 24):
+                        // dest = linmem + 0x7F000 + n*4096
+                        0x48, 0x89, 0xD0, // 24: mov rax, rdx              (n)
+                        0x48, 0xC1, 0xE0, 0x0C, // 27: shl rax, 12             (n * 4096)
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // 31: lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x81, 0xC1, 0x00, 0xF0, 0x07, 0x00, // 38: add r9, 0x7F000
+                        0x49, 0x01, 0xC1, // 45: add r9, rax               (dest = linmem + 0x7F000 + n*4096)
+                        0x48, 0x89, 0xD1, // 48: mov rcx, rdx              (save n for return value)
+                        0x41, 0xBA, 0xFF, 0x0F, 0x00, 0x00, // 51: mov r10d, 4095          (max copy)
+                        // .copy_loop (offset 57):
+                        0x4D, 0x85, 0xD2, // 57: test r10, r10
+                        0x74, 0x16, // 60: jz +22                  (→ .truncate at 84)
+                        0x41, 0x0F, 0xB6, 0x00, // 62: movzx eax, byte [r8]
+                        0x41, 0x88, 0x01, // 66: mov [r9], al
+                        0x85, 0xC0, // 69: test eax, eax
+                        0x74, 0x0F, // 71: jz +15                  (NUL found → .done at 88)
+                        0x49, 0xFF, 0xC0, // 73: inc r8
+                        0x49, 0xFF, 0xC1, // 76: inc r9
+                        0x49, 0xFF, 0xCA, // 79: dec r10
+                        0xEB, 0xE5, // 82: jmp -27                 (→ .copy_loop at 57)
+                        // .truncate (offset 84):
+                        0x41, 0xC6, 0x01, 0x00, // 84: mov byte [r9], 0  (NUL-terminate)
+                        // .done (offset 88): return wasm offset 0x7F000 + n*4096
+                        0x48, 0xC7, 0xC0, 0x00, 0xF0, 0x07, 0x00, // 88: mov rax, 0x7F000
+                        0x48, 0xC1, 0xE1, 0x0C, // 95: shl rcx, 12  (n * 4096)
+                        0x48, 0x01, 0xC8, // 99: add rax, rcx  (0x7F000 + n*4096)
+                        0x5D, //102: pop rbp
+                        0xC3, //103: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_environ_ptr, &.{});
                 }
             } else {
                 try module.defineFunction(elf_func_ids[i], cf);
@@ -1592,7 +1779,9 @@ pub const Driver = struct {
         //   0x20008: Heap bound (i64) - ~15.7MB
         //   0x30000: argc (i64) - set by _main wrapper from OS
         //   0x30008: argv (i64, char**) - set by _main wrapper from OS
+        //   0x30010: envp (i64, char**) - set by _main wrapper from OS
         //   0x40000 - 0xFFFFFF: Linear memory (~15.7MB heap)
+        //     0xBF000 (linmem+0x7F000): environ string buffer for @environ_ptr
         //     0xEF000 (linmem+0xAF000): arg string buffer for @arg_ptr
         // =================================================================
         const vmctx_size: usize = 0x1000000; // 16MB
@@ -1653,33 +1842,36 @@ pub const Driver = struct {
         // =================================================================
         // Step 2: Generate main wrapper function
         // This wrapper:
-        //   1. Saves argc/argv (before lea rdi clobbers them)
+        //   1. Saves argc/argv/envp (before lea rdi clobbers them)
         //   2. Loads address of vmctx_data
         //   3. Initializes heap base pointer (requires runtime address)
-        //   4. Stores argc/argv into vmctx+0x30000/0x30008
+        //   4. Stores argc/argv/envp into vmctx+0x30000/0x30008/0x30010
         //   5. Calls __wasm_main(vmctx, vmctx)
         //   6. Returns result
         //
-        // On Linux, main(int argc, char **argv): edi=argc, rsi=argv
+        // On Linux, main(int argc, char **argv, char **envp): edi=argc, rsi=argv, rdx=envp
         //
         // x86-64 code (System V AMD64 ABI):
         //   push   rbp                        ; 1  byte  (offset 0)
         //   mov    rbp, rsp                   ; 3  bytes (offset 1)
         //   push   rdi                        ; 1  byte  (offset 4)  save argc
         //   push   rsi                        ; 1  byte  (offset 5)  save argv
-        //   lea    rdi, [rip + vmctx_data]    ; 7  bytes (offset 6, reloc at 9)
-        //   lea    rax, [rdi + 0x40000]       ; 7  bytes (offset 13)
-        //   mov    [rdi + 0x20000], rax       ; 7  bytes (offset 20)
-        //   pop    rax                        ; 1  byte  (offset 27) restore argv
-        //   mov    [rdi + 0x30008], rax       ; 7  bytes (offset 28) store argv
-        //   pop    rax                        ; 1  byte  (offset 35) restore argc
-        //   cdqe                              ; 2  bytes (offset 36) sign-extend eax→rax
-        //   mov    [rdi + 0x30000], rax       ; 7  bytes (offset 38) store argc
-        //   mov    rsi, rdi                   ; 3  bytes (offset 45)
-        //   call   __wasm_main                ; 5  bytes (offset 48, reloc at 49)
-        //   pop    rbp                        ; 1  byte  (offset 53)
-        //   ret                               ; 1  byte  (offset 54)
-        // Total: 55 bytes
+        //   push   rdx                        ; 1  byte  (offset 6)  save envp
+        //   lea    rdi, [rip + vmctx_data]    ; 7  bytes (offset 7, reloc at 10)
+        //   lea    rax, [rdi + 0x40000]       ; 7  bytes (offset 14)
+        //   mov    [rdi + 0x20000], rax       ; 7  bytes (offset 21)
+        //   pop    rax                        ; 1  byte  (offset 28) restore envp
+        //   mov    [rdi + 0x30010], rax       ; 7  bytes (offset 29) store envp
+        //   pop    rax                        ; 1  byte  (offset 36) restore argv
+        //   mov    [rdi + 0x30008], rax       ; 7  bytes (offset 37) store argv
+        //   pop    rax                        ; 1  byte  (offset 44) restore argc
+        //   cdqe                              ; 2  bytes (offset 45) sign-extend eax→rax
+        //   mov    [rdi + 0x30000], rax       ; 7  bytes (offset 47) store argc
+        //   mov    rsi, rdi                   ; 3  bytes (offset 54)
+        //   call   __wasm_main                ; 5  bytes (offset 57, reloc at 58)
+        //   pop    rbp                        ; 1  byte  (offset 62)
+        //   ret                               ; 1  byte  (offset 63)
+        // Total: 64 bytes
         // =================================================================
         var wrapper_code = std.ArrayListUnmanaged(u8){};
         defer wrapper_code.deinit(self.allocator);
@@ -1696,40 +1888,49 @@ pub const Driver = struct {
         // push rsi (0x56) — save argv before mov rsi,rdi      offset 5
         try wrapper_code.append(self.allocator, 0x56);
 
-        // lea rdi, [rip + vmctx_data] (48 8d 3d XX XX XX XX)  offset 6, reloc disp at 9
+        // push rdx (0x52) — save envp                          offset 6
+        try wrapper_code.append(self.allocator, 0x52);
+
+        // lea rdi, [rip + vmctx_data] (48 8d 3d XX XX XX XX)  offset 7, reloc disp at 10
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x3d, 0x00, 0x00, 0x00, 0x00 });
 
-        // lea rax, [rdi + 0x40000] (48 8d 87 00 00 04 00)     offset 13
+        // lea rax, [rdi + 0x40000] (48 8d 87 00 00 04 00)     offset 14
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x8d, 0x87, 0x00, 0x00, 0x04, 0x00 });
 
-        // mov [rdi + 0x20000], rax (48 89 87 00 00 02 00)     offset 20
+        // mov [rdi + 0x20000], rax (48 89 87 00 00 02 00)     offset 21
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x00, 0x00, 0x02, 0x00 });
 
-        // pop rax (0x58) — restore argv                        offset 27
+        // pop rax (0x58) — restore envp                        offset 28
         try wrapper_code.append(self.allocator, 0x58);
 
-        // mov [rdi + 0x30008], rax (48 89 87 08 00 03 00)     offset 28
+        // mov [rdi + 0x30010], rax (48 89 87 10 00 03 00)     offset 29 store envp
+        try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x10, 0x00, 0x03, 0x00 });
+
+        // pop rax (0x58) — restore argv                        offset 36
+        try wrapper_code.append(self.allocator, 0x58);
+
+        // mov [rdi + 0x30008], rax (48 89 87 08 00 03 00)     offset 37
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x08, 0x00, 0x03, 0x00 });
 
-        // pop rax (0x58) — restore argc                        offset 35
+        // pop rax (0x58) — restore argc                        offset 44
         try wrapper_code.append(self.allocator, 0x58);
 
-        // cdqe (48 98) — sign-extend eax to rax                offset 36
+        // cdqe (48 98) — sign-extend eax to rax                offset 45
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x98 });
 
-        // mov [rdi + 0x30000], rax (48 89 87 00 00 03 00)     offset 38
+        // mov [rdi + 0x30000], rax (48 89 87 00 00 03 00)     offset 47
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0x87, 0x00, 0x00, 0x03, 0x00 });
 
-        // mov rsi, rdi (48 89 fe)                              offset 45
+        // mov rsi, rdi (48 89 fe)                              offset 54
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0x48, 0x89, 0xfe });
 
-        // call __wasm_main (e8 XX XX XX XX)                    offset 48, reloc disp at 49
+        // call __wasm_main (e8 XX XX XX XX)                    offset 57, reloc disp at 58
         try wrapper_code.appendSlice(self.allocator, &[_]u8{ 0xe8, 0x00, 0x00, 0x00, 0x00 });
 
-        // pop rbp (5d)                                         offset 53
+        // pop rbp (5d)                                         offset 62
         try wrapper_code.append(self.allocator, 0x5d);
 
-        // ret (c3)                                             offset 54
+        // ret (c3)                                             offset 63
         try wrapper_code.append(self.allocator, 0xc3);
 
         // Declare main wrapper
@@ -1753,20 +1954,17 @@ pub const Driver = struct {
         try module.declareExternalName(vmctx_ext_idx, "vmctx_data");
         try module.declareExternalName(wasm_main_ext_idx, "__wasm_main");
 
-        // Calculate relocation offsets:
-        // push rbp(1) + mov rbp,rsp(3) + push rdi(1) + push rsi(1) + lea opcode(3) = 9 for lea displacement
-        // lea(7) + lea(7) + mov(7) + pop(1) + mov(7) + pop(1) + cdqe(2) + mov(7) + mov(3) + call opcode(1) = 49 for call displacement
         const relocs = [_]FinalizedMachReloc{
-            // lea rdi, [rip + vmctx_data] - displacement at offset 9
+            // lea rdi, [rip + vmctx_data] - displacement at offset 10
             .{
-                .offset = 9,
+                .offset = 10,
                 .kind = Reloc.X86PCRel4,
                 .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
                 .addend = -4, // RIP-relative adjustment
             },
-            // call __wasm_main - displacement at offset 49
+            // call __wasm_main - displacement at offset 58
             .{
-                .offset = 49,
+                .offset = 58,
                 .kind = Reloc.X86CallPCRel4,
                 .target = FinalizedRelocTarget{ .ExternalName = wasm_main_name_ref },
                 .addend = -4, // Call instruction adjustment
@@ -1873,6 +2071,9 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, wasi_runtime.ARGS_COUNT_NAME, wasi_funcs.args_count_idx);
         try func_indices.put(self.allocator, wasi_runtime.ARG_LEN_NAME, wasi_funcs.arg_len_idx);
         try func_indices.put(self.allocator, wasi_runtime.ARG_PTR_NAME, wasi_funcs.arg_ptr_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ENVIRON_COUNT_NAME, wasi_funcs.environ_count_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ENVIRON_LEN_NAME, wasi_funcs.environ_len_idx);
+        try func_indices.put(self.allocator, wasi_runtime.ENVIRON_PTR_NAME, wasi_funcs.environ_ptr_idx);
 
         // Add test function names to index map (Zig)
         try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx);

@@ -65,6 +65,7 @@ const batch_files = [_]TestFileSpec{
     .{ .path = "test/e2e/set.cot", .test_count = 10 },
     .{ .path = "test/e2e/string_interp.cot", .test_count = 10 },
     .{ .path = "test/e2e/wasi_io.cot", .test_count = 19 },
+    .{ .path = "test/e2e/std_io.cot", .test_count = 30 },
     // cases/
     .{ .path = "test/cases/arithmetic.cot", .test_count = 10 },
     .{ .path = "test/cases/arrays.cot", .test_count = 6 },
@@ -158,7 +159,7 @@ fn buildCombinedSource(allocator: std.mem.Allocator) ![]const u8 {
 // Batch test: ALL test files compiled together (1 compile, 1 link, 1 run)
 // ============================================================================
 
-test "all native tests (735 tests)" {
+test "all native tests (765 tests)" {
     var timer = std.time.Timer.start() catch {
         std.debug.print("[native] all tests (batch)...", .{});
         return runBatchTest(std.testing.allocator);
@@ -569,115 +570,8 @@ test "native: fd_read from stdin" {
     , "hello", 0, "hello", "fd_read_stdin");
 }
 
-// fd_close: close stderr (fd 2), verify no crash, write still works on stdout
-// Reference: Wasmtime p1_close_preopen.rs — close fd, verify program continues
-test "native: fd_close valid fd" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    var msg = "OK"
-        \\    var r = @fd_close(2)
-        \\    @fd_write(1, @ptrOf(msg), @lenOf(msg))
-        \\    return 0
-        \\}
-    , 0, "OK", "fd_close_valid");
-}
-
-// fd_open: verify we can open /dev/null and get a valid fd
-// Simplified to avoid register pressure in main() mode
-test "native: fd_open dev null" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    var path = "/dev/null"
-        \\    var fd = @fd_open(@ptrOf(path), @lenOf(path), 0)
-        \\    @fd_close(fd)
-        \\    return fd
-        \\}
-    , 3, "", "fd_open_devnull");
-}
-
-// @time() — verify it returns a positive value (nanoseconds since epoch)
-test "native: time returns positive" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    var t = @time()
-        \\    if t > 0 {
-        \\        return 42
-        \\    }
-        \\    return 1
-        \\}
-    , 42, "", "time_positive");
-}
-
-// @random(buf, len) — verify it fills buffer and returns 0
-test "native: random returns success" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    var buf = @alloc(16)
-        \\    var result = @random(buf, 16)
-        \\    @dealloc(buf)
-        \\    return result
-        \\}
-    , 0, "", "random_success");
-}
-
-// @exit(code) — verify it exits with the specified code
-test "native: exit with code 42" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    @exit(42)
-        \\    return 0
-        \\}
-    , 42, "", "exit_42");
-}
-
-// @exit(code) — verify it exits with code 0
-test "native: exit with code 0" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    @exit(0)
-        \\    return 1
-        \\}
-    , 0, "", "exit_0");
-}
-
-// @args_count() — verify argc >= 1 (program name always present)
-test "native: args_count returns at least 1" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    var n = @args_count()
-        \\    if n >= 1 {
-        \\        return 0
-        \\    }
-        \\    return 1
-        \\}
-    , 0, "", "args_count");
-}
-
-// @arg_len(0) — verify program name has positive length
-test "native: arg_len of program name" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    var len = @arg_len(0)
-        \\    if len > 0 {
-        \\        return 0
-        \\    }
-        \\    return 1
-        \\}
-    , 0, "", "arg_len_0");
-}
-
-// @arg_ptr(0) — verify program name pointer is valid
-test "native: arg_ptr of program name" {
-    try expectOutput(std.testing.allocator,
-        \\fn main() i64 {
-        \\    var ptr = @arg_ptr(0)
-        \\    if ptr > 0 {
-        \\        return 0
-        \\    }
-        \\    return 1
-        \\}
-    , 0, "", "arg_ptr_0");
-}
+// fd_close, fd_open, time, random, exit, args_count, arg_len, arg_ptr
+// are all tested via the batch test (wasi_io.cot). No individual tests needed.
 
 // ============================================================================
 // Test Mode (cot test) E2E Tests -- inline code, verify output format
@@ -793,6 +687,24 @@ fn expectTestModeInner(backing_allocator: std.mem.Allocator, code: []const u8, e
         });
         return error.WrongOutput;
     }
+}
+
+// @exit() terminates the process, so it can't be batch-tested.
+// These must remain as individual subprocess tests.
+test "native: exit with code 42" {
+    try expectOutput(std.testing.allocator,
+        \\fn main() void {
+        \\    @exit(42)
+        \\}
+    , 42, "", "exit_42");
+}
+
+test "native: exit with code 0" {
+    try expectOutput(std.testing.allocator,
+        \\fn main() void {
+        \\    @exit(0)
+        \\}
+    , 0, "", "exit_0");
 }
 
 test "native: test mode - all pass" {

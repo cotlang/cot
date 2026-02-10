@@ -308,7 +308,7 @@ fn compileAndLink(
         const triple: []const u8 = switch (compile_target.os) {
             .linux => if (compile_target.arch == .amd64) "x86_64-linux-gnu" else "aarch64-linux-gnu",
             .macos => if (compile_target.arch == .arm64) "aarch64-macos" else "x86_64-macos",
-            .freestanding => unreachable, // Handled above with isWasm()
+            .freestanding, .wasi => unreachable, // Handled above with isWasm()
         };
         link_args.appendSlice(allocator, &.{ "zig", "cc", "-target", triple, "-o", output_name, obj_path }) catch {
             std.debug.print("Error: Allocation failed\n", .{});

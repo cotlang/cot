@@ -1,0 +1,39 @@
+// time — Clock utilities.
+//
+// Wraps @time() builtin (nanoseconds since epoch).
+// Reference: Zig std.time (nanoTimestamp, milliTimestamp, timestamp, Timer)
+
+const ns_per_ms: i64 = 1000000
+const ns_per_s: i64 = 1000000000
+const ms_per_s: i64 = 1000
+
+fn nanoTimestamp() i64 {
+    return @time()
+}
+
+fn milliTimestamp() i64 {
+    return @time() / 1000000
+}
+
+fn timestamp() i64 {
+    return @time() / 1000000000
+}
+
+struct Timer {
+    start_time: i64,
+}
+
+fn startTimer() Timer {
+    var t = nanoTimestamp()
+    return Timer { .start_time = t }
+}
+
+impl Timer {
+    fn elapsed(self: *Timer) i64 {
+        return @time() - self.start_time
+    }
+
+    fn reset(self: *Timer) void {
+        self.start_time = @time()
+    }
+}

@@ -978,13 +978,13 @@ pub const Parser = struct {
             const v = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = t, .args = .{ v, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "trap") or std.mem.eql(u8, name, "time") or std.mem.eql(u8, name, "args_count")) {
+        } else if (std.mem.eql(u8, name, "trap") or std.mem.eql(u8, name, "time") or std.mem.eql(u8, name, "args_count") or std.mem.eql(u8, name, "environ_count")) {
             // @trap() — 0 args, Wasm unreachable / ARM64 brk #1
             // @time() — 0 args, returns nanoseconds since epoch
             // @args_count() — 0 args, returns number of CLI arguments
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
-        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf") or std.mem.eql(u8, name, "fd_close") or std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "arg_len") or std.mem.eql(u8, name, "arg_ptr")) {
+        } else if (std.mem.eql(u8, name, "ptrToInt") or std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "dealloc") or std.mem.eql(u8, name, "ptrOf") or std.mem.eql(u8, name, "lenOf") or std.mem.eql(u8, name, "fd_close") or std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "arg_len") or std.mem.eql(u8, name, "arg_ptr") or std.mem.eql(u8, name, "environ_len") or std.mem.eql(u8, name, "environ_ptr")) {
             const arg = try self.parseExpr() orelse return null;
             if (!self.expect(.rparen)) return null;
             return try self.tree.addExpr(.{ .builtin_call = .{ .name = name, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });

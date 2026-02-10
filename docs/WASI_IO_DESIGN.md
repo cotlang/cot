@@ -292,16 +292,18 @@ Eventually, `cot_write` could be reimplemented on top of `fd_write` (building a 
 
 | Phase | What | Files to modify | Effort |
 |-------|------|-----------------|--------|
-| **1a** | `fd_write` + `fd_read` + `fd_close` WASI functions | `driver.zig`, `arc.zig` or new `wasi_runtime.zig`, `link.zig` | Medium |
-| **1b** | `path_open` + `fd_seek` + `fd_fdstat_get` | `driver.zig` (native overrides) | Medium |
-| **1c** | `std/fs.cot` stdlib — File struct with open/read/write/seek/close | `stdlib/fs.cot` (new) | Small |
-| **2a** | `args_get` + `args_sizes_get` native implementation | `driver.zig` | Small |
-| **2b** | `environ_get` + `environ_sizes_get` native implementation | `driver.zig` | Small |
-| **2c** | `std/os.cot` stdlib — args(), getenv(), exit() | `stdlib/os.cot` (new) | Small |
-| **3a** | `clock_time_get` + `random_get` native implementation | `driver.zig` | Small |
-| **3b** | `std/time.cot` + `std/random.cot` stdlib | `stdlib/time.cot`, `stdlib/random.cot` (new) | Small |
+| **1a** | `fd_write` + `fd_read` + `fd_close` WASI functions | `wasi_runtime.zig`, `driver.zig` | **DONE** |
+| **1b** | `path_open` + `fd_seek` + `fd_fdstat_get` | `driver.zig` (native overrides) | **DONE** |
+| **1c** | `std/fs.cot` stdlib — File struct with open/read/write/seek/close | `stdlib/fs.cot` | **DONE** |
+| **2a** | `args_get` + `args_sizes_get` native implementation | `driver.zig` | **DONE** |
+| **2b** | `environ_get` + `environ_sizes_get` native implementation | `driver.zig` | **DONE** |
+| **2c** | `std/os.cot` stdlib — args, environ, exit | `stdlib/os.cot` | **DONE** |
+| **3a** | `clock_time_get` + `random_get` native implementation | `driver.zig` | **DONE** |
+| **3b** | `std/time.cot` + `std/random.cot` stdlib | `stdlib/time.cot`, `stdlib/random.cot` | **DONE** |
 
-**Phase 1a is the critical path** — it proves the full WASI function pattern (registration, iovec handling, native override, Wasm import) end-to-end. All subsequent phases follow the same pattern.
+**All stdlib and native override phases complete.** The pattern established in Phase 1a (registration + native override + stdlib wrapper) was replicated across all subsequent phases.
+
+**Remaining:** `--target=wasm32-wasi` conditional import registration. When `target.os == .wasi`, `wasi_runtime.zig` should emit WASI functions as **imports** from `"wasi_snapshot_preview1"` instead of stub module functions. The target enum and CLI parsing are done (`compiler/core/target.zig`, `compiler/cli.zig`), but the conditional codegen logic in `wasi_runtime.zig` is not yet wired up. See Section 4 ("Target: `--target=wasm32-wasi`") for the design.
 
 ### Dependency graph
 
@@ -377,12 +379,14 @@ Unlike file I/O, `args_get` and `environ_get` don't map to a single syscall. On 
 
 ---
 
-## 9. Open Questions
+## 9. Open Questions (Resolved / Remaining)
 
-1. **WASI function registration location:** Should WASI functions go in `print_runtime.zig` (renamed to `runtime.zig`), a new `wasi_runtime.zig`, or `arc.zig`? Recommendation: new `wasi_runtime.zig` to keep concerns separated.
+1. **WASI function registration location:** ~~Should WASI functions go in `print_runtime.zig`, a new `wasi_runtime.zig`, or `arc.zig`?~~ **Resolved:** `compiler/codegen/wasi_runtime.zig` — separate file, clean separation of concerns.
 
-2. **Vectored I/O:** Should `fd_write`/`fd_read` native overrides use `SYS_writev`/`SYS_readv` (single syscall for multiple iovecs) or loop over `SYS_write`/`SYS_read`? Recommendation: start with loop (simpler), optimize to `writev`/`readv` later if needed.
+2. **Vectored I/O:** ~~`SYS_writev`/`SYS_readv` vs loop?~~ **Resolved:** Using simple `SYS_write`/`SYS_read` loop. Cot stdlib always passes 1-element iovecs, so single syscall per call.
 
-3. **Error handling in stdlib:** Cot has error unions (Zig pattern). Should `File.open()` return `File!Error` (error union) or trap on failure? Recommendation: error unions — matches language design.
+3. **Error handling in stdlib:** ~~Error unions or trap?~~ **Resolved:** File methods use `FsError!i64` error unions. `openFile`/`createFile` currently return `File` directly (caller checks `isValid()`). Future: return `FsError!File` once error union struct returns are supported.
 
-4. **Multi-file imports:** Currently Cot's multi-file support uses `SharedGenericContext`. Stdlib modules (`std/fs.cot`, `std/os.cot`) will need to be importable. This depends on the import system design, which is a separate concern.
+4. **Multi-file imports:** ~~Depends on import system.~~ **Resolved:** `import "std/fs"` works via `SharedGenericContext` + 3-tier stdlib discovery (COT_STDLIB env var → ancestor walk → CWD fallback).
+
+5. **Remaining: `--target=wasm32-wasi` conditional imports.** Target enum and CLI parsing are done, but `wasi_runtime.zig` doesn't yet conditionally emit WASI imports vs stubs based on target. This is the last piece needed for full WASI host compatibility.

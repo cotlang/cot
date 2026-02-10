@@ -1,0 +1,32 @@
+// os — Process utilities.
+//
+// Wraps @exit, @args_count, @arg_len, @arg_ptr, @environ_count, @environ_len, @environ_ptr builtins.
+// Reference: Zig std.process (exit, argsAlloc, EnvMap)
+
+fn exit(code: i64) void {
+    @exit(code)
+}
+
+fn argsCount() i64 {
+    return @args_count()
+}
+
+fn argLen(n: i64) i64 {
+    return @arg_len(n)
+}
+
+fn argPtr(n: i64) i64 {
+    return @arg_ptr(n)
+}
+
+fn environCount() i64 {
+    return @environ_count()
+}
+
+fn environLen(n: i64) i64 {
+    return @environ_len(n)
+}
+
+fn environPtr(n: i64) i64 {
+    return @environ_ptr(n)
+}

@@ -1,0 +1,26 @@
+// random — Random number generation.
+//
+// Wraps @random(buf, len) builtin (cryptographic random bytes).
+// Reference: Zig std.crypto.random (fill pattern)
+
+fn fillBytes(buf: i64, len: i64) i64 {
+    return @random(buf, len)
+}
+
+fn randomInt() i64 {
+    var buf = @alloc(8)
+    @random(buf, 8)
+    var ptr = @intToPtr(*i64, buf)
+    var val = ptr.*
+    @dealloc(buf)
+    return val
+}
+
+fn randomRange(max: i64) i64 {
+    if max <= 0 { return 0 }
+    var val = randomInt()
+    // Clear sign bit to ensure non-negative
+    var mask = (0 - 1) >> 1
+    val = val & mask
+    return val - (val / max) * max
+}

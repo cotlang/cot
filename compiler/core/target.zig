@@ -21,6 +21,7 @@ pub const Os = enum {
     macos,
     linux,
     freestanding, // For Wasm (no OS)
+    wasi, // WebAssembly System Interface
 
     pub fn name(self: Os) []const u8 {
         return @tagName(self);
@@ -34,6 +35,7 @@ pub const Target = struct {
     pub const arm64_macos = Target{ .arch = .arm64, .os = .macos };
     pub const amd64_linux = Target{ .arch = .amd64, .os = .linux };
     pub const wasm32 = Target{ .arch = .wasm32, .os = .freestanding };
+    pub const wasm32_wasi = Target{ .arch = .wasm32, .os = .wasi };
 
     pub fn native() Target {
         const arch: Arch = switch (builtin.cpu.arch) {
@@ -50,6 +52,7 @@ pub const Target = struct {
     }
 
     pub fn name(self: Target) []const u8 {
+        if (self.arch == .wasm32 and self.os == .wasi) return "wasm32-wasi";
         if (self.arch == .wasm32) return "wasm32";
         if (self.arch == .arm64 and self.os == .macos) return "arm64-macos";
         if (self.arch == .amd64 and self.os == .linux) return "amd64-linux";
@@ -59,6 +62,7 @@ pub const Target = struct {
     }
 
     pub fn parse(s: []const u8) ?Target {
+        if (std.mem.eql(u8, s, "wasm32-wasi") or std.mem.eql(u8, s, "wasi")) return wasm32_wasi;
         if (std.mem.eql(u8, s, "wasm32") or std.mem.eql(u8, s, "wasm")) return wasm32;
         if (std.mem.eql(u8, s, "arm64-macos")) return arm64_macos;
         if (std.mem.eql(u8, s, "amd64-linux")) return amd64_linux;
@@ -70,6 +74,10 @@ pub const Target = struct {
 
     pub fn isWasm(self: Target) bool {
         return self.arch.isWasm();
+    }
+
+    pub fn isWasi(self: Target) bool {
+        return self.os == .wasi;
     }
 
     pub inline fn usesMachO(self: Target) bool {
