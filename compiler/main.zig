@@ -181,11 +181,6 @@ fn runCommand(allocator: std.mem.Allocator, opts: cli.RunOptions) void {
 }
 
 fn testCommand(allocator: std.mem.Allocator, opts: cli.TestOptions) void {
-    if (opts.target.isWasm()) {
-        std.debug.print("Error: 'cot test' does not support --target=wasm32\n", .{});
-        std.process.exit(1);
-    }
-
     // Compile to temp directory
     const tmp_dir = "/tmp/cot-run";
     std.fs.cwd().makePath(tmp_dir) catch {
@@ -207,11 +202,28 @@ fn testCommand(allocator: std.mem.Allocator, opts: cli.TestOptions) void {
 
     compileAndLink(allocator, opts.input_file, tmp_output, opts.target, true, true);
 
-    // Run the test executable
-    var child = std.process.Child.init(&.{tmp_output}, allocator);
-    // stdin/stdout/stderr default to .Inherit
+    // Run the test: wasmtime for wasm targets, direct execution for native
+    const run_path = if (opts.target.isWasm())
+        std.fmt.allocPrint(allocator, "{s}.wasm", .{tmp_output}) catch {
+            std.debug.print("Error: Allocation failed\n", .{});
+            std.process.exit(1);
+        }
+    else
+        tmp_output;
+
+    const argv: []const []const u8 = if (opts.target.isWasm())
+        &.{ "wasmtime", run_path }
+    else
+        &.{run_path};
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
     const result = child.spawnAndWait() catch |e| {
-        std.debug.print("Error: Failed to run tests: {any}\n", .{e});
+        if (opts.target.isWasm()) {
+            std.debug.print("Error: Failed to run wasmtime (is it installed?): {any}\n", .{e});
+        } else {
+            std.debug.print("Error: Failed to run tests: {any}\n", .{e});
+        }
         cleanup(tmp_dir);
         std.process.exit(1);
     };
