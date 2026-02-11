@@ -27,14 +27,14 @@ jobs:
       - name: Install wasmtime
         run: |
           curl https://wasmtime.dev/install.sh -sSf | bash
-          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
+          ls -la $HOME/.wasmtime/bin/ || true
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Verify wasmtime
+        run: wasmtime --version
 
       - name: Cot tests (wasm)
-        run: |
-          wasmtime --version
-          # Debug: test a single file first
-          ./zig-out/bin/cot test test/e2e/auto_free.cot --target=wasm32 || echo "Exit code: $?"
-          ./test/run_all.sh --target=wasm32
+        run: ./test/run_all.sh --target=wasm32
 
   test-linux:
     runs-on: ubuntu-latest
@@ -57,11 +57,11 @@ jobs:
       - name: Install wasmtime
         run: |
           curl https://wasmtime.dev/install.sh -sSf | bash
-          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
+          ls -la $HOME/.wasmtime/bin/ || true
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Verify wasmtime
+        run: wasmtime --version
 
       - name: Cot tests (wasm)
-        run: |
-          wasmtime --version
-          # Debug: test a single file first
-          ./zig-out/bin/cot test test/e2e/auto_free.cot --target=wasm32 || echo "Exit code: $?"
-          ./test/run_all.sh --target=wasm32
+        run: ./test/run_all.sh --target=wasm32
