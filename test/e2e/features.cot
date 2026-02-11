@@ -1708,6 +1708,10 @@ test "compileError in dead else with target check" {
         @assert(true)
     } else if @target_os() == "linux" {
         @assert(true)
+    } else if @target_os() == "freestanding" {
+        @assert(true)
+    } else if @target_os() == "wasi" {
+        @assert(true)
     } else {
         @compileError("unsupported OS")
     }

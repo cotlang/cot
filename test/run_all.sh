@@ -57,8 +57,8 @@ echo ""
 for f in "${files[@]}"; do
     printf "%-45s" "$f"
     if output=$("$COT" test "$f" $TARGET_FLAG 2>&1); then
-        # Extract summary line (last non-empty line of stderr)
-        summary=$(echo "$output" | grep -E '[0-9]+ passed' | tail -1)
+        # Extract summary line if present (may be just "Tests passed" for wasm)
+        summary=$(echo "$output" | grep -E '[0-9]+ passed' | tail -1 || true)
         echo "ok  $summary"
         passed=$((passed + 1))
     else
