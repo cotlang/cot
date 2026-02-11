@@ -25,11 +25,13 @@ jobs:
         run: ./test/run_all.sh
 
       - name: Install wasmtime
-        run: curl https://wasmtime.dev/install.sh -sSf | bash
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
 
       - name: Cot tests (wasm)
         run: |
-          export PATH="$HOME/.wasmtime/bin:$PATH"
+          wasmtime --version
           ./test/run_all.sh --target=wasm32
 
   test-linux:
@@ -51,9 +53,11 @@ jobs:
         run: ./test/run_all.sh
 
       - name: Install wasmtime
-        run: curl https://wasmtime.dev/install.sh -sSf | bash
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
 
       - name: Cot tests (wasm)
         run: |
-          export PATH="$HOME/.wasmtime/bin:$PATH"
+          wasmtime --version
           ./test/run_all.sh --target=wasm32
