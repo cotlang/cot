@@ -7,3 +7,5 @@ a.out.o
 *.wasm
 *.wasm.o
 test_io*
+cot-mcp
+cot-mcp.o

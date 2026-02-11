@@ -1,6 +1,6 @@
 // cot-mcp — MCP server for Cot language tools.
 //
-// Provides Claude with Cot syntax reference, stdlib docs, and known issues.
+// Provides Claude with Cot syntax reference, stdlib docs, and project info.
 // Protocol: JSON-RPC 2.0 over stdio, newline-delimited.
 
 import "std/json"
