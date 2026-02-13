@@ -712,7 +712,7 @@ pub const SSABuilder = struct {
         const is_float = type_idx == TypeRegistry.F64 or type_idx == TypeRegistry.F32 or type_idx == TypeRegistry.UNTYPED_FLOAT;
         const op_kind: Op = switch (u.op) {
             .neg => if (is_float) .neg64f else .neg,
-            .not => .not, .bit_not => .not, .optional_unwrap => .copy,
+            .not => .bool_not, .bit_not => .not, .optional_unwrap => .copy,
             // Math builtins — emit Wasm f64 ops directly (already in lower_wasm pass-through)
             .abs => .wasm_f64_abs,
             .ceil => .wasm_f64_ceil,

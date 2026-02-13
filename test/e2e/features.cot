@@ -1787,3 +1787,23 @@ test "string conditional reassignment" {
     @assert_eq(s, "yes")
     @assert_eq(@lenOf(s), 3)
 }
+
+test "while not done" {
+    var done = false
+    var count: i64 = 0
+    while not done {
+        count = count + 1
+        if count == 5 {
+            done = true
+        }
+    }
+    @assert_eq(count, 5)
+}
+
+test "not operator on bool" {
+    var x = true
+    var y = not x
+    @assert_eq(y, 0)
+    var z = not false
+    @assert_eq(z, 1)
+}

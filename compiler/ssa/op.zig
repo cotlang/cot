@@ -26,7 +26,7 @@ pub const Op = enum(u16) {
     divmod32, divmod64, divmodu32, divmodu64,
 
     // === Bitwise (Generic) ===
-    and_, or_, xor, shl, shr, sar, not,
+    and_, or_, xor, shl, shr, sar, not, bool_not,
 
     // === Bitwise (Sized) ===
     and8, and16, and32, and64, or8, or16, or32, or64, xor8, xor16, xor32, xor64,
@@ -317,6 +317,7 @@ const op_info_table = blk: {
         table[@intFromEnum(op)] = .{ .name = @tagName(op), .arg_len = 2 };
     }
     table[@intFromEnum(Op.not)] = .{ .name = "Not", .arg_len = 1 };
+    table[@intFromEnum(Op.bool_not)] = .{ .name = "BoolNot", .arg_len = 1 };
 
     // Comparisons (all produce bool, 2 args)
     for ([_]Op{ .eq, .ne }) |op| {

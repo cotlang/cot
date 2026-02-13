@@ -85,6 +85,7 @@ fn lowerValue(v: *Value) bool {
         .shr, .shr64 => .wasm_i64_shr_u, // unsigned
         .sar, .sar64 => .wasm_i64_shr_s, // signed (arithmetic)
         .not => null, // Wasm has no not; use xor -1
+        .bool_not => .wasm_i64_eqz, // Go: OpNot → OpWasmI64Eqz (rewriteWasm.go:412-414)
 
         // 32-bit bitwise
         .and32 => .wasm_i32_and,

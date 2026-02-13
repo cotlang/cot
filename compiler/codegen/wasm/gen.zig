@@ -267,12 +267,8 @@ pub const GenState = struct {
                 if (v.op != .phi) continue;
                 if (pred_idx >= v.args.len) continue;
                 const arg = v.args[pred_idx];
-                // Get arg value on stack
+                // Get arg value on stack (getValue64 handles i32→i64 extend for cmp values)
                 try self.getValue64(arg);
-                // If arg produces i32 (cmp/bool), extend to i64 for the phi's i64 local
-                if (isCmp(arg)) {
-                    _ = try self.builder.append(.i64_extend_i32_u);
-                }
                 // Store to phi's local
                 if (self.value_to_local.get(v.id)) |local_idx| {
                     _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(local_idx));
@@ -314,8 +310,12 @@ pub const GenState = struct {
             return;
         }
 
-        // Generate on stack
+        // Generate on stack (on-demand values like comparisons)
+        // Go: ssaGenValueOnStack(s, v, true) — extend=true extends i32 cmp results to i64
         try self.ssaGenValueOnStack(v);
+        if (isCmp(v)) {
+            _ = try self.builder.append(.i64_extend_i32_u);
+        }
     }
 
     /// Store top of stack to local
@@ -343,8 +343,8 @@ pub const GenState = struct {
                 _ = try self.builder.appendFrom(.f64_const, prog_mod.floatAddr(@bitCast(v.aux_int)));
             },
             .const_bool => {
-                // Booleans are i32 in Wasm (0 or 1)
-                _ = try self.builder.appendFrom(.i32_const, prog_mod.constAddr(if (v.aux_int != 0) @as(i64, 1) else @as(i64, 0)));
+                // Go: booleans are i64 (0 or 1) — same as all other values
+                _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(if (v.aux_int != 0) @as(i64, 1) else @as(i64, 0)));
             },
             .const_nil => {
                 // Nil/null is 0 (null pointer)
@@ -1344,13 +1344,13 @@ fn isRematerializable(v: *const SsaValue) bool {
 }
 
 fn isCmp(v: *const SsaValue) bool {
-    // Returns true if value is already i32 (comparisons and booleans)
+    // Returns true if value is already i32 (comparisons produce i32 in wasm)
+    // Go: isCmp (ssa.go:463-471) — only wasm comparison ops
     return switch (v.op) {
         .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
         .wasm_i64_gt_s, .wasm_i64_ge_s, .wasm_i64_eqz,
         .wasm_f64_eq, .wasm_f64_ne, .wasm_f64_lt, .wasm_f64_le,
         .wasm_f64_gt, .wasm_f64_ge,
-        .const_bool, // Booleans are already i32
         => true,
         else => false,
     };
