@@ -1,5 +1,8 @@
 # Cot Compiler
 
+[![CI](https://github.com/cot-land/cot/actions/workflows/test.yml/badge.svg)](https://github.com/cot-land/cot/actions/workflows/test.yml)
+[![Release](https://github.com/cot-land/cot/actions/workflows/release.yml/badge.svg)](https://github.com/cot-land/cot/actions/workflows/release.yml)
+
 A Wasm-first language for full-stack web development.
 
 **The pitch:** Write like TypeScript, run like Rust, deploy anywhere, never think about memory.
