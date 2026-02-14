@@ -1,4 +1,5 @@
 //! textDocument/references — find all references to a symbol.
+//! Supports cross-file references: scans both the current file and imported deps.
 
 const std = @import("std");
 const ast_mod = @import("../frontend/ast.zig");
@@ -19,7 +20,7 @@ const AnalysisResult = analysis.AnalysisResult;
 const Location = lsp_types.Location;
 
 /// Find all references to the symbol at the given byte offset.
-/// Single-file only (same as current goto-def).
+/// Scans the current file and all imported dependency files.
 pub fn getReferences(
     allocator: std.mem.Allocator,
     result: *AnalysisResult,
@@ -38,7 +39,7 @@ pub fn getReferences(
     const sym = result.global_scope.lookup(name) orelse return &.{};
     const def_node_idx = sym.node;
 
-    // Walk all nodes and collect references
+    // Walk all nodes in current file and collect references
     var locations = std.ArrayListUnmanaged(Location){};
 
     for (result.tree.nodes.items, 0..) |n, i| {
@@ -54,6 +55,19 @@ pub fn getReferences(
             .uri = uri,
             .range = lsp_types.spanToRange(result.src.content, span),
         });
+    }
+
+    // Scan dependency files for references
+    for (result.dep_files) |dep| {
+        for (dep.tree.nodes.items) |n| {
+            const ref_name = getNodeName(n) orelse continue;
+            if (!std.mem.eql(u8, ref_name, name)) continue;
+            const span = n.span();
+            try locations.append(allocator, .{
+                .uri = dep.uri,
+                .range = lsp_types.spanToRange(dep.src.content, span),
+            });
+        }
     }
 
     return locations.toOwnedSlice(allocator);

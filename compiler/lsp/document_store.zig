@@ -45,7 +45,7 @@ pub const DocumentStore = struct {
         // Extract filename from URI (strip file:// prefix)
         const filename = uriToFilename(uri);
 
-        var result = analysis.analyze(self.allocator, text_dupe, filename);
+        const result = analysis.analyzeWithImports(self.allocator, text_dupe, filename);
 
         const handle = DocumentHandle{
             .uri = uri_dupe,
@@ -57,7 +57,6 @@ pub const DocumentStore = struct {
 
         // Use uri_dupe as key (same memory as handle.uri)
         try self.documents.put(uri_dupe, handle);
-        _ = &result;
     }
 
     pub fn change(self: *DocumentStore, uri: []const u8, version: i64, new_text: []const u8) !void {
@@ -71,7 +70,7 @@ pub const DocumentStore = struct {
 
             handle.version = version;
             handle.text = text_dupe;
-            handle.result = analysis.analyze(self.allocator, text_dupe, filename);
+            handle.result = analysis.analyzeWithImports(self.allocator, text_dupe, filename);
         }
     }
 
