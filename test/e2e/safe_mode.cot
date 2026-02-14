@@ -62,3 +62,130 @@ test "safe scalars unchanged" {
     @assert_eq(s, "hello")
     @assert_eq(b, true)
 }
+
+// --- Feature 1: Field init shorthand ---
+
+test "field init shorthand in new expr" {
+    var x: i64 = 10
+    var y: i64 = 20
+    var p = new SafePoint { x, y }
+    @assert_eq(p.x, 10)
+    @assert_eq(p.y, 20)
+}
+
+test "field init shorthand mixed" {
+    var x: i64 = 5
+    var p = new SafePoint { x, y: 99 }
+    @assert_eq(p.x, 5)
+    @assert_eq(p.y, 99)
+}
+
+// --- Feature 2: Unified init syntax (colon syntax for stack struct init) ---
+
+test "colon syntax stack struct init" {
+    var p = SafePoint { x: 1, y: 2 }
+    @assert_eq(p.x + p.y, 3)
+}
+
+test "colon syntax stack struct shorthand" {
+    var x: i64 = 7
+    var y: i64 = 8
+    var p = SafePoint { x, y }
+    @assert_eq(p.x, 7)
+    @assert_eq(p.y, 8)
+}
+
+test "colon syntax mixed shorthand and explicit" {
+    var x: i64 = 3
+    var p = SafePoint { x, y: 42 }
+    @assert_eq(p.x, 3)
+    @assert_eq(p.y, 42)
+}
+
+test "period syntax still works" {
+    var p = SafePoint { .x = 100, .y = 200 }
+    @assert_eq(p.x + p.y, 300)
+}
+
+// --- Feature 3: Implicit self in @safe mode ---
+
+struct ImplicitSelfPoint { x: i64, y: i64 }
+
+impl ImplicitSelfPoint {
+    fn getX() i64 { return self.x }
+    fn getY() i64 { return self.y }
+    fn sum() i64 { return self.x + self.y }
+    fn setX(val: i64) void { self.x = val }
+}
+
+test "implicit self getter" {
+    var p = new ImplicitSelfPoint { x: 42, y: 58 }
+    @assert_eq(p.getX(), 42)
+    @assert_eq(p.getY(), 58)
+}
+
+test "implicit self computed method" {
+    var p = new ImplicitSelfPoint { x: 10, y: 20 }
+    @assert_eq(p.sum(), 30)
+}
+
+test "implicit self mutation" {
+    var p = new ImplicitSelfPoint { x: 1, y: 2 }
+    p.setX(99)
+    @assert_eq(p.getX(), 99)
+}
+
+test "explicit self still works in safe mode" {
+    var p = new SafePoint { x: 5, y: 6 }
+    @assert_eq(p.getX(), 5)
+}
+
+// --- Feature 4: Constructor sugar ---
+
+struct Rect { width: i64, height: i64 }
+
+impl Rect {
+    fn init(self: *Rect, w: i64, h: i64) void {
+        self.width = w
+        self.height = h
+    }
+
+    fn area(self: *Rect) i64 {
+        return self.width * self.height
+    }
+}
+
+test "constructor sugar basic" {
+    var r = new Rect(10, 20)
+    @assert_eq(r.width, 10)
+    @assert_eq(r.height, 20)
+}
+
+test "constructor sugar with method call" {
+    var r = new Rect(5, 8)
+    @assert_eq(r.area(), 40)
+}
+
+test "constructor sugar zero args" {
+    var p = new SafePoint { x: 0, y: 0 }
+    @assert_eq(p.x, 0)
+}
+
+// Constructor with implicit self
+struct Circle { radius: i64 }
+
+impl Circle {
+    fn init(r: i64) void {
+        self.radius = r
+    }
+
+    fn diameter() i64 {
+        return self.radius * 2
+    }
+}
+
+test "constructor sugar with implicit self" {
+    var c = new Circle(7)
+    @assert_eq(c.radius, 7)
+    @assert_eq(c.diameter(), 14)
+}

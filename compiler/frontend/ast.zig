@@ -134,12 +134,16 @@ pub const SwitchCase = struct {
 pub const BlockExpr = struct { stmts: []const NodeIndex, expr: NodeIndex, span: Span };
 pub const StructInit = struct { type_name: []const u8, type_args: []const NodeIndex = &.{}, fields: []const FieldInit, span: Span };
 pub const FieldInit = struct { name: []const u8, value: NodeIndex, span: Span };
-/// Heap allocation expression: new Type { field: value, ... }
+/// Heap allocation expression: new Type { field: value, ... } or new Type(args...)
 /// Reference: Go's walkNew (walk/builtin.go:601-616)
 pub const NewExpr = struct {
     type_name: []const u8,
     type_args: []const NodeIndex = &.{},
     fields: []const FieldInit,
+    /// Constructor args for `new Type(args...)` sugar — calls init() method
+    constructor_args: []const NodeIndex = &.{},
+    /// True when `()` syntax used instead of `{}`
+    is_constructor: bool = false,
     span: Span,
 };
 pub const BuiltinKind = enum {

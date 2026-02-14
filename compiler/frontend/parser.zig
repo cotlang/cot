@@ -26,6 +26,12 @@ pub const Parser = struct {
     tok: TokenInfo,
     peek_tok: ?TokenInfo,
     nest_lev: u32,
+    /// @safe mode: enables implicit self injection in impl blocks
+    safe_mode: bool = false,
+    /// Current impl block type name (for implicit self injection)
+    current_impl_type: ?[]const u8 = null,
+    /// Whether current impl block is generic (skip implicit self for generics)
+    current_impl_is_generic: bool = false,
 
     const max_nest_lev: u32 = 10000;
     pub const ParseError = error{OutOfMemory};
@@ -51,6 +57,50 @@ pub const Parser = struct {
 
     fn peekNextIsPeriod(self: *Parser) bool {
         return self.check(.lbrace) and self.peekToken().tok == .period;
+    }
+
+    /// Check if current position is `{ ident :` or `{ ident ,` or `{ ident }` — colon-syntax struct init
+    /// (including field shorthand). Handles the case where peek_tok may already be populated.
+    fn peekNextIsIdentColon(self: *Parser) bool {
+        if (!self.check(.lbrace)) return false;
+        // Save complete parser+scanner state
+        const saved_scan_pos = self.scan.pos;
+        const saved_scan_ch = self.scan.ch;
+        // The next token after { is either in peek_tok (if already peeked) or needs scanning
+        const tok_after_brace: TokenInfo = self.peek_tok orelse self.scan.next();
+        if (tok_after_brace.tok != .ident) {
+            self.scan.pos = saved_scan_pos;
+            self.scan.ch = saved_scan_ch;
+            return false;
+        }
+        // Scan one more token: should be : or , or }
+        const tok3 = self.scan.next();
+        const is_colon_syntax = tok3.tok == .colon or tok3.tok == .comma or tok3.tok == .rbrace;
+        // Restore scanner state (parser tok and peek_tok are untouched)
+        self.scan.pos = saved_scan_pos;
+        self.scan.ch = saved_scan_ch;
+        return is_colon_syntax;
+    }
+
+    /// Parse colon-syntax struct fields (@safe only): `{ x: 10, y: 20 }` or shorthand `{ x, y }`
+    /// Caller must have already consumed the `{`. Returns field list.
+    fn parseColonFields(self: *Parser) ParseError![]const ast.FieldInit {
+        var fields = std.ArrayListUnmanaged(ast.FieldInit){};
+        defer fields.deinit(self.allocator);
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            if (!self.check(.ident)) { self.syntaxError("expected field name"); return error.OutOfMemory; }
+            const fname = self.tok.text;
+            const fstart = self.pos();
+            self.advance();
+            const fval = if (self.match(.colon))
+                try self.parseExpr() orelse return error.OutOfMemory
+            else
+                // Field shorthand: `{ x }` → `{ x: x }`
+                try self.tree.addExpr(.{ .ident = .{ .name = fname, .span = Span.init(fstart, self.pos()) } });
+            try fields.append(self.allocator, .{ .name = fname, .value = fval, .span = Span.init(fstart, self.pos()) });
+            if (!self.match(.comma)) break;
+        }
+        return try self.allocator.dupe(ast.FieldInit, fields.items);
     }
 
     fn match(self: *Parser, t: Token) bool {
@@ -99,6 +149,7 @@ pub const Parser = struct {
                 self.advance(); // consume @
                 self.advance(); // consume safe
                 safe_mode = true;
+                self.safe_mode = true;
             }
         }
 
@@ -169,8 +220,25 @@ pub const Parser = struct {
             if (!self.expect(.lparen)) return null;
         }
 
-        const params = try self.parseFieldList(.rparen);
+        var params = try self.parseFieldList(.rparen);
         if (!self.expect(.rparen)) return null;
+
+        // @safe implicit self: In safe-mode non-generic impl blocks, inject `self: *TypeName`
+        // if the first param is not already named "self"
+        if (self.safe_mode and self.current_impl_type != null and !self.current_impl_is_generic) {
+            const needs_self = params.len == 0 or !std.mem.eql(u8, params[0].name, "self");
+            if (needs_self) {
+                const impl_type = self.current_impl_type.?;
+                // Create *TypeName type expression: pointer to named type
+                const named_type = try self.tree.addExpr(.{ .type_expr = .{ .kind = .{ .named = impl_type }, .span = Span.init(start, start) } });
+                const ptr_type = try self.tree.addExpr(.{ .type_expr = .{ .kind = .{ .pointer = named_type }, .span = Span.init(start, start) } });
+                // Prepend self param
+                var new_params = try self.allocator.alloc(ast.Field, params.len + 1);
+                new_params[0] = .{ .name = "self", .type_expr = ptr_type, .default_value = null_node, .span = Span.init(start, start) };
+                @memcpy(new_params[1..], params);
+                params = new_params;
+            }
+        }
 
         var return_type: NodeIndex = null_node;
         if (!self.check(.lbrace) and !self.check(.semicolon) and !self.check(.eof) and !self.check(.kw_where))
@@ -328,6 +396,16 @@ pub const Parser = struct {
 
         if (!self.expect(.lbrace)) return null;
 
+        // Save/restore impl context for implicit self injection (@safe mode)
+        const saved_impl_type = self.current_impl_type;
+        const saved_impl_is_generic = self.current_impl_is_generic;
+        self.current_impl_type = type_name;
+        self.current_impl_is_generic = (type_params.len > 0);
+        defer {
+            self.current_impl_type = saved_impl_type;
+            self.current_impl_is_generic = saved_impl_is_generic;
+        }
+
         var methods = std.ArrayListUnmanaged(NodeIndex){};
         defer methods.deinit(self.allocator);
         while (!self.check(.rbrace) and !self.check(.eof)) {
@@ -374,6 +452,16 @@ pub const Parser = struct {
             return null;
         }
         if (!self.expect(.lbrace)) return null;
+
+        // Save/restore impl context for implicit self injection (@safe mode)
+        const saved_impl_type = self.current_impl_type;
+        const saved_impl_is_generic = self.current_impl_is_generic;
+        self.current_impl_type = target_type;
+        self.current_impl_is_generic = (type_params.len > 0);
+        defer {
+            self.current_impl_type = saved_impl_type;
+            self.current_impl_is_generic = saved_impl_is_generic;
+        }
 
         var methods = std.ArrayListUnmanaged(NodeIndex){};
         defer methods.deinit(self.allocator);
@@ -694,7 +782,8 @@ pub const Parser = struct {
                     if (n.asExpr()) |e| {
                         // Generic struct literal: List(i64) { .items = 0, ... }
                         // Detected when expr is call(UppercaseIdent, args) followed by { .
-                        if (e == .call and self.peekNextIsPeriod()) {
+                        if (e == .call and (self.peekNextIsPeriod() or (self.safe_mode and self.peekNextIsIdentColon()))) {
+                            const use_colon = self.safe_mode and self.peekNextIsIdentColon();
                             const call_node = e.call;
                             if (self.tree.getNode(call_node.callee)) |callee_node| {
                                 if (callee_node.asExpr()) |callee_expr| {
@@ -703,24 +792,27 @@ pub const Parser = struct {
                                         if (callee_name.len > 0 and std.ascii.isUpper(callee_name[0])) {
                                             const s = self.tree.getNode(expr).?.span();
                                             self.advance(); // consume {
-                                            var fields = std.ArrayListUnmanaged(ast.FieldInit){};
-                                            defer fields.deinit(self.allocator);
-                                            while (!self.check(.rbrace) and !self.check(.eof)) {
-                                                if (!self.expect(.period)) return null;
-                                                if (!self.check(.ident)) { self.syntaxError("expected field name"); return null; }
-                                                const fname = self.tok.text;
-                                                const fstart = self.pos();
-                                                self.advance();
-                                                if (!self.expect(.assign)) return null;
-                                                const val = try self.parseExpr() orelse return null;
-                                                try fields.append(self.allocator, .{ .name = fname, .value = val, .span = Span.init(fstart, self.pos()) });
-                                                if (!self.match(.comma)) break;
-                                            }
+                                            const init_fields = if (use_colon) try self.parseColonFields() else blk: {
+                                                var fields = std.ArrayListUnmanaged(ast.FieldInit){};
+                                                defer fields.deinit(self.allocator);
+                                                while (!self.check(.rbrace) and !self.check(.eof)) {
+                                                    if (!self.expect(.period)) return null;
+                                                    if (!self.check(.ident)) { self.syntaxError("expected field name"); return null; }
+                                                    const fname = self.tok.text;
+                                                    const fstart = self.pos();
+                                                    self.advance();
+                                                    if (!self.expect(.assign)) return null;
+                                                    const val = try self.parseExpr() orelse return null;
+                                                    try fields.append(self.allocator, .{ .name = fname, .value = val, .span = Span.init(fstart, self.pos()) });
+                                                    if (!self.match(.comma)) break;
+                                                }
+                                                break :blk try self.allocator.dupe(ast.FieldInit, fields.items);
+                                            };
                                             if (!self.expect(.rbrace)) return null;
                                             expr = try self.tree.addExpr(.{ .struct_init = .{
                                                 .type_name = callee_name,
                                                 .type_args = call_node.args,
-                                                .fields = try self.allocator.dupe(ast.FieldInit, fields.items),
+                                                .fields = init_fields,
                                                 .span = Span.init(s.start, self.pos()),
                                             } });
                                             continue;
@@ -749,6 +841,15 @@ pub const Parser = struct {
                                 }
                                 if (!self.expect(.rbrace)) return null;
                                 expr = try self.tree.addExpr(.{ .struct_init = .{ .type_name = type_name, .fields = try self.allocator.dupe(ast.FieldInit, fields.items), .span = Span.init(s.start, self.pos()) } });
+                                continue;
+                            }
+                            // Unified init syntax (@safe only): `Point { x: 10, y: 20 }` (colon syntax, with shorthand support)
+                            if (self.safe_mode and type_name.len > 0 and std.ascii.isUpper(type_name[0]) and self.peekNextIsIdentColon()) {
+                                const s = self.tree.getNode(expr).?.span();
+                                self.advance(); // consume {
+                                const col_fields = try self.parseColonFields();
+                                if (!self.expect(.rbrace)) return null;
+                                expr = try self.tree.addExpr(.{ .struct_init = .{ .type_name = type_name, .fields = col_fields, .span = Span.init(s.start, self.pos()) } });
                                 continue;
                             }
                         }
@@ -826,18 +927,82 @@ pub const Parser = struct {
                 const type_name = self.tok.text;
                 self.advance();
                 // Parse optional generic type args: new List(i64) { ... }
+                // In @safe mode, also supports constructor args: new Point(10, 20)
                 var type_args: []const NodeIndex = &.{};
+                var constructor_args: []const NodeIndex = &.{};
+                var is_constructor = false;
                 if (self.check(.lparen)) {
-                    self.advance();
-                    var ta = std.ArrayListUnmanaged(NodeIndex){};
-                    defer ta.deinit(self.allocator);
-                    while (!self.check(.rparen) and !self.check(.eof)) {
-                        const arg = try self.parseType() orelse break;
-                        try ta.append(self.allocator, arg);
-                        if (!self.match(.comma)) break;
+                    if (self.safe_mode) {
+                        // @safe mode: disambiguate type args vs constructor args
+                        // Type args start with type-like tokens (uppercase ident, type keyword, *, ?, [)
+                        // Constructor args start with value-like tokens (int, string, lowercase ident, etc.)
+                        const peek = self.peekToken();
+                        const is_type_arg = peek.tok == .mul or peek.tok == .question or peek.tok == .lbrack or
+                            peek.tok.isTypeKeyword() or
+                            (peek.tok == .ident and peek.text.len > 0 and std.ascii.isUpper(peek.text[0]));
+                        if (is_type_arg) {
+                            self.advance();
+                            var ta = std.ArrayListUnmanaged(NodeIndex){};
+                            defer ta.deinit(self.allocator);
+                            while (!self.check(.rparen) and !self.check(.eof)) {
+                                const arg = try self.parseType() orelse break;
+                                try ta.append(self.allocator, arg);
+                                if (!self.match(.comma)) break;
+                            }
+                            if (!self.expect(.rparen)) return null;
+                            type_args = try self.allocator.dupe(NodeIndex, ta.items);
+                            // After type args, check for constructor args: new List(i64)(16)
+                            if (self.check(.lparen)) {
+                                self.advance();
+                                var ca = std.ArrayListUnmanaged(NodeIndex){};
+                                defer ca.deinit(self.allocator);
+                                while (!self.check(.rparen) and !self.check(.eof)) {
+                                    const arg = try self.parseExpr() orelse break;
+                                    try ca.append(self.allocator, arg);
+                                    if (!self.match(.comma)) break;
+                                }
+                                if (!self.expect(.rparen)) return null;
+                                constructor_args = try self.allocator.dupe(NodeIndex, ca.items);
+                                is_constructor = true;
+                            }
+                        } else {
+                            // Constructor args: new Point(10, 20)
+                            self.advance();
+                            var ca = std.ArrayListUnmanaged(NodeIndex){};
+                            defer ca.deinit(self.allocator);
+                            while (!self.check(.rparen) and !self.check(.eof)) {
+                                const arg = try self.parseExpr() orelse break;
+                                try ca.append(self.allocator, arg);
+                                if (!self.match(.comma)) break;
+                            }
+                            if (!self.expect(.rparen)) return null;
+                            constructor_args = try self.allocator.dupe(NodeIndex, ca.items);
+                            is_constructor = true;
+                        }
+                    } else {
+                        // Non-safe mode: ( always means type args (original behavior)
+                        self.advance();
+                        var ta = std.ArrayListUnmanaged(NodeIndex){};
+                        defer ta.deinit(self.allocator);
+                        while (!self.check(.rparen) and !self.check(.eof)) {
+                            const arg = try self.parseType() orelse break;
+                            try ta.append(self.allocator, arg);
+                            if (!self.match(.comma)) break;
+                        }
+                        if (!self.expect(.rparen)) return null;
+                        type_args = try self.allocator.dupe(NodeIndex, ta.items);
                     }
-                    if (!self.expect(.rparen)) return null;
-                    type_args = try self.allocator.dupe(NodeIndex, ta.items);
+                }
+                // Constructor syntax: `new Point(10, 20)` — no field block needed
+                if (is_constructor and !self.check(.lbrace)) {
+                    return try self.tree.addExpr(.{ .new_expr = .{
+                        .type_name = type_name,
+                        .type_args = type_args,
+                        .fields = &.{},
+                        .constructor_args = constructor_args,
+                        .is_constructor = true,
+                        .span = Span.init(start, self.pos()),
+                    } });
                 }
                 if (!self.expect(.lbrace)) return null;
                 var fields = std.ArrayListUnmanaged(ast.FieldInit){};
@@ -849,8 +1014,15 @@ pub const Parser = struct {
                     const fname = self.tok.text;
                     const fstart = self.pos();
                     self.advance();
-                    if (!self.expect(.colon)) return null;
-                    const fval = try self.parseExpr() orelse return null;
+                    // Field init shorthand (@safe only): `new Point { x, y }` → `new Point { x: x, y: y }` (ES6/TS pattern)
+                    const fval = if (self.match(.colon))
+                        try self.parseExpr() orelse return null
+                    else if (self.safe_mode)
+                        try self.tree.addExpr(.{ .ident = .{ .name = fname, .span = Span.init(fstart, self.pos()) } })
+                    else {
+                        if (!self.expect(.colon)) return null;
+                        return null;
+                    };
                     try fields.append(self.allocator, .{ .name = fname, .value = fval, .span = Span.init(fstart, self.pos()) });
                     if (!self.check(.rbrace) and !self.expect(.comma)) return null;
                 }

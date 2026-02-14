@@ -507,6 +507,73 @@ import "std/list"          // stdlib modules
 | `json` | `import "std/json"` | JSON parser (parse) + encoder (encode), JsonValue constructors + accessors |
 | `sort` | `import "std/sort"` | Insertion sort + reverse for List(T) |
 
+## @safe Mode
+
+The `@safe` file annotation enables C#/TypeScript-friendly extensions. All `@safe` features are **opt-in** — they only activate in files that start with `@safe` and never affect the base language.
+
+```cot
+@safe  // must be the first line
+
+struct Point { x: i64, y: i64 }
+```
+
+### Feature Summary
+
+| Feature | Standard Cot | @safe Mode |
+|---------|-------------|------------|
+| Struct init (stack) | `Point { .x = 10, .y = 20 }` | `Point { x: 10, y: 20 }` (colon syntax) |
+| Field shorthand | Not available | `new Point { x, y }` → `new Point { x: x, y: y }` |
+| Self parameter | `fn getX(self: *Point) i64` | `fn getX() i64` (self injected) |
+| Constructor | `new Point { x: 10, y: 20 }` | `new Point(10, 20)` (calls init) |
+| Struct params | `fn foo(p: *Point)` explicit | `fn foo(p: Point)` auto-wrapped to pointer |
+
+### Unified Init Syntax (Colon Syntax)
+
+```cot
+// Standard:   Point { .x = 10, .y = 20 }
+// @safe mode: Point { x: 10, y: 20 }     — colon instead of period+equals
+var p = Point { x: 10, y: 20 }
+```
+
+### Field Init Shorthand
+
+```cot
+var x: i64 = 10
+var y: i64 = 20
+var p = new Point { x, y }        // shorthand for { x: x, y: y }
+var q = new Point { x, y: 99 }    // mixed shorthand + explicit
+```
+
+### Implicit Self
+
+In non-generic impl blocks, `self: *Type` is injected automatically:
+
+```cot
+impl Point {
+    // Standard:   fn getX(self: *Point) i64 { return self.x }
+    // @safe mode: fn getX() i64 { return self.x }
+    fn getX() i64 { return self.x }
+    fn setX(val: i64) void { self.x = val }
+}
+```
+
+Explicit `self` still works. Generic impl blocks require explicit self.
+
+### Constructor Sugar
+
+`new Type(args...)` calls the `init(self: *Type, ...)` method after allocation:
+
+```cot
+impl Rect {
+    fn init(w: i64, h: i64) void {  // self injected by implicit self
+        self.width = w
+        self.height = h
+    }
+}
+
+var r = new Rect(10, 20)  // allocates + calls init
+```
+
 ## No Semicolons
 
 Cot does not use semicolons. Newlines terminate statements.

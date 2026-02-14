@@ -1169,6 +1169,35 @@ pub const Checker = struct {
             self.err.errorWithCode(ne.span.start, .e300, "new requires a struct type");
             return invalid_type;
         }
+        // Constructor sugar: `new Point(10, 20)` calls init() method
+        if (ne.is_constructor) {
+            const type_name = if (ne.type_args.len > 0) struct_type.struct_type.name else ne.type_name;
+            const init_method = self.types.lookupMethod(type_name, "init") orelse {
+                self.err.errorWithCode(ne.span.start, .e301, "no init method for constructor call");
+                return invalid_type;
+            };
+            const func_type = self.types.get(init_method.func_type);
+            if (func_type == .func) {
+                const init_params = func_type.func.params;
+                // init's first param is self, constructor args map to params[1..]
+                const expected_args = if (init_params.len > 0) init_params.len - 1 else 0;
+                if (ne.constructor_args.len != expected_args) {
+                    self.err.errorWithCode(ne.span.start, .e300, "wrong number of constructor arguments");
+                } else {
+                    for (ne.constructor_args, 0..) |arg_idx, i| {
+                        const arg_type = try self.checkExpr(arg_idx);
+                        if (!self.types.isAssignable(arg_type, init_params[i + 1].type_idx)) {
+                            self.err.errorWithCode(ne.span.start, .e300, "type mismatch in constructor argument");
+                        }
+                    }
+                }
+                // Validate init returns void
+                if (func_type.func.return_type != TypeRegistry.VOID) {
+                    self.err.errorWithCode(ne.span.start, .e300, "init method must return void");
+                }
+            }
+            return self.types.makePointer(struct_type_idx) catch invalid_type;
+        }
         // Validate field initializers (same as StructInit)
         for (ne.fields) |fi| {
             var found = false;

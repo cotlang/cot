@@ -2700,6 +2700,41 @@ pub const Lowerer = struct {
             }
         }
 
+        // Constructor sugar: call init() method after allocation
+        if (ne.is_constructor) {
+            const type_name = if (ne.type_args.len > 0) struct_type.name else ne.type_name;
+            if (self.chk.lookupMethod(type_name, "init")) |init_method| {
+                var init_args = std.ArrayListUnmanaged(ir.NodeIndex){};
+                defer init_args.deinit(self.allocator);
+                // First arg is self (the pointer)
+                const self_ptr = try fb.emitLoadLocal(temp_idx, ptr_type, ne.span);
+                try init_args.append(self.allocator, self_ptr);
+                // Remaining args from constructor_args (with compound decomposition)
+                const func_type = self.type_reg.get(init_method.func_type);
+                const init_params = if (func_type == .func) func_type.func.params else &[_]types.FuncParam{};
+                for (ne.constructor_args, 0..) |arg_idx, arg_i| {
+                    const arg_node = try self.lowerExprNode(arg_idx);
+                    if (arg_node == ir.null_node) continue;
+                    // Check if param needs compound decomposition (string/slice)
+                    const param_idx = arg_i + 1; // +1 for self
+                    var param_is_compound = false;
+                    if (param_idx < init_params.len) {
+                        const param_type = self.type_reg.get(init_params[param_idx].type_idx);
+                        param_is_compound = (param_type == .slice) or (init_params[param_idx].type_idx == TypeRegistry.STRING);
+                    }
+                    if (param_is_compound) {
+                        const p = try fb.emitSlicePtr(arg_node, TypeRegistry.I64, ne.span);
+                        const l = try fb.emitSliceLen(arg_node, ne.span);
+                        try init_args.append(self.allocator, p);
+                        try init_args.append(self.allocator, l);
+                    } else {
+                        try init_args.append(self.allocator, arg_node);
+                    }
+                }
+                _ = try fb.emitCall(init_method.func_name, init_args.items, false, TypeRegistry.VOID, ne.span);
+            }
+        }
+
         // Return the pointer to the allocated object.
         // NOTE: Cleanup is NOT registered here - it's registered in lowerLocalVarDecl
         // when the result is stored to a local variable. This allows the cleanup to
