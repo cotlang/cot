@@ -4110,6 +4110,43 @@ pub const Lowerer = struct {
                 var args = [_]ir.NodeIndex{ path_ptr_arg, path_len_arg, flags_arg };
                 return try fb.emitCall("cot_fd_open", &args, false, TypeRegistry.I64, bc.span);
             },
+            .net_socket => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_net_socket", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .net_bind => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_net_bind", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .net_listen => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                var args = [_]ir.NodeIndex{ a1, a2 };
+                return try fb.emitCall("cot_net_listen", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .net_accept => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{a1};
+                return try fb.emitCall("cot_net_accept", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .net_connect => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_net_connect", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .net_set_reuse_addr => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{a1};
+                return try fb.emitCall("cot_net_set_reuse_addr", &args, false, TypeRegistry.I64, bc.span);
+            },
             .ptr_of => {
                 const str_val = try self.lowerExprNode(bc.args[0]);
                 const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);

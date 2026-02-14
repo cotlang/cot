@@ -1,0 +1,127 @@
+import "std/http"
+import "std/string"
+
+// ===== Socket creation tests =====
+
+test "tcp socket creation" {
+    var fd = tcpSocket() catch -1
+    @assert(fd >= 0)
+    socketClose(fd)
+}
+
+test "tcp socket reuse addr" {
+    var fd = tcpSocket() catch -1
+    @assert(fd >= 0)
+    setReuseAddr(fd)
+    socketClose(fd)
+}
+
+// ===== sockaddr_in construction tests =====
+
+test "build sockaddr for loopback port 8080" {
+    var buf = @alloc(16)
+    buildSockaddrIn(buf, INADDR_LOOPBACK, 8080)
+
+    // port 8080 = 0x1F90, big-endian: 0x1F, 0x90
+    var port_hi = @intToPtr(*u8, buf + 2).*
+    var port_lo = @intToPtr(*u8, buf + 3).*
+    @assert_eq(port_hi, 31)   // 0x1F
+    @assert_eq(port_lo, 144)  // 0x90
+
+    // 127.0.0.1 big-endian: 127, 0, 0, 1
+    var ip0 = @intToPtr(*u8, buf + 4).*
+    var ip1 = @intToPtr(*u8, buf + 5).*
+    var ip2 = @intToPtr(*u8, buf + 6).*
+    var ip3 = @intToPtr(*u8, buf + 7).*
+    @assert_eq(ip0, 127)
+    @assert_eq(ip1, 0)
+    @assert_eq(ip2, 0)
+    @assert_eq(ip3, 1)
+
+    @dealloc(buf)
+}
+
+test "build sockaddr for any addr port 80" {
+    var buf = @alloc(16)
+    buildSockaddrIn(buf, INADDR_ANY, 80)
+
+    // port 80 = 0x0050, big-endian: 0x00, 0x50
+    var port_hi = @intToPtr(*u8, buf + 2).*
+    var port_lo = @intToPtr(*u8, buf + 3).*
+    @assert_eq(port_hi, 0)
+    @assert_eq(port_lo, 80)
+
+    // 0.0.0.0
+    var ip0 = @intToPtr(*u8, buf + 4).*
+    var ip1 = @intToPtr(*u8, buf + 5).*
+    var ip2 = @intToPtr(*u8, buf + 6).*
+    var ip3 = @intToPtr(*u8, buf + 7).*
+    @assert_eq(ip0, 0)
+    @assert_eq(ip1, 0)
+    @assert_eq(ip2, 0)
+    @assert_eq(ip3, 0)
+
+    @dealloc(buf)
+}
+
+test "build sockaddr zero padding" {
+    var buf = @alloc(16)
+    buildSockaddrIn(buf, INADDR_LOOPBACK, 8080)
+
+    // bytes 8-15 should be zero (sin_zero)
+    var i: i64 = 8
+    while (i < 16) {
+        @assert_eq(@intToPtr(*u8, buf + i).*, 0)
+        i = i + 1
+    }
+
+    @dealloc(buf)
+}
+
+// ===== Bind and listen tests =====
+
+test "bind and listen on ephemeral port" {
+    var fd = tcpSocket() catch -1
+    @assert(fd >= 0)
+    setReuseAddr(fd)
+
+    // Port 0 = kernel assigns ephemeral port
+    var bind_result = bindSocket(fd, INADDR_LOOPBACK, 0) catch -1
+    @assert(bind_result >= 0)
+
+    var listen_result = listenSocket(fd, 1) catch -1
+    @assert(listen_result >= 0)
+
+    socketClose(fd)
+}
+
+// ===== HTTP response builder tests =====
+
+test "http response 200" {
+    var resp = httpResponse(200, "hello")
+    @assert(startsWith(resp, "HTTP/1.1 200 OK\r\n"))
+    @assert(contains(resp, "Content-Length: 5"))
+    @assert(endsWith(resp, "hello"))
+}
+
+test "http response 404" {
+    var resp = httpResponse(404, "not found")
+    @assert(startsWith(resp, "HTTP/1.1 404 Not Found\r\n"))
+    @assert(contains(resp, "Content-Length: 9"))
+}
+
+test "http response 500" {
+    var resp = httpResponse(500, "error")
+    @assert(startsWith(resp, "HTTP/1.1 500 Internal Server Error\r\n"))
+}
+
+// ===== Constants =====
+
+test "INADDR_LOOPBACK value" {
+    // 127.0.0.1 = (127 << 24) | (0 << 16) | (0 << 8) | 1 = 2130706433
+    @assert_eq(INADDR_LOOPBACK, 2130706433)
+}
+
+test "INADDR_ANY value" {
+    @assert_eq(INADDR_ANY, 0)
+}

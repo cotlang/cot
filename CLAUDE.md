@@ -41,12 +41,13 @@ cot <file.cot>                  # Implicit build (shorthand for cot build)
 cot build <file.cot> [-o name]  # Compile to executable (or .wasm)
 cot run <file.cot> [-- args]    # Compile, run in /tmp, clean up, forward exit code
 cot test <file.cot>             # Compile + run in test mode
+cot init [name]                 # Create new project (cot.json, src/main.cot, .gitignore)
 cot lsp                         # Start language server (LSP over stdio)
 cot version                     # Print version: cot 0.3.1 (arm64-macos)
 cot help [command]              # Print help (per-subcommand help available)
 ```
 
-**Key files:** `compiler/cli.zig` (arg parsing, help text), `compiler/main.zig` (command dispatch + compileAndLink).
+**Key files:** `compiler/cli.zig` (arg parsing, help text), `compiler/main.zig` (command dispatch + compileAndLink), `compiler/project.zig` (cot.json manifest loading).
 
 **Output naming:** Strip path, strip `.cot`, append `.wasm` for wasm targets. `app.cot` → `./app` (native) or `./app.wasm` (wasm). Override with `-o`.
 
@@ -114,11 +115,11 @@ Two categories:
 | Category | Examples | Implementation |
 |----------|----------|----------------|
 | **Compiler intrinsics** | `@intCast`, `@sizeOf`, `@intToPtr` | Inline Wasm ops in `lower.zig` |
-| **Runtime functions** | `@alloc`, `@dealloc`, `@realloc`, `@memcpy` | Wasm module functions in `arc.zig` → `func_indices` in `driver.zig` |
+| **Runtime functions** | `@alloc`, `@dealloc`, `@realloc`, `@memcpy`, `@net_socket`, `@net_bind`, etc. | Wasm module functions in `arc.zig`/`wasi_runtime.zig` → `func_indices` in `driver.zig` |
 
 **Runtime builtins are Wasm MODULE functions, NOT host imports.** The compiler has ZERO host imports. If a function name is missing from `func_indices`, `wasm_gen.zig` silently calls function index 0 (cot_alloc) — a silent bug.
 
-**To add a new runtime builtin:** parser.zig → checker.zig → lower.zig → arc.zig (body + addToLinker) → driver.zig (func_indices)
+**To add a new runtime builtin:** parser.zig → checker.zig → lower.zig → arc.zig or wasi_runtime.zig (body + addToLinker) → driver.zig (func_indices + native override)
 
 ---
 
@@ -133,7 +134,7 @@ zig build test                                    # Compiler internals (~163 tes
 cot test test/e2e/features.cot                    # Primary: 127 feature tests, native
 cot test test/e2e/features.cot --target=wasm32    # Primary: same tests, wasm via wasmtime
 cot test test/cases/<category>.cot                # Targeted: specific category
-./test/run_all.sh                                 # Full suite (~785 tests across 35 files)
+./test/run_all.sh                                 # Full suite (~1020 tests across 46 files)
 ```
 
 **`cot test --target=wasm32`** runs Wasm binaries via `wasmtime` (must be installed). Use this to verify Wasm codegen — bugs often manifest on one target but not the other.
@@ -146,7 +147,7 @@ cot test test/cases/<category>.cot                # Targeted: specific category
 
 **Test directories:**
 - `test/cases/` — Category unit tests (21 files, ~106 tests)
-- `test/e2e/` — Comprehensive feature tests (14 files, ~679 tests)
+- `test/e2e/` — Comprehensive feature tests (25 files, ~904 tests)
 - All tests use inline `test "name" { @assert_eq(...) }` format
 - See `docs/TESTING.md` for full details
 

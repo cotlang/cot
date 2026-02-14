@@ -1,0 +1,165 @@
+@safe
+
+// http — TCP networking and basic HTTP.
+//
+// Wraps @net_socket, @net_bind, @net_listen, @net_accept, @net_connect,
+// @net_set_reuse_addr builtins.
+// Reference: Go net/http (patterns), POSIX sockets (API)
+//
+// All socket addresses use struct sockaddr_in (16 bytes) built in linear memory:
+//   macOS: [0] sa_len  [1] sa_family  [2:4] sin_port  [4:8] sin_addr  [8:16] zero
+//   Linux: [0:2] sa_family  [2:4] sin_port  [4:8] sin_addr  [8:16] zero
+
+import "std/string"
+
+// Socket constants
+const AF_INET: i64 = 2
+const SOCK_STREAM: i64 = 1
+const IPPROTO_TCP: i64 = 6
+const SOCKADDR_IN_SIZE: i64 = 16
+
+const NetError = error { SocketError, BindError, ListenError, ConnectError, AcceptError }
+
+// Build a sockaddr_in struct in linear memory at the given buffer pointer.
+// ip: 32-bit IPv4 address in host byte order (e.g. INADDR_LOOPBACK = 0x7F000001)
+// port: 16-bit port in host byte order (e.g. 8080)
+fn buildSockaddrIn(buf: i64, ip: i64, port: i64) void {
+    // Zero the entire 16-byte struct
+    var i: i64 = 0
+    while (i < SOCKADDR_IN_SIZE) {
+        @intToPtr(*u8, buf + i).* = @intCast(u8, 0)
+        i = i + 1
+    }
+
+    if (@target_os() == "macos") {
+        // macOS sockaddr_in: sa_len(1) + sa_family(1)
+        @intToPtr(*u8, buf).* = @intCast(u8, SOCKADDR_IN_SIZE)
+        @intToPtr(*u8, buf + 1).* = @intCast(u8, AF_INET)
+    } else {
+        // Linux sockaddr_in: sa_family(2) little-endian
+        @intToPtr(*u8, buf).* = @intCast(u8, AF_INET)
+        @intToPtr(*u8, buf + 1).* = @intCast(u8, 0)
+    }
+
+    // sin_port (network byte order = big-endian)
+    @intToPtr(*u8, buf + 2).* = @intCast(u8, (port >> 8) & 255)
+    @intToPtr(*u8, buf + 3).* = @intCast(u8, port & 255)
+
+    // sin_addr (network byte order = big-endian)
+    @intToPtr(*u8, buf + 4).* = @intCast(u8, (ip >> 24) & 255)
+    @intToPtr(*u8, buf + 5).* = @intCast(u8, (ip >> 16) & 255)
+    @intToPtr(*u8, buf + 6).* = @intCast(u8, (ip >> 8) & 255)
+    @intToPtr(*u8, buf + 7).* = @intCast(u8, ip & 255)
+}
+
+// INADDR_ANY = 0.0.0.0
+const INADDR_ANY: i64 = 0
+// INADDR_LOOPBACK = 127.0.0.1 = 0x7F000001
+const INADDR_LOOPBACK: i64 = 2130706433
+
+// Create a TCP socket. Returns fd or error.
+fn tcpSocket() NetError!i64 {
+    var fd = @net_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    if (fd < 0) { return error.SocketError }
+    return fd
+}
+
+// Set SO_REUSEADDR on a socket (prevents "address already in use" errors).
+fn setReuseAddr(fd: i64) void {
+    @net_set_reuse_addr(fd)
+}
+
+// Bind a socket to an address and port.
+fn bindSocket(fd: i64, ip: i64, port: i64) NetError!i64 {
+    var addr_buf = @alloc(SOCKADDR_IN_SIZE)
+    buildSockaddrIn(addr_buf, ip, port)
+    var result = @net_bind(fd, addr_buf, SOCKADDR_IN_SIZE)
+    @dealloc(addr_buf)
+    if (result < 0) { return error.BindError }
+    return result
+}
+
+// Start listening for connections with the given backlog.
+fn listenSocket(fd: i64, backlog: i64) NetError!i64 {
+    var result = @net_listen(fd, backlog)
+    if (result < 0) { return error.ListenError }
+    return result
+}
+
+// Accept a connection on a listening socket. Returns new fd.
+fn acceptConnection(fd: i64) NetError!i64 {
+    var client_fd = @net_accept(fd)
+    if (client_fd < 0) { return error.AcceptError }
+    return client_fd
+}
+
+// Connect to a remote address. Returns 0 on success.
+fn connectSocket(fd: i64, ip: i64, port: i64) NetError!i64 {
+    var addr_buf = @alloc(SOCKADDR_IN_SIZE)
+    buildSockaddrIn(addr_buf, ip, port)
+    var result = @net_connect(fd, addr_buf, SOCKADDR_IN_SIZE)
+    @dealloc(addr_buf)
+    if (result < 0) { return error.ConnectError }
+    return result
+}
+
+// Read from a socket fd. Returns bytes read.
+fn socketRead(fd: i64, buf: i64, len: i64) i64 {
+    return @fd_read(fd, buf, len)
+}
+
+// Write raw bytes to a socket fd. Returns bytes written.
+fn socketWrite(fd: i64, buf: i64, len: i64) i64 {
+    return @fd_write(fd, buf, len)
+}
+
+// Write a string to a socket fd.
+fn socketWriteString(fd: i64, s: string) i64 {
+    return @fd_write(fd, @ptrOf(s), @lenOf(s))
+}
+
+// Close a socket fd.
+fn socketClose(fd: i64) void {
+    @fd_close(fd)
+}
+
+// ===== High-level TCP Server =====
+
+// Create a TCP server socket bound to the given port on all interfaces.
+// Sets SO_REUSEADDR and starts listening with backlog 128.
+fn tcpListen(port: i64) NetError!i64 {
+    var fd = try tcpSocket()
+    setReuseAddr(fd)
+    try bindSocket(fd, INADDR_ANY, port)
+    try listenSocket(fd, 128)
+    return fd
+}
+
+// Connect to a TCP server at the given ip and port. Returns connected fd.
+fn tcpConnect(ip: i64, port: i64) NetError!i64 {
+    var fd = try tcpSocket()
+    try connectSocket(fd, ip, port)
+    return fd
+}
+
+// ===== HTTP Response Builder =====
+
+fn httpResponse(status: i64, body: string) string {
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    if (status == 200) {
+        sb.append("HTTP/1.1 200 OK\r\n")
+    } else if (status == 404) {
+        sb.append("HTTP/1.1 404 Not Found\r\n")
+    } else if (status == 500) {
+        sb.append("HTTP/1.1 500 Internal Server Error\r\n")
+    } else {
+        sb.append("HTTP/1.1 200 OK\r\n")
+    }
+    sb.append("Content-Type: text/plain\r\n")
+    sb.append("Connection: close\r\n")
+    sb.append("Content-Length: ")
+    sb.appendInt(@lenOf(body))
+    sb.append("\r\n\r\n")
+    sb.append(body)
+    return sb.toString()
+}

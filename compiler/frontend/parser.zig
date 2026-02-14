@@ -1014,13 +1014,14 @@ pub const Parser = struct {
             .fd_close, .exit, .arg_len, .arg_ptr, .environ_len, .environ_ptr,
             .compile_error,
             .abs, .ceil, .floor, .trunc, .round, .sqrt,
+            .net_accept, .net_set_reuse_addr,
             => {
                 const arg = try self.parseExpr() orelse return null;
                 if (!self.expect(.rparen)) return null;
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
             },
             // 2 value args
-            .string, .assert_eq, .realloc, .random, .fmin, .fmax => {
+            .string, .assert_eq, .realloc, .random, .fmin, .fmax, .net_listen => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
                 const a2 = try self.parseExpr() orelse return null;
@@ -1028,7 +1029,9 @@ pub const Parser = struct {
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ a1, a2, null_node }, .span = Span.init(start, self.pos()) } });
             },
             // 3 value args
-            .memcpy, .fd_write, .fd_read, .fd_seek, .fd_open => {
+            .memcpy, .fd_write, .fd_read, .fd_seek, .fd_open,
+            .net_socket, .net_bind, .net_connect,
+            => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
                 const a2 = try self.parseExpr() orelse return null;

@@ -1,0 +1,141 @@
+import "std/encoding"
+
+// ============================================================================
+// Hex tests
+// ============================================================================
+
+test "hex encode empty" {
+    @assert_eq(hexEncode(""), "")
+}
+
+test "hex encode hello" {
+    @assert_eq(hexEncode("hello"), "68656c6c6f")
+}
+
+test "hex encode single byte" {
+    @assert_eq(hexEncode("A"), "41")
+}
+
+test "hex encode null byte" {
+    // \x00 = 0, represented as "00"
+    var buf = @alloc(1)
+    @intToPtr(*u8, buf).* = @intCast(u8, 0)
+    var s = @string(buf, 1)
+    @assert_eq(hexEncode(s), "00")
+}
+
+test "hex encode 0xff byte" {
+    var buf = @alloc(1)
+    @intToPtr(*u8, buf).* = @intCast(u8, 255)
+    var s = @string(buf, 1)
+    @assert_eq(hexEncode(s), "ff")
+}
+
+test "hex decode empty" {
+    @assert_eq(hexDecode(""), "")
+}
+
+test "hex decode hello" {
+    @assert_eq(hexDecode("68656c6c6f"), "hello")
+}
+
+test "hex decode uppercase" {
+    @assert_eq(hexDecode("48454C4C4F"), "HELLO")
+}
+
+test "hex roundtrip" {
+    var original = "Hello, World!"
+    @assert_eq(hexDecode(hexEncode(original)), original)
+}
+
+// ============================================================================
+// Base64 tests (RFC 4648 test vectors)
+// ============================================================================
+
+test "base64 encode empty" {
+    @assert_eq(base64Encode(""), "")
+}
+
+test "base64 encode f" {
+    @assert_eq(base64Encode("f"), "Zg==")
+}
+
+test "base64 encode fo" {
+    @assert_eq(base64Encode("fo"), "Zm8=")
+}
+
+test "base64 encode foo" {
+    @assert_eq(base64Encode("foo"), "Zm9v")
+}
+
+test "base64 encode foob" {
+    @assert_eq(base64Encode("foob"), "Zm9vYg==")
+}
+
+test "base64 encode fooba" {
+    @assert_eq(base64Encode("fooba"), "Zm9vYmE=")
+}
+
+test "base64 encode foobar" {
+    @assert_eq(base64Encode("foobar"), "Zm9vYmFy")
+}
+
+test "base64 decode empty" {
+    @assert_eq(base64Decode(""), "")
+}
+
+test "base64 decode Zg==" {
+    @assert_eq(base64Decode("Zg=="), "f")
+}
+
+test "base64 decode Zm8=" {
+    @assert_eq(base64Decode("Zm8="), "fo")
+}
+
+test "base64 decode Zm9v" {
+    @assert_eq(base64Decode("Zm9v"), "foo")
+}
+
+test "base64 decode Zm9vYmFy" {
+    @assert_eq(base64Decode("Zm9vYmFy"), "foobar")
+}
+
+test "base64 roundtrip" {
+    var original = "Hello, World!"
+    @assert_eq(base64Decode(base64Encode(original)), original)
+}
+
+test "base64 roundtrip long" {
+    var original = "The quick brown fox jumps over the lazy dog"
+    @assert_eq(base64Decode(base64Encode(original)), original)
+}
+
+// ============================================================================
+// URL-safe base64
+// ============================================================================
+
+test "base64url encode no padding" {
+    // URL-safe base64 doesn't pad by default
+    @assert_eq(base64UrlEncode("f"), "Zg")
+}
+
+test "base64url roundtrip" {
+    var original = "Hello, World!"
+    @assert_eq(base64UrlDecode(base64UrlEncode(original)), original)
+}
+
+test "base64url uses -_ instead of +/" {
+    // Byte 0x3E = 62 = '+' in standard, '-' in URL-safe
+    // Byte 0x3F = 63 = '/' in standard, '_' in URL-safe
+    var buf = @alloc(3)
+    @intToPtr(*u8, buf).* = @intCast(u8, 0)
+    @intToPtr(*u8, buf + 1).* = @intCast(u8, 62)
+    @intToPtr(*u8, buf + 2).* = @intCast(u8, 63)
+    var data = @string(buf, 3)
+    var std_enc = base64Encode(data)
+    var url_enc = base64UrlEncode(data)
+    // Standard should contain + or /, URL-safe should not
+    @assert(indexOf(std_enc, "+") >= 0 or indexOf(std_enc, "/") >= 0)
+    @assert(indexOf(url_enc, "+") < 0)
+    @assert(indexOf(url_enc, "/") < 0)
+}

@@ -45,6 +45,8 @@ const elf = @import("codegen/native/elf.zig");
 const object_module = @import("codegen/native/object_module.zig");
 const buffer_mod = @import("codegen/native/machinst/buffer.zig");
 
+const project_mod = @import("project.zig");
+
 const Allocator = std.mem.Allocator;
 const Target = target_mod.Target;
 
@@ -138,6 +140,22 @@ pub const Driver = struct {
             parsed_files.deinit(self.allocator);
         }
         try self.parseFileRecursive(path, &parsed_files, &seen_files);
+
+        // Apply project-level @safe mode from cot.json
+        {
+            const maybe_loaded = project_mod.loadConfig(self.allocator, null) catch null;
+            if (maybe_loaded) |loaded_val| {
+                var loaded = loaded_val;
+                defer loaded.deinit();
+                if (loaded.value().safe orelse false) {
+                    for (parsed_files.items) |*pf| {
+                        if (pf.tree.file) |*file| {
+                            file.safe_mode = true;
+                        }
+                    }
+                }
+            }
+        }
 
         // Phase 2: Type check all files with shared symbol table
         var type_reg = try types_mod.TypeRegistry.init(self.allocator);
@@ -696,7 +714,13 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "cot_arg_ptr") or
                         std.mem.eql(u8, exp.name, "cot_environ_count") or
                         std.mem.eql(u8, exp.name, "cot_environ_len") or
-                        std.mem.eql(u8, exp.name, "cot_environ_ptr"))
+                        std.mem.eql(u8, exp.name, "cot_environ_ptr") or
+                        std.mem.eql(u8, exp.name, "cot_net_socket") or
+                        std.mem.eql(u8, exp.name, "cot_net_bind") or
+                        std.mem.eql(u8, exp.name, "cot_net_listen") or
+                        std.mem.eql(u8, exp.name, "cot_net_accept") or
+                        std.mem.eql(u8, exp.name, "cot_net_connect") or
+                        std.mem.eql(u8, exp.name, "cot_net_set_reuse_addr"))
                     {
                         override_name = exp.name;
                         break;
@@ -1075,6 +1099,126 @@ pub const Driver = struct {
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };
                     try module.defineFunctionBytes(func_ids[i], &arm64_environ_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_socket")) {
+                    // ARM64 macOS syscall for socket(domain, type, protocol)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=domain, x3=type, x4=protocol
+                    // macOS SYS_socket = 97
+                    // Returns fd on success, -errno on error.
+                    const arm64_socket = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (domain)
+                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3  (type)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (protocol)
+                        0x30, 0x0C, 0x80, 0xD2, // mov x16, #97  (SYS_socket)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_socket, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_bind")) {
+                    // ARM64 macOS syscall for bind(fd, addr_ptr, addr_len)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=addr_ptr(wasm), x4=addr_len
+                    // addr_ptr is a wasm pointer into linear memory
+                    // macOS SYS_bind = 104
+                    const arm64_bind = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real addr = linmem + wasm_ptr)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (addr_len)
+                        0x10, 0x0D, 0x80, 0xD2, // mov x16, #104  (SYS_bind)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_bind, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_listen")) {
+                    // ARM64 macOS syscall for listen(fd, backlog)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=backlog
+                    // macOS SYS_listen = 106
+                    const arm64_listen = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3  (backlog)
+                        0x50, 0x0D, 0x80, 0xD2, // mov x16, #106  (SYS_listen)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_listen, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_accept")) {
+                    // ARM64 macOS syscall for accept(fd, NULL, NULL)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd
+                    // We pass NULL for addr and addrlen (don't need peer info)
+                    // macOS SYS_accept = 30
+                    const arm64_accept = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE1, 0x03, 0x1F, 0xAA, // mov x1, xzr  (addr = NULL)
+                        0xE2, 0x03, 0x1F, 0xAA, // mov x2, xzr  (addrlen = NULL)
+                        0xD0, 0x03, 0x80, 0xD2, // mov x16, #30  (SYS_accept)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_accept, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_connect")) {
+                    // ARM64 macOS syscall for connect(fd, addr_ptr, addr_len)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd, x3=addr_ptr(wasm), x4=addr_len
+                    // macOS SYS_connect = 98
+                    const arm64_connect = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0x01, 0x01, 0x03, 0x8B, // add x1, x8, x3  (real addr = linmem + wasm_ptr)
+                        0xE2, 0x03, 0x04, 0xAA, // mov x2, x4  (addr_len)
+                        0x50, 0x0C, 0x80, 0xD2, // mov x16, #98  (SYS_connect)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_connect, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_set_reuse_addr")) {
+                    // ARM64 macOS syscall for setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, 4)
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=fd
+                    // SOL_SOCKET=0xFFFF, SO_REUSEADDR=0x0004 on macOS
+                    // macOS SYS_setsockopt = 105
+                    // We store the value 1 on the stack and pass a pointer to it
+                    const arm64_reuse = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x28, 0x00, 0x80, 0xD2, // mov x8, #1  (optval = 1)
+                        0xFF, 0x43, 0x00, 0xD1, // sub sp, sp, #16
+                        0xE8, 0x03, 0x00, 0xB9, // str w8, [sp]  (store optval on stack)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (fd)
+                        0xE1, 0xFF, 0x9F, 0xD2, // mov x1, #0xFFFF  (SOL_SOCKET)
+                        0x82, 0x00, 0x80, 0xD2, // mov x2, #4  (SO_REUSEADDR)
+                        0xE3, 0x03, 0x00, 0x91, // mov x3, sp  (&optval)
+                        0x84, 0x00, 0x80, 0xD2, // mov x4, #4  (optlen)
+                        0x30, 0x0D, 0x80, 0xD2, // mov x16, #105  (SYS_setsockopt)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xBF, 0x03, 0x00, 0x91, // mov sp, x29  (restore stack)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_reuse, &.{});
                 }
             } else {
                 try module.defineFunction(func_ids[i], cf);
@@ -1391,7 +1535,13 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "cot_arg_ptr") or
                         std.mem.eql(u8, exp.name, "cot_environ_count") or
                         std.mem.eql(u8, exp.name, "cot_environ_len") or
-                        std.mem.eql(u8, exp.name, "cot_environ_ptr"))
+                        std.mem.eql(u8, exp.name, "cot_environ_ptr") or
+                        std.mem.eql(u8, exp.name, "cot_net_socket") or
+                        std.mem.eql(u8, exp.name, "cot_net_bind") or
+                        std.mem.eql(u8, exp.name, "cot_net_listen") or
+                        std.mem.eql(u8, exp.name, "cot_net_accept") or
+                        std.mem.eql(u8, exp.name, "cot_net_connect") or
+                        std.mem.eql(u8, exp.name, "cot_net_set_reuse_addr"))
                     {
                         override_name = exp.name;
                         break;
@@ -1795,6 +1945,112 @@ pub const Driver = struct {
                         0xC3, //103: ret
                     };
                     try module.defineFunctionBytes(elf_func_ids[i], &x64_environ_ptr, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_socket")) {
+                    // x86-64 Linux syscall for socket(domain, type, protocol)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=domain, rcx=type, r8=protocol
+                    // Linux socket: rax=41(SYS_socket), rdi=domain, rsi=type, rdx=protocol
+                    const x64_socket = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (domain)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx  (type)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (protocol)
+                        0x48, 0xC7, 0xC0, 0x29, 0x00, 0x00, 0x00, // mov rax, 41  (SYS_socket)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_socket, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_bind")) {
+                    // x86-64 Linux syscall for bind(fd, addr, addrlen)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=addr(wasm), r8=addrlen
+                    // Linux bind: rax=49(SYS_bind), rdi=fd, rsi=addr, rdx=addrlen
+                    const x64_bind = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x01, 0xC9, // add r9, rcx  (real addr = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x4C, 0x89, 0xCE, // mov rsi, r9   (addr)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (addrlen)
+                        0x48, 0xC7, 0xC0, 0x31, 0x00, 0x00, 0x00, // mov rax, 49  (SYS_bind)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_bind, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_listen")) {
+                    // x86-64 Linux syscall for listen(fd, backlog)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=backlog
+                    // Linux listen: rax=50(SYS_listen), rdi=fd, rsi=backlog
+                    const x64_listen = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx  (backlog)
+                        0x48, 0xC7, 0xC0, 0x32, 0x00, 0x00, 0x00, // mov rax, 50  (SYS_listen)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_listen, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_accept")) {
+                    // x86-64 Linux syscall for accept(fd, NULL, NULL)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd
+                    // Linux accept: rax=43(SYS_accept), rdi=fd, rsi=addr(NULL), rdx=addrlen(NULL)
+                    const x64_accept = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x31, 0xF6, // xor esi, esi  (addr = NULL)
+                        0x31, 0xD2, // xor edx, edx  (addrlen = NULL)
+                        0x48, 0xC7, 0xC0, 0x2B, 0x00, 0x00, 0x00, // mov rax, 43  (SYS_accept)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_accept, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_connect")) {
+                    // x86-64 Linux syscall for connect(fd, addr, addrlen)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd, rcx=addr(wasm), r8=addrlen
+                    // Linux connect: rax=42(SYS_connect), rdi=fd, rsi=addr, rdx=addrlen
+                    const x64_connect = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // lea r9, [rdi + 0x40000]  (linmem base)
+                        0x49, 0x01, 0xC9, // add r9, rcx  (real addr = linmem + wasm_ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (fd)
+                        0x4C, 0x89, 0xCE, // mov rsi, r9   (addr)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (addrlen)
+                        0x48, 0xC7, 0xC0, 0x2A, 0x00, 0x00, 0x00, // mov rax, 42  (SYS_connect)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_connect, &.{});
+                } else if (std.mem.eql(u8, name, "cot_net_set_reuse_addr")) {
+                    // x86-64 Linux syscall for setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, 4)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=fd
+                    // Linux: SOL_SOCKET=1, SO_REUSEADDR=2
+                    // SYS_setsockopt = 54
+                    const x64_reuse = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16
+                        0xC7, 0x04, 0x24, 0x01, 0x00, 0x00, 0x00, //  8: mov dword [rsp], 1  (optval = 1)
+                        0x48, 0x89, 0xD7, // 15: mov rdi, rdx  (fd)
+                        0xBE, 0x01, 0x00, 0x00, 0x00, // 18: mov esi, 1  (SOL_SOCKET)
+                        0xBA, 0x02, 0x00, 0x00, 0x00, // 23: mov edx, 2  (SO_REUSEADDR)
+                        0x48, 0x89, 0xE1, // 28: mov rcx, rsp  (&optval, arg4 in rcx for syscall→r10)
+                        0x49, 0x89, 0xCA, // 31: mov r10, rcx  (Linux syscall: arg4 in r10)
+                        0x41, 0xB8, 0x04, 0x00, 0x00, 0x00, // 34: mov r8d, 4  (optlen)
+                        0x48, 0xC7, 0xC0, 0x36, 0x00, 0x00, 0x00, // 40: mov rax, 54  (SYS_setsockopt)
+                        0x0F, 0x05, // 47: syscall
+                        0x48, 0x83, 0xC4, 0x10, // 49: add rsp, 16
+                        0x5D, // 53: pop rbp
+                        0xC3, // 54: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_reuse, &.{});
                 }
             } else {
                 try module.defineFunction(elf_func_ids[i], cf);
@@ -2149,6 +2405,13 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, wasi_runtime.ENVIRON_COUNT_NAME, wasi_funcs.environ_count_idx);
         try func_indices.put(self.allocator, wasi_runtime.ENVIRON_LEN_NAME, wasi_funcs.environ_len_idx);
         try func_indices.put(self.allocator, wasi_runtime.ENVIRON_PTR_NAME, wasi_funcs.environ_ptr_idx);
+        // Networking
+        try func_indices.put(self.allocator, wasi_runtime.NET_SOCKET_NAME, wasi_funcs.net_socket_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_BIND_NAME, wasi_funcs.net_bind_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_LISTEN_NAME, wasi_funcs.net_listen_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_ACCEPT_NAME, wasi_funcs.net_accept_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_CONNECT_NAME, wasi_funcs.net_connect_idx);
+        try func_indices.put(self.allocator, wasi_runtime.NET_SET_REUSE_ADDR_NAME, wasi_funcs.net_set_reuse_addr_idx);
 
         // Add test function names to index map (Zig)
         try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx);

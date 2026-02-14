@@ -9,7 +9,7 @@ Cot uses inline test blocks (Zig syntax) with error-union-based test isolation. 
 | Tier | Command | What it runs | Speed |
 |------|---------|-------------|-------|
 | **Zig compiler tests** | `zig build test` | ~163 Zig-level tests with inline Cot snippets | Fast (<10s) |
-| **Cot language tests** | `./test/run_all.sh` | ~914 Cot tests across 41 `.cot` files | Slower (~60s) |
+| **Cot language tests** | `./test/run_all.sh` | ~1020 Cot tests across 46 `.cot` files | Slower (~60s) |
 | **Single file** | `cot test file.cot` | Tests in one file | Fast |
 
 ### `zig build test` — Compiler internals
@@ -140,7 +140,7 @@ test/
     switch.cot             2 tests
     types.cot              2 tests
     union.cot              4 tests
-  e2e/                  # Comprehensive feature tests (20 files, ~808 tests)
+  e2e/                  # Comprehensive feature tests (25 files, ~904 tests)
     features.cot         127 tests
     expressions.cot      160 tests
     functions.cot        107 tests
@@ -161,6 +161,11 @@ test/
     sort.cot               7 tests
     json.cot              38 tests
     safe_mode.cot          8 tests
+    io.cot                14 tests
+    encoding.cot          26 tests
+    url.cot               13 tests
+    http.cot              11 tests
+    wasmgc.cot            12 tests
   test_inline.cot       # Manual smoke test
   browser/              # Pre-compiled Wasm for manual browser testing
 ```

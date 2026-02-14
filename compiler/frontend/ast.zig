@@ -200,6 +200,13 @@ pub const BuiltinKind = enum {
     // Math (float binary)
     fmin,
     fmax,
+    // Networking (TCP sockets)
+    net_socket,
+    net_bind,
+    net_listen,
+    net_accept,
+    net_connect,
+    net_set_reuse_addr,
 
     const map = std.StaticStringMap(BuiltinKind).initComptime(.{
         .{ "sizeOf", .size_of },
@@ -244,6 +251,12 @@ pub const BuiltinKind = enum {
         .{ "sqrt", .sqrt },
         .{ "fmin", .fmin },
         .{ "fmax", .fmax },
+        .{ "net_socket", .net_socket },
+        .{ "net_bind", .net_bind },
+        .{ "net_listen", .net_listen },
+        .{ "net_accept", .net_accept },
+        .{ "net_connect", .net_connect },
+        .{ "net_set_reuse_addr", .net_set_reuse_addr },
     });
 
     pub fn fromString(s: []const u8) ?BuiltinKind {
@@ -294,6 +307,12 @@ pub const BuiltinKind = enum {
             .sqrt => "sqrt",
             .fmin => "fmin",
             .fmax => "fmax",
+            .net_socket => "net_socket",
+            .net_bind => "net_bind",
+            .net_listen => "net_listen",
+            .net_accept => "net_accept",
+            .net_connect => "net_connect",
+            .net_set_reuse_addr => "net_set_reuse_addr",
         };
     }
 };

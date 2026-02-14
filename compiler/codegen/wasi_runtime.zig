@@ -39,6 +39,13 @@ pub const ARG_PTR_NAME = "cot_arg_ptr";
 pub const ENVIRON_COUNT_NAME = "cot_environ_count";
 pub const ENVIRON_LEN_NAME = "cot_environ_len";
 pub const ENVIRON_PTR_NAME = "cot_environ_ptr";
+// Networking
+pub const NET_SOCKET_NAME = "cot_net_socket";
+pub const NET_BIND_NAME = "cot_net_bind";
+pub const NET_LISTEN_NAME = "cot_net_listen";
+pub const NET_ACCEPT_NAME = "cot_net_accept";
+pub const NET_CONNECT_NAME = "cot_net_connect";
+pub const NET_SET_REUSE_ADDR_NAME = "cot_net_set_reuse_addr";
 
 // WASI scratch memory addresses in linear memory
 // Used by adapter shims to build iov structs and read WASI output params
@@ -70,6 +77,13 @@ pub const WasiFunctions = struct {
     environ_count_idx: u32,
     environ_len_idx: u32,
     environ_ptr_idx: u32,
+    // Networking
+    net_socket_idx: u32,
+    net_bind_idx: u32,
+    net_listen_idx: u32,
+    net_accept_idx: u32,
+    net_connect_idx: u32,
+    net_set_reuse_addr_idx: u32,
 };
 
 // =============================================================================
@@ -382,6 +396,23 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .exported = false,
     });
 
+    // Network stubs for WASI (no WASI socket support in preview1)
+    const net_3arg_type = try linker.addType(&[_]ValType{ .i64, .i64, .i64 }, &[_]ValType{.i64});
+    const net_2arg_type = try linker.addType(&[_]ValType{ .i64, .i64 }, &[_]ValType{.i64});
+
+    const net_socket_body = try generateStubReturnsNegOne(allocator);
+    const net_socket_idx = try linker.addFunc(.{ .name = NET_SOCKET_NAME, .type_idx = net_3arg_type, .code = net_socket_body, .exported = false });
+    const net_bind_body = try generateStubReturnsNegOne(allocator);
+    const net_bind_idx = try linker.addFunc(.{ .name = NET_BIND_NAME, .type_idx = net_3arg_type, .code = net_bind_body, .exported = false });
+    const net_listen_body = try generateStubReturnsNegOne(allocator);
+    const net_listen_idx = try linker.addFunc(.{ .name = NET_LISTEN_NAME, .type_idx = net_2arg_type, .code = net_listen_body, .exported = false });
+    const net_accept_body = try generateStubReturnsNegOne(allocator);
+    const net_accept_idx = try linker.addFunc(.{ .name = NET_ACCEPT_NAME, .type_idx = arg_one_type, .code = net_accept_body, .exported = false });
+    const net_connect_body = try generateStubReturnsNegOne(allocator);
+    const net_connect_idx = try linker.addFunc(.{ .name = NET_CONNECT_NAME, .type_idx = net_3arg_type, .code = net_connect_body, .exported = false });
+    const net_reuse_body = try generateStubReturnsZero(allocator);
+    const net_reuse_idx = try linker.addFunc(.{ .name = NET_SET_REUSE_ADDR_NAME, .type_idx = arg_one_type, .code = net_reuse_body, .exported = false });
+
     // Return indices: addFunc returns 0-based func indices.
     // Actual Wasm function index = import_count + func_local_index.
     return WasiFunctions{
@@ -400,6 +431,12 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .environ_count_idx = environ_count_idx + import_count,
         .environ_len_idx = environ_len_idx + import_count,
         .environ_ptr_idx = environ_ptr_idx + import_count,
+        .net_socket_idx = net_socket_idx + import_count,
+        .net_bind_idx = net_bind_idx + import_count,
+        .net_listen_idx = net_listen_idx + import_count,
+        .net_accept_idx = net_accept_idx + import_count,
+        .net_connect_idx = net_connect_idx + import_count,
+        .net_set_reuse_addr_idx = net_reuse_idx + import_count,
     };
 }
 
@@ -553,6 +590,23 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .exported = true,
     });
 
+    // Networking stubs (native overrides in driver.zig provide real syscalls)
+    const net_3arg_type = try linker.addType(&[_]ValType{ .i64, .i64, .i64 }, &[_]ValType{.i64});
+    const net_2arg_type = try linker.addType(&[_]ValType{ .i64, .i64 }, &[_]ValType{.i64});
+
+    const net_socket_body = try generateStubReturnsNegOne(allocator);
+    const net_socket_idx = try linker.addFunc(.{ .name = NET_SOCKET_NAME, .type_idx = net_3arg_type, .code = net_socket_body, .exported = true });
+    const net_bind_body = try generateStubReturnsNegOne(allocator);
+    const net_bind_idx = try linker.addFunc(.{ .name = NET_BIND_NAME, .type_idx = net_3arg_type, .code = net_bind_body, .exported = true });
+    const net_listen_body = try generateStubReturnsNegOne(allocator);
+    const net_listen_idx = try linker.addFunc(.{ .name = NET_LISTEN_NAME, .type_idx = net_2arg_type, .code = net_listen_body, .exported = true });
+    const net_accept_body = try generateStubReturnsNegOne(allocator);
+    const net_accept_idx = try linker.addFunc(.{ .name = NET_ACCEPT_NAME, .type_idx = fd_close_type, .code = net_accept_body, .exported = true });
+    const net_connect_body = try generateStubReturnsNegOne(allocator);
+    const net_connect_idx = try linker.addFunc(.{ .name = NET_CONNECT_NAME, .type_idx = net_3arg_type, .code = net_connect_body, .exported = true });
+    const net_reuse_body = try generateStubReturnsZero(allocator);
+    const net_reuse_idx = try linker.addFunc(.{ .name = NET_SET_REUSE_ADDR_NAME, .type_idx = fd_close_type, .code = net_reuse_body, .exported = true });
+
     return WasiFunctions{
         .fd_write_idx = fd_write_idx,
         .fd_write_simple_idx = fd_write_simple_idx,
@@ -569,6 +623,12 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .environ_count_idx = environ_count_idx,
         .environ_len_idx = environ_len_idx,
         .environ_ptr_idx = environ_ptr_idx,
+        .net_socket_idx = net_socket_idx,
+        .net_bind_idx = net_bind_idx,
+        .net_listen_idx = net_listen_idx,
+        .net_accept_idx = net_accept_idx,
+        .net_connect_idx = net_connect_idx,
+        .net_set_reuse_addr_idx = net_reuse_idx,
     };
 }
 
@@ -995,6 +1055,13 @@ fn generateStubReturnsZero(allocator: std.mem.Allocator) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
     try code.emitI64Const(0);
+    return try code.finish();
+}
+
+fn generateStubReturnsNegOne(allocator: std.mem.Allocator) ![]const u8 {
+    var code = wasm.CodeBuilder.init(allocator);
+    defer code.deinit();
+    try code.emitI64Const(-1);
     return try code.finish();
 }
 

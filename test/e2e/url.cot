@@ -1,0 +1,92 @@
+import "std/url"
+
+test "parse simple http url" {
+    var u = parseUrl("http://example.com/path")
+    @assert_eq(urlScheme(u), "http")
+    @assert_eq(urlHost(u), "example.com")
+    @assert_eq(urlPath(u), "/path")
+    @assert_eq(urlPort(u), "")
+    @assert_eq(urlQuery(u), "")
+    @assert_eq(urlFragment(u), "")
+}
+
+test "parse https with port" {
+    var u = parseUrl("https://localhost:8080/api")
+    @assert_eq(urlScheme(u), "https")
+    @assert_eq(urlHost(u), "localhost")
+    @assert_eq(urlPort(u), "8080")
+    @assert_eq(urlPath(u), "/api")
+}
+
+test "parse with query" {
+    var u = parseUrl("http://example.com/search?q=hello&lang=en")
+    @assert_eq(urlScheme(u), "http")
+    @assert_eq(urlHost(u), "example.com")
+    @assert_eq(urlPath(u), "/search")
+    @assert_eq(urlQuery(u), "q=hello&lang=en")
+}
+
+test "parse with fragment" {
+    var u = parseUrl("http://example.com/page#section")
+    @assert_eq(urlPath(u), "/page")
+    @assert_eq(urlFragment(u), "section")
+}
+
+test "parse with query and fragment" {
+    var u = parseUrl("http://example.com/page?key=val#top")
+    @assert_eq(urlPath(u), "/page")
+    @assert_eq(urlQuery(u), "key=val")
+    @assert_eq(urlFragment(u), "top")
+}
+
+test "parse no path" {
+    var u = parseUrl("http://example.com")
+    @assert_eq(urlScheme(u), "http")
+    @assert_eq(urlHost(u), "example.com")
+    @assert_eq(urlPath(u), "/")
+}
+
+test "parse path only" {
+    var u = parseUrl("/path/to/resource")
+    @assert_eq(urlScheme(u), "")
+    @assert_eq(urlHost(u), "")
+    @assert_eq(urlPath(u), "/path/to/resource")
+}
+
+test "parse empty" {
+    var u = parseUrl("")
+    @assert_eq(urlScheme(u), "")
+    @assert_eq(urlHost(u), "")
+    @assert_eq(urlPath(u), "")
+}
+
+test "parse deep path" {
+    var u = parseUrl("https://api.example.com/v1/users/123/posts")
+    @assert_eq(urlScheme(u), "https")
+    @assert_eq(urlHost(u), "api.example.com")
+    @assert_eq(urlPath(u), "/v1/users/123/posts")
+}
+
+test "urlToString roundtrip" {
+    var original = "http://example.com:8080/path?q=1#top"
+    var u = parseUrl(original)
+    var result = urlToString(u)
+    @assert_eq(result, original)
+}
+
+test "urlToString no port" {
+    var u = parseUrl("https://example.com/path")
+    @assert_eq(urlToString(u), "https://example.com/path")
+}
+
+test "urlToString with query only" {
+    var u = parseUrl("http://example.com/?q=test")
+    @assert_eq(urlQuery(u), "q=test")
+}
+
+test "parse ftp scheme" {
+    var u = parseUrl("ftp://files.example.com/pub/data.txt")
+    @assert_eq(urlScheme(u), "ftp")
+    @assert_eq(urlHost(u), "files.example.com")
+    @assert_eq(urlPath(u), "/pub/data.txt")
+}

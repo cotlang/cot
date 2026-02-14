@@ -919,14 +919,19 @@ pub const Checker = struct {
                 _ = try self.checkExpr(bc.args[2]);
                 return TypeRegistry.VOID;
             },
-            .fd_write, .fd_read, .fd_seek, .fd_open => {
+            .fd_write, .fd_read, .fd_seek, .fd_open, .net_socket, .net_bind, .net_connect => {
                 _ = try self.checkExpr(bc.args[0]);
                 _ = try self.checkExpr(bc.args[1]);
                 _ = try self.checkExpr(bc.args[2]);
                 return TypeRegistry.I64;
             },
-            .fd_close => {
+            .fd_close, .net_accept, .net_set_reuse_addr => {
                 _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            .net_listen => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
                 return TypeRegistry.I64;
             },
             .ptr_of => {

@@ -101,9 +101,9 @@ Cot Source → Scanner → Parser → Checker → IR → SSA
 - Traits: `trait`/`impl Trait for Type` (monomorphized, no vtables)
 - I/O: `print`, `println`, `eprint`, `eprintln` (native syscalls)
 - Imports: `import "std/list"` with cross-file generic instantiation
-- Stdlib: `List(T)`, `Map(K,V)`, `Set(T)`, `std/string` (~25 functions + StringBuilder), `std/math`, `std/json` (parser + encoder), `std/sort`, `std/fs`, `std/os`, `std/time`, `std/random`
+- Stdlib: `List(T)`, `Map(K,V)`, `Set(T)`, `std/string` (~25 functions + StringBuilder), `std/math`, `std/json` (parser + encoder), `std/sort`, `std/fs`, `std/os`, `std/time`, `std/random`, `std/io` (buffered I/O), `std/encoding` (base64 + hex), `std/url` (URL parser), `std/http` (TCP sockets + HTTP)
 - Comptime: `comptime {}` blocks, `@compileError`, const-fold if-expressions, dead branch elimination
-- CLI: `cot build`, `cot run`, `cot test`, `cot version`
+- CLI: `cot build`, `cot run`, `cot test`, `cot init`, `cot lsp`, `cot version`
 - Targets: Wasm32, WASI (`--target=wasm32-wasi`), ARM64 (macOS), x64 (Linux)
 
 ## Project Status
@@ -169,7 +169,7 @@ cot/
 │           ├── isa/aarch64/   # ARM64 backend
 │           ├── isa/x64/       # x64 backend
 │           └── regalloc/      # Register allocator (regalloc2 port)
-├── stdlib/                # Standard library (.cot files)
+├── stdlib/                # Standard library (15 modules, .cot files)
 │   ├── list.cot           # List(T) — ~20 methods
 │   ├── map.cot            # Map(K,V) — hash map with splitmix64
 │   ├── set.cot            # Set(T) — thin wrapper over Map
@@ -180,7 +180,11 @@ cot/
 │   ├── fs.cot             # File I/O (File struct, openFile, readFile, etc.)
 │   ├── os.cot             # Process args, env, exit
 │   ├── time.cot           # Timestamps, Timer struct
-│   └── random.cot         # Random bytes, ints, ranges
+│   ├── random.cot         # Random bytes, ints, ranges
+│   ├── io.cot             # Buffered reader/writer
+│   ├── encoding.cot       # Base64 + hex encode/decode
+│   ├── url.cot            # URL parsing
+│   └── http.cot           # TCP sockets + HTTP response builder
 ├── runtime/               # Native runtime (.o files)
 ├── test/cases/            # .cot test files
 ├── VERSION                # Semantic version (single source of truth)

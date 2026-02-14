@@ -38,7 +38,9 @@ pub const ssa_layout = @import("ssa/passes/layout.zig");
 pub const pipeline_debug = @import("pipeline_debug.zig");
 pub const driver = @import("driver.zig");
 pub const cli = @import("cli.zig");
+pub const project = @import("project.zig");
 pub const lsp_main = @import("lsp/main.zig");
+pub const mcp_main = @import("lsp/mcp_main.zig");
 
 // Native codegen (AOT compiler path)
 // Cranelift-style pipeline: Wasm → CLIF IR → MachInst → ARM64/x64
@@ -104,7 +106,9 @@ pub fn main() !void {
         .run => |opts| runCommand(allocator, opts),
         .@"test" => |opts| testCommand(allocator, opts),
         .fmt => |opts| fmtCommand(allocator, opts),
+        .init => |opts| initCommand(allocator, opts),
         .lsp => lsp_main.run(allocator),
+        .mcp => mcp_main.run(allocator),
         .version => cli.printVersion(),
         .help => |opts| cli.printHelp(opts.subcommand),
     }
@@ -303,6 +307,120 @@ fn fmtCommand(allocator: std.mem.Allocator, opts: cli.FmtOptions) void {
             std.debug.print("Error: Failed to write to stdout\n", .{});
             std.process.exit(1);
         };
+    }
+}
+
+fn initCommand(allocator: std.mem.Allocator, opts: cli.InitOptions) void {
+    // Determine project directory and name
+    const project_name = opts.project_name;
+    const in_subdir = project_name != null;
+
+    // If a name is given, create the directory
+    if (in_subdir) {
+        std.fs.cwd().makePath(project_name.?) catch |e| {
+            std.debug.print("Error: Failed to create directory '{s}': {any}\n", .{ project_name.?, e });
+            std.process.exit(1);
+        };
+    }
+
+    // Resolve display name (for cot.json "name" field)
+    const display_name = project_name orelse blk: {
+        // Use current directory name
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.fs.cwd().realpath(".", &buf) catch {
+            break :blk "myapp";
+        };
+        break :blk std.fs.path.basename(cwd);
+    };
+
+    // Check if cot.json already exists
+    const base_dir = project_name orelse ".";
+    const manifest_path = std.fmt.allocPrint(allocator, "{s}/cot.json", .{base_dir}) catch {
+        std.debug.print("Error: Allocation failed\n", .{});
+        std.process.exit(1);
+    };
+    if (std.fs.cwd().access(manifest_path, .{})) |_| {
+        std.debug.print("Error: cot.json already exists in {s}\n", .{base_dir});
+        std.process.exit(1);
+    } else |_| {}
+
+    // Create src/ directory
+    const src_dir = std.fmt.allocPrint(allocator, "{s}/src", .{base_dir}) catch {
+        std.debug.print("Error: Allocation failed\n", .{});
+        std.process.exit(1);
+    };
+    std.fs.cwd().makePath(src_dir) catch |e| {
+        std.debug.print("Error: Failed to create src/: {any}\n", .{e});
+        std.process.exit(1);
+    };
+
+    // Write cot.json
+    const manifest_content = std.fmt.allocPrint(allocator,
+        \\{{
+        \\    "name": "{s}",
+        \\    "version": "0.1.0",
+        \\    "main": "src/main.cot",
+        \\    "safe": true
+        \\}}
+        \\
+    , .{display_name}) catch {
+        std.debug.print("Error: Allocation failed\n", .{});
+        std.process.exit(1);
+    };
+    std.fs.cwd().writeFile(.{ .sub_path = manifest_path, .data = manifest_content }) catch |e| {
+        std.debug.print("Error: Failed to write cot.json: {any}\n", .{e});
+        std.process.exit(1);
+    };
+
+    // Write src/main.cot
+    const main_path = std.fmt.allocPrint(allocator, "{s}/src/main.cot", .{base_dir}) catch {
+        std.debug.print("Error: Allocation failed\n", .{});
+        std.process.exit(1);
+    };
+    const main_content =
+        \\fn main() i64 {
+        \\    println("Hello, world!")
+        \\    return 0
+        \\}
+        \\
+    ;
+    std.fs.cwd().writeFile(.{ .sub_path = main_path, .data = main_content }) catch |e| {
+        std.debug.print("Error: Failed to write src/main.cot: {any}\n", .{e});
+        std.process.exit(1);
+    };
+
+    // Write .gitignore
+    const gitignore_path = std.fmt.allocPrint(allocator, "{s}/.gitignore", .{base_dir}) catch {
+        std.debug.print("Error: Allocation failed\n", .{});
+        std.process.exit(1);
+    };
+    const gitignore_content =
+        \\# Build output
+        \\*.wasm
+        \\*.o
+        \\
+        \\# Editor
+        \\.vscode/
+        \\.idea/
+        \\
+    ;
+    // Only write .gitignore if it doesn't exist
+    if (std.fs.cwd().access(gitignore_path, .{})) |_| {
+        // Already exists, skip
+    } else |_| {
+        std.fs.cwd().writeFile(.{ .sub_path = gitignore_path, .data = gitignore_content }) catch |e| {
+            std.debug.print("Error: Failed to write .gitignore: {any}\n", .{e});
+            std.process.exit(1);
+        };
+    }
+
+    // Print success
+    if (in_subdir) {
+        std.debug.print("Created project '{s}' in {s}/\n", .{ display_name, project_name.? });
+        std.debug.print("\n  cd {s}\n  cot run src/main.cot\n\n", .{project_name.?});
+    } else {
+        std.debug.print("Initialized project '{s}'\n", .{display_name});
+        std.debug.print("\n  cot run src/main.cot\n\n", .{});
     }
 }
 

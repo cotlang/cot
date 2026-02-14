@@ -42,6 +42,10 @@ pub const FmtOptions = struct {
     write: bool = false,
 };
 
+pub const InitOptions = struct {
+    project_name: ?[]const u8 = null,
+};
+
 pub const HelpOptions = struct {
     subcommand: ?[]const u8 = null,
 };
@@ -51,7 +55,9 @@ pub const Command = union(enum) {
     run: RunOptions,
     @"test": TestOptions,
     fmt: FmtOptions,
+    init: InitOptions,
     lsp,
+    mcp,
     version,
     help: HelpOptions,
 };
@@ -67,7 +73,9 @@ pub fn parseArgs(allocator: std.mem.Allocator) ?Command {
     if (std.mem.eql(u8, first, "run")) return parseRun(allocator, &args);
     if (std.mem.eql(u8, first, "test")) return parseTest(&args);
     if (std.mem.eql(u8, first, "fmt")) return parseFmt(&args);
+    if (std.mem.eql(u8, first, "init")) return parseInit(&args);
     if (std.mem.eql(u8, first, "lsp")) return .lsp;
+    if (std.mem.eql(u8, first, "mcp")) return .mcp;
     if (std.mem.eql(u8, first, "version")) return .version;
     if (std.mem.eql(u8, first, "help")) {
         const sub = args.next();
@@ -202,6 +210,19 @@ fn parseFmt(args: *std.process.ArgIterator) ?Command {
     return .{ .fmt = opts };
 }
 
+fn parseInit(args: *std.process.ArgIterator) ?Command {
+    var opts = InitOptions{};
+    if (args.next()) |arg| {
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            opts.project_name = arg;
+        } else {
+            std.debug.print("Error: Unknown option '{s}'\n", .{arg});
+            return null;
+        }
+    }
+    return .{ .init = opts };
+}
+
 fn parseImplicitBuild(maybe_file: ?[]const u8, args: *std.process.ArgIterator, first_flag: ?[]const u8) ?Command {
     var opts = BuildOptions{ .input_file = undefined };
     var has_input = false;
@@ -314,6 +335,10 @@ pub fn printHelp(subcommand: ?[]const u8) void {
             printTestHelp();
         } else if (std.mem.eql(u8, sub, "fmt")) {
             printFmtHelp();
+        } else if (std.mem.eql(u8, sub, "init")) {
+            printInitHelp();
+        } else if (std.mem.eql(u8, sub, "mcp")) {
+            printMcpHelp();
         } else {
             std.debug.print("Unknown command: {s}\n\n", .{sub});
             printUsage();
@@ -332,7 +357,9 @@ fn printUsage() void {
         \\  cot run <file.cot> [-- args]    Compile and run
         \\  cot test <file.cot>             Run tests
         \\  cot fmt <file.cot> [-w]         Format source code
+        \\  cot init [name]                 Create a new project
         \\  cot lsp                         Start language server (LSP)
+        \\  cot mcp                         Start MCP server for AI tools
         \\  cot version                     Print version
         \\  cot help [command]              Print help
         \\
@@ -393,6 +420,54 @@ fn printTestHelp() void {
         \\Examples:
         \\  cot test app.cot                    Run all tests in app.cot
         \\  cot test app.cot --filter=math       Run only tests matching "math"
+        \\
+    , .{});
+}
+
+fn printInitHelp() void {
+    std.debug.print(
+        \\Usage: cot init [name]
+        \\
+        \\Create a new Cot project with cot.json, src/main.cot, and .gitignore.
+        \\
+        \\Arguments:
+        \\  name            Project name and directory (default: current directory)
+        \\
+        \\Examples:
+        \\  cot init                        Initialize in current directory
+        \\  cot init myapp                  Create myapp/ directory with project
+        \\
+    , .{});
+}
+
+fn printMcpHelp() void {
+    std.debug.print(
+        \\Usage: cot mcp
+        \\
+        \\Start a Model Context Protocol (MCP) server over stdio.
+        \\Provides compiler-powered tools for AI assistants (Claude Code, etc.).
+        \\
+        \\Tools provided:
+        \\  get_syntax_reference   Cot language syntax cheat sheet
+        \\  get_stdlib_docs        Standard library function signatures
+        \\  get_project_info       CLI commands and project structure
+        \\  check_file             Parse and type-check a file, return diagnostics
+        \\  list_symbols           List all declarations in a file
+        \\  build                  Compile a file, return success/errors
+        \\  run_tests              Run tests in a file, return results
+        \\
+        \\Protocol: JSON-RPC 2.0 over stdio, newline-delimited.
+        \\
+        \\Configuration (.mcp.json):
+        \\  {{
+        \\    "mcpServers": {{
+        \\      "cot-tools": {{
+        \\        "type": "stdio",
+        \\        "command": "cot",
+        \\        "args": ["mcp"]
+        \\      }}
+        \\    }}
+        \\  }}
         \\
     , .{});
 }

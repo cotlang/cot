@@ -8,7 +8,14 @@ const goto_mod = @import("goto.zig");
 const doc_symbol = @import("document_symbol.zig");
 const semantic_tokens = @import("semantic_tokens.zig");
 const completion_mod = @import("completion.zig");
+const signature_help_mod = @import("signature_help.zig");
 const lsp_types = @import("types.zig");
+const source_mod = @import("../frontend/source.zig");
+const scanner_mod = @import("../frontend/scanner.zig");
+const ast_mod = @import("../frontend/ast.zig");
+const parser_mod = @import("../frontend/parser.zig");
+const errors_mod = @import("../frontend/errors.zig");
+const fmt_mod = @import("../frontend/formatter.zig");
 
 const DocumentStore = document_store.DocumentStore;
 
@@ -88,6 +95,10 @@ pub const Server = struct {
             return try self.handlePrepareRename(arena, id, params);
         } else if (std.mem.eql(u8, method, "textDocument/rename")) {
             return try self.handleRename(arena, id, params);
+        } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
+            return try self.handleSignatureHelp(arena, id, params);
+        } else if (std.mem.eql(u8, method, "textDocument/formatting")) {
+            return try self.handleFormatting(arena, id, params);
         } else if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) {
             return try self.handleSemanticTokensFull(arena, id, params);
         } else {
@@ -125,7 +136,7 @@ pub const Server = struct {
         try legend.append(arena, ']');
 
         const result = try std.fmt.allocPrint(arena,
-            \\{{"capabilities":{{"textDocumentSync":{{"openClose":true,"change":1}},"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true,"completionProvider":{{"triggerCharacters":["@","."]}},"referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"semanticTokensProvider":{{"legend":{{{s}}},"full":true}}}},"serverInfo":{{"name":"cot-lsp","version":"0.1.0"}}}}
+            \\{{"capabilities":{{"textDocumentSync":{{"openClose":true,"change":1}},"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true,"completionProvider":{{"triggerCharacters":["@","."]}},"signatureHelpProvider":{{"triggerCharacters":["(",","]}},"documentFormattingProvider":true,"referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"semanticTokensProvider":{{"legend":{{{s}}},"full":true}}}},"serverInfo":{{"name":"cot-lsp","version":"0.4.0"}}}}
         , .{legend.items});
         return try self.successResponse(arena, id, result);
     }
@@ -267,19 +278,7 @@ pub const Server = struct {
         try json.append(arena, '[');
         for (items, 0..) |item, i| {
             if (i > 0) try json.append(arena, ',');
-            const label_escaped = lsp_types.jsonEscape(arena, item.label) catch item.label;
-            if (item.detail) |detail| {
-                const detail_escaped = lsp_types.jsonEscape(arena, detail) catch detail;
-                const entry = try std.fmt.allocPrint(arena,
-                    \\{{"label":"{s}","kind":{d},"detail":"{s}"}}
-                , .{ label_escaped, item.kind, detail_escaped });
-                try json.appendSlice(arena, entry);
-            } else {
-                const entry = try std.fmt.allocPrint(arena,
-                    \\{{"label":"{s}","kind":{d}}}
-                , .{ label_escaped, item.kind });
-                try json.appendSlice(arena, entry);
-            }
+            try serializeCompletionItem(arena, &json, item);
         }
         try json.append(arena, ']');
 
@@ -421,6 +420,77 @@ pub const Server = struct {
         try json.appendSlice(arena, "]}}");
 
         return try self.successResponse(arena, id, json.items);
+    }
+
+    fn handleSignatureHelp(self: *Server, arena: std.mem.Allocator, id: ?std.json.Value, params: ?std.json.Value) ![]const u8 {
+        const p = params orelse return try self.nullResponse(arena, id);
+        const td = p.object.get("textDocument") orelse return try self.nullResponse(arena, id);
+        const uri = (td.object.get("uri") orelse return try self.nullResponse(arena, id)).string;
+        const pos = p.object.get("position") orelse return try self.nullResponse(arena, id);
+        const line_val: u32 = @intCast(pos.object.get("line").?.integer);
+        const char_val: u32 = @intCast(pos.object.get("character").?.integer);
+
+        const handle = self.store.get(uri) orelse return try self.nullResponse(arena, id);
+        var result = handle.result orelse return try self.nullResponse(arena, id);
+
+        const byte_offset = lsp_types.lspToByteOffset(result.src.content, .{ .line = line_val, .character = char_val });
+        const sig_info = signature_help_mod.getSignatureHelp(arena, &result, byte_offset) orelse return try self.nullResponse(arena, id);
+
+        // Serialize SignatureHelp
+        var json = std.ArrayListUnmanaged(u8){};
+        const label_escaped = lsp_types.jsonEscape(arena, sig_info.label) catch sig_info.label;
+        try json.appendSlice(arena, "{\"signatures\":[{\"label\":\"");
+        try json.appendSlice(arena, label_escaped);
+        try json.appendSlice(arena, "\",\"parameters\":[");
+        for (sig_info.parameters, 0..) |param, i| {
+            if (i > 0) try json.append(arena, ',');
+            const plabel = lsp_types.jsonEscape(arena, param.label) catch param.label;
+            const pentry = try std.fmt.allocPrint(arena,
+                \\{{"label":"{s}"}}
+            , .{plabel});
+            try json.appendSlice(arena, pentry);
+        }
+        try json.appendSlice(arena, "]}],\"activeSignature\":0,\"activeParameter\":");
+        const ap_str = try std.fmt.allocPrint(arena, "{d}", .{sig_info.active_parameter});
+        try json.appendSlice(arena, ap_str);
+        try json.append(arena, '}');
+
+        return try self.successResponse(arena, id, json.items);
+    }
+
+    fn handleFormatting(self: *Server, arena: std.mem.Allocator, id: ?std.json.Value, params: ?std.json.Value) ![]const u8 {
+        const p = params orelse return try self.successResponse(arena, id, "[]");
+        const td = p.object.get("textDocument") orelse return try self.successResponse(arena, id, "[]");
+        const uri = (td.object.get("uri") orelse return try self.successResponse(arena, id, "[]")).string;
+
+        const handle = self.store.get(uri) orelse return try self.successResponse(arena, id, "[]");
+        const result = handle.result orelse return try self.successResponse(arena, id, "[]");
+
+        // Only format if parsing succeeded
+        if (!result.parse_ok) return try self.successResponse(arena, id, "[]");
+
+        // Collect comments from source
+        const comments = fmt_mod.collectComments(arena, result.src.content) catch return try self.successResponse(arena, id, "[]");
+
+        // Format using the existing formatter
+        var fmtr = fmt_mod.Formatter.init(arena, &result.tree, result.src.content, comments);
+        const formatted = fmtr.format() catch return try self.successResponse(arena, id, "[]");
+
+        // If no change, return empty edit list
+        if (std.mem.eql(u8, formatted, result.src.content)) {
+            return try self.successResponse(arena, id, "[]");
+        }
+
+        // Return a single TextEdit that replaces the entire document
+        const line_count = countLines(result.src.content);
+        const last_line_len = lastLineLength(result.src.content);
+        const formatted_escaped = lsp_types.jsonEscape(arena, formatted) catch return try self.successResponse(arena, id, "[]");
+
+        const edit = try std.fmt.allocPrint(arena,
+            \\[{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":{d},"character":{d}}}}},"newText":"{s}"}}]
+        , .{ line_count, last_line_len, formatted_escaped });
+
+        return try self.successResponse(arena, id, edit);
     }
 
     fn handleSemanticTokensFull(self: *Server, arena: std.mem.Allocator, id: ?std.json.Value, params: ?std.json.Value) ![]const u8 {
@@ -569,4 +639,50 @@ fn serializeSymbol(arena: std.mem.Allocator, json: *std.ArrayListUnmanaged(u8), 
     }
 
     try json.append(arena, '}');
+}
+
+fn serializeCompletionItem(arena: std.mem.Allocator, json: *std.ArrayListUnmanaged(u8), item: completion_mod.CompletionItem) !void {
+    const label_escaped = lsp_types.jsonEscape(arena, item.label) catch item.label;
+    try json.appendSlice(arena, "{\"label\":\"");
+    try json.appendSlice(arena, label_escaped);
+    const kind_str = try std.fmt.allocPrint(arena, "\",\"kind\":{d}", .{item.kind});
+    try json.appendSlice(arena, kind_str);
+
+    if (item.detail) |detail| {
+        const detail_escaped = lsp_types.jsonEscape(arena, detail) catch detail;
+        try json.appendSlice(arena, ",\"detail\":\"");
+        try json.appendSlice(arena, detail_escaped);
+        try json.append(arena, '"');
+    }
+
+    if (item.insert_text) |insert_text| {
+        const it_escaped = lsp_types.jsonEscape(arena, insert_text) catch insert_text;
+        try json.appendSlice(arena, ",\"insertText\":\"");
+        try json.appendSlice(arena, it_escaped);
+        try json.append(arena, '"');
+        if (item.insert_text_format == .snippet) {
+            try json.appendSlice(arena, ",\"insertTextFormat\":2");
+        }
+    }
+
+    try json.append(arena, '}');
+}
+
+fn countLines(content: []const u8) u32 {
+    var lines: u32 = 0;
+    for (content) |c| {
+        if (c == '\n') lines += 1;
+    }
+    return lines;
+}
+
+fn lastLineLength(content: []const u8) u32 {
+    var len: u32 = 0;
+    var i = content.len;
+    while (i > 0) {
+        i -= 1;
+        if (content[i] == '\n') break;
+        len += 1;
+    }
+    return len;
 }

@@ -1086,6 +1086,20 @@ pub const GenState = struct {
                 _ = try self.builder.append(.memory_copy);
             },
 
+            // Bulk memory zero using memory.fill (Wasm 2.0)
+            // Go reference: wasm/ssa.go:254-258 (OpWasmLoweredZero)
+            // Stack: [dest_i32, fill_value_i32, size_i32] → []
+            .wasm_lowered_zero => {
+                const size: i32 = @intCast(v.aux_int);
+                try self.getValue64(v.args[0]); // dest addr
+                _ = try self.builder.append(.i32_wrap_i64);
+                const zero_op = try self.builder.append(.i32_const);
+                zero_op.from = prog_mod.constAddr(0); // fill value = 0
+                const size_op = try self.builder.append(.i32_const);
+                size_op.from = prog_mod.constAddr(size);
+                _ = try self.builder.append(.memory_fill);
+            },
+
             else => {
                 debug.log(.codegen, "wasm/gen: unhandled op {s}", .{@tagName(v.op)});
             },
@@ -1235,7 +1249,7 @@ pub const GenState = struct {
                 // Go: SliceMake/StringMake are conceptual — no Wasm local needed
                 // wasm_lowered_move is inline bulk copy — no value produced
                 // wasm_return_call is a terminator (opcode 0x12) — no value on stack
-                if (v.op == .slice_make or v.op == .string_make or v.op == .wasm_lowered_move or v.op == .wasm_return_call) continue;
+                if (v.op == .slice_make or v.op == .string_make or v.op == .wasm_lowered_move or v.op == .wasm_lowered_zero or v.op == .wasm_return_call) continue;
                 if (isFloatType(v.type_idx)) continue; // Skip floats for pass 2
                 if (v.op == .wasm_gc_struct_new) continue; // Skip GC refs for pass 3
 

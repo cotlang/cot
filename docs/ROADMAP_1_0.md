@@ -279,18 +279,18 @@ Combines compiler-internal improvements (Wasm codegen cleanup) with user-facing 
 
 | # | Feature | Description | Risk | Effort | Reference |
 |---|---------|-------------|------|--------|-----------|
-| 14 | `memory.fill` wiring | Opcode defined but never emitted. Wire into zero-init paths (`@alloc`, struct default init). Pure perf win. | Low | Hours | Go `cmd/compile/internal/wasm` |
-| 15 | Multi-value return cleanup | Remove `compound_len_locals` workaround in `gen.zig`. Compound returns (string ptr+len) should use Wasm multi-value natively. Eliminates 5+ special-case code paths that are a recurring source of bugs. | High | 2-3 days | Wasm multi-value spec |
+| 14 | `memory.fill` wiring | **DONE** — Codegen handler added for `wasm_lowered_zero` op. Emits `memory.fill` (0xFC 0x0B). | Low | Hours | Go `cmd/compile/internal/wasm` |
+| 15 | Multi-value return cleanup | **DEFERRED** — Reviewed: `compound_len_locals` works correctly. Go reference doesn't use multi-value returns at all. Cleanup is high risk, low reward. Defer to post-1.0. | High | — | — |
 
 **User-facing features:**
 
 | # | Feature | Description | Reference |
 |---|---------|-------------|-----------|
-| 16 | `cot.toml` project manifest | Project name, version, dependencies (local paths for now), build targets, test config. | `deno.json`, Zig `build.zig.zon`, Cargo.toml |
-| 17 | `cot init` | Create a new project with `cot.toml`, `src/main.cot`, `.gitignore`. | `deno init`, `cargo init` |
-| 18 | `std/http` | HTTP server and client — the minimum viable web story. `http.serve(":8080", handler)` for server, `http.get(url)` for client. | Deno `Deno.serve()`, Go `net/http` |
-| 19 | `std/url` | URL parsing — needed by HTTP. | Go `net/url` |
-| 20 | `std/encoding` | Base64 encode/decode, hex encode/decode. | Deno `std/encoding`, Go `encoding/` |
+| 16 | `cot.json` project manifest | **DONE** — `compiler/project.zig` reads cot.json via `std.json.parseFromSlice`. | `deno.json`, `package.json` |
+| 17 | `cot init` | **DONE** — Creates `cot.json`, `src/main.cot`, `.gitignore`. | `deno init`, `cargo init` |
+| 18 | `std/http` | **DONE** — TCP sockets (`@net_socket`, `@net_bind`, `@net_listen`, `@net_accept`, `@net_connect`, `@net_set_reuse_addr`), sockaddr_in construction, HTTP response builder. ARM64+x64 native overrides. 11 tests. | Go `net/http`, POSIX sockets |
+| 19 | `std/url` | **DONE** — URL parsing (scheme, host, port, path, query, fragment). Heap-allocated pattern. 13 tests. | Go `net/url` |
+| 20 | `std/encoding` | **DONE** — Base64 encode/decode, hex encode/decode, URL-safe base64. 26 tests. | Deno `std/encoding`, Go `encoding/` |
 
 **Why multi-value cleanup belongs here:** `std/http` will return strings and structs heavily. The `compound_len_locals` workaround has caused 5+ bugs already (see MEMORY.md items 12, 14, 17). Cleaning it up before building more stdlib on top prevents a class of compound-return regressions.
 
@@ -322,9 +322,9 @@ These Wasm upgrades are tracked in `docs/WASM_UPGRADE_PLAN.md` but aren't needed
 | `deno fmt` | `cot fmt` | Done |
 | `deno lint` | — | Wave 4 |
 | `deno check` | — | Wave 4 |
-| `deno init` | — | Wave 3 |
-| `deno.json` | — | Wave 3 (`cot.toml`) |
-| Built-in HTTP server | — | Wave 3 (`std/http`) |
+| `deno init` | `cot init` | Done |
+| `deno.json` | `cot.json` | Done |
+| Built-in HTTP server | `std/http` | Done |
 | LSP | autocomplete, rename, references | Done |
 | TypeScript types | Cot types (stronger) | Done |
 | Single binary | `cot` binary | Done |
@@ -352,7 +352,7 @@ A developer should be able to:
 
 - **Wave 1 (language):** 7/7 done
 - **Wave 2 (DX):** 6/6 done
-- **Wave 3 (maturity + project system):** 0/7 — current focus
+- **Wave 3 (maturity + project system):** 6/7 done (multi-value cleanup deferred)
 - **Wave 4 (polish):** 0/4 — can slip to 0.4.x patches
 
 ### 0.5: Make It Production-Capable
@@ -450,7 +450,7 @@ Cot 0.3 built the hard infrastructure — a complete compiler pipeline with dual
 The road to 1.0:
 
 1. **0.3 (COMPLETE):** Language features, type system, stdlib, I/O, MCP server — Cot is a real language
-2. **0.4 (IN PROGRESS):** Waves 1-2 done (language + DX). Remaining: compiler maturity (multi-value cleanup), project system (`cot init`, `std/http`), ecosystem polish
+2. **0.4 (IN PROGRESS):** Waves 1-3 done (language + DX + project system). Remaining: ecosystem polish (Wave 4)
 3. **0.5:** Async, concurrency, WasmGC completion, web framework — make it production-capable
 4. **0.6+:** Ecosystem, package manager — make it community-ready
 5. **1.0:** Polish, docs, stability — make it public

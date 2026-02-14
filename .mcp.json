@@ -2,8 +2,8 @@
   "mcpServers": {
     "cot-tools": {
       "type": "stdio",
-      "command": "./cot-mcp",
-      "args": []
+      "command": "./zig-out/bin/cot",
+      "args": ["mcp"]
     }
   }
 }

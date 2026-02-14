@@ -129,6 +129,17 @@ This document maps **every stage of the Cot compilation pipeline** to its refere
 | `cot_retain` | Swift `swift_retain` (HeapObject.cpp:476) | Increment refcount (null-safe, immortal-safe) |
 | `cot_release` | Swift `swift_release` (HeapObject.cpp:835) | Decrement refcount, call destructor via `call_indirect` at zero, then dealloc |
 
+**Networking runtime functions** are generated as WASI stubs (return -1) by `wasi_runtime.zig`. On native, `driver.zig` overrides them with raw ARM64/x64 syscall implementations. Reference: POSIX sockets API.
+
+| Net Function | Syscall (macOS/Linux) | What It Does |
+|-------------|----------------------|--------------|
+| `cot_net_socket` | 97/41 | Create TCP socket (AF_INET, SOCK_STREAM, IPPROTO_TCP) |
+| `cot_net_bind` | 104/49 | Bind socket to address (translates Wasm ptr → real ptr) |
+| `cot_net_listen` | 106/50 | Start listening with backlog |
+| `cot_net_accept` | 30/43 | Accept connection (NULL addr/addrlen) |
+| `cot_net_connect` | 98/42 | Connect to remote address |
+| `cot_net_set_reuse_addr` | 105/54 (setsockopt) | Set SO_REUSEADDR on socket |
+
 ### Stage 3: Wasm Parse (native path only)
 
 **Reference: wasmparser crate (Rust)**
