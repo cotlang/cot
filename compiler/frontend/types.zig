@@ -71,6 +71,7 @@ pub const ArrayType = struct { elem: TypeIndex, length: u64 };
 pub const MapType = struct { key: TypeIndex, value: TypeIndex };
 pub const ListType = struct { elem: TypeIndex };
 pub const TupleType = struct { element_types: []const TypeIndex };
+pub const FutureType = struct { result_type: TypeIndex };
 
 // Aggregate types
 pub const StructField = struct { name: []const u8, type_idx: TypeIndex, offset: u32 };
@@ -97,6 +98,7 @@ pub const Type = union(enum) {
     enum_type: EnumType,
     union_type: UnionType,
     func: FuncType,
+    future: FutureType,
 
     pub fn underlying(self: Type) Type { return self; }
     pub fn isInvalid(self: Type) bool { return self == .basic and self.basic == .invalid; }
@@ -227,6 +229,7 @@ pub const TypeRegistry = struct {
             .enum_type => |e| e.name,
             .pointer => "pointer",
             .tuple => "tuple",
+            .future => "Future",
             else => "unknown",
         };
     }
@@ -263,6 +266,10 @@ pub const TypeRegistry = struct {
         return self.add(.{ .func = .{ .params = try self.allocator.dupe(FuncParam, params), .return_type = ret } });
     }
 
+    pub fn makeFuture(self: *TypeRegistry, result_type: TypeIndex) !TypeIndex {
+        return self.add(.{ .future = .{ .result_type = result_type } });
+    }
+
     pub fn isPointer(self: *const TypeRegistry, idx: TypeIndex) bool { return self.get(idx) == .pointer; }
     pub fn pointerElem(self: *const TypeRegistry, idx: TypeIndex) TypeIndex {
         return if (self.get(idx) == .pointer) self.get(idx).pointer.elem else invalid_type;
@@ -274,7 +281,7 @@ pub const TypeRegistry = struct {
         if (idx == UNTYPED_INT or idx == UNTYPED_FLOAT) return 8;
         return switch (self.get(idx)) {
             .basic => |k| k.size(),
-            .pointer, .map, .list, .func, .error_set => 8,
+            .pointer, .map, .list, .func, .error_set, .future => 8,
             .tuple => |tup| blk: {
                 var total: u32 = 0;
                 for (tup.element_types) |et| total += ((self.sizeOf(et) + 7) / 8) * 8;
@@ -302,7 +309,7 @@ pub const TypeRegistry = struct {
     pub fn alignmentOf(self: *const TypeRegistry, idx: TypeIndex) u32 {
         return switch (self.get(idx)) {
             .basic => |k| if (k.size() == 0) 1 else k.size(),
-            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple => 8,
+            .pointer, .func, .optional, .error_union, .error_set, .slice, .map, .list, .union_type, .tuple, .future => 8,
             .array => |a| self.alignmentOf(a.elem),
             .struct_type => |s| s.alignment,
             .enum_type => |e| self.alignmentOf(e.backing_type),
@@ -340,8 +347,8 @@ pub const TypeRegistry = struct {
             // For now, all structs are stack-allocated (trivial)
             // When M18 adds heap allocation, this will check for heap objects
             .struct_type => true,
-            // Collections are non-trivial (heap-allocated)
-            .map, .list => false,
+            // Collections and futures are non-trivial (heap-allocated)
+            .map, .list, .future => false,
             // Union types are trivial for now
             .union_type => true,
             // Tuples are trivial if all elements are trivial
@@ -394,6 +401,7 @@ pub const TypeRegistry = struct {
                 return true;
             },
             .func => false,
+            .future => |fa| self.equal(fa.result_type, tb.future.result_type),
         };
     }
 

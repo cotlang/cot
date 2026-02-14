@@ -1,0 +1,188 @@
+// Event loop (kqueue/epoll) E2E tests.
+// Tests run on native only — kqueue on macOS, epoll on Linux.
+// Wasm stubs return -1 (no event loop support in WASI).
+
+import "std/async"
+
+test "kqueue_create returns valid fd" {
+    if (@target_os() == "macos") {
+        const kq = @kqueue_create()
+        @assert(kq >= 0)
+        @fd_close(kq)
+    }
+}
+
+test "epoll_create returns valid fd on linux" {
+    if (@target_os() == "linux") {
+        const ep = @epoll_create()
+        @assert(ep >= 0)
+        @fd_close(ep)
+    }
+}
+
+test "eventLoopCreate returns valid fd" {
+    const loop_fd = eventLoopCreate()
+    @assert(loop_fd >= 0)
+    @fd_close(loop_fd)
+}
+
+test "set_nonblocking on socket" {
+    // Create a TCP socket and set it non-blocking
+    const AF_INET: i64 = 2
+    const SOCK_STREAM: i64 = 1
+    const fd = @net_socket(AF_INET, SOCK_STREAM, 0)
+    if (fd >= 0) {
+        const result = setNonBlocking(fd)
+        @assert(result >= 0)
+        @fd_close(fd)
+    }
+}
+
+test "kqueue kevent_add and kevent_del on socket" {
+    if (@target_os() == "macos") {
+        const kq = @kqueue_create()
+        @assert(kq >= 0)
+
+        const AF_INET: i64 = 2
+        const SOCK_STREAM: i64 = 1
+        const sock = @net_socket(AF_INET, SOCK_STREAM, 0)
+        @assert(sock >= 0)
+
+        // Register socket for read events
+        const add_result = @kevent_add(kq, sock, EVFILT_READ)
+        @assert(add_result >= 0)
+
+        // Remove the watch
+        const del_result = @kevent_del(kq, sock, EVFILT_READ)
+        @assert(del_result >= 0)
+
+        @fd_close(sock)
+        @fd_close(kq)
+    }
+}
+
+test "watchRead and unwatchRead via stdlib" {
+    const loop_fd = eventLoopCreate()
+    @assert(loop_fd >= 0)
+
+    const AF_INET: i64 = 2
+    const SOCK_STREAM: i64 = 1
+    const sock = @net_socket(AF_INET, SOCK_STREAM, 0)
+    @assert(sock >= 0)
+
+    const watch_result = watchRead(loop_fd, sock)
+    @assert(watch_result >= 0)
+
+    const unwatch_result = unwatchRead(loop_fd, sock)
+    @assert(unwatch_result >= 0)
+
+    @fd_close(sock)
+    @fd_close(loop_fd)
+}
+
+test "watchWrite via stdlib" {
+    const loop_fd = eventLoopCreate()
+    @assert(loop_fd >= 0)
+
+    const AF_INET: i64 = 2
+    const SOCK_STREAM: i64 = 1
+    const sock = @net_socket(AF_INET, SOCK_STREAM, 0)
+    @assert(sock >= 0)
+
+    const watch_result = watchWrite(loop_fd, sock)
+    @assert(watch_result >= 0)
+
+    const unwatch_result = unwatchWrite(loop_fd, sock)
+    @assert(unwatch_result >= 0)
+
+    @fd_close(sock)
+    @fd_close(loop_fd)
+}
+
+test "event constants are correct" {
+    @assert_eq(EVFILT_READ, 0 - 1)
+    @assert_eq(EVFILT_WRITE, 0 - 2)
+    @assert_eq(EPOLLIN, 1)
+    @assert_eq(EPOLLOUT, 4)
+    @assert_eq(KEVENT_SIZE, 32)
+    @assert_eq(EPOLL_EVENT_SIZE, 12)
+    @assert_eq(MAX_EVENTS, 64)
+}
+
+// --- Async I/O wrapper tests ---
+
+test "isEagain detects platform EAGAIN" {
+    if (@target_os() == "macos") {
+        @assert_eq(isEagain(0 - 35), true)
+        @assert_eq(isEagain(0 - 11), false)
+    }
+    if (@target_os() == "linux") {
+        @assert_eq(isEagain(0 - 11), true)
+        @assert_eq(isEagain(0 - 35), false)
+    }
+    @assert_eq(isEagain(0), false)
+    @assert_eq(isEagain(5), false)
+}
+
+test "IoError constants" {
+    // Verify the error set compiles and error values are distinct
+    @assert_eq(EAGAIN_MACOS, 35)
+    @assert_eq(EAGAIN_LINUX, 11)
+}
+
+test "asyncRead on ready fd returns immediately" {
+    // Create a pipe — write end is always ready for read
+    // Use a regular file instead (always ready for read on native)
+    var buf = @alloc(64)
+    // Read from /dev/null — returns 0 (EOF) immediately, no EAGAIN
+    const null_fd = @fd_open("/dev/null", 0, 0)
+    if (null_fd >= 0) {
+        const loop_fd = eventLoopCreate()
+        const result = await asyncRead(loop_fd, null_fd, buf, 64) catch 0 - 1
+        @assert_eq(result, 0)
+        @fd_close(null_fd)
+        @fd_close(loop_fd)
+    }
+    @dealloc(buf)
+}
+
+test "asyncWrite on ready fd returns immediately" {
+    // Write to /dev/null — always succeeds immediately
+    var data = @alloc(4)
+    @intToPtr(*u8, data).* = @intCast(u8, 65)
+    const null_fd = @fd_open("/dev/null", 1, 0)
+    if (null_fd >= 0) {
+        const loop_fd = eventLoopCreate()
+        const result = await asyncWrite(loop_fd, null_fd, data, 1) catch 0 - 1
+        @assert_eq(result, 1)
+        @fd_close(null_fd)
+        @fd_close(loop_fd)
+    }
+    @dealloc(data)
+}
+
+test "asyncAccept on non-listening socket returns error" {
+    // Create a socket but don't bind/listen — accept should fail
+    const AF_INET: i64 = 2
+    const SOCK_STREAM: i64 = 1
+    const sock = @net_socket(AF_INET, SOCK_STREAM, 0)
+    if (sock >= 0) {
+        setNonBlocking(sock)
+        const loop_fd = eventLoopCreate()
+        const result = await asyncAccept(loop_fd, sock) catch 0 - 1
+        @assert_eq(result, 0 - 1)
+        @fd_close(sock)
+        @fd_close(loop_fd)
+    }
+}
+
+test "asyncWriteString on ready fd" {
+    const null_fd = @fd_open("/dev/null", 1, 0)
+    if (null_fd >= 0) {
+        const loop_fd = eventLoopCreate()
+        const result = await asyncWriteString(loop_fd, null_fd, "hello") catch 0 - 1
+        @assert_eq(result, 5)
+        @fd_close(null_fd)
+        @fd_close(loop_fd)
+    }
+}

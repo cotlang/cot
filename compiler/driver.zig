@@ -720,7 +720,16 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "cot_net_listen") or
                         std.mem.eql(u8, exp.name, "cot_net_accept") or
                         std.mem.eql(u8, exp.name, "cot_net_connect") or
-                        std.mem.eql(u8, exp.name, "cot_net_set_reuse_addr"))
+                        std.mem.eql(u8, exp.name, "cot_net_set_reuse_addr") or
+                        std.mem.eql(u8, exp.name, "cot_kqueue_create") or
+                        std.mem.eql(u8, exp.name, "cot_kevent_add") or
+                        std.mem.eql(u8, exp.name, "cot_kevent_del") or
+                        std.mem.eql(u8, exp.name, "cot_kevent_wait") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_create") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_add") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_del") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_wait") or
+                        std.mem.eql(u8, exp.name, "cot_set_nonblocking"))
                     {
                         override_name = exp.name;
                         break;
@@ -1219,6 +1228,144 @@ pub const Driver = struct {
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };
                     try module.defineFunctionBytes(func_ids[i], &arm64_reuse, &.{});
+                } else if (std.mem.eql(u8, name, "cot_kqueue_create")) {
+                    // ARM64 macOS syscall for kqueue()
+                    // No user args. Returns kqueue fd.
+                    // macOS SYS_kqueue = 362
+                    const arm64_kqueue_create = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x50, 0x2D, 0x80, 0xD2, // movz x16, #362 (SYS_kqueue)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kqueue_create, &.{});
+                } else if (std.mem.eql(u8, name, "cot_kevent_add")) {
+                    // ARM64 macOS: kevent(kq, changelist, 1, NULL, 0, NULL)
+                    // Builds kevent struct on stack with EV_ADD|EV_CLEAR (0x0021)
+                    // x2=kq, x3=fd, x4=filter. macOS SYS_kevent = 363
+                    const arm64_kevent_add = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xFF, 0x83, 0x00, 0xD1, // sub sp, sp, #32
+                        0xE3, 0x03, 0x00, 0xF9, // str x3, [sp, #0]   (ident = fd)
+                        0xE4, 0x13, 0x00, 0x79, // strh w4, [sp, #8]  (filter)
+                        0x28, 0x04, 0x80, 0x52, // movz w8, #0x0021   (EV_ADD|EV_CLEAR)
+                        0xE8, 0x17, 0x00, 0x79, // strh w8, [sp, #10] (flags)
+                        0xFF, 0x0F, 0x00, 0xB9, // str wzr, [sp, #12] (fflags = 0)
+                        0xFF, 0x0B, 0x00, 0xF9, // str xzr, [sp, #16] (data = 0)
+                        0xFF, 0x0F, 0x00, 0xF9, // str xzr, [sp, #24] (udata = 0)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (kq)
+                        0xE1, 0x03, 0x00, 0x91, // mov x1, sp  (changelist)
+                        0x22, 0x00, 0x80, 0xD2, // movz x2, #1 (nchanges)
+                        0xE3, 0x03, 0x1F, 0xAA, // mov x3, xzr (eventlist = NULL)
+                        0xE4, 0x03, 0x1F, 0xAA, // mov x4, xzr (nevents = 0)
+                        0xE5, 0x03, 0x1F, 0xAA, // mov x5, xzr (timeout = NULL)
+                        0x70, 0x2D, 0x80, 0xD2, // movz x16, #363 (SYS_kevent)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xBF, 0x03, 0x00, 0x91, // mov sp, x29
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kevent_add, &.{});
+                } else if (std.mem.eql(u8, name, "cot_kevent_del")) {
+                    // ARM64 macOS: kevent(kq, changelist, 1, NULL, 0, NULL)
+                    // Builds kevent struct with EV_DELETE (0x0002)
+                    // x2=kq, x3=fd, x4=filter. macOS SYS_kevent = 363
+                    const arm64_kevent_del = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xFF, 0x83, 0x00, 0xD1, // sub sp, sp, #32
+                        0xE3, 0x03, 0x00, 0xF9, // str x3, [sp, #0]   (ident = fd)
+                        0xE4, 0x13, 0x00, 0x79, // strh w4, [sp, #8]  (filter)
+                        0x48, 0x00, 0x80, 0x52, // movz w8, #0x0002   (EV_DELETE)
+                        0xE8, 0x17, 0x00, 0x79, // strh w8, [sp, #10] (flags)
+                        0xFF, 0x0F, 0x00, 0xB9, // str wzr, [sp, #12] (fflags = 0)
+                        0xFF, 0x0B, 0x00, 0xF9, // str xzr, [sp, #16] (data = 0)
+                        0xFF, 0x0F, 0x00, 0xF9, // str xzr, [sp, #24] (udata = 0)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (kq)
+                        0xE1, 0x03, 0x00, 0x91, // mov x1, sp  (changelist)
+                        0x22, 0x00, 0x80, 0xD2, // movz x2, #1 (nchanges)
+                        0xE3, 0x03, 0x1F, 0xAA, // mov x3, xzr (eventlist = NULL)
+                        0xE4, 0x03, 0x1F, 0xAA, // mov x4, xzr (nevents = 0)
+                        0xE5, 0x03, 0x1F, 0xAA, // mov x5, xzr (timeout = NULL)
+                        0x70, 0x2D, 0x80, 0xD2, // movz x16, #363 (SYS_kevent)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xBF, 0x03, 0x00, 0x91, // mov sp, x29
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kevent_del, &.{});
+                } else if (std.mem.eql(u8, name, "cot_kevent_wait")) {
+                    // ARM64 macOS: kevent(kq, NULL, 0, eventlist, max_events, NULL)
+                    // x2=kq, x3=buf_ptr(wasm), x4=max_events. SYS_kevent = 363
+                    // buf_ptr converted to real ptr via linmem at vmctx+0x40000
+                    const arm64_kevent_wait = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // add x8, x0, #0x40, lsl #12  (linmem base)
+                        0x09, 0x01, 0x03, 0x8B, // add x9, x8, x3  (real eventlist ptr)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2      (kq)
+                        0xE1, 0x03, 0x1F, 0xAA, // mov x1, xzr     (changelist = NULL)
+                        0xE2, 0x03, 0x1F, 0xAA, // mov x2, xzr     (nchanges = 0)
+                        0xE3, 0x03, 0x09, 0xAA, // mov x3, x9      (eventlist)
+                        // x4 = max_events (already in x4, untouched)
+                        0xE5, 0x03, 0x1F, 0xAA, // mov x5, xzr     (timeout = NULL, block)
+                        0x70, 0x2D, 0x80, 0xD2, // movz x16, #363  (SYS_kevent)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_kevent_wait, &.{});
+                } else if (std.mem.eql(u8, name, "cot_set_nonblocking")) {
+                    // ARM64 macOS: fcntl(fd, F_GETFL) then fcntl(fd, F_SETFL, flags|O_NONBLOCK)
+                    // x2=fd. macOS SYS_fcntl=92, F_GETFL=3, F_SETFL=4, O_NONBLOCK=4
+                    const arm64_set_nonblocking = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xF3, 0x53, 0xBF, 0xA9, // stp x19, x20, [sp, #-16]!
+                        0xF3, 0x03, 0x02, 0xAA, // mov x19, x2  (save fd)
+                        0xE0, 0x03, 0x13, 0xAA, // mov x0, x19  (fd)
+                        0x61, 0x00, 0x80, 0xD2, // movz x1, #3  (F_GETFL)
+                        0x90, 0x0B, 0x80, 0xD2, // movz x16, #92 (SYS_fcntl)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x62, 0x01, 0x00, 0x54, // b.cs +11  (error → neg)
+                        0x88, 0x00, 0x80, 0xD2, // movz x8, #4  (O_NONBLOCK)
+                        0x14, 0x00, 0x08, 0xAA, // orr x20, x0, x8  (flags | O_NONBLOCK)
+                        0xE0, 0x03, 0x13, 0xAA, // mov x0, x19  (fd)
+                        0x81, 0x00, 0x80, 0xD2, // movz x1, #4  (F_SETFL)
+                        0xE2, 0x03, 0x14, 0xAA, // mov x2, x20  (new flags)
+                        0x90, 0x0B, 0x80, 0xD2, // movz x16, #92 (SYS_fcntl)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x62, 0x00, 0x00, 0x54, // b.cs +3  (error → neg)
+                        0xE0, 0x03, 0x1F, 0xAA, // mov x0, xzr  (return 0)
+                        0x02, 0x00, 0x00, 0x14, // b +2  (skip error)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0
+                        0xF3, 0x53, 0xC1, 0xA8, // ldp x19, x20, [sp], #16
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_set_nonblocking, &.{});
+                } else if (std.mem.eql(u8, name, "cot_epoll_create") or
+                    std.mem.eql(u8, name, "cot_epoll_add") or
+                    std.mem.eql(u8, name, "cot_epoll_del") or
+                    std.mem.eql(u8, name, "cot_epoll_wait"))
+                {
+                    // epoll is Linux-only — return -1 on macOS
+                    const arm64_stub_neg1 = [_]u8{
+                        0x00, 0x00, 0x80, 0x92, // movn x0, #0  (x0 = -1)
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_stub_neg1, &.{});
                 }
             } else {
                 try module.defineFunction(func_ids[i], cf);
@@ -1541,7 +1688,16 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "cot_net_listen") or
                         std.mem.eql(u8, exp.name, "cot_net_accept") or
                         std.mem.eql(u8, exp.name, "cot_net_connect") or
-                        std.mem.eql(u8, exp.name, "cot_net_set_reuse_addr"))
+                        std.mem.eql(u8, exp.name, "cot_net_set_reuse_addr") or
+                        std.mem.eql(u8, exp.name, "cot_kqueue_create") or
+                        std.mem.eql(u8, exp.name, "cot_kevent_add") or
+                        std.mem.eql(u8, exp.name, "cot_kevent_del") or
+                        std.mem.eql(u8, exp.name, "cot_kevent_wait") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_create") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_add") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_del") or
+                        std.mem.eql(u8, exp.name, "cot_epoll_wait") or
+                        std.mem.eql(u8, exp.name, "cot_set_nonblocking"))
                     {
                         override_name = exp.name;
                         break;
@@ -2051,6 +2207,113 @@ pub const Driver = struct {
                         0xC3, // 54: ret
                     };
                     try module.defineFunctionBytes(elf_func_ids[i], &x64_reuse, &.{});
+                } else if (std.mem.eql(u8, name, "cot_epoll_create")) {
+                    // x86-64 Linux: epoll_create1(0)
+                    // SYS_epoll_create1 = 291
+                    const x64_epoll_create = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x31, 0xFF, // xor edi, edi  (flags = 0)
+                        0x48, 0xC7, 0xC0, 0x23, 0x01, 0x00, 0x00, // mov rax, 291 (SYS_epoll_create1)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_create, &.{});
+                } else if (std.mem.eql(u8, name, "cot_epoll_add")) {
+                    // x86-64 Linux: epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event)
+                    // rdx=epfd, rcx=fd, r8=events_mask
+                    // SYS_epoll_ctl = 233, EPOLL_CTL_ADD = 1
+                    // Build struct epoll_event on stack: events(u32@0), data.fd(i32@4)
+                    const x64_epoll_add = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16
+                        0x44, 0x89, 0x04, 0x24, //  8: mov [rsp], r8d  (events = events_mask)
+                        0x89, 0x4C, 0x24, 0x04, // 12: mov [rsp+4], ecx (data.fd = fd)
+                        0x48, 0x89, 0xD7, // 16: mov rdi, rdx  (epfd)
+                        0xBE, 0x01, 0x00, 0x00, 0x00, // 19: mov esi, 1  (EPOLL_CTL_ADD)
+                        0x48, 0x89, 0xCA, // 24: mov rdx, rcx  (fd)
+                        0x49, 0x89, 0xE2, // 27: mov r10, rsp  (&event, arg4)
+                        0x48, 0xC7, 0xC0, 0xE9, 0x00, 0x00, 0x00, // 30: mov rax, 233 (SYS_epoll_ctl)
+                        0x0F, 0x05, // 37: syscall
+                        0x48, 0x83, 0xC4, 0x10, // 39: add rsp, 16
+                        0x5D, // 43: pop rbp
+                        0xC3, // 44: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_add, &.{});
+                } else if (std.mem.eql(u8, name, "cot_epoll_del")) {
+                    // x86-64 Linux: epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL)
+                    // rdx=epfd, rcx=fd. SYS_epoll_ctl = 233, EPOLL_CTL_DEL = 2
+                    const x64_epoll_del = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (epfd)
+                        0xBE, 0x02, 0x00, 0x00, 0x00, // mov esi, 2  (EPOLL_CTL_DEL)
+                        0x48, 0x89, 0xCA, // mov rdx, rcx  (fd)
+                        0x4D, 0x31, 0xD2, // xor r10, r10  (event = NULL)
+                        0x48, 0xC7, 0xC0, 0xE9, 0x00, 0x00, 0x00, // mov rax, 233 (SYS_epoll_ctl)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_del, &.{});
+                } else if (std.mem.eql(u8, name, "cot_epoll_wait")) {
+                    // x86-64 Linux: epoll_wait(epfd, events, maxevents, timeout=-1)
+                    // rdx=epfd, rcx=buf_ptr(wasm), r8=max_events
+                    // SYS_epoll_wait = 232, timeout=-1 (block indefinitely)
+                    const x64_epoll_wait = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, // lea r9, [rdi + 0x40000] (linmem)
+                        0x49, 0x01, 0xC9, // add r9, rcx  (real buf ptr)
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (epfd)
+                        0x4C, 0x89, 0xCE, // mov rsi, r9   (events buf)
+                        0x4C, 0x89, 0xC2, // mov rdx, r8   (maxevents)
+                        0x49, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF, // mov r10, -1  (timeout = block)
+                        0x48, 0xC7, 0xC0, 0xE8, 0x00, 0x00, 0x00, // mov rax, 232 (SYS_epoll_wait)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_epoll_wait, &.{});
+                } else if (std.mem.eql(u8, name, "cot_set_nonblocking")) {
+                    // x86-64 Linux: fcntl(fd, F_GETFL) + fcntl(fd, F_SETFL, flags|O_NONBLOCK)
+                    // rdx=fd. SYS_fcntl=72, F_GETFL=3, F_SETFL=4, O_NONBLOCK=0x800
+                    const x64_set_nonblocking = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x41, 0x54, //  4: push r12  (save fd)
+                        0x49, 0x89, 0xD4, //  6: mov r12, rdx  (fd)
+                        0x4C, 0x89, 0xE7, //  9: mov rdi, r12  (fd)
+                        0xBE, 0x03, 0x00, 0x00, 0x00, // 12: mov esi, 3  (F_GETFL)
+                        0x48, 0xC7, 0xC0, 0x48, 0x00, 0x00, 0x00, // 17: mov rax, 72 (SYS_fcntl)
+                        0x0F, 0x05, // 24: syscall
+                        0x48, 0x85, 0xC0, // 26: test rax, rax
+                        0x78, 0x15, // 29: js +21  (→ error at 52)
+                        0x48, 0x0D, 0x00, 0x08, 0x00, 0x00, // 31: or rax, 0x800 (O_NONBLOCK)
+                        0x4C, 0x89, 0xE7, // 37: mov rdi, r12  (fd)
+                        0xBE, 0x04, 0x00, 0x00, 0x00, // 40: mov esi, 4  (F_SETFL)
+                        0x48, 0x89, 0xC2, // 45: mov rdx, rax  (new flags)
+                        0x48, 0xC7, 0xC0, 0x48, 0x00, 0x00, 0x00, // 48: mov rax, 72 (SYS_fcntl)
+                        0x0F, 0x05, // 55: syscall
+                        // 57: (fall through — rax has result or error)
+                        0x41, 0x5C, // 57: pop r12
+                        0x5D, // 59: pop rbp
+                        0xC3, // 60: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_set_nonblocking, &.{});
+                } else if (std.mem.eql(u8, name, "cot_kqueue_create") or
+                    std.mem.eql(u8, name, "cot_kevent_add") or
+                    std.mem.eql(u8, name, "cot_kevent_del") or
+                    std.mem.eql(u8, name, "cot_kevent_wait"))
+                {
+                    // kqueue is macOS-only — return -1 on Linux
+                    const x64_stub_neg1 = [_]u8{
+                        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_stub_neg1, &.{});
                 }
             } else {
                 try module.defineFunction(elf_func_ids[i], cf);
@@ -2412,6 +2675,16 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, wasi_runtime.NET_ACCEPT_NAME, wasi_funcs.net_accept_idx);
         try func_indices.put(self.allocator, wasi_runtime.NET_CONNECT_NAME, wasi_funcs.net_connect_idx);
         try func_indices.put(self.allocator, wasi_runtime.NET_SET_REUSE_ADDR_NAME, wasi_funcs.net_set_reuse_addr_idx);
+        // Event loop (kqueue/epoll)
+        try func_indices.put(self.allocator, wasi_runtime.KQUEUE_CREATE_NAME, wasi_funcs.kqueue_create_idx);
+        try func_indices.put(self.allocator, wasi_runtime.KEVENT_ADD_NAME, wasi_funcs.kevent_add_idx);
+        try func_indices.put(self.allocator, wasi_runtime.KEVENT_DEL_NAME, wasi_funcs.kevent_del_idx);
+        try func_indices.put(self.allocator, wasi_runtime.KEVENT_WAIT_NAME, wasi_funcs.kevent_wait_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_CREATE_NAME, wasi_funcs.epoll_create_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_ADD_NAME, wasi_funcs.epoll_add_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_DEL_NAME, wasi_funcs.epoll_del_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EPOLL_WAIT_NAME, wasi_funcs.epoll_wait_idx);
+        try func_indices.put(self.allocator, wasi_runtime.SET_NONBLOCK_NAME, wasi_funcs.set_nonblocking_idx);
 
         // Add test function names to index map (Zig)
         try func_indices.put(self.allocator, test_runtime.TEST_PRINT_NAME_NAME, test_funcs.test_print_name_idx);

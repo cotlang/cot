@@ -46,6 +46,16 @@ pub const NET_LISTEN_NAME = "cot_net_listen";
 pub const NET_ACCEPT_NAME = "cot_net_accept";
 pub const NET_CONNECT_NAME = "cot_net_connect";
 pub const NET_SET_REUSE_ADDR_NAME = "cot_net_set_reuse_addr";
+// Event loop (kqueue/epoll)
+pub const KQUEUE_CREATE_NAME = "cot_kqueue_create";
+pub const KEVENT_ADD_NAME = "cot_kevent_add";
+pub const KEVENT_DEL_NAME = "cot_kevent_del";
+pub const KEVENT_WAIT_NAME = "cot_kevent_wait";
+pub const EPOLL_CREATE_NAME = "cot_epoll_create";
+pub const EPOLL_ADD_NAME = "cot_epoll_add";
+pub const EPOLL_DEL_NAME = "cot_epoll_del";
+pub const EPOLL_WAIT_NAME = "cot_epoll_wait";
+pub const SET_NONBLOCK_NAME = "cot_set_nonblocking";
 
 // WASI scratch memory addresses in linear memory
 // Used by adapter shims to build iov structs and read WASI output params
@@ -84,6 +94,16 @@ pub const WasiFunctions = struct {
     net_accept_idx: u32,
     net_connect_idx: u32,
     net_set_reuse_addr_idx: u32,
+    // Event loop
+    kqueue_create_idx: u32,
+    kevent_add_idx: u32,
+    kevent_del_idx: u32,
+    kevent_wait_idx: u32,
+    epoll_create_idx: u32,
+    epoll_add_idx: u32,
+    epoll_del_idx: u32,
+    epoll_wait_idx: u32,
+    set_nonblocking_idx: u32,
 };
 
 // =============================================================================
@@ -413,6 +433,26 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
     const net_reuse_body = try generateStubReturnsZero(allocator);
     const net_reuse_idx = try linker.addFunc(.{ .name = NET_SET_REUSE_ADDR_NAME, .type_idx = arg_one_type, .code = net_reuse_body, .exported = false });
 
+    // Event loop stubs for WASI (no kqueue/epoll in WASI preview1)
+    const kqueue_create_body = try generateStubReturnsNegOne(allocator);
+    const kqueue_create_idx = try linker.addFunc(.{ .name = KQUEUE_CREATE_NAME, .type_idx = time_type, .code = kqueue_create_body, .exported = false });
+    const kevent_add_body = try generateStubReturnsNegOne(allocator);
+    const kevent_add_idx = try linker.addFunc(.{ .name = KEVENT_ADD_NAME, .type_idx = net_3arg_type, .code = kevent_add_body, .exported = false });
+    const kevent_del_body = try generateStubReturnsNegOne(allocator);
+    const kevent_del_idx = try linker.addFunc(.{ .name = KEVENT_DEL_NAME, .type_idx = net_3arg_type, .code = kevent_del_body, .exported = false });
+    const kevent_wait_body = try generateStubReturnsNegOne(allocator);
+    const kevent_wait_idx = try linker.addFunc(.{ .name = KEVENT_WAIT_NAME, .type_idx = net_3arg_type, .code = kevent_wait_body, .exported = false });
+    const epoll_create_body = try generateStubReturnsNegOne(allocator);
+    const epoll_create_idx = try linker.addFunc(.{ .name = EPOLL_CREATE_NAME, .type_idx = time_type, .code = epoll_create_body, .exported = false });
+    const epoll_add_body = try generateStubReturnsNegOne(allocator);
+    const epoll_add_idx = try linker.addFunc(.{ .name = EPOLL_ADD_NAME, .type_idx = net_3arg_type, .code = epoll_add_body, .exported = false });
+    const epoll_del_body = try generateStubReturnsNegOne(allocator);
+    const epoll_del_idx = try linker.addFunc(.{ .name = EPOLL_DEL_NAME, .type_idx = net_2arg_type, .code = epoll_del_body, .exported = false });
+    const epoll_wait_body = try generateStubReturnsNegOne(allocator);
+    const epoll_wait_idx = try linker.addFunc(.{ .name = EPOLL_WAIT_NAME, .type_idx = net_3arg_type, .code = epoll_wait_body, .exported = false });
+    const set_nonblock_body = try generateStubReturnsNegOne(allocator);
+    const set_nonblock_idx = try linker.addFunc(.{ .name = SET_NONBLOCK_NAME, .type_idx = arg_one_type, .code = set_nonblock_body, .exported = false });
+
     // Return indices: addFunc returns 0-based func indices.
     // Actual Wasm function index = import_count + func_local_index.
     return WasiFunctions{
@@ -437,6 +477,15 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .net_accept_idx = net_accept_idx + import_count,
         .net_connect_idx = net_connect_idx + import_count,
         .net_set_reuse_addr_idx = net_reuse_idx + import_count,
+        .kqueue_create_idx = kqueue_create_idx + import_count,
+        .kevent_add_idx = kevent_add_idx + import_count,
+        .kevent_del_idx = kevent_del_idx + import_count,
+        .kevent_wait_idx = kevent_wait_idx + import_count,
+        .epoll_create_idx = epoll_create_idx + import_count,
+        .epoll_add_idx = epoll_add_idx + import_count,
+        .epoll_del_idx = epoll_del_idx + import_count,
+        .epoll_wait_idx = epoll_wait_idx + import_count,
+        .set_nonblocking_idx = set_nonblock_idx + import_count,
     };
 }
 
@@ -607,6 +656,29 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
     const net_reuse_body = try generateStubReturnsZero(allocator);
     const net_reuse_idx = try linker.addFunc(.{ .name = NET_SET_REUSE_ADDR_NAME, .type_idx = fd_close_type, .code = net_reuse_body, .exported = true });
 
+    // Event loop stubs (native overrides in driver.zig provide real syscalls)
+    // kqueue (macOS): 0-arg create, 3-arg add/del/wait
+    const kqueue_create_body = try generateStubReturnsNegOne(allocator);
+    const kqueue_create_idx = try linker.addFunc(.{ .name = KQUEUE_CREATE_NAME, .type_idx = time_type, .code = kqueue_create_body, .exported = true });
+    const kevent_add_body = try generateStubReturnsNegOne(allocator);
+    const kevent_add_idx = try linker.addFunc(.{ .name = KEVENT_ADD_NAME, .type_idx = net_3arg_type, .code = kevent_add_body, .exported = true });
+    const kevent_del_body = try generateStubReturnsNegOne(allocator);
+    const kevent_del_idx = try linker.addFunc(.{ .name = KEVENT_DEL_NAME, .type_idx = net_3arg_type, .code = kevent_del_body, .exported = true });
+    const kevent_wait_body = try generateStubReturnsNegOne(allocator);
+    const kevent_wait_idx = try linker.addFunc(.{ .name = KEVENT_WAIT_NAME, .type_idx = net_3arg_type, .code = kevent_wait_body, .exported = true });
+    // epoll (Linux): 0-arg create, 3-arg add, 2-arg del, 3-arg wait
+    const epoll_create_body = try generateStubReturnsNegOne(allocator);
+    const epoll_create_idx = try linker.addFunc(.{ .name = EPOLL_CREATE_NAME, .type_idx = time_type, .code = epoll_create_body, .exported = true });
+    const epoll_add_body = try generateStubReturnsNegOne(allocator);
+    const epoll_add_idx = try linker.addFunc(.{ .name = EPOLL_ADD_NAME, .type_idx = net_3arg_type, .code = epoll_add_body, .exported = true });
+    const epoll_del_body = try generateStubReturnsNegOne(allocator);
+    const epoll_del_idx = try linker.addFunc(.{ .name = EPOLL_DEL_NAME, .type_idx = net_2arg_type, .code = epoll_del_body, .exported = true });
+    const epoll_wait_body = try generateStubReturnsNegOne(allocator);
+    const epoll_wait_idx = try linker.addFunc(.{ .name = EPOLL_WAIT_NAME, .type_idx = net_3arg_type, .code = epoll_wait_body, .exported = true });
+    // set_nonblocking: 1-arg
+    const set_nonblock_body = try generateStubReturnsNegOne(allocator);
+    const set_nonblock_idx = try linker.addFunc(.{ .name = SET_NONBLOCK_NAME, .type_idx = fd_close_type, .code = set_nonblock_body, .exported = true });
+
     return WasiFunctions{
         .fd_write_idx = fd_write_idx,
         .fd_write_simple_idx = fd_write_simple_idx,
@@ -629,6 +701,15 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .net_accept_idx = net_accept_idx,
         .net_connect_idx = net_connect_idx,
         .net_set_reuse_addr_idx = net_reuse_idx,
+        .kqueue_create_idx = kqueue_create_idx,
+        .kevent_add_idx = kevent_add_idx,
+        .kevent_del_idx = kevent_del_idx,
+        .kevent_wait_idx = kevent_wait_idx,
+        .epoll_create_idx = epoll_create_idx,
+        .epoll_add_idx = epoll_add_idx,
+        .epoll_del_idx = epoll_del_idx,
+        .epoll_wait_idx = epoll_wait_idx,
+        .set_nonblocking_idx = set_nonblock_idx,
     };
 }
 

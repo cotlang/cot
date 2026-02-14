@@ -1,0 +1,198 @@
+// Async/await E2E tests.
+// Wasm: Rust-style stackless state machine (poll-based).
+// Native: Zig-style eager evaluation (body runs as normal function).
+
+async fn compute(x: i64) i64 {
+    return x * 2 + 1
+}
+
+test "await basic async fn" {
+    const result = await compute(5)
+    @assert_eq(result, 11)
+}
+
+test "await with different args" {
+    const a = await compute(0)
+    @assert_eq(a, 1)
+    const b = await compute(10)
+    @assert_eq(b, 21)
+    const c = await compute(100)
+    @assert_eq(c, 201)
+}
+
+async fn add(a: i64, b: i64) i64 {
+    return a + b
+}
+
+test "async fn with multiple params" {
+    const result = await add(3, 7)
+    @assert_eq(result, 10)
+}
+
+async fn get_value() i64 {
+    return 42
+}
+
+test "async fn with no params" {
+    const result = await get_value()
+    @assert_eq(result, 42)
+}
+
+async fn nested_helper(x: i64) i64 {
+    return x * 3
+}
+
+async fn nested_caller(x: i64) i64 {
+    const inner = await nested_helper(x)
+    return inner + 1
+}
+
+test "nested await" {
+    const result = await nested_caller(5)
+    @assert_eq(result, 16)
+}
+
+async fn conditional(x: i64) i64 {
+    if (x > 10) {
+        return x * 2
+    }
+    return x + 5
+}
+
+test "async fn with branching" {
+    const a = await conditional(3)
+    @assert_eq(a, 8)
+    const b = await conditional(20)
+    @assert_eq(b, 40)
+}
+
+test "await on variable holding future" {
+    const future = compute(7)
+    const result = await future
+    @assert_eq(result, 15)
+}
+
+// --- Tests that exercise deeper async patterns ---
+
+async fn double_nested_a(x: i64) i64 {
+    return x + 10
+}
+
+async fn double_nested_b(x: i64) i64 {
+    const a = await double_nested_a(x)
+    return a * 2
+}
+
+async fn double_nested_c(x: i64) i64 {
+    const b = await double_nested_b(x)
+    return b - 1
+}
+
+test "three-level nested await" {
+    const result = await double_nested_c(5)
+    @assert_eq(result, 29)
+}
+
+async fn async_loop_sum(n: i64) i64 {
+    var sum: i64 = 0
+    var i: i64 = 1
+    while (i <= n) {
+        sum = sum + i
+        i = i + 1
+    }
+    return sum
+}
+
+test "async fn with loop" {
+    const result = await async_loop_sum(10)
+    @assert_eq(result, 55)
+}
+
+test "multiple independent awaits" {
+    const a = await compute(1)
+    const b = await compute(2)
+    const c = await compute(3)
+    @assert_eq(a + b + c, 3 + 5 + 7)
+}
+
+async fn factorial(n: i64) i64 {
+    if (n <= 1) {
+        return 1
+    }
+    var result: i64 = 1
+    var i: i64 = 2
+    while (i <= n) {
+        result = result * i
+        i = i + 1
+    }
+    return result
+}
+
+test "async factorial" {
+    const r1 = await factorial(5)
+    @assert_eq(r1, 120)
+    const r2 = await factorial(10)
+    @assert_eq(r2, 3628800)
+}
+
+test "await in expression context" {
+    const result = await compute(3) + await compute(4)
+    @assert_eq(result, 7 + 9)
+}
+
+// --- Error unions across await points (try await) ---
+// Zig pattern: error unions and async are orthogonal.
+// Errors propagate naturally, suspension is transparent.
+
+const AsyncError = error { NotFound, InvalidInput }
+
+async fn async_may_fail(x: i64) AsyncError!i64 {
+    if (x < 0) { return error.InvalidInput }
+    if (x == 0) { return error.NotFound }
+    return x * 2
+}
+
+fn call_try_await_success() AsyncError!i64 {
+    const result = try await async_may_fail(5)
+    return result
+}
+
+test "try await success" {
+    const val = call_try_await_success() catch 99
+    @assert_eq(val, 10)
+}
+
+fn call_try_await_error() AsyncError!i64 {
+    const result = try await async_may_fail(-1)
+    return result
+}
+
+test "try await error propagation" {
+    const val = call_try_await_error() catch 99
+    @assert_eq(val, 99)
+}
+
+test "try await with catch" {
+    const val = await async_may_fail(5) catch 0
+    @assert_eq(val, 10)
+}
+
+test "try await error with catch" {
+    const val = await async_may_fail(-1) catch 42
+    @assert_eq(val, 42)
+}
+
+async fn async_chain(x: i64) AsyncError!i64 {
+    const intermediate = try await async_may_fail(x)
+    return intermediate + 100
+}
+
+test "try await chain" {
+    const val = await async_chain(5) catch 0
+    @assert_eq(val, 110)
+}
+
+test "try await chain error" {
+    const val = await async_chain(-1) catch 77
+    @assert_eq(val, 77)
+}

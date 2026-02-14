@@ -1,0 +1,229 @@
+// async — Event loop and async I/O primitives.
+//
+// Wraps platform-specific event notification (kqueue on macOS, epoll on Linux).
+// Reference: Go runtime/netpoll_kqueue.go (event loop patterns), Zig std/Io/Kqueue.zig
+//
+// Design: The event loop is a global singleton. File descriptors are registered
+// for read/write interest. The loop blocks on kqueue/epoll and returns which
+// FDs are ready.
+
+// ============================================================================
+// Platform Constants
+// ============================================================================
+
+// kqueue filter constants (macOS)
+const EVFILT_READ: i64 = 0 - 1
+const EVFILT_WRITE: i64 = 0 - 2
+
+// epoll event constants (Linux)
+const EPOLLIN: i64 = 1
+const EPOLLOUT: i64 = 4
+
+// Maximum events per wait call
+const MAX_EVENTS: i64 = 64
+
+// Size of a kevent struct (macOS) = 32 bytes
+const KEVENT_SIZE: i64 = 32
+
+// Size of an epoll_event struct (Linux) = 12 bytes
+const EPOLL_EVENT_SIZE: i64 = 12
+
+// ============================================================================
+// Event Loop
+// ============================================================================
+
+// Create a new event loop. Returns the kqueue/epoll fd.
+fn eventLoopCreate() i64 {
+    if (@target_os() == "macos") {
+        return @kqueue_create()
+    }
+    return @epoll_create()
+}
+
+// Register a file descriptor for read events.
+fn watchRead(loop_fd: i64, fd: i64) i64 {
+    if (@target_os() == "macos") {
+        return @kevent_add(loop_fd, fd, EVFILT_READ)
+    }
+    return @epoll_add(loop_fd, fd, EPOLLIN)
+}
+
+// Register a file descriptor for write events.
+fn watchWrite(loop_fd: i64, fd: i64) i64 {
+    if (@target_os() == "macos") {
+        return @kevent_add(loop_fd, fd, EVFILT_WRITE)
+    }
+    return @epoll_add(loop_fd, fd, EPOLLOUT)
+}
+
+// Remove a file descriptor from the event loop.
+fn unwatchRead(loop_fd: i64, fd: i64) i64 {
+    if (@target_os() == "macos") {
+        return @kevent_del(loop_fd, fd, EVFILT_READ)
+    }
+    return @epoll_del(loop_fd, fd)
+}
+
+// Remove a write watch from the event loop.
+fn unwatchWrite(loop_fd: i64, fd: i64) i64 {
+    if (@target_os() == "macos") {
+        return @kevent_del(loop_fd, fd, EVFILT_WRITE)
+    }
+    return @epoll_del(loop_fd, fd)
+}
+
+// Wait for events. Returns number of ready events.
+// buf must be a pointer to a buffer large enough for MAX_EVENTS * KEVENT_SIZE (macOS)
+// or MAX_EVENTS * EPOLL_EVENT_SIZE (Linux).
+fn eventLoopWait(loop_fd: i64, buf: i64, max_events: i64) i64 {
+    if (@target_os() == "macos") {
+        return @kevent_wait(loop_fd, buf, max_events)
+    }
+    return @epoll_wait(loop_fd, buf, max_events)
+}
+
+// Set a file descriptor to non-blocking mode.
+fn setNonBlocking(fd: i64) i64 {
+    return @set_nonblocking(fd)
+}
+
+// ============================================================================
+// Event Access Helpers
+// ============================================================================
+
+// Extract the fd (ident) from a kevent at index i in the buffer.
+// macOS kevent: ident is at offset 0, 8 bytes.
+fn keventFd(buf: i64, index: i64) i64 {
+    var ptr = buf + index * KEVENT_SIZE
+    return @intToPtr(*i64, ptr).*
+}
+
+// Extract the fd from an epoll_event at index i in the buffer.
+// Linux epoll_event: data.fd is at offset 4, 4 bytes (events is u32 at offset 0).
+fn epollEventFd(buf: i64, index: i64) i64 {
+    var ptr = buf + index * EPOLL_EVENT_SIZE + 4
+    return @intCast(i64, @intToPtr(*i32, ptr).*)
+}
+
+// Get the fd from event at index i (platform-appropriate).
+fn eventFd(buf: i64, index: i64) i64 {
+    if (@target_os() == "macos") {
+        return keventFd(buf, index)
+    }
+    return epollEventFd(buf, index)
+}
+
+// ============================================================================
+// Async I/O Wrappers
+// ============================================================================
+//
+// Zig pattern: EAGAIN is NOT an error — it means "not ready, try again later".
+// The loop: non-blocking syscall → if EAGAIN → register with event loop → yield → retry.
+// All real errors return immediately via error union.
+// Reference: Zig std/Io/Kqueue.zig (read/write/accept methods)
+
+// EAGAIN / EWOULDBLOCK errno values
+const EAGAIN_MACOS: i64 = 35
+const EAGAIN_LINUX: i64 = 11
+
+const IoError = error { ReadError, WriteError, AcceptError, ConnectError }
+
+// Check if a negative result is EAGAIN (would block).
+fn isEagain(result: i64) bool {
+    if (@target_os() == "macos") {
+        return result == (0 - EAGAIN_MACOS)
+    }
+    return result == (0 - EAGAIN_LINUX)
+}
+
+// Async accept — waits for a connection on a non-blocking listening socket.
+// Zig pattern: loop { accept(); if EAGAIN { register; yield; continue } else return }
+async fn asyncAccept(loop_fd: i64, listen_fd: i64) IoError!i64 {
+    var result = @net_accept(listen_fd)
+    if (result >= 0) {
+        return result
+    }
+    if (not isEagain(result)) {
+        return error.AcceptError
+    }
+    // EAGAIN — register for read events and wait
+    watchRead(loop_fd, listen_fd)
+    // Poll the event loop — blocking wait for this fd to become ready
+    var event_buf = @alloc(MAX_EVENTS * KEVENT_SIZE)
+    var n = eventLoopWait(loop_fd, event_buf, MAX_EVENTS)
+    @dealloc(event_buf)
+    // Retry the accept after the event fires
+    result = @net_accept(listen_fd)
+    if (result < 0) { return error.AcceptError }
+    return result
+}
+
+// Async read — reads from a non-blocking fd, waiting if necessary.
+// Zig pattern: non-blocking read → EAGAIN → register → wait → retry
+async fn asyncRead(loop_fd: i64, fd: i64, buf: i64, len: i64) IoError!i64 {
+    var result = @fd_read(fd, buf, len)
+    if (result >= 0) {
+        return result
+    }
+    if (not isEagain(result)) {
+        return error.ReadError
+    }
+    // EAGAIN — register for read events and wait
+    watchRead(loop_fd, fd)
+    var event_buf = @alloc(MAX_EVENTS * KEVENT_SIZE)
+    var n = eventLoopWait(loop_fd, event_buf, MAX_EVENTS)
+    @dealloc(event_buf)
+    // Retry after event
+    result = @fd_read(fd, buf, len)
+    if (result < 0) { return error.ReadError }
+    return result
+}
+
+// Async write — writes to a non-blocking fd, waiting if necessary.
+// Zig pattern: non-blocking write → EAGAIN → register → wait → retry
+async fn asyncWrite(loop_fd: i64, fd: i64, buf: i64, len: i64) IoError!i64 {
+    var result = @fd_write(fd, buf, len)
+    if (result >= 0) {
+        return result
+    }
+    if (not isEagain(result)) {
+        return error.WriteError
+    }
+    // EAGAIN — register for write events and wait
+    watchWrite(loop_fd, fd)
+    var event_buf = @alloc(MAX_EVENTS * KEVENT_SIZE)
+    var n = eventLoopWait(loop_fd, event_buf, MAX_EVENTS)
+    @dealloc(event_buf)
+    // Retry after event
+    result = @fd_write(fd, buf, len)
+    if (result < 0) { return error.WriteError }
+    return result
+}
+
+// Async write string — convenience wrapper for writing strings.
+async fn asyncWriteString(loop_fd: i64, fd: i64, s: string) IoError!i64 {
+    return try await asyncWrite(loop_fd, fd, @ptrOf(s), @lenOf(s))
+}
+
+// Async connect — connects a non-blocking socket, waiting if necessary.
+// Connect returns EINPROGRESS (not EAGAIN) on non-blocking sockets.
+// EINPROGRESS: macOS=36, Linux=115
+async fn asyncConnect(loop_fd: i64, fd: i64, addr_buf: i64, addr_len: i64) IoError!i64 {
+    var result = @net_connect(fd, addr_buf, addr_len)
+    if (result >= 0) {
+        return result
+    }
+    // EINPROGRESS — connection in progress, wait for write-ready
+    var einprogress: i64 = 36
+    if (@target_os() == "linux") {
+        einprogress = 115
+    }
+    if (result == (0 - einprogress)) {
+        watchWrite(loop_fd, fd)
+        var event_buf = @alloc(MAX_EVENTS * KEVENT_SIZE)
+        var n = eventLoopWait(loop_fd, event_buf, MAX_EVENTS)
+        @dealloc(event_buf)
+        return 0
+    }
+    return error.ConnectError
+}

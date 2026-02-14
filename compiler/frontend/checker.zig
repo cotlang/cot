@@ -176,6 +176,7 @@ pub const Checker = struct {
     expr_types: std.AutoHashMap(NodeIndex, TypeIndex),
     current_return_type: TypeIndex = TypeRegistry.VOID,
     in_loop: bool = false,
+    in_async_fn: bool = false,
     // Generics support (Zig-style lazy monomorphization + Go checker flow)
     // Shared across all checkers in multi-file mode (owned by driver)
     generics: *SharedGenericContext,
@@ -248,7 +249,13 @@ pub const Checker = struct {
                     try self.scope.define(Symbol.init(f.name, .type_name, invalid_type, idx, false));
                     return;
                 }
-                const func_type = try self.buildFuncType(f.params, f.return_type);
+                var func_type = try self.buildFuncType(f.params, f.return_type);
+                // Async functions: wrap return type in Future(T)
+                if (f.is_async) {
+                    const inner_ret = self.types.get(func_type).func.return_type;
+                    const future_ret = try self.types.makeFuture(inner_ret);
+                    func_type = try self.types.makeFunc(self.types.get(func_type).func.params, future_ret);
+                }
                 try self.scope.define(Symbol.initExtern(f.name, .function, func_type, idx, false, f.is_extern));
                 if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "self"))
                     try self.registerMethod(f.name, f.params[0].type_expr, func_type);
@@ -430,6 +437,12 @@ pub const Checker = struct {
     pub fn checkFnDeclWithName(self: *Checker, f: ast.FnDecl, idx: NodeIndex, lookup_name: []const u8) CheckError!void {
         const sym = self.scope.lookup(lookup_name) orelse return;
         const return_type = if (self.types.get(sym.type_idx) == .func) self.types.get(sym.type_idx).func.return_type else TypeRegistry.VOID;
+        // For async functions, the registered return type is Future(T).
+        // Inside the body, current_return_type should be T (the inner type).
+        const body_return_type = if (f.is_async and self.types.get(return_type) == .future)
+            self.types.get(return_type).future.result_type
+        else
+            return_type;
         var func_scope = Scope.init(self.allocator, self.scope);
         defer func_scope.deinit();
         for (f.params) |param| {
@@ -439,11 +452,14 @@ pub const Checker = struct {
         }
         const old_scope = self.scope;
         const old_return = self.current_return_type;
+        const old_in_async = self.in_async_fn;
         self.scope = &func_scope;
-        self.current_return_type = return_type;
+        self.current_return_type = body_return_type;
+        self.in_async_fn = f.is_async;
         if (f.body != null_node) try self.checkBlockExpr(f.body);
         self.scope = old_scope;
         self.current_return_type = old_return;
+        self.in_async_fn = old_in_async;
     }
 
     fn checkVarDecl(self: *Checker, v: ast.VarDecl, idx: NodeIndex) CheckError!void {
@@ -645,6 +661,7 @@ pub const Checker = struct {
             .builtin_call => |bc| self.checkBuiltinCall(bc),
             .string_interp => |si| self.checkStringInterp(si),
             .try_expr => |te| self.checkTryExpr(te),
+            .await_expr => |ae| self.checkAwaitExpr(ae),
             .catch_expr => |ce| self.checkCatchExpr(ce),
             .error_literal => |el| self.checkErrorLiteral(el),
             .closure_expr => |ce| self.checkClosureExpr(ce),
@@ -919,19 +936,24 @@ pub const Checker = struct {
                 _ = try self.checkExpr(bc.args[2]);
                 return TypeRegistry.VOID;
             },
-            .fd_write, .fd_read, .fd_seek, .fd_open, .net_socket, .net_bind, .net_connect => {
+            .fd_write, .fd_read, .fd_seek, .fd_open, .net_socket, .net_bind, .net_connect,
+            .kevent_add, .kevent_del, .kevent_wait, .epoll_add, .epoll_wait,
+            => {
                 _ = try self.checkExpr(bc.args[0]);
                 _ = try self.checkExpr(bc.args[1]);
                 _ = try self.checkExpr(bc.args[2]);
                 return TypeRegistry.I64;
             },
-            .fd_close, .net_accept, .net_set_reuse_addr => {
+            .fd_close, .net_accept, .net_set_reuse_addr, .set_nonblocking => {
                 _ = try self.checkExpr(bc.args[0]);
                 return TypeRegistry.I64;
             },
-            .net_listen => {
+            .net_listen, .epoll_del => {
                 _ = try self.checkExpr(bc.args[0]);
                 _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
+            .kqueue_create, .epoll_create => {
                 return TypeRegistry.I64;
             },
             .ptr_of => {
@@ -1408,6 +1430,19 @@ pub const Checker = struct {
             self.err.errorWithCode(te.span.start, .e300, "try in non-error-returning function");
         }
         return operand_info.error_union.elem;
+    }
+
+    fn checkAwaitExpr(self: *Checker, ae: ast.AwaitExpr) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(ae.operand);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .future) {
+            self.err.errorWithCode(ae.span.start, .e300, "cannot await non-future type");
+            return invalid_type;
+        }
+        // await is allowed both in async and sync contexts.
+        // In sync context, it blocks until the future completes (like block_on).
+        // No function coloring — any code can await a Future.
+        return operand_info.future.result_type;
     }
 
     fn checkCatchExpr(self: *Checker, ce: ast.CatchExpr) CheckError!TypeIndex {

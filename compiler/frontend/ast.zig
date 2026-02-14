@@ -51,6 +51,7 @@ pub const FnDecl = struct {
     return_type: NodeIndex,
     body: NodeIndex,
     is_extern: bool,
+    is_async: bool = false,
     span: Span,
 };
 pub const VarDecl = struct { name: []const u8, type_expr: NodeIndex, value: NodeIndex, is_const: bool, span: Span };
@@ -92,6 +93,7 @@ pub const Expr = union(enum) {
     string_interp: StringInterp,
     type_expr: TypeExpr,
     try_expr: TryExpr,
+    await_expr: AwaitExpr,
     catch_expr: CatchExpr,
     error_literal: ErrorLiteral,
     closure_expr: ClosureExpr,
@@ -211,6 +213,16 @@ pub const BuiltinKind = enum {
     net_accept,
     net_connect,
     net_set_reuse_addr,
+    // Event loop (kqueue/epoll)
+    kqueue_create,
+    kevent_add,
+    kevent_del,
+    kevent_wait,
+    epoll_create,
+    epoll_add,
+    epoll_del,
+    epoll_wait,
+    set_nonblocking,
 
     const map = std.StaticStringMap(BuiltinKind).initComptime(.{
         .{ "sizeOf", .size_of },
@@ -261,6 +273,15 @@ pub const BuiltinKind = enum {
         .{ "net_accept", .net_accept },
         .{ "net_connect", .net_connect },
         .{ "net_set_reuse_addr", .net_set_reuse_addr },
+        .{ "kqueue_create", .kqueue_create },
+        .{ "kevent_add", .kevent_add },
+        .{ "kevent_del", .kevent_del },
+        .{ "kevent_wait", .kevent_wait },
+        .{ "epoll_create", .epoll_create },
+        .{ "epoll_add", .epoll_add },
+        .{ "epoll_del", .epoll_del },
+        .{ "epoll_wait", .epoll_wait },
+        .{ "set_nonblocking", .set_nonblocking },
     });
 
     pub fn fromString(s: []const u8) ?BuiltinKind {
@@ -317,6 +338,15 @@ pub const BuiltinKind = enum {
             .net_accept => "net_accept",
             .net_connect => "net_connect",
             .net_set_reuse_addr => "net_set_reuse_addr",
+            .kqueue_create => "kqueue_create",
+            .kevent_add => "kevent_add",
+            .kevent_del => "kevent_del",
+            .kevent_wait => "kevent_wait",
+            .epoll_create => "epoll_create",
+            .epoll_add => "epoll_add",
+            .epoll_del => "epoll_del",
+            .epoll_wait => "epoll_wait",
+            .set_nonblocking => "set_nonblocking",
         };
     }
 };
@@ -339,6 +369,7 @@ pub const TypeKind = union(enum) {
     generic_instance: GenericInstance,
 };
 pub const TryExpr = struct { operand: NodeIndex, span: Span };
+pub const AwaitExpr = struct { operand: NodeIndex, span: Span };
 pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, fallback: NodeIndex, span: Span };
 pub const ErrorLiteral = struct { error_name: []const u8, span: Span };
 pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, span: Span };

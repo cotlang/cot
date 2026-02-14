@@ -45,6 +45,15 @@ pub const Lowerer = struct {
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
     /// Compilation target — used for @target_os(), @target_arch(), @target() comptime builtins
     target: target_mod.Target = target_mod.Target.native(),
+    /// Async state machine: local index of the state pointer param for the current async poll function.
+    /// Stored as a local index (not IR node) so we can reload it in each block (Wasm br_table dispatch
+    /// doesn't carry values across blocks).
+    current_async_state_local: ?ir.LocalIdx = null,
+    /// Async state machine: result type for the current async function
+    current_async_result_type: ?TypeIndex = null,
+    /// Maps variable names to their async poll function names.
+    /// Populated when `const f = async_fn(args)` is lowered, used by `await f`.
+    async_poll_names: std.StringHashMap([]const u8) = undefined,
     /// Global error variant table: maps error variant names to globally unique indices.
     /// Zig pattern: each error value has a unique integer across all error sets.
     /// Reference: Zig compiler uses a global error value table for @intFromError/@errorName.
@@ -90,6 +99,7 @@ pub const Lowerer = struct {
             .lowered_generics = std.StringHashMap(void).init(allocator),
             .target = target,
             .global_error_table = std.StringHashMap(i64).init(allocator),
+            .async_poll_names = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -237,6 +247,17 @@ pub const Lowerer = struct {
         if (fn_decl.is_extern) return;
         if (fn_decl.type_params.len > 0) return; // Skip generic fn defs — lowered on demand at call sites
         if (self.test_mode and std.mem.eql(u8, fn_decl.name, "main")) return;
+
+        // Async functions get special lowering
+        if (fn_decl.is_async) {
+            if (self.target.isWasm()) {
+                try self.lowerAsyncStateMachine(fn_decl);
+            } else {
+                try self.lowerAsyncFiber(fn_decl);
+            }
+            return;
+        }
+
         const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
         // SRET: callee receives hidden __sret pointer, returns void at Wasm level
         const uses_sret = self.needsSret(return_type);
@@ -268,6 +289,333 @@ pub const Lowerer = struct {
             self.current_func = null;
         }
         try self.builder.endFunc();
+    }
+
+    /// Wasm async: emit constructor function (allocs state, returns future ptr)
+    /// and poll function (state machine with if-chain dispatch).
+    /// Ported from Rust's coroutine transform (rustc_mir_transform/coroutine.rs).
+    fn lowerAsyncStateMachine(self: *Lowerer, fn_decl: ast.FnDecl) !void {
+        const inner_return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
+
+        // Count await points in the body to determine state count
+        var await_count: u32 = 0;
+        if (fn_decl.body != null_node) {
+            await_count = self.countAwaitPoints(fn_decl.body);
+        }
+
+        // State struct layout (all i64-aligned):
+        //   offset 0: __state (i64) — 0=UNRESUMED, 1=RETURNED, 2=POISONED, 3+=suspend points
+        //   offset 8+: __result — result value (1 word for simple, 2 for error union)
+        //   offset 8+result_words*8: params (each i64)
+        const result_size = if (inner_return_type != TypeRegistry.VOID) self.type_reg.sizeOf(inner_return_type) else 0;
+        const result_words: u32 = if (result_size > 0) (result_size + 7) / 8 else 1;
+        const param_count: u32 = @intCast(fn_decl.params.len);
+        const state_size: u32 = (1 + result_words + param_count + await_count) * 8;
+
+        // --- Emit constructor function (original name) ---
+        // Returns a heap-allocated state pointer (the Future)
+        self.builder.startFunc(fn_decl.name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+
+            // Add params matching the declared signature
+            for (fn_decl.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+
+            // Allocate state struct on heap: cot_alloc(metadata_ptr=0, size)
+            const metadata = try fb.emitConstInt(0, TypeRegistry.I64, fn_decl.span);
+            const size_val = try fb.emitConstInt(@intCast(state_size), TypeRegistry.I64, fn_decl.span);
+            var alloc_args = [_]ir.NodeIndex{ metadata, size_val };
+            const state_ptr = try fb.emitCall("cot_alloc", &alloc_args, false, TypeRegistry.I64, fn_decl.span);
+
+            // Store state_ptr to a local for multi-use (Wasm stack machine semantics)
+            const state_local = try fb.addLocalWithSize("__state", TypeRegistry.I64, false, 8);
+            _ = try fb.emitStoreLocal(state_local, state_ptr, fn_decl.span);
+
+            // Store __state = 0 (UNRESUMED) at offset 0
+            {
+                const sp = try fb.emitLoadLocal(state_local, TypeRegistry.I64, fn_decl.span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, fn_decl.span);
+                _ = try fb.emitPtrStoreValue(sp, zero, fn_decl.span);
+            }
+
+            // Store params into state struct (offset after state + result words)
+            const param_base: u32 = (1 + result_words) * 8;
+            for (fn_decl.params, 0..) |param, i| {
+                const sp = try fb.emitLoadLocal(state_local, TypeRegistry.I64, fn_decl.span);
+                const local_idx = fb.lookupLocal(param.name) orelse continue;
+                const param_ref = try fb.emitLoadLocal(local_idx, TypeRegistry.I64, fn_decl.span);
+                const offset: i64 = @intCast(param_base + i * 8);
+                const param_addr = try fb.emitAddrOffset(sp, offset, TypeRegistry.I64, fn_decl.span);
+                _ = try fb.emitPtrStoreValue(param_addr, param_ref, fn_decl.span);
+            }
+
+            // Return state pointer (this is the Future)
+            const ret_val = try fb.emitLoadLocal(state_local, TypeRegistry.I64, fn_decl.span);
+            _ = try fb.emitRet(ret_val, fn_decl.span);
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+
+        // --- Emit poll function (FnName_poll) ---
+        // Takes state pointer, returns i64 (0=PENDING, 1=READY)
+        const poll_name = try std.fmt.allocPrint(self.allocator, "{s}_poll", .{fn_decl.name});
+        self.builder.startFunc(poll_name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+
+            // Single parameter: state pointer
+            _ = try fb.addParam("__state_ptr", TypeRegistry.I64, 8);
+            const state_ptr_local = fb.lookupLocal("__state_ptr") orelse unreachable;
+
+            // Load current state — reload state_ptr from local (Wasm br_table doesn't carry values across blocks)
+            const state_ptr_0 = try fb.emitLoadLocal(state_ptr_local, TypeRegistry.I64, fn_decl.span);
+            const state_val = try fb.emitPtrLoadValue(state_ptr_0, TypeRegistry.I64, fn_decl.span);
+
+            // State 0 (UNRESUMED): run the body from the start
+            // State 1 (RETURNED): already done, return READY
+            const already_done = try fb.newBlock("poll.done");
+            const run_body = try fb.newBlock("poll.body");
+
+            const one_0 = try fb.emitConstInt(1, TypeRegistry.I64, fn_decl.span);
+            const is_done = try fb.emitBinary(.eq, state_val, one_0, TypeRegistry.BOOL, fn_decl.span);
+            _ = try fb.emitBranch(is_done, already_done, run_body, fn_decl.span);
+
+            // Already done block: return READY (1)
+            fb.setBlock(already_done);
+            const ready_done = try fb.emitConstInt(1, TypeRegistry.I64, fn_decl.span);
+            _ = try fb.emitRet(ready_done, fn_decl.span);
+
+            // Body block: reload state_ptr from local (fresh load for this block)
+            fb.setBlock(run_body);
+
+            // Restore params from state struct into locals
+            // Reload state_ptr from local for each use (Wasm stack doesn't persist across blocks)
+            const poll_param_base: u32 = (1 + result_words) * 8;
+            for (fn_decl.params, 0..) |param, i| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                const offset: i64 = @intCast(poll_param_base + i * 8);
+                const sp = try fb.emitLoadLocal(state_ptr_local, TypeRegistry.I64, fn_decl.span);
+                const param_addr = try fb.emitAddrOffset(sp, offset, TypeRegistry.I64, fn_decl.span);
+                const val = try fb.emitPtrLoadValue(param_addr, param_type, fn_decl.span);
+                const local = try fb.addLocalWithSize(param.name, param_type, false, self.type_reg.sizeOf(param_type));
+                _ = try fb.emitStoreLocal(local, val, fn_decl.span);
+            }
+
+            // Lower the body — any `return val` in an async fn becomes:
+            // store result to state[8], set state to RETURNED, return READY
+            // This is handled by lowerReturn checking current_async_state_local
+            self.current_async_state_local = state_ptr_local;
+            self.current_async_result_type = inner_return_type;
+            // Override fb.return_type so that lowerErrorLiteral/lowerReturn's
+            // error union checks see the actual inner return type (not poll's I64).
+            const saved_return_type = fb.return_type;
+            fb.return_type = inner_return_type;
+            if (fn_decl.body != null_node) {
+                _ = try self.lowerBlockNode(fn_decl.body);
+            }
+            fb.return_type = saved_return_type;
+
+            // If body falls through (void return), mark as RETURNED
+            if (fb.needsTerminator()) {
+                const sp = try fb.emitLoadLocal(state_ptr_local, TypeRegistry.I64, fn_decl.span);
+                const one_body = try fb.emitConstInt(1, TypeRegistry.I64, fn_decl.span);
+                _ = try fb.emitPtrStoreValue(sp, one_body, fn_decl.span);
+                _ = try fb.emitRet(one_body, fn_decl.span);
+            }
+
+            self.current_async_state_local = null;
+            self.current_async_result_type = null;
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    /// Native async: eager evaluation with body + constructor pattern.
+    /// Ported from Zig's approach — the async fn body is lowered as a normal function,
+    /// preserving natural call stacks and debug info. The constructor calls the body
+    /// directly, stores the result in a future struct, and returns the future pointer.
+    /// No state machine transform needed — this is much simpler than the Wasm approach.
+    /// Real context-switching fibers will be added in Phase D with the event loop.
+    fn lowerAsyncFiber(self: *Lowerer, fn_decl: ast.FnDecl) !void {
+        const inner_return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
+
+        // --- Emit body function (fn_name_body) — normal function, no state machine ---
+        // This preserves the natural call stack for debuggers (Zig lesson: stackful > stackless).
+        const body_name = try std.fmt.allocPrint(self.allocator, "{s}_body", .{fn_decl.name});
+        self.builder.startFunc(body_name, TypeRegistry.VOID, inner_return_type, fn_decl.span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            for (fn_decl.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+            if (fn_decl.body != null_node) {
+                _ = try self.lowerBlockNode(fn_decl.body);
+                if (inner_return_type == TypeRegistry.VOID and fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    _ = try fb.emitRet(null, fn_decl.span);
+                }
+            }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+
+        // --- Emit constructor (fn_name) — calls body eagerly, stores result in future ---
+        // Future struct layout: [state(i64) @ 0, result(i64) @ 8]
+        self.builder.startFunc(fn_decl.name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+
+            // Add params matching the declared signature
+            for (fn_decl.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+
+            // Compute future size: state(8) + result (sizeOf inner_return_type, aligned to 8)
+            const result_size = if (inner_return_type != TypeRegistry.VOID) self.type_reg.sizeOf(inner_return_type) else 0;
+            const result_words = (result_size + 7) / 8;
+            const future_size: i64 = @intCast(8 + result_size);
+            // Error unions return a pointer (single i64) to stack-local data.
+            // We must dereference and copy before the body's stack frame is gone.
+            const inner_info = self.type_reg.get(inner_return_type);
+            const is_eu_result = (inner_info == .error_union);
+
+            // Allocate future struct: cot_alloc(metadata=0, size)
+            const metadata = try fb.emitConstInt(0, TypeRegistry.I64, fn_decl.span);
+            const size_val = try fb.emitConstInt(future_size, TypeRegistry.I64, fn_decl.span);
+            var alloc_args = [_]ir.NodeIndex{ metadata, size_val };
+            const future_ptr = try fb.emitCall("cot_alloc", &alloc_args, false, TypeRegistry.I64, fn_decl.span);
+            const future_local = try fb.addLocalWithSize("__future", TypeRegistry.I64, false, 8);
+            _ = try fb.emitStoreLocal(future_local, future_ptr, fn_decl.span);
+
+            // Call body function with same args — eager evaluation
+            // Compound params (string/slice) must be decomposed into (ptr, len) at call site
+            // to match the body function's Wasm-level parameter count.
+            var body_args: [64]ir.NodeIndex = undefined;
+            var body_arg_count: usize = 0;
+            for (fn_decl.params) |param| {
+                var param_type = self.resolveTypeNode(param.type_expr);
+                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                const local_idx = fb.lookupLocal(param.name) orelse continue;
+                const param_info = self.type_reg.get(param_type);
+                if (param_type == TypeRegistry.STRING or param_info == .slice) {
+                    // Compound: decompose into (ptr, len)
+                    const val = try fb.emitLoadLocal(local_idx, param_type, fn_decl.span);
+                    body_args[body_arg_count] = try fb.emitSlicePtr(val, TypeRegistry.I64, fn_decl.span);
+                    body_arg_count += 1;
+                    body_args[body_arg_count] = try fb.emitSliceLen(val, fn_decl.span);
+                    body_arg_count += 1;
+                } else {
+                    body_args[body_arg_count] = try fb.emitLoadLocal(local_idx, TypeRegistry.I64, fn_decl.span);
+                    body_arg_count += 1;
+                }
+            }
+            const result = try fb.emitCall(body_name, body_args[0..body_arg_count], false, inner_return_type, fn_decl.span);
+
+            // Store result at future[8..] — compound types store multiple words
+            if (inner_return_type != TypeRegistry.VOID) {
+                if (is_eu_result) {
+                    // Error union: body returns a POINTER to 16-byte stack data.
+                    // Dereference and copy both words (tag + payload) into future.
+                    for (0..result_words) |w| {
+                        const fp = try fb.emitLoadLocal(future_local, TypeRegistry.I64, fn_decl.span);
+                        const dst_offset: i64 = @intCast(8 + w * 8);
+                        const dst_addr = try fb.emitAddrOffset(fp, dst_offset, TypeRegistry.I64, fn_decl.span);
+                        const src_offset: i64 = @intCast(w * 8);
+                        const src_addr = try fb.emitAddrOffset(result, src_offset, TypeRegistry.I64, fn_decl.span);
+                        const word = try fb.emitPtrLoadValue(src_addr, TypeRegistry.I64, fn_decl.span);
+                        _ = try fb.emitPtrStoreValue(dst_addr, word, fn_decl.span);
+                    }
+                } else {
+                    const fp = try fb.emitLoadLocal(future_local, TypeRegistry.I64, fn_decl.span);
+                    const result_addr = try fb.emitAddrOffset(fp, 8, TypeRegistry.I64, fn_decl.span);
+                    _ = try fb.emitPtrStoreValue(result_addr, result, fn_decl.span);
+                }
+            }
+
+            // Set state = 1 (DONE) at future[0]
+            {
+                const fp = try fb.emitLoadLocal(future_local, TypeRegistry.I64, fn_decl.span);
+                const one = try fb.emitConstInt(1, TypeRegistry.I64, fn_decl.span);
+                _ = try fb.emitPtrStoreValue(fp, one, fn_decl.span);
+            }
+
+            // Return future pointer
+            const ret_val = try fb.emitLoadLocal(future_local, TypeRegistry.I64, fn_decl.span);
+            _ = try fb.emitRet(ret_val, fn_decl.span);
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    /// Count await expressions in an AST subtree.
+    fn countAwaitPoints(self: *Lowerer, idx: NodeIndex) u32 {
+        const node = self.tree.getNode(idx) orelse return 0;
+        var count: u32 = 0;
+        switch (node) {
+            .expr => |expr| switch (expr) {
+                .await_expr => count += 1,
+                .binary => |b| {
+                    count += self.countAwaitPoints(b.left);
+                    count += self.countAwaitPoints(b.right);
+                },
+                .unary => |u| count += self.countAwaitPoints(u.operand),
+                .call => |c| {
+                    count += self.countAwaitPoints(c.callee);
+                    for (c.args) |a| count += self.countAwaitPoints(a);
+                },
+                .if_expr => |ie| {
+                    count += self.countAwaitPoints(ie.condition);
+                    count += self.countAwaitPoints(ie.then_branch);
+                    if (ie.else_branch != null_node) count += self.countAwaitPoints(ie.else_branch);
+                },
+                .block_expr => |be| {
+                    for (be.stmts) |s| count += self.countAwaitPoints(s);
+                    if (be.expr != null_node) count += self.countAwaitPoints(be.expr);
+                },
+                .paren => |p| count += self.countAwaitPoints(p.inner),
+                .try_expr => |t| count += self.countAwaitPoints(t.operand),
+                else => {},
+            },
+            .stmt => |stmt| switch (stmt) {
+                .expr_stmt => |es| count += self.countAwaitPoints(es.expr),
+                .return_stmt => |rs| if (rs.value != null_node) {
+                    count += self.countAwaitPoints(rs.value);
+                },
+                .var_stmt => |vs| if (vs.value != null_node) {
+                    count += self.countAwaitPoints(vs.value);
+                },
+                .assign_stmt => |as_stmt| count += self.countAwaitPoints(as_stmt.value),
+                .if_stmt => |is_stmt| {
+                    count += self.countAwaitPoints(is_stmt.condition);
+                    count += self.countAwaitPoints(is_stmt.then_branch);
+                    if (is_stmt.else_branch != null_node) count += self.countAwaitPoints(is_stmt.else_branch);
+                },
+                .while_stmt => |ws| {
+                    count += self.countAwaitPoints(ws.condition);
+                    count += self.countAwaitPoints(ws.body);
+                },
+                .block_stmt => |bs| {
+                    for (bs.stmts) |s| count += self.countAwaitPoints(s);
+                },
+                .defer_stmt => |ds| count += self.countAwaitPoints(ds.expr),
+                else => {},
+            },
+            .decl => {},
+        }
+        return count;
     }
 
     fn lowerGlobalVarDecl(self: *Lowerer, var_decl: ast.VarDecl) !void {
@@ -506,6 +854,66 @@ pub const Lowerer = struct {
 
     fn lowerReturn(self: *Lowerer, ret: ast.ReturnStmt) !void {
         const fb = self.current_func orelse return;
+
+        // Async poll function: store result to state struct, set state to RETURNED, return READY
+        if (self.current_async_state_local) |state_local| {
+            if (ret.value != null_node) {
+                const async_result_type = self.current_async_result_type orelse TypeRegistry.I64;
+                const async_result_info = self.type_reg.get(async_result_type);
+                const is_eu = (async_result_info == .error_union);
+
+                if (is_eu) {
+                    // Error union result — check if return value is error literal or success value
+                    const ret_node = self.tree.getNode(ret.value);
+                    const is_error_literal = if (ret_node) |n| if (n.asExpr()) |e| e == .error_literal else false else false;
+
+                    if (is_error_literal) {
+                        // `return error.X` — lowerExprNode returns pointer to 16-byte EU
+                        const eu_ptr = try self.lowerExprNode(ret.value);
+                        const num_words: usize = 2; // error union = 16 bytes = 2 words
+                        for (0..num_words) |w| {
+                            const sp = try fb.emitLoadLocal(state_local, TypeRegistry.I64, ret.span);
+                            const dst_offset: i64 = @intCast(8 + w * 8);
+                            const dst_addr = try fb.emitAddrOffset(sp, dst_offset, TypeRegistry.I64, ret.span);
+                            const src_offset: i64 = @intCast(w * 8);
+                            const src_addr = try fb.emitAddrOffset(eu_ptr, src_offset, TypeRegistry.I64, ret.span);
+                            const word = try fb.emitPtrLoadValue(src_addr, TypeRegistry.I64, ret.span);
+                            _ = try fb.emitPtrStoreValue(dst_addr, word, ret.span);
+                        }
+                    } else {
+                        // Success value — wrap as tag=0, payload=value directly into state[8..]
+                        const lowered = try self.lowerExprNode(ret.value);
+                        {
+                            const sp = try fb.emitLoadLocal(state_local, TypeRegistry.I64, ret.span);
+                            const tag_addr = try fb.emitAddrOffset(sp, 8, TypeRegistry.I64, ret.span);
+                            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, ret.span);
+                            _ = try fb.emitPtrStoreValue(tag_addr, tag_zero, ret.span);
+                        }
+                        {
+                            const sp = try fb.emitLoadLocal(state_local, TypeRegistry.I64, ret.span);
+                            const payload_addr = try fb.emitAddrOffset(sp, 16, TypeRegistry.I64, ret.span);
+                            _ = try fb.emitPtrStoreValue(payload_addr, lowered, ret.span);
+                        }
+                    }
+                } else {
+                    const lowered = try self.lowerExprNode(ret.value);
+                    // Reload state_ptr from local (Wasm stack doesn't persist across blocks)
+                    const sp = try fb.emitLoadLocal(state_local, TypeRegistry.I64, ret.span);
+                    // Store result at state[8]
+                    const result_addr = try fb.emitAddrOffset(sp, 8, TypeRegistry.I64, ret.span);
+                    _ = try fb.emitPtrStoreValue(result_addr, lowered, ret.span);
+                }
+            }
+            // Reload state_ptr again for state update
+            const sp2 = try fb.emitLoadLocal(state_local, TypeRegistry.I64, ret.span);
+            // Set __state = 1 (RETURNED)
+            const one = try fb.emitConstInt(1, TypeRegistry.I64, ret.span);
+            _ = try fb.emitPtrStoreValue(sp2, one, ret.span);
+            // Return READY (1)
+            _ = try fb.emitRet(one, ret.span);
+            return;
+        }
+
         var value_node: ?ir.NodeIndex = null;
         // Track whether this return is an error path (for errdefer)
         // Zig reference: errdefer fires on `return error.X` and `try` propagation
@@ -780,6 +1188,17 @@ pub const Lowerer = struct {
         if (var_stmt.value != null_node) {
             const value_node_ast = self.tree.getNode(var_stmt.value);
             const value_expr = if (value_node_ast) |n| n.asExpr() else null;
+
+            // Track async future → poll name mapping for `await <variable>`.
+            // When `const f = async_fn(args)`, store "f" → "async_fn_poll".
+            if (value_expr) |ve| {
+                if (ve == .call) {
+                    const poll_name = self.resolveAsyncPollName(var_stmt.value);
+                    if (poll_name) |pn| {
+                        self.async_poll_names.put(var_stmt.name, pn) catch {};
+                    }
+                }
+            }
 
             // Check for undefined literal or .{} zero init - zero memory
             const is_undefined = if (value_expr) |e| (e == .literal and e.literal.kind == .undefined_lit) else false;
@@ -1957,6 +2376,7 @@ pub const Lowerer = struct {
             .array_literal => |al| return try self.lowerArrayLiteral(al),
             .slice_expr => |se| return try self.lowerSliceExpr(se),
             .try_expr => |te| return try self.lowerTryExpr(te),
+            .await_expr => |ae| return try self.lowerAwaitExpr(ae),
             .catch_expr => |ce| return try self.lowerCatchExpr(ce),
             .error_literal => |el| return try self.lowerErrorLiteral(el),
             .builtin_call => |bc| return try self.lowerBuiltinCall(bc),
@@ -4182,6 +4602,60 @@ pub const Lowerer = struct {
                 var args = [_]ir.NodeIndex{a1};
                 return try fb.emitCall("cot_net_set_reuse_addr", &args, false, TypeRegistry.I64, bc.span);
             },
+            .kqueue_create => {
+                var args = [_]ir.NodeIndex{};
+                return try fb.emitCall("cot_kqueue_create", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .kevent_add => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_kevent_add", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .kevent_del => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_kevent_del", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .kevent_wait => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_kevent_wait", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .epoll_create => {
+                var args = [_]ir.NodeIndex{};
+                return try fb.emitCall("cot_epoll_create", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .epoll_add => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_epoll_add", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .epoll_del => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                var args = [_]ir.NodeIndex{ a1, a2 };
+                return try fb.emitCall("cot_epoll_del", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .epoll_wait => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_epoll_wait", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .set_nonblocking => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{a1};
+                return try fb.emitCall("cot_set_nonblocking", &args, false, TypeRegistry.I64, bc.span);
+            },
             .ptr_of => {
                 const str_val = try self.lowerExprNode(bc.args[0]);
                 const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
@@ -4514,6 +4988,110 @@ pub const Lowerer = struct {
         fb.setBlock(ok_block);
         const payload_addr_ok = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, te.span);
         return try fb.emitPtrLoadValue(payload_addr_ok, elem_type, te.span);
+    }
+
+    /// Lower await expr — poll a future to completion and extract the result.
+    /// On Wasm: calls the poll function in a loop until READY, then reads result.
+    /// On native: calls fiber_switch to suspend current fiber and resume target.
+    fn lowerAwaitExpr(self: *Lowerer, ae: ast.AwaitExpr) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Get the future type from the operand
+        const operand_type = self.inferExprType(ae.operand);
+        const operand_info = self.type_reg.get(operand_type);
+        if (operand_info != .future) {
+            return try self.lowerExprNode(ae.operand);
+        }
+        const result_type = operand_info.future.result_type;
+
+        // Lower the future operand (this gives us the state/fiber pointer)
+        const future_ptr = try self.lowerExprNode(ae.operand);
+
+        // Check if result is compound (error union, >8 bytes) — needs multi-word copy
+        const result_size = self.type_reg.sizeOf(result_type);
+        const is_compound_result = result_size > 8;
+
+        if (!self.target.isWasm()) {
+            // Native (Zig approach): eager evaluation — result is already in future[8].
+            // No poll loop needed. Just extract the result directly.
+            if (is_compound_result) {
+                // Compound result: copy all words from future[8..] into a local,
+                // return pointer to the local (matching lowerTryExpr expectation)
+                const num_words = (result_size + 7) / 8;
+                const result_local = try fb.addLocalWithSize("__await_result", result_type, false, result_size);
+                for (0..num_words) |w| {
+                    const src_offset: i64 = @intCast(8 + w * 8);
+                    const src_addr = try fb.emitAddrOffset(future_ptr, src_offset, TypeRegistry.I64, ae.span);
+                    const word = try fb.emitPtrLoadValue(src_addr, TypeRegistry.I64, ae.span);
+                    _ = try fb.emitStoreLocalField(result_local, @intCast(w), @intCast(w * 8), word, ae.span);
+                }
+                return try fb.emitAddrLocal(result_local, TypeRegistry.I64, ae.span);
+            }
+            const result_addr = try fb.emitAddrOffset(future_ptr, 8, TypeRegistry.I64, ae.span);
+            return try fb.emitPtrLoadValue(result_addr, result_type, ae.span);
+        }
+
+        // Wasm (Rust approach): poll-based state machine.
+        // Store future pointer to a local so it can be reloaded across blocks
+        // (Wasm br_table dispatch doesn't carry values across blocks)
+        const future_local = try fb.addLocalWithSize("__await_future", TypeRegistry.I64, false, 8);
+        _ = try fb.emitStoreLocal(future_local, future_ptr, ae.span);
+
+        const poll_name = self.resolveAsyncPollName(ae.operand) orelse "__async_poll";
+
+        const poll_loop = try fb.newBlock("await.poll");
+        const await_done = try fb.newBlock("await.done");
+        _ = try fb.emitJump(poll_loop, ae.span);
+
+        // Poll loop: reload future_ptr from local, call poll, check result
+        fb.setBlock(poll_loop);
+        const fp_poll = try fb.emitLoadLocal(future_local, TypeRegistry.I64, ae.span);
+        var poll_args = [_]ir.NodeIndex{fp_poll};
+        const poll_result = try fb.emitCall(poll_name, &poll_args, false, TypeRegistry.I64, ae.span);
+        const one = try fb.emitConstInt(1, TypeRegistry.I64, ae.span);
+        const is_ready = try fb.emitBinary(.eq, poll_result, one, TypeRegistry.BOOL, ae.span);
+        _ = try fb.emitBranch(is_ready, await_done, poll_loop, ae.span);
+
+        // Done: reload future_ptr, extract result from state[8..]
+        fb.setBlock(await_done);
+        const fp_done = try fb.emitLoadLocal(future_local, TypeRegistry.I64, ae.span);
+        if (is_compound_result) {
+            // Compound result: copy all words from state[8..] into a local,
+            // return pointer to the local (matching lowerTryExpr expectation)
+            const num_words = (result_size + 7) / 8;
+            const result_local = try fb.addLocalWithSize("__await_result", result_type, false, result_size);
+            for (0..num_words) |w| {
+                const src_offset: i64 = @intCast(8 + w * 8);
+                const src_addr = try fb.emitAddrOffset(fp_done, src_offset, TypeRegistry.I64, ae.span);
+                const word = try fb.emitPtrLoadValue(src_addr, TypeRegistry.I64, ae.span);
+                _ = try fb.emitStoreLocalField(result_local, @intCast(w), @intCast(w * 8), word, ae.span);
+            }
+            return try fb.emitAddrLocal(result_local, TypeRegistry.I64, ae.span);
+        }
+        const result_addr = try fb.emitAddrOffset(fp_done, 8, TypeRegistry.I64, ae.span);
+        return try fb.emitPtrLoadValue(result_addr, result_type, ae.span);
+    }
+
+    /// Resolve the poll function name from an await operand.
+    /// Handles two cases:
+    /// 1. Direct call: `await foo(args)` → `foo_poll`
+    /// 2. Variable: `await f` → look up f's poll name from async_poll_names map
+    fn resolveAsyncPollName(self: *Lowerer, operand_idx: NodeIndex) ?[]const u8 {
+        const node = self.tree.getNode(operand_idx) orelse return null;
+        const expr = node.asExpr() orelse return null;
+        // Case 1: direct call — `await foo(args)`
+        if (expr == .call) {
+            const callee_node = self.tree.getNode(expr.call.callee) orelse return null;
+            const callee_expr = callee_node.asExpr() orelse return null;
+            if (callee_expr == .ident) {
+                return std.fmt.allocPrint(self.allocator, "{s}_poll", .{callee_expr.ident.name}) catch null;
+            }
+        }
+        // Case 2: ident — `await f` where f was assigned from an async call
+        if (expr == .ident) {
+            return self.async_poll_names.get(expr.ident.name);
+        }
+        return null;
     }
 
     /// Lower catch expr — unwrap error union, use fallback on error.

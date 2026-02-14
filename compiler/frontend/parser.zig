@@ -170,7 +170,8 @@ pub const Parser = struct {
     fn parseDecl(self: *Parser) ParseError!?NodeIndex {
         return switch (self.tok.tok) {
             .kw_extern => self.parseExternFn(),
-            .kw_fn => self.parseFnDecl(false),
+            .kw_fn => self.parseFnDecl(false, false),
+            .kw_async => self.parseAsyncFn(),
             .kw_var => self.parseVarDecl(false),
             .kw_const => self.parseVarDecl(true),
             .kw_struct => self.parseStructDecl(),
@@ -188,10 +189,16 @@ pub const Parser = struct {
     fn parseExternFn(self: *Parser) ParseError!?NodeIndex {
         self.advance();
         if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'extern'"); return null; }
-        return self.parseFnDecl(true);
+        return self.parseFnDecl(true, false);
     }
 
-    fn parseFnDecl(self: *Parser, is_extern: bool) ParseError!?NodeIndex {
+    fn parseAsyncFn(self: *Parser) ParseError!?NodeIndex {
+        self.advance(); // consume 'async'
+        if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'async'"); return null; }
+        return self.parseFnDecl(false, true);
+    }
+
+    fn parseFnDecl(self: *Parser, is_extern: bool, is_async: bool) ParseError!?NodeIndex {
         const start = self.pos();
         self.advance();
         if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected function name"); return null; }
@@ -278,7 +285,7 @@ pub const Parser = struct {
             body = try self.parseBlock() orelse return null;
         }
 
-        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .fn_decl = .{ .name = name, .type_params = type_params, .type_param_bounds = type_param_bounds, .params = params, .return_type = return_type, .body = body, .is_extern = is_extern, .is_async = is_async, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseFieldList(self: *Parser, end_tok: Token) ParseError![]const ast.Field {
@@ -410,7 +417,7 @@ pub const Parser = struct {
         defer methods.deinit(self.allocator);
         while (!self.check(.rbrace) and !self.check(.eof)) {
             if (self.check(.kw_fn)) {
-                if (try self.parseFnDecl(false)) |idx| try methods.append(self.allocator, idx);
+                if (try self.parseFnDecl(false, false)) |idx| try methods.append(self.allocator, idx);
             } else { self.syntaxError("expected 'fn' in impl block"); self.advance(); }
         }
         if (!self.expect(.rbrace)) return null;
@@ -430,7 +437,7 @@ pub const Parser = struct {
         while (!self.check(.rbrace) and !self.check(.eof)) {
             if (self.check(.kw_fn)) {
                 // Parse method signature (fn_decl with body = null_node)
-                if (try self.parseFnDecl(false)) |idx| try methods.append(self.allocator, idx);
+                if (try self.parseFnDecl(false, false)) |idx| try methods.append(self.allocator, idx);
             } else { self.syntaxError("expected 'fn' in trait declaration"); self.advance(); }
         }
         if (!self.expect(.rbrace)) return null;
@@ -467,7 +474,7 @@ pub const Parser = struct {
         defer methods.deinit(self.allocator);
         while (!self.check(.rbrace) and !self.check(.eof)) {
             if (self.check(.kw_fn)) {
-                if (try self.parseFnDecl(false)) |idx| try methods.append(self.allocator, idx);
+                if (try self.parseFnDecl(false, false)) |idx| try methods.append(self.allocator, idx);
             } else { self.syntaxError("expected 'fn' in impl block"); self.advance(); }
         }
         if (!self.expect(.rbrace)) return null;
@@ -711,8 +718,15 @@ pub const Parser = struct {
             },
             .kw_try => {
                 self.advance();
-                const operand = try self.parsePrimaryExpr() orelse return null;
+                // Zig pattern: try is prefix unary, can nest other unary ops (try await ...)
+                const operand = try self.parseUnaryExpr() orelse return null;
                 return try self.tree.addExpr(.{ .try_expr = .{ .operand = operand, .span = Span.init(start, self.pos()) } });
+            },
+            .kw_await => {
+                self.advance();
+                // Allow nesting: await can wrap calls and other unary exprs
+                const operand = try self.parseUnaryExpr() orelse return null;
+                return try self.tree.addExpr(.{ .await_expr = .{ .operand = operand, .span = Span.init(start, self.pos()) } });
             },
             .sub, .lnot, .not, .kw_not => {
                 const op = self.tok.tok;
@@ -1163,7 +1177,9 @@ pub const Parser = struct {
 
         switch (kind) {
             // 0 args
-            .trap, .time, .args_count, .environ_count, .target_os, .target_arch, .target => {
+            .trap, .time, .args_count, .environ_count, .target_os, .target_arch, .target,
+            .kqueue_create, .epoll_create,
+            => {
                 if (!self.expect(.rparen)) return null;
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
             },
@@ -1187,13 +1203,16 @@ pub const Parser = struct {
             .compile_error,
             .abs, .ceil, .floor, .trunc, .round, .sqrt,
             .net_accept, .net_set_reuse_addr,
+            .set_nonblocking,
             => {
                 const arg = try self.parseExpr() orelse return null;
                 if (!self.expect(.rparen)) return null;
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ arg, null_node, null_node }, .span = Span.init(start, self.pos()) } });
             },
             // 2 value args
-            .string, .assert_eq, .realloc, .random, .fmin, .fmax, .net_listen => {
+            .string, .assert_eq, .realloc, .random, .fmin, .fmax, .net_listen,
+            .epoll_del,
+            => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
                 const a2 = try self.parseExpr() orelse return null;
@@ -1203,6 +1222,8 @@ pub const Parser = struct {
             // 3 value args
             .memcpy, .fd_write, .fd_read, .fd_seek, .fd_open,
             .net_socket, .net_bind, .net_connect,
+            .kevent_add, .kevent_del, .kevent_wait,
+            .epoll_add, .epoll_wait,
             => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
