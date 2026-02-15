@@ -34,6 +34,7 @@ pub const Decl = union(enum) {
     impl_trait: ImplTraitBlock,
     error_set_decl: ErrorSetDecl,
     test_decl: TestDecl,
+    bench_decl: BenchDecl,
     bad_decl: BadDecl,
 
     pub fn span(self: Decl) Span {
@@ -60,6 +61,7 @@ pub const ImplBlock = struct { type_name: []const u8, type_params: []const []con
 pub const TraitDecl = struct { name: []const u8, methods: []const NodeIndex, span: Span };
 pub const ImplTraitBlock = struct { trait_name: []const u8, target_type: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, span: Span };
 pub const TestDecl = struct { name: []const u8, body: NodeIndex, span: Span };
+pub const BenchDecl = struct { name: []const u8, body: NodeIndex, span: Span };
 pub const EnumDecl = struct { name: []const u8, backing_type: NodeIndex, variants: []const EnumVariant, span: Span };
 pub const UnionDecl = struct { name: []const u8, variants: []const UnionVariant, span: Span };
 pub const TypeAlias = struct { name: []const u8, target: NodeIndex, span: Span };

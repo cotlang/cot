@@ -225,6 +225,9 @@ const TokenCollector = struct {
             .test_decl => |t| {
                 self.walkNode(t.body);
             },
+            .bench_decl => |b| {
+                self.walkNode(b.body);
+            },
             .bad_decl => {},
         }
     }

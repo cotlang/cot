@@ -204,6 +204,16 @@ fn declToSymbol(allocator: std.mem.Allocator, tree: *const Ast, content: []const
                 .children = &.{},
             };
         },
+        .bench_decl => |b| {
+            const range = lsp_types.spanToRange(content, b.span);
+            return DocumentSymbol{
+                .name = b.name,
+                .kind = .function,
+                .range = range,
+                .selection_range = range,
+                .children = &.{},
+            };
+        },
         .type_alias => |ta| {
             const range = lsp_types.spanToRange(content, ta.span);
             return DocumentSymbol{

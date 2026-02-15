@@ -40,6 +40,9 @@ pub const Lowerer = struct {
     test_names: std.ArrayListUnmanaged([]const u8),
     test_display_names: std.ArrayListUnmanaged([]const u8),
     current_test_name: ?[]const u8 = null,
+    bench_mode: bool = false,
+    bench_names: std.ArrayListUnmanaged([]const u8),
+    bench_display_names: std.ArrayListUnmanaged([]const u8),
     closure_counter: u32 = 0,
     lowered_generics: std.StringHashMap(void),
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
@@ -96,6 +99,8 @@ pub const Lowerer = struct {
             .float_const_types = std.StringHashMap(TypeIndex).init(allocator),
             .test_names = .{},
             .test_display_names = .{},
+            .bench_names = .{},
+            .bench_display_names = .{},
             .lowered_generics = std.StringHashMap(void).init(allocator),
             .target = target,
             .global_error_table = std.StringHashMap(i64).init(allocator),
@@ -109,6 +114,12 @@ pub const Lowerer = struct {
     pub fn getTestNames(self: *const Lowerer) []const []const u8 { return self.test_names.items; }
     pub fn getTestDisplayNames(self: *const Lowerer) []const []const u8 { return self.test_display_names.items; }
 
+    pub fn setBenchMode(self: *Lowerer, enabled: bool) void { self.bench_mode = enabled; }
+    pub fn addBenchName(self: *Lowerer, name: []const u8) !void { try self.bench_names.append(self.allocator, name); }
+    pub fn addBenchDisplayName(self: *Lowerer, name: []const u8) !void { try self.bench_display_names.append(self.allocator, name); }
+    pub fn getBenchNames(self: *const Lowerer) []const []const u8 { return self.bench_names.items; }
+    pub fn getBenchDisplayNames(self: *const Lowerer) []const []const u8 { return self.bench_display_names.items; }
+
     pub fn deinit(self: *Lowerer) void {
         self.loop_stack.deinit(self.allocator);
         self.cleanup_stack.deinit();
@@ -117,6 +128,8 @@ pub const Lowerer = struct {
         self.float_const_types.deinit();
         self.test_names.deinit(self.allocator);
         self.test_display_names.deinit(self.allocator);
+        self.bench_names.deinit(self.allocator);
+        self.bench_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
         self.builder.deinit();
     }
@@ -128,6 +141,8 @@ pub const Lowerer = struct {
         self.float_const_types.deinit();
         self.test_names.deinit(self.allocator);
         self.test_display_names.deinit(self.allocator);
+        self.bench_names.deinit(self.allocator);
+        self.bench_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
     }
 
@@ -245,6 +260,7 @@ pub const Lowerer = struct {
             .impl_block => |d| try self.lowerImplBlock(d),
             .impl_trait => |d| try self.lowerImplTraitBlock(d),
             .test_decl => |d| if (self.test_mode) try self.lowerTestDecl(d),
+            .bench_decl => |d| if (self.bench_mode) try self.lowerBenchDecl(d),
             .trait_decl, .enum_decl, .union_decl, .type_alias, .import_decl, .error_set_decl, .bad_decl => {},
         }
     }
@@ -252,7 +268,7 @@ pub const Lowerer = struct {
     fn lowerFnDecl(self: *Lowerer, fn_decl: ast.FnDecl) !void {
         if (fn_decl.is_extern) return;
         if (fn_decl.type_params.len > 0) return; // Skip generic fn defs — lowered on demand at call sites
-        if (self.test_mode and std.mem.eql(u8, fn_decl.name, "main")) return;
+        if ((self.test_mode or self.bench_mode) and std.mem.eql(u8, fn_decl.name, "main")) return;
 
         // Async functions get special lowering
         if (fn_decl.is_async) {
@@ -786,6 +802,154 @@ pub const Lowerer = struct {
             result[5 + i] = if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')) c else '_';
         }
         return result;
+    }
+
+    fn lowerBenchDecl(self: *Lowerer, bench_decl: ast.BenchDecl) !void {
+        const bench_name = try self.sanitizeBenchName(bench_decl.name);
+        try self.bench_names.append(self.allocator, bench_name);
+        try self.bench_display_names.append(self.allocator, bench_decl.name);
+        // Bench functions return i64 (matching main convention) to avoid void-return
+        // complications in the br_table dispatch pattern
+        self.builder.startFunc(bench_name, TypeRegistry.VOID, TypeRegistry.I64, bench_decl.span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            self.cleanup_stack.clear();
+            if (bench_decl.body != null_node) {
+                _ = try self.lowerBlockNode(bench_decl.body);
+                if (fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, bench_decl.span);
+                    _ = try fb.emitRet(zero, bench_decl.span);
+                }
+            }
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    fn sanitizeBenchName(self: *Lowerer, name: []const u8) ![]const u8 {
+        var result = try self.allocator.alloc(u8, 6 + name.len);
+        @memcpy(result[0..6], "bench_");
+        for (name, 0..) |c, i| {
+            result[6 + i] = if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')) c else '_';
+        }
+        return result;
+    }
+
+    pub fn generateBenchRunner(self: *Lowerer) !void {
+        if (self.bench_names.items.len == 0) return;
+        const span = Span.init(Pos.zero, Pos.zero);
+        self.builder.startFunc("main", TypeRegistry.VOID, TypeRegistry.I64, span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+
+            // Temp local for discarding bench function return values
+            const discard_local = try fb.addLocalWithSize("__bench_discard", TypeRegistry.I64, true, 8);
+            // Loop counter
+            const loop_counter = try fb.addLocalWithSize("__bench_i", TypeRegistry.I64, true, 8);
+
+            for (self.bench_names.items, 0..) |bench_name, bench_idx| {
+                const display_name = self.bench_display_names.items[bench_idx];
+
+                // __bench_print_name(name_ptr, name_len)
+                {
+                    const name_copy = try self.allocator.dupe(u8, display_name);
+                    const str_idx = try fb.addStringLiteral(name_copy);
+                    const str_slice = try fb.emitConstSlice(str_idx, span);
+                    const name_ptr = try fb.emitSlicePtr(str_slice, ptr_type, span);
+                    const name_len = try fb.emitSliceLen(str_slice, span);
+                    var pn_args = [_]ir.NodeIndex{ name_ptr, name_len };
+                    _ = try fb.emitCall("__bench_print_name", &pn_args, false, TypeRegistry.VOID, span);
+                }
+
+                // Warmup: call bench_fn() × 3
+                for (0..3) |_| {
+                    var no_args = [_]ir.NodeIndex{};
+                    const r = try fb.emitCall(bench_name, &no_args, false, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocal(discard_local, r, span);
+                }
+
+                // Calibrate: single timed call
+                {
+                    var cs_args = [_]ir.NodeIndex{};
+                    _ = try fb.emitCall("__bench_calibrate_start", &cs_args, false, TypeRegistry.VOID, span);
+                }
+                {
+                    var no_args = [_]ir.NodeIndex{};
+                    const r = try fb.emitCall(bench_name, &no_args, false, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocal(discard_local, r, span);
+                }
+                {
+                    var ce_args = [_]ir.NodeIndex{};
+                    _ = try fb.emitCall("__bench_calibrate_end", &ce_args, false, TypeRegistry.VOID, span);
+                }
+
+                // Measure: loop N times
+                {
+                    var ms_args = [_]ir.NodeIndex{};
+                    _ = try fb.emitCall("__bench_measure_start", &ms_args, false, TypeRegistry.VOID, span);
+                }
+
+                // i = 0
+                {
+                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocal(loop_counter, zero, span);
+                }
+
+                // while (i < __bench_get_n()) { bench_fn(); i = i + 1 }
+                const loop_cond_block = try fb.newBlock("bench.loop.cond");
+                const loop_body_block = try fb.newBlock("bench.loop.body");
+                const loop_exit_block = try fb.newBlock("bench.loop.exit");
+                _ = try fb.emitJump(loop_cond_block, span);
+
+                // Condition block: i < N ?
+                fb.setBlock(loop_cond_block);
+                {
+                    var gn_args = [_]ir.NodeIndex{};
+                    const n_val = try fb.emitCall("__bench_get_n", &gn_args, false, TypeRegistry.I64, span);
+                    const i_val = try fb.emitLoadLocal(loop_counter, TypeRegistry.I64, span);
+                    const cond = try fb.emitBinary(.lt, i_val, n_val, TypeRegistry.BOOL, span);
+                    _ = try fb.emitBranch(cond, loop_body_block, loop_exit_block, span);
+                }
+
+                // Body block: bench_fn(); i += 1; jump to cond
+                fb.setBlock(loop_body_block);
+                {
+                    var no_args = [_]ir.NodeIndex{};
+                    const r = try fb.emitCall(bench_name, &no_args, false, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocal(discard_local, r, span);
+
+                    const i_reload = try fb.emitLoadLocal(loop_counter, TypeRegistry.I64, span);
+                    const one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                    const i_next = try fb.emitBinary(.add, i_reload, one, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocal(loop_counter, i_next, span);
+                    _ = try fb.emitJump(loop_cond_block, span);
+                }
+
+                // Exit block: continue
+                fb.setBlock(loop_exit_block);
+
+                // __bench_measure_end()
+                {
+                    var me_args = [_]ir.NodeIndex{};
+                    _ = try fb.emitCall("__bench_measure_end", &me_args, false, TypeRegistry.VOID, span);
+                }
+            }
+
+            // __bench_summary(bench_count)
+            {
+                const count = try fb.emitConstInt(@intCast(self.bench_names.items.len), TypeRegistry.I64, span);
+                var sum_args = [_]ir.NodeIndex{count};
+                _ = try fb.emitCall("__bench_summary", &sum_args, false, TypeRegistry.VOID, span);
+            }
+
+            // Return 0
+            const ret_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitRet(ret_zero, span);
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
     }
 
     // ============================================================================

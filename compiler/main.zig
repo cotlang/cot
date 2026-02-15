@@ -56,6 +56,7 @@ pub const wasm_opcodes = @import("codegen/wasm_opcodes.zig");
 pub const wasm_encode = @import("codegen/wasm_encode.zig");
 pub const wasm_gen = @import("codegen/wasm_gen.zig");
 pub const test_runtime = @import("codegen/test_runtime.zig");
+pub const bench_runtime = @import("codegen/bench_runtime.zig");
 
 const Target = core_target.Target;
 const Driver = driver.Driver;
@@ -105,6 +106,7 @@ pub fn main() !void {
         .build => |opts| buildCommand(allocator, opts),
         .run => |opts| runCommand(allocator, opts),
         .@"test" => |opts| testCommand(allocator, opts),
+        .bench => |opts| benchCommand(allocator, opts),
         .check => |opts| checkCommand(allocator, opts),
         .lint => |opts| lintCommand(allocator, opts),
         .fmt => |opts| fmtCommand(allocator, opts),
@@ -255,6 +257,77 @@ fn testCommand(allocator: std.mem.Allocator, opts: cli.TestOptions) void {
         },
         .Signal => |sig| {
             std.debug.print("Test program killed by signal: {d}\n", .{sig});
+            std.process.exit(1);
+        },
+        else => std.process.exit(1),
+    }
+}
+
+fn benchCommand(allocator: std.mem.Allocator, opts: cli.BenchOptions) void {
+    // Compile to temp directory
+    const tmp_dir = "/tmp/cot-run";
+    std.fs.cwd().makePath(tmp_dir) catch {
+        std.debug.print("Error: Failed to create temp directory {s}\n", .{tmp_dir});
+        std.process.exit(1);
+    };
+
+    const stem = blk: {
+        const basename = std.fs.path.basename(opts.input_file);
+        break :blk if (std.mem.endsWith(u8, basename, ".cot"))
+            basename[0 .. basename.len - 4]
+        else
+            basename;
+    };
+    const tmp_output = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, stem }) catch {
+        std.debug.print("Error: Allocation failed\n", .{});
+        std.process.exit(1);
+    };
+
+    compileAndLinkFull(allocator, opts.input_file, tmp_output, opts.target, false, true, null, true, opts.filter, opts.n);
+
+    // Run the benchmark: wasmtime for wasm targets, direct execution for native
+    const run_path = if (opts.target.isWasm())
+        std.fmt.allocPrint(allocator, "{s}.wasm", .{tmp_output}) catch {
+            std.debug.print("Error: Allocation failed\n", .{});
+            std.process.exit(1);
+        }
+    else
+        tmp_output;
+
+    const argv: []const []const u8 = if (opts.target.isWasmGC())
+        &.{ "wasmtime", "-W", "gc=y", run_path }
+    else if (opts.target.isWasm())
+        &.{ "wasmtime", run_path }
+    else
+        &.{run_path};
+
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    const result = child.spawnAndWait() catch |e| {
+        if (opts.target.isWasm()) {
+            std.debug.print("Error: Failed to run wasmtime (is it installed?): {any}\n", .{e});
+        } else {
+            std.debug.print("Error: Failed to run benchmarks: {any}\n", .{e});
+        }
+        cleanup(tmp_dir);
+        std.process.exit(1);
+    };
+
+    cleanup(tmp_dir);
+
+    switch (result) {
+        .Exited => |code| {
+            if (opts.target.isWasm()) {
+                if (code == 0) {
+                    std.debug.print("\x1b[1;32mok\x1b[0m | benchmarks completed\n", .{});
+                } else {
+                    std.debug.print("\x1b[1;31mFAILED\x1b[0m | benchmark exited with code {d}\n", .{code});
+                }
+            }
+            std.process.exit(code);
+        },
+        .Signal => |sig| {
+            std.debug.print("Benchmark killed by signal: {d}\n", .{sig});
             std.process.exit(1);
         },
         else => std.process.exit(1),
@@ -475,7 +548,7 @@ fn cleanup(dir: []const u8) void {
     std.fs.cwd().deleteTree(dir) catch {};
 }
 
-/// Core compile + link logic shared by build, run, and test commands.
+/// Core compile + link logic shared by build, run, test, and bench commands.
 fn compileAndLink(
     allocator: std.mem.Allocator,
     input_file: []const u8,
@@ -485,14 +558,35 @@ fn compileAndLink(
     quiet: bool,
     test_filter: ?[]const u8,
 ) void {
+    compileAndLinkFull(allocator, input_file, output_name, compile_target, test_mode, quiet, test_filter, false, null, null);
+}
+
+fn compileAndLinkFull(
+    allocator: std.mem.Allocator,
+    input_file: []const u8,
+    output_name: []const u8,
+    compile_target: Target,
+    test_mode: bool,
+    quiet: bool,
+    test_filter: ?[]const u8,
+    bench_mode: bool,
+    bench_filter: ?[]const u8,
+    bench_n: ?i64,
+) void {
     var compile_driver = Driver.init(allocator);
     compile_driver.setTarget(compile_target);
     if (test_mode) compile_driver.setTestMode(true);
     if (test_filter) |f| compile_driver.setTestFilter(f);
+    if (bench_mode) compile_driver.setBenchMode(true);
+    if (bench_filter) |f| compile_driver.setBenchFilter(f);
+    if (bench_n) |n| compile_driver.setBenchN(n);
 
     const code = compile_driver.compileFile(input_file) catch |e| {
         if (e == error.NoTestsMatched) {
             // Already printed "0 tests matched filter" — exit success
+            std.process.exit(0);
+        }
+        if (e == error.NoBenchesMatched) {
             std.process.exit(0);
         }
         std.debug.print("Compilation failed: {any}\n", .{e});

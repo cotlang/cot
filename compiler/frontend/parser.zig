@@ -182,6 +182,7 @@ pub const Parser = struct {
             .kw_type => self.parseTypeAlias(),
             .kw_import => self.parseImportDecl(),
             .kw_test => self.parseTestDecl(),
+            .kw_bench => self.parseBenchDecl(),
             else => { self.syntaxError("expected declaration"); return null; },
         };
     }
@@ -562,6 +563,17 @@ pub const Parser = struct {
         const name = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') raw[1 .. raw.len - 1] else raw;
         const body = try self.parseBlock() orelse return null;
         return try self.tree.addDecl(.{ .test_decl = .{ .name = name, .body = body, .span = Span.init(start, self.pos()) } });
+    }
+
+    fn parseBenchDecl(self: *Parser) ParseError!?NodeIndex {
+        const start = self.pos();
+        self.advance();
+        if (!self.check(.string_lit)) { self.syntaxError("expected bench name string"); return null; }
+        const raw = self.tok.text;
+        self.advance();
+        const name = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') raw[1 .. raw.len - 1] else raw;
+        const body = try self.parseBlock() orelse return null;
+        return try self.tree.addDecl(.{ .bench_decl = .{ .name = name, .body = body, .span = Span.init(start, self.pos()) } });
     }
 
     // Type parsing

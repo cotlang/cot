@@ -48,6 +48,13 @@ pub const TestOptions = struct {
     verbose: bool = false,
 };
 
+pub const BenchOptions = struct {
+    input_file: []const u8,
+    target: Target = Target.native(),
+    filter: ?[]const u8 = null,
+    n: ?i64 = null,
+};
+
 pub const FmtOptions = struct {
     input_file: []const u8,
     write: bool = false,
@@ -65,6 +72,7 @@ pub const Command = union(enum) {
     build: BuildOptions,
     run: RunOptions,
     @"test": TestOptions,
+    bench: BenchOptions,
     check: CheckOptions,
     lint: LintOptions,
     fmt: FmtOptions,
@@ -85,6 +93,7 @@ pub fn parseArgs(allocator: std.mem.Allocator) ?Command {
     if (std.mem.eql(u8, first, "build")) return parseBuild(&args);
     if (std.mem.eql(u8, first, "run")) return parseRun(allocator, &args);
     if (std.mem.eql(u8, first, "test")) return parseTest(&args);
+    if (std.mem.eql(u8, first, "bench")) return parseBench(&args);
     if (std.mem.eql(u8, first, "check")) return parseCheck(&args);
     if (std.mem.eql(u8, first, "lint")) return parseLint(&args);
     if (std.mem.eql(u8, first, "fmt")) return parseFmt(&args);
@@ -202,6 +211,51 @@ fn parseTest(args: *std.process.ArgIterator) ?Command {
         return null;
     }
     return .{ .@"test" = opts };
+}
+
+fn parseBench(args: *std.process.ArgIterator) ?Command {
+    var opts = BenchOptions{ .input_file = undefined };
+    var has_input = false;
+
+    while (args.next()) |arg| {
+        if (isTargetFlag(arg)) {
+            opts.target = parseTarget(arg, args) orelse return null;
+        } else if (std.mem.startsWith(u8, arg, "--filter=")) {
+            opts.filter = arg[9..];
+        } else if (std.mem.eql(u8, arg, "--filter")) {
+            opts.filter = args.next() orelse {
+                std.debug.print("Error: --filter requires an argument\n", .{});
+                return null;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--n=")) {
+            const val_str = arg[4..];
+            opts.n = std.fmt.parseInt(i64, val_str, 10) catch {
+                std.debug.print("Error: --n requires a number, got '{s}'\n", .{val_str});
+                return null;
+            };
+        } else if (std.mem.eql(u8, arg, "--n")) {
+            const val_str = args.next() orelse {
+                std.debug.print("Error: --n requires an argument\n", .{});
+                return null;
+            };
+            opts.n = std.fmt.parseInt(i64, val_str, 10) catch {
+                std.debug.print("Error: --n requires a number, got '{s}'\n", .{val_str});
+                return null;
+            };
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            opts.input_file = arg;
+            has_input = true;
+        } else {
+            std.debug.print("Error: Unknown option '{s}'\n", .{arg});
+            return null;
+        }
+    }
+
+    if (!has_input) {
+        std.debug.print("Error: No input file\nUsage: cot bench <file.cot> [--target=<t>] [--filter=<str>] [--n=<count>]\n", .{});
+        return null;
+    }
+    return .{ .bench = opts };
 }
 
 fn parseCheck(args: *std.process.ArgIterator) ?Command {
@@ -396,6 +450,8 @@ pub fn printHelp(subcommand: ?[]const u8) void {
             printRunHelp();
         } else if (std.mem.eql(u8, sub, "test")) {
             printTestHelp();
+        } else if (std.mem.eql(u8, sub, "bench")) {
+            printBenchHelp();
         } else if (std.mem.eql(u8, sub, "check")) {
             printCheckHelp();
         } else if (std.mem.eql(u8, sub, "lint")) {
@@ -423,6 +479,7 @@ fn printUsage() void {
         \\  cot build <file.cot> [-o name]  Compile with options
         \\  cot run <file.cot> [-- args]    Compile and run
         \\  cot test <file.cot>             Run tests
+        \\  cot bench <file.cot>            Run benchmarks
         \\  cot check <file.cot>            Type-check without compiling
         \\  cot lint <file.cot>             Check for warnings
         \\  cot fmt <file.cot> [-w]         Format source code
@@ -491,6 +548,26 @@ fn printTestHelp() void {
         \\  cot test app.cot                    Run all tests in app.cot
         \\  cot test app.cot --filter=math       Run only tests matching "math"
         \\  cot test app.cot --verbose           Run with detailed output
+        \\
+    , .{});
+}
+
+fn printBenchHelp() void {
+    std.debug.print(
+        \\Usage: cot bench <file.cot> [--target=<t>] [--filter=<str>] [--n=<count>]
+        \\
+        \\Compile and run a Cot source file in benchmark mode.
+        \\Uses Go-style adaptive calibration to target ~1s per benchmark.
+        \\
+        \\Flags:
+        \\  --target=<t>    Target: arm64-macos, amd64-linux
+        \\  --filter=<str>  Only run benchmarks whose name contains <str>
+        \\  --n=<count>     Fixed iteration count (skip auto-calibration)
+        \\
+        \\Examples:
+        \\  cot bench app.cot                    Run all benchmarks
+        \\  cot bench app.cot --filter=fib       Run only benchmarks matching "fib"
+        \\  cot bench app.cot --n=100            Run each benchmark 100 times
         \\
     , .{});
 }

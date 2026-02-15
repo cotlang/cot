@@ -186,6 +186,7 @@ pub const Formatter = struct {
             .impl_trait => |d| self.printImplTrait(d),
             .error_set_decl => |d| self.printErrorSet(d),
             .test_decl => |d| self.printTestDecl(d),
+            .bench_decl => |d| self.printBenchDecl(d),
             .bad_decl => {},
         }
     }
@@ -441,6 +442,14 @@ pub const Formatter = struct {
     fn printTestDecl(self: *Formatter, d: ast_mod.TestDecl) void {
         self.writeIndent();
         self.write("test \"") catch {};
+        self.write(d.name) catch {};
+        self.write("\" ") catch {};
+        self.printBlock(d.body);
+    }
+
+    fn printBenchDecl(self: *Formatter, d: ast_mod.BenchDecl) void {
+        self.writeIndent();
+        self.write("bench \"") catch {};
         self.write(d.name) catch {};
         self.write("\" ") catch {};
         self.printBlock(d.body);

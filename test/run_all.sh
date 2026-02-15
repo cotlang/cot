@@ -55,6 +55,13 @@ fi
 echo ""
 
 for f in "${files[@]}"; do
+    # Skip bench-only files (they need `cot bench`, not `cot test`)
+    if grep -q '^bench "' "$f" && ! grep -q '^test "' "$f"; then
+        printf "%-45s" "$f"
+        echo "skip (bench file)"
+        total=$((total - 1))
+        continue
+    fi
     printf "%-45s" "$f"
     if output=$("$COT" test "$f" $TARGET_FLAG 2>&1); then
         # Extract summary line if present (may be just "Tests passed" for wasm)

@@ -245,4 +245,5 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 | `VISION.md` | Language vision, design principles, execution roadmap |
 | `claude/CONCURRENCY_DESIGN.md` | Concurrency roadmap: spawn, channels, work-stealing, atomic ARC |
 | `claude/BUSINESS_MODEL.md` | Licensing, trademark, revenue model, funding strategy |
+| `claude/RELEASE_PLAN.md` | 0.4 release plan: branding, distribution, polish, tooling, criteria |
 | `claude/archive/` | Historical: completed milestones, past bug fixes, postmortems |

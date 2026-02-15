@@ -461,6 +461,7 @@ pub const Checker = struct {
                 }
             },
             .test_decl => |t| try self.checkTestDecl(t),
+            .bench_decl => |b| try self.checkBenchDecl(b),
             else => {},
         }
     }
@@ -474,6 +475,19 @@ pub const Checker = struct {
         self.current_return_type = TypeRegistry.VOID;
         if (t.body != null_node) try self.checkStmt(t.body);
         if (self.lint_mode) self.checkScopeUnused(&test_scope);
+        self.scope = old_scope;
+        self.current_return_type = old_return;
+    }
+
+    fn checkBenchDecl(self: *Checker, b: ast.BenchDecl) CheckError!void {
+        var bench_scope = Scope.init(self.allocator, self.scope);
+        defer bench_scope.deinit();
+        const old_scope = self.scope;
+        const old_return = self.current_return_type;
+        self.scope = &bench_scope;
+        self.current_return_type = TypeRegistry.VOID;
+        if (b.body != null_node) try self.checkStmt(b.body);
+        if (self.lint_mode) self.checkScopeUnused(&bench_scope);
         self.scope = old_scope;
         self.current_return_type = old_return;
     }

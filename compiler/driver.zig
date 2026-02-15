@@ -32,6 +32,7 @@ const slice_runtime = @import("codegen/slice_runtime.zig"); // Slice runtime (Go
 const print_runtime = @import("codegen/print_runtime.zig"); // Print runtime (Go)
 const wasi_runtime = @import("codegen/wasi_runtime.zig"); // WASI runtime (fd_write)
 const test_runtime = @import("codegen/test_runtime.zig"); // Test runtime (Zig)
+const bench_runtime = @import("codegen/bench_runtime.zig"); // Bench runtime (Go testing.B)
 
 // Native codegen modules (Cranelift-style AOT compiler)
 const native_compile = @import("codegen/native/compile.zig");
@@ -62,6 +63,9 @@ pub const Driver = struct {
     target: Target = Target.native(),
     test_mode: bool = false,
     test_filter: ?[]const u8 = null,
+    bench_mode: bool = false,
+    bench_filter: ?[]const u8 = null,
+    bench_n: ?i64 = null,
 
     pub fn init(allocator: Allocator) Driver {
         return .{ .allocator = allocator };
@@ -77,6 +81,18 @@ pub const Driver = struct {
 
     pub fn setTestFilter(self: *Driver, filter: []const u8) void {
         self.test_filter = filter;
+    }
+
+    pub fn setBenchMode(self: *Driver, enabled: bool) void {
+        self.bench_mode = enabled;
+    }
+
+    pub fn setBenchFilter(self: *Driver, filter: []const u8) void {
+        self.bench_filter = filter;
+    }
+
+    pub fn setBenchN(self: *Driver, n: i64) void {
+        self.bench_n = n;
     }
 
     /// Type-check a source file without compiling (supports imports).
@@ -313,11 +329,16 @@ pub const Driver = struct {
         defer all_test_names.deinit(self.allocator);
         var all_test_display_names = std.ArrayListUnmanaged([]const u8){};
         defer all_test_display_names.deinit(self.allocator);
+        var all_bench_names = std.ArrayListUnmanaged([]const u8){};
+        defer all_bench_names.deinit(self.allocator);
+        var all_bench_display_names = std.ArrayListUnmanaged([]const u8){};
+        defer all_bench_display_names.deinit(self.allocator);
 
         for (parsed_files.items, 0..) |*pf, i| {
             var lower_err = errors_mod.ErrorReporter.init(&pf.source, null);
             var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder, self.target);
             if (self.test_mode) lowerer.setTestMode(true);
+            if (self.bench_mode) lowerer.setBenchMode(true);
 
             lowerer.lowerToBuilder() catch |e| {
                 lowerer.deinitWithoutBuilder();
@@ -331,6 +352,10 @@ pub const Driver = struct {
             if (self.test_mode) {
                 for (lowerer.getTestNames()) |n| try all_test_names.append(self.allocator, n);
                 for (lowerer.getTestDisplayNames()) |n| try all_test_display_names.append(self.allocator, n);
+            }
+            if (self.bench_mode) {
+                for (lowerer.getBenchNames()) |n| try all_bench_names.append(self.allocator, n);
+                for (lowerer.getBenchDisplayNames()) |n| try all_bench_display_names.append(self.allocator, n);
             }
             shared_builder = lowerer.builder;
             lowerer.deinitWithoutBuilder();
@@ -361,6 +386,31 @@ pub const Driver = struct {
             }
         }
 
+        // Filter benchmarks if --filter is specified
+        if (self.bench_filter) |filter| {
+            var filtered_names = std.ArrayListUnmanaged([]const u8){};
+            defer filtered_names.deinit(self.allocator);
+            var filtered_display = std.ArrayListUnmanaged([]const u8){};
+            defer filtered_display.deinit(self.allocator);
+
+            for (all_bench_names.items, all_bench_display_names.items) |name, display| {
+                if (std.mem.indexOf(u8, display, filter) != null) {
+                    try filtered_names.append(self.allocator, name);
+                    try filtered_display.append(self.allocator, display);
+                }
+            }
+
+            all_bench_names.clearRetainingCapacity();
+            all_bench_display_names.clearRetainingCapacity();
+            for (filtered_names.items) |n| try all_bench_names.append(self.allocator, n);
+            for (filtered_display.items) |n| try all_bench_display_names.append(self.allocator, n);
+
+            if (all_bench_names.items.len == 0) {
+                std.debug.print("0 benchmarks matched filter \"{s}\"\n", .{filter});
+                return error.NoBenchesMatched;
+            }
+        }
+
         // Generate test runner if in test mode
         if (self.test_mode and all_test_names.items.len > 0) {
             var dummy_err = errors_mod.ErrorReporter.init(&parsed_files.items[0].source, null);
@@ -368,6 +418,17 @@ pub const Driver = struct {
             for (all_test_names.items) |n| try runner.addTestName(n);
             for (all_test_display_names.items) |n| try runner.addTestDisplayName(n);
             try runner.generateTestRunner();
+            shared_builder = runner.builder;
+            runner.deinitWithoutBuilder();
+        }
+
+        // Generate bench runner if in bench mode
+        if (self.bench_mode and all_bench_names.items.len > 0) {
+            var dummy_err = errors_mod.ErrorReporter.init(&parsed_files.items[0].source, null);
+            var runner = lower_mod.Lowerer.initWithBuilder(self.allocator, &parsed_files.items[0].tree, &type_reg, &dummy_err, &checkers.items[0], shared_builder, self.target);
+            for (all_bench_names.items) |n| try runner.addBenchName(n);
+            for (all_bench_display_names.items) |n| try runner.addBenchDisplayName(n);
+            try runner.generateBenchRunner();
             shared_builder = runner.builder;
             runner.deinitWithoutBuilder();
         }
@@ -979,26 +1040,20 @@ pub const Driver = struct {
                     };
                     try module.defineFunctionBytes(func_ids[i], &arm64_open, &.{});
                 } else if (std.mem.eql(u8, name, "cot_time")) {
-                    // ARM64 macOS: gettimeofday → convert to nanoseconds since epoch
+                    // ARM64 macOS: monotonic nanoseconds via CNTVCT_EL0
                     // Cranelift CC: x0=vmctx, x1=caller_vmctx (no user args)
-                    // Returns: i64 nanoseconds = tv_sec * 1_000_000_000 + tv_usec * 1_000
-                    // Reference: Go runtime/sys_darwin_arm64.s walltime_trampoline
-                    // Note: Go doesn't check gettimeofday errors either — it never fails in practice.
+                    // Returns: i64 nanoseconds = CNTVCT_EL0 * 125 / 3
+                    // Reference: Go runtime/sys_darwin_arm64.s uses libSystem trampolines,
+                    // NOT raw SVC #0x80. macOS gettimeofday uses commpage internally.
+                    // Raw SVC #0x80 corrupts vmctx memory on Apple Silicon — confirmed bug.
+                    // Apple Silicon timebase: 24MHz → numer=125, denom=3 → ns = ticks * 125 / 3
                     const arm64_time = [_]u8{
-                        0xFD, 0x7B, 0xBE, 0xA9, // stp x29, x30, [sp, #-32]!  (save FP/LR + 16 bytes for timeval)
-                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
-                        0xE0, 0x43, 0x00, 0x91, // add x0, sp, #16             (x0 = &timeval at sp+16)
-                        0x01, 0x00, 0x80, 0xD2, // movz x1, #0                 (tz = NULL)
-                        0x90, 0x0E, 0x80, 0xD2, // movz x16, #116              (SYS_gettimeofday)
-                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
-                        0xE8, 0x0B, 0x40, 0xF9, // ldr x8, [sp, #16]           (tv_sec: i64)
-                        0xE9, 0x1B, 0x40, 0xB9, // ldr w9, [sp, #24]           (tv_usec: i32, zero-ext)
-                        0x0A, 0x40, 0x99, 0xD2, // movz x10, #0xCA00
-                        0x4A, 0x73, 0xA7, 0xF2, // movk x10, #0x3B9A, lsl #16 (x10 = 1_000_000_000)
-                        0x00, 0x7D, 0x0A, 0x9B, // mul x0, x8, x10             (tv_sec * 1B)
-                        0x0B, 0x7D, 0x80, 0xD2, // movz x11, #1000
-                        0x20, 0x01, 0x0B, 0x9B, // madd x0, x9, x11, x0        (+ tv_usec * 1000)
-                        0xFD, 0x7B, 0xC2, 0xA8, // ldp x29, x30, [sp], #32
+                        0xDF, 0x3F, 0x03, 0xD5, // isb  (barrier before CNTVCT read)
+                        0x40, 0xE0, 0x3B, 0xD5, // mrs x0, CNTVCT_EL0
+                        0xA1, 0x0F, 0x80, 0xD2, // movz x1, #125
+                        0x00, 0x7C, 0x01, 0x9B, // mul x0, x0, x1
+                        0x61, 0x00, 0x80, 0xD2, // movz x1, #3
+                        0x00, 0x0C, 0xC1, 0x9A, // udiv x0, x0, x1
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };
                     try module.defineFunctionBytes(func_ids[i], &arm64_time, &.{});
@@ -2741,6 +2796,11 @@ pub const Driver = struct {
         // ====================================================================
         const test_funcs = try test_runtime.addToLinker(self.allocator, &linker, print_funcs.write_idx, print_funcs.eprint_int_idx, wasi_funcs.time_idx);
 
+        // ====================================================================
+        // Add bench runtime functions (Go testing.B calibration pattern)
+        // ====================================================================
+        const bench_funcs = try bench_runtime.addToLinker(self.allocator, &linker, print_funcs.write_idx, print_funcs.eprint_int_idx, wasi_funcs.time_idx, self.bench_n);
+
         // Get actual count from linker - never hardcode (Go: len(hostImports))
         const runtime_func_count = linker.funcCount();
 
@@ -2814,6 +2874,15 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, test_runtime.TEST_PASS_NAME, test_funcs.test_pass_idx);
         try func_indices.put(self.allocator, test_runtime.TEST_FAIL_NAME, test_funcs.test_fail_idx);
         try func_indices.put(self.allocator, test_runtime.TEST_SUMMARY_NAME, test_funcs.test_summary_idx);
+
+        // Add bench function names to index map (Go testing.B)
+        try func_indices.put(self.allocator, bench_runtime.BENCH_PRINT_NAME_NAME, bench_funcs.bench_print_name_idx);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_START_NAME, bench_funcs.bench_calibrate_start_idx);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_CALIBRATE_END_NAME, bench_funcs.bench_calibrate_end_idx);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_START_NAME, bench_funcs.bench_measure_start_idx);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_MEASURE_END_NAME, bench_funcs.bench_measure_end_idx);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_GET_N_NAME, bench_funcs.bench_get_n_idx);
+        try func_indices.put(self.allocator, bench_runtime.BENCH_SUMMARY_NAME, bench_funcs.bench_summary_idx);
 
         // Add user function names (offset by ARC function count)
         for (funcs, 0..) |*ir_func, i| {
