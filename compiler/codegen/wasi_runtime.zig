@@ -56,6 +56,12 @@ pub const EPOLL_ADD_NAME = "cot_epoll_add";
 pub const EPOLL_DEL_NAME = "cot_epoll_del";
 pub const EPOLL_WAIT_NAME = "cot_epoll_wait";
 pub const SET_NONBLOCK_NAME = "cot_set_nonblocking";
+// Process spawning
+pub const FORK_NAME = "cot_fork";
+pub const EXECVE_NAME = "cot_execve";
+pub const WAITPID_NAME = "cot_waitpid";
+pub const PIPE_NAME = "cot_pipe";
+pub const DUP2_NAME = "cot_dup2";
 
 // WASI scratch memory addresses in linear memory
 // Used by adapter shims to build iov structs and read WASI output params
@@ -104,6 +110,12 @@ pub const WasiFunctions = struct {
     epoll_del_idx: u32,
     epoll_wait_idx: u32,
     set_nonblocking_idx: u32,
+    // Process spawning
+    fork_idx: u32,
+    execve_idx: u32,
+    waitpid_idx: u32,
+    pipe_idx: u32,
+    dup2_idx: u32,
 };
 
 // =============================================================================
@@ -453,6 +465,18 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
     const set_nonblock_body = try generateStubReturnsNegOne(allocator);
     const set_nonblock_idx = try linker.addFunc(.{ .name = SET_NONBLOCK_NAME, .type_idx = arg_one_type, .code = set_nonblock_body, .exported = false });
 
+    // Process spawning stubs (WASI has no process spawning — return -1)
+    const fork_body = try generateStubReturnsNegOne(allocator);
+    const fork_idx = try linker.addFunc(.{ .name = FORK_NAME, .type_idx = time_type, .code = fork_body, .exported = false });
+    const execve_body = try generateStubReturnsNegOne(allocator);
+    const execve_idx = try linker.addFunc(.{ .name = EXECVE_NAME, .type_idx = net_3arg_type, .code = execve_body, .exported = false });
+    const waitpid_body = try generateStubReturnsNegOne(allocator);
+    const waitpid_idx = try linker.addFunc(.{ .name = WAITPID_NAME, .type_idx = arg_one_type, .code = waitpid_body, .exported = false });
+    const pipe_body = try generateStubReturnsNegOne(allocator);
+    const pipe_idx = try linker.addFunc(.{ .name = PIPE_NAME, .type_idx = time_type, .code = pipe_body, .exported = false });
+    const dup2_body = try generateStubReturnsNegOne(allocator);
+    const dup2_idx = try linker.addFunc(.{ .name = DUP2_NAME, .type_idx = net_2arg_type, .code = dup2_body, .exported = false });
+
     // Return indices: addFunc returns 0-based func indices.
     // Actual Wasm function index = import_count + func_local_index.
     return WasiFunctions{
@@ -486,6 +510,11 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .epoll_del_idx = epoll_del_idx + import_count,
         .epoll_wait_idx = epoll_wait_idx + import_count,
         .set_nonblocking_idx = set_nonblock_idx + import_count,
+        .fork_idx = fork_idx + import_count,
+        .execve_idx = execve_idx + import_count,
+        .waitpid_idx = waitpid_idx + import_count,
+        .pipe_idx = pipe_idx + import_count,
+        .dup2_idx = dup2_idx + import_count,
     };
 }
 
@@ -679,6 +708,18 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
     const set_nonblock_body = try generateStubReturnsNegOne(allocator);
     const set_nonblock_idx = try linker.addFunc(.{ .name = SET_NONBLOCK_NAME, .type_idx = fd_close_type, .code = set_nonblock_body, .exported = true });
 
+    // Process spawning stubs (native overrides in driver.zig provide real syscalls)
+    const fork_body = try generateStubReturnsNegOne(allocator);
+    const fork_idx = try linker.addFunc(.{ .name = FORK_NAME, .type_idx = time_type, .code = fork_body, .exported = true });
+    const execve_body = try generateStubReturnsNegOne(allocator);
+    const execve_idx = try linker.addFunc(.{ .name = EXECVE_NAME, .type_idx = net_3arg_type, .code = execve_body, .exported = true });
+    const waitpid_body = try generateStubReturnsNegOne(allocator);
+    const waitpid_idx = try linker.addFunc(.{ .name = WAITPID_NAME, .type_idx = fd_close_type, .code = waitpid_body, .exported = true });
+    const pipe_body = try generateStubReturnsNegOne(allocator);
+    const pipe_idx = try linker.addFunc(.{ .name = PIPE_NAME, .type_idx = time_type, .code = pipe_body, .exported = true });
+    const dup2_body = try generateStubReturnsNegOne(allocator);
+    const dup2_idx = try linker.addFunc(.{ .name = DUP2_NAME, .type_idx = net_2arg_type, .code = dup2_body, .exported = true });
+
     return WasiFunctions{
         .fd_write_idx = fd_write_idx,
         .fd_write_simple_idx = fd_write_simple_idx,
@@ -710,6 +751,11 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .epoll_del_idx = epoll_del_idx,
         .epoll_wait_idx = epoll_wait_idx,
         .set_nonblocking_idx = set_nonblock_idx,
+        .fork_idx = fork_idx,
+        .execve_idx = execve_idx,
+        .waitpid_idx = waitpid_idx,
+        .pipe_idx = pipe_idx,
+        .dup2_idx = dup2_idx,
     };
 }
 

@@ -1,0 +1,106 @@
+import "std/testing"
+import "std/string"
+
+// ============================================================================
+// assertContains
+// ============================================================================
+
+test "assertContains passes on match" {
+    assertContains("hello world", "world")
+}
+
+test "assertContains passes on full match" {
+    assertContains("hello", "hello")
+}
+
+test "assertContains passes on empty needle" {
+    assertContains("hello", "")
+}
+
+// ============================================================================
+// assertStartsWith / assertEndsWith
+// ============================================================================
+
+test "assertStartsWith passes" {
+    assertStartsWith("hello world", "hello")
+}
+
+test "assertEndsWith passes" {
+    assertEndsWith("hello world", "world")
+}
+
+// ============================================================================
+// assertStrEq
+// ============================================================================
+
+test "assertStrEq passes on equal strings" {
+    assertStrEq("hello", "hello", "greeting")
+}
+
+// ============================================================================
+// Numeric Assertions
+// ============================================================================
+
+test "assertGt passes" {
+    assertGt(10, 5)
+}
+
+test "assertGte passes on equal" {
+    assertGte(5, 5)
+}
+
+test "assertGte passes on greater" {
+    assertGte(10, 5)
+}
+
+test "assertLt passes" {
+    assertLt(3, 10)
+}
+
+test "assertLte passes on equal" {
+    assertLte(5, 5)
+}
+
+test "assertLte passes on less" {
+    assertLte(3, 10)
+}
+
+test "assertInRange passes" {
+    assertInRange(5, 1, 10)
+}
+
+test "assertInRange boundary min" {
+    assertInRange(1, 1, 10)
+}
+
+test "assertInRange boundary max" {
+    assertInRange(10, 1, 10)
+}
+
+// ============================================================================
+// Boolean / String Assertions
+// ============================================================================
+
+test "assertTrue passes" {
+    assertTrue(1 == 1, "one equals one")
+}
+
+test "assertFalse passes" {
+    assertFalse(1 == 2, "one does not equal two")
+}
+
+test "assertEmpty on empty string" {
+    assertEmpty("")
+}
+
+test "assertNotEmpty on non-empty string" {
+    assertNotEmpty("hello")
+}
+
+test "assertLen checks length" {
+    assertLen("hello", 5)
+}
+
+test "assertLen empty" {
+    assertLen("", 0)
+}

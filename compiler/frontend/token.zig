@@ -37,7 +37,7 @@ pub const Token = enum(u8) {
     kw_comptime,
     kw_async, kw_await,
     kw_and, kw_or, kw_not,
-    kw_int, kw_float, kw_bool, kw_string, kw_byte, kw_void,
+    kw_int, kw_float, kw_bool, kw_string, kw_byte, kw_void, kw_noreturn,
     kw_i8, kw_i16, kw_i32, kw_i64, kw_u8, kw_u16, kw_u32, kw_u64, kw_f32, kw_f64,
     keyword_end,
 
@@ -74,7 +74,7 @@ pub const Token = enum(u8) {
 
     pub fn isTypeKeyword(self: Token) bool {
         return switch (self) {
-            .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte, .kw_void,
+            .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte, .kw_void, .kw_noreturn,
             .kw_i8, .kw_i16, .kw_i32, .kw_i64, .kw_u8, .kw_u16, .kw_u32, .kw_u64, .kw_f32, .kw_f64,
             => true,
             else => false,
@@ -200,6 +200,7 @@ const token_strings = blk: {
     s[@intFromEnum(Token.kw_string)] = "string";
     s[@intFromEnum(Token.kw_byte)] = "byte";
     s[@intFromEnum(Token.kw_void)] = "void";
+    s[@intFromEnum(Token.kw_noreturn)] = "noreturn";
     s[@intFromEnum(Token.kw_i8)] = "i8";
     s[@intFromEnum(Token.kw_i16)] = "i16";
     s[@intFromEnum(Token.kw_i32)] = "i32";
@@ -226,7 +227,7 @@ pub const keywords = std.StaticStringMap(Token).initComptime(.{
     .{ "async", .kw_async }, .{ "await", .kw_await },
     .{ "and", .kw_and }, .{ "or", .kw_or }, .{ "not", .kw_not },
     .{ "int", .kw_int }, .{ "float", .kw_float }, .{ "bool", .kw_bool }, .{ "string", .kw_string },
-    .{ "byte", .kw_byte }, .{ "void", .kw_void },
+    .{ "byte", .kw_byte }, .{ "void", .kw_void }, .{ "noreturn", .kw_noreturn },
     .{ "i8", .kw_i8 }, .{ "i16", .kw_i16 }, .{ "i32", .kw_i32 }, .{ "i64", .kw_i64 },
     .{ "u8", .kw_u8 }, .{ "u16", .kw_u16 }, .{ "u32", .kw_u32 }, .{ "u64", .kw_u64 },
     .{ "f32", .kw_f32 }, .{ "f64", .kw_f64 },

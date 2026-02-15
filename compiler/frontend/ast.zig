@@ -226,6 +226,14 @@ pub const BuiltinKind = enum {
     epoll_del,
     epoll_wait,
     set_nonblocking,
+    // Process spawning
+    fork,
+    execve,
+    waitpid,
+    pipe,
+    dup2,
+    // Compile-time file embedding
+    embed_file,
 
     const map = std.StaticStringMap(BuiltinKind).initComptime(.{
         .{ "sizeOf", .size_of },
@@ -285,6 +293,12 @@ pub const BuiltinKind = enum {
         .{ "epoll_del", .epoll_del },
         .{ "epoll_wait", .epoll_wait },
         .{ "set_nonblocking", .set_nonblocking },
+        .{ "fork", .fork },
+        .{ "execve", .execve },
+        .{ "waitpid", .waitpid },
+        .{ "pipe", .pipe },
+        .{ "dup2", .dup2 },
+        .{ "embedFile", .embed_file },
     });
 
     pub fn fromString(s: []const u8) ?BuiltinKind {
@@ -350,6 +364,12 @@ pub const BuiltinKind = enum {
             .epoll_del => "epoll_del",
             .epoll_wait => "epoll_wait",
             .set_nonblocking => "set_nonblocking",
+            .fork => "fork",
+            .execve => "execve",
+            .waitpid => "waitpid",
+            .pipe => "pipe",
+            .dup2 => "dup2",
+            .embed_file => "embedFile",
         };
     }
 };
@@ -397,6 +417,7 @@ pub const Stmt = union(enum) {
     break_stmt: BreakStmt,
     continue_stmt: ContinueStmt,
     defer_stmt: DeferStmt,
+    destructure_stmt: DestructureStmt,
     bad_stmt: BadStmt,
 
     pub fn span(self: Stmt) Span {
@@ -407,6 +428,8 @@ pub const Stmt = union(enum) {
 pub const ExprStmt = struct { expr: NodeIndex, span: Span };
 pub const ReturnStmt = struct { value: NodeIndex, span: Span };
 pub const VarStmt = struct { name: []const u8, type_expr: NodeIndex, value: NodeIndex, is_const: bool, span: Span };
+pub const DestructureBinding = struct { name: []const u8, type_expr: NodeIndex, span: Span };
+pub const DestructureStmt = struct { bindings: []const DestructureBinding, value: NodeIndex, is_const: bool, span: Span };
 pub const AssignStmt = struct { target: NodeIndex, op: Token, value: NodeIndex, span: Span };
 pub const IfStmt = struct { condition: NodeIndex, then_branch: NodeIndex, else_branch: NodeIndex, capture: []const u8 = "", span: Span };
 pub const WhileStmt = struct { condition: NodeIndex, body: NodeIndex, label: ?[]const u8 = null, span: Span };
@@ -527,6 +550,7 @@ pub const Ast = struct {
                 },
                 .stmt => |stmt| switch (stmt) {
                     .block_stmt => |b| if (b.stmts.len > 0) self.allocator.free(b.stmts),
+                    .destructure_stmt => |d| if (d.bindings.len > 0) self.allocator.free(d.bindings),
                     else => {},
                 },
             }

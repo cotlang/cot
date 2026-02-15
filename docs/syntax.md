@@ -32,6 +32,7 @@ f32  f64
 // Other primitives
 bool                       // true or false
 void                       // no value / no return
+noreturn                   // bottom type (functions that never return)
 ```
 
 ### Type Aliases (keywords)
@@ -49,6 +50,7 @@ string                     // alias for []u8 (ptr + len pair at ABI level)
 *T                         // pointer to T
 ?T                         // optional T (can be null)
 E!T                        // error union (E = error set, T = value type)
+!T                         // inferred error union (compiler tracks error set)
 []T                        // slice of T (ptr + len)
 [N]T                       // fixed-size array of N elements of type T
 [K]V                       // map type (key K, value V)
@@ -159,6 +161,12 @@ const MyError = error { Fail, NotFound }
 
 fn mayFail(x: i64) MyError!i64 {
     if (x < 0) { return error.Fail }
+    return x * 2
+}
+
+// Inferred error set — no need to name the error set
+fn mayFail2(x: i64) !i64 {
+    if (x < 0) { return error.Negative }
     return x * 2
 }
 
@@ -474,6 +482,7 @@ var addr = @ptrToInt(ptr)
 | `@target_arch()` | Target arch as string ("arm64", "x86_64") |
 | `@target()` | Full target description |
 | `@compileError("msg")` | Trigger compile-time error with message |
+| `@embedFile("path")` | Embed file contents as string at compile time |
 
 `comptime { expr }` blocks evaluate expressions at compile time:
 
@@ -562,6 +571,15 @@ import "std/list"          // stdlib modules
 | `url` | `import "std/url"` | URL parsing (scheme, host, port, path, query, fragment) |
 | `http` | `import "std/http"` | TCP sockets, HTTP response builder, sockaddr_in |
 | `async` | `import "std/async"` | Event loop (kqueue/epoll), async I/O wrappers (asyncRead, asyncWrite, asyncAccept, asyncConnect) |
+| `path` | `import "std/path"` | join, dirname, basename, extname, isAbsolute, relative, clean |
+| `crypto` | `import "std/crypto"` | SHA-256, HMAC-SHA256 |
+| `fmt` | `import "std/fmt"` | ANSI colors, text styles, formatBytes, formatDuration, padding |
+| `log` | `import "std/log"` | Structured logging (debug/info/warn/logError), timestamps, key-value |
+| `dotenv` | `import "std/dotenv"` | Parse .env files, get/has/entryCount |
+| `cli` | `import "std/cli"` | --flag=value, -f, positional args, getFlag/hasFlag/getFlagInt |
+| `uuid` | `import "std/uuid"` | UUID v4 generation, isValid, version |
+| `semver` | `import "std/semver"` | Parse, compare (gt/lt/eq), format, incMajor/incMinor/incPatch |
+| `testing` | `import "std/testing"` | assertContains, assertStartsWith, assertGt, assertTrue, assertLen |
 
 ## @safe Mode
 
@@ -629,6 +647,55 @@ impl Rect {
 
 var r = new Rect(10, 20)  // allocates + calls init
 ```
+
+## Destructuring
+
+Unpack tuples into multiple variables:
+
+```cot
+fn getPair() (i64, i64) { return (10, 20) }
+
+// Destructure a tuple literal
+const a, b = (10, 20)
+
+// Destructure from a function return
+const x, y = getPair()
+
+// Mutable destructured bindings
+var p, q = (1, 2)
+p = p + 10
+
+// Three or more elements
+const a, b, c = (1, 2, 3)
+```
+
+All bindings in a destructure statement share the same mutability (`const` or `var`).
+
+## noreturn Type
+
+The `noreturn` type represents functions that never return — they always exit, trap, or loop forever. It is a bottom type that coerces to any other type.
+
+```cot
+fn exit_wrapper(code: i64) noreturn {
+    @exit(code)
+}
+
+// noreturn in if branches — the other branch determines the type
+var x = if (cond) { @exit(1) } else { 42 }
+```
+
+Builtins `@exit` and `@trap` return `noreturn`. A function with return type `noreturn` cannot contain a `return` statement.
+
+## @embedFile
+
+Embed a file's contents as a `string` at compile time:
+
+```cot
+const data = @embedFile("config.txt")
+const template = @embedFile("templates/page.html")
+```
+
+The path is resolved **relative to the source file**, not the working directory. Maximum file size is 10MB.
 
 ## No Semicolons
 

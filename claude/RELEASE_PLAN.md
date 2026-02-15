@@ -184,38 +184,38 @@ Features developers use every day during development.
 
 | # | Item | Description | Effort |
 |---|------|-------------|--------|
-| T1 | Watch mode | `cot run --watch file.cot`, `cot test --watch file.cot`. Use fsevents (macOS) / inotify (Linux). Recompile + rerun on file change. | 2-3 days |
-| T2 | Doc comments (`///`) | Parse `///` comments above declarations. Store in AST. Required for T3. | 1 day |
-| T3 | `cot doc` | Generate HTML documentation from `///` doc comments. Module-level, function-level, struct-level. Clean HTML output matching brand aesthetic. | 3-5 days |
+| T1 | Watch mode | **Done** (11e676f). `cot run --watch`, `cot test --watch` via fsevents/inotify. | **Done** |
+| T2 | Doc comments (`///`) | **Done** (11e676f). Parse `///` comments above declarations, store in AST. | **Done** |
+| T3 | `cot doc` | **Done** (11e676f). Generate HTML documentation from `///` doc comments. | **Done** |
 | T4 | `cot info` | Show project info: version, entry point, targets, dependencies (when package manager exists). | Hours |
-| T5 | Expanded lint rules | Add to existing `cot lint`: unused imports, unreachable code after return, empty blocks, shadowed variables in nested scope. | 2-3 days |
-| T6 | `cot task` | Run tasks from `cot.json`: `{ "tasks": { "dev": "cot run --watch src/main.cot" } }`. Like Deno task / npm scripts. | 1 day |
+| T5 | Expanded lint rules | **Done** (11e676f). Unused imports, unreachable code after return, empty blocks, shadowed variables. | **Done** |
+| T6 | `cot task` | **Done** (11e676f). Run tasks from `cot.json`. | **Done** |
 
 ### Phase 4: Language Features (Waves 4-6 from Roadmap)
 
 These run in parallel with Phases 1-3. Some are already in progress from the other Claude session.
 
-**Wave 4 remaining (ecosystem polish):**
+**Wave 4 (ecosystem polish) — ALL DONE:**
 
 | # | Feature | Status | Notes |
 |---|---------|--------|-------|
-| 24 | `cot check` | In progress | Type-check without compile |
-| 25 | `cot lint` (basic) | In progress | Unused vars, unreachable, shadowing |
-| 26 | Improved test output | Pending | Colors, timing, failure diffs |
-| 27 | Watch mode | Pending | `--watch` flag |
-| 28 | `cot bench` | In progress | bench blocks, timing, ns/op |
-| 29 | `cot task` | Pending | Tasks from cot.json |
+| 24 | `cot check` | **DONE** | Type-check without compile (3ddbe10) |
+| 25 | `cot lint` (basic) | **DONE** | Unused vars, unreachable, shadowing + expanded rules (3ddbe10, 11e676f) |
+| 26 | Improved test output | **DONE** | Colors, timing, failure diffs (3ddbe10) |
+| 27 | Watch mode | **DONE** | `--watch` flag via fsevents/inotify (11e676f) |
+| 28 | `cot bench` | **DONE** | bench blocks, Go-style adaptive calibration, ns/op (742ec8e) |
+| 29 | `cot task` | **DONE** | Tasks from cot.json (11e676f) |
 
 **Wave 5 (language maturity — Zig ports):**
 
 | # | Feature | Priority | Notes |
 |---|---------|----------|-------|
-| 30 | Destructuring | High | `const a, b = getTuple()` |
-| 31 | Inferred error sets (`!T`) | High | `fn read() ![]u8` |
-| 32 | `noreturn` type | Medium | For @exit, @trap, unreachable |
-| 33 | Doc comments (`///`) | High | Required for `cot doc` |
-| 34 | `cot doc` | High | Generate API docs |
-| 35 | `@embedFile("path")` | Medium | Compile-time file embedding |
+| 30 | Destructuring | **DONE** | `const a, b = getTuple()`, `const a, b, c = getTriple()` |
+| 31 | Inferred error sets (`!T`) | **DONE** | `fn read() ![]u8` — parser + checker handle inferred sets |
+| 32 | `noreturn` type | **DONE** | Bottom type for @exit, @trap. Coerces to any type. |
+| 33 | Doc comments (`///`) | **DONE** | Parse `///`, store in AST (11e676f) |
+| 34 | `cot doc` | **DONE** | Generate HTML API docs from `///` comments (11e676f) |
+| 35 | `@embedFile("path")` | **DONE** | Compile-time file embedding, path relative to source file |
 | 36-39 | Reflection builtins | Low | `@TypeOf`, `@hasField`, `@field`, `inline for` |
 | 40 | Runtime safety | Medium | Overflow/bounds checks in debug |
 | 41 | Error set merge | Low | `const All = A || B` |
@@ -224,16 +224,16 @@ These run in parallel with Phases 1-3. Some are already in progress from the oth
 
 | # | Feature | Priority | Notes |
 |---|---------|----------|-------|
-| 42 | `std/path` | High | join, resolve, dirname, basename |
-| 43 | `std/crypto` | High | SHA-256, SHA-512, HMAC |
+| 42 | `std/path` | **DONE** | basename, dirname, extname, isAbsolute, join, clean, relative. 38 tests (d363cc5) |
+| 43 | `std/crypto` | **DONE** | SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104). 17 tests |
 | 44 | `std/regex` | Medium | NFA-based, match/find/replace |
-| 45 | `std/fmt` | Medium | Format strings, ANSI colors |
-| 46 | `std/log` | Medium | Structured logging |
-| 47 | `std/dotenv` | Low | Parse .env files |
-| 48 | `std/cli` | High | Argument parsing, --help generation |
-| 49 | `std/uuid` | Low | UUID v4 |
-| 50 | `std/semver` | Low | Version parsing/comparison |
-| 51 | `std/testing` | Medium | assertContains, assertThrows, mocking |
+| 45 | `std/fmt` | **DONE** | ANSI colors, text styles, stripAnsi, formatBytes, formatDuration, padding, hex. 36 tests |
+| 46 | `std/log` | **DONE** | Structured logging with levels, timestamps, key-value. 14 tests |
+| 47 | `std/dotenv` | **DONE** | parseEnv, get/has/entryCount/entryKey/entryValue. 12 tests (d363cc5) |
+| 48 | `std/cli` | **DONE** | --flag=value, -f, positional, getFlag/hasFlag/getFlagInt. 13 tests |
+| 49 | `std/uuid` | **DONE** | UUID v4 generation, isValid, version. 10 tests (d363cc5) |
+| 50 | `std/semver` | **DONE** | parse, cmp, gt/gte/lt/lte/eq, format, incMajor/Minor/Patch. 28 tests (d363cc5) |
+| 51 | `std/testing` | **DONE** | assertContains, assertStartsWith/EndsWith, assertGt/Lt/InRange, assertTrue/False, assertEmpty/Len. 21 tests |
 | 52 | `std/process` | High | Subprocess spawning |
 
 ### 0.4 Release Criteria

@@ -1,0 +1,239 @@
+import "std/regex"
+import "std/string"
+
+// ============================================================================
+// Basic Matching
+// ============================================================================
+
+test "literal match" {
+    @assert(regexMatch("hello", "hello world"))
+}
+
+test "literal no match" {
+    @assert(not regexMatch("xyz", "hello world"))
+}
+
+test "dot matches any" {
+    @assert(regexMatch("h.llo", "hello"))
+}
+
+test "dot does not match newline" {
+    @assert(not regexMatch("a.b", "a\nb"))
+}
+
+// ============================================================================
+// Quantifiers
+// ============================================================================
+
+test "star zero matches" {
+    @assert(regexMatch("ab*c", "ac"))
+}
+
+test "star multiple matches" {
+    @assert(regexMatch("ab*c", "abbbc"))
+}
+
+test "plus requires one" {
+    @assert(not regexMatch("ab+c", "ac"))
+}
+
+test "plus matches one" {
+    @assert(regexMatch("ab+c", "abc"))
+}
+
+test "plus matches multiple" {
+    @assert(regexMatch("ab+c", "abbc"))
+}
+
+test "question zero" {
+    @assert(regexMatch("ab?c", "ac"))
+}
+
+test "question one" {
+    @assert(regexMatch("ab?c", "abc"))
+}
+
+// ============================================================================
+// Character Classes
+// ============================================================================
+
+test "char class basic" {
+    @assert(regexMatch("[abc]", "b"))
+}
+
+test "char class no match" {
+    @assert(not regexMatch("[abc]", "d"))
+}
+
+test "char class range" {
+    @assert(regexMatch("[a-z]", "m"))
+}
+
+test "char class range no match" {
+    @assert(not regexMatch("[a-z]", "M"))
+}
+
+test "negated class" {
+    @assert(regexMatch("[^abc]", "d"))
+}
+
+test "negated class no match" {
+    @assert(not regexMatch("[^abc]", "a"))
+}
+
+// ============================================================================
+// Escape Sequences
+// ============================================================================
+
+test "digit class" {
+    @assert(regexMatch("\\d+", "123"))
+}
+
+test "digit class no match" {
+    @assert(not regexMatch("^\\d+$", "abc"))
+}
+
+test "word class" {
+    @assert(regexMatch("\\w+", "hello_123"))
+}
+
+test "space class" {
+    @assert(regexMatch("\\s", " "))
+}
+
+test "not digit" {
+    @assert(regexMatch("\\D", "a"))
+}
+
+test "not digit no match" {
+    @assert(not regexMatch("^\\D$", "5"))
+}
+
+// ============================================================================
+// Anchors
+// ============================================================================
+
+test "start anchor match" {
+    @assert(regexMatch("^hello", "hello world"))
+}
+
+test "start anchor no match" {
+    @assert(not regexMatch("^world", "hello world"))
+}
+
+test "end anchor match" {
+    @assert(regexMatch("world$", "hello world"))
+}
+
+test "end anchor no match" {
+    @assert(not regexMatch("hello$", "hello world"))
+}
+
+test "both anchors" {
+    @assert(regexMatch("^hello$", "hello"))
+}
+
+test "both anchors no match" {
+    @assert(not regexMatch("^hello$", "hello world"))
+}
+
+// ============================================================================
+// Alternation
+// ============================================================================
+
+test "alternation first" {
+    @assert(regexMatch("cat|dog", "cat"))
+}
+
+test "alternation second" {
+    @assert(regexMatch("cat|dog", "dog"))
+}
+
+test "alternation no match" {
+    @assert(not regexMatch("^cat$|^dog$", "fish"))
+}
+
+// ============================================================================
+// Groups
+// ============================================================================
+
+test "group with quantifier" {
+    @assert(regexMatch("(ab)+", "abab"))
+}
+
+test "group alternation" {
+    @assert(regexMatch("(foo|bar)baz", "foobaz"))
+}
+
+test "group alternation second" {
+    @assert(regexMatch("(foo|bar)baz", "barbaz"))
+}
+
+// ============================================================================
+// Find
+// ============================================================================
+
+test "find returns position" {
+    @assert_eq(regexFind("\\d+", "abc123def"), 3)
+}
+
+test "find no match returns -1" {
+    @assert_eq(regexFind("\\d+", "abcdef"), 0 - 1)
+}
+
+test "find at start" {
+    @assert_eq(regexFind("hello", "hello world"), 0)
+}
+
+// ============================================================================
+// Replace
+// ============================================================================
+
+test "replace first" {
+    @assert_eq(regexReplace("\\d+", "abc123def456", "NUM"), "abcNUMdef456")
+}
+
+test "replace no match unchanged" {
+    @assert_eq(regexReplace("\\d+", "abcdef", "NUM"), "abcdef")
+}
+
+test "replaceAll" {
+    @assert_eq(regexReplaceAll("\\d+", "a1b2c3", "X"), "aXbXcX")
+}
+
+// ============================================================================
+// Split
+// ============================================================================
+
+test "split by comma" {
+    var parts = regexSplit(",", "a,b,c")
+    @assert_eq(splitCount(parts), 3)
+    @assert_eq(splitGet(parts, 0), "a")
+    @assert_eq(splitGet(parts, 1), "b")
+    @assert_eq(splitGet(parts, 2), "c")
+}
+
+test "split by whitespace" {
+    var parts = regexSplit("\\s+", "hello world")
+    @assert_eq(splitCount(parts), 2)
+    @assert_eq(splitGet(parts, 0), "hello")
+    @assert_eq(splitGet(parts, 1), "world")
+}
+
+test "split no match returns whole string" {
+    var parts = regexSplit(",", "hello")
+    @assert_eq(splitCount(parts), 1)
+    @assert_eq(splitGet(parts, 0), "hello")
+}
+
+// ============================================================================
+// Complex Patterns
+// ============================================================================
+
+test "email-like pattern" {
+    @assert(regexMatch("[a-z]+@[a-z]+\\.[a-z]+", "user@example.com"))
+}
+
+test "ip-like pattern" {
+    @assert(regexMatch("\\d+\\.\\d+\\.\\d+\\.\\d+", "192.168.1.1"))
+}

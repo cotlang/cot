@@ -465,7 +465,7 @@ pub const Driver = struct {
         };
         errdefer self.allocator.free(source_text);
 
-        var src = source_mod.Source.init(self.allocator, canonical_path, source_text);
+        var src = source_mod.Source.init(self.allocator, path_copy, source_text);
         errdefer src.deinit();
         var err_reporter = errors_mod.ErrorReporter.init(&src, null);
 
@@ -910,7 +910,12 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "cot_epoll_add") or
                         std.mem.eql(u8, exp.name, "cot_epoll_del") or
                         std.mem.eql(u8, exp.name, "cot_epoll_wait") or
-                        std.mem.eql(u8, exp.name, "cot_set_nonblocking"))
+                        std.mem.eql(u8, exp.name, "cot_set_nonblocking") or
+                        std.mem.eql(u8, exp.name, "cot_fork") or
+                        std.mem.eql(u8, exp.name, "cot_execve") or
+                        std.mem.eql(u8, exp.name, "cot_waitpid") or
+                        std.mem.eql(u8, exp.name, "cot_pipe") or
+                        std.mem.eql(u8, exp.name, "cot_dup2"))
                     {
                         override_name = exp.name;
                         break;
@@ -1530,6 +1535,127 @@ pub const Driver = struct {
                         0xC0, 0x03, 0x5F, 0xD6, // ret
                     };
                     try module.defineFunctionBytes(func_ids[i], &arm64_set_nonblocking, &.{});
+                } else if (std.mem.eql(u8, name, "cot_fork")) {
+                    // ARM64 macOS: fork() syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no value args)
+                    // macOS SYS_fork = 2. Returns child pid in parent, 0 in child.
+                    // macOS fork: x0=other_pid in both, x1=0 (parent) / x1=1 (child)
+                    // Must check x1 to distinguish, return 0 in child.
+                    const arm64_fork = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // 0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // 1: mov x29, sp
+                        0x50, 0x00, 0x80, 0xD2, // 2: movz x16, #2  (SYS_fork)
+                        0x01, 0x10, 0x00, 0xD4, // 3: svc #0x80
+                        0x82, 0x00, 0x00, 0x54, // 4: b.cs +4 → 8  (error)
+                        0x81, 0x00, 0x00, 0xB4, // 5: cbz x1, +4 → 9  (parent: x0=child_pid)
+                        0x00, 0x00, 0x80, 0xD2, // 6: movz x0, #0  (child: return 0)
+                        0x02, 0x00, 0x00, 0x14, // 7: b +2 → 9  (epilogue)
+                        0xE0, 0x03, 0x00, 0xCB, // 8: neg x0, x0  (error: -errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // 9: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 10: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_fork, &.{});
+                } else if (std.mem.eql(u8, name, "cot_waitpid")) {
+                    // ARM64 macOS: wait4(pid, &status, options, NULL) syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=pid
+                    // macOS SYS_wait4 = 7. Returns pid on success, status in stack buf.
+                    // We return (status >> 8) & 0xFF as the exit code.
+                    const arm64_waitpid = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xFF, 0x43, 0x00, 0xD1, // sub sp, sp, #16  (stack space for status)
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (pid)
+                        0xE1, 0x03, 0x00, 0x91, // mov x1, sp  (status_ptr)
+                        0x02, 0x00, 0x80, 0xD2, // movz x2, #0  (options = 0)
+                        0x03, 0x00, 0x80, 0xD2, // movz x3, #0  (rusage = NULL)
+                        0xF0, 0x00, 0x80, 0xD2, // movz x16, #7  (SYS_wait4)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x63, 0x00, 0x00, 0x54, // b.cc +3  (success → load status)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error: -errno)
+                        0x03, 0x00, 0x00, 0x14, // b +3  (skip to cleanup)
+                        // Success: extract exit code = (status >> 8) & 0xFF
+                        0xE0, 0x03, 0x40, 0xB9, // ldr w0, [sp]  (load status as i32)
+                        0x00, 0x3C, 0x48, 0xD3, // ubfx x0, x0, #8, #8  (UBFM x0,x0,#8,#15)
+                        0xFF, 0x43, 0x00, 0x91, // add sp, sp, #16  (cleanup)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_waitpid, &.{});
+                } else if (std.mem.eql(u8, name, "cot_pipe")) {
+                    // ARM64 macOS: pipe() syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx (no value args)
+                    // macOS SYS_pipe = 42. Writes [read_fd, write_fd] to buffer.
+                    // Returns packed: (write_fd << 32) | read_fd
+                    // macOS pipe: no args, returns x0=read_fd, x1=write_fd in registers.
+                    // Pack as (write_fd << 32) | read_fd for Cot.
+                    const arm64_pipe = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // 0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // 1: mov x29, sp
+                        0x50, 0x05, 0x80, 0xD2, // 2: movz x16, #42  (SYS_pipe)
+                        0x01, 0x10, 0x00, 0xD4, // 3: svc #0x80
+                        0x62, 0x00, 0x00, 0x54, // 4: b.cs +3 → 7  (error)
+                        0x00, 0x80, 0x01, 0xAA, // 5: orr x0, x0, x1, lsl #32  (pack fds)
+                        0x02, 0x00, 0x00, 0x14, // 6: b +2 → 8  (epilogue)
+                        0xE0, 0x03, 0x00, 0xCB, // 7: neg x0, x0  (error: -errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // 8: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 9: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_pipe, &.{});
+                } else if (std.mem.eql(u8, name, "cot_dup2")) {
+                    // ARM64 macOS: dup2(oldfd, newfd) syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=oldfd, x3=newfd
+                    // macOS SYS_dup2 = 90. Returns newfd on success, -errno on error.
+                    const arm64_dup2 = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                        0xE0, 0x03, 0x02, 0xAA, // mov x0, x2  (oldfd)
+                        0xE1, 0x03, 0x03, 0xAA, // mov x1, x3  (newfd)
+                        0x50, 0x0B, 0x80, 0xD2, // movz x16, #90  (SYS_dup2)
+                        0x01, 0x10, 0x00, 0xD4, // svc #0x80
+                        0x43, 0x00, 0x00, 0x54, // b.cc +2  (success)
+                        0xE0, 0x03, 0x00, 0xCB, // neg x0, x0  (error)
+                        0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_dup2, &.{});
+                } else if (std.mem.eql(u8, name, "cot_execve")) {
+                    // ARM64 macOS: execve(path, argv, envp) syscall
+                    // Cranelift CC: x0=vmctx, x1=caller_vmctx, x2=path_ptr, x3=argv_ptr, x4=envp_ptr
+                    // All pointers are wasm linear memory offsets — add linmem base.
+                    // macOS SYS_execve = 59. Does not return on success.
+                    // execve with argv/envp pointer fixup: wasm addresses → real addresses
+                    // argv[i] and envp[i] are wasm offsets that must have linmem_base added.
+                    const arm64_execve = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, // 0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, // 1: mov x29, sp
+                        0x08, 0x00, 0x41, 0x91, // 2: add x8, x0, #0x40, lsl #12  (linmem base)
+                        0x00, 0x01, 0x02, 0x8B, // 3: add x0, x8, x2  (path = linmem + wasm_ptr)
+                        0x01, 0x01, 0x03, 0x8B, // 4: add x1, x8, x3  (argv = linmem + wasm_argv)
+                        0x02, 0x01, 0x04, 0x8B, // 5: add x2, x8, x4  (envp = linmem + wasm_envp)
+                        // Fixup argv pointers (each entry is a wasm addr that needs linmem_base)
+                        0xEA, 0x03, 0x01, 0xAA, // 6: mov x10, x1
+                        0x4B, 0x01, 0x40, 0xF9, // 7: ldr x11, [x10]  (argv_loop)
+                        0xAB, 0x00, 0x00, 0xB4, // 8: cbz x11, +5 → 13
+                        0x6B, 0x01, 0x08, 0x8B, // 9: add x11, x11, x8
+                        0x4B, 0x01, 0x00, 0xF9, // 10: str x11, [x10]
+                        0x4A, 0x21, 0x00, 0x91, // 11: add x10, x10, #8
+                        0xFB, 0xFF, 0xFF, 0x17, // 12: b -5 → 7
+                        // Fixup envp pointers
+                        0xEA, 0x03, 0x02, 0xAA, // 13: mov x10, x2
+                        0x4B, 0x01, 0x40, 0xF9, // 14: ldr x11, [x10]  (envp_loop)
+                        0xAB, 0x00, 0x00, 0xB4, // 15: cbz x11, +5 → 20
+                        0x6B, 0x01, 0x08, 0x8B, // 16: add x11, x11, x8
+                        0x4B, 0x01, 0x00, 0xF9, // 17: str x11, [x10]
+                        0x4A, 0x21, 0x00, 0x91, // 18: add x10, x10, #8
+                        0xFB, 0xFF, 0xFF, 0x17, // 19: b -5 → 14
+                        // Call execve (only returns on error)
+                        0x70, 0x07, 0x80, 0xD2, // 20: movz x16, #59  (SYS_execve)
+                        0x01, 0x10, 0x00, 0xD4, // 21: svc #0x80
+                        0xE0, 0x03, 0x00, 0xCB, // 22: neg x0, x0  (error: -errno)
+                        0xFD, 0x7B, 0xC1, 0xA8, // 23: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 24: ret
+                    };
+                    try module.defineFunctionBytes(func_ids[i], &arm64_execve, &.{});
                 } else if (std.mem.eql(u8, name, "cot_epoll_create") or
                     std.mem.eql(u8, name, "cot_epoll_add") or
                     std.mem.eql(u8, name, "cot_epoll_del") or
@@ -1872,7 +1998,12 @@ pub const Driver = struct {
                         std.mem.eql(u8, exp.name, "cot_epoll_add") or
                         std.mem.eql(u8, exp.name, "cot_epoll_del") or
                         std.mem.eql(u8, exp.name, "cot_epoll_wait") or
-                        std.mem.eql(u8, exp.name, "cot_set_nonblocking"))
+                        std.mem.eql(u8, exp.name, "cot_set_nonblocking") or
+                        std.mem.eql(u8, exp.name, "cot_fork") or
+                        std.mem.eql(u8, exp.name, "cot_execve") or
+                        std.mem.eql(u8, exp.name, "cot_waitpid") or
+                        std.mem.eql(u8, exp.name, "cot_pipe") or
+                        std.mem.eql(u8, exp.name, "cot_dup2"))
                     {
                         override_name = exp.name;
                         break;
@@ -2478,6 +2609,114 @@ pub const Driver = struct {
                         0xC3, // 60: ret
                     };
                     try module.defineFunctionBytes(elf_func_ids[i], &x64_set_nonblocking, &.{});
+                } else if (std.mem.eql(u8, name, "cot_fork")) {
+                    // x86-64 Linux: fork() syscall (SYS_fork = 57)
+                    const x64_fork = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0xC7, 0xC0, 0x39, 0x00, 0x00, 0x00, // mov rax, 57 (SYS_fork)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_fork, &.{});
+                } else if (std.mem.eql(u8, name, "cot_waitpid")) {
+                    // x86-64 Linux: wait4(pid, &status, options, NULL) (SYS_wait4 = 61)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=pid
+                    // Returns exit code = (status >> 8) & 0xFF
+                    const x64_waitpid = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, //  4: sub rsp, 16  (status on stack)
+                        0x48, 0x89, 0xD7, //  8: mov rdi, rdx  (pid)
+                        0x48, 0x89, 0xE6, // 11: mov rsi, rsp  (status_ptr)
+                        0x31, 0xD2, // 14: xor edx, edx  (options = 0)
+                        0x49, 0xC7, 0xC2, 0x00, 0x00, 0x00, 0x00, // 16: mov r10, 0  (rusage = NULL)
+                        0x48, 0xC7, 0xC0, 0x3D, 0x00, 0x00, 0x00, // 23: mov rax, 61  (SYS_wait4)
+                        0x0F, 0x05, // 30: syscall
+                        0x48, 0x85, 0xC0, // 32: test rax, rax
+                        0x78, 0x09, // 35: js +9  (error → return rax)
+                        0x8B, 0x04, 0x24, // 37: mov eax, [rsp]  (load status as i32)
+                        0xC1, 0xE8, 0x08, // 40: shr eax, 8  (status >> 8)
+                        0x25, 0xFF, 0x00, 0x00, 0x00, // 43: and eax, 0xFF  (& 0xFF)
+                        0x48, 0x83, 0xC4, 0x10, // 48: add rsp, 16
+                        0x5D, // 52: pop rbp
+                        0xC3, // 53: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_waitpid, &.{});
+                } else if (std.mem.eql(u8, name, "cot_pipe")) {
+                    // x86-64 Linux: pipe2(fds_ptr, 0) (SYS_pipe2 = 293)
+                    // Returns packed: (write_fd << 32) | read_fd  (as i64 from stack)
+                    const x64_pipe = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x83, 0xEC, 0x10, // sub rsp, 16  (stack for fds)
+                        0x48, 0x89, 0xE7, // mov rdi, rsp  (fds_ptr)
+                        0x31, 0xF6, // xor esi, esi  (flags = 0)
+                        0x48, 0xC7, 0xC0, 0x25, 0x01, 0x00, 0x00, // mov rax, 293  (SYS_pipe2)
+                        0x0F, 0x05, // syscall
+                        0x48, 0x85, 0xC0, // test rax, rax
+                        0x78, 0x04, // js +4  (error → return rax)
+                        0x48, 0x8B, 0x04, 0x24, // mov rax, [rsp]  (packed fds as i64)
+                        0x48, 0x83, 0xC4, 0x10, // add rsp, 16
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_pipe, &.{});
+                } else if (std.mem.eql(u8, name, "cot_dup2")) {
+                    // x86-64 Linux: dup2(oldfd, newfd) (SYS_dup2 = 33)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=oldfd, rcx=newfd
+                    const x64_dup2 = [_]u8{
+                        0x55, // push rbp
+                        0x48, 0x89, 0xE5, // mov rbp, rsp
+                        0x48, 0x89, 0xD7, // mov rdi, rdx  (oldfd)
+                        0x48, 0x89, 0xCE, // mov rsi, rcx  (newfd)
+                        0x48, 0xC7, 0xC0, 0x21, 0x00, 0x00, 0x00, // mov rax, 33  (SYS_dup2)
+                        0x0F, 0x05, // syscall
+                        0x5D, // pop rbp
+                        0xC3, // ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_dup2, &.{});
+                } else if (std.mem.eql(u8, name, "cot_execve")) {
+                    // x86-64 Linux: execve(path, argv, envp) (SYS_execve = 59)
+                    // Cranelift CC: rdi=vmctx, rsi=caller_vmctx, rdx=path, rcx=argv, r8=envp
+                    // All pointers are wasm offsets — add linmem base (vmctx + 0x40000)
+                    // execve with argv/envp pointer fixup (wasm offsets → real addresses)
+                    const x64_execve = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x4C, 0x8D, 0x8F, 0x00, 0x00, 0x04, 0x00, //  4: lea r9, [rdi + 0x40000] (linmem)
+                        0x4C, 0x01, 0xCA, // 11: add rdx, r9  (path)
+                        0x4C, 0x01, 0xC9, // 14: add rcx, r9  (argv)
+                        0x4D, 0x01, 0xC8, // 17: add r8, r9   (envp)
+                        // Fixup argv pointers
+                        0x49, 0x89, 0xCA, // 20: mov r10, rcx
+                        0x4D, 0x8B, 0x1A, // 23: ldr r11, [r10]  (argv_loop)
+                        0x4D, 0x85, 0xDB, // 26: test r11, r11
+                        0x74, 0x0C, // 29: jz +12 → 43 (argv_done)
+                        0x4D, 0x01, 0xCB, // 31: add r11, r9
+                        0x4D, 0x89, 0x1A, // 34: mov [r10], r11
+                        0x49, 0x83, 0xC2, 0x08, // 37: add r10, 8
+                        0xEB, 0xEC, // 41: jmp -20 → 23 (argv_loop)
+                        // Fixup envp pointers
+                        0x4D, 0x89, 0xC2, // 43: mov r10, r8  (argv_done)
+                        0x4D, 0x8B, 0x1A, // 46: ldr r11, [r10]  (envp_loop)
+                        0x4D, 0x85, 0xDB, // 49: test r11, r11
+                        0x74, 0x0C, // 52: jz +12 → 66 (envp_done)
+                        0x4D, 0x01, 0xCB, // 54: add r11, r9
+                        0x4D, 0x89, 0x1A, // 57: mov [r10], r11
+                        0x49, 0x83, 0xC2, 0x08, // 60: add r10, 8
+                        0xEB, 0xEC, // 64: jmp -20 → 46 (envp_loop)
+                        // Call execve
+                        0x48, 0x89, 0xD7, // 66: mov rdi, rdx (path)
+                        0x48, 0x89, 0xCE, // 69: mov rsi, rcx (argv)
+                        0x4C, 0x89, 0xC2, // 72: mov rdx, r8  (envp)
+                        0x48, 0xC7, 0xC0, 0x3B, 0x00, 0x00, 0x00, // 75: mov rax, 59 (SYS_execve)
+                        0x0F, 0x05, // 82: syscall
+                        0x5D, // 84: pop rbp
+                        0xC3, // 85: ret
+                    };
+                    try module.defineFunctionBytes(elf_func_ids[i], &x64_execve, &.{});
                 } else if (std.mem.eql(u8, name, "cot_kqueue_create") or
                     std.mem.eql(u8, name, "cot_kevent_add") or
                     std.mem.eql(u8, name, "cot_kevent_del") or
@@ -2867,6 +3106,12 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, wasi_runtime.EPOLL_DEL_NAME, wasi_funcs.epoll_del_idx);
         try func_indices.put(self.allocator, wasi_runtime.EPOLL_WAIT_NAME, wasi_funcs.epoll_wait_idx);
         try func_indices.put(self.allocator, wasi_runtime.SET_NONBLOCK_NAME, wasi_funcs.set_nonblocking_idx);
+        // Process spawning
+        try func_indices.put(self.allocator, wasi_runtime.FORK_NAME, wasi_funcs.fork_idx);
+        try func_indices.put(self.allocator, wasi_runtime.EXECVE_NAME, wasi_funcs.execve_idx);
+        try func_indices.put(self.allocator, wasi_runtime.WAITPID_NAME, wasi_funcs.waitpid_idx);
+        try func_indices.put(self.allocator, wasi_runtime.PIPE_NAME, wasi_funcs.pipe_idx);
+        try func_indices.put(self.allocator, wasi_runtime.DUP2_NAME, wasi_funcs.dup2_idx);
 
         // Add test function names to index map (Zig)
         try func_indices.put(self.allocator, test_runtime.TEST_BEGIN_NAME, test_funcs.test_begin_idx);

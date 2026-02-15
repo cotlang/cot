@@ -1,0 +1,7 @@
+# Build output
+*.wasm
+*.o
+
+# Editor
+.vscode/
+.idea/

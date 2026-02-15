@@ -284,17 +284,17 @@ Combines compiler-internal improvements (Wasm codegen cleanup) with user-facing 
 | 21 | Cross-file LSP intelligence | **DONE** — Goto-definition, find-references, and completions work across imported files. LSP resolves symbols from dependencies. | ZLS, rust-analyzer |
 | 22 | `@safe` mode | **DONE** — Opt-in `@safe` file annotation enables C#/TS-friendly extensions: colon struct init, field shorthand, implicit self, constructor sugar (`new Type(args...)`), auto pointer wrapping. All gated — zero impact on base language. 22 tests. | C#, TypeScript |
 
-#### Wave 4: Ecosystem Polish (current work)
+#### Wave 4: Ecosystem Polish — DONE
 
 | # | Feature | Status | Description | Reference |
 |---|---------|--------|-------------|-----------|
 | 23 | Tree-sitter grammar | **DONE** | Syntax highlighting in any editor (Neovim, Helix, Zed, GitHub). Zero errors across all 62 Cot files. | Zig tree-sitter-zig |
-| 24 | `cot check` | | Type-check without compiling — fast feedback loop. | `zig build check`, `deno check` |
-| 25 | `cot lint` (basic) | | Unused variables, unreachable code, shadowing warnings. | `deno lint`, `zig` warnings |
-| 26 | Improved `cot test` output | | Colors, timing per test, `--verbose` flag, failure diffs. | Deno test output, Zig test output |
-| 27 | Watch mode (`--watch`) | | `cot run --watch`, `cot test --watch` — auto-restart on file changes. | `deno run --watch` |
-| 28 | `cot bench` | | `bench "name" { }` blocks with timing output, iterations, ns/op. | `deno bench`, Zig `@Timer` |
-| 29 | `cot task` | | Run tasks defined in `cot.json` — like npm scripts but built-in. | `deno task`, npm scripts |
+| 24 | `cot check` | **DONE** | Type-check without compiling — fast feedback loop. | `zig build check`, `deno check` |
+| 25 | `cot lint` (basic) | **DONE** | Unused variables, unreachable code, shadowing warnings. Expanded rules: unused imports, empty blocks, shadowed variables. | `deno lint`, `zig` warnings |
+| 26 | Improved `cot test` output | **DONE** | Colors, timing per test, `--verbose` flag, failure diffs. | Deno test output, Zig test output |
+| 27 | Watch mode (`--watch`) | **DONE** | `cot run --watch`, `cot test --watch` — auto-restart on file changes via fsevents/inotify. | `deno run --watch` |
+| 28 | `cot bench` | **DONE** | `bench "name" { }` blocks with Go-style adaptive calibration, timing output, ns/op. | `deno bench`, Zig `@Timer` |
+| 29 | `cot task` | **DONE** | Run tasks defined in `cot.json` — like npm scripts but built-in. | `deno task`, npm scripts |
 
 #### Wave 5: Language Maturity (ported from Zig)
 
@@ -302,12 +302,12 @@ Language features that make Cot a more capable and ergonomic language, ported fr
 
 | # | Feature | Description | Reference |
 |---|---------|-------------|-----------|
-| 30 | Destructuring | `const a, b = getTuple()` and `const a, b, c = getTriple()`. Essential ergonomics for tuples. | Zig 0.14 destructuring |
-| 31 | Inferred error sets (`!T`) | `fn read() ![]u8` — compiler tracks exact error set. No need to name it when callers just `try`. | Zig `!T` syntax |
-| 32 | `noreturn` type | Type for functions that never return (`@exit`, `@trap`, `unreachable`). Enables better dead code analysis. | Zig `noreturn` |
-| 33 | Doc comments (`///`) | Attach documentation to declarations. Required for `cot doc`. | Zig `///`, Rust `///` |
-| 34 | `cot doc` | Generate API documentation from doc comments. HTML output. | `deno doc`, `zig doc` |
-| 35 | `@embedFile("path")` | Compile-time file embedding — returns `string`. For templates, config, assets, SQL schemas. | Zig `@embedFile` |
+| 30 | Destructuring | **DONE** — `const a, b = getTuple()` and `const a, b, c = getTriple()`. New `DestructureStmt` AST node, tuple element extraction, compound type decomposition. | Zig 0.14 destructuring |
+| 31 | Inferred error sets (`!T`) | **DONE** — `fn read() ![]u8` — compiler tracks exact error set. Parser handles `!T`, checker creates `ErrorUnionType` with inferred set. | Zig `!T` syntax |
+| 32 | `noreturn` type | **DONE** — Bottom type for functions that never return (`@exit`, `@trap`). Coerces to any type. `noreturn` functions cannot return. | Zig `noreturn` |
+| 33 | Doc comments (`///`) | **DONE** — Parse `///` comments above declarations, store in AST. | Zig `///`, Rust `///` |
+| 34 | `cot doc` | **DONE** — Generate API documentation from doc comments. HTML output. | `deno doc`, `zig doc` |
+| 35 | `@embedFile("path")` | **DONE** — Compile-time file embedding — returns `string`. Path relative to source file. 10MB limit. | Zig `@embedFile` |
 | 36 | `@TypeOf(expr)` | Get the type of any expression at comptime. Needed for type-level programming. | Zig `@TypeOf` |
 | 37 | `@hasField(T, "name")` | Comptime query: does struct T have this field? Enables generic serialization. | Zig `@hasField` |
 | 38 | `@field(value, "name")` | Access struct field by comptime string. Key enabler for JSON derive, ORM, reflection. | Zig `@field` |
@@ -321,16 +321,16 @@ Batteries-included standard library matching Deno's breadth. Every module is pur
 
 | # | Feature | Description | Reference |
 |---|---------|-------------|-----------|
-| 42 | `std/path` | `join`, `resolve`, `dirname`, `basename`, `extname`, `isAbsolute`, `relative`. Cross-platform (POSIX + Windows separators via comptime). | Deno `@std/path`, Go `path/filepath` |
-| 43 | `std/crypto` | SHA-256, SHA-512, BLAKE3, HMAC. Pure Cot implementation (no C deps). Essential for auth tokens, checksums. | Deno `@std/crypto`, Go `crypto/sha256` |
+| 42 | `std/path` | **DONE** — `join`, `dirname`, `basename`, `extname`, `isAbsolute`, `relative`, `clean`. Ported from Go `path/filepath`. 38 tests. | Deno `@std/path`, Go `path/filepath` |
+| 43 | `std/crypto` | **DONE** — SHA-256 (FIPS 180-4) + HMAC-SHA256 (RFC 2104). Pure Cot, no C deps. 17 tests including NIST vectors. | Deno `@std/crypto`, Go `crypto/sha256` |
 | 44 | `std/regex` | Regular expression engine. NFA-based (Thompson's construction). `match`, `find`, `findAll`, `replace`, `split`. | Go `regexp`, Rust `regex` |
-| 45 | `std/fmt` | Format strings (`fmt("Hello, {}", name)`), ANSI colors (`red`, `bold`, `dim`), byte formatting (`formatBytes(1024)` → `"1 KB"`), duration formatting. | Deno `@std/fmt`, Go `fmt` |
-| 46 | `std/log` | Structured logging with levels (debug/info/warn/error). Configurable handlers (stdout, file). Timestamp + level prefix. | Deno `@std/log`, Go `log/slog` |
-| 47 | `std/dotenv` | Parse `.env` files into key-value pairs. `loadEnv()` reads `.env` and populates environment. | Deno `@std/dotenv` |
-| 48 | `std/cli` | Argument parsing: define flags (`--port=8080`), positional args, subcommands, auto-generated `--help`. | Deno `@std/cli`, Go `flag` |
-| 49 | `std/uuid` | UUID v4 generation (random-based). Uses `@random` builtin. | Deno `@std/uuid` |
-| 50 | `std/semver` | Parse, compare, and check semantic versions. `satisfies("1.2.3", ">=1.0.0")`. | Deno `@std/semver` |
-| 51 | `std/testing` | Enhanced test utilities: `assertContains`, `assertThrows`, snapshot testing, basic mocking. | Deno `@std/testing`, Zig testing |
+| 45 | `std/fmt` | **DONE** — ANSI colors (red/green/yellow/blue/magenta/cyan/gray/white), text styles (bold/dim/italic/underline/strikethrough), stripAnsi, formatBytes, formatDuration, padLeft/padRight/center, zeroPad, hex. 36 tests. | Deno `@std/fmt`, Go `fmt` |
+| 46 | `std/log` | **DONE** — Structured logging with levels (debug/info/warn/logError). Configurable timestamps, level tags. Key-value pairs. 14 tests. | Deno `@std/log`, Go `log/slog` |
+| 47 | `std/dotenv` | **DONE** — Parse `.env` files into key-value pairs. `parseEnv(text)`, `get`/`has`/`entryCount`/`entryKey`/`entryValue`. 12 tests. | Deno `@std/dotenv` |
+| 48 | `std/cli` | **DONE** — Parse `--flag=value`, `-f value`, positional args, `--` separator. `getFlag`/`hasFlag`/`getFlagInt`/`positional`. 13 tests. | Deno `@std/cli`, Go `flag` |
+| 49 | `std/uuid` | **DONE** — UUID v4 generation (random-based), `isValid`, `version`. Uses `@random` builtin. 10 tests. | Deno `@std/uuid` |
+| 50 | `std/semver` | **DONE** — Parse, compare (`cmp`/`gt`/`gte`/`lt`/`lte`/`eq`), `format`, `incMajor`/`incMinor`/`incPatch`. 28 tests. | Deno `@std/semver` |
+| 51 | `std/testing` | **DONE** — `assertContains`, `assertStartsWith`, `assertEndsWith`, `assertStrEq`, `assertGt`/`assertGte`/`assertLt`/`assertLte`, `assertInRange`, `assertTrue`/`assertFalse`, `assertEmpty`/`assertNotEmpty`/`assertLen`. 21 tests. | Deno `@std/testing`, Zig testing |
 | 52 | `std/process` | Subprocess spawning: `exec("ls", ["-la"])` → output string. Pipe stdin/stdout. Exit code. | Deno `Deno.Command`, Go `os/exec` |
 
 #### Wave 5 (legacy): Production Capabilities
@@ -357,12 +357,12 @@ Batteries-included standard library matching Deno's breadth. Every module is pur
 | `deno run` | `cot run` | Done |
 | `deno test` | `cot test --filter` | Done |
 | `deno fmt` | `cot fmt` | Done |
-| `deno lint` | — | Wave 4 |
-| `deno check` | — | Wave 4 |
-| `deno bench` | — | Wave 4 |
-| `deno doc` | — | Wave 5 |
+| `deno lint` | `cot lint` | Done |
+| `deno check` | `cot check` | Done |
+| `deno bench` | `cot bench` | Done |
+| `deno doc` | `cot doc` | Done |
 | `deno init` | `cot init` | Done |
-| `deno task` | — | Wave 4 |
+| `deno task` | `cot task` | Done |
 | `deno.json` | `cot.json` | Done |
 | `deno compile` | `cot build` | Done (native binary, no runtime) |
 | `deno serve` | `std/http` | Done |
@@ -370,7 +370,7 @@ Batteries-included standard library matching Deno's breadth. Every module is pur
 | TypeScript types | Cot types (stronger, compiled) | Done |
 | Single binary | `cot` binary | Done |
 | Edge deploy | `--target=wasm32-wasi` | Done |
-| Watch mode | — | Wave 4 |
+| Watch mode | `--watch` | Done |
 | Permissions | — | 0.6 |
 | Test coverage | — | 0.5 |
 
@@ -389,7 +389,7 @@ Batteries-included standard library matching Deno's breadth. Every module is pur
 | Structs + methods | Done | Cot has `impl` blocks |
 | Enums + tagged unions | Done | Zig pattern |
 | Optionals (`?T`) | Done | `??` (orelse), `.?`, if-unwrap |
-| Error unions (`!T`) | Partial | Named sets work. Inferred `!T` in Wave 5 |
+| Error unions (`!T`) | Done | Named sets + inferred `!T` |
 | `try` / `catch` / `errdefer` | Done | |
 | Generics (comptime T) | Done | Cot uses `fn(T)` syntax, monomorphized |
 | Traits / interfaces | Done | Cot has explicit `trait` keyword (Zig uses duck-typing) |
@@ -401,14 +401,14 @@ Batteries-included standard library matching Deno's breadth. Every module is pur
 | Labeled blocks / break / continue | Done | |
 | Switch with ranges | Done | |
 | `@sizeOf` / `@alignOf` / casts | Done | |
-| `@embedFile` | — | Wave 5 |
-| Destructuring | — | Wave 5 |
+| `@embedFile` | Done | Compile-time file embedding |
+| Destructuring | Done | `const a, b = getTuple()` |
 | `@TypeOf` / `@hasField` / `@field` | — | Wave 5 |
 | `inline for` | — | Wave 5 |
-| Inferred error sets (`!T`) | — | Wave 5 |
+| Inferred error sets (`!T`) | Done | `fn read() ![]u8` |
 | Runtime safety (debug mode) | — | Wave 5 |
-| `noreturn` type | — | Wave 5 |
-| Doc comments (`///`) | — | Wave 5 |
+| `noreturn` type | Done | Bottom type for @exit, @trap |
+| Doc comments (`///`) | Done | `///` parsed, stored in AST, used by `cot doc` |
 | Packed structs / bitfields | — | 0.5 |
 | Wrapping arithmetic (`+%`) | — | 0.5 |
 | SIMD vectors | — | 0.6+ |
@@ -441,9 +441,9 @@ A developer should be able to:
 - **Wave 1 (language):** 7/7 done
 - **Wave 2 (DX):** 6/6 done
 - **Wave 3 (maturity + project system + DX):** 8/9 done (multi-value cleanup deferred)
-- **Wave 4 (ecosystem polish):** 1/7 (tree-sitter done)
-- **Wave 5 (language maturity — Zig ports):** 0/12
-- **Wave 6 (stdlib expansion — Deno ports):** 0/11
+- **Wave 4 (ecosystem polish):** 7/7 done
+- **Wave 5 (language maturity — Zig ports):** 6/12 (doc comments, cot doc, noreturn, !T, destructuring, @embedFile done)
+- **Wave 6 (stdlib expansion — Deno ports):** 9/11 (path, uuid, semver, dotenv, crypto, fmt, log, cli, testing done)
 - **Wave 5-legacy (production):** 2/4 (async/await, event loop done; browser async, IR split remaining)
 
 ---

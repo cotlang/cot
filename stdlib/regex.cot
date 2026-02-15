@@ -1,0 +1,896 @@
+// regex — Regular expression engine (Thompson NFA).
+//
+// Supports: literals, . * + ? | () [] [^] [a-z] ^ $ \d \w \s \D \W \S \\
+// Thompson's construction guarantees linear-time matching.
+//
+// References:
+//   Russ Cox: "Regular Expression Matching Can Be Simple And Fast"
+//   Go: regexp/syntax (NFA compilation)
+//   Ken Thompson: "Regular Expression Search Algorithm" (1968)
+
+import "std/string"
+import "std/list"
+
+// ============================================================================
+// NFA State Representation
+// ============================================================================
+
+// State types
+const STATE_MATCH: i64 = 0
+const STATE_LITERAL: i64 = 1
+const STATE_DOT: i64 = 2
+const STATE_SPLIT: i64 = 3
+const STATE_CLASS: i64 = 4
+const STATE_NEG_CLASS: i64 = 5
+const STATE_DIGIT: i64 = 6
+const STATE_WORD: i64 = 7
+const STATE_SPACE: i64 = 8
+const STATE_NOT_DIGIT: i64 = 9
+const STATE_NOT_WORD: i64 = 10
+const STATE_NOT_SPACE: i64 = 11
+
+// NFA state layout (40 bytes each):
+//   [0]  type     (i64)
+//   [8]  char_val (i64) — for LITERAL
+//   [16] out1     (i64) — next state index (-1 = none)
+//   [24] out2     (i64) — second next state (for SPLIT)
+//   [32] class_ptr (i64) — pointer to class data (ranges)
+
+const STATE_SIZE: i64 = 40
+
+// NFA structure layout:
+//   [0]  states_buf (i64)
+//   [8]  state_count (i64)
+//   [16] state_cap (i64)
+//   [24] start (i64) — start state index
+//   [32] anchored_start (i64)
+//   [40] anchored_end (i64)
+
+fn newNfa() i64 {
+    var nfa = @alloc(48)
+    @intToPtr(*i64, nfa).* = 0
+    @intToPtr(*i64, nfa + 8).* = 0
+    @intToPtr(*i64, nfa + 16).* = 0
+    @intToPtr(*i64, nfa + 24).* = 0
+    @intToPtr(*i64, nfa + 32).* = 0
+    @intToPtr(*i64, nfa + 40).* = 0
+    return nfa
+}
+
+fn addState(nfa: i64, stype: i64, char_val: i64, out1: i64, out2: i64, class_ptr: i64) i64 {
+    var count = @intToPtr(*i64, nfa + 8).*
+    var cap = @intToPtr(*i64, nfa + 16).*
+
+    if (count >= cap) {
+        var new_cap = cap * 2
+        if (new_cap == 0) { new_cap = 32 }
+        var buf = @intToPtr(*i64, nfa).*
+        var new_buf = @alloc(new_cap * STATE_SIZE)
+        if (count > 0) {
+            @memcpy(new_buf, buf, count * STATE_SIZE)
+            @dealloc(buf)
+        }
+        @intToPtr(*i64, nfa).* = new_buf
+        @intToPtr(*i64, nfa + 16).* = new_cap
+    }
+
+    var buf = @intToPtr(*i64, nfa).*
+    var offset = count * STATE_SIZE
+    @intToPtr(*i64, buf + offset).* = stype
+    @intToPtr(*i64, buf + offset + 8).* = char_val
+    @intToPtr(*i64, buf + offset + 16).* = out1
+    @intToPtr(*i64, buf + offset + 24).* = out2
+    @intToPtr(*i64, buf + offset + 32).* = class_ptr
+
+    @intToPtr(*i64, nfa + 8).* = count + 1
+    return count
+}
+
+fn getStateType(nfa: i64, idx: i64) i64 {
+    var buf = @intToPtr(*i64, nfa).*
+    return @intToPtr(*i64, buf + idx * STATE_SIZE).*
+}
+
+fn getStateChar(nfa: i64, idx: i64) i64 {
+    var buf = @intToPtr(*i64, nfa).*
+    return @intToPtr(*i64, buf + idx * STATE_SIZE + 8).*
+}
+
+fn getStateOut1(nfa: i64, idx: i64) i64 {
+    var buf = @intToPtr(*i64, nfa).*
+    return @intToPtr(*i64, buf + idx * STATE_SIZE + 16).*
+}
+
+fn getStateOut2(nfa: i64, idx: i64) i64 {
+    var buf = @intToPtr(*i64, nfa).*
+    return @intToPtr(*i64, buf + idx * STATE_SIZE + 24).*
+}
+
+fn getStateClass(nfa: i64, idx: i64) i64 {
+    var buf = @intToPtr(*i64, nfa).*
+    return @intToPtr(*i64, buf + idx * STATE_SIZE + 32).*
+}
+
+fn setStateOut1(nfa: i64, idx: i64, out: i64) void {
+    var buf = @intToPtr(*i64, nfa).*
+    @intToPtr(*i64, buf + idx * STATE_SIZE + 16).* = out
+}
+
+fn setStateOut2(nfa: i64, idx: i64, out: i64) void {
+    var buf = @intToPtr(*i64, nfa).*
+    @intToPtr(*i64, buf + idx * STATE_SIZE + 24).* = out
+}
+
+// ============================================================================
+// Fragment Helpers (for Thompson's construction)
+// ============================================================================
+
+// Fragment: partially-built NFA piece
+// Layout: [0] start, [8] patch_buf, [16] patch_count
+
+fn newFrag(start: i64) i64 {
+    var f = @alloc(24)
+    @intToPtr(*i64, f).* = start
+    @intToPtr(*i64, f + 8).* = @alloc(128)
+    @intToPtr(*i64, f + 16).* = 0
+    return f
+}
+
+fn fragAddPatch(f: i64, state_idx: i64, which_out: i64) void {
+    var count = @intToPtr(*i64, f + 16).*
+    var buf = @intToPtr(*i64, f + 8).*
+    @intToPtr(*i64, buf + count * 16).* = state_idx
+    @intToPtr(*i64, buf + count * 16 + 8).* = which_out
+    @intToPtr(*i64, f + 16).* = count + 1
+}
+
+fn fragPatch(nfa: i64, f: i64, target: i64) void {
+    var count = @intToPtr(*i64, f + 16).*
+    var buf = @intToPtr(*i64, f + 8).*
+    var i: i64 = 0
+    while (i < count) {
+        var state_idx = @intToPtr(*i64, buf + i * 16).*
+        var which_out = @intToPtr(*i64, buf + i * 16 + 8).*
+        if (which_out == 1) {
+            setStateOut1(nfa, state_idx, target)
+        } else {
+            setStateOut2(nfa, state_idx, target)
+        }
+        i = i + 1
+    }
+}
+
+fn fragMergePatches(dst: i64, src: i64) void {
+    var sc = @intToPtr(*i64, src + 16).*
+    var sbuf = @intToPtr(*i64, src + 8).*
+    var i: i64 = 0
+    while (i < sc) {
+        fragAddPatch(dst, @intToPtr(*i64, sbuf + i * 16).*, @intToPtr(*i64, sbuf + i * 16 + 8).*)
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Character Class Parsing
+// ============================================================================
+
+// Parse [abc], [a-z], [^abc]. Returns pointer to ranges data.
+fn parseCharClass(pat: string, plen: i64, pos_ptr: i64) i64 {
+    var pos = @intToPtr(*i64, pos_ptr).*
+    var ranges = @alloc(256)
+    var rcount: i64 = 0
+
+    while (pos < plen) {
+        var c = @intCast(i64, @intToPtr(*u8, @ptrOf(pat) + pos).*)
+        if (c == 93) {
+            pos = pos + 1
+            @intToPtr(*i64, pos_ptr).* = pos
+            @intToPtr(*i64, ranges).* = rcount
+            return ranges
+        }
+
+        var lo = c
+        var hi = c
+        pos = pos + 1
+
+        if (pos + 1 < plen and @intCast(i64, @intToPtr(*u8, @ptrOf(pat) + pos).*) == 45) {
+            if (pos + 1 < plen and @intCast(i64, @intToPtr(*u8, @ptrOf(pat) + pos + 1).*) != 93) {
+                hi = @intCast(i64, @intToPtr(*u8, @ptrOf(pat) + pos + 1).*)
+                pos = pos + 2
+            }
+        }
+
+        @intToPtr(*i64, ranges + 8 + rcount * 16).* = lo
+        @intToPtr(*i64, ranges + 8 + rcount * 16 + 8).* = hi
+        rcount = rcount + 1
+    }
+
+    @intToPtr(*i64, pos_ptr).* = pos
+    @intToPtr(*i64, ranges).* = rcount
+    return ranges
+}
+
+fn matchClass(class_ptr: i64, c: i64) bool {
+    var count = @intToPtr(*i64, class_ptr).*
+    var i: i64 = 0
+    while (i < count) {
+        var lo = @intToPtr(*i64, class_ptr + 8 + i * 16).*
+        var hi = @intToPtr(*i64, class_ptr + 8 + i * 16 + 8).*
+        if (c >= lo and c <= hi) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ============================================================================
+// Stack Operations (decomposed to avoid deep if/else in compile)
+// ============================================================================
+
+fn concatTop(nfa: i64, stack_buf: i64, stack_top: i64) i64 {
+    var f2 = @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).*
+    var f1 = @intToPtr(*i64, stack_buf + (stack_top - 2) * 8).*
+    fragPatch(nfa, f1, @intToPtr(*i64, f2).*)
+    // Reset f1's patch list — patches were just applied, keeping them would
+    // cause stale re-application in later concats (Thompson construction bug)
+    @intToPtr(*i64, f1 + 16).* = 0
+    fragMergePatches(f1, f2)
+    @intToPtr(*i64, stack_buf + (stack_top - 2) * 8).* = f1
+    return stack_top - 1
+}
+
+fn alternateTop(nfa: i64, stack_buf: i64, stack_top: i64) i64 {
+    var f2 = @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).*
+    var f1 = @intToPtr(*i64, stack_buf + (stack_top - 2) * 8).*
+    var si = addState(nfa, STATE_SPLIT, 0, @intToPtr(*i64, f1).*, @intToPtr(*i64, f2).*, 0)
+    var merged = newFrag(si)
+    fragMergePatches(merged, f1)
+    fragMergePatches(merged, f2)
+    @intToPtr(*i64, stack_buf + (stack_top - 2) * 8).* = merged
+    return stack_top - 1
+}
+
+fn pushAtom(nfa: i64, stack_buf: i64, stack_top: i64, stype: i64, cval: i64, cls: i64) i64 {
+    var si = addState(nfa, stype, cval, 0 - 1, 0 - 1, cls)
+    var f = newFrag(si)
+    fragAddPatch(f, si, 1)
+    @intToPtr(*i64, stack_buf + stack_top * 8).* = f
+    return stack_top + 1
+}
+
+fn applyStar(nfa: i64, stack_buf: i64, stack_top: i64) i64 {
+    var f = @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).*
+    var f_start = @intToPtr(*i64, f).*
+    var si = addState(nfa, STATE_SPLIT, 0, f_start, 0 - 1, 0)
+    fragPatch(nfa, f, si)
+    var nf = newFrag(si)
+    fragAddPatch(nf, si, 2)
+    @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).* = nf
+    return stack_top
+}
+
+fn applyPlus(nfa: i64, stack_buf: i64, stack_top: i64) i64 {
+    var f = @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).*
+    var f_start = @intToPtr(*i64, f).*
+    var si = addState(nfa, STATE_SPLIT, 0, f_start, 0 - 1, 0)
+    fragPatch(nfa, f, si)
+    var nf = newFrag(f_start)
+    fragAddPatch(nf, si, 2)
+    @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).* = nf
+    return stack_top
+}
+
+fn applyQuestion(nfa: i64, stack_buf: i64, stack_top: i64) i64 {
+    var f = @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).*
+    var f_start = @intToPtr(*i64, f).*
+    var si = addState(nfa, STATE_SPLIT, 0, f_start, 0 - 1, 0)
+    var nf = newFrag(si)
+    fragMergePatches(nf, f)
+    fragAddPatch(nf, si, 2)
+    @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).* = nf
+    return stack_top
+}
+
+// ============================================================================
+// Compile: parse escape sequence
+// ============================================================================
+
+fn compileEscape(nfa: i64, stack_buf: i64, stack_top: i64, pat: string, plen: i64, pos: i64) i64 {
+    // Returns packed (new_stack_top << 32) | new_pos
+    if (pos >= plen) { return (stack_top << 32) | pos }
+
+    var ec = @intCast(i64, @intToPtr(*u8, @ptrOf(pat) + pos).*)
+    var st: i64 = STATE_LITERAL
+    var cv: i64 = ec
+
+    // \d \w \s \D \W \S
+    if (ec == 100) { st = STATE_DIGIT }
+    if (ec == 119) { st = STATE_WORD }
+    if (ec == 115) { st = STATE_SPACE }
+    if (ec == 68) { st = STATE_NOT_DIGIT }
+    if (ec == 87) { st = STATE_NOT_WORD }
+    if (ec == 83) { st = STATE_NOT_SPACE }
+    if (st != STATE_LITERAL) { cv = 0 }
+
+    var new_top = pushAtom(nfa, stack_buf, stack_top, st, cv, 0)
+    return (new_top << 32) | (pos + 1)
+}
+
+// Compile: parse character class [...]
+fn compileCharClass(nfa: i64, stack_buf: i64, stack_top: i64, pat: string, plen: i64, pos: i64) i64 {
+    var cur_pos = pos
+    var negated = false
+    if (cur_pos < plen and @intCast(i64, @intToPtr(*u8, @ptrOf(pat) + cur_pos).*) == 94) {
+        negated = true
+        cur_pos = cur_pos + 1
+    }
+    var pos_store = @alloc(8)
+    @intToPtr(*i64, pos_store).* = cur_pos
+    var class_data = parseCharClass(pat, plen, pos_store)
+    cur_pos = @intToPtr(*i64, pos_store).*
+    @dealloc(pos_store)
+
+    var st = STATE_CLASS
+    if (negated) { st = STATE_NEG_CLASS }
+    var new_top = pushAtom(nfa, stack_buf, stack_top, st, 0, class_data)
+    return (new_top << 32) | cur_pos
+}
+
+// ============================================================================
+// Compile Main Function
+// ============================================================================
+
+// Compiler state: passed as a heap-allocated struct to avoid too many params.
+// Layout: [0] natom, [8] nfrags, [16] paren_depth,
+//         [24] paren_natom_buf, [32] paren_nfrags_buf, [40] stack_top
+
+fn newCompilerState() i64 {
+    var cs = @alloc(48)
+    @intToPtr(*i64, cs).* = 0
+    @intToPtr(*i64, cs + 8).* = 0
+    @intToPtr(*i64, cs + 16).* = 0
+    @intToPtr(*i64, cs + 24).* = @alloc(64)
+    @intToPtr(*i64, cs + 32).* = @alloc(64)
+    @intToPtr(*i64, cs + 40).* = 0
+    return cs
+}
+
+fn compileHandleOpen(nfa: i64, stack_buf: i64, cs: i64) void {
+    var natom = @intToPtr(*i64, cs).*
+    var nfrags = @intToPtr(*i64, cs + 8).*
+    var depth = @intToPtr(*i64, cs + 16).*
+    var stack_top = @intToPtr(*i64, cs + 40).*
+
+    if (natom > 1) {
+        stack_top = concatTop(nfa, stack_buf, stack_top)
+        natom = natom - 1
+    }
+    var pna = @intToPtr(*i64, cs + 24).*
+    var pnf = @intToPtr(*i64, cs + 32).*
+    @intToPtr(*i64, pna + depth * 8).* = natom
+    @intToPtr(*i64, pnf + depth * 8).* = nfrags
+
+    @intToPtr(*i64, cs).* = 0
+    @intToPtr(*i64, cs + 8).* = 0
+    @intToPtr(*i64, cs + 16).* = depth + 1
+    @intToPtr(*i64, cs + 40).* = stack_top
+}
+
+fn compileHandleClose(nfa: i64, stack_buf: i64, cs: i64) void {
+    var natom = @intToPtr(*i64, cs).*
+    var nfrags = @intToPtr(*i64, cs + 8).*
+    var depth = @intToPtr(*i64, cs + 16).*
+    var stack_top = @intToPtr(*i64, cs + 40).*
+
+    while (natom > 1) {
+        stack_top = concatTop(nfa, stack_buf, stack_top)
+        natom = natom - 1
+    }
+    while (nfrags > 0) {
+        stack_top = alternateTop(nfa, stack_buf, stack_top)
+        nfrags = nfrags - 1
+    }
+
+    depth = depth - 1
+    var pna = @intToPtr(*i64, cs + 24).*
+    var pnf = @intToPtr(*i64, cs + 32).*
+    natom = @intToPtr(*i64, pna + depth * 8).* + 1
+    nfrags = @intToPtr(*i64, pnf + depth * 8).*
+
+    @intToPtr(*i64, cs).* = natom
+    @intToPtr(*i64, cs + 8).* = nfrags
+    @intToPtr(*i64, cs + 16).* = depth
+    @intToPtr(*i64, cs + 40).* = stack_top
+}
+
+fn compileHandleAlternate(nfa: i64, stack_buf: i64, cs: i64) void {
+    var natom = @intToPtr(*i64, cs).*
+    var stack_top = @intToPtr(*i64, cs + 40).*
+
+    while (natom > 1) {
+        stack_top = concatTop(nfa, stack_buf, stack_top)
+        natom = natom - 1
+    }
+
+    @intToPtr(*i64, cs).* = 0
+    @intToPtr(*i64, cs + 8).* = @intToPtr(*i64, cs + 8).* + 1
+    @intToPtr(*i64, cs + 40).* = stack_top
+}
+
+fn compileHandleAtom(nfa: i64, stack_buf: i64, cs: i64, pat: string, plen: i64, pos: i64) i64 {
+    var natom = @intToPtr(*i64, cs).*
+    var stack_top = @intToPtr(*i64, cs + 40).*
+
+    if (natom > 1) {
+        stack_top = concatTop(nfa, stack_buf, stack_top)
+        natom = natom - 1
+    }
+
+    var c = @intCast(i64, @intToPtr(*u8, @ptrOf(pat) + pos).*)
+    var new_pos = pos
+
+    if (c == 46) {
+        stack_top = pushAtom(nfa, stack_buf, stack_top, STATE_DOT, 0, 0)
+        new_pos = pos + 1
+    } else if (c == 91) {
+        var packed = compileCharClass(nfa, stack_buf, stack_top, pat, plen, pos + 1)
+        stack_top = (packed >> 32) & 4294967295
+        new_pos = packed & 4294967295
+    } else if (c == 92) {
+        var packed = compileEscape(nfa, stack_buf, stack_top, pat, plen, pos + 1)
+        stack_top = (packed >> 32) & 4294967295
+        new_pos = packed & 4294967295
+    } else {
+        stack_top = pushAtom(nfa, stack_buf, stack_top, STATE_LITERAL, c, 0)
+        new_pos = pos + 1
+    }
+
+    @intToPtr(*i64, cs).* = natom + 1
+    @intToPtr(*i64, cs + 40).* = stack_top
+    return new_pos
+}
+
+fn compile(pattern: string) i64 {
+    var nfa = newNfa()
+    var plen = @lenOf(pattern)
+    var pos: i64 = 0
+
+    // Check for ^ anchor
+    if (pos < plen and @intCast(i64, @intToPtr(*u8, @ptrOf(pattern) + pos).*) == 94) {
+        @intToPtr(*i64, nfa + 32).* = 1
+        pos = pos + 1
+    }
+
+    // Check for $ anchor at end
+    if (plen > 0 and @intCast(i64, @intToPtr(*u8, @ptrOf(pattern) + plen - 1).*) == 36) {
+        @intToPtr(*i64, nfa + 40).* = 1
+        plen = plen - 1
+    }
+
+    var stack_buf = @alloc(256)
+    var cs = newCompilerState()
+
+    while (pos < plen) {
+        var c = @intCast(i64, @intToPtr(*u8, @ptrOf(pattern) + pos).*)
+
+        if (c == 40) {
+            compileHandleOpen(nfa, stack_buf, cs)
+            pos = pos + 1
+        } else if (c == 41) {
+            compileHandleClose(nfa, stack_buf, cs)
+            pos = pos + 1
+        } else if (c == 124) {
+            compileHandleAlternate(nfa, stack_buf, cs)
+            pos = pos + 1
+        } else if (c == 42) {
+            var stack_top = @intToPtr(*i64, cs + 40).*
+            stack_top = applyStar(nfa, stack_buf, stack_top)
+            @intToPtr(*i64, cs + 40).* = stack_top
+            pos = pos + 1
+        } else if (c == 43) {
+            var stack_top = @intToPtr(*i64, cs + 40).*
+            stack_top = applyPlus(nfa, stack_buf, stack_top)
+            @intToPtr(*i64, cs + 40).* = stack_top
+            pos = pos + 1
+        } else if (c == 63) {
+            var stack_top = @intToPtr(*i64, cs + 40).*
+            stack_top = applyQuestion(nfa, stack_buf, stack_top)
+            @intToPtr(*i64, cs + 40).* = stack_top
+            pos = pos + 1
+        } else {
+            pos = compileHandleAtom(nfa, stack_buf, cs, pattern, plen, pos)
+        }
+    }
+
+    // Finish: concat remaining atoms, then alternate
+    var natom = @intToPtr(*i64, cs).*
+    var nfrags = @intToPtr(*i64, cs + 8).*
+    var stack_top = @intToPtr(*i64, cs + 40).*
+
+    while (natom > 1) {
+        stack_top = concatTop(nfa, stack_buf, stack_top)
+        natom = natom - 1
+    }
+    while (nfrags > 0) {
+        stack_top = alternateTop(nfa, stack_buf, stack_top)
+        nfrags = nfrags - 1
+    }
+
+    // Add match state and wire up
+    var match_state = addState(nfa, STATE_MATCH, 0, 0 - 1, 0 - 1, 0)
+
+    if (stack_top > 0) {
+        var f = @intToPtr(*i64, stack_buf + (stack_top - 1) * 8).*
+        fragPatch(nfa, f, match_state)
+        @intToPtr(*i64, nfa + 24).* = @intToPtr(*i64, f).*
+    } else {
+        @intToPtr(*i64, nfa + 24).* = match_state
+    }
+
+    @dealloc(stack_buf)
+    return nfa
+}
+
+// ============================================================================
+// NFA Simulation — state matching (decomposed for native backend)
+// ============================================================================
+
+fn isDigitChar(c: i64) bool {
+    return c >= 48 and c <= 57
+}
+
+fn isWordChar(c: i64) bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+}
+
+fn isSpaceChar(c: i64) bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
+fn stateMatchesLiteral(nfa: i64, idx: i64, c: i64) bool {
+    return c == getStateChar(nfa, idx)
+}
+
+fn stateMatchesClass(nfa: i64, idx: i64, c: i64) bool {
+    return matchClass(getStateClass(nfa, idx), c)
+}
+
+fn stateMatchesNegClass(nfa: i64, idx: i64, c: i64) bool {
+    return not matchClass(getStateClass(nfa, idx), c)
+}
+
+// Check if a char matches a state. Dispatches by type using a lookup approach.
+fn stateMatches(nfa: i64, idx: i64, c: i64) bool {
+    var stype = getStateType(nfa, idx)
+    if (stype == STATE_LITERAL) { return stateMatchesLiteral(nfa, idx, c) }
+    if (stype == STATE_DOT) { return c != 10 }
+    if (stype == STATE_DIGIT) { return isDigitChar(c) }
+    if (stype == STATE_WORD) { return isWordChar(c) }
+    if (stype == STATE_SPACE) { return isSpaceChar(c) }
+    if (stype == STATE_NOT_DIGIT) { return not isDigitChar(c) }
+    if (stype == STATE_NOT_WORD) { return not isWordChar(c) }
+    if (stype == STATE_NOT_SPACE) { return not isSpaceChar(c) }
+    if (stype == STATE_CLASS) { return stateMatchesClass(nfa, idx, c) }
+    if (stype == STATE_NEG_CLASS) { return stateMatchesNegClass(nfa, idx, c) }
+    return false
+}
+
+// ============================================================================
+// NFA Simulation — addToSet (iterative, not recursive for native safety)
+// ============================================================================
+
+fn addToSet(nfa: i64, set_buf: i64, set_count_ptr: i64, visited: i64, idx: i64) void {
+    if (idx < 0) { return }
+    // Use an explicit stack to avoid deep recursion
+    var work = @alloc(256)
+    var work_top: i64 = 0
+    @intToPtr(*i64, work).* = idx
+    work_top = 1
+
+    while (work_top > 0) {
+        work_top = work_top - 1
+        var cur = @intToPtr(*i64, work + work_top * 8).*
+        if (cur < 0) { continue }
+
+        var vis = @intToPtr(*u8, visited + cur).*
+        if (vis != 0) { continue }
+        @intToPtr(*u8, visited + cur).* = @intCast(u8, 1)
+
+        var stype = getStateType(nfa, cur)
+        if (stype == STATE_SPLIT) {
+            @intToPtr(*i64, work + work_top * 8).* = getStateOut1(nfa, cur)
+            work_top = work_top + 1
+            @intToPtr(*i64, work + work_top * 8).* = getStateOut2(nfa, cur)
+            work_top = work_top + 1
+        } else {
+            var count = @intToPtr(*i64, set_count_ptr).*
+            @intToPtr(*i64, set_buf + count * 8).* = cur
+            @intToPtr(*i64, set_count_ptr).* = count + 1
+        }
+    }
+    @dealloc(work)
+}
+
+// ============================================================================
+// NFA Simulation — run
+// ============================================================================
+
+fn checkSetForMatch(nfa: i64, set_buf: i64, set_count: i64) bool {
+    var i: i64 = 0
+    while (i < set_count) {
+        var si = @intToPtr(*i64, set_buf + i * 8).*
+        if (getStateType(nfa, si) == STATE_MATCH) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn stepNfa(nfa: i64, cur_buf: i64, cur_count: i64, next_buf: i64, next_count_ptr: i64, visited: i64, state_count: i64, c: i64) void {
+    @intToPtr(*i64, next_count_ptr).* = 0
+    var vi: i64 = 0
+    while (vi <= state_count) {
+        @intToPtr(*u8, visited + vi).* = @intCast(u8, 0)
+        vi = vi + 1
+    }
+
+    var ci: i64 = 0
+    while (ci < cur_count) {
+        var si = @intToPtr(*i64, cur_buf + ci * 8).*
+        if (stateMatches(nfa, si, c)) {
+            addToSet(nfa, next_buf, next_count_ptr, visited, getStateOut1(nfa, si))
+        }
+        ci = ci + 1
+    }
+}
+
+fn runNfa(nfa: i64, text: string, start_pos: i64) i64 {
+    var tlen = @lenOf(text)
+    var state_count = @intToPtr(*i64, nfa + 8).*
+    var start = @intToPtr(*i64, nfa + 24).*
+    var anchored_end = @intToPtr(*i64, nfa + 40).*
+
+    var cur_buf = @alloc(state_count * 8 + 8)
+    var next_buf = @alloc(state_count * 8 + 8)
+    var cur_count = @alloc(8)
+    var next_count = @alloc(8)
+    var visited = @alloc(state_count + 1)
+
+    // Initialize current set
+    @intToPtr(*i64, cur_count).* = 0
+    var vi: i64 = 0
+    while (vi <= state_count) {
+        @intToPtr(*u8, visited + vi).* = @intCast(u8, 0)
+        vi = vi + 1
+    }
+    addToSet(nfa, cur_buf, cur_count, visited, start)
+
+    var last_match: i64 = 0 - 1
+    var cc = @intToPtr(*i64, cur_count).*
+
+    // Check initial set for match
+    if (checkSetForMatch(nfa, cur_buf, cc)) {
+        if (anchored_end == 0 or start_pos == tlen) {
+            last_match = 0
+        }
+    }
+
+    var pos = start_pos
+    while (pos < tlen) {
+        var c = @intCast(i64, @intToPtr(*u8, @ptrOf(text) + pos).*)
+        cc = @intToPtr(*i64, cur_count).*
+
+        stepNfa(nfa, cur_buf, cc, next_buf, next_count, visited, state_count, c)
+
+        // Swap cur/next
+        var tmp_buf = cur_buf
+        cur_buf = next_buf
+        next_buf = tmp_buf
+        var tmp_count = cur_count
+        cur_count = next_count
+        next_count = tmp_count
+
+        cc = @intToPtr(*i64, cur_count).*
+        if (cc == 0) {
+            @dealloc(cur_buf)
+            @dealloc(next_buf)
+            @dealloc(cur_count)
+            @dealloc(next_count)
+            @dealloc(visited)
+            return last_match
+        }
+
+        if (checkSetForMatch(nfa, cur_buf, cc)) {
+            var match_len = pos + 1 - start_pos
+            if (anchored_end == 0 or pos + 1 == tlen) {
+                last_match = match_len
+            }
+        }
+
+        pos = pos + 1
+    }
+
+    @dealloc(cur_buf)
+    @dealloc(next_buf)
+    @dealloc(cur_count)
+    @dealloc(next_count)
+    @dealloc(visited)
+    return last_match
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+fn regexMatch(pattern: string, text: string) bool {
+    var nfa = compile(pattern)
+    var anchored_start = @intToPtr(*i64, nfa + 32).*
+    var tlen = @lenOf(text)
+
+    if (anchored_start != 0) {
+        return runNfa(nfa, text, 0) >= 0
+    }
+
+    var i: i64 = 0
+    while (i <= tlen) {
+        if (runNfa(nfa, text, i) >= 0) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn regexFind(pattern: string, text: string) i64 {
+    var nfa = compile(pattern)
+    var anchored_start = @intToPtr(*i64, nfa + 32).*
+    var tlen = @lenOf(text)
+
+    if (anchored_start != 0) {
+        if (runNfa(nfa, text, 0) >= 0) { return 0 }
+        return 0 - 1
+    }
+
+    var i: i64 = 0
+    while (i <= tlen) {
+        if (runNfa(nfa, text, i) >= 0) { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn regexFindSpan(pattern: string, text: string) i64 {
+    var nfa = compile(pattern)
+    var anchored_start = @intToPtr(*i64, nfa + 32).*
+    var tlen = @lenOf(text)
+
+    if (anchored_start != 0) {
+        var result = runNfa(nfa, text, 0)
+        if (result >= 0) { return (result << 32) | 0 }
+        return 0 - 1
+    }
+
+    var i: i64 = 0
+    while (i <= tlen) {
+        var result = runNfa(nfa, text, i)
+        if (result >= 0) {
+            return (result << 32) | (i & 4294967295)
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn spanStart(span: i64) i64 {
+    return span & 4294967295
+}
+
+fn spanLen(span: i64) i64 {
+    return (span >> 32) & 4294967295
+}
+
+fn regexReplace(pattern: string, text: string, replacement: string) string {
+    var nfa = compile(pattern)
+    var anchored_start = @intToPtr(*i64, nfa + 32).*
+    var tlen = @lenOf(text)
+    var match_start: i64 = 0 - 1
+    var match_len: i64 = 0
+
+    if (anchored_start != 0) {
+        var result = runNfa(nfa, text, 0)
+        if (result >= 0) {
+            match_start = 0
+            match_len = result
+        }
+    } else {
+        var i: i64 = 0
+        while (i <= tlen and match_start < 0) {
+            var result = runNfa(nfa, text, i)
+            if (result >= 0) {
+                match_start = i
+                match_len = result
+            }
+            i = i + 1
+        }
+    }
+
+    if (match_start < 0) { return text }
+
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    if (match_start > 0) {
+        sb.append(substring(text, 0, match_start))
+    }
+    sb.append(replacement)
+    var after = match_start + match_len
+    if (after < tlen) {
+        sb.append(substring(text, after, tlen))
+    }
+    return sb.toString()
+}
+
+fn regexReplaceAll(pattern: string, text: string, replacement: string) string {
+    var nfa = compile(pattern)
+    var tlen = @lenOf(text)
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var pos: i64 = 0
+
+    while (pos <= tlen) {
+        var result = runNfa(nfa, text, pos)
+        if (result >= 0) {
+            sb.append(replacement)
+            if (result == 0) {
+                if (pos < tlen) {
+                    sb.appendByte(@intCast(i64, @intToPtr(*u8, @ptrOf(text) + pos).*))
+                }
+                pos = pos + 1
+            } else {
+                pos = pos + result
+            }
+        } else {
+            if (pos < tlen) {
+                sb.appendByte(@intCast(i64, @intToPtr(*u8, @ptrOf(text) + pos).*))
+            }
+            pos = pos + 1
+        }
+    }
+    return sb.toString()
+}
+
+fn regexSplit(pattern: string, text: string) i64 {
+    var nfa = compile(pattern)
+    var tlen = @lenOf(text)
+    var result = @alloc(256)
+    var rcount: i64 = 0
+    var last: i64 = 0
+    var pos: i64 = 0
+
+    while (pos <= tlen) {
+        var mlen = runNfa(nfa, text, pos)
+        if (mlen >= 0 and pos < tlen) {
+            @intToPtr(*i64, result + 8 + rcount * 16).* = @ptrOf(text) + last
+            @intToPtr(*i64, result + 8 + rcount * 16 + 8).* = pos - last
+            rcount = rcount + 1
+            if (mlen == 0) {
+                pos = pos + 1
+            } else {
+                pos = pos + mlen
+            }
+            last = pos
+        } else {
+            pos = pos + 1
+        }
+    }
+
+    @intToPtr(*i64, result + 8 + rcount * 16).* = @ptrOf(text) + last
+    @intToPtr(*i64, result + 8 + rcount * 16 + 8).* = tlen - last
+    rcount = rcount + 1
+
+    @intToPtr(*i64, result).* = rcount
+    return result
+}
+
+fn splitCount(result: i64) i64 {
+    return @intToPtr(*i64, result).*
+}
+
+fn splitGet(result: i64, index: i64) string {
+    var ptr = @intToPtr(*i64, result + 8 + index * 16).*
+    var len = @intToPtr(*i64, result + 8 + index * 16 + 8).*
+    return @string(ptr, len)
+}

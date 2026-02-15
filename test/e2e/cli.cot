@@ -1,0 +1,109 @@
+import "std/cli"
+import "std/string"
+
+// Note: parseArgs() reads actual process args, which in test mode
+// are minimal. We test the internal data structure operations
+// by calling addFlag/addPositional directly.
+
+test "newArgs creates empty result" {
+    var args = newArgs()
+    @assert_eq(flagCount(args), 0)
+    @assert_eq(positionalCount(args), 0)
+}
+
+test "addFlag stores key-value" {
+    var args = newArgs()
+    addFlag(args, "port", "8080")
+    @assert_eq(flagCount(args), 1)
+    @assert_eq(flagKey(args, 0), "port")
+    @assert_eq(flagValue(args, 0), "8080")
+}
+
+test "addFlag multiple flags" {
+    var args = newArgs()
+    addFlag(args, "host", "localhost")
+    addFlag(args, "port", "3000")
+    addFlag(args, "verbose", "true")
+    @assert_eq(flagCount(args), 3)
+    @assert_eq(flagKey(args, 0), "host")
+    @assert_eq(flagValue(args, 0), "localhost")
+    @assert_eq(flagKey(args, 2), "verbose")
+    @assert_eq(flagValue(args, 2), "true")
+}
+
+test "addPositional stores value" {
+    var args = newArgs()
+    addPositional(args, "file.cot")
+    @assert_eq(positionalCount(args), 1)
+    @assert_eq(positional(args, 0), "file.cot")
+}
+
+test "addPositional multiple" {
+    var args = newArgs()
+    addPositional(args, "src/main.cot")
+    addPositional(args, "src/lib.cot")
+    @assert_eq(positionalCount(args), 2)
+    @assert_eq(positional(args, 0), "src/main.cot")
+    @assert_eq(positional(args, 1), "src/lib.cot")
+}
+
+test "getFlag returns value" {
+    var args = newArgs()
+    addFlag(args, "port", "8080")
+    @assert_eq(getFlag(args, "port", "3000"), "8080")
+}
+
+test "getFlag returns default when missing" {
+    var args = newArgs()
+    @assert_eq(getFlag(args, "port", "3000"), "3000")
+}
+
+test "hasFlag true when present" {
+    var args = newArgs()
+    addFlag(args, "verbose", "true")
+    @assert(hasFlag(args, "verbose"))
+}
+
+test "hasFlag false when absent" {
+    var args = newArgs()
+    @assert(not hasFlag(args, "verbose"))
+}
+
+test "getFlagInt returns parsed integer" {
+    var args = newArgs()
+    addFlag(args, "port", "8080")
+    @assert_eq(getFlagInt(args, "port", 3000), 8080)
+}
+
+test "getFlagInt returns default when missing" {
+    var args = newArgs()
+    @assert_eq(getFlagInt(args, "port", 3000), 3000)
+}
+
+test "mixed flags and positionals" {
+    var args = newArgs()
+    addFlag(args, "output", "build")
+    addPositional(args, "main.cot")
+    addFlag(args, "verbose", "true")
+    addPositional(args, "lib.cot")
+    @assert_eq(flagCount(args), 2)
+    @assert_eq(positionalCount(args), 2)
+    @assert_eq(getFlag(args, "output", ""), "build")
+    @assert_eq(positional(args, 1), "lib.cot")
+}
+
+test "grow beyond initial capacity" {
+    var args = newArgs()
+    addFlag(args, "a", "1")
+    addFlag(args, "b", "2")
+    addFlag(args, "c", "3")
+    addFlag(args, "d", "4")
+    addFlag(args, "e", "5")
+    addFlag(args, "f", "6")
+    addFlag(args, "g", "7")
+    addFlag(args, "h", "8")
+    addFlag(args, "i", "9")
+    @assert_eq(flagCount(args), 9)
+    @assert_eq(flagKey(args, 8), "i")
+    @assert_eq(flagValue(args, 8), "9")
+}

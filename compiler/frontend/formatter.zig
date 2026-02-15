@@ -516,6 +516,22 @@ pub const Formatter = struct {
                     self.printNode(s.value);
                 }
             },
+            .destructure_stmt => |s| {
+                self.writeIndent();
+                self.write(if (s.is_const) "const " else "var ") catch {};
+                for (s.bindings, 0..) |b, i| {
+                    if (i > 0) self.write(", ") catch {};
+                    self.write(b.name) catch {};
+                    if (b.type_expr != null_node) {
+                        self.write(": ") catch {};
+                        self.printNode(b.type_expr);
+                    }
+                }
+                if (s.value != null_node) {
+                    self.write(" = ") catch {};
+                    self.printNode(s.value);
+                }
+            },
             .assign_stmt => |s| {
                 self.writeIndent();
                 self.printNode(s.target);

@@ -1,0 +1,93 @@
+import "std/crypto"
+
+// ============================================================================
+// SHA-256 — Test vectors from FIPS 180-4 and NIST
+// ============================================================================
+
+test "sha256 empty string" {
+    @assert_eq(sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+}
+
+test "sha256 abc" {
+    @assert_eq(sha256("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+test "sha256 hello world" {
+    @assert_eq(sha256("hello world"), "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+}
+
+test "sha256 single char" {
+    @assert_eq(sha256("a"), "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
+}
+
+test "sha256 numbers" {
+    @assert_eq(sha256("123456789"), "15e2b0d3c33891ebb0f1ef609ec419420c20e320ce94c65fbc8c3312448eb225")
+}
+
+test "sha256 56 byte boundary (NIST)" {
+    // Exactly 56 bytes = padding boundary (message + 0x80 + length fills exactly two blocks)
+    @assert_eq(sha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+}
+
+test "sha256 longer string" {
+    @assert_eq(sha256("The quick brown fox jumps over the lazy dog"), "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592")
+}
+
+test "sha256 longer with period" {
+    @assert_eq(sha256("The quick brown fox jumps over the lazy dog."), "ef537f25c895bfa782526529a9b63d97aa631564d5d789c2b765448c8635fb6c")
+}
+
+// ============================================================================
+// HMAC-SHA256
+// ============================================================================
+
+test "hmac-sha256 basic" {
+    var result = hmacSha256("key", "The quick brown fox jumps over the lazy dog")
+    @assert_eq(result, "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+}
+
+test "hmac-sha256 empty message" {
+    var result = hmacSha256("key", "")
+    @assert_eq(result, "5d5d139563c95b5967b9bd9a8c9b233a9dedb45072794cd232dc1b74832607d0")
+}
+
+// ============================================================================
+// Hex Helpers
+// ============================================================================
+
+test "hexVal digits" {
+    @assert_eq(hexVal(48), 0)
+    @assert_eq(hexVal(57), 9)
+}
+
+test "hexVal lowercase" {
+    @assert_eq(hexVal(97), 10)
+    @assert_eq(hexVal(102), 15)
+}
+
+test "hexVal uppercase" {
+    @assert_eq(hexVal(65), 10)
+    @assert_eq(hexVal(70), 15)
+}
+
+// ============================================================================
+// Bit Operations
+// ============================================================================
+
+test "rotr32 basic" {
+    @assert_eq(rotr32(1, 1), 2147483648)
+}
+
+test "rotr32 identity at 32" {
+    @assert_eq(rotr32(255, 0), 255)
+}
+
+test "sha256Ch function" {
+    var result = sha256Ch(0, 4294967295, 0)
+    @assert_eq(result, 0)
+}
+
+test "sha256Maj function" {
+    var result = sha256Maj(4294967295, 4294967295, 0)
+    @assert_eq(result, 4294967295)
+}

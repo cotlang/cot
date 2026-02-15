@@ -1,0 +1,439 @@
+// crypto — Cryptographic hash functions.
+//
+// SHA-256 (FIPS 180-4) implemented in pure Cot.
+// All operations use 32-bit values via masking with 0xFFFFFFFF.
+//
+// References:
+//   FIPS 180-4: Secure Hash Standard
+//   Go: crypto/sha256 (block processing, padding)
+//   Deno: @std/crypto
+
+import "std/string"
+
+// ============================================================================
+// SHA-256 Constants
+// ============================================================================
+
+// 32-bit mask for unsigned arithmetic.
+const MASK32: i64 = 4294967295
+
+// SHA-256 round constants (first 32 bits of fractional parts of cube roots of first 64 primes).
+// Stored as functions to avoid top-level array limitations.
+fn sha256K(i: i64) i64 {
+    if (i == 0) { return 1116352408 }
+    if (i == 1) { return 1899447441 }
+    if (i == 2) { return 3049323471 }
+    if (i == 3) { return 3921009573 }
+    if (i == 4) { return 961987163 }
+    if (i == 5) { return 1508970993 }
+    if (i == 6) { return 2453635748 }
+    if (i == 7) { return 2870763221 }
+    if (i == 8) { return 3624381080 }
+    if (i == 9) { return 310598401 }
+    if (i == 10) { return 607225278 }
+    if (i == 11) { return 1426881987 }
+    if (i == 12) { return 1925078388 }
+    if (i == 13) { return 2162078206 }
+    if (i == 14) { return 2614888103 }
+    if (i == 15) { return 3248222580 }
+    if (i == 16) { return 3835390401 }
+    if (i == 17) { return 4022224774 }
+    if (i == 18) { return 264347078 }
+    if (i == 19) { return 604807628 }
+    if (i == 20) { return 770255983 }
+    if (i == 21) { return 1249150122 }
+    if (i == 22) { return 1555081692 }
+    if (i == 23) { return 1996064986 }
+    if (i == 24) { return 2554220882 }
+    if (i == 25) { return 2821834349 }
+    if (i == 26) { return 2952996808 }
+    if (i == 27) { return 3210313671 }
+    if (i == 28) { return 3336571891 }
+    if (i == 29) { return 3584528711 }
+    if (i == 30) { return 113926993 }
+    if (i == 31) { return 338241895 }
+    if (i == 32) { return 666307205 }
+    if (i == 33) { return 773529912 }
+    if (i == 34) { return 1294757372 }
+    if (i == 35) { return 1396182291 }
+    if (i == 36) { return 1695183700 }
+    if (i == 37) { return 1986661051 }
+    if (i == 38) { return 2177026350 }
+    if (i == 39) { return 2456956037 }
+    if (i == 40) { return 2730485921 }
+    if (i == 41) { return 2820302411 }
+    if (i == 42) { return 3259730800 }
+    if (i == 43) { return 3345764771 }
+    if (i == 44) { return 3516065817 }
+    if (i == 45) { return 3600352804 }
+    if (i == 46) { return 4094571909 }
+    if (i == 47) { return 275423344 }
+    if (i == 48) { return 430227734 }
+    if (i == 49) { return 506948616 }
+    if (i == 50) { return 659060556 }
+    if (i == 51) { return 883997877 }
+    if (i == 52) { return 958139571 }
+    if (i == 53) { return 1322822218 }
+    if (i == 54) { return 1537002063 }
+    if (i == 55) { return 1747873779 }
+    if (i == 56) { return 1955562222 }
+    if (i == 57) { return 2024104815 }
+    if (i == 58) { return 2227730452 }
+    if (i == 59) { return 2361852424 }
+    if (i == 60) { return 2428436474 }
+    if (i == 61) { return 2756734187 }
+    if (i == 62) { return 3204031479 }
+    if (i == 63) { return 3329325298 }
+    return 0
+}
+
+// ============================================================================
+// SHA-256 Bit Operations (32-bit, masked)
+// ============================================================================
+
+// Right rotate a 32-bit value by n bits.
+fn rotr32(x: i64, n: i64) i64 {
+    var masked = x & MASK32
+    return ((masked >> n) | (masked << (32 - n))) & MASK32
+}
+
+// Right shift a 32-bit value by n bits.
+fn shr32(x: i64, n: i64) i64 {
+    return (x & MASK32) >> n
+}
+
+// SHA-256 Ch function: (x AND y) XOR (NOT x AND z)
+fn sha256Ch(x: i64, y: i64, z: i64) i64 {
+    return ((x & y) ^ ((x ^ MASK32) & z)) & MASK32
+}
+
+// SHA-256 Maj function: (x AND y) XOR (x AND z) XOR (y AND z)
+fn sha256Maj(x: i64, y: i64, z: i64) i64 {
+    return ((x & y) ^ (x & z) ^ (y & z)) & MASK32
+}
+
+// SHA-256 Sigma0: ROTR(2) XOR ROTR(13) XOR ROTR(22)
+fn sha256Sigma0(x: i64) i64 {
+    return (rotr32(x, 2) ^ rotr32(x, 13) ^ rotr32(x, 22)) & MASK32
+}
+
+// SHA-256 Sigma1: ROTR(6) XOR ROTR(11) XOR ROTR(25)
+fn sha256Sigma1(x: i64) i64 {
+    return (rotr32(x, 6) ^ rotr32(x, 11) ^ rotr32(x, 25)) & MASK32
+}
+
+// SHA-256 sigma0: ROTR(7) XOR ROTR(18) XOR SHR(3)
+fn sha256sigma0(x: i64) i64 {
+    return (rotr32(x, 7) ^ rotr32(x, 18) ^ shr32(x, 3)) & MASK32
+}
+
+// SHA-256 sigma1: ROTR(17) XOR ROTR(19) XOR SHR(10)
+fn sha256sigma1(x: i64) i64 {
+    return (rotr32(x, 17) ^ rotr32(x, 19) ^ shr32(x, 10)) & MASK32
+}
+
+// ============================================================================
+// SHA-256 Block Processing
+// ============================================================================
+
+// Read a big-endian 32-bit word from buffer at byte offset.
+fn readBE32(buf: i64, offset: i64) i64 {
+    var b0 = @intCast(i64, @intToPtr(*u8, buf + offset).*)
+    var b1 = @intCast(i64, @intToPtr(*u8, buf + offset + 1).*)
+    var b2 = @intCast(i64, @intToPtr(*u8, buf + offset + 2).*)
+    var b3 = @intCast(i64, @intToPtr(*u8, buf + offset + 3).*)
+    return ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & MASK32
+}
+
+// Write a big-endian 32-bit word to buffer at byte offset.
+fn writeBE32(buf: i64, offset: i64, val: i64) void {
+    @intToPtr(*u8, buf + offset).* = @intCast(u8, (val >> 24) & 255)
+    @intToPtr(*u8, buf + offset + 1).* = @intCast(u8, (val >> 16) & 255)
+    @intToPtr(*u8, buf + offset + 2).* = @intCast(u8, (val >> 8) & 255)
+    @intToPtr(*u8, buf + offset + 3).* = @intCast(u8, val & 255)
+}
+
+// Process one 64-byte block. state is pointer to 8 x i64 (32-bit values).
+// block is pointer to 64 bytes of data.
+fn sha256Block(state: i64, block: i64) void {
+    // Message schedule: W[0..63] stored in allocated buffer (64 * 8 bytes)
+    var W = @alloc(512)
+
+    // Load first 16 words from block (big-endian)
+    var t: i64 = 0
+    while (t < 16) {
+        @intToPtr(*i64, W + t * 8).* = readBE32(block, t * 4)
+        t = t + 1
+    }
+
+    // Extend to 64 words
+    while (t < 64) {
+        var w2 = @intToPtr(*i64, W + (t - 2) * 8).*
+        var w7 = @intToPtr(*i64, W + (t - 7) * 8).*
+        var w15 = @intToPtr(*i64, W + (t - 15) * 8).*
+        var w16 = @intToPtr(*i64, W + (t - 16) * 8).*
+        @intToPtr(*i64, W + t * 8).* = (sha256sigma1(w2) + w7 + sha256sigma0(w15) + w16) & MASK32
+        t = t + 1
+    }
+
+    // Working variables
+    var a = @intToPtr(*i64, state).*
+    var b = @intToPtr(*i64, state + 8).*
+    var c = @intToPtr(*i64, state + 16).*
+    var d = @intToPtr(*i64, state + 24).*
+    var e = @intToPtr(*i64, state + 32).*
+    var f = @intToPtr(*i64, state + 40).*
+    var g = @intToPtr(*i64, state + 48).*
+    var h = @intToPtr(*i64, state + 56).*
+
+    // 64 rounds
+    t = 0
+    while (t < 64) {
+        var T1 = (h + sha256Sigma1(e) + sha256Ch(e, f, g) + sha256K(t) + @intToPtr(*i64, W + t * 8).*) & MASK32
+        var T2 = (sha256Sigma0(a) + sha256Maj(a, b, c)) & MASK32
+        h = g
+        g = f
+        f = e
+        e = (d + T1) & MASK32
+        d = c
+        c = b
+        b = a
+        a = (T1 + T2) & MASK32
+        t = t + 1
+    }
+
+    // Update state
+    @intToPtr(*i64, state).* = (@intToPtr(*i64, state).* + a) & MASK32
+    @intToPtr(*i64, state + 8).* = (@intToPtr(*i64, state + 8).* + b) & MASK32
+    @intToPtr(*i64, state + 16).* = (@intToPtr(*i64, state + 16).* + c) & MASK32
+    @intToPtr(*i64, state + 24).* = (@intToPtr(*i64, state + 24).* + d) & MASK32
+    @intToPtr(*i64, state + 32).* = (@intToPtr(*i64, state + 32).* + e) & MASK32
+    @intToPtr(*i64, state + 40).* = (@intToPtr(*i64, state + 40).* + f) & MASK32
+    @intToPtr(*i64, state + 48).* = (@intToPtr(*i64, state + 48).* + g) & MASK32
+    @intToPtr(*i64, state + 56).* = (@intToPtr(*i64, state + 56).* + h) & MASK32
+
+    @dealloc(W)
+}
+
+// ============================================================================
+// SHA-256 Public API
+// ============================================================================
+
+// Compute SHA-256 hash of a string. Returns 64-char lowercase hex string.
+fn sha256(input: string) string {
+    var msg_ptr = @ptrOf(input)
+    var msg_len = @lenOf(input)
+
+    // Initialize state (H0..H7)
+    var state = @alloc(64)
+    @intToPtr(*i64, state).* = 1779033703
+    @intToPtr(*i64, state + 8).* = 3144134277
+    @intToPtr(*i64, state + 16).* = 1013904242
+    @intToPtr(*i64, state + 24).* = 2773480762
+    @intToPtr(*i64, state + 32).* = 1359893119
+    @intToPtr(*i64, state + 40).* = 2600822924
+    @intToPtr(*i64, state + 48).* = 528734635
+    @intToPtr(*i64, state + 56).* = 1541459225
+
+    // Process complete 64-byte blocks
+    var offset: i64 = 0
+    while (offset + 64 <= msg_len) {
+        sha256Block(state, msg_ptr + offset)
+        offset = offset + 64
+    }
+
+    // Padding: remaining bytes + 0x80 + zeros + 8-byte big-endian length
+    var remaining = msg_len - offset
+    var pad_buf = @alloc(128)
+
+    // Copy remaining bytes
+    if (remaining > 0) {
+        @memcpy(pad_buf, msg_ptr + offset, remaining)
+    }
+
+    // Append 0x80
+    @intToPtr(*u8, pad_buf + remaining).* = @intCast(u8, 128)
+
+    // Zero fill
+    var fill_start = remaining + 1
+    var pad_len: i64 = 0
+    if (remaining < 56) {
+        pad_len = 64
+    } else {
+        pad_len = 128
+    }
+
+    var zi = fill_start
+    while (zi < pad_len - 8) {
+        @intToPtr(*u8, pad_buf + zi).* = @intCast(u8, 0)
+        zi = zi + 1
+    }
+
+    // Append message length in bits as big-endian 64-bit
+    var bit_len = msg_len * 8
+    @intToPtr(*u8, pad_buf + pad_len - 8).* = @intCast(u8, (bit_len >> 56) & 255)
+    @intToPtr(*u8, pad_buf + pad_len - 7).* = @intCast(u8, (bit_len >> 48) & 255)
+    @intToPtr(*u8, pad_buf + pad_len - 6).* = @intCast(u8, (bit_len >> 40) & 255)
+    @intToPtr(*u8, pad_buf + pad_len - 5).* = @intCast(u8, (bit_len >> 32) & 255)
+    @intToPtr(*u8, pad_buf + pad_len - 4).* = @intCast(u8, (bit_len >> 24) & 255)
+    @intToPtr(*u8, pad_buf + pad_len - 3).* = @intCast(u8, (bit_len >> 16) & 255)
+    @intToPtr(*u8, pad_buf + pad_len - 2).* = @intCast(u8, (bit_len >> 8) & 255)
+    @intToPtr(*u8, pad_buf + pad_len - 1).* = @intCast(u8, bit_len & 255)
+
+    // Process padded block(s)
+    sha256Block(state, pad_buf)
+    if (pad_len == 128) {
+        sha256Block(state, pad_buf + 64)
+    }
+
+    // Convert state to hex string
+    var result = sha256StateToHex(state)
+
+    @dealloc(pad_buf)
+    @dealloc(state)
+    return result
+}
+
+// Convert 8 x i64 state values to 64-char hex string.
+fn sha256StateToHex(state: i64) string {
+    var buf = @alloc(64)
+    var pos: i64 = 0
+    var si: i64 = 0
+    while (si < 8) {
+        var val = @intToPtr(*i64, state + si * 8).*
+        var bi: i64 = 0
+        while (bi < 4) {
+            var byte_val = (val >> (24 - bi * 8)) & 255
+            var hi = (byte_val >> 4) & 15
+            var lo = byte_val & 15
+            if (hi < 10) {
+                @intToPtr(*u8, buf + pos).* = @intCast(u8, hi + 48)
+            } else {
+                @intToPtr(*u8, buf + pos).* = @intCast(u8, hi - 10 + 97)
+            }
+            pos = pos + 1
+            if (lo < 10) {
+                @intToPtr(*u8, buf + pos).* = @intCast(u8, lo + 48)
+            } else {
+                @intToPtr(*u8, buf + pos).* = @intCast(u8, lo - 10 + 97)
+            }
+            pos = pos + 1
+            bi = bi + 1
+        }
+        si = si + 1
+    }
+    return @string(buf, 64)
+}
+
+// ============================================================================
+// HMAC-SHA256
+// ============================================================================
+
+// Compute HMAC-SHA256(key, message). Returns 64-char lowercase hex string.
+// Reference: RFC 2104
+fn hmacSha256(key: string, message: string) string {
+    var key_ptr = @ptrOf(key)
+    var key_len = @lenOf(key)
+
+    // If key > 64 bytes, hash it first
+    var actual_key_ptr: i64 = 0
+    var actual_key_len: i64 = 0
+    var hashed_key_buf: i64 = 0
+
+    if (key_len > 64) {
+        // Hash the key to get 32 bytes
+        var hashed = sha256(key)
+        // Convert hex string back to 32 bytes
+        hashed_key_buf = @alloc(32)
+        hexToBytes(hashed, hashed_key_buf)
+        actual_key_ptr = hashed_key_buf
+        actual_key_len = 32
+    } else {
+        actual_key_ptr = key_ptr
+        actual_key_len = key_len
+    }
+
+    // Create padded key (64 bytes, zero-filled)
+    var ipad = @alloc(64)
+    var opad = @alloc(64)
+
+    // Zero fill
+    var ki: i64 = 0
+    while (ki < 64) {
+        @intToPtr(*u8, ipad + ki).* = @intCast(u8, 0)
+        @intToPtr(*u8, opad + ki).* = @intCast(u8, 0)
+        ki = ki + 1
+    }
+
+    // Copy key
+    if (actual_key_len > 0) {
+        @memcpy(ipad, actual_key_ptr, actual_key_len)
+        @memcpy(opad, actual_key_ptr, actual_key_len)
+    }
+
+    // XOR with ipad (0x36) and opad (0x5c)
+    ki = 0
+    while (ki < 64) {
+        @intToPtr(*u8, ipad + ki).* = @intCast(u8, @intCast(i64, @intToPtr(*u8, ipad + ki).*) ^ 54)
+        @intToPtr(*u8, opad + ki).* = @intCast(u8, @intCast(i64, @intToPtr(*u8, opad + ki).*) ^ 92)
+        ki = ki + 1
+    }
+
+    // Inner hash: SHA256(ipad || message)
+    var inner_len = 64 + @lenOf(message)
+    var inner_buf = @alloc(inner_len)
+    @memcpy(inner_buf, ipad, 64)
+    if (@lenOf(message) > 0) {
+        @memcpy(inner_buf + 64, @ptrOf(message), @lenOf(message))
+    }
+    var inner_str = @string(inner_buf, inner_len)
+    var inner_hash = sha256(inner_str)
+
+    // Convert inner hash hex to 32 bytes
+    var inner_bytes = @alloc(32)
+    hexToBytes(inner_hash, inner_bytes)
+
+    // Outer hash: SHA256(opad || inner_hash_bytes)
+    var outer_len: i64 = 96
+    var outer_buf = @alloc(outer_len)
+    @memcpy(outer_buf, opad, 64)
+    @memcpy(outer_buf + 64, inner_bytes, 32)
+    var outer_str = @string(outer_buf, outer_len)
+    var result = sha256(outer_str)
+
+    // Cleanup
+    @dealloc(ipad)
+    @dealloc(opad)
+    @dealloc(inner_buf)
+    @dealloc(inner_bytes)
+    @dealloc(outer_buf)
+    if (hashed_key_buf != 0) {
+        @dealloc(hashed_key_buf)
+    }
+
+    return result
+}
+
+// ============================================================================
+// Hex Helpers
+// ============================================================================
+
+// Convert a hex character to its numeric value (0-15).
+fn hexVal(c: i64) i64 {
+    if (c >= 48 and c <= 57) { return c - 48 }
+    if (c >= 97 and c <= 102) { return c - 97 + 10 }
+    if (c >= 65 and c <= 70) { return c - 65 + 10 }
+    return 0
+}
+
+// Convert a hex string to bytes. Output buffer must be len/2 bytes.
+fn hexToBytes(hex_str: string, out: i64) void {
+    var hlen = @lenOf(hex_str)
+    var i: i64 = 0
+    while (i < hlen) {
+        var hi = hexVal(@intCast(i64, @intToPtr(*u8, @ptrOf(hex_str) + i).*))
+        var lo = hexVal(@intCast(i64, @intToPtr(*u8, @ptrOf(hex_str) + i + 1).*))
+        @intToPtr(*u8, out + i / 2).* = @intCast(u8, (hi << 4) | lo)
+        i = i + 2
+    }
+}

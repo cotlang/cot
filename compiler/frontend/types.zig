@@ -12,11 +12,12 @@ pub const BasicKind = enum(u8) {
     u8_type, u16_type, u32_type, u64_type,
     f32_type, f64_type,
     void_type,
+    noreturn_type,
     untyped_int, untyped_float, untyped_bool, untyped_null,
 
     pub fn name(self: BasicKind) []const u8 {
         return switch (self) {
-            .invalid => "invalid", .bool_type => "bool", .void_type => "void",
+            .invalid => "invalid", .bool_type => "bool", .void_type => "void", .noreturn_type => "noreturn",
             .i8_type => "i8", .i16_type => "i16", .i32_type => "i32", .i64_type => "i64",
             .u8_type => "u8", .u16_type => "u16", .u32_type => "u32", .u64_type => "u64",
             .f32_type => "f32", .f64_type => "f64",
@@ -140,7 +141,8 @@ pub const TypeRegistry = struct {
     pub const SSA_FLAGS: TypeIndex = 19;
     pub const SSA_TUPLE: TypeIndex = 20;
     pub const SSA_RESULTS: TypeIndex = 21;
-    pub const FIRST_USER_TYPE: TypeIndex = 22;
+    pub const NORETURN: TypeIndex = 22;
+    pub const FIRST_USER_TYPE: TypeIndex = 23;
     pub const INT: TypeIndex = I64;
     pub const FLOAT: TypeIndex = F64;
 
@@ -153,14 +155,14 @@ pub const TypeRegistry = struct {
             UNTYPED_INT => "untyped_int", UNTYPED_FLOAT => "untyped_float",
             UNTYPED_BOOL => "untyped_bool", UNTYPED_NULL => "untyped_null",
             STRING => "string", SSA_MEM => "ssa_mem", SSA_FLAGS => "ssa_flags",
-            SSA_TUPLE => "ssa_tuple", SSA_RESULTS => "ssa_results",
+            SSA_TUPLE => "ssa_tuple", SSA_RESULTS => "ssa_results", NORETURN => "noreturn",
             else => "composite",
         };
     }
 
     pub fn basicTypeSize(type_idx: TypeIndex) u8 {
         return switch (type_idx) {
-            VOID, SSA_MEM, SSA_FLAGS, SSA_TUPLE, SSA_RESULTS => 0,
+            VOID, SSA_MEM, SSA_FLAGS, SSA_TUPLE, SSA_RESULTS, NORETURN => 0,
             BOOL, UNTYPED_BOOL, I8, U8 => 1,
             I16, U16 => 2,
             I32, U32, F32 => 4,
@@ -185,9 +187,11 @@ pub const TypeRegistry = struct {
         try reg.types.append(allocator, .{ .slice = .{ .elem = U8 } }); // 17 = STRING
         // SSA placeholders (18-21)
         for (0..4) |_| try reg.types.append(allocator, .{ .basic = .void_type });
+        // 22 = NORETURN
+        try reg.types.append(allocator, .{ .basic = .noreturn_type });
 
         // Register type names
-        const names = .{ .{ "bool", BOOL }, .{ "i8", I8 }, .{ "i16", I16 }, .{ "i32", I32 }, .{ "i64", I64 }, .{ "int", INT }, .{ "u8", U8 }, .{ "u16", U16 }, .{ "u32", U32 }, .{ "u64", U64 }, .{ "f32", F32 }, .{ "f64", F64 }, .{ "float", F64 }, .{ "void", VOID }, .{ "string", STRING }, .{ "byte", U8 } };
+        const names = .{ .{ "bool", BOOL }, .{ "i8", I8 }, .{ "i16", I16 }, .{ "i32", I32 }, .{ "i64", I64 }, .{ "int", INT }, .{ "u8", U8 }, .{ "u16", U16 }, .{ "u32", U32 }, .{ "u64", U64 }, .{ "f32", F32 }, .{ "f64", F64 }, .{ "float", F64 }, .{ "void", VOID }, .{ "string", STRING }, .{ "byte", U8 }, .{ "noreturn", NORETURN } };
         inline for (names) |pair| try reg.name_map.put(pair[0], pair[1]);
 
         return reg;
@@ -408,6 +412,8 @@ pub const TypeRegistry = struct {
     pub fn isAssignable(self: *const TypeRegistry, from: TypeIndex, to: TypeIndex) bool {
         if (from == to) return true;
         if (from == invalid_type or to == invalid_type) return true;
+        // noreturn is the bottom type — coerces to anything (Zig pattern)
+        if (from == NORETURN) return true;
         const from_t = self.get(from);
         const to_t = self.get(to);
 

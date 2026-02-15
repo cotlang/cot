@@ -1,0 +1,19 @@
+id = "cot"
+name = "Cot"
+description = "Cot language support: syntax highlighting, LSP, and code navigation."
+version = "0.1.0"
+schema_version = 1
+authors = ["Cot Team"]
+repository = "https://github.com/cot-land/cot"
+languages = ["languages/cot"]
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[language_servers.cot-lsp]
+language = "Cot"
+
+[grammars.cot]
+repository = "file:///Users/johnc/cot-land/cot/editors/tree-sitter-cot"
+rev = "main"

@@ -1001,6 +1001,7 @@ pub const Lowerer = struct {
                 fb.restoreScope(scope_depth);
                 return false;
             },
+            .destructure_stmt => |ds| { try self.lowerDestructureStmt(ds); return false; },
             .break_stmt => |bs| { try self.lowerBreak(bs.label); return true; },
             .continue_stmt => |cs| { try self.lowerContinue(cs.label); return true; },
             .expr_stmt => |es| { _ = try self.lowerExprNode(es.expr); return false; },
@@ -1455,6 +1456,73 @@ pub const Lowerer = struct {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    fn lowerDestructureStmt(self: *Lowerer, ds: ast.DestructureStmt) !void {
+        const fb = self.current_func orelse return;
+
+        // Infer the tuple type from the RHS
+        const tuple_type_idx = self.inferExprType(ds.value);
+        const tuple_info = self.type_reg.get(tuple_type_idx);
+        if (tuple_info != .tuple) return;
+        const tup = tuple_info.tuple;
+
+        // Check if RHS is a tuple literal — can lower each element directly
+        const value_node_ast = self.tree.getNode(ds.value);
+        const value_expr = if (value_node_ast) |n| n.asExpr() else null;
+        const is_tuple_literal = if (value_expr) |e| e == .tuple_literal else false;
+
+        if (is_tuple_literal) {
+            // Direct: lower each tuple element to its own local
+            const tl = value_expr.?.tuple_literal;
+            for (ds.bindings, 0..) |b, i| {
+                const elem_type = tup.element_types[i];
+                const elem_size = self.type_reg.sizeOf(elem_type);
+                const local_idx = try fb.addLocalWithSize(b.name, elem_type, !ds.is_const, elem_size);
+                if (elem_type == TypeRegistry.STRING) {
+                    try self.lowerStringInit(local_idx, tl.elements[i], ds.span);
+                } else {
+                    const val = try self.lowerExprNode(tl.elements[i]);
+                    if (val != ir.null_node) _ = try fb.emitStoreLocal(local_idx, val, ds.span);
+                }
+            }
+        } else {
+            // General: lower RHS to a temp tuple local, then extract each element
+            const tuple_size = self.type_reg.sizeOf(tuple_type_idx);
+            const temp_idx = try fb.addLocalWithSize("__destruct_tmp", tuple_type_idx, true, tuple_size);
+
+            // Check if RHS is itself a tuple literal expression or a function call
+            // Lower the value and store into temp
+            const rhs_node_ast = self.tree.getNode(ds.value);
+            const rhs_expr = if (rhs_node_ast) |n| n.asExpr() else null;
+            const is_rhs_tuple_lit = if (rhs_expr) |e| e == .tuple_literal else false;
+            if (is_rhs_tuple_lit) {
+                try self.lowerTupleInit(temp_idx, ds.value, ds.span);
+            } else {
+                const rhs_val = try self.lowerExprNode(ds.value);
+                if (rhs_val == ir.null_node) return;
+                _ = try fb.emitStoreLocal(temp_idx, rhs_val, ds.span);
+            }
+
+            // Extract each element from the temp
+            for (ds.bindings, 0..) |b, i| {
+                const elem_type = tup.element_types[i];
+                const elem_size = self.type_reg.sizeOf(elem_type);
+                const local_idx = try fb.addLocalWithSize(b.name, elem_type, !ds.is_const, elem_size);
+                const offset: i64 = @intCast(self.type_reg.tupleElementOffset(tuple_type_idx, @intCast(i)));
+
+                if (elem_type == TypeRegistry.STRING) {
+                    // Compound decomposition: extract ptr and len from tuple field
+                    const ptr_val = try fb.emitFieldLocal(temp_idx, @intCast(i * 2), offset, TypeRegistry.I64, ds.span);
+                    const len_val = try fb.emitFieldLocal(temp_idx, @intCast(i * 2 + 1), offset + 8, TypeRegistry.I64, ds.span);
+                    _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, ds.span);
+                    _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, ds.span);
+                } else {
+                    const elem_val = try fb.emitFieldLocal(temp_idx, @intCast(i), offset, elem_type, ds.span);
+                    _ = try fb.emitStoreLocal(local_idx, elem_val, ds.span);
                 }
             }
         }
@@ -3549,6 +3617,9 @@ pub const Lowerer = struct {
                     for (bs.stmts) |s| try self.detectCaptures(s, parent_fb, captures);
                 },
                 .defer_stmt => |ds| try self.detectCaptures(ds.expr, parent_fb, captures),
+                .destructure_stmt => |ds| {
+                    try self.detectCaptures(ds.value, parent_fb, captures);
+                },
                 .break_stmt, .continue_stmt, .bad_stmt => {},
             },
             .decl => {},
@@ -4875,6 +4946,32 @@ pub const Lowerer = struct {
                 var args = [_]ir.NodeIndex{a1};
                 return try fb.emitCall("cot_set_nonblocking", &args, false, TypeRegistry.I64, bc.span);
             },
+            .fork => {
+                var args = [_]ir.NodeIndex{};
+                return try fb.emitCall("cot_fork", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .pipe => {
+                var args = [_]ir.NodeIndex{};
+                return try fb.emitCall("cot_pipe", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .waitpid => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                var args = [_]ir.NodeIndex{a1};
+                return try fb.emitCall("cot_waitpid", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .dup2 => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                var args = [_]ir.NodeIndex{ a1, a2 };
+                return try fb.emitCall("cot_dup2", &args, false, TypeRegistry.I64, bc.span);
+            },
+            .execve => {
+                const a1 = try self.lowerExprNode(bc.args[0]);
+                const a2 = try self.lowerExprNode(bc.args[1]);
+                const a3 = try self.lowerExprNode(bc.args[2]);
+                var args = [_]ir.NodeIndex{ a1, a2, a3 };
+                return try fb.emitCall("cot_execve", &args, false, TypeRegistry.I64, bc.span);
+            },
             .ptr_of => {
                 const str_val = try self.lowerExprNode(bc.args[0]);
                 const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
@@ -4936,6 +5033,33 @@ pub const Lowerer = struct {
             },
             .compile_error => {
                 return try fb.emitTrap(bc.span);
+            },
+            .embed_file => {
+                // Extract path from string literal argument
+                const arg_node = self.tree.getNode(bc.args[0]) orelse return ir.null_node;
+                const arg_expr = arg_node.asExpr() orelse return ir.null_node;
+                if (arg_expr != .literal or arg_expr.literal.kind != .string) return ir.null_node;
+                const raw_path = arg_expr.literal.value;
+                // Strip quotes
+                const rel_path = if (raw_path.len >= 2 and raw_path[0] == '"' and raw_path[raw_path.len - 1] == '"')
+                    raw_path[1 .. raw_path.len - 1]
+                else
+                    raw_path;
+
+                // Resolve relative to source file directory
+                const source_dir = if (self.tree.file) |f|
+                    std.fs.path.dirname(f.filename) orelse "."
+                else
+                    ".";
+                const full_path = try std.fs.path.join(self.allocator, &.{ source_dir, rel_path });
+
+                // Read file at compile time
+                const file_content = std.fs.cwd().readFileAlloc(self.allocator, full_path, 10 * 1024 * 1024) catch {
+                    self.err.errorWithCode(bc.span.start, .e300, "cannot read embedded file");
+                    return ir.null_node;
+                };
+                const str_idx = try fb.addStringLiteral(file_content);
+                return try fb.emitConstSlice(str_idx, bc.span);
             },
             .target_os => {
                 const str = try self.allocator.dupe(u8, self.target.os.name());

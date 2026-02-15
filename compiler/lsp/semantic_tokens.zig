@@ -392,6 +392,13 @@ const TokenCollector = struct {
                 for (b.stmts) |s| self.walkNode(s);
             },
             .defer_stmt => |d| self.walkNode(d.expr),
+            .destructure_stmt => |d| {
+                for (d.bindings) |b| {
+                    self.emitName(b.span, b.name, .variable, MOD_DECLARATION);
+                    self.walkNode(b.type_expr);
+                }
+                self.walkNode(d.value);
+            },
             .break_stmt, .continue_stmt, .bad_stmt => {},
         }
     }

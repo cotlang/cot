@@ -1044,22 +1044,23 @@ pub const Checker = struct {
             },
             .fd_write, .fd_read, .fd_seek, .fd_open, .net_socket, .net_bind, .net_connect,
             .kevent_add, .kevent_del, .kevent_wait, .epoll_add, .epoll_wait,
+            .execve,
             => {
                 _ = try self.checkExpr(bc.args[0]);
                 _ = try self.checkExpr(bc.args[1]);
                 _ = try self.checkExpr(bc.args[2]);
                 return TypeRegistry.I64;
             },
-            .fd_close, .net_accept, .net_set_reuse_addr, .set_nonblocking => {
+            .fd_close, .net_accept, .net_set_reuse_addr, .set_nonblocking, .waitpid => {
                 _ = try self.checkExpr(bc.args[0]);
                 return TypeRegistry.I64;
             },
-            .net_listen, .epoll_del => {
+            .net_listen, .epoll_del, .dup2 => {
                 _ = try self.checkExpr(bc.args[0]);
                 _ = try self.checkExpr(bc.args[1]);
                 return TypeRegistry.I64;
             },
-            .kqueue_create, .epoll_create => {
+            .kqueue_create, .epoll_create, .fork, .pipe => {
                 return TypeRegistry.I64;
             },
             .ptr_of => {
@@ -1072,10 +1073,10 @@ pub const Checker = struct {
                 if (arg_type != TypeRegistry.STRING) { self.err.errorWithCode(bc.span.start, .e300, "@lenOf requires string argument"); return invalid_type; }
                 return TypeRegistry.I64;
             },
-            .trap => return TypeRegistry.VOID,
+            .trap => return TypeRegistry.NORETURN,
             .exit => {
                 _ = try self.checkExpr(bc.args[0]);
-                return TypeRegistry.VOID;
+                return TypeRegistry.NORETURN;
             },
             .time => return TypeRegistry.I64,
             .random => {
@@ -1097,7 +1098,19 @@ pub const Checker = struct {
             .compile_error => {
                 const msg = self.evalConstString(bc.args[0]) orelse "compile error";
                 self.err.errorWithCode(bc.span.start, .e300, msg);
-                return TypeRegistry.VOID;
+                return TypeRegistry.NORETURN;
+            },
+            .embed_file => {
+                // Validate argument is a string literal
+                const arg_node = self.tree.getNode(bc.args[0]);
+                if (arg_node) |n| {
+                    if (n.asExpr()) |e| {
+                        if (e != .literal or e.literal.kind != .string) {
+                            self.err.errorWithCode(bc.span.start, .e300, "@embedFile requires a string literal path");
+                        }
+                    }
+                }
+                return TypeRegistry.STRING;
             },
             .abs, .ceil, .floor, .trunc, .round, .sqrt => {
                 const arg_type = try self.checkExpr(bc.args[0]);
@@ -1614,11 +1627,16 @@ pub const Checker = struct {
             .break_stmt => |bs| if (!self.in_loop) self.err.errorWithCode(bs.span.start, .e300, "break outside of loop"),
             .continue_stmt => |cs| if (!self.in_loop) self.err.errorWithCode(cs.span.start, .e300, "continue outside of loop"),
             .defer_stmt => |ds| _ = try self.checkExpr(ds.expr),
+            .destructure_stmt => |ds| try self.checkDestructureStmt(ds, idx),
             .bad_stmt => {},
         }
     }
 
     fn checkReturn(self: *Checker, rs: ast.ReturnStmt) CheckError!void {
+        if (self.current_return_type == TypeRegistry.NORETURN) {
+            self.err.errorWithCode(rs.span.start, .e300, "noreturn function cannot return");
+            return;
+        }
         if (rs.value != null_node) {
             const val_type = try self.checkExpr(rs.value);
             if (self.current_return_type == TypeRegistry.VOID) self.err.errorWithCode(rs.span.start, .e300, "void function should not return a value")
@@ -1661,6 +1679,48 @@ pub const Checker = struct {
             }
         }
         try self.scope.define(Symbol.init(vs.name, if (vs.is_const) .constant else .variable, var_type, idx, !vs.is_const));
+    }
+
+    fn checkDestructureStmt(self: *Checker, ds: ast.DestructureStmt, idx: NodeIndex) CheckError!void {
+        // Check for redefinitions
+        for (ds.bindings) |b| {
+            if (self.scope.isDefined(b.name)) {
+                self.err.errorWithCode(b.span.start, .e302, "redefined identifier");
+                return;
+            }
+        }
+
+        // Check the RHS value type
+        const val_type = try self.checkExpr(ds.value);
+        const val_info = self.types.get(val_type);
+
+        // RHS must be a tuple type
+        if (val_info != .tuple) {
+            self.err.errorWithCode(ds.span.start, .e300, "destructuring requires a tuple value");
+            return;
+        }
+        const tup = val_info.tuple;
+
+        // Count must match
+        if (ds.bindings.len != tup.element_types.len) {
+            self.err.errorWithCode(ds.span.start, .e300, "destructuring count mismatch");
+            return;
+        }
+
+        // Define each binding with its element type
+        for (ds.bindings, 0..) |b, i| {
+            var elem_type = tup.element_types[i];
+            if (b.type_expr != null_node) {
+                const annotated = try self.resolveTypeExpr(b.type_expr);
+                if (!self.types.isAssignable(elem_type, annotated)) {
+                    self.err.errorWithCode(b.span.start, .e300, "type mismatch");
+                }
+                elem_type = annotated;
+            } else {
+                elem_type = self.materializeType(elem_type);
+            }
+            try self.scope.define(Symbol.init(b.name, if (ds.is_const) .constant else .variable, elem_type, idx, !ds.is_const));
+        }
     }
 
     fn checkAssign(self: *Checker, as_stmt: ast.AssignStmt) CheckError!void {

@@ -2119,3 +2119,97 @@ test "labeled break with mixed for and while" {
     // i=0: 4, i=1: 4, i=2: 1 (j=0 then break) = 9
     @assert_eq(result, 9)
 }
+
+// ============================================================================
+// Wave 5: Language Features (Zig Ports)
+// ============================================================================
+
+// -- noreturn type --
+
+fn exit_wrapper(code: i64) noreturn {
+    @exit(code)
+}
+
+test "noreturn in if branch" {
+    var x = 10
+    if (x > 100) { @exit(1) }
+    @assert_eq(x, 10)
+}
+
+test "noreturn with exit wrapper" {
+    var x = 42
+    if (x != 42) { exit_wrapper(1) }
+    @assert_eq(x, 42)
+}
+
+// -- inferred error sets (!T) --
+
+fn mayFail2(x: i64) !i64 {
+    if (x < 0) { return error.Negative }
+    return x * 2
+}
+
+test "inferred error set catch" {
+    var result = mayFail2(-1) catch 99
+    @assert_eq(result, 99)
+}
+
+test "inferred error set success" {
+    var result = mayFail2(5) catch 0
+    @assert_eq(result, 10)
+}
+
+fn wrapperInferred() !i64 {
+    var x = try mayFail2(5)
+    return x + 1
+}
+
+test "inferred try propagation" {
+    var result = wrapperInferred() catch 0
+    @assert_eq(result, 11)
+}
+
+// -- destructuring --
+
+fn getPair() (i64, i64) {
+    return (10, 20)
+}
+
+fn getTriple() (i64, i64, i64) {
+    return (1, 2, 3)
+}
+
+test "destructure tuple literal" {
+    const a, b = (10, 20)
+    @assert_eq(a, 10)
+    @assert_eq(b, 20)
+}
+
+test "destructure from function" {
+    const x, y = getPair()
+    @assert_eq(x + y, 30)
+}
+
+test "destructure var" {
+    var x, y = (1, 2)
+    x = x + 10
+    @assert_eq(x, 11)
+    @assert_eq(y, 2)
+}
+
+test "destructure three elements" {
+    const a, b, c = getTriple()
+    @assert_eq(a + b + c, 6)
+}
+
+// -- @embedFile --
+
+test "embed file basic" {
+    const data = @embedFile("embed_data.txt")
+    @assert(@lenOf(data) > 0)
+}
+
+test "embed file content" {
+    const data = @embedFile("embed_data.txt")
+    @assert_eq(@lenOf(data), 22)
+}

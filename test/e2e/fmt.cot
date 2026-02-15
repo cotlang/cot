@@ -1,0 +1,188 @@
+import "std/fmt"
+import "std/string"
+
+// ============================================================================
+// ANSI Colors
+// ============================================================================
+
+test "red wraps with ANSI codes" {
+    var s = red("hello")
+    @assert_eq(s, "\x1b[31mhello\x1b[0m")
+}
+
+test "green wraps with ANSI codes" {
+    var s = green("hello")
+    @assert_eq(s, "\x1b[32mhello\x1b[0m")
+}
+
+test "yellow wraps with ANSI codes" {
+    var s = yellow("hello")
+    @assert_eq(s, "\x1b[33mhello\x1b[0m")
+}
+
+test "blue wraps with ANSI codes" {
+    var s = blue("hello")
+    @assert_eq(s, "\x1b[34mhello\x1b[0m")
+}
+
+test "magenta wraps with ANSI codes" {
+    var s = magenta("hello")
+    @assert_eq(s, "\x1b[35mhello\x1b[0m")
+}
+
+test "cyan wraps with ANSI codes" {
+    var s = cyan("hello")
+    @assert_eq(s, "\x1b[36mhello\x1b[0m")
+}
+
+test "gray wraps with ANSI codes" {
+    var s = gray("hello")
+    @assert_eq(s, "\x1b[90mhello\x1b[0m")
+}
+
+// ============================================================================
+// Text Styles
+// ============================================================================
+
+test "bold wraps with ANSI codes" {
+    var s = bold("hello")
+    @assert_eq(s, "\x1b[1mhello\x1b[0m")
+}
+
+test "dim wraps with ANSI codes" {
+    var s = dim("hello")
+    @assert_eq(s, "\x1b[2mhello\x1b[0m")
+}
+
+test "italic wraps with ANSI codes" {
+    var s = italic("hello")
+    @assert_eq(s, "\x1b[3mhello\x1b[0m")
+}
+
+test "underline wraps with ANSI codes" {
+    var s = underline("hello")
+    @assert_eq(s, "\x1b[4mhello\x1b[0m")
+}
+
+test "strikethrough wraps with ANSI codes" {
+    var s = strikethrough("hello")
+    @assert_eq(s, "\x1b[9mhello\x1b[0m")
+}
+
+// ============================================================================
+// stripAnsi
+// ============================================================================
+
+test "stripAnsi removes color codes" {
+    var s = red("hello")
+    @assert_eq(stripAnsi(s), "hello")
+}
+
+test "stripAnsi no-op on plain string" {
+    @assert_eq(stripAnsi("plain"), "plain")
+}
+
+test "stripAnsi multiple codes" {
+    var s = bold(red("error"))
+    @assert_eq(stripAnsi(s), "error")
+}
+
+// ============================================================================
+// Byte Formatting
+// ============================================================================
+
+test "formatBytes zero" {
+    @assert_eq(formatBytes(0), "0 B")
+}
+
+test "formatBytes bytes" {
+    @assert_eq(formatBytes(100), "100 B")
+}
+
+test "formatBytes KB" {
+    @assert_eq(formatBytes(1024), "1.0 KB")
+}
+
+test "formatBytes MB" {
+    @assert_eq(formatBytes(1048576), "1.0 MB")
+}
+
+test "formatBytes GB" {
+    @assert_eq(formatBytes(1073741824), "1.0 GB")
+}
+
+test "formatBytes fractional KB" {
+    @assert_eq(formatBytes(1536), "1.5 KB")
+}
+
+// ============================================================================
+// Duration Formatting
+// ============================================================================
+
+test "formatDuration nanoseconds" {
+    @assert_eq(formatDuration(500), "500ns")
+}
+
+test "formatDuration microseconds" {
+    @assert_eq(formatDuration(1500), "1.5us")
+}
+
+test "formatDuration milliseconds" {
+    @assert_eq(formatDuration(1500000), "1.5ms")
+}
+
+test "formatDuration seconds" {
+    @assert_eq(formatDuration(1500000000), "1.5s")
+}
+
+test "formatDuration exact ms" {
+    @assert_eq(formatDuration(2000000), "2ms")
+}
+
+// ============================================================================
+// Padding
+// ============================================================================
+
+test "padRight adds spaces" {
+    @assert_eq(padRight("hi", 5), "hi   ")
+}
+
+test "padRight no-op when long enough" {
+    @assert_eq(padRight("hello", 3), "hello")
+}
+
+test "padLeft adds spaces" {
+    @assert_eq(padLeft("42", 5), "   42")
+}
+
+test "padLeft no-op when long enough" {
+    @assert_eq(padLeft("hello", 3), "hello")
+}
+
+test "center pads both sides" {
+    @assert_eq(center("hi", 6), "  hi  ")
+}
+
+// ============================================================================
+// Number Formatting
+// ============================================================================
+
+test "zeroPad adds leading zeros" {
+    @assert_eq(zeroPad(5, 3), "005")
+}
+
+test "zeroPad no-op when wide enough" {
+    @assert_eq(zeroPad(42, 2), "42")
+}
+
+test "hex decimal to hex" {
+    @assert_eq(hex(255), "ff")
+}
+
+test "hex zero" {
+    @assert_eq(hex(0), "0")
+}
+
+test "hex large number" {
+    @assert_eq(hex(65535), "ffff")
+}

@@ -1,0 +1,168 @@
+// testing — Enhanced test assertion utilities.
+//
+// Extends the built-in @assert/@assert_eq with richer assertions
+// for string containment, comparison, and boolean checks.
+//
+// References:
+//   Deno: @std/testing (assertStringIncludes, assertMatch)
+//   Zig: std.testing (expectEqual, expectError)
+
+import "std/string"
+
+// Assert that a string contains the given substring.
+// Prints both strings on failure.
+fn assertContains(haystack: string, needle: string) void {
+    if (not contains(haystack, needle)) {
+        eprint("assertContains failed: '")
+        eprint(haystack)
+        eprint("' does not contain '")
+        eprint(needle)
+        eprintln("'")
+        @trap()
+    }
+}
+
+// Assert that a string starts with the given prefix.
+fn assertStartsWith(s: string, prefix: string) void {
+    if (not startsWith(s, prefix)) {
+        eprint("assertStartsWith failed: '")
+        eprint(s)
+        eprint("' does not start with '")
+        eprint(prefix)
+        eprintln("'")
+        @trap()
+    }
+}
+
+// Assert that a string ends with the given suffix.
+fn assertEndsWith(s: string, suffix: string) void {
+    if (not endsWith(s, suffix)) {
+        eprint("assertEndsWith failed: '")
+        eprint(s)
+        eprint("' does not end with '")
+        eprint(suffix)
+        eprintln("'")
+        @trap()
+    }
+}
+
+// Assert that two strings are equal (same as @assert_eq for strings,
+// but with a custom label for context).
+fn assertStrEq(actual: string, expected: string, label: string) void {
+    if (actual != expected) {
+        eprint("assertStrEq failed [")
+        eprint(label)
+        eprint("]: expected '")
+        eprint(expected)
+        eprint("', got '")
+        eprint(actual)
+        eprintln("'")
+        @trap()
+    }
+}
+
+// Assert that a value is greater than another.
+fn assertGt(actual: i64, threshold: i64) void {
+    if (not (actual > threshold)) {
+        eprint("assertGt failed: ")
+        eprint(intToString(actual))
+        eprint(" is not greater than ")
+        eprintln(intToString(threshold))
+        @trap()
+    }
+}
+
+// Assert that a value is greater than or equal to another.
+fn assertGte(actual: i64, threshold: i64) void {
+    if (not (actual >= threshold)) {
+        eprint("assertGte failed: ")
+        eprint(intToString(actual))
+        eprint(" is not >= ")
+        eprintln(intToString(threshold))
+        @trap()
+    }
+}
+
+// Assert that a value is less than another.
+fn assertLt(actual: i64, threshold: i64) void {
+    if (not (actual < threshold)) {
+        eprint("assertLt failed: ")
+        eprint(intToString(actual))
+        eprint(" is not less than ")
+        eprintln(intToString(threshold))
+        @trap()
+    }
+}
+
+// Assert that a value is less than or equal to another.
+fn assertLte(actual: i64, threshold: i64) void {
+    if (not (actual <= threshold)) {
+        eprint("assertLte failed: ")
+        eprint(intToString(actual))
+        eprint(" is not <= ")
+        eprintln(intToString(threshold))
+        @trap()
+    }
+}
+
+// Assert that a value is within a range [min, max] inclusive.
+fn assertInRange(actual: i64, min: i64, max: i64) void {
+    if (actual < min or actual > max) {
+        eprint("assertInRange failed: ")
+        eprint(intToString(actual))
+        eprint(" is not in [")
+        eprint(intToString(min))
+        eprint(", ")
+        eprint(intToString(max))
+        eprintln("]")
+        @trap()
+    }
+}
+
+// Assert that a boolean condition is true, with a custom message.
+fn assertTrue(cond: bool, msg: string) void {
+    if (not cond) {
+        eprint("assertTrue failed: ")
+        eprintln(msg)
+        @trap()
+    }
+}
+
+// Assert that a boolean condition is false, with a custom message.
+fn assertFalse(cond: bool, msg: string) void {
+    if (cond) {
+        eprint("assertFalse failed: ")
+        eprintln(msg)
+        @trap()
+    }
+}
+
+// Assert that a string is empty.
+fn assertEmpty(s: string) void {
+    if (@lenOf(s) != 0) {
+        eprint("assertEmpty failed: got '")
+        eprint(s)
+        eprintln("'")
+        @trap()
+    }
+}
+
+// Assert that a string is not empty.
+fn assertNotEmpty(s: string) void {
+    if (@lenOf(s) == 0) {
+        eprintln("assertNotEmpty failed: string is empty")
+        @trap()
+    }
+}
+
+// Assert that a string has the expected length.
+fn assertLen(s: string, expected: i64) void {
+    var actual = @lenOf(s)
+    if (actual != expected) {
+        eprint("assertLen failed: expected length ")
+        eprint(intToString(expected))
+        eprint(", got ")
+        eprintln(intToString(actual))
+        @trap()
+    }
+}

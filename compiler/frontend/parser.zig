@@ -1237,6 +1237,7 @@ pub const Parser = struct {
             // 0 args
             .trap, .time, .args_count, .environ_count, .target_os, .target_arch, .target,
             .kqueue_create, .epoll_create,
+            .fork, .pipe,
             => {
                 if (!self.expect(.rparen)) return null;
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
@@ -1262,6 +1263,8 @@ pub const Parser = struct {
             .abs, .ceil, .floor, .trunc, .round, .sqrt,
             .net_accept, .net_set_reuse_addr,
             .set_nonblocking,
+            .waitpid,
+            .embed_file,
             => {
                 const arg = try self.parseExpr() orelse return null;
                 if (!self.expect(.rparen)) return null;
@@ -1270,6 +1273,7 @@ pub const Parser = struct {
             // 2 value args
             .string, .assert_eq, .realloc, .random, .fmin, .fmax, .net_listen,
             .epoll_del,
+            .dup2,
             => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
@@ -1282,6 +1286,7 @@ pub const Parser = struct {
             .net_socket, .net_bind, .net_connect,
             .kevent_add, .kevent_del, .kevent_wait,
             .epoll_add, .epoll_wait,
+            .execve,
             => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
@@ -1519,13 +1524,42 @@ pub const Parser = struct {
         self.advance();
         if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected variable name"); return null; }
         const name = self.tok.text;
+        const name_start = self.pos();
         self.advance();
         var type_expr: NodeIndex = null_node;
         if (self.match(.colon)) type_expr = try self.parseType() orelse null_node;
+
+        // Destructuring: const a, b = expr  OR  const a: i64, b: i64 = expr
+        if (self.check(.comma)) {
+            return try self.parseDestructureStmt(name, type_expr, name_start, start, is_const);
+        }
+
         var val: NodeIndex = null_node;
         if (self.match(.assign)) val = try self.parseExpr() orelse null_node;
         _ = self.match(.semicolon);
         return try self.tree.addStmt(.{ .var_stmt = .{ .name = name, .type_expr = type_expr, .value = val, .is_const = is_const, .span = Span.init(start, self.pos()) } });
+    }
+
+    fn parseDestructureStmt(self: *Parser, first_name: []const u8, first_type: NodeIndex, first_start: Pos, start: Pos, is_const: bool) ParseError!?NodeIndex {
+        var bindings = std.ArrayListUnmanaged(ast.DestructureBinding){};
+        defer bindings.deinit(self.allocator);
+        try bindings.append(self.allocator, .{ .name = first_name, .type_expr = first_type, .span = Span.init(first_start, self.pos()) });
+
+        while (self.match(.comma)) {
+            if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected variable name"); return null; }
+            const bname = self.tok.text;
+            const bstart = self.pos();
+            self.advance();
+            var btype: NodeIndex = null_node;
+            if (self.match(.colon)) btype = try self.parseType() orelse null_node;
+            try bindings.append(self.allocator, .{ .name = bname, .type_expr = btype, .span = Span.init(bstart, self.pos()) });
+        }
+
+        if (!self.expect(.assign)) return null;
+        const val = try self.parseExpr() orelse return null;
+        _ = self.match(.semicolon);
+        const owned = try self.allocator.dupe(ast.DestructureBinding, bindings.items);
+        return try self.tree.addStmt(.{ .destructure_stmt = .{ .bindings = owned, .value = val, .is_const = is_const, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseIfStmt(self: *Parser) ParseError!?NodeIndex {

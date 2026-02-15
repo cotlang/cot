@@ -1,0 +1,26 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "cot",
+      "camelcase": "Cot",
+      "scope": "source.cot",
+      "file-types": ["cot"],
+      "highlights": "queries/highlights.scm",
+      "injection-regex": "^cot$"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Cot grammar for tree-sitter",
+    "authors": [
+      {
+        "name": "Cot Team"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/cot-land/tree-sitter-cot"
+    }
+  }
+}

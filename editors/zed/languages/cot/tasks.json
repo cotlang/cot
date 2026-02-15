@@ -1,0 +1,19 @@
+[
+  {
+    "label": "cot run",
+    "command": "cot",
+    "args": ["run", "$ZED_FILE"],
+    "tags": ["cot-run"]
+  },
+  {
+    "label": "cot test",
+    "command": "cot",
+    "args": ["test", "$ZED_FILE"],
+    "tags": ["cot-test"]
+  },
+  {
+    "label": "cot build",
+    "command": "cot",
+    "args": ["build", "$ZED_FILE"]
+  }
+]
