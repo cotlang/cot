@@ -37,6 +37,7 @@ pub const Token = enum(u8) {
     kw_comptime,
     kw_async, kw_await,
     kw_inline,
+    kw_unreachable,
     kw_and, kw_or, kw_not,
     kw_int, kw_float, kw_bool, kw_string, kw_byte, kw_void, kw_noreturn,
     kw_i8, kw_i16, kw_i32, kw_i64, kw_u8, kw_u16, kw_u32, kw_u64, kw_f32, kw_f64,
@@ -193,6 +194,7 @@ const token_strings = blk: {
     s[@intFromEnum(Token.kw_async)] = "async";
     s[@intFromEnum(Token.kw_await)] = "await";
     s[@intFromEnum(Token.kw_inline)] = "inline";
+    s[@intFromEnum(Token.kw_unreachable)] = "unreachable";
     s[@intFromEnum(Token.kw_and)] = "and";
     s[@intFromEnum(Token.kw_or)] = "or";
     s[@intFromEnum(Token.kw_not)] = "not";
@@ -228,6 +230,7 @@ pub const keywords = std.StaticStringMap(Token).initComptime(.{
     .{ "undefined", .kw_undefined }, .{ "comptime", .kw_comptime },
     .{ "async", .kw_async }, .{ "await", .kw_await },
     .{ "inline", .kw_inline },
+    .{ "unreachable", .kw_unreachable },
     .{ "and", .kw_and }, .{ "or", .kw_or }, .{ "not", .kw_not },
     .{ "int", .kw_int }, .{ "float", .kw_float }, .{ "bool", .kw_bool }, .{ "string", .kw_string },
     .{ "byte", .kw_byte }, .{ "void", .kw_void }, .{ "noreturn", .kw_noreturn },

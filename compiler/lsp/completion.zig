@@ -43,44 +43,112 @@ pub const CompletionItem = struct {
 
 /// Builtin names for @ completions (sorted for display).
 const builtin_names = [_][]const u8{
-    "abs",           "alignOf",       "alloc",         "arg_len",
-    "arg_ptr",       "args_count",    "assert",        "assert_eq",
-    "ceil",          "compileError",  "dealloc",       "environ_count",
-    "environ_len",   "environ_ptr",   "exit",          "fmax",
-    "fmin",          "fd_close",      "fd_open",       "fd_read",
-    "fd_seek",       "fd_write",      "floor",         "intCast",
-    "intToPtr",      "lenOf",         "memcpy",        "ptrCast",
-    "ptrOf",         "ptrToInt",      "random",        "realloc",
-    "round",         "sizeOf",        "sqrt",          "string",
-    "target",        "target_arch",   "target_os",     "time",
-    "trap",          "trunc",
+    "abs",             "alignOf",         "alloc",           "arg_len",
+    "arg_ptr",         "args_count",      "assert",          "assert_eq",
+    "ceil",            "compileError",    "dealloc",         "dup2",
+    "embedFile",       "environ_count",   "environ_len",     "environ_ptr",
+    "epoll_add",       "epoll_create",    "epoll_del",       "epoll_wait",
+    "execve",          "exit",            "fd_close",        "fd_open",
+    "fd_read",         "fd_seek",         "fd_write",        "field",
+    "fmax",            "fmin",            "floor",           "fork",
+    "hasField",        "intCast",         "intToPtr",        "kevent_add",
+    "kevent_del",      "kevent_wait",     "kqueue_create",   "lenOf",
+    "memcpy",          "net_accept",      "net_bind",        "net_connect",
+    "net_listen",      "net_set_reuse_addr", "net_socket",   "pipe",
+    "ptrCast",         "ptrOf",           "ptrToInt",        "random",
+    "realloc",         "round",           "set_nonblocking", "sizeOf",
+    "sqrt",            "string",          "target",          "target_arch",
+    "target_os",       "time",            "trap",            "trunc",
+    "TypeOf",          "waitpid",
 };
 
 /// Cot keywords for statement-position completions.
 const keyword_names = [_][]const u8{
-    "break",    "comptime",  "const",    "continue", "defer",
+    "async",    "await",     "bench",    "break",    "byte",
+    "catch",    "comptime",  "const",    "continue", "defer",
     "else",     "enum",      "errdefer", "error",    "extern",
     "false",    "fn",        "for",      "if",       "impl",
-    "import",   "in",        "let",      "new",      "not",
-    "null",     "or",        "and",      "return",   "struct",
-    "switch",   "test",      "trait",    "true",     "try",
-    "type",     "undefined", "union",    "var",      "void",
-    "where",    "while",
+    "import",   "in",        "inline",   "let",      "new",
+    "noreturn", "not",       "null",     "or",       "and",
+    "return",   "struct",    "switch",   "test",     "trait",
+    "true",     "try",       "type",     "undefined","union",
+    "unreachable", "var",    "void",     "where",    "while",
 };
 
 /// Code snippet templates for common patterns.
 const snippets = [_]struct { label: []const u8, detail: []const u8, insert_text: []const u8 }{
     .{ .label = "fn", .detail = "function declaration", .insert_text = "fn ${1:name}(${2:}) ${3:void} {\n\t$0\n}" },
+    .{ .label = "async fn", .detail = "async function", .insert_text = "async fn ${1:name}(${2:}) ${3:i64} {\n\t$0\n}" },
     .{ .label = "test", .detail = "test block", .insert_text = "test \"${1:name}\" {\n\t$0\n}" },
+    .{ .label = "bench", .detail = "benchmark block", .insert_text = "bench \"${1:name}\" {\n\t$0\n}" },
     .{ .label = "if", .detail = "if statement", .insert_text = "if (${1:condition}) {\n\t$0\n}" },
     .{ .label = "if else", .detail = "if-else statement", .insert_text = "if (${1:condition}) {\n\t$2\n} else {\n\t$0\n}" },
     .{ .label = "while", .detail = "while loop", .insert_text = "while (${1:condition}) {\n\t$0\n}" },
     .{ .label = "for", .detail = "for loop", .insert_text = "for (${1:items}) |${2:item}| {\n\t$0\n}" },
+    .{ .label = "inline for", .detail = "inline for loop", .insert_text = "inline for ${1:i} in ${2:0}..${3:N} {\n\t$0\n}" },
     .{ .label = "struct", .detail = "struct declaration", .insert_text = "struct ${1:Name} {\n\t${2:field}: ${3:i64}\n}" },
     .{ .label = "impl", .detail = "impl block", .insert_text = "impl ${1:Type} {\n\tfn ${2:method}(self: *${1:Type}) ${3:void} {\n\t\t$0\n\t}\n}" },
     .{ .label = "switch", .detail = "switch expression", .insert_text = "switch (${1:value}) {\n\t${2:pattern} => $0,\n}" },
     .{ .label = "import", .detail = "import statement", .insert_text = "import \"${1:module}\"" },
+    .{ .label = "defer", .detail = "defer statement", .insert_text = "defer ${0}" },
+    .{ .label = "errdefer", .detail = "errdefer statement", .insert_text = "errdefer ${0}" },
 };
+
+/// Categorized detail string for a builtin name.
+fn builtinDetail(name: []const u8) []const u8 {
+    // File I/O
+    if (name.len >= 3 and name[0] == 'f' and name[1] == 'd' and name[2] == '_') return "file I/O";
+    // Networking
+    if (name.len >= 4 and name[0] == 'n' and name[1] == 'e' and name[2] == 't' and name[3] == '_') return "networking";
+    // Event loop — kqueue/kevent/epoll/set_nonblocking
+    if (name.len >= 5 and name[0] == 'k' and (name[1] == 'q' or name[1] == 'e')) return "event loop";
+    if (name.len >= 5 and name[0] == 'e' and name[1] == 'p' and name[2] == 'o') return "event loop";
+    if (std.mem.eql(u8, name, "set_nonblocking")) return "event loop";
+    // Process
+    if (std.mem.eql(u8, name, "fork")) return "process";
+    if (std.mem.eql(u8, name, "execve")) return "process";
+    if (std.mem.eql(u8, name, "waitpid")) return "process";
+    if (std.mem.eql(u8, name, "pipe")) return "process";
+    if (std.mem.eql(u8, name, "dup2")) return "process";
+    if (std.mem.eql(u8, name, "exit")) return "process";
+    // Memory
+    if (std.mem.eql(u8, name, "alloc")) return "memory";
+    if (std.mem.eql(u8, name, "dealloc")) return "memory";
+    if (std.mem.eql(u8, name, "realloc")) return "memory";
+    if (std.mem.eql(u8, name, "memcpy")) return "memory";
+    // Reflection
+    if (std.mem.eql(u8, name, "TypeOf")) return "reflection";
+    if (std.mem.eql(u8, name, "hasField")) return "reflection";
+    if (std.mem.eql(u8, name, "field")) return "reflection";
+    // Comptime
+    if (std.mem.eql(u8, name, "embedFile")) return "comptime";
+    if (std.mem.eql(u8, name, "compileError")) return "comptime";
+    if (name.len >= 6 and name[0] == 't' and name[1] == 'a' and name[2] == 'r' and name[3] == 'g' and name[4] == 'e' and name[5] == 't') return "comptime";
+    // Testing
+    if (std.mem.eql(u8, name, "assert")) return "testing";
+    if (std.mem.eql(u8, name, "assert_eq")) return "testing";
+    // Math
+    if (std.mem.eql(u8, name, "abs")) return "math";
+    if (std.mem.eql(u8, name, "ceil")) return "math";
+    if (std.mem.eql(u8, name, "floor")) return "math";
+    if (std.mem.eql(u8, name, "trunc")) return "math";
+    if (std.mem.eql(u8, name, "round")) return "math";
+    if (std.mem.eql(u8, name, "sqrt")) return "math";
+    if (std.mem.eql(u8, name, "fmin")) return "math";
+    if (std.mem.eql(u8, name, "fmax")) return "math";
+    // Type intrinsics
+    if (std.mem.eql(u8, name, "sizeOf")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "alignOf")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "intCast")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "ptrCast")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "intToPtr")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "ptrToInt")) return "type intrinsic";
+    // String
+    if (std.mem.eql(u8, name, "string")) return "string";
+    if (std.mem.eql(u8, name, "ptrOf")) return "string";
+    if (std.mem.eql(u8, name, "lenOf")) return "string";
+    return "builtin";
+}
 
 /// Get completion items for the given byte offset.
 pub fn getCompletions(allocator: std.mem.Allocator, result: *AnalysisResult, byte_offset: u32) ![]CompletionItem {
@@ -95,12 +163,12 @@ pub fn getCompletions(allocator: std.mem.Allocator, result: *AnalysisResult, byt
     const prev_char = content[byte_offset - 1];
 
     if (prev_char == '@') {
-        // @ trigger: show builtins
+        // @ trigger: show builtins with categorized details
         for (&builtin_names) |name| {
             try items.append(allocator, .{
                 .label = name,
                 .kind = CompletionItemKind.function,
-                .detail = "builtin",
+                .detail = builtinDetail(name),
             });
         }
         return items.toOwnedSlice(allocator);

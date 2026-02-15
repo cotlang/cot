@@ -75,7 +75,7 @@ pub const TupleType = struct { element_types: []const TypeIndex };
 pub const FutureType = struct { result_type: TypeIndex };
 
 // Aggregate types
-pub const StructField = struct { name: []const u8, type_idx: TypeIndex, offset: u32 };
+pub const StructField = struct { name: []const u8, type_idx: TypeIndex, offset: u32, default_value: @import("ast.zig").NodeIndex = @import("ast.zig").null_node };
 pub const StructType = struct { name: []const u8, fields: []const StructField, size: u32, alignment: u8 };
 pub const EnumVariant = struct { name: []const u8, value: i64 };
 pub const EnumType = struct { name: []const u8, variants: []const EnumVariant, backing_type: TypeIndex };

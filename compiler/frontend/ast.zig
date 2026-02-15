@@ -114,7 +114,7 @@ pub const Expr = union(enum) {
 
 pub const Ident = struct { name: []const u8, span: Span };
 pub const Literal = struct { kind: LiteralKind, value: []const u8, span: Span };
-pub const LiteralKind = enum { int, float, string, char, true_lit, false_lit, null_lit, undefined_lit };
+pub const LiteralKind = enum { int, float, string, char, true_lit, false_lit, null_lit, undefined_lit, unreachable_lit };
 pub const Binary = struct { op: Token, left: NodeIndex, right: NodeIndex, span: Span };
 pub const Unary = struct { op: Token, operand: NodeIndex, span: Span };
 pub const Call = struct { callee: NodeIndex, args: []const NodeIndex, span: Span };
@@ -442,7 +442,7 @@ pub const DestructureBinding = struct { name: []const u8, type_expr: NodeIndex, 
 pub const DestructureStmt = struct { bindings: []const DestructureBinding, value: NodeIndex, is_const: bool, span: Span };
 pub const AssignStmt = struct { target: NodeIndex, op: Token, value: NodeIndex, span: Span };
 pub const IfStmt = struct { condition: NodeIndex, then_branch: NodeIndex, else_branch: NodeIndex, capture: []const u8 = "", span: Span };
-pub const WhileStmt = struct { condition: NodeIndex, body: NodeIndex, label: ?[]const u8 = null, span: Span };
+pub const WhileStmt = struct { condition: NodeIndex, body: NodeIndex, label: ?[]const u8 = null, capture: []const u8 = "", continue_expr: NodeIndex = null_node, span: Span };
 /// For loop statement supporting:
 /// - `for item in collection { }` (value only)
 /// - `for i, item in collection { }` (index and value)

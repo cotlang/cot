@@ -401,8 +401,15 @@ pub const Checker = struct {
                         const f = method_decl.fn_decl;
                         const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, f.name });
                         const func_type = try self.buildFuncType(f.params, f.return_type);
+                        // Detect receiver_is_ptr from resolved func type (accounts for @safe auto-wrapping)
+                        var is_ptr = true;
+                        const func_info = self.types.get(func_type);
+                        if (func_info == .func and func_info.func.params.len > 0) {
+                            const first_param_type = self.types.get(func_info.func.params[0].type_idx);
+                            if (first_param_type != .pointer) is_ptr = false;
+                        }
                         try self.scope.define(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
-                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = true });
+                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr });
                     }
                 }
             },
@@ -848,6 +855,7 @@ pub const Checker = struct {
             .string => TypeRegistry.STRING, .char => TypeRegistry.U8,
             .true_lit, .false_lit => TypeRegistry.UNTYPED_BOOL,
             .null_lit, .undefined_lit => TypeRegistry.UNTYPED_NULL,
+            .unreachable_lit => TypeRegistry.NORETURN,
         };
     }
 
@@ -1014,8 +1022,16 @@ pub const Checker = struct {
         const base_type = self.types.get(base_type_idx);
         const struct_name = switch (base_type) {
             .struct_type => |st| st.name,
-            .pointer => |ptr| if (self.types.get(ptr.elem) == .struct_type) self.types.get(ptr.elem).struct_type.name else return null,
+            .pointer => |ptr| blk: {
+                const inner = self.types.get(ptr.elem);
+                break :blk switch (inner) {
+                    .struct_type => |st| st.name,
+                    .enum_type => |et| et.name,
+                    else => return null,
+                };
+            },
             .basic => |bk| bk.name(),
+            .enum_type => |et| et.name,
             else => return null,
         };
         return self.lookupMethod(struct_name, fa.field);
@@ -1280,6 +1296,7 @@ pub const Checker = struct {
             },
             .enum_type => |et| {
                 for (et.variants) |v| if (std.mem.eql(u8, v.name, f.field)) return base_type;
+                if (self.lookupMethod(et.name, f.field)) |m| return m.func_type;
                 self.errWithSuggestion(f.span.start, "undefined variant", findSimilarVariant(f.field, et.variants));
                 return invalid_type;
             },
@@ -1395,6 +1412,13 @@ pub const Checker = struct {
             };
             if (!found) self.errWithSuggestion(fi.span.start, "unknown field", findSimilarField(fi.name, struct_type.struct_type.fields));
         }
+        // Check that all fields without defaults are provided (Zig: Sema structInit)
+        for (struct_type.struct_type.fields) |sf| {
+            if (sf.default_value != null_node) continue; // has default, ok to omit
+            var provided = false;
+            for (si.fields) |fi| if (std.mem.eql(u8, sf.name, fi.name)) { provided = true; break; };
+            if (!provided) self.err.errorWithCode(si.span.start, .e300, "missing field in struct init");
+        }
         return struct_type_idx;
     }
 
@@ -1455,6 +1479,13 @@ pub const Checker = struct {
                 break;
             };
             if (!found) self.errWithSuggestion(fi.span.start, "unknown field", findSimilarField(fi.name, struct_type.struct_type.fields));
+        }
+        // Check that all fields without defaults are provided (Zig: Sema structInit)
+        for (struct_type.struct_type.fields) |sf| {
+            if (sf.default_value != null_node) continue;
+            var provided = false;
+            for (ne.fields) |fi| if (std.mem.eql(u8, sf.name, fi.name)) { provided = true; break; };
+            if (!provided) self.err.errorWithCode(ne.span.start, .e300, "missing field in struct init");
         }
         // Return pointer to struct (heap-allocated object)
         return self.types.makePointer(struct_type_idx) catch invalid_type;
@@ -1883,6 +1914,27 @@ pub const Checker = struct {
 
     fn checkWhileStmt(self: *Checker, ws: ast.WhileStmt) CheckError!void {
         const cond_type = try self.checkExpr(ws.condition);
+        // Optional capture: while (expr) |val| { ... } — Zig payload capture pattern
+        if (ws.capture.len > 0) {
+            const cond_info = self.types.get(cond_type);
+            if (cond_info != .optional) {
+                self.err.errorWithCode(ws.span.start, .e300, "capture requires optional type");
+                return;
+            }
+            const elem_type = cond_info.optional.elem;
+            var capture_scope = Scope.init(self.allocator, self.scope);
+            defer capture_scope.deinit();
+            const old_scope = self.scope;
+            self.scope = &capture_scope;
+            try capture_scope.define(Symbol.init(ws.capture, .variable, elem_type, ast.null_node, false));
+            const old_in_loop = self.in_loop;
+            self.in_loop = true;
+            if (ws.continue_expr != ast.null_node) try self.checkContinueExpr(ws.continue_expr);
+            try self.checkStmt(ws.body);
+            self.in_loop = old_in_loop;
+            self.scope = old_scope;
+            return;
+        }
         if (!types.isBool(self.types.get(cond_type))) self.err.errorWithCode(ws.span.start, .e300, "condition must be bool");
         // Lint: empty block detection (W005)
         if (self.lint_mode and self.isEmptyBlock(ws.body)) {
@@ -1890,8 +1942,19 @@ pub const Checker = struct {
         }
         const old_in_loop = self.in_loop;
         self.in_loop = true;
+        if (ws.continue_expr != ast.null_node) try self.checkContinueExpr(ws.continue_expr);
         try self.checkStmt(ws.body);
         self.in_loop = old_in_loop;
+    }
+
+    /// Check a while continue expression — may be a statement (assignment) or expression
+    fn checkContinueExpr(self: *Checker, node_idx: ast.NodeIndex) CheckError!void {
+        const node = self.tree.getNode(node_idx) orelse return;
+        if (node.asStmt() != null) {
+            try self.checkStmt(node_idx);
+        } else {
+            _ = try self.checkExpr(node_idx);
+        }
     }
 
     fn checkForStmt(self: *Checker, fs: ast.ForStmt) CheckError!void {
@@ -2377,7 +2440,7 @@ pub const Checker = struct {
             const field_type = try self.resolveTypeExpr(field.type_expr);
             const field_align = self.types.alignmentOf(field_type);
             if (field_align > 0) offset = (offset + field_align - 1) & ~(field_align - 1);
-            try struct_fields.append(self.allocator, .{ .name = field.name, .type_idx = field_type, .offset = offset });
+            try struct_fields.append(self.allocator, .{ .name = field.name, .type_idx = field_type, .offset = offset, .default_value = field.default_value });
             offset += self.types.sizeOf(field_type);
         }
         offset = (offset + 7) & ~@as(u32, 7);
@@ -2437,6 +2500,9 @@ pub const Checker = struct {
         if (tb == .optional and ta == .basic and ta.basic == .untyped_null) return true;
         if (ta == .pointer and tb == .basic and tb.basic == .untyped_null) return true;
         if (tb == .pointer and ta == .basic and ta.basic == .untyped_null) return true;
+        // Enum values are comparable to their backing type (integer) — Zig: @intFromEnum
+        if (ta == .enum_type and types.isInteger(tb)) return true;
+        if (tb == .enum_type and types.isInteger(ta)) return true;
         return false;
     }
 

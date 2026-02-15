@@ -11,6 +11,8 @@ import "std/map"
 struct Foo { x: i64 }
 struct Bar { y: i64 }
 struct Point { x: i64, y: i64 }
+struct Config { width: i64 = 800, height: i64 = 600, debug: i64 = 0 }
+struct Partial { name: string, score: i64 = 100 }
 type Coord = Point;
 
 enum Color { Red, Green, Blue }
@@ -22,6 +24,16 @@ union Result { Ok: i64, Err: i32 }
 union Event { Click: i64, Hover, KeyPress: i64 }
 
 const MyError = error { Fail, NotFound }
+
+impl Level {
+    fn isHigh(self: *Level) bool {
+        return self.* == 100
+    }
+
+    fn toInt(self: *Level) i64 {
+        return self.*
+    }
+}
 
 // DFoo: Foo variant with deinit (deinit tests need Foo_deinit but ARC tests must NOT have it)
 struct DFoo { x: i64 }
@@ -2310,4 +2322,161 @@ test "bounds check valid" {
 test "null unwrap valid" {
     var x: ?i64 = 42
     @assert_eq(x.?, 42)
+}
+
+// -- unreachable keyword --
+
+test "unreachable in switch else" {
+    var x: i64 = 2
+    var result = switch x {
+        1 => 10,
+        2 => 20,
+        3 => 30,
+        else => unreachable,
+    }
+    @assert_eq(result, 20)
+}
+
+test "unreachable in if branch" {
+    var x: i64 = 42
+    var result: i64 = 0
+    if (x > 0) {
+        result = x
+    } else {
+        unreachable
+    }
+    @assert_eq(result, 42)
+}
+
+// ============================================================================
+// Default struct field values
+// ============================================================================
+
+test "struct default all fields" {
+    var c = Config {}
+    @assert_eq(c.width, 800)
+    @assert_eq(c.height, 600)
+    @assert_eq(c.debug, 0)
+}
+
+test "struct default override some" {
+    var c = Config { .width = 1920 }
+    @assert_eq(c.width, 1920)
+    @assert_eq(c.height, 600)
+    @assert_eq(c.debug, 0)
+}
+
+test "struct default override all" {
+    var c = Config { .width = 320, .height = 240, .debug = 1 }
+    @assert_eq(c.width, 320)
+    @assert_eq(c.height, 240)
+    @assert_eq(c.debug, 1)
+}
+
+test "struct default mixed required and default" {
+    var p = Partial { .name = "alice" }
+    @assert_eq(p.score, 100)
+}
+
+test "struct default mixed override default" {
+    var p = Partial { .name = "bob", .score = 42 }
+    @assert_eq(p.score, 42)
+}
+
+// ============================================================================
+// while (optional) |capture| — Zig pattern
+// ============================================================================
+
+struct Iter { pos: i64, limit: i64 }
+
+impl Iter {
+    fn next(self: *Iter) ?i64 {
+        if (self.pos >= self.limit) {
+            return null
+        }
+        var val = self.pos
+        self.pos = self.pos + 1
+        return val
+    }
+}
+
+test "while optional capture" {
+    var it = Iter { .pos = 1, .limit = 4 }
+    var sum: i64 = 0
+    while (it.next()) |val| {
+        sum = sum + val
+    }
+    @assert_eq(sum, 6)
+}
+
+test "while optional capture no iterations" {
+    var it = Iter { .pos = 5, .limit = 3 }
+    var sum: i64 = 0
+    while (it.next()) |val| {
+        sum = sum + val
+    }
+    @assert_eq(sum, 0)
+}
+
+// ============================================================================
+// while continue expression — Zig pattern: while (cond) : (expr) { ... }
+// ============================================================================
+
+test "while continue expression" {
+    var i: i64 = 0
+    var sum: i64 = 0
+    while (i < 5) : (i = i + 1) {
+        sum = sum + i
+    }
+    @assert_eq(sum, 10)
+    @assert_eq(i, 5)
+}
+
+// ============================================================================
+// Enum methods — impl on enums
+// ============================================================================
+
+test "enum method pointer receiver" {
+    var lvl = Level.High
+    @assert_eq(lvl.isHigh(), true)
+    @assert_eq(lvl.toInt(), 100)
+}
+
+test "enum method dispatch" {
+    var lvl = Level.Low
+    @assert_eq(lvl.isHigh(), false)
+    @assert_eq(lvl.toInt(), 10)
+}
+
+// ============================================================================
+// Exhaustive switch — compile error on missing variants (Zig/Rust pattern)
+// ============================================================================
+
+fn colorToInt(c: Color) i64 {
+    return switch (c) {
+        Color.Red => 1,
+        Color.Green => 2,
+        Color.Blue => 3,
+    }
+}
+
+fn colorWithElse(c: Color) i64 {
+    return switch (c) {
+        Color.Red => 10,
+        else => 0,
+    }
+}
+
+test "exhaustive switch all variants" {
+    var c = Color.Blue
+    @assert_eq(colorToInt(c), 3)
+    var r = Color.Red
+    @assert_eq(colorToInt(r), 1)
+}
+
+test "switch with else branch" {
+    var c = Color.Green
+    @assert_eq(colorWithElse(c), 0)
+    var r = Color.Red
+    @assert_eq(colorWithElse(r), 10)
 }

@@ -904,6 +904,14 @@ pub const Parser = struct {
                         }
                         if (e == .ident) {
                             const type_name = e.ident.name;
+                            // Empty struct init: Type {} (all fields have defaults)
+                            if (type_name.len > 0 and std.ascii.isUpper(type_name[0]) and self.check(.lbrace) and self.peekToken().tok == .rbrace) {
+                                const s = self.tree.getNode(expr).?.span();
+                                self.advance(); // consume {
+                                self.advance(); // consume }
+                                expr = try self.tree.addExpr(.{ .struct_init = .{ .type_name = type_name, .fields = &.{}, .span = Span.init(s.start, self.pos()) } });
+                                continue;
+                            }
                             if (type_name.len > 0 and std.ascii.isUpper(type_name[0]) and self.peekNextIsPeriod()) {
                                 const s = self.tree.getNode(expr).?.span();
                                 self.advance();
@@ -955,6 +963,7 @@ pub const Parser = struct {
             .kw_false => { self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .false_lit, .value = "false", .span = Span.init(start, self.pos()) } }); },
             .kw_null => { self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .null_lit, .value = "null", .span = Span.init(start, self.pos()) } }); },
             .kw_undefined => { self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .undefined_lit, .value = "undefined", .span = Span.init(start, self.pos()) } }); },
+            .kw_unreachable => { self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .unreachable_lit, .value = "unreachable", .span = Span.init(start, self.pos()) } }); },
             .lparen => {
                 self.advance();
                 const inner = try self.parseExpr() orelse return null;
@@ -1605,13 +1614,27 @@ pub const Parser = struct {
     fn parseWhileStmt(self: *Parser, label: ?[]const u8) ParseError!?NodeIndex {
         const start = self.pos();
         self.advance();
-        // Zig pattern: while (expr) { ... }
+        // Zig pattern: while (expr) |capture| : (continue_expr) { ... }
         if (!self.expect(.lparen)) return null;
         const cond = try self.parseExpr() orelse return null;
         if (!self.expect(.rparen)) return null;
+        // Optional capture: |val| (Zig PtrPayload)
+        var capture: []const u8 = "";
+        if (self.match(.@"or")) {
+            if (self.check(.ident)) { capture = self.tok.text; self.advance(); } else { self.syntaxError("expected identifier for optional capture"); return null; }
+            if (!self.expect(.@"or")) return null;
+        }
+        // Continue expression: : (stmt) — evaluated after each iteration (Zig pattern)
+        // Parsed as expr-or-assign to support `i = i + 1` (assignment) and `i += 1`
+        var continue_expr: NodeIndex = null_node;
+        if (self.match(.colon)) {
+            if (!self.expect(.lparen)) return null;
+            continue_expr = try self.parseExprOrAssign(self.pos()) orelse return null;
+            if (!self.expect(.rparen)) return null;
+        }
         if (!self.check(.lbrace)) { self.err.errorWithCode(self.pos(), .e204, "expected '{' after while condition"); return null; }
         const body = try self.parseBlock() orelse return null;
-        return try self.tree.addStmt(.{ .while_stmt = .{ .condition = cond, .body = body, .label = label, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addStmt(.{ .while_stmt = .{ .condition = cond, .body = body, .label = label, .capture = capture, .continue_expr = continue_expr, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseForStmt(self: *Parser, label: ?[]const u8, is_inline: bool) ParseError!?NodeIndex {

@@ -579,7 +579,18 @@ pub const Formatter = struct {
                 }
                 self.write("while (") catch {};
                 self.printNode(s.condition);
-                self.write(") ") catch {};
+                self.write(")") catch {};
+                if (s.capture.len > 0) {
+                    self.write(" |") catch {};
+                    self.write(s.capture) catch {};
+                    self.write("|") catch {};
+                }
+                if (s.continue_expr != null_node) {
+                    self.write(" : (") catch {};
+                    self.printNode(s.continue_expr);
+                    self.write(")") catch {};
+                }
+                self.write(" ") catch {};
                 self.printBlock(s.body);
             },
             .for_stmt => |s| {

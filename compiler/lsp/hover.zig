@@ -82,6 +82,7 @@ fn exprHover(allocator: std.mem.Allocator, result: *AnalysisResult, node_idx: No
                 .true_lit, .false_lit => "bool",
                 .null_lit => "null",
                 .undefined_lit => "undefined",
+                .unreachable_lit => "noreturn",
             };
             const value = std.fmt.allocPrint(allocator, "```cot\n{s} literal: {s}\n```", .{ kind_str, lit.value }) catch return null;
             return .{ .kind = "markdown", .value = value };

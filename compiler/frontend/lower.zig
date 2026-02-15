@@ -1624,7 +1624,11 @@ pub const Lowerer = struct {
             }
             for (struct_type.fields, 0..) |struct_field, i| {
                 if (field_values[i] == ir.null_node) {
-                    field_values[i] = try fb.emitConstInt(0, struct_field.type_idx, span);
+                    if (struct_field.default_value != null_node) {
+                        field_values[i] = try self.lowerExprNode(struct_field.default_value);
+                    } else {
+                        field_values[i] = try fb.emitConstInt(0, struct_field.type_idx, span);
+                    }
                 }
             }
             const gc_ref = try fb.emitGcStructNew(type_name, field_values, struct_type_idx, span);
@@ -1652,6 +1656,29 @@ pub const Lowerer = struct {
                     }
                     break;
                 }
+            }
+        }
+        // Emit default values for omitted fields (Zig: Sema structInit default_field_values)
+        for (struct_type.fields, 0..) |struct_field, i| {
+            if (struct_field.default_value == null_node) continue;
+            var provided = false;
+            for (struct_init.fields) |field_init| {
+                if (std.mem.eql(u8, struct_field.name, field_init.name)) { provided = true; break; }
+            }
+            if (provided) continue;
+            const field_idx: u32 = @intCast(i);
+            const field_offset: i64 = @intCast(struct_field.offset);
+            const value_node_ir = try self.lowerExprNode(struct_field.default_value);
+            const field_type = self.type_reg.get(struct_field.type_idx);
+            const is_string_field = struct_field.type_idx == TypeRegistry.STRING or field_type == .slice;
+            if (is_string_field) {
+                const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                const ptr_ir = try fb.emitSlicePtr(value_node_ir, ptr_type, span);
+                const len_ir = try fb.emitSliceLen(value_node_ir, span);
+                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, ptr_ir, span);
+                _ = try fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, len_ir, span);
+            } else {
+                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node_ir, span);
             }
         }
     }
@@ -2198,20 +2225,91 @@ pub const Lowerer = struct {
     }
 
     fn lowerWhile(self: *Lowerer, while_stmt: ast.WhileStmt) !void {
+        // Optional capture: while (expr) |val| { ... } — Zig payload capture pattern
+        if (while_stmt.capture.len > 0) return try self.lowerWhileOptional(while_stmt);
         const fb = self.current_func orelse return;
         const cond_block = try fb.newBlock("while.cond");
         const body_block = try fb.newBlock("while.body");
         const exit_block = try fb.newBlock("while.end");
+        // Continue expression block (Zig: evaluated after body, before re-checking condition)
+        const cont_block = if (while_stmt.continue_expr != null_node) try fb.newBlock("while.cont") else cond_block;
         _ = try fb.emitJump(cond_block, while_stmt.span);
         fb.setBlock(cond_block);
         const cond_node = try self.lowerExprNode(while_stmt.condition);
         if (cond_node == ir.null_node) return;
         _ = try fb.emitBranch(cond_node, body_block, exit_block, while_stmt.span);
-        try self.loop_stack.append(self.allocator, .{ .cond_block = cond_block, .exit_block = exit_block, .cleanup_depth = self.cleanup_stack.getScopeDepth(), .label = while_stmt.label });
+        try self.loop_stack.append(self.allocator, .{ .cond_block = cont_block, .exit_block = exit_block, .cleanup_depth = self.cleanup_stack.getScopeDepth(), .label = while_stmt.label });
         fb.setBlock(body_block);
-        if (!try self.lowerBlockNode(while_stmt.body)) _ = try fb.emitJump(cond_block, while_stmt.span);
+        if (!try self.lowerBlockNode(while_stmt.body)) _ = try fb.emitJump(cont_block, while_stmt.span);
+        // Emit continue expression block
+        if (while_stmt.continue_expr != null_node) {
+            fb.setBlock(cont_block);
+            try self.lowerContinueExpr(while_stmt.continue_expr);
+            _ = try fb.emitJump(cond_block, while_stmt.span);
+        }
         _ = self.loop_stack.pop();
         fb.setBlock(exit_block);
+    }
+
+    /// Lower while-optional: while (expr) |val| { ... }
+    /// Pattern: evaluate optional, store to local, check non-null, unwrap into capture, loop.
+    /// Reference: Zig AstGen.zig whileExpr with payload capture.
+    fn lowerWhileOptional(self: *Lowerer, while_stmt: ast.WhileStmt) !void {
+        const fb = self.current_func orelse return;
+        const cond_block = try fb.newBlock("while.opt.cond");
+        const body_block = try fb.newBlock("while.opt.body");
+        const exit_block = try fb.newBlock("while.opt.end");
+        const cont_block = if (while_stmt.continue_expr != null_node) try fb.newBlock("while.opt.cont") else cond_block;
+
+        // Allocate a local to hold the optional result across blocks
+        const opt_type_idx = self.inferExprType(while_stmt.condition);
+        const opt_info = self.type_reg.get(opt_type_idx);
+        const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
+        const opt_local = try fb.addLocalWithSize("__while_opt", opt_type_idx, true, self.type_reg.sizeOf(opt_type_idx));
+
+        _ = try fb.emitJump(cond_block, while_stmt.span);
+        fb.setBlock(cond_block);
+
+        // Evaluate the optional expression and store to local
+        const opt_val = try self.lowerExprNode(while_stmt.condition);
+        if (opt_val == ir.null_node) return;
+        _ = try fb.emitStoreLocal(opt_local, opt_val, while_stmt.span);
+
+        // Check if non-null: val != null
+        const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, while_stmt.span));
+        const is_non_null = try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, while_stmt.span);
+        _ = try fb.emitBranch(is_non_null, body_block, exit_block, while_stmt.span);
+
+        // Body block: reload from local, unwrap and bind capture variable
+        try self.loop_stack.append(self.allocator, .{ .cond_block = cont_block, .exit_block = exit_block, .cleanup_depth = self.cleanup_stack.getScopeDepth(), .label = while_stmt.label });
+        fb.setBlock(body_block);
+        const scope_depth = fb.markScopeEntry();
+        const opt_reload = try fb.emitLoadLocal(opt_local, opt_type_idx, while_stmt.span);
+        const unwrapped = try fb.emitUnary(.optional_unwrap, opt_reload, elem_type, while_stmt.span);
+        const capture_local = try fb.addLocalWithSize(while_stmt.capture, elem_type, false, self.type_reg.sizeOf(elem_type));
+        _ = try fb.emitStoreLocal(capture_local, unwrapped, while_stmt.span);
+        if (!try self.lowerBlockNode(while_stmt.body)) _ = try fb.emitJump(cont_block, while_stmt.span);
+        fb.restoreScope(scope_depth);
+
+        // Continue expression block
+        if (while_stmt.continue_expr != null_node) {
+            fb.setBlock(cont_block);
+            try self.lowerContinueExpr(while_stmt.continue_expr);
+            _ = try fb.emitJump(cond_block, while_stmt.span);
+        }
+
+        _ = self.loop_stack.pop();
+        fb.setBlock(exit_block);
+    }
+
+    /// Lower a continue expression (could be a statement like assignment, or just an expression)
+    fn lowerContinueExpr(self: *Lowerer, node_idx: NodeIndex) !void {
+        const node = self.tree.getNode(node_idx) orelse return;
+        if (node.asStmt()) |stmt| {
+            _ = try self.lowerStmt(stmt);
+        } else {
+            _ = try self.lowerExprNode(node_idx);
+        }
     }
 
     fn lowerFor(self: *Lowerer, for_stmt: ast.ForStmt) !void {
@@ -2689,6 +2787,12 @@ pub const Lowerer = struct {
             .true_lit => return try fb.emitConstBool(true, lit.span),
             .false_lit => return try fb.emitConstBool(false, lit.span),
             .null_lit, .undefined_lit => return try fb.emitConstNull(TypeRegistry.UNTYPED_NULL, lit.span),
+            .unreachable_lit => {
+                _ = try fb.emitTrap(lit.span);
+                const dead_block = try fb.newBlock("unreachable.dead");
+                fb.setBlock(dead_block);
+                return ir.null_node;
+            },
             .string => {
                 var buf: [4096]u8 = undefined;
                 const unescaped = parseStringLiteral(lit.value, &buf);
@@ -3297,6 +3401,29 @@ pub const Lowerer = struct {
                 }
             }
         }
+        // Emit default values for omitted fields (Zig: Sema structInit default_field_values)
+        for (struct_type.fields, 0..) |struct_field, i| {
+            if (struct_field.default_value == null_node) continue;
+            var provided = false;
+            for (si.fields) |field_init| {
+                if (std.mem.eql(u8, struct_field.name, field_init.name)) { provided = true; break; }
+            }
+            if (provided) continue;
+            const field_idx: u32 = @intCast(i);
+            const field_offset: i64 = @intCast(struct_field.offset);
+            const value_node = try self.lowerExprNode(struct_field.default_value);
+            const field_type = self.type_reg.get(struct_field.type_idx);
+            const is_string_field = struct_field.type_idx == TypeRegistry.STRING or field_type == .slice;
+            if (is_string_field) {
+                const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                const ptr_ir = try fb.emitSlicePtr(value_node, ptr_type, si.span);
+                const len_ir = try fb.emitSliceLen(value_node, si.span);
+                _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, ptr_ir, si.span);
+                _ = try fb.emitStoreLocalField(temp_idx, field_idx + 1, field_offset + 8, len_ir, si.span);
+            } else {
+                _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, value_node, si.span);
+            }
+        }
         return try fb.emitLoadLocal(temp_idx, struct_type_idx, si.span);
     }
 
@@ -3355,10 +3482,14 @@ pub const Lowerer = struct {
                     }
                 }
             }
-            // For any uninitialized fields, emit zero
+            // For any uninitialized fields, use default value or zero
             for (struct_type.fields, 0..) |struct_field, i| {
                 if (field_values[i] == ir.null_node) {
-                    field_values[i] = try fb.emitConstInt(0, struct_field.type_idx, ne.span);
+                    if (struct_field.default_value != null_node) {
+                        field_values[i] = try self.lowerExprNode(struct_field.default_value);
+                    } else {
+                        field_values[i] = try fb.emitConstInt(0, struct_field.type_idx, ne.span);
+                    }
                 }
             }
             return try fb.emitGcStructNew(type_name, field_values, struct_type_idx, ne.span);
@@ -3415,6 +3546,31 @@ pub const Lowerer = struct {
                     _ = i;
                     break;
                 }
+            }
+        }
+        // Emit default values for omitted fields (Zig: Sema structInit default_field_values)
+        for (struct_type.fields) |struct_field| {
+            if (struct_field.default_value == null_node) continue;
+            var provided = false;
+            for (ne.fields) |field_init| {
+                if (std.mem.eql(u8, struct_field.name, field_init.name)) { provided = true; break; }
+            }
+            if (provided) continue;
+            const field_offset: i64 = @intCast(struct_field.offset);
+            const value_node = try self.lowerExprNode(struct_field.default_value);
+            const field_type = self.type_reg.get(struct_field.type_idx);
+            const is_string_field = struct_field.type_idx == TypeRegistry.STRING or field_type == .slice;
+            if (is_string_field) {
+                const u8_ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                const ptr_ir = try fb.emitSlicePtr(value_node, u8_ptr_type, ne.span);
+                const len_ir = try fb.emitSliceLen(value_node, ne.span);
+                const ptr_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                _ = try fb.emitPtrStoreValue(ptr_addr, ptr_ir, ne.span);
+                const len_addr = try fb.emitAddrOffset(ptr_node, field_offset + 8, ptr_type, ne.span);
+                _ = try fb.emitPtrStoreValue(len_addr, len_ir, ne.span);
+            } else {
+                const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
             }
         }
 
@@ -3945,6 +4101,8 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return ir.null_node;
         const subject = try self.lowerExprNode(se.subject);
         var result = if (se.else_body != null_node) try self.lowerExprNode(se.else_body) else try fb.emitConstNull(result_type, se.span);
+        // noreturn else arm (e.g., else => unreachable): use a placeholder that gets overwritten
+        if (result == ir.null_node) result = try fb.emitConstInt(0, result_type, se.span);
         var i: usize = se.cases.len;
         while (i > 0) {
             i -= 1;
@@ -3973,6 +4131,9 @@ pub const Lowerer = struct {
             }
 
             const case_val = try self.lowerExprNode(case.body);
+            // noreturn arms (unreachable, @trap) return null_node — skip select,
+            // control never reaches the merge point from this arm
+            if (case_val == ir.null_node) continue;
             result = try fb.emitSelect(case_cond, case_val, result, result_type, se.span);
         }
         return result;
@@ -3991,9 +4152,11 @@ pub const Lowerer = struct {
                 const base_type = self.type_reg.get(base_type_idx);
                 const type_name: ?[]const u8 = switch (base_type) {
                     .struct_type => |s| s.name,
+                    .enum_type => |et| et.name,
                     .pointer => |p| blk: {
                         const elem = self.type_reg.get(p.elem);
                         if (elem == .struct_type) break :blk elem.struct_type.name;
+                        if (elem == .enum_type) break :blk elem.enum_type.name;
                         break :blk null;
                     },
                     .basic => |bk| bk.name(),
