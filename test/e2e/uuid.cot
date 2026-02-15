@@ -1,0 +1,57 @@
+import "std/uuid"
+import "std/string"
+
+test "v4 length" {
+    var id = v4()
+    @assert_eq(@lenOf(id), 36)
+}
+
+test "v4 dashes" {
+    var id = v4()
+    // Dashes at positions 8, 13, 18, 23
+    @assert_eq(substring(id, 8, 9), "-")
+    @assert_eq(substring(id, 13, 14), "-")
+    @assert_eq(substring(id, 18, 19), "-")
+    @assert_eq(substring(id, 23, 24), "-")
+}
+
+test "v4 version nibble" {
+    var id = v4()
+    // Position 14 must be '4'
+    @assert_eq(substring(id, 14, 15), "4")
+}
+
+test "v4 variant nibble" {
+    var id = v4()
+    // Position 19 must be 8, 9, a, or b
+    var c = @intCast(i64, @intToPtr(*u8, @ptrOf(id) + 19).*)
+    @assert(c == 56 or c == 57 or c == 97 or c == 98)
+}
+
+test "v4 uniqueness" {
+    var id1 = v4()
+    var id2 = v4()
+    @assert(id1 != id2)
+}
+
+test "isValid valid uuid" {
+    var id = v4()
+    @assert(isValid(id))
+}
+
+test "isValid wrong length" {
+    @assert(!isValid("too-short"))
+}
+
+test "isValid wrong format" {
+    @assert(!isValid("00000000000000000000000000000000000x"))
+}
+
+test "version returns 4" {
+    var id = v4()
+    @assert_eq(version(id), 4)
+}
+
+test "version short string" {
+    @assert_eq(version("short"), 0 - 1)
+}

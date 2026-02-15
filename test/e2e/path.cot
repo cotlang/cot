@@ -1,0 +1,181 @@
+import "std/path"
+
+// ============================================================================
+// basename
+// ============================================================================
+
+test "basename simple" {
+    @assert_eq(basename("a/b/c"), "c")
+}
+
+test "basename trailing slash" {
+    @assert_eq(basename("/a/"), "a")
+}
+
+test "basename root" {
+    @assert_eq(basename("/"), "/")
+}
+
+test "basename empty" {
+    @assert_eq(basename(""), ".")
+}
+
+test "basename no slash" {
+    @assert_eq(basename("file.txt"), "file.txt")
+}
+
+test "basename deep path" {
+    @assert_eq(basename("/usr/local/bin/cot"), "cot")
+}
+
+// ============================================================================
+// dirname
+// ============================================================================
+
+test "dirname simple" {
+    @assert_eq(dirname("a/b/c"), "a/b")
+}
+
+test "dirname single component" {
+    @assert_eq(dirname("a"), ".")
+}
+
+test "dirname root file" {
+    @assert_eq(dirname("/a"), "/")
+}
+
+test "dirname root" {
+    @assert_eq(dirname("/"), "/")
+}
+
+test "dirname empty" {
+    @assert_eq(dirname(""), ".")
+}
+
+test "dirname deep path" {
+    @assert_eq(dirname("/usr/local/bin/cot"), "/usr/local/bin")
+}
+
+// ============================================================================
+// extname
+// ============================================================================
+
+test "extname txt" {
+    @assert_eq(extname("file.txt"), ".txt")
+}
+
+test "extname double ext" {
+    @assert_eq(extname("file.tar.gz"), ".gz")
+}
+
+test "extname no ext" {
+    @assert_eq(extname("file"), "")
+}
+
+test "extname dotfile" {
+    @assert_eq(extname(".gitignore"), "")
+}
+
+test "extname empty" {
+    @assert_eq(extname(""), "")
+}
+
+test "extname in path" {
+    @assert_eq(extname("/path/to/file.cot"), ".cot")
+}
+
+// ============================================================================
+// isAbsolute
+// ============================================================================
+
+test "isAbsolute absolute" {
+    @assert(isAbsolute("/usr/bin"))
+}
+
+test "isAbsolute relative" {
+    @assert(!isAbsolute("src/main.cot"))
+}
+
+test "isAbsolute empty" {
+    @assert(!isAbsolute(""))
+}
+
+// ============================================================================
+// join
+// ============================================================================
+
+test "join two segments" {
+    @assert_eq(join("a", "b"), "a/b")
+}
+
+test "join trailing slash" {
+    @assert_eq(join("a/", "b"), "a/b")
+}
+
+test "join absolute second" {
+    @assert_eq(join("a", "/b"), "/b")
+}
+
+test "join empty first" {
+    @assert_eq(join("", "b"), "b")
+}
+
+test "join empty second" {
+    @assert_eq(join("a", ""), "a")
+}
+
+test "join3" {
+    @assert_eq(join3("a", "b", "c"), "a/b/c")
+}
+
+test "join4" {
+    @assert_eq(join4("a", "b", "c", "d"), "a/b/c/d")
+}
+
+// ============================================================================
+// clean
+// ============================================================================
+
+test "clean double slash" {
+    @assert_eq(clean("a//b"), "a/b")
+}
+
+test "clean dot" {
+    @assert_eq(clean("a/./b"), "a/b")
+}
+
+test "clean dotdot" {
+    @assert_eq(clean("a/b/../c"), "a/c")
+}
+
+test "clean rooted dotdot" {
+    @assert_eq(clean("/../a"), "/a")
+}
+
+test "clean empty" {
+    @assert_eq(clean(""), ".")
+}
+
+test "clean trailing slash" {
+    @assert_eq(clean("a/b/"), "a/b")
+}
+
+test "clean relative dotdot" {
+    @assert_eq(clean("a/../../b"), "../b")
+}
+
+// ============================================================================
+// relative
+// ============================================================================
+
+test "relative same" {
+    @assert_eq(relative("/a/b", "/a/b"), ".")
+}
+
+test "relative child" {
+    @assert_eq(relative("/a", "/a/b/c"), "b/c")
+}
+
+test "relative sibling" {
+    @assert_eq(relative("/a/b", "/a/c"), "../c")
+}

@@ -1,0 +1,348 @@
+// path — File path manipulation utilities.
+//
+// Cross-platform path operations for POSIX systems (macOS, Linux).
+// All functions are pure string manipulation — no filesystem access.
+//
+// References:
+//   Go: path/filepath (Join, Dir, Base, Ext, IsAbs, Rel, Clean)
+//   Deno: @std/path (join, resolve, dirname, basename, extname)
+
+import "std/string"
+
+// ============================================================================
+// Basic Operations
+// ============================================================================
+
+// Returns the last element of the path.
+// "a/b/c" → "c", "/a/" → "a", "/" → "/", "" → "."
+fn basename(p: string) string {
+    var plen = @lenOf(p)
+    if (plen == 0) { return "." }
+
+    // Find the end (strip trailing slashes)
+    var end = plen
+    while (end > 1 and @intToPtr(*u8, @ptrOf(p) + end - 1).* == 47) {
+        end = end - 1
+    }
+
+    // Root only
+    if (end == 1 and @intToPtr(*u8, @ptrOf(p)).* == 47) {
+        return "/"
+    }
+
+    // Find last slash before end
+    var i = end - 1
+    while (i >= 0) {
+        if (@intToPtr(*u8, @ptrOf(p) + i).* == 47) {
+            return substring(p, i + 1, end)
+        }
+        i = i - 1
+    }
+
+    // No slash found
+    return substring(p, 0, end)
+}
+
+// Returns all but the last element of the path.
+// Go: filepath.Dir calls Clean on the result.
+// "a/b/c" → "a/b", "/a" → "/", "a" → ".", "/" → "/", "" → "."
+fn dirname(p: string) string {
+    var plen = @lenOf(p)
+    if (plen == 0) { return "." }
+
+    // Find last slash
+    var i = plen - 1
+
+    // Skip trailing slashes
+    while (i > 0 and @intToPtr(*u8, @ptrOf(p) + i).* == 47) {
+        i = i - 1
+    }
+
+    // Find the slash before the basename
+    while (i >= 0) {
+        if (@intToPtr(*u8, @ptrOf(p) + i).* == 47) {
+            if (i == 0) { return "/" }
+            // Go: return Clean(path[:i])
+            return clean(substring(p, 0, i))
+        }
+        i = i - 1
+    }
+
+    return "."
+}
+
+// Returns the file extension including the dot.
+// "file.txt" → ".txt", "file.tar.gz" → ".gz", "file" → "", ".gitignore" → ""
+fn extname(p: string) string {
+    var plen = @lenOf(p)
+    if (plen == 0) { return "" }
+
+    // Work on the basename only
+    var base = basename(p)
+    var blen = @lenOf(base)
+
+    // Find last dot, starting from end
+    var i = blen - 1
+    while (i > 0) {
+        if (@intToPtr(*u8, @ptrOf(base) + i).* == 46) {
+            return substring(base, i, blen)
+        }
+        i = i - 1
+    }
+
+    return ""
+}
+
+// Returns true if the path is absolute (starts with /).
+fn isAbsolute(p: string) bool {
+    if (@lenOf(p) == 0) { return false }
+    return @intToPtr(*u8, @ptrOf(p)).* == 47
+}
+
+// ============================================================================
+// Path Joining (Go: filepath.Join)
+// ============================================================================
+
+// Join two path segments with a separator.
+// Go: filepath.Join calls Clean on the result.
+fn join(a: string, b: string) string {
+    var alen = @lenOf(a)
+    var blen = @lenOf(b)
+
+    if (alen == 0) { return b }
+    if (blen == 0) { return a }
+
+    // If b is absolute, return b
+    if (@intToPtr(*u8, @ptrOf(b)).* == 47) { return b }
+
+    // Check if a ends with /
+    var a_has_slash = @intToPtr(*u8, @ptrOf(a) + alen - 1).* == 47
+
+    if (a_has_slash) {
+        var buf = @alloc(alen + blen)
+        @memcpy(buf, @ptrOf(a), alen)
+        @memcpy(buf + alen, @ptrOf(b), blen)
+        return clean(@string(buf, alen + blen))
+    }
+
+    var total = alen + 1 + blen
+    var buf = @alloc(total)
+    @memcpy(buf, @ptrOf(a), alen)
+    @intToPtr(*u8, buf + alen).* = @intCast(u8, 47)
+    @memcpy(buf + alen + 1, @ptrOf(b), blen)
+    return clean(@string(buf, total))
+}
+
+// Join three path segments.
+fn join3(a: string, b: string, c: string) string {
+    return join(join(a, b), c)
+}
+
+// Join four path segments.
+fn join4(a: string, b: string, c: string, d: string) string {
+    return join(join(join(a, b), c), d)
+}
+
+// ============================================================================
+// Path Cleaning (Go: filepath.Clean)
+// ============================================================================
+
+// Helper: remove last path segment from StringBuilder (for ".." handling).
+// Returns true if we went above the start (for relative paths).
+fn cleanGoUp(sb: *StringBuilder, rooted: bool) bool {
+    // Minimum length: rooted paths keep "/" (len=1), relative paths can go to 0.
+    // Matches Go filepath.Clean's dotdot tracking.
+    var minlen: i64 = 0
+    if (rooted) { minlen = 1 }
+
+    if (sb.len > minlen) {
+        var k = sb.len - 1
+        while (k > minlen and @intToPtr(*u8, sb.buf + k - 1).* != 47) {
+            k = k - 1
+        }
+        if (k > minlen) { k = k - 1 }
+        sb.len = k
+        if (!rooted and sb.len == 0) {
+            return true
+        }
+        return false
+    }
+    if (!rooted and sb.len == 0) {
+        return true
+    }
+    return false
+}
+
+// Classify a character position in a path for clean().
+// Returns: 1=slash, 2=single dot, 3=double dot, 0=regular segment.
+fn classifyPathChar(p: string, plen: i64, i: i64) i64 {
+    var c = @intToPtr(*u8, @ptrOf(p) + i).*
+    if (c == 47) { return 1 }
+    if (c == 46) {
+        // Single dot: "." at end or "./"
+        if (i + 1 == plen or @intToPtr(*u8, @ptrOf(p) + i + 1).* == 47) {
+            return 2
+        }
+        // Double dot: ".." at end or "../"
+        if (i + 1 < plen and @intToPtr(*u8, @ptrOf(p) + i + 1).* == 46 and (i + 2 == plen or @intToPtr(*u8, @ptrOf(p) + i + 2).* == 47)) {
+            return 3
+        }
+    }
+    return 0
+}
+
+// Append a regular path segment to the StringBuilder.
+fn appendSegment(sb: *StringBuilder, p: string, plen: i64, start: i64) i64 {
+    if (sb.len > 0 and @intToPtr(*u8, sb.buf + sb.len - 1).* != 47) {
+        sb.appendByte(47)
+    }
+    var i = start
+    while (i < plen and @intToPtr(*u8, @ptrOf(p) + i).* != 47) {
+        sb.appendByte(@intCast(i64, @intToPtr(*u8, @ptrOf(p) + i).*))
+        i = i + 1
+    }
+    return i
+}
+
+// Clean returns the shortest path name equivalent to path.
+// Applies these rules:
+//   1. Replace multiple slashes with a single slash
+//   2. Eliminate . path elements
+//   3. Eliminate .. and the non-.. element that precedes it
+//   4. Eliminate .. at beginning of rooted path (/../ → /)
+fn clean(p: string) string {
+    var plen = @lenOf(p)
+    if (plen == 0) { return "." }
+
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var rooted = @intToPtr(*u8, @ptrOf(p)).* == 47
+    if (rooted) {
+        sb.appendByte(47)
+    }
+
+    var i: i64 = 0
+    while (i < plen) {
+        var kind = classifyPathChar(p, plen, i)
+
+        if (kind == 1) {
+            // Slash: skip
+            i = i + 1
+        } else if (kind == 2) {
+            // Single dot: skip
+            i = i + 1
+            if (i < plen) { i = i + 1 }
+        } else if (kind == 3) {
+            // Double dot: go up
+            i = i + 2
+            if (i < plen) { i = i + 1 }
+            var went_above = cleanGoUp(&sb, rooted)
+            if (went_above) {
+                sb.append("..")
+            }
+        } else {
+            // Regular path segment
+            i = appendSegment(&sb, p, plen, i)
+        }
+    }
+
+    if (sb.len == 0) { return "." }
+    return sb.toString()
+}
+
+// ============================================================================
+// Relative Path (Go: filepath.Rel)
+// ============================================================================
+
+// Find common prefix length between two cleaned paths.
+fn findCommonPrefix(cbase: string, ctarget: string) i64 {
+    var blen = @lenOf(cbase)
+    var tlen = @lenOf(ctarget)
+    var bi: i64 = 0
+    var ti: i64 = 0
+    var common: i64 = 0
+
+    while (bi < blen and ti < tlen) {
+        var bc = @intToPtr(*u8, @ptrOf(cbase) + bi).*
+        var tc = @intToPtr(*u8, @ptrOf(ctarget) + ti).*
+        if (bc != tc) {
+            // Rewind to last slash
+            while (common > 0 and @intToPtr(*u8, @ptrOf(cbase) + common - 1).* != 47) {
+                common = common - 1
+            }
+            return common
+        }
+        if (bc == 47) {
+            common = bi + 1
+        }
+        bi = bi + 1
+        ti = ti + 1
+    }
+
+    // Check if we consumed everything
+    if (bi == blen and ti == tlen) {
+        return blen
+    }
+    if (bi == blen and ti < tlen and @intToPtr(*u8, @ptrOf(ctarget) + ti).* == 47) {
+        return blen
+    }
+    if (ti == tlen and bi < blen and @intToPtr(*u8, @ptrOf(cbase) + bi).* == 47) {
+        return blen
+    }
+    return common
+}
+
+// Count how many ".." segments are needed to go from common to end of base.
+fn countUps(cbase: string, common: i64) i64 {
+    var blen = @lenOf(cbase)
+    var ups: i64 = 0
+    var k = common
+    if (k < blen and @intToPtr(*u8, @ptrOf(cbase) + k).* == 47) {
+        k = k + 1
+    }
+    while (k < blen) {
+        if (@intToPtr(*u8, @ptrOf(cbase) + k).* == 47) {
+            ups = ups + 1
+        }
+        k = k + 1
+    }
+    if (k > common) { ups = ups + 1 }
+    return ups
+}
+
+// Build relative path result from ups count and remaining target.
+fn buildRelResult(ups: i64, ctarget: string, common: i64) string {
+    var tlen = @lenOf(ctarget)
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+
+    var u: i64 = 0
+    while (u < ups) {
+        if (sb.len > 0) { sb.appendByte(47) }
+        sb.append("..")
+        u = u + 1
+    }
+
+    var rest_start = common
+    if (rest_start < tlen and @intToPtr(*u8, @ptrOf(ctarget) + rest_start).* == 47) {
+        rest_start = rest_start + 1
+    }
+    if (rest_start < tlen) {
+        if (sb.len > 0) { sb.appendByte(47) }
+        sb.append(substring(ctarget, rest_start, tlen))
+    }
+
+    if (sb.len == 0) { return "." }
+    // Go: filepath.Rel calls Clean on the result.
+    return clean(sb.toString())
+}
+
+// Returns a relative path from base to target.
+// Both paths should be either both absolute or both relative.
+fn relative(base: string, target: string) string {
+    var cbase = clean(base)
+    var ctarget = clean(target)
+    if (cbase == ctarget) { return "." }
+
+    var common = findCommonPrefix(cbase, ctarget)
+    var ups = countUps(cbase, common)
+    return buildRelResult(ups, ctarget, common)
+}

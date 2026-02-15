@@ -1,0 +1,72 @@
+import "std/dotenv"
+
+test "parse simple" {
+    var env = parseEnv("KEY=value")
+    @assert_eq(entryCount(env), 1)
+    @assert_eq(entryKey(env, 0), "KEY")
+    @assert_eq(entryValue(env, 0), "value")
+}
+
+test "parse multiple" {
+    var env = parseEnv("A=1\nB=2\nC=3")
+    @assert_eq(entryCount(env), 3)
+    @assert_eq(entryKey(env, 0), "A")
+    @assert_eq(entryValue(env, 0), "1")
+    @assert_eq(entryKey(env, 2), "C")
+    @assert_eq(entryValue(env, 2), "3")
+}
+
+test "skip comments" {
+    var env = parseEnv("# comment\nKEY=val")
+    @assert_eq(entryCount(env), 1)
+    @assert_eq(entryKey(env, 0), "KEY")
+}
+
+test "skip empty lines" {
+    var env = parseEnv("\n\nKEY=val\n\n")
+    @assert_eq(entryCount(env), 1)
+}
+
+test "double quoted value" {
+    var env = parseEnv("KEY=\"hello world\"")
+    @assert_eq(entryValue(env, 0), "hello world")
+}
+
+test "single quoted value" {
+    var env = parseEnv("KEY='hello'")
+    @assert_eq(entryValue(env, 0), "hello")
+}
+
+test "inline comment" {
+    var env = parseEnv("KEY=value # this is a comment")
+    @assert_eq(entryValue(env, 0), "value")
+}
+
+test "whitespace trimming" {
+    var env = parseEnv("  KEY  =  value  ")
+    @assert_eq(entryKey(env, 0), "KEY")
+    @assert_eq(entryValue(env, 0), "value")
+}
+
+test "get by key" {
+    var env = parseEnv("DB_HOST=localhost\nDB_PORT=5432")
+    @assert_eq(get(env, "DB_HOST"), "localhost")
+    @assert_eq(get(env, "DB_PORT"), "5432")
+}
+
+test "get missing key" {
+    var env = parseEnv("KEY=val")
+    @assert_eq(get(env, "MISSING"), "")
+}
+
+test "has key" {
+    var env = parseEnv("KEY=val")
+    @assert(has(env, "KEY"))
+    @assert(!has(env, "OTHER"))
+}
+
+test "empty value" {
+    var env = parseEnv("KEY=")
+    @assert_eq(entryCount(env), 1)
+    @assert_eq(entryValue(env, 0), "")
+}

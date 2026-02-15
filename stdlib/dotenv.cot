@@ -1,0 +1,169 @@
+// dotenv — Parse .env files into key-value pairs.
+//
+// Supports:
+//   - KEY=VALUE pairs (one per line)
+//   - Comments (lines starting with #)
+//   - Quoted values (double and single quotes, with stripping)
+//   - Empty lines skipped
+//   - Inline comments after unquoted values
+//   - Trim whitespace around keys and values
+//
+// References:
+//   Deno: @std/dotenv (parse, load)
+//   Node: dotenv (parse)
+
+import "std/string"
+import "std/list"
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
+// Entry layout: [key_ptr(i64) @ 0, key_len(i64) @ 8,
+//                val_ptr(i64) @ 16, val_len(i64) @ 24]
+const ENTRY_SIZE: i64 = 32
+
+// Parse a .env format string into a list of entries.
+// Returns a heap pointer to an array of entries.
+// Use entryCount(), entryKey(), entryValue() to access.
+// Layout: [count(i64) @ 0, entries_ptr(i64) @ 8]
+fn parseEnv(content: string) i64 {
+    var clen = @lenOf(content)
+    var cptr = @ptrOf(content)
+
+    // First pass: count lines
+    var line_count: i64 = 0
+    var i: i64 = 0
+    while (i < clen) {
+        if (@intToPtr(*u8, cptr + i).* == 10) {
+            line_count = line_count + 1
+        }
+        i = i + 1
+    }
+    line_count = line_count + 1
+
+    // Allocate entries (max = line_count)
+    var entries = @alloc(line_count * ENTRY_SIZE)
+    var count: i64 = 0
+
+    // Parse line by line
+    var pos: i64 = 0
+    while (pos < clen) {
+        // Find end of line
+        var line_end = pos
+        while (line_end < clen and @intToPtr(*u8, cptr + line_end).* != 10) {
+            line_end = line_end + 1
+        }
+
+        // Process line
+        var line = @string(cptr + pos, line_end - pos)
+        var trimmed = trim(line)
+        var tlen = @lenOf(trimmed)
+
+        if (tlen > 0 and @intToPtr(*u8, @ptrOf(trimmed)).* != 35) {
+            // Not empty and not a comment — find '='
+            var eq_pos = indexOf(trimmed, "=")
+            if (eq_pos > 0) {
+                var key = trim(substring(trimmed, 0, eq_pos))
+                var raw_val = substring(trimmed, eq_pos + 1, tlen)
+                var val = parseValue(raw_val)
+
+                // Store entry
+                var entry_ptr = entries + count * ENTRY_SIZE
+                @intToPtr(*i64, entry_ptr).* = @ptrOf(key)
+                @intToPtr(*i64, entry_ptr + 8).* = @lenOf(key)
+                @intToPtr(*i64, entry_ptr + 16).* = @ptrOf(val)
+                @intToPtr(*i64, entry_ptr + 24).* = @lenOf(val)
+                count = count + 1
+            }
+        }
+
+        pos = line_end + 1
+    }
+
+    // Create result object
+    var result = @alloc(16)
+    @intToPtr(*i64, result).* = count
+    @intToPtr(*i64, result + 8).* = entries
+    return result
+}
+
+fn parseValue(raw: string) string {
+    var v = trim(raw)
+    var vlen = @lenOf(v)
+    if (vlen == 0) { return "" }
+
+    // Strip quotes
+    var first = @intCast(i64, @intToPtr(*u8, @ptrOf(v)).*)
+    var last = @intCast(i64, @intToPtr(*u8, @ptrOf(v) + vlen - 1).*)
+
+    // Double quotes
+    if (first == 34 and last == 34 and vlen >= 2) {
+        return substring(v, 1, vlen - 1)
+    }
+    // Single quotes
+    if (first == 39 and last == 39 and vlen >= 2) {
+        return substring(v, 1, vlen - 1)
+    }
+
+    // Strip inline comment (space + #)
+    var hash_pos = indexOf(v, " #")
+    if (hash_pos >= 0) {
+        return trim(substring(v, 0, hash_pos))
+    }
+
+    return v
+}
+
+// ============================================================================
+// Accessors
+// ============================================================================
+
+// Return the number of parsed entries.
+fn entryCount(env: i64) i64 {
+    return @intToPtr(*i64, env).*
+}
+
+// Return the key of the nth entry.
+fn entryKey(env: i64, n: i64) string {
+    var entries = @intToPtr(*i64, env + 8).*
+    var entry_ptr = entries + n * ENTRY_SIZE
+    var kp = @intToPtr(*i64, entry_ptr).*
+    var kl = @intToPtr(*i64, entry_ptr + 8).*
+    return @string(kp, kl)
+}
+
+// Return the value of the nth entry.
+fn entryValue(env: i64, n: i64) string {
+    var entries = @intToPtr(*i64, env + 8).*
+    var entry_ptr = entries + n * ENTRY_SIZE
+    var vp = @intToPtr(*i64, entry_ptr + 16).*
+    var vl = @intToPtr(*i64, entry_ptr + 24).*
+    return @string(vp, vl)
+}
+
+// Look up a value by key. Returns empty string if not found.
+fn get(env: i64, key: string) string {
+    var count = entryCount(env)
+    var i: i64 = 0
+    while (i < count) {
+        if (entryKey(env, i) == key) {
+            return entryValue(env, i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Check if a key exists.
+fn has(env: i64, key: string) bool {
+    var count = entryCount(env)
+    var i: i64 = 0
+    while (i < count) {
+        if (entryKey(env, i) == key) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
