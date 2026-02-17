@@ -227,15 +227,15 @@ test "parse number zero" {
 }
 
 test "parse number with exponent" {
-    // 1e2 is valid JSON — parseInt returns 1 (V1: integer value only)
+    // 1e2 has exponent notation — treated as float
     var v = parse("1e2")
-    @assert_eq(jsonTag(v), JSON_INT)
+    @assert_eq(jsonTag(v), JSON_FLOAT)
 }
 
 test "parse number with decimal and exponent" {
-    // 3.14e0 is valid JSON
+    // 3.14e0 has decimal and exponent — treated as float
     var v = parse("3.14e0")
-    @assert_eq(jsonTag(v), JSON_INT)
+    @assert_eq(jsonTag(v), JSON_FLOAT)
 }
 
 test "parse object with escaped key" {

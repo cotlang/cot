@@ -290,7 +290,9 @@ pub const FuncGen = struct {
         _ = self;
         return switch (v.op) {
             .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
-            .wasm_i64_gt_s, .wasm_i64_ge_s, .wasm_i64_eqz,
+            .wasm_i64_gt_s, .wasm_i64_ge_s,
+            .wasm_i64_lt_u, .wasm_i64_le_u, .wasm_i64_gt_u, .wasm_i64_ge_u,
+            .wasm_i64_eqz,
             .wasm_f64_eq, .wasm_f64_ne, .wasm_f64_lt, .wasm_f64_le,
             .wasm_f64_gt, .wasm_f64_ge,
             => true,
@@ -975,6 +977,26 @@ pub const FuncGen = struct {
                 try self.getValue64(v.args[1]);
                 try self.code.emitI64GeS();
             },
+            .wasm_i64_lt_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                try self.code.emitI64LtU();
+            },
+            .wasm_i64_le_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                try self.code.emitI64LeU();
+            },
+            .wasm_i64_gt_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                try self.code.emitI64GtU();
+            },
+            .wasm_i64_ge_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                try self.code.emitI64GeU();
+            },
             .wasm_i64_eqz => {
                 try self.getValue64(v.args[0]);
                 try self.code.emitI64Eqz();
@@ -1085,7 +1107,9 @@ pub const FuncGen = struct {
             .wasm_i32_const, .const_32, .wasm_i32_load => true,
             // Comparisons produce i32
             .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
-            .wasm_i64_gt_s, .wasm_i64_ge_s, .wasm_i64_eqz,
+            .wasm_i64_gt_s, .wasm_i64_ge_s,
+            .wasm_i64_lt_u, .wasm_i64_le_u, .wasm_i64_gt_u, .wasm_i64_ge_u,
+            .wasm_i64_eqz,
             .wasm_f64_eq, .wasm_f64_ne, .wasm_f64_lt, .wasm_f64_le,
             .wasm_f64_gt, .wasm_f64_ge,
             => true,

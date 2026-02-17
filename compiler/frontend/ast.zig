@@ -158,6 +158,7 @@ pub const BuiltinKind = enum {
     align_of,
     // Casts
     int_cast,
+    float_from_int,
     ptr_cast,
     int_to_ptr,
     ptr_to_int,
@@ -266,6 +267,7 @@ pub const BuiltinKind = enum {
         .{ "sizeOf", .size_of },
         .{ "alignOf", .align_of },
         .{ "intCast", .int_cast },
+        .{ "floatFromInt", .float_from_int },
         .{ "ptrCast", .ptr_cast },
         .{ "intToPtr", .int_to_ptr },
         .{ "ptrToInt", .ptr_to_int },
@@ -355,6 +357,7 @@ pub const BuiltinKind = enum {
             .size_of => "sizeOf",
             .align_of => "alignOf",
             .int_cast => "intCast",
+            .float_from_int => "floatFromInt",
             .ptr_cast => "ptrCast",
             .int_to_ptr => "intToPtr",
             .ptr_to_int => "ptrToInt",

@@ -2131,14 +2131,17 @@ pub const Driver = struct {
                         0x41, 0x0F, 0xBA, 0xE0, 0x03, //113: bt r8d, 3     (test macOS O_APPEND 0x8)
                         0x73, 0x05, //118: jnc +5                  (skip 5-byte or eax,imm32)
                         0x0D, 0x00, 0x04, 0x00, 0x00, //120: or eax, 0x400 (Linux O_APPEND)
-                        0x89, 0xC2, //125: mov edx, eax             (Linux flags → rdx)
+                        0x41, 0x0F, 0xBA, 0xE0, 0x0B, //125: bt r8d, 11    (test macOS O_EXCL 0x800)
+                        0x73, 0x03, //130: jnc +3                  (skip if not set)
+                        0x83, 0xC8, 0x80, //132: or eax, 0x80              (Linux O_EXCL)
+                        0x89, 0xC2, //135: mov edx, eax             (Linux flags → rdx)
                         // --- End flag translation ---
-                        0x49, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00, //127: mov r10, 420  (mode 0644, arg4=r10 for syscall)
-                        0x48, 0xC7, 0xC0, 0x01, 0x01, 0x00, 0x00, //134: mov rax, 257  (SYS_openat)
-                        0x0F, 0x05, //141: syscall
-                        0x48, 0x89, 0xEC, //143: mov rsp, rbp  (restore stack)
-                        0x5D, //146: pop rbp
-                        0xC3, //147: ret
+                        0x49, 0xC7, 0xC2, 0xA4, 0x01, 0x00, 0x00, //137: mov r10, 420  (mode 0644, arg4=r10 for syscall)
+                        0x48, 0xC7, 0xC0, 0x01, 0x01, 0x00, 0x00, //144: mov rax, 257  (SYS_openat)
+                        0x0F, 0x05, //151: syscall
+                        0x48, 0x89, 0xEC, //153: mov rsp, rbp  (restore stack)
+                        0x5D, //156: pop rbp
+                        0xC3, //157: ret
                     };
                     try module.defineFunctionBytes(elf_func_ids[i], &x64_open, &.{});
                 } else if (std.mem.eql(u8, name, "cot_time")) {

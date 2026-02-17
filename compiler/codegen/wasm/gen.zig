@@ -527,6 +527,26 @@ pub const GenState = struct {
                 try self.getValue64(v.args[1]);
                 _ = try self.builder.append(.i64_ge_s);
             },
+            .wasm_i64_lt_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_lt_u);
+            },
+            .wasm_i64_le_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_le_u);
+            },
+            .wasm_i64_gt_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_gt_u);
+            },
+            .wasm_i64_ge_u => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.i64_ge_u);
+            },
             .wasm_i64_eqz => {
                 try self.getValue64(v.args[0]);
                 _ = try self.builder.append(.i64_eqz);
@@ -1367,7 +1387,9 @@ fn isCmp(v: *const SsaValue) bool {
     // Go: isCmp (ssa.go:463-471) — only wasm comparison ops
     return switch (v.op) {
         .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
-        .wasm_i64_gt_s, .wasm_i64_ge_s, .wasm_i64_eqz,
+        .wasm_i64_gt_s, .wasm_i64_ge_s,
+        .wasm_i64_lt_u, .wasm_i64_le_u, .wasm_i64_gt_u, .wasm_i64_ge_u,
+        .wasm_i64_eqz,
         .wasm_f64_eq, .wasm_f64_ne, .wasm_f64_lt, .wasm_f64_le,
         .wasm_f64_gt, .wasm_f64_ge,
         => true,

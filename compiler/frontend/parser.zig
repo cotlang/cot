@@ -1332,7 +1332,7 @@ pub const Parser = struct {
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = t, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
             },
             // 1 type + 1 value arg: @intCast(T, val), @enumFromInt(T, val), @bitCast(T, val), @truncate(T, val), @as(T, val), @offsetOf(T, "field"), @alignCast(T, val)
-            .int_cast, .ptr_cast, .int_to_ptr, .has_field,
+            .int_cast, .float_from_int, .ptr_cast, .int_to_ptr, .has_field,
             .enum_from_int, .bit_cast, .truncate, .as, .offset_of, .align_cast,
             => {
                 const t = try self.parseType() orelse return null;

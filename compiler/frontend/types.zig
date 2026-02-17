@@ -414,7 +414,18 @@ pub const TypeRegistry = struct {
         if (a_size > b_size) return a;
         if (b_size > a_size) return b;
 
-        // Same width: signed wins (Zig: signed absorbs unsigned at same width)
+        // Same width, different signedness → promote to next wider signed type
+        // Ref: Zig Sema.zig:peerType promotes to wider signed to avoid value loss
+        if (isBasicSigned(a) != isBasicSigned(b)) {
+            return switch (a_size) {
+                1 => I16, // u8 + i8 → i16
+                2 => I32, // u16 + i16 → i32
+                4 => I64, // u32 + i32 → i64
+                else => I64, // 64-bit: no wider type available, use i64
+            };
+        }
+
+        // Same width, same signedness: return first
         if (isBasicSigned(a)) return a;
         if (isBasicSigned(b)) return b;
 

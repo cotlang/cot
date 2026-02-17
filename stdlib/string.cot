@@ -139,6 +139,8 @@ fn count(s: string, needle: string) i64 {
 // Extraction
 // ============================================================================
 
+// Ref: Go string([]byte) always copies; Zig slices have explicit lifetime
+// Copy semantics prevent use-after-free if parent is deallocated.
 fn substring(s: string, start: i64, end: i64) string {
     var slen = @lenOf(s)
     var st = start
@@ -146,7 +148,10 @@ fn substring(s: string, start: i64, end: i64) string {
     if (st < 0) { st = 0 }
     if (en > slen) { en = slen }
     if (st >= en) { return "" }
-    return @string(@ptrOf(s) + st, en - st)
+    var new_len = en - st
+    var buf = @alloc(new_len)
+    @memcpy(buf, @ptrOf(s) + st, new_len)
+    return @string(buf, new_len)
 }
 
 fn trimLeft(s: string) string {

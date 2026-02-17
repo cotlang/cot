@@ -229,6 +229,7 @@ impl Map(K, V) {
         return 0
     }
 
+    // Ref: Zig HashMap rehashes to clean tombstones when load factor is unhealthy
     fn delete(self: Map(K, V), key: K) void {
         if (self.capacity == 0) { return }
         var k = key
@@ -247,6 +248,18 @@ impl Map(K, V) {
                     @arc_release(dvp.*)
                     st.* = 2
                     self.count -= 1
+                    // Tombstone cleanup: if tombstones > capacity/4, rehash at same capacity
+                    // Count tombstones by scanning states
+                    var tombstones: i64 = 0
+                    var ti: i64 = 0
+                    while (ti < self.capacity) {
+                        var ts = @intToPtr(*i64, self.states + ti * @sizeOf(i64))
+                        if (ts.* == 2) { tombstones += 1 }
+                        ti += 1
+                    }
+                    if (tombstones > self.capacity / 4) {
+                        self.rehash(self.capacity)
+                    }
                     return
                 }
             }

@@ -63,7 +63,7 @@ fn fmax(a: f64, b: f64) f64 { return @fmax(a, b) }
 // =========================================================================
 
 fn toInt(x: f64) i64 { return @intCast(i64, x) }
-fn toFloat(x: i64) f64 { return @intCast(f64, x) }
+fn toFloat(x: i64) f64 { return @floatFromInt(f64, x) }
 
 // =========================================================================
 // Power

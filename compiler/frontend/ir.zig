@@ -24,8 +24,10 @@ pub const GlobalIdx = u32;
 pub const BinaryOp = enum(u8) {
     add, sub, mul, div, mod, eq, ne, lt, le, gt, ge, @"and", @"or", bit_and, bit_or, bit_xor, shl, shr,
     fmin, fmax,
+    // Unsigned comparison ops (for @min/@max with unsigned types)
+    lt_u, le_u, gt_u, ge_u,
 
-    pub fn isComparison(self: BinaryOp) bool { return switch (self) { .eq, .ne, .lt, .le, .gt, .ge => true, else => false }; }
+    pub fn isComparison(self: BinaryOp) bool { return switch (self) { .eq, .ne, .lt, .le, .gt, .ge, .lt_u, .le_u, .gt_u, .ge_u => true, else => false }; }
     pub fn isArithmetic(self: BinaryOp) bool { return switch (self) { .add, .sub, .mul, .div, .mod => true, else => false }; }
     pub fn isLogical(self: BinaryOp) bool { return switch (self) { .@"and", .@"or" => true, else => false }; }
     pub fn isBitwise(self: BinaryOp) bool { return switch (self) { .bit_and, .bit_or, .bit_xor, .shl, .shr => true, else => false }; }

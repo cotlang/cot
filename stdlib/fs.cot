@@ -15,7 +15,7 @@ const O_CREAT: i64 = if (@target_os() == "linux") { 64 } else { 512 }
 const O_TRUNC: i64 = if (@target_os() == "linux") { 512 } else { 1024 }
 const O_APPEND: i64 = if (@target_os() == "linux") { 1024 } else { 8 }
 const O_EXCL: i64 = if (@target_os() == "linux") { 128 } else { 2048 }
-const O_CREATE: i64 = if (@target_os() == "linux") { 577 } else { 1538 }
+const O_CREATE: i64 = if (@target_os() == "linux") { 578 } else { 1538 }
 const O_WRITE_CREATE: i64 = if (@target_os() == "linux") { 577 } else { 1537 }
 
 // Seek whence
@@ -90,18 +90,30 @@ fn stderr() File { return File { .fd = 2 } }
 
 // ===== High-level APIs =====
 
+// High-level file APIs (handle errors internally, return empty/void on failure)
+// Note: error union returns (!string) not yet supported for compound types in native.
 fn readFile(path: string) string {
     var fd = @fd_open(@ptrOf(path), @lenOf(path), O_RDONLY)
+    if (fd < 0) { return "" }
     var size = @fd_seek(fd, 0, 2)
     @fd_seek(fd, 0, 0)
+    if (size <= 0) {
+        @fd_close(fd)
+        return ""
+    }
     var buf = @alloc(size)
     var n = @fd_read(fd, buf, size)
     @fd_close(fd)
+    if (n < 0) {
+        @dealloc(buf)
+        return ""
+    }
     return @string(buf, n)
 }
 
 fn writeFile(path: string, data: string) void {
     var fd = @fd_open(@ptrOf(path), @lenOf(path), O_CREATE)
+    if (fd < 0) { return }
     @fd_write(fd, @ptrOf(data), @lenOf(data))
     @fd_close(fd)
 }

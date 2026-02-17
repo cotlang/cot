@@ -163,3 +163,119 @@ fn httpResponse(status: i64, body: string) string {
     sb.append(body)
     return sb.toString()
 }
+
+// ===== HTTP Request Parsing =====
+// Reference: Go net/http.ReadRequest — parse method, path, headers, body
+
+// HttpRequest layout — heap-allocated (5 string fields × 16 = 80 bytes):
+//   offset  0: method_ptr   (i64)
+//   offset  8: method_len   (i64)
+//   offset 16: path_ptr     (i64)
+//   offset 24: path_len     (i64)
+//   offset 32: version_ptr  (i64)
+//   offset 40: version_len  (i64)
+//   offset 48: headers_ptr  (i64) — raw headers block
+//   offset 56: headers_len  (i64)
+//   offset 64: body_ptr     (i64)
+//   offset 72: body_len     (i64)
+
+fn requestMethod(req: i64) string {
+    var p = @intToPtr(*i64, req).*
+    var l = @intToPtr(*i64, req + 8).*
+    if (l == 0) { return "" }
+    return @string(p, l)
+}
+
+fn requestPath(req: i64) string {
+    var p = @intToPtr(*i64, req + 16).*
+    var l = @intToPtr(*i64, req + 24).*
+    if (l == 0) { return "" }
+    return @string(p, l)
+}
+
+fn requestVersion(req: i64) string {
+    var p = @intToPtr(*i64, req + 32).*
+    var l = @intToPtr(*i64, req + 40).*
+    if (l == 0) { return "" }
+    return @string(p, l)
+}
+
+fn requestHeaders(req: i64) string {
+    var p = @intToPtr(*i64, req + 48).*
+    var l = @intToPtr(*i64, req + 56).*
+    if (l == 0) { return "" }
+    return @string(p, l)
+}
+
+fn requestBody(req: i64) string {
+    var p = @intToPtr(*i64, req + 64).*
+    var l = @intToPtr(*i64, req + 72).*
+    if (l == 0) { return "" }
+    return @string(p, l)
+}
+
+fn reqSetField(req: i64, offset: i64, s: string) void {
+    @intToPtr(*i64, req + offset).* = @ptrOf(s)
+    @intToPtr(*i64, req + offset + 8).* = @lenOf(s)
+}
+
+// Parse a raw HTTP request string into an HttpRequest object.
+// Format: "METHOD /path HTTP/1.1\r\nHeaders\r\n\r\nBody"
+// Reference: Go net/http.ReadRequest
+fn parseRequest(data: string) i64 {
+    var req = @alloc(80)
+    var i: i64 = 0
+    while (i < 80) {
+        @intToPtr(*u8, req + i).* = @intCast(u8, 0)
+        i = i + 1
+    }
+
+    var dptr = @ptrOf(data)
+    var dlen = @lenOf(data)
+    if (dlen == 0) { return req }
+
+    // Find first space (end of method)
+    var pos: i64 = 0
+    while (pos < dlen and @intToPtr(*u8, dptr + pos).* != 32) {
+        pos = pos + 1
+    }
+    reqSetField(req, 0, substring(data, 0, pos))
+    pos = pos + 1
+
+    // Find second space (end of path)
+    var path_start = pos
+    while (pos < dlen and @intToPtr(*u8, dptr + pos).* != 32) {
+        pos = pos + 1
+    }
+    reqSetField(req, 16, substring(data, path_start, pos))
+    pos = pos + 1
+
+    // Find end of request line (\r\n)
+    var ver_start = pos
+    while (pos < dlen - 1) {
+        if (@intToPtr(*u8, dptr + pos).* == 13 and @intToPtr(*u8, dptr + pos + 1).* == 10) {
+            reqSetField(req, 32, substring(data, ver_start, pos))
+            pos = pos + 2
+            break
+        }
+        pos = pos + 1
+    }
+
+    // Find end of headers (\r\n\r\n)
+    var hdr_start = pos
+    while (pos < dlen - 3) {
+        if (@intToPtr(*u8, dptr + pos).* == 13 and @intToPtr(*u8, dptr + pos + 1).* == 10 and @intToPtr(*u8, dptr + pos + 2).* == 13 and @intToPtr(*u8, dptr + pos + 3).* == 10) {
+            reqSetField(req, 48, substring(data, hdr_start, pos))
+            pos = pos + 4
+            break
+        }
+        pos = pos + 1
+    }
+
+    // Remaining is body
+    if (pos < dlen) {
+        reqSetField(req, 64, substring(data, pos, dlen))
+    }
+
+    return req
+}

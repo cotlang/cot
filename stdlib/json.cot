@@ -16,6 +16,7 @@ const JSON_INT: i64 = 2
 const JSON_STRING: i64 = 3
 const JSON_ARRAY: i64 = 4
 const JSON_OBJECT: i64 = 5
+const JSON_FLOAT: i64 = 6
 
 // JsonValue — flat struct with type tag.
 // For scalars: int_val holds the value (bool 0/1, or integer).
@@ -86,6 +87,18 @@ fn jsonString(val: string) i64 {
     return p
 }
 
+// Ref: Go encoding/json uses strconv.ParseFloat
+// Store float as string representation (V1: no f64 type in Cot yet)
+fn jsonFloat(str_repr: string) i64 {
+    var p = @alloc(40)
+    @intToPtr(*i64, p).* = JSON_FLOAT
+    @intToPtr(*i64, p + 8).* = 0
+    @intToPtr(*i64, p + 16).* = @ptrOf(str_repr)
+    @intToPtr(*i64, p + 24).* = @lenOf(str_repr)
+    @intToPtr(*i64, p + 32).* = 0
+    return p
+}
+
 fn jsonArray() i64 {
     var p = @alloc(40)
     @intToPtr(*i64, p).* = JSON_ARRAY
@@ -139,6 +152,17 @@ fn jsonGetBool(val: i64) bool {
 
 fn jsonGetInt(val: i64) i64 {
     return @intToPtr(*i64, val + 8).*
+}
+
+fn jsonIsFloat(val: i64) bool {
+    return jsonTag(val) == JSON_FLOAT
+}
+
+// Returns the string representation of a float number
+fn jsonGetFloat(val: i64) string {
+    var sp = @intToPtr(*i64, val + 16).*
+    var sl = @intToPtr(*i64, val + 24).*
+    return @string(sp, sl)
 }
 
 fn jsonGetString(val: i64) string {
@@ -195,6 +219,23 @@ fn jsonObjectLen(val: i64) i64 {
 fn jsonObjectPut(obj: i64, key: string, val: i64) void {
     var keys_p = @intToPtr(*i64, obj + 8).*
     var vals_p = @intToPtr(*i64, obj + 32).*
+
+    // Check for duplicate key — update in place if found (Go map semantics: last wins)
+    // Reference: Go encoding/json uses map, RFC 8259 recommends unique keys
+    var dup_k_items = @intToPtr(*i64, keys_p).*
+    var dup_k_count = @intToPtr(*i64, keys_p + 8).*
+    var dup_v_items = @intToPtr(*i64, vals_p).*
+    var di: i64 = 0
+    while (di < dup_k_count) {
+        var kptr = @intToPtr(*i64, dup_k_items + di * 16).*
+        var klen = @intToPtr(*i64, dup_k_items + di * 16 + 8).*
+        var existing = @string(kptr, klen)
+        if (existing == key) {
+            @intToPtr(*i64, dup_v_items + di * 8).* = val
+            return
+        }
+        di += 1
+    }
 
     // Append key (string = 2 i64s: ptr, len)
     var k_items = @intToPtr(*i64, keys_p).*
@@ -433,10 +474,25 @@ fn parseNumber(p: i64) i64 {
         }
     }
 
-    // Parse integer value from consumed bytes (V1: integer only)
+    // Detect if number contains '.' or 'e'/'E' — treat as float
+    // Ref: Go encoding/json uses strconv.ParseFloat for non-integer numbers
     var s = @string(src + start, pos - start)
-    var result = parseInt(s)
+    var is_float = false
+    var di: i64 = 0
+    while (di < pos - start) {
+        var dc = @intToPtr(*u8, src + start + di).*
+        if (dc == 46 or dc == 101 or dc == 69) {
+            is_float = true
+            di = pos - start
+        } else {
+            di += 1
+        }
+    }
     @intToPtr(*i64, p + 16).* = pos
+    if (is_float) {
+        return jsonFloat(s)
+    }
+    var result = parseInt(s)
     return jsonInt(result)
 }
 
@@ -770,4 +826,53 @@ fn encodeObject(val: i64, sb: *StringBuilder) void {
         i += 1
     }
     sb.appendByte(125) // }
+}
+
+// ============================================================================
+// Cleanup
+// ============================================================================
+
+// Recursively free a JsonValue and all its children.
+// Reference: Go encoding/json — GC handles this; we need explicit cleanup for ARC.
+fn jsonFree(val: i64) void {
+    if (val == 0) { return }
+    var tag = @intToPtr(*i64, val).*
+
+    if (tag == JSON_ARRAY) {
+        var arr_p = @intToPtr(*i64, val + 8).*
+        if (arr_p != 0) {
+            var items = @intToPtr(*i64, arr_p).*
+            var count = @intToPtr(*i64, arr_p + 8).*
+            var i: i64 = 0
+            while (i < count) {
+                jsonFree(@intToPtr(*i64, items + i * 8).*)
+                i += 1
+            }
+            if (items != 0) { @dealloc(items) }
+            @dealloc(arr_p)
+        }
+    }
+
+    if (tag == JSON_OBJECT) {
+        var keys_p = @intToPtr(*i64, val + 8).*
+        var vals_p = @intToPtr(*i64, val + 32).*
+        if (vals_p != 0) {
+            var v_items = @intToPtr(*i64, vals_p).*
+            var v_count = @intToPtr(*i64, vals_p + 8).*
+            var i: i64 = 0
+            while (i < v_count) {
+                jsonFree(@intToPtr(*i64, v_items + i * 8).*)
+                i += 1
+            }
+            if (v_items != 0) { @dealloc(v_items) }
+            @dealloc(vals_p)
+        }
+        if (keys_p != 0) {
+            var k_items = @intToPtr(*i64, keys_p).*
+            if (k_items != 0) { @dealloc(k_items) }
+            @dealloc(keys_p)
+        }
+    }
+
+    @dealloc(val)
 }

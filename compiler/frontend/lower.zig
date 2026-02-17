@@ -2957,44 +2957,31 @@ pub const Lowerer = struct {
         }
         const result = try fb.emitBinary(tokenToBinaryOp(bin.op), left, right, result_type, bin.span);
 
-        // Overflow detection for narrow integer arithmetic (debug mode only).
-        // Reference: Zig Sema.zig:analyzeArithmetic — add_safe/mul_safe emit
-        // runtime overflow checks in debug mode, skip in release mode.
-        // Pattern: mask result to type width, compare with unmasked, trap if overflow.
-        if (!self.release_mode and isArithOp(bin.op)) {
-            const mask = overflowMask(result_type);
-            if (mask != 0) {
-                const mask_val = try fb.emitConstInt(@intCast(mask), TypeRegistry.I64, bin.span);
-                const masked = try fb.emitBinary(.bit_and, result, mask_val, result_type, bin.span);
-                const ok = try fb.emitBinary(.eq, result, masked, TypeRegistry.BOOL, bin.span);
-                // Same pattern as @assert: branch on condition, trap in fail block
-                const ok_block = try fb.newBlock("overflow.ok");
-                const fail_block = try fb.newBlock("overflow.fail");
-                _ = try fb.emitBranch(ok, ok_block, fail_block, bin.span);
-                fb.setBlock(fail_block);
-                _ = try fb.emitTrap(bin.span);
-                fb.setBlock(ok_block);
-            }
+        // Div-by-zero check for integer division/modulo.
+        // Reference: Go ssa.go — OpDiv64/OpMod64 check for zero divisor.
+        // NOTE: Narrow type overflow checks were removed — Go's Wasm backend
+        // does NOT emit runtime overflow checks (ssa.go, rewriteWasm.go).
+        // Zig does comptime overflow in Sema.zig, not runtime Wasm checks.
+        const result_info = self.type_reg.get(result_type);
+        const is_integer_type = result_info == .basic and result_info.basic.isInteger();
+        if (!self.release_mode and isDivOp(bin.op) and is_integer_type) {
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+            const rhs_nz = try fb.emitBinary(.ne, right, zero, TypeRegistry.BOOL, bin.span);
+            const ok_block = try fb.newBlock("divzero.ok");
+            const fail_block = try fb.newBlock("divzero.fail");
+            _ = try fb.emitBranch(rhs_nz, ok_block, fail_block, bin.span);
+            fb.setBlock(fail_block);
+            _ = try fb.emitTrap(bin.span);
+            fb.setBlock(ok_block);
         }
 
         return result;
     }
 
-    fn isArithOp(op: Token) bool {
+    fn isDivOp(op: Token) bool {
         return switch (op) {
-            .add, .sub, .mul => true,
+            .quo, .rem => true,
             else => false,
-        };
-    }
-
-    /// Returns the overflow mask for narrow unsigned types, 0 for full-width types.
-    /// Reference: Zig — narrow types need range checks, full-width wraps naturally.
-    fn overflowMask(type_idx: TypeIndex) u64 {
-        return switch (type_idx) {
-            TypeRegistry.U8 => 0xFF,
-            TypeRegistry.U16 => 0xFFFF,
-            TypeRegistry.U32 => 0xFFFFFFFF,
-            else => 0, // i64/u64/f64/signed: no mask-based check
         };
     }
 
@@ -4973,6 +4960,11 @@ pub const Lowerer = struct {
                 const value = try self.lowerExprNode(bc.args[0]);
                 return try fb.emitIntCast(value, target_type, bc.span);
             },
+            .float_from_int => {
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitIntCast(value, target_type, bc.span);
+            },
             .ptr_cast => {
                 const target_type = self.resolveTypeNode(bc.type_arg);
                 const value = try self.lowerExprNode(bc.args[0]);
@@ -5552,12 +5544,49 @@ pub const Lowerer = struct {
                 return fb.emitConstSlice(empty, bc.span);
             },
             // @errorName(err) — Zig Sema.zig:20375: error value → name string
-            // Error values in Cot are integer tags. We need a global error variant table.
-            // For now, emit the error tag as a string (simplified — full impl needs error registry)
+            // Build if-chain like @tagName: compare value against each variant index
             .error_name => {
-                // Error names are not easily recoverable at runtime without a global table.
-                // For comptime-known errors, the checker can resolve the name.
-                // For runtime: return "error" as placeholder (full impl in Tier 3 with error registry)
+                const arg = try self.lowerExprNode(bc.args[0]);
+                const arg_type = self.inferExprType(bc.args[0]);
+                var error_set_type = arg_type;
+                const info = self.type_reg.get(arg_type);
+                // For error unions, extract the error set type
+                if (info == .error_union) {
+                    error_set_type = info.error_union.error_set;
+                }
+                const es_info = self.type_reg.get(error_set_type);
+                if (es_info == .error_set and es_info.error_set.variants.len > 0) {
+                    const variants = es_info.error_set.variants;
+                    // Store arg to local (br_table can't carry values across blocks)
+                    const arg_local = try fb.addLocalWithSize("__err_val", TypeRegistry.I64, false, 8);
+                    _ = try fb.emitStoreLocal(arg_local, arg, bc.span);
+                    const result_local = try fb.addLocalWithSize("__err_result", TypeRegistry.STRING, false, 16);
+                    const merge_block = try fb.newBlock("errname.merge");
+                    for (variants, 0..) |name, i| {
+                        const val_node = try fb.emitLoadLocal(arg_local, TypeRegistry.I64, bc.span);
+                        const variant_val = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, bc.span);
+                        const cmp = try fb.emitBinary(.eq, val_node, variant_val, TypeRegistry.BOOL, bc.span);
+                        const match_block = try fb.newBlock("errname.match");
+                        const next_block = try fb.newBlock("errname.next");
+                        _ = try fb.emitBranch(cmp, match_block, next_block, bc.span);
+                        fb.setBlock(match_block);
+                        const str = try fb.addStringLiteral(try self.allocator.dupe(u8, name));
+                        const str_val = try fb.emitConstSlice(str, bc.span);
+                        _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(str_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
+                        _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(str_val, bc.span), bc.span);
+                        _ = try fb.emitJump(merge_block, bc.span);
+                        fb.setBlock(next_block);
+                    }
+                    // Default: "error" for unknown values
+                    const fallback = try fb.addStringLiteral(try self.allocator.dupe(u8, "error"));
+                    const fallback_val = try fb.emitConstSlice(fallback, bc.span);
+                    _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(fallback_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
+                    _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(fallback_val, bc.span), bc.span);
+                    _ = try fb.emitJump(merge_block, bc.span);
+                    fb.setBlock(merge_block);
+                    return fb.emitLoadLocal(result_local, TypeRegistry.STRING, bc.span);
+                }
+                // Fallback for unresolved error sets
                 const fallback = try fb.addStringLiteral(try self.allocator.dupe(u8, "error"));
                 return fb.emitConstSlice(fallback, bc.span);
             },
@@ -5606,9 +5635,10 @@ pub const Lowerer = struct {
             },
             // @as(T, val) — Zig Sema.zig:9659: explicit type coercion, delegates to intCast
             .as => {
-                const target_type = self.resolveTypeNode(bc.type_arg);
-                const value = try self.lowerExprNode(bc.args[0]);
-                return try fb.emitIntCast(value, target_type, bc.span);
+                // @as is a pure type annotation — identity at Wasm level (all values are i64)
+                // Ref: Zig @as is type coercion with no codegen
+                _ = self.resolveTypeNode(bc.type_arg);
+                return try self.lowerExprNode(bc.args[0]);
             },
             // @offsetOf(T, "field") — Zig Sema.zig:23060: always comptime, byte offset
             .offset_of => {
@@ -5627,9 +5657,15 @@ pub const Lowerer = struct {
                 return fb.emitConstInt(0, TypeRegistry.I64, bc.span);
             },
             // @min(a, b) — Zig Sema.zig:24678: if a < b then a else b
+            // Uses unsigned comparison for unsigned integer types (Ref: Zig peerType)
             .min => {
                 const a = try self.lowerExprNode(bc.args[0]);
                 const b = try self.lowerExprNode(bc.args[1]);
+                // Determine comparison op based on arg types
+                const a_type = self.inferExprType(bc.args[0]);
+                const a_info = self.type_reg.get(a_type);
+                const use_unsigned = a_info == .basic and a_info.basic.isUnsigned();
+                const cmp_op: ir.BinaryOp = if (use_unsigned) .lt_u else .lt;
                 // Store to locals (br_table can't carry values)
                 const a_local = try fb.addLocalWithSize("__min_a", TypeRegistry.I64, false, 8);
                 _ = try fb.emitStoreLocal(a_local, a, bc.span);
@@ -5638,7 +5674,7 @@ pub const Lowerer = struct {
                 const result_local = try fb.addLocalWithSize("__min_r", TypeRegistry.I64, false, 8);
                 const a_val = try fb.emitLoadLocal(a_local, TypeRegistry.I64, bc.span);
                 const b_val = try fb.emitLoadLocal(b_local, TypeRegistry.I64, bc.span);
-                const cmp = try fb.emitBinary(.lt, a_val, b_val, TypeRegistry.BOOL, bc.span);
+                const cmp = try fb.emitBinary(cmp_op, a_val, b_val, TypeRegistry.BOOL, bc.span);
                 const then_block = try fb.newBlock("min.a");
                 const else_block = try fb.newBlock("min.b");
                 const merge_block = try fb.newBlock("min.merge");
@@ -5656,6 +5692,10 @@ pub const Lowerer = struct {
             .max => {
                 const a = try self.lowerExprNode(bc.args[0]);
                 const b = try self.lowerExprNode(bc.args[1]);
+                const a_type = self.inferExprType(bc.args[0]);
+                const a_info = self.type_reg.get(a_type);
+                const use_unsigned = a_info == .basic and a_info.basic.isUnsigned();
+                const cmp_op: ir.BinaryOp = if (use_unsigned) .gt_u else .gt;
                 const a_local = try fb.addLocalWithSize("__max_a", TypeRegistry.I64, false, 8);
                 _ = try fb.emitStoreLocal(a_local, a, bc.span);
                 const b_local = try fb.addLocalWithSize("__max_b", TypeRegistry.I64, false, 8);
@@ -5663,7 +5703,7 @@ pub const Lowerer = struct {
                 const result_local = try fb.addLocalWithSize("__max_r", TypeRegistry.I64, false, 8);
                 const a_val = try fb.emitLoadLocal(a_local, TypeRegistry.I64, bc.span);
                 const b_val = try fb.emitLoadLocal(b_local, TypeRegistry.I64, bc.span);
-                const cmp = try fb.emitBinary(.gt, a_val, b_val, TypeRegistry.BOOL, bc.span);
+                const cmp = try fb.emitBinary(cmp_op, a_val, b_val, TypeRegistry.BOOL, bc.span);
                 const then_block = try fb.newBlock("max.a");
                 const else_block = try fb.newBlock("max.b");
                 const merge_block = try fb.newBlock("max.merge");

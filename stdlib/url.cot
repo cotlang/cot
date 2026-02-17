@@ -188,3 +188,75 @@ fn urlToString(url: i64) string {
     }
     return sb.toString()
 }
+
+// ===== Percent-Encoding (RFC 3986 Section 2.1) =====
+// Reference: Go url.PathEscape/PathUnescape
+
+// Check if a byte is in the unreserved set: A-Z, a-z, 0-9, '-', '.', '_', '~'
+fn isUnreserved(c: i64) bool {
+    if (c >= 65 and c <= 90) { return true }
+    if (c >= 97 and c <= 122) { return true }
+    if (c >= 48 and c <= 57) { return true }
+    if (c == 45 or c == 46 or c == 95 or c == 126) { return true }
+    return false
+}
+
+fn hexDigit(n: i64) i64 {
+    if (n < 10) { return 48 + n }
+    return 65 + n - 10
+}
+
+fn fromHexDigit(c: i64) i64 {
+    if (c >= 48 and c <= 57) { return c - 48 }
+    if (c >= 65 and c <= 70) { return c - 65 + 10 }
+    if (c >= 97 and c <= 102) { return c - 97 + 10 }
+    return 0 - 1
+}
+
+// Percent-encode a string. Non-unreserved bytes become %XX.
+// Reference: Go url.PathEscape — encode all except unreserved set
+fn percentEncode(s: string) string {
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var i: i64 = 0
+    var slen = @lenOf(s)
+    var sptr = @ptrOf(s)
+    while (i < slen) {
+        var c: i64 = @intToPtr(*u8, sptr + i).*
+        if (isUnreserved(c)) {
+            sb.appendByte(c)
+        } else {
+            sb.appendByte(37)
+            sb.appendByte(hexDigit((c >> 4) & 15))
+            sb.appendByte(hexDigit(c & 15))
+        }
+        i = i + 1
+    }
+    return sb.toString()
+}
+
+// Percent-decode a string. %XX sequences become the corresponding byte.
+// Reference: Go url.PathUnescape
+fn percentDecode(s: string) string {
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var i: i64 = 0
+    var slen = @lenOf(s)
+    var sptr = @ptrOf(s)
+    while (i < slen) {
+        var c: i64 = @intToPtr(*u8, sptr + i).*
+        if (c == 37 and i + 2 < slen) {
+            var hi = fromHexDigit(@intToPtr(*u8, sptr + i + 1).*)
+            var lo = fromHexDigit(@intToPtr(*u8, sptr + i + 2).*)
+            if (hi >= 0 and lo >= 0) {
+                sb.appendByte(hi * 16 + lo)
+                i = i + 3
+            } else {
+                sb.appendByte(c)
+                i = i + 1
+            }
+        } else {
+            sb.appendByte(c)
+            i = i + 1
+        }
+    }
+    return sb.toString()
+}

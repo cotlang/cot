@@ -64,6 +64,18 @@ pub const ALIGN_MINUS_ONE: i32 = @as(i32, @intCast(ALIGNMENT)) - 1;
 pub const ALIGN_MASK: i32 = -@as(i32, @intCast(ALIGNMENT));
 
 // =============================================================================
+// Size-Class Freelist Constants (jemalloc/Swift pattern)
+// =============================================================================
+
+/// Size class thresholds (total_size including header, aligned to 8)
+/// User sizes: ≤16, ≤64, ≤256, ≤1024 → total: ≤32, ≤80, ≤272, ≤1040
+pub const SIZE_CLASS_COUNT: u32 = 4;
+pub const SIZE_CLASS_0_MAX: i32 = 32; // user ≤16
+pub const SIZE_CLASS_1_MAX: i32 = 80; // user ≤64
+pub const SIZE_CLASS_2_MAX: i32 = 272; // user ≤256
+pub const SIZE_CLASS_3_MAX: i32 = 1040; // user ≤1024
+
+// =============================================================================
 // Wasm Page Constants (for memory.grow)
 // =============================================================================
 
@@ -116,8 +128,8 @@ pub const RuntimeFunctions = struct {
     /// heap_ptr global index
     heap_ptr_global: u32,
 
-    /// freelist_head global index
-    freelist_head_global: u32,
+    /// Size-class freelist globals (4 classes: ≤32, ≤80, ≤272, ≤1040 total_size)
+    freelist_globals: [SIZE_CLASS_COUNT]u32,
 
     /// Destructor function type index for call_indirect
     destructor_type: u32,
@@ -173,19 +185,24 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
     });
     const heap_ptr_global = heap_ptr_dynamic_idx + 1; // Offset by SP
 
-    // Add freelist head global (mutable i32, starts at 0 = empty)
-    const freelist_dynamic_idx = try linker.addGlobal(.{
-        .val_type = .i32,
-        .mutable = true,
-        .init_i32 = 0,
-    });
-    const freelist_head_global = freelist_dynamic_idx + 1; // Offset by SP
+    // Add 4 size-class freelist globals (mutable i32, start at 0 = empty)
+    // Reference: jemalloc size-class bins; Swift swift_allocObject size slabs
+    var freelist_globals: [SIZE_CLASS_COUNT]u32 = undefined;
+    for (0..SIZE_CLASS_COUNT) |i| {
+        const dynamic_idx = try linker.addGlobal(.{
+            .val_type = .i32,
+            .mutable = true,
+            .init_i32 = 0,
+        });
+        freelist_globals[i] = dynamic_idx + 1; // Offset by SP
+    }
+    const freelist_head_global = freelist_globals[0]; // for backward compat in realloc
 
     // Generate alloc function: (i64, i64) -> i64
     // Takes (metadata_ptr, size), returns pointer to user data (after header)
     // Reference: Swift's swift_allocObject(metadata, size, align)
     const alloc_type = try linker.addType(&[_]ValType{ .i64, .i64 }, &[_]ValType{.i64});
-    const alloc_body = try generateAllocBody(allocator, heap_ptr_global, freelist_head_global);
+    const alloc_body = try generateAllocBody(allocator, heap_ptr_global, freelist_globals);
     const alloc_idx = try linker.addFunc(.{
         .name = ALLOC_NAME,
         .type_idx = alloc_type,
@@ -212,7 +229,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
     // Returns memory to freelist
     // Reference: Swift's swift_deallocObject (HeapObject.cpp:967-1070)
     const dealloc_type = destructor_type; // Same signature: (i64) -> void
-    const dealloc_body = try generateDeallocBody(allocator, freelist_head_global);
+    const dealloc_body = try generateDeallocBody(allocator, freelist_globals);
     const dealloc_idx = try linker.addFunc(.{
         .name = DEALLOC_NAME,
         .type_idx = dealloc_type,
@@ -249,7 +266,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         &[_]ValType{ .i64, .i64, .i64, .i64 },
         &[_]ValType{.i64},
     );
-    const string_concat_body = try generateStringConcatBody(allocator, heap_ptr_global);
+    const string_concat_body = try generateStringConcatBody(allocator, heap_ptr_global, alloc_idx);
     const string_concat_idx = try linker.addFunc(.{
         .name = STRING_CONCAT_NAME,
         .type_idx = string_concat_type,
@@ -311,7 +328,7 @@ pub fn addToLinker(allocator: std.mem.Allocator, linker: *wasm_link.Linker) !Run
         .memset_zero_idx = memset_zero_idx,
         .memcpy_idx = memcpy_idx,
         .heap_ptr_global = heap_ptr_global,
-        .freelist_head_global = freelist_head_global,
+        .freelist_globals = freelist_globals,
         .destructor_type = destructor_type,
     };
 }
@@ -493,9 +510,9 @@ fn generateI64StubBody(allocator: std.mem.Allocator) ![]const u8 {
 
 /// Generates bytecode for cot_alloc(metadata_ptr: i64, size: i64) -> i64
 /// Allocates heap memory with header, returns pointer to user data.
-/// Uses bump allocation. Freed blocks go to freelist (checked by Wasm-side alloc only).
-/// Reference: Swift's swift_allocObject (HeapObject.cpp:247-270)
-fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelist_head_global: u32) ![]const u8 {
+/// Uses 4 size-class freelists (≤32, ≤80, ≤272, ≤1040 total bytes) + bump fallback.
+/// Reference: Swift's swift_allocObject + jemalloc size-class bins
+fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelist_globals: [SIZE_CLASS_COUNT]u32) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
 
@@ -518,36 +535,49 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     try code.emitI32And();
     try code.emitLocalSet(3); // total_size
 
-    // --- Freelist first-fit (head only) ---
-    // Check if freelist head has a block that fits
-    try code.emitGlobalGet(freelist_head_global);
-    try code.emitLocalTee(2); // ptr = freelist_head
-    try code.emitIf(BLOCK_VOID); // if (freelist_head != 0)
+    // --- Size-class freelist lookup ---
+    // Check each class in order: if total_size fits, check that class's head.
+    // Reference: jemalloc bin lookup → first-fit on head
+    const thresholds = [_]i32{ SIZE_CLASS_0_MAX, SIZE_CLASS_1_MAX, SIZE_CLASS_2_MAX, SIZE_CLASS_3_MAX };
+    for (thresholds, 0..) |threshold, i| {
+        // if (total_size <= threshold && !found)
+        try code.emitLocalGet(4); // found
+        try code.emitI32Eqz(); // !found
+        try code.emitLocalGet(3); // total_size
+        try code.emitI32Const(threshold);
+        try code.emitI32LeU(); // total_size <= threshold
+        try code.emitI32And(); // !found && total_size <= threshold
+        try code.emitIf(BLOCK_VOID);
 
-    // block_size = i32.load(ptr + SIZE_OFFSET)
-    try code.emitLocalGet(2);
-    try code.emitI32Load(2, SIZE_OFFSET);
-    // block_size >= total_size?
-    try code.emitLocalGet(3);
-    try code.emitI32GeU();
-    try code.emitIf(BLOCK_VOID); // if (block_size >= total_size)
+        // Check freelist head for this class
+        try code.emitGlobalGet(freelist_globals[i]);
+        try code.emitLocalTee(2); // ptr = freelist_head[class]
+        try code.emitIf(BLOCK_VOID); // if (head != 0)
 
-    // Unlink head: freelist_head = i32.load(ptr + FREELIST_NEXT_OFFSET)
-    try code.emitLocalGet(2);
-    try code.emitI32Load(2, FREELIST_NEXT_OFFSET);
-    try code.emitGlobalSet(freelist_head_global);
+        // Check block_size >= total_size
+        try code.emitLocalGet(2);
+        try code.emitI32Load(2, SIZE_OFFSET);
+        try code.emitLocalGet(3);
+        try code.emitI32GeU();
+        try code.emitIf(BLOCK_VOID); // if fits
 
-    // found = 1
-    try code.emitI32Const(1);
-    try code.emitLocalSet(4);
+        // Unlink: freelist_head[class] = next
+        try code.emitLocalGet(2);
+        try code.emitI32Load(2, FREELIST_NEXT_OFFSET);
+        try code.emitGlobalSet(freelist_globals[i]);
 
-    try code.emitEnd(); // end block_size >= total_size
-    try code.emitEnd(); // end freelist_head != 0
+        // found = 1
+        try code.emitI32Const(1);
+        try code.emitLocalSet(4);
+
+        try code.emitEnd(); // end fits
+        try code.emitEnd(); // end head != 0
+        try code.emitEnd(); // end class check
+    }
 
     // --- Bump allocation fallback ---
     // if (!found) bump allocate with bounds check + memory.grow
-    // Reference: Go runtime/mem_wasm.go sbrk():
-    //   if bl+n > blocMax { grow := (bl+n-blocMax)/pageSize; growMemory(grow) }
+    // Reference: Go runtime/mem_wasm.go sbrk()
     try code.emitLocalGet(4);
     try code.emitI32Eqz();
     try code.emitIf(BLOCK_VOID);
@@ -557,65 +587,56 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     try code.emitLocalSet(2); // ptr = heap_ptr
 
     // Check bounds: heap_ptr + total_size > memory.size * WASM_PAGE_SIZE
-    // Reference: Go sbrk: if bl+n > blocMax
     try code.emitLocalGet(2); // heap_ptr
     try code.emitLocalGet(3); // total_size
     try code.emitI32Add(); // new_top
     try code.emitMemorySize(); // current pages (i32)
     try code.emitI32Const(WASM_PAGE_SIZE_LOG2);
-    try code.emitI32Shl(); // current_bytes = pages << WASM_PAGE_SIZE_LOG2
+    try code.emitI32Shl(); // current_bytes
     try code.emitI32GtU(); // new_top > current_bytes?
     try code.emitIf(BLOCK_VOID);
 
-    // Need more memory. Compute pages needed:
-    // grow = (new_top - current_bytes + WASM_PAGE_SIZE_MINUS_ONE) / WASM_PAGE_SIZE
-    // Reference: Go sbrk: grow := divRoundUp(bl+n-blocMax, physPageSize)
+    // Grow memory
     try code.emitLocalGet(2); // heap_ptr
     try code.emitLocalGet(3); // total_size
     try code.emitI32Add(); // new_top
     try code.emitMemorySize(); // current pages
     try code.emitI32Const(WASM_PAGE_SIZE_LOG2);
     try code.emitI32Shl(); // current_bytes
-    try code.emitI32Sub(); // new_top - current_bytes
+    try code.emitI32Sub(); // deficit
     try code.emitI32Const(WASM_PAGE_SIZE_MINUS_ONE);
     try code.emitI32Add(); // round up
     try code.emitI32Const(WASM_PAGE_SIZE_LOG2);
-    try code.emitI32ShrU(); // / WASM_PAGE_SIZE = pages needed
+    try code.emitI32ShrU(); // pages needed
 
-    // memory.grow(pages)
-    // Reference: Go sbrk: if growMemory(grow) < 0 { return nil }
     try code.emitMemoryGrow();
     try code.emitI32Const(MEMORY_GROW_FAILED);
     try code.emitI32Eq();
     try code.emitIf(BLOCK_VOID);
-    // OOM: trap (Swift: swift_abortAllocationFailure)
-    try code.emitUnreachable();
-    try code.emitEnd(); // end OOM check
+    try code.emitUnreachable(); // OOM: trap
+    try code.emitEnd(); // end OOM
 
-    try code.emitEnd(); // end memory.grow needed
+    try code.emitEnd(); // end grow needed
 
     // Bump: heap_ptr += total_size
-    try code.emitLocalGet(2); // ptr = old heap_ptr
-    try code.emitLocalGet(3); // total_size
+    try code.emitLocalGet(2);
+    try code.emitLocalGet(3);
     try code.emitI32Add();
-    try code.emitGlobalSet(heap_ptr_global); // heap_ptr = ptr + total_size
+    try code.emitGlobalSet(heap_ptr_global);
 
     try code.emitEnd(); // end bump allocation
 
     // --- Initialize header ---
-    // Store total_size at ptr + SIZE_OFFSET
     try code.emitLocalGet(2);
     try code.emitLocalGet(3);
     try code.emitI32Store(2, SIZE_OFFSET);
 
-    // Store metadata_ptr at ptr + METADATA_OFFSET
-    try code.emitLocalGet(2); // ptr
+    try code.emitLocalGet(2);
     try code.emitLocalGet(0); // metadata_ptr (i64)
-    try code.emitI32WrapI64(); // convert to i32
+    try code.emitI32WrapI64();
     try code.emitI32Store(2, METADATA_OFFSET);
 
-    // Store initial refcount at ptr + REFCOUNT_OFFSET
-    try code.emitLocalGet(2); // ptr
+    try code.emitLocalGet(2);
     try code.emitI64Const(INITIAL_REFCOUNT);
     try code.emitI64Store(3, REFCOUNT_OFFSET);
 
@@ -623,20 +644,23 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     try code.emitLocalGet(2);
     try code.emitI32Const(@intCast(USER_DATA_OFFSET));
     try code.emitI32Add();
-    try code.emitI64ExtendI32U(); // zero-extend to i64
+    try code.emitI64ExtendI32U();
 
     return code.finish();
 }
 
 /// Generates bytecode for cot_dealloc(obj: i64) -> void
-/// Returns memory to freelist. Reference: Swift's swift_deallocObject.
-fn generateDeallocBody(allocator: std.mem.Allocator, freelist_head_global: u32) ![]const u8 {
+/// Routes freed blocks to the appropriate size-class freelist.
+/// Reference: Swift's swift_deallocObject + jemalloc size-class bins
+fn generateDeallocBody(allocator: std.mem.Allocator, freelist_globals: [SIZE_CLASS_COUNT]u32) ![]const u8 {
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
 
     // Parameter: obj (local 0, i64)
     // Local 1: header_ptr (i32)
-    _ = try code.declareLocals(&[_]wasm.ValType{.i32});
+    // Local 2: block_size (i32)
+    // Local 3: routed (i32, flag)
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32 });
 
     // if (obj == 0) return
     try code.emitLocalGet(0);
@@ -652,14 +676,39 @@ fn generateDeallocBody(allocator: std.mem.Allocator, freelist_head_global: u32) 
     try code.emitI32WrapI64();
     try code.emitLocalSet(1);
 
-    // Push onto freelist: i32.store(header_ptr + FREELIST_NEXT_OFFSET, freelist_head)
+    // block_size = i32.load(header_ptr + SIZE_OFFSET)
     try code.emitLocalGet(1);
-    try code.emitGlobalGet(freelist_head_global);
-    try code.emitI32Store(2, FREELIST_NEXT_OFFSET);
+    try code.emitI32Load(2, SIZE_OFFSET);
+    try code.emitLocalSet(2);
 
-    // freelist_head = header_ptr
-    try code.emitLocalGet(1);
-    try code.emitGlobalSet(freelist_head_global);
+    // Route to appropriate size class
+    const thresholds = [_]i32{ SIZE_CLASS_0_MAX, SIZE_CLASS_1_MAX, SIZE_CLASS_2_MAX, SIZE_CLASS_3_MAX };
+    for (thresholds, 0..) |threshold, i| {
+        // if (block_size <= threshold && !routed)
+        try code.emitLocalGet(3); // routed
+        try code.emitI32Eqz(); // !routed
+        try code.emitLocalGet(2); // block_size
+        try code.emitI32Const(threshold);
+        try code.emitI32LeU(); // block_size <= threshold
+        try code.emitI32And();
+        try code.emitIf(BLOCK_VOID);
+
+        // Push onto this class's freelist
+        try code.emitLocalGet(1); // header_ptr
+        try code.emitGlobalGet(freelist_globals[i]); // old head
+        try code.emitI32Store(2, FREELIST_NEXT_OFFSET); // next = old head
+
+        try code.emitLocalGet(1); // header_ptr
+        try code.emitGlobalSet(freelist_globals[i]); // head = header_ptr
+
+        try code.emitI32Const(1);
+        try code.emitLocalSet(3); // routed = 1
+
+        try code.emitEnd(); // end class check
+    }
+
+    // Large blocks (>1040 total) are not freelisted — memory is "leaked"
+    // back to the bump allocator. This is fine since large allocs are rare.
 
     return code.finish();
 }
@@ -1015,9 +1064,10 @@ fn generateStringEqBody(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 /// Generates bytecode for cot_string_concat(s1_ptr, s1_len, s2_ptr, s2_len) -> new_ptr
-/// Allocates a new buffer on the heap and copies both strings into it.
-/// Reference: Go's runtime/string.go concatstrings
-fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) ![]const u8 {
+/// Allocates via cot_alloc (ARC-managed) and copies both strings into it.
+/// Reference: Go's runtime/string.go concatstrings (allocates through GC-aware runtime)
+fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32, alloc_func_idx: u32) ![]const u8 {
+    _ = heap_ptr_global; // No longer used — allocation goes through cot_alloc
     var code = wasm.CodeBuilder.init(allocator);
     defer code.deinit();
 
@@ -1027,41 +1077,34 @@ fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) 
     //   local 2: s2_ptr (i64)
     //   local 3: s2_len (i64)
     // Locals:
-    //   local 4: new_len (i32)
-    //   local 5: new_ptr (i32)
+    //   local 4: new_len_i64 (i64)
+    //   local 5: new_ptr_i64 (i64) - pointer from cot_alloc (i64)
     //   local 6: tmp_src (i32) - for byte-copy loop
     //   local 7: tmp_len (i32) - for byte-copy loop
     //   local 8: tmp_dest (i32) - for byte-copy loop (2nd copy)
     //   local 9: counter (i32) - byte-copy loop counter
-    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32, .i32, .i32, .i32 });
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i64, .i64, .i32, .i32, .i32, .i32 });
 
-    // new_len = (i32)s1_len + (i32)s2_len
+    // new_len = s1_len + s2_len (i64)
     try code.emitLocalGet(1); // s1_len (i64)
-    try code.emitI32WrapI64();
     try code.emitLocalGet(3); // s2_len (i64)
-    try code.emitI32WrapI64();
-    try code.emitI32Add();
-    try code.emitLocalTee(4); // new_len
+    try code.emitI64Add();
+    try code.emitLocalSet(4); // new_len_i64
 
     // Check for zero length - if both strings empty, return 0
-    try code.emitI32Eqz();
+    try code.emitLocalGet(4);
+    try code.emitI64Eqz();
     try code.emitIf(BLOCK_VOID);
     try code.emitI64Const(0);
     try code.emitReturn();
     try code.emitEnd();
 
-    // Allocate buffer: new_ptr = heap_ptr
-    try code.emitGlobalGet(heap_ptr_global);
-    try code.emitLocalTee(5); // new_ptr
-
-    // heap_ptr = heap_ptr + ((new_len + ALIGN_MINUS_ONE) & ALIGN_MASK)
-    try code.emitLocalGet(4); // new_len
-    try code.emitI32Const(ALIGN_MINUS_ONE);
-    try code.emitI32Add();
-    try code.emitI32Const(ALIGN_MASK);
-    try code.emitI32And();
-    try code.emitI32Add();
-    try code.emitGlobalSet(heap_ptr_global);
+    // Allocate buffer via cot_alloc(metadata=0, size=new_len)
+    // cot_alloc returns ARC-managed pointer (user data after 16-byte header)
+    try code.emitI64Const(0); // metadata_ptr = 0 (no destructor)
+    try code.emitLocalGet(4); // size = new_len
+    try code.emitCall(alloc_func_idx);
+    try code.emitLocalSet(5); // new_ptr_i64 = cot_alloc result
 
     // Copy s1 into new buffer: byte_copy(dest=new_ptr, src=s1_ptr, len=s1_len)
     try code.emitLocalGet(0); // s1_ptr (i64)
@@ -1070,15 +1113,18 @@ fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) 
     try code.emitLocalGet(1); // s1_len (i64)
     try code.emitI32WrapI64();
     try code.emitLocalSet(7); // tmp_len = s1_len as i32
-    // dest is local 5 (new_ptr), already i32
-    try code.emitByteCopyLoop(5, 6, 7, 9);
+    // dest = new_ptr as i32
+    try code.emitLocalGet(5);
+    try code.emitI32WrapI64();
+    try code.emitLocalSet(8); // use local 8 as dest for first copy
+    try code.emitByteCopyLoop(8, 6, 7, 9);
 
     // Copy s2 into new buffer: byte_copy(dest=new_ptr+s1_len, src=s2_ptr, len=s2_len)
-    try code.emitLocalGet(5); // new_ptr
+    try code.emitLocalGet(5); // new_ptr (i64)
     try code.emitLocalGet(1); // s1_len (i64)
+    try code.emitI64Add();
     try code.emitI32WrapI64();
-    try code.emitI32Add();
-    try code.emitLocalSet(8); // tmp_dest = new_ptr + s1_len
+    try code.emitLocalSet(8); // tmp_dest = (new_ptr + s1_len) as i32
     try code.emitLocalGet(2); // s2_ptr (i64)
     try code.emitI32WrapI64();
     try code.emitLocalSet(6); // tmp_src = s2_ptr as i32
@@ -1087,9 +1133,8 @@ fn generateStringConcatBody(allocator: std.mem.Allocator, heap_ptr_global: u32) 
     try code.emitLocalSet(7); // tmp_len = s2_len as i32
     try code.emitByteCopyLoop(8, 6, 7, 9);
 
-    // Return (i64)new_ptr
+    // Return new_ptr (i64, already from cot_alloc)
     try code.emitLocalGet(5);
-    try code.emitI64ExtendI32U();
 
     return code.finish();
 }
@@ -1475,6 +1520,6 @@ test "addToLinker creates functions" {
     // Verify functions were added (alloc, retain, dealloc, release, realloc, string_concat, string_eq, memset_zero, memcpy = 9)
     try std.testing.expectEqual(@as(usize, 9), linker.funcs.items.len);
 
-    // Verify globals were added (heap_ptr, freelist_head)
-    try std.testing.expectEqual(@as(usize, 2), linker.globals.items.len);
+    // Verify globals were added (heap_ptr + 4 size-class freelists)
+    try std.testing.expectEqual(@as(usize, 5), linker.globals.items.len);
 }

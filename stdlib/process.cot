@@ -44,12 +44,12 @@ fn dup2(oldfd: i64, newfd: i64) i64 {
 // Each pointer is an i64 (wasm linear memory address).
 // Returns the buffer address (for use as argv_ptr in execve).
 
-const ARGV_BUF_ADDR: i64 = 0xD0000
-const ARGV_STR_ADDR: i64 = 0xD1000
+// Ref: Go os/exec.Cmd inherits parent env; Zig std.process.Child same
+// Dynamically allocate argv/string buffers instead of hardcoded addresses
 
 fn argvBuild1(cmd: string) i64 {
-    var buf = ARGV_BUF_ADDR
-    var str_pos = ARGV_STR_ADDR
+    var buf = @alloc(64)
+    var str_pos = @alloc(4096)
 
     // Copy command string
     @memcpy(str_pos, @ptrOf(cmd), @lenOf(cmd))
@@ -63,8 +63,8 @@ fn argvBuild1(cmd: string) i64 {
 }
 
 fn argvBuild2(cmd: string, a1: string) i64 {
-    var buf = ARGV_BUF_ADDR
-    var str_pos = ARGV_STR_ADDR
+    var buf = @alloc(64)
+    var str_pos = @alloc(4096)
 
     // Command
     @memcpy(str_pos, @ptrOf(cmd), @lenOf(cmd))
@@ -84,8 +84,8 @@ fn argvBuild2(cmd: string, a1: string) i64 {
 }
 
 fn argvBuild3(cmd: string, a1: string, a2: string) i64 {
-    var buf = ARGV_BUF_ADDR
-    var str_pos = ARGV_STR_ADDR
+    var buf = @alloc(64)
+    var str_pos = @alloc(4096)
 
     @memcpy(str_pos, @ptrOf(cmd), @lenOf(cmd))
     @intToPtr(*u8, str_pos + @lenOf(cmd)).* = @intCast(u8, 0)
@@ -106,21 +106,19 @@ fn argvBuild3(cmd: string, a1: string, a2: string) i64 {
     return buf
 }
 
-// Build null-terminated path string in scratch memory, returns address
-const PATH_BUF_ADDR: i64 = 0xD2000
-
+// Build null-terminated path string, dynamically allocated
 fn buildPath(path: string) i64 {
-    @memcpy(PATH_BUF_ADDR, @ptrOf(path), @lenOf(path))
-    @intToPtr(*u8, PATH_BUF_ADDR + @lenOf(path)).* = @intCast(u8, 0)
-    return PATH_BUF_ADDR
+    var buf = @alloc(@lenOf(path) + 1)
+    @memcpy(buf, @ptrOf(path), @lenOf(path))
+    @intToPtr(*u8, buf + @lenOf(path)).* = @intCast(u8, 0)
+    return buf
 }
 
-// Empty envp (just NULL pointer)
-const ENVP_BUF_ADDR: i64 = 0xD3000
-
+// Empty envp (just NULL pointer), dynamically allocated
 fn emptyEnvp() i64 {
-    @intToPtr(*i64, ENVP_BUF_ADDR).* = 0
-    return ENVP_BUF_ADDR
+    var buf = @alloc(8)
+    @intToPtr(*i64, buf).* = 0
+    return buf
 }
 
 // ============================================================================

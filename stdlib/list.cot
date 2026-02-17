@@ -189,6 +189,7 @@ impl List(T) {
         }
     }
 
+    // Ref: Swift Array.init(copying:) retains each element
     fn clone(self: List(T)) List(T) {
         var new_list: List(T) = .{}
         if (self.count > 0) {
@@ -197,6 +198,13 @@ impl List(T) {
             @memcpy(new_list.items, self.items, bytes)
             new_list.count = self.count
             new_list.capacity = self.count
+            // Retain all ARC-managed elements (no-op for non-ARC types)
+            var ci: i64 = 0
+            while (ci < self.count) {
+                var cptr = @intToPtr(*T, new_list.items + ci * @sizeOf(T))
+                @arc_retain(cptr.*)
+                ci += 1
+            }
         }
         return new_list
     }
@@ -433,28 +441,61 @@ impl List(T) {
         return 1
     }
 
-    // Selection sort: O(n^2), in-place
+    // Bottom-up merge sort: O(n log n), stable.
+    // Ref: Zig std.sort.sort uses block merge; Go sort.Slice uses pdqsort.
+    // Bottom-up merge sort is simplest faithful O(n log n).
     // cmp(a, b): negative if a < b, 0 if equal, positive if a > b
     fn sort(self: List(T), cmp: fn(T, T) -> i64) void {
         if (self.count < 2) { return }
-        var si: i64 = 0
-        while (si < self.count - 1) {
-            var smin: i64 = si
-            var sj: i64 = si + 1
-            while (sj < self.count) {
-                var sjp = @intToPtr(*T, self.items + sj * @sizeOf(T))
-                var smp = @intToPtr(*T, self.items + smin * @sizeOf(T))
-                if (cmp(sjp.*, smp.*) < 0) { smin = sj }
-                sj += 1
+        var n = self.count
+        var tmp = @alloc(n * @sizeOf(T))
+        var width: i64 = 1
+        while (width < n) {
+            var i: i64 = 0
+            while (i < n) {
+                var left = i
+                var mid = i + width
+                if (mid > n) { mid = n }
+                var right = i + width * 2
+                if (right > n) { right = n }
+                // Merge [left, mid) and [mid, right) into tmp
+                var li = left
+                var ri = mid
+                var ti = left
+                while (li < mid and ri < right) {
+                    var lp = @intToPtr(*T, self.items + li * @sizeOf(T))
+                    var rp = @intToPtr(*T, self.items + ri * @sizeOf(T))
+                    if (cmp(lp.*, rp.*) <= 0) {
+                        var tp = @intToPtr(*T, tmp + ti * @sizeOf(T))
+                        tp.* = lp.*
+                        li += 1
+                    } else {
+                        var tp = @intToPtr(*T, tmp + ti * @sizeOf(T))
+                        tp.* = rp.*
+                        ri += 1
+                    }
+                    ti += 1
+                }
+                while (li < mid) {
+                    var lp = @intToPtr(*T, self.items + li * @sizeOf(T))
+                    var tp = @intToPtr(*T, tmp + ti * @sizeOf(T))
+                    tp.* = lp.*
+                    li += 1
+                    ti += 1
+                }
+                while (ri < right) {
+                    var rp = @intToPtr(*T, self.items + ri * @sizeOf(T))
+                    var tp = @intToPtr(*T, tmp + ti * @sizeOf(T))
+                    tp.* = rp.*
+                    ri += 1
+                    ti += 1
+                }
+                i = i + width * 2
             }
-            if (smin != si) {
-                var sip = @intToPtr(*T, self.items + si * @sizeOf(T))
-                var smip = @intToPtr(*T, self.items + smin * @sizeOf(T))
-                var stmp = sip.*
-                sip.* = smip.*
-                smip.* = stmp
-            }
-            si += 1
+            // Copy tmp back to items
+            @memcpy(self.items, tmp, n * @sizeOf(T))
+            width = width * 2
         }
+        @dealloc(tmp)
     }
 }

@@ -692,10 +692,12 @@ pub const SSABuilder = struct {
             .fmin => .wasm_f64_min, .fmax => .wasm_f64_max,
             .mod => return error.MissingValue, // No float modulo in Wasm
             .bit_and, .bit_or, .bit_xor, .shl, .shr => return error.MissingValue, // Bitwise ops don't apply to floats
+            .lt_u, .le_u, .gt_u, .ge_u => return error.MissingValue, // Unsigned ops don't apply to floats
             .@"and", .@"or" => unreachable,
         } else switch (b.op) {
             .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod,
             .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
+            .lt_u => .ult, .le_u => .ule, .gt_u => .ugt, .ge_u => .uge,
             .bit_and => .and_, .bit_or => .or_, .bit_xor => .xor, .shl => .shl, .shr => .shr,
             .fmin => .wasm_f64_min, .fmax => .wasm_f64_max, // Always float ops
             .@"and", .@"or" => unreachable, // Handled by convertLogicalOp

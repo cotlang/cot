@@ -449,3 +449,66 @@ fn formatInt(n: i64, base: i64) string {
     @dealloc(buf)
     return sb.toString()
 }
+
+// ============================================================================
+// Format Strings (sprintf)
+// ============================================================================
+
+// Format a template string with positional arguments from a heap-allocated array.
+// Placeholders: {} = integer, {s} = string, {d} = decimal, {x} = hex.
+// args is a pointer to an array of i64 values, args_len is the count.
+// Reference: Go fmt.Sprintf — scans format string for verbs, substitutes args
+fn sprintf(template: string, args: i64, args_len: i64) string {
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var tptr = @ptrOf(template)
+    var tlen = @lenOf(template)
+    var i: i64 = 0
+    var arg_idx: i64 = 0
+
+    while (i < tlen) {
+        var c: i64 = @intToPtr(*u8, tptr + i).*
+        if (c == 123 and i + 1 < tlen) {
+            var next: i64 = @intToPtr(*u8, tptr + i + 1).*
+            if (next == 125) {
+                // {} — default integer format
+                if (arg_idx < args_len) {
+                    sb.appendInt(@intToPtr(*i64, args + arg_idx * 8).*)
+                }
+                arg_idx = arg_idx + 1
+                i = i + 2
+            } else if (next == 115 and i + 2 < tlen and @intToPtr(*u8, tptr + i + 2).* == 125) {
+                // {s} — string argument (ptr, len pair = 2 slots)
+                if (arg_idx + 1 < args_len) {
+                    var sptr = @intToPtr(*i64, args + arg_idx * 8).*
+                    var slen = @intToPtr(*i64, args + (arg_idx + 1) * 8).*
+                    if (slen > 0) {
+                        sb.append(@string(sptr, slen))
+                    }
+                }
+                arg_idx = arg_idx + 2
+                i = i + 3
+            } else if (next == 100 and i + 2 < tlen and @intToPtr(*u8, tptr + i + 2).* == 125) {
+                // {d} — decimal (same as {})
+                if (arg_idx < args_len) {
+                    sb.appendInt(@intToPtr(*i64, args + arg_idx * 8).*)
+                }
+                arg_idx = arg_idx + 1
+                i = i + 3
+            } else if (next == 120 and i + 2 < tlen and @intToPtr(*u8, tptr + i + 2).* == 125) {
+                // {x} — hexadecimal
+                if (arg_idx < args_len) {
+                    sb.append(hex(@intToPtr(*i64, args + arg_idx * 8).*))
+                }
+                arg_idx = arg_idx + 1
+                i = i + 3
+            } else {
+                sb.appendByte(c)
+                i = i + 1
+            }
+        } else {
+            sb.appendByte(c)
+            i = i + 1
+        }
+    }
+    return sb.toString()
+}

@@ -16,11 +16,16 @@ fn randomInt() i64 {
     return val
 }
 
+// Ref: Go rand.Int63n uses rejection sampling; Zig std.crypto.random.intRangeLessThan
+// Rejection sampling eliminates modulo bias for non-power-of-2 max
 fn randomRange(max: i64) i64 {
     if (max <= 0) { return 0 }
-    var val = randomInt()
-    // Clear sign bit to ensure non-negative
     var mask = (0 - 1) >> 1
-    val = val & mask
-    return val - (val / max) * max
+    var threshold = ((mask - max + 1) - ((mask - max + 1) / max) * max)
+    while (true) {
+        var val = randomInt() & mask
+        if (val >= threshold) {
+            return val - (val / max) * max
+        }
+    }
 }

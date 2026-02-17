@@ -1157,7 +1157,14 @@ pub const Checker = struct {
             },
             .int_cast => {
                 const target_type = try self.resolveTypeExpr(bc.type_arg);
-                if (!types.isNumeric(self.types.get(target_type))) { self.err.errorWithCode(bc.span.start, .e300, "@intCast target must be numeric"); return invalid_type; }
+                // Ref: Zig zirIntCast (Sema.zig:9867) — only accepts integer targets (use @floatFromInt for floats)
+                if (!types.isInteger(self.types.get(target_type))) { self.err.errorWithCode(bc.span.start, .e300, "@intCast target must be integer type"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            .float_from_int => {
+                // Ref: Zig @floatFromInt — converts integer to float type
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
                 _ = try self.checkExpr(bc.args[0]);
                 return target_type;
             },
@@ -1168,7 +1175,13 @@ pub const Checker = struct {
                 return target_type;
             },
             .ptr_to_int => {
-                _ = try self.checkExpr(bc.args[0]);
+                // Ref: Zig zirPtrToInt — validate operand is pointer type
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer and arg_type != TypeRegistry.I64) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@ptrToInt operand must be a pointer");
+                    return invalid_type;
+                }
                 return TypeRegistry.I64;
             },
             .int_to_ptr => {
@@ -1346,11 +1359,20 @@ pub const Checker = struct {
             // @enumFromInt(T, i) — Zig Sema.zig:8480: validate T is enum, operand is int
             .enum_from_int => {
                 const target_type = try self.resolveTypeExpr(bc.type_arg);
-                if (self.types.get(target_type) != .enum_type) {
+                const target_info = self.types.get(target_type);
+                if (target_info != .enum_type) {
                     self.err.errorWithCode(bc.span.start, .e300, "@enumFromInt target must be enum type");
                     return invalid_type;
                 }
                 _ = try self.checkExpr(bc.args[0]);
+                // Ref: Zig zirEnumFromInt — comptime range validation
+                if (self.evalConstExpr(bc.args[0])) |val| {
+                    const num_variants: i64 = @intCast(target_info.enum_type.variants.len);
+                    if (val < 0 or val >= num_variants) {
+                        self.err.errorWithCode(bc.span.start, .e300, "@enumFromInt value out of range for enum type");
+                        return invalid_type;
+                    }
+                }
                 return target_type;
             },
             // @tagName(val) — Zig Sema.zig:20487: enum or union → string name
@@ -1365,8 +1387,13 @@ pub const Checker = struct {
             },
             // @errorName(err) — Zig Sema.zig:20375: error value → string name
             .error_name => {
-                _ = try self.checkExpr(bc.args[0]);
-                // Accept any type — at runtime the error tag is an integer index
+                // Ref: Zig zirErrorName — requires error set or error union type
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .error_set and arg_info != .error_union) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@errorName operand must be error type");
+                    return invalid_type;
+                }
                 return TypeRegistry.STRING;
             },
             // @intFromBool(b) — Zig Sema.zig:20341: bool → i64 (0 or 1)
@@ -1381,19 +1408,26 @@ pub const Checker = struct {
             // @bitCast(T, val) — Zig Sema.zig:30554: reinterpret bits as target type
             .bit_cast => {
                 const target_type = try self.resolveTypeExpr(bc.type_arg);
-                _ = try self.checkExpr(bc.args[0]);
+                const arg_type = try self.checkExpr(bc.args[0]);
+                // Ref: Zig zirBitCast — enforce equal sizes
+                const target_size = self.types.sizeOf(target_type);
+                const arg_size = self.types.sizeOf(arg_type);
+                if (target_size != arg_size) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@bitCast requires same-size types");
+                    return invalid_type;
+                }
                 return target_type;
             },
             // @truncate(T, val) — Zig Sema.zig:22882: narrow integer to smaller type
-            // Returns I64 because all Cot runtime values are i64; the AND mask handles narrowing.
+            // Ref: Zig zirTruncate returns the target type
             .truncate => {
                 const target_type = try self.resolveTypeExpr(bc.type_arg);
-                if (!types.isNumeric(self.types.get(target_type))) {
-                    self.err.errorWithCode(bc.span.start, .e300, "@truncate target must be numeric");
+                if (!types.isInteger(self.types.get(target_type))) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@truncate target must be integer type");
                     return invalid_type;
                 }
                 _ = try self.checkExpr(bc.args[0]);
-                return TypeRegistry.I64;
+                return target_type;
             },
             // @as(T, val) — Zig Sema.zig:9659: explicit type coercion
             .as => {
@@ -1424,10 +1458,11 @@ pub const Checker = struct {
                 return TypeRegistry.I64;
             },
             // @min(a, b) / @max(a, b) — Zig Sema.zig:24678: integer min/max
+            // Ref: Zig zirMin/zirMax returns peer type of both args
             .min, .max => {
-                _ = try self.checkExpr(bc.args[0]);
-                _ = try self.checkExpr(bc.args[1]);
-                return TypeRegistry.I64;
+                const a_type = try self.checkExpr(bc.args[0]);
+                const b_type = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.commonType(a_type, b_type);
             },
             // @alignCast(alignment, ptr) — Zig: assert alignment, identity in release
             .align_cast => {
@@ -1436,9 +1471,9 @@ pub const Checker = struct {
                 return TypeRegistry.I64;
             },
             // @constCast(ptr) — Zig: remove const qualifier, type-system only
+            // Ref: Zig zirConstCast returns same type as input (identity)
             .const_cast => {
-                _ = try self.checkExpr(bc.args[0]);
-                return TypeRegistry.I64;
+                return try self.checkExpr(bc.args[0]);
             },
             // @arc_retain(val), @arc_release(val) — conditional ARC management
             // Emits cot_retain/cot_release only when arg type is ARC-managed.

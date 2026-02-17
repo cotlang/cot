@@ -156,12 +156,21 @@ fn newBufferedWriterSize(fd: i64, size: i64) i64 {
 }
 
 // Go bufio.go:635 — write buffered data to fd
+// Ref: Go bufio.Writer.Flush loops; POSIX write(2) can return short
 fn writerFlush(w: i64) void {
     var wr = @intToPtr(*i64, w + 16).*
     if (wr > 0) {
         var fd = @intToPtr(*i64, w).*
         var buf = @intToPtr(*i64, w + 8).*
-        @fd_write(fd, buf, wr)
+        var written: i64 = 0
+        while (written < wr) {
+            var n = @fd_write(fd, buf + written, wr - written)
+            if (n <= 0) {
+                written = wr
+            } else {
+                written += n
+            }
+        }
         @intToPtr(*i64, w + 16).* = 0
     }
 }
