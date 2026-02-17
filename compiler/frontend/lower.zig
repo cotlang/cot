@@ -2955,7 +2955,47 @@ pub const Lowerer = struct {
                 }
             }
         }
-        return try fb.emitBinary(tokenToBinaryOp(bin.op), left, right, result_type, bin.span);
+        const result = try fb.emitBinary(tokenToBinaryOp(bin.op), left, right, result_type, bin.span);
+
+        // Overflow detection for narrow integer arithmetic (debug mode only).
+        // Reference: Zig Sema.zig:analyzeArithmetic — add_safe/mul_safe emit
+        // runtime overflow checks in debug mode, skip in release mode.
+        // Pattern: mask result to type width, compare with unmasked, trap if overflow.
+        if (!self.release_mode and isArithOp(bin.op)) {
+            const mask = overflowMask(result_type);
+            if (mask != 0) {
+                const mask_val = try fb.emitConstInt(@intCast(mask), TypeRegistry.I64, bin.span);
+                const masked = try fb.emitBinary(.bit_and, result, mask_val, result_type, bin.span);
+                const ok = try fb.emitBinary(.eq, result, masked, TypeRegistry.BOOL, bin.span);
+                // Same pattern as @assert: branch on condition, trap in fail block
+                const ok_block = try fb.newBlock("overflow.ok");
+                const fail_block = try fb.newBlock("overflow.fail");
+                _ = try fb.emitBranch(ok, ok_block, fail_block, bin.span);
+                fb.setBlock(fail_block);
+                _ = try fb.emitTrap(bin.span);
+                fb.setBlock(ok_block);
+            }
+        }
+
+        return result;
+    }
+
+    fn isArithOp(op: Token) bool {
+        return switch (op) {
+            .add, .sub, .mul => true,
+            else => false,
+        };
+    }
+
+    /// Returns the overflow mask for narrow unsigned types, 0 for full-width types.
+    /// Reference: Zig — narrow types need range checks, full-width wraps naturally.
+    fn overflowMask(type_idx: TypeIndex) u64 {
+        return switch (type_idx) {
+            TypeRegistry.U8 => 0xFF,
+            TypeRegistry.U16 => 0xFFFF,
+            TypeRegistry.U32 => 0xFFFFFFFF,
+            else => 0, // i64/u64/f64/signed: no mask-based check
+        };
     }
 
     fn lowerUnary(self: *Lowerer, un: ast.Unary) Error!ir.NodeIndex {

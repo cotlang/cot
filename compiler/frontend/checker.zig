@@ -953,16 +953,17 @@ pub const Checker = struct {
                 if (left == .pointer and types.isInteger(right)) return left_type;
                 if (types.isInteger(left) and right == .pointer) return right_type;
                 if (!types.isNumeric(left) or !types.isNumeric(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
-                return self.materializeType(left_type);
+                // Zig Sema.zig:peerType — common type of both operands
+                return TypeRegistry.commonType(left_type, right_type);
             },
             .sub => {
                 if (left == .pointer and types.isInteger(right)) return left_type;
                 if (!types.isNumeric(left) or !types.isNumeric(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
-                return self.materializeType(left_type);
+                return TypeRegistry.commonType(left_type, right_type);
             },
             .mul, .quo, .rem => {
                 if (!types.isNumeric(left) or !types.isNumeric(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
-                return self.materializeType(left_type);
+                return TypeRegistry.commonType(left_type, right_type);
             },
             .eql, .neq, .lss, .leq, .gtr, .geq => {
                 if (!self.isComparable(left_type, right_type)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
@@ -974,7 +975,7 @@ pub const Checker = struct {
             },
             .@"and", .@"or", .xor, .shl, .shr => {
                 if (!types.isInteger(left) or !types.isInteger(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }
-                return self.materializeType(left_type);
+                return TypeRegistry.commonType(left_type, right_type);
             },
             .land => {
                 if (!types.isBool(left) or !types.isBool(right)) { self.err.errorWithCode(bin.span.start, .e300, "invalid operation"); return invalid_type; }

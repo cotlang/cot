@@ -186,3 +186,59 @@ test "hex zero" {
 test "hex large number" {
     @assert_eq(hex(65535), "ffff")
 }
+
+// ============================================================================
+// Binary Formatting
+// ============================================================================
+
+test "binary zero" {
+    @assert_eq(binary(0), "0")
+}
+
+test "binary small" {
+    @assert_eq(binary(5), "101")
+}
+
+test "binary byte" {
+    @assert_eq(binary(255), "11111111")
+}
+
+test "binary 42" {
+    @assert_eq(binary(42), "101010")
+}
+
+// ============================================================================
+// Octal Formatting
+// ============================================================================
+
+test "octal zero" {
+    @assert_eq(octal(0), "0")
+}
+
+test "octal 8" {
+    @assert_eq(octal(8), "10")
+}
+
+test "octal 255" {
+    @assert_eq(octal(255), "377")
+}
+
+test "octal 64" {
+    @assert_eq(octal(64), "100")
+}
+
+// ============================================================================
+// Generic Base Formatting
+// ============================================================================
+
+test "formatInt base 2" {
+    @assert_eq(formatInt(10, 2), "1010")
+}
+
+test "formatInt base 16" {
+    @assert_eq(formatInt(255, 16), "ff")
+}
+
+test "formatInt base 8" {
+    @assert_eq(formatInt(8, 8), "10")
+}

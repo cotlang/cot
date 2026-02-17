@@ -1,0 +1,36 @@
+// debug — Debug assertions and printing.
+//
+// Reference: Zig std/debug.zig
+//   assert(ok: bool) — if (!ok) unreachable
+//   print(msg) — write to stderr
+
+// Assert condition is true. Traps with message on failure.
+// Reference: Zig debug.assert — if (!ok) unreachable
+fn assert(cond: bool, msg: string) void {
+    if (not cond) {
+        @fd_write(2, @ptrOf(msg), @lenOf(msg))
+        @fd_write(2, @ptrOf("\n"), 1)
+        @trap()
+    }
+}
+
+// Assert two integers are equal. Traps with message on failure.
+fn assertEq(a: i64, b: i64, msg: string) void {
+    if (a != b) {
+        @fd_write(2, @ptrOf(msg), @lenOf(msg))
+        @fd_write(2, @ptrOf("\n"), 1)
+        @trap()
+    }
+}
+
+// Print a message to stderr (debug output).
+// Reference: Zig debug.print — writes to stderr (fd 2)
+fn print(msg: string) void {
+    @fd_write(2, @ptrOf(msg), @lenOf(msg))
+}
+
+// Print a message to stderr with a trailing newline.
+fn println(msg: string) void {
+    @fd_write(2, @ptrOf(msg), @lenOf(msg))
+    @fd_write(2, @ptrOf("\n"), 1)
+}

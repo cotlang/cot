@@ -1,0 +1,24 @@
+import "std/debug"
+
+test "debug: assert true does not trap" {
+    assert(true, "should not trap")
+}
+
+test "debug: assertEq equal values" {
+    assertEq(42, 42, "should be equal")
+}
+
+test "debug: assertEq zero" {
+    assertEq(0, 0, "zeros should match")
+}
+
+test "debug: assert with expression" {
+    var x: i64 = 10
+    assert(x > 5, "x should be greater than 5")
+}
+
+test "debug: assertEq computed values" {
+    var a: i64 = 3
+    var b: i64 = 4
+    assertEq(a + b, 7, "3 + 4 should be 7")
+}

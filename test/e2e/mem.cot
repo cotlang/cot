@@ -1,0 +1,157 @@
+import "std/mem"
+
+// ============================================================================
+// Byte Equality
+// ============================================================================
+
+test "mem: eql same content" {
+    var a = @ptrOf("hello")
+    var b = @ptrOf("hello")
+    @assert(eql(a, 5, b, 5))
+}
+
+test "mem: eql different length" {
+    var a = @ptrOf("hello")
+    var b = @ptrOf("hell")
+    @assert(not eql(a, 5, b, 4))
+}
+
+test "mem: eql different content" {
+    var a = @ptrOf("hello")
+    var b = @ptrOf("world")
+    @assert(not eql(a, 5, b, 5))
+}
+
+test "mem: eql empty" {
+    @assert(eql(0, 0, 0, 0))
+}
+
+test "mem: eql same pointer" {
+    var a = @ptrOf("test")
+    @assert(eql(a, 4, a, 4))
+}
+
+// ============================================================================
+// Byte Comparison
+// ============================================================================
+
+test "mem: cmp equal" {
+    var a = @ptrOf("abc")
+    var b = @ptrOf("abc")
+    @assert_eq(cmp(a, 3, b, 3), 0)
+}
+
+test "mem: cmp less" {
+    var a = @ptrOf("abc")
+    var b = @ptrOf("abd")
+    @assert_eq(cmp(a, 3, b, 3), 0 - 1)
+}
+
+test "mem: cmp greater" {
+    var a = @ptrOf("abd")
+    var b = @ptrOf("abc")
+    @assert_eq(cmp(a, 3, b, 3), 1)
+}
+
+test "mem: cmp shorter prefix" {
+    var a = @ptrOf("ab")
+    var b = @ptrOf("abc")
+    @assert_eq(cmp(a, 2, b, 3), 0 - 1)
+}
+
+// ============================================================================
+// Byte Search
+// ============================================================================
+
+test "mem: indexOfScalar found" {
+    var p = @ptrOf("hello")
+    @assert_eq(indexOfScalar(p, 5, 108), 2)
+}
+
+test "mem: indexOfScalar not found" {
+    var p = @ptrOf("hello")
+    @assert_eq(indexOfScalar(p, 5, 122), 0 - 1)
+}
+
+test "mem: lastIndexOfScalar found" {
+    var p = @ptrOf("hello")
+    @assert_eq(lastIndexOfScalar(p, 5, 108), 3)
+}
+
+test "mem: lastIndexOfScalar not found" {
+    var p = @ptrOf("hello")
+    @assert_eq(lastIndexOfScalar(p, 5, 122), 0 - 1)
+}
+
+// ============================================================================
+// Prefix/Suffix
+// ============================================================================
+
+test "mem: startsWith true" {
+    var s = @ptrOf("hello world")
+    var p = @ptrOf("hello")
+    @assert(startsWith(s, 11, p, 5))
+}
+
+test "mem: startsWith false" {
+    var s = @ptrOf("hello world")
+    var p = @ptrOf("world")
+    @assert(not startsWith(s, 11, p, 5))
+}
+
+test "mem: endsWith true" {
+    var s = @ptrOf("hello world")
+    var p = @ptrOf("world")
+    @assert(endsWith(s, 11, p, 5))
+}
+
+test "mem: endsWith false" {
+    var s = @ptrOf("hello world")
+    var p = @ptrOf("hello")
+    @assert(not endsWith(s, 11, p, 5))
+}
+
+// ============================================================================
+// Zero/Set/Count
+// ============================================================================
+
+test "mem: zero clears bs" {
+    var buf = @alloc(4)
+    @intToPtr(*u8, buf).* = 65
+    @intToPtr(*u8, buf + 1).* = 66
+    zero(buf, 4)
+    @assert_eq(@intToPtr(*u8, buf).*, 0)
+    @assert_eq(@intToPtr(*u8, buf + 1).*, 0)
+    @dealloc(buf)
+}
+
+test "mem: set fills bs" {
+    var buf = @alloc(4)
+    set(buf, 4, 42)
+    @assert_eq(@intToPtr(*u8, buf).*, 42)
+    @assert_eq(@intToPtr(*u8, buf + 3).*, 42)
+    @dealloc(buf)
+}
+
+test "mem: countScalar" {
+    var p = @ptrOf("hello")
+    @assert_eq(countScalar(p, 5, 108), 2)
+}
+
+// ============================================================================
+// Little-Endian Read/Write
+// ============================================================================
+
+test "mem: writeU32LE and readU32LE" {
+    var buf = @alloc(4)
+    writeU32LE(buf, 305419896)
+    @assert_eq(readU32LE(buf), 305419896)
+    @dealloc(buf)
+}
+
+test "mem: writeU16LE and readU16LE" {
+    var buf = @alloc(2)
+    writeU16LE(buf, 4660)
+    @assert_eq(readU16LE(buf), 4660)
+    @dealloc(buf)
+}

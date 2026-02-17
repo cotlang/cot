@@ -191,3 +191,98 @@ test "readLine then readByte" {
     @assert_eq(y, 89)
     @fd_close(fd)
 }
+
+// ============================================================================
+// BufferWriter trait tests
+// ============================================================================
+
+test "BufferWriter write bytes" {
+    var bw = BufferWriter { .buf = 0, .len = 0, .cap = 0 }
+    bw.writeString("hello")
+    @assert_eq(bw.len, 5)
+    var result = bw.toSlice()
+    @assert_eq(result, "hello")
+    bw.free()
+}
+
+test "BufferWriter writeByte" {
+    var bw = BufferWriter { .buf = 0, .len = 0, .cap = 0 }
+    bw.writeByte(65)
+    bw.writeByte(66)
+    bw.writeByte(67)
+    var result = bw.toSlice()
+    @assert_eq(result, "ABC")
+    bw.free()
+}
+
+test "BufferWriter writeU32LE" {
+    var bw = BufferWriter { .buf = 0, .len = 0, .cap = 0 }
+    bw.writeU32LE(1)
+    @assert_eq(bw.len, 4)
+    @assert_eq(@intToPtr(*u8, bw.buf).*, 1)
+    @assert_eq(@intToPtr(*u8, bw.buf + 1).*, 0)
+    bw.free()
+}
+
+test "BufferWriter reset" {
+    var bw = BufferWriter { .buf = 0, .len = 0, .cap = 0 }
+    bw.writeString("test")
+    @assert_eq(bw.len, 4)
+    bw.reset()
+    @assert_eq(bw.len, 0)
+    bw.writeString("new")
+    @assert_eq(bw.toSlice(), "new")
+    bw.free()
+}
+
+test "BufferWriter grow" {
+    var bw = BufferWriter { .buf = 0, .len = 0, .cap = 0 }
+    // Write more than initial capacity
+    var i: i64 = 0
+    while (i < 300) {
+        bw.writeByte(65)
+        i = i + 1
+    }
+    @assert_eq(bw.len, 300)
+    @assert(bw.cap >= 300)
+    bw.free()
+}
+
+// ============================================================================
+// BufferReader trait tests
+// ============================================================================
+
+test "BufferReader read" {
+    var data = "hello world"
+    var br = BufferReader { .buf = @ptrOf(data), .len = @lenOf(data), .pos = 0 }
+    var buf = @alloc(5)
+    var n = br.read(buf, 5)
+    @assert_eq(n, 5)
+    @assert_eq(@intToPtr(*u8, buf).*, 104)
+    @assert_eq(br.pos, 5)
+    @dealloc(buf)
+}
+
+test "BufferReader readByte" {
+    var data = "AB"
+    var br = BufferReader { .buf = @ptrOf(data), .len = @lenOf(data), .pos = 0 }
+    @assert_eq(br.readByte(), 65)
+    @assert_eq(br.readByte(), 66)
+    @assert_eq(br.readByte(), 0 - 1)
+}
+
+test "BufferReader remaining" {
+    var data = "test"
+    var br = BufferReader { .buf = @ptrOf(data), .len = @lenOf(data), .pos = 0 }
+    @assert_eq(br.remaining(), 4)
+    br.readByte()
+    @assert_eq(br.remaining(), 3)
+}
+
+test "BufferReader atEnd" {
+    var data = "x"
+    var br = BufferReader { .buf = @ptrOf(data), .len = @lenOf(data), .pos = 0 }
+    @assert(not br.atEnd())
+    br.readByte()
+    @assert(br.atEnd())
+}

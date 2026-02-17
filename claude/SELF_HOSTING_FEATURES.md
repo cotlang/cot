@@ -960,8 +960,8 @@ After each phase, port a section of the compiler to Cot as a proof-of-concept:
 |----------|----------|---------------------------|
 | Tier 1: Language | 10 features | ~2200 lines across parser/checker/lower | ✅ DONE |
 | Tier 2: Builtins | 11 features | ~800 lines across ast/checker/lower | ✅ DONE |
-| Tier 3: Stdlib | 4 modules | ~1000 lines of Cot stdlib code | TODO |
-| Tier 4: Type System | 2 features | ~400 lines in checker/lower | TODO |
+| Tier 3: Stdlib | 4 modules | ~1000 lines of Cot stdlib code | ✅ DONE |
+| Tier 4: Type System | 2 features | ~400 lines in checker/lower | ✅ DONE |
 | **Total** | **27 features** | **~4400 lines** |
 
 This brings Cot from ~75% to ~95% Zig feature parity for the compiler's needs,

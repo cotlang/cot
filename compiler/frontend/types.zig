@@ -387,6 +387,55 @@ pub const TypeRegistry = struct {
         return false;
     }
 
+    /// Compute the common type for binary operations between two numeric types.
+    /// Reference: Zig Sema.zig peerType/intFittingRange — wider type wins,
+    /// untyped adopts concrete, float absorbs integer.
+    pub fn commonType(a: TypeIndex, b: TypeIndex) TypeIndex {
+        // Same type → same type
+        if (a == b) return a;
+
+        // Untyped materializes to concrete type
+        if (a == UNTYPED_INT) return if (isBasicNumeric(b)) b else I64;
+        if (b == UNTYPED_INT) return if (isBasicNumeric(a)) a else I64;
+        if (a == UNTYPED_FLOAT) return if (isBasicFloat(b)) b else F64;
+        if (b == UNTYPED_FLOAT) return if (isBasicFloat(a)) a else F64;
+
+        // Float absorbs integer (Zig: float wins over int in peer type)
+        if (isBasicFloat(a) and isBasicFloat(b)) {
+            return if (basicTypeSize(a) >= basicTypeSize(b)) a else b;
+        }
+        if (isBasicFloat(a)) return a;
+        if (isBasicFloat(b)) return b;
+
+        // Both integers: wider type wins
+        // Zig: intFittingRange — result must hold all values from both types
+        const a_size = basicTypeSize(a);
+        const b_size = basicTypeSize(b);
+        if (a_size > b_size) return a;
+        if (b_size > a_size) return b;
+
+        // Same width: signed wins (Zig: signed absorbs unsigned at same width)
+        if (isBasicSigned(a)) return a;
+        if (isBasicSigned(b)) return b;
+
+        return a; // both unsigned, same width
+    }
+
+    fn isBasicNumeric(idx: TypeIndex) bool {
+        return switch (idx) {
+            I8, I16, I32, I64, U8, U16, U32, U64, F32, F64 => true,
+            else => false,
+        };
+    }
+
+    fn isBasicFloat(idx: TypeIndex) bool {
+        return switch (idx) { F32, F64, UNTYPED_FLOAT => true, else => false };
+    }
+
+    fn isBasicSigned(idx: TypeIndex) bool {
+        return switch (idx) { I8, I16, I32, I64 => true, else => false };
+    }
+
     pub fn equal(self: *const TypeRegistry, a: TypeIndex, b: TypeIndex) bool {
         if (a == b) return true;
         if (a == invalid_type or b == invalid_type) return false;

@@ -2682,3 +2682,82 @@ test "@bitCast same-size identity" {
     var y = @bitCast(i64, x)
     @assert_eq(y, 42)
 }
+
+// ============================================================================
+// Integer type promotion (Tier 4.1)
+// Reference: Zig Sema.zig peerType — wider type wins, untyped materializes
+// ============================================================================
+
+test "type promotion: u8 + i64 = i64" {
+    var a: u8 = 100
+    var b: i64 = 200
+    var c = a + b
+    @assert_eq(c, 300)
+}
+
+test "type promotion: u16 + u32 = u32" {
+    var a: u16 = 1000
+    var b: u32 = 2000
+    var c = a + b
+    @assert_eq(c, 3000)
+}
+
+test "type promotion: untyped + u8 = u8" {
+    var a: u8 = 10
+    var c = a + 5
+    @assert_eq(c, 15)
+}
+
+test "type promotion: i32 * i64 = i64" {
+    var a: i32 = 100
+    var b: i64 = 200
+    var c = a * b
+    @assert_eq(c, 20000)
+}
+
+test "type promotion: u8 - u8 = u8" {
+    var a: u8 = 50
+    var b: u8 = 30
+    var c = a - b
+    @assert_eq(c, 20)
+}
+
+// --- Overflow detection (debug mode, narrow types) ---
+// Reference: Zig Sema.zig analyzeArithmetic — add_safe/mul_safe emit
+// runtime overflow checks in debug mode. Tests verify valid ops don't trap.
+
+test "overflow: u8 add no overflow" {
+    var a: u8 = 100
+    var b: u8 = 155
+    @assert_eq(a + b, 255)
+}
+
+test "overflow: u8 sub no overflow" {
+    var a: u8 = 200
+    var b: u8 = 100
+    @assert_eq(a - b, 100)
+}
+
+test "overflow: u8 mul no overflow" {
+    var a: u8 = 15
+    var b: u8 = 17
+    @assert_eq(a * b, 255)
+}
+
+test "overflow: u16 add no overflow" {
+    var a: u16 = 60000
+    var b: u16 = 5535
+    @assert_eq(a + b, 65535)
+}
+
+test "overflow: u32 add no overflow" {
+    var a: u32 = 2000000000
+    var b: u32 = 1000000000
+    @assert_eq(a + b, 3000000000)
+}
+
+test "overflow: u32 mul no overflow" {
+    var a: u32 = 65536
+    var b: u32 = 65535
+    @assert_eq(a * b, 4294901760)
+}

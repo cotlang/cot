@@ -369,3 +369,83 @@ fn hex(n: i64) string {
     @dealloc(buf)
     return sb.toString()
 }
+
+// Format integer in binary.
+// Reference: Zig fmt.zig digitToChar with base=2
+fn binary(n: i64) string {
+    if (n == 0) { return "0" }
+    var val = n
+    if (val < 0) { val = 0 - val }
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var buf = @alloc(64)
+    var pos: i64 = 0
+    while (val > 0) {
+        var digit = val & 1
+        @intToPtr(*u8, buf + pos).* = @intCast(u8, digit + 48)
+        pos = pos + 1
+        val = val >> 1
+    }
+    if (n < 0) { sb.append("-") }
+    var i = pos - 1
+    while (i >= 0) {
+        sb.appendByte(@intCast(i64, @intToPtr(*u8, buf + i).*))
+        i = i - 1
+    }
+    @dealloc(buf)
+    return sb.toString()
+}
+
+// Format integer in octal.
+// Reference: Zig fmt.zig digitToChar with base=8
+fn octal(n: i64) string {
+    if (n == 0) { return "0" }
+    var val = n
+    if (val < 0) { val = 0 - val }
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var buf = @alloc(22)
+    var pos: i64 = 0
+    while (val > 0) {
+        var digit = val & 7
+        @intToPtr(*u8, buf + pos).* = @intCast(u8, digit + 48)
+        pos = pos + 1
+        val = val >> 3
+    }
+    if (n < 0) { sb.append("-") }
+    var i = pos - 1
+    while (i >= 0) {
+        sb.appendByte(@intCast(i64, @intToPtr(*u8, buf + i).*))
+        i = i - 1
+    }
+    @dealloc(buf)
+    return sb.toString()
+}
+
+// Format integer with given base (2-36).
+// Reference: Zig fmt.zig printIntAny — generic base-N formatting
+fn formatInt(n: i64, base: i64) string {
+    if (base < 2 or base > 36) { @trap() }
+    if (n == 0) { return "0" }
+    var val = n
+    if (val < 0) { val = 0 - val }
+    var sb = StringBuilder { .buf = 0, .len = 0, .cap = 0 }
+    var buf = @alloc(64)
+    var pos: i64 = 0
+    while (val > 0) {
+        var digit = val % base
+        if (digit < 10) {
+            @intToPtr(*u8, buf + pos).* = @intCast(u8, digit + 48)
+        } else {
+            @intToPtr(*u8, buf + pos).* = @intCast(u8, digit - 10 + 97)
+        }
+        pos = pos + 1
+        val = val / base
+    }
+    if (n < 0) { sb.append("-") }
+    var i = pos - 1
+    while (i >= 0) {
+        sb.appendByte(@intCast(i64, @intToPtr(*u8, buf + i).*))
+        i = i - 1
+    }
+    @dealloc(buf)
+    return sb.toString()
+}
