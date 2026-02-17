@@ -700,6 +700,51 @@ pub const Checker = struct {
                     if (type_idx == invalid_type) return null;
                     return @as(i64, @intCast(self.types.sizeOf(type_idx)));
                 }
+                // @alignOf(T) — comptime, Zig Sema.zig
+                if (bc.kind == .align_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    return @as(i64, @intCast(self.types.alignmentOf(type_idx)));
+                }
+                // @offsetOf(T, "field") — always comptime, Zig Sema.zig:23060
+                if (bc.kind == .offset_of) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const name_str = self.evalConstString(bc.args[0]) orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .struct_type) {
+                        var offset: i64 = 0;
+                        for (info.struct_type.fields) |sf| {
+                            if (std.mem.eql(u8, sf.name, name_str)) return offset;
+                            offset += @as(i64, @intCast(self.types.sizeOf(sf.type_idx)));
+                        }
+                    }
+                    return null;
+                }
+                // @intFromBool(b) — comptime when arg is comptime-known
+                if (bc.kind == .int_from_bool) {
+                    if (self.evalConstExpr(bc.args[0])) |v| {
+                        return if (v != 0) @as(i64, 1) else @as(i64, 0);
+                    }
+                    return null;
+                }
+                // @min(a, b) / @max(a, b) — comptime fold
+                if (bc.kind == .min) {
+                    if (self.evalConstExpr(bc.args[0])) |a| {
+                        if (self.evalConstExpr(bc.args[1])) |b| {
+                            return if (a < b) a else b;
+                        }
+                    }
+                    return null;
+                }
+                if (bc.kind == .max) {
+                    if (self.evalConstExpr(bc.args[0])) |a| {
+                        if (self.evalConstExpr(bc.args[1])) |b| {
+                            return if (a > b) a else b;
+                        }
+                    }
+                    return null;
+                }
                 if (bc.kind == .has_field) {
                     const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
                     if (type_idx == invalid_type) return null;
@@ -1287,6 +1332,112 @@ pub const Checker = struct {
                 }
                 self.err.errorWithCode(bc.span.start, .e300, "@field requires struct type");
                 return invalid_type;
+            },
+            // @intFromEnum(e) — Zig Sema.zig:8420: validate operand is enum, return i64
+            .int_from_enum => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (self.types.get(arg_type) != .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@intFromEnum requires enum argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.I64;
+            },
+            // @enumFromInt(T, i) — Zig Sema.zig:8480: validate T is enum, operand is int
+            .enum_from_int => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (self.types.get(target_type) != .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@enumFromInt target must be enum type");
+                    return invalid_type;
+                }
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            // @tagName(val) — Zig Sema.zig:20487: enum or union → string name
+            .tag_name => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const info = self.types.get(arg_type);
+                if (info != .enum_type and info != .union_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@tagName requires enum or union argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.STRING;
+            },
+            // @errorName(err) — Zig Sema.zig:20375: error value → string name
+            .error_name => {
+                _ = try self.checkExpr(bc.args[0]);
+                // Accept any type — at runtime the error tag is an integer index
+                return TypeRegistry.STRING;
+            },
+            // @intFromBool(b) — Zig Sema.zig:20341: bool → i64 (0 or 1)
+            .int_from_bool => {
+                const arg_type = try self.checkExpr(bc.args[0]);
+                if (arg_type != TypeRegistry.BOOL and arg_type != TypeRegistry.UNTYPED_BOOL) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@intFromBool requires bool argument");
+                    return invalid_type;
+                }
+                return TypeRegistry.I64;
+            },
+            // @bitCast(T, val) — Zig Sema.zig:30554: reinterpret bits as target type
+            .bit_cast => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            // @truncate(T, val) — Zig Sema.zig:22882: narrow integer to smaller type
+            // Returns I64 because all Cot runtime values are i64; the AND mask handles narrowing.
+            .truncate => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                if (!types.isNumeric(self.types.get(target_type))) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@truncate target must be numeric");
+                    return invalid_type;
+                }
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            // @as(T, val) — Zig Sema.zig:9659: explicit type coercion
+            .as => {
+                const target_type = try self.resolveTypeExpr(bc.type_arg);
+                _ = try self.checkExpr(bc.args[0]);
+                return target_type;
+            },
+            // @offsetOf(T, "field") — Zig Sema.zig:23060: comptime struct field offset
+            .offset_of => {
+                const type_idx = try self.resolveTypeExpr(bc.type_arg);
+                const info = self.types.get(type_idx);
+                if (info != .struct_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@offsetOf requires struct type");
+                    return invalid_type;
+                }
+                const name_str = self.evalConstString(bc.args[0]) orelse {
+                    self.err.errorWithCode(bc.span.start, .e300, "@offsetOf requires string literal field name");
+                    return invalid_type;
+                };
+                var found = false;
+                for (info.struct_type.fields) |sf| {
+                    if (std.mem.eql(u8, sf.name, name_str)) { found = true; break; }
+                }
+                if (!found) {
+                    self.err.errorWithCode(bc.span.start, .e300, "struct has no field with this name");
+                    return invalid_type;
+                }
+                return TypeRegistry.I64;
+            },
+            // @min(a, b) / @max(a, b) — Zig Sema.zig:24678: integer min/max
+            .min, .max => {
+                _ = try self.checkExpr(bc.args[0]);
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
+            // @alignCast(alignment, ptr) — Zig: assert alignment, identity in release
+            .align_cast => {
+                _ = try self.resolveTypeExpr(bc.type_arg);
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
+            },
+            // @constCast(ptr) — Zig: remove const qualifier, type-system only
+            .const_cast => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.I64;
             },
         }
     }

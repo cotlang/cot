@@ -5395,6 +5395,228 @@ pub const Lowerer = struct {
                 const name_str = self.getStringLiteral(bc.args[1]) orelse return ir.null_node;
                 return self.lowerFieldAccess(.{ .base = bc.args[0], .field = name_str, .span = bc.span });
             },
+            // @intFromEnum(e) — Zig Sema.zig:8420: enum value IS its backing integer
+            .int_from_enum => {
+                // Enums are already integers at runtime — identity operation
+                return try self.lowerExprNode(bc.args[0]);
+            },
+            // @enumFromInt(T, i) — Zig Sema.zig:8480: integer → enum, identity at runtime
+            .enum_from_int => {
+                // Enums are integers at runtime — identity operation (type changes in checker)
+                return try self.lowerExprNode(bc.args[0]);
+            },
+            // @tagName(val) — Zig Sema.zig:20487: build string table, index by enum value
+            .tag_name => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                const arg_type = self.inferExprType(bc.args[0]);
+                const info = self.type_reg.get(arg_type);
+                if (info == .enum_type) {
+                    // Build if-chain: if val == 0 return "variant0" elif val == 1 return "variant1" ...
+                    // Zig uses string table + index; we use if-chain (simpler, same semantics)
+                    const variants = info.enum_type.variants;
+                    if (variants.len == 0) {
+                        const empty = try fb.addStringLiteral(try self.allocator.dupe(u8, ""));
+                        return fb.emitConstSlice(empty, bc.span);
+                    }
+                    // Store arg to local (br_table can't carry values across blocks)
+                    const arg_local = try fb.addLocalWithSize("__tag_val", TypeRegistry.I64, false, 8);
+                    _ = try fb.emitStoreLocal(arg_local, arg, bc.span);
+                    // Result local for string (ptr + len = 16 bytes)
+                    const result_local = try fb.addLocalWithSize("__tag_result", TypeRegistry.STRING, false, 16);
+                    // Build if-chain for each variant
+                    const merge_block = try fb.newBlock("tagname.merge");
+                    for (variants) |v| {
+                        const val_node = try fb.emitLoadLocal(arg_local, TypeRegistry.I64, bc.span);
+                        const variant_val = try fb.emitConstInt(v.value, TypeRegistry.I64, bc.span);
+                        const cmp = try fb.emitBinary(.eq, val_node, variant_val, TypeRegistry.BOOL, bc.span);
+                        const match_block = try fb.newBlock("tagname.match");
+                        const next_block = try fb.newBlock("tagname.next");
+                        _ = try fb.emitBranch(cmp, match_block, next_block, bc.span);
+                        fb.setBlock(match_block);
+                        const str = try fb.addStringLiteral(try self.allocator.dupe(u8, v.name));
+                        const str_val = try fb.emitConstSlice(str, bc.span);
+                        _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(str_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
+                        _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(str_val, bc.span), bc.span);
+                        _ = try fb.emitJump(merge_block, bc.span);
+                        fb.setBlock(next_block);
+                    }
+                    // Default: empty string for unknown values
+                    const empty = try fb.addStringLiteral(try self.allocator.dupe(u8, ""));
+                    const empty_val = try fb.emitConstSlice(empty, bc.span);
+                    _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(empty_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
+                    _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(empty_val, bc.span), bc.span);
+                    _ = try fb.emitJump(merge_block, bc.span);
+                    fb.setBlock(merge_block);
+                    return fb.emitLoadLocal(result_local, TypeRegistry.STRING, bc.span);
+                }
+                if (info == .union_type) {
+                    // Tagged union: extract tag (field 0), then same if-chain pattern
+                    const tag_val = try self.lowerFieldAccess(.{ .base = bc.args[0], .field = "__tag", .span = bc.span });
+                    const tag_local = try fb.addLocalWithSize("__utag_val", TypeRegistry.I64, false, 8);
+                    _ = try fb.emitStoreLocal(tag_local, tag_val, bc.span);
+                    const result_local = try fb.addLocalWithSize("__utag_result", TypeRegistry.STRING, false, 16);
+                    const merge_block = try fb.newBlock("utagname.merge");
+                    for (info.union_type.variants, 0..) |v, i| {
+                        const val_node = try fb.emitLoadLocal(tag_local, TypeRegistry.I64, bc.span);
+                        const variant_val = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, bc.span);
+                        const cmp = try fb.emitBinary(.eq, val_node, variant_val, TypeRegistry.BOOL, bc.span);
+                        const match_block = try fb.newBlock("utagname.match");
+                        const next_block = try fb.newBlock("utagname.next");
+                        _ = try fb.emitBranch(cmp, match_block, next_block, bc.span);
+                        fb.setBlock(match_block);
+                        const str = try fb.addStringLiteral(try self.allocator.dupe(u8, v.name));
+                        const str_val = try fb.emitConstSlice(str, bc.span);
+                        _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(str_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
+                        _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(str_val, bc.span), bc.span);
+                        _ = try fb.emitJump(merge_block, bc.span);
+                        fb.setBlock(next_block);
+                    }
+                    const empty = try fb.addStringLiteral(try self.allocator.dupe(u8, ""));
+                    const empty_val = try fb.emitConstSlice(empty, bc.span);
+                    _ = try fb.emitStoreLocalField(result_local, 0, 0, try fb.emitSlicePtr(empty_val, try self.type_reg.makePointer(TypeRegistry.U8), bc.span), bc.span);
+                    _ = try fb.emitStoreLocalField(result_local, 1, 8, try fb.emitSliceLen(empty_val, bc.span), bc.span);
+                    _ = try fb.emitJump(merge_block, bc.span);
+                    fb.setBlock(merge_block);
+                    return fb.emitLoadLocal(result_local, TypeRegistry.STRING, bc.span);
+                }
+                // Fallback: empty string
+                const empty = try fb.addStringLiteral(try self.allocator.dupe(u8, ""));
+                return fb.emitConstSlice(empty, bc.span);
+            },
+            // @errorName(err) — Zig Sema.zig:20375: error value → name string
+            // Error values in Cot are integer tags. We need a global error variant table.
+            // For now, emit the error tag as a string (simplified — full impl needs error registry)
+            .error_name => {
+                // Error names are not easily recoverable at runtime without a global table.
+                // For comptime-known errors, the checker can resolve the name.
+                // For runtime: return "error" as placeholder (full impl in Tier 3 with error registry)
+                const fallback = try fb.addStringLiteral(try self.allocator.dupe(u8, "error"));
+                return fb.emitConstSlice(fallback, bc.span);
+            },
+            // @intFromBool(b) — Zig Sema.zig:20341: bool → integer, identity at Wasm level
+            .int_from_bool => {
+                // Bools are already 0/1 integers at Wasm level — identity operation
+                return try self.lowerExprNode(bc.args[0]);
+            },
+            // @bitCast(T, val) — Zig Sema.zig:30554: reinterpret bits, no conversion
+            .bit_cast => {
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                // Check if this is an f64 <-> i64 reinterpret (Wasm has specific ops)
+                const target_info = self.type_reg.get(target_type);
+                const source_type = self.inferExprType(bc.args[0]);
+                const source_info = self.type_reg.get(source_type);
+                if ((target_info == .basic and target_info.basic == .f64_type) and
+                    (source_info == .basic and (source_info.basic == .i64_type or source_info.basic == .u64_type)))
+                {
+                    // i64 → f64: Wasm f64.reinterpret_i64 (0xBF)
+                    return fb.emit(ir.Node.init(.{ .unary = .{ .op = .f64_reinterpret_i64, .operand = value } }, TypeRegistry.F64, bc.span));
+                }
+                if ((target_info == .basic and (target_info.basic == .i64_type or target_info.basic == .u64_type)) and
+                    (source_info == .basic and source_info.basic == .f64_type))
+                {
+                    // f64 → i64: Wasm i64.reinterpret_f64 (0xBD)
+                    return fb.emit(ir.Node.init(.{ .unary = .{ .op = .i64_reinterpret_f64, .operand = value } }, TypeRegistry.I64, bc.span));
+                }
+                // For same-size integer types, identity operation
+                return value;
+            },
+            // @truncate(T, val) — Zig Sema.zig:22882: narrow to smaller integer via masking
+            .truncate => {
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                // Emit AND with appropriate mask for target bit width
+                const target_info = self.type_reg.get(target_type);
+                const mask: i64 = if (target_info == .basic) switch (target_info.basic) {
+                    .u8_type => 0xFF,
+                    .u16_type => 0xFFFF,
+                    .u32_type, .i32_type => 0xFFFFFFFF,
+                    else => return value, // i64/u64 — no truncation needed
+                } else return value;
+                const mask_node = try fb.emitConstInt(mask, TypeRegistry.I64, bc.span);
+                return try fb.emitBinary(.bit_and, value, mask_node, TypeRegistry.I64, bc.span);
+            },
+            // @as(T, val) — Zig Sema.zig:9659: explicit type coercion, delegates to intCast
+            .as => {
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitIntCast(value, target_type, bc.span);
+            },
+            // @offsetOf(T, "field") — Zig Sema.zig:23060: always comptime, byte offset
+            .offset_of => {
+                const type_idx = self.resolveTypeNode(bc.type_arg);
+                const name_str = self.getStringLiteral(bc.args[0]) orelse return fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+                const info = self.type_reg.get(type_idx);
+                if (info == .struct_type) {
+                    var offset: u32 = 0;
+                    for (info.struct_type.fields) |sf| {
+                        if (std.mem.eql(u8, sf.name, name_str)) {
+                            return fb.emitConstInt(@intCast(offset), TypeRegistry.I64, bc.span);
+                        }
+                        offset += self.type_reg.sizeOf(sf.type_idx);
+                    }
+                }
+                return fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+            },
+            // @min(a, b) — Zig Sema.zig:24678: if a < b then a else b
+            .min => {
+                const a = try self.lowerExprNode(bc.args[0]);
+                const b = try self.lowerExprNode(bc.args[1]);
+                // Store to locals (br_table can't carry values)
+                const a_local = try fb.addLocalWithSize("__min_a", TypeRegistry.I64, false, 8);
+                _ = try fb.emitStoreLocal(a_local, a, bc.span);
+                const b_local = try fb.addLocalWithSize("__min_b", TypeRegistry.I64, false, 8);
+                _ = try fb.emitStoreLocal(b_local, b, bc.span);
+                const result_local = try fb.addLocalWithSize("__min_r", TypeRegistry.I64, false, 8);
+                const a_val = try fb.emitLoadLocal(a_local, TypeRegistry.I64, bc.span);
+                const b_val = try fb.emitLoadLocal(b_local, TypeRegistry.I64, bc.span);
+                const cmp = try fb.emitBinary(.lt, a_val, b_val, TypeRegistry.BOOL, bc.span);
+                const then_block = try fb.newBlock("min.a");
+                const else_block = try fb.newBlock("min.b");
+                const merge_block = try fb.newBlock("min.merge");
+                _ = try fb.emitBranch(cmp, then_block, else_block, bc.span);
+                fb.setBlock(then_block);
+                _ = try fb.emitStoreLocal(result_local, try fb.emitLoadLocal(a_local, TypeRegistry.I64, bc.span), bc.span);
+                _ = try fb.emitJump(merge_block, bc.span);
+                fb.setBlock(else_block);
+                _ = try fb.emitStoreLocal(result_local, try fb.emitLoadLocal(b_local, TypeRegistry.I64, bc.span), bc.span);
+                _ = try fb.emitJump(merge_block, bc.span);
+                fb.setBlock(merge_block);
+                return fb.emitLoadLocal(result_local, TypeRegistry.I64, bc.span);
+            },
+            // @max(a, b) — Zig Sema.zig:24678: if a > b then a else b
+            .max => {
+                const a = try self.lowerExprNode(bc.args[0]);
+                const b = try self.lowerExprNode(bc.args[1]);
+                const a_local = try fb.addLocalWithSize("__max_a", TypeRegistry.I64, false, 8);
+                _ = try fb.emitStoreLocal(a_local, a, bc.span);
+                const b_local = try fb.addLocalWithSize("__max_b", TypeRegistry.I64, false, 8);
+                _ = try fb.emitStoreLocal(b_local, b, bc.span);
+                const result_local = try fb.addLocalWithSize("__max_r", TypeRegistry.I64, false, 8);
+                const a_val = try fb.emitLoadLocal(a_local, TypeRegistry.I64, bc.span);
+                const b_val = try fb.emitLoadLocal(b_local, TypeRegistry.I64, bc.span);
+                const cmp = try fb.emitBinary(.gt, a_val, b_val, TypeRegistry.BOOL, bc.span);
+                const then_block = try fb.newBlock("max.a");
+                const else_block = try fb.newBlock("max.b");
+                const merge_block = try fb.newBlock("max.merge");
+                _ = try fb.emitBranch(cmp, then_block, else_block, bc.span);
+                fb.setBlock(then_block);
+                _ = try fb.emitStoreLocal(result_local, try fb.emitLoadLocal(a_local, TypeRegistry.I64, bc.span), bc.span);
+                _ = try fb.emitJump(merge_block, bc.span);
+                fb.setBlock(else_block);
+                _ = try fb.emitStoreLocal(result_local, try fb.emitLoadLocal(b_local, TypeRegistry.I64, bc.span), bc.span);
+                _ = try fb.emitJump(merge_block, bc.span);
+                fb.setBlock(merge_block);
+                return fb.emitLoadLocal(result_local, TypeRegistry.I64, bc.span);
+            },
+            // @alignCast(alignment, ptr) — identity at runtime, debug check would go here
+            .align_cast => {
+                return try self.lowerExprNode(bc.args[0]);
+            },
+            // @constCast(ptr) — identity, type-system only (Zig Sema.zig)
+            .const_cast => {
+                return try self.lowerExprNode(bc.args[0]);
+            },
         }
     }
 

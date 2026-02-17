@@ -409,7 +409,7 @@ Batteries-included standard library matching Deno's breadth. Every module is pur
 | Runtime safety (debug mode) | Done | Overflow, bounds, null checks in debug; `--release` disables |
 | `noreturn` type | Done | Bottom type for @exit, @trap |
 | Doc comments (`///`) | Done | `///` parsed, stored in AST, used by `cot doc` |
-| Packed structs / bitfields | — | 0.5 |
+| Packed structs / bitfields | Done | Packed + extern structs |
 | Wrapping arithmetic (`+%`) | — | 0.5 |
 | SIMD vectors | — | 0.6+ |
 | Sentinel-terminated types | — | 0.6+ (FFI story) |
@@ -456,12 +456,16 @@ The package manager + web framework release. Cot becomes something you can build
 
 | Feature | Description | Reference |
 |---------|-------------|-----------|
-| Packed structs / bitfields | `packed struct { flags: u3, mode: u2 }` — bit-level layout, backed by integer. For binary protocols, network headers, flags. | Zig `packed struct` |
+| ~~Packed structs / bitfields~~ | ~~DONE in 0.4~~ — `packed struct` and `extern struct` with C ABI layout. | Zig `packed struct` |
 | Wrapping/saturating arithmetic | `+%` (wrapping), `+\|` (saturating) — explicit overflow behavior. | Zig `+%`, `+\|` |
 | `for` multi-sequence | `for (a, b) \|x, y\|` — iterate multiple collections in lockstep. | Zig multi-object for |
-| `while` continue expression | `while (i < n) : (i += 1) { }` — elegant loop increment. | Zig while continue |
+| ~~`while` continue expression~~ | ~~DONE in 0.4~~ — `while (i < n) : (i += 1) { }`. | Zig while continue |
 | Non-exhaustive enums | `enum(u8) { A, B, _ }` — allows values outside the defined set. For forward-compatible protocols. | Zig non-exhaustive |
 | `weak` references | ARC cycle breaker. `weak var ref: ?*Node = null` — doesn't prevent deallocation. | Swift `weak` |
+| Self-hosting builtins | ~~DONE in 0.4~~ — @intFromEnum, @enumFromInt, @bitCast, @truncate, @as, @offsetOf, @min, @max, @tagName, @errorName, @intFromBool, @alignCast, @constCast. | Zig Sema.zig |
+| Nested type namespaces | ~~DONE in 0.4~~ — `const Error = error { ... }` inside struct body. `Parser.Error` access. | Zig namespace structs |
+| Anonymous struct literals | ~~DONE in 0.4~~ — `.{ .x = 1, .y = 2 }` with expected-type inference from context. | Zig ResultLoc |
+| Extern structs | ~~DONE in 0.4~~ — `extern struct` with C ABI field alignment. | Zig extern struct |
 
 #### Ecosystem
 

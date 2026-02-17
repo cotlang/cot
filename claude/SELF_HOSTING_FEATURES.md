@@ -249,7 +249,7 @@ position (e.g., switch arms, `orelse unreachable`).
 
 ---
 
-### 1.6 Nested Type Namespaces
+### 1.6 Nested Type Namespaces ✅ DONE
 
 **What**: Declare types inside structs, creating a namespace.
 
@@ -290,7 +290,7 @@ that logically belong to their parent struct.
 
 ---
 
-### 1.7 Anonymous Struct Literals
+### 1.7 Anonymous Struct Literals ✅ DONE
 
 **What**: Struct values without naming the type, inferred from context.
 
@@ -368,7 +368,7 @@ lowering: for each missing field, lower the default_value expression and store i
 
 ---
 
-### 1.9 Packed Structs (new)
+### 1.9 Packed Structs ✅ DONE
 
 **What**: Structs with no padding between fields, laid out in declaration order with
 bit-level precision.
@@ -408,7 +408,7 @@ fields, direct offset for byte-aligned fields).
 
 ---
 
-### 1.10 Extern Structs (new)
+### 1.10 Extern Structs ✅ DONE
 
 **What**: Structs with C ABI layout, for interop with system calls and binary formats.
 
@@ -449,7 +449,7 @@ alignment rules), lower.zig (same codegen as regular structs but with C offsets)
 New `@builtin` registrations through the standard pipeline:
 parser.zig → checker.zig → lower.zig → (some need wasi_runtime.zig + driver.zig)
 
-### 2.1 `@intFromEnum(e)` / `@enumFromInt(T, i)`
+### 2.1 `@intFromEnum(e)` / `@enumFromInt(T, i)` ✅ DONE
 
 **What**: Convert between enum values and their backing integer.
 
@@ -474,7 +474,7 @@ type-check that the target is an enum.
 
 ---
 
-### 2.2 `@bitCast(T, val)`
+### 2.2 `@bitCast(T, val)` ✅ DONE
 
 **What**: Reinterpret the bits of a value as a different type without conversion.
 
@@ -501,7 +501,7 @@ for NaN boxing, hash functions on floats, and serialization.
 
 ---
 
-### 2.3 `@truncate(T, val)`
+### 2.3 `@truncate(T, val)` ✅ DONE
 
 **What**: Explicitly truncate an integer to a narrower type, discarding high bits.
 
@@ -526,7 +526,7 @@ i64 → i32.
 
 ---
 
-### 2.4 `@as(T, val)`
+### 2.4 `@as(T, val)` ✅ DONE
 
 **What**: Explicit type coercion. Asserts that val is coercible to T.
 
@@ -551,7 +551,7 @@ or @intCast-style widening/narrowing as needed.
 
 ---
 
-### 2.5 `@offsetOf(T, "field")`
+### 2.5 `@offsetOf(T, "field")` ✅ DONE
 
 **What**: Returns the byte offset of a field within a struct.
 
@@ -573,7 +573,7 @@ layout already computed by the checker.
 
 ---
 
-### 2.6 `@min(a, b)` / `@max(a, b)`
+### 2.6 `@min(a, b)` / `@max(a, b)` ✅ DONE
 
 **What**: Integer min/max (complement existing @fmin/@fmax for floats).
 
@@ -597,7 +597,7 @@ conditional branch.
 
 ---
 
-### 2.7 `@tagName(val)`
+### 2.7 `@tagName(val)` ✅ DONE
 
 **What**: Get the name of an enum variant or tagged union tag as a string.
 
@@ -621,7 +621,7 @@ values starting from 0.
 
 ---
 
-### 2.8 `@errorName(err)`
+### 2.8 `@errorName(err)` ✅ DONE
 
 **What**: Get the name of an error value as a string.
 
@@ -642,7 +642,7 @@ appears in diagnostics. Without it, error messages show numeric codes instead of
 
 ---
 
-### 2.9 `@intFromBool(b)`
+### 2.9 `@intFromBool(b)` ✅ DONE
 
 **What**: Convert bool to integer (false → 0, true → 1).
 
@@ -664,7 +664,7 @@ Type check that input is bool, result is integer.
 
 ---
 
-### 2.10 `@alignCast(alignment, ptr)`
+### 2.10 `@alignCast(alignment, ptr)` ✅ DONE
 
 **What**: Assert pointer alignment at runtime (debug) or assume it (release).
 
@@ -686,7 +686,7 @@ Release mode: no-op. Returns same pointer with adjusted type.
 
 ---
 
-### 2.11 `@constCast(ptr)` / `@volatileCast(ptr)`
+### 2.11 `@constCast(ptr)` / `@volatileCast(ptr)` ✅ DONE
 
 **What**: Remove const qualifier from a pointer type.
 
@@ -707,88 +707,11 @@ mutability.
 
 These are Cot stdlib modules/patterns needed for clean compiler code.
 
-### 3.1 Allocator Interface (Trait)
+**Note**: Allocator interface and arena allocator were removed from this tier.
+Cot uses ARC (like Swift) — memory management is automatic. Go and Swift both
+compile fast without allocator interfaces. Adding one would be unnecessary complexity.
 
-**What**: A trait that abstracts memory allocation, allowing different strategies
-(heap, arena, page) to be swapped.
-
-**Zig**:
-```zig
-const Allocator = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub fn alloc(self: Allocator, comptime T: type, n: usize) ![]T { ... }
-    pub fn free(self: Allocator, slice: []T) void { ... }
-    pub fn create(self: Allocator, comptime T: type) !*T { ... }
-    pub fn destroy(self: Allocator, ptr: *T) void { ... }
-};
-```
-
-**Cot design** (proposed):
-```cot
-trait Allocator {
-    fn alloc(self: *Self, size: i64) i64       // returns ptr
-    fn dealloc(self: *Self, ptr: i64) void
-    fn realloc(self: *Self, ptr: i64, new_size: i64) i64
-}
-
-struct HeapAllocator {}
-impl Allocator for HeapAllocator {
-    fn alloc(self: *HeapAllocator, size: i64) i64 { return @alloc(size) }
-    fn dealloc(self: *HeapAllocator, ptr: i64) void { @dealloc(ptr) }
-    fn realloc(self: *HeapAllocator, ptr: i64, new_size: i64) i64 {
-        return @realloc(ptr, new_size)
-    }
-}
-```
-
-**Why**: The Zig compiler threads `allocator` through every function that allocates.
-This enables arena allocation in the parser (allocate many nodes, free all at once)
-and page allocation for large buffers. Without it, all code uses global `@alloc` which
-prevents arena optimization.
-
-**Stdlib location**: `stdlib/mem.cot`
-
-**Depends on**: Traits (already supported).
-
----
-
-### 3.2 Arena Allocator
-
-**What**: Allocator that allocates from a contiguous buffer, frees everything at once.
-
-**Zig**:
-```zig
-var arena = std.heap.ArenaAllocator.init(allocator);
-defer arena.deinit();
-const alloc = arena.allocator();
-// many allocations...
-// all freed at once when arena.deinit() runs
-```
-
-**Cot design**:
-```cot
-import "std/mem"
-
-var arena = ArenaAllocator.init(heapAllocator())
-defer arena.deinit()
-
-// Use arena for parser nodes — all freed at once after parsing
-var tree = parser.parse(arena.allocator())
-```
-
-**Why**: The parser generates hundreds of AST nodes per file. With heap allocation,
-each node is a separate `@alloc` call. With arena, one large buffer is allocated and
-nodes are bump-allocated from it. 10-50x faster for parsing.
-
-**Stdlib location**: `stdlib/mem.cot` (alongside Allocator trait)
-
-**Depends on**: 3.1 Allocator Interface.
-
----
-
-### 3.3 `std/mem` Functions
+### 3.1 `std/mem` Functions
 
 **What**: Memory comparison and search utilities.
 
@@ -816,7 +739,7 @@ Also need `@memcmp(a, b, len)` builtin for raw pointer comparison.
 
 ---
 
-### 3.4 Writer / Reader Interfaces
+### 3.2 Writer / Reader Interfaces
 
 **What**: Trait-based streaming I/O for composable output.
 
@@ -853,11 +776,11 @@ arithmetic. A Writer trait enables: buffer writer (for in-memory assembly), file
 
 **Stdlib location**: `stdlib/io.cot` (extend existing module)
 
-**Depends on**: 3.1 Allocator Interface, Traits.
+**Depends on**: Traits (already supported).
 
 ---
 
-### 3.5 `std/fmt` — Format Strings
+### 3.3 `std/fmt` — Format Strings
 
 **What**: Type-safe string formatting beyond interpolation.
 
@@ -888,7 +811,7 @@ fmt.octal(8)         // "10"
 
 ---
 
-### 3.6 `std/debug` — Assert and Debug Print
+### 3.4 `std/debug` — Assert and Debug Print
 
 **What**: Debug assertions with messages, conditional debug output.
 
@@ -996,11 +919,10 @@ All independent, can be implemented in any order:
 - 1.10 Extern structs
 
 ### Phase 4: Standard Library
-- 3.1 Allocator interface → 3.2 Arena allocator
-- 3.3 `std/mem` functions
-- 3.4 Writer/Reader interfaces
-- 3.5 `std/fmt` number formatting
-- 3.6 `std/debug` assertions
+- 3.1 `std/mem` functions
+- 3.2 Writer/Reader interfaces
+- 3.3 `std/fmt` number formatting
+- 3.4 `std/debug` assertions
 
 ### Phase 5: Type System Polish
 - 4.1 Integer promotion rules
@@ -1026,11 +948,11 @@ After each phase, port a section of the compiler to Cot as a proof-of-concept:
 
 | Category | Features | Estimated Compiler Changes |
 |----------|----------|---------------------------|
-| Tier 1: Language | 10 features | ~2200 lines across parser/checker/lower |
-| Tier 2: Builtins | 11 features | ~800 lines across ast/checker/lower |
-| Tier 3: Stdlib | 6 modules | ~1500 lines of Cot stdlib code |
-| Tier 4: Type System | 2 features | ~400 lines in checker/lower |
-| **Total** | **29 features** | **~4900 lines** |
+| Tier 1: Language | 10 features | ~2200 lines across parser/checker/lower | ✅ DONE |
+| Tier 2: Builtins | 11 features | ~800 lines across ast/checker/lower | ✅ DONE |
+| Tier 3: Stdlib | 4 modules | ~1000 lines of Cot stdlib code | TODO |
+| Tier 4: Type System | 2 features | ~400 lines in checker/lower | TODO |
+| **Total** | **27 features** | **~4400 lines** |
 
 This brings Cot from ~75% to ~95% Zig feature parity for the compiler's needs,
 enabling a clean self-hosted Cot→Wasm compiler without workarounds.

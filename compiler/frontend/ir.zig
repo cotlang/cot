@@ -31,7 +31,7 @@ pub const BinaryOp = enum(u8) {
     pub fn isBitwise(self: BinaryOp) bool { return switch (self) { .bit_and, .bit_or, .bit_xor, .shl, .shr => true, else => false }; }
 };
 
-pub const UnaryOp = enum(u8) { neg, not, bit_not, optional_unwrap, abs, ceil, floor, trunc_float, nearest, sqrt };
+pub const UnaryOp = enum(u8) { neg, not, bit_not, optional_unwrap, abs, ceil, floor, trunc_float, nearest, sqrt, f64_reinterpret_i64, i64_reinterpret_f64 };
 
 // Typed operation payloads
 pub const ConstInt = struct { value: i64 };

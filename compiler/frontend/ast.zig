@@ -239,6 +239,24 @@ pub const BuiltinKind = enum {
     has_field,
     type_of,
     field,
+    // Enum/error intrinsics (Zig Sema.zig:8420, 20375)
+    int_from_enum,
+    enum_from_int,
+    tag_name,
+    error_name,
+    int_from_bool,
+    // Cast intrinsics (Zig Sema.zig:30554, 22882)
+    bit_cast,
+    truncate,
+    as,
+    // Struct introspection (Zig Sema.zig:23060)
+    offset_of,
+    // Integer min/max (Zig Sema.zig:24678)
+    min,
+    max,
+    // Pointer cast (Zig Sema.zig)
+    align_cast,
+    const_cast,
 
     const map = std.StaticStringMap(BuiltinKind).initComptime(.{
         .{ "sizeOf", .size_of },
@@ -307,6 +325,19 @@ pub const BuiltinKind = enum {
         .{ "hasField", .has_field },
         .{ "TypeOf", .type_of },
         .{ "field", .field },
+        .{ "intFromEnum", .int_from_enum },
+        .{ "enumFromInt", .enum_from_int },
+        .{ "tagName", .tag_name },
+        .{ "errorName", .error_name },
+        .{ "intFromBool", .int_from_bool },
+        .{ "bitCast", .bit_cast },
+        .{ "truncate", .truncate },
+        .{ "as", .as },
+        .{ "offsetOf", .offset_of },
+        .{ "min", .min },
+        .{ "max", .max },
+        .{ "alignCast", .align_cast },
+        .{ "constCast", .const_cast },
     });
 
     pub fn fromString(s: []const u8) ?BuiltinKind {
@@ -381,6 +412,19 @@ pub const BuiltinKind = enum {
             .has_field => "hasField",
             .type_of => "TypeOf",
             .field => "field",
+            .int_from_enum => "intFromEnum",
+            .enum_from_int => "enumFromInt",
+            .tag_name => "tagName",
+            .error_name => "errorName",
+            .int_from_bool => "intFromBool",
+            .bit_cast => "bitCast",
+            .truncate => "truncate",
+            .as => "as",
+            .offset_of => "offsetOf",
+            .min => "min",
+            .max => "max",
+            .align_cast => "alignCast",
+            .const_cast => "constCast",
         };
     }
 };

@@ -720,6 +720,9 @@ pub const SSABuilder = struct {
             .trunc_float => .wasm_f64_trunc,
             .nearest => .wasm_f64_nearest,
             .sqrt => .wasm_f64_sqrt,
+            // Reinterpret casts — Wasm 0xBD/0xBF (Zig @bitCast between f64/i64)
+            .f64_reinterpret_i64 => .wasm_f64_reinterpret_i64,
+            .i64_reinterpret_f64 => .wasm_i64_reinterpret_f64,
         };
         const val = try self.func.newValue(op_kind, type_idx, cur, self.cur_pos);
         val.addArg(operand);

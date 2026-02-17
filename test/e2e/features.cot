@@ -2576,3 +2576,109 @@ test "anonymous struct return" {
     @assert_eq(p.x, 0)
     @assert_eq(p.y, 0)
 }
+
+// ============================================================================
+// Tier 2 Builtins: Self-hosting intrinsics (Zig Sema.zig ports)
+// ============================================================================
+
+// --- @intFromEnum / @enumFromInt (Zig Sema.zig:8420) ---
+
+enum BuiltinColor { red, green, blue }
+
+test "@intFromEnum" {
+    var c = BuiltinColor.green
+    @assert_eq(@intFromEnum(c), 1)
+    @assert_eq(@intFromEnum(BuiltinColor.red), 0)
+    @assert_eq(@intFromEnum(BuiltinColor.blue), 2)
+}
+
+test "@enumFromInt" {
+    var val = @enumFromInt(BuiltinColor, 2)
+    @assert_eq(@intFromEnum(val), 2)
+}
+
+// --- @tagName (Zig Sema.zig:20487) ---
+
+test "@tagName enum" {
+    var c = BuiltinColor.green
+    @assert_eq(@tagName(c), "green")
+    @assert_eq(@tagName(BuiltinColor.red), "red")
+    @assert_eq(@tagName(BuiltinColor.blue), "blue")
+}
+
+// --- @intFromBool (Zig Sema.zig:20341) ---
+
+test "@intFromBool" {
+    @assert_eq(@intFromBool(true), 1)
+    @assert_eq(@intFromBool(false), 0)
+    var b = true
+    @assert_eq(@intFromBool(b), 1)
+}
+
+// --- @truncate (Zig Sema.zig:22882) ---
+
+test "@truncate u8" {
+    var big: i64 = 258
+    var small = @truncate(u8, big)
+    @assert_eq(small, 2)
+}
+
+test "@truncate u16" {
+    var big: i64 = 65538
+    var small = @truncate(u16, big)
+    @assert_eq(small, 2)
+}
+
+// --- @as (Zig Sema.zig:9659) ---
+
+test "@as explicit coercion" {
+    var x = @as(i64, 42)
+    @assert_eq(x, 42)
+}
+
+// --- @offsetOf (Zig Sema.zig:23060) ---
+
+struct OffsetTest { a: i64, b: i64, c: i64 }
+
+test "@offsetOf" {
+    @assert_eq(@offsetOf(OffsetTest, "a"), 0)
+    @assert_eq(@offsetOf(OffsetTest, "b"), 8)
+    @assert_eq(@offsetOf(OffsetTest, "c"), 16)
+}
+
+// --- @min / @max (Zig Sema.zig:24678) ---
+
+test "@min" {
+    @assert_eq(@min(3, 7), 3)
+    @assert_eq(@min(10, 2), 2)
+    @assert_eq(@min(5, 5), 5)
+}
+
+test "@max" {
+    @assert_eq(@max(3, 7), 7)
+    @assert_eq(@max(10, 2), 10)
+    @assert_eq(@max(5, 5), 5)
+}
+
+test "@min @max comptime" {
+    const a = @min(10, 20)
+    const b = @max(10, 20)
+    @assert_eq(a, 10)
+    @assert_eq(b, 20)
+}
+
+// --- @constCast / @alignCast (identity ops) ---
+
+test "@constCast identity" {
+    var ptr: i64 = 12345
+    var result = @constCast(ptr)
+    @assert_eq(result, 12345)
+}
+
+// --- @bitCast (Zig Sema.zig:30554) — integer identity ---
+
+test "@bitCast same-size identity" {
+    var x: i64 = 42
+    var y = @bitCast(i64, x)
+    @assert_eq(y, 42)
+}

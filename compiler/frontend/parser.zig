@@ -1325,14 +1325,16 @@ pub const Parser = struct {
                 if (!self.expect(.rparen)) return null;
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
             },
-            // 1 type arg (no value)
+            // 1 type arg (no value): @sizeOf(T), @alignOf(T)
             .size_of, .align_of => {
                 const t = try self.parseType() orelse return null;
                 if (!self.expect(.rparen)) return null;
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = t, .args = .{ null_node, null_node, null_node }, .span = Span.init(start, self.pos()) } });
             },
-            // 1 type + 1 value arg
-            .int_cast, .ptr_cast, .int_to_ptr, .has_field => {
+            // 1 type + 1 value arg: @intCast(T, val), @enumFromInt(T, val), @bitCast(T, val), @truncate(T, val), @as(T, val), @offsetOf(T, "field"), @alignCast(T, val)
+            .int_cast, .ptr_cast, .int_to_ptr, .has_field,
+            .enum_from_int, .bit_cast, .truncate, .as, .offset_of, .align_cast,
+            => {
                 const t = try self.parseType() orelse return null;
                 if (!self.expect(.comma)) return null;
                 const v = try self.parseExpr() orelse return null;
@@ -1349,6 +1351,7 @@ pub const Parser = struct {
             .waitpid,
             .embed_file,
             .type_of,
+            .int_from_enum, .tag_name, .error_name, .int_from_bool, .const_cast,
             => {
                 const arg = try self.parseExpr() orelse return null;
                 if (!self.expect(.rparen)) return null;
@@ -1359,6 +1362,7 @@ pub const Parser = struct {
             .epoll_del,
             .dup2,
             .field,
+            .min, .max,
             => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
