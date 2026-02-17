@@ -1259,7 +1259,7 @@ pub const Lowerer = struct {
     }
 
     /// Check if an expression's root local has an active ARC cleanup.
-    /// Walks chains: a.b.c → checks if a has cleanup.
+    /// Walks chains: a.b.c → checks if a has cleanup. Also follows deref.
     /// Reference: Swift checks ManagedValue::hasCleanup() on base.
     fn baseHasCleanup(self: *Lowerer, base_idx: NodeIndex) bool {
         const base_node = self.tree.getNode(base_idx) orelse return false;
@@ -1272,6 +1272,7 @@ pub const Lowerer = struct {
         }
         if (base_expr == .field_access) return self.baseHasCleanup(base_expr.field_access.base);
         if (base_expr == .index) return self.baseHasCleanup(base_expr.index.base);
+        if (base_expr == .deref) return self.baseHasCleanup(base_expr.deref.operand);
         return false;
     }
 
@@ -1445,7 +1446,10 @@ pub const Lowerer = struct {
 
                     // Register cleanup for ARC values.
                     // Reference: Swift's emitManagedRValueWithCleanup (SILGenExpr.cpp:375-390)
-                    if (self.type_reg.couldBeARC(type_idx)) {
+                    // `weak var` skips ARC entirely — no retain, no cleanup.
+                    // This breaks reference cycles (parent↔child, delegate patterns).
+                    // Reference: Swift's `weak` and `unowned` modifiers.
+                    if (!var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
                         const is_owned = if (value_expr) |e| (e == .new_expr or e == .call) else false;
 
                         if (is_owned) {
@@ -1891,11 +1895,23 @@ pub const Lowerer = struct {
                         const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
                         var release_args = [_]ir.NodeIndex{old_value};
                         _ = try fb.emitCall("cot_release", &release_args, false, TypeRegistry.VOID, assign.span);
-                        // Retain new value (we're taking ownership)
-                        var retain_args = [_]ir.NodeIndex{value_node};
-                        const retained = try fb.emitCall("cot_retain", &retain_args, false, local_type, assign.span);
-                        _ = try fb.emitStoreLocal(local_idx, retained, assign.span);
-                        self.cleanup_stack.updateValueForLocal(local_idx, retained);
+
+                        // Check if RHS is +1 (owned) or +0 (borrowed)
+                        // Reference: Swift SILGenAssign.cpp — assignment consumes +1, retains +0
+                        const rhs_node = self.tree.getNode(assign.value);
+                        const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
+                        const is_owned = if (rhs_expr) |e| (e == .new_expr or e == .call) else false;
+                        if (!is_owned) {
+                            // +0 value (borrowed): retain before storing
+                            var retain_args = [_]ir.NodeIndex{value_node};
+                            const retained = try fb.emitCall("cot_retain", &retain_args, false, local_type, assign.span);
+                            _ = try fb.emitStoreLocal(local_idx, retained, assign.span);
+                            self.cleanup_stack.updateValueForLocal(local_idx, retained);
+                        } else {
+                            // +1 value (owned): store directly, no retain needed
+                            _ = try fb.emitStoreLocal(local_idx, value_node, assign.span);
+                            self.cleanup_stack.updateValueForLocal(local_idx, value_node);
+                        }
                     } else {
                         const local_type = fb.locals.items[local_idx].type_idx;
                         if (local_type == TypeRegistry.STRING) {
@@ -1931,6 +1947,7 @@ pub const Lowerer = struct {
             .deref => |d| {
                 const ptr_node = try self.lowerExprNode(d.operand);
                 // ARC: release old value at *ptr before storing new (skip for WasmGC)
+                // Reference: Swift SILGenLValue.cpp — assign into lvalue releases old, consumes +1 / retains +0
                 if (!self.target.isWasmGC()) {
                     const ptr_type_idx = self.inferExprType(d.operand);
                     const ptr_type_info = self.type_reg.get(ptr_type_idx);
@@ -1940,6 +1957,17 @@ pub const Lowerer = struct {
                             const old_val = try fb.emitPtrLoadValue(ptr_node, pointee_type, assign.span);
                             var release_args = [_]ir.NodeIndex{old_val};
                             _ = try fb.emitCall("cot_release", &release_args, false, TypeRegistry.VOID, assign.span);
+
+                            // Retain new value if borrowed (+0)
+                            const rhs_node = self.tree.getNode(assign.value);
+                            const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
+                            const is_owned = if (rhs_expr) |e| (e == .new_expr or e == .call) else false;
+                            if (!is_owned) {
+                                var retain_args = [_]ir.NodeIndex{value_node};
+                                const retained = try fb.emitCall("cot_retain", &retain_args, false, pointee_type, assign.span);
+                                _ = try fb.emitPtrStoreValue(ptr_node, retained, assign.span);
+                                return;
+                            }
                         }
                     }
                 }
@@ -5616,6 +5644,29 @@ pub const Lowerer = struct {
             // @constCast(ptr) — identity, type-system only (Zig Sema.zig)
             .const_cast => {
                 return try self.lowerExprNode(bc.args[0]);
+            },
+            // @arc_retain(val), @arc_release(val) — conditional ARC builtins.
+            // Resolved at monomorphization: emit cot_retain/cot_release only when
+            // the argument type is ARC-managed. No-op for non-ARC types (i64, etc).
+            // Reference: Swift value witness tables — destroy/copy resolved per-type.
+            // In Cot, monomorphization makes the concrete type known at compile time.
+            .arc_retain => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                const arg_type = self.inferExprType(bc.args[0]);
+                if (self.type_reg.couldBeARC(arg_type)) {
+                    var args = [_]ir.NodeIndex{arg};
+                    return try fb.emitCall("cot_retain", &args, false, arg_type, bc.span);
+                }
+                return arg;
+            },
+            .arc_release => {
+                const arg = try self.lowerExprNode(bc.args[0]);
+                const arg_type = self.inferExprType(bc.args[0]);
+                if (self.type_reg.couldBeARC(arg_type)) {
+                    var args = [_]ir.NodeIndex{arg};
+                    _ = try fb.emitCall("cot_release", &args, false, TypeRegistry.VOID, bc.span);
+                }
+                return ir.null_node;
             },
         }
     }

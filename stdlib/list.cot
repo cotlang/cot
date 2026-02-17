@@ -61,6 +61,7 @@ impl List(T) {
         if (index < 0) { @trap() }
         if (index >= self.count) { @trap() }
         var ptr = @intToPtr(*T, self.items + index * @sizeOf(T))
+        @arc_release(ptr.*)
         ptr.* = value
     }
 
@@ -88,6 +89,15 @@ impl List(T) {
     // ===== Lifecycle =====
 
     fn free(self: List(T)) void {
+        // Release all ARC-managed elements before deallocating backing buffer.
+        // @arc_release is a no-op when T is not ARC-managed (resolved at monomorphization).
+        // Reference: Swift Array.deinit — releases all elements via value witness destroy.
+        var fi: i64 = 0
+        while (fi < self.count) {
+            var fptr = @intToPtr(*T, self.items + fi * @sizeOf(T))
+            @arc_release(fptr.*)
+            fi += 1
+        }
         if (self.capacity > 0) {
             @dealloc(self.items)
         }
@@ -97,6 +107,13 @@ impl List(T) {
     }
 
     fn clear(self: List(T)) void {
+        // Release all ARC-managed elements before clearing.
+        var ci: i64 = 0
+        while (ci < self.count) {
+            var cptr = @intToPtr(*T, self.items + ci * @sizeOf(T))
+            @arc_release(cptr.*)
+            ci += 1
+        }
         self.count = 0
     }
 
@@ -320,6 +337,13 @@ impl List(T) {
         if (start > end) { @trap() }
         var removed = end - start
         if (removed == 0) { return }
+        // Release ARC-managed elements being removed
+        var di: i64 = start
+        while (di < end) {
+            var dptr = @intToPtr(*T, self.items + di * @sizeOf(T))
+            @arc_release(dptr.*)
+            di += 1
+        }
         if (end < self.count) {
             var src = self.items + end * @sizeOf(T)
             var dst = self.items + start * @sizeOf(T)
@@ -343,6 +367,8 @@ impl List(T) {
                     dst.* = curr.*
                 }
                 write += 1
+            } else {
+                @arc_release(curr.*)
             }
             read += 1
         }
@@ -385,6 +411,8 @@ impl List(T) {
                     dst.* = ptr.*
                 }
                 write += 1
+            } else {
+                @arc_release(ptr.*)
             }
             read += 1
         }

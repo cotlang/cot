@@ -1439,6 +1439,13 @@ pub const Checker = struct {
                 _ = try self.checkExpr(bc.args[0]);
                 return TypeRegistry.I64;
             },
+            // @arc_retain(val), @arc_release(val) — conditional ARC management
+            // Emits cot_retain/cot_release only when arg type is ARC-managed.
+            // No-op for non-ARC types. Used in generic collections.
+            .arc_retain, .arc_release => {
+                _ = try self.checkExpr(bc.args[0]);
+                return TypeRegistry.VOID;
+            },
         }
     }
 

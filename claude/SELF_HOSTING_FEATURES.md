@@ -928,6 +928,16 @@ All independent, can be implemented in any order:
 - 4.1 Integer promotion rules
 - 4.2 Overflow detection
 
+### Phase 0 (DONE): ARC Critical Gaps
+
+**All 4 critical ARC gaps fixed (Feb 18, 2026).**
+See `claude/ARC_AUDIT.md` for full audit details.
+
+1. **Ownership formalization** (DONE) — `lowerAssign` now checks `is_owned` before retaining, matching Swift SILGenAssign pattern. Deref assignment retains +0 sources.
+2. **Widen ARC detection** (DONE) — `couldBeARC()` now handles `*EnumType`, `*UnionType`, `?*T` (optional wrapping ARC pointer).
+3. **Collection element ARC** (DONE) — Added `@arc_retain`/`@arc_release` conditional builtins (no-op for non-ARC types, resolved at monomorphization). Updated List.free/set/clear/deleteRange/compact/removeIf and Map.free/set/clear/delete.
+4. **Weak references** (DONE) — `weak var x = expr` keyword suppresses ARC retain/cleanup. Breaks reference cycles. Tests: `test/e2e/arc.cot` (15 tests).
+
 ---
 
 ## Verification

@@ -1352,6 +1352,7 @@ pub const Parser = struct {
             .embed_file,
             .type_of,
             .int_from_enum, .tag_name, .error_name, .int_from_bool, .const_cast,
+            .arc_retain, .arc_release,
             => {
                 const arg = try self.parseExpr() orelse return null;
                 if (!self.expect(.rparen)) return null;
@@ -1534,8 +1535,14 @@ pub const Parser = struct {
                 _ = self.match(.semicolon);
                 return try self.tree.addStmt(.{ .return_stmt = .{ .value = val, .span = Span.init(start, self.pos()) } });
             },
-            .kw_var, .kw_let => return self.parseVarStmt(false),
-            .kw_const => return self.parseVarStmt(true),
+            .kw_var, .kw_let => return self.parseVarStmt(false, false),
+            .kw_const => return self.parseVarStmt(true, false),
+            .kw_weak => {
+                self.advance();
+                if (self.check(.kw_var) or self.check(.kw_let)) return self.parseVarStmt(false, true);
+                self.syntaxError("expected 'var' after 'weak'");
+                return null;
+            },
             .kw_if => return self.parseIfStmt(),
             .kw_while => return self.parseWhileStmt(null),
             .kw_for => return self.parseForStmt(null, false),
@@ -1614,7 +1621,7 @@ pub const Parser = struct {
         return try self.tree.addStmt(.{ .expr_stmt = .{ .expr = expr, .span = Span.init(start, self.pos()) } });
     }
 
-    fn parseVarStmt(self: *Parser, is_const: bool) ParseError!?NodeIndex {
+    fn parseVarStmt(self: *Parser, is_const: bool, is_weak: bool) ParseError!?NodeIndex {
         const start = self.pos();
         self.advance();
         if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected variable name"); return null; }
@@ -1632,7 +1639,7 @@ pub const Parser = struct {
         var val: NodeIndex = null_node;
         if (self.match(.assign)) val = try self.parseExpr() orelse null_node;
         _ = self.match(.semicolon);
-        return try self.tree.addStmt(.{ .var_stmt = .{ .name = name, .type_expr = type_expr, .value = val, .is_const = is_const, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addStmt(.{ .var_stmt = .{ .name = name, .type_expr = type_expr, .value = val, .is_const = is_const, .is_weak = is_weak, .span = Span.init(start, self.pos()) } });
     }
 
     fn parseDestructureStmt(self: *Parser, first_name: []const u8, first_type: NodeIndex, first_start: Pos, start: Pos, is_const: bool) ParseError!?NodeIndex {

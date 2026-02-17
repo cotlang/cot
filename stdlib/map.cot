@@ -143,8 +143,9 @@ impl Map(K, V) {
             if (st.* == 1) {
                 var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if (kp.* == key) {
-                    // Key exists — update value
+                    // Key exists — release old value, store new
                     var vp = @intToPtr(*V, self.values + idx * @sizeOf(V))
+                    @arc_release(vp.*)
                     vp.* = value
                     return
                 }
@@ -241,6 +242,9 @@ impl Map(K, V) {
             if (st.* == 1) {
                 var kp = @intToPtr(*K, self.keys + idx * @sizeOf(K))
                 if (kp.* == key) {
+                    @arc_release(kp.*)
+                    var dvp = @intToPtr(*V, self.values + idx * @sizeOf(V))
+                    @arc_release(dvp.*)
                     st.* = 2
                     self.count -= 1
                     return
@@ -263,6 +267,18 @@ impl Map(K, V) {
     // ===== Lifecycle =====
 
     fn free(self: Map(K, V)) void {
+        // Release all ARC-managed keys and values before deallocating.
+        var fi: i64 = 0
+        while (fi < self.capacity) {
+            var fst = @intToPtr(*i64, self.states + fi * @sizeOf(i64))
+            if (fst.* == 1) {
+                var fkp = @intToPtr(*K, self.keys + fi * @sizeOf(K))
+                var fvp = @intToPtr(*V, self.values + fi * @sizeOf(V))
+                @arc_release(fkp.*)
+                @arc_release(fvp.*)
+            }
+            fi += 1
+        }
         if (self.capacity > 0) {
             @dealloc(self.keys)
             @dealloc(self.values)
@@ -276,11 +292,18 @@ impl Map(K, V) {
     }
 
     fn clear(self: Map(K, V)) void {
-        var i: i64 = 0
-        while (i < self.capacity) {
-            var sp = @intToPtr(*i64, self.states + i * @sizeOf(i64))
-            sp.* = 0
-            i += 1
+        // Release all ARC-managed keys and values before clearing.
+        var ci: i64 = 0
+        while (ci < self.capacity) {
+            var cst = @intToPtr(*i64, self.states + ci * @sizeOf(i64))
+            if (cst.* == 1) {
+                var ckp = @intToPtr(*K, self.keys + ci * @sizeOf(K))
+                var cvp = @intToPtr(*V, self.values + ci * @sizeOf(V))
+                @arc_release(ckp.*)
+                @arc_release(cvp.*)
+            }
+            cst.* = 0
+            ci += 1
         }
         self.count = 0
     }

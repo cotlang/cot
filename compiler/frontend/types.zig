@@ -371,12 +371,20 @@ pub const TypeRegistry = struct {
     }
 
     /// Returns true if type could be an ARC-managed heap pointer.
-    /// Only *StructType can come from `new`. Raw pointers (*i64) are trivial.
-    /// Reference: Swift TypeLowering — only class types (heap) are non-trivial.
+    /// `new T` creates ARC-managed *T for struct, enum, or union types.
+    /// Also handles ?*T (optional pointer wrapping an ARC type).
+    /// Reference: Swift TypeLowering — class types (heap) are non-trivial.
     pub fn couldBeARC(self: *const TypeRegistry, idx: TypeIndex) bool {
         const t = self.get(idx);
-        if (t != .pointer) return false;
-        return self.get(t.pointer.elem) == .struct_type;
+        if (t == .pointer) {
+            const pointee = self.get(t.pointer.elem);
+            return pointee == .struct_type or pointee == .enum_type or pointee == .union_type;
+        }
+        // Optional wrapping an ARC pointer: ?*T
+        if (t == .optional) {
+            return self.couldBeARC(t.optional.elem);
+        }
+        return false;
     }
 
     pub fn equal(self: *const TypeRegistry, a: TypeIndex, b: TypeIndex) bool {

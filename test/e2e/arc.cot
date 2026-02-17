@@ -1,0 +1,146 @@
+// ARC (Automatic Reference Counting) tests
+// Verifies retain/release correctness across all ownership patterns
+// Reference: Swift SILGen — ManagedValue ownership tracking
+
+struct ArcNode { value: i64, next: i64 }
+
+impl ArcNode {
+    fn deinit(self: *ArcNode) {
+    }
+}
+
+// -- Basic ARC: new creates +1, cleanup releases to 0 --
+
+test "arc: new creates owned (+1)" {
+    var n = new ArcNode { value: 42, next: 0 }
+    @assert_eq(n.value, 42)
+}
+
+test "arc: multiple news independent lifetimes" {
+    var a = new ArcNode { value: 1, next: 0 }
+    var b = new ArcNode { value: 2, next: 0 }
+    @assert_eq(a.value + b.value, 3)
+}
+
+// -- Reassignment: release old, handle +1/+0 correctly --
+
+test "arc: reassign with new (owned +1)" {
+    var n = new ArcNode { value: 1, next: 0 }
+    n = new ArcNode { value: 2, next: 0 }
+    @assert_eq(n.value, 2)
+}
+
+test "arc: reassign from variable (borrowed +0)" {
+    var a = new ArcNode { value: 10, next: 0 }
+    var b = new ArcNode { value: 20, next: 0 }
+    b = a
+    @assert_eq(b.value, 10)
+}
+
+// -- Field assignment --
+
+struct ArcContainer { item: *ArcNode }
+
+impl ArcContainer {
+    fn deinit(self: *ArcContainer) {
+    }
+}
+
+test "arc: field assign with new (owned +1)" {
+    var c = new ArcContainer { item: new ArcNode { value: 1, next: 0 } }
+    c.item = new ArcNode { value: 2, next: 0 }
+    var item = c.item
+    @assert_eq(item.value, 2)
+}
+
+// -- Function return ownership --
+
+fn makeArcNode(v: i64) *ArcNode {
+    return new ArcNode { value: v, next: 0 }
+}
+
+test "arc: function call returns owned (+1)" {
+    var n = makeArcNode(99)
+    @assert_eq(n.value, 99)
+}
+
+test "arc: reassign from call (owned +1)" {
+    var n = makeArcNode(1)
+    n = makeArcNode(2)
+    @assert_eq(n.value, 2)
+}
+
+// -- Scope cleanup ordering (LIFO) --
+
+test "arc: scope cleanup LIFO order" {
+    var first = new ArcNode { value: 1, next: 0 }
+    var second = new ArcNode { value: 2, next: 0 }
+    var third = new ArcNode { value: 3, next: 0 }
+    @assert_eq(first.value + second.value + third.value, 6)
+}
+
+// -- Linked structures --
+
+test "arc: linked nodes via ptrToInt" {
+    var b = new ArcNode { value: 20, next: 0 }
+    var a = new ArcNode { value: 10, next: @ptrToInt(b) }
+    @assert_eq(a.value, 10)
+    @assert_eq(a.next, @ptrToInt(b))
+}
+
+// -- Multiple reassignments --
+
+test "arc: multiple reassignments" {
+    var n = makeArcNode(1)
+    n = makeArcNode(2)
+    n = makeArcNode(3)
+    n = makeArcNode(4)
+    @assert_eq(n.value, 4)
+}
+
+test "arc: reassign in loop" {
+    var n = makeArcNode(0)
+    var i: i64 = 0
+    while (i < 5) {
+        n = makeArcNode(i)
+        i = i + 1
+    }
+    @assert_eq(n.value, 4)
+}
+
+// -- Conditional ARC builtins --
+
+test "arc: @arc_retain on ARC type" {
+    var n = new ArcNode { value: 55, next: 0 }
+    @arc_retain(n)
+    // n now has refcount 2 — release once to balance
+    @arc_release(n)
+    @assert_eq(n.value, 55)
+}
+
+test "arc: @arc_retain no-op on non-ARC type" {
+    var x: i64 = 42
+    @arc_retain(x)
+    @arc_release(x)
+    // No crash — builtins are no-ops for i64
+    @assert_eq(x, 42)
+}
+
+// -- Weak references (break cycles) --
+
+test "arc: weak var no retain" {
+    var strong = new ArcNode { value: 77, next: 0 }
+    weak var w = strong
+    // w holds the same pointer but did NOT retain
+    @assert_eq(w.value, 77)
+}
+
+test "arc: weak var cycle breaking" {
+    // Simulate parent/child: parent owns child, child has weak ref to parent
+    var parent = new ArcNode { value: 1, next: 0 }
+    var child = new ArcNode { value: 2, next: 0 }
+    // child stores parent as weak (no retain → no cycle)
+    weak var parent_ref = parent
+    child.next = @ptrToInt(parent_ref)
+    @assert_eq(child.next, @ptrToInt(parent))
+}

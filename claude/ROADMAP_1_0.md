@@ -218,7 +218,7 @@ Zig is 10+ years of development and still on 0.15. Each version represents a mea
 - Multiple return values — `fn divmod(a, b: i64) (i64, i64)` — deferred, not blocking current programs
 
 **Carried to 0.5+:**
-- `weak` references — ARC cycle breaker → 0.5
+- ~~`weak` references — ARC cycle breaker~~ → **DONE in 0.4** (`weak var`, `@arc_retain`/`@arc_release`, collection element ARC)
 - `std/dom` — browser DOM API → 0.5 (web framework)
 
 **I/O implementation:** I/O functions are defined using the WASI interface design. The compiler emits:
@@ -461,7 +461,7 @@ The package manager + web framework release. Cot becomes something you can build
 | `for` multi-sequence | `for (a, b) \|x, y\|` — iterate multiple collections in lockstep. | Zig multi-object for |
 | ~~`while` continue expression~~ | ~~DONE in 0.4~~ — `while (i < n) : (i += 1) { }`. | Zig while continue |
 | Non-exhaustive enums | `enum(u8) { A, B, _ }` — allows values outside the defined set. For forward-compatible protocols. | Zig non-exhaustive |
-| `weak` references | ARC cycle breaker. `weak var ref: ?*Node = null` — doesn't prevent deallocation. | Swift `weak` |
+| ~~`weak` references~~ | ~~DONE in 0.4~~ — `weak var` suppresses ARC, `@arc_retain`/`@arc_release` conditional builtins, collection element ARC for List/Map/Set. | Swift `weak`/`unowned` |
 | Self-hosting builtins | ~~DONE in 0.4~~ — @intFromEnum, @enumFromInt, @bitCast, @truncate, @as, @offsetOf, @min, @max, @tagName, @errorName, @intFromBool, @alignCast, @constCast. | Zig Sema.zig |
 | Nested type namespaces | ~~DONE in 0.4~~ — `const Error = error { ... }` inside struct body. `Parser.Error` access. | Zig namespace structs |
 | Anonymous struct literals | ~~DONE in 0.4~~ — `.{ .x = 1, .y = 2 }` with expected-type inference from context. | Zig ResultLoc |

@@ -257,6 +257,10 @@ pub const BuiltinKind = enum {
     // Pointer cast (Zig Sema.zig)
     align_cast,
     const_cast,
+    // ARC management (conditional on type — no-op for non-ARC types)
+    // Resolves at monomorphization: emit cot_retain/cot_release only when arg is ARC-managed.
+    arc_retain,
+    arc_release,
 
     const map = std.StaticStringMap(BuiltinKind).initComptime(.{
         .{ "sizeOf", .size_of },
@@ -338,6 +342,8 @@ pub const BuiltinKind = enum {
         .{ "max", .max },
         .{ "alignCast", .align_cast },
         .{ "constCast", .const_cast },
+        .{ "arc_retain", .arc_retain },
+        .{ "arc_release", .arc_release },
     });
 
     pub fn fromString(s: []const u8) ?BuiltinKind {
@@ -425,6 +431,8 @@ pub const BuiltinKind = enum {
             .max => "max",
             .align_cast => "alignCast",
             .const_cast => "constCast",
+            .arc_retain => "arc_retain",
+            .arc_release => "arc_release",
         };
     }
 };
@@ -482,7 +490,7 @@ pub const Stmt = union(enum) {
 
 pub const ExprStmt = struct { expr: NodeIndex, span: Span };
 pub const ReturnStmt = struct { value: NodeIndex, span: Span };
-pub const VarStmt = struct { name: []const u8, type_expr: NodeIndex, value: NodeIndex, is_const: bool, span: Span };
+pub const VarStmt = struct { name: []const u8, type_expr: NodeIndex, value: NodeIndex, is_const: bool, is_weak: bool = false, span: Span };
 pub const DestructureBinding = struct { name: []const u8, type_expr: NodeIndex, span: Span };
 pub const DestructureStmt = struct { bindings: []const DestructureBinding, value: NodeIndex, is_const: bool, span: Span };
 pub const AssignStmt = struct { target: NodeIndex, op: Token, value: NodeIndex, span: Span };
