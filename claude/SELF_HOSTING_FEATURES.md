@@ -930,36 +930,41 @@ with corresponding test cases in `test/e2e/features.cot`.
 
 ---
 
-## Remaining Gaps for First 3 Files (token.zig, scanner.zig, assemble.zig)
+## Features Still Needed for First 3 Files (token.zig, scanner.zig, assemble.zig)
 
-Re-audited Feb 18, 2026 by reading each Zig file and identifying features not yet in Cot.
+Re-audited Feb 18, 2026 by reading each Zig source file line-by-line.
 
-### Portable with workarounds (token.zig, scanner.zig)
+### token.zig — needs 2 features
 
-| Gap | File | Workaround |
-|-----|------|------------|
-| `std.meta.fields(T)` enum reflection | token.zig | Replace comptime table with 70-arm switch in `string()` |
-| `std.StaticStringMap` keyword lookup | token.zig | Replace with runtime `Map(string, Token)` or switch chain |
-| `self.ch.?` force-unwrap | scanner.zig | Restructure: `if (opt) \|v\| use(v) else @trap()` |
-| `?T == value` optional comparison | scanner.zig (~15 sites) | Expand to `if (opt) \|v\| v == x else false` |
-| One-liner while-capture bodies | scanner.zig | Wrap in braces (syntactic only) |
+| Feature | Why | Reference |
+|---------|-----|-----------|
+| **`@enumFields(T)`** comptime enum reflection | `token_strings` table built via `std.meta.fields(Token)` — iterates all enum variants at comptime to populate a name lookup array | Zig `std.meta.fields()` in `lib/std/meta.zig` |
+| **`StaticStringMap`** or equivalent comptime string→enum lookup | `keywords` perfect hash table maps string literals to Token values at comptime. Used by `lookup()` function | Zig `std.StaticStringMap` in `lib/std/static_string_map.zig` |
 
-### Needs new features (assemble.zig)
+### scanner.zig — needs 2 features
 
-| Gap | Severity | Description |
-|-----|----------|-------------|
-| **Fixed-size arrays `[N]T`** | HIGH | `[128]?RegVar`, `[4]u8`, `[8]u8` — pervasive in assemble.zig. No Cot equivalent. Workaround: write bytes individually via shift+mask, replace reg_vars with switch |
-| **`@floatCast(f32, f64_val)`** | MEDIUM | Float narrowing for f32 constant encoding. Need new builtin or manual IEEE 754 bit manipulation |
-| **`@bitCast` to byte array** | MEDIUM | `@as([4]u8, @bitCast(val))` — materializes value as byte array. Requires fixed-size arrays |
-| **`ArrayListUnmanaged(u8)` API** | LOW | Different from `List(u8)` API. Translation: `append(alloc, b)` → `push(b)`, `toOwnedSlice` → just use the list (ARC handles lifetime) |
+| Feature | Why | Reference |
+|---------|-----|-----------|
+| **`.?` force-unwrap operator** | `self.ch.?` used to unwrap `?u8` when it's known non-null from a preceding guard. Cot has `??` (coalesce) but not `.?` (unwrap-or-trap) | Zig optional unwrap: `opt.?` equivalent to `opt orelse unreachable` |
+| **`?T == value` optional-to-value comparison** | `self.ch == '/'` where `ch: ?u8` — Zig compares optional directly to non-optional (~15 call sites in scanner). Null never equals any value | Zig language spec: optional equality comparison |
 
-### Summary: What's needed before porting each file
+### assemble.zig — needs 3 features
 
-| File | Can port now? | Blockers |
-|------|---------------|----------|
-| `token.zig` | **YES** (with switch workaround) | No blockers — replace comptime tables with switch statements |
-| `scanner.zig` | **YES** (with refactoring) | No blockers — expand optional comparisons, add braces to one-liners |
-| `assemble.zig` | **NO** — needs `[N]T` or byte-write helpers | Fixed-size arrays are fundamental to byte-level encoding. Either add `[N]T` to the language, or add `List(u8).appendU32LE(val)` / `appendU64LE(val)` convenience methods to stdlib |
+| Feature | Why | Reference |
+|---------|-----|-----------|
+| **Fixed-size arrays `[N]T`** | `[128]?RegVar`, `[4]u8`, `[8]u8` — register mapping table and byte-level float constant encoding. Pervasive, not optional | Zig fixed-size arrays, Go `[N]T` |
+| **`@floatCast(f32, f64_val)`** builtin | Float narrowing for f32 constant encoding in Wasm bytecode | Zig `@floatCast` in `lib/std/builtin.zig` |
+| **`@bitCast` to fixed-size byte array** | `@as([4]u8, @bitCast(val))` — materializes a value as individual bytes for binary encoding. Depends on `[N]T` | Zig `@bitCast` with array target type |
+
+### Summary
+
+| File | Ready to port? | Features needed |
+|------|---------------|-----------------|
+| `token.zig` | **NO** | `@enumFields(T)`, `StaticStringMap` |
+| `scanner.zig` | **NO** | `.?` force-unwrap, `?T == value` comparison |
+| `assemble.zig` | **NO** | Fixed-size arrays `[N]T`, `@floatCast`, `@bitCast` to array |
+
+**7 features total** must be implemented before clean self-hosting of these 3 files.
 
 ---
 
@@ -971,8 +976,5 @@ Re-audited Feb 18, 2026 by reading each Zig file and identifying features not ye
 | Tier 2: Builtins | 11 features | 9/11 VERIFIED, 2 PARTIAL (missing tests only) |
 | Tier 3: Stdlib | 4 modules | 3/4 VERIFIED, 1 PARTIAL (mem.indexOf gap) |
 | Tier 4: Type System | 2 features | 1/2 VERIFIED, 1 NOT IMPLEMENTED (overflow detection removed) |
-| **Total** | **27 features** | **23 VERIFIED, 3 PARTIAL, 1 NOT IMPLEMENTED** |
-
-This brings Cot from ~75% to ~90% Zig feature parity for the compiler's needs.
-The remaining gaps are: missing tests for 2 builtins, `std/mem` multi-byte indexOf,
-and the decision to skip runtime overflow detection (matching Go's approach).
+| **Tier 5: Self-hosting blockers** | **7 features** | **0/7 — all need implementation** |
+| **Total** | **34 features** | **23 VERIFIED, 3 PARTIAL, 1 NOT IMPLEMENTED, 7 TODO** |
