@@ -1409,6 +1409,17 @@ pub const Checker = struct {
             .bit_cast => {
                 const target_type = try self.resolveTypeExpr(bc.type_arg);
                 const arg_type = try self.checkExpr(bc.args[0]);
+                // Ref: Zig zirBitCast — reject pointer and enum types
+                const target_info = self.types.get(target_type);
+                const arg_info = self.types.get(arg_type);
+                if (target_info == .pointer or target_info == .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@bitCast target cannot be pointer or enum type");
+                    return invalid_type;
+                }
+                if (arg_info == .pointer or arg_info == .enum_type) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@bitCast source cannot be pointer or enum type");
+                    return invalid_type;
+                }
                 // Ref: Zig zirBitCast — enforce equal sizes
                 const target_size = self.types.sizeOf(target_type);
                 const arg_size = self.types.sizeOf(arg_type);
@@ -1458,10 +1469,18 @@ pub const Checker = struct {
                 return TypeRegistry.I64;
             },
             // @min(a, b) / @max(a, b) — Zig Sema.zig:24678: integer min/max
-            // Ref: Zig zirMin/zirMax returns peer type of both args
+            // Ref: Zig zirMin/zirMax calls checkNumericType on both args, returns peer type
             .min, .max => {
                 const a_type = try self.checkExpr(bc.args[0]);
                 const b_type = try self.checkExpr(bc.args[1]);
+                if (!types.isNumeric(self.types.get(a_type))) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@min/@max requires numeric types");
+                    return invalid_type;
+                }
+                if (!types.isNumeric(self.types.get(b_type))) {
+                    self.err.errorWithCode(bc.span.start, .e300, "@min/@max requires numeric types");
+                    return invalid_type;
+                }
                 return TypeRegistry.commonType(a_type, b_type);
             },
             // @alignCast(alignment, ptr) — Zig: assert alignment, identity in release

@@ -8,24 +8,27 @@
 
 import "std/string"
 
-// BufferedReader layout (5 * 8 = 40 bytes):
+// BufferedReader layout (6 * 8 = 48 bytes):
 //   +0:  fd (i64)
 //   +8:  buf (i64 — pointer to @alloc'd buffer)
 //   +16: rd (i64 — read position)
 //   +24: wr (i64 — write position / valid data end)
 //   +32: buf_size (i64 — buffer capacity)
+//   +40: err (i64 — 0=ok, negative=last error from fd_read)
+// Reference: Go bufio.Reader stores err field (bufio.go:36)
 
 fn newBufferedReader(fd: i64) i64 {
     return newBufferedReaderSize(fd, 4096)
 }
 
 fn newBufferedReaderSize(fd: i64, size: i64) i64 {
-    var p = @alloc(40)
+    var p = @alloc(48)
     @intToPtr(*i64, p).* = fd
     @intToPtr(*i64, p + 8).* = @alloc(size)
     @intToPtr(*i64, p + 16).* = 0
     @intToPtr(*i64, p + 24).* = 0
     @intToPtr(*i64, p + 32).* = size
+    @intToPtr(*i64, p + 40).* = 0
     return p
 }
 
@@ -54,7 +57,15 @@ fn readerFill(r: i64) void {
     var n = @fd_read(fd, buf + wr, buf_size - wr)
     if (n > 0) {
         @intToPtr(*i64, r + 24).* = wr + n
+    } else if (n < 0) {
+        // Store error (Go bufio.go:108: b.err = err)
+        @intToPtr(*i64, r + 40).* = n
     }
+}
+
+// Go bufio.go:75 — return stored error from last read.
+fn readerErr(r: i64) i64 {
+    return @intToPtr(*i64, r + 40).*
 }
 
 // Go bufio.go:267 — single byte or -1 for EOF
@@ -136,22 +147,25 @@ fn readLine(r: i64) string {
 // BufferedWriter
 // ============================================================================
 
-// BufferedWriter layout (4 * 8 = 32 bytes):
+// BufferedWriter layout (5 * 8 = 40 bytes):
 //   +0:  fd (i64)
 //   +8:  buf (i64 — pointer to @alloc'd buffer)
 //   +16: wr (i64 — bytes buffered)
 //   +24: buf_size (i64 — buffer capacity)
+//   +32: err (i64 — 0=ok, negative=last error from fd_write)
+// Reference: Go bufio.Writer stores err field (bufio.go:594)
 
 fn newBufferedWriter(fd: i64) i64 {
     return newBufferedWriterSize(fd, 4096)
 }
 
 fn newBufferedWriterSize(fd: i64, size: i64) i64 {
-    var p = @alloc(32)
+    var p = @alloc(40)
     @intToPtr(*i64, p).* = fd
     @intToPtr(*i64, p + 8).* = @alloc(size)
     @intToPtr(*i64, p + 16).* = 0
     @intToPtr(*i64, p + 24).* = size
+    @intToPtr(*i64, p + 32).* = 0
     return p
 }
 
@@ -166,6 +180,8 @@ fn writerFlush(w: i64) void {
         while (written < wr) {
             var n = @fd_write(fd, buf + written, wr - written)
             if (n <= 0) {
+                // Store error (Go bufio.go:639: b.err = err)
+                @intToPtr(*i64, w + 32).* = 0 - 1
                 written = wr
             } else {
                 written += n
@@ -173,6 +189,11 @@ fn writerFlush(w: i64) void {
         }
         @intToPtr(*i64, w + 16).* = 0
     }
+}
+
+// Go bufio.go:592 — return stored error from last write.
+fn writerErr(w: i64) i64 {
+    return @intToPtr(*i64, w + 32).*
 }
 
 fn writeByte(w: i64, b: i64) void {

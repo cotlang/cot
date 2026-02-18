@@ -221,12 +221,12 @@ test "os: environ(0) is non-empty string" {
 
 test "fs: writeFile and readFile" {
     writeFile("/tmp/cot_std_readwrite.txt", "hello world")
-    var content = readFile("/tmp/cot_std_readwrite.txt")
+    var content = readFile("/tmp/cot_std_readwrite.txt") catch ""
     @assert_eq(@lenOf(content), 11)
 }
 
 test "fs: readFile reads correct content" {
     writeFile("/tmp/cot_std_readback.txt", "abc")
-    var content = readFile("/tmp/cot_std_readback.txt")
+    var content = readFile("/tmp/cot_std_readback.txt") catch ""
     @assert(content == "abc")
 }

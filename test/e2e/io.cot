@@ -117,7 +117,7 @@ test "buffered write and flush" {
     writerFlush(writer)
     @fd_close(fd)
 
-    var content = readFile("/tmp/cot_io_bw.txt")
+    var content = readFile("/tmp/cot_io_bw.txt") catch ""
     @assert_eq(content, "hello world")
 }
 
@@ -129,7 +129,7 @@ test "buffered writeByte" {
     writerFlush(writer)
     @fd_close(fd)
 
-    var content = readFile("/tmp/cot_io_wb.txt")
+    var content = readFile("/tmp/cot_io_wb.txt") catch ""
     @assert_eq(content, "Hi")
 }
 
@@ -140,7 +140,7 @@ test "buffered write large data" {
     writerFlush(writer)
     @fd_close(fd)
 
-    var content = readFile("/tmp/cot_io_large.txt")
+    var content = readFile("/tmp/cot_io_large.txt") catch ""
     @assert_eq(content, "abcdefghijklmnop")
 }
 
@@ -152,7 +152,7 @@ test "buffered writeAll raw" {
     writerFlush(writer)
     @fd_close(fd)
 
-    var content = readFile("/tmp/cot_io_wa.txt")
+    var content = readFile("/tmp/cot_io_wa.txt") catch ""
     @assert_eq(content, "raw data")
 }
 

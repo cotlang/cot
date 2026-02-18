@@ -520,7 +520,9 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     // Local 2: ptr (allocated address, i32)
     // Local 3: total_size (i32)
     // Local 4: found (i32, flag for freelist hit)
-    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32 });
+    // Local 5: head/current (i32, for 2-deep freelist scan)
+    // Local 6: second (i32, second node in freelist)
+    _ = try code.declareLocals(&[_]wasm.ValType{ .i32, .i32, .i32, .i32, .i32 });
 
     // total_size = (i32)size + HEAP_OBJECT_HEADER_SIZE
     try code.emitLocalGet(1); // size (i64)
@@ -536,41 +538,73 @@ fn generateAllocBody(allocator: std.mem.Allocator, heap_ptr_global: u32, freelis
     try code.emitLocalSet(3); // total_size
 
     // --- Size-class freelist lookup ---
-    // Check each class in order: if total_size fits, check that class's head.
-    // Reference: jemalloc bin lookup → first-fit on head
+    // Check head AND second node per class (unrolled first-fit scan).
+    // Reference: jemalloc bin scan. Unrolled to avoid block/loop in runtime
+    // functions (ARM64 backend limitation with complex control flow in allocator).
     const thresholds = [_]i32{ SIZE_CLASS_0_MAX, SIZE_CLASS_1_MAX, SIZE_CLASS_2_MAX, SIZE_CLASS_3_MAX };
     for (thresholds, 0..) |threshold, i| {
-        // if (total_size <= threshold && !found)
+        // if (!found && total_size <= threshold)
         try code.emitLocalGet(4); // found
         try code.emitI32Eqz(); // !found
         try code.emitLocalGet(3); // total_size
         try code.emitI32Const(threshold);
         try code.emitI32LeU(); // total_size <= threshold
-        try code.emitI32And(); // !found && total_size <= threshold
+        try code.emitI32And(); // !found && fits class
         try code.emitIf(BLOCK_VOID);
 
-        // Check freelist head for this class
+        // --- Check head node ---
         try code.emitGlobalGet(freelist_globals[i]);
-        try code.emitLocalTee(2); // ptr = freelist_head[class]
+        try code.emitLocalSet(5); // head = freelist_head[class]
+        try code.emitLocalGet(5);
         try code.emitIf(BLOCK_VOID); // if (head != 0)
 
-        // Check block_size >= total_size
-        try code.emitLocalGet(2);
+        // Check head.size >= total_size
+        try code.emitLocalGet(5);
         try code.emitI32Load(2, SIZE_OFFSET);
         try code.emitLocalGet(3);
         try code.emitI32GeU();
-        try code.emitIf(BLOCK_VOID); // if fits
+        try code.emitIf(BLOCK_VOID); // if head fits
 
-        // Unlink: freelist_head[class] = next
-        try code.emitLocalGet(2);
+        // Unlink head: freelist_head[class] = head.next
+        try code.emitLocalGet(5);
         try code.emitI32Load(2, FREELIST_NEXT_OFFSET);
         try code.emitGlobalSet(freelist_globals[i]);
-
-        // found = 1
+        // ptr = head, found = 1
+        try code.emitLocalGet(5);
+        try code.emitLocalSet(2);
         try code.emitI32Const(1);
         try code.emitLocalSet(4);
 
-        try code.emitEnd(); // end fits
+        try code.emitElse(); // head doesn't fit — check second node
+
+        // --- Check second node (head.next) ---
+        try code.emitLocalGet(5);
+        try code.emitI32Load(2, FREELIST_NEXT_OFFSET);
+        try code.emitLocalSet(6); // second = head.next
+        try code.emitLocalGet(6);
+        try code.emitIf(BLOCK_VOID); // if (second != 0)
+
+        // Check second.size >= total_size
+        try code.emitLocalGet(6);
+        try code.emitI32Load(2, SIZE_OFFSET);
+        try code.emitLocalGet(3);
+        try code.emitI32GeU();
+        try code.emitIf(BLOCK_VOID); // if second fits
+
+        // Unlink second: head.next = second.next
+        try code.emitLocalGet(5); // head (store address)
+        try code.emitLocalGet(6); // second
+        try code.emitI32Load(2, FREELIST_NEXT_OFFSET); // second.next
+        try code.emitI32Store(2, FREELIST_NEXT_OFFSET); // head.next = second.next
+        // ptr = second, found = 1
+        try code.emitLocalGet(6);
+        try code.emitLocalSet(2);
+        try code.emitI32Const(1);
+        try code.emitLocalSet(4);
+
+        try code.emitEnd(); // end second fits
+        try code.emitEnd(); // end second != 0
+        try code.emitEnd(); // end head fits
         try code.emitEnd(); // end head != 0
         try code.emitEnd(); // end class check
     }

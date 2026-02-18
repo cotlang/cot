@@ -89,31 +89,38 @@ fn stdout() File { return File { .fd = 1 } }
 fn stderr() File { return File { .fd = 2 } }
 
 // ===== High-level APIs =====
+// Reference: Zig std.fs.cwd().openFile() returns OpenError!File
 
-// High-level file APIs (handle errors internally, return empty/void on failure)
-// Note: error union returns (!string) not yet supported for compound types in native.
-fn readFile(path: string) string {
+// openFileChecked returns error union — use for explicit error handling.
+fn openFileChecked(path: string, flags: i64) FsError!File {
+    var fd = @fd_open(@ptrOf(path), @lenOf(path), flags)
+    if (fd < 0) { return error.NotFound }
+    return File { .fd = fd }
+}
+
+fn readFile(path: string) FsError!string {
     var fd = @fd_open(@ptrOf(path), @lenOf(path), O_RDONLY)
-    if (fd < 0) { return "" }
+    if (fd < 0) { return error.NotFound }
     var size = @fd_seek(fd, 0, 2)
     @fd_seek(fd, 0, 0)
     if (size <= 0) {
         @fd_close(fd)
-        return ""
+        return error.IoError
     }
     var buf = @alloc(size)
     var n = @fd_read(fd, buf, size)
     @fd_close(fd)
     if (n < 0) {
         @dealloc(buf)
-        return ""
+        return error.IoError
     }
     return @string(buf, n)
 }
 
-fn writeFile(path: string, data: string) void {
+fn writeFile(path: string, data: string) FsError!void {
     var fd = @fd_open(@ptrOf(path), @lenOf(path), O_CREATE)
-    if (fd < 0) { return }
-    @fd_write(fd, @ptrOf(data), @lenOf(data))
+    if (fd < 0) { return error.NotFound }
+    var n = @fd_write(fd, @ptrOf(data), @lenOf(data))
     @fd_close(fd)
+    if (n < 0) { return error.IoError }
 }

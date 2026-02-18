@@ -292,7 +292,13 @@ pub const TypeRegistry = struct {
                 for (tup.element_types) |et| total += ((self.sizeOf(et) + 7) / 8) * 8;
                 break :blk total;
             },
-            .optional, .error_union => 16,
+            .optional => 16,
+            .error_union => |eu| blk: {
+                // 8 bytes for tag + payload (min 8 bytes to match !void / !i64 layout)
+                const elem_size = self.sizeOf(eu.elem);
+                const payload_size: u32 = if (elem_size <= 8) 8 else ((elem_size + 7) / 8) * 8;
+                break :blk 8 + payload_size;
+            },
             .slice => 24,  // Go's slice: (ptr=8, len=8, cap=8)
             .array => |a| @intCast(self.sizeOf(a.elem) * a.length),
             .struct_type => |s| s.size,

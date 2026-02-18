@@ -1131,7 +1131,18 @@ pub const Lowerer = struct {
                     const tmp_local = try fb.addLocalWithSize("__ret_eu", ret_type, false, eu_size);
                     const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, ret.span);
                     _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, ret.span);
-                    _ = try fb.emitStoreLocalField(tmp_local, 1, 8, lowered, ret.span);
+                    // Check if payload is compound (string = ptr+len)
+                    const eu_elem = ret_type_info.error_union.elem;
+                    if (eu_elem == TypeRegistry.STRING) {
+                        // Compound: decompose string into ptr (field 1, offset 8) + len (field 2, offset 16)
+                        const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+                        const ptr_val = try fb.emitSlicePtr(lowered, ptr_type, ret.span);
+                        const len_val = try fb.emitSliceLen(lowered, ret.span);
+                        _ = try fb.emitStoreLocalField(tmp_local, 1, 8, ptr_val, ret.span);
+                        _ = try fb.emitStoreLocalField(tmp_local, 2, 16, len_val, ret.span);
+                    } else {
+                        _ = try fb.emitStoreLocalField(tmp_local, 1, 8, lowered, ret.span);
+                    }
                     value_node = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, ret.span);
                 }
             } else if (fb.sret_return_type) |sret_type| {
@@ -6111,6 +6122,7 @@ pub const Lowerer = struct {
             return try self.lowerExprNode(ce.operand);
         }
         const elem_type = operand_info.error_union.elem;
+        const is_compound = (elem_type == TypeRegistry.STRING);
 
         // Call returns a POINTER to the error union
         const eu_ptr = try self.lowerExprNode(ce.operand);
@@ -6132,9 +6144,20 @@ pub const Lowerer = struct {
 
         // OK block: read success payload from [ptr + 8], store to result
         fb.setBlock(ok_block);
-        const payload_addr = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, ce.span);
-        const success_val = try fb.emitPtrLoadValue(payload_addr, elem_type, ce.span);
-        _ = try fb.emitStoreLocal(result_local, success_val, ce.span);
+        if (is_compound) {
+            // Compound type (string): read ptr at [eu_ptr+8], len at [eu_ptr+16]
+            // Must match lowerStringInit pattern — decompose into field stores
+            const ptr_addr = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, ce.span);
+            const ptr_val = try fb.emitPtrLoadValue(ptr_addr, TypeRegistry.I64, ce.span);
+            const len_addr = try fb.emitAddrOffset(eu_ptr, 16, TypeRegistry.I64, ce.span);
+            const len_val = try fb.emitPtrLoadValue(len_addr, TypeRegistry.I64, ce.span);
+            _ = try fb.emitStoreLocalField(result_local, 0, 0, ptr_val, ce.span);
+            _ = try fb.emitStoreLocalField(result_local, 1, 8, len_val, ce.span);
+        } else {
+            const payload_addr = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, ce.span);
+            const success_val = try fb.emitPtrLoadValue(payload_addr, elem_type, ce.span);
+            _ = try fb.emitStoreLocal(result_local, success_val, ce.span);
+        }
         _ = try fb.emitJump(merge_block, ce.span);
 
         // Error block: evaluate fallback
@@ -6146,17 +6169,36 @@ pub const Lowerer = struct {
             const capture_local = try fb.addLocalWithSize(ce.capture, TypeRegistry.I64, false, 8);
             _ = try fb.emitStoreLocal(capture_local, err_val, ce.span);
             const fallback_val = try self.lowerExprNode(ce.fallback);
-            _ = try fb.emitStoreLocal(result_local, fallback_val, ce.span);
+            if (is_compound) {
+                try self.storeCatchCompound(result_local, fallback_val, ce.span);
+            } else {
+                _ = try fb.emitStoreLocal(result_local, fallback_val, ce.span);
+            }
             fb.restoreScope(scope_depth);
         } else {
             const fallback_val = try self.lowerExprNode(ce.fallback);
-            _ = try fb.emitStoreLocal(result_local, fallback_val, ce.span);
+            if (is_compound) {
+                try self.storeCatchCompound(result_local, fallback_val, ce.span);
+            } else {
+                _ = try fb.emitStoreLocal(result_local, fallback_val, ce.span);
+            }
         }
         _ = try fb.emitJump(merge_block, ce.span);
 
         // Merge block: load result
         fb.setBlock(merge_block);
         return try fb.emitLoadLocal(result_local, elem_type, ce.span);
+    }
+
+    // Helper: store a compound value (string ptr+len) into a local's fields.
+    // Matches lowerStringInit decomposition pattern.
+    fn storeCatchCompound(self: *Lowerer, local_idx: ir.LocalIdx, val: ir.NodeIndex, span: Span) !void {
+        const fb = self.current_func orelse return;
+        const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+        const ptr_val = try fb.emitSlicePtr(val, ptr_type, span);
+        const len_val = try fb.emitSliceLen(val, span);
+        _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span);
+        _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, span);
     }
 
     fn inferExprType(self: *Lowerer, idx: NodeIndex) TypeIndex {
