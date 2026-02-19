@@ -68,6 +68,10 @@ pub const Driver = struct {
     bench_filter: ?[]const u8 = null,
     bench_n: ?i64 = null,
     release_mode: bool = false,
+    // Debug info: source file/text and IR funcs for DWARF generation
+    debug_source_file: []const u8 = "",
+    debug_source_text: []const u8 = "",
+    debug_ir_funcs: []const ir_mod.Func = &.{},
 
     pub fn init(allocator: Allocator) Driver {
         return .{ .allocator = allocator };
@@ -579,8 +583,10 @@ pub const Driver = struct {
         // 6. Emit machine code
         // 7. Link into object file
 
-        _ = source_file;
-        _ = source_text;
+        // Store source info for DWARF debug generation in generateMachO/generateElf
+        self.debug_source_file = source_file;
+        self.debug_source_text = source_text;
+        self.debug_ir_funcs = funcs;
 
         // Step 1: Generate Wasm bytecode first
         pipeline_debug.log(.codegen, "driver: generating Wasm for native AOT compilation", .{});
@@ -1751,6 +1757,38 @@ pub const Driver = struct {
             try self.generateMainWrapperMachO(&module, data_segments, globals, @intCast(compiled_funcs.len));
         }
 
+        // Generate DWARF debug info: map function code offsets to source lines.
+        // Build name→span lookup from IR functions, then create line entries.
+        if (self.debug_source_file.len > 0 and self.debug_ir_funcs.len > 0) {
+            module.setDebugInfo(self.debug_source_file, self.debug_source_text);
+
+            // Build IR function name → source span.start mapping
+            var ir_name_to_span = std.StringHashMap(u32).init(self.allocator);
+            defer ir_name_to_span.deinit();
+            for (self.debug_ir_funcs) |ir_func| {
+                try ir_name_to_span.put(ir_func.name, ir_func.span.start.offset);
+            }
+
+            // For each compiled function, look up its source span via export name
+            for (compiled_funcs, 0..) |_, i| {
+                // Find this function's export name (same logic as Pass 1)
+                var func_name: []const u8 = "";
+                for (exports) |exp| {
+                    if (exp.kind == .func and exp.index == i) {
+                        func_name = exp.name;
+                        break;
+                    }
+                }
+                if (func_name.len == 0) continue;
+
+                // Look up the IR function's source span
+                if (ir_name_to_span.get(func_name)) |source_offset| {
+                    const code_offset = module.getFuncCodeOffset(func_ids[i]);
+                    try module.addLineEntry(code_offset, source_offset);
+                }
+            }
+        }
+
         // Write to memory buffer
         var output = std.ArrayListUnmanaged(u8){};
         defer output.deinit(self.allocator);
@@ -1879,15 +1917,18 @@ pub const Driver = struct {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
         // =================================================================
-        const vmctx_size: usize = 0x1000000; // 16MB
-        const vmctx_data = try self.allocator.alloc(u8, vmctx_size);
+        // Total virtual memory: 256 MB. Only initialized portion goes on disk;
+        // the rest is BSS (zero-fill, no disk cost). Go pattern: sysAlloc → mmap.
+        const vmctx_total: usize = 0x10000000; // 256 MB total virtual memory
+        const vmctx_init_size: usize = 0x100000; // 1 MB for initialized data (globals + data segments + control)
+        const vmctx_data = try self.allocator.alloc(u8, vmctx_init_size);
         defer self.allocator.free(vmctx_data);
         @memset(vmctx_data, 0);
 
         const linear_memory_base: usize = 0x40000;
         for (data_segments) |segment| {
             const dest_offset = linear_memory_base + segment.offset;
-            if (dest_offset + segment.data.len <= vmctx_size) {
+            if (dest_offset + segment.data.len <= vmctx_init_size) {
                 @memcpy(vmctx_data[dest_offset..][0..segment.data.len], segment.data);
             }
         }
@@ -1896,7 +1937,7 @@ pub const Driver = struct {
         const global_stride: usize = 16;
         for (globals, 0..) |g, i| {
             const offset = global_base + i * global_stride;
-            if (offset + 8 <= vmctx_size) {
+            if (offset + 8 <= vmctx_init_size) {
                 switch (g.val_type) {
                     .i32 => {
                         const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
@@ -1919,11 +1960,14 @@ pub const Driver = struct {
             }
         }
 
-        const heap_bound: u64 = 0x1000000 - 0x40000;
+        // heap_bound = total virtual size - linear_memory_base (what the allocator sees)
+        const heap_bound: u64 = vmctx_total - 0x40000;
         @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
 
         const vmctx_data_id = try module.declareData("_vmctx_data", .Local, true);
         try module.defineData(vmctx_data_id, vmctx_data);
+        // BSS extends virtual memory from init_size to total (no disk cost)
+        module.setBssSize(vmctx_total - vmctx_init_size);
 
         // =================================================================
         // Step 1b: Panic strings data section for signal handler
@@ -3332,15 +3376,18 @@ pub const Driver = struct {
         // =================================================================
         // Step 1: Declare and define static vmctx data section
         // =================================================================
-        const vmctx_size: usize = 0x1000000; // 16MB
-        const vmctx_data = try self.allocator.alloc(u8, vmctx_size);
+        // Total virtual memory: 256 MB. Only initialized portion goes on disk;
+        // the rest is BSS (zero-fill, no disk cost). Go pattern: sysAlloc → mmap.
+        const vmctx_total: usize = 0x10000000; // 256 MB total virtual memory
+        const vmctx_init_size: usize = 0x100000; // 1 MB for initialized data (globals + data segments + control)
+        const vmctx_data = try self.allocator.alloc(u8, vmctx_init_size);
         defer self.allocator.free(vmctx_data);
         @memset(vmctx_data, 0);
 
         const linear_memory_base: usize = 0x40000;
         for (data_segments) |segment| {
             const dest_offset = linear_memory_base + segment.offset;
-            if (dest_offset + segment.data.len <= vmctx_size) {
+            if (dest_offset + segment.data.len <= vmctx_init_size) {
                 @memcpy(vmctx_data[dest_offset..][0..segment.data.len], segment.data);
             }
         }
@@ -3349,7 +3396,7 @@ pub const Driver = struct {
         const global_stride: usize = 16;
         for (globals, 0..) |g, i| {
             const offset = global_base + i * global_stride;
-            if (offset + 8 <= vmctx_size) {
+            if (offset + 8 <= vmctx_init_size) {
                 switch (g.val_type) {
                     .i32 => {
                         const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
@@ -3372,11 +3419,13 @@ pub const Driver = struct {
             }
         }
 
-        const heap_bound: u64 = 0x1000000 - 0x40000;
+        const heap_bound: u64 = vmctx_total - 0x40000;
         @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
 
         const vmctx_data_id = try module.declareData("vmctx_data", .Local, true);
         try module.defineData(vmctx_data_id, vmctx_data);
+        // BSS extends virtual memory from init_size to total (no disk cost)
+        module.setBssSize(vmctx_total - vmctx_init_size);
 
         // =================================================================
         // Step 1b: Panic strings data section (same content as MachO)

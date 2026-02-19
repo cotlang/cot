@@ -3525,10 +3525,11 @@ pub const Lowerer = struct {
             end_val = str_len;
         }
 
-        // Runtime safety: bounds check — Zig Sema.zig pattern
+        // Runtime safety: slice bounds check — Go OpIsSliceInBounds (index <= length)
+        // Slice end can equal length (exclusive upper bound).
         if (!self.release_mode) {
-            try self.emitBoundsCheck(fb, start_val, str_len, se.span);
-            try self.emitBoundsCheck(fb, end_val, str_len, se.span);
+            try self.emitSliceBoundsCheck(fb, start_val, str_len, se.span);
+            try self.emitSliceBoundsCheck(fb, end_val, str_len, se.span);
         }
 
         // new_ptr = str_ptr + start
@@ -5865,22 +5866,38 @@ pub const Lowerer = struct {
                 }
                 return ir.null_node;
             },
-            // @panic("message") — Zig @panic: write message to stderr (fd 2), then trap
+            // @panic("message") — Zig @panic: write file:line + message to stderr, then exit(2)
             // Reference: Zig std/debug.zig panic(), Go runtime.gopanic
+            // Output: "file.cot:42: panic: user message\n"
             .panic => {
+                const fd_arg = try fb.emitConstInt(2, TypeRegistry.I64, bc.span); // stderr
+
+                // Emit file:line prefix (compile-time embedded, Zig pattern)
+                const pos = self.err.src.position(bc.span.start);
+                const loc_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}: panic: ", .{ pos.filename, pos.line });
+                const loc_idx = try fb.addStringLiteral(loc_str);
+                const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
+                var loc_args = [_]ir.NodeIndex{ fd_arg, loc_val };
+                _ = try fb.emitCall("cot_write", &loc_args, true, TypeRegistry.I64, bc.span);
+
                 if (bc.args[0] != null_node) {
                     const msg_arg = try self.lowerExprNode(bc.args[0]);
-                    const fd_arg = try fb.emitConstInt(2, TypeRegistry.I64, bc.span); // stderr
-                    // cot_write(fd, ptr, len) — string is decomposed at call site
                     var write_args = [_]ir.NodeIndex{ fd_arg, msg_arg };
                     _ = try fb.emitCall("cot_write", &write_args, true, TypeRegistry.I64, bc.span);
-                    // Write newline
-                    const nl_idx = try fb.addStringLiteral(try self.allocator.dupe(u8, "\n"));
-                    const nl_val = try fb.emitConstSlice(nl_idx, bc.span);
-                    var nl_args = [_]ir.NodeIndex{ fd_arg, nl_val };
-                    _ = try fb.emitCall("cot_write", &nl_args, true, TypeRegistry.I64, bc.span);
                 }
-                _ = try fb.emitTrap(bc.span);
+
+                // Newline
+                const nl_idx = try fb.addStringLiteral(try self.allocator.dupe(u8, "\n"));
+                const nl_val = try fb.emitConstSlice(nl_idx, bc.span);
+                var nl_args = [_]ir.NodeIndex{ fd_arg, nl_val };
+                _ = try fb.emitCall("cot_write", &nl_args, true, TypeRegistry.I64, bc.span);
+
+                // Exit with code 2 (Go crash exit code)
+                const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
+                var exit_args = [_]ir.NodeIndex{exit_code};
+                _ = try fb.emitCall("cot_exit", &exit_args, false, TypeRegistry.VOID, bc.span);
+
+                _ = try fb.emitTrap(bc.span); // unreachable after exit
                 const dead_block = try fb.newBlock("panic.dead");
                 fb.setBlock(dead_block);
                 return ir.null_node;
@@ -5933,17 +5950,72 @@ pub const Lowerer = struct {
         return v;
     }
 
-    /// Emit a bounds check: if index >= length, trap.
-    /// Zig Sema.zig:26482 — addSafetyCheck pattern.
+    /// Emit a bounds check: if index >= length, print Go-style panic message and exit.
+    /// Go: runtime/panic.go goPanicIndex — OpIsInBounds: "index out of range [N] with length M"
+    /// Zig: Sema.zig:26482 — addSafetyCheck pattern (branch + cold panic path).
     fn emitBoundsCheck(self: *Lowerer, fb: *ir.FuncBuilder, index_node: ir.NodeIndex, length_node: ir.NodeIndex, span: Span) !void {
-        _ = self;
-        // index < length → ok, else trap
-        const in_bounds = try fb.emitBinary(.lt, index_node, length_node, TypeRegistry.BOOL, span);
+        // OpIsInBounds: index < length (strict — for element access)
+        try self.emitBoundsCheckImpl(fb, index_node, length_node, .lt, span);
+    }
+
+    /// Emit a slice bounds check: if index > length, panic.
+    /// Go: runtime/panic.go goPanicSliceAlen — OpIsSliceInBounds: index <= length
+    /// Slice end index CAN equal length (exclusive upper bound).
+    fn emitSliceBoundsCheck(self: *Lowerer, fb: *ir.FuncBuilder, index_node: ir.NodeIndex, length_node: ir.NodeIndex, span: Span) !void {
+        // OpIsSliceInBounds: index <= length (non-strict — for slice bounds)
+        try self.emitBoundsCheckImpl(fb, index_node, length_node, .le, span);
+    }
+
+    fn emitBoundsCheckImpl(self: *Lowerer, fb: *ir.FuncBuilder, index_node: ir.NodeIndex, length_node: ir.NodeIndex, cmp_op: ir.BinaryOp, span: Span) !void {
+        const in_bounds = try fb.emitBinary(cmp_op, index_node, length_node, TypeRegistry.BOOL, span);
         const ok_block = try fb.newBlock("bounds.ok");
         const fail_block = try fb.newBlock("bounds.fail");
         _ = try fb.emitBranch(in_bounds, ok_block, fail_block, span);
         fb.setBlock(fail_block);
-        _ = try fb.emitTrap(span);
+
+        // Go pattern: "file:line: panic: index out of range [N] with length M\n"
+        const fd = try fb.emitConstInt(2, TypeRegistry.I64, span); // stderr
+
+        // Emit file:line prefix from source position
+        const pos = self.err.src.position(span.start);
+        const loc_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}: ", .{ pos.filename, pos.line });
+        const loc_idx = try fb.addStringLiteral(loc_str);
+        const loc_val = try fb.emitConstSlice(loc_idx, span);
+        var loc_args = [_]ir.NodeIndex{ fd, loc_val };
+        _ = try fb.emitCall("cot_write", &loc_args, true, TypeRegistry.I64, span);
+
+        // "panic: index out of range ["
+        const prefix = try fb.addStringLiteral(try self.allocator.dupe(u8, "panic: index out of range ["));
+        const prefix_val = try fb.emitConstSlice(prefix, span);
+        var prefix_args = [_]ir.NodeIndex{ fd, prefix_val };
+        _ = try fb.emitCall("cot_write", &prefix_args, true, TypeRegistry.I64, span);
+
+        // Print the index value
+        var idx_args = [_]ir.NodeIndex{index_node};
+        _ = try fb.emitCall("cot_eprint_int", &idx_args, false, TypeRegistry.VOID, span);
+
+        // "] with length "
+        const mid = try fb.addStringLiteral(try self.allocator.dupe(u8, "] with length "));
+        const mid_val = try fb.emitConstSlice(mid, span);
+        var mid_args = [_]ir.NodeIndex{ fd, mid_val };
+        _ = try fb.emitCall("cot_write", &mid_args, true, TypeRegistry.I64, span);
+
+        // Print the length value
+        var len_args = [_]ir.NodeIndex{length_node};
+        _ = try fb.emitCall("cot_eprint_int", &len_args, false, TypeRegistry.VOID, span);
+
+        // Newline
+        const nl = try fb.addStringLiteral(try self.allocator.dupe(u8, "\n"));
+        const nl_val = try fb.emitConstSlice(nl, span);
+        var nl_args = [_]ir.NodeIndex{ fd, nl_val };
+        _ = try fb.emitCall("cot_write", &nl_args, true, TypeRegistry.I64, span);
+
+        // Exit with code 2 (Go crash exit code)
+        const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, span);
+        var exit_args = [_]ir.NodeIndex{exit_code};
+        _ = try fb.emitCall("cot_exit", &exit_args, false, TypeRegistry.VOID, span);
+
+        _ = try fb.emitTrap(span); // unreachable after exit
         fb.setBlock(ok_block);
     }
 

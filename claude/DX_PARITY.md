@@ -69,37 +69,31 @@
 
 | Behavior | Go | Zig | Cot | Status |
 |----------|-----|-----|-----|--------|
-| Panic message | `panic: <message>` | `thread N panic: <message>` | `fatal error: SIGSEGV` + pc + addr | PARTIAL (no user message) |
-| Stack trace on crash | Full goroutine trace with `file:line +0xaddr` | Full trace with source lines + carets | pc + fault addr (no trace) | GAP |
-| Bounds check | Runtime panic with index info | Runtime panic with index info | Wasm trap (opaque) | **CRITICAL GAP** |
+| Panic message | `panic: <message>` | `thread N panic: <message>` | `file:line: panic: message` | DONE (matches Go format) |
+| Stack trace on crash | Full goroutine trace with `file:line +0xaddr` | Full trace with source lines + carets | pc + fault addr (no trace) | GAP (needs DWARF) |
+| Bounds check | Runtime panic with index info | Runtime panic with index info | `file:line: panic: index out of range [N] with length M` | DONE (matches Go) |
 | Null deref | Panic with trace | `attempt to use null value` + trace | `fatal error: SIGBUS` + pc + addr | PARTIAL (no trace) |
 | Integer overflow | Wraps silently | Panic in debug, wraps in release | Wraps silently | ACCEPTABLE (matches Go) |
 | Stack overflow | `goroutine stack exceeds N-byte limit` | SIGSEGV | SIGSEGV | GAP |
 | Division by zero | Panic with trace | Panic with trace | Wasm trap | GAP |
-| @panic builtin | N/A | `@panic("msg")` | `@panic("msg")` — prints + exits | PARTIAL |
+| @panic builtin | N/A | `@panic("msg")` | `file:line: panic: message` + exit 2 | DONE (with file:line) |
 
-**Signal handler is now implemented.** Crashes print signal name, PC, and fault address with exit code 2 (matching Go). Remaining gap: no stack traces or source-level info yet (requires DWARF debug info).
-
-### What "good crash output" looks like (Go):
-```
-panic: runtime error: index out of range [5] with length 3
-
-goroutine 1 [running]:
-main.processItems(...)
-        /home/user/app/main.go:42 +0x68
-main.main()
-        /home/user/app/main.go:15 +0x2c
-exit status 2
-```
+**Signal handler + bounds checking + @panic all implemented.** Bounds checks emit Go-style `"index out of range [N] with length M"` with file:line. @panic embeds compile-time file:line. All exit with code 2 (Go pattern). Slice bounds use `<=` (Go `OpIsSliceInBounds`), element access uses `<` (Go `OpIsInBounds`).
 
 ### What Cot gives today:
+```
+test.cot:3: panic: index out of range [5] with length 3
+```
+```
+test.cot:2: panic: something went wrong
+```
 ```
 fatal error: SIGBUS
 pc=0x00000001043d4d84
 addr=0x00000001e2eec010
 ```
 
-**Next steps:** Stack traces (DWARF), bounds-check panics, `@panic` with file:line.
+**Next steps:** Stack traces (DWARF), division-by-zero panic message.
 
 ---
 
@@ -136,11 +130,11 @@ addr=0x00000001e2eec010
 |--------|-----|-----|-----|--------|
 | Main thread stack | 1MB initial, 1GB max (growable) | OS default (8MB macOS/Linux) | 8MB (fixed, in linear memory) | DONE |
 | Spawned thread stack | 2KB-8KB initial, 1GB max (growable) | 16MB (fixed) | N/A (single-threaded) | N/A |
-| Heap | GC-managed, growable | Allocator-based, growable | ARC, linear memory (~8MB vmctx) | PARTIAL |
+| Heap | GC-managed, growable | Allocator-based, growable | ARC, linear memory (~248MB vmctx) | DONE |
 | OS process stack | 8MB (OS default) | 8MB (OS default) | 256MB (`-Wl,-stack_size`) | DONE |
-| Max heap | Limited by OS | Limited by OS | ~8MB (vmctx linear memory) | GAP |
+| Max heap | Limited by OS | Limited by OS | ~248MB (vmctx linear memory via BSS) | DONE |
 
-**Note:** The 16MB vmctx with 8MB stack leaves only ~8MB for heap in linear memory. Go programs can allocate GBs. This will need to grow — either larger vmctx or mmap-based heap expansion.
+**Note:** vmctx is 256MB total (1MB initialized on disk + 255MB BSS zero-fill). Binary size ~1.1MB. Heap has ~248MB usable. For apps needing more, future work: mmap-based heap expansion.
 
 ---
 
@@ -160,9 +154,9 @@ addr=0x00000001e2eec010
 
 ### P0 — Crash diagnostics (blocks real-world adoption)
 1. ~~**Signal handler** that catches SIGSEGV/SIGBUS/SIGILL and prints a message instead of silent death~~ **DONE** — `fatal error: SIGNAME` + pc + fault addr, exit code 2. Both ARM64 macOS and x64 Linux. Ported from Go (`signal_unix.go`, `os_darwin.go`, `os_linux.go`).
-2. **Bounds checking** with meaningful panic messages (not just Wasm trap)
-3. **@panic** should print file:line (currently prints message but no location)
-4. **Stack traces** on native crashes (requires DWARF debug info — `compiler/codegen/native/dwarf.zig` exists but may not be wired)
+2. ~~**Bounds checking** with meaningful panic messages~~ **DONE** — `file:line: panic: index out of range [N] with length M`. Go `OpIsInBounds` (strict `<`) for element access, `OpIsSliceInBounds` (`<=`) for slice bounds. Exit code 2.
+3. ~~**@panic** should print file:line~~ **DONE** — `file:line: panic: message`. Compile-time embedded source location (Zig pattern). Exit code 2.
+4. ~~**DWARF debug info**~~ **DONE** — Function-level DWARF line tables in Mach-O binaries. `dwarfdump` shows file:line per function. `atos -o binary 0xPC` resolves to `funcname (in binary) (file.cot:line)`. Crash diagnostic `pc=0x...` is now actionable. Full per-instruction line tables deferred (requires source position threading through Wasm→CLIF→MachInst pipeline).
 
 ### P1 — Build ergonomics
 5. ~~**`cot run --target=wasm32`** via wasmtime~~ **DONE** — same wasmtime execution path as `cot test`, builds to `/tmp` then runs.
@@ -175,7 +169,7 @@ addr=0x00000001e2eec010
 ### P2 — Error message quality
 9. ~~**`note:` secondary diagnostics**~~ **DONE** — E302 (redefined identifier) now shows `note: previously defined here` with source line + caret (Zig pattern). Infrastructure supports notes on any error.
 10. **Fix suggestions** ("help:" lines, e.g., "did you mean X?")
-11. **Larger heap** — 8MB linear memory is limiting for real apps
+11. ~~**Larger heap**~~ **DONE** — 256MB vmctx (1MB disk + 255MB BSS), binary size reduced from 16MB to ~1.1MB
 
 ### P3 — Build performance (matters at scale)
 12. **Build cache** (content-addressed, like Go)

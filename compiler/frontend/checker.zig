@@ -463,7 +463,7 @@ pub const Checker = struct {
             .impl_trait => |it| {
                 // Validate trait exists
                 const trait_def = self.generics.trait_defs.get(it.trait_name) orelse {
-                    self.err.errorWithCode(it.span.start, .e301, "undefined trait");
+                    self.errWithSuggestion(it.span.start, "undefined trait", self.findSimilarTrait(it.trait_name));
                     return;
                 };
                 // Validate all required methods are provided (name check)
@@ -1380,7 +1380,12 @@ pub const Checker = struct {
                     for (info.struct_type.fields) |sf| {
                         if (std.mem.eql(u8, sf.name, name_str)) return sf.type_idx;
                     }
-                    self.err.errorWithCode(bc.span.start, .e300, "struct has no field with this name");
+                    if (findSimilarField(name_str, info.struct_type.fields)) |suggestion| {
+                        const msg = std.fmt.allocPrint(self.allocator, "struct has no field with this name; did you mean '{s}'?", .{suggestion}) catch "struct has no field with this name";
+                        self.err.errorWithCode(bc.span.start, .e300, msg);
+                    } else {
+                        self.err.errorWithCode(bc.span.start, .e300, "struct has no field with this name");
+                    }
                     return invalid_type;
                 }
                 self.err.errorWithCode(bc.span.start, .e300, "@field requires struct type");
@@ -3061,6 +3066,23 @@ pub const Checker = struct {
             }
         }
 
+        return best;
+    }
+
+    /// Search trait names for the closest match.
+    fn findSimilarTrait(self: *Checker, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_dist: usize = std.math.maxInt(usize);
+        var it = self.generics.trait_defs.iterator();
+        while (it.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (std.mem.eql(u8, candidate, name)) continue;
+            const d = editDistance(name, candidate);
+            if (d < best_dist and d <= 2 and d * 2 <= name.len) {
+                best_dist = d;
+                best = candidate;
+            }
+        }
         return best;
     }
 

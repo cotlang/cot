@@ -19,6 +19,7 @@ pub const SHT_PROGBITS: u32 = 1;
 pub const SHT_SYMTAB: u32 = 2;
 pub const SHT_STRTAB: u32 = 3;
 pub const SHT_RELA: u32 = 4;
+pub const SHT_NOBITS: u32 = 8;
 
 pub const SHF_WRITE: u64 = 1;
 pub const SHF_ALLOC: u64 = 2;
@@ -39,6 +40,7 @@ pub const R_X86_64_PLT32: u32 = 4;
 // Section indices (layout-dependent, matches write() section order)
 pub const SHIDX_TEXT: u16 = 1;
 pub const SHIDX_DATA: u16 = 2;
+pub const SHIDX_BSS: u16 = 3;
 pub const SHIDX_SYMTAB: u16 = 3;
 pub const SHIDX_STRTAB: u16 = 4;
 pub const SHIDX_SHSTRTAB: u16 = 5;
@@ -148,6 +150,7 @@ pub const ElfWriter = struct {
     allocator: std.mem.Allocator,
     text_data: std.ArrayListUnmanaged(u8) = .{},
     data: std.ArrayListUnmanaged(u8) = .{},
+    bss_size: u64 = 0, // Zero-fill section size (SHT_NOBITS, no disk space)
     symbols: std.ArrayListUnmanaged(Symbol) = .{},
     relocations: std.ArrayListUnmanaged(Relocation) = .{},
     strtab: std.ArrayListUnmanaged(u8) = .{},
@@ -157,6 +160,7 @@ pub const ElfWriter = struct {
 
     shstrtab_text: u32 = 0,
     shstrtab_data: u32 = 0,
+    shstrtab_bss: u32 = 0,
     shstrtab_symtab: u32 = 0,
     shstrtab_strtab: u32 = 0,
     shstrtab_shstrtab: u32 = 0,
@@ -169,6 +173,7 @@ pub const ElfWriter = struct {
 
         writer.shstrtab_text = writer.addShstrtab(".text") catch 0;
         writer.shstrtab_data = writer.addShstrtab(".data") catch 0;
+        writer.shstrtab_bss = writer.addShstrtab(".bss") catch 0;
         writer.shstrtab_symtab = writer.addShstrtab(".symtab") catch 0;
         writer.shstrtab_strtab = writer.addShstrtab(".strtab") catch 0;
         writer.shstrtab_shstrtab = writer.addShstrtab(".shstrtab") catch 0;
@@ -210,6 +215,11 @@ pub const ElfWriter = struct {
 
     pub fn addData(self: *ElfWriter, bytes: []const u8) !void {
         try self.data.appendSlice(self.allocator, bytes);
+    }
+
+    /// Add BSS (zero-fill) region. SHT_NOBITS — no disk space.
+    pub fn setBssSize(self: *ElfWriter, size: u64) void {
+        self.bss_size = size;
     }
 
     pub fn addSymbol(self: *ElfWriter, name: []const u8, value: u64, section: u16, external: bool) !void {
@@ -317,7 +327,8 @@ pub const ElfWriter = struct {
         // Calculate layout
         const has_relocs = self.relocations.items.len > 0;
         const has_data = self.data.items.len > 0;
-        const num_sections: u16 = if (has_relocs) 7 else 6;
+        const has_bss = self.bss_size > 0;
+        const num_sections: u16 = (if (has_relocs) @as(u16, 7) else @as(u16, 6)) + (if (has_bss) @as(u16, 1) else @as(u16, 0));
         const ehdr_size: u64 = @sizeOf(Elf64_Ehdr);
 
         var offset: u64 = ehdr_size;
@@ -476,6 +487,18 @@ pub const ElfWriter = struct {
                 .sh_info = SHIDX_TEXT,
                 .sh_addralign = 8,
                 .sh_entsize = @sizeOf(Elf64_Rela),
+            }));
+        }
+
+        // BSS section (SHT_NOBITS): zero-fill, no disk space. Placed after all other sections.
+        if (has_bss) {
+            try writer.writeAll(std.mem.asBytes(&Elf64_Shdr{
+                .sh_name = self.shstrtab_bss,
+                .sh_type = SHT_NOBITS,
+                .sh_flags = SHF_ALLOC | SHF_WRITE,
+                .sh_offset = 0, // SHT_NOBITS has no file data
+                .sh_size = self.bss_size,
+                .sh_addralign = 4096, // page alignment
             }));
         }
     }

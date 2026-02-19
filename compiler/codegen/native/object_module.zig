@@ -190,6 +190,14 @@ pub const ObjectModule = struct {
     /// Accumulated data bytes.
     data_section: std.ArrayListUnmanaged(u8),
 
+    /// BSS (zero-fill) size. No disk space — OS zero-fills at load.
+    bss_size: u64 = 0,
+
+    /// DWARF debug info: source file path, source text, and line entries.
+    debug_source_file: []const u8 = "",
+    debug_source_text: []const u8 = "",
+    debug_line_entries: std.ArrayListUnmanaged(macho.LineEntry) = .{},
+
     /// Accumulated relocations (for object file).
     relocations: std.ArrayListUnmanaged(ObjectReloc),
 
@@ -238,6 +246,7 @@ pub const ObjectModule = struct {
         self.data_section.deinit(self.allocator);
         self.relocations.deinit(self.allocator);
         self.data_relocations.deinit(self.allocator);
+        self.debug_line_entries.deinit(self.allocator);
     }
 
     // =========================================================================
@@ -351,6 +360,28 @@ pub const ObjectModule = struct {
         }
 
         func.defined = true;
+    }
+
+    /// Set BSS (zero-fill) size for the data segment. No disk space used.
+    /// Go runtime pattern: large zero regions (heap/stack) use BSS.
+    pub fn setBssSize(self: *Self, size: u64) void {
+        self.bss_size = size;
+    }
+
+    /// Set DWARF debug info source file and text.
+    pub fn setDebugInfo(self: *Self, source_file: []const u8, source_text: []const u8) void {
+        self.debug_source_file = source_file;
+        self.debug_source_text = source_text;
+    }
+
+    /// Add DWARF line entry (code_offset → source_offset mapping).
+    pub fn addLineEntry(self: *Self, code_offset: u32, source_offset: u32) !void {
+        try self.debug_line_entries.append(self.allocator, .{ .code_offset = code_offset, .source_offset = source_offset });
+    }
+
+    /// Get the code offset of a defined function in the text section.
+    pub fn getFuncCodeOffset(self: *const Self, func_id: FuncId) u32 {
+        return self.functions.items[func_id.index].code_offset;
     }
 
     /// Define a data object with the given bytes.
@@ -473,6 +504,11 @@ pub const ObjectModule = struct {
             try macho_writer.addData(self.data_section.items);
         }
 
+        // Add BSS (zero-fill) section — extends virtual memory without disk cost
+        if (self.bss_size > 0) {
+            macho_writer.setBssSize(self.bss_size);
+        }
+
         // Add function symbols
         for (self.functions.items) |func| {
             if (func.defined) {
@@ -509,6 +545,13 @@ pub const ObjectModule = struct {
             }
         }
 
+        // Generate DWARF debug sections if line entries are present
+        if (self.debug_line_entries.items.len > 0) {
+            macho_writer.setDebugInfo(self.debug_source_file, self.debug_source_text);
+            try macho_writer.addLineEntries(self.debug_line_entries.items);
+            try macho_writer.generateDebugSections();
+        }
+
         try macho_writer.write(writer);
     }
 
@@ -523,6 +566,11 @@ pub const ObjectModule = struct {
         // Add data section
         if (self.data_section.items.len > 0) {
             try elf_writer.addData(self.data_section.items);
+        }
+
+        // Add BSS (zero-fill) section
+        if (self.bss_size > 0) {
+            elf_writer.setBssSize(self.bss_size);
         }
 
         // Add function symbols

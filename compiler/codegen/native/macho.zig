@@ -15,6 +15,7 @@ pub const VM_PROT_ALL: u32 = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
 pub const NO_SECT: u8 = 0;
 pub const SECT_TEXT: u8 = 1;
 pub const SECT_DATA: u8 = 2;
+pub const SECT_BSS: u8 = 3;
 
 pub const MH_MAGIC_64: u32 = 0xFEEDFACF;
 pub const CPU_TYPE_ARM64: u32 = 0x0100000C;
@@ -27,6 +28,7 @@ pub const LC_SEGMENT_64: u32 = 0x19;
 pub const LC_SYMTAB: u32 = 0x02;
 
 pub const S_REGULAR: u32 = 0x0;
+pub const S_ZEROFILL: u32 = 0x1;
 pub const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x80000000;
 pub const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00000400;
 
@@ -154,6 +156,7 @@ pub const MachOWriter = struct {
     allocator: std.mem.Allocator,
     text_data: std.ArrayListUnmanaged(u8) = .{},
     data: std.ArrayListUnmanaged(u8) = .{},
+    bss_size: u64 = 0, // Zero-fill section size (no disk space, OS zero-fills at load)
     cstring_data: std.ArrayListUnmanaged(u8) = .{},
     string_literals: std.ArrayListUnmanaged(StringLiteral) = .{},
     symbols: std.ArrayListUnmanaged(Symbol) = .{},
@@ -198,6 +201,12 @@ pub const MachOWriter = struct {
 
     pub fn addData(self: *MachOWriter, bytes: []const u8) !void {
         try self.data.appendSlice(self.allocator, bytes);
+    }
+
+    /// Add a BSS (zero-fill) region. Occupies no disk space; OS zero-fills at load.
+    /// Go runtime/mem.go pattern: large zero regions use S_ZEROFILL.
+    pub fn setBssSize(self: *MachOWriter, size: u64) void {
+        self.bss_size = size;
     }
 
     pub fn addSymbol(self: *MachOWriter, name: []const u8, value: u64, section: u8, external: bool) !void {
@@ -306,7 +315,8 @@ pub const MachOWriter = struct {
         const symtab_cmd_size: u64 = @sizeOf(SymtabCommand);
 
         const has_debug = self.debug_line_data.items.len > 0;
-        const num_sections: u32 = if (has_debug) 5 else 2;
+        const has_bss = self.bss_size > 0;
+        const num_sections: u32 = (if (has_debug) @as(u32, 5) else @as(u32, 2)) + (if (has_bss) @as(u32, 1) else @as(u32, 0));
         const load_cmds_size = segment_cmd_size + (section_size * num_sections) + symtab_cmd_size;
 
         const text_offset = header_size + load_cmds_size;
@@ -344,10 +354,12 @@ pub const MachOWriter = struct {
         try writer.writeAll(std.mem.asBytes(&header));
 
         // Write segment command
+        // filesize = disk bytes (code + data + debug), vmsize = filesize + BSS (zero-fill, no disk)
         const segment_filesize = if (has_debug) debug_info_offset + debug_info_size - text_offset else data_offset + data_size - text_offset;
+        const bss_aligned = alignTo(self.bss_size, 4096); // page-align BSS
         var segment = SegmentCommand64{
             .cmdsize = @intCast(segment_cmd_size + section_size * num_sections),
-            .vmsize = segment_filesize,
+            .vmsize = segment_filesize + bss_aligned,
             .fileoff = text_offset,
             .filesize = segment_filesize,
             .nsects = num_sections,
@@ -371,6 +383,21 @@ pub const MachOWriter = struct {
         @memcpy(data_sect.sectname[0..6], "__data");
         @memcpy(data_sect.segname[0..6], "__DATA");
         try writer.writeAll(std.mem.asBytes(&data_sect));
+
+        // BSS (zero-fill) section: S_ZEROFILL, offset=0 (no disk data), placed right after __data
+        if (has_bss) {
+            var bss_sect = Section64{
+                .size = bss_aligned,
+                .offset = 0, // S_ZEROFILL sections have no file data
+                .@"align" = 12, // 4096 byte (page) alignment
+                .flags = S_ZEROFILL,
+            };
+            // addr = right after data section in virtual memory
+            bss_sect.addr = data_size;
+            @memcpy(bss_sect.sectname[0..5], "__bss");
+            @memcpy(bss_sect.segname[0..6], "__DATA");
+            try writer.writeAll(std.mem.asBytes(&bss_sect));
+        }
 
         if (has_debug) {
             try self.writeDebugSectionHeader(writer, "__debug_line", debug_line_offset, debug_line_size, debug_line_reloc_offset, num_debug_line_relocs);
