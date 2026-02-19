@@ -358,14 +358,14 @@ var msg = "Value is ${x}, next is ${y + 1}"
 ### Postfix
 `ptr.*` (dereference) `opt.?` (unwrap optional) `?.` (optional chain) `.field` (field access) `[i]` (index) `[start:end]` (slice) `(args)` (call)
 
-### Nullish Coalesce
-`opt ?? default_value`
+### Unwrap with Default
+`opt orelse default_value`
 
 ### Operator Precedence (low to high)
 
 | Precedence | Operators |
 |------------|-----------|
-| 1 (lowest) | `??` |
+| 1 (lowest) | `orelse` |
 | 2 | `\|\|`, `or` |
 | 3 | `&&`, `and` |
 | 4 | `==`, `!=`, `<`, `<=`, `>`, `>=` |

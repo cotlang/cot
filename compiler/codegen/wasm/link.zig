@@ -304,7 +304,7 @@ pub const Linker = struct {
     /// Returns the offset in memory where the data will be placed
     pub fn addData(self: *Linker, data: []const u8) !i32 {
         // Data starts after stack area (at low memory)
-        // Stack grows down from 64KB, data grows up from 0
+        // Stack grows down from 1MB, data grows up from 0
         var offset: i32 = 0;
         for (self.data_segments.items) |seg| {
             const seg_end = seg.offset + @as(i32, @intCast(seg.data.len));

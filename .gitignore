@@ -4,8 +4,11 @@ zig-out/
 # Build artifacts
 a.out
 a.out.o
+*.o
 *.wasm
-*.wasm.o
+*.js
 test_io*
 cot-mcp
-cot-mcp.o
+
+# Self-hosting build output
+self/main

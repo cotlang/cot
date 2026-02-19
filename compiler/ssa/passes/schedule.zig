@@ -107,10 +107,14 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
         } else if (v.op == .static_call or v.op == .wasm_lowered_static_call or
             v.op == .call or v.op == .wasm_call or
             v.op == .closure_call or v.op == .wasm_lowered_closure_call or
-            v.op == .inter_call or v.op == .wasm_lowered_inter_call)
+            v.op == .inter_call or v.op == .wasm_lowered_inter_call or
+            v.op == .move or v.op == .wasm_lowered_move or
+            v.op == .zero or v.op == .wasm_lowered_zero)
         {
             // Calls are memory barriers: must order after prior stores/loads
-            // and before subsequent loads/stores
+            // and before subsequent loads/stores.
+            // move (memory.copy) and zero (memory.fill) are bulk memory ops
+            // that both read and write — treat as barriers.
             if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
             last_mem = v;
         }

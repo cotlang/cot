@@ -991,7 +991,7 @@ pub const Checker = struct {
                 self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
                 return invalid_type;
             },
-            .coalesce => return if (left == .optional) left.optional.elem else left_type,
+            .kw_orelse => return if (left == .optional) left.optional.elem else left_type,
             else => return invalid_type,
         }
     }

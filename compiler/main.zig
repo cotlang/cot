@@ -1304,6 +1304,8 @@ fn compileAndLinkFull(
             defer f.close();
             f.chmod(0o755) catch {};
         } else |_| {}
+        // Clean up intermediate .o file after successful link
+        std.fs.cwd().deleteFile(obj_path) catch {};
         if (!quiet) std.debug.print("Success: {s}\n", .{output_name});
     } else {
         std.debug.print("Link failed with code: {d}\n", .{result.Exited});

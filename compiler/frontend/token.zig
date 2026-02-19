@@ -21,7 +21,7 @@ pub const Token = enum(u8) {
     and_assign, or_assign, xor_assign, // &= |= ^=
     eql, neq, lss, leq, gtr, geq, // == != < <= > >=
     land, lor, lnot, // && || !
-    assign, arrow, fat_arrow, coalesce, optional_chain, // = -> => ?? ?.
+    assign, arrow, fat_arrow, optional_chain, // = -> => ?.
     lparen, rparen, lbrack, rbrack, lbrace, rbrace, // ( ) [ ] { }
     comma, period, period_period, period_star, period_question, // , . .. .* .?
     semicolon, colon, at, question, // ; : @ ?
@@ -32,7 +32,7 @@ pub const Token = enum(u8) {
     kw_fn, kw_var, kw_let, kw_const, kw_struct, kw_impl, kw_trait, kw_where,
     kw_enum, kw_union, kw_type, kw_import, kw_extern, kw_test, kw_bench,
     kw_if, kw_else, kw_switch, kw_while, kw_for, kw_in,
-    kw_return, kw_break, kw_continue, kw_defer, kw_errdefer, kw_try, kw_catch, kw_error,
+    kw_return, kw_break, kw_continue, kw_defer, kw_errdefer, kw_try, kw_catch, kw_orelse, kw_error,
     kw_true, kw_false, kw_null, kw_new, kw_undefined,
     kw_comptime,
     kw_async, kw_await,
@@ -51,7 +51,7 @@ pub const Token = enum(u8) {
 
     pub fn precedence(self: Token) u8 {
         return switch (self) {
-            .coalesce => 1,
+            .kw_orelse => 1,
             .lor, .kw_or => 2,
             .land, .kw_and => 3,
             .eql, .neq, .lss, .leq, .gtr, .geq => 4,
@@ -140,7 +140,6 @@ const token_strings = blk: {
     s[@intFromEnum(Token.assign)] = "=";
     s[@intFromEnum(Token.arrow)] = "->";
     s[@intFromEnum(Token.fat_arrow)] = "=>";
-    s[@intFromEnum(Token.coalesce)] = "??";
     s[@intFromEnum(Token.optional_chain)] = "?.";
     s[@intFromEnum(Token.lparen)] = "(";
     s[@intFromEnum(Token.rparen)] = ")";
@@ -186,6 +185,7 @@ const token_strings = blk: {
     s[@intFromEnum(Token.kw_errdefer)] = "errdefer";
     s[@intFromEnum(Token.kw_try)] = "try";
     s[@intFromEnum(Token.kw_catch)] = "catch";
+    s[@intFromEnum(Token.kw_orelse)] = "orelse";
     s[@intFromEnum(Token.kw_error)] = "error";
     s[@intFromEnum(Token.kw_true)] = "true";
     s[@intFromEnum(Token.kw_false)] = "false";
@@ -229,7 +229,7 @@ pub const keywords = std.StaticStringMap(Token).initComptime(.{
     .{ "if", .kw_if }, .{ "else", .kw_else }, .{ "switch", .kw_switch }, .{ "while", .kw_while },
     .{ "for", .kw_for }, .{ "in", .kw_in }, .{ "return", .kw_return }, .{ "break", .kw_break },
     .{ "continue", .kw_continue }, .{ "defer", .kw_defer }, .{ "errdefer", .kw_errdefer },
-    .{ "try", .kw_try }, .{ "catch", .kw_catch }, .{ "error", .kw_error },
+    .{ "try", .kw_try }, .{ "catch", .kw_catch }, .{ "orelse", .kw_orelse }, .{ "error", .kw_error },
     .{ "true", .kw_true }, .{ "false", .kw_false }, .{ "null", .kw_null }, .{ "new", .kw_new },
     .{ "undefined", .kw_undefined }, .{ "comptime", .kw_comptime },
     .{ "async", .kw_async }, .{ "await", .kw_await },
@@ -275,7 +275,7 @@ test "precedence" {
     try std.testing.expectEqual(@as(u8, 4), Token.eql.precedence());
     try std.testing.expectEqual(@as(u8, 3), Token.kw_and.precedence());
     try std.testing.expectEqual(@as(u8, 2), Token.kw_or.precedence());
-    try std.testing.expectEqual(@as(u8, 1), Token.coalesce.precedence());
+    try std.testing.expectEqual(@as(u8, 1), Token.kw_orelse.precedence());
     try std.testing.expectEqual(@as(u8, 0), Token.lparen.precedence());
 }
 

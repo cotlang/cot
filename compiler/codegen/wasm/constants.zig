@@ -761,8 +761,8 @@ pub const TABLE_IDX_ZERO: u8 = 0x00;
 /// Wasm linear memory page size
 pub const WASM_PAGE_SIZE: u32 = 65536;
 
-/// Default stack size (64KB = 1 Wasm page)
-pub const STACK_SIZE: u32 = WASM_PAGE_SIZE;
+/// Default stack size (8MB = 128 Wasm pages, matches OS thread default)
+pub const STACK_SIZE: u32 = 128 * WASM_PAGE_SIZE;
 
 // ============================================================================
 // WasmGC opcodes (GC proposal, standardized in Wasm 3.0)

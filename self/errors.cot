@@ -1,0 +1,85 @@
+// errors — Error reporting for the self-hosted compiler.
+// Ported from compiler/frontend/errors.zig
+
+// Error codes: 1xx=scanner, 2xx=parser, 3xx=type, 4xx=semantic
+// Stored as plain i64 constants (no enum needed for now)
+const E100: i64 = 100  // unterminated string literal
+const E101: i64 = 101  // unterminated character literal
+const E102: i64 = 102  // invalid escape sequence
+const E103: i64 = 103  // invalid number literal
+const E104: i64 = 104  // unexpected character
+const E200: i64 = 200  // unexpected token
+const E201: i64 = 201  // expected expression
+const E202: i64 = 202  // expected type
+const E203: i64 = 203  // expected identifier
+const E204: i64 = 204  // expected '{'
+const E205: i64 = 205  // expected '}'
+const E206: i64 = 206  // expected '('
+const E207: i64 = 207  // expected ')'
+const E208: i64 = 208  // expected ';' or newline
+const E300: i64 = 300  // type mismatch
+const E301: i64 = 301  // undefined identifier
+const E302: i64 = 302  // redefined identifier
+const E303: i64 = 303  // invalid operation
+const E304: i64 = 304  // wrong number of arguments
+const E305: i64 = 305  // not callable
+const E306: i64 = 306  // field not found
+const E400: i64 = 400  // break outside loop
+const E401: i64 = 401  // continue outside loop
+const E402: i64 = 402  // return type mismatch
+const E403: i64 = 403  // missing return
+
+struct ErrorReporter {
+    count: i64,
+    first_msg: string,
+    first_offset: i64,
+}
+
+fn reporterInit() ErrorReporter {
+    return ErrorReporter { .count = 0, .first_msg = "", .first_offset = 0 }
+}
+
+fn reportError(r: *ErrorReporter, offset: i64, code: i64, msg: string) void {
+    if (r.count == 0) {
+        r.first_msg = msg
+        r.first_offset = offset
+    }
+    r.count = r.count + 1
+}
+
+fn hasErrors(r: *ErrorReporter) bool {
+    return r.count > 0
+}
+
+fn errorCount(r: *ErrorReporter) i64 {
+    return r.count
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "reporter init" {
+    var r = reporterInit()
+    @assert_eq(hasErrors(&r), false)
+    @assert_eq(errorCount(&r), 0)
+}
+
+test "report single error" {
+    var r = reporterInit()
+    reportError(&r, 10, E100, "unterminated string")
+    @assert_eq(hasErrors(&r), true)
+    @assert_eq(errorCount(&r), 1)
+    @assert_eq(r.first_offset, 10)
+    @assert_eq(r.first_msg, "unterminated string")
+}
+
+test "report multiple errors" {
+    var r = reporterInit()
+    reportError(&r, 0, E200, "error 1")
+    reportError(&r, 5, E201, "error 2")
+    reportError(&r, 10, E300, "error 3")
+    @assert_eq(errorCount(&r), 3)
+    @assert_eq(r.first_msg, "error 1")
+    @assert_eq(r.first_offset, 0)
+}

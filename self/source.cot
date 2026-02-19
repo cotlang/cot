@@ -1,0 +1,96 @@
+// source — Source text handling and position tracking.
+// Ported from compiler/frontend/source.zig
+
+import "std/string"
+
+struct Pos {
+    offset: i64,
+}
+
+struct Span {
+    start_offset: i64,
+    end_offset: i64,
+}
+
+struct Source {
+    filename: string,
+    content: string,
+}
+
+fn posAdvance(p: Pos, n: i64) Pos {
+    return Pos { .offset = p.offset + n }
+}
+
+fn spanInit(start: i64, end: i64) Span {
+    return Span { .start_offset = start, .end_offset = end }
+}
+
+fn spanFromPos(offset: i64) Span {
+    return Span { .start_offset = offset, .end_offset = offset }
+}
+
+fn spanLen(s: Span) i64 {
+    return s.end_offset - s.start_offset
+}
+
+fn sourceAt(src: *Source, offset: i64) ?i64 {
+    if (offset >= @lenOf(src.content)) {
+        return null
+    }
+    return charAt(src.content, offset)
+}
+
+fn sourceSlice(src: *Source, start: i64, end: i64) string {
+    return substring(src.content, start, end)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "pos advance" {
+    var p = Pos { .offset = 5 }
+    var p2 = posAdvance(p, 3)
+    @assert_eq(p2.offset, 8)
+}
+
+test "span init" {
+    var s = spanInit(5, 10)
+    @assert_eq(s.start_offset, 5)
+    @assert_eq(s.end_offset, 10)
+}
+
+test "span from pos" {
+    var s = spanFromPos(7)
+    @assert_eq(s.start_offset, 7)
+    @assert_eq(s.end_offset, 7)
+}
+
+test "span len" {
+    var s = spanInit(5, 10)
+    @assert_eq(spanLen(s), 5)
+}
+
+test "source at" {
+    var src = Source { .filename = "test.cot", .content = "abc" }
+    var a = sourceAt(&src, 0)
+    @assert_eq(a.?, 97)
+    var b = sourceAt(&src, 1)
+    @assert_eq(b.?, 98)
+    var c = sourceAt(&src, 2)
+    @assert_eq(c.?, 99)
+}
+
+test "source at past end" {
+    var src = Source { .filename = "test.cot", .content = "abc" }
+    var result = sourceAt(&src, 3)
+    @assert_eq(result == null, true)
+}
+
+test "source slice" {
+    var src = Source { .filename = "test.cot", .content = "hello world" }
+    var s = sourceSlice(&src, 0, 5)
+    @assert_eq(s, "hello")
+    var s2 = sourceSlice(&src, 6, 11)
+    @assert_eq(s2, "world")
+}

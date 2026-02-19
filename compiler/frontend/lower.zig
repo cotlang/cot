@@ -2936,7 +2936,7 @@ pub const Lowerer = struct {
                 return try fb.emitBinary(.eq, eq_result, zero, TypeRegistry.BOOL, bin.span);
             }
         }
-        if (bin.op == .coalesce) {
+        if (bin.op == .kw_orelse) {
             const left_type_idx = self.inferExprType(bin.left);
             const left_type = self.type_reg.get(left_type_idx);
             if (left_type == .optional) {
@@ -3291,6 +3291,17 @@ pub const Lowerer = struct {
         }
 
         const base_val = try self.lowerExprNode(fa.base);
+
+        // For struct value expressions (call results, etc.), store to a temp local first
+        // so field_local decomposition works correctly on native (off_ptr+load on a
+        // call result value is invalid — the result is SSA values, not a memory address).
+        if (!base_is_pointer and (base_type == .struct_type or base_type == .tuple)) {
+            const type_size = self.type_reg.sizeOf(base_type_idx);
+            const tmp_local = try fb.addLocalWithSize("__field_tmp", base_type_idx, false, @intCast(type_size));
+            _ = try fb.emitStoreLocal(tmp_local, base_val, fa.span);
+            return try fb.emitFieldLocal(tmp_local, field_idx, field_offset, field_type, fa.span);
+        }
+
         return try fb.emitFieldValue(base_val, field_idx, field_offset, field_type, fa.span);
     }
 
@@ -6299,6 +6310,7 @@ pub const Lowerer = struct {
 
         // Error block: evaluate fallback
         fb.setBlock(err_block);
+        var fallback_is_noreturn = false;
         if (ce.capture.len > 0) {
             const scope_depth = fb.markScopeEntry();
             const err_payload_addr = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, ce.span);
@@ -6306,7 +6318,9 @@ pub const Lowerer = struct {
             const capture_local = try fb.addLocalWithSize(ce.capture, TypeRegistry.I64, false, 8);
             _ = try fb.emitStoreLocal(capture_local, err_val, ce.span);
             const fallback_val = try self.lowerExprNode(ce.fallback);
-            if (is_compound) {
+            if (fallback_val == ir.null_node) {
+                fallback_is_noreturn = true;
+            } else if (is_compound) {
                 try self.storeCatchCompound(result_local, fallback_val, ce.span);
             } else {
                 _ = try fb.emitStoreLocal(result_local, fallback_val, ce.span);
@@ -6314,13 +6328,17 @@ pub const Lowerer = struct {
             fb.restoreScope(scope_depth);
         } else {
             const fallback_val = try self.lowerExprNode(ce.fallback);
-            if (is_compound) {
+            if (fallback_val == ir.null_node) {
+                fallback_is_noreturn = true;
+            } else if (is_compound) {
                 try self.storeCatchCompound(result_local, fallback_val, ce.span);
             } else {
                 _ = try fb.emitStoreLocal(result_local, fallback_val, ce.span);
             }
         }
-        _ = try fb.emitJump(merge_block, ce.span);
+        if (!fallback_is_noreturn) {
+            _ = try fb.emitJump(merge_block, ce.span);
+        }
 
         // Merge block: load result
         fb.setBlock(merge_block);

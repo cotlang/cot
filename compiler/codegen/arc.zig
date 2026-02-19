@@ -48,7 +48,7 @@ pub const IMMORTAL_REFCOUNT: i64 = 0x7FFFFFFFFFFFFFFF;
 pub const INITIAL_REFCOUNT: i64 = 1;
 
 /// Memory layout globals
-pub const HEAP_START: u32 = 0x10000; // 64KB reserved for stack
+pub const HEAP_START: u32 = 0x800000; // 8MB reserved for stack
 
 // =============================================================================
 // Alignment Constants (used by alloc, realloc, growslice, string_concat)

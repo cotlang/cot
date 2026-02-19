@@ -5,10 +5,10 @@ test "basic" {
 
 test "null coalesce" {
     var x: ?i64 = null
-    @assert_eq(x ?? 99, 99)
+    @assert_eq(x orelse 99, 99)
 }
 
 test "coalesce value" {
     var x: ?i64 = 42
-    @assert_eq(x ?? 99, 42)
+    @assert_eq(x orelse 99, 42)
 }

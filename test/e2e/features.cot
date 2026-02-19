@@ -290,9 +290,9 @@ test "phase3" {
     var opt1: ?i64 = 42
     @assert_eq(opt1.?, 42)
     var opt2: ?i64 = null
-    @assert_eq(opt2 ?? 99, 99)
+    @assert_eq(opt2 orelse 99, 99)
     var opt3: ?i64 = 42
-    @assert_eq(opt3 ?? 99, 42)
+    @assert_eq(opt3 orelse 99, 42)
 
     // Switch
     var sw1 = switch 2 {

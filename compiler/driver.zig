@@ -486,8 +486,15 @@ pub const Driver = struct {
         for (imports) |import_path| {
             const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
                 try self.resolveStdImport(import_path, file_dir)
-            else
-                try std.fs.path.join(self.allocator, &.{ file_dir, import_path });
+            else blk: {
+                // Auto-append .cot extension if not present (like std/ imports do)
+                const name = if (std.mem.endsWith(u8, import_path, ".cot"))
+                    import_path
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
+                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+            };
             defer self.allocator.free(full_path);
             try self.parseFileRecursive(full_path, parsed_files, seen_files);
         }
@@ -3032,11 +3039,10 @@ pub const Driver = struct {
 
         const is_wasm_gc = self.target.isWasmGC();
 
-        // Configure memory (3 pages = 192KB minimum)
-        // Page 0: Stack (grows down from 64KB)
-        // Page 1: Heap (starts at 64KB)
-        // Page 2+: Globals (starts at 128KB / 0x20000)
-        linker.setMemory(3, null);
+        // Configure memory (256 pages = 16MB minimum)
+        // Pages 0-127: Stack (grows down from 8MB, matches OS thread default)
+        // Page 128+: Heap (starts at 8MB / 0x800000)
+        linker.setMemory(256, null);
 
         // ====================================================================
         // Add CTXT global (closure context pointer, Go: REG_CTXT = Global 1)

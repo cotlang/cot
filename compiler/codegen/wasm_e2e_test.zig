@@ -85,8 +85,9 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
     module.addMemory(1, null);
 
     // Add stack pointer global (index 0, expected by wasm_gen)
-    // SP starts at 65536 (top of first memory page, grows down)
-    _ = try module.addGlobal(.i32, true, 65536);
+    // SP starts at STACK_SIZE (top of stack area, grows down)
+    const constants = @import("wasm/constants.zig");
+    _ = try module.addGlobal(.i32, true, constants.STACK_SIZE);
 
     // Add ARC runtime functions (they get indices 0-4)
     // Note: heap_ptr global will be at index 1

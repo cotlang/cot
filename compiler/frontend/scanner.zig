@@ -296,7 +296,7 @@ pub const Scanner = struct {
             '<' => if (self.ch == '=') blk: { self.advance(); break :blk .leq; } else if (self.ch == '<') blk: { self.advance(); break :blk .shl; } else .lss,
             '>' => if (self.ch == '=') blk: { self.advance(); break :blk .geq; } else if (self.ch == '>') blk: { self.advance(); break :blk .shr; } else .gtr,
             '.' => if (self.ch == '.') blk: { self.advance(); break :blk .period_period; } else if (self.ch == '*') blk: { self.advance(); break :blk .period_star; } else if (self.ch == '?') blk: { self.advance(); break :blk .period_question; } else .period,
-            '?' => if (self.ch == '?') blk: { self.advance(); break :blk .coalesce; } else if (self.ch == '.') blk: { self.advance(); break :blk .optional_chain; } else .question,
+            '?' => if (self.ch == '.') blk: { self.advance(); break :blk .optional_chain; } else .question,
             else => .illegal,
         };
 
@@ -356,7 +356,7 @@ test "scanner basics" {
 }
 
 test "scanner operators" {
-    const content = "== != <= >= << >> .* .? ?? ?.";
+    const content = "== != <= >= << >> .* .? ?. orelse";
     var src = Source.init(std.testing.allocator, "test.cot", content);
     defer src.deinit();
     var scanner = Scanner.init(&src);
@@ -369,8 +369,8 @@ test "scanner operators" {
     try std.testing.expectEqual(Token.shr, scanner.next().tok);
     try std.testing.expectEqual(Token.period_star, scanner.next().tok);
     try std.testing.expectEqual(Token.period_question, scanner.next().tok);
-    try std.testing.expectEqual(Token.coalesce, scanner.next().tok);
     try std.testing.expectEqual(Token.optional_chain, scanner.next().tok);
+    try std.testing.expectEqual(Token.kw_orelse, scanner.next().tok);
 }
 
 test "scanner strings" {

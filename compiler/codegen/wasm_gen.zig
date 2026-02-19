@@ -36,7 +36,7 @@ const BLOCK_TYPE_I32: u8 = @intFromEnum(wasm_op.ValType.i32);
 const BLOCK_TYPE_I64: u8 = @intFromEnum(wasm_op.ValType.i64);
 
 // Memory layout constants
-// SP is global 0, initialized to 65536 by the linker
+// SP is global 0, initialized to 8MB (8388608) by the linker
 const SP_GLOBAL: u32 = 0;
 
 /// Function index map type - maps function names to Wasm function indices.

@@ -540,6 +540,17 @@ pub const SSABuilder = struct {
             return slice_val;
         }
 
+        // For large structs (>8 bytes), return the local's address directly.
+        // convertFieldValue treats base as an address (off_ptr + load).
+        // A single .load would only get 8 bytes, and field access would
+        // use that loaded value as an address → SIGSEGV.
+        // convertStoreLocal handles this via OpMove (else branch extracts addr).
+        const type_size = self.type_registry.sizeOf(type_idx);
+        if ((load_type == .struct_type or load_type == .tuple) and type_size > 8) {
+            addr_val.type_idx = type_idx;
+            return addr_val;
+        }
+
         const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
         load_val.addArg(addr_val);
         try cur.addValue(self.allocator, load_val);
@@ -867,6 +878,29 @@ pub const SSABuilder = struct {
         const field_type = self.type_registry.get(type_idx);
         if (field_type == .struct_type or field_type == .array) return off_val;
 
+        // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make
+        const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;
+        if (is_string_or_slice) {
+            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            ptr_load.addArg(off_val);
+            try cur.addValue(self.allocator, ptr_load);
+
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(off_val);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            len_load.addArg(len_addr);
+            try cur.addValue(self.allocator, len_load);
+
+            const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
+            const make_val = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
+            make_val.addArg2(ptr_load, len_load);
+            try cur.addValue(self.allocator, make_val);
+            return make_val;
+        }
+
         const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
         load_val.addArg(off_val);
         try cur.addValue(self.allocator, load_val);
@@ -880,6 +914,54 @@ pub const SSABuilder = struct {
         off_val.addArg(addr_val);
         off_val.aux_int = f.offset;
         try cur.addValue(self.allocator, off_val);
+
+        // String/slice compound store: decompose into ptr@0, len@8
+        const value_type = self.type_registry.get(value.type_idx);
+        const is_string_or_slice = value.type_idx == TypeRegistry.STRING or value_type == .slice;
+        if (is_string_or_slice) {
+            var ptr_component: *Value = undefined;
+            var len_component: *Value = undefined;
+
+            if ((value.op == .string_make or value.op == .slice_make) and value.args.len >= 2) {
+                ptr_component = value.args[0];
+                len_component = value.args[1];
+            } else {
+                ptr_component = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+                ptr_component.addArg(value);
+                try cur.addValue(self.allocator, ptr_component);
+
+                len_component = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+                len_component.addArg(value);
+                try cur.addValue(self.allocator, len_component);
+            }
+
+            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            ptr_store.addArg2(off_val, ptr_component);
+            try cur.addValue(self.allocator, ptr_store);
+
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(off_val);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            len_store.addArg2(len_addr, len_component);
+            try cur.addValue(self.allocator, len_store);
+            return len_store;
+        }
+
+        // Large struct/tuple: use OpMove for bulk memory copy (same as convertStoreLocal).
+        // Extract source address from load result, copy to dest field offset.
+        const type_size = self.type_registry.sizeOf(value.type_idx);
+        const is_large = (value_type == .struct_type or value_type == .tuple) and type_size > 8;
+        if (is_large) {
+            const src_addr = if (value.op == .load and value.args.len > 0) value.args[0] else value;
+            const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
+            move_val.addArg2(off_val, src_addr);
+            move_val.aux_int = @intCast(type_size);
+            try cur.addValue(self.allocator, move_val);
+            return move_val;
+        }
 
         const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(off_val, value);
@@ -897,6 +979,29 @@ pub const SSABuilder = struct {
         const field_type = self.type_registry.get(type_idx);
         if (field_type == .struct_type or field_type == .array) return off_val;
 
+        // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make
+        const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;
+        if (is_string_or_slice) {
+            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            ptr_load.addArg(off_val);
+            try cur.addValue(self.allocator, ptr_load);
+
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(off_val);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            len_load.addArg(len_addr);
+            try cur.addValue(self.allocator, len_load);
+
+            const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
+            const make_val = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
+            make_val.addArg2(ptr_load, len_load);
+            try cur.addValue(self.allocator, make_val);
+            return make_val;
+        }
+
         const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
         load_val.addArg(off_val);
         try cur.addValue(self.allocator, load_val);
@@ -910,6 +1015,41 @@ pub const SSABuilder = struct {
         off_val.addArg(base);
         off_val.aux_int = f.offset;
         try cur.addValue(self.allocator, off_val);
+
+        // String/slice compound store: decompose into ptr@0, len@8
+        const value_type = self.type_registry.get(value.type_idx);
+        const is_string_or_slice = value.type_idx == TypeRegistry.STRING or value_type == .slice;
+        if (is_string_or_slice) {
+            var ptr_component: *Value = undefined;
+            var len_component: *Value = undefined;
+
+            if ((value.op == .string_make or value.op == .slice_make) and value.args.len >= 2) {
+                ptr_component = value.args[0];
+                len_component = value.args[1];
+            } else {
+                ptr_component = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+                ptr_component.addArg(value);
+                try cur.addValue(self.allocator, ptr_component);
+
+                len_component = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+                len_component.addArg(value);
+                try cur.addValue(self.allocator, len_component);
+            }
+
+            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            ptr_store.addArg2(off_val, ptr_component);
+            try cur.addValue(self.allocator, ptr_store);
+
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(off_val);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            len_store.addArg2(len_addr, len_component);
+            try cur.addValue(self.allocator, len_store);
+            return len_store;
+        }
 
         const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(off_val, value);
@@ -1250,6 +1390,48 @@ pub const SSABuilder = struct {
         const cond = try self.convertNode(s.condition) orelse return error.MissingValue;
         const then_val = try self.convertNode(s.then_value) orelse return error.MissingValue;
         const else_val = try self.convertNode(s.else_value) orelse return error.MissingValue;
+
+        // Compound type decomposition: string/slice are (ptr, len) pairs.
+        // Wasm `select` only works on single i64, so decompose into
+        // separate selects for each component, then recombine.
+        const val_type = self.type_registry.get(type_idx);
+        const is_string_or_slice = type_idx == TypeRegistry.STRING or val_type == .slice;
+        if (is_string_or_slice) {
+            const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
+
+            // Extract ptr from both sides
+            const then_ptr = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+            then_ptr.addArg(then_val);
+            try cur.addValue(self.allocator, then_ptr);
+            const else_ptr = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+            else_ptr.addArg(else_val);
+            try cur.addValue(self.allocator, else_ptr);
+
+            // Select ptr
+            const sel_ptr = try self.func.newValue(.cond_select, TypeRegistry.I64, cur, self.cur_pos);
+            sel_ptr.addArg3(cond, then_ptr, else_ptr);
+            try cur.addValue(self.allocator, sel_ptr);
+
+            // Extract len from both sides
+            const then_len = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+            then_len.addArg(then_val);
+            try cur.addValue(self.allocator, then_len);
+            const else_len = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+            else_len.addArg(else_val);
+            try cur.addValue(self.allocator, else_len);
+
+            // Select len
+            const sel_len = try self.func.newValue(.cond_select, TypeRegistry.I64, cur, self.cur_pos);
+            sel_len.addArg3(cond, then_len, else_len);
+            try cur.addValue(self.allocator, sel_len);
+
+            // Recombine into string_make/slice_make
+            const result = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
+            result.addArg2(sel_ptr, sel_len);
+            try cur.addValue(self.allocator, result);
+            return result;
+        }
+
         const val = try self.func.newValue(.cond_select, type_idx, cur, self.cur_pos);
         val.addArg3(cond, then_val, else_val);
         try cur.addValue(self.allocator, val);
