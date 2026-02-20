@@ -47,127 +47,164 @@ const Token = enum {
     keyword_end,
 }
 
-fn tokenToString(tok: i64) string {
-    return switch tok {
-        @intFromEnum(Token.illegal) => "ILLEGAL",
-        @intFromEnum(Token.eof) => "EOF",
-        @intFromEnum(Token.comment) => "COMMENT",
-        @intFromEnum(Token.doc_comment) => "DOC_COMMENT",
-        @intFromEnum(Token.ident) => "IDENT",
-        @intFromEnum(Token.int_lit) => "INT",
-        @intFromEnum(Token.float_lit) => "FLOAT",
-        @intFromEnum(Token.string_lit) => "STRING",
-        @intFromEnum(Token.char_lit) => "CHAR",
-        @intFromEnum(Token.add) => "+",
-        @intFromEnum(Token.sub) => "-",
-        @intFromEnum(Token.mul) => "*",
-        @intFromEnum(Token.quo) => "/",
-        @intFromEnum(Token.rem) => "%",
-        @intFromEnum(Token.bit_and) => "&",
-        @intFromEnum(Token.bit_or) => "|",
-        @intFromEnum(Token.xor) => "^",
-        @intFromEnum(Token.shl) => "<<",
-        @intFromEnum(Token.shr) => ">>",
-        @intFromEnum(Token.bit_not) => "~",
-        @intFromEnum(Token.add_assign) => "+=",
-        @intFromEnum(Token.sub_assign) => "-=",
-        @intFromEnum(Token.mul_assign) => "*=",
-        @intFromEnum(Token.quo_assign) => "/=",
-        @intFromEnum(Token.rem_assign) => "%=",
-        @intFromEnum(Token.and_assign) => "&=",
-        @intFromEnum(Token.or_assign) => "|=",
-        @intFromEnum(Token.xor_assign) => "^=",
-        @intFromEnum(Token.eql) => "==",
-        @intFromEnum(Token.neq) => "!=",
-        @intFromEnum(Token.lss) => "<",
-        @intFromEnum(Token.leq) => "<=",
-        @intFromEnum(Token.gtr) => ">",
-        @intFromEnum(Token.geq) => ">=",
-        @intFromEnum(Token.land) => "&&",
-        @intFromEnum(Token.lor) => "||",
-        @intFromEnum(Token.lnot) => "!",
-        @intFromEnum(Token.assign) => "=",
-        @intFromEnum(Token.arrow) => "->",
-        @intFromEnum(Token.fat_arrow) => "=>",
-        @intFromEnum(Token.optional_chain) => "?.",
-        @intFromEnum(Token.lparen) => "(",
-        @intFromEnum(Token.rparen) => ")",
-        @intFromEnum(Token.lbrack) => "[",
-        @intFromEnum(Token.rbrack) => "]",
-        @intFromEnum(Token.lbrace) => "{",
-        @intFromEnum(Token.rbrace) => "}",
-        @intFromEnum(Token.comma) => ",",
-        @intFromEnum(Token.period) => ".",
-        @intFromEnum(Token.period_period) => "..",
-        @intFromEnum(Token.period_star) => ".*",
-        @intFromEnum(Token.period_question) => ".?",
-        @intFromEnum(Token.semicolon) => ";",
-        @intFromEnum(Token.colon) => ":",
-        @intFromEnum(Token.at) => "@",
-        @intFromEnum(Token.question) => "?",
-        @intFromEnum(Token.kw_fn) => "fn",
-        @intFromEnum(Token.kw_var) => "var",
-        @intFromEnum(Token.kw_let) => "let",
-        @intFromEnum(Token.kw_const) => "const",
-        @intFromEnum(Token.kw_struct) => "struct",
-        @intFromEnum(Token.kw_impl) => "impl",
-        @intFromEnum(Token.kw_trait) => "trait",
-        @intFromEnum(Token.kw_where) => "where",
-        @intFromEnum(Token.kw_enum) => "enum",
-        @intFromEnum(Token.kw_union) => "union",
-        @intFromEnum(Token.kw_type) => "type",
-        @intFromEnum(Token.kw_import) => "import",
-        @intFromEnum(Token.kw_extern) => "extern",
-        @intFromEnum(Token.kw_test) => "test",
-        @intFromEnum(Token.kw_bench) => "bench",
-        @intFromEnum(Token.kw_if) => "if",
-        @intFromEnum(Token.kw_else) => "else",
-        @intFromEnum(Token.kw_switch) => "switch",
-        @intFromEnum(Token.kw_while) => "while",
-        @intFromEnum(Token.kw_for) => "for",
-        @intFromEnum(Token.kw_in) => "in",
-        @intFromEnum(Token.kw_return) => "return",
-        @intFromEnum(Token.kw_break) => "break",
-        @intFromEnum(Token.kw_continue) => "continue",
-        @intFromEnum(Token.kw_defer) => "defer",
-        @intFromEnum(Token.kw_errdefer) => "errdefer",
-        @intFromEnum(Token.kw_try) => "try",
-        @intFromEnum(Token.kw_catch) => "catch",
-        @intFromEnum(Token.kw_orelse) => "orelse",
-        @intFromEnum(Token.kw_error) => "error",
-        @intFromEnum(Token.kw_true) => "true",
-        @intFromEnum(Token.kw_false) => "false",
-        @intFromEnum(Token.kw_null) => "null",
-        @intFromEnum(Token.kw_new) => "new",
-        @intFromEnum(Token.kw_undefined) => "undefined",
-        @intFromEnum(Token.kw_comptime) => "comptime",
-        @intFromEnum(Token.kw_async) => "async",
-        @intFromEnum(Token.kw_await) => "await",
-        @intFromEnum(Token.kw_inline) => "inline",
-        @intFromEnum(Token.kw_unreachable) => "unreachable",
-        @intFromEnum(Token.kw_packed) => "packed",
-        @intFromEnum(Token.kw_weak) => "weak",
-        @intFromEnum(Token.kw_and) => "and",
-        @intFromEnum(Token.kw_or) => "or",
-        @intFromEnum(Token.kw_not) => "not",
-        @intFromEnum(Token.kw_int) => "int",
-        @intFromEnum(Token.kw_float) => "float",
-        @intFromEnum(Token.kw_bool) => "bool",
-        @intFromEnum(Token.kw_string) => "string",
-        @intFromEnum(Token.kw_byte) => "byte",
-        @intFromEnum(Token.kw_void) => "void",
-        @intFromEnum(Token.kw_noreturn) => "noreturn",
-        @intFromEnum(Token.kw_i8) => "i8",
-        @intFromEnum(Token.kw_i16) => "i16",
-        @intFromEnum(Token.kw_i32) => "i32",
-        @intFromEnum(Token.kw_i64) => "i64",
-        @intFromEnum(Token.kw_u8) => "u8",
-        @intFromEnum(Token.kw_u16) => "u16",
-        @intFromEnum(Token.kw_u32) => "u32",
-        @intFromEnum(Token.kw_u64) => "u64",
-        @intFromEnum(Token.kw_f32) => "f32",
-        @intFromEnum(Token.kw_f64) => "f64",
-        else => "?",
+impl Token {
+    fn toString(self: Token) string {
+        return switch (self) {
+            .illegal => "ILLEGAL",
+            .eof => "EOF",
+            .comment => "COMMENT",
+            .doc_comment => "DOC_COMMENT",
+            .ident => "IDENT",
+            .int_lit => "INT",
+            .float_lit => "FLOAT",
+            .string_lit => "STRING",
+            .char_lit => "CHAR",
+            .add => "+",
+            .sub => "-",
+            .mul => "*",
+            .quo => "/",
+            .rem => "%",
+            .bit_and => "&",
+            .bit_or => "|",
+            .xor => "^",
+            .shl => "<<",
+            .shr => ">>",
+            .bit_not => "~",
+            .add_assign => "+=",
+            .sub_assign => "-=",
+            .mul_assign => "*=",
+            .quo_assign => "/=",
+            .rem_assign => "%=",
+            .and_assign => "&=",
+            .or_assign => "|=",
+            .xor_assign => "^=",
+            .eql => "==",
+            .neq => "!=",
+            .lss => "<",
+            .leq => "<=",
+            .gtr => ">",
+            .geq => ">=",
+            .land => "&&",
+            .lor => "||",
+            .lnot => "!",
+            .assign => "=",
+            .arrow => "->",
+            .fat_arrow => "=>",
+            .optional_chain => "?.",
+            .lparen => "(",
+            .rparen => ")",
+            .lbrack => "[",
+            .rbrack => "]",
+            .lbrace => "{",
+            .rbrace => "}",
+            .comma => ",",
+            .period => ".",
+            .period_period => "..",
+            .period_star => ".*",
+            .period_question => ".?",
+            .semicolon => ";",
+            .colon => ":",
+            .at => "@",
+            .question => "?",
+            .kw_fn => "fn",
+            .kw_var => "var",
+            .kw_let => "let",
+            .kw_const => "const",
+            .kw_struct => "struct",
+            .kw_impl => "impl",
+            .kw_trait => "trait",
+            .kw_where => "where",
+            .kw_enum => "enum",
+            .kw_union => "union",
+            .kw_type => "type",
+            .kw_import => "import",
+            .kw_extern => "extern",
+            .kw_test => "test",
+            .kw_bench => "bench",
+            .kw_if => "if",
+            .kw_else => "else",
+            .kw_switch => "switch",
+            .kw_while => "while",
+            .kw_for => "for",
+            .kw_in => "in",
+            .kw_return => "return",
+            .kw_break => "break",
+            .kw_continue => "continue",
+            .kw_defer => "defer",
+            .kw_errdefer => "errdefer",
+            .kw_try => "try",
+            .kw_catch => "catch",
+            .kw_orelse => "orelse",
+            .kw_error => "error",
+            .kw_true => "true",
+            .kw_false => "false",
+            .kw_null => "null",
+            .kw_new => "new",
+            .kw_undefined => "undefined",
+            .kw_comptime => "comptime",
+            .kw_async => "async",
+            .kw_await => "await",
+            .kw_inline => "inline",
+            .kw_unreachable => "unreachable",
+            .kw_packed => "packed",
+            .kw_weak => "weak",
+            .kw_and => "and",
+            .kw_or => "or",
+            .kw_not => "not",
+            .kw_int => "int",
+            .kw_float => "float",
+            .kw_bool => "bool",
+            .kw_string => "string",
+            .kw_byte => "byte",
+            .kw_void => "void",
+            .kw_noreturn => "noreturn",
+            .kw_i8 => "i8",
+            .kw_i16 => "i16",
+            .kw_i32 => "i32",
+            .kw_i64 => "i64",
+            .kw_u8 => "u8",
+            .kw_u16 => "u16",
+            .kw_u32 => "u32",
+            .kw_u64 => "u64",
+            .kw_f32 => "f32",
+            .kw_f64 => "f64",
+            else => "?",
+        }
+    }
+
+    fn precedence(self: Token) i64 {
+        if (self == Token.kw_orelse) { return 1 }
+        if (self == Token.lor or self == Token.kw_or) { return 2 }
+        if (self == Token.land or self == Token.kw_and) { return 3 }
+        if (self == Token.eql or self == Token.neq or self == Token.lss or self == Token.leq or self == Token.gtr or self == Token.geq) { return 4 }
+        if (self == Token.add or self == Token.sub or self == Token.bit_or or self == Token.xor) { return 5 }
+        if (self == Token.mul or self == Token.quo or self == Token.rem or self == Token.bit_and or self == Token.shl or self == Token.shr) { return 6 }
+        return 0
+    }
+
+    fn isLiteral(self: Token) bool {
+        return self > Token.literal_beg and self < Token.literal_end
+    }
+
+    fn isOperator(self: Token) bool {
+        return self > Token.operator_beg and self < Token.operator_end
+    }
+
+    fn isKeyword(self: Token) bool {
+        return self > Token.keyword_beg and self < Token.keyword_end
+    }
+
+    fn isAssignment(self: Token) bool {
+        if (self == Token.assign) { return true }
+        if (self == Token.add_assign) { return true }
+        if (self == Token.sub_assign) { return true }
+        if (self == Token.mul_assign) { return true }
+        if (self == Token.quo_assign) { return true }
+        if (self == Token.rem_assign) { return true }
+        if (self == Token.and_assign) { return true }
+        if (self == Token.or_assign) { return true }
+        if (self == Token.xor_assign) { return true }
+        return false
     }
 }
 
@@ -238,43 +275,8 @@ fn initKeywords() StringMap {
     return m
 }
 
-fn lookupKeyword(keywords: *StringMap, name: string) i64 {
-    return keywords.getOrDefault(name, @intFromEnum(Token.ident))
-}
-
-fn precedence(tok: i64) i64 {
-    if (tok == @intFromEnum(Token.kw_orelse)) { return 1 }
-    if (tok == @intFromEnum(Token.lor) or tok == @intFromEnum(Token.kw_or)) { return 2 }
-    if (tok == @intFromEnum(Token.land) or tok == @intFromEnum(Token.kw_and)) { return 3 }
-    if (tok == @intFromEnum(Token.eql) or tok == @intFromEnum(Token.neq) or tok == @intFromEnum(Token.lss) or tok == @intFromEnum(Token.leq) or tok == @intFromEnum(Token.gtr) or tok == @intFromEnum(Token.geq)) { return 4 }
-    if (tok == @intFromEnum(Token.add) or tok == @intFromEnum(Token.sub) or tok == @intFromEnum(Token.bit_or) or tok == @intFromEnum(Token.xor)) { return 5 }
-    if (tok == @intFromEnum(Token.mul) or tok == @intFromEnum(Token.quo) or tok == @intFromEnum(Token.rem) or tok == @intFromEnum(Token.bit_and) or tok == @intFromEnum(Token.shl) or tok == @intFromEnum(Token.shr)) { return 6 }
-    return 0
-}
-
-fn isLiteral(tok: i64) bool {
-    return tok > @intFromEnum(Token.literal_beg) and tok < @intFromEnum(Token.literal_end)
-}
-
-fn isOperator(tok: i64) bool {
-    return tok > @intFromEnum(Token.operator_beg) and tok < @intFromEnum(Token.operator_end)
-}
-
-fn isKeyword(tok: i64) bool {
-    return tok > @intFromEnum(Token.keyword_beg) and tok < @intFromEnum(Token.keyword_end)
-}
-
-fn isAssignment(tok: i64) bool {
-    if (tok == @intFromEnum(Token.assign)) { return true }
-    if (tok == @intFromEnum(Token.add_assign)) { return true }
-    if (tok == @intFromEnum(Token.sub_assign)) { return true }
-    if (tok == @intFromEnum(Token.mul_assign)) { return true }
-    if (tok == @intFromEnum(Token.quo_assign)) { return true }
-    if (tok == @intFromEnum(Token.rem_assign)) { return true }
-    if (tok == @intFromEnum(Token.and_assign)) { return true }
-    if (tok == @intFromEnum(Token.or_assign)) { return true }
-    if (tok == @intFromEnum(Token.xor_assign)) { return true }
-    return false
+fn lookupKeyword(keywords: *StringMap, name: string) Token {
+    return @enumFromInt(Token, keywords.getOrDefault(name, @intFromEnum(Token.ident)))
 }
 
 // ============================================================================
@@ -282,59 +284,67 @@ fn isAssignment(tok: i64) bool {
 // ============================================================================
 
 test "token to string" {
-    @assert_eq(tokenToString(@intFromEnum(Token.add)), "+")
-    @assert_eq(tokenToString(@intFromEnum(Token.kw_fn)), "fn")
-    @assert_eq(tokenToString(@intFromEnum(Token.eql)), "==")
-    @assert_eq(tokenToString(@intFromEnum(Token.eof)), "EOF")
+    var tok = Token.add
+    @assert_eq(tok.toString(), "+")
+    @assert_eq(Token.kw_fn.toString(), "fn")
+    @assert_eq(Token.eql.toString(), "==")
+    @assert_eq(Token.eof.toString(), "EOF")
 }
 
 test "keyword lookup" {
     var kw = initKeywords()
-    @assert_eq(lookupKeyword(&kw, "fn"), @intFromEnum(Token.kw_fn))
-    @assert_eq(lookupKeyword(&kw, "var"), @intFromEnum(Token.kw_var))
-    @assert_eq(lookupKeyword(&kw, "and"), @intFromEnum(Token.kw_and))
-    @assert_eq(lookupKeyword(&kw, "i64"), @intFromEnum(Token.kw_i64))
-    @assert_eq(lookupKeyword(&kw, "notakeyword"), @intFromEnum(Token.ident))
-    @assert_eq(lookupKeyword(&kw, "main"), @intFromEnum(Token.ident))
+    @assert_eq(lookupKeyword(&kw, "fn"), Token.kw_fn)
+    @assert_eq(lookupKeyword(&kw, "var"), Token.kw_var)
+    @assert_eq(lookupKeyword(&kw, "and"), Token.kw_and)
+    @assert_eq(lookupKeyword(&kw, "i64"), Token.kw_i64)
+    @assert_eq(lookupKeyword(&kw, "notakeyword"), Token.ident)
+    @assert_eq(lookupKeyword(&kw, "main"), Token.ident)
 }
 
 test "precedence" {
-    @assert_eq(precedence(@intFromEnum(Token.mul)), 6)
-    @assert_eq(precedence(@intFromEnum(Token.add)), 5)
-    @assert_eq(precedence(@intFromEnum(Token.eql)), 4)
-    @assert_eq(precedence(@intFromEnum(Token.kw_and)), 3)
-    @assert_eq(precedence(@intFromEnum(Token.kw_or)), 2)
-    @assert_eq(precedence(@intFromEnum(Token.kw_orelse)), 1)
-    @assert_eq(precedence(@intFromEnum(Token.lparen)), 0)
+    @assert_eq(Token.mul.precedence(), 6)
+    @assert_eq(Token.add.precedence(), 5)
+    @assert_eq(Token.eql.precedence(), 4)
+    @assert_eq(Token.kw_and.precedence(), 3)
+    @assert_eq(Token.kw_or.precedence(), 2)
+    @assert_eq(Token.kw_orelse.precedence(), 1)
+    @assert_eq(Token.lparen.precedence(), 0)
 }
 
 test "isLiteral" {
-    @assert_eq(isLiteral(@intFromEnum(Token.ident)), true)
-    @assert_eq(isLiteral(@intFromEnum(Token.int_lit)), true)
-    @assert_eq(isLiteral(@intFromEnum(Token.string_lit)), true)
-    @assert_eq(isLiteral(@intFromEnum(Token.add)), false)
-    @assert_eq(isLiteral(@intFromEnum(Token.kw_fn)), false)
+    @assert_eq(Token.ident.isLiteral(), true)
+    @assert_eq(Token.int_lit.isLiteral(), true)
+    @assert_eq(Token.string_lit.isLiteral(), true)
+    @assert_eq(Token.add.isLiteral(), false)
+    @assert_eq(Token.kw_fn.isLiteral(), false)
 }
 
 test "isOperator" {
-    @assert_eq(isOperator(@intFromEnum(Token.add)), true)
-    @assert_eq(isOperator(@intFromEnum(Token.eql)), true)
-    @assert_eq(isOperator(@intFromEnum(Token.lparen)), true)
-    @assert_eq(isOperator(@intFromEnum(Token.ident)), false)
-    @assert_eq(isOperator(@intFromEnum(Token.kw_fn)), false)
+    @assert_eq(Token.add.isOperator(), true)
+    @assert_eq(Token.eql.isOperator(), true)
+    @assert_eq(Token.lparen.isOperator(), true)
+    @assert_eq(Token.ident.isOperator(), false)
+    @assert_eq(Token.kw_fn.isOperator(), false)
 }
 
 test "isKeyword" {
-    @assert_eq(isKeyword(@intFromEnum(Token.kw_fn)), true)
-    @assert_eq(isKeyword(@intFromEnum(Token.kw_and)), true)
-    @assert_eq(isKeyword(@intFromEnum(Token.kw_i64)), true)
-    @assert_eq(isKeyword(@intFromEnum(Token.add)), false)
-    @assert_eq(isKeyword(@intFromEnum(Token.ident)), false)
+    @assert_eq(Token.kw_fn.isKeyword(), true)
+    @assert_eq(Token.kw_and.isKeyword(), true)
+    @assert_eq(Token.kw_i64.isKeyword(), true)
+    @assert_eq(Token.add.isKeyword(), false)
+    @assert_eq(Token.ident.isKeyword(), false)
 }
 
 test "isAssignment" {
-    @assert_eq(isAssignment(@intFromEnum(Token.assign)), true)
-    @assert_eq(isAssignment(@intFromEnum(Token.add_assign)), true)
-    @assert_eq(isAssignment(@intFromEnum(Token.add)), false)
-    @assert_eq(isAssignment(@intFromEnum(Token.eql)), false)
+    @assert_eq(Token.assign.isAssignment(), true)
+    @assert_eq(Token.add_assign.isAssignment(), true)
+    @assert_eq(Token.add.isAssignment(), false)
+    @assert_eq(Token.eql.isAssignment(), false)
+}
+
+test "string method via switch shorthand" {
+    var tok = Token.arrow
+    @assert_eq(tok.toString(), "->")
+    @assert_eq(Token.fat_arrow.toString(), "=>")
+    @assert_eq(Token.question.toString(), "?")
 }
