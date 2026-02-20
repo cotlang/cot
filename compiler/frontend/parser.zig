@@ -272,18 +272,19 @@ pub const Parser = struct {
         var params = try self.parseFieldList(.rparen);
         if (!self.expect(.rparen)) return null;
 
-        // @safe implicit self: In safe-mode non-generic impl blocks, inject `self: *TypeName`
-        // if the first param is not already named "self"
+        // @safe implicit self: In safe-mode non-generic impl blocks, inject `self: TypeName`
+        // if the first param is not already named "self".
+        // The checker's safeWrapType will upgrade struct types to *TypeName automatically;
+        // enum types stay as value receivers (Zig pattern: self: Token, not self: *Token).
         if (self.safe_mode and self.current_impl_type != null and !self.current_impl_is_generic) {
             const needs_self = params.len == 0 or !std.mem.eql(u8, params[0].name, "self");
             if (needs_self) {
                 const impl_type = self.current_impl_type.?;
-                // Create *TypeName type expression: pointer to named type
+                // Create TypeName type expression (value receiver — safeWrapType adds pointer for structs)
                 const named_type = try self.tree.addExpr(.{ .type_expr = .{ .kind = .{ .named = impl_type }, .span = Span.init(start, start) } });
-                const ptr_type = try self.tree.addExpr(.{ .type_expr = .{ .kind = .{ .pointer = named_type }, .span = Span.init(start, start) } });
                 // Prepend self param
                 var new_params = try self.allocator.alloc(ast.Field, params.len + 1);
-                new_params[0] = .{ .name = "self", .type_expr = ptr_type, .default_value = null_node, .span = Span.init(start, start) };
+                new_params[0] = .{ .name = "self", .type_expr = named_type, .default_value = null_node, .span = Span.init(start, start) };
                 @memcpy(new_params[1..], params);
                 params = new_params;
             }
@@ -383,11 +384,14 @@ pub const Parser = struct {
             // Zig-style enum: const Color = enum { Red, Green, Blue }
             if (self.check(.kw_enum)) {
                 const peek = self.peekToken();
-                if (peek.tok == .lbrace or peek.tok == .colon) {
+                if (peek.tok == .lbrace or peek.tok == .colon or peek.tok == .lparen) {
                     // Reuse parseEnumDecl logic: name already captured, advance past 'enum'
                     self.advance(); // consume 'enum'
                     var backing_type: NodeIndex = null_node;
-                    if (self.match(.colon)) backing_type = try self.parseType() orelse null_node;
+                    if (self.match(.lparen)) {
+                        backing_type = try self.parseType() orelse null_node;
+                        if (!self.expect(.rparen)) return null;
+                    } else if (self.match(.colon)) backing_type = try self.parseType() orelse null_node;
                     if (!self.expect(.lbrace)) return null;
                     var enum_variants = std.ArrayListUnmanaged(ast.EnumVariant){};
                     defer enum_variants.deinit(self.allocator);
@@ -596,7 +600,10 @@ pub const Parser = struct {
         const name = self.tok.text;
         self.advance();
         var backing_type: NodeIndex = null_node;
-        if (self.match(.colon)) backing_type = try self.parseType() orelse null_node;
+        if (self.match(.lparen)) {
+            backing_type = try self.parseType() orelse null_node;
+            if (!self.expect(.rparen)) return null;
+        } else if (self.match(.colon)) backing_type = try self.parseType() orelse null_node;
         if (!self.expect(.lbrace)) return null;
 
         var variants = std.ArrayListUnmanaged(ast.EnumVariant){};
@@ -1660,6 +1667,46 @@ pub const Parser = struct {
         // Destructuring: const a, b = expr  OR  const a: i64, b: i64 = expr
         if (self.check(.comma)) {
             return try self.parseDestructureStmt(name, type_expr, name_start, start, is_const);
+        }
+
+        // Check for inline type declarations: const Name = enum { ... } or const Name = enum(u8) { ... }
+        if (is_const and self.check(.assign)) {
+            const saved_tok = self.tok;
+            const saved_peek = self.peek_tok;
+            const saved_scan_pos = self.scan.pos;
+            const saved_scan_ch = self.scan.ch;
+            self.advance(); // consume '='
+            if (self.check(.kw_enum)) {
+                const peek = self.peekToken();
+                if (peek.tok == .lbrace or peek.tok == .colon or peek.tok == .lparen) {
+                    self.advance(); // consume 'enum'
+                    var backing_type: NodeIndex = null_node;
+                    if (self.match(.lparen)) {
+                        backing_type = try self.parseType() orelse null_node;
+                        if (!self.expect(.rparen)) return null;
+                    } else if (self.match(.colon)) backing_type = try self.parseType() orelse null_node;
+                    if (!self.expect(.lbrace)) return null;
+                    var enum_variants = std.ArrayListUnmanaged(ast.EnumVariant){};
+                    defer enum_variants.deinit(self.allocator);
+                    while (!self.check(.rbrace) and !self.check(.eof)) {
+                        const var_start = self.pos();
+                        if (!self.check(.ident)) break;
+                        const var_name = self.tok.text;
+                        self.advance();
+                        var value: NodeIndex = null_node;
+                        if (self.match(.assign)) value = try self.parseExpr() orelse break;
+                        try enum_variants.append(self.allocator, .{ .name = var_name, .value = value, .span = Span.init(var_start, self.pos()) });
+                        if (!self.match(.comma)) break;
+                    }
+                    if (!self.expect(.rbrace)) return null;
+                    return try self.tree.addDecl(.{ .enum_decl = .{ .name = name, .backing_type = backing_type, .variants = try self.allocator.dupe(ast.EnumVariant, enum_variants.items), .doc_comment = "", .span = Span.init(start, self.pos()) } });
+                }
+            }
+            // Not a type declaration, restore state
+            self.tok = saved_tok;
+            self.peek_tok = saved_peek;
+            self.scan.pos = saved_scan_pos;
+            self.scan.ch = saved_scan_ch;
         }
 
         var val: NodeIndex = null_node;

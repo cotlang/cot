@@ -71,6 +71,8 @@ pub const Lowerer = struct {
     current_switch_enum_type: TypeIndex = types.invalid_type,
     /// Comptime structured value bindings — for inline for over comptime arrays (Phase 5)
     comptime_value_vars: std.StringHashMap(comptime_mod.ComptimeValue),
+    /// Global (top-level) comptime values — persists across functions, not cleared per-function.
+    global_comptime_values: std.StringHashMap(comptime_mod.ComptimeValue),
 
     pub const Error = error{OutOfMemory};
 
@@ -115,6 +117,7 @@ pub const Lowerer = struct {
             .global_error_table = std.StringHashMap(i64).init(allocator),
             .async_poll_names = std.StringHashMap([]const u8).init(allocator),
             .comptime_value_vars = std.StringHashMap(comptime_mod.ComptimeValue).init(allocator),
+            .global_comptime_values = std.StringHashMap(comptime_mod.ComptimeValue).init(allocator),
         };
     }
 
@@ -143,6 +146,7 @@ pub const Lowerer = struct {
         self.bench_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
         self.comptime_value_vars.deinit();
+        self.global_comptime_values.deinit();
         self.builder.deinit();
     }
 
@@ -157,6 +161,7 @@ pub const Lowerer = struct {
         self.bench_display_names.deinit(self.allocator);
         self.lowered_generics.deinit();
         self.comptime_value_vars.deinit();
+        self.global_comptime_values.deinit();
     }
 
     pub fn lower(self: *Lowerer) !ir.IR {
@@ -691,6 +696,21 @@ pub const Lowerer = struct {
                     try self.float_const_values.put(var_decl.name, fval);
                     try self.float_const_types.put(var_decl.name, type_idx);
                     return;
+                }
+            }
+            // Comptime block producing structured values (arrays, strings).
+            // Store in global_comptime_values — persists across functions (not cleared per-function).
+            // Materialized on-demand when accessed in lowerIndex/lowerIdent.
+            if (var_decl.value != null_node) {
+                const val_node = self.tree.getNode(var_decl.value);
+                const val_expr = if (val_node) |n| n.asExpr() else null;
+                if (val_expr) |ve| {
+                    if (ve == .comptime_block) {
+                        if (self.chk.evalComptimeValue(var_decl.value)) |cv| {
+                            try self.global_comptime_values.put(var_decl.name, cv);
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -1452,8 +1472,8 @@ pub const Lowerer = struct {
                     try self.comptime_value_vars.put(var_stmt.name, cv);
                     if (cv == .array) {
                         // Materialize comptime array into local variable's stack memory.
-                        // Int/bool arrays: store each element via StoreIndexLocal (elem_size=8).
-                        // String arrays not yet supported for runtime indexing (SSA compound limitation).
+                        // Element size must match sizeOf(elem_type): 8 for int/bool, 24 for string.
+                        // STRING is internally a slice type (ptr+len+cap = 24 bytes).
                         for (cv.array.elements.items, 0..) |elem, i| {
                             const idx_node = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, var_stmt.span);
                             switch (elem) {
@@ -1465,13 +1485,32 @@ pub const Lowerer = struct {
                                     const val_node = try fb.emitConstInt(if (b) 1 else 0, TypeRegistry.I64, var_stmt.span);
                                     _ = try fb.emitStoreIndexLocal(local_idx, idx_node, val_node, 8, var_stmt.span);
                                 },
+                                .string => |s| {
+                                    // String elements: emit as string literal, store with elem_size=24.
+                                    // STRING = slice(U8), sizeOf=24 (ptr+len+cap). Store decomposes to ptr@0, len@8.
+                                    // Cap@16 left as zero from memset_zero initialization.
+                                    const copied = try self.allocator.dupe(u8, s);
+                                    const str_idx = try fb.addStringLiteral(copied);
+                                    const str_node = try fb.emitConstSlice(str_idx, var_stmt.span);
+                                    _ = try fb.emitStoreIndexLocal(local_idx, idx_node, str_node, self.type_reg.sizeOf(TypeRegistry.STRING), var_stmt.span);
+                                },
                                 else => {},
                             }
                         }
                     } else {
                         const result_node = try self.emitComptimeValue(cv, var_stmt.span);
                         if (result_node != ir.null_node) {
-                            _ = try fb.emitStoreLocal(local_idx, result_node, var_stmt.span);
+                            // String values need compound decomposition (ptr+len), same as lowerStringInit.
+                            // emitStoreLocal does a single store which doesn't decompose STRING → (ptr@0, len@8).
+                            if (cv == .string) {
+                                const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+                                const ptr_val = try fb.emitSlicePtr(result_node, ptr_type, var_stmt.span);
+                                const len_val = try fb.emitSliceLen(result_node, var_stmt.span);
+                                _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, var_stmt.span);
+                                _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, var_stmt.span);
+                            } else {
+                                _ = try fb.emitStoreLocal(local_idx, result_node, var_stmt.span);
+                            }
                         }
                     }
                     return;
@@ -2963,7 +3002,7 @@ pub const Lowerer = struct {
     fn lowerIdent(self: *Lowerer, ident: ast.Ident) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
         // Check comptime value vars first (for inline for over comptime arrays)
-        if (self.comptime_value_vars.get(ident.name)) |cv| {
+        if (self.lookupComptimeValue(ident.name)) |cv| {
             return try self.emitComptimeValue(cv, ident.span);
         }
         if (self.const_values.get(ident.name)) |value| return try fb.emitConstInt(value, TypeRegistry.I64, ident.span);
@@ -3452,13 +3491,15 @@ pub const Lowerer = struct {
 
         // Comptime array indexing: resolve from lowerer's comptime_value_vars map.
         // If base is a known comptime array and index is comptime-known, emit element directly.
+        // If index is runtime, materialize the array and emit indexed load.
         {
             const base_node = self.tree.getNode(idx.base);
             const base_expr = if (base_node) |n| n.asExpr() else null;
             if (base_expr) |be| {
                 if (be == .ident) {
-                    if (self.comptime_value_vars.get(be.ident.name)) |base_cv| {
+                    if (self.lookupComptimeValue(be.ident.name)) |base_cv| {
                         if (base_cv == .array) {
+                            // Try comptime index first (direct element emission)
                             if (self.chk.evalComptimeValue(idx.idx)) |iv| {
                                 if (iv.asInt()) |i_val| {
                                     if (i_val >= 0 and i_val < @as(i64, @intCast(base_cv.array.elements.items.len))) {
@@ -3467,6 +3508,13 @@ pub const Lowerer = struct {
                                     }
                                 }
                             }
+                            // Dynamic index: materialize array, then emit indexed load.
+                            const base_ptr = try self.emitComptimeArray(base_cv.array, idx.span);
+                            const index_node = try self.lowerExprNode(idx.idx);
+                            const first = base_cv.array.elements.items[0];
+                            const elem_size: u32 = if (first == .string) @intCast(self.type_reg.sizeOf(TypeRegistry.STRING)) else 8;
+                            const elem_type: TypeIndex = if (first == .string) TypeRegistry.STRING else TypeRegistry.I64;
+                            return try fb.emitIndexValue(base_ptr, index_node, elem_size, elem_type, idx.span);
                         }
                     }
                 }
@@ -4278,6 +4326,16 @@ pub const Lowerer = struct {
         const subject = try self.lowerExprNode(se.subject);
         const merge_block = try fb.newBlock("switch.end");
 
+        // String switch: pre-extract ptr/len for content comparison (same as lowerBinary line 3060)
+        const is_string_switch = subject_type == TypeRegistry.STRING;
+        var subject_ptr: ir.NodeIndex = ir.null_node;
+        var subject_len: ir.NodeIndex = ir.null_node;
+        if (is_string_switch) {
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            subject_ptr = try fb.emitSlicePtr(subject, ptr_type, se.span);
+            subject_len = try fb.emitSliceLen(subject, se.span);
+        }
+
         var i: usize = 0;
         while (i < se.cases.len) : (i += 1) {
             const case = se.cases[i];
@@ -4295,7 +4353,16 @@ pub const Lowerer = struct {
                 for (case.patterns) |pattern_idx| {
                     // Error literal pattern: resolve to variant index for comparison
                     const pattern_val = try self.resolveErrorPatternOrLower(pattern_idx, se.span);
-                    const pattern_cond = try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, se.span);
+                    const pattern_cond = if (is_string_switch) blk: {
+                        // String comparison: decompose pattern and call cot_string_eq
+                        const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                        const p_ptr = try fb.emitSlicePtr(pattern_val, ptr_type, se.span);
+                        const p_len = try fb.emitSliceLen(pattern_val, se.span);
+                        var eq_args = [_]ir.NodeIndex{ subject_ptr, subject_len, p_ptr, p_len };
+                        const eq_result = try fb.emitCall("cot_string_eq", &eq_args, false, TypeRegistry.I64, se.span);
+                        const zero = try fb.emitConstInt(0, TypeRegistry.I64, se.span);
+                        break :blk try fb.emitBinary(.ne, eq_result, zero, TypeRegistry.BOOL, se.span);
+                    } else try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, se.span);
                     case_cond = if (case_cond == ir.null_node) pattern_cond else try fb.emitBinary(.@"or", case_cond, pattern_cond, TypeRegistry.BOOL, se.span);
                 }
             }
@@ -4444,6 +4511,17 @@ pub const Lowerer = struct {
         if (self.type_reg.get(sel_subject_type) == .enum_type) self.current_switch_enum_type = sel_subject_type;
         defer self.current_switch_enum_type = old_switch_enum;
         const subject = try self.lowerExprNode(se.subject);
+
+        // String switch: pre-extract ptr/len for content comparison (same as lowerBinary line 3060)
+        const is_string_switch = sel_subject_type == TypeRegistry.STRING;
+        var subject_ptr: ir.NodeIndex = ir.null_node;
+        var subject_len: ir.NodeIndex = ir.null_node;
+        if (is_string_switch) {
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            subject_ptr = try fb.emitSlicePtr(subject, ptr_type, se.span);
+            subject_len = try fb.emitSliceLen(subject, se.span);
+        }
+
         var result = if (se.else_body != null_node) try self.lowerExprNode(se.else_body) else try fb.emitConstNull(result_type, se.span);
         // noreturn else arm (e.g., else => unreachable): use a placeholder that gets overwritten
         if (result == ir.null_node) result = try fb.emitConstInt(0, result_type, se.span);
@@ -4463,7 +4541,16 @@ pub const Lowerer = struct {
             } else {
                 for (case.patterns) |pattern_idx| {
                     const pattern_val = try self.resolveErrorPatternOrLower(pattern_idx, se.span);
-                    const pattern_cond = try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, se.span);
+                    const pattern_cond = if (is_string_switch) blk: {
+                        // String comparison: decompose pattern and call cot_string_eq
+                        const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                        const p_ptr = try fb.emitSlicePtr(pattern_val, ptr_type, se.span);
+                        const p_len = try fb.emitSliceLen(pattern_val, se.span);
+                        var eq_args = [_]ir.NodeIndex{ subject_ptr, subject_len, p_ptr, p_len };
+                        const eq_result = try fb.emitCall("cot_string_eq", &eq_args, false, TypeRegistry.I64, se.span);
+                        const zero = try fb.emitConstInt(0, TypeRegistry.I64, se.span);
+                        break :blk try fb.emitBinary(.ne, eq_result, zero, TypeRegistry.BOOL, se.span);
+                    } else try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, se.span);
                     case_cond = if (case_cond == ir.null_node) pattern_cond else try fb.emitBinary(.@"or", case_cond, pattern_cond, TypeRegistry.BOOL, se.span);
                 }
             }
@@ -6147,7 +6234,7 @@ pub const Lowerer = struct {
         const base_node = self.tree.getNode(fa.base) orelse return null;
         const base_expr = base_node.asExpr() orelse return null;
         if (base_expr != .ident) return null;
-        const cv = self.comptime_value_vars.get(base_expr.ident.name) orelse return null;
+        const cv = self.lookupComptimeValue(base_expr.ident.name) orelse return null;
         return switch (cv) {
             .enum_field => |ef| {
                 if (std.mem.eql(u8, fa.field, "name")) return comptime_mod.ComptimeValue{ .string = ef.name };
@@ -6189,25 +6276,15 @@ pub const Lowerer = struct {
     }
 
     /// Emit a comptime array as static data in linear memory.
-    /// For integer/bool arrays: allocate memory and store each element.
-    /// For string arrays: emit a placeholder (string arrays are resolved at index sites via comptime evaluation).
+    /// Allocates heap memory and stores each element at the correct byte offset.
+    /// Element size: 8 for int/bool, sizeOf(STRING)=24 for string (slice: ptr+len+cap).
     fn emitComptimeArray(self: *Lowerer, arr: comptime_mod.ComptimeValue.ComptimeArray, span: Span) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
         const elem_count = arr.elements.items.len;
         if (elem_count == 0) return try fb.emitConstInt(0, TypeRegistry.I64, span);
 
         const first = arr.elements.items[0];
-
-        // String arrays: can't emit as runtime data easily (compound type SSA issue).
-        // Instead, string array elements are resolved at index sites via comptime evaluation.
-        // Emit a placeholder value — runtime dynamic indexing of comptime string arrays
-        // is not yet supported (requires static data segment layout).
-        if (first == .string) {
-            return try fb.emitConstInt(0, TypeRegistry.I64, span);
-        }
-
-        // Integer/bool arrays: allocate memory and store each element (8 bytes each)
-        const elem_size: i64 = 8;
+        const elem_size: i64 = if (first == .string) @intCast(self.type_reg.sizeOf(TypeRegistry.STRING)) else 8;
         const total_size = elem_size * @as(i64, @intCast(elem_count));
 
         const size_node = try fb.emitConstInt(total_size, TypeRegistry.I64, span);
@@ -6225,6 +6302,16 @@ pub const Lowerer = struct {
                     const val_node = try fb.emitConstInt(if (b) 1 else 0, TypeRegistry.I64, span);
                     _ = try fb.emitStoreField(base_ptr, @intCast(i), byte_offset, val_node, span);
                 },
+                .string => |s| {
+                    // String: emit as literal, store ptr@offset and len@offset+8
+                    const copied = try self.allocator.dupe(u8, s);
+                    const str_idx = try fb.addStringLiteral(copied);
+                    const str_node = try fb.emitConstSlice(str_idx, span);
+                    const ptr_node = try fb.emitSlicePtr(str_node, TypeRegistry.I64, span);
+                    const len_node = try fb.emitSliceLen(str_node, span);
+                    _ = try fb.emitStoreField(base_ptr, @intCast(2 * i), byte_offset, ptr_node, span);
+                    _ = try fb.emitStoreField(base_ptr, @intCast(2 * i + 1), byte_offset + 8, len_node, span);
+                },
                 else => {},
             }
         }
@@ -6239,6 +6326,11 @@ pub const Lowerer = struct {
         const v = expr.literal.value;
         if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') return v[1 .. v.len - 1];
         return v;
+    }
+
+    /// Look up a comptime value by name — checks function-local vars first, then globals.
+    fn lookupComptimeValue(self: *Lowerer, name: []const u8) ?comptime_mod.ComptimeValue {
+        return self.comptime_value_vars.get(name) orelse self.global_comptime_values.get(name);
     }
 
     /// Emit a bounds check: if index >= length, print Go-style panic message and exit.

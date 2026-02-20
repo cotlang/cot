@@ -282,7 +282,25 @@ pub const Scanner = struct {
         const tok: Token = switch (c) {
             '(' => .lparen, ')' => .rparen, '[' => .lbrack, ']' => .rbrack,
             '{' => .lbrace, '}' => .rbrace, ',' => .comma, ';' => .semicolon,
-            ':' => .colon, '~' => .not, '@' => .at,
+            ':' => .colon, '~' => .not,
+            '@' => if (self.ch == '"') {
+                // @"..." quoted identifier (Zig pattern: use keywords as identifiers)
+                self.advance(); // consume opening "
+                const text_start = self.pos.offset;
+                var terminated = false;
+                while (self.ch) |cc| {
+                    if (cc == '"') { terminated = true; break; }
+                    if (cc == '\n') break; // Zig rejects newlines in quoted identifiers
+                    self.advance();
+                }
+                const ident_text = self.src.content[text_start..self.pos.offset];
+                if (terminated) {
+                    self.advance(); // consume closing "
+                } else {
+                    self.errorAt(start, .e100, "quoted identifier not terminated");
+                }
+                return .{ .tok = .ident, .span = Span.init(start, self.pos), .text = ident_text };
+            } else .at,
             '+' => if (self.ch == '=') blk: { self.advance(); break :blk .add_assign; } else .add,
             '-' => if (self.ch == '=') blk: { self.advance(); break :blk .sub_assign; } else if (self.ch == '>') blk: { self.advance(); break :blk .arrow; } else .sub,
             '*' => if (self.ch == '=') blk: { self.advance(); break :blk .mul_assign; } else .mul,

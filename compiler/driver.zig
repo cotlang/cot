@@ -68,6 +68,7 @@ pub const Driver = struct {
     bench_filter: ?[]const u8 = null,
     bench_n: ?i64 = null,
     release_mode: bool = false,
+    project_safe: ?bool = null, // cached cot.json "safe" field, loaded lazily
     // Debug info: source file/text and IR funcs for DWARF generation
     debug_source_file: []const u8 = "",
     debug_source_text: []const u8 = "",
@@ -103,6 +104,21 @@ pub const Driver = struct {
 
     pub fn setBenchN(self: *Driver, n: i64) void {
         self.bench_n = n;
+    }
+
+    /// Lazily load and cache the project-level @safe flag from cot.json.
+    fn isProjectSafe(self: *Driver) bool {
+        if (self.project_safe) |s| return s;
+        const maybe_loaded = project_mod.loadConfig(self.allocator, null) catch null;
+        if (maybe_loaded) |loaded_val| {
+            var loaded = loaded_val;
+            defer loaded.deinit();
+            const safe = loaded.value().safe orelse false;
+            self.project_safe = safe;
+            return safe;
+        }
+        self.project_safe = false;
+        return false;
     }
 
     /// Type-check a source file without compiling (supports imports).
@@ -503,6 +519,8 @@ pub const Driver = struct {
         errdefer tree.deinit();
         var scan = scanner_mod.Scanner.initWithErrors(&src, &err_reporter);
         var parser = parser_mod.Parser.init(self.allocator, &scan, &tree, &err_reporter);
+        // Project-level @safe: set parser safe_mode BEFORE parsing so syntax features work
+        if (self.isProjectSafe()) parser.safe_mode = true;
         try parser.parseFile();
         if (err_reporter.hasErrors()) return error.ParseError;
 
@@ -775,7 +793,6 @@ pub const Driver = struct {
                 if (op.toBasicOperator()) |basic| {
                     try basic_ops.append(self.allocator, basic);
                 }
-                // Skip unsupported ops for now (memory, calls, etc.)
             }
 
             // Translate to CLIF

@@ -1039,6 +1039,27 @@ pub fn VCode(comptime I: type) type {
                         const enc: u32 = 0xf81f0fe0 | @as(u32, rt);
                         try buffer.put4(enc);
                     }
+
+                    // Allocate stack space for spill slots (below callee-saves)
+                    // Port of Cranelift's gen_clobber_save stack frame allocation.
+                    // Without this, spill slot stores [sp, #N] overlap the callee-save area.
+                    const aligned_frame_size = (frame_size + 15) & ~@as(u32, 15);
+                    if (aligned_frame_size > 0) {
+                        if (aligned_frame_size <= 4095) {
+                            // sub sp, sp, #imm
+                            const sub_enc: u32 = 0xd10003ff | (@as(u32, aligned_frame_size) << 10);
+                            try buffer.put4(sub_enc);
+                        } else {
+                            // Large frame: movz x16, #lo; movk x16, #hi, lsl #16; sub sp, sp, x16
+                            const lo: u32 = aligned_frame_size & 0xFFFF;
+                            const hi: u32 = (aligned_frame_size >> 16) & 0xFFFF;
+                            try buffer.put4(0xd2800010 | (lo << 5)); // movz x16, #lo
+                            if (hi > 0) {
+                                try buffer.put4(0xf2a00010 | (hi << 5)); // movk x16, #hi, lsl #16
+                            }
+                            try buffer.put4(0xcb1003ff); // sub sp, sp, x16
+                        }
+                    }
                 }
             }
 
@@ -1128,7 +1149,26 @@ pub fn VCode(comptime I: type) type {
                             }
                             if (needs_frame and is_term_ret) {
                                 if (is_aarch64) {
-                                    // ARM64 epilogue: restore clobbered regs then FP/LR
+                                    // ARM64 epilogue: deallocate spill slot space first
+                                    const aligned_frame_size = (frame_size + 15) & ~@as(u32, 15);
+                                    if (aligned_frame_size > 0) {
+                                        if (aligned_frame_size <= 4095) {
+                                            // add sp, sp, #imm
+                                            const add_enc: u32 = 0x910003ff | (@as(u32, aligned_frame_size) << 10);
+                                            try buffer.put4(add_enc);
+                                        } else {
+                                            // Large frame: movz x16, #lo; movk x16, #hi, lsl #16; add sp, sp, x16
+                                            const lo: u32 = aligned_frame_size & 0xFFFF;
+                                            const hi: u32 = (aligned_frame_size >> 16) & 0xFFFF;
+                                            try buffer.put4(0xd2800010 | (lo << 5)); // movz x16, #lo
+                                            if (hi > 0) {
+                                                try buffer.put4(0xf2a00010 | (hi << 5)); // movk x16, #hi, lsl #16
+                                            }
+                                            try buffer.put4(0x8b1003ff); // add sp, sp, x16
+                                        }
+                                    }
+
+                                    // Restore clobbered regs then FP/LR
                                     // Handle odd register first if present
                                     if (num_clobbered > 0 and num_clobbered % 2 == 1) {
                                         const rt = clobbered_regs[num_clobbered - 1];

@@ -1294,6 +1294,36 @@ pub const Checker = struct {
                     }
                     return 0;
                 }
+                // @intFromEnum(e) — comptime when arg resolves to enum variant value
+                // Zig Sema.zig:8420 — evaluate to backing integer at comptime.
+                if (bc.kind == .int_from_enum) {
+                    if (self.evalConstExpr(bc.args[0])) |v| return v;
+                    return null;
+                }
+                // @enumLen(T) — comptime, returns number of enum variants
+                if (bc.kind == .enum_len) {
+                    const type_idx = self.resolveTypeExpr(bc.type_arg) catch return null;
+                    if (type_idx == invalid_type) return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .enum_type) return @intCast(info.enum_type.variants.len);
+                    return null;
+                }
+                return null;
+            },
+            // Enum field access: Color.Red → integer variant value
+            // Zig Sema.zig: enum values are comptime-known when accessed as Type.field.
+            .field_access => |fa| {
+                const base_node = self.tree.getNode(fa.base) orelse return null;
+                const base_expr = base_node.asExpr() orelse return null;
+                if (base_expr == .ident) {
+                    const type_idx = self.types.lookupByName(base_expr.ident.name) orelse return null;
+                    const info = self.types.get(type_idx);
+                    if (info == .enum_type) {
+                        for (info.enum_type.variants) |v| {
+                            if (std.mem.eql(u8, v.name, fa.field)) return @intCast(v.value);
+                        }
+                    }
+                }
                 return null;
             },
             // Comptime if-expression: fold when condition is comptime-known
@@ -2526,8 +2556,10 @@ pub const Checker = struct {
         const old_switch_enum = self.current_switch_enum_type;
         if (is_enum) self.current_switch_enum_type = subject_type;
         defer self.current_switch_enum_type = old_switch_enum;
-        var result_type: TypeIndex = TypeRegistry.VOID;
-        var first = true;
+        // Zig result location: if expected_type is set (e.g. from return type), use it
+        // so untyped literals in arms materialize to the expected type, not i64.
+        var result_type: TypeIndex = if (self.expected_type != invalid_type) self.expected_type else TypeRegistry.VOID;
+        var first = self.expected_type != invalid_type; // skip first-arm inference if expected type is known
         for (se.cases) |case| {
             // Range patterns: check both start and end are valid expressions
             for (case.patterns) |val_idx| _ = try self.checkExpr(val_idx);
@@ -2544,10 +2576,10 @@ pub const Checker = struct {
                 try capture_scope.define(Symbol.init(case.capture, .variable, payload_type, ast.null_node, false));
                 const body_type = try self.checkExpr(case.body);
                 self.scope = old_scope;
-                if (first) { result_type = self.materializeType(body_type); first = false; }
+                if (!first) { result_type = self.materializeType(body_type); first = true; }
             } else {
                 const body_type = try self.checkExpr(case.body);
-                if (first) { result_type = self.materializeType(body_type); first = false; }
+                if (!first) { result_type = self.materializeType(body_type); first = true; }
             }
         }
         if (se.else_body != null_node) _ = try self.checkExpr(se.else_body);
@@ -3120,7 +3152,12 @@ pub const Checker = struct {
             .array => |a| blk: {
                 const elem = try self.resolveTypeExpr(a.elem);
                 const size_expr = (self.tree.getNode(a.size) orelse break :blk invalid_type).asExpr() orelse break :blk invalid_type;
-                const size: u64 = if (size_expr == .literal and size_expr.literal.kind == .int) std.fmt.parseInt(u64, size_expr.literal.value, 0) catch 0 else 0;
+                const size: u64 = if (size_expr == .literal and size_expr.literal.kind == .int)
+                    std.fmt.parseInt(u64, size_expr.literal.value, 0) catch 0
+                else if (self.evalConstExpr(a.size)) |v|
+                    if (v > 0) @as(u64, @intCast(v)) else 0
+                else
+                    0;
                 break :blk try self.types.makeArray(elem, size);
             },
             .map => |m| self.types.makeMap(try self.resolveTypeExpr(m.key), try self.resolveTypeExpr(m.value)),

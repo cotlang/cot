@@ -3215,3 +3215,93 @@ test "comptime string array from typeInfo" {
     @assert_eq(names[1], "Green")
     @assert_eq(names[2], "Blue")
 }
+
+// ============================================================================
+// Quoted identifiers (@"keyword")
+// ============================================================================
+
+const QuotedOp = enum { @"and", @"or", @"not", add }
+
+test "quoted identifier enum variant" {
+    @assert_eq(@intFromEnum(QuotedOp.@"and"), 0)
+    @assert_eq(@intFromEnum(QuotedOp.@"or"), 1)
+    @assert_eq(@intFromEnum(QuotedOp.@"not"), 2)
+    @assert_eq(@intFromEnum(QuotedOp.add), 3)
+}
+
+test "quoted ident in switch" {
+    var op = QuotedOp.@"and"
+    var result = switch (op) {
+        .@"and" => 10,
+        .@"or" => 20,
+        .@"not" => 30,
+        .add => 40,
+        else => 0,
+    }
+    @assert_eq(result, 10)
+}
+
+test "quoted ident typeInfo name" {
+    @assert_eq(@typeInfo(QuotedOp).fields[0].name, "and")
+    @assert_eq(@typeInfo(QuotedOp).fields[1].name, "or")
+    @assert_eq(@typeInfo(QuotedOp).fields[2].name, "not")
+}
+
+// ============================================================================
+// Enum backing type — enum(u8) syntax
+// ============================================================================
+
+const BackedColor = enum(u8) { Red, Green, Blue }
+const BackedStatus = enum(u16) { Ok = 200, NotFound = 404 }
+
+test "enum backing type u8" {
+    @assert_eq(@intFromEnum(BackedColor.Red), 0)
+    @assert_eq(@intFromEnum(BackedColor.Blue), 2)
+}
+
+test "enum backing type with values" {
+    @assert_eq(@intFromEnum(BackedStatus.Ok), 200)
+    @assert_eq(@intFromEnum(BackedStatus.NotFound), 404)
+}
+
+// ============================================================================
+// String switch expression
+// ============================================================================
+
+test "string switch expression" {
+    const result = switch ("hello") {
+        "hello" => 1,
+        "world" => 2,
+        else => 0,
+    }
+    @assert_eq(result, 1)
+}
+
+test "string switch no match" {
+    const result = switch ("unknown") {
+        "hello" => 1,
+        else => 0,
+    }
+    @assert_eq(result, 0)
+}
+
+test "string switch statement" {
+    var x: i64 = 0
+    var name = "fn"
+    switch (name) {
+        "fn" => { x = 1 },
+        "var" => { x = 2 },
+        else => { x = 99 },
+    }
+    @assert_eq(x, 1)
+}
+
+test "string switch with variable" {
+    var s = "world"
+    const r = switch (s) {
+        "hello" => 10,
+        "world" => 20,
+        else => 0,
+    }
+    @assert_eq(r, 20)
+}

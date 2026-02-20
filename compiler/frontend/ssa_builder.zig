@@ -1082,6 +1082,31 @@ pub const SSABuilder = struct {
         ptr.addArg2(base, offset);
         try cur.addValue(self.allocator, ptr);
 
+        // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make.
+        // Same pattern as convertFieldLocal (line 881): compound types need two loads.
+        const field_type = self.type_registry.get(type_idx);
+        const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;
+        if (is_string_or_slice) {
+            const ptr_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            ptr_load.addArg(ptr);
+            try cur.addValue(self.allocator, ptr_load);
+
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(ptr);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_load = try self.func.newValue(.load, TypeRegistry.I64, cur, self.cur_pos);
+            len_load.addArg(len_addr);
+            try cur.addValue(self.allocator, len_load);
+
+            const make_op: Op = if (type_idx == TypeRegistry.STRING) .string_make else .slice_make;
+            const make_val = try self.func.newValue(make_op, type_idx, cur, self.cur_pos);
+            make_val.addArg2(ptr_load, len_load);
+            try cur.addValue(self.allocator, make_val);
+            return make_val;
+        }
+
         // Choose the right load op based on type size
         // Go reference: wasm/ssa.go loadOp() function
         const load_op = self.getLoadOp(type_idx);
@@ -1152,6 +1177,42 @@ pub const SSABuilder = struct {
         const ptr = try self.func.newValue(.add_ptr, TypeRegistry.VOID, cur, self.cur_pos);
         ptr.addArg2(base, offset);
         try cur.addValue(self.allocator, ptr);
+
+        // String/slice compound store: decompose into ptr@0, len@8.
+        // Same pattern as convertStoreLocalField (line 918): compound types need two stores.
+        const value_type = self.type_registry.get(value.type_idx);
+        const is_string_or_slice = value.type_idx == TypeRegistry.STRING or value_type == .slice;
+        if (is_string_or_slice) {
+            var ptr_component: *Value = undefined;
+            var len_component: *Value = undefined;
+
+            if ((value.op == .string_make or value.op == .slice_make) and value.args.len >= 2) {
+                ptr_component = value.args[0];
+                len_component = value.args[1];
+            } else {
+                ptr_component = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+                ptr_component.addArg(value);
+                try cur.addValue(self.allocator, ptr_component);
+
+                len_component = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+                len_component.addArg(value);
+                try cur.addValue(self.allocator, len_component);
+            }
+
+            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            ptr_store.addArg2(ptr, ptr_component);
+            try cur.addValue(self.allocator, ptr_store);
+
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(ptr);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            len_store.addArg2(len_addr, len_component);
+            try cur.addValue(self.allocator, len_store);
+            return len_store;
+        }
 
         const store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
         store.addArg2(ptr, value);
