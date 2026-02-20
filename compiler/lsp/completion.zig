@@ -43,22 +43,29 @@ pub const CompletionItem = struct {
 
 /// Builtin names for @ completions (sorted for display).
 const builtin_names = [_][]const u8{
-    "abs",             "alignOf",         "alloc",           "arg_len",
-    "arg_ptr",         "args_count",      "assert",          "assert_eq",
-    "ceil",            "compileError",    "dealloc",         "dup2",
-    "embedFile",       "environ_count",   "environ_len",     "environ_ptr",
-    "epoll_add",       "epoll_create",    "epoll_del",       "epoll_wait",
+    "abs",             "alignCast",       "alignOf",         "alloc",
+    "arc_release",     "arc_retain",      "arg_len",         "arg_ptr",
+    "args_count",      "as",              "assert",          "assert_eq",
+    "bitCast",         "ceil",            "clz",             "compileError",
+    "constCast",       "ctz",             "dealloc",         "dup2",
+    "embedFile",       "enumFromInt",     "enumLen",         "enumName",
+    "environ_count",   "environ_len",     "environ_ptr",     "epoll_add",
+    "epoll_create",    "epoll_del",       "epoll_wait",      "errorName",
     "execve",          "exit",            "fd_close",        "fd_open",
     "fd_read",         "fd_seek",         "fd_write",        "field",
-    "fmax",            "fmin",            "floor",           "fork",
-    "hasField",        "intCast",         "intToPtr",        "kevent_add",
-    "kevent_del",      "kevent_wait",     "kqueue_create",   "lenOf",
-    "memcpy",          "net_accept",      "net_bind",        "net_connect",
-    "net_listen",      "net_set_reuse_addr", "net_socket",   "pipe",
+    "floatCast",       "floatFromInt",    "fmax",            "fmin",
+    "floor",           "fork",            "hasField",        "intCast",
+    "intFromBool",     "intFromEnum",     "intFromFloat",    "intToPtr",
+    "isatty",          "kevent_add",      "kevent_del",      "kevent_wait",
+    "kqueue_create",   "lenOf",           "max",             "memcpy",
+    "memset",          "min",             "net_accept",      "net_bind",
+    "net_connect",     "net_listen",      "net_set_reuse_addr", "net_socket",
+    "offsetOf",        "panic",           "pipe",            "popCount",
     "ptrCast",         "ptrOf",           "ptrToInt",        "random",
     "realloc",         "round",           "set_nonblocking", "sizeOf",
-    "sqrt",            "string",          "target",          "target_arch",
-    "target_os",       "time",            "trap",            "trunc",
+    "sqrt",            "string",          "tagName",         "target",
+    "target_arch",     "target_os",       "time",            "trap",
+    "truncate",        "trunc",           "typeInfo",        "typeName",
     "TypeOf",          "waitpid",
 };
 
@@ -72,7 +79,8 @@ const keyword_names = [_][]const u8{
     "noreturn", "not",       "null",     "or",       "and",
     "return",   "struct",    "switch",   "test",     "trait",
     "true",     "try",       "type",     "undefined","union",
-    "unreachable", "var",    "void",     "where",    "while",
+    "unreachable", "var",    "void",     "weak",     "where",
+    "while",    "packed",
 };
 
 /// Code snippet templates for common patterns.
@@ -92,6 +100,8 @@ const snippets = [_]struct { label: []const u8, detail: []const u8, insert_text:
     .{ .label = "import", .detail = "import statement", .insert_text = "import \"${1:module}\"" },
     .{ .label = "defer", .detail = "defer statement", .insert_text = "defer ${0}" },
     .{ .label = "errdefer", .detail = "errdefer statement", .insert_text = "errdefer ${0}" },
+    .{ .label = "comptime", .detail = "comptime block", .insert_text = "comptime {\n\t$0\n}" },
+    .{ .label = "weak var", .detail = "weak variable (no ARC retain)", .insert_text = "weak var ${1:name} = ${0}" },
 };
 
 /// Categorized detail string for a builtin name.
@@ -116,10 +126,17 @@ fn builtinDetail(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "dealloc")) return "memory";
     if (std.mem.eql(u8, name, "realloc")) return "memory";
     if (std.mem.eql(u8, name, "memcpy")) return "memory";
+    if (std.mem.eql(u8, name, "memset")) return "memory";
+    if (std.mem.eql(u8, name, "arc_retain")) return "ARC memory";
+    if (std.mem.eql(u8, name, "arc_release")) return "ARC memory";
     // Reflection
     if (std.mem.eql(u8, name, "TypeOf")) return "reflection";
     if (std.mem.eql(u8, name, "hasField")) return "reflection";
     if (std.mem.eql(u8, name, "field")) return "reflection";
+    if (std.mem.eql(u8, name, "typeInfo")) return "reflection";
+    if (std.mem.eql(u8, name, "typeName")) return "reflection";
+    if (std.mem.eql(u8, name, "enumName")) return "reflection";
+    if (std.mem.eql(u8, name, "offsetOf")) return "reflection";
     // Comptime
     if (std.mem.eql(u8, name, "embedFile")) return "comptime";
     if (std.mem.eql(u8, name, "compileError")) return "comptime";
@@ -136,13 +153,37 @@ fn builtinDetail(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "sqrt")) return "math";
     if (std.mem.eql(u8, name, "fmin")) return "math";
     if (std.mem.eql(u8, name, "fmax")) return "math";
-    // Type intrinsics
+    // Type intrinsics / casts
     if (std.mem.eql(u8, name, "sizeOf")) return "type intrinsic";
     if (std.mem.eql(u8, name, "alignOf")) return "type intrinsic";
-    if (std.mem.eql(u8, name, "intCast")) return "type intrinsic";
-    if (std.mem.eql(u8, name, "ptrCast")) return "type intrinsic";
-    if (std.mem.eql(u8, name, "intToPtr")) return "type intrinsic";
-    if (std.mem.eql(u8, name, "ptrToInt")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "alignCast")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "constCast")) return "type intrinsic";
+    if (std.mem.eql(u8, name, "intCast")) return "type cast";
+    if (std.mem.eql(u8, name, "floatCast")) return "type cast";
+    if (std.mem.eql(u8, name, "intFromFloat")) return "type cast";
+    if (std.mem.eql(u8, name, "floatFromInt")) return "type cast";
+    if (std.mem.eql(u8, name, "bitCast")) return "type cast";
+    if (std.mem.eql(u8, name, "truncate")) return "type cast";
+    if (std.mem.eql(u8, name, "as")) return "type cast";
+    if (std.mem.eql(u8, name, "ptrCast")) return "type cast";
+    if (std.mem.eql(u8, name, "intToPtr")) return "type cast";
+    if (std.mem.eql(u8, name, "ptrToInt")) return "type cast";
+    // Enum / error
+    if (std.mem.eql(u8, name, "intFromEnum")) return "enum";
+    if (std.mem.eql(u8, name, "enumFromInt")) return "enum";
+    if (std.mem.eql(u8, name, "enumLen")) return "enum";
+    if (std.mem.eql(u8, name, "tagName")) return "enum";
+    if (std.mem.eql(u8, name, "errorName")) return "error";
+    if (std.mem.eql(u8, name, "intFromBool")) return "cast";
+    // Integer math / bits
+    if (std.mem.eql(u8, name, "min")) return "math";
+    if (std.mem.eql(u8, name, "max")) return "math";
+    if (std.mem.eql(u8, name, "ctz")) return "bit manipulation";
+    if (std.mem.eql(u8, name, "clz")) return "bit manipulation";
+    if (std.mem.eql(u8, name, "popCount")) return "bit manipulation";
+    // System
+    if (std.mem.eql(u8, name, "panic")) return "system";
+    if (std.mem.eql(u8, name, "isatty")) return "system";
     // String
     if (std.mem.eql(u8, name, "string")) return "string";
     if (std.mem.eql(u8, name, "ptrOf")) return "string";

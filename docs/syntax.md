@@ -148,6 +148,52 @@ const Status = enum { Ok = 0, Warning = 50, Error = 100 }
 
 Access: `Color.Red`, `Status.Ok`
 
+### Backing Type
+
+Specify the integer storage type with `enum(T)` (Zig pattern):
+
+```cot
+const Token = enum(u8) { Eof, Ident, Int, String }
+const HttpStatus = enum(u16) { Ok = 200, NotFound = 404, ServerError = 500 }
+```
+
+Both `enum(u8)` (parenthesized, Zig-style) and `enum: u8` (colon) syntaxes are accepted. Backing type controls `@intFromEnum` / `@enumFromInt` semantics.
+
+### Quoted Identifiers
+
+Use `@"name"` to use keywords as enum variant names (Zig pattern):
+
+```cot
+const Op = enum { @"and", @"or", @"not", add, sub }
+var op = Op.@"and"
+switch (op) {
+    .@"and" => println("bitwise and"),
+    .@"or" => println("bitwise or"),
+    else => println("other"),
+}
+```
+
+`@"name"` produces an identifier token — works in enum declarations, field access, and switch arms.
+
+### Enum Methods
+
+Enums can have methods via `impl` blocks (value receiver, not pointer):
+
+```cot
+impl Color {
+    fn isWarm(self: Color) bool {
+        return switch (self) {
+            .Red => true,
+            .Green => false,
+            .Blue => false,
+        }
+    }
+}
+
+var c = Color.Red
+@assert_eq(c.isWarm(), true)
+```
+
 ## Unions (tagged)
 
 ```cot
@@ -249,6 +295,10 @@ if (optional_val) |val| { ... } else { ... }
 // While (parens required)
 while (x < 10) { x = x + 1 }
 
+// While with continue expression (C-style step)
+var i: i64 = 0
+while (i < 10) : (i = i + 1) { sum = sum + i }
+
 // For-in (collection)
 for item in collection { ... }
 for i, item in collection { ... }    // indexed
@@ -259,9 +309,22 @@ for i in 0..10 { ... }
 // Inline for — unrolled at compile time (Zig pattern)
 inline for i in 0..5 { sum = sum + i }
 
+// Labeled loops — break/continue to outer loop
+'outer: while (true) {
+    for i in 0..10 {
+        if (i == 5) { break 'outer }
+    }
+}
+
+'search: for i, item in list {
+    if (item == target) { break 'search }
+}
+
 // Break / Continue
 break
 continue
+break 'label           // break from labeled loop
+continue 'label        // continue labeled loop
 ```
 
 ## Switch
@@ -283,6 +346,14 @@ switch result {
 switch x {
     1 if x > 0 => 10,
     _ => 0,
+}
+
+// String switch — compares by value, not pointer:
+switch (name) {
+    "fn" => Token.kw_fn,
+    "var" => Token.kw_var,
+    "const" => Token.kw_const,
+    else => Token.ident,
 }
 ```
 
@@ -407,10 +478,29 @@ var addr = @ptrToInt(ptr)
 |---------|---------|
 | `@sizeOf(T)` | Size of type in bytes |
 | `@alignOf(T)` | Alignment of type |
+| `@offsetOf(T, "field")` | Byte offset of struct field |
 | `@intCast(T, value)` | Cast integer to type T |
+| `@floatCast(T, value)` | Cast float to type T |
+| `@intFromFloat(value)` | Truncate float to integer |
+| `@floatFromInt(T, value)` | Convert integer to float |
+| `@bitCast(T, value)` | Reinterpret bits as type T |
+| `@truncate(T, value)` | Narrow integer to smaller type |
+| `@as(T, value)` | Explicit type coercion |
 | `@ptrCast(*T, ptr)` | Cast pointer type |
+| `@alignCast(alignment, ptr)` | Assert pointer alignment |
+| `@constCast(ptr)` | Remove const from pointer |
 | `@intToPtr(*T, addr)` | Cast integer to pointer |
 | `@ptrToInt(ptr)` | Cast pointer to integer |
+
+### Integer Math & Bits
+
+| Builtin | Purpose |
+|---------|---------|
+| `@min(a, b)` | Minimum of two integers |
+| `@max(a, b)` | Maximum of two integers |
+| `@ctz(value)` | Count trailing zeros |
+| `@clz(value)` | Count leading zeros |
+| `@popCount(value)` | Count set bits |
 
 ### Memory
 
@@ -420,6 +510,9 @@ var addr = @ptrToInt(ptr)
 | `@dealloc(ptr)` | Free memory |
 | `@realloc(ptr, new_size)` | Reallocate |
 | `@memcpy(dst, src, len)` | Copy memory |
+| `@memset(ptr, val, len)` | Fill memory with byte value |
+| `@arc_retain(value)` | Increment ARC refcount (no-op for non-ARC types) |
+| `@arc_release(value)` | Decrement ARC refcount (no-op for non-ARC types) |
 
 ### String
 
@@ -496,6 +589,8 @@ var addr = @ptrToInt(ptr)
 | `@time()` | Wall clock time in nanoseconds |
 | `@random(buf, len)` | Fill buffer with random bytes |
 | `@trap()` | Unconditional trap / unreachable |
+| `@panic(msg)` | Panic with message (prints file:line) |
+| `@isatty(fd)` | Check if fd is a terminal |
 
 ### Reflection
 
@@ -504,6 +599,15 @@ var addr = @ptrToInt(ptr)
 | `@hasField(T, "name")` | Comptime bool: true if struct/enum/union T has field/variant "name" |
 | `@TypeOf(expr)` | Returns the type of expr (usable in type position or expression) |
 | `@field(value, "name")` | Access struct field by string name at compile time |
+| `@typeInfo(T)` | Full comptime type info with `.fields` array and `.name` |
+| `@typeName(T)` | Type name as string at compile time |
+| `@enumName(E, idx)` | Enum variant name by index at compile time |
+| `@enumLen(E)` | Number of variants in enum |
+| `@intFromEnum(val)` | Extract integer value from enum |
+| `@enumFromInt(E, n)` | Construct enum from integer |
+| `@intFromBool(b)` | Convert bool to integer (true=1, false=0) |
+| `@tagName(val)` | Tag name of enum/union value as string |
+| `@errorName(err)` | Error name as string |
 
 ```cot
 struct Point { x: i64, y: i64 }
@@ -526,6 +630,30 @@ var y: @TypeOf(x) = 10               // y is i64
 // @field — comptime field access by name
 var p = Point { .x = 10, .y = 20 }
 @assert_eq(@field(p, "x"), 10)
+
+// @typeInfo — comptime type reflection (Zig pattern)
+const Color = enum { Red, Green, Blue }
+const fields = @typeInfo(Color).fields
+@assert_eq(fields[0].name, "Red")
+@assert_eq(fields[0].value, 0)
+
+// inline for over @typeInfo fields
+const token_strings = comptime {
+    var s: [@enumLen(Color)]string = undefined
+    inline for field in @typeInfo(Color).fields {
+        s[field.value] = field.name
+    }
+    s
+}
+
+// @typeName / @enumName
+@assert_eq(@typeName(i64), "i64")
+@assert_eq(@enumName(Color, 0), "Red")
+
+// @intFromEnum / @enumFromInt
+@assert_eq(@intFromEnum(Color.Green), 1)
+var blue = @enumFromInt(Color, 2)
+@assert_eq(@intFromBool(true), 1)
 ```
 
 ### Comptime
@@ -538,10 +666,28 @@ var p = Point { .x = 10, .y = 20 }
 | `@compileError("msg")` | Trigger compile-time error with message |
 | `@embedFile("path")` | Embed file contents as string at compile time |
 
-`comptime { expr }` blocks evaluate expressions at compile time:
+`comptime { ... }` blocks evaluate at compile time. They support mutable variables and produce the final expression as the result:
 
 ```cot
 const SIZE = comptime { 4 * 1024 }
+
+// Comptime blocks with statements — mutable variables
+const RESULT = comptime {
+    var x = 0
+    x += 10
+    x += 5
+    x                  // final expression is the result (15)
+}
+
+// Build lookup tables with comptime + inline for + @typeInfo
+const Color = enum { Red, Green, Blue }
+const color_names = comptime {
+    var s: [@enumLen(Color)]string = undefined
+    inline for field in @typeInfo(Color).fields {
+        s[field.value] = field.name
+    }
+    s
+}
 ```
 
 Dead branch elimination: if an `if` condition is comptime-known, only the taken branch is checked. This enables `@compileError` in unreachable branches:
@@ -588,6 +734,17 @@ Destructors: functions named `TypeName_deinit` are called automatically:
 fn DFoo_deinit(self: *DFoo) void { ... }
 ```
 
+### Weak References
+
+`weak var` suppresses retain/cleanup — use to break reference cycles:
+```cot
+var strong = new Node { value: 1 }
+weak var w = strong            // w does NOT retain strong
+// strong is freed when its last non-weak reference dies
+```
+
+Use `@arc_retain(value)` and `@arc_release(value)` for manual refcount control in collection types. These are no-ops for non-ARC types.
+
 ## Tests
 
 ```cot
@@ -597,6 +754,21 @@ test "my test" {
 ```
 
 Run with: `cot test file.cot`
+
+## Benchmarks
+
+```cot
+bench "fibonacci 20" {
+    fib(20)
+}
+
+bench "sum to 1000" {
+    var s: i64 = 0
+    for i in 1..1001 { s = s + i }
+}
+```
+
+Run with: `cot bench file.cot`
 
 ## Import
 
@@ -617,6 +789,8 @@ import "std/list"          // stdlib modules
 | `map` | `import "std/map"` | Map(K,V) with splitmix64 hash, ~25 methods |
 | `set` | `import "std/set"` | Set(T) wrapping Map(T, i64) |
 | `string` | `import "std/string"` | ~25 string functions (indexOf, split, trim, replace, etc.) + StringBuilder |
+| `string_map` | `import "std/string_map"` | StringMap(V) — hash map with string keys, optimized for string hashing |
+| `mem` | `import "std/mem"` | Byte-level ops: eql, cmp, startsWith, endsWith, zero, set, readU32LE, writeU32LE |
 | `math` | `import "std/math"` | abs, min, max, clamp, ipow, fabs, ceil, floor, sqrt, fmin, fmax, PI, E |
 | `json` | `import "std/json"` | JSON parser (parse) + encoder (encode), JsonValue constructors + accessors |
 | `sort` | `import "std/sort"` | Insertion sort + reverse for List(T) |
@@ -633,6 +807,8 @@ import "std/list"          // stdlib modules
 | `cli` | `import "std/cli"` | --flag=value, -f, positional args, getFlag/hasFlag/getFlagInt |
 | `uuid` | `import "std/uuid"` | UUID v4 generation, isValid, version |
 | `semver` | `import "std/semver"` | Parse, compare (gt/lt/eq), format, incMajor/incMinor/incPatch |
+| `process` | `import "std/process"` | run, output — high-level process spawning (native only, uses fork/exec) |
+| `regex` | `import "std/regex"` | Regex struct — match, matchAll, replace, split, test (Thompson NFA) |
 | `testing` | `import "std/testing"` | assertContains, assertStartsWith, assertGt, assertTrue, assertLen |
 
 ## @safe Mode

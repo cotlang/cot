@@ -18,6 +18,10 @@
     "comments": {
       "patterns": [
         {
+          "name": "comment.line.documentation.cot",
+          "match": "///.*$"
+        },
+        {
           "name": "comment.line.double-slash.cot",
           "match": "//.*$"
         },
@@ -100,15 +104,15 @@
       "patterns": [
         {
           "name": "keyword.declaration.cot",
-          "match": "\\b(fn|struct|enum|union|trait|impl|type|extern|test)\\b"
+          "match": "\\b(fn|struct|enum|union|trait|impl|type|extern|test|bench)\\b"
         },
         {
           "name": "keyword.control.cot",
-          "match": "\\b(if|else|switch|while|for|in|return|break|continue|defer|where)\\b"
+          "match": "\\b(if|else|switch|while|for|in|return|break|continue|defer|errdefer|where|comptime|inline|async|await)\\b"
         },
         {
           "name": "keyword.storage.cot",
-          "match": "\\b(var|let|const)\\b"
+          "match": "\\b(var|let|const|weak|packed)\\b"
         },
         {
           "name": "keyword.operator.cot",
@@ -116,7 +120,7 @@
         },
         {
           "name": "keyword.other.cot",
-          "match": "\\b(new|try|catch|error|import)\\b"
+          "match": "\\b(new|try|catch|error|import|orelse|unreachable)\\b"
         },
         {
           "name": "constant.language.cot",
@@ -132,7 +136,7 @@
       "patterns": [
         {
           "name": "storage.type.primitive.cot",
-          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|int|float|bool|void|string|byte)\\b"
+          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|int|float|bool|void|string|byte|noreturn)\\b"
         },
         {
           "name": "entity.name.type.cot",
@@ -142,6 +146,16 @@
     },
     "builtins": {
       "patterns": [
+        {
+          "comment": "@safe file annotation",
+          "name": "keyword.other.safe.cot",
+          "match": "^@safe\\b"
+        },
+        {
+          "comment": "@\"keyword\" quoted identifier (Zig pattern)",
+          "name": "entity.name.tag.quoted.cot",
+          "match": "@\"[^\"]*\""
+        },
         {
           "name": "support.function.builtin.cot",
           "match": "@[a-zA-Z_][a-zA-Z0-9_]*"
