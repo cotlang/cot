@@ -1424,6 +1424,17 @@ pub const Lowerer = struct {
         var type_idx = TypeRegistry.VOID;
         if (var_stmt.type_expr != null_node) {
             type_idx = self.resolveTypeNode(var_stmt.type_expr);
+            // @safe coercion: checker upgrades `var p: Foo = new Foo{...}` to *Foo,
+            // but resolveTypeNode returns raw Foo from AST. Match the checker's coercion.
+            if (self.chk.safe_mode and var_stmt.value != null_node) {
+                const val_type = self.inferExprType(var_stmt.value);
+                if (val_type != TypeRegistry.VOID) {
+                    const val_info = self.type_reg.get(val_type);
+                    if (val_info == .pointer and val_info.pointer.elem == type_idx) {
+                        type_idx = val_type;
+                    }
+                }
+            }
         } else if (var_stmt.value != null_node) {
             type_idx = self.inferExprType(var_stmt.value);
         }
