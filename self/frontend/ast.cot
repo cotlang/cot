@@ -1,5 +1,5 @@
-// ast — Abstract Syntax Tree node definitions.
-// Ported from compiler/frontend/ast.zig
+/// Abstract Syntax Tree node definitions.
+/// Ported from compiler/frontend/ast.zig
 
 // ============================================================================
 // Node index — reference AST nodes by position in the node array
@@ -8,21 +8,23 @@
 const null_node: int = 0xFFFFFFFF
 
 // ============================================================================
-// Span — source location tracking (inlined from source.cot)
+// Span — source location tracking
 // ============================================================================
 
+/// Half-open byte range [start, end) in source text.
 struct Span {
     start: int,
     end: int,
 }
 
-
 // ============================================================================
 // Declarations
 // ============================================================================
 
+/// Struct memory layout strategy.
 const StructLayout = enum { auto, @"packed", @"extern" }
 
+/// Function declaration.
 struct FnDecl {
     name: string,
     return_type: int,
@@ -33,6 +35,7 @@ struct FnDecl {
     span: Span,
 }
 
+/// Variable or constant declaration.
 struct VarDecl {
     name: string,
     type_expr: int,
@@ -42,6 +45,7 @@ struct VarDecl {
     span: Span,
 }
 
+/// Struct type declaration.
 struct StructDecl {
     name: string,
     layout: int,
@@ -49,6 +53,7 @@ struct StructDecl {
     span: Span,
 }
 
+/// Enum type declaration.
 struct EnumDecl {
     name: string,
     backing_type: int,
@@ -56,12 +61,14 @@ struct EnumDecl {
     span: Span,
 }
 
+/// Tagged union declaration.
 struct UnionDecl {
     name: string,
     doc_comment: string,
     span: Span,
 }
 
+/// Type alias declaration.
 struct TypeAlias {
     name: string,
     target: int,
@@ -69,23 +76,27 @@ struct TypeAlias {
     span: Span,
 }
 
+/// Import declaration.
 struct ImportDecl {
     path: string,
     span: Span,
 }
 
+/// Impl block (methods for a type).
 struct ImplBlock {
     type_name: string,
     doc_comment: string,
     span: Span,
 }
 
+/// Trait declaration.
 struct TraitDecl {
     name: string,
     doc_comment: string,
     span: Span,
 }
 
+/// Trait implementation for a type.
 struct ImplTraitBlock {
     trait_name: string,
     target_type: string,
@@ -93,29 +104,33 @@ struct ImplTraitBlock {
     span: Span,
 }
 
+/// Error set declaration.
 struct ErrorSetDecl {
     name: string,
     doc_comment: string,
     span: Span,
 }
 
+/// Test block declaration.
 struct TestDecl {
     name: string,
     body: int,
     span: Span,
 }
 
+/// Benchmark block declaration.
 struct BenchDecl {
     name: string,
     body: int,
     span: Span,
 }
 
+/// Invalid declaration (parse error recovery).
 struct BadDecl {
     span: Span,
 }
 
-// Helper types for declarations
+/// Struct field definition.
 struct Field {
     name: string,
     type_expr: int,
@@ -124,20 +139,21 @@ struct Field {
     span: Span,
 }
 
+/// Enum variant definition.
 struct EnumVariant {
     name: string,
     value: int,
     span: Span,
 }
 
+/// Union variant definition.
 struct UnionVariant {
     name: string,
     type_expr: int,
     span: Span,
 }
 
-// Decl — top-level construct in a Cot source file.
-// Zig: pub const Decl = union(enum) { fn_decl: FnDecl, ... };
+/// Top-level declaration in a Cot source file.
 union Decl {
     fn_decl: FnDecl,
     var_decl: VarDecl,
@@ -155,6 +171,7 @@ union Decl {
     bad_decl: BadDecl,
 }
 
+/// Return the source span for any declaration.
 fn declSpan(d: Decl) Span {
     switch d {
         Decl.fn_decl |v| => { return v.span },
@@ -178,6 +195,7 @@ fn declSpan(d: Decl) Span {
 // Expressions
 // ============================================================================
 
+/// Literal value categories.
 const LiteralKind = enum {
     @"int", @"float", @"string", char,
     true_lit, false_lit, null_lit, undefined_lit, unreachable_lit,
@@ -215,8 +233,7 @@ struct AddrOf { operand: int, span: Span }
 struct Deref { operand: int, span: Span }
 struct BadExpr { span: Span }
 
-// Expr — any expression node.
-// Zig: pub const Expr = union(enum) { ident: Ident, literal: Literal, ... };
+/// Any expression node.
 union Expr {
     ident: Ident,
     literal: Literal,
@@ -249,6 +266,7 @@ union Expr {
     bad_expr: BadExpr,
 }
 
+/// Return the source span for any expression.
 fn exprSpan(e: Expr) Span {
     switch e {
         Expr.ident |v| => { return v.span },
@@ -310,8 +328,7 @@ struct DestructureBinding { name: string, type_expr: int, span: Span }
 struct DestructureStmt { value: int, is_const: bool, span: Span }
 struct BadStmt { span: Span }
 
-// Stmt — any statement node.
-// Zig: pub const Stmt = union(enum) { expr_stmt: ExprStmt, ... };
+/// Any statement node.
 union Stmt {
     expr_stmt: ExprStmt,
     return_stmt: ReturnStmt,
@@ -328,6 +345,7 @@ union Stmt {
     bad_stmt: BadStmt,
 }
 
+/// Return the source span for any statement.
 fn stmtSpan(s: Stmt) Span {
     switch s {
         Stmt.expr_stmt |v| => { return v.span },
@@ -350,14 +368,14 @@ fn stmtSpan(s: Stmt) Span {
 // Unified Node
 // ============================================================================
 
-// Node — any AST node (declaration, expression, or statement).
-// Zig: pub const Node = union(enum) { decl: Decl, expr: Expr, stmt: Stmt };
+/// Any AST node (declaration, expression, or statement).
 union Node {
     decl: Decl,
     expr: Expr,
     stmt: Stmt,
 }
 
+/// Return the source span for any node.
 fn nodeSpan(n: Node) Span {
     switch n {
         Node.decl |d| => { return declSpan(d) },
@@ -367,83 +385,50 @@ fn nodeSpan(n: Node) Span {
 }
 
 // ============================================================================
-// BuiltinKind — all @builtin function variants
+// BuiltinKind — compiler intrinsic @builtin variants (v0.3.2)
+// Runtime functions (alloc, fd_write, etc.) moved to stdlib/sys.cot as extern fn.
 // ============================================================================
 
+/// Compiler intrinsic builtins (the @-prefixed functions).
 const BuiltinKind = enum {
-    // Type intrinsics
-    size_of, align_of, enum_len,
-    // Casts
-    int_cast, float_cast, float_from_int, int_from_float,
-    ptr_cast, int_to_ptr, ptr_to_int,
-    // String construction
-    @"string",
-    // Assertions
-    assert, assert_eq,
-    // Memory
-    alloc, dealloc, realloc, memcpy,
-    // WASI file I/O
-    fd_write, fd_read, fd_close, fd_seek, fd_open,
-    // String decomposition
-    ptr_of, len_of,
-    // Process control
-    trap, exit,
-    // Time/random
-    time, random,
-    // CLI args
-    args_count, arg_len, arg_ptr,
-    // Environment
-    environ_count, environ_len, environ_ptr,
-    // Comptime targets
-    target_os, target_arch, target,
-    // Compile-time
-    compile_error,
-    // Math (float unary)
-    abs, ceil, floor, @"trunc", round, sqrt,
-    // Math (float binary)
-    fmin, fmax,
-    // Networking (TCP sockets)
-    net_socket, net_bind, net_listen, net_accept, net_connect, net_set_reuse_addr,
-    // Event loop (kqueue/epoll)
-    kqueue_create, kevent_add, kevent_del, kevent_wait,
-    epoll_create, epoll_add, epoll_del, epoll_wait, set_nonblocking,
-    // Process spawning
-    fork, execve, waitpid, pipe, dup2,
-    // Compile-time file embedding
-    embed_file,
-    // Reflection builtins
-    has_field, type_of, field,
-    // Enum/error intrinsics
-    int_from_enum, enum_from_int, tag_name, error_name, int_from_bool,
-    // Cast intrinsics
-    bit_cast, truncate, @"as",
-    // Struct introspection
-    offset_of,
-    // Integer min/max
-    min, max,
-    // Pointer cast
-    align_cast, const_cast,
-    // ARC management
-    arc_retain, arc_release,
-    // Panic
-    panic,
-    // Terminal detection
-    isatty,
-    // Memory fill
-    memset,
-    // Bit manipulation
-    ctz, clz, pop_count,
+    // Type introspection
+    size_of, align_of, enum_len, has_field, type_of, field, offset_of,
     // Comptime reflection
     type_name, enum_name, type_info,
+    // Casts
+    int_cast, float_cast, float_from_int, int_from_float,
+    ptr_cast, int_to_ptr, ptr_to_int, bit_cast, truncate, @"as",
+    align_cast, const_cast,
+    // Enum/error/bool conversions
+    int_from_enum, enum_from_int, tag_name, error_name, int_from_bool,
+    // String construction + decomposition
+    @"string", ptr_of, len_of,
+    // Assertions
+    assert, assertEq,
+    // Control
+    trap, panic,
+    // Comptime
+    compile_error, embed_file, target, targetOs, targetArch,
+    // ARC management
+    arcRetain, arcRelease,
 }
 
-// Zig: pub fn fromString(s: []const u8) ?BuiltinKind { return map.get(s); }
-// Cot: String switch for keyword dispatch (same pattern as token.cot lookup).
-fn builtinFromString(name: string) int {
+/// Look up a builtin name string and return its BuiltinKind index, or null if unknown.
+fn builtinFromString(name: string) ?int {
     return switch (name) {
+        // Type introspection
         "sizeOf" => @intFromEnum(BuiltinKind.size_of),
         "alignOf" => @intFromEnum(BuiltinKind.align_of),
         "enumLen" => @intFromEnum(BuiltinKind.enum_len),
+        "hasField" => @intFromEnum(BuiltinKind.has_field),
+        "TypeOf" => @intFromEnum(BuiltinKind.type_of),
+        "field" => @intFromEnum(BuiltinKind.field),
+        "offsetOf" => @intFromEnum(BuiltinKind.offset_of),
+        // Comptime reflection
+        "typeName" => @intFromEnum(BuiltinKind.type_name),
+        "enumName" => @intFromEnum(BuiltinKind.enum_name),
+        "typeInfo" => @intFromEnum(BuiltinKind.type_info),
+        // Casts
         "intCast" => @intFromEnum(BuiltinKind.int_cast),
         "floatCast" => @intFromEnum(BuiltinKind.float_cast),
         "floatFromInt" => @intFromEnum(BuiltinKind.float_from_int),
@@ -451,91 +436,37 @@ fn builtinFromString(name: string) int {
         "ptrCast" => @intFromEnum(BuiltinKind.ptr_cast),
         "intToPtr" => @intFromEnum(BuiltinKind.int_to_ptr),
         "ptrToInt" => @intFromEnum(BuiltinKind.ptr_to_int),
-        "string" => @intFromEnum(BuiltinKind.@"string"),
-        "assert" => @intFromEnum(BuiltinKind.assert),
-        "assertEq" => @intFromEnum(BuiltinKind.assert_eq),
-        "alloc" => @intFromEnum(BuiltinKind.alloc),
-        "dealloc" => @intFromEnum(BuiltinKind.dealloc),
-        "realloc" => @intFromEnum(BuiltinKind.realloc),
-        "memcpy" => @intFromEnum(BuiltinKind.memcpy),
-        "fd_write" => @intFromEnum(BuiltinKind.fd_write),
-        "fd_read" => @intFromEnum(BuiltinKind.fd_read),
-        "fd_close" => @intFromEnum(BuiltinKind.fd_close),
-        "fd_seek" => @intFromEnum(BuiltinKind.fd_seek),
-        "fd_open" => @intFromEnum(BuiltinKind.fd_open),
-        "ptrOf" => @intFromEnum(BuiltinKind.ptr_of),
-        "lenOf" => @intFromEnum(BuiltinKind.len_of),
-        "trap" => @intFromEnum(BuiltinKind.trap),
-        "exit" => @intFromEnum(BuiltinKind.exit),
-        "time" => @intFromEnum(BuiltinKind.time),
-        "random" => @intFromEnum(BuiltinKind.random),
-        "args_count" => @intFromEnum(BuiltinKind.args_count),
-        "arg_len" => @intFromEnum(BuiltinKind.arg_len),
-        "arg_ptr" => @intFromEnum(BuiltinKind.arg_ptr),
-        "environ_count" => @intFromEnum(BuiltinKind.environ_count),
-        "environ_len" => @intFromEnum(BuiltinKind.environ_len),
-        "environ_ptr" => @intFromEnum(BuiltinKind.environ_ptr),
-        "targetOs" => @intFromEnum(BuiltinKind.target_os),
-        "targetArch" => @intFromEnum(BuiltinKind.target_arch),
-        "target" => @intFromEnum(BuiltinKind.target),
-        "compileError" => @intFromEnum(BuiltinKind.compile_error),
-        "abs" => @intFromEnum(BuiltinKind.abs),
-        "ceil" => @intFromEnum(BuiltinKind.ceil),
-        "floor" => @intFromEnum(BuiltinKind.floor),
-        "trunc" => @intFromEnum(BuiltinKind.@"trunc"),
-        "round" => @intFromEnum(BuiltinKind.round),
-        "sqrt" => @intFromEnum(BuiltinKind.sqrt),
-        "fmin" => @intFromEnum(BuiltinKind.fmin),
-        "fmax" => @intFromEnum(BuiltinKind.fmax),
-        "net_socket" => @intFromEnum(BuiltinKind.net_socket),
-        "net_bind" => @intFromEnum(BuiltinKind.net_bind),
-        "net_listen" => @intFromEnum(BuiltinKind.net_listen),
-        "net_accept" => @intFromEnum(BuiltinKind.net_accept),
-        "net_connect" => @intFromEnum(BuiltinKind.net_connect),
-        "net_set_reuse_addr" => @intFromEnum(BuiltinKind.net_set_reuse_addr),
-        "kqueue_create" => @intFromEnum(BuiltinKind.kqueue_create),
-        "kevent_add" => @intFromEnum(BuiltinKind.kevent_add),
-        "kevent_del" => @intFromEnum(BuiltinKind.kevent_del),
-        "kevent_wait" => @intFromEnum(BuiltinKind.kevent_wait),
-        "epoll_create" => @intFromEnum(BuiltinKind.epoll_create),
-        "epoll_add" => @intFromEnum(BuiltinKind.epoll_add),
-        "epoll_del" => @intFromEnum(BuiltinKind.epoll_del),
-        "epoll_wait" => @intFromEnum(BuiltinKind.epoll_wait),
-        "set_nonblocking" => @intFromEnum(BuiltinKind.set_nonblocking),
-        "fork" => @intFromEnum(BuiltinKind.fork),
-        "execve" => @intFromEnum(BuiltinKind.execve),
-        "waitpid" => @intFromEnum(BuiltinKind.waitpid),
-        "pipe" => @intFromEnum(BuiltinKind.pipe),
-        "dup2" => @intFromEnum(BuiltinKind.dup2),
-        "embedFile" => @intFromEnum(BuiltinKind.embed_file),
-        "hasField" => @intFromEnum(BuiltinKind.has_field),
-        "TypeOf" => @intFromEnum(BuiltinKind.type_of),
-        "field" => @intFromEnum(BuiltinKind.field),
+        "bitCast" => @intFromEnum(BuiltinKind.bit_cast),
+        "truncate" => @intFromEnum(BuiltinKind.truncate),
+        "as" => @intFromEnum(BuiltinKind.@"as"),
+        "alignCast" => @intFromEnum(BuiltinKind.align_cast),
+        "constCast" => @intFromEnum(BuiltinKind.const_cast),
+        // Enum/error/bool
         "intFromEnum" => @intFromEnum(BuiltinKind.int_from_enum),
         "enumFromInt" => @intFromEnum(BuiltinKind.enum_from_int),
         "tagName" => @intFromEnum(BuiltinKind.tag_name),
         "errorName" => @intFromEnum(BuiltinKind.error_name),
         "intFromBool" => @intFromEnum(BuiltinKind.int_from_bool),
-        "bitCast" => @intFromEnum(BuiltinKind.bit_cast),
-        "truncate" => @intFromEnum(BuiltinKind.truncate),
-        "as" => @intFromEnum(BuiltinKind.@"as"),
-        "offsetOf" => @intFromEnum(BuiltinKind.offset_of),
-        "min" => @intFromEnum(BuiltinKind.min),
-        "max" => @intFromEnum(BuiltinKind.max),
-        "alignCast" => @intFromEnum(BuiltinKind.align_cast),
-        "constCast" => @intFromEnum(BuiltinKind.const_cast),
-        "arcRetain" => @intFromEnum(BuiltinKind.arc_retain),
-        "arcRelease" => @intFromEnum(BuiltinKind.arc_release),
+        // String
+        "string" => @intFromEnum(BuiltinKind.@"string"),
+        "ptrOf" => @intFromEnum(BuiltinKind.ptr_of),
+        "lenOf" => @intFromEnum(BuiltinKind.len_of),
+        // Assertions
+        "assert" => @intFromEnum(BuiltinKind.assert),
+        "assertEq" => @intFromEnum(BuiltinKind.assertEq),
+        // Control
+        "trap" => @intFromEnum(BuiltinKind.trap),
         "panic" => @intFromEnum(BuiltinKind.panic),
-        "isatty" => @intFromEnum(BuiltinKind.isatty),
-        "memset" => @intFromEnum(BuiltinKind.memset),
-        "ctz" => @intFromEnum(BuiltinKind.ctz),
-        "clz" => @intFromEnum(BuiltinKind.clz),
-        "popCount" => @intFromEnum(BuiltinKind.pop_count),
-        "typeName" => @intFromEnum(BuiltinKind.type_name),
-        "enumName" => @intFromEnum(BuiltinKind.enum_name),
-        "typeInfo" => @intFromEnum(BuiltinKind.type_info),
-        else => -1,
+        // Comptime
+        "compileError" => @intFromEnum(BuiltinKind.compile_error),
+        "embedFile" => @intFromEnum(BuiltinKind.embed_file),
+        "target" => @intFromEnum(BuiltinKind.target),
+        "targetOs" => @intFromEnum(BuiltinKind.targetOs),
+        "targetArch" => @intFromEnum(BuiltinKind.targetArch),
+        // ARC
+        "arcRetain" => @intFromEnum(BuiltinKind.arcRetain),
+        "arcRelease" => @intFromEnum(BuiltinKind.arcRelease),
+        else => null,
     }
 }
 
@@ -548,13 +479,13 @@ test "null_node sentinel" {
 }
 
 test "span init" {
-    var s = Span { start: 5, end: 10 }
+    const s = Span { start: 5, end: 10 }
     @assertEq(s.start, 5)
     @assertEq(s.end, 10)
 }
 
 test "span zero" {
-    var s = Span { start: 0, end: 0 }
+    const s = Span { start: 0, end: 0 }
     @assertEq(s.start, 0)
     @assertEq(s.end, 0)
 }
@@ -576,9 +507,9 @@ test "LiteralKind enum" {
 }
 
 test "Decl union fn_decl" {
-    var s = Span { start: 0, end: 10 }
-    var fd = FnDecl { name: "main", return_type: null_node, body: null_node, is_extern: false, is_async: false, doc_comment: "", span: s }
-    var d: Decl = Decl.fn_decl(fd)
+    const s = Span { start: 0, end: 10 }
+    const fd = FnDecl { name: "main", return_type: null_node, body: null_node, is_extern: false, is_async: false, doc_comment: "", span: s }
+    const d: Decl = Decl.fn_decl(fd)
     switch d {
         Decl.fn_decl |v| => {
             @assertEq(v.name, "main")
@@ -586,26 +517,14 @@ test "Decl union fn_decl" {
             @assertEq(v.span.end, 10)
             @assertEq(v.is_extern, false)
         },
-        Decl.var_decl |v| => { @assertEq(0, 1) },
-        Decl.struct_decl |v| => { @assertEq(0, 1) },
-        Decl.enum_decl |v| => { @assertEq(0, 1) },
-        Decl.union_decl |v| => { @assertEq(0, 1) },
-        Decl.type_alias |v| => { @assertEq(0, 1) },
-        Decl.import_decl |v| => { @assertEq(0, 1) },
-        Decl.impl_block |v| => { @assertEq(0, 1) },
-        Decl.trait_decl |v| => { @assertEq(0, 1) },
-        Decl.impl_trait |v| => { @assertEq(0, 1) },
-        Decl.error_set_decl |v| => { @assertEq(0, 1) },
-        Decl.test_decl |v| => { @assertEq(0, 1) },
-        Decl.bench_decl |v| => { @assertEq(0, 1) },
-        Decl.bad_decl |v| => { @assertEq(0, 1) },
+        else => unreachable,
     }
 }
 
 test "Decl union test_decl" {
-    var s = Span { start: 5, end: 15 }
-    var td = TestDecl { name: "my test", body: 42, span: s }
-    var d: Decl = Decl.test_decl(td)
+    const s = Span { start: 5, end: 15 }
+    const td = TestDecl { name: "my test", body: 42, span: s }
+    const d: Decl = Decl.test_decl(td)
     switch d {
         Decl.test_decl |v| => {
             @assertEq(v.name, "my test")
@@ -613,67 +532,28 @@ test "Decl union test_decl" {
             @assertEq(v.span.start, 5)
             @assertEq(v.span.end, 15)
         },
-        Decl.fn_decl |v| => { @assertEq(0, 1) },
-        Decl.var_decl |v| => { @assertEq(0, 1) },
-        Decl.struct_decl |v| => { @assertEq(0, 1) },
-        Decl.enum_decl |v| => { @assertEq(0, 1) },
-        Decl.union_decl |v| => { @assertEq(0, 1) },
-        Decl.type_alias |v| => { @assertEq(0, 1) },
-        Decl.import_decl |v| => { @assertEq(0, 1) },
-        Decl.impl_block |v| => { @assertEq(0, 1) },
-        Decl.trait_decl |v| => { @assertEq(0, 1) },
-        Decl.impl_trait |v| => { @assertEq(0, 1) },
-        Decl.error_set_decl |v| => { @assertEq(0, 1) },
-        Decl.bench_decl |v| => { @assertEq(0, 1) },
-        Decl.bad_decl |v| => { @assertEq(0, 1) },
+        else => unreachable,
     }
 }
 
 test "Expr union ident" {
-    var s = Span { start: 0, end: 3 }
-    var id = Ident { name: "foo", span: s }
-    var e: Expr = Expr.ident(id)
+    const s = Span { start: 0, end: 3 }
+    const id = Ident { name: "foo", span: s }
+    const e: Expr = Expr.ident(id)
     switch e {
         Expr.ident |v| => {
             @assertEq(v.name, "foo")
             @assertEq(v.span.start, 0)
             @assertEq(v.span.end, 3)
         },
-        Expr.literal |v| => { @assertEq(0, 1) },
-        Expr.binary |v| => { @assertEq(0, 1) },
-        Expr.unary |v| => { @assertEq(0, 1) },
-        Expr.call |v| => { @assertEq(0, 1) },
-        Expr.index |v| => { @assertEq(0, 1) },
-        Expr.slice_expr |v| => { @assertEq(0, 1) },
-        Expr.field_access |v| => { @assertEq(0, 1) },
-        Expr.array_literal |v| => { @assertEq(0, 1) },
-        Expr.paren |v| => { @assertEq(0, 1) },
-        Expr.if_expr |v| => { @assertEq(0, 1) },
-        Expr.switch_expr |v| => { @assertEq(0, 1) },
-        Expr.block_expr |v| => { @assertEq(0, 1) },
-        Expr.struct_init |v| => { @assertEq(0, 1) },
-        Expr.new_expr |v| => { @assertEq(0, 1) },
-        Expr.builtin_call |v| => { @assertEq(0, 1) },
-        Expr.string_interp |v| => { @assertEq(0, 1) },
-        Expr.type_expr |v| => { @assertEq(0, 1) },
-        Expr.try_expr |v| => { @assertEq(0, 1) },
-        Expr.await_expr |v| => { @assertEq(0, 1) },
-        Expr.catch_expr |v| => { @assertEq(0, 1) },
-        Expr.error_literal |v| => { @assertEq(0, 1) },
-        Expr.closure_expr |v| => { @assertEq(0, 1) },
-        Expr.tuple_literal |v| => { @assertEq(0, 1) },
-        Expr.comptime_block |v| => { @assertEq(0, 1) },
-        Expr.zero_init |v| => { @assertEq(0, 1) },
-        Expr.addr_of |v| => { @assertEq(0, 1) },
-        Expr.deref |v| => { @assertEq(0, 1) },
-        Expr.bad_expr |v| => { @assertEq(0, 1) },
+        else => unreachable,
     }
 }
 
 test "Expr union binary" {
-    var s = Span { start: 0, end: 5 }
-    var b = Binary { op: 0, left: 1, right: 2, span: s }
-    var e: Expr = Expr.binary(b)
+    const s = Span { start: 0, end: 5 }
+    const b = Binary { op: 0, left: 1, right: 2, span: s }
+    const e: Expr = Expr.binary(b)
     switch e {
         Expr.binary |v| => {
             @assertEq(v.op, 0)
@@ -681,89 +561,77 @@ test "Expr union binary" {
             @assertEq(v.right, 2)
             @assertEq(v.span.end, 5)
         },
-        else => { @assertEq(0, 1) },
+        else => unreachable,
     }
 }
 
 test "Stmt union return" {
-    var s = Span { start: 0, end: 8 }
-    var r = ReturnStmt { value: 42, span: s }
-    var st: Stmt = Stmt.return_stmt(r)
+    const s = Span { start: 0, end: 8 }
+    const r = ReturnStmt { value: 42, span: s }
+    const st: Stmt = Stmt.return_stmt(r)
     switch st {
         Stmt.return_stmt |v| => {
             @assertEq(v.value, 42)
             @assertEq(v.span.start, 0)
             @assertEq(v.span.end, 8)
         },
-        Stmt.expr_stmt |v| => { @assertEq(0, 1) },
-        Stmt.var_stmt |v| => { @assertEq(0, 1) },
-        Stmt.assign_stmt |v| => { @assertEq(0, 1) },
-        Stmt.if_stmt |v| => { @assertEq(0, 1) },
-        Stmt.while_stmt |v| => { @assertEq(0, 1) },
-        Stmt.for_stmt |v| => { @assertEq(0, 1) },
-        Stmt.block_stmt |v| => { @assertEq(0, 1) },
-        Stmt.break_stmt |v| => { @assertEq(0, 1) },
-        Stmt.continue_stmt |v| => { @assertEq(0, 1) },
-        Stmt.defer_stmt |v| => { @assertEq(0, 1) },
-        Stmt.destructure_stmt |v| => { @assertEq(0, 1) },
-        Stmt.bad_stmt |v| => { @assertEq(0, 1) },
+        else => unreachable,
     }
 }
 
 test "Node union wraps expr" {
-    var s = Span { start: 1, end: 9 }
-    var id = Ident { name: "x", span: s }
-    var e: Expr = Expr.ident(id)
-    var n: Node = Node.expr(e)
-    // Test Node dispatches to correct variant
+    const s = Span { start: 1, end: 9 }
+    const id = Ident { name: "x", span: s }
+    const e: Expr = Expr.ident(id)
+    const n: Node = Node.expr(e)
     var matched = false
     switch n {
         Node.expr |inner| => { matched = true },
-        Node.decl |d| => { @assertEq(0, 1) },
-        Node.stmt |s2| => { @assertEq(0, 1) },
+        else => unreachable,
     }
     @assertEq(matched, true)
 }
 
 test "BuiltinKind enum count" {
-    // Verify enum has all 94 variants
-    @assertEq(@enumLen(BuiltinKind), 94)
+    @assertEq(@enumLen(BuiltinKind), 41)
 }
 
 test "builtinFromString known" {
-    @assertEq(builtinFromString("sizeOf"), @intFromEnum(BuiltinKind.size_of))
-    @assertEq(builtinFromString("intCast"), @intFromEnum(BuiltinKind.int_cast))
-    @assertEq(builtinFromString("assertEq"), @intFromEnum(BuiltinKind.assert_eq))
-    @assertEq(builtinFromString("fd_write"), @intFromEnum(BuiltinKind.fd_write))
-    @assertEq(builtinFromString("net_socket"), @intFromEnum(BuiltinKind.net_socket))
-    @assertEq(builtinFromString("typeName"), @intFromEnum(BuiltinKind.type_name))
-    @assertEq(builtinFromString("typeInfo"), @intFromEnum(BuiltinKind.type_info))
-    @assertEq(builtinFromString("panic"), @intFromEnum(BuiltinKind.panic))
+    @assertEq(builtinFromString("sizeOf").?, @intFromEnum(BuiltinKind.size_of))
+    @assertEq(builtinFromString("intCast").?, @intFromEnum(BuiltinKind.int_cast))
+    @assertEq(builtinFromString("assertEq").?, @intFromEnum(BuiltinKind.assertEq))
+    @assertEq(builtinFromString("typeName").?, @intFromEnum(BuiltinKind.type_name))
+    @assertEq(builtinFromString("typeInfo").?, @intFromEnum(BuiltinKind.type_info))
+    @assertEq(builtinFromString("panic").?, @intFromEnum(BuiltinKind.panic))
+    @assertEq(builtinFromString("arcRetain").?, @intFromEnum(BuiltinKind.arcRetain))
+    @assertEq(builtinFromString("arcRelease").?, @intFromEnum(BuiltinKind.arcRelease))
 }
 
 test "builtinFromString unknown" {
-    @assertEq(builtinFromString("nonexistent"), -1)
-    @assertEq(builtinFromString(""), -1)
+    @assertEq(builtinFromString("nonexistent") == null, true)
+    @assertEq(builtinFromString("") == null, true)
+    // Runtime functions are no longer builtins
+    @assertEq(builtinFromString("fd_write") == null, true)
+    @assertEq(builtinFromString("alloc") == null, true)
+    @assertEq(builtinFromString("net_socket") == null, true)
 }
 
 test "BuiltinKind quoted identifiers" {
-    // Verify @"string", @"trunc", @"as" work as enum variants
-    @assertEq(@intFromEnum(BuiltinKind.@"string"), 10)
-    @assertEq(@intFromEnum(BuiltinKind.@"as"), 77)
+    @assertEq(builtinFromString("string").?, @intFromEnum(BuiltinKind.@"string"))
+    @assertEq(builtinFromString("as").?, @intFromEnum(BuiltinKind.@"as"))
 }
 
 test "ForStmt isRange pattern" {
-    var s = Span { start: 0, end: 10 }
-    var fs = ForStmt { binding: "i", iterable: null_node, range_start: 0, range_end: 10, body: 1, is_inline: false, span: s }
-    // range check: range_start != null_node means it's a range loop
+    const s = Span { start: 0, end: 10 }
+    const fs = ForStmt { binding: "i", iterable: null_node, range_start: 0, range_end: 10, body: 1, is_inline: false, span: s }
     @assertEq(fs.range_start != null_node, true)
-    var fs2 = ForStmt { binding: "item", iterable: 5, range_start: null_node, range_end: null_node, body: 1, is_inline: false, span: s }
+    const fs2 = ForStmt { binding: "item", iterable: 5, range_start: null_node, range_end: null_node, body: 1, is_inline: false, span: s }
     @assertEq(fs2.range_start != null_node, false)
 }
 
 test "VarStmt fields" {
-    var s = Span { start: 0, end: 20 }
-    var vs = VarStmt { name: "x", type_expr: null_node, value: 42, is_const: true, is_weak: false, span: s }
+    const s = Span { start: 0, end: 20 }
+    const vs = VarStmt { name: "x", type_expr: null_node, value: 42, is_const: true, is_weak: false, span: s }
     @assertEq(vs.name, "x")
     @assertEq(vs.is_const, true)
     @assertEq(vs.is_weak, false)
@@ -771,16 +639,14 @@ test "VarStmt fields" {
 }
 
 test "nested union Decl in Node" {
-    var s = Span { start: 0, end: 5 }
-    var bd = BadDecl { span: s }
-    var d: Decl = Decl.bad_decl(bd)
-    var n: Node = Node.decl(d)
-    // Test Node dispatches to correct variant
+    const s = Span { start: 0, end: 5 }
+    const bd = BadDecl { span: s }
+    const d: Decl = Decl.bad_decl(bd)
+    const n: Node = Node.decl(d)
     var matched = false
     switch n {
         Node.decl |inner| => { matched = true },
-        Node.expr |e| => { @assertEq(0, 1) },
-        Node.stmt |s2| => { @assertEq(0, 1) },
+        else => unreachable,
     }
     @assertEq(matched, true)
 }

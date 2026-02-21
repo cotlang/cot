@@ -1,47 +1,62 @@
-// source — Source text handling and position tracking.
-// Ported from compiler/frontend/source.zig
+/// Source text handling and position tracking.
+/// Ported from compiler/frontend/source.zig
 
 import "std/string"
 
+/// Byte offset into source text.
 struct Pos {
     offset: int,
 }
 
+impl Pos {
+    /// Return a new Pos advanced by n bytes.
+    fn advance(n: int) Pos {
+        return Pos { offset: self.offset + n }
+    }
+}
+
+/// Half-open byte range [start_offset, end_offset) in source text.
 struct Span {
     start_offset: int,
     end_offset: int,
 }
 
+impl Span {
+    /// Number of bytes in this span.
+    fn len() int {
+        return self.end_offset - self.start_offset
+    }
+}
+
+/// A source file: filename + content.
 struct Source {
     filename: string,
     content: string,
 }
 
-fn posAdvance(p: *Pos, n: int) Pos {
-    return Pos { offset: p.offset + n }
+impl Source {
+    /// Return the byte at offset, or null if past end.
+    fn at(offset: int) ?int {
+        if (offset >= @lenOf(self.content)) {
+            return null
+        }
+        return charAt(self.content, offset)
+    }
+
+    /// Return a substring [start, end) of the source content.
+    fn slice(start: int, end: int) string {
+        return substring(self.content, start, end)
+    }
 }
 
+/// Create a span from start to end offsets.
 fn spanInit(start: int, end: int) Span {
     return Span { start_offset: start, end_offset: end }
 }
 
+/// Create a zero-length span at a single offset.
 fn spanFromPos(offset: int) Span {
     return Span { start_offset: offset, end_offset: offset }
-}
-
-fn spanLen(s: *Span) int {
-    return s.end_offset - s.start_offset
-}
-
-fn sourceAt(src: *Source, offset: int) ?int {
-    if (offset >= @lenOf(src.content)) {
-        return null
-    }
-    return charAt(src.content, offset)
-}
-
-fn sourceSlice(src: *Source, start: int, end: int) string {
-    return substring(src.content, start, end)
 }
 
 // ============================================================================
@@ -50,47 +65,47 @@ fn sourceSlice(src: *Source, start: int, end: int) string {
 
 test "pos advance" {
     var p = Pos { offset: 5 }
-    var p2 = posAdvance(&p, 3)
+    const p2 = p.advance(3)
     @assertEq(p2.offset, 8)
 }
 
 test "span init" {
-    var s = spanInit(5, 10)
+    const s = spanInit(5, 10)
     @assertEq(s.start_offset, 5)
     @assertEq(s.end_offset, 10)
 }
 
 test "span from pos" {
-    var s = spanFromPos(7)
+    const s = spanFromPos(7)
     @assertEq(s.start_offset, 7)
     @assertEq(s.end_offset, 7)
 }
 
 test "span len" {
     var s = spanInit(5, 10)
-    @assertEq(spanLen(&s), 5)
+    @assertEq(s.len(), 5)
 }
 
 test "source at" {
     var src = Source { filename: "test.cot", content: "abc" }
-    var a = sourceAt(&src, 0)
+    const a = src.at(0)
     @assertEq(a.?, 97)
-    var b = sourceAt(&src, 1)
+    const b = src.at(1)
     @assertEq(b.?, 98)
-    var c = sourceAt(&src, 2)
+    const c = src.at(2)
     @assertEq(c.?, 99)
 }
 
 test "source at past end" {
     var src = Source { filename: "test.cot", content: "abc" }
-    var result = sourceAt(&src, 3)
+    const result = src.at(3)
     @assertEq(result == null, true)
 }
 
 test "source slice" {
     var src = Source { filename: "test.cot", content: "hello world" }
-    var s = sourceSlice(&src, 0, 5)
+    const s = src.slice(0, 5)
     @assertEq(s, "hello")
-    var s2 = sourceSlice(&src, 6, 11)
+    const s2 = src.slice(6, 11)
     @assertEq(s2, "world")
 }

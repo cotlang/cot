@@ -1,0 +1,688 @@
+/// Lexical scanner for the self-hosted compiler.
+/// Ported from compiler/frontend/scanner.zig
+
+import "std/string"
+import "token"
+
+/// Result of scanning a single token: token type, span, and text.
+struct TokenInfo {
+    tok: int,
+    start_offset: int,
+    end_offset: int,
+    text: string,
+}
+
+/// Lexical scanner state: tracks position, current character, and interpolation depth.
+struct Scanner {
+    content: string,
+    pos: int,
+    ch: ?int,
+    in_interp_string: bool,
+    interp_brace_depth: int,
+}
+
+/// Create a new scanner for the given source content.
+fn scannerInit(content: string) Scanner {
+    var s = Scanner {
+        content: content,
+        pos: 0,
+        ch: null,
+        in_interp_string: false,
+        interp_brace_depth: 0,
+    }
+    if (@lenOf(content) > 0) {
+        s.ch = charAt(content, 0)
+    }
+    return s
+}
+
+impl Scanner {
+    /// Advance one byte forward.
+    fn advance() void {
+        self.pos = self.pos + 1
+        if (self.pos >= @lenOf(self.content)) {
+            self.ch = null
+        } else {
+            self.ch = charAt(self.content, self.pos)
+        }
+    }
+
+    /// Peek n bytes ahead without advancing.
+    fn peek(n: int) ?int {
+        const offset = self.pos + n
+        if (offset >= @lenOf(self.content)) {
+            return null
+        }
+        return charAt(self.content, offset)
+    }
+
+    /// Scan the next token from input.
+    fn scanNext() TokenInfo {
+        self.skipWhitespaceAndComments()
+        const start = self.pos
+
+        if (self.ch == null) {
+            return TokenInfo {
+                tok: @intFromEnum(Token.eof),
+                start_offset: start,
+                end_offset: start,
+                text: "",
+            }
+        }
+
+        // Doc comment: /// ... (handled separately to keep scanNext simple)
+        const c = self.ch.?
+        if (c == 47) {
+            if (self.peek(1) == 47) {
+                if (self.peek(2) == 47) {
+                    return self.scanDocComment(start)
+                }
+            }
+            return self.scanOperator(start)
+        }
+
+        return self.scanNextInner(start)
+    }
+
+    fn scanNextInner(start: int) TokenInfo {
+        const c = self.ch.?
+        if (isAlpha(c) or c == 95) { return self.scanIdentifier(start) }
+        if (isDigit(c)) { return self.scanNumber(start) }
+        if (c == 34) { return self.scanString(start) }
+        if (c == 39) { return self.scanChar(start) }
+        return self.scanOperator(start)
+    }
+
+    /// Scan a /// doc comment.
+    fn scanDocComment(start: int) TokenInfo {
+        self.advance() // /
+        self.advance() // /
+        self.advance() // /
+        // Skip optional space after ///
+        if (self.ch) |c| {
+            if (c == 32) { self.advance() }
+        }
+        const text_start = self.pos
+        while (self.ch) |c| {
+            if (c == 10) { break }
+            self.advance()
+        }
+        const text = substring(self.content, text_start, self.pos)
+        // Consume the newline
+        if (self.ch) |c| {
+            if (c == 10) { self.advance() }
+        }
+        return TokenInfo {
+            tok: @intFromEnum(Token.doc_comment),
+            start_offset: start,
+            end_offset: self.pos,
+            text: text,
+        }
+    }
+
+    /// Skip whitespace and comments (line // and block /* */).
+    fn skipWhitespaceAndComments() void {
+        while (self.ch) |c| {
+            if (c == 32 or c == 9 or c == 10 or c == 13) {
+                // Whitespace
+                self.advance()
+            } else if (c == 47 and self.peek(1) == 47) {
+                // // prefix — check if doc comment or line comment
+                if (self.peek(2) == 47) {
+                    // Doc comment /// — stop, let scanNext handle it
+                    break
+                }
+                // Line comment (not doc comment) — skip to end of line
+                self.advance()
+                self.advance()
+                while (self.ch) |cc| {
+                    if (cc == 10) {
+                        self.advance()
+                        break
+                    }
+                    self.advance()
+                }
+            } else if (c == 47 and self.peek(1) == 42) {
+                // Block comment /* ... */
+                self.advance()
+                self.advance()
+                while (self.ch != null) {
+                    if (self.ch.? == 42 and self.peek(1) == 47) {
+                        self.advance()
+                        self.advance()
+                        break
+                    }
+                    self.advance()
+                }
+            } else {
+                break
+            }
+        }
+    }
+
+    /// Scan an identifier or keyword.
+    fn scanIdentifier(start: int) TokenInfo {
+        while (self.ch) |c| {
+            if (isAlphaNumeric(c) or c == 95) {
+                self.advance()
+            } else {
+                break
+            }
+        }
+        const text = substring(self.content, start, self.pos)
+        const kw = lookup(text)
+        if (kw != Token.ident) {
+            return TokenInfo { tok: @intFromEnum(kw), start_offset: start, end_offset: self.pos, text: "" }
+        }
+        return TokenInfo {
+            tok: @intFromEnum(Token.ident),
+            start_offset: start,
+            end_offset: self.pos,
+            text: text,
+        }
+    }
+
+    /// Scan float decimal point and exponent suffix. Returns 1 if float, 0 if int.
+    fn scanFloatPart() int {
+        // Decimal point (but not ".." range)
+        if (self.ch) |c| {
+            if (c == 46 and self.peek(1) != 46) {
+                self.advance()
+                while (self.ch) |cc| {
+                    if (isDigit(cc) or cc == 95) { self.advance() } else { break }
+                }
+                // Check for exponent after decimal
+                if (self.ch) |ec| {
+                    if (ec == 101 or ec == 69) {
+                        self.advance()
+                        if (self.ch) |sc| {
+                            if (sc == 43 or sc == 45) { self.advance() }
+                        }
+                        while (self.ch) |cc| {
+                            if (isDigit(cc) or cc == 95) { self.advance() } else { break }
+                        }
+                    }
+                }
+                return 1
+            }
+        }
+        // Exponent without decimal (e.g. 1e5)
+        if (self.ch) |c| {
+            if (c == 101 or c == 69) {
+                self.advance()
+                if (self.ch) |sc| {
+                    if (sc == 43 or sc == 45) { self.advance() }
+                }
+                while (self.ch) |cc| {
+                    if (isDigit(cc) or cc == 95) { self.advance() } else { break }
+                }
+                return 1
+            }
+        }
+        return 0
+    }
+
+    /// Scan a numeric literal (int, float, hex, octal, binary).
+    fn scanNumber(start: int) TokenInfo {
+        if (self.ch.? == 48) {
+            // '0' prefix — check for hex/octal/binary
+            self.advance()
+            if (self.ch) |c| {
+                if (c == 120 or c == 88) {
+                    // 0x or 0X — hex
+                    self.advance()
+                    while (self.ch) |cc| {
+                        if (isHexDigit(cc) or cc == 95) { self.advance() } else { break }
+                    }
+                    return self.makeNumberToken(start, false)
+                } else if (c == 111 or c == 79) {
+                    // 0o or 0O — octal
+                    self.advance()
+                    while (self.ch) |cc| {
+                        if ((cc >= 48 and cc <= 55) or cc == 95) { self.advance() } else { break }
+                    }
+                    return self.makeNumberToken(start, false)
+                } else if (c == 98 or c == 66) {
+                    // 0b or 0B — binary
+                    self.advance()
+                    while (self.ch) |cc| {
+                        if (cc == 48 or cc == 49 or cc == 95) { self.advance() } else { break }
+                    }
+                    return self.makeNumberToken(start, false)
+                }
+            }
+        }
+
+        // Decimal digits
+        while (self.ch) |c| {
+            if (isDigit(c) or c == 95) { self.advance() } else { break }
+        }
+
+        // Float detection (decimal point + exponent) in separate function
+        if (self.scanFloatPart() == 1) {
+            return self.makeNumberToken(start, true)
+        }
+        return self.makeNumberToken(start, false)
+    }
+
+    fn makeNumberToken(start: int, is_float: bool) TokenInfo {
+        var tok = @intFromEnum(Token.int_lit)
+        if (is_float) { tok = @intFromEnum(Token.float_lit) }
+        return TokenInfo {
+            tok: tok,
+            start_offset: start,
+            end_offset: self.pos,
+            text: substring(self.content, start, self.pos),
+        }
+    }
+
+    /// Scan a string literal (with interpolation support).
+    fn scanString(start: int) TokenInfo {
+        self.advance() // opening "
+
+        while (self.ch) |c| {
+            if (c == 34) {
+                // closing "
+                self.advance()
+                break
+            } else if (c == 92) {
+                // backslash escape
+                self.advance()
+                if (self.ch != null) { self.advance() }
+            } else if (c == 36 and self.peek(1) == 123) {
+                // ${ — string interpolation
+                self.advance()
+                self.advance()
+                self.in_interp_string = true
+                self.interp_brace_depth = 1
+                const text = substring(self.content, start, self.pos)
+                return TokenInfo {
+                    tok: @intFromEnum(Token.string_interp_start),
+                    start_offset: start,
+                    end_offset: self.pos,
+                    text: text,
+                }
+            } else if (c == 10) {
+                // newline — unterminated
+                break
+            } else {
+                self.advance()
+            }
+        }
+
+        return TokenInfo {
+            tok: @intFromEnum(Token.string_lit),
+            start_offset: start,
+            end_offset: self.pos,
+            text: substring(self.content, start, self.pos),
+        }
+    }
+
+    /// Scan string continuation after interpolation expression.
+    fn scanStringContinuation(start: int) TokenInfo {
+        while (self.ch) |c| {
+            if (c == 34) {
+                self.advance()
+                self.in_interp_string = false
+                return TokenInfo {
+                    tok: @intFromEnum(Token.string_interp_end),
+                    start_offset: start,
+                    end_offset: self.pos,
+                    text: substring(self.content, start, self.pos),
+                }
+            } else if (c == 92) {
+                self.advance()
+                if (self.ch != null) { self.advance() }
+            } else if (c == 36 and self.peek(1) == 123) {
+                self.advance()
+                self.advance()
+                self.interp_brace_depth = 1
+                return TokenInfo {
+                    tok: @intFromEnum(Token.string_interp_mid),
+                    start_offset: start,
+                    end_offset: self.pos,
+                    text: substring(self.content, start, self.pos),
+                }
+            } else if (c == 10) {
+                break
+            } else {
+                self.advance()
+            }
+        }
+
+        return TokenInfo {
+            tok: @intFromEnum(Token.string_interp_end),
+            start_offset: start,
+            end_offset: self.pos,
+            text: substring(self.content, start, self.pos),
+        }
+    }
+
+    /// Scan a character literal.
+    fn scanChar(start: int) TokenInfo {
+        self.advance() // opening '
+        if (self.ch) |c| {
+            if (c == 92) {
+                // escape sequence
+                self.advance()
+                if (self.ch != null) { self.advance() }
+            } else if (c != 39) {
+                self.advance()
+            }
+        }
+        if (self.ch) |c| {
+            if (c == 39) {
+                self.advance()
+            }
+        }
+        return TokenInfo {
+            tok: @intFromEnum(Token.char_lit),
+            start_offset: start,
+            end_offset: self.pos,
+            text: substring(self.content, start, self.pos),
+        }
+    }
+
+    /// Scan an operator or punctuation token.
+    fn scanOperator(start: int) TokenInfo {
+        const c = self.ch.?
+        self.advance()
+
+        // String interpolation brace tracking
+        if (c == 123 and self.in_interp_string) {
+            self.interp_brace_depth = self.interp_brace_depth + 1
+            return TokenInfo {
+                tok: @intFromEnum(Token.lbrace),
+                start_offset: start,
+                end_offset: self.pos,
+                text: "",
+            }
+        }
+        if (c == 125 and self.in_interp_string) {
+            self.interp_brace_depth = self.interp_brace_depth - 1
+            if (self.interp_brace_depth == 0) {
+                return self.scanStringContinuation(start)
+            }
+            return TokenInfo {
+                tok: @intFromEnum(Token.rbrace),
+                start_offset: start,
+                end_offset: self.pos,
+                text: "",
+            }
+        }
+
+        // Single-char operators (no lookahead needed)
+        if (c == 40) { return makeOp(start, self.pos, @intFromEnum(Token.lparen)) }
+        if (c == 41) { return makeOp(start, self.pos, @intFromEnum(Token.rparen)) }
+        if (c == 91) { return makeOp(start, self.pos, @intFromEnum(Token.lbrack)) }
+        if (c == 93) { return makeOp(start, self.pos, @intFromEnum(Token.rbrack)) }
+        if (c == 123) { return makeOp(start, self.pos, @intFromEnum(Token.lbrace)) }
+        if (c == 125) { return makeOp(start, self.pos, @intFromEnum(Token.rbrace)) }
+        if (c == 44) { return makeOp(start, self.pos, @intFromEnum(Token.comma)) }
+        if (c == 59) { return makeOp(start, self.pos, @intFromEnum(Token.semicolon)) }
+        if (c == 58) { return makeOp(start, self.pos, @intFromEnum(Token.colon)) }
+        if (c == 126) { return makeOp(start, self.pos, @intFromEnum(Token.@"not")) }
+        if (c == 64) { return makeOp(start, self.pos, @intFromEnum(Token.at)) }
+
+        // Two-char arithmetic operators
+        if (c == 43) {
+            if (self.ch) |nc| { if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.add_assign)) } }
+            return makeOp(start, self.pos, @intFromEnum(Token.add))
+        }
+        if (c == 45) {
+            if (self.ch) |nc| {
+                if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.sub_assign)) }
+                if (nc == 62) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.arrow)) }
+            }
+            return makeOp(start, self.pos, @intFromEnum(Token.sub))
+        }
+        if (c == 42) {
+            if (self.ch) |nc| { if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.mul_assign)) } }
+            return makeOp(start, self.pos, @intFromEnum(Token.mul))
+        }
+        if (c == 47) {
+            if (self.ch) |nc| { if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.quo_assign)) } }
+            return makeOp(start, self.pos, @intFromEnum(Token.quo))
+        }
+        if (c == 37) {
+            if (self.ch) |nc| { if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.rem_assign)) } }
+            return makeOp(start, self.pos, @intFromEnum(Token.rem))
+        }
+
+        // Delegate to second half for bitwise, comparison, and punctuation operators
+        return self.scanOperator2(c, start)
+    }
+
+    fn scanOperator2(c: int, start: int) TokenInfo {
+        if (c == 38) {
+            if (self.ch) |nc| {
+                if (nc == 38) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.land)) }
+                if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.and_assign)) }
+            }
+            return makeOp(start, self.pos, @intFromEnum(Token.@"and"))
+        }
+        if (c == 124) {
+            if (self.ch) |nc| {
+                if (nc == 124) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.lor)) }
+                if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.or_assign)) }
+            }
+            return makeOp(start, self.pos, @intFromEnum(Token.@"or"))
+        }
+        if (c == 94) {
+            if (self.ch) |nc| { if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.xor_assign)) } }
+            return makeOp(start, self.pos, @intFromEnum(Token.xor))
+        }
+        if (c == 61) {
+            if (self.ch) |nc| {
+                if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.eql)) }
+                if (nc == 62) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.fat_arrow)) }
+            }
+            return makeOp(start, self.pos, @intFromEnum(Token.assign))
+        }
+        if (c == 33) {
+            if (self.ch) |nc| { if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.neq)) } }
+            return makeOp(start, self.pos, @intFromEnum(Token.lnot))
+        }
+        if (c == 60) {
+            if (self.ch) |nc| {
+                if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.leq)) }
+                if (nc == 60) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.shl)) }
+            }
+            return makeOp(start, self.pos, @intFromEnum(Token.lss))
+        }
+        if (c == 62) {
+            if (self.ch) |nc| {
+                if (nc == 61) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.geq)) }
+                if (nc == 62) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.shr)) }
+            }
+            return makeOp(start, self.pos, @intFromEnum(Token.gtr))
+        }
+        if (c == 46) {
+            if (self.ch) |nc| {
+                if (nc == 46) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.period_period)) }
+                if (nc == 42) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.period_star)) }
+                if (nc == 63) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.period_question)) }
+            }
+            return makeOp(start, self.pos, @intFromEnum(Token.period))
+        }
+        if (c == 63) {
+            if (self.ch) |nc| { if (nc == 46) { self.advance(); return makeOp(start, self.pos, @intFromEnum(Token.optional_chain)) } }
+            return makeOp(start, self.pos, @intFromEnum(Token.question))
+        }
+
+        return makeOp(start, self.pos, @intFromEnum(Token.illegal))
+    }
+}
+
+/// Create an operator TokenInfo with no text.
+fn makeOp(start: int, end: int, tok: int) TokenInfo {
+    return TokenInfo { tok: tok, start_offset: start, end_offset: end, text: "" }
+}
+
+// Character classification helpers
+fn isHexDigit(c: int) bool {
+    return isDigit(c) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}
+
+fn isAlphaNumeric(c: int) bool {
+    return isAlpha(c) or isDigit(c)
+}
+
+// ============================================================================
+// Test helpers
+// ============================================================================
+
+fn expectTok(s: *Scanner, expected: int) void {
+    const t = s.scanNext()
+    @assertEq(t.tok, expected)
+}
+
+fn expectTokText(s: *Scanner, expected_tok: int, expected_text: string) void {
+    const t = s.scanNext()
+    @assertEq(t.tok, expected_tok)
+    @assertEq(t.text, expected_text)
+}
+
+fn expectText(s: *Scanner, expected_text: string) void {
+    const t = s.scanNext()
+    @assertEq(t.text, expected_text)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "scanner basics" {
+    var s = scannerInit("fn main() { return 42 }")
+    expectTok(&s, @intFromEnum(Token.kw_fn))
+    expectTokText(&s, @intFromEnum(Token.ident), "main")
+    expectTok(&s, @intFromEnum(Token.lparen))
+    expectTok(&s, @intFromEnum(Token.rparen))
+    expectTok(&s, @intFromEnum(Token.lbrace))
+    expectTok(&s, @intFromEnum(Token.kw_return))
+    expectTokText(&s, @intFromEnum(Token.int_lit), "42")
+    expectTok(&s, @intFromEnum(Token.rbrace))
+    expectTok(&s, @intFromEnum(Token.eof))
+}
+
+test "scanner operators" {
+    var s = scannerInit("== != <= >= << >> .* .? ?. orelse")
+    expectTok(&s, @intFromEnum(Token.eql))
+    expectTok(&s, @intFromEnum(Token.neq))
+    expectTok(&s, @intFromEnum(Token.leq))
+    expectTok(&s, @intFromEnum(Token.geq))
+    expectTok(&s, @intFromEnum(Token.shl))
+    expectTok(&s, @intFromEnum(Token.shr))
+    expectTok(&s, @intFromEnum(Token.period_star))
+    expectTok(&s, @intFromEnum(Token.period_question))
+    expectTok(&s, @intFromEnum(Token.optional_chain))
+    expectTok(&s, @intFromEnum(Token.kw_orelse))
+}
+
+test "scanner strings" {
+    var s = scannerInit("\"hello world\"")
+    expectTokText(&s, @intFromEnum(Token.string_lit), "\"hello world\"")
+}
+
+test "scanner numbers" {
+    var s = scannerInit("42 3.14 0xFF 0b1010 0o777 1_000_000")
+    expectTokText(&s, @intFromEnum(Token.int_lit), "42")
+    expectTokText(&s, @intFromEnum(Token.float_lit), "3.14")
+    expectText(&s, "0xFF")
+    expectText(&s, "0b1010")
+    expectText(&s, "0o777")
+    expectText(&s, "1_000_000")
+}
+
+test "scanner comments" {
+    var s = scannerInit("// line comment\nx /* block */ y")
+    expectTokText(&s, @intFromEnum(Token.ident), "x")
+    expectText(&s, "y")
+    expectTok(&s, @intFromEnum(Token.eof))
+}
+
+test "scanner keywords" {
+    var s = scannerInit("fn var const if else while for return")
+    expectTok(&s, @intFromEnum(Token.kw_fn))
+    expectTok(&s, @intFromEnum(Token.kw_var))
+    expectTok(&s, @intFromEnum(Token.kw_const))
+    expectTok(&s, @intFromEnum(Token.kw_if))
+    expectTok(&s, @intFromEnum(Token.kw_else))
+    expectTok(&s, @intFromEnum(Token.kw_while))
+    expectTok(&s, @intFromEnum(Token.kw_for))
+    expectTok(&s, @intFromEnum(Token.kw_return))
+}
+
+test "scanner type keywords" {
+    var s = scannerInit("int float bool string i64 u8")
+    expectTok(&s, @intFromEnum(Token.kw_int))
+    expectTok(&s, @intFromEnum(Token.kw_float))
+    expectTok(&s, @intFromEnum(Token.kw_bool))
+    expectTok(&s, @intFromEnum(Token.kw_string))
+    expectTok(&s, @intFromEnum(Token.kw_i64))
+    expectTok(&s, @intFromEnum(Token.kw_u8))
+}
+
+test "scanner char literals" {
+    var s = scannerInit("'a' '\\n'")
+    expectTokText(&s, @intFromEnum(Token.char_lit), "'a'")
+    expectTok(&s, @intFromEnum(Token.char_lit))
+}
+
+test "scanner compound assignment" {
+    var s = scannerInit("+= -= *= /= %= &= |= ^=")
+    expectTok(&s, @intFromEnum(Token.add_assign))
+    expectTok(&s, @intFromEnum(Token.sub_assign))
+    expectTok(&s, @intFromEnum(Token.mul_assign))
+    expectTok(&s, @intFromEnum(Token.quo_assign))
+    expectTok(&s, @intFromEnum(Token.rem_assign))
+    expectTok(&s, @intFromEnum(Token.and_assign))
+    expectTok(&s, @intFromEnum(Token.or_assign))
+    expectTok(&s, @intFromEnum(Token.xor_assign))
+}
+
+test "scanner arrows" {
+    var s = scannerInit("-> =>")
+    expectTok(&s, @intFromEnum(Token.arrow))
+    expectTok(&s, @intFromEnum(Token.fat_arrow))
+}
+
+test "scanner doc comment" {
+    var s = scannerInit("/// hello world\nx")
+    expectTokText(&s, @intFromEnum(Token.doc_comment), "hello world")
+    expectTokText(&s, @intFromEnum(Token.ident), "x")
+}
+
+test "scanner empty input" {
+    var s = scannerInit("")
+    expectTok(&s, @intFromEnum(Token.eof))
+}
+
+test "scanner logical operators" {
+    var s = scannerInit("&& || ! & |")
+    expectTok(&s, @intFromEnum(Token.land))
+    expectTok(&s, @intFromEnum(Token.lor))
+    expectTok(&s, @intFromEnum(Token.lnot))
+    expectTok(&s, @intFromEnum(Token.@"and"))
+    expectTok(&s, @intFromEnum(Token.@"or"))
+}
+
+test "scanner comparison operators" {
+    var s = scannerInit("< > = . ?")
+    expectTok(&s, @intFromEnum(Token.lss))
+    expectTok(&s, @intFromEnum(Token.gtr))
+    expectTok(&s, @intFromEnum(Token.assign))
+    expectTok(&s, @intFromEnum(Token.period))
+    expectTok(&s, @intFromEnum(Token.question))
+}
+
+test "scanner full statement" {
+    var s = scannerInit("var x = 42 + y")
+    expectTok(&s, @intFromEnum(Token.kw_var))
+    expectTokText(&s, @intFromEnum(Token.ident), "x")
+    expectTok(&s, @intFromEnum(Token.assign))
+    expectTokText(&s, @intFromEnum(Token.int_lit), "42")
+    expectTok(&s, @intFromEnum(Token.add))
+    expectTokText(&s, @intFromEnum(Token.ident), "y")
+    expectTok(&s, @intFromEnum(Token.eof))
+}

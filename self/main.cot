@@ -1,11 +1,11 @@
-// main — Entry point for the self-hosted Cot compiler.
-// Currently: tokenizes a source file and prints each token.
+/// Entry point for the self-hosted Cot compiler.
+/// Currently: tokenizes a source file and prints each token.
 
 import "std/os"
 import "std/fs"
 import "std/sys"
-import "token"
-import "scanner"
+import "frontend/token"
+import "frontend/scanner"
 
 fn main() void {
     if (argsCount() < 2) {
@@ -13,18 +13,17 @@ fn main() void {
         exit(1)
     }
 
-    var path = arg(1)
-    var content = readFile(path) catch {
+    const path = arg(1)
+    const content = readFile(path) catch {
         fd_write(2, @ptrOf("error: cannot read file\n"), 24)
         exit(1)
     }
 
     var s = scannerInit(content)
-    var done = false
-    while (not done) {
-        var t = scanNext(&s)
-        var tok = @as(Token, @enumFromInt(t.tok))
-        var name = tok.toString()
+    while (true) {
+        const t = s.scanNext()
+        const tok = @as(Token, @enumFromInt(t.tok))
+        const name = tok.toString()
         fd_write(1, @ptrOf(name), @lenOf(name))
         if (@lenOf(t.text) > 0) {
             fd_write(1, @ptrOf(" \""), 2)
@@ -33,7 +32,7 @@ fn main() void {
         }
         fd_write(1, @ptrOf("\n"), 1)
         if (tok == Token.eof) {
-            done = true
+            break
         }
     }
 }

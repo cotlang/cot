@@ -1,8 +1,7 @@
-// token — Token definitions for the self-hosted compiler.
-// Ported from compiler/frontend/token.zig
+/// Token definitions for the self-hosted compiler.
+/// Ported from compiler/frontend/token.zig
 
-// No imports needed — keyword lookup uses the comptime token_strings array directly.
-
+/// All token types produced by the scanner.
 const Token = enum(u8) {
     // Special
     illegal, eof, comment, doc_comment,
@@ -47,8 +46,8 @@ const Token = enum(u8) {
     keyword_end,
 }
 
-// Zig: const token_strings = blk: { var s: [...]; for (fields) |f| s[f.value] = f.name; break :blk s; };
-// Cot: comptime block with inline for over @typeInfo fields, then overrides.
+/// Comptime string table: maps every Token variant to its display string.
+/// Zig: const token_strings = blk: { var s: [...]; for (fields) |f| s[f.value] = f.name; break :blk s; };
 const token_strings = comptime {
     var s: [@enumLen(Token)]string = undefined
     inline for field in @typeInfo(Token).fields {
@@ -179,13 +178,12 @@ const token_strings = comptime {
 }
 
 impl Token {
-    // Zig: pub fn string(self: Token) []const u8 { return token_strings[@intFromEnum(self)]; }
-    // Cot: `string` is a keyword (type), so we use `toString` instead.
+    /// Return the display string for this token.
     fn toString() string {
         return token_strings[@intFromEnum(self)]
     }
 
-    // Zig: pub fn precedence(self: Token) u8 { return switch (self) { ... }; }
+    /// Return operator precedence (0 = not an operator).
     fn precedence() u8 {
         return switch (self) {
             .kw_orelse => 1,
@@ -198,22 +196,22 @@ impl Token {
         }
     }
 
-    // Zig: pub fn isLiteral(self: Token) bool
+    /// Whether this token is a literal (ident, int, float, string, char).
     fn isLiteral() bool {
         return self > Token.literal_beg and self < Token.literal_end
     }
 
-    // Zig: pub fn isOperator(self: Token) bool
+    /// Whether this token is an operator or punctuation.
     fn isOperator() bool {
         return self > Token.operator_beg and self < Token.operator_end
     }
 
-    // Zig: pub fn isKeyword(self: Token) bool
+    /// Whether this token is a keyword.
     fn isKeyword() bool {
         return self > Token.keyword_beg and self < Token.keyword_end
     }
 
-    // Zig: pub fn isTypeKeyword(self: Token) bool
+    /// Whether this token is a type keyword (int, f64, string, etc).
     fn isTypeKeyword() bool {
         return switch (self) {
             .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte, .kw_void, .kw_noreturn,
@@ -222,7 +220,7 @@ impl Token {
         }
     }
 
-    // Zig: pub fn isAssignment(self: Token) bool { return switch (self) { ... }; }
+    /// Whether this token is an assignment operator (=, +=, -=, etc).
     fn isAssignment() bool {
         return switch (self) {
             .assign, .add_assign, .sub_assign, .mul_assign, .quo_assign,
@@ -232,8 +230,7 @@ impl Token {
     }
 }
 
-// Zig: pub const keywords = std.StaticStringMap(Token).initComptime(...)
-// Cot: String switch for O(n) keyword lookup — matches Zig's pattern of string-keyed dispatch.
+/// Look up an identifier string and return its keyword token, or .ident if not a keyword.
 fn lookup(name: string) Token {
     return switch (name) {
         "fn" => Token.kw_fn,
@@ -307,7 +304,7 @@ fn lookup(name: string) Token {
 // ============================================================================
 
 test "token to string" {
-    var tok = Token.add
+    const tok = Token.add
     @assertEq(tok.toString(), "+")
     @assertEq(Token.kw_fn.toString(), "fn")
     @assertEq(Token.eql.toString(), "==")
@@ -377,14 +374,13 @@ test "isAssignment" {
 }
 
 test "string method via switch shorthand" {
-    var tok = Token.arrow
+    const tok = Token.arrow
     @assertEq(tok.toString(), "->")
     @assertEq(Token.fat_arrow.toString(), "=>")
     @assertEq(Token.question.toString(), "?")
 }
 
 test "precedence multi-case arms" {
-    // Verify all operators at each precedence level
     @assertEq(Token.sub.precedence(), 5)
     @assertEq(Token.@"or".precedence(), 5)
     @assertEq(Token.xor.precedence(), 5)
@@ -403,7 +399,6 @@ test "precedence multi-case arms" {
 }
 
 test "quoted ident operator tokens" {
-    // Verify @"and", @"or", @"not" are the bitwise operators (& | ~)
     @assertEq(Token.@"and".toString(), "&")
     @assertEq(Token.@"or".toString(), "|")
     @assertEq(Token.@"not".toString(), "~")
@@ -413,7 +408,6 @@ test "quoted ident operator tokens" {
 }
 
 test "string switch keyword lookup" {
-    // Verify the string switch-based lookup works for all keyword categories
     @assertEq(lookup("struct"), Token.kw_struct)
     @assertEq(lookup("enum"), Token.kw_enum)
     @assertEq(lookup("if"), Token.kw_if)

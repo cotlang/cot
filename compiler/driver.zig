@@ -107,8 +107,11 @@ pub const Driver = struct {
     }
 
     /// Lazily load and cache the project-level @safe flag from cot.json.
-    fn isProjectSafe(self: *Driver) bool {
+    /// Walks up from the input file's directory (like npm's package.json resolution)
+    /// so nested files (e.g. self/frontend/scanner.cot) find self/cot.json.
+    fn isProjectSafe(self: *Driver, file_path: ?[]const u8) bool {
         if (self.project_safe) |s| return s;
+        // Try CWD first
         const maybe_loaded = project_mod.loadConfig(self.allocator, null) catch null;
         if (maybe_loaded) |loaded_val| {
             var loaded = loaded_val;
@@ -116,6 +119,26 @@ pub const Driver = struct {
             const safe = loaded.value().safe orelse false;
             self.project_safe = safe;
             return safe;
+        }
+        // Walk up from the input file's directory looking for cot.json
+        if (file_path) |fp| {
+            var dir: ?[]const u8 = std.fs.path.dirname(fp);
+            var depth: usize = 0;
+            while (dir != null and depth < 10) : (depth += 1) {
+                const d = dir.?;
+                const maybe_file_loaded = project_mod.loadConfig(self.allocator, d) catch null;
+                if (maybe_file_loaded) |loaded_val| {
+                    var loaded = loaded_val;
+                    defer loaded.deinit();
+                    const safe = loaded.value().safe orelse false;
+                    self.project_safe = safe;
+                    return safe;
+                }
+                // Go up one level
+                const parent = std.fs.path.dirname(d);
+                if (parent != null and std.mem.eql(u8, parent.?, d)) break; // reached root
+                dir = parent;
+            }
         }
         self.project_safe = false;
         return false;
@@ -143,18 +166,11 @@ pub const Driver = struct {
         defer in_progress.deinit();
         try self.parseFileRecursive(path, &parsed_files, &seen_files, &in_progress);
 
-        // Apply project-level @safe mode from cot.json
-        {
-            const maybe_loaded = project_mod.loadConfig(self.allocator, null) catch null;
-            if (maybe_loaded) |loaded_val| {
-                var loaded = loaded_val;
-                defer loaded.deinit();
-                if (loaded.value().safe orelse false) {
-                    for (parsed_files.items) |*pf| {
-                        if (pf.tree.file) |*file| {
-                            file.safe_mode = true;
-                        }
-                    }
+        // Apply project-level @safe mode from cot.json (search CWD + file's dir)
+        if (self.isProjectSafe(path)) {
+            for (parsed_files.items) |*pf| {
+                if (pf.tree.file) |*file| {
+                    file.safe_mode = true;
                 }
             }
         }
@@ -201,18 +217,11 @@ pub const Driver = struct {
         defer in_progress.deinit();
         try self.parseFileRecursive(path, &parsed_files, &seen_files, &in_progress);
 
-        // Apply project-level @safe mode from cot.json
-        {
-            const maybe_loaded = project_mod.loadConfig(self.allocator, null) catch null;
-            if (maybe_loaded) |loaded_val| {
-                var loaded = loaded_val;
-                defer loaded.deinit();
-                if (loaded.value().safe orelse false) {
-                    for (parsed_files.items) |*pf| {
-                        if (pf.tree.file) |*file| {
-                            file.safe_mode = true;
-                        }
-                    }
+        // Apply project-level @safe mode from cot.json (search CWD + file's dir)
+        if (self.isProjectSafe(path)) {
+            for (parsed_files.items) |*pf| {
+                if (pf.tree.file) |*file| {
+                    file.safe_mode = true;
                 }
             }
         }
@@ -311,18 +320,11 @@ pub const Driver = struct {
         defer in_progress.deinit();
         try self.parseFileRecursive(path, &parsed_files, &seen_files, &in_progress);
 
-        // Apply project-level @safe mode from cot.json
-        {
-            const maybe_loaded = project_mod.loadConfig(self.allocator, null) catch null;
-            if (maybe_loaded) |loaded_val| {
-                var loaded = loaded_val;
-                defer loaded.deinit();
-                if (loaded.value().safe orelse false) {
-                    for (parsed_files.items) |*pf| {
-                        if (pf.tree.file) |*file| {
-                            file.safe_mode = true;
-                        }
-                    }
+        // Apply project-level @safe mode from cot.json (search CWD + file's dir)
+        if (self.isProjectSafe(path)) {
+            for (parsed_files.items) |*pf| {
+                if (pf.tree.file) |*file| {
+                    file.safe_mode = true;
                 }
             }
         }
@@ -520,7 +522,7 @@ pub const Driver = struct {
         var scan = scanner_mod.Scanner.initWithErrors(&src, &err_reporter);
         var parser = parser_mod.Parser.init(self.allocator, &scan, &tree, &err_reporter);
         // Project-level @safe: set parser safe_mode BEFORE parsing so syntax features work
-        if (self.isProjectSafe()) parser.safe_mode = true;
+        if (self.isProjectSafe(canonical_path)) parser.safe_mode = true;
         try parser.parseFile();
         if (err_reporter.hasErrors()) return error.ParseError;
 
