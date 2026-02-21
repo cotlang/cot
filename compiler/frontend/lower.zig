@@ -4311,6 +4311,10 @@ pub const Lowerer = struct {
         const subject_type = self.inferExprType(se.subject);
         const is_union = self.type_reg.get(subject_type) == .union_type;
         if (result_type == TypeRegistry.VOID or (is_union and self.hasCapture(se))) return try self.lowerSwitchStatement(se);
+        // Switch arms with calls must use block-based lowering (branches, not selects).
+        // Select-based lowering eagerly evaluates ALL arm bodies — wrong for side effects.
+        // Reference: Zig, Go, Cranelift all use conditional branches for switch.
+        if (self.switchArmsHaveCalls(se)) return try self.lowerSwitchValueBlocks(se, result_type);
         return try self.lowerSwitchAsSelect(se, result_type);
     }
 
@@ -4320,6 +4324,43 @@ pub const Lowerer = struct {
             if (case.capture.len > 0) return true;
         }
         return false;
+    }
+
+    /// Check if any switch arm body contains a function call (direct or method).
+    /// Calls have side effects — select-based lowering would eagerly evaluate ALL arms.
+    fn switchArmsHaveCalls(self: *Lowerer, se: ast.SwitchExpr) bool {
+        for (se.cases) |case| {
+            if (self.exprMayHaveSideEffects(case.body)) return true;
+        }
+        if (se.else_body != null_node) {
+            if (self.exprMayHaveSideEffects(se.else_body)) return true;
+        }
+        return false;
+    }
+
+    /// Conservative check: does this expression potentially have side effects?
+    /// Returns true for calls, blocks (may contain calls), and other non-pure expressions.
+    fn exprMayHaveSideEffects(self: *Lowerer, idx: ast.NodeIndex) bool {
+        const node = self.tree.getNode(idx) orelse return false;
+        const expr = node.asExpr() orelse {
+            // Statement bodies (blocks) may have side effects
+            return true;
+        };
+        return switch (expr) {
+            .call => true,
+            .builtin_call => true,
+            .new_expr => true,
+            .block_expr => true,
+            .if_expr => |ie| {
+                return self.exprMayHaveSideEffects(ie.then_branch) or
+                    (ie.else_branch != null_node and self.exprMayHaveSideEffects(ie.else_branch));
+            },
+            .switch_expr => true,
+            // Pure expressions
+            .literal, .ident, .field_access, .error_literal, .binary, .unary, .index, .slice_expr => false,
+            // Conservative: unknown expression types assumed side-effectful
+            else => true,
+        };
     }
 
     fn lowerSwitchStatement(self: *Lowerer, se: ast.SwitchExpr) Error!ir.NodeIndex {
@@ -4527,6 +4568,86 @@ pub const Lowerer = struct {
             return ut.variants[vidx].payload_type;
         }
         return TypeRegistry.VOID;
+    }
+
+    /// Block-based switch expression lowering: each arm in its own block, result stored in local.
+    /// Used when arms contain function calls or other side effects.
+    /// Follows Zig/Go/Cranelift pattern: conditional branches, only one arm executes.
+    fn lowerSwitchValueBlocks(self: *Lowerer, se: ast.SwitchExpr, result_type: TypeIndex) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const old_switch_enum = self.current_switch_enum_type;
+        const subject_type = self.inferExprType(se.subject);
+        const subject_info = self.type_reg.get(subject_type);
+        if (subject_info == .enum_type) self.current_switch_enum_type = subject_type;
+        defer self.current_switch_enum_type = old_switch_enum;
+
+        const subject = try self.lowerExprNode(se.subject);
+        const merge_block = try fb.newBlock("switch.end");
+
+        // Result local: each arm stores its value here, merge block loads it
+        const result_size = self.type_reg.sizeOf(result_type);
+        const result_local = try fb.addLocalWithSize("__switch_result", result_type, true, result_size);
+
+        // String switch: pre-extract ptr/len
+        const is_string_switch = subject_type == TypeRegistry.STRING;
+        var subject_ptr: ir.NodeIndex = ir.null_node;
+        var subject_len: ir.NodeIndex = ir.null_node;
+        if (is_string_switch) {
+            const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+            subject_ptr = try fb.emitSlicePtr(subject, ptr_type, se.span);
+            subject_len = try fb.emitSliceLen(subject, se.span);
+        }
+
+        var i: usize = 0;
+        while (i < se.cases.len) : (i += 1) {
+            const case = se.cases[i];
+            var case_cond: ir.NodeIndex = ir.null_node;
+
+            if (case.is_range and case.patterns.len >= 2) {
+                const range_start = try self.lowerExprNode(case.patterns[0]);
+                const range_end = try self.lowerExprNode(case.patterns[1]);
+                const ge_cond = try fb.emitBinary(.ge, subject, range_start, TypeRegistry.BOOL, se.span);
+                const le_cond = try fb.emitBinary(.le, subject, range_end, TypeRegistry.BOOL, se.span);
+                case_cond = try fb.emitBinary(.@"and", ge_cond, le_cond, TypeRegistry.BOOL, se.span);
+            } else {
+                for (case.patterns) |pattern_idx| {
+                    const pattern_val = try self.resolveErrorPatternOrLower(pattern_idx, se.span);
+                    const pattern_cond = if (is_string_switch) blk: {
+                        const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
+                        const p_ptr = try fb.emitSlicePtr(pattern_val, ptr_type, se.span);
+                        const p_len = try fb.emitSliceLen(pattern_val, se.span);
+                        var eq_args = [_]ir.NodeIndex{ subject_ptr, subject_len, p_ptr, p_len };
+                        const eq_result = try fb.emitCall("string_eq", &eq_args, false, TypeRegistry.I64, se.span);
+                        const zero = try fb.emitConstInt(0, TypeRegistry.I64, se.span);
+                        break :blk try fb.emitBinary(.ne, eq_result, zero, TypeRegistry.BOOL, se.span);
+                    } else try fb.emitBinary(.eq, subject, pattern_val, TypeRegistry.BOOL, se.span);
+                    case_cond = if (case_cond == ir.null_node) pattern_cond else try fb.emitBinary(.@"or", case_cond, pattern_cond, TypeRegistry.BOOL, se.span);
+                }
+            }
+
+            if (case.guard != ast.null_node and case_cond != ir.null_node) {
+                const guard_cond = try self.lowerExprNode(case.guard);
+                case_cond = try fb.emitBinary(.@"and", case_cond, guard_cond, TypeRegistry.BOOL, se.span);
+            }
+
+            const case_block = try fb.newBlock("switch.case");
+            const next_block = if (i + 1 < se.cases.len) try fb.newBlock("switch.next") else if (se.else_body != null_node) try fb.newBlock("switch.else") else merge_block;
+            if (case_cond != ir.null_node) _ = try fb.emitBranch(case_cond, case_block, next_block, se.span);
+            fb.setBlock(case_block);
+            const case_val = try self.lowerExprNode(case.body);
+            if (case_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+            _ = try fb.emitJump(merge_block, se.span);
+            fb.setBlock(next_block);
+        }
+
+        // Else arm
+        if (se.else_body != null_node) {
+            const else_val = try self.lowerExprNode(se.else_body);
+            if (else_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, else_val, se.span);
+            _ = try fb.emitJump(merge_block, se.span);
+        }
+        fb.setBlock(merge_block);
+        return try fb.emitLoadLocal(result_local, result_type, se.span);
     }
 
     fn lowerSwitchAsSelect(self: *Lowerer, se: ast.SwitchExpr, result_type: TypeIndex) Error!ir.NodeIndex {
@@ -4809,6 +4930,27 @@ pub const Lowerer = struct {
             }
             if (arg_node == ir.null_node) continue;
 
+            // @safe auto-ref: when passing a struct value to a *Struct param
+            // (safeWrapType wraps struct params to pointers), auto-ref the value.
+            if (self.chk.safe_mode and param_is_pointer) {
+                if (param_types) |params| {
+                    if (arg_i < params.len) {
+                        const param_info = self.type_reg.get(params[arg_i].type_idx);
+                        if (param_info == .pointer) {
+                            const arg_type = self.inferExprType(arg_idx);
+                            const arg_info = self.type_reg.get(arg_type);
+                            if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                                // Store struct value in temp local, then take its address
+                                const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
+                                arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Go pattern: decompose compound types (slice/string) into (ptr, len)
             // at call sites. The callee SSA builder reconstructs via slice_make.
             // Reference: Go's OSPTR()/OLEN() in walk/builtin.go
@@ -5089,6 +5231,26 @@ pub const Lowerer = struct {
                 arg_node = try self.lowerExprNode(arg_idx);
             }
             if (arg_node == ir.null_node) continue;
+
+            // @safe auto-ref: when passing a struct value to a *Struct param
+            if (self.chk.safe_mode and param_is_pointer) {
+                if (param_types) |params| {
+                    const param_idx = arg_i + 1; // +1 for self receiver
+                    if (param_idx < params.len) {
+                        const param_info = self.type_reg.get(params[param_idx].type_idx);
+                        if (param_info == .pointer) {
+                            const arg_type = self.inferExprType(arg_idx);
+                            const arg_info = self.type_reg.get(arg_type);
+                            if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                                const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
+                                arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Go pattern: decompose compound types (slice/string) into (ptr, len)
             // at call sites. Reference: Go's OSPTR()/OLEN() in walk/builtin.go

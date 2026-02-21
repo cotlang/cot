@@ -1677,8 +1677,17 @@ pub const Checker = struct {
             self.expected_type = ft.params[i + param_offset].type_idx;
             const arg_type = try self.checkExpr(arg_idx);
             self.expected_type = saved_expected;
-            if (!self.types.isAssignable(arg_type, ft.params[i + param_offset].type_idx))
-                self.err.errorWithCode(c.span.start, .e300, "type mismatch");
+            if (!self.types.isAssignable(arg_type, ft.params[i + param_offset].type_idx)) {
+                // @safe coercion: Struct arg → *Struct param (safeWrapType wraps struct params)
+                const param_tidx = ft.params[i + param_offset].type_idx;
+                const pt = self.types.get(param_tidx);
+                const is_safe_struct = self.safe_mode and pt == .pointer and
+                    self.types.get(pt.pointer.elem) == .struct_type and
+                    self.types.isAssignable(arg_type, pt.pointer.elem);
+                if (!is_safe_struct) {
+                    self.err.errorWithCode(c.span.start, .e300, "type mismatch");
+                }
+            }
         }
         return ft.return_type;
     }

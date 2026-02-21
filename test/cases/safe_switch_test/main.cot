@@ -1,0 +1,80 @@
+/// Reproduction: switch with method-call arms + block else in @safe mode
+import "myenum"
+
+struct ErrorReporter {
+    count: int,
+}
+
+fn reporterInit() ErrorReporter {
+    return ErrorReporter { count: 0 }
+}
+
+impl ErrorReporter {
+    fn report(offset: int, msg: string) void {
+        self.count = self.count + 1
+    }
+}
+
+struct Parser {
+    tok: int,
+    tok_start: int,
+    errors: *ErrorReporter,
+}
+
+impl Parser {
+    fn doImport() int { return 1 }
+    fn doFn() int { return 2 }
+    fn doConst() int { return 3 }
+    fn doVar() int { return 4 }
+    fn doStruct() int { return 5 }
+    fn doEnum() int { return 6 }
+    fn doIf() int { return 7 }
+    fn doElse() int { return 8 }
+    fn doReturn() int { return 9 }
+    fn doTest() int { return 10 }
+    fn doBench() int { return 11 }
+    fn doLet() int { return 12 }
+    fn doTrait() int { return 13 }
+    fn doType() int { return 14 }
+    fn doAsync() int { return 15 }
+    fn doPacked() int { return 16 }
+
+    /// Mirrors parseDecl: return switch with method calls + block else
+    fn dispatch() int {
+        const tok = @as(MyToken, @enumFromInt(self.tok))
+        return switch (tok) {
+            MyToken.kw_import => self.doImport(),
+            MyToken.kw_fn => self.doFn(),
+            MyToken.kw_const => self.doConst(),
+            MyToken.kw_var => self.doVar(),
+            MyToken.kw_struct => self.doStruct(),
+            MyToken.kw_enum => self.doEnum(),
+            MyToken.kw_if => self.doIf(),
+            MyToken.kw_else => self.doElse(),
+            MyToken.kw_return => self.doReturn(),
+            else => {
+                self.errors.report(self.tok_start, "expected declaration")
+                0
+            },
+        }
+    }
+}
+
+test "dispatch with method-call arms and block else" {
+    var errors = reporterInit()
+    var p = Parser { tok: @intFromEnum(MyToken.kw_import), tok_start: 0, errors: &errors }
+    @assertEq(p.dispatch(), 1)
+}
+
+test "dispatch - fn" {
+    var errors = reporterInit()
+    var p = Parser { tok: @intFromEnum(MyToken.kw_fn), tok_start: 0, errors: &errors }
+    @assertEq(p.dispatch(), 2)
+}
+
+test "dispatch - else arm" {
+    var errors = reporterInit()
+    var p = Parser { tok: @intFromEnum(MyToken.eof), tok_start: 0, errors: &errors }
+    @assertEq(p.dispatch(), 0)
+    @assertEq(errors.count, 1)
+}

@@ -285,6 +285,17 @@ pub const GenState = struct {
     /// Get 32-bit value onto wasm stack
     /// Go: getValue32 (lines 474-489)
     pub fn getValue32(self: *GenState, v: *const SsaValue) GenError!void {
+        // Check if already computed and stored in a local (e.g. call results).
+        // Without this, calls used as if-conditions get emitted TWICE:
+        // once by ssaGenValue (stored in local) and again here for the branch.
+        if (!isRematerializable(v)) {
+            if (self.value_to_local.get(v.id)) |local_idx| {
+                _ = try self.builder.appendFrom(.local_get, prog_mod.constAddr(local_idx));
+                _ = try self.builder.append(.i32_wrap_i64);
+                return;
+            }
+        }
+
         // Generate value on stack
         try self.ssaGenValueOnStack(v);
 

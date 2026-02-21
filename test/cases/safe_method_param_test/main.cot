@@ -1,0 +1,111 @@
+/// BUG: method-with-param as if-condition loses mutations in if-body
+
+struct Source {
+    text: string,
+    pos: int,
+}
+
+fn sourceInit(text: string) Source {
+    return Source { text: text, pos: 0 }
+}
+
+impl Source {
+    fn next() int {
+        const p = self.pos
+        self.pos = self.pos + 1
+        return p
+    }
+}
+
+struct P {
+    src: *Source,
+    tok: int,
+    value: int,
+}
+
+fn pInit(src: *Source) P {
+    var p = P { src: src, tok: 0, value: 0 }
+    p.step()
+    return p
+}
+
+impl P {
+    fn step() void {
+        self.tok = self.src.next()
+    }
+
+    fn tryMatch(t: int) bool {
+        if (self.tok == t) {
+            self.step()
+            return true
+        }
+        return false
+    }
+
+    fn isAt(t: int) bool {
+        return self.tok == t
+    }
+
+    /// BUG: method-with-param as if condition
+    fn bugPattern(n: int) void {
+        self.step()
+        if (self.tryMatch(1)) {
+            self.value = n
+        }
+    }
+
+    /// WORKAROUND: store result in local first
+    fn workaround(n: int) void {
+        self.step()
+        const matched = self.tryMatch(1)
+        if (matched) {
+            self.value = n
+        }
+    }
+
+    /// TEST: method-no-param as if condition
+    fn noParamCondition() void {
+        self.step()
+        if (self.isAt(1)) {
+            self.step()
+            self.value = 99
+        }
+    }
+
+    /// TEST: is the issue with ANY call in if-condition, or only method-with-param?
+    fn directCompareCondition(n: int) void {
+        self.step()
+        if (self.tok == 1) {
+            self.step()
+            self.value = n
+        }
+    }
+}
+
+test "BUG: method-with-param if condition" {
+    var src = sourceInit("abcde")
+    var p = pInit(&src)
+    p.bugPattern(42)
+    @assertEq(p.value, 42)
+}
+
+test "WORKAROUND: store in local" {
+    var src = sourceInit("abcde")
+    var p = pInit(&src)
+    p.workaround(42)
+    @assertEq(p.value, 42)
+}
+
+test "method-no-param if condition" {
+    var src = sourceInit("abcde")
+    var p = pInit(&src)
+    p.noParamCondition()
+    @assertEq(p.value, 99)
+}
+
+test "direct compare if condition" {
+    var src = sourceInit("abcde")
+    var p = pInit(&src)
+    p.directCompareCondition(42)
+    @assertEq(p.value, 42)
+}

@@ -1,0 +1,10 @@
+/// A token-like enum for testing
+const MyToken = enum(u8) {
+    eof,
+    ident,
+    int_lit,
+    string_lit,
+    kw_fn, kw_var, kw_const, kw_import, kw_struct, kw_enum,
+    kw_if, kw_else, kw_return,
+    lparen, rparen, lbrace, rbrace,
+}

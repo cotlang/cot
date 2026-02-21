@@ -374,27 +374,12 @@ fn lowerValue(v: *Value) bool {
 /// the return, the return value becomes a local_get (not a call), so the pattern
 /// won't match. Only cleanup-free `return f(args)` patterns are converted.
 fn optimizeTailCalls(f: *Func) void {
-    var converted: usize = 0;
-    for (f.blocks.items) |block| {
-        if (block.kind != .ret) continue;
-        const ret_val = block.controls[0] orelse continue;
-        // Control value must be a call with exactly 1 use (the return)
-        if (ret_val.op != .wasm_lowered_static_call and ret_val.op != .wasm_call) continue;
-        if (ret_val.uses != 1) continue;
-        // Must be the last value in the block (nothing between call and return)
-        if (block.values.items.len == 0) continue;
-        if (block.values.items[block.values.items.len - 1] != ret_val) continue;
-        // Skip compound returns (string, etc.) — too complex
-        if (ret_val.type_idx == TypeRegistry.STRING) continue;
-        // Convert to tail call
-        ret_val.op = .wasm_return_call;
-        block.kind = .exit;
-        block.resetControls();
-        converted += 1;
-    }
-    if (converted > 0) {
-        debug.log(.codegen, "  tail-call optimized {d} blocks", .{converted});
-    }
+    // Disabled: return_call (Wasm 3.0 tail call) causes SIGILL in the native
+    // pipeline for functions with many parameters. The wasm_to_clif translator
+    // handles return_call as call+return, but the block kind change from .ret
+    // to .exit disrupts native code generation for complex call signatures.
+    // TODO: re-enable once the native return_call translation is fixed.
+    _ = f;
 }
 
 fn isFloatType(type_idx: TypeIndex) bool {

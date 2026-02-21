@@ -1,15 +1,20 @@
 /// Abstract Syntax Tree node definitions.
 /// Ported from compiler/frontend/ast.zig
+///
+/// Nodes are stored in parallel arrays (Zig AST flat-encoding pattern).
+/// Each node has a tag (NodeTag), and its data fields are packed
+/// sequentially in the `data` array starting at `offsets[node_idx]`.
+/// String data lives in a separate `strings` array, referenced by index.
+///
+/// This avoids List(union) and List(struct) which have compiler limitations.
+
+import "std/list"
 
 // ============================================================================
-// Node index — reference AST nodes by position in the node array
+// Constants and basic types
 // ============================================================================
 
 const null_node: int = 0xFFFFFFFF
-
-// ============================================================================
-// Span — source location tracking
-// ============================================================================
 
 /// Half-open byte range [start, end) in source text.
 struct Span {
@@ -17,183 +22,8 @@ struct Span {
     end: int,
 }
 
-// ============================================================================
-// Declarations
-// ============================================================================
-
 /// Struct memory layout strategy.
 const StructLayout = enum { auto, @"packed", @"extern" }
-
-/// Function declaration.
-struct FnDecl {
-    name: string,
-    return_type: int,
-    body: int,
-    is_extern: bool,
-    is_async: bool,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Variable or constant declaration.
-struct VarDecl {
-    name: string,
-    type_expr: int,
-    value: int,
-    is_const: bool,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Struct type declaration.
-struct StructDecl {
-    name: string,
-    layout: int,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Enum type declaration.
-struct EnumDecl {
-    name: string,
-    backing_type: int,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Tagged union declaration.
-struct UnionDecl {
-    name: string,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Type alias declaration.
-struct TypeAlias {
-    name: string,
-    target: int,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Import declaration.
-struct ImportDecl {
-    path: string,
-    span: Span,
-}
-
-/// Impl block (methods for a type).
-struct ImplBlock {
-    type_name: string,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Trait declaration.
-struct TraitDecl {
-    name: string,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Trait implementation for a type.
-struct ImplTraitBlock {
-    trait_name: string,
-    target_type: string,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Error set declaration.
-struct ErrorSetDecl {
-    name: string,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Test block declaration.
-struct TestDecl {
-    name: string,
-    body: int,
-    span: Span,
-}
-
-/// Benchmark block declaration.
-struct BenchDecl {
-    name: string,
-    body: int,
-    span: Span,
-}
-
-/// Invalid declaration (parse error recovery).
-struct BadDecl {
-    span: Span,
-}
-
-/// Struct field definition.
-struct Field {
-    name: string,
-    type_expr: int,
-    default_value: int,
-    doc_comment: string,
-    span: Span,
-}
-
-/// Enum variant definition.
-struct EnumVariant {
-    name: string,
-    value: int,
-    span: Span,
-}
-
-/// Union variant definition.
-struct UnionVariant {
-    name: string,
-    type_expr: int,
-    span: Span,
-}
-
-/// Top-level declaration in a Cot source file.
-union Decl {
-    fn_decl: FnDecl,
-    var_decl: VarDecl,
-    struct_decl: StructDecl,
-    enum_decl: EnumDecl,
-    union_decl: UnionDecl,
-    type_alias: TypeAlias,
-    import_decl: ImportDecl,
-    impl_block: ImplBlock,
-    trait_decl: TraitDecl,
-    impl_trait: ImplTraitBlock,
-    error_set_decl: ErrorSetDecl,
-    test_decl: TestDecl,
-    bench_decl: BenchDecl,
-    bad_decl: BadDecl,
-}
-
-/// Return the source span for any declaration.
-fn declSpan(d: Decl) Span {
-    switch d {
-        Decl.fn_decl |v| => { return v.span },
-        Decl.var_decl |v| => { return v.span },
-        Decl.struct_decl |v| => { return v.span },
-        Decl.enum_decl |v| => { return v.span },
-        Decl.union_decl |v| => { return v.span },
-        Decl.type_alias |v| => { return v.span },
-        Decl.import_decl |v| => { return v.span },
-        Decl.impl_block |v| => { return v.span },
-        Decl.trait_decl |v| => { return v.span },
-        Decl.impl_trait |v| => { return v.span },
-        Decl.error_set_decl |v| => { return v.span },
-        Decl.test_decl |v| => { return v.span },
-        Decl.bench_decl |v| => { return v.span },
-        Decl.bad_decl |v| => { return v.span },
-    }
-}
-
-// ============================================================================
-// Expressions
-// ============================================================================
 
 /// Literal value categories.
 const LiteralKind = enum {
@@ -201,192 +31,1000 @@ const LiteralKind = enum {
     true_lit, false_lit, null_lit, undefined_lit, unreachable_lit,
 }
 
-struct Ident { name: string, span: Span }
-struct Literal { kind: int, value: string, span: Span }
-struct Binary { op: int, left: int, right: int, span: Span }
-struct Unary { op: int, operand: int, span: Span }
-struct Call { callee: int, span: Span }
-struct Index { base: int, idx: int, span: Span }
-struct SliceExpr { base: int, start: int, end: int, span: Span }
-struct FieldAccess { base: int, field: string, span: Span }
-struct ArrayLiteral { span: Span }
-struct Paren { inner: int, span: Span }
-struct IfExpr { condition: int, then_branch: int, else_branch: int, capture: string, span: Span }
-struct SwitchExpr { subject: int, else_body: int, span: Span }
-struct SwitchCase { capture: string, guard: int, is_range: bool, body: int, span: Span }
-struct BlockExpr { expr: int, span: Span }
-struct StructInit { type_name: string, span: Span }
-struct FieldInit { name: string, value: int, span: Span }
-struct NewExpr { type_name: string, is_constructor: bool, span: Span }
-struct BuiltinCall { kind: int, type_arg: int, span: Span }
-struct StringInterp { span: Span }
-struct TypeExpr { span: Span }
-struct TryExpr { operand: int, span: Span }
-struct AwaitExpr { operand: int, span: Span }
-struct CatchExpr { operand: int, capture: string, fallback: int, span: Span }
-struct ErrorLiteral { error_name: string, span: Span }
-struct ClosureExpr { return_type: int, body: int, span: Span }
-struct TupleLiteral { span: Span }
-struct ComptimeBlock { body: int, span: Span }
-struct ZeroInit { span: Span }
-struct AddrOf { operand: int, span: Span }
-struct Deref { operand: int, span: Span }
-struct BadExpr { span: Span }
+// ============================================================================
+// NodeTag — identifies node kind and determines data layout
+// ============================================================================
+//
+// Data layout for each tag is documented in brackets.
+// _s = string index into strings array
+// _n = node index
+// Variable-length lists: [count, elem0, elem1, ...]
+// All nodes end with [span_start, span_end].
 
-/// Any expression node.
-union Expr {
-    ident: Ident,
-    literal: Literal,
-    binary: Binary,
-    unary: Unary,
-    call: Call,
-    index: Index,
-    slice_expr: SliceExpr,
-    field_access: FieldAccess,
-    array_literal: ArrayLiteral,
-    paren: Paren,
-    if_expr: IfExpr,
-    switch_expr: SwitchExpr,
-    block_expr: BlockExpr,
-    struct_init: StructInit,
-    new_expr: NewExpr,
-    builtin_call: BuiltinCall,
-    string_interp: StringInterp,
-    type_expr: TypeExpr,
-    try_expr: TryExpr,
-    await_expr: AwaitExpr,
-    catch_expr: CatchExpr,
-    error_literal: ErrorLiteral,
-    closure_expr: ClosureExpr,
-    tuple_literal: TupleLiteral,
-    comptime_block: ComptimeBlock,
-    zero_init: ZeroInit,
-    addr_of: AddrOf,
-    deref: Deref,
-    bad_expr: BadExpr,
+const NodeTag = enum {
+    // === Declarations ===
+    fn_decl,          // [name_s, ret_type_n, body_n, is_extern, is_async, doc_s, params_count, ...param_nodes, tp_count, ...tp_strings, span_s, span_e]
+    var_decl,         // [name_s, type_expr_n, value_n, is_const, doc_s, span_s, span_e]
+    struct_decl,      // [name_s, layout, doc_s, fields_count, ...field_nodes, tp_count, ...tp_strings, nested_count, ...nested_nodes, span_s, span_e]
+    enum_decl,        // [name_s, backing_type_n, doc_s, variants_count, ...variant_nodes, span_s, span_e]
+    union_decl,       // [name_s, doc_s, variants_count, ...variant_nodes, span_s, span_e]
+    type_alias,       // [name_s, target_n, doc_s, span_s, span_e]
+    import_decl,      // [path_s, span_s, span_e]
+    impl_block,       // [type_name_s, doc_s, methods_count, ...method_nodes, tp_count, ...tp_strings, span_s, span_e]
+    trait_decl,       // [name_s, doc_s, methods_count, ...method_nodes, span_s, span_e]
+    impl_trait,       // [trait_name_s, target_type_s, doc_s, methods_count, ...method_nodes, tp_count, ...tp_strings, span_s, span_e]
+    error_set_decl,   // [name_s, doc_s, variants_count, ...variant_strings, span_s, span_e]
+    test_decl,        // [name_s, body_n, span_s, span_e]
+    bench_decl,       // [name_s, body_n, span_s, span_e]
+    bad_decl,         // [span_s, span_e]
+
+    // === Expressions ===
+    ident,            // [name_s, span_s, span_e]
+    literal,          // [kind, value_s, span_s, span_e]
+    binary,           // [op, left_n, right_n, span_s, span_e]
+    unary,            // [op, operand_n, span_s, span_e]
+    call,             // [callee_n, args_count, ...arg_nodes, span_s, span_e]
+    index_expr,       // [base_n, idx_n, span_s, span_e]
+    slice_expr,       // [base_n, start_n, end_n, span_s, span_e]
+    field_access,     // [base_n, field_s, span_s, span_e]
+    array_literal,    // [elems_count, ...elem_nodes, span_s, span_e]
+    paren,            // [inner_n, span_s, span_e]
+    if_expr,          // [cond_n, then_n, else_n, capture_s, span_s, span_e]
+    switch_expr,      // [subject_n, else_body_n, cases_count, ...case_nodes, span_s, span_e]
+    switch_case,      // [capture_s, guard_n, is_range, body_n, patterns_count, ...pattern_nodes, span_s, span_e]
+    block_expr,       // [result_expr_n, stmts_count, ...stmt_nodes, span_s, span_e]
+    struct_init,      // [type_name_s, fi_count, ...fi_nodes, ta_count, ...ta_nodes, span_s, span_e]
+    new_expr,         // [type_name_s, is_ctor, fi_count, ...fi_nodes, ta_count, ...ta_nodes, ca_count, ...ca_nodes, span_s, span_e]
+    builtin_call,     // [kind, type_arg_n, args_count, ...arg_nodes, span_s, span_e]
+    string_interp,    // [segments_count, ...segment_nodes, span_s, span_e]
+    type_expr,        // [kind, data1, data2, span_s, span_e]
+    try_expr,         // [operand_n, span_s, span_e]
+    await_expr,       // [operand_n, span_s, span_e]
+    catch_expr,       // [operand_n, capture_s, fallback_n, span_s, span_e]
+    error_literal,    // [name_s, span_s, span_e]
+    closure_expr,     // [ret_type_n, body_n, params_count, ...param_nodes, span_s, span_e]
+    tuple_literal,    // [elems_count, ...elem_nodes, span_s, span_e]
+    comptime_block,   // [body_n, span_s, span_e]
+    zero_init,        // [span_s, span_e]
+    addr_of,          // [operand_n, span_s, span_e]
+    deref,            // [operand_n, span_s, span_e]
+    generic_instance, // [name_s, ta_count, ...ta_nodes, span_s, span_e]
+    bad_expr,         // [span_s, span_e]
+
+    // === Auxiliary (sub-nodes referenced by declarations/expressions) ===
+    field_def,        // [name_s, type_expr_n, default_val_n, doc_s, span_s, span_e]
+    field_init_node,  // [name_s, value_n, span_s, span_e]
+    enum_variant,     // [name_s, value_n, span_s, span_e]
+    union_variant,    // [name_s, type_expr_n, span_s, span_e]
+    destructure_bind, // [name_s, type_expr_n, span_s, span_e]
+
+    // === Statements ===
+    expr_stmt,        // [expr_n, span_s, span_e]
+    return_stmt,      // [value_n, span_s, span_e]
+    var_stmt,         // [name_s, type_expr_n, value_n, is_const, is_weak, span_s, span_e]
+    assign_stmt,      // [target_n, op, value_n, span_s, span_e]
+    if_stmt,          // [cond_n, then_n, else_n, capture_s, span_s, span_e]
+    while_stmt,       // [cond_n, body_n, capture_s, cont_expr_n, label_s, span_s, span_e]
+    for_stmt,         // [binding_s, index_s, iterable_n, range_start_n, range_end_n, body_n, is_inline, label_s, span_s, span_e]
+    block_stmt,       // [stmts_count, ...stmt_nodes, span_s, span_e]
+    break_stmt,       // [label_s, span_s, span_e]
+    continue_stmt,    // [label_s, span_s, span_e]
+    defer_stmt,       // [expr_n, is_errdefer, span_s, span_e]
+    destructure_stmt, // [value_n, is_const, bindings_count, ...binding_nodes, span_s, span_e]
+    bad_stmt,         // [span_s, span_e]
 }
 
-/// Return the source span for any expression.
-fn exprSpan(e: Expr) Span {
-    switch e {
-        Expr.ident |v| => { return v.span },
-        Expr.literal |v| => { return v.span },
-        Expr.binary |v| => { return v.span },
-        Expr.unary |v| => { return v.span },
-        Expr.call |v| => { return v.span },
-        Expr.index |v| => { return v.span },
-        Expr.slice_expr |v| => { return v.span },
-        Expr.field_access |v| => { return v.span },
-        Expr.array_literal |v| => { return v.span },
-        Expr.paren |v| => { return v.span },
-        Expr.if_expr |v| => { return v.span },
-        Expr.switch_expr |v| => { return v.span },
-        Expr.block_expr |v| => { return v.span },
-        Expr.struct_init |v| => { return v.span },
-        Expr.new_expr |v| => { return v.span },
-        Expr.builtin_call |v| => { return v.span },
-        Expr.string_interp |v| => { return v.span },
-        Expr.type_expr |v| => { return v.span },
-        Expr.try_expr |v| => { return v.span },
-        Expr.await_expr |v| => { return v.span },
-        Expr.catch_expr |v| => { return v.span },
-        Expr.error_literal |v| => { return v.span },
-        Expr.closure_expr |v| => { return v.span },
-        Expr.tuple_literal |v| => { return v.span },
-        Expr.comptime_block |v| => { return v.span },
-        Expr.zero_init |v| => { return v.span },
-        Expr.addr_of |v| => { return v.span },
-        Expr.deref |v| => { return v.span },
-        Expr.bad_expr |v| => { return v.span },
+// ============================================================================
+// AST container — flat-encoded node storage
+// ============================================================================
+
+/// AST container: nodes stored as parallel arrays.
+struct Ast {
+    tags: List(int),
+    offsets: List(int),
+    data: List(int),
+    strings: List(string),
+    file_decls: List(int),
+    filename: string,
+    safe_mode: bool,
+}
+
+/// Create a new empty AST for a file.
+fn astInit(filename: string) Ast {
+    var tags: List(int) = undefined
+    tags.items = 0
+    tags.count = 0
+    tags.capacity = 0
+    var offsets: List(int) = undefined
+    offsets.items = 0
+    offsets.count = 0
+    offsets.capacity = 0
+    var data_list: List(int) = undefined
+    data_list.items = 0
+    data_list.count = 0
+    data_list.capacity = 0
+    var strings: List(string) = undefined
+    strings.items = 0
+    strings.count = 0
+    strings.capacity = 0
+    var file_decls: List(int) = undefined
+    file_decls.items = 0
+    file_decls.count = 0
+    file_decls.capacity = 0
+    return Ast {
+        tags: tags,
+        offsets: offsets,
+        data: data_list,
+        strings: strings,
+        file_decls: file_decls,
+        filename: filename,
+        safe_mode: false,
     }
 }
 
-// ============================================================================
-// Statements
-// ============================================================================
+impl Ast {
+    // ---- Core methods ----
 
-struct ExprStmt { expr: int, span: Span }
-struct ReturnStmt { value: int, span: Span }
-struct VarStmt { name: string, type_expr: int, value: int, is_const: bool, is_weak: bool, span: Span }
-struct AssignStmt { target: int, op: int, value: int, span: Span }
-struct IfStmt { condition: int, then_branch: int, else_branch: int, capture: string, span: Span }
-struct WhileStmt { condition: int, body: int, capture: string, continue_expr: int, span: Span }
-struct ForStmt {
-    binding: string,
-    iterable: int,
-    range_start: int,
-    range_end: int,
-    body: int,
-    is_inline: bool,
-    span: Span,
-}
-struct BlockStmt { span: Span }
-struct BreakStmt { span: Span }
-struct ContinueStmt { span: Span }
-struct DeferStmt { expr: int, is_errdefer: bool, span: Span }
-struct DestructureBinding { name: string, type_expr: int, span: Span }
-struct DestructureStmt { value: int, is_const: bool, span: Span }
-struct BadStmt { span: Span }
-
-/// Any statement node.
-union Stmt {
-    expr_stmt: ExprStmt,
-    return_stmt: ReturnStmt,
-    var_stmt: VarStmt,
-    assign_stmt: AssignStmt,
-    if_stmt: IfStmt,
-    while_stmt: WhileStmt,
-    for_stmt: ForStmt,
-    block_stmt: BlockStmt,
-    break_stmt: BreakStmt,
-    continue_stmt: ContinueStmt,
-    defer_stmt: DeferStmt,
-    destructure_stmt: DestructureStmt,
-    bad_stmt: BadStmt,
-}
-
-/// Return the source span for any statement.
-fn stmtSpan(s: Stmt) Span {
-    switch s {
-        Stmt.expr_stmt |v| => { return v.span },
-        Stmt.return_stmt |v| => { return v.span },
-        Stmt.var_stmt |v| => { return v.span },
-        Stmt.assign_stmt |v| => { return v.span },
-        Stmt.if_stmt |v| => { return v.span },
-        Stmt.while_stmt |v| => { return v.span },
-        Stmt.for_stmt |v| => { return v.span },
-        Stmt.block_stmt |v| => { return v.span },
-        Stmt.break_stmt |v| => { return v.span },
-        Stmt.continue_stmt |v| => { return v.span },
-        Stmt.defer_stmt |v| => { return v.span },
-        Stmt.destructure_stmt |v| => { return v.span },
-        Stmt.bad_stmt |v| => { return v.span },
+    /// Start a new node. Returns node index. Call addData() to append fields.
+    fn addNode(tag: int) int {
+        const idx = self.tags.count
+        self.tags.append(tag)
+        self.offsets.append(self.data.count)
+        return idx
     }
-}
 
-// ============================================================================
-// Unified Node
-// ============================================================================
+    /// Append an int data field to the current node being built.
+    fn addData(val: int) void {
+        self.data.append(val)
+    }
 
-/// Any AST node (declaration, expression, or statement).
-union Node {
-    decl: Decl,
-    expr: Expr,
-    stmt: Stmt,
-}
+    /// Store a string and return its index.
+    fn addStr(s: string) int {
+        const idx = self.strings.count
+        self.strings.append(s)
+        return idx
+    }
 
-/// Return the source span for any node.
-fn nodeSpan(n: Node) Span {
-    switch n {
-        Node.decl |d| => { return declSpan(d) },
-        Node.expr |e| => { return exprSpan(e) },
-        Node.stmt |s| => { return stmtSpan(s) },
+    /// Append a top-level declaration index.
+    fn addFileDecl(idx: int) void {
+        self.file_decls.append(idx)
+    }
+
+    /// Number of nodes.
+    fn nodeCount() int {
+        return self.tags.count
+    }
+
+    /// Get the tag of node at idx.
+    fn getTag(idx: int) int {
+        return self.tags.get(idx)
+    }
+
+    /// Get the Nth data field of node at idx.
+    fn getData(idx: int, field: int) int {
+        return self.data.get(self.offsets.get(idx) + field)
+    }
+
+    /// Get a string by its index.
+    fn getStr(idx: int) string {
+        return self.strings.get(idx)
+    }
+
+    // ---- Typed add helpers: Expressions ----
+
+    fn addIdent(name: string, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.ident))
+        self.addData(str_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addLiteral(kind: int, value: string, s: Span) int {
+        const str_idx = self.addStr(value)
+        const idx = self.addNode(@intFromEnum(NodeTag.literal))
+        self.addData(kind)
+        self.addData(str_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBinary(op: int, left: int, right: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.binary))
+        self.addData(op)
+        self.addData(left)
+        self.addData(right)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addUnary(op: int, operand: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.unary))
+        self.addData(op)
+        self.addData(operand)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addCallNode(callee: int, args: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.call))
+        self.addData(callee)
+        self.addData(args.count)
+        var i = 0
+        while (i < args.count) {
+            self.addData(args.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addIndexExpr(base: int, index: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.index_expr))
+        self.addData(base)
+        self.addData(index)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addSliceExpr(base: int, start: int, end: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.slice_expr))
+        self.addData(base)
+        self.addData(start)
+        self.addData(end)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addFieldAccess(base: int, field: string, s: Span) int {
+        const str_idx = self.addStr(field)
+        const idx = self.addNode(@intFromEnum(NodeTag.field_access))
+        self.addData(base)
+        self.addData(str_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addArrayLit(elems: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.array_literal))
+        self.addData(elems.count)
+        var i = 0
+        while (i < elems.count) {
+            self.addData(elems.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addParen(inner: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.paren))
+        self.addData(inner)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addIfExpr(cond: int, then_br: int, else_br: int, capture: string, s: Span) int {
+        const cap_idx = self.addStr(capture)
+        const idx = self.addNode(@intFromEnum(NodeTag.if_expr))
+        self.addData(cond)
+        self.addData(then_br)
+        self.addData(else_br)
+        self.addData(cap_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addSwitchExpr(subject: int, else_body: int, cases: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.switch_expr))
+        self.addData(subject)
+        self.addData(else_body)
+        self.addData(cases.count)
+        var i = 0
+        while (i < cases.count) {
+            self.addData(cases.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addSwitchCase(capture: string, guard: int, is_range: int, body: int, patterns: List(int), s: Span) int {
+        const cap_idx = self.addStr(capture)
+        const idx = self.addNode(@intFromEnum(NodeTag.switch_case))
+        self.addData(cap_idx)
+        self.addData(guard)
+        self.addData(is_range)
+        self.addData(body)
+        self.addData(patterns.count)
+        var i = 0
+        while (i < patterns.count) {
+            self.addData(patterns.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBlockExpr(result_expr: int, stmts: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.block_expr))
+        self.addData(result_expr)
+        self.addData(stmts.count)
+        var i = 0
+        while (i < stmts.count) {
+            self.addData(stmts.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addStructInit(type_name: string, fields: List(int), type_args: List(int), s: Span) int {
+        const str_idx = self.addStr(type_name)
+        const idx = self.addNode(@intFromEnum(NodeTag.struct_init))
+        self.addData(str_idx)
+        self.addData(fields.count)
+        var i = 0
+        while (i < fields.count) {
+            self.addData(fields.get(i))
+            i = i + 1
+        }
+        self.addData(type_args.count)
+        i = 0
+        while (i < type_args.count) {
+            self.addData(type_args.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addNewExpr(type_name: string, is_ctor: int, fields: List(int), type_args: List(int), ctor_args: List(int), s: Span) int {
+        const str_idx = self.addStr(type_name)
+        const idx = self.addNode(@intFromEnum(NodeTag.new_expr))
+        self.addData(str_idx)
+        self.addData(is_ctor)
+        self.addData(fields.count)
+        var fi = 0
+        while (fi < fields.count) {
+            self.addData(fields.get(fi))
+            fi = fi + 1
+        }
+        self.addData(type_args.count)
+        var ti = 0
+        while (ti < type_args.count) {
+            self.addData(type_args.get(ti))
+            ti = ti + 1
+        }
+        self.addData(ctor_args.count)
+        var ci = 0
+        while (ci < ctor_args.count) {
+            self.addData(ctor_args.get(ci))
+            ci = ci + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBuiltinCall(kind: int, type_arg: int, args: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.builtin_call))
+        self.addData(kind)
+        self.addData(type_arg)
+        self.addData(args.count)
+        var i = 0
+        while (i < args.count) {
+            self.addData(args.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addStringInterp(segments: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.string_interp))
+        self.addData(segments.count)
+        var i = 0
+        while (i < segments.count) {
+            self.addData(segments.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addTypeExpr(kind: int, d1: int, d2: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.type_expr))
+        self.addData(kind)
+        self.addData(d1)
+        self.addData(d2)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addTryExpr(operand: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.try_expr))
+        self.addData(operand)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addAwaitExpr(operand: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.await_expr))
+        self.addData(operand)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addCatchExpr(operand: int, capture: string, fallback: int, s: Span) int {
+        const cap_idx = self.addStr(capture)
+        const idx = self.addNode(@intFromEnum(NodeTag.catch_expr))
+        self.addData(operand)
+        self.addData(cap_idx)
+        self.addData(fallback)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addErrorLit(name: string, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.error_literal))
+        self.addData(str_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addClosureExpr(ret_type: int, body: int, params: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.closure_expr))
+        self.addData(ret_type)
+        self.addData(body)
+        self.addData(params.count)
+        var i = 0
+        while (i < params.count) {
+            self.addData(params.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addTupleLit(elems: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.tuple_literal))
+        self.addData(elems.count)
+        var i = 0
+        while (i < elems.count) {
+            self.addData(elems.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addComptimeBlock(body: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.comptime_block))
+        self.addData(body)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addZeroInit(s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.zero_init))
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addAddrOf(operand: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.addr_of))
+        self.addData(operand)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addDeref(operand: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.deref))
+        self.addData(operand)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addGenericInst(name: string, type_args: List(int), s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.generic_instance))
+        self.addData(str_idx)
+        self.addData(type_args.count)
+        var i = 0
+        while (i < type_args.count) {
+            self.addData(type_args.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBadExpr(s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.bad_expr))
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    // ---- Typed add helpers: Auxiliary ----
+
+    fn addFieldDef(name: string, type_expr: int, default_val: int, doc: string, s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.field_def))
+        self.addData(name_idx)
+        self.addData(type_expr)
+        self.addData(default_val)
+        self.addData(doc_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addFieldInitNode(name: string, value: int, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.field_init_node))
+        self.addData(str_idx)
+        self.addData(value)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addEnumVariant(name: string, value: int, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.enum_variant))
+        self.addData(str_idx)
+        self.addData(value)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addUnionVariant(name: string, type_expr: int, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.union_variant))
+        self.addData(str_idx)
+        self.addData(type_expr)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addDestructureBind(name: string, type_expr: int, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.destructure_bind))
+        self.addData(str_idx)
+        self.addData(type_expr)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    // ---- Typed add helpers: Declarations ----
+
+    fn addFnDecl(name: string, ret_type: int, body: int, is_extern: int, is_async: int, doc: string, params: List(int), type_params: List(string), s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.fn_decl))
+        self.addData(name_idx)
+        self.addData(ret_type)
+        self.addData(body)
+        self.addData(is_extern)
+        self.addData(is_async)
+        self.addData(doc_idx)
+        self.addData(params.count)
+        var i = 0
+        while (i < params.count) {
+            self.addData(params.get(i))
+            i = i + 1
+        }
+        self.addData(type_params.count)
+        i = 0
+        while (i < type_params.count) {
+            const tp_str = self.addStr(type_params.get(i))
+            self.addData(tp_str)
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addVarDecl(name: string, type_expr: int, value: int, is_const: int, doc: string, s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.var_decl))
+        self.addData(name_idx)
+        self.addData(type_expr)
+        self.addData(value)
+        self.addData(is_const)
+        self.addData(doc_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addStructDecl(name: string, layout: int, doc: string, fields: List(int), type_params: List(string), nested: List(int), s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.struct_decl))
+        self.addData(name_idx)
+        self.addData(layout)
+        self.addData(doc_idx)
+        self.addData(fields.count)
+        var i = 0
+        while (i < fields.count) {
+            self.addData(fields.get(i))
+            i = i + 1
+        }
+        self.addData(type_params.count)
+        i = 0
+        while (i < type_params.count) {
+            const tp_str = self.addStr(type_params.get(i))
+            self.addData(tp_str)
+            i = i + 1
+        }
+        self.addData(nested.count)
+        i = 0
+        while (i < nested.count) {
+            self.addData(nested.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addEnumDecl(name: string, backing_type: int, doc: string, variants: List(int), s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.enum_decl))
+        self.addData(name_idx)
+        self.addData(backing_type)
+        self.addData(doc_idx)
+        self.addData(variants.count)
+        var i = 0
+        while (i < variants.count) {
+            self.addData(variants.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addUnionDecl(name: string, doc: string, variants: List(int), s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.union_decl))
+        self.addData(name_idx)
+        self.addData(doc_idx)
+        self.addData(variants.count)
+        var i = 0
+        while (i < variants.count) {
+            self.addData(variants.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addTypeAliasDecl(name: string, target: int, doc: string, s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.type_alias))
+        self.addData(name_idx)
+        self.addData(target)
+        self.addData(doc_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addImportDecl(path: string, s: Span) int {
+        const str_idx = self.addStr(path)
+        const idx = self.addNode(@intFromEnum(NodeTag.import_decl))
+        self.addData(str_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addImplBlock(type_name: string, doc: string, methods: List(int), type_params: List(string), s: Span) int {
+        const name_idx = self.addStr(type_name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.impl_block))
+        self.addData(name_idx)
+        self.addData(doc_idx)
+        self.addData(methods.count)
+        var i = 0
+        while (i < methods.count) {
+            self.addData(methods.get(i))
+            i = i + 1
+        }
+        self.addData(type_params.count)
+        i = 0
+        while (i < type_params.count) {
+            const tp_str = self.addStr(type_params.get(i))
+            self.addData(tp_str)
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addTraitDecl(name: string, doc: string, methods: List(int), s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.trait_decl))
+        self.addData(name_idx)
+        self.addData(doc_idx)
+        self.addData(methods.count)
+        var i = 0
+        while (i < methods.count) {
+            self.addData(methods.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addImplTrait(trait_name: string, target_type: string, doc: string, methods: List(int), type_params: List(string), s: Span) int {
+        const tn_idx = self.addStr(trait_name)
+        const tt_idx = self.addStr(target_type)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.impl_trait))
+        self.addData(tn_idx)
+        self.addData(tt_idx)
+        self.addData(doc_idx)
+        self.addData(methods.count)
+        var i = 0
+        while (i < methods.count) {
+            self.addData(methods.get(i))
+            i = i + 1
+        }
+        self.addData(type_params.count)
+        i = 0
+        while (i < type_params.count) {
+            const tp_str = self.addStr(type_params.get(i))
+            self.addData(tp_str)
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addErrorSetDecl(name: string, doc: string, variants: List(string), s: Span) int {
+        const name_idx = self.addStr(name)
+        const doc_idx = self.addStr(doc)
+        const idx = self.addNode(@intFromEnum(NodeTag.error_set_decl))
+        self.addData(name_idx)
+        self.addData(doc_idx)
+        self.addData(variants.count)
+        var i = 0
+        while (i < variants.count) {
+            const v_str = self.addStr(variants.get(i))
+            self.addData(v_str)
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addTestDecl(name: string, body: int, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.test_decl))
+        self.addData(str_idx)
+        self.addData(body)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBenchDecl(name: string, body: int, s: Span) int {
+        const str_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.bench_decl))
+        self.addData(str_idx)
+        self.addData(body)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBadDecl(s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.bad_decl))
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    // ---- Typed add helpers: Statements ----
+
+    fn addExprStmt(expr: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.expr_stmt))
+        self.addData(expr)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addReturnStmt(value: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.return_stmt))
+        self.addData(value)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addVarStmt(name: string, type_expr: int, value: int, is_const: int, is_weak: int, s: Span) int {
+        const name_idx = self.addStr(name)
+        const idx = self.addNode(@intFromEnum(NodeTag.var_stmt))
+        self.addData(name_idx)
+        self.addData(type_expr)
+        self.addData(value)
+        self.addData(is_const)
+        self.addData(is_weak)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addAssignStmt(target: int, op: int, value: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.assign_stmt))
+        self.addData(target)
+        self.addData(op)
+        self.addData(value)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addIfStmt(cond: int, then_br: int, else_br: int, capture: string, s: Span) int {
+        const cap_idx = self.addStr(capture)
+        const idx = self.addNode(@intFromEnum(NodeTag.if_stmt))
+        self.addData(cond)
+        self.addData(then_br)
+        self.addData(else_br)
+        self.addData(cap_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addWhileStmt(cond: int, body: int, capture: string, cont_expr: int, label: string, s: Span) int {
+        const cap_idx = self.addStr(capture)
+        const lbl_idx = self.addStr(label)
+        const idx = self.addNode(@intFromEnum(NodeTag.while_stmt))
+        self.addData(cond)
+        self.addData(body)
+        self.addData(cap_idx)
+        self.addData(cont_expr)
+        self.addData(lbl_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addForStmt(binding: string, index_binding: string, iterable: int, range_start: int, range_end: int, body: int, is_inline: int, label: string, s: Span) int {
+        const bind_idx = self.addStr(binding)
+        const ibind_idx = self.addStr(index_binding)
+        const lbl_idx = self.addStr(label)
+        const idx = self.addNode(@intFromEnum(NodeTag.for_stmt))
+        self.addData(bind_idx)
+        self.addData(ibind_idx)
+        self.addData(iterable)
+        self.addData(range_start)
+        self.addData(range_end)
+        self.addData(body)
+        self.addData(is_inline)
+        self.addData(lbl_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBlockStmt(stmts: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.block_stmt))
+        self.addData(stmts.count)
+        var i = 0
+        while (i < stmts.count) {
+            self.addData(stmts.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBreakStmt(label: string, s: Span) int {
+        const lbl_idx = self.addStr(label)
+        const idx = self.addNode(@intFromEnum(NodeTag.break_stmt))
+        self.addData(lbl_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addContinueStmt(label: string, s: Span) int {
+        const lbl_idx = self.addStr(label)
+        const idx = self.addNode(@intFromEnum(NodeTag.continue_stmt))
+        self.addData(lbl_idx)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addDeferStmt(expr: int, is_errdefer: int, s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.defer_stmt))
+        self.addData(expr)
+        self.addData(is_errdefer)
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addDestructureStmt(value: int, is_const: int, bindings: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.destructure_stmt))
+        self.addData(value)
+        self.addData(is_const)
+        self.addData(bindings.count)
+        var i = 0
+        while (i < bindings.count) {
+            self.addData(bindings.get(i))
+            i = i + 1
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
+    fn addBadStmt(s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.bad_stmt))
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
     }
 }
 
 // ============================================================================
 // BuiltinKind — compiler intrinsic @builtin variants (v0.3.2)
-// Runtime functions (alloc, fd_write, etc.) moved to stdlib/sys.cot as extern fn.
 // ============================================================================
 
 /// Compiler intrinsic builtins (the @-prefixed functions).
@@ -416,7 +1054,6 @@ const BuiltinKind = enum {
 /// Look up a builtin name string and return its BuiltinKind index, or null if unknown.
 fn builtinFromString(name: string) ?int {
     return switch (name) {
-        // Type introspection
         "sizeOf" => @intFromEnum(BuiltinKind.size_of),
         "alignOf" => @intFromEnum(BuiltinKind.align_of),
         "enumLen" => @intFromEnum(BuiltinKind.enum_len),
@@ -424,11 +1061,9 @@ fn builtinFromString(name: string) ?int {
         "TypeOf" => @intFromEnum(BuiltinKind.type_of),
         "field" => @intFromEnum(BuiltinKind.field),
         "offsetOf" => @intFromEnum(BuiltinKind.offset_of),
-        // Comptime reflection
         "typeName" => @intFromEnum(BuiltinKind.type_name),
         "enumName" => @intFromEnum(BuiltinKind.enum_name),
         "typeInfo" => @intFromEnum(BuiltinKind.type_info),
-        // Casts
         "intCast" => @intFromEnum(BuiltinKind.int_cast),
         "floatCast" => @intFromEnum(BuiltinKind.float_cast),
         "floatFromInt" => @intFromEnum(BuiltinKind.float_from_int),
@@ -441,29 +1076,23 @@ fn builtinFromString(name: string) ?int {
         "as" => @intFromEnum(BuiltinKind.@"as"),
         "alignCast" => @intFromEnum(BuiltinKind.align_cast),
         "constCast" => @intFromEnum(BuiltinKind.const_cast),
-        // Enum/error/bool
         "intFromEnum" => @intFromEnum(BuiltinKind.int_from_enum),
         "enumFromInt" => @intFromEnum(BuiltinKind.enum_from_int),
         "tagName" => @intFromEnum(BuiltinKind.tag_name),
         "errorName" => @intFromEnum(BuiltinKind.error_name),
         "intFromBool" => @intFromEnum(BuiltinKind.int_from_bool),
-        // String
         "string" => @intFromEnum(BuiltinKind.@"string"),
         "ptrOf" => @intFromEnum(BuiltinKind.ptr_of),
         "lenOf" => @intFromEnum(BuiltinKind.len_of),
-        // Assertions
         "assert" => @intFromEnum(BuiltinKind.assert),
         "assertEq" => @intFromEnum(BuiltinKind.assertEq),
-        // Control
         "trap" => @intFromEnum(BuiltinKind.trap),
         "panic" => @intFromEnum(BuiltinKind.panic),
-        // Comptime
         "compileError" => @intFromEnum(BuiltinKind.compile_error),
         "embedFile" => @intFromEnum(BuiltinKind.embed_file),
         "target" => @intFromEnum(BuiltinKind.target),
         "targetOs" => @intFromEnum(BuiltinKind.targetOs),
         "targetArch" => @intFromEnum(BuiltinKind.targetArch),
-        // ARC
         "arcRetain" => @intFromEnum(BuiltinKind.arcRetain),
         "arcRelease" => @intFromEnum(BuiltinKind.arcRelease),
         else => null,
@@ -484,12 +1113,6 @@ test "span init" {
     @assertEq(s.end, 10)
 }
 
-test "span zero" {
-    const s = Span { start: 0, end: 0 }
-    @assertEq(s.start, 0)
-    @assertEq(s.end, 0)
-}
-
 test "StructLayout enum" {
     @assertEq(@intFromEnum(StructLayout.auto), 0)
     @assertEq(@intFromEnum(StructLayout.@"packed"), 1)
@@ -504,92 +1127,6 @@ test "LiteralKind enum" {
     @assertEq(@intFromEnum(LiteralKind.true_lit), 4)
     @assertEq(@intFromEnum(LiteralKind.null_lit), 6)
     @assertEq(@intFromEnum(LiteralKind.unreachable_lit), 8)
-}
-
-test "Decl union fn_decl" {
-    const s = Span { start: 0, end: 10 }
-    const fd = FnDecl { name: "main", return_type: null_node, body: null_node, is_extern: false, is_async: false, doc_comment: "", span: s }
-    const d: Decl = Decl.fn_decl(fd)
-    switch d {
-        Decl.fn_decl |v| => {
-            @assertEq(v.name, "main")
-            @assertEq(v.span.start, 0)
-            @assertEq(v.span.end, 10)
-            @assertEq(v.is_extern, false)
-        },
-        else => unreachable,
-    }
-}
-
-test "Decl union test_decl" {
-    const s = Span { start: 5, end: 15 }
-    const td = TestDecl { name: "my test", body: 42, span: s }
-    const d: Decl = Decl.test_decl(td)
-    switch d {
-        Decl.test_decl |v| => {
-            @assertEq(v.name, "my test")
-            @assertEq(v.body, 42)
-            @assertEq(v.span.start, 5)
-            @assertEq(v.span.end, 15)
-        },
-        else => unreachable,
-    }
-}
-
-test "Expr union ident" {
-    const s = Span { start: 0, end: 3 }
-    const id = Ident { name: "foo", span: s }
-    const e: Expr = Expr.ident(id)
-    switch e {
-        Expr.ident |v| => {
-            @assertEq(v.name, "foo")
-            @assertEq(v.span.start, 0)
-            @assertEq(v.span.end, 3)
-        },
-        else => unreachable,
-    }
-}
-
-test "Expr union binary" {
-    const s = Span { start: 0, end: 5 }
-    const b = Binary { op: 0, left: 1, right: 2, span: s }
-    const e: Expr = Expr.binary(b)
-    switch e {
-        Expr.binary |v| => {
-            @assertEq(v.op, 0)
-            @assertEq(v.left, 1)
-            @assertEq(v.right, 2)
-            @assertEq(v.span.end, 5)
-        },
-        else => unreachable,
-    }
-}
-
-test "Stmt union return" {
-    const s = Span { start: 0, end: 8 }
-    const r = ReturnStmt { value: 42, span: s }
-    const st: Stmt = Stmt.return_stmt(r)
-    switch st {
-        Stmt.return_stmt |v| => {
-            @assertEq(v.value, 42)
-            @assertEq(v.span.start, 0)
-            @assertEq(v.span.end, 8)
-        },
-        else => unreachable,
-    }
-}
-
-test "Node union wraps expr" {
-    const s = Span { start: 1, end: 9 }
-    const id = Ident { name: "x", span: s }
-    const e: Expr = Expr.ident(id)
-    const n: Node = Node.expr(e)
-    var matched = false
-    switch n {
-        Node.expr |inner| => { matched = true },
-        else => unreachable,
-    }
-    @assertEq(matched, true)
 }
 
 test "BuiltinKind enum count" {
@@ -610,10 +1147,8 @@ test "builtinFromString known" {
 test "builtinFromString unknown" {
     @assertEq(builtinFromString("nonexistent") == null, true)
     @assertEq(builtinFromString("") == null, true)
-    // Runtime functions are no longer builtins
     @assertEq(builtinFromString("fd_write") == null, true)
     @assertEq(builtinFromString("alloc") == null, true)
-    @assertEq(builtinFromString("net_socket") == null, true)
 }
 
 test "BuiltinKind quoted identifiers" {
@@ -621,32 +1156,112 @@ test "BuiltinKind quoted identifiers" {
     @assertEq(builtinFromString("as").?, @intFromEnum(BuiltinKind.@"as"))
 }
 
-test "ForStmt isRange pattern" {
-    const s = Span { start: 0, end: 10 }
-    const fs = ForStmt { binding: "i", iterable: null_node, range_start: 0, range_end: 10, body: 1, is_inline: false, span: s }
-    @assertEq(fs.range_start != null_node, true)
-    const fs2 = ForStmt { binding: "item", iterable: 5, range_start: null_node, range_end: null_node, body: 1, is_inline: false, span: s }
-    @assertEq(fs2.range_start != null_node, false)
+test "Ast init" {
+    var ast = astInit("test.cot")
+    @assertEq(ast.nodeCount(), 0)
+    @assertEq(ast.filename, "test.cot")
+    @assertEq(ast.safe_mode, false)
 }
 
-test "VarStmt fields" {
-    const s = Span { start: 0, end: 20 }
-    const vs = VarStmt { name: "x", type_expr: null_node, value: 42, is_const: true, is_weak: false, span: s }
-    @assertEq(vs.name, "x")
-    @assertEq(vs.is_const, true)
-    @assertEq(vs.is_weak, false)
-    @assertEq(vs.value, 42)
+test "Ast addIdent" {
+    var ast = astInit("test.cot")
+    const s = Span { start: 5, end: 8 }
+    const idx = ast.addIdent("foo", s)
+    @assertEq(idx, 0)
+    @assertEq(ast.nodeCount(), 1)
+    @assertEq(ast.getTag(0), @intFromEnum(NodeTag.ident))
+    // data: [name_str_idx, span_start, span_end]
+    @assertEq(ast.getStr(ast.getData(0, 0)), "foo")
+    @assertEq(ast.getData(0, 1), 5)
+    @assertEq(ast.getData(0, 2), 8)
 }
 
-test "nested union Decl in Node" {
+test "Ast addBinary" {
+    var ast = astInit("test.cot")
     const s = Span { start: 0, end: 5 }
-    const bd = BadDecl { span: s }
-    const d: Decl = Decl.bad_decl(bd)
-    const n: Node = Node.decl(d)
-    var matched = false
-    switch n {
-        Node.decl |inner| => { matched = true },
-        else => unreachable,
-    }
-    @assertEq(matched, true)
+    const left = ast.addIdent("a", s)
+    const right = ast.addIdent("b", s)
+    const bin = ast.addBinary(10, left, right, s)
+    @assertEq(ast.nodeCount(), 3)
+    @assertEq(ast.getTag(bin), @intFromEnum(NodeTag.binary))
+    @assertEq(ast.getData(bin, 0), 10)
+    @assertEq(ast.getData(bin, 1), 0)
+    @assertEq(ast.getData(bin, 2), 1)
+}
+
+test "Ast addCallNode" {
+    var ast = astInit("test.cot")
+    const s = Span { start: 0, end: 10 }
+    const callee = ast.addIdent("foo", s)
+    const arg0 = ast.addLiteral(0, "1", s)
+    const arg1 = ast.addLiteral(0, "2", s)
+    var args: List(int) = undefined
+    args.items = 0
+    args.count = 0
+    args.capacity = 0
+    args.append(arg0)
+    args.append(arg1)
+    const call = ast.addCallNode(callee, args, s)
+    @assertEq(ast.getTag(call), @intFromEnum(NodeTag.call))
+    // data: [callee, args_count, arg0, arg1, span_s, span_e]
+    @assertEq(ast.getData(call, 0), callee)
+    @assertEq(ast.getData(call, 1), 2)
+    @assertEq(ast.getData(call, 2), arg0)
+    @assertEq(ast.getData(call, 3), arg1)
+}
+
+test "Ast addFnDecl" {
+    var ast = astInit("test.cot")
+    const s = Span { start: 0, end: 20 }
+    var params: List(int) = undefined
+    params.items = 0
+    params.count = 0
+    params.capacity = 0
+    var tp: List(string) = undefined
+    tp.items = 0
+    tp.count = 0
+    tp.capacity = 0
+    const fn_idx = ast.addFnDecl("main", null_node, null_node, 0, 0, "", params, tp, s)
+    @assertEq(ast.getTag(fn_idx), @intFromEnum(NodeTag.fn_decl))
+    @assertEq(ast.getStr(ast.getData(fn_idx, 0)), "main")
+}
+
+test "Ast addImportDecl" {
+    var ast = astInit("test.cot")
+    const s = Span { start: 0, end: 15 }
+    const idx = ast.addImportDecl("std/list", s)
+    @assertEq(ast.getTag(idx), @intFromEnum(NodeTag.import_decl))
+    @assertEq(ast.getStr(ast.getData(idx, 0)), "std/list")
+    @assertEq(ast.getData(idx, 1), 0)
+    @assertEq(ast.getData(idx, 2), 15)
+}
+
+test "Ast addBlockStmt" {
+    var ast = astInit("test.cot")
+    const s = Span { start: 0, end: 10 }
+    const s0 = ast.addReturnStmt(null_node, s)
+    const s1 = ast.addExprStmt(0, s)
+    var stmts: List(int) = undefined
+    stmts.items = 0
+    stmts.count = 0
+    stmts.capacity = 0
+    stmts.append(s0)
+    stmts.append(s1)
+    const blk = ast.addBlockStmt(stmts, s)
+    @assertEq(ast.getTag(blk), @intFromEnum(NodeTag.block_stmt))
+    @assertEq(ast.getData(blk, 0), 2)
+    @assertEq(ast.getData(blk, 1), s0)
+    @assertEq(ast.getData(blk, 2), s1)
+}
+
+test "Ast file_decls" {
+    var ast = astInit("main.cot")
+    const s = Span { start: 0, end: 10 }
+    const imp = ast.addImportDecl("std/list", s)
+    const test_n = ast.addTestDecl("basic", null_node, s)
+    ast.file_decls.append(imp)
+    ast.file_decls.append(test_n)
+    @assertEq(ast.file_decls.count, 2)
+    @assertEq(ast.file_decls.get(0), imp)
+    @assertEq(ast.file_decls.get(1), test_n)
 }
