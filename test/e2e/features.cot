@@ -2576,6 +2576,53 @@ test "nested type with struct field" {
 }
 
 // ============================================================================
+// Chained pointer field access (regression: lowerer must dereference pointer fields)
+// ============================================================================
+
+struct InnerState { pos: int, ch: int }
+struct OuterState { scanner: *InnerState, value: int }
+
+test "chained pointer field read" {
+    var inner = InnerState { .pos = 42, .ch = 65 }
+    var outer = OuterState { .scanner = &inner, .value = 99 }
+    @assertEq(outer.scanner.pos, 42)
+    @assertEq(outer.scanner.ch, 65)
+    @assertEq(outer.value, 99)
+}
+
+test "chained pointer field write" {
+    var inner = InnerState { .pos = 42, .ch = 65 }
+    var outer = OuterState { .scanner = &inner, .value = 99 }
+    outer.scanner.pos = 100
+    @assertEq(outer.scanner.pos, 100)
+    @assertEq(inner.pos, 100)
+}
+
+test "chained pointer field save restore" {
+    var inner = InnerState { .pos = 42, .ch = 65 }
+    var outer = OuterState { .scanner = &inner, .value = 99 }
+    const saved_pos = outer.scanner.pos
+    const saved_ch = outer.scanner.ch
+    outer.scanner.pos = 999
+    outer.scanner.ch = 90
+    @assertEq(outer.scanner.pos, 999)
+    outer.scanner.pos = saved_pos
+    outer.scanner.ch = saved_ch
+    @assertEq(outer.scanner.pos, 42)
+    @assertEq(outer.scanner.ch, 65)
+}
+
+test "double pointer chain field access" {
+    var inner = InnerState { .pos = 42, .ch = 65 }
+    var outer = OuterState { .scanner = &inner, .value = 99 }
+    const p: *OuterState = &outer
+    @assertEq(p.scanner.pos, 42)
+    p.scanner.pos = 200
+    @assertEq(p.scanner.pos, 200)
+    @assertEq(inner.pos, 200)
+}
+
+// ============================================================================
 // Anonymous struct literals (Tier 1.7)
 // ============================================================================
 

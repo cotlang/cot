@@ -189,3 +189,108 @@ test "constructor sugar with implicit self" {
     @assertEq(c.radius, 7)
     @assertEq(c.diameter(), 14)
 }
+
+// --- Feature 5: Auto-ref (pass structs to pointer params without &) ---
+// In @safe mode, structs are passed by reference automatically.
+// No & needed — just like TypeScript/C# where objects are always references.
+
+struct Counter { value: i64 }
+
+fn incrementCounter(c: *Counter) void {
+    c.value = c.value + 1
+}
+
+fn getCounterValue(c: *Counter) i64 {
+    return c.value
+}
+
+impl Counter {
+    fn reset() void { self.value = 0 }
+    fn inc() void { self.value = self.value + 1 }
+    fn get() i64 { return self.value }
+}
+
+test "auto-ref: pass local to pointer param" {
+    var c = Counter { value: 0 }
+    incrementCounter(c)
+    @assertEq(c.value, 1)
+}
+
+test "auto-ref: mutations visible to caller" {
+    var c = Counter { value: 10 }
+    incrementCounter(c)
+    incrementCounter(c)
+    incrementCounter(c)
+    @assertEq(c.value, 13)
+}
+
+test "auto-ref: read through pointer param" {
+    var c = Counter { value: 42 }
+    @assertEq(getCounterValue(c), 42)
+}
+
+test "auto-ref: multiple functions same variable" {
+    var c = Counter { value: 0 }
+    incrementCounter(c)
+    @assertEq(getCounterValue(c), 1)
+    incrementCounter(c)
+    @assertEq(getCounterValue(c), 2)
+}
+
+struct Scanner { pos: i64, line: i64 }
+struct Ast { count: i64 }
+struct Errors { count: i64 }
+
+fn scannerInit() Scanner {
+    return Scanner { pos: 0, line: 1 }
+}
+
+struct Parser {
+    scanner: *Scanner,
+    ast: *Ast,
+    errors: *Errors,
+    tok: i64,
+}
+
+fn parserInit(scanner: *Scanner, ast: *Ast, errors: *Errors) Parser {
+    return Parser { scanner: scanner, ast: ast, errors: errors, tok: 0 }
+}
+
+impl Parser {
+    fn advance() void {
+        self.scanner.pos = self.scanner.pos + 1
+        self.tok = self.scanner.pos
+    }
+
+    fn addNode() void {
+        self.ast.count = self.ast.count + 1
+    }
+}
+
+test "auto-ref: parser pattern — no & needed" {
+    var s = scannerInit()
+    var ast = Ast { count: 0 }
+    var errors = Errors { count: 0 }
+    var p = parserInit(s, ast, errors)
+    p.advance()
+    p.advance()
+    p.addNode()
+    @assertEq(s.pos, 2)
+    @assertEq(ast.count, 1)
+    @assertEq(p.tok, 2)
+}
+
+test "auto-ref: field access mutation propagates" {
+    var s = scannerInit()
+    var ast = Ast { count: 0 }
+    var errors = Errors { count: 0 }
+    var p = parserInit(s, ast, errors)
+    p.scanner.pos = 100
+    @assertEq(s.pos, 100)
+}
+
+test "auto-ref: explicit & still works" {
+    var c = Counter { value: 0 }
+    incrementCounter(&c)
+    @assertEq(c.value, 1)
+}

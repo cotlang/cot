@@ -76,9 +76,9 @@ self/
   total: 2,054 lines
 ```
 
-**What's done:** Scanner tokenizes Cot source correctly. Token types match the Zig compiler. AST node types are defined (pruned to 41 builtins from 94). All files use @safe mode with TypeScript-style DX.
+**What's done:** Scanner, token, AST, parser all complete (~5,400 lines). Parser is ~2,650 lines with 85 tests covering all Cot syntax. All files use @safe mode — no `&` operators, structs passed by reference like TypeScript objects.
 
-**What's next:** Parser (the biggest single component).
+**What's next:** Checker (type checking, scope resolution).
 
 ---
 
@@ -165,7 +165,7 @@ The parser transforms tokens into an AST. This is the largest single component.
 **Cot is starting self-hosting work 33 months earlier in its lifecycle than Zig did.** This is possible because:
 1. LLM-assisted development compresses implementation time
 2. Cot's simpler type system (no full comptime) makes the compiler easier to write
-3. The @safe mode + TypeScript-style DX makes Cot pleasant to write compiler code in
+3. The @safe mode (auto-ref, implicit self, colon init) makes Cot feel like TypeScript
 4. All infrastructure (collections, I/O, error handling) is already in place
 
 ---

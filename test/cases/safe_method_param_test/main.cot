@@ -84,28 +84,28 @@ impl P {
 
 test "BUG: method-with-param if condition" {
     var src = sourceInit("abcde")
-    var p = pInit(&src)
+    var p = pInit(src)
     p.bugPattern(42)
     @assertEq(p.value, 42)
 }
 
 test "WORKAROUND: store in local" {
     var src = sourceInit("abcde")
-    var p = pInit(&src)
+    var p = pInit(src)
     p.workaround(42)
     @assertEq(p.value, 42)
 }
 
 test "method-no-param if condition" {
     var src = sourceInit("abcde")
-    var p = pInit(&src)
+    var p = pInit(src)
     p.noParamCondition()
     @assertEq(p.value, 99)
 }
 
 test "direct compare if condition" {
     var src = sourceInit("abcde")
-    var p = pInit(&src)
+    var p = pInit(src)
     p.directCompareCondition(42)
     @assertEq(p.value, 42)
 }

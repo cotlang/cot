@@ -634,7 +634,7 @@ impl Ast {
 
     // ---- Typed add helpers: Declarations ----
 
-    fn addFnDecl(name: string, ret_type: int, body: int, is_extern: int, is_async: int, doc: string, params: List(int), type_params: List(string), s: Span) int {
+    fn addFnDecl(name: string, ret_type: int, body: int, is_extern: int, is_async: int, doc: string, params: List(int), type_params: List(string), type_param_bounds: List(string), s: Span) int {
         const name_idx = self.addStr(name)
         const doc_idx = self.addStr(doc)
         const idx = self.addNode(@intFromEnum(NodeTag.fn_decl))
@@ -655,6 +655,14 @@ impl Ast {
         while (i < type_params.count) {
             const tp_str = self.addStr(type_params.get(i))
             self.addData(tp_str)
+            i = i + 1
+        }
+        // Where clause bounds: one per type param, "" = no bound
+        self.addData(type_param_bounds.count)
+        i = 0
+        while (i < type_param_bounds.count) {
+            const bound_str = self.addStr(type_param_bounds.get(i))
+            self.addData(bound_str)
             i = i + 1
         }
         self.addData(s.start)
@@ -1033,6 +1041,10 @@ const BuiltinKind = enum {
     size_of, align_of, enum_len, has_field, type_of, field, offset_of,
     // Comptime reflection
     type_name, enum_name, type_info,
+    // Math unary
+    abs, ceil, floor, trunc, round,
+    // Math binary
+    fmin, fmax, min, max,
     // Casts
     int_cast, float_cast, float_from_int, int_from_float,
     ptr_cast, int_to_ptr, ptr_to_int, bit_cast, truncate, @"as",
@@ -1041,6 +1053,8 @@ const BuiltinKind = enum {
     int_from_enum, enum_from_int, tag_name, error_name, int_from_bool,
     // String construction + decomposition
     @"string", ptr_of, len_of,
+    // Bit manipulation
+    ctz, clz, pop_count,
     // Assertions
     assert, assertEq,
     // Control
@@ -1064,6 +1078,15 @@ fn builtinFromString(name: string) ?int {
         "typeName" => @intFromEnum(BuiltinKind.type_name),
         "enumName" => @intFromEnum(BuiltinKind.enum_name),
         "typeInfo" => @intFromEnum(BuiltinKind.type_info),
+        "abs" => @intFromEnum(BuiltinKind.abs),
+        "ceil" => @intFromEnum(BuiltinKind.ceil),
+        "floor" => @intFromEnum(BuiltinKind.floor),
+        "trunc" => @intFromEnum(BuiltinKind.trunc),
+        "round" => @intFromEnum(BuiltinKind.round),
+        "fmin" => @intFromEnum(BuiltinKind.fmin),
+        "fmax" => @intFromEnum(BuiltinKind.fmax),
+        "min" => @intFromEnum(BuiltinKind.min),
+        "max" => @intFromEnum(BuiltinKind.max),
         "intCast" => @intFromEnum(BuiltinKind.int_cast),
         "floatCast" => @intFromEnum(BuiltinKind.float_cast),
         "floatFromInt" => @intFromEnum(BuiltinKind.float_from_int),
@@ -1084,6 +1107,9 @@ fn builtinFromString(name: string) ?int {
         "string" => @intFromEnum(BuiltinKind.@"string"),
         "ptrOf" => @intFromEnum(BuiltinKind.ptr_of),
         "lenOf" => @intFromEnum(BuiltinKind.len_of),
+        "ctz" => @intFromEnum(BuiltinKind.ctz),
+        "clz" => @intFromEnum(BuiltinKind.clz),
+        "popCount" => @intFromEnum(BuiltinKind.pop_count),
         "assert" => @intFromEnum(BuiltinKind.assert),
         "assertEq" => @intFromEnum(BuiltinKind.assertEq),
         "trap" => @intFromEnum(BuiltinKind.trap),
@@ -1130,7 +1156,7 @@ test "LiteralKind enum" {
 }
 
 test "BuiltinKind enum count" {
-    @assertEq(@enumLen(BuiltinKind), 41)
+    @assertEq(@enumLen(BuiltinKind), 53)
 }
 
 test "builtinFromString known" {
@@ -1221,7 +1247,11 @@ test "Ast addFnDecl" {
     tp.items = 0
     tp.count = 0
     tp.capacity = 0
-    const fn_idx = ast.addFnDecl("main", null_node, null_node, 0, 0, "", params, tp, s)
+    var tpb: List(string) = undefined
+    tpb.items = 0
+    tpb.count = 0
+    tpb.capacity = 0
+    const fn_idx = ast.addFnDecl("main", null_node, null_node, 0, 0, "", params, tp, tpb, s)
     @assertEq(ast.getTag(fn_idx), @intFromEnum(NodeTag.fn_decl))
     @assertEq(ast.getStr(ast.getData(fn_idx, 0)), "main")
 }

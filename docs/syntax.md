@@ -799,10 +799,10 @@ import "std/list"          // stdlib modules
 
 ## @safe Mode
 
-The `@safe` file annotation enables C#/TypeScript-friendly extensions. All `@safe` features are **opt-in** — they only activate in files that start with `@safe` and never affect the base language.
+The `@safe` annotation enables **TypeScript/C#-style** ergonomics. Structs behave like objects — passed by reference, no manual `&` or `*`. All features are **opt-in** and never affect the base language.
 
 ```cot
-@safe  // must be the first line
+@safe  // must be the first line (or "safe": true in cot.json for whole project)
 
 struct Point { x: i64, y: i64 }
 ```
@@ -811,11 +811,50 @@ struct Point { x: i64, y: i64 }
 
 | Feature | Standard Cot | @safe Mode |
 |---------|-------------|------------|
+| Struct passing | `fn foo(p: *Point)` + `foo(&p)` | `fn foo(p: Point)` + `foo(p)` — like TypeScript |
 | Struct init (stack) | `Point { .x = 10, .y = 20 }` | `Point { x: 10, y: 20 }` (colon syntax) |
 | Field shorthand | Not available | `new Point { x, y }` → `new Point { x: x, y: y }` |
 | Self parameter | `fn getX(self: *Point) i64` | `fn getX() i64` (self injected) |
 | Constructor | `new Point { x: 10, y: 20 }` | `new Point(10, 20)` (calls init) |
-| Struct params | `fn foo(p: *Point)` explicit | `fn foo(p: Point)` auto-wrapped to pointer |
+
+### Auto-Ref: Pass Structs Like TypeScript Objects
+
+The headline feature: structs are passed by reference automatically. No `&` operator needed. Mutations through the callee are visible to the caller — exactly like TypeScript/C# objects.
+
+```cot
+struct Counter { value: i64 }
+
+fn increment(c: *Counter) void {    // accepts pointer
+    c.value = c.value + 1
+}
+
+test "no & needed" {
+    var c = Counter { value: 0 }
+    increment(c)                    // just pass c, not &c
+    increment(c)
+    @assertEq(c.value, 2)          // mutations visible
+}
+```
+
+This works for any pattern where locals are passed to pointer params — including the common "init + store pointer" pattern:
+
+```cot
+struct Parser { scanner: *Scanner, ast: *Ast }
+
+fn parserInit(scanner: *Scanner, ast: *Ast) Parser {
+    return Parser { scanner: scanner, ast: ast }
+}
+
+test "parser pattern" {
+    var s = scannerInit()
+    var ast = Ast { count: 0 }
+    var p = parserInit(s, ast)     // no & needed
+    p.advance()
+    @assertEq(s.pos, 1)           // mutation propagates through p.scanner
+}
+```
+
+Explicit `&` still works if you prefer it. Non-lvalue expressions (function returns) get a temporary copy.
 
 ### Unified Init Syntax (Colon Syntax)
 

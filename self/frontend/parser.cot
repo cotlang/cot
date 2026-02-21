@@ -32,6 +32,7 @@ struct Parser {
     has_peek: bool,
     safe_mode: bool,
     current_impl_type: string,
+    current_impl_is_generic: bool,
     nest_level: int,
     pending_doc: string,
 }
@@ -53,6 +54,7 @@ fn parserInit(scanner: *Scanner, ast: *Ast, errors: *ErrorReporter) Parser {
         has_peek: false,
         safe_mode: false,
         current_impl_type: "",
+        current_impl_is_generic: false,
         nest_level: 0,
         pending_doc: "",
     }
@@ -254,36 +256,44 @@ impl Parser {
         const name = self.tok_text
         self.advance()  // consume name
 
-        // Type parameters: (T) or (T, U)
+        // Ported from parser.zig:250-270: fn max(T)(a: T, b: T) T
+        // First '(' is consumed, then we distinguish type params from regular params:
+        // bare idents (no ':') = type params; ident followed by ':' = regular params.
+        if (!self.expect(@intFromEnum(Token.lparen))) {
+            return null_node
+        }
+
         var type_params: List(string) = undefined
         type_params.items = 0
         type_params.count = 0
         type_params.capacity = 0
-        if (self.tok == @intFromEnum(Token.lparen)) {
-            const pk = self.peekToken()
-            if (pk == @intFromEnum(Token.ident)) {
-                self.advance()  // consume (
-                while (self.tok == @intFromEnum(Token.ident)) {
-                    type_params.append(self.tok_text)
-                    self.advance()
-                    if (!self.match(@intFromEnum(Token.comma))) {
-                        break
-                    }
-                }
-                if (!self.expect(@intFromEnum(Token.rparen))) {
+        if (self.tok == @intFromEnum(Token.ident) and self.peekToken() != @intFromEnum(Token.colon)) {
+            // Type parameters: (T) or (T, U)
+            while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+                if (self.tok != @intFromEnum(Token.ident)) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected type parameter name")
                     return null_node
                 }
+                type_params.append(self.tok_text)
+                self.advance()
+                if (!self.match(@intFromEnum(Token.comma))) {
+                    break
+                }
+            }
+            if (!self.expect(@intFromEnum(Token.rparen))) {
+                return null_node
+            }
+            // Expect second ( for value parameters
+            if (!self.expect(@intFromEnum(Token.lparen))) {
+                return null_node
             }
         }
 
-        // Regular parameters
+        // Regular parameters (lparen already consumed above)
         var params: List(int) = undefined
         params.items = 0
         params.count = 0
         params.capacity = 0
-        if (!self.expect(@intFromEnum(Token.lparen))) {
-            return null_node
-        }
         while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
             const param_node = self.parseFieldDef()
             if (param_node != null_node) {
@@ -297,10 +307,84 @@ impl Parser {
             return null_node
         }
 
-        // Return type
+        // @safe implicit self: inject `self: TypeName` if in impl block
+        if (self.safe_mode and @lenOf(self.current_impl_type) > 0 and !self.current_impl_is_generic) {
+            // Check if first param is already named "self"
+            var needs_self = true
+            if (params.count > 0) {
+                const first_tag = self.ast.getTag(params.get(0))
+                if (first_tag == @intFromEnum(NodeTag.field_def)) {
+                    const first_name = self.ast.getStr(self.ast.getData(params.get(0), 0))
+                    if (strEqual(first_name, "self")) {
+                        needs_self = false
+                    }
+                }
+            }
+            if (needs_self) {
+                // Create self param with type = current_impl_type
+                const self_type = self.ast.addIdent(self.current_impl_type, self.spanSE(start, start))
+                const self_param = self.ast.addFieldDef("self", self_type, null_node, "", self.spanSE(start, start))
+                // Prepend self to params
+                var new_params: List(int) = undefined
+                new_params.items = 0
+                new_params.count = 0
+                new_params.capacity = 0
+                new_params.append(self_param)
+                var pi = 0
+                while (pi < params.count) {
+                    new_params.append(params.get(pi))
+                    pi = pi + 1
+                }
+                params = new_params
+            }
+        }
+
+        // Return type — skip if at '{', eof, or 'where'
+        // Ported from parser.zig:294-295
         var ret_type = null_node
-        if (self.tok != @intFromEnum(Token.lbrace) and self.tok != @intFromEnum(Token.eof)) {
+        if (self.tok != @intFromEnum(Token.lbrace) and self.tok != @intFromEnum(Token.eof) and self.tok != @intFromEnum(Token.kw_where)) {
             ret_type = self.parseType()
+        }
+
+        // Where clause: fn sort(T)(list: *List(T)) void where T: Ord
+        // Ported from parser.zig:299-321
+        var type_param_bounds: List(string) = undefined
+        type_param_bounds.items = 0
+        type_param_bounds.count = 0
+        type_param_bounds.capacity = 0
+        if (self.tok == @intFromEnum(Token.kw_where) and type_params.len() > 0) {
+            // Initialize bounds array with "" for each type param
+            var bi = 0
+            while (bi < type_params.len()) {
+                type_param_bounds.append("")
+                bi = bi + 1
+            }
+            self.advance()  // consume 'where'
+            while (self.tok == @intFromEnum(Token.ident)) {
+                const param_name = self.tok_text
+                self.advance()
+                if (!self.expect(@intFromEnum(Token.colon))) {
+                    break
+                }
+                if (self.tok != @intFromEnum(Token.ident)) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected trait name after ':'")
+                    break
+                }
+                const trait_name = self.tok_text
+                self.advance()
+                // Find matching type param and set its bound
+                var wi = 0
+                while (wi < type_params.len()) {
+                    if (strEqual(type_params.get(wi), param_name)) {
+                        type_param_bounds.set(wi, trait_name)
+                        break
+                    }
+                    wi = wi + 1
+                }
+                if (!self.match(@intFromEnum(Token.comma))) {
+                    break
+                }
+            }
         }
 
         // Body (optional for extern)
@@ -309,19 +393,21 @@ impl Parser {
             body = self.parseBlock()
         }
 
-        return self.ast.addFnDecl(name, ret_type, body, is_extern, is_async, doc, params, type_params, self.spanSE(start, self.tok_end))
+        return self.ast.addFnDecl(name, ret_type, body, is_extern, is_async, doc, params, type_params, type_param_bounds, self.spanSE(start, self.tok_end))
     }
 
     /// const/var name: Type = value
+    /// Also handles: const Name = enum { ... }, const Name = error { ... }
     fn parseVarDecl(is_const: int) int {
         const start = self.tok_start
         const doc = self.consumeDocComment()
         self.advance()  // consume const/var/let
         if (self.tok != @intFromEnum(Token.ident)) {
             // Could be destructuring: const a, b = ...
-            return self.parseDestructureDecl(is_const, start)
+            return self.parseDestructureDecl(is_const, start, doc)
         }
         const name = self.tok_text
+        const name_start = self.tok_start
         self.advance()  // consume name
 
         // Optional type annotation
@@ -330,7 +416,161 @@ impl Parser {
             type_expr = self.parseType()
         }
 
-        // Optional initializer
+        // Destructuring: const a, b = expr
+        if (self.tok == @intFromEnum(Token.comma)) {
+            return self.parseDestructureDeclFrom(name, type_expr, name_start, start, is_const, doc)
+        }
+
+        // Check for inline type declarations: const Name = enum { ... } or const Name = enum(u8) { ... }
+        // Ported from parser.zig:1678-1716 — full state save/restore backtracking
+        if (is_const == 1 and self.tok == @intFromEnum(Token.assign)) {
+            // Save parser + scanner state for backtracking
+            const saved_tok = self.tok
+            const saved_tok_text = self.tok_text
+            const saved_tok_start = self.tok_start
+            const saved_tok_end = self.tok_end
+            const saved_has_peek = self.has_peek
+            const saved_peek_tok = self.peek_tok
+            const saved_peek_text = self.peek_text
+            const saved_peek_start = self.peek_start
+            const saved_peek_end = self.peek_end
+            const saved_scan_pos = self.scanner.pos
+            const saved_scan_ch = self.scanner.ch
+
+            self.advance()  // consume '='
+
+            if (self.tok == @intFromEnum(Token.kw_enum)) {
+                self.advance()  // consume 'enum'
+                var backing = null_node
+                if (self.match(@intFromEnum(Token.lparen))) {
+                    backing = self.parseType()
+                    self.expect(@intFromEnum(Token.rparen))
+                }
+                if (!self.expect(@intFromEnum(Token.lbrace))) {
+                    return null_node
+                }
+                var variants: List(int) = undefined
+                variants.items = 0
+                variants.count = 0
+                variants.capacity = 0
+                while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+                    const vstart = self.tok_start
+                    if (self.tok == @intFromEnum(Token.at)) {
+                        self.advance()
+                    }
+                    if (self.tok != @intFromEnum(Token.ident) and self.tok != @intFromEnum(Token.string_lit)) {
+                        self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
+                        break
+                    }
+                    const vname = self.tok_text
+                    self.advance()
+                    var vval = null_node
+                    if (self.match(@intFromEnum(Token.assign))) {
+                        vval = self.parseExpr()
+                    }
+                    variants.append(self.ast.addEnumVariant(vname, vval, self.spanSE(vstart, self.tok_end)))
+                    self.match(@intFromEnum(Token.comma))
+                }
+                self.expect(@intFromEnum(Token.rbrace))
+                return self.ast.addEnumDecl(name, backing, doc, variants, self.spanSE(start, self.tok_end))
+            }
+
+            if (self.tok == @intFromEnum(Token.kw_error)) {
+                if (self.peekToken() == @intFromEnum(Token.lbrace)) {
+                    self.advance()  // consume 'error'
+                    self.advance()  // consume '{'
+                    var variants: List(string) = undefined
+                    variants.items = 0
+                    variants.count = 0
+                    variants.capacity = 0
+                    while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+                        if (self.tok != @intFromEnum(Token.ident)) {
+                            break
+                        }
+                        variants.append(self.tok_text)
+                        self.advance()
+                        if (!self.match(@intFromEnum(Token.comma))) {
+                            break
+                        }
+                    }
+                    self.expect(@intFromEnum(Token.rbrace))
+                    return self.ast.addErrorSetDecl(name, doc, variants, self.spanSE(start, self.tok_end))
+                }
+                // error.Name expression — not an error set, restore state
+            }
+
+            if (self.tok == @intFromEnum(Token.kw_union)) {
+                self.advance()  // consume 'union'
+                if (!self.expect(@intFromEnum(Token.lbrace))) {
+                    return null_node
+                }
+                var variants: List(int) = undefined
+                variants.items = 0
+                variants.count = 0
+                variants.capacity = 0
+                while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+                    const vstart = self.tok_start
+                    if (self.tok != @intFromEnum(Token.ident)) {
+                        self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
+                        break
+                    }
+                    const vname = self.tok_text
+                    self.advance()
+                    var vtype = null_node
+                    if (self.match(@intFromEnum(Token.colon))) {
+                        vtype = self.parseType()
+                    }
+                    variants.append(self.ast.addUnionVariant(vname, vtype, self.spanSE(vstart, self.tok_end)))
+                    self.match(@intFromEnum(Token.comma))
+                }
+                self.expect(@intFromEnum(Token.rbrace))
+                return self.ast.addUnionDecl(name, doc, variants, self.spanSE(start, self.tok_end))
+            }
+
+            if (self.tok == @intFromEnum(Token.kw_struct)) {
+                self.advance()  // consume 'struct'
+                var sfields: List(int) = undefined
+                sfields.items = 0
+                sfields.count = 0
+                sfields.capacity = 0
+                var nested: List(int) = undefined
+                nested.items = 0
+                nested.count = 0
+                nested.capacity = 0
+                var type_params: List(string) = undefined
+                type_params.items = 0
+                type_params.count = 0
+                type_params.capacity = 0
+                if (!self.expect(@intFromEnum(Token.lbrace))) {
+                    return null_node
+                }
+                while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+                    self.collectDocComment()
+                    const fd = self.parseFieldDef()
+                    if (fd != null_node) {
+                        sfields.append(fd)
+                    }
+                    self.match(@intFromEnum(Token.comma))
+                }
+                self.expect(@intFromEnum(Token.rbrace))
+                return self.ast.addStructDecl(name, 0, doc, sfields, type_params, nested, self.spanSE(start, self.tok_end))
+            }
+
+            // Not a type declaration — restore parser + scanner state
+            self.tok = saved_tok
+            self.tok_text = saved_tok_text
+            self.tok_start = saved_tok_start
+            self.tok_end = saved_tok_end
+            self.has_peek = saved_has_peek
+            self.peek_tok = saved_peek_tok
+            self.peek_text = saved_peek_text
+            self.peek_start = saved_peek_start
+            self.peek_end = saved_peek_end
+            self.scanner.pos = saved_scan_pos
+            self.scanner.ch = saved_scan_ch
+        }
+
+        // Regular initializer
         var value = null_node
         if (self.match(@intFromEnum(Token.assign))) {
             value = self.parseExpr()
@@ -339,14 +579,44 @@ impl Parser {
         return self.ast.addVarDecl(name, type_expr, value, is_const, doc, self.spanSE(start, self.tok_end))
     }
 
-    /// Destructure: const a, b = expr
-    fn parseDestructureDecl(is_const: int, start: int) int {
-        // TODO: implement destructuring declarations
-        self.errors.report(self.tok_start, ErrorCode.e200, "destructuring not yet supported in self-hosted parser")
+    /// Destructure top-level: const a, b = expr (no ident found, multiple bindings)
+    fn parseDestructureDecl(is_const: int, start: int, doc: string) int {
+        // First token isn't ident — this shouldn't normally happen for destructuring
+        // Destructuring starts with ident: const a, b = ...
+        self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
         return null_node
     }
 
+    /// Destructure from first binding: const a, b = expr
+    fn parseDestructureDeclFrom(first_name: string, first_type: int, first_start: int, start: int, is_const: int, doc: string) int {
+        var bindings: List(int) = undefined
+        bindings.items = 0
+        bindings.count = 0
+        bindings.capacity = 0
+        bindings.append(self.ast.addDestructureBind(first_name, first_type, self.spanSE(first_start, self.tok_end)))
+        while (self.match(@intFromEnum(Token.comma))) {
+            if (self.tok != @intFromEnum(Token.ident)) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+                break
+            }
+            const bname = self.tok_text
+            const bstart = self.tok_start
+            self.advance()
+            var btype = null_node
+            if (self.match(@intFromEnum(Token.colon))) {
+                btype = self.parseType()
+            }
+            bindings.append(self.ast.addDestructureBind(bname, btype, self.spanSE(bstart, self.tok_end)))
+        }
+        if (!self.expect(@intFromEnum(Token.assign))) {
+            return null_node
+        }
+        const value = self.parseExpr()
+        return self.ast.addDestructureStmt(value, is_const, bindings, self.spanSE(start, self.tok_end))
+    }
+
     /// struct Name { fields }
+    /// Ported from parser.zig:428-483 (parseStructDeclWithLayout)
     fn parseStructDecl(layout: int) int {
         const start = self.tok_start
         const doc = self.consumeDocComment()
@@ -358,25 +628,56 @@ impl Parser {
         const name = self.tok_text
         self.advance()
 
-        // Optional type params
+        // Parse optional type parameters: struct Pair(T, U) { ... }
+        // Ported from parser.zig:440-454
         var type_params: List(string) = undefined
         type_params.items = 0
         type_params.count = 0
         type_params.capacity = 0
+        if (self.tok == @intFromEnum(Token.lparen)) {
+            self.advance()  // consume (
+            while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+                if (self.tok != @intFromEnum(Token.ident)) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected type parameter name")
+                    return null_node
+                }
+                type_params.append(self.tok_text)
+                self.advance()
+                if (!self.match(@intFromEnum(Token.comma))) {
+                    break
+                }
+            }
+            self.expect(@intFromEnum(Token.rparen))
+        }
+
+        if (!self.expect(@intFromEnum(Token.lbrace))) {
+            return null_node
+        }
+
+        // Parse nested declarations (const, enum, struct, type, fn) before fields
+        // Ported from parser.zig:458-470
+        var nested: List(int) = undefined
+        nested.items = 0
+        nested.count = 0
+        nested.capacity = 0
+        while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+            const tok = @as(Token, @enumFromInt(self.tok))
+            if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
+                tok == Token.kw_fn) {
+                const nested_decl = self.parseDecl()
+                if (nested_decl != null_node) {
+                    nested.append(nested_decl)
+                }
+            } else {
+                break
+            }
+        }
 
         // Fields
         var fields: List(int) = undefined
         fields.items = 0
         fields.count = 0
         fields.capacity = 0
-        var nested: List(int) = undefined
-        nested.items = 0
-        nested.count = 0
-        nested.capacity = 0
-
-        if (!self.expect(@intFromEnum(Token.lbrace))) {
-            return null_node
-        }
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
             self.collectDocComment()
             const fd = self.parseFieldDef()
@@ -486,7 +787,8 @@ impl Parser {
         return self.ast.addUnionDecl("", doc, variants, self.spanSE(start, self.tok_end))
     }
 
-    /// impl Type { methods }
+    /// impl Type { methods }  or  impl Type(T) { methods }  or  impl Trait for Type { methods }
+    /// Ported from parser.zig:485-534
     fn parseImplBlock() int {
         const start = self.tok_start
         const doc = self.consumeDocComment()
@@ -498,38 +800,50 @@ impl Parser {
         const type_name = self.tok_text
         self.advance()
 
-        // Check for trait impl: impl Trait for Type
-        var trait_name = ""
-        if (self.tok == @intFromEnum(Token.kw_for)) {
-            // impl Trait for Type { ... }
-            trait_name = type_name
-            self.advance()  // consume 'for'
-            if (self.tok != @intFromEnum(Token.ident)) {
-                self.errors.report(self.tok_start, ErrorCode.e203, "expected type name after for")
-                return null_node
-            }
-            const target = self.tok_text
-            self.advance()
-            return self.parseImplTraitBlock(trait_name, target, doc, start)
-        }
-
-        // Save/restore impl context
-        const saved_impl = self.current_impl_type
-        self.current_impl_type = type_name
-
+        // Parse optional type parameters: impl List(T) { ... }
+        // Ported from parser.zig:493-507
         var type_params: List(string) = undefined
         type_params.items = 0
         type_params.count = 0
         type_params.capacity = 0
+        if (self.tok == @intFromEnum(Token.lparen)) {
+            self.advance()
+            while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+                if (self.tok != @intFromEnum(Token.ident)) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected type parameter name")
+                    return null_node
+                }
+                type_params.append(self.tok_text)
+                self.advance()
+                if (!self.match(@intFromEnum(Token.comma))) {
+                    break
+                }
+            }
+            self.expect(@intFromEnum(Token.rparen))
+        }
+
+        // Check for trait impl: impl Trait for Type { ... }
+        // Ported from parser.zig:510
+        if (self.tok == @intFromEnum(Token.kw_for)) {
+            return self.parseImplTraitBlock(type_name, type_params, doc, start)
+        }
+
+        if (!self.expect(@intFromEnum(Token.lbrace))) {
+            return null_node
+        }
+
+        // Save/restore impl context for implicit self injection (@safe mode)
+        // Ported from parser.zig:515-522
+        const saved_impl = self.current_impl_type
+        const saved_generic = self.current_impl_is_generic
+        self.current_impl_type = type_name
+        self.current_impl_is_generic = type_params.len() > 0
+
         var methods: List(int) = undefined
         methods.items = 0
         methods.count = 0
         methods.capacity = 0
 
-        if (!self.expect(@intFromEnum(Token.lbrace))) {
-            self.current_impl_type = saved_impl
-            return null_node
-        }
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
             self.collectDocComment()
             if (self.tok == @intFromEnum(Token.kw_fn)) {
@@ -549,27 +863,38 @@ impl Parser {
         }
         self.expect(@intFromEnum(Token.rbrace))
         self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_generic
 
         return self.ast.addImplBlock(type_name, doc, methods, type_params, self.spanSE(start, self.tok_end))
     }
 
-    fn parseImplTraitBlock(trait_name: string, target: string, doc: string, start: int) int {
-        var type_params: List(string) = undefined
-        type_params.items = 0
-        type_params.count = 0
-        type_params.capacity = 0
+    /// impl Trait for Type { methods }
+    /// Ported from parser.zig:558-594
+    /// type_params already parsed by parseImplBlock, trait_name is actually the first ident
+    fn parseImplTraitBlock(trait_name: string, type_params: List(string), doc: string, start: int) int {
+        self.advance()  // consume 'for'
+        if (self.tok != @intFromEnum(Token.ident)) {
+            self.errors.report(self.tok_start, ErrorCode.e203, "expected type name after for")
+            return null_node
+        }
+        const target = self.tok_text
+        self.advance()
+
+        if (!self.expect(@intFromEnum(Token.lbrace))) {
+            return null_node
+        }
+
+        // Save/restore impl context — ported from parser.zig:575-582
+        const saved_impl = self.current_impl_type
+        const saved_generic = self.current_impl_is_generic
+        self.current_impl_type = target
+        self.current_impl_is_generic = type_params.len() > 0
+
         var methods: List(int) = undefined
         methods.items = 0
         methods.count = 0
         methods.capacity = 0
 
-        const saved_impl = self.current_impl_type
-        self.current_impl_type = target
-
-        if (!self.expect(@intFromEnum(Token.lbrace))) {
-            self.current_impl_type = saved_impl
-            return null_node
-        }
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
             self.collectDocComment()
             if (self.tok == @intFromEnum(Token.kw_fn)) {
@@ -584,6 +909,7 @@ impl Parser {
         }
         self.expect(@intFromEnum(Token.rbrace))
         self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_generic
 
         return self.ast.addImplTrait(trait_name, target, doc, methods, type_params, self.spanSE(start, self.tok_end))
     }
@@ -820,6 +1146,9 @@ impl Parser {
                 }
                 self.expect(@intFromEnum(Token.rparen))
                 node = self.ast.addCallNode(node, args, self.spanSE(self.tok_start, self.tok_end))
+            } else if (self.peekNextIsPeriod() or (self.safe_mode and self.peekNextIsIdentColon())) {
+                // Struct init: Type { .x = 1 } or Type { x: 1 } (@safe)
+                node = self.parseStructInitFrom(node)
             } else {
                 break
             }
@@ -858,6 +1187,11 @@ impl Parser {
             const text = self.tok_text
             self.advance()
             return self.ast.addLiteral(@intFromEnum(LiteralKind.@"string"), text, self.spanSE(start, self.tok_end))
+        }
+
+        // String interpolation: "text${expr}..."
+        if (tok == Token.string_interp_start) {
+            return self.parseStringInterp()
         }
 
         // Char literal
@@ -952,6 +1286,11 @@ impl Parser {
             return self.parseSwitchExpr()
         }
 
+        // Anonymous function (closure): fn(params) rettype { body }
+        if (tok == Token.kw_fn) {
+            return self.parseClosureExpr()
+        }
+
         // Builtin call: @name(args)
         if (tok == Token.at) {
             return self.parseBuiltinCall()
@@ -983,10 +1322,23 @@ impl Parser {
             return self.ast.addComptimeBlock(body, self.spanSE(start, self.tok_end))
         }
 
-        // Period prefix: .{ } anonymous struct or .variant
+        // Period prefix: .variant, .{ .x = 1 } anonymous struct, or .{ } zero-init
         if (tok == Token.period) {
             self.advance()
             if (self.tok == @intFromEnum(Token.lbrace)) {
+                // .{ } — check if struct init or zero-init
+                if (self.peekToken() == @intFromEnum(Token.period) or self.peekToken() == @intFromEnum(Token.ident)) {
+                    // .{ .x = 1 } or .{ x: 1 } — anonymous struct init
+                    const anon = self.ast.addIdent("", self.spanSE(start, start))
+                    return self.parseStructInitFrom(anon)
+                }
+                if (self.peekToken() == @intFromEnum(Token.rbrace)) {
+                    // .{ } — zero-init
+                    self.advance()  // consume {
+                    self.advance()  // consume }
+                    return self.ast.addZeroInit(self.spanSE(start, self.tok_end))
+                }
+                // .{ expr, expr } — could be tuple or array init
                 return self.parseBlockExpr()
             }
             if (self.tok == @intFromEnum(Token.ident)) {
@@ -1002,8 +1354,183 @@ impl Parser {
     }
 
     // ================================================================
-    // Phase B: Complex expressions
+    // Phase E: Struct init disambiguation helpers
     // ================================================================
+
+    /// Check if { . follows — indicates struct init with period syntax.
+    fn peekNextIsPeriod() bool {
+        if (self.tok != @intFromEnum(Token.lbrace)) { return false }
+        return self.peekToken() == @intFromEnum(Token.period)
+    }
+
+    /// Check if { ident : follows — indicates struct init with colon syntax (@safe).
+    /// Uses 2-token lookahead with scanner state save/restore.
+    fn peekNextIsIdentColon() bool {
+        if (self.tok != @intFromEnum(Token.lbrace)) { return false }
+        // Save scanner state for restoration after lookahead
+        const saved_pos = self.scanner.pos
+        const saved_ch = self.scanner.ch
+        // Get token after { (use existing peek or scan new)
+        var after_brace: int = 0
+        if (self.has_peek) {
+            after_brace = self.peek_tok
+        } else {
+            after_brace = self.scanner.scanNext().tok
+        }
+        if (after_brace != @intFromEnum(Token.ident)) {
+            self.scanner.pos = saved_pos
+            self.scanner.ch = saved_ch
+            return false
+        }
+        // Scan third token (after ident)
+        const third = self.scanner.scanNext()
+        const result = third.tok == @intFromEnum(Token.colon) or
+                       third.tok == @intFromEnum(Token.comma) or
+                       third.tok == @intFromEnum(Token.rbrace)
+        // Restore scanner state
+        self.scanner.pos = saved_pos
+        self.scanner.ch = saved_ch
+        return result
+    }
+
+    // ================================================================
+    // Phase E: Complex expressions
+    // ================================================================
+
+    /// Parse string interpolation: "text${expr}more${expr}end"
+    /// Scanner produces string_interp_start, then exprs with
+    /// string_interp_mid between them, ending with string_interp_end.
+    fn parseStringInterp() int {
+        const start = self.tok_start
+        var segments: List(int) = undefined
+        segments.items = 0
+        segments.count = 0
+        segments.capacity = 0
+        // Start segment text (between " and ${)
+        const start_text = self.tok_text
+        if (@lenOf(start_text) > 0) {
+            segments.append(self.ast.addLiteral(
+                @intFromEnum(LiteralKind.@"string"), start_text,
+                self.spanSE(start, self.tok_end)))
+        }
+        self.advance()  // consume string_interp_start
+        // Expression inside ${ }
+        segments.append(self.parseExpr())
+        // Mid and end segments
+        while (true) {
+            if (self.tok == @intFromEnum(Token.string_interp_mid)) {
+                const mid_text = self.tok_text
+                if (@lenOf(mid_text) > 0) {
+                    segments.append(self.ast.addLiteral(
+                        @intFromEnum(LiteralKind.@"string"), mid_text,
+                        self.spanSE(self.tok_start, self.tok_end)))
+                }
+                self.advance()  // consume mid
+                segments.append(self.parseExpr())
+            } else if (self.tok == @intFromEnum(Token.string_interp_end)) {
+                const end_text = self.tok_text
+                if (@lenOf(end_text) > 0) {
+                    segments.append(self.ast.addLiteral(
+                        @intFromEnum(LiteralKind.@"string"), end_text,
+                        self.spanSE(self.tok_start, self.tok_end)))
+                }
+                self.advance()  // consume end
+                break
+            } else {
+                self.errors.report(self.tok_start, ErrorCode.e200, "unterminated string interpolation")
+                break
+            }
+        }
+        return self.ast.addStringInterp(segments, self.spanSE(start, self.tok_end))
+    }
+
+    /// Parse anonymous function (closure): fn(params) rettype { body }
+    fn parseClosureExpr() int {
+        const start = self.tok_start
+        self.advance()  // consume 'fn'
+        if (!self.expect(@intFromEnum(Token.lparen))) {
+            return null_node
+        }
+        var params: List(int) = undefined
+        params.items = 0
+        params.count = 0
+        params.capacity = 0
+        while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+            const param = self.parseFieldDef()
+            if (param != null_node) {
+                params.append(param)
+            }
+            if (!self.match(@intFromEnum(Token.comma))) {
+                break
+            }
+        }
+        if (!self.expect(@intFromEnum(Token.rparen))) {
+            return null_node
+        }
+        var ret_type = null_node
+        if (self.tok != @intFromEnum(Token.lbrace) and self.tok != @intFromEnum(Token.eof)) {
+            ret_type = self.parseType()
+        }
+        const body = self.parseBlock()
+        return self.ast.addClosureExpr(ret_type, body, params, self.spanSE(start, self.tok_end))
+    }
+
+    /// Parse struct init fields after detecting { in postfix position.
+    /// `preceding` is the already-parsed type-name expression node.
+    fn parseStructInitFrom(preceding: int) int {
+        const start = self.tok_start
+        // Determine type name from preceding node
+        var type_name = ""
+        var type_args: List(int) = undefined
+        type_args.items = 0
+        type_args.count = 0
+        type_args.capacity = 0
+        const tag = self.ast.getTag(preceding)
+        if (tag == @intFromEnum(NodeTag.ident)) {
+            type_name = self.ast.getStr(self.ast.getData(preceding, 0))
+        }
+        // Determine syntax: period vs colon
+        const use_colon = self.safe_mode and self.peekNextIsIdentColon()
+        self.advance()  // consume {
+        var fields: List(int) = undefined
+        fields.items = 0
+        fields.count = 0
+        fields.capacity = 0
+        if (use_colon) {
+            // Colon syntax (@safe): { name: val, name2: val2 }
+            while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+                const fi = self.parseFieldInit()
+                if (fi != null_node) {
+                    fields.append(fi)
+                }
+                if (!self.match(@intFromEnum(Token.comma))) {
+                    break
+                }
+            }
+        } else {
+            // Period syntax: { .name = val, .name2 = val2 }
+            while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+                if (!self.expect(@intFromEnum(Token.period))) {
+                    break
+                }
+                if (self.tok != @intFromEnum(Token.ident)) {
+                    self.errors.report(self.tok_start, ErrorCode.e203, "expected field name")
+                    break
+                }
+                const fname = self.tok_text
+                const fstart = self.tok_start
+                self.advance()
+                self.expect(@intFromEnum(Token.assign))
+                const val = self.parseExpr()
+                fields.append(self.ast.addFieldInitNode(fname, val, self.spanSE(fstart, self.tok_end)))
+                if (!self.match(@intFromEnum(Token.comma))) {
+                    break
+                }
+            }
+        }
+        self.expect(@intFromEnum(Token.rbrace))
+        return self.ast.addStructInit(type_name, fields, type_args, self.spanSE(start, self.tok_end))
+    }
 
     /// if (cond) |capture| { then } else { else }
     fn parseIfExpr() int {
@@ -1054,7 +1581,15 @@ impl Parser {
         cases.capacity = 0
         var else_body = null_node
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+            // else => body
             if (self.tok == @intFromEnum(Token.kw_else)) {
+                self.advance()
+                self.expect(@intFromEnum(Token.fat_arrow))
+                else_body = self.parseExpr()
+                self.match(@intFromEnum(Token.comma))
+            } else if (self.tok == @intFromEnum(Token.ident) and strEqual(self.tok_text, "_")) {
+                // Wildcard _ => treat as else (Rust/Zig convention)
+                // Ported from parser.zig:1502-1508
                 self.advance()
                 self.expect(@intFromEnum(Token.fat_arrow))
                 else_body = self.parseExpr()
@@ -1070,21 +1605,36 @@ impl Parser {
         return self.ast.addSwitchExpr(subject, else_body, cases, self.spanSE(start, self.tok_end))
     }
 
+    /// Ported from parser.zig:1510-1546
     fn parseSwitchCase() int {
         const start = self.tok_start
         var patterns: List(int) = undefined
         patterns.items = 0
         patterns.count = 0
         patterns.capacity = 0
-        // Parse pattern(s)
-        patterns.append(self.parseExpr())
-        while (self.match(@intFromEnum(Token.comma))) {
-            if (self.tok == @intFromEnum(Token.fat_arrow) or self.tok == @intFromEnum(Token.rbrace)) {
-                break
+        var is_range = 0
+
+        // First pattern
+        const first = self.parsePrimaryExpr()
+        patterns.append(first)
+
+        // Range pattern: 1..5 (ported from parser.zig:1517-1521)
+        if (self.tok == @intFromEnum(Token.period_period)) {
+            self.advance()
+            const range_end = self.parsePrimaryExpr()
+            patterns.append(range_end)
+            is_range = 1
+        } else {
+            // Multiple comma-separated patterns
+            while (self.match(@intFromEnum(Token.comma))) {
+                if (self.tok == @intFromEnum(Token.fat_arrow) or self.tok == @intFromEnum(Token.kw_else) or self.tok == @intFromEnum(Token.rbrace)) {
+                    break
+                }
+                patterns.append(self.parsePrimaryExpr())
             }
-            patterns.append(self.parseExpr())
         }
-        // Optional capture
+
+        // Optional capture: |val|
         var capture = ""
         if (self.tok == @intFromEnum(Token.@"or")) {
             self.advance()
@@ -1094,10 +1644,18 @@ impl Parser {
             }
             self.expect(@intFromEnum(Token.@"or"))
         }
+
+        // Guard expression: pattern if expr => (ported from parser.zig:1537-1542)
+        var guard = null_node
+        if (self.tok == @intFromEnum(Token.kw_if)) {
+            self.advance()
+            guard = self.parseExpr()
+        }
+
         self.expect(@intFromEnum(Token.fat_arrow))
         const body = self.parseExpr()
         self.match(@intFromEnum(Token.comma))
-        return self.ast.addSwitchCase(capture, null_node, 0, body, patterns, self.spanSE(start, self.tok_end))
+        return self.ast.addSwitchCase(capture, guard, is_range, body, patterns, self.spanSE(start, self.tok_end))
     }
 
     /// Block expression: { stmts; result_expr }
@@ -1249,6 +1807,22 @@ impl Parser {
     /// Parse a statement.
     fn parseStmt() int {
         const tok = @as(Token, @enumFromInt(self.tok))
+        // Label detection: `label: while` or `label: for`
+        if (tok == Token.ident) {
+            if (self.peekToken() == @intFromEnum(Token.colon)) {
+                const label = self.tok_text
+                self.advance()  // consume ident
+                self.advance()  // consume :
+                if (self.tok == @intFromEnum(Token.kw_while)) {
+                    return self.parseWhileStmt(label)
+                }
+                if (self.tok == @intFromEnum(Token.kw_for)) {
+                    return self.parseForStmt(label, 0)
+                }
+                self.errors.report(self.tok_start, ErrorCode.e201, "expected 'while' or 'for' after label")
+                return null_node
+            }
+        }
         return switch (tok) {
             .kw_return => self.parseReturnStmt(),
             .kw_var, .kw_let => self.parseVarStmt(0),
@@ -1286,10 +1860,15 @@ impl Parser {
             return null_node
         }
         const name = self.tok_text
+        const name_start = self.tok_start
         self.advance()
         var type_expr = null_node
         if (self.match(@intFromEnum(Token.colon))) {
             type_expr = self.parseType()
+        }
+        // Destructuring: const a, b = expr
+        if (self.tok == @intFromEnum(Token.comma)) {
+            return self.parseDestructureStmtFrom(name, type_expr, name_start, start, is_const)
         }
         var value = null_node
         if (self.match(@intFromEnum(Token.assign))) {
@@ -1465,6 +2044,35 @@ impl Parser {
         return self.ast.addDeferStmt(expr, is_errdefer, self.spanSE(start, self.tok_end))
     }
 
+    /// Destructure statement: const a, b = expr (called after first binding parsed)
+    fn parseDestructureStmtFrom(first_name: string, first_type: int, first_start: int, start: int, is_const: int) int {
+        var bindings: List(int) = undefined
+        bindings.items = 0
+        bindings.count = 0
+        bindings.capacity = 0
+        bindings.append(self.ast.addDestructureBind(first_name, first_type, self.spanSE(first_start, self.tok_end)))
+        while (self.match(@intFromEnum(Token.comma))) {
+            if (self.tok != @intFromEnum(Token.ident)) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+                break
+            }
+            const bname = self.tok_text
+            const bstart = self.tok_start
+            self.advance()
+            var btype = null_node
+            if (self.match(@intFromEnum(Token.colon))) {
+                btype = self.parseType()
+            }
+            bindings.append(self.ast.addDestructureBind(bname, btype, self.spanSE(bstart, self.tok_end)))
+        }
+        if (!self.expect(@intFromEnum(Token.assign))) {
+            return null_node
+        }
+        const value = self.parseExpr()
+        self.match(@intFromEnum(Token.semicolon))
+        return self.ast.addDestructureStmt(value, is_const, bindings, self.spanSE(start, self.tok_end))
+    }
+
     /// Expression statement or assignment: expr = value
     fn parseExprOrAssign() int {
         const start = self.tok_start
@@ -1573,15 +2181,45 @@ impl Parser {
     }
 
     fn parseFnType(start: int) int {
+        // Ported from parser.zig:800-812: fn(Type, Type) -> RetType
         self.advance()  // consume 'fn'
         self.expect(@intFromEnum(Token.lparen))
-        // TODO: parse function type params
+        // Parse function type parameter types
+        var param_count = 0
+        while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+            self.parseType()
+            param_count = param_count + 1
+            if (!self.match(@intFromEnum(Token.comma))) {
+                break
+            }
+        }
         self.expect(@intFromEnum(Token.rparen))
+        // Return type after '->'
         var ret = null_node
-        if (self.tok != @intFromEnum(Token.eof) and self.tok != @intFromEnum(Token.comma) and self.tok != @intFromEnum(Token.rparen)) {
+        if (self.match(@intFromEnum(Token.arrow))) {
             ret = self.parseType()
         }
         return self.ast.addTypeExpr(6, ret, null_node, self.spanSE(start, self.tok_end))  // kind=6 function
+    }
+
+    // ================================================================
+    // Phase G: Error recovery
+    // ================================================================
+
+    /// Skip tokens until we find a declaration-starting keyword.
+    /// Used for error recovery after parse errors.
+    fn synchronize() void {
+        while (self.tok != @intFromEnum(Token.eof)) {
+            const tok = @as(Token, @enumFromInt(self.tok))
+            if (tok == Token.kw_fn or tok == Token.kw_const or tok == Token.kw_var or
+                tok == Token.kw_struct or tok == Token.kw_enum or tok == Token.kw_union or
+                tok == Token.kw_impl or tok == Token.kw_trait or tok == Token.kw_import or
+                tok == Token.kw_test or tok == Token.kw_bench or tok == Token.kw_type or
+                tok == Token.kw_extern) {
+                return
+            }
+            self.advance()
+        }
     }
 }
 
@@ -1594,7 +2232,7 @@ test "parser init" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     @assertEq(errors.hasErrors(), false)
     // Verify first token was loaded
     @assertEq(p.tok, @intFromEnum(Token.kw_const))
@@ -1605,7 +2243,7 @@ test "parse import" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -1617,7 +2255,7 @@ test "parse const decl" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -1629,7 +2267,7 @@ test "parse fn decl" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -1641,7 +2279,7 @@ test "parse test decl" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -1653,7 +2291,7 @@ test "parse struct decl" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -1665,7 +2303,7 @@ test "parse multiple decls" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 3)
@@ -1676,7 +2314,7 @@ test "parse binary expr" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -1687,7 +2325,7 @@ test "parse if stmt" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
@@ -1697,7 +2335,7 @@ test "parse while stmt" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
@@ -1707,7 +2345,303 @@ test "parse for stmt" {
     var s = scannerInit(src)
     var ast = astInit("test.cot")
     var errors = reporterInit()
-    var p = parserInit(&s, &ast, &errors)
+    var p = parserInit(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
+}
+
+// ============================================================================
+// Phase E: Complex expressions
+// ============================================================================
+
+test "parse builtin call" {
+    const src = "fn f() void { @assertEq(1, 2) }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse closure expr" {
+    const src = "const f = fn(x: int) int { return x * 2 }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse struct init" {
+    const src = "fn f() void { const p = Point { .x = 1, .y = 2 } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse anon struct literal" {
+    const src = "fn f() void { const p = .{ .x = 1, .y = 2 } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+// ============================================================================
+// Phase F: Labels, destructuring, inline types, backtracking
+// ============================================================================
+
+test "parse enum decl" {
+    const src = "const Color = enum { red, green, blue }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.enum_decl))
+}
+
+test "parse enum with backing type" {
+    const src = "const Flags = enum(u8) { a = 1, b = 2, c = 4 }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.enum_decl))
+}
+
+test "parse error set decl" {
+    const src = "const FileError = error { NotFound, PermissionDenied, IoError }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.error_set_decl))
+}
+
+test "parse union decl" {
+    const src = "const Value = union { int_val: int, str_val: string }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.union_decl))
+}
+
+test "parse inline struct decl" {
+    const src = "const Pair = struct { a: int, b: int }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.struct_decl))
+}
+
+test "parse const non-type backtrack" {
+    // const x = regular_expr must backtrack when '=' is not followed by a type keyword
+    const src = "const x = 42\nconst y = x + 1"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 2)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.var_decl))
+    @assertEq(ast.getTag(ast.file_decls.get(1)), @intFromEnum(NodeTag.var_decl))
+}
+
+test "parse labeled while" {
+    const src = "fn f() void { outer: while (true) { break } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse labeled for" {
+    const src = "fn f() void { outer: for i in 0..10 { break } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+}
+
+test "parse fn type simple" {
+    const src = "const f: fn(int) -> int = null"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse fn type as param" {
+    const src = "fn apply(f: fn(int) -> int, x: int) int { return f(x) }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse mixed inline types" {
+    const src = "const Color = enum { red }\nconst E = error { Fail }\nconst x = 42"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.hasErrors(), false)
+    @assertEq(ast.file_decls.count, 3)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.enum_decl))
+    @assertEq(ast.getTag(ast.file_decls.get(1)), @intFromEnum(NodeTag.error_set_decl))
+    @assertEq(ast.getTag(ast.file_decls.get(2)), @intFromEnum(NodeTag.var_decl))
+}
+
+test "parse impl block with param" {
+    const src = "impl Foo { fn bar(x: int) int { return 0 } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.impl_block))
+}
+
+test "parse generic fn" {
+    const src = "fn max(T)(a: T, b: T) T { return a }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.fn_decl))
+}
+
+test "parse generic impl block" {
+    const src = "impl List(T) { fn push(val: T) void { return } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.impl_block))
+}
+
+test "parse impl trait for type" {
+    const src = "impl Display for Point { fn toString(s: *Point) string { return \"\" } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.impl_trait))
+}
+
+test "parse where clause" {
+    const src = "fn sort(T)(list: *T) void where T: Ord { return }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.fn_decl))
+}
+
+test "parse where clause multi" {
+    const src = "fn combine(T, U)(a: T, b: U) int where T: Display, U: Clone { return 0 }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.fn_decl))
+}
+
+test "parse switch range pattern" {
+    const src = "fn f(x: int) int { return switch (x) { 1..5 => 1, else => 0 } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse switch guard" {
+    const src = "fn f(x: int) int { return switch (x) { 1 if x > 0 => 1, else => 0 } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse switch wildcard" {
+    const src = "fn f(x: int) int { return switch (x) { 1 => 10, _ => 0 } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+}
+
+test "parse generic impl trait" {
+    const src = "impl Iterable(T) for List { fn next(s: *List) int { return 0 } }"
+    var s = scannerInit(src)
+    var ast = astInit("test.cot")
+    var errors = reporterInit()
+    var p = parserInit(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(ast.getTag(ast.file_decls.get(0)), @intFromEnum(NodeTag.impl_trait))
 }

@@ -3473,9 +3473,10 @@ pub const Lowerer = struct {
             return try fb.emitFieldValue(elem_addr, field_idx, field_offset, field_type, fa.span);
         }
 
-        // Nested struct field access: o.inner.val
-        // Resolve the base field chain to an address, then load from it.
-        if (base_expr == .field_access) {
+        // Nested struct field access: o.inner.val (where inner is an embedded struct, NOT a pointer)
+        // When base is a pointer (e.g., outer.scanner.pos where scanner is *Inner),
+        // skip this path — fall through to lowerExprNode which loads the pointer value.
+        if (base_expr == .field_access and !base_is_pointer) {
             const base_addr = try self.resolveStructFieldAddr(fa.base);
             if (base_addr != ir.null_node) {
                 return try fb.emitFieldValue(base_addr, field_idx, field_offset, field_type, fa.span);
@@ -4932,6 +4933,7 @@ pub const Lowerer = struct {
 
             // @safe auto-ref: when passing a struct value to a *Struct param
             // (safeWrapType wraps struct params to pointers), auto-ref the value.
+            // C#/TypeScript semantics: pass by reference, mutations visible to caller.
             if (self.chk.safe_mode and param_is_pointer) {
                 if (param_types) |params| {
                     if (arg_i < params.len) {
@@ -4940,11 +4942,35 @@ pub const Lowerer = struct {
                             const arg_type = self.inferExprType(arg_idx);
                             const arg_info = self.type_reg.get(arg_type);
                             if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
-                                // Store struct value in temp local, then take its address
-                                const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
-                                _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
                                 const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
-                                arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                // Try to take address of original lvalue (local or field)
+                                if (ast_expr == .ident) {
+                                    if (fb.lookupLocal(ast_expr.ident.name)) |local_idx| {
+                                        arg_node = try fb.emitAddrLocal(local_idx, ptr_type, call.span);
+                                    } else if (self.builder.lookupGlobal(ast_expr.ident.name)) |g| {
+                                        arg_node = try fb.emitAddrGlobal(g.idx, ast_expr.ident.name, ptr_type, call.span);
+                                    } else {
+                                        // Unknown ident — fallback to temp copy
+                                        const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                        _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                        arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                    }
+                                } else if (ast_expr == .field_access) {
+                                    // Take address of struct field directly
+                                    const addr = try self.resolveStructFieldAddr(arg_idx);
+                                    if (addr != ir.null_node) {
+                                        arg_node = addr;
+                                    } else {
+                                        const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                        _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                        arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                    }
+                                } else {
+                                    // Non-lvalue expression (e.g. function call result) — temp copy
+                                    const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                    _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                    arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                }
                             }
                         }
                     }
@@ -5233,6 +5259,7 @@ pub const Lowerer = struct {
             if (arg_node == ir.null_node) continue;
 
             // @safe auto-ref: when passing a struct value to a *Struct param
+            // C#/TypeScript semantics: pass by reference, mutations visible to caller.
             if (self.chk.safe_mode and param_is_pointer) {
                 if (param_types) |params| {
                     const param_idx = arg_i + 1; // +1 for self receiver
@@ -5242,10 +5269,32 @@ pub const Lowerer = struct {
                             const arg_type = self.inferExprType(arg_idx);
                             const arg_info = self.type_reg.get(arg_type);
                             if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
-                                const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
-                                _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
                                 const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
-                                arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                // Try to take address of original lvalue (local or field)
+                                if (ast_expr == .ident) {
+                                    if (fb.lookupLocal(ast_expr.ident.name)) |local_idx| {
+                                        arg_node = try fb.emitAddrLocal(local_idx, ptr_type, call.span);
+                                    } else if (self.builder.lookupGlobal(ast_expr.ident.name)) |g| {
+                                        arg_node = try fb.emitAddrGlobal(g.idx, ast_expr.ident.name, ptr_type, call.span);
+                                    } else {
+                                        const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                        _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                        arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                    }
+                                } else if (ast_expr == .field_access) {
+                                    const addr = try self.resolveStructFieldAddr(arg_idx);
+                                    if (addr != ir.null_node) {
+                                        arg_node = addr;
+                                    } else {
+                                        const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                        _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                        arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                    }
+                                } else {
+                                    const tmp_local = try fb.addLocalWithSize("__safe_ref", arg_type, true, self.type_reg.sizeOf(arg_type));
+                                    _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
+                                    arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
+                                }
                             }
                         }
                     }

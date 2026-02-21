@@ -8,9 +8,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- **`@safe` auto-ref**: Structs passed by reference automatically — no `&` needed. `foo(myStruct)` passes the original, mutations visible to caller. TypeScript/C#-style object semantics.
+- **Self-hosted parser**: Recursive descent parser (`self/frontend/parser.cot`, ~2,650 lines, 85 tests) — generic structs, generic impl, where clauses, switch range/guard, 53 builtins, quoted identifiers
 - CI/CD pipeline with GitHub Actions (test on every commit, release on tag)
 - Pre-built binaries for macOS (ARM64, x64) and Linux (x64)
 - Curl installer: `curl -fsSL https://raw.githubusercontent.com/cot-land/cot/main/install.sh | sh`
+
+### Fixed
+- **`@safe` auto-ref correctness**: Auto-ref now takes address of original local variable instead of creating a temporary copy. Previously, mutations through pointer params didn't propagate back to the caller.
+- **Chained pointer field access**: `outer.scanner.pos` where `scanner` is `*Inner` now correctly loads the pointer value before field access (was returning pointer address instead of field value).
 
 ## [0.3.2] - 2026-02-21
 
