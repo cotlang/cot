@@ -11,7 +11,30 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - CI/CD pipeline with GitHub Actions (test on every commit, release on tag)
 - Pre-built binaries for macOS (ARM64, x64) and Linux (x64)
 - Curl installer: `curl -fsSL https://raw.githubusercontent.com/cot-land/cot/main/install.sh | sh`
-- `cot mcp` subcommand — compiler-powered MCP server for Claude Code (planned)
+
+## [0.3.2] - 2026-02-21
+
+### Added
+- **Builtin cleanup**: ~55 runtime builtins moved from `@` syntax to `extern fn` in `stdlib/sys.cot`
+- **`extern fn` support**: Declare external functions that link to Wasm module functions
+- **`stdlib/math.cot`**: Math functions (`sqrt`, `abs`, `ceil`, `floor`, etc.) as regular functions wrapping internal builtins
+- **`stdlib/sys.cot`**: Low-level system functions (memory, I/O, networking, process) as `extern fn`
+- **Consistent camelCase**: All stdlib APIs renamed to camelCase (`fd_write` → `fdWrite`, `args_count` → `argsCount`, etc.)
+- **Comptime infrastructure**: `@typeInfo(T)`, `@typeName(T)`, `@enumName(T, idx)`, `comptime {}` blocks with mutable vars, `inline for` over type info
+- **Self-hosted compiler progress**: Scanner, token, AST, source, errors in `self/frontend/` (2,054 LOC)
+- **@safe mode**: Project-level `cot.json` `"safe": true` with colon struct init, implicit self, field shorthand
+- **Walk-up cot.json resolution**: npm-style directory search for project config
+- **Single-arg `@enumFromInt`**: `@as(Token, @enumFromInt(val))` pattern (Zig parity)
+- **`cot-out/` build directory**: Build artifacts in project-local directory
+
+### Changed
+- `@` builtins reduced from ~94 to ~35 compiler intrinsics
+- All stdlib modules updated to use `extern fn` from `sys.cot` instead of `@` builtins
+- `self/` files restructured to `self/frontend/` mirroring `compiler/frontend/`
+
+### Fixed
+- `@safe` var annotation coercion in lowerer
+- `comptime_value_vars` leaking across functions in lowerer
 
 ## [0.3.1] - 2026-02-11
 
@@ -71,6 +94,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - LSP server (`cot lsp`): diagnostics, hover, goto-def, document symbols, semantic tokens
 - VS Code/Cursor extension with syntax highlighting + LSP client
 
-[Unreleased]: https://github.com/cot-land/cot/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/cot-land/cot/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/cot-land/cot/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/cot-land/cot/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/cot-land/cot/releases/tag/v0.3.0

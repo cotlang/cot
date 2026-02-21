@@ -247,11 +247,14 @@ cursor --uninstall-extension cot-lang.cot-lang 2>/dev/null; cursor --install-ext
 | `claude/PIPELINE_ARCHITECTURE.md` | **Full pipeline map, reference for every stage** |
 | `claude/BR_TABLE_ARCHITECTURE.md` | Why br_table appears in generated code |
 | `claude/specs/WASM_3_0_REFERENCE.md` | Wasm 3.0 opcodes and adoption plan |
-| `claude/ROADMAP_1_0.md` | Road to 1.0: versioning, feature waves, outstanding work items |
-| `claude/VERSION_TRAJECTORY.md` | Version plan benchmarked against Zig's history (self-hosting at 0.11) |
+| `claude/ROADMAP.md` | Forward-looking roadmap: 0.4→1.0, competitive positioning |
+| `claude/VERSION_TRAJECTORY.md` | **Self-hosting trajectory** — benchmarked against Zig, inspirational |
+| `claude/SELF_HOSTING_FEATURES.md` | Feature gap analysis for self-hosting (Zig→Cot patterns) |
+| `claude/ARC_AUDIT.md` | ARC memory management audit — 4 critical gaps fixed |
 | `docs/syntax.md` | Complete language syntax reference with examples |
 | `VISION.md` | Language vision, design principles, execution roadmap |
 | `claude/CONCURRENCY_DESIGN.md` | Concurrency roadmap: spawn, channels, work-stealing, atomic ARC |
 | `claude/BUSINESS_MODEL.md` | Licensing, trademark, revenue model, funding strategy |
-| `claude/RELEASE_PLAN.md` | 0.4 release plan: branding, distribution, polish, tooling, criteria |
-| `claude/archive/` | Historical: completed milestones, past bug fixes, postmortems |
+| `claude/RELEASE_PLAN.md` | 0.4 release plan: branding, distribution, polish, criteria |
+| `claude/TESTING.md` | Test system: 66 files, ~1100+ tests, error-union isolation |
+| `claude/archive/` | Historical: 17 archived docs (completed milestones, past plans) |

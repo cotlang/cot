@@ -9,7 +9,7 @@ Cot uses inline test blocks (Zig syntax) with error-union-based test isolation. 
 | Tier | Command | What it runs | Speed |
 |------|---------|-------------|-------|
 | **Zig compiler tests** | `zig build test` | ~163 Zig-level tests with inline Cot snippets | Fast (<10s) |
-| **Cot language tests** | `./test/run_all.sh` | ~1020 Cot tests across 46 `.cot` files | Slower (~60s) |
+| **Cot language tests** | `./test/run_all.sh` | ~1100+ Cot tests across 66 `.cot` files | Slower (~60s) |
 | **Single file** | `cot test file.cot` | Tests in one file | Fast |
 
 ### `zig build test` — Compiler internals
@@ -118,54 +118,24 @@ Exit code = number of failures (0 = all pass).
 ```
 test/
   run_all.sh            # Run all Cot tests (glob discovery, no hardcoded lists)
-  cases/                # Category unit tests (21 files, ~106 tests)
-    arithmetic.cot        10 tests
-    arrays.cot             6 tests
-    arc.cot                5 tests
-    bitwise.cot            6 tests
-    builtins.cot           4 tests
-    chars.cot              2 tests
-    compound.cot           8 tests
-    control_flow.cot      14 tests
-    enum.cot               2 tests
-    extern.cot             1 test
-    float.cot              1 test
-    functions.cot         16 tests
-    loops.cot              3 tests
-    memory.cot             5 tests
-    methods.cot            1 test
-    optional.cot           3 tests
-    strings.cot           13 tests
-    structs.cot            5 tests
-    switch.cot             2 tests
-    types.cot              2 tests
-    union.cot              4 tests
-  e2e/                  # Comprehensive feature tests (25 files, ~904 tests)
-    features.cot         127 tests
-    expressions.cot      160 tests
-    functions.cot        107 tests
-    control_flow.cot      82 tests
-    variables.cot         40 tests
-    types.cot             46 tests
-    memory.cot            17 tests
-    stdlib.cot             8 tests
-    map.cot               25 tests
-    auto_free.cot          5 tests
-    set.cot               10 tests
-    string_interp.cot     10 tests
-    wasi_io.cot           19 tests
-    std_io.cot            34 tests
-    string_methods.cot    34 tests
-    math.cot               8 tests
-    std_math.cot          16 tests
-    sort.cot               7 tests
-    json.cot              38 tests
-    safe_mode.cot          8 tests
-    io.cot                14 tests
-    encoding.cot          26 tests
-    url.cot               13 tests
-    http.cot              11 tests
-    wasmgc.cot            12 tests
+  cases/                # Category unit tests (21 files)
+    arithmetic.cot, arrays.cot, arc.cot, bitwise.cot, builtins.cot,
+    chars.cot, compound.cot, control_flow.cot, enum.cot, extern.cot,
+    float.cot, functions.cot, loops.cot, memory.cot, methods.cot,
+    optional.cot, strings.cot, structs.cot, switch.cot, types.cot,
+    union.cot
+  e2e/                  # Comprehensive feature tests (45 files)
+    arc.cot, async.cot, auto_free.cot, bench_test.cot,
+    browser_async.cot, cli.cot, control_flow.cot, crypto.cot,
+    debug.cot, dotenv.cot, encoding.cot, event_loop.cot,
+    expressions.cot, extern_fn.cot, features.cot, fmt.cot,
+    functions.cot, http.cot, io.cot, json.cot, log.cot, map.cot,
+    math.cot, mem.cot, memory.cot, path.cot, process.cot,
+    regex.cot, safe_mode.cot, semver.cot, set.cot, sort.cot,
+    std_io.cot, std_math.cot, stdlib.cot, string_interp.cot,
+    string_map.cot, string_methods.cot, testing_utils.cot,
+    types.cot, url.cot, uuid.cot, variables.cot, wasi_io.cot,
+    wasmgc.cot
   test_inline.cot       # Manual smoke test
   browser/              # Pre-compiled Wasm for manual browser testing
 ```
@@ -197,7 +167,5 @@ test/
 ## Future Improvements
 
 - Source location in assert messages (`file:line:col`)
-- Expected vs actual value display for `@assert_eq`
+- Expected vs actual value display for `@assert_eq` failure diffs
 - `@expect(cond)` returning error (Zig pattern) for use with `try`
-- Test filtering by name pattern
-- Timing per test

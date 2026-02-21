@@ -306,7 +306,7 @@ Before tagging 0.4, all of these must be true:
 | Browser | `std/dom` — DOM manipulation for `--target=wasm32` |
 | Cross-compile | `cot build --target=x86_64-linux` from macOS |
 | Test coverage | `cot coverage` — line/branch coverage, lcov output |
-| Language | Packed structs, wrapping arithmetic, weak references |
+| Language | ~~Packed structs~~ **Done**, wrapping arithmetic, ~~weak references~~ **Done** |
 
 ---
 
@@ -329,7 +329,7 @@ Before tagging 0.4, all of these must be true:
 | Feature | Reason | When |
 |---------|--------|------|
 | REPL | Compiled language, low priority (Zig doesn't have one) | Maybe never |
-| Self-hosting | Graduation ceremony, not entrance exam | Post-1.0 |
+| Self-hosting | Active — scanner+AST done (2,054 LOC), parser next. See `VERSION_TRAJECTORY.md` | 0.10 target |
 | `cot deploy` | Needs infrastructure (cot.land) first | 0.6+ |
 | Jupyter kernel | Niche | Maybe never |
 | JUnit XML export | CI integration, low priority | 0.5 |
