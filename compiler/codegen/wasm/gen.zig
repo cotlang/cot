@@ -1258,6 +1258,12 @@ pub const GenState = struct {
         // a value on the Wasm stack. Skip setReg to avoid popping from empty stack.
         if (v.op == .wasm_return_call) return;
 
+        // Store ops consume stack values and produce nothing — don't call setReg.
+        // Go: ssaGenValue lines 280-284 — stores have no setReg call.
+        if (v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
+            v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32 or
+            v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set) return;
+
         // Compound return handling: calls returning string/slice push 2 values (ptr, len).
         // Store len to a separate local, then ptr to the value's main local.
         const is_call = v.op == .wasm_call or v.op == .wasm_lowered_static_call;
@@ -1312,6 +1318,11 @@ pub const GenState = struct {
                 // wasm_lowered_move is inline bulk copy — no value produced
                 // wasm_return_call is a terminator (opcode 0x12) — no value on stack
                 if (v.op == .slice_make or v.op == .string_make or v.op == .wasm_lowered_move or v.op == .wasm_lowered_zero or v.op == .wasm_return_call) continue;
+                // Store ops write to memory and produce no value — no local needed
+                // Go: ssaGenValue lines 280-284 — stores have no setReg call
+                if (v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
+                    v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32 or
+                    v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set) continue;
                 if (isFloatType(v.type_idx)) continue; // Skip floats for pass 2
                 if (v.op == .wasm_gc_struct_new) continue; // Skip GC refs for pass 3
 

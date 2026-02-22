@@ -947,7 +947,8 @@ pub const SSABuilder = struct {
             return make_val;
         }
 
-        const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+        const load_op = self.getLoadOp(type_idx);
+        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load_val.addArg(off_val);
         try cur.addValue(self.allocator, load_val);
         return load_val;
@@ -1009,7 +1010,8 @@ pub const SSABuilder = struct {
             return move_val;
         }
 
-        const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+        const store_op = self.getStoreOp(value.type_idx);
+        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(off_val, value);
         try cur.addValue(self.allocator, store_val);
         return store_val;
@@ -1057,7 +1059,8 @@ pub const SSABuilder = struct {
             return make_val;
         }
 
-        const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+        const load_op = self.getLoadOp(type_idx);
+        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load_val.addArg(off_val);
         try cur.addValue(self.allocator, load_val);
         return load_val;
@@ -1106,7 +1109,8 @@ pub const SSABuilder = struct {
             return len_store;
         }
 
-        const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+        const store_op = self.getStoreOp(value.type_idx);
+        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(off_val, value);
         try cur.addValue(self.allocator, store_val);
         return store_val;
@@ -1177,6 +1181,7 @@ pub const SSABuilder = struct {
         const type_info = self.type_registry.get(type_idx);
         if (type_info == .basic) {
             return switch (type_info.basic) {
+                .bool_type => .load8, // Go: AI64Load8U (1-byte, zero-extend)
                 .i8_type => .load8s,
                 .u8_type => .load8,
                 .i16_type => .load16s,
@@ -1197,7 +1202,7 @@ pub const SSABuilder = struct {
         const type_info = self.type_registry.get(type_idx);
         if (type_info == .basic) {
             return switch (type_info.basic) {
-                .i8_type, .u8_type => .store8,
+                .bool_type, .i8_type, .u8_type => .store8, // Go: AI64Store8 (1-byte truncate)
                 .i16_type, .u16_type => .store16,
                 .i32_type, .u32_type, .f32_type => .store32,
                 else => .store,
@@ -1269,7 +1274,8 @@ pub const SSABuilder = struct {
             return len_store;
         }
 
-        const store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+        const store_op = self.getStoreOp(value.type_idx);
+        const store = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
         store.addArg2(ptr, value);
         try cur.addValue(self.allocator, store);
         return store;
@@ -1338,7 +1344,8 @@ pub const SSABuilder = struct {
 
     fn convertPtrLoad(self: *SSABuilder, ptr_local: ir.LocalIdx, type_idx: TypeIndex, cur: *Block) !*Value {
         const ptr_val = try self.variable(ptr_local, type_idx);
-        const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+        const load_op = self.getLoadOp(type_idx);
+        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load_val.addArg(ptr_val);
         try cur.addValue(self.allocator, load_val);
         return load_val;
@@ -1347,7 +1354,8 @@ pub const SSABuilder = struct {
     fn convertPtrStore(self: *SSABuilder, p: ir.PtrStore, cur: *Block) !*Value {
         const ptr_val = try self.variable(p.ptr_local, TypeRegistry.VOID);
         const value = try self.convertNode(p.value) orelse return error.MissingValue;
-        const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+        const store_op = self.getStoreOp(value.type_idx);
+        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(ptr_val, value);
         try cur.addValue(self.allocator, store_val);
         return store_val;
@@ -1491,7 +1499,8 @@ pub const SSABuilder = struct {
         const field_type = self.type_registry.get(type_idx);
         if (field_type == .struct_type or field_type == .array) return off_val;
 
-        const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+        const load_op = self.getLoadOp(type_idx);
+        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load_val.addArg(off_val);
         try cur.addValue(self.allocator, load_val);
         return load_val;
@@ -1505,7 +1514,8 @@ pub const SSABuilder = struct {
         off_val.aux_int = p.offset;
         try cur.addValue(self.allocator, off_val);
 
-        const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+        const store_op = self.getStoreOp(value.type_idx);
+        const store_val = try self.func.newValue(store_op, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(off_val, value);
         try cur.addValue(self.allocator, store_val);
         return store_val;
