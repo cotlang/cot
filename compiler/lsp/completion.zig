@@ -77,6 +77,7 @@ const keyword_names = [_][]const u8{
 /// Code snippet templates for common patterns.
 const snippets = [_]struct { label: []const u8, detail: []const u8, insert_text: []const u8 }{
     .{ .label = "fn", .detail = "function declaration", .insert_text = "fn ${1:name}(${2:}) ${3:void} {\n\t$0\n}" },
+    .{ .label = "static fn", .detail = "static method (impl block)", .insert_text = "static fn ${1:name}(${2:}) ${3:void} {\n\t$0\n}" },
     .{ .label = "async fn", .detail = "async function", .insert_text = "async fn ${1:name}(${2:}) ${3:i64} {\n\t$0\n}" },
     .{ .label = "test", .detail = "test block", .insert_text = "test \"${1:name}\" {\n\t$0\n}" },
     .{ .label = "bench", .detail = "benchmark block", .insert_text = "bench \"${1:name}\" {\n\t$0\n}" },

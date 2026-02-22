@@ -825,7 +825,7 @@ import "std/list"          // stdlib modules
 | `list` | `import "std/list"` | List(T) with ~20 methods (append, get, remove, indexOf, clone, etc.) |
 | `map` | `import "std/map"` | Map(K,V) with splitmix64 hash, ~25 methods |
 | `set` | `import "std/set"` | Set(T) wrapping Map(T, i64) |
-| `string` | `import "std/string"` | ~25 string functions (indexOf, split, trim, replace, etc.) + StringBuilder |
+| `string` | `import "std/string"` | ~25 string functions (indexOf, split, trim, replace, etc.) + StringBuilder, parseIntOrNull, parseFloatOrNull |
 | `string_map` | `import "std/string_map"` | StringMap(V) — hash map with string keys, optimized for string hashing |
 | `mem` | `import "std/mem"` | Byte-level ops: eql, cmp, startsWith, endsWith, zero, set, readU32LE, writeU32LE |
 | `math` | `import "std/math"` | abs, min, max, clamp, ipow, fabs, ceil, floor, sqrt, fmin, fmax, PI, E |

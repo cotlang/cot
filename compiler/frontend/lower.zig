@@ -100,6 +100,45 @@ pub const Lowerer = struct {
         return self.type_reg.get(info.optional.elem) == .pointer;
     }
 
+    /// Block-based orelse for compound optionals (Zig pattern).
+    /// Lowers `opt_expr orelse fallback` using branch+merge instead of select.
+    /// The fallback expression is lowered INSIDE the else_block to avoid cross-block
+    /// value references that cause native codegen issues (select + native regalloc).
+    /// Reference: Zig AIR — optional orelse uses conditional branch, not select.
+    fn lowerCompoundOrelse(self: *Lowerer, fb: *ir.FuncBuilder, left: ir.NodeIndex, bin: ast.Binary, left_type_idx: TypeIndex, left_type: anytype, result_type: TypeIndex) Error!ir.NodeIndex {
+        const opt_local = try fb.addLocalWithSize("__orelse_opt", left_type_idx, false, 16);
+        _ = try fb.emitStoreLocal(opt_local, left, bin.span);
+        const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
+        const zero_tag = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+        const is_non_null = try fb.emitBinary(.ne, tag, zero_tag, TypeRegistry.BOOL, bin.span);
+
+        const result_size = self.type_reg.sizeOf(result_type);
+        const result_local = try fb.addLocalWithSize("__orelse_result", result_type, false, result_size);
+        const then_block = try fb.newBlock("orelse.nonnull");
+        const else_block = try fb.newBlock("orelse.null");
+        const merge_block = try fb.newBlock("orelse.end");
+        _ = try fb.emitBranch(is_non_null, then_block, else_block, bin.span);
+
+        // Non-null path: extract payload from compound optional
+        fb.setBlock(then_block);
+        const payload = try fb.emitFieldLocal(opt_local, 1, 8, left_type.optional.elem, bin.span);
+        _ = try fb.emitStoreLocal(result_local, payload, bin.span);
+        _ = try fb.emitJump(merge_block, bin.span);
+
+        // Null path: lower fallback expression HERE (in else_block, not before the branch)
+        fb.setBlock(else_block);
+        const fallback = try self.lowerExprNode(bin.right);
+        if (fallback != ir.null_node) {
+            _ = try fb.emitStoreLocal(result_local, fallback, bin.span);
+        }
+        _ = try fb.emitJump(merge_block, bin.span);
+
+        // Merge: load result as scalar value.
+        // result_type is the element type (e.g. i64), so this is a standard scalar load.
+        fb.setBlock(merge_block);
+        return try fb.emitLoadLocal(result_local, result_type, bin.span);
+    }
+
     /// Store a value into a compound optional result local, wrapping T → ?T as needed.
     /// Used by switch/if expressions that produce compound optional results.
     fn storeCompoundOptArm(self: *Lowerer, fb: *ir.FuncBuilder, result_local: ir.LocalIdx, val: ir.NodeIndex, body_idx: NodeIndex, span: Span) !void {
@@ -1291,7 +1330,8 @@ pub const Lowerer = struct {
                 const sret_info = self.type_reg.get(sret_type);
                 if (sret_info == .optional and !self.isPtrLikeOptional(sret_type)) {
                     // Compound optional return: write tag+payload to __sret buffer.
-                    // Reference: Zig CodeGen.zig:4379 airWrapOptional — [payload][null_flag]
+                    // Reference: Zig CodeGen.zig:4379 airWrapOptional — Zig uses [payload][null_flag],
+                    // Cot uses [tag:i64][payload:i64] (tag-first layout, both 16 bytes for i64).
                     const sret_idx_opt = fb.lookupLocal("__sret").?;
                     const sret_ptr_opt = try fb.emitLoadLocal(sret_idx_opt, TypeRegistry.I64, ret.span);
 
@@ -1715,16 +1755,25 @@ pub const Lowerer = struct {
                 } else {
                     const value_node = try self.lowerExprNode(var_stmt.value);
                     if (value_node == ir.null_node) return;
-                    const value_type = self.inferExprType(var_stmt.value);
-                    const value_info = self.type_reg.get(value_type);
-                    if (value_info == .optional) {
-                        // Already ?T (from function call SRET) — compound copy
-                        _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
+                    // Check if the lowered IR node is const_null (e.g. from comptime-folded
+                    // if-expression: `if (false) { 42 } else { null }`). The AST check above
+                    // only catches direct null literals, not null values from expressions.
+                    const is_lowered_null = fb.nodes.items[value_node].data == .const_null;
+                    if (is_lowered_null) {
+                        const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, var_stmt.span);
+                        _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_zero, var_stmt.span);
                     } else {
-                        // Plain T → wrap as tag=1, payload=value
-                        const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, var_stmt.span);
-                        _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_one, var_stmt.span);
-                        _ = try fb.emitStoreLocalField(local_idx, 1, 8, value_node, var_stmt.span);
+                        const value_type = self.inferExprType(var_stmt.value);
+                        const value_info = self.type_reg.get(value_type);
+                        if (value_info == .optional) {
+                            // Already ?T (from function call SRET) — compound copy
+                            _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
+                        } else {
+                            // Plain T → wrap as tag=1, payload=value
+                            const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, var_stmt.span);
+                            _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_one, var_stmt.span);
+                            _ = try fb.emitStoreLocalField(local_idx, 1, 8, value_node, var_stmt.span);
+                        }
                     }
                 }
             } else {
@@ -2226,7 +2275,9 @@ pub const Lowerer = struct {
                             const rhs_node = self.tree.getNode(assign.value);
                             const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
                             const is_null_assign = if (rhs_expr) |e| (e == .literal and e.literal.kind == .null_lit) else false;
-                            if (is_null_assign) {
+                            // Also check lowered IR node for const_null (comptime-folded expressions)
+                            const is_lowered_null = fb.nodes.items[value_node].data == .const_null;
+                            if (is_null_assign or is_lowered_null) {
                                 // x = null → tag=0
                                 const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, assign.span);
                                 _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_zero, assign.span);
@@ -3300,6 +3351,24 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return ir.null_node;
         const left = try self.lowerExprNode(bin.left);
         if (left == ir.null_node) return ir.null_node;
+
+        // Compound optional orelse: must defer right-side lowering until inside else_block.
+        // Block-based approach (Zig pattern) — right is lowered in the null branch,
+        // not before the branch, to avoid cross-block value reference issues on native.
+        if (bin.op == .kw_orelse) {
+            const left_type_idx = self.inferExprType(bin.left);
+            const left_type = self.type_reg.get(left_type_idx);
+            if (left_type == .optional and !self.isPtrLikeOptional(left_type_idx)) {
+                // Result type is the ELEMENT type (i64), not the optional type (?i64).
+                // inferBinaryType returns ?i64 (the left operand type), but orelse unwraps
+                // the optional — the result is the payload type. Using the optional type would
+                // create 16-byte compound locals, causing move/address semantics in the SSA
+                // builder when we only need scalar 8-byte store/load.
+                const result_type = left_type.optional.elem;
+                return try self.lowerCompoundOrelse(fb, left, bin, left_type_idx, left_type, result_type);
+            }
+        }
+
         const right = try self.lowerExprNode(bin.right);
         if (right == ir.null_node) return ir.null_node;
         const result_type = self.inferBinaryType(bin.op, bin.left, bin.right);
@@ -3364,16 +3433,9 @@ pub const Lowerer = struct {
             const left_type_idx = self.inferExprType(bin.left);
             const left_type = self.type_reg.get(left_type_idx);
             if (left_type == .optional) {
-                if (!self.isPtrLikeOptional(left_type_idx)) {
-                    // Compound optional: store to temp, read tag for condition, payload for unwrap
-                    const opt_local = try fb.addLocalWithSize("__orelse_opt", left_type_idx, false, 16);
-                    _ = try fb.emitStoreLocal(opt_local, left, bin.span);
-                    const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
-                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
-                    const condition = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, bin.span);
-                    const payload = try fb.emitFieldLocal(opt_local, 1, 8, left_type.optional.elem, bin.span);
-                    return try fb.emitSelect(condition, payload, right, result_type, bin.span);
-                } else {
+                // Compound optional case handled early (before right is lowered) via lowerCompoundOrelse
+                if (!self.isPtrLikeOptional(left_type_idx)) unreachable;
+                {
                     // Pointer-like optional: null=0 sentinel
                     const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, bin.span));
                     const condition = try fb.emitBinary(.ne, left, null_val, TypeRegistry.BOOL, bin.span);

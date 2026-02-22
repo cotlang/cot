@@ -3541,3 +3541,59 @@ test "string switch with variable" {
     }
     @assertEq(r, 20)
 }
+
+// ============================================================================
+// parseFloatOrNull
+// ============================================================================
+
+test "parseFloatOrNull valid integer" {
+    const v = parseFloatOrNull("42")
+    @assert(v != null)
+    if (v) |val| { @assertEq(val, @floatFromInt(f64, 42)) }
+}
+
+test "parseFloatOrNull valid decimal" {
+    const v = parseFloatOrNull("3.14")
+    @assert(v != null)
+}
+
+test "parseFloatOrNull negative" {
+    const v = parseFloatOrNull("-5.0")
+    @assert(v != null)
+}
+
+test "parseFloatOrNull invalid" {
+    const v = parseFloatOrNull("abc")
+    @assert(v == null)
+}
+
+test "parseFloatOrNull empty" {
+    const v = parseFloatOrNull("")
+    @assert(v == null)
+}
+
+test "parseFloatOrNull zero" {
+    const v = parseFloatOrNull("0")
+    @assert(v != null)
+    if (v) |val| { @assertEq(val, @floatFromInt(f64, 0)) }
+}
+
+test "parseFloatOrNull zero point zero" {
+    const v = parseFloatOrNull("0.0")
+    @assert(v != null)
+}
+
+// ============================================================================
+// Compound optional if-expression null path
+// ============================================================================
+
+test "if-expr comptime fold null to optional" {
+    var x: ?i64 = if (false) { 42 } else { null }
+    @assert(x == null)
+}
+
+test "if-expr comptime fold value to optional" {
+    var x: ?i64 = if (true) { 42 } else { null }
+    @assert(x != null)
+    if (x) |val| { @assertEq(val, 42) }
+}

@@ -52,7 +52,7 @@ test "zero" {
 test "string concat in interp" {
     var a = "he"
     var b = "llo"
-    var s = "say: ${a + b}"
+    var s = "say: ${a ++ b}"
     @assertEq(s, "say: hello")
 }
 

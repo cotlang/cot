@@ -1013,15 +1013,15 @@ The optional type representation was changed from single-value (`null = 0`) to c
 | New helper: `storeCompoundOptFieldPtr` | lower.zig | Done |
 | E2E tests: optional zero, local null, assign, orelse | features.cot | Done |
 
-### Follow-Up Tasks (Not in this PR)
+### Follow-Up Tasks — Completed (Feb 22, 2026)
 
-#### P1 — Should fix before 0.4
-
-1. **`var val: T = opt orelse fallback` store corruption** — When `x orelse 99` (null case) result is stored to a typed local via `var val: i64 = ...`, `@assertEq` comparison produces garbage. Direct use `@assert((x orelse 99) == 99)` works correctly. Root cause: possible type inference mismatch between checker (returns `?T` for orelse) and lowerer (expects `T`). The checker's orelse rule at `checker.zig:1643` correctly returns `optional.elem`, but the actual `expr_types` cache entry may store `?T` from the binary node's overall type. Need to investigate `checkBinary` orelse caching.
-
-2. **If-expressions returning `?T` need block-based path** — `lowerIfExpr` uses `emitSelect` which can't handle 16-byte compound values. When `if (cond) someInt else null` produces `?T`, needs block-based lowering like switch expressions. Not triggered by current self-hosted code, but will break user code.
-
-3. **Re-add `parseFloatOrNull` to `stdlib/string.cot`** — Now that `?f64` works with compound representation, the `parseFloatOrNull(s: string) ?f64` function should work correctly. Was previously removed because `?f64` crashed (type mismatch — payload is f64 but machinery assumed i64).
+| Change | Fix | Status |
+|--------|-----|--------|
+| Orelse inline type mismatch | `inferBinaryType` returned `?T` not `T`; fixed to use `left_type.optional.elem` | Done |
+| Block-based orelse (Zig pattern) | Replaced `emitSelect` with branch+merge; fallback lowered in else_block | Done |
+| If-expr comptime fold null path | Added IR `const_null` detection in var decl and assignment wrapping | Done |
+| `parseFloatOrNull` | Re-added to `stdlib/string.cot`, 7 E2E tests | Done |
+| String interp `+` → `++` | Fixed `test/e2e/string_interp.cot` test using old concat operator | Done |
 
 #### P2 — Nice to have
 
