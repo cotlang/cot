@@ -368,6 +368,7 @@ fn parseInt(s: string) i64 {
                 i = i + 2
                 while (i < slen) {
                     var c = @intToPtr(*u8, @ptrOf(s) + i).*
+                    if (c == 95) { i = i + 1; continue }
                     var digit: i64 = 0
                     if (c >= 48 and c <= 57) { digit = c - 48 }
                     else if (c >= 97 and c <= 102) { digit = c - 87 }
@@ -384,6 +385,7 @@ fn parseInt(s: string) i64 {
                 i = i + 2
                 while (i < slen) {
                     var c = @intToPtr(*u8, @ptrOf(s) + i).*
+                    if (c == 95) { i = i + 1; continue }
                     if (c == 48) { result = result * 2 }
                     else if (c == 49) { result = result * 2 + 1 }
                     else { return 0 }
@@ -397,6 +399,7 @@ fn parseInt(s: string) i64 {
                 i = i + 2
                 while (i < slen) {
                     var c = @intToPtr(*u8, @ptrOf(s) + i)
+                    if (c.* == 95) { i = i + 1; continue }
                     var digit = c.* - 48
                     if (digit < 0 or digit > 7) { return 0 }
                     result = result * 8 + digit
@@ -410,12 +413,99 @@ fn parseInt(s: string) i64 {
     // Decimal
     while (i < slen) {
         var c = @intToPtr(*u8, @ptrOf(s) + i)
+        if (c.* == 95) { i = i + 1; continue }
         var digit = c.* - 48
         if (digit < 0) { return 0 }
         if (digit > 9) { return 0 }
         result = result * 10 + digit
         i = i + 1
     }
+    if (negative) { return 0 - result }
+    return result
+}
+
+// Ref: Zig std.fmt.parseInt(...) catch null — returns ?i64, null on invalid input.
+// Distinguishes "parsed 0" from "parse failed" (unlike parseInt which returns 0 for both).
+// Handles underscore separators (scanner stores "1_000" as literal text).
+fn parseIntOrNull(s: string) ?i64 {
+    var slen = @lenOf(s)
+    if (slen == 0) { return null }
+    var result: i64 = 0
+    var i: i64 = 0
+    var negative = false
+    var has_digits = false
+    var first = @intToPtr(*u8, @ptrOf(s))
+    if (first.* == 45) {
+        negative = true
+        i = 1
+    }
+    // Handle radix prefixes: 0x (hex), 0b (binary), 0o (octal)
+    if (i + 1 < slen) {
+        var prefix = @intToPtr(*u8, @ptrOf(s) + i)
+        if (prefix.* == 48) {
+            var next = @intToPtr(*u8, @ptrOf(s) + i + 1)
+            if (next.* == 120 or next.* == 88) {
+                i = i + 2
+                while (i < slen) {
+                    var c = @intToPtr(*u8, @ptrOf(s) + i).*
+                    if (c == 95) { i = i + 1; continue }
+                    var digit: i64 = 0
+                    if (c >= 48 and c <= 57) { digit = c - 48 }
+                    else if (c >= 97 and c <= 102) { digit = c - 87 }
+                    else if (c >= 65 and c <= 70) { digit = c - 55 }
+                    else { return null }
+                    has_digits = true
+                    result = result * 16 + digit
+                    i = i + 1
+                }
+                if (not has_digits) { return null }
+                if (negative) { return 0 - result }
+                return result
+            }
+            if (next.* == 98 or next.* == 66) {
+                i = i + 2
+                while (i < slen) {
+                    var c = @intToPtr(*u8, @ptrOf(s) + i).*
+                    if (c == 95) { i = i + 1; continue }
+                    if (c == 48) { result = result * 2 }
+                    else if (c == 49) { result = result * 2 + 1 }
+                    else { return null }
+                    has_digits = true
+                    i = i + 1
+                }
+                if (not has_digits) { return null }
+                if (negative) { return 0 - result }
+                return result
+            }
+            if (next.* == 111 or next.* == 79) {
+                i = i + 2
+                while (i < slen) {
+                    var c = @intToPtr(*u8, @ptrOf(s) + i)
+                    if (c.* == 95) { i = i + 1; continue }
+                    var digit = c.* - 48
+                    if (digit < 0 or digit > 7) { return null }
+                    has_digits = true
+                    result = result * 8 + digit
+                    i = i + 1
+                }
+                if (not has_digits) { return null }
+                if (negative) { return 0 - result }
+                return result
+            }
+        }
+    }
+    // Decimal
+    while (i < slen) {
+        var c = @intToPtr(*u8, @ptrOf(s) + i)
+        if (c.* == 95) { i = i + 1; continue }
+        var digit = c.* - 48
+        if (digit < 0) { return null }
+        if (digit > 9) { return null }
+        has_digits = true
+        result = result * 10 + digit
+        i = i + 1
+    }
+    if (not has_digits) { return null }
     if (negative) { return 0 - result }
     return result
 }
@@ -458,6 +548,7 @@ fn parseFloat(s: string) f64 {
     var int_part: f64 = @floatFromInt(f64, 0)
     while (i < slen) {
         var c = @intToPtr(*u8, @ptrOf(s) + i).*
+        if (c == 95) { i = i + 1; continue }
         if (c == 46) { break }
         if (c == 101 or c == 69) { break }
         if (c < 48 or c > 57) { return @floatFromInt(f64, 0) }
@@ -473,6 +564,7 @@ fn parseFloat(s: string) f64 {
             i = i + 1
             while (i < slen) {
                 var c = @intToPtr(*u8, @ptrOf(s) + i).*
+                if (c == 95) { i = i + 1; continue }
                 if (c == 101 or c == 69) { break }
                 if (c < 48 or c > 57) { return @floatFromInt(f64, 0) }
                 frac_scale = frac_scale * @floatFromInt(f64, 10)
@@ -496,6 +588,7 @@ fn parseFloat(s: string) f64 {
             var exp: i64 = 0
             while (i < slen) {
                 var c = @intToPtr(*u8, @ptrOf(s) + i).*
+                if (c == 95) { i = i + 1; continue }
                 if (c < 48 or c > 57) { break }
                 exp = exp * 10 + (c - 48)
                 i = i + 1

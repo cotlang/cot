@@ -441,6 +441,17 @@ pub const Checker = struct {
                     try gop.value_ptr.append(self.allocator, .{ .type_params = impl_b.type_params, .methods = impl_b.methods, .tree = self.tree });
                     return;
                 }
+                // Register associated constants with qualified names: TypeName_ConstName
+                for (impl_b.consts) |const_idx| {
+                    const const_decl = (self.tree.getNode(const_idx) orelse continue).asDecl() orelse continue;
+                    if (const_decl == .var_decl) {
+                        const v = const_decl.var_decl;
+                        var const_type: TypeIndex = invalid_type;
+                        if (v.type_expr != null_node) const_type = self.resolveTypeExpr(v.type_expr) catch invalid_type;
+                        const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, v.name });
+                        try self.scope.define(Symbol.init(qualified, .constant, const_type, const_idx, false));
+                    }
+                }
                 for (impl_b.methods) |method_idx| {
                     const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
                     if (method_decl == .fn_decl) {
@@ -448,14 +459,16 @@ pub const Checker = struct {
                         const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, f.name });
                         const func_type = try self.buildFuncType(f.params, f.return_type);
                         // Detect receiver_is_ptr from resolved func type (accounts for @safe auto-wrapping)
-                        var is_ptr = true;
-                        const func_info = self.types.get(func_type);
-                        if (func_info == .func and func_info.func.params.len > 0) {
-                            const first_param_type = self.types.get(func_info.func.params[0].type_idx);
-                            if (first_param_type != .pointer) is_ptr = false;
+                        var is_ptr = !f.is_static;
+                        if (!f.is_static) {
+                            const func_info = self.types.get(func_type);
+                            if (func_info == .func and func_info.func.params.len > 0) {
+                                const first_param_type = self.types.get(func_info.func.params[0].type_idx);
+                                if (first_param_type != .pointer) is_ptr = false;
+                            }
                         }
                         try self.scope.define(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
-                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr });
+                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static });
                     }
                 }
             },
@@ -612,7 +625,24 @@ pub const Checker = struct {
         defer func_scope.deinit();
         for (f.params) |param| {
             var param_type = try self.resolveTypeExpr(param.type_expr);
-            param_type = try self.safeWrapType(param_type);
+            // Don't auto-ref parameters whose type is a generic type parameter (T).
+            // Generic code uses value semantics for T; wrapping T to *T when T=struct
+            // would break body code (e.g. `ptr.* = value` expects T, not *T).
+            const is_generic_param = if (self.type_substitution) |sub| blk: {
+                if (param.type_expr != null_node) {
+                    if (self.tree.getNode(param.type_expr)) |node| {
+                        if (node.asExpr()) |expr| {
+                            if (expr == .ident) {
+                                break :blk sub.contains(expr.ident.name);
+                            } else if (expr == .type_expr and expr.type_expr.kind == .named) {
+                                break :blk sub.contains(expr.type_expr.kind.named);
+                            }
+                        }
+                    }
+                }
+                break :blk false;
+            } else false;
+            if (!is_generic_param) param_type = try self.safeWrapType(param_type);
             try func_scope.define(Symbol.init(param.name, .parameter, param_type, idx, false));
         }
         const old_scope = self.scope;
@@ -1705,9 +1735,10 @@ pub const Checker = struct {
         }
         if (callee != .func) { self.err.errorWithCode(c.span.start, .e300, "cannot call non-function"); return invalid_type; }
         const ft = callee.func;
-        const expected_args = if (is_method and ft.params.len > 0) ft.params.len - 1 else ft.params.len;
+        const is_instance_method = is_method and (method_info == null or !method_info.?.is_static);
+        const expected_args = if (is_instance_method and ft.params.len > 0) ft.params.len - 1 else ft.params.len;
         if (c.args.len != expected_args) { self.err.errorWithCode(c.span.start, .e300, "wrong number of arguments"); return invalid_type; }
-        const param_offset: usize = if (is_method) 1 else 0;
+        const param_offset: usize = if (is_instance_method) 1 else 0;
         for (c.args, 0..) |arg_idx, i| {
             // Zig Sema pattern: set expected_type from parameter type for result location inference
             const saved_expected = self.expected_type;
@@ -1747,6 +1778,8 @@ pub const Checker = struct {
             },
             .basic => |bk| bk.name(),
             .enum_type => |et| et.name,
+            // string is stored as slice(u8) — look up methods registered under "string"
+            .slice => if (base_type_idx == TypeRegistry.STRING) "string" else return null,
             else => return null,
         };
         return self.lookupMethod(struct_name, fa.field);
@@ -2242,6 +2275,33 @@ pub const Checker = struct {
                         if (self.types.lookupByName(qualified)) |nested_type_idx| {
                             return nested_type_idx;
                         }
+                        // Also check scope for associated constants and static methods
+                        if (self.scope.lookup(qualified)) |sym| {
+                            if (sym.kind == .constant) {
+                                // If type was resolved during registration, use it directly
+                                if (sym.type_idx != invalid_type) return sym.type_idx;
+                                // Lazy resolution: check the constant's value expr
+                                if (self.tree.getNode(sym.node)) |node| {
+                                    if (node.asDecl()) |decl| {
+                                        if (decl == .var_decl and decl.var_decl.value != null_node) {
+                                            return try self.checkExpr(decl.var_decl.value);
+                                        }
+                                    }
+                                }
+                            }
+                            // Static method: return func_type so call machinery works
+                            // Also store base type in expr_types so lowerer can detect the method call
+                            if (sym.kind == .function and sym.type_idx != invalid_type) {
+                                if (self.lookupMethod(base_name, f.field)) |m| {
+                                    if (m.is_static) {
+                                        if (self.types.lookupByName(base_name)) |base_type_idx| {
+                                            try self.expr_types.put(f.base, base_type_idx);
+                                        }
+                                        return sym.type_idx;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2338,6 +2398,10 @@ pub const Checker = struct {
             .slice => |sl| {
                 if (std.mem.eql(u8, f.field, "ptr")) return try self.types.add(.{ .pointer = .{ .elem = sl.elem } })
                 else if (std.mem.eql(u8, f.field, "len")) return TypeRegistry.I64;
+                // string is stored as slice(u8) — check for methods registered on "string" (e.g. trait impls)
+                if (base_type == TypeRegistry.STRING) {
+                    if (self.lookupMethod("string", f.field)) |m| return m.func_type;
+                }
                 self.errWithSuggestion(f.span.start, "undefined field", editDistSuggest(f.field, &.{ "ptr", "len" }));
                 return invalid_type;
             },
@@ -2386,7 +2450,13 @@ pub const Checker = struct {
             for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi.name)) {
                 found = true;
                 const vt = try self.checkExpr(fi.value);
-                if (!self.types.isAssignable(vt, sf.type_idx)) self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
+                if (!self.types.isAssignable(vt, sf.type_idx)) {
+                    // @safe coercion: *Struct → Struct when value is an auto-reffed param
+                    const vt_t = self.types.get(vt);
+                    const is_safe_deref = self.safe_mode and vt_t == .pointer and
+                        self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
+                    if (!is_safe_deref) self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
+                }
                 break;
             };
             if (!found) self.errWithSuggestion(fi.span.start, "unknown field", findSimilarField(fi.name, struct_type.struct_type.fields));
@@ -3203,10 +3273,18 @@ pub const Checker = struct {
             try sub_map.put(param_name, resolved_args.items[i]);
         }
 
-        // Swap to the defining file's AST for cross-file generic resolution
+        // Swap to the defining file's AST and safe_mode for cross-file generic resolution
+        // Must swap safe_mode so safeWrapType() uses the defining file's mode when
+        // building method signatures (e.g. List(Foo).append where T=struct).
+        // Pattern copied from instantiateGenericImplMethods().
         const saved_tree = self.tree;
+        const saved_safe_mode = self.safe_mode;
         self.tree = gen_info.tree;
-        defer self.tree = saved_tree;
+        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        defer {
+            self.tree = saved_tree;
+            self.safe_mode = saved_safe_mode;
+        }
 
         // Get the struct declaration AST node
         const struct_decl = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
@@ -3373,10 +3451,18 @@ pub const Checker = struct {
         // Go pattern: context.go:87-102 — hash-based dedup with identity verification
         const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
 
-        // Swap to the defining file's AST for cross-file generic resolution
+        // Swap to the defining file's AST and safe_mode for cross-file generic resolution
+        // Must swap safe_mode so safeWrapType() uses the defining file's mode when
+        // building function signatures (e.g. generic fn with T=struct params).
+        // Pattern copied from instantiateGenericImplMethods().
         const saved_tree = self.tree;
+        const saved_safe_mode = self.safe_mode;
         self.tree = gen_info.tree;
-        defer self.tree = saved_tree;
+        if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        defer {
+            self.tree = saved_tree;
+            self.safe_mode = saved_safe_mode;
+        }
 
         // Get the fn_decl AST node
         const fn_node = (self.tree.getNode(gen_info.node_idx) orelse return invalid_type).asDecl() orelse return invalid_type;
@@ -3465,7 +3551,27 @@ pub const Checker = struct {
         defer func_params.deinit(self.allocator);
         for (params) |param| {
             var type_idx = try self.resolveTypeExpr(param.type_expr);
-            type_idx = try self.safeWrapType(type_idx);
+            // Don't auto-ref parameters whose type is a generic type parameter.
+            // Generic functions are written with value semantics for T; wrapping T to *T
+            // when T=struct would break body code (e.g. `ptr.* = value` expects T, not *T).
+            // Only auto-ref parameters with statically-known struct types.
+            const is_substituted = if (self.type_substitution) |sub| blk: {
+                if (param.type_expr != null_node) {
+                    if (self.tree.getNode(param.type_expr)) |node| {
+                        if (node.asExpr()) |expr| {
+                            // Type params can appear as either .ident or .type_expr(.named)
+                            if (expr == .ident) {
+                                break :blk sub.contains(expr.ident.name);
+                            } else if (expr == .type_expr and expr.type_expr.kind == .named) {
+                                break :blk sub.contains(expr.type_expr.kind.named);
+                            }
+                        }
+                    }
+                }
+                break :blk false;
+            } else false;
+
+            if (!is_substituted) type_idx = try self.safeWrapType(type_idx);
             try func_params.append(self.allocator, .{ .name = param.name, .type_idx = type_idx });
         }
         const ret_type = if (return_type_idx != null_node) try self.resolveTypeExpr(return_type_idx) else TypeRegistry.VOID;

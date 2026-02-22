@@ -3122,6 +3122,124 @@ test "parseFloat exponent" {
 }
 
 // ============================================================================
+// parseInt with underscores (scanner stores "1_000" as literal text)
+// ============================================================================
+
+test "parseInt underscore decimal" {
+    @assertEq(parseInt("1_000_000"), 1000000)
+}
+
+test "parseInt underscore hex" {
+    @assertEq(parseInt("0xFF_FF"), 65535)
+}
+
+test "parseInt underscore binary" {
+    @assertEq(parseInt("0b1010_0011"), 163)
+}
+
+// ============================================================================
+// parseIntOrNull — optional-returning parseInt
+// ============================================================================
+
+test "parseIntOrNull valid" {
+    if (parseIntOrNull("42")) |val| {
+        @assertEq(val, 42)
+    } else {
+        @assert(false)
+    }
+}
+
+test "parseIntOrNull zero" {
+    if (parseIntOrNull("0")) |val| {
+        @assertEq(val, 0)
+    } else {
+        @assert(false)
+    }
+}
+
+test "parseIntOrNull invalid" {
+    var result = parseIntOrNull("abc")
+    @assertEq(result == null, true)
+}
+
+test "parseIntOrNull empty" {
+    var result = parseIntOrNull("")
+    @assertEq(result == null, true)
+}
+
+test "parseIntOrNull hex" {
+    if (parseIntOrNull("0xFF")) |val| {
+        @assertEq(val, 255)
+    } else {
+        @assert(false)
+    }
+}
+
+test "parseIntOrNull underscore" {
+    if (parseIntOrNull("1_000")) |val| {
+        @assertEq(val, 1000)
+    } else {
+        @assert(false)
+    }
+}
+
+test "parseIntOrNull negative" {
+    if (parseIntOrNull("-42")) |val| {
+        @assertEq(val, -42)
+    } else {
+        @assert(false)
+    }
+}
+
+// ============================================================================
+// Optional compound: tag+payload representation (zero is NOT null)
+// ============================================================================
+
+test "optional local zero" {
+    var x: ?i64 = 0
+    @assert(x != null)
+    if (x) |val| {
+        @assertEq(val, 0)
+    } else {
+        @assert(false)
+    }
+}
+
+test "optional local null" {
+    var x: ?i64 = null
+    @assertEq(x == null, true)
+}
+
+test "optional assign zero" {
+    var x: ?i64 = null
+    x = 0
+    @assert(x != null)
+    if (x) |val| {
+        @assertEq(val, 0)
+    } else {
+        @assert(false)
+    }
+}
+
+test "optional assign null" {
+    var x: ?i64 = 42
+    @assert(x != null)
+    x = null
+    @assertEq(x == null, true)
+}
+
+test "optional orelse zero" {
+    var x: ?i64 = 0
+    const val = x orelse 99
+    @assertEq(val, 0)
+}
+
+test "optional orelse null" {
+    var x: ?i64 = null
+    @assert((x orelse 99) == 99)
+}
+
+// ============================================================================
 // @enumLen(T) — comptime enum variant count
 // ============================================================================
 

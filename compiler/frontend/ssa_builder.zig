@@ -545,8 +545,14 @@ pub const SSABuilder = struct {
         // A single .load would only get 8 bytes, and field access would
         // use that loaded value as an address → SIGSEGV.
         // convertStoreLocal handles this via OpMove (else branch extracts addr).
+        // Non-pointer-like optionals (?i64, ?f64) are compound (tag+payload = 16 bytes).
+        // Pointer-like optionals (?*T) use null=0 sentinel — single i64, not compound.
         const type_size = self.type_registry.sizeOf(type_idx);
-        if ((load_type == .struct_type or load_type == .tuple or load_type == .union_type) and type_size > 8) {
+        const is_compound_optional = load_type == .optional and blk: {
+            const elem_info = self.type_registry.get(load_type.optional.elem);
+            break :blk elem_info != .pointer;
+        };
+        if (((load_type == .struct_type or load_type == .tuple or load_type == .union_type) and type_size > 8) or is_compound_optional) {
             addr_val.type_idx = type_idx;
             return addr_val;
         }
@@ -568,18 +574,33 @@ pub const SSABuilder = struct {
             return value;
         }
 
-        const is_slice_value = (value.op == .slice_make or value.op == .string_make) and value.args.len >= 2;
+        // String/slice compound store: decompose into ptr@0, len@8 (and cap@16 for slices).
+        // Handles both decomposed values (string_make/slice_make with args) and
+        // non-decomposed values (const_string, field loads) via slice_ptr/slice_len ops.
+        const is_string_or_slice = value.type_idx == TypeRegistry.STRING or value_type == .slice;
+        if (is_string_or_slice) {
+            var ptr_component: *Value = undefined;
+            var len_component: *Value = undefined;
+            var cap_component: ?*Value = null;
 
-        if (is_slice_value) {
-            // Go slice layout: { ptr@0, len@8, cap@16 }
-            // Decompose into separate stores for each component
-            const ptr_val = value.args[0];
-            const len_val = value.args[1];
-            const cap_val = if (value.args.len >= 3) value.args[2] else len_val; // cap defaults to len
+            const is_decomposed = (value.op == .slice_make or value.op == .string_make) and value.args.len >= 2;
+            if (is_decomposed) {
+                ptr_component = value.args[0];
+                len_component = value.args[1];
+                if (value.op == .slice_make and value.args.len >= 3) cap_component = value.args[2];
+            } else {
+                ptr_component = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+                ptr_component.addArg(value);
+                try cur.addValue(self.allocator, ptr_component);
+
+                len_component = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+                len_component.addArg(value);
+                try cur.addValue(self.allocator, len_component);
+            }
 
             const addr_val = try self.emitLocalAddr(local_idx, TypeRegistry.VOID, cur);
             const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            ptr_store.addArg2(addr_val, ptr_val);
+            ptr_store.addArg2(addr_val, ptr_component);
             try cur.addValue(self.allocator, ptr_store);
 
             const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
@@ -588,11 +609,11 @@ pub const SSABuilder = struct {
             try cur.addValue(self.allocator, len_addr);
 
             const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
-            len_store.addArg2(len_addr, len_val);
+            len_store.addArg2(len_addr, len_component);
             try cur.addValue(self.allocator, len_store);
 
-            // Store cap at offset 16 (Go slice layout)
-            if (value.op == .slice_make) {
+            // Store cap at offset 16 (Go slice layout) for slices with cap
+            if (cap_component) |cap_val| {
                 const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
                 cap_addr.aux_int = 16;
                 cap_addr.addArg(addr_val);
@@ -600,6 +621,16 @@ pub const SSABuilder = struct {
 
                 const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
                 cap_store.addArg2(cap_addr, cap_val);
+                try cur.addValue(self.allocator, cap_store);
+            } else if (value.op == .slice_make) {
+                // cap defaults to len for slices without explicit cap
+                const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                cap_addr.aux_int = 16;
+                cap_addr.addArg(addr_val);
+                try cur.addValue(self.allocator, cap_addr);
+
+                const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                cap_store.addArg2(cap_addr, len_component);
                 try cur.addValue(self.allocator, cap_store);
             }
 
@@ -609,7 +640,11 @@ pub const SSABuilder = struct {
 
         const addr_val = try self.emitLocalAddr(local_idx, TypeRegistry.VOID, cur);
         const type_size = self.type_registry.sizeOf(value.type_idx);
-        const is_large_struct = (value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8;
+        const is_compound_opt = value_type == .optional and blk: {
+            const elem_info = self.type_registry.get(value_type.optional.elem);
+            break :blk elem_info != .pointer;
+        };
+        const is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
 
         if (is_large_struct) {
             // Use OpMove for bulk memory copy.
@@ -880,6 +915,15 @@ pub const SSABuilder = struct {
         const field_type = self.type_registry.get(type_idx);
         if (field_type == .struct_type or field_type == .array) return off_val;
 
+        // Compound optional: return address (like struct), not loaded scalar
+        if (field_type == .optional) {
+            const elem_info = self.type_registry.get(field_type.optional.elem);
+            if (elem_info != .pointer) {
+                off_val.type_idx = type_idx;
+                return off_val;
+            }
+        }
+
         // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make
         const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;
         if (is_string_or_slice) {
@@ -980,6 +1024,15 @@ pub const SSABuilder = struct {
 
         const field_type = self.type_registry.get(type_idx);
         if (field_type == .struct_type or field_type == .array) return off_val;
+
+        // Compound optional: return address (like struct), not loaded scalar
+        if (field_type == .optional) {
+            const elem_info = self.type_registry.get(field_type.optional.elem);
+            if (elem_info != .pointer) {
+                off_val.type_idx = type_idx;
+                return off_val;
+            }
+        }
 
         // String/slice compound load: decompose into ptr@0, len@8, create string_make/slice_make
         const is_string_or_slice = type_idx == TypeRegistry.STRING or field_type == .slice;

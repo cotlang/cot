@@ -1,0 +1,102 @@
+// Tests for static methods and associated constants in impl blocks
+
+struct Counter {
+    value: int
+}
+
+impl Counter {
+    const MAX: int = 100
+    const MIN: int = 0
+
+    static fn create(initial: int) Counter {
+        return Counter { .value = initial }
+    }
+
+    static fn zero() Counter {
+        return Counter { .value = 0 }
+    }
+
+    static fn add(a: int, b: int) int {
+        return a + b
+    }
+
+    fn getValue(self: *Counter) int {
+        return self.value
+    }
+
+    fn increment(self: *Counter) {
+        self.value = self.value + 1
+    }
+}
+
+test "static method no args" {
+    var c = Counter.zero()
+    @assertEq(c.value, 0)
+}
+
+test "static method with args" {
+    var c = Counter.create(42)
+    @assertEq(c.value, 42)
+}
+
+test "static method pure function" {
+    @assertEq(Counter.add(3, 4), 7)
+}
+
+test "associated constant" {
+    @assertEq(Counter.MAX, 100)
+    @assertEq(Counter.MIN, 0)
+}
+
+test "static and instance methods coexist" {
+    var c = Counter.create(10)
+    @assertEq(c.getValue(), 10)
+    c.increment()
+    @assertEq(c.getValue(), 11)
+}
+
+test "associated constant in expression" {
+    var c = Counter.create(Counter.MAX)
+    @assertEq(c.value, 100)
+}
+
+struct Point {
+    x: int,
+    y: int
+}
+
+impl Point {
+    const ORIGIN_X: int = 0
+    const ORIGIN_Y: int = 0
+
+    static fn origin() Point {
+        return Point { .x = 0, .y = 0 }
+    }
+
+    static fn fromXY(x: int, y: int) Point {
+        return Point { .x = x, .y = y }
+    }
+
+    fn distSquared(self: *Point) int {
+        return self.x * self.x + self.y * self.y
+    }
+}
+
+test "static method returns struct" {
+    var p = Point.origin()
+    @assertEq(p.x, 0)
+    @assertEq(p.y, 0)
+}
+
+test "static method with multiple args" {
+    var p = Point.fromXY(3, 4)
+    @assertEq(p.x, 3)
+    @assertEq(p.y, 4)
+    @assertEq(p.distSquared(), 25)
+}
+
+test "associated constants from different types" {
+    @assertEq(Counter.MAX, 100)
+    @assertEq(Point.ORIGIN_X, 0)
+    @assertEq(Point.ORIGIN_Y, 0)
+}

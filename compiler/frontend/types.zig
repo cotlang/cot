@@ -111,6 +111,7 @@ pub const MethodInfo = struct {
     func_name: []const u8,
     func_type: TypeIndex,
     receiver_is_ptr: bool,
+    is_static: bool = false,
 };
 
 pub const TypeRegistry = struct {

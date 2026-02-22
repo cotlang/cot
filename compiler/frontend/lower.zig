@@ -81,7 +81,104 @@ pub const Lowerer = struct {
     /// Reference: references/zig/src/codegen/wasm/CodeGen.zig:1354 firstParamSRet()
     fn needsSret(self: *const Lowerer, type_idx: TypeIndex) bool {
         const info = self.type_reg.get(type_idx);
-        return (info == .struct_type or info == .tuple or info == .union_type) and self.type_reg.sizeOf(type_idx) > 8;
+        if ((info == .struct_type or info == .tuple or info == .union_type) and self.type_reg.sizeOf(type_idx) > 8)
+            return true;
+        // Non-pointer-like optionals use compound return (tag+payload = 16 bytes).
+        // Pointer-like optionals (?*T) use null=0 sentinel — no SRET needed.
+        // Reference: Zig type.zig:1604 — optional layout is [payload][null_flag]
+        if (info == .optional and !self.isPtrLikeOptional(type_idx))
+            return true;
+        return false;
+    }
+
+    /// Returns true if the optional type wraps a pointer (e.g., ?*T).
+    /// Pointer-like optionals use null=0 sentinel representation (single value).
+    /// Non-pointer-like optionals (?i64, ?f64, ?bool) use compound tag+payload.
+    fn isPtrLikeOptional(self: *const Lowerer, type_idx: TypeIndex) bool {
+        const info = self.type_reg.get(type_idx);
+        if (info != .optional) return false;
+        return self.type_reg.get(info.optional.elem) == .pointer;
+    }
+
+    /// Store a value into a compound optional result local, wrapping T → ?T as needed.
+    /// Used by switch/if expressions that produce compound optional results.
+    fn storeCompoundOptArm(self: *Lowerer, fb: *ir.FuncBuilder, result_local: ir.LocalIdx, val: ir.NodeIndex, body_idx: NodeIndex, span: Span) !void {
+        // Check if arm value is a null literal
+        const body_node = self.tree.getNode(body_idx);
+        const body_expr = if (body_node) |n| n.asExpr() else null;
+        const is_null = if (body_expr) |e| (e == .literal and e.literal.kind == .null_lit) else false;
+        if (is_null) {
+            // null → tag=0
+            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitStoreLocalField(result_local, 0, 0, tag_zero, span);
+        } else {
+            const arm_type = self.inferExprType(body_idx);
+            const arm_info = self.type_reg.get(arm_type);
+            if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
+                // Already compound optional → compound copy
+                _ = try fb.emitStoreLocal(result_local, val, span);
+            } else {
+                // Plain T → wrap as tag=1, payload=value
+                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(result_local, 0, 0, tag_one, span);
+                _ = try fb.emitStoreLocalField(result_local, 1, 8, val, span);
+            }
+        }
+    }
+
+    /// Store compound optional via pointer base (for struct field assign through pointer).
+    fn storeCompoundOptFieldPtr(self: *Lowerer, fb: *ir.FuncBuilder, ptr: ir.NodeIndex, field_idx: u32, field_offset: i64, val: ir.NodeIndex, ast_idx: NodeIndex, span: Span) !void {
+        const body_node = self.tree.getNode(ast_idx);
+        const body_expr = if (body_node) |n| n.asExpr() else null;
+        const is_null = if (body_expr) |e| (e == .literal and e.literal.kind == .null_lit) else false;
+        if (is_null) {
+            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag_zero, span);
+        } else {
+            const arm_type = self.inferExprType(ast_idx);
+            const arm_info = self.type_reg.get(arm_type);
+            if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
+                const tmp = try fb.addLocalWithSize("__opt_fap_tmp", arm_type, false, 16);
+                _ = try fb.emitStoreLocal(tmp, val, span);
+                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+                const payload = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
+                _ = try fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag, span);
+                _ = try fb.emitStoreFieldValue(ptr, field_idx + 1, field_offset + 8, payload, span);
+            } else {
+                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                _ = try fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag_one, span);
+                _ = try fb.emitStoreFieldValue(ptr, field_idx + 1, field_offset + 8, val, span);
+            }
+        }
+    }
+
+    /// Store a value into a compound optional struct field, wrapping T → ?T as needed.
+    /// Handles struct init fields and default values.
+    fn storeCompoundOptField(self: *Lowerer, fb: *ir.FuncBuilder, local_idx: ir.LocalIdx, field_idx: u32, field_offset: i64, val: ir.NodeIndex, ast_idx: NodeIndex, span: Span) !void {
+        const body_node = self.tree.getNode(ast_idx);
+        const body_expr = if (body_node) |n| n.asExpr() else null;
+        const is_null = if (body_expr) |e| (e == .literal and e.literal.kind == .null_lit) else false;
+        if (is_null) {
+            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag_zero, span);
+        } else {
+            const arm_type = self.inferExprType(ast_idx);
+            const arm_info = self.type_reg.get(arm_type);
+            if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
+                // Already compound optional — copy both words
+                const tmp = try fb.addLocalWithSize("__opt_field_tmp", arm_type, false, 16);
+                _ = try fb.emitStoreLocal(tmp, val, span);
+                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
+                const payload = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag, span);
+                _ = try fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, payload, span);
+            } else {
+                // Plain T → wrap as tag=1, payload=value
+                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
+                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag_one, span);
+                _ = try fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, val, span);
+            }
+        }
     }
 
     const LoopContext = struct {
@@ -1191,6 +1288,66 @@ pub const Lowerer = struct {
                     value_node = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, ret.span);
                 }
             } else if (fb.sret_return_type) |sret_type| {
+                const sret_info = self.type_reg.get(sret_type);
+                if (sret_info == .optional and !self.isPtrLikeOptional(sret_type)) {
+                    // Compound optional return: write tag+payload to __sret buffer.
+                    // Reference: Zig CodeGen.zig:4379 airWrapOptional — [payload][null_flag]
+                    const sret_idx_opt = fb.lookupLocal("__sret").?;
+                    const sret_ptr_opt = try fb.emitLoadLocal(sret_idx_opt, TypeRegistry.I64, ret.span);
+
+                    // Detect null literal return
+                    const is_null_return = if (ret_node) |n| if (n.asExpr()) |e|
+                        (e == .literal and e.literal.kind == .null_lit)
+                    else
+                        false
+                    else
+                        false;
+
+                    if (is_null_return) {
+                        // return null → tag=0 (payload left as zero/undefined)
+                        const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, ret.span);
+                        _ = try fb.emitStoreField(sret_ptr_opt, 0, 0, tag_zero, ret.span);
+                    } else {
+                        const lowered = try self.lowerExprNode(ret.value);
+                        if (lowered != ir.null_node) {
+                            const ret_expr_type = self.inferExprType(ret.value);
+                            const ret_expr_info = self.type_reg.get(ret_expr_type);
+                            if (ret_expr_info == .optional) {
+                                // Returning an existing optional → forward compound (copy 2 words)
+                                const tmp_local = try fb.addLocalWithSize("__ret_opt_src", sret_type, false, 16);
+                                _ = try fb.emitStoreLocal(tmp_local, lowered, ret.span);
+                                for (0..2) |i| {
+                                    const offset: i64 = @intCast(i * 8);
+                                    const field = try fb.emitFieldLocal(tmp_local, @intCast(i), offset, TypeRegistry.I64, ret.span);
+                                    _ = try fb.emitStoreField(sret_ptr_opt, @intCast(i), offset, field, ret.span);
+                                }
+                            } else {
+                                // Returning a plain T → wrap as tag=1, payload=value
+                                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, ret.span);
+                                _ = try fb.emitStoreField(sret_ptr_opt, 0, 0, tag_one, ret.span);
+                                _ = try fb.emitStoreField(sret_ptr_opt, 1, 8, lowered, ret.span);
+                            }
+                        }
+                    }
+
+                    // Forward ownership before cleanup
+                    if (ret_node) |node| {
+                        if (node.asExpr()) |expr| {
+                            if (expr == .ident) {
+                                if (fb.lookupLocal(expr.ident.name)) |local_idx| {
+                                    _ = self.cleanup_stack.disableForLocal(local_idx);
+                                }
+                            }
+                        }
+                    }
+
+                    // Handle defers
+                    if (self.hasDeferCleanups()) {
+                        try self.emitCleanups(0);
+                    }
+                    _ = try fb.emitRet(null, ret.span); // void return — SRET pattern
+                    return;
+                }
                 // SRET: write return value to caller-allocated buffer via __sret pointer.
                 // Zig pattern: firstParamSRet() — callee writes, returns void.
                 const sret_size = self.type_reg.sizeOf(sret_type);
@@ -1548,6 +1705,28 @@ pub const Lowerer = struct {
                 try self.lowerTupleInit(local_idx, var_stmt.value, var_stmt.span);
             } else if (self.type_reg.get(type_idx) == .union_type) {
                 try self.lowerUnionInit(local_idx, var_stmt.value, type_idx, var_stmt.span);
+            } else if (self.type_reg.get(type_idx) == .optional and !self.isPtrLikeOptional(type_idx)) {
+                // Compound optional init: T → ?T wrapping
+                const is_null_init = if (value_expr) |e| (e == .literal and e.literal.kind == .null_lit) else false;
+                if (is_null_init) {
+                    // null → tag=0 (payload left uninitialized)
+                    const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, var_stmt.span);
+                    _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_zero, var_stmt.span);
+                } else {
+                    const value_node = try self.lowerExprNode(var_stmt.value);
+                    if (value_node == ir.null_node) return;
+                    const value_type = self.inferExprType(var_stmt.value);
+                    const value_info = self.type_reg.get(value_type);
+                    if (value_info == .optional) {
+                        // Already ?T (from function call SRET) — compound copy
+                        _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
+                    } else {
+                        // Plain T → wrap as tag=1, payload=value
+                        const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, var_stmt.span);
+                        _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_one, var_stmt.span);
+                        _ = try fb.emitStoreLocalField(local_idx, 1, 8, value_node, var_stmt.span);
+                    }
+                }
             } else {
                 const type_info = self.type_reg.get(type_idx);
                 const is_compound_copy = (type_info == .struct_type or type_info == .tuple) and value_expr != null and
@@ -1795,6 +1974,9 @@ pub const Lowerer = struct {
                         const len_ir = try fb.emitSliceLen(value_node_ir, span);
                         _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, ptr_ir, span);
                         _ = try fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, len_ir, span);
+                    } else if (field_type == .optional and !self.isPtrLikeOptional(struct_field.type_idx)) {
+                        // Compound optional field: wrap T → ?T
+                        try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node_ir, field_init.value, span);
                     } else {
                         _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node_ir, span);
                     }
@@ -1821,6 +2003,8 @@ pub const Lowerer = struct {
                 const len_ir = try fb.emitSliceLen(value_node_ir, span);
                 _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, ptr_ir, span);
                 _ = try fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, len_ir, span);
+            } else if (field_type == .optional and !self.isPtrLikeOptional(struct_field.type_idx)) {
+                try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node_ir, struct_field.default_value, span);
             } else {
                 _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node_ir, span);
             }
@@ -2036,7 +2220,30 @@ pub const Lowerer = struct {
                         }
                     } else {
                         const local_type = fb.locals.items[local_idx].type_idx;
-                        if (local_type == TypeRegistry.STRING) {
+                        const local_info = self.type_reg.get(local_type);
+                        if (local_info == .optional and !self.isPtrLikeOptional(local_type)) {
+                            // Compound optional assignment: T → ?T wrapping
+                            const rhs_node = self.tree.getNode(assign.value);
+                            const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
+                            const is_null_assign = if (rhs_expr) |e| (e == .literal and e.literal.kind == .null_lit) else false;
+                            if (is_null_assign) {
+                                // x = null → tag=0
+                                const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, assign.span);
+                                _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_zero, assign.span);
+                            } else {
+                                const rhs_type = self.inferExprType(assign.value);
+                                const rhs_info = self.type_reg.get(rhs_type);
+                                if (rhs_info == .optional) {
+                                    // Already ?T → compound copy
+                                    _ = try fb.emitStoreLocal(local_idx, value_node, assign.span);
+                                } else {
+                                    // Plain T → wrap as tag=1, payload=value
+                                    const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, assign.span);
+                                    _ = try fb.emitStoreLocalField(local_idx, 0, 0, tag_one, assign.span);
+                                    _ = try fb.emitStoreLocalField(local_idx, 1, 8, value_node, assign.span);
+                                }
+                            }
+                        } else if (local_type == TypeRegistry.STRING) {
                             // Compound reassignment: decompose into ptr + len
                             // Must match lowerStringInit pattern (line ~1130)
                             const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
@@ -2154,22 +2361,42 @@ pub const Lowerer = struct {
                             _ = try fb.emitStoreFieldValue(ptr_val, field_idx, field_offset, value_node, span);
                         }
                     } else {
-                        _ = try fb.emitStoreFieldValue(ptr_val, field_idx, field_offset, value_node, span);
+                        const fld_info = self.type_reg.get(field.type_idx);
+                        if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
+                            try self.storeCompoundOptFieldPtr(fb, ptr_val, field_idx, field_offset, value_node, rhs_ast, span);
+                        } else {
+                            _ = try fb.emitStoreFieldValue(ptr_val, field_idx, field_offset, value_node, span);
+                        }
                     }
                 } else if (base_expr == .ident) {
                     if (fb.lookupLocal(base_expr.ident.name)) |local_idx| {
-                        _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node, span);
+                        const fld_info = self.type_reg.get(field.type_idx);
+                        if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
+                            try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node, rhs_ast, span);
+                        } else {
+                            _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node, span);
+                        }
                     } else if (self.builder.lookupGlobal(base_expr.ident.name)) |g| {
                         const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.VOID;
                         const global_addr = try fb.emitAddrGlobal(g.idx, base_expr.ident.name, ptr_type, span);
-                        _ = try fb.emitStoreFieldValue(global_addr, field_idx, field_offset, value_node, span);
+                        const fld_info = self.type_reg.get(field.type_idx);
+                        if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
+                            try self.storeCompoundOptFieldPtr(fb, global_addr, field_idx, field_offset, value_node, rhs_ast, span);
+                        } else {
+                            _ = try fb.emitStoreFieldValue(global_addr, field_idx, field_offset, value_node, span);
+                        }
                     }
                 } else if (base_expr == .field_access) {
                     // Nested struct field assign: o.inner.val = 42
                     // Resolve the base field chain to an address, then store to the final field.
                     const base_addr = try self.resolveStructFieldAddr(fa.base);
                     if (base_addr != ir.null_node) {
-                        _ = try fb.emitStoreFieldValue(base_addr, field_idx, field_offset, value_node, span);
+                        const fld_info = self.type_reg.get(field.type_idx);
+                        if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
+                            try self.storeCompoundOptFieldPtr(fb, base_addr, field_idx, field_offset, value_node, rhs_ast, span);
+                        } else {
+                            _ = try fb.emitStoreFieldValue(base_addr, field_idx, field_offset, value_node, span);
+                        }
                     }
                 }
                 break;
@@ -2361,9 +2588,23 @@ pub const Lowerer = struct {
         const opt_val = try self.lowerExprNode(if_stmt.condition);
         if (opt_val == ir.null_node) return false;
 
-        // Check if non-null: val != null
-        const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, if_stmt.span));
-        const is_non_null = try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, if_stmt.span);
+        const opt_type_idx = self.inferExprType(if_stmt.condition);
+        const opt_info = self.type_reg.get(opt_type_idx);
+        const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
+        const is_compound_opt = opt_info == .optional and !self.isPtrLikeOptional(opt_type_idx);
+
+        const is_non_null = if (is_compound_opt) blk: {
+            // Compound optional: store to temp, read tag at field 0
+            const opt_local = try fb.addLocalWithSize("__opt_if", opt_type_idx, false, 16);
+            _ = try fb.emitStoreLocal(opt_local, opt_val, if_stmt.span);
+            const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, if_stmt.span);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, if_stmt.span);
+            break :blk try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, if_stmt.span);
+        } else blk: {
+            // Pointer-like optional or legacy: compare value to null
+            const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, if_stmt.span));
+            break :blk try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, if_stmt.span);
+        };
 
         const then_block = try fb.newBlock("if.opt.then");
         const else_block = if (if_stmt.else_branch != null_node) try fb.newBlock("if.opt.else") else null;
@@ -2373,10 +2614,14 @@ pub const Lowerer = struct {
         // Then block: unwrap and bind capture variable
         fb.setBlock(then_block);
         const scope_depth = fb.markScopeEntry();
-        const opt_type_idx = self.inferExprType(if_stmt.condition);
-        const opt_info = self.type_reg.get(opt_type_idx);
-        const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
-        const unwrapped = try fb.emitUnary(.optional_unwrap, opt_val, elem_type, if_stmt.span);
+        const unwrapped = if (is_compound_opt) blk: {
+            // Compound optional: read payload at field 1, offset 8
+            const opt_local = fb.lookupLocal("__opt_if").?;
+            break :blk try fb.emitFieldLocal(opt_local, 1, 8, elem_type, if_stmt.span);
+        } else blk: {
+            // Pointer-like: unwrap is identity (copy)
+            break :blk try fb.emitUnary(.optional_unwrap, opt_val, elem_type, if_stmt.span);
+        };
         const capture_local = try fb.addLocalWithSize(if_stmt.capture, elem_type, false, self.type_reg.sizeOf(elem_type));
         _ = try fb.emitStoreLocal(capture_local, unwrapped, if_stmt.span);
         if (!try self.lowerBlockNode(if_stmt.then_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
@@ -2433,6 +2678,7 @@ pub const Lowerer = struct {
         const opt_type_idx = self.inferExprType(while_stmt.condition);
         const opt_info = self.type_reg.get(opt_type_idx);
         const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
+        const is_compound_opt = opt_info == .optional and !self.isPtrLikeOptional(opt_type_idx);
         const opt_local = try fb.addLocalWithSize("__while_opt", opt_type_idx, true, self.type_reg.sizeOf(opt_type_idx));
 
         _ = try fb.emitJump(cond_block, while_stmt.span);
@@ -2443,17 +2689,29 @@ pub const Lowerer = struct {
         if (opt_val == ir.null_node) return;
         _ = try fb.emitStoreLocal(opt_local, opt_val, while_stmt.span);
 
-        // Check if non-null: val != null
-        const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, while_stmt.span));
-        const is_non_null = try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, while_stmt.span);
+        // Check if non-null
+        const is_non_null = if (is_compound_opt) blk: {
+            // Compound optional: read tag at field 0
+            const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, while_stmt.span);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, while_stmt.span);
+            break :blk try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, while_stmt.span);
+        } else blk: {
+            const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, while_stmt.span));
+            break :blk try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, while_stmt.span);
+        };
         _ = try fb.emitBranch(is_non_null, body_block, exit_block, while_stmt.span);
 
         // Body block: reload from local, unwrap and bind capture variable
         try self.loop_stack.append(self.allocator, .{ .cond_block = cont_block, .exit_block = exit_block, .cleanup_depth = self.cleanup_stack.getScopeDepth(), .label = while_stmt.label });
         fb.setBlock(body_block);
         const scope_depth = fb.markScopeEntry();
-        const opt_reload = try fb.emitLoadLocal(opt_local, opt_type_idx, while_stmt.span);
-        const unwrapped = try fb.emitUnary(.optional_unwrap, opt_reload, elem_type, while_stmt.span);
+        const unwrapped = if (is_compound_opt) blk: {
+            // Compound optional: read payload at field 1, offset 8
+            break :blk try fb.emitFieldLocal(opt_local, 1, 8, elem_type, while_stmt.span);
+        } else blk: {
+            const opt_reload = try fb.emitLoadLocal(opt_local, opt_type_idx, while_stmt.span);
+            break :blk try fb.emitUnary(.optional_unwrap, opt_reload, elem_type, while_stmt.span);
+        };
         const capture_local = try fb.addLocalWithSize(while_stmt.capture, elem_type, false, self.type_reg.sizeOf(elem_type));
         _ = try fb.emitStoreLocal(capture_local, unwrapped, while_stmt.span);
         if (!try self.lowerBlockNode(while_stmt.body)) _ = try fb.emitJump(cont_block, while_stmt.span);
@@ -3106,10 +3364,22 @@ pub const Lowerer = struct {
             const left_type_idx = self.inferExprType(bin.left);
             const left_type = self.type_reg.get(left_type_idx);
             if (left_type == .optional) {
-                const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, bin.span));
-                const condition = try fb.emitBinary(.ne, left, null_val, TypeRegistry.BOOL, bin.span);
-                const unwrapped = try fb.emitUnary(.optional_unwrap, left, left_type.optional.elem, bin.span);
-                return try fb.emitSelect(condition, unwrapped, right, result_type, bin.span);
+                if (!self.isPtrLikeOptional(left_type_idx)) {
+                    // Compound optional: store to temp, read tag for condition, payload for unwrap
+                    const opt_local = try fb.addLocalWithSize("__orelse_opt", left_type_idx, false, 16);
+                    _ = try fb.emitStoreLocal(opt_local, left, bin.span);
+                    const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
+                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+                    const condition = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, bin.span);
+                    const payload = try fb.emitFieldLocal(opt_local, 1, 8, left_type.optional.elem, bin.span);
+                    return try fb.emitSelect(condition, payload, right, result_type, bin.span);
+                } else {
+                    // Pointer-like optional: null=0 sentinel
+                    const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, bin.span));
+                    const condition = try fb.emitBinary(.ne, left, null_val, TypeRegistry.BOOL, bin.span);
+                    const unwrapped = try fb.emitUnary(.optional_unwrap, left, left_type.optional.elem, bin.span);
+                    return try fb.emitSelect(condition, unwrapped, right, result_type, bin.span);
+                }
             }
         }
         // Pointer arithmetic: p + n scales by element size (like Go's PtrIndex)
@@ -3132,6 +3402,56 @@ pub const Lowerer = struct {
                 }
             }
         }
+        // Compound optional comparisons: x == null, x != null, x == value, x != value
+        // For non-pointer-like optionals, extract tag (field 0) and payload (field 1).
+        if (bin.op == .eql or bin.op == .neq) {
+            const left_type_idx = self.inferExprType(bin.left);
+            const right_type_idx = self.inferExprType(bin.right);
+            const left_info = self.type_reg.get(left_type_idx);
+            const right_info = self.type_reg.get(right_type_idx);
+            const left_is_null = left_info == .basic and left_info.basic == .untyped_null;
+            const right_is_null = right_info == .basic and right_info.basic == .untyped_null;
+            const left_is_compound_opt = left_info == .optional and !self.isPtrLikeOptional(left_type_idx);
+            const right_is_compound_opt = right_info == .optional and !self.isPtrLikeOptional(right_type_idx);
+
+            // x == null / x != null where x is compound optional
+            if (left_is_compound_opt and right_is_null) {
+                const opt_local = try fb.addLocalWithSize("__opt_cmp", left_type_idx, false, 16);
+                _ = try fb.emitStoreLocal(opt_local, left, bin.span);
+                const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+                return try fb.emitBinary(if (bin.op == .eql) .eq else .ne, tag, zero, TypeRegistry.BOOL, bin.span);
+            }
+            // null == x / null != x where x is compound optional
+            if (right_is_compound_opt and left_is_null) {
+                const opt_local = try fb.addLocalWithSize("__opt_cmp", right_type_idx, false, 16);
+                _ = try fb.emitStoreLocal(opt_local, right, bin.span);
+                const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+                return try fb.emitBinary(if (bin.op == .eql) .eq else .ne, tag, zero, TypeRegistry.BOOL, bin.span);
+            }
+            // x == value / x != value where x is compound optional (e.g., ?i64 == 42)
+            // Result: (tag != 0) AND (payload == value) for eql; NOT that for neq
+            if (left_is_compound_opt and !right_is_null) {
+                const opt_local = try fb.addLocalWithSize("__opt_vcmp", left_type_idx, false, 16);
+                _ = try fb.emitStoreLocal(opt_local, left, bin.span);
+                const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
+                const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, bin.span);
+                const elem_type = left_info.optional.elem;
+                const payload = try fb.emitFieldLocal(opt_local, 1, 8, elem_type, bin.span);
+                const payload_eq = try fb.emitBinary(.eq, payload, right, TypeRegistry.BOOL, bin.span);
+                if (bin.op == .eql) {
+                    // x == val: non_null AND payload_eq
+                    return try fb.emitBinary(.@"and", is_non_null, payload_eq, TypeRegistry.BOOL, bin.span);
+                } else {
+                    // x != val: null OR payload_neq → NOT (non_null AND payload_eq)
+                    const eq_result = try fb.emitBinary(.@"and", is_non_null, payload_eq, TypeRegistry.BOOL, bin.span);
+                    return try fb.emitUnary(.not, eq_result, TypeRegistry.BOOL, bin.span);
+                }
+            }
+        }
+
         const result = try fb.emitBinary(tokenToBinaryOp(bin.op), left, right, result_type, bin.span);
 
         // Div-by-zero check for integer division/modulo.
@@ -3167,11 +3487,34 @@ pub const Lowerer = struct {
         const operand = try self.lowerExprNode(un.operand);
         if (operand == ir.null_node) return ir.null_node;
         const operand_type_idx = self.inferExprType(un.operand);
+        const operand_type = self.type_reg.get(operand_type_idx);
         const result_type = if (un.op == .question) blk: {
-            const operand_type = self.type_reg.get(operand_type_idx);
             break :blk if (operand_type == .optional) operand_type.optional.elem else operand_type_idx;
         } else operand_type_idx;
-        // Runtime safety: null unwrap check in debug mode — Zig Sema.zig:26482
+
+        // Compound optional unwrap: ?T (non-pointer-like) — read tag + payload from compound
+        if (un.op == .question and operand_type == .optional and !self.isPtrLikeOptional(operand_type_idx)) {
+            const opt_local = try fb.addLocalWithSize("__unwrap_opt", operand_type_idx, false, 16);
+            _ = try fb.emitStoreLocal(opt_local, operand, un.span);
+
+            // Runtime safety: null check on tag
+            if (!self.release_mode) {
+                const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, un.span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, un.span);
+                const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, un.span);
+                const ok_block = try fb.newBlock("unwrap.ok");
+                const fail_block = try fb.newBlock("unwrap.fail");
+                _ = try fb.emitBranch(is_non_null, ok_block, fail_block, un.span);
+                fb.setBlock(fail_block);
+                _ = try fb.emitTrap(un.span);
+                fb.setBlock(ok_block);
+            }
+
+            // Read payload from field 1, offset 8
+            return try fb.emitFieldLocal(opt_local, 1, 8, result_type, un.span);
+        }
+
+        // Legacy / pointer-like optional unwrap
         if (un.op == .question and !self.release_mode) {
             const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, un.span));
             const is_non_null = try fb.emitBinary(.ne, operand, null_val, TypeRegistry.BOOL, un.span);
@@ -3308,6 +3651,34 @@ pub const Lowerer = struct {
                     else => null,
                 };
                 if (field_val) |fv| return try self.emitComptimeValue(fv, fa.span);
+            }
+        }
+
+        // Associated constant: TypeName.CONST (qualified constant from impl block)
+        if (fa.base != ast.null_node) {
+            if (self.tree.getNode(fa.base)) |base_node| {
+                if (base_node.asExpr()) |base_expr| {
+                    if (base_expr == .ident) {
+                        var buf: [512]u8 = undefined;
+                        const qualified = std.fmt.bufPrint(&buf, "{s}_{s}", .{ base_expr.ident.name, fa.field }) catch "";
+                        if (qualified.len > 0) {
+                            if (self.chk.scope.lookup(qualified)) |sym| {
+                                if (sym.kind == .constant) {
+                                    // Evaluate the constant's value
+                                    if (sym.const_value) |cv| return try fb.emitConstInt(cv, sym.type_idx, fa.span);
+                                    // Not a known const_value — lower the declaration's value expr
+                                    if (self.tree.getNode(sym.node)) |node| {
+                                        if (node.asDecl()) |decl| {
+                                            if (decl == .var_decl and decl.var_decl.value != ast.null_node) {
+                                                return try self.lowerExprNode(decl.var_decl.value);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -4339,9 +4710,22 @@ pub const Lowerer = struct {
         const opt_val = try self.lowerExprNode(if_expr.condition);
         if (opt_val == ir.null_node) return ir.null_node;
 
+        const opt_type_idx = self.inferExprType(if_expr.condition);
+        const opt_info = self.type_reg.get(opt_type_idx);
+        const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
+        const is_compound_opt = opt_info == .optional and !self.isPtrLikeOptional(opt_type_idx);
+
         // Check if non-null
-        const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, if_expr.span));
-        const is_non_null = try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, if_expr.span);
+        const is_non_null = if (is_compound_opt) blk: {
+            const opt_local = try fb.addLocalWithSize("__opt_ifx", opt_type_idx, false, 16);
+            _ = try fb.emitStoreLocal(opt_local, opt_val, if_expr.span);
+            const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, if_expr.span);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, if_expr.span);
+            break :blk try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, if_expr.span);
+        } else blk: {
+            const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, if_expr.span));
+            break :blk try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, if_expr.span);
+        };
 
         // Determine result type
         const result_type = self.inferExprType(if_expr.then_branch);
@@ -4356,10 +4740,12 @@ pub const Lowerer = struct {
         // Then block: unwrap and bind capture, evaluate then-branch
         fb.setBlock(then_block);
         const scope_depth = fb.markScopeEntry();
-        const opt_type_idx = self.inferExprType(if_expr.condition);
-        const opt_info = self.type_reg.get(opt_type_idx);
-        const elem_type = if (opt_info == .optional) opt_info.optional.elem else opt_type_idx;
-        const unwrapped = try fb.emitUnary(.optional_unwrap, opt_val, elem_type, if_expr.span);
+        const unwrapped = if (is_compound_opt) blk: {
+            const opt_local = fb.lookupLocal("__opt_ifx").?;
+            break :blk try fb.emitFieldLocal(opt_local, 1, 8, elem_type, if_expr.span);
+        } else blk: {
+            break :blk try fb.emitUnary(.optional_unwrap, opt_val, elem_type, if_expr.span);
+        };
         const capture_local = try fb.addLocalWithSize(if_expr.capture, elem_type, false, self.type_reg.sizeOf(elem_type));
         _ = try fb.emitStoreLocal(capture_local, unwrapped, if_expr.span);
         const then_val = try self.lowerExprNode(if_expr.then_branch);
@@ -4381,15 +4767,34 @@ pub const Lowerer = struct {
     }
 
     fn lowerSwitchExpr(self: *Lowerer, se: ast.SwitchExpr) Error!ir.NodeIndex {
-        const result_type = if (se.cases.len > 0) self.inferExprType(se.cases[0].body) else if (se.else_body != null_node) self.inferExprType(se.else_body) else TypeRegistry.VOID;
-        // Union switches with captures always use statement form (need block scoping for captures)
+        // Infer result type from the first case that produces a non-void type.
+        // Arms with early returns (e.g., `{ return expr }`) infer as VOID from the
+        // switch perspective, but other arms may produce values.
+        var result_type: TypeIndex = TypeRegistry.VOID;
+        for (se.cases) |case| {
+            const t = self.inferExprType(case.body);
+            if (t != TypeRegistry.VOID) { result_type = t; break; }
+        }
+        if (result_type == TypeRegistry.VOID and se.else_body != null_node) {
+            result_type = self.inferExprType(se.else_body);
+        }
         const subject_type = self.inferExprType(se.subject);
         const is_union = self.type_reg.get(subject_type) == .union_type;
-        if (result_type == TypeRegistry.VOID or (is_union and self.hasCapture(se))) return try self.lowerSwitchStatement(se);
+        // Union switches with captures use a dedicated handler that supports both
+        // statement form (void result) and expression form (value result).
+        if (is_union and self.hasCapture(se)) {
+            const ut = self.type_reg.get(subject_type).union_type;
+            return try self.lowerUnionSwitch(se, subject_type, ut, result_type);
+        }
+        if (result_type == TypeRegistry.VOID) return try self.lowerSwitchStatement(se);
         // Switch arms with calls must use block-based lowering (branches, not selects).
         // Select-based lowering eagerly evaluates ALL arm bodies — wrong for side effects.
         // Reference: Zig, Go, Cranelift all use conditional branches for switch.
         if (self.switchArmsHaveCalls(se)) return try self.lowerSwitchValueBlocks(se, result_type);
+        // Compound optionals can't use select (16-byte values) — force block path
+        const result_info = self.type_reg.get(result_type);
+        if (result_info == .optional and !self.isPtrLikeOptional(result_type))
+            return try self.lowerSwitchValueBlocks(se, result_type);
         return try self.lowerSwitchAsSelect(se, result_type);
     }
 
@@ -4448,7 +4853,7 @@ pub const Lowerer = struct {
         if (subject_info == .enum_type) self.current_switch_enum_type = subject_type;
         defer self.current_switch_enum_type = old_switch_enum;
 
-        if (is_union) return try self.lowerUnionSwitch(se, subject_type, subject_info.union_type);
+        if (is_union) return try self.lowerUnionSwitch(se, subject_type, subject_info.union_type, TypeRegistry.VOID);
 
         const subject = try self.lowerExprNode(se.subject);
         const merge_block = try fb.newBlock("switch.end");
@@ -4537,8 +4942,16 @@ pub const Lowerer = struct {
         return idx;
     }
 
-    fn lowerUnionSwitch(self: *Lowerer, se: ast.SwitchExpr, subject_type: TypeIndex, ut: types.UnionType) Error!ir.NodeIndex {
+    fn lowerUnionSwitch(self: *Lowerer, se: ast.SwitchExpr, subject_type: TypeIndex, ut: types.UnionType, result_type: TypeIndex) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
+        const is_expr = result_type != TypeRegistry.VOID;
+
+        // Allocate result local for expression form (same pattern as lowerSwitchValueBlocks)
+        var result_local: ir.LocalIdx = 0;
+        if (is_expr) {
+            const result_size = self.type_reg.sizeOf(result_type);
+            result_local = try fb.addLocalWithSize("__switch_result", result_type, true, result_size);
+        }
 
         // Store subject into a local so we can extract tag/payload via field offsets
         const subject_local = blk: {
@@ -4597,34 +5010,50 @@ pub const Lowerer = struct {
                 const capture_local = try fb.addLocalWithSize(case.capture, payload_type, false, payload_size);
 
                 // Copy payload from union (after 8-byte tag) to capture local.
-                // Use i64-chunk copy to handle nested structs, compound types (string),
-                // and any payload size correctly.
+                // Always use i64-chunk copy (Go pattern: field-by-field extraction via
+                // OpStructSelect + OffPtr + Load, never single-field special case).
+                // Using payload_type with emitFieldLocal returns a pointer for struct types
+                // (convertFieldLocal line 906), so we must use I64 chunks for all sizes.
                 const num_chunks = (payload_size + 7) / 8;
-                if (num_chunks <= 1) {
-                    const payload_val = try fb.emitFieldLocal(subject_local, 1, 8, payload_type, se.span);
-                    _ = try fb.emitStoreLocal(capture_local, payload_val, se.span);
-                } else {
-                    for (0..num_chunks) |ci| {
-                        const union_offset: i64 = 8 + @as(i64, @intCast(ci * 8));
-                        const cap_offset: i64 = @intCast(ci * 8);
-                        const chunk_val = try fb.emitFieldLocal(subject_local, @intCast(1 + ci), union_offset, TypeRegistry.I64, se.span);
-                        _ = try fb.emitStoreLocalField(capture_local, @intCast(ci), cap_offset, chunk_val, se.span);
-                    }
+                for (0..num_chunks) |ci| {
+                    const union_offset: i64 = 8 + @as(i64, @intCast(ci * 8));
+                    const cap_offset: i64 = @intCast(ci * 8);
+                    const chunk_val = try fb.emitFieldLocal(subject_local, @intCast(1 + ci), union_offset, TypeRegistry.I64, se.span);
+                    _ = try fb.emitStoreLocalField(capture_local, @intCast(ci), cap_offset, chunk_val, se.span);
                 }
 
-                if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
+                if (is_expr) {
+                    const case_val = try self.lowerExprNode(case.body);
+                    if (case_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+                    if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+                } else {
+                    if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
+                }
                 fb.restoreScope(scope_depth);
             } else {
-                if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
+                if (is_expr) {
+                    const case_val = try self.lowerExprNode(case.body);
+                    if (case_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+                    if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+                } else {
+                    if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
+                }
             }
 
             fb.setBlock(next_block);
         }
 
         if (se.else_body != null_node) {
-            if (!try self.lowerBlockNode(se.else_body)) _ = try fb.emitJump(merge_block, se.span);
+            if (is_expr) {
+                const else_val = try self.lowerExprNode(se.else_body);
+                if (else_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, else_val, se.span);
+                if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+            } else {
+                if (!try self.lowerBlockNode(se.else_body)) _ = try fb.emitJump(merge_block, se.span);
+            }
         }
         fb.setBlock(merge_block);
+        if (is_expr) return try fb.emitLoadLocal(result_local, result_type, se.span);
         return ir.null_node;
     }
 
@@ -4668,6 +5097,8 @@ pub const Lowerer = struct {
         // Result local: each arm stores its value here, merge block loads it
         const result_size = self.type_reg.sizeOf(result_type);
         const result_local = try fb.addLocalWithSize("__switch_result", result_type, true, result_size);
+        const result_type_info = self.type_reg.get(result_type);
+        const is_compound_opt = result_type_info == .optional and !self.isPtrLikeOptional(result_type);
 
         // String switch: pre-extract ptr/len
         const is_string_switch = subject_type == TypeRegistry.STRING;
@@ -4716,16 +5147,28 @@ pub const Lowerer = struct {
             if (case_cond != ir.null_node) _ = try fb.emitBranch(case_cond, case_block, next_block, se.span);
             fb.setBlock(case_block);
             const case_val = try self.lowerExprNode(case.body);
-            if (case_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
-            _ = try fb.emitJump(merge_block, se.span);
+            if (case_val != ir.null_node) {
+                if (is_compound_opt) {
+                    try self.storeCompoundOptArm(fb, result_local, case_val, case.body, se.span);
+                } else {
+                    _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+                }
+            }
+            if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
             fb.setBlock(next_block);
         }
 
         // Else arm
         if (se.else_body != null_node) {
             const else_val = try self.lowerExprNode(se.else_body);
-            if (else_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, else_val, se.span);
-            _ = try fb.emitJump(merge_block, se.span);
+            if (else_val != ir.null_node) {
+                if (is_compound_opt) {
+                    try self.storeCompoundOptArm(fb, result_local, else_val, se.else_body, se.span);
+                } else {
+                    _ = try fb.emitStoreLocal(result_local, else_val, se.span);
+                }
+            }
+            if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
         }
         fb.setBlock(merge_block);
         return try fb.emitLoadLocal(result_local, result_type, se.span);
@@ -4819,6 +5262,8 @@ pub const Lowerer = struct {
                         break :blk null;
                     },
                     .basic => |bk| bk.name(),
+                    // string is stored as slice(u8) — look up methods registered under "string"
+                    .slice => if (base_type_idx == TypeRegistry.STRING) "string" else null,
                     else => null,
                 };
                 if (type_name) |name| {
@@ -5322,49 +5767,54 @@ pub const Lowerer = struct {
         var args = std.ArrayListUnmanaged(ir.NodeIndex){};
         defer args.deinit(self.allocator);
 
-        const base_type_idx = self.inferExprType(fa.base);
-        const base_type = self.type_reg.get(base_type_idx);
+        // Static methods: no receiver, call directly with user args only
+        const receiver_offset: usize = if (method_info.is_static) 0 else 1;
 
-        // Prepare receiver
-        const receiver_val = blk: {
-            if (method_info.receiver_is_ptr) {
-                // WasmGC: struct refs are NOT memory pointers. Pass the ref directly.
-                // Reference: Kotlin/Dart WasmGC — method self is a struct ref, not address.
-                if (self.target.isWasmGC() and (base_type == .struct_type or
-                    (base_type == .pointer and self.type_reg.get(base_type.pointer.elem) == .struct_type)))
-                {
-                    break :blk try self.lowerExprNode(fa.base);
-                }
-                if (base_type == .pointer) {
-                    break :blk try self.lowerExprNode(fa.base);
-                } else {
-                    const base_node = self.tree.getNode(fa.base) orelse return ir.null_node;
-                    const base_expr = base_node.asExpr() orelse return ir.null_node;
-                    if (base_expr == .ident) {
-                        if (fb.lookupLocal(base_expr.ident.name)) |local_idx| {
-                            // Use pointer type so SSA builder doesn't decompose as struct value
-                            const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.I64;
-                            break :blk try fb.emitAddrLocal(local_idx, ptr_type, fa.span);
-                        }
-                        if (self.builder.lookupGlobal(base_expr.ident.name)) |g| {
-                            const ptr_type = self.type_reg.makePointer(base_type_idx) catch base_type_idx;
-                            break :blk try fb.emitAddrGlobal(g.idx, base_expr.ident.name, ptr_type, fa.span);
-                        }
+        if (!method_info.is_static) {
+            const base_type_idx = self.inferExprType(fa.base);
+            const base_type = self.type_reg.get(base_type_idx);
+
+            // Prepare receiver
+            const receiver_val = blk: {
+                if (method_info.receiver_is_ptr) {
+                    // WasmGC: struct refs are NOT memory pointers. Pass the ref directly.
+                    // Reference: Kotlin/Dart WasmGC — method self is a struct ref, not address.
+                    if (self.target.isWasmGC() and (base_type == .struct_type or
+                        (base_type == .pointer and self.type_reg.get(base_type.pointer.elem) == .struct_type)))
+                    {
+                        break :blk try self.lowerExprNode(fa.base);
                     }
-                    break :blk try self.lowerExprNode(fa.base);
-                }
-            } else {
-                if (base_type == .pointer) {
-                    const ptr_val = try self.lowerExprNode(fa.base);
-                    break :blk try fb.emitPtrLoadValue(ptr_val, base_type_idx, fa.span);
+                    if (base_type == .pointer) {
+                        break :blk try self.lowerExprNode(fa.base);
+                    } else {
+                        const base_node = self.tree.getNode(fa.base) orelse return ir.null_node;
+                        const base_expr = base_node.asExpr() orelse return ir.null_node;
+                        if (base_expr == .ident) {
+                            if (fb.lookupLocal(base_expr.ident.name)) |local_idx| {
+                                // Use pointer type so SSA builder doesn't decompose as struct value
+                                const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.I64;
+                                break :blk try fb.emitAddrLocal(local_idx, ptr_type, fa.span);
+                            }
+                            if (self.builder.lookupGlobal(base_expr.ident.name)) |g| {
+                                const ptr_type = self.type_reg.makePointer(base_type_idx) catch base_type_idx;
+                                break :blk try fb.emitAddrGlobal(g.idx, base_expr.ident.name, ptr_type, fa.span);
+                            }
+                        }
+                        break :blk try self.lowerExprNode(fa.base);
+                    }
                 } else {
-                    break :blk try self.lowerExprNode(fa.base);
+                    if (base_type == .pointer) {
+                        const ptr_val = try self.lowerExprNode(fa.base);
+                        break :blk try fb.emitPtrLoadValue(ptr_val, base_type_idx, fa.span);
+                    } else {
+                        break :blk try self.lowerExprNode(fa.base);
+                    }
                 }
-            }
-        };
+            };
 
-        if (receiver_val == ir.null_node) return ir.null_node;
-        try args.append(self.allocator, receiver_val);
+            if (receiver_val == ir.null_node) return ir.null_node;
+            try args.append(self.allocator, receiver_val);
+        }
 
         // Get param types for string->ptr coercion
         const func_type_for_params = self.type_reg.get(method_info.func_type);
@@ -5376,11 +5826,11 @@ pub const Lowerer = struct {
             const ast_expr = ast_node.asExpr() orelse continue;
             var arg_node: ir.NodeIndex = ir.null_node;
 
-            // Determine parameter type for ABI decomposition (offset by 1 for self)
+            // Determine parameter type for ABI decomposition (offset by 1 for self, 0 for static)
             var param_is_pointer = false;
             var param_is_compound = false; // slice or string — passed as (ptr, len)
             if (param_types) |params| {
-                const param_idx = arg_i + 1; // +1 for self receiver
+                const param_idx = arg_i + receiver_offset;
                 if (param_idx < params.len) {
                     const param_type = self.type_reg.get(params[param_idx].type_idx);
                     param_is_pointer = (param_type == .pointer);
@@ -5404,7 +5854,7 @@ pub const Lowerer = struct {
             // C#/TypeScript semantics: pass by reference, mutations visible to caller.
             if (self.chk.safe_mode and param_is_pointer) {
                 if (param_types) |params| {
-                    const param_idx = arg_i + 1; // +1 for self receiver
+                    const param_idx = arg_i + receiver_offset;
                     if (param_idx < params.len) {
                         const param_info = self.type_reg.get(params[param_idx].type_idx);
                         if (param_info == .pointer) {
@@ -5454,7 +5904,7 @@ pub const Lowerer = struct {
                 // Decompose large compound args (struct/union/tuple > 8 bytes)
                 var is_large_compound = false;
                 if (param_types) |params| {
-                    const param_idx = arg_i + 1; // +1 for self receiver
+                    const param_idx = arg_i + receiver_offset;
                     if (param_idx < params.len) {
                         const pt = self.type_reg.get(params[param_idx].type_idx);
                         const ps = self.type_reg.sizeOf(params[param_idx].type_idx);
@@ -5462,7 +5912,7 @@ pub const Lowerer = struct {
                     }
                 }
                 if (is_large_compound) {
-                    const param_idx = arg_i + 1;
+                    const param_idx = arg_i + receiver_offset;
                     const param_type_idx = param_types.?[param_idx].type_idx;
                     const param_size = self.type_reg.sizeOf(param_type_idx);
                     const num_slots: u32 = @intCast((param_size + 7) / 8);

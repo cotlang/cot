@@ -266,6 +266,48 @@ impl List(T) {
 }
 ```
 
+### Static Methods
+
+Methods declared with `static fn` have no receiver (`self`). Called as `Type.method()`.
+
+```cot
+impl Counter {
+    static fn create(initial: int) Counter {
+        return Counter { .value = initial }
+    }
+
+    static fn zero() Counter {
+        return Counter { .value = 0 }
+    }
+
+    fn getValue(self: *Counter) int {
+        return self.value
+    }
+}
+
+var c = Counter.create(42)   // static call — no receiver
+c.getValue()                 // instance call — c is receiver
+```
+
+In `@safe` mode, `static fn` skips the implicit self injection that normal `fn` gets.
+
+### Associated Constants
+
+`const` declarations inside `impl` blocks. Accessed as `Type.CONSTANT`.
+
+```cot
+impl TypeRegistry {
+    const BOOL: int = 1
+    const I64: int = 5
+    const STRING: int = 17
+
+    fn get(idx: int) Type { ... }
+}
+
+@assertEq(TypeRegistry.BOOL, 1)
+@assertEq(TypeRegistry.STRING, 17)
+```
+
 ## Traits
 
 ```cot

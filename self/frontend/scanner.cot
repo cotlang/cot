@@ -21,22 +21,22 @@ struct Scanner {
     interp_brace_depth: int,
 }
 
-/// Create a new scanner for the given source content.
-fn scannerInit(content: string) Scanner {
-    var s = Scanner {
-        content: content,
-        pos: 0,
-        ch: null,
-        in_interp_string: false,
-        interp_brace_depth: 0,
-    }
-    if (@lenOf(content) > 0) {
-        s.ch = charAt(content, 0)
-    }
-    return s
-}
-
 impl Scanner {
+    /// Create a new scanner for the given source content.
+    static fn init(content: string) Scanner {
+        var s = Scanner {
+            content: content,
+            pos: 0,
+            ch: null,
+            in_interp_string: false,
+            interp_brace_depth: 0,
+        }
+        if (@lenOf(content) > 0) {
+            s.ch = charAt(content, 0)
+        }
+        return s
+    }
+
     /// Advance one byte forward.
     fn advance() void {
         self.pos = self.pos + 1
@@ -582,7 +582,7 @@ fn expectText(s: *Scanner, expected_text: string) void {
 // ============================================================================
 
 test "scanner basics" {
-    var s = scannerInit("fn main() { return 42 }")
+    var s = Scanner.init("fn main() { return 42 }")
     expectTok(s, @intFromEnum(Token.kw_fn))
     expectTokText(s, @intFromEnum(Token.ident), "main")
     expectTok(s, @intFromEnum(Token.lparen))
@@ -595,7 +595,7 @@ test "scanner basics" {
 }
 
 test "scanner operators" {
-    var s = scannerInit("== != <= >= << >> .* .? ?. orelse")
+    var s = Scanner.init("== != <= >= << >> .* .? ?. orelse")
     expectTok(s, @intFromEnum(Token.eql))
     expectTok(s, @intFromEnum(Token.neq))
     expectTok(s, @intFromEnum(Token.leq))
@@ -609,12 +609,12 @@ test "scanner operators" {
 }
 
 test "scanner strings" {
-    var s = scannerInit("\"hello world\"")
+    var s = Scanner.init("\"hello world\"")
     expectTokText(s, @intFromEnum(Token.string_lit), "\"hello world\"")
 }
 
 test "scanner numbers" {
-    var s = scannerInit("42 3.14 0xFF 0b1010 0o777 1_000_000")
+    var s = Scanner.init("42 3.14 0xFF 0b1010 0o777 1_000_000")
     expectTokText(s, @intFromEnum(Token.int_lit), "42")
     expectTokText(s, @intFromEnum(Token.float_lit), "3.14")
     expectText(s, "0xFF")
@@ -624,14 +624,14 @@ test "scanner numbers" {
 }
 
 test "scanner comments" {
-    var s = scannerInit("// line comment\nx /* block */ y")
+    var s = Scanner.init("// line comment\nx /* block */ y")
     expectTokText(s, @intFromEnum(Token.ident), "x")
     expectText(s, "y")
     expectTok(s, @intFromEnum(Token.eof))
 }
 
 test "scanner keywords" {
-    var s = scannerInit("fn var const if else while for return")
+    var s = Scanner.init("fn var const if else while for return")
     expectTok(s, @intFromEnum(Token.kw_fn))
     expectTok(s, @intFromEnum(Token.kw_var))
     expectTok(s, @intFromEnum(Token.kw_const))
@@ -643,7 +643,7 @@ test "scanner keywords" {
 }
 
 test "scanner type keywords" {
-    var s = scannerInit("int float bool string i64 u8")
+    var s = Scanner.init("int float bool string i64 u8")
     expectTok(s, @intFromEnum(Token.kw_int))
     expectTok(s, @intFromEnum(Token.kw_float))
     expectTok(s, @intFromEnum(Token.kw_bool))
@@ -653,13 +653,13 @@ test "scanner type keywords" {
 }
 
 test "scanner char literals" {
-    var s = scannerInit("'a' '\\n'")
+    var s = Scanner.init("'a' '\\n'")
     expectTokText(s, @intFromEnum(Token.char_lit), "'a'")
     expectTok(s, @intFromEnum(Token.char_lit))
 }
 
 test "scanner compound assignment" {
-    var s = scannerInit("+= -= *= /= %= &= |= ^=")
+    var s = Scanner.init("+= -= *= /= %= &= |= ^=")
     expectTok(s, @intFromEnum(Token.add_assign))
     expectTok(s, @intFromEnum(Token.sub_assign))
     expectTok(s, @intFromEnum(Token.mul_assign))
@@ -671,24 +671,24 @@ test "scanner compound assignment" {
 }
 
 test "scanner arrows" {
-    var s = scannerInit("-> =>")
+    var s = Scanner.init("-> =>")
     expectTok(s, @intFromEnum(Token.arrow))
     expectTok(s, @intFromEnum(Token.fat_arrow))
 }
 
 test "scanner doc comment" {
-    var s = scannerInit("/// hello world\nx")
+    var s = Scanner.init("/// hello world\nx")
     expectTokText(s, @intFromEnum(Token.doc_comment), "hello world")
     expectTokText(s, @intFromEnum(Token.ident), "x")
 }
 
 test "scanner empty input" {
-    var s = scannerInit("")
+    var s = Scanner.init("")
     expectTok(s, @intFromEnum(Token.eof))
 }
 
 test "scanner logical operators" {
-    var s = scannerInit("&& || ! & |")
+    var s = Scanner.init("&& || ! & |")
     expectTok(s, @intFromEnum(Token.land))
     expectTok(s, @intFromEnum(Token.lor))
     expectTok(s, @intFromEnum(Token.lnot))
@@ -697,7 +697,7 @@ test "scanner logical operators" {
 }
 
 test "scanner comparison operators" {
-    var s = scannerInit("< > = . ?")
+    var s = Scanner.init("< > = . ?")
     expectTok(s, @intFromEnum(Token.lss))
     expectTok(s, @intFromEnum(Token.gtr))
     expectTok(s, @intFromEnum(Token.assign))
@@ -706,7 +706,7 @@ test "scanner comparison operators" {
 }
 
 test "scanner full statement" {
-    var s = scannerInit("var x = 42 + y")
+    var s = Scanner.init("var x = 42 + y")
     expectTok(s, @intFromEnum(Token.kw_var))
     expectTokText(s, @intFromEnum(Token.ident), "x")
     expectTok(s, @intFromEnum(Token.assign))
@@ -717,14 +717,14 @@ test "scanner full statement" {
 }
 
 test "scanner quoted identifier" {
-    var s = scannerInit("@\"or\" @\"and\"")
+    var s = Scanner.init("@\"or\" @\"and\"")
     expectTokText(s, @intFromEnum(Token.ident), "or")
     expectTokText(s, @intFromEnum(Token.ident), "and")
     expectTok(s, @intFromEnum(Token.eof))
 }
 
 test "scanner concat operator" {
-    var s = scannerInit("a ++ b")
+    var s = Scanner.init("a ++ b")
     expectTokText(s, @intFromEnum(Token.ident), "a")
     expectTok(s, @intFromEnum(Token.concat))
     expectTokText(s, @intFromEnum(Token.ident), "b")

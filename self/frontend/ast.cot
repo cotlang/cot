@@ -129,40 +129,40 @@ struct Ast {
     safe_mode: bool,
 }
 
-/// Create a new empty AST for a file.
-fn astInit(filename: string) Ast {
-    var tags: List(int) = undefined
-    tags.items = 0
-    tags.count = 0
-    tags.capacity = 0
-    var offsets: List(int) = undefined
-    offsets.items = 0
-    offsets.count = 0
-    offsets.capacity = 0
-    var data_list: List(int) = undefined
-    data_list.items = 0
-    data_list.count = 0
-    data_list.capacity = 0
-    var strings: List(string) = undefined
-    strings.items = 0
-    strings.count = 0
-    strings.capacity = 0
-    var file_decls: List(int) = undefined
-    file_decls.items = 0
-    file_decls.count = 0
-    file_decls.capacity = 0
-    return Ast {
-        tags: tags,
-        offsets: offsets,
-        data: data_list,
-        strings: strings,
-        file_decls: file_decls,
-        filename: filename,
-        safe_mode: false,
-    }
-}
-
 impl Ast {
+    /// Create a new empty AST for a file.
+    static fn init(filename: string) Ast {
+        var tags: List(int) = undefined
+        tags.items = 0
+        tags.count = 0
+        tags.capacity = 0
+        var offsets: List(int) = undefined
+        offsets.items = 0
+        offsets.count = 0
+        offsets.capacity = 0
+        var data_list: List(int) = undefined
+        data_list.items = 0
+        data_list.count = 0
+        data_list.capacity = 0
+        var strings: List(string) = undefined
+        strings.items = 0
+        strings.count = 0
+        strings.capacity = 0
+        var file_decls: List(int) = undefined
+        file_decls.items = 0
+        file_decls.count = 0
+        file_decls.capacity = 0
+        return Ast {
+            tags: tags,
+            offsets: offsets,
+            data: data_list,
+            strings: strings,
+            file_decls: file_decls,
+            filename: filename,
+            safe_mode: false,
+        }
+    }
+
     // ---- Core methods ----
 
     /// Start a new node. Returns node index. Call addData() to append fields.
@@ -1183,14 +1183,14 @@ test "BuiltinKind quoted identifiers" {
 }
 
 test "Ast init" {
-    var ast = astInit("test.cot")
+    var ast = Ast.init("test.cot")
     @assertEq(ast.nodeCount(), 0)
     @assertEq(ast.filename, "test.cot")
     @assertEq(ast.safe_mode, false)
 }
 
 test "Ast addIdent" {
-    var ast = astInit("test.cot")
+    var ast = Ast.init("test.cot")
     const s = Span { start: 5, end: 8 }
     const idx = ast.addIdent("foo", s)
     @assertEq(idx, 0)
@@ -1203,7 +1203,7 @@ test "Ast addIdent" {
 }
 
 test "Ast addBinary" {
-    var ast = astInit("test.cot")
+    var ast = Ast.init("test.cot")
     const s = Span { start: 0, end: 5 }
     const left = ast.addIdent("a", s)
     const right = ast.addIdent("b", s)
@@ -1216,7 +1216,7 @@ test "Ast addBinary" {
 }
 
 test "Ast addCallNode" {
-    var ast = astInit("test.cot")
+    var ast = Ast.init("test.cot")
     const s = Span { start: 0, end: 10 }
     const callee = ast.addIdent("foo", s)
     const arg0 = ast.addLiteral(0, "1", s)
@@ -1237,7 +1237,7 @@ test "Ast addCallNode" {
 }
 
 test "Ast addFnDecl" {
-    var ast = astInit("test.cot")
+    var ast = Ast.init("test.cot")
     const s = Span { start: 0, end: 20 }
     var params: List(int) = undefined
     params.items = 0
@@ -1257,7 +1257,7 @@ test "Ast addFnDecl" {
 }
 
 test "Ast addImportDecl" {
-    var ast = astInit("test.cot")
+    var ast = Ast.init("test.cot")
     const s = Span { start: 0, end: 15 }
     const idx = ast.addImportDecl("std/list", s)
     @assertEq(ast.getTag(idx), @intFromEnum(NodeTag.import_decl))
@@ -1267,7 +1267,7 @@ test "Ast addImportDecl" {
 }
 
 test "Ast addBlockStmt" {
-    var ast = astInit("test.cot")
+    var ast = Ast.init("test.cot")
     const s = Span { start: 0, end: 10 }
     const s0 = ast.addReturnStmt(null_node, s)
     const s1 = ast.addExprStmt(0, s)
@@ -1285,7 +1285,7 @@ test "Ast addBlockStmt" {
 }
 
 test "Ast file_decls" {
-    var ast = astInit("main.cot")
+    var ast = Ast.init("main.cot")
     const s = Span { start: 0, end: 10 }
     const imp = ast.addImportDecl("std/list", s)
     const test_n = ast.addTestDecl("basic", null_node, s)

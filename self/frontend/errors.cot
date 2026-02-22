@@ -71,17 +71,17 @@ struct ErrorReporter {
     first_offset: int,
 }
 
-/// Create a fresh reporter with no errors.
-fn reporterInit() ErrorReporter {
-    return ErrorReporter {
-        count: 0,
-        first_msg: "",
-        first_code: ErrorCode.e100,
-        first_offset: 0,
-    }
-}
-
 impl ErrorReporter {
+    /// Create a fresh reporter with no errors.
+    static fn init() ErrorReporter {
+        return ErrorReporter {
+            count: 0,
+            first_msg: "",
+            first_code: ErrorCode.e100,
+            first_offset: 0,
+        }
+    }
+
     /// Record an error.
     fn report(offset: int, code: ErrorCode, msg: string) void {
         if (self.count == 0) {
@@ -148,13 +148,13 @@ test "error code descriptions" {
 }
 
 test "reporter init" {
-    var r = reporterInit()
+    var r = ErrorReporter.init()
     @assertEq(r.hasErrors(), false)
     @assertEq(r.errorCount(), 0)
 }
 
 test "report single error" {
-    var r = reporterInit()
+    var r = ErrorReporter.init()
     r.report(10, ErrorCode.e100, "unterminated string")
     @assertEq(r.hasErrors(), true)
     @assertEq(r.errorCount(), 1)
@@ -164,7 +164,7 @@ test "report single error" {
 }
 
 test "report multiple errors" {
-    var r = reporterInit()
+    var r = ErrorReporter.init()
     r.report(0, ErrorCode.e200, "error 1")
     r.report(5, ErrorCode.e201, "error 2")
     r.report(10, ErrorCode.e300, "error 3")

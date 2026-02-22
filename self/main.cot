@@ -63,10 +63,10 @@ fn main() void {
 
 /// Parse a file and report syntax errors.
 fn cmdParse(path: string, content: string) void {
-    var s = scannerInit(content)
-    var ast = astInit(path)
-    var errs = reporterInit()
-    var p = parserInit(s, ast, errs)
+    var s = Scanner.init(content)
+    var ast = Ast.init(path)
+    var errs = ErrorReporter.init()
+    var p = Parser.init(s, ast, errs)
     p.parseFile()
 
     if (errs.hasErrors()) {
@@ -86,7 +86,7 @@ fn cmdParse(path: string, content: string) void {
 
 /// Tokenize a file and print each token.
 fn cmdLex(path: string, content: string) void {
-    var s = scannerInit(content)
+    var s = Scanner.init(content)
     while (true) {
         const t = s.scanNext()
         const tok = @as(Token, @enumFromInt(t.tok))
@@ -155,20 +155,20 @@ test "offsetToLineCol third line" {
 }
 
 test "parse valid source" {
-    var s = scannerInit("const x = 42")
-    var ast = astInit("test.cot")
-    var errs = reporterInit()
-    var p = parserInit(s, ast, errs)
+    var s = Scanner.init("const x = 42")
+    var ast = Ast.init("test.cot")
+    var errs = ErrorReporter.init()
+    var p = Parser.init(s, ast, errs)
     p.parseFile()
     @assertEq(errs.hasErrors(), false)
     @assertEq(ast.file_decls.len(), 1)
 }
 
 test "parse reports errors" {
-    var s = scannerInit("fn { }")
-    var ast = astInit("test.cot")
-    var errs = reporterInit()
-    var p = parserInit(s, ast, errs)
+    var s = Scanner.init("fn { }")
+    var ast = Ast.init("test.cot")
+    var errs = ErrorReporter.init()
+    var p = Parser.init(s, ast, errs)
     p.parseFile()
     @assertEq(errs.hasErrors(), true)
 }

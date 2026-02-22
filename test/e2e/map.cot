@@ -411,3 +411,148 @@ test "map_putAll_overwrite" {
     m1.free()
     m2.free()
 }
+
+// ===== getOrNull =====
+
+test "map_getOrNull_existing" {
+    var m: Map(i64, i64) = .{}
+    m.set(1, 100)
+    m.set(2, 200)
+    if (m.getOrNull(1)) |val| {
+        @assertEq(val, 100)
+    } else {
+        @assert(false)
+    }
+    if (m.getOrNull(2)) |val| {
+        @assertEq(val, 200)
+    } else {
+        @assert(false)
+    }
+    m.free()
+}
+
+test "map_getOrNull_missing" {
+    var m: Map(i64, i64) = .{}
+    m.set(1, 100)
+    var result = m.getOrNull(999)
+    @assertEq(result == null, true)
+    m.free()
+}
+
+test "map_getOrNull_empty" {
+    var m: Map(i64, i64) = .{}
+    var result = m.getOrNull(1)
+    @assertEq(result == null, true)
+    m.free()
+}
+
+test "map_getOrNull_after_delete" {
+    var m: Map(i64, i64) = .{}
+    m.set(1, 100)
+    m.set(2, 200)
+    m.delete(1)
+    var result = m.getOrNull(1)
+    @assertEq(result == null, true)
+    if (m.getOrNull(2)) |val| {
+        @assertEq(val, 200)
+    } else {
+        @assert(false)
+    }
+    m.free()
+}
+
+// ===== remove =====
+
+test "map_remove_existing" {
+    var m: Map(i64, i64) = .{}
+    m.set(1, 100)
+    m.set(2, 200)
+    if (m.remove(1)) |val| {
+        @assertEq(val, 100)
+    } else {
+        @assert(false)
+    }
+    @assertEq(m.len(), 1)
+    @assertEq(m.has(1), 0)
+    @assertEq(m.get(2), 200)
+    m.free()
+}
+
+test "map_remove_missing" {
+    var m: Map(i64, i64) = .{}
+    m.set(1, 100)
+    var result = m.remove(999)
+    @assertEq(result == null, true)
+    @assertEq(m.len(), 1)
+    m.free()
+}
+
+test "map_remove_empty" {
+    var m: Map(i64, i64) = .{}
+    var result = m.remove(1)
+    @assertEq(result == null, true)
+    @assertEq(m.len(), 0)
+    m.free()
+}
+
+test "map_remove_reinsert" {
+    var m: Map(i64, i64) = .{}
+    m.set(1, 100)
+    var old = m.remove(1)
+    @assertEq(old == null, false)
+    m.set(1, 999)
+    @assertEq(m.get(1), 999)
+    @assertEq(m.len(), 1)
+    m.free()
+}
+
+// ===== ensureTotalCapacity =====
+
+test "map_ensureTotalCapacity" {
+    var m: Map(i64, i64) = .{}
+    m.ensureTotalCapacity(100)
+    // Should have pre-allocated enough capacity
+    @assert(m.capacity >= 100)
+    // Data operations still work
+    var i: i64 = 0
+    while (i < 50) {
+        m.set(i, i * 10)
+        i += 1
+    }
+    @assertEq(m.len(), 50)
+    @assertEq(m.get(25), 250)
+    m.free()
+}
+
+test "map_ensureTotalCapacity_zero" {
+    var m: Map(i64, i64) = .{}
+    m.ensureTotalCapacity(0)
+    @assertEq(m.capacity, 0)
+    m.free()
+}
+
+// ===== contains =====
+
+test "map_contains_bool" {
+    var m: Map(i64, i64) = .{}
+    m.set(42, 99)
+    @assertEq(m.contains(42), true)
+    @assertEq(m.contains(99), false)
+    m.free()
+}
+
+test "map_contains_empty" {
+    var m: Map(i64, i64) = .{}
+    @assertEq(m.contains(1), false)
+    m.free()
+}
+
+test "map_contains_after_delete" {
+    var m: Map(i64, i64) = .{}
+    m.set(1, 10)
+    m.set(2, 20)
+    m.delete(1)
+    @assertEq(m.contains(1), false)
+    @assertEq(m.contains(2), true)
+    m.free()
+}

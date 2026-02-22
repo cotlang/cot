@@ -17,7 +17,7 @@ These Zig features have direct Cot equivalents:
 |---|---|---|
 | Structs + methods (`self: *T`) | Same | 1000+ |
 | Tagged unions (`union(enum)`) + switch captures | `union` + switch | 3750+ |
-| Optionals `?T` + `if (opt) \|val\|` | Same | 400+ |
+| Optionals `?T` + `if (opt) \|val\|` | Same (compound tag+payload) | 400+ |
 | Error unions `!T` + `try`/`catch` | Same | 2000+ |
 | `defer` / `errdefer` | Same | 500+ |
 | Generics (monomorphization) | Same | Heavy |
@@ -37,6 +37,8 @@ These Zig features have direct Cot equivalents:
 | `for i, item in collection` | Same | 200+ |
 | `noreturn` type | Same | Functions that trap |
 | Default struct field values | Same (fully wired: parser → checker → lowerer) | 100+ structs |
+| Static methods (`static fn` in impl) | Same as Zig's `pub fn init()` without self | 50+ |
+| Associated constants (`const` in impl) | Same as Zig's namespace constants | 22+ |
 | `??` nullish coalesce | Same as Zig's `orelse` | 150+ |
 | `@trap()` | Same as Zig's `unreachable` | 50+ |
 | `@fmin`, `@fmax` | Same (float) | 30+ |
@@ -976,3 +978,61 @@ Re-audited Feb 18, 2026. **All 7 features now implemented.**
 | Tier 4: Type System | 2 features | 1/2 VERIFIED, 1 NOT IMPLEMENTED (overflow detection removed) |
 | Tier 5: Self-hosting blockers | 7 features | **7/7 DONE** |
 | **Total** | **34 features** | **30 VERIFIED, 3 PARTIAL, 1 NOT IMPLEMENTED** |
+
+---
+
+## Optional Compound Representation — Follow-Up Tasks (Feb 22, 2026)
+
+The optional type representation was changed from single-value (`null = 0`) to compound tag+payload (`[tag:i64][payload:i64]` = 16 bytes) for non-pointer-like optionals. Pointer-like optionals (`?*T`) retain `null = 0` sentinel.
+
+### Completed
+
+| Change | Files | Status |
+|--------|-------|--------|
+| `isPtrLikeOptional` helper | lower.zig | Done |
+| `needsSret` for compound optionals | lower.zig | Done |
+| `lowerReturn` SRET optional path | lower.zig | Done |
+| `lowerIfOptional` compound unwrap | lower.zig | Done |
+| `lowerIfOptionalExpr` compound unwrap | lower.zig | Done |
+| `lowerWhileOptional` compound unwrap | lower.zig | Done |
+| Orelse handler compound path | lower.zig | Done |
+| `?` unwrap compound path | lower.zig | Done |
+| Null comparison (`== null`, `!= null`, `== value`) | lower.zig | Done |
+| `lowerLocalVarDecl` T→?T wrapping | lower.zig | Done |
+| `lowerAssign` T→?T wrapping | lower.zig | Done |
+| `lowerStructInit` compound optional fields | lower.zig | Done |
+| `lowerFieldAssign` compound optional fields (ptr/local/nested) | lower.zig | Done |
+| `lowerSwitchExpr` force block path for compound opt results | lower.zig | Done |
+| `lowerSwitchValueBlocks` arm value wrapping | lower.zig | Done |
+| `convertLoadLocal` return address for compound opt | ssa_builder.zig | Done |
+| `convertStoreLocal` compound opt OpMove | ssa_builder.zig | Done |
+| `convertFieldLocal` return address for compound opt fields | ssa_builder.zig | Done |
+| `convertFieldValue` return address for compound opt fields | ssa_builder.zig | Done |
+| New helper: `storeCompoundOptArm` | lower.zig | Done |
+| New helper: `storeCompoundOptField` | lower.zig | Done |
+| New helper: `storeCompoundOptFieldPtr` | lower.zig | Done |
+| E2E tests: optional zero, local null, assign, orelse | features.cot | Done |
+
+### Follow-Up Tasks (Not in this PR)
+
+#### P1 — Should fix before 0.4
+
+1. **`var val: T = opt orelse fallback` store corruption** — When `x orelse 99` (null case) result is stored to a typed local via `var val: i64 = ...`, `@assertEq` comparison produces garbage. Direct use `@assert((x orelse 99) == 99)` works correctly. Root cause: possible type inference mismatch between checker (returns `?T` for orelse) and lowerer (expects `T`). The checker's orelse rule at `checker.zig:1643` correctly returns `optional.elem`, but the actual `expr_types` cache entry may store `?T` from the binary node's overall type. Need to investigate `checkBinary` orelse caching.
+
+2. **If-expressions returning `?T` need block-based path** — `lowerIfExpr` uses `emitSelect` which can't handle 16-byte compound values. When `if (cond) someInt else null` produces `?T`, needs block-based lowering like switch expressions. Not triggered by current self-hosted code, but will break user code.
+
+3. **Re-add `parseFloatOrNull` to `stdlib/string.cot`** — Now that `?f64` works with compound representation, the `parseFloatOrNull(s: string) ?f64` function should work correctly. Was previously removed because `?f64` crashed (type mismatch — payload is f64 but machinery assumed i64).
+
+#### P2 — Nice to have
+
+4. **Optional function parameters** — When a function takes `?T` parameter, the compound needs to be passed correctly at call sites. Currently untested. The SRET machinery handles return values, but compound optional parameters may need decomposition at the caller and reconstruction at the callee.
+
+5. **`?bool` sentinel optimization** — Zig uses 2 as sentinel for `?bool` (since bool only uses 0/1). We use full 16-byte compound for `?bool` which is wasteful but correct. Low priority.
+
+6. **Nested optional `??T`** — Double-optional would be `[tag:i64][inner_tag:i64][payload:i64]` = 24 bytes. Not currently needed but should work with the compound approach.
+
+#### Pre-existing bugs (unrelated to optionals)
+
+7. **Quoted identifier enum variant access** — `@intFromEnum(BuiltinKind.@"string"))` evaluates to 0 instead of 36 at runtime. Self-hosted test "BuiltinKind quoted identifiers" fails. Likely a lowerer issue with `@"..."` syntax in member/field access paths.
+
+8. **Self-hosted wasm duplicate export** — `cot test self/main.cot --target=wasm32` fails with "duplicate export name" error. Pre-existing multi-file wasm compilation issue with `lowered_generics`.

@@ -37,33 +37,33 @@ struct Parser {
     pending_doc: string,
 }
 
-/// Create a new parser. Caller must call advance() once before parsing.
-fn parserInit(scanner: *Scanner, ast: *Ast, errors: *ErrorReporter) Parser {
-    var p = Parser {
-        scanner: scanner,
-        ast: ast,
-        errors: errors,
-        tok: 0,
-        tok_text: "",
-        tok_start: 0,
-        tok_end: 0,
-        peek_tok: 0,
-        peek_text: "",
-        peek_start: 0,
-        peek_end: 0,
-        has_peek: false,
-        safe_mode: false,
-        current_impl_type: "",
-        current_impl_is_generic: false,
-        nest_level: 0,
-        pending_doc: "",
-    }
-    // Prime the first token
-    p.advance()
-    return p
-}
-
 impl Parser {
+    /// Create a new parser. Primes the first token automatically.
+    static fn init(scanner: *Scanner, ast: *Ast, errors: *ErrorReporter) Parser {
+        var p = Parser {
+            scanner: scanner,
+            ast: ast,
+            errors: errors,
+            tok: 0,
+            tok_text: "",
+            tok_start: 0,
+            tok_end: 0,
+            peek_tok: 0,
+            peek_text: "",
+            peek_start: 0,
+            peek_end: 0,
+            has_peek: false,
+            safe_mode: false,
+            current_impl_type: "",
+            current_impl_is_generic: false,
+            nest_level: 0,
+            pending_doc: "",
+        }
+        // Prime the first token
+        p.advance()
+        return p
+    }
+
 
     // ================================================================
     // Core navigation helpers
@@ -2229,10 +2229,10 @@ impl Parser {
 
 test "parser init" {
     const src = "const x = 42"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     @assertEq(errors.hasErrors(), false)
     // Verify first token was loaded
     @assertEq(p.tok, @intFromEnum(Token.kw_const))
@@ -2240,10 +2240,10 @@ test "parser init" {
 
 test "parse import" {
     const src = "import \"std/list\""
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2252,10 +2252,10 @@ test "parse import" {
 
 test "parse const decl" {
     const src = "const x = 42"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2264,10 +2264,10 @@ test "parse const decl" {
 
 test "parse fn decl" {
     const src = "fn main() void { return }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2276,10 +2276,10 @@ test "parse fn decl" {
 
 test "parse test decl" {
     const src = "test \"basic\" { @assertEq(1, 1) }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2288,10 +2288,10 @@ test "parse test decl" {
 
 test "parse struct decl" {
     const src = "struct Point { x: int, y: int }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2300,10 +2300,10 @@ test "parse struct decl" {
 
 test "parse multiple decls" {
     const src = "import \"std/list\"\nconst x = 1\nfn foo() void { }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 3)
@@ -2311,10 +2311,10 @@ test "parse multiple decls" {
 
 test "parse binary expr" {
     const src = "const x = 1 + 2 * 3"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2322,30 +2322,30 @@ test "parse binary expr" {
 
 test "parse if stmt" {
     const src = "fn f() void { if (x > 0) { return x } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
 
 test "parse while stmt" {
     const src = "fn f() void { while (true) { break } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
 
 test "parse for stmt" {
     const src = "fn f() void { for i in 0..10 { } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
@@ -2356,20 +2356,20 @@ test "parse for stmt" {
 
 test "parse builtin call" {
     const src = "fn f() void { @assertEq(1, 2) }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
 
 test "parse closure expr" {
     const src = "const f = fn(x: int) int { return x * 2 }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2377,20 +2377,20 @@ test "parse closure expr" {
 
 test "parse struct init" {
     const src = "fn f() void { const p = Point { .x = 1, .y = 2 } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
 
 test "parse anon struct literal" {
     const src = "fn f() void { const p = .{ .x = 1, .y = 2 } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
@@ -2401,10 +2401,10 @@ test "parse anon struct literal" {
 
 test "parse enum decl" {
     const src = "const Color = enum { red, green, blue }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2413,10 +2413,10 @@ test "parse enum decl" {
 
 test "parse enum with backing type" {
     const src = "const Flags = enum(u8) { a = 1, b = 2, c = 4 }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2425,10 +2425,10 @@ test "parse enum with backing type" {
 
 test "parse error set decl" {
     const src = "const FileError = error { NotFound, PermissionDenied, IoError }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2437,10 +2437,10 @@ test "parse error set decl" {
 
 test "parse union decl" {
     const src = "const Value = union { int_val: int, str_val: string }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2449,10 +2449,10 @@ test "parse union decl" {
 
 test "parse inline struct decl" {
     const src = "const Pair = struct { a: int, b: int }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 1)
@@ -2462,10 +2462,10 @@ test "parse inline struct decl" {
 test "parse const non-type backtrack" {
     // const x = regular_expr must backtrack when '=' is not followed by a type keyword
     const src = "const x = 42\nconst y = x + 1"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 2)
@@ -2475,30 +2475,30 @@ test "parse const non-type backtrack" {
 
 test "parse labeled while" {
     const src = "fn f() void { outer: while (true) { break } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
 
 test "parse labeled for" {
     const src = "fn f() void { outer: for i in 0..10 { break } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
 }
 
 test "parse fn type simple" {
     const src = "const f: fn(int) -> int = null"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2506,10 +2506,10 @@ test "parse fn type simple" {
 
 test "parse fn type as param" {
     const src = "fn apply(f: fn(int) -> int, x: int) int { return f(x) }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2517,10 +2517,10 @@ test "parse fn type as param" {
 
 test "parse mixed inline types" {
     const src = "const Color = enum { red }\nconst E = error { Fail }\nconst x = 42"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.hasErrors(), false)
     @assertEq(ast.file_decls.count, 3)
@@ -2531,10 +2531,10 @@ test "parse mixed inline types" {
 
 test "parse impl block with param" {
     const src = "impl Foo { fn bar(x: int) int { return 0 } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2543,10 +2543,10 @@ test "parse impl block with param" {
 
 test "parse generic fn" {
     const src = "fn max(T)(a: T, b: T) T { return a }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2555,10 +2555,10 @@ test "parse generic fn" {
 
 test "parse generic impl block" {
     const src = "impl List(T) { fn push(val: T) void { return } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2567,10 +2567,10 @@ test "parse generic impl block" {
 
 test "parse impl trait for type" {
     const src = "impl Display for Point { fn toString(s: *Point) string { return \"\" } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2579,10 +2579,10 @@ test "parse impl trait for type" {
 
 test "parse where clause" {
     const src = "fn sort(T)(list: *T) void where T: Ord { return }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2591,10 +2591,10 @@ test "parse where clause" {
 
 test "parse where clause multi" {
     const src = "fn combine(T, U)(a: T, b: U) int where T: Display, U: Clone { return 0 }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2603,10 +2603,10 @@ test "parse where clause multi" {
 
 test "parse switch range pattern" {
     const src = "fn f(x: int) int { return switch (x) { 1..5 => 1, else => 0 } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2614,10 +2614,10 @@ test "parse switch range pattern" {
 
 test "parse switch guard" {
     const src = "fn f(x: int) int { return switch (x) { 1 if x > 0 => 1, else => 0 } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2625,10 +2625,10 @@ test "parse switch guard" {
 
 test "parse switch wildcard" {
     const src = "fn f(x: int) int { return switch (x) { 1 => 10, _ => 0 } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
@@ -2636,10 +2636,10 @@ test "parse switch wildcard" {
 
 test "parse generic impl trait" {
     const src = "impl Iterable(T) for List { fn next(s: *List) int { return 0 } }"
-    var s = scannerInit(src)
-    var ast = astInit("test.cot")
-    var errors = reporterInit()
-    var p = parserInit(s, ast, errors)
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
     p.parseFile()
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)

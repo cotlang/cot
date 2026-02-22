@@ -71,7 +71,7 @@ const keyword_names = [_][]const u8{
     "return",   "struct",    "switch",   "test",     "trait",
     "true",     "try",       "type",     "undefined","union",
     "unreachable", "var",    "void",     "weak",     "where",
-    "while",    "packed",
+    "while",    "packed",    "static",
 };
 
 /// Code snippet templates for common patterns.

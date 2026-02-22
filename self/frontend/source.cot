@@ -22,6 +22,16 @@ struct Span {
 }
 
 impl Span {
+    /// Create a span from start to end offsets.
+    static fn init(start: int, end: int) Span {
+        return Span { start_offset: start, end_offset: end }
+    }
+
+    /// Create a zero-length span at a single offset.
+    static fn fromPos(offset: int) Span {
+        return Span { start_offset: offset, end_offset: offset }
+    }
+
     /// Number of bytes in this span.
     fn len() int {
         return self.end_offset - self.start_offset
@@ -49,16 +59,6 @@ impl Source {
     }
 }
 
-/// Create a span from start to end offsets.
-fn spanInit(start: int, end: int) Span {
-    return Span { start_offset: start, end_offset: end }
-}
-
-/// Create a zero-length span at a single offset.
-fn spanFromPos(offset: int) Span {
-    return Span { start_offset: offset, end_offset: offset }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -70,19 +70,19 @@ test "pos advance" {
 }
 
 test "span init" {
-    const s = spanInit(5, 10)
+    const s = Span.init(5, 10)
     @assertEq(s.start_offset, 5)
     @assertEq(s.end_offset, 10)
 }
 
 test "span from pos" {
-    const s = spanFromPos(7)
+    const s = Span.fromPos(7)
     @assertEq(s.start_offset, 7)
     @assertEq(s.end_offset, 7)
 }
 
 test "span len" {
-    var s = spanInit(5, 10)
+    var s = Span.init(5, 10)
     @assertEq(s.len(), 5)
 }
 

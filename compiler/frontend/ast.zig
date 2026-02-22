@@ -53,13 +53,14 @@ pub const FnDecl = struct {
     body: NodeIndex,
     is_extern: bool,
     is_async: bool = false,
+    is_static: bool = false,
     doc_comment: []const u8 = "",
     span: Span,
 };
 pub const VarDecl = struct { name: []const u8, type_expr: NodeIndex, value: NodeIndex, is_const: bool, doc_comment: []const u8 = "", span: Span };
 pub const StructLayout = enum { auto, @"packed", @"extern" };
 pub const StructDecl = struct { name: []const u8, type_params: []const []const u8 = &.{}, fields: []const Field, layout: StructLayout = .auto, nested_decls: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
-pub const ImplBlock = struct { type_name: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };
+pub const ImplBlock = struct { type_name: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, consts: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
 pub const TraitDecl = struct { name: []const u8, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };
 pub const ImplTraitBlock = struct { trait_name: []const u8, target_type: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };
 pub const TestDecl = struct { name: []const u8, body: NodeIndex, span: Span };
@@ -494,6 +495,7 @@ pub const Ast = struct {
                     .error_set_decl => |e| if (e.variants.len > 0) self.allocator.free(e.variants),
                     .impl_block => |ib| {
                         if (ib.type_params.len > 0) self.allocator.free(ib.type_params);
+                        if (ib.consts.len > 0) self.allocator.free(ib.consts);
                     },
                     .impl_trait => |it| {
                         if (it.type_params.len > 0) self.allocator.free(it.type_params);

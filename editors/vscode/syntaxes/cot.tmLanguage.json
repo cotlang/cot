@@ -112,7 +112,7 @@
         },
         {
           "name": "keyword.storage.cot",
-          "match": "\\b(var|let|const|weak|packed)\\b"
+          "match": "\\b(var|let|const|weak|packed|static)\\b"
         },
         {
           "name": "keyword.operator.cot",

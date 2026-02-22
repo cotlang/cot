@@ -1,0 +1,1266 @@
+/// Type representation for the self-hosted Cot compiler.
+/// Ported from compiler/frontend/types.zig
+
+import "std/list"
+import "std/map"
+import "std/string"
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const null_node: int = 0xFFFFFFFF
+const invalid_type: int = 0xFFFFFFFF
+
+// Pre-registered basic type indices (match Zig compiler's TypeRegistry constants)
+const INVALID: int = 0
+const BOOL: int = 1
+const I8: int = 2
+const I16: int = 3
+const I32: int = 4
+const I64: int = 5
+const U8: int = 6
+const U16: int = 7
+const U32: int = 8
+const U64: int = 9
+const F32: int = 10
+const F64: int = 11
+const VOID: int = 12
+const UNTYPED_INT: int = 13
+const UNTYPED_FLOAT: int = 14
+const UNTYPED_BOOL: int = 15
+const UNTYPED_NULL: int = 16
+const STRING: int = 17
+const SSA_MEM: int = 18
+const SSA_FLAGS: int = 19
+const SSA_TUPLE: int = 20
+const SSA_RESULTS: int = 21
+const NORETURN: int = 22
+const FIRST_USER_TYPE: int = 23
+const INT: int = 5
+const FLOAT: int = 11
+
+// Struct layout constants (avoids enum naming conflicts with ast.cot)
+const LAYOUT_AUTO: int = 0
+const LAYOUT_PACKED: int = 1
+const LAYOUT_EXTERN: int = 2
+
+// ============================================================================
+// BasicKind — primitive type categories
+// ============================================================================
+
+const BasicKind = enum(u8) {
+    invalid,
+    bool_type,
+    i8_type, i16_type, i32_type, i64_type,
+    u8_type, u16_type, u32_type, u64_type,
+    f32_type, f64_type,
+    void_type,
+    noreturn_type,
+    untyped_int, untyped_float, untyped_bool, untyped_null,
+}
+
+impl BasicKind {
+    fn name() string {
+        return switch (self) {
+            .invalid => "invalid",
+            .bool_type => "bool",
+            .void_type => "void",
+            .noreturn_type => "noreturn",
+            .i8_type => "i8",
+            .i16_type => "i16",
+            .i32_type => "i32",
+            .i64_type => "i64",
+            .u8_type => "u8",
+            .u16_type => "u16",
+            .u32_type => "u32",
+            .u64_type => "u64",
+            .f32_type => "f32",
+            .f64_type => "f64",
+            .untyped_int => "untyped int",
+            .untyped_float => "untyped float",
+            .untyped_bool => "untyped bool",
+            .untyped_null => "untyped null",
+        }
+    }
+
+    fn isNumeric() bool { return self.isInteger() or self.isFloat() }
+
+    fn isInteger() bool {
+        return switch (self) {
+            .i8_type, .i16_type, .i32_type, .i64_type,
+            .u8_type, .u16_type, .u32_type, .u64_type,
+            .untyped_int => true,
+            else => false,
+        }
+    }
+
+    fn isSigned() bool {
+        return switch (self) {
+            .i8_type, .i16_type, .i32_type, .i64_type => true,
+            else => false,
+        }
+    }
+
+    fn isUnsigned() bool {
+        return switch (self) {
+            .u8_type, .u16_type, .u32_type, .u64_type => true,
+            else => false,
+        }
+    }
+
+    fn isFloat() bool {
+        return switch (self) {
+            .f32_type, .f64_type, .untyped_float => true,
+            else => false,
+        }
+    }
+
+    fn isUntyped() bool {
+        return switch (self) {
+            .untyped_int, .untyped_float, .untyped_bool, .untyped_null => true,
+            else => false,
+        }
+    }
+
+    fn size() int {
+        return switch (self) {
+            .bool_type, .i8_type, .u8_type => 1,
+            .i16_type, .u16_type => 2,
+            .i32_type, .u32_type, .f32_type => 4,
+            .i64_type, .u64_type, .f64_type => 8,
+            else => 0,
+        }
+    }
+}
+
+// ============================================================================
+// Composite type structs
+// ============================================================================
+
+struct PointerType { elem: int }
+struct OptionalType { elem: int }
+struct SliceType { elem: int }
+struct ArrayType { elem: int, length: int }
+struct CotMapType { key: int, value: int }
+struct CotListType { elem: int }
+struct FutureType { result_type: int }
+
+struct ErrorSetType {
+    name: string,
+    variant_count: int,
+    variant_names: int,    // raw pointer to string array
+}
+
+struct ErrorUnionType {
+    elem: int,
+    error_set: int,
+}
+
+struct TupleType {
+    elem_count: int,
+    elem_types: int,    // raw pointer to int array
+}
+
+struct StructField {
+    name: string,
+    type_idx: int,
+    offset: int,
+    default_value: int,
+}
+
+struct StructType {
+    name: string,
+    field_count: int,
+    fields: int,        // raw pointer to StructField array
+    size: int,
+    alignment: int,
+    layout: int,
+}
+
+struct EnumVariant {
+    name: string,
+    value: int,
+}
+
+struct EnumType {
+    name: string,
+    variant_count: int,
+    variants: int,      // raw pointer to EnumVariant array
+    backing_type: int,
+}
+
+struct UnionVariant {
+    name: string,
+    payload_type: int,
+}
+
+struct UnionType {
+    name: string,
+    variant_count: int,
+    variants: int,      // raw pointer to UnionVariant array
+    tag_type: int,
+}
+
+struct FuncParam {
+    name: string,
+    type_idx: int,
+}
+
+struct FuncType {
+    param_count: int,
+    params: int,        // raw pointer to FuncParam array
+    return_type: int,
+}
+
+struct MethodInfo {
+    name: string,
+    func_name: string,
+    func_type: int,
+    receiver_is_ptr: bool,
+}
+
+// ============================================================================
+// Type — tagged union of all type kinds
+// ============================================================================
+
+// Type tag constants (match union variant order)
+const TAG_BASIC: int = 0
+const TAG_POINTER: int = 1
+const TAG_OPTIONAL: int = 2
+const TAG_ERROR_UNION: int = 3
+const TAG_ERROR_SET: int = 4
+const TAG_SLICE: int = 5
+const TAG_ARRAY: int = 6
+const TAG_MAP: int = 7
+const TAG_LIST: int = 8
+const TAG_TUPLE: int = 9
+const TAG_STRUCT: int = 10
+const TAG_ENUM: int = 11
+const TAG_UNION: int = 12
+const TAG_FUNC: int = 13
+const TAG_FUTURE: int = 14
+
+union Type {
+    basic: BasicKind,
+    pointer: PointerType,
+    optional: OptionalType,
+    error_union: ErrorUnionType,
+    error_set: ErrorSetType,
+    slice: SliceType,
+    array: ArrayType,
+    map_type: CotMapType,
+    list_type: CotListType,
+    tuple: TupleType,
+    struct_type: StructType,
+    enum_type: EnumType,
+    union_type: UnionType,
+    func: FuncType,
+    future: FutureType,
+}
+
+// ============================================================================
+// TypeRegistry — type storage and lookup
+// ============================================================================
+
+/// Flat entry for method registry (avoids nested Map(string, List) complexity).
+struct MethodEntry {
+    type_name: string,
+    info: MethodInfo,
+}
+
+struct TypeRegistry {
+    types: List(Type),
+    name_map: Map(string, int),
+    methods: List(MethodEntry),
+}
+
+impl TypeRegistry {
+    // Pre-registered basic type indices (accessible as TypeRegistry.BOOL etc.)
+    const INVALID: int = 0
+    const BOOL: int = 1
+    const I8: int = 2
+    const I16: int = 3
+    const I32: int = 4
+    const I64: int = 5
+    const U8: int = 6
+    const U16: int = 7
+    const U32: int = 8
+    const U64: int = 9
+    const F32: int = 10
+    const F64: int = 11
+    const VOID: int = 12
+    const UNTYPED_INT: int = 13
+    const UNTYPED_FLOAT: int = 14
+    const UNTYPED_BOOL: int = 15
+    const UNTYPED_NULL: int = 16
+    const STRING: int = 17
+    const NORETURN: int = 22
+    const FIRST_USER_TYPE: int = 23
+    const INT: int = 5
+    const FLOAT: int = 11
+
+    /// Create and initialize a TypeRegistry with all basic types pre-registered.
+    static fn init() TypeRegistry {
+        var types: List(Type) = undefined
+        types.items = 0
+        types.count = 0
+        types.capacity = 0
+
+        var name_map: Map(string, int) = undefined
+        name_map.keys = 0
+        name_map.values = 0
+        name_map.states = 0
+        name_map.count = 0
+        name_map.capacity = 0
+
+        var methods: List(MethodEntry) = undefined
+        methods.items = 0
+        methods.count = 0
+        methods.capacity = 0
+
+        // Register basic types in order (0-16)
+        types.append(Type.basic(BasicKind.invalid))
+        types.append(Type.basic(BasicKind.bool_type))
+        types.append(Type.basic(BasicKind.i8_type))
+        types.append(Type.basic(BasicKind.i16_type))
+        types.append(Type.basic(BasicKind.i32_type))
+        types.append(Type.basic(BasicKind.i64_type))
+        types.append(Type.basic(BasicKind.u8_type))
+        types.append(Type.basic(BasicKind.u16_type))
+        types.append(Type.basic(BasicKind.u32_type))
+        types.append(Type.basic(BasicKind.u64_type))
+        types.append(Type.basic(BasicKind.f32_type))
+        types.append(Type.basic(BasicKind.f64_type))
+        types.append(Type.basic(BasicKind.void_type))
+        types.append(Type.basic(BasicKind.untyped_int))
+        types.append(Type.basic(BasicKind.untyped_float))
+        types.append(Type.basic(BasicKind.untyped_bool))
+        types.append(Type.basic(BasicKind.untyped_null))
+        // 17 = STRING (slice of u8)
+        types.append(Type.slice(SliceType { elem: U8 }))
+        // 18-21 = SSA placeholders
+        types.append(Type.basic(BasicKind.void_type))
+        types.append(Type.basic(BasicKind.void_type))
+        types.append(Type.basic(BasicKind.void_type))
+        types.append(Type.basic(BasicKind.void_type))
+        // 22 = NORETURN
+        types.append(Type.basic(BasicKind.noreturn_type))
+
+        // Register type names
+        name_map.set("bool", BOOL)
+        name_map.set("i8", I8)
+        name_map.set("i16", I16)
+        name_map.set("i32", I32)
+        name_map.set("i64", I64)
+        name_map.set("int", INT)
+        name_map.set("u8", U8)
+        name_map.set("u16", U16)
+        name_map.set("u32", U32)
+        name_map.set("u64", U64)
+        name_map.set("f32", F32)
+        name_map.set("f64", F64)
+        name_map.set("float", FLOAT)
+        name_map.set("void", VOID)
+        name_map.set("string", STRING)
+        name_map.set("byte", U8)
+        name_map.set("noreturn", NORETURN)
+
+        return TypeRegistry {
+            types: types,
+            name_map: name_map,
+            methods: methods,
+        }
+    }
+
+    /// Compute the common type for binary operations between two numeric types.
+    /// Reference: Zig Sema.zig peerType/intFittingRange
+    static fn commonType(a: int, b: int) int {
+        if (a == b) { return a }
+
+        // Untyped materializes to concrete type
+        if (a == UNTYPED_INT) { return if (TypeRegistry.isBasicNumeric(b)) { b } else { I64 } }
+        if (b == UNTYPED_INT) { return if (TypeRegistry.isBasicNumeric(a)) { a } else { I64 } }
+        if (a == UNTYPED_FLOAT) { return if (TypeRegistry.isBasicFloat(b)) { b } else { F64 } }
+        if (b == UNTYPED_FLOAT) { return if (TypeRegistry.isBasicFloat(a)) { a } else { F64 } }
+
+        // Float absorbs integer
+        if (TypeRegistry.isBasicFloat(a) and TypeRegistry.isBasicFloat(b)) {
+            return if (TypeRegistry.basicTypeSize(a) >= TypeRegistry.basicTypeSize(b)) { a } else { b }
+        }
+        if (TypeRegistry.isBasicFloat(a)) { return a }
+        if (TypeRegistry.isBasicFloat(b)) { return b }
+
+        // Both integers: wider type wins
+        const a_size = TypeRegistry.basicTypeSize(a)
+        const b_size = TypeRegistry.basicTypeSize(b)
+        if (a_size > b_size) { return a }
+        if (b_size > a_size) { return b }
+
+        // Same width, different signedness: promote to next wider signed type
+        if (TypeRegistry.isBasicSigned(a) != TypeRegistry.isBasicSigned(b)) {
+            return switch (a_size) {
+                1 => I16,
+                2 => I32,
+                4 => I64,
+                else => I64,
+            }
+        }
+
+        if (TypeRegistry.isBasicSigned(a)) { return a }
+        if (TypeRegistry.isBasicSigned(b)) { return b }
+        return a
+    }
+
+    static fn isBasicNumeric(idx: int) bool {
+        return switch (idx) {
+            I8, I16, I32, I64, U8, U16, U32, U64, F32, F64 => true,
+            else => false,
+        }
+    }
+
+    static fn isBasicFloat(idx: int) bool {
+        return switch (idx) {
+            F32, F64, UNTYPED_FLOAT => true,
+            else => false,
+        }
+    }
+
+    static fn isBasicSigned(idx: int) bool {
+        return switch (idx) {
+            I8, I16, I32, I64 => true,
+            else => false,
+        }
+    }
+    /// Look up a type by index. Returns invalid type for out-of-bounds.
+    fn get(idx: int) Type {
+        if (idx == invalid_type or idx >= self.types.count) {
+            return Type.basic(BasicKind.invalid)
+        }
+        return self.types.get(idx)
+    }
+
+    /// Look up a type index by name. Returns -1 if not found.
+    fn lookupByName(n: string) int {
+        if (self.name_map.has(n) != 0) {
+            return self.name_map.get(n)
+        }
+        return -1
+    }
+
+    /// Add a type to the registry. Returns its index.
+    fn add(t: Type) int {
+        const idx = self.types.count
+        self.types.append(t)
+        return idx
+    }
+
+    /// Register a named type mapping.
+    fn registerNamed(n: string, idx: int) void {
+        self.name_map.set(n, idx)
+    }
+
+    /// Return the display name of a type for diagnostics.
+    fn typeName(idx: int) string {
+        if (idx == STRING) { return "string" }
+        const t = self.get(idx)
+        return switch (t) {
+            Type.basic |bk| => bk.name(),
+            Type.struct_type |s| => s.name,
+            Type.enum_type |e| => e.name,
+            Type.union_type |u| => u.name,
+            Type.pointer |_| => "pointer",
+            Type.slice |_| => "slice",
+            Type.array |_| => "array",
+            Type.tuple |_| => "tuple",
+            Type.future |_| => "Future",
+            Type.func |_| => "function",
+            else => "unknown",
+        }
+    }
+
+    // ---- Factory methods ----
+
+    fn makePointer(elem: int) int {
+        return self.add(Type.pointer(PointerType { elem: elem }))
+    }
+
+    fn makeOptional(elem: int) int {
+        return self.add(Type.optional(OptionalType { elem: elem }))
+    }
+
+    fn makeErrorUnion(elem: int) int {
+        return self.add(Type.error_union(ErrorUnionType { elem: elem, error_set: invalid_type }))
+    }
+
+    fn makeErrorUnionWithSet(elem: int, error_set: int) int {
+        return self.add(Type.error_union(ErrorUnionType { elem: elem, error_set: error_set }))
+    }
+
+    fn makeSlice(elem: int) int {
+        return self.add(Type.slice(SliceType { elem: elem }))
+    }
+
+    fn makeArray(elem: int, length: int) int {
+        return self.add(Type.array(ArrayType { elem: elem, length: length }))
+    }
+
+    fn makeMap(key: int, value: int) int {
+        return self.add(Type.map_type(CotMapType { key: key, value: value }))
+    }
+
+    fn makeList(elem: int) int {
+        return self.add(Type.list_type(CotListType { elem: elem }))
+    }
+
+    fn makeFuture(result_type: int) int {
+        return self.add(Type.future(FutureType { result_type: result_type }))
+    }
+
+    // ---- Predicates ----
+
+    fn isPointer(idx: int) bool {
+        return self.get(idx).tag == TAG_POINTER
+    }
+
+    fn pointerElem(idx: int) int {
+        const t = self.get(idx)
+        if (t.tag == TAG_POINTER) {
+            return switch (t) {
+                Type.pointer |p| => p.elem,
+                else => invalid_type,
+            }
+        }
+        return invalid_type
+    }
+
+    fn isArray(idx: int) bool {
+        return self.get(idx).tag == TAG_ARRAY
+    }
+
+    fn isSlice(idx: int) bool {
+        return self.get(idx).tag == TAG_SLICE
+    }
+
+    // ---- Size and alignment ----
+
+    fn basicTypeName(type_idx: int) string {
+        return switch (type_idx) {
+            INVALID => "invalid",
+            BOOL => "bool",
+            VOID => "void",
+            I8 => "i8",
+            I16 => "i16",
+            I32 => "i32",
+            I64 => "i64",
+            U8 => "u8",
+            U16 => "u16",
+            U32 => "u32",
+            U64 => "u64",
+            F32 => "f32",
+            F64 => "f64",
+            UNTYPED_INT => "untyped_int",
+            UNTYPED_FLOAT => "untyped_float",
+            UNTYPED_BOOL => "untyped_bool",
+            UNTYPED_NULL => "untyped_null",
+            STRING => "string",
+            SSA_MEM => "ssa_mem",
+            SSA_FLAGS => "ssa_flags",
+            SSA_TUPLE => "ssa_tuple",
+            SSA_RESULTS => "ssa_results",
+            NORETURN => "noreturn",
+            else => "composite",
+        }
+    }
+
+    static fn basicTypeSize(type_idx: int) int {
+        return switch (type_idx) {
+            VOID, SSA_MEM, SSA_FLAGS, SSA_TUPLE, SSA_RESULTS, NORETURN => 0,
+            BOOL, UNTYPED_BOOL, I8, U8 => 1,
+            I16, U16 => 2,
+            I32, U32, F32 => 4,
+            I64, U64, F64, UNTYPED_INT => 8,
+            STRING => 16,
+            else => 8,
+        }
+    }
+
+    fn sizeOf(idx: int) int {
+        if (idx == UNTYPED_INT or idx == UNTYPED_FLOAT) { return 8 }
+        const t = self.get(idx)
+        return switch (t) {
+            Type.basic |k| => k.size(),
+            Type.pointer |_| => 8,
+            Type.map_type |_| => 8,
+            Type.list_type |_| => 8,
+            Type.func |_| => 8,
+            Type.error_set |_| => 8,
+            Type.future |_| => 8,
+            Type.optional |_| => 16,
+            Type.slice |_| => 24,
+            Type.array |a| => self.sizeOf(a.elem) * a.length,
+            Type.struct_type |s| => s.size,
+            Type.enum_type |e| => self.sizeOf(e.backing_type),
+            Type.error_union |eu| => {
+                const elem_size = self.sizeOf(eu.elem)
+                var payload_size: int = 8
+                if (elem_size > 8) { payload_size = ((elem_size + 7) / 8) * 8 }
+                return 8 + payload_size
+            },
+            Type.tuple |tup| => {
+                var total: int = 0
+                var i: int = 0
+                while (i < tup.elem_count) {
+                    const et = @intToPtr(*int, tup.elem_types + i * 8).*
+                    total = total + ((self.sizeOf(et) + 7) / 8) * 8
+                    i = i + 1
+                }
+                return total
+            },
+            Type.union_type |u| => {
+                var max_payload: int = 0
+                var i: int = 0
+                while (i < u.variant_count) {
+                    const v = @intToPtr(*UnionVariant, u.variants + i * @sizeOf(UnionVariant))
+                    if (v.payload_type != invalid_type) {
+                        const ps = self.sizeOf(v.payload_type)
+                        if (ps > max_payload) { max_payload = ps }
+                    }
+                    i = i + 1
+                }
+                var payload_aligned: int = 0
+                if (max_payload > 0) { payload_aligned = ((max_payload + 7) / 8) * 8 }
+                return 8 + payload_aligned
+            },
+        }
+    }
+
+    fn alignmentOf(idx: int) int {
+        const t = self.get(idx)
+        return switch (t) {
+            Type.basic |k| => {
+                var s = k.size()
+                if (s == 0) { s = 1 }
+                return s
+            },
+            Type.pointer |_| => 8,
+            Type.func |_| => 8,
+            Type.optional |_| => 8,
+            Type.error_union |_| => 8,
+            Type.error_set |_| => 8,
+            Type.slice |_| => 8,
+            Type.map_type |_| => 8,
+            Type.list_type |_| => 8,
+            Type.union_type |_| => 8,
+            Type.tuple |_| => 8,
+            Type.future |_| => 8,
+            Type.array |a| => self.alignmentOf(a.elem),
+            Type.struct_type |s| => s.alignment,
+            Type.enum_type |e| => self.alignmentOf(e.backing_type),
+        }
+    }
+
+    // ---- ARC predicates ----
+
+    /// Returns true if the type is trivial (doesn't need ARC).
+    /// Reference: Swift TypeLowering::isTrivial()
+    fn isTrivial(idx: int) bool {
+        const t = self.get(idx)
+        return switch (t) {
+            Type.basic |_| => true,
+            Type.pointer |_| => true,
+            Type.func |_| => true,
+            Type.error_set |_| => true,
+            Type.struct_type |_| => true,
+            Type.union_type |_| => true,
+            Type.enum_type |e| => self.isTrivial(e.backing_type),
+            Type.array |a| => self.isTrivial(a.elem),
+            Type.slice |s| => self.isTrivial(s.elem),
+            Type.optional |o| => self.isTrivial(o.elem),
+            Type.error_union |e| => self.isTrivial(e.elem),
+            Type.map_type |_| => false,
+            Type.list_type |_| => false,
+            Type.future |_| => false,
+            Type.tuple |tup| => {
+                var i: int = 0
+                while (i < tup.elem_count) {
+                    const et = @intToPtr(*int, tup.elem_types + i * 8).*
+                    if (!self.isTrivial(et)) { return false }
+                    i = i + 1
+                }
+                return true
+            },
+        }
+    }
+
+    /// Returns true if the type needs ARC (opposite of isTrivial).
+    fn needsARC(idx: int) bool {
+        return !self.isTrivial(idx)
+    }
+
+    /// Returns true if type could be an ARC-managed heap pointer.
+    fn couldBeARC(idx: int) bool {
+        const t = self.get(idx)
+        if (t.tag == TAG_POINTER) {
+            const elem_idx = switch (t) {
+                Type.pointer |p| => p.elem,
+                else => invalid_type,
+            }
+            const pointee = self.get(elem_idx)
+            return pointee.tag == TAG_STRUCT or pointee.tag == TAG_ENUM or pointee.tag == TAG_UNION
+        }
+        if (t.tag == TAG_OPTIONAL) {
+            const elem_idx = switch (t) {
+                Type.optional |o| => o.elem,
+                else => invalid_type,
+            }
+            return self.couldBeARC(elem_idx)
+        }
+        return false
+    }
+
+    // ---- Method registry ----
+
+    fn registerMethod(type_name: string, info: MethodInfo) void {
+        self.methods.append(MethodEntry { type_name: type_name, info: info })
+    }
+
+    fn lookupMethod(type_name: string, method_name: string) int {
+        var i: int = 0
+        while (i < self.methods.count) {
+            const entry = self.methods.get(i)
+            if (entry.type_name == type_name and entry.info.name == method_name) {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+
+    fn getMethodInfo(idx: int) MethodInfo {
+        return self.methods.get(idx).info
+    }
+
+    // ---- Type equality ----
+
+    fn equal(a: int, b: int) bool {
+        if (a == b) { return true }
+        if (a == invalid_type or b == invalid_type) { return false }
+        const ta = self.get(a)
+        const tb = self.get(b)
+        if (ta.tag != tb.tag) { return false }
+        return switch (ta) {
+            Type.basic |ka| => {
+                return switch (tb) {
+                    Type.basic |kb| => @intFromEnum(ka) == @intFromEnum(kb),
+                    else => false,
+                }
+            },
+            Type.pointer |pa| => {
+                return switch (tb) {
+                    Type.pointer |pb| => self.equal(pa.elem, pb.elem),
+                    else => false,
+                }
+            },
+            Type.optional |oa| => {
+                return switch (tb) {
+                    Type.optional |ob| => self.equal(oa.elem, ob.elem),
+                    else => false,
+                }
+            },
+            Type.error_union |ea| => {
+                return switch (tb) {
+                    Type.error_union |eb| => self.equal(ea.elem, eb.elem),
+                    else => false,
+                }
+            },
+            Type.slice |sa| => {
+                return switch (tb) {
+                    Type.slice |sb| => self.equal(sa.elem, sb.elem),
+                    else => false,
+                }
+            },
+            Type.array |aa| => {
+                return switch (tb) {
+                    Type.array |ab| => aa.length == ab.length and self.equal(aa.elem, ab.elem),
+                    else => false,
+                }
+            },
+            Type.map_type |ma| => {
+                return switch (tb) {
+                    Type.map_type |mb| => self.equal(ma.key, mb.key) and self.equal(ma.value, mb.value),
+                    else => false,
+                }
+            },
+            Type.list_type |la| => {
+                return switch (tb) {
+                    Type.list_type |lb| => self.equal(la.elem, lb.elem),
+                    else => false,
+                }
+            },
+            Type.struct_type |sa| => {
+                return switch (tb) {
+                    Type.struct_type |sb| => sa.name == sb.name,
+                    else => false,
+                }
+            },
+            Type.enum_type |ea| => {
+                return switch (tb) {
+                    Type.enum_type |eb| => ea.name == eb.name,
+                    else => false,
+                }
+            },
+            Type.union_type |ua| => {
+                return switch (tb) {
+                    Type.union_type |ub| => ua.name == ub.name,
+                    else => false,
+                }
+            },
+            Type.error_set |es| => {
+                return switch (tb) {
+                    Type.error_set |esb| => es.name == esb.name,
+                    else => false,
+                }
+            },
+            Type.future |fa| => {
+                return switch (tb) {
+                    Type.future |fb| => self.equal(fa.result_type, fb.result_type),
+                    else => false,
+                }
+            },
+            else => false,
+        }
+    }
+
+    // ---- Type assignability ----
+
+    fn isAssignable(from: int, to: int) bool {
+        if (from == to) { return true }
+        if (from == invalid_type or to == invalid_type) { return true }
+        if (from == NORETURN) { return true }
+        const from_t = self.get(from)
+        const to_t = self.get(to)
+
+        // Untyped conversions
+        if (from_t.tag == TAG_BASIC) {
+            const from_kind = switch (from_t) {
+                Type.basic |k| => k,
+                else => BasicKind.invalid,
+            }
+            if (from_kind == BasicKind.untyped_int) {
+                const to_kind = switch (to_t) {
+                    Type.basic |k| => k,
+                    else => BasicKind.invalid,
+                }
+                if (to_kind.isInteger()) { return true }
+            }
+            if (from_kind == BasicKind.untyped_float) {
+                const to_kind = switch (to_t) {
+                    Type.basic |k| => k,
+                    else => BasicKind.invalid,
+                }
+                if (to_kind.isFloat()) { return true }
+            }
+            if (from_kind == BasicKind.untyped_bool) {
+                const to_kind = switch (to_t) {
+                    Type.basic |k| => k,
+                    else => BasicKind.invalid,
+                }
+                if (to_kind == BasicKind.bool_type) { return true }
+            }
+            if (from_kind == BasicKind.untyped_null) {
+                if (to_t.tag == TAG_OPTIONAL or to_t.tag == TAG_POINTER) { return true }
+            }
+        }
+
+        // T -> ?T
+        if (to_t.tag == TAG_OPTIONAL) {
+            const opt_elem = switch (to_t) {
+                Type.optional |o| => o.elem,
+                else => invalid_type,
+            }
+            return self.isAssignable(from, opt_elem)
+        }
+
+        // T -> E!T (success value) and ErrorSet -> E!T (error coercion)
+        if (to_t.tag == TAG_ERROR_UNION) {
+            const eu_elem = switch (to_t) {
+                Type.error_union |eu| => eu.elem,
+                else => invalid_type,
+            }
+            if (self.isAssignable(from, eu_elem)) { return true }
+            if (from_t.tag == TAG_ERROR_SET) { return true }
+        }
+
+        // Same basic types
+        if (from_t.tag == TAG_BASIC and to_t.tag == TAG_BASIC) {
+            const fk = switch (from_t) {
+                Type.basic |k| => k,
+                else => BasicKind.invalid,
+            }
+            const tk = switch (to_t) {
+                Type.basic |k| => k,
+                else => BasicKind.invalid,
+            }
+            if (@intFromEnum(fk) == @intFromEnum(tk)) { return true }
+
+            // Integer widening
+            if (fk.isInteger() and tk.isInteger()) {
+                const from_size = fk.size()
+                const to_size = tk.size()
+                const from_signed = fk.isSigned()
+                const to_signed = tk.isSigned()
+
+                if (from_signed == to_signed) { return to_size >= from_size }
+                if (!from_signed and to_signed) { return to_size > from_size }
+                return false
+            }
+        }
+
+        // Slices
+        if (from_t.tag == TAG_SLICE and to_t.tag == TAG_SLICE) {
+            const fa = switch (from_t) { Type.slice |s| => s.elem, else => invalid_type }
+            const ta = switch (to_t) { Type.slice |s| => s.elem, else => invalid_type }
+            return self.equal(fa, ta)
+        }
+        if (from_t.tag == TAG_ARRAY and to_t.tag == TAG_SLICE) {
+            const fa = switch (from_t) { Type.array |a| => a.elem, else => invalid_type }
+            const ta = switch (to_t) { Type.slice |s| => s.elem, else => invalid_type }
+            return self.equal(fa, ta)
+        }
+
+        // STRING -> *u8
+        if (from == STRING and to_t.tag == TAG_POINTER) {
+            const pe = switch (to_t) { Type.pointer |p| => p.elem, else => invalid_type }
+            if (pe == U8) { return true }
+        }
+
+        // Named types by name
+        if (from_t.tag == TAG_STRUCT and to_t.tag == TAG_STRUCT) {
+            const fn_ = switch (from_t) { Type.struct_type |s| => s.name, else => "" }
+            const tn = switch (to_t) { Type.struct_type |s| => s.name, else => "" }
+            return fn_ == tn
+        }
+        if (from_t.tag == TAG_ENUM and to_t.tag == TAG_ENUM) {
+            const fn_ = switch (from_t) { Type.enum_type |e| => e.name, else => "" }
+            const tn = switch (to_t) { Type.enum_type |e| => e.name, else => "" }
+            return fn_ == tn
+        }
+
+        // Enum to backing type
+        if (from_t.tag == TAG_ENUM) {
+            const bt = switch (from_t) { Type.enum_type |e| => e.backing_type, else => invalid_type }
+            return self.isAssignable(bt, to)
+        }
+
+        // Union to tag type
+        if (from_t.tag == TAG_UNION) {
+            const tt = switch (from_t) { Type.union_type |u| => u.tag_type, else => invalid_type }
+            return self.isAssignable(tt, to)
+        }
+
+        // Pointer compatibility
+        if (from_t.tag == TAG_POINTER and to_t.tag == TAG_POINTER) {
+            const fe = switch (from_t) { Type.pointer |p| => p.elem, else => invalid_type }
+            const te = switch (to_t) { Type.pointer |p| => p.elem, else => invalid_type }
+            return self.equal(fe, te)
+        }
+
+        // Array compatibility
+        if (from_t.tag == TAG_ARRAY and to_t.tag == TAG_ARRAY) {
+            const fa = switch (from_t) { Type.array |a| => a, else => ArrayType { elem: invalid_type, length: 0 } }
+            const ta = switch (to_t) { Type.array |a| => a, else => ArrayType { elem: invalid_type, length: 0 } }
+            return fa.length == ta.length and self.isAssignable(fa.elem, ta.elem)
+        }
+
+        // Function type compatibility
+        if (from_t.tag == TAG_FUNC and to_t.tag == TAG_FUNC) {
+            const ff = switch (from_t) { Type.func |f| => f, else => FuncType { param_count: -1, params: 0, return_type: invalid_type } }
+            const tf = switch (to_t) { Type.func |f| => f, else => FuncType { param_count: -1, params: 0, return_type: invalid_type } }
+            if (ff.param_count != tf.param_count) { return false }
+            var i: int = 0
+            while (i < ff.param_count) {
+                const fp = @intToPtr(*FuncParam, ff.params + i * @sizeOf(FuncParam))
+                const tp = @intToPtr(*FuncParam, tf.params + i * @sizeOf(FuncParam))
+                if (!self.equal(fp.type_idx, tp.type_idx)) { return false }
+                i = i + 1
+            }
+            return self.equal(ff.return_type, tf.return_type)
+        }
+
+        return false
+    }
+}
+
+/// Type predicates (take Type values, not indices)
+fn isNumericType(t: Type) bool {
+    if (t.tag != TAG_BASIC) { return false }
+    return switch (t) {
+        Type.basic |k| => k.isNumeric(),
+        else => false,
+    }
+}
+
+fn isIntegerType(t: Type) bool {
+    if (t.tag != TAG_BASIC) { return false }
+    return switch (t) {
+        Type.basic |k| => k.isInteger(),
+        else => false,
+    }
+}
+
+fn isBoolType(t: Type) bool {
+    if (t.tag != TAG_BASIC) { return false }
+    return switch (t) {
+        Type.basic |k| => k == BasicKind.bool_type or k == BasicKind.untyped_bool,
+        else => false,
+    }
+}
+
+fn isUntypedType(t: Type) bool {
+    if (t.tag != TAG_BASIC) { return false }
+    return switch (t) {
+        Type.basic |k| => k.isUntyped(),
+        else => false,
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "BasicKind predicates" {
+    var k = BasicKind.i32_type
+    @assert(k.isInteger())
+    @assert(k.isNumeric())
+    @assert(k.isSigned())
+    @assertEq(k.isUnsigned(), false)
+
+    var u = BasicKind.u64_type
+    @assert(u.isUnsigned())
+
+    var f = BasicKind.f64_type
+    @assert(f.isFloat())
+
+    var ut = BasicKind.untyped_int
+    @assert(ut.isUntyped())
+}
+
+test "BasicKind size" {
+    var b = BasicKind.bool_type
+    @assertEq(b.size(), 1)
+    var i = BasicKind.i32_type
+    @assertEq(i.size(), 4)
+    var l = BasicKind.i64_type
+    @assertEq(l.size(), 8)
+}
+
+test "BasicKind name" {
+    var k = BasicKind.i32_type
+    @assertEq(k.name(), "i32")
+    var b = BasicKind.bool_type
+    @assertEq(b.name(), "bool")
+    var v = BasicKind.void_type
+    @assertEq(v.name(), "void")
+}
+
+test "invalid_type constant" {
+    @assertEq(invalid_type, 0xFFFFFFFF)
+}
+
+test "type index constants" {
+    @assertEq(INVALID, 0)
+    @assertEq(BOOL, 1)
+    @assertEq(I64, 5)
+    @assertEq(U8, 6)
+    @assertEq(F64, 11)
+    @assertEq(VOID, 12)
+    @assertEq(STRING, 17)
+    @assertEq(NORETURN, 22)
+    @assertEq(FIRST_USER_TYPE, 23)
+    @assertEq(INT, I64)
+    @assertEq(FLOAT, F64)
+}
+
+test "TypeRegistry init and lookup" {
+    var reg = TypeRegistry.init()
+    @assertEq(reg.lookupByName("bool"), BOOL)
+    @assertEq(reg.lookupByName("int"), INT)
+    @assertEq(reg.lookupByName("string"), STRING)
+    @assertEq(reg.lookupByName("noreturn"), NORETURN)
+    @assertEq(reg.lookupByName("nonexistent"), -1)
+}
+
+test "TypeRegistry get basic type" {
+    var reg = TypeRegistry.init()
+    const t = reg.get(BOOL)
+    @assertEq(t.tag, TAG_BASIC)
+    const bk = switch (t) {
+        Type.basic |k| => @intFromEnum(k),
+        else => -1,
+    }
+    @assertEq(bk, @intFromEnum(BasicKind.bool_type))
+}
+
+test "TypeRegistry make pointer" {
+    var reg = TypeRegistry.init()
+    const ptr_i32 = reg.makePointer(I32)
+    @assert(reg.isPointer(ptr_i32))
+    @assertEq(reg.pointerElem(ptr_i32), I32)
+}
+
+test "TypeRegistry make array" {
+    var reg = TypeRegistry.init()
+    const arr = reg.makeArray(I32, 10)
+    @assert(reg.isArray(arr))
+    const t = reg.get(arr)
+    const len = switch (t) {
+        Type.array |a| => a.length,
+        else => -1,
+    }
+    @assertEq(len, 10)
+}
+
+test "TypeRegistry sizeOf basics" {
+    var reg = TypeRegistry.init()
+    @assertEq(reg.sizeOf(BOOL), 1)
+    @assertEq(reg.sizeOf(I64), 8)
+    @assertEq(reg.sizeOf(STRING), 24)
+}
+
+test "TypeRegistry sizeOf pointer" {
+    var reg = TypeRegistry.init()
+    const ptr = reg.makePointer(I32)
+    @assertEq(reg.sizeOf(ptr), 8)
+}
+
+test "TypeRegistry sizeOf array" {
+    var reg = TypeRegistry.init()
+    const arr = reg.makeArray(I64, 4)
+    @assertEq(reg.sizeOf(arr), 32)
+}
+
+test "TypeRegistry isTrivial" {
+    var reg = TypeRegistry.init()
+    @assert(reg.isTrivial(I64))
+    @assert(reg.isTrivial(F64))
+    @assert(reg.isTrivial(BOOL))
+    @assert(reg.isTrivial(VOID))
+
+    const ptr_i32 = reg.makePointer(I32)
+    @assert(reg.isTrivial(ptr_i32))
+
+    const arr_i64 = reg.makeArray(I64, 10)
+    @assert(reg.isTrivial(arr_i64))
+
+    const slice_i64 = reg.makeSlice(I64)
+    @assert(reg.isTrivial(slice_i64))
+
+    const list_i64 = reg.makeList(I64)
+    @assertEq(reg.isTrivial(list_i64), false)
+    @assert(reg.needsARC(list_i64))
+
+    const map_i64 = reg.makeMap(I64, I64)
+    @assertEq(reg.isTrivial(map_i64), false)
+    @assert(reg.needsARC(map_i64))
+}
+
+test "TypeRegistry typeName" {
+    var reg = TypeRegistry.init()
+    @assertEq(reg.typeName(BOOL), "bool")
+    @assertEq(reg.typeName(I64), "i64")
+    @assertEq(reg.typeName(STRING), "string")
+    @assertEq(reg.typeName(VOID), "void")
+}
+
+test "commonType same" {
+    @assertEq(TypeRegistry.commonType(I64, I64), I64)
+    @assertEq(TypeRegistry.commonType(F64, F64), F64)
+}
+
+test "commonType untyped" {
+    @assertEq(TypeRegistry.commonType(UNTYPED_INT, I32), I32)
+    @assertEq(TypeRegistry.commonType(I32, UNTYPED_INT), I32)
+    @assertEq(TypeRegistry.commonType(UNTYPED_FLOAT, F32), F32)
+    @assertEq(TypeRegistry.commonType(F32, UNTYPED_FLOAT), F32)
+}
+
+test "commonType float absorbs int" {
+    @assertEq(TypeRegistry.commonType(F64, I64), F64)
+    @assertEq(TypeRegistry.commonType(I64, F64), F64)
+}
+
+test "commonType wider wins" {
+    @assertEq(TypeRegistry.commonType(I32, I64), I64)
+    @assertEq(TypeRegistry.commonType(I64, I32), I64)
+    @assertEq(TypeRegistry.commonType(U8, U64), U64)
+}
+
+test "commonType mixed sign promotion" {
+    @assertEq(TypeRegistry.commonType(U8, I8), I16)
+    @assertEq(TypeRegistry.commonType(U16, I16), I32)
+    @assertEq(TypeRegistry.commonType(U32, I32), I64)
+}
+
+test "Type predicates" {
+    const num = Type.basic(BasicKind.i32_type)
+    @assert(isNumericType(num))
+    @assertEq(isBoolType(num), false)
+
+    const b = Type.basic(BasicKind.bool_type)
+    @assert(isBoolType(b))
+    @assertEq(isNumericType(b), false)
+
+    const u = Type.basic(BasicKind.untyped_int)
+    @assert(isUntypedType(u))
+}
+
+test "TypeRegistry equal" {
+    var reg = TypeRegistry.init()
+    @assert(reg.equal(I64, I64))
+    @assert(reg.equal(BOOL, BOOL))
+    @assertEq(reg.equal(I64, F64), false)
+
+    const p1 = reg.makePointer(I32)
+    const p2 = reg.makePointer(I32)
+    @assert(reg.equal(p1, p2))
+
+    const p3 = reg.makePointer(I64)
+    @assertEq(reg.equal(p1, p3), false)
+}
+
+test "TypeRegistry isAssignable same" {
+    var reg = TypeRegistry.init()
+    @assert(reg.isAssignable(I64, I64))
+    @assert(reg.isAssignable(BOOL, BOOL))
+}
+
+test "TypeRegistry isAssignable untyped" {
+    var reg = TypeRegistry.init()
+    @assert(reg.isAssignable(UNTYPED_INT, I32))
+    @assert(reg.isAssignable(UNTYPED_INT, I64))
+    @assert(reg.isAssignable(UNTYPED_FLOAT, F64))
+}
+
+test "TypeRegistry isAssignable widening" {
+    var reg = TypeRegistry.init()
+    @assert(reg.isAssignable(I8, I16))
+    @assert(reg.isAssignable(I8, I32))
+    @assert(reg.isAssignable(I8, I64))
+    @assert(reg.isAssignable(U8, I16))
+    @assertEq(reg.isAssignable(I64, I32), false)
+}
+
+test "TypeRegistry isAssignable optional" {
+    var reg = TypeRegistry.init()
+    const opt_i64 = reg.makeOptional(I64)
+    @assert(reg.isAssignable(I64, opt_i64))
+    @assert(reg.isAssignable(UNTYPED_NULL, opt_i64))
+}
+
+test "TypeRegistry isAssignable noreturn" {
+    var reg = TypeRegistry.init()
+    @assert(reg.isAssignable(NORETURN, I64))
+    @assert(reg.isAssignable(NORETURN, BOOL))
+    @assert(reg.isAssignable(NORETURN, STRING))
+}
