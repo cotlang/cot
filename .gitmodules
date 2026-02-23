@@ -26,3 +26,14 @@
 	path = references/deno
 	url = https://github.com/denoland/deno.git
 	shallow = true
+[submodule "references/ghostty"]
+	path = references/ghostty
+	url = https://github.com/ghostty-org/ghostty.git
+	shallow = true
+[submodule "references/zed"]
+	path = references/zed
+	url = https://github.com/zed-industries/zed.git
+	shallow = true
+[submodule "stdlib"]
+	path = stdlib
+	url = https://github.com/cotlang/std.git
