@@ -609,24 +609,20 @@ impl TypeRegistry {
             },
             Type.tuple |tup| => {
                 var total: int = 0
-                var i: int = 0
-                while (i < tup.elem_count) {
+                for i in 0..tup.elem_count {
                     const et = @intToPtr(*int, tup.elem_types + i * 8).*
-                    total = total + ((self.sizeOf(et) + 7) / 8) * 8
-                    i += 1
+                    total += ((self.sizeOf(et) + 7) / 8) * 8
                 }
                 return total
             },
             Type.union_type |u| => {
                 var max_payload: int = 0
-                var i: int = 0
-                while (i < u.variant_count) {
+                for i in 0..u.variant_count {
                     const v = @intToPtr(*UnionVariant, u.variants + i * @sizeOf(UnionVariant))
                     if (v.payload_type != invalid_type) {
                         const ps = self.sizeOf(v.payload_type)
                         if (ps > max_payload) { max_payload = ps }
                     }
-                    i += 1
                 }
                 var payload_aligned: int = 0
                 if (max_payload > 0) { payload_aligned = ((max_payload + 7) / 8) * 8 }
@@ -682,11 +678,9 @@ impl TypeRegistry {
             Type.list_type |_| => false,
             Type.future |_| => false,
             Type.tuple |tup| => {
-                var i: int = 0
-                while (i < tup.elem_count) {
+                for i in 0..tup.elem_count {
                     const et = @intToPtr(*int, tup.elem_types + i * 8).*
                     if (!self.isTrivial(et)) { return false }
-                    i += 1
                 }
                 return true
             },
@@ -726,13 +720,11 @@ impl TypeRegistry {
     }
 
     fn lookupMethod(type_name: string, method_name: string) int {
-        var i: int = 0
-        while (i < self.methods.count) {
+        for i in 0..self.methods.count {
             const entry = self.methods.get(i)
             if (entry.type_name == type_name and entry.info.name == method_name) {
                 return i
             }
-            i += 1
         }
         return -1
     }
@@ -978,12 +970,10 @@ impl TypeRegistry {
             const ff = switch (from_t) { Type.func |f| => f, else => FuncType { param_count: -1, params: 0, return_type: invalid_type } }
             const tf = switch (to_t) { Type.func |f| => f, else => FuncType { param_count: -1, params: 0, return_type: invalid_type } }
             if (ff.param_count != tf.param_count) { return false }
-            var i: int = 0
-            while (i < ff.param_count) {
+            for i in 0..ff.param_count {
                 const fp = @intToPtr(*FuncParam, ff.params + i * @sizeOf(FuncParam))
                 const tp = @intToPtr(*FuncParam, tf.params + i * @sizeOf(FuncParam))
                 if (!self.equal(fp.type_idx, tp.type_idx)) { return false }
-                i += 1
             }
             return self.equal(ff.return_type, tf.return_type)
         }

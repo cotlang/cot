@@ -1167,6 +1167,11 @@ pub const Lowerer = struct {
                     const stmt_node = self.tree.getNode(stmt_idx) orelse continue;
                     if (stmt_node.asStmt()) |s| {
                         if (try self.lowerStmt(s)) { terminated = true; break; }
+                    } else if (stmt_node.asDecl()) |decl| {
+                        switch (decl) {
+                            .struct_decl => |d| try self.lowerStructDecl(d),
+                            else => {},
+                        }
                     }
                 }
                 if (!terminated and expr.block_expr.expr != null_node) _ = try self.lowerExprNode(expr.block_expr.expr);
@@ -1194,6 +1199,11 @@ pub const Lowerer = struct {
                     const stmt_node = self.tree.getNode(stmt_idx) orelse continue;
                     if (stmt_node.asStmt()) |s| {
                         if (try self.lowerStmt(s)) { fb.restoreScope(scope_depth); return true; }
+                    } else if (stmt_node.asDecl()) |decl| {
+                        switch (decl) {
+                            .struct_decl => |d| try self.lowerStructDecl(d),
+                            else => {},
+                        }
                     }
                 }
                 try self.emitCleanups(cleanup_depth);
@@ -4365,6 +4375,7 @@ pub const Lowerer = struct {
         const fb = self.current_func orelse return ir.null_node;
 
         // Lookup the struct type (generic or non-generic)
+        // Block-scoped structs work via registerNamed in the checker.
         const struct_type_idx = if (ne.type_args.len > 0)
             self.resolveGenericTypeName(ne.type_name, ne.type_args)
         else
@@ -5816,7 +5827,24 @@ pub const Lowerer = struct {
             }
             for (f.params) |param| {
                 var param_type = self.resolveTypeNode(param.type_expr);
-                param_type = self.chk.safeWrapType(param_type) catch param_type;
+                // Mirror checker buildFuncType: skip safeWrapType for generic type params.
+                // T → Point shouldn't become *Point even in @safe; the checker's func_type
+                // already kept it as Point, so the caller decomposes it as a struct value.
+                const is_substituted = if (self.type_substitution) |sub| blk: {
+                    if (param.type_expr != null_node) {
+                        if (self.tree.getNode(param.type_expr)) |node| {
+                            if (node.asExpr()) |expr| {
+                                if (expr == .ident) {
+                                    break :blk sub.contains(expr.ident.name);
+                                } else if (expr == .type_expr and expr.type_expr.kind == .named) {
+                                    break :blk sub.contains(expr.type_expr.kind.named);
+                                }
+                            }
+                        }
+                    }
+                    break :blk false;
+                } else false;
+                if (!is_substituted) param_type = self.chk.safeWrapType(param_type) catch param_type;
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
             }
             if (f.body != null_node) {

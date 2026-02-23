@@ -124,9 +124,7 @@ fn offsetToLineCol(content: string, offset: int) (int, int) {
 /// Format a diagnostic as "filename:line:col: error[E###]: message"
 fn formatDiagnostic(filename: string, content: string, diag: Diagnostic) string {
     const line, col = offsetToLineCol(content, diag.offset)
-    const loc = filename ++ ":" ++ intToString(line) ++ ":" ++ intToString(col)
-    const code_str = "error[E" ++ intToString(diag.code.code()) ++ "]: "
-    return loc ++ ": " ++ code_str ++ diag.msg
+    return "${filename}:${line}:${col}: error[E${diag.code.code()}]: ${diag.msg}"
 }
 
 // ============================================================================

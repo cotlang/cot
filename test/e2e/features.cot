@@ -1647,6 +1647,20 @@ test "list_compact" {
     list.free()
 }
 
+test "list_struct" {
+    var list: List(Point) = .{}
+    defer list.free()
+    const p1 = Point { .x = 10, .y = 20 }
+    const p2 = Point { .x = 30, .y = 40 }
+    list.append(p1)
+    list.append(p2)
+    @assertEq(list.len(), 2)
+    @assertEq(list.get(0).x, 10)
+    @assertEq(list.get(0).y, 20)
+    @assertEq(list.get(1).x, 30)
+    @assertEq(list.get(1).y, 40)
+}
+
 // ============================================================================
 // Comptime target builtins
 // ============================================================================
@@ -3596,4 +3610,42 @@ test "if-expr comptime fold value to optional" {
     var x: ?i64 = if (true) { 42 } else { null }
     @assert(x != null)
     if (x) |val| { @assertEq(val, 42) }
+}
+
+// ============================================================================
+// Block-scoped struct and union declarations
+// ============================================================================
+
+test "block_scoped_struct" {
+    struct Pair { a: i64, b: i64 }
+    const p = Pair { .a = 10, .b = 20 }
+    @assertEq(p.a, 10)
+    @assertEq(p.b, 20)
+}
+
+test "block_scoped_struct_var" {
+    struct Counter { value: i64 }
+    var c = Counter { .value = 0 }
+    c.value = 42
+    @assertEq(c.value, 42)
+}
+
+test "block_scoped_union" {
+    union Shape { circle: i64, rect: i64 }
+    var s: Shape = Shape.circle(5)
+    @assertEq(s.tag, 0)
+    @assertEq(s.circle, 5)
+}
+
+test "block_scoped_struct_new" {
+    struct Node { value: i64 }
+    const n = new Node { value: 99 }
+    @assertEq(n.value, 99)
+}
+
+test "block_scoped_packed_struct" {
+    packed struct Flags { a: i8, b: i8 }
+    const f = Flags { .a = 1, .b = 2 }
+    @assertEq(f.a, 1)
+    @assertEq(f.b, 2)
 }

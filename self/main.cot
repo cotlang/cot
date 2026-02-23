@@ -27,12 +27,12 @@ fn main() void {
 
     const cmd = arg(1)
 
-    if (strEqual(cmd, "help") or strEqual(cmd, "--help") or strEqual(cmd, "-h")) {
+    if (cmd == "help" or cmd == "--help" or cmd == "-h") {
         printUsage()
         return
     }
 
-    if (strEqual(cmd, "version") or strEqual(cmd, "--version")) {
+    if (cmd == "version" or cmd == "--version") {
         writeOut("cot 0.3.2 (self-hosted)\n")
         return
     }
@@ -45,24 +45,19 @@ fn main() void {
 
     const path = arg(2)
     const content = readFile(path) catch {
-        writeErr("error: cannot read file: ")
-        writeErr(path)
-        writeErr("\n")
+        writeErr("error: cannot read file: ${path}\n")
         exit(1)
     }
 
-    if (strEqual(cmd, "parse")) {
-        cmdParse(path, content)
-    } else if (strEqual(cmd, "check")) {
-        cmdCheck(path, content)
-    } else if (strEqual(cmd, "lex")) {
-        cmdLex(path, content)
-    } else {
-        writeErr("error: unknown command: ")
-        writeErr(cmd)
-        writeErr("\n")
-        printUsage()
-        exit(1)
+    switch (cmd) {
+        "parse" => cmdParse(path, content),
+        "check" => cmdCheck(path, content),
+        "lex" => cmdLex(path, content),
+        else => {
+            writeErr("error: unknown command: ${cmd}\n")
+            printUsage()
+            exit(1)
+        },
     }
 }
 
@@ -76,17 +71,14 @@ fn cmdParse(path: string, content: string) void {
 
     if (errs.hasErrors()) {
         const diag = Diagnostic { offset: errs.first_offset, code: errs.first_code, msg: errs.first_msg }
-        const msg = formatDiagnostic(path, content, diag)
-        writeErr(msg)
-        writeErr("\n")
+        writeErr("${formatDiagnostic(path, content, diag)}\n")
         if (errs.errorCount() > 1) {
-            writeErr("... and " ++ intToString(errs.errorCount() - 1) ++ " more error(s)\n")
+            writeErr("... and ${errs.errorCount() - 1} more error(s)\n")
         }
         exit(1)
     }
 
-    const decl_count = ast.file_decls.len()
-    writeOut(path ++ ": ok (" ++ intToString(decl_count) ++ " declarations)\n")
+    writeOut("${path}: ok (${ast.file_decls.len()} declarations)\n")
 }
 
 /// Type-check a file and report errors.
@@ -99,9 +91,7 @@ fn cmdCheck(path: string, content: string) void {
 
     if (errs.hasErrors()) {
         const diag = Diagnostic { offset: errs.first_offset, code: errs.first_code, msg: errs.first_msg }
-        const msg = formatDiagnostic(path, content, diag)
-        writeErr(msg)
-        writeErr("\n")
+        writeErr("${formatDiagnostic(path, content, diag)}\n")
         exit(1)
     }
 
@@ -111,16 +101,14 @@ fn cmdCheck(path: string, content: string) void {
 
     if (errs.hasErrors()) {
         const diag = Diagnostic { offset: errs.first_offset, code: errs.first_code, msg: errs.first_msg }
-        const msg = formatDiagnostic(path, content, diag)
-        writeErr(msg)
-        writeErr("\n")
+        writeErr("${formatDiagnostic(path, content, diag)}\n")
         if (errs.errorCount() > 1) {
-            writeErr("... and " ++ intToString(errs.errorCount() - 1) ++ " more error(s)\n")
+            writeErr("... and ${errs.errorCount() - 1} more error(s)\n")
         }
         exit(1)
     }
 
-    writeOut(path ++ ": ok\n")
+    writeOut("${path}: ok\n")
 }
 
 /// Tokenize a file and print each token.
@@ -130,16 +118,12 @@ fn cmdLex(path: string, content: string) void {
         const t = s.scanNext()
         const tok = @as(Token, @enumFromInt(t.tok))
         const name = tok.toString()
-        writeOut(name)
         if (@lenOf(t.text) > 0) {
-            writeOut(" \"")
-            writeOut(t.text)
-            writeOut("\"")
+            writeOut("${name} \"${t.text}\"\n")
+        } else {
+            writeOut("${name}\n")
         }
-        writeOut("\n")
-        if (tok == Token.eof) {
-            break
-        }
+        if (tok == Token.eof) { break }
     }
 }
 

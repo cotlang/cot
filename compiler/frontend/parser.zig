@@ -1639,6 +1639,14 @@ pub const Parser = struct {
                 _ = self.match(.semicolon);
                 return try self.tree.addStmt(.{ .defer_stmt = .{ .expr = e, .is_errdefer = is_errdefer, .span = Span.init(start, self.pos()) } });
             },
+            // Block-scoped type declarations (reuse top-level parse functions)
+            .kw_struct => return self.parseStructDeclWithLayout(.auto),
+            .kw_union => return self.parseUnionDecl(),
+            .kw_packed => {
+                if (self.peekToken().tok == .kw_struct)
+                    return self.parseStructDeclWithLayout(.@"packed");
+                return self.parseExprOrAssign(start);
+            },
             .ident => {
                 if (self.peekToken().tok == .colon) {
                     const label = self.tok.text;

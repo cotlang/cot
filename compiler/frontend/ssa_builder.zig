@@ -77,7 +77,7 @@ pub const SSABuilder = struct {
             const local_type = type_registry.get(param.type_idx);
             const is_string_or_slice = !is_wasm_gc and (param.type_idx == TypeRegistry.STRING or local_type == .slice);
             const type_size = type_registry.sizeOf(param.type_idx);
-            const is_large_struct = !is_wasm_gc and (local_type == .struct_type or local_type == .union_type) and type_size > 8;
+            const is_large_struct = !is_wasm_gc and (local_type == .struct_type or local_type == .union_type or local_type == .tuple) and type_size > 8;
 
             if (is_string_or_slice) {
                 // String/slice: two registers (ptr, len)
@@ -826,7 +826,7 @@ pub const SSABuilder = struct {
         }
 
         // Large struct decomposition: structs >8 bytes passed as N i64 values
-        const is_large_struct = arg_type == .struct_type and type_size > 8;
+        const is_large_struct = (arg_type == .struct_type or arg_type == .union_type or arg_type == .tuple) and type_size > 8;
         if (is_large_struct) {
             const addr = try self.getStructAddr(arg_val, cur);
             const num_slots: u32 = @intCast((type_size + 7) / 8);

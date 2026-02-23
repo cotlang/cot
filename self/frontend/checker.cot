@@ -236,24 +236,18 @@ impl Checker {
         self.safe_mode = self.ast.safe_mode
 
         // Pass 1: collect type declarations (struct, enum, union, type alias)
-        var i: int = 0
-        while (i < self.ast.file_decls.count) {
+        for i in 0..self.ast.file_decls.count {
             self.collectTypeDecl(self.ast.file_decls.get(i))
-            i += 1
         }
 
         // Pass 2: collect non-type declarations (fn, var/const, impl)
-        i = 0
-        while (i < self.ast.file_decls.count) {
+        for i in 0..self.ast.file_decls.count {
             self.collectNonTypeDecl(self.ast.file_decls.get(i))
-            i += 1
         }
 
         // Pass 3: check declaration bodies
-        i = 0
-        while (i < self.ast.file_decls.count) {
+        for i in 0..self.ast.file_decls.count {
             self.checkDecl(self.ast.file_decls.get(i))
-            i += 1
         }
     }
 
@@ -404,13 +398,12 @@ impl Checker {
             return
         }
 
-        var mi: int = 0
-        while (mi < methods_count) {
+        for mi in 0..methods_count {
             const method_idx = self.ast.getData(idx, 3 + mi)
             const method_tag = self.ast.getTag(method_idx)
             if (method_tag == @intFromEnum(NodeTag.fn_decl)) {
                 const method_name = self.ast.getStr(self.ast.getData(method_idx, 0))
-                const synth_name = type_name ++ "_" ++ method_name
+                const synth_name = "${type_name}_${method_name}"
                 const func_type = self.buildFuncType(method_idx)
 
                 // Detect static (no params or first param not named "self")
@@ -421,7 +414,7 @@ impl Checker {
                     const first_tag = self.ast.getTag(first_param)
                     if (first_tag == @intFromEnum(NodeTag.field_def)) {
                         const pname = self.ast.getStr(self.ast.getData(first_param, 0))
-                        if (strEqual(pname, "self")) {
+                        if (pname == "self") {
                             is_static = false
                         }
                     }
@@ -438,11 +431,10 @@ impl Checker {
                 // Also define associated constants (var_decl inside impl)
             } else if (method_tag == @intFromEnum(NodeTag.var_decl)) {
                 const const_name = self.ast.getStr(self.ast.getData(method_idx, 0))
-                const synth_name = type_name ++ "_" ++ const_name
+                const synth_name = "${type_name}_${const_name}"
                 const is_const = self.ast.getData(method_idx, 3)
                 self.defineSymbol(makeSymbol(synth_name, invalid_type, method_idx, is_const == 0))
             }
-            mi += 1
         }
     }
 
@@ -475,15 +467,12 @@ impl Checker {
         const tp_count = self.ast.getData(idx, 3 + methods_count)
         if (tp_count > 0) { return }
 
-        var mi: int = 0
-        while (mi < methods_count) {
+        for mi in 0..methods_count {
             const method_idx = self.ast.getData(idx, 3 + mi)
             if (self.ast.getTag(method_idx) == @intFromEnum(NodeTag.fn_decl)) {
                 const method_name = self.ast.getStr(self.ast.getData(method_idx, 0))
-                const synth_name = type_name ++ "_" ++ method_name
-                self.checkFnDeclBody(method_idx, synth_name)
+                self.checkFnDeclBody(method_idx, "${type_name}_${method_name}")
             }
-            mi += 1
         }
     }
 
@@ -525,8 +514,7 @@ impl Checker {
         self.current_return_type = return_type
 
         // Define parameters in scope
-        var pi: int = 0
-        while (pi < params_count) {
+        for pi in 0..params_count {
             const param_idx = self.ast.getData(idx, 7 + pi)
             // field_def: [name_s, type_expr_n, default_val_n, doc_s, span_s, span_e]
             if (self.ast.getTag(param_idx) == @intFromEnum(NodeTag.field_def)) {
@@ -535,7 +523,6 @@ impl Checker {
                 var ptype = self.resolveTypeExpr(ptype_n)
                 self.defineSymbol(makeSymbol(pname, ptype, idx, false))
             }
-            pi += 1
         }
 
         self.checkBlockBody(body)
@@ -845,10 +832,8 @@ impl Checker {
         // block_stmt: [stmts_count, ...stmt_nodes, span_s, span_e]
         const stmts_count = self.ast.getData(idx, 0)
         self.pushScope()
-        var i: int = 0
-        while (i < stmts_count) {
+        for i in 0..stmts_count {
             self.checkStmt(self.ast.getData(idx, 1 + i))
-            i += 1
         }
         self.popScope()
     }
@@ -873,15 +858,13 @@ impl Checker {
             return
         }
 
-        var i: int = 0
-        while (i < bindings_count) {
+        for i in 0..bindings_count {
             const bind_idx = self.ast.getData(idx, 3 + i)
             // destructure_bind: [name_s, type_expr_n, span_s, span_e]
             const bname = self.ast.getStr(self.ast.getData(bind_idx, 0))
             var elem_type = @intToPtr(*int, tup.elem_types + i * 8).*
             elem_type = self.materializeType(elem_type)
             self.defineSymbol(makeSymbol(bname, elem_type, idx, is_const != 0))
-            i += 1
         }
     }
 
@@ -902,10 +885,8 @@ impl Checker {
         const result_expr = self.ast.getData(idx, 0)
         const stmts_count = self.ast.getData(idx, 1)
         self.pushScope()
-        var i: int = 0
-        while (i < stmts_count) {
+        for i in 0..stmts_count {
             self.checkStmt(self.ast.getData(idx, 2 + i))
-            i += 1
         }
         if (result_expr != null_node) {
             self.checkExpr(result_expr)
@@ -1126,17 +1107,15 @@ impl Checker {
         // Check for built-in function calls: print, println, etc.
         if (self.ast.getTag(callee_n) == @intFromEnum(NodeTag.ident)) {
             const name = self.ast.getStr(self.ast.getData(callee_n, 0))
-            if (strEqual(name, "print") or strEqual(name, "println") or
-                strEqual(name, "eprint") or strEqual(name, "eprintln")) {
+            if (name == "print" or name == "println" or
+                name == "eprint" or name == "eprintln") {
                 // Check args but always returns void
-                var ai: int = 0
-                while (ai < args_count) {
+                for ai in 0..args_count {
                     self.checkExpr(self.ast.getData(idx, 2 + ai))
-                    ai += 1
                 }
                 return VOID
             }
-            if (strEqual(name, "len")) {
+            if (name == "len") {
                 if (args_count >= 1) {
                     self.checkExpr(self.ast.getData(idx, 2))
                 }
@@ -1182,14 +1161,12 @@ impl Checker {
 
         // Check argument types
         const param_offset = if (is_method) { 1 } else { 0 }
-        var ai: int = 0
-        while (ai < args_count) {
+        for ai in 0..args_count {
             const arg_type = self.checkExpr(self.ast.getData(idx, 2 + ai))
             const param = @intToPtr(*FuncParam, func_info.params + (ai + param_offset) * @sizeOf(FuncParam))
             if (!self.types.isAssignable(arg_type, param.type_idx)) {
                 self.reportError(idx, ErrorCode.e300, "type mismatch")
             }
-            ai += 1
         }
 
         return func_info.return_type
@@ -1209,7 +1186,7 @@ impl Checker {
         }
 
         const type_name = self.types.typeName(base_type)
-        if (strEqual(type_name, "unknown")) { return -1 }
+        if (type_name == "unknown") { return -1 }
         return self.types.lookupMethod(type_name, field_name)
     }
 
@@ -1262,7 +1239,7 @@ impl Checker {
         // Nested type namespace: TypeName.Nested
         if (self.ast.getTag(base_n) == @intFromEnum(NodeTag.ident)) {
             const base_name = self.ast.getStr(self.ast.getData(base_n, 0))
-            const qualified = base_name ++ "_" ++ field_name
+            const qualified = "${base_name}_${field_name}"
 
             // Check named types
             const nested_type = self.types.lookupByName(qualified)
@@ -1297,13 +1274,11 @@ impl Checker {
         if (base.tag == TAG_STRUCT) {
             const st = switch (base) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
             // Search fields
-            var fi: int = 0
-            while (fi < st.field_count) {
+            for fi in 0..st.field_count {
                 const sf = @intToPtr(*StructField, st.fields + fi * @sizeOf(StructField))
-                if (strEqual(sf.name, field_name)) {
+                if (sf.name == field_name) {
                     return sf.type_idx
                 }
-                fi += 1
             }
             // Check methods
             const mi = self.types.lookupMethod(st.name, field_name)
@@ -1317,13 +1292,11 @@ impl Checker {
         // Enum variant access
         if (base.tag == TAG_ENUM) {
             const et = switch (base) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
-            var vi: int = 0
-            while (vi < et.variant_count) {
+            for vi in 0..et.variant_count {
                 const ev = @intToPtr(*EnumVariant, et.variants + vi * @sizeOf(EnumVariant))
-                if (strEqual(ev.name, field_name)) {
+                if (ev.name == field_name) {
                     return base_type
                 }
-                vi += 1
             }
             // Check methods
             const mi = self.types.lookupMethod(et.name, field_name)
@@ -1337,15 +1310,13 @@ impl Checker {
         // Union variant access
         if (base.tag == TAG_UNION) {
             const ut = switch (base) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
-            if (strEqual(field_name, "tag")) { return I64 }
-            var vi: int = 0
-            while (vi < ut.variant_count) {
+            if (field_name == "tag") { return I64 }
+            for vi in 0..ut.variant_count {
                 const uv = @intToPtr(*UnionVariant, ut.variants + vi * @sizeOf(UnionVariant))
-                if (strEqual(uv.name, field_name)) {
+                if (uv.name == field_name) {
                     if (uv.payload_type == invalid_type) { return base_type }
                     return uv.payload_type
                 }
-                vi += 1
             }
             self.reportError(idx, ErrorCode.e306, "field not found")
             return invalid_type
@@ -1353,8 +1324,8 @@ impl Checker {
 
         // Slice fields: .ptr, .len
         if (base.tag == TAG_SLICE or base_type == STRING) {
-            if (strEqual(field_name, "len")) { return I64 }
-            if (strEqual(field_name, "ptr")) { return I64 }
+            if (field_name == "len") { return I64 }
+            if (field_name == "ptr") { return I64 }
             // String methods
             if (base_type == STRING) {
                 const mi = self.types.lookupMethod("string", field_name)
@@ -1366,12 +1337,12 @@ impl Checker {
 
         // Map/List methods
         if (base.tag == TAG_MAP) {
-            if (strEqual(field_name, "set") or strEqual(field_name, "get") or strEqual(field_name, "has")) {
+            if (field_name == "set" or field_name == "get" or field_name == "has") {
                 return I64  // simplified — would need func type construction
             }
         }
         if (base.tag == TAG_LIST) {
-            if (strEqual(field_name, "append") or strEqual(field_name, "get") or strEqual(field_name, "len")) {
+            if (field_name == "append" or field_name == "get" or field_name == "len") {
                 return I64  // simplified
             }
         }
@@ -1397,13 +1368,11 @@ impl Checker {
         }
 
         // Check field initializers
-        var fi: int = 0
-        while (fi < fi_count) {
+        for fi in 0..fi_count {
             const fi_idx = self.ast.getData(idx, 2 + fi)
             // field_init_node: [name_s, value_n, span_s, span_e]
             const value_n = self.ast.getData(fi_idx, 1)
             self.checkExpr(value_n)
-            fi += 1
         }
 
         return struct_type_idx
@@ -1426,12 +1395,10 @@ impl Checker {
 
         // Check field initializers
         const fi_count = self.ast.getData(idx, 2)
-        var fi: int = 0
-        while (fi < fi_count) {
+        for fi in 0..fi_count {
             const fi_idx = self.ast.getData(idx, 3 + fi)
             const value_n = self.ast.getData(fi_idx, 1)
             self.checkExpr(value_n)
-            fi += 1
         }
 
         // Return pointer to struct (heap-allocated)
@@ -1446,10 +1413,8 @@ impl Checker {
             return invalid_type
         }
         const first_type = self.checkExpr(self.ast.getData(idx, 1))
-        var i: int = 1
-        while (i < count) {
+        for i in 1..count {
             self.checkExpr(self.ast.getData(idx, 1 + i))
-            i += 1
         }
         return self.types.makeArray(first_type, count)
     }
@@ -1459,10 +1424,8 @@ impl Checker {
         const count = self.ast.getData(idx, 0)
         // For self-hosted we simplified tuple type representation
         // Just check all elements
-        var i: int = 0
-        while (i < count) {
+        for i in 0..count {
             self.checkExpr(self.ast.getData(idx, 1 + i))
-            i += 1
         }
         return I64  // simplified
     }
@@ -1517,8 +1480,7 @@ impl Checker {
         var result_type: int = VOID
         var first = true
 
-        var ci: int = 0
-        while (ci < cases_count) {
+        for ci in 0..cases_count {
             const case_idx = self.ast.getData(idx, 3 + ci)
             // switch_case: [capture_s, guard_n, is_range, body_n, patterns_count, ...patterns, span_s, span_e]
             const body_n = self.ast.getData(case_idx, 3)
@@ -1527,7 +1489,6 @@ impl Checker {
                 result_type = self.materializeType(body_type)
                 first = false
             }
-            ci += 1
         }
         if (else_body_n != null_node) {
             self.checkExpr(else_body_n)
@@ -1542,10 +1503,8 @@ impl Checker {
         const stmts_count = self.ast.getData(idx, 1)
 
         self.pushScope()
-        var i: int = 0
-        while (i < stmts_count) {
+        for i in 0..stmts_count {
             self.checkStmt(self.ast.getData(idx, 2 + i))
-            i += 1
         }
         var result: int = VOID
         if (result_expr != null_node) {
@@ -1744,10 +1703,8 @@ impl Checker {
         }
 
         // Check all args as fallback
-        var ai: int = 0
-        while (ai < args_count) {
+        for ai in 0..args_count {
             self.checkExpr(self.ast.getData(idx, 3 + ai))
-            ai += 1
         }
         return invalid_type
     }
@@ -1755,10 +1712,8 @@ impl Checker {
     fn checkStringInterp(idx: int) int {
         // string_interp: [segments_count, ...segment_nodes, span_s, span_e]
         const count = self.ast.getData(idx, 0)
-        var i: int = 0
-        while (i < count) {
+        for i in 0..count {
             self.checkExpr(self.ast.getData(idx, 1 + i))
-            i += 1
         }
         return STRING
     }
@@ -1892,8 +1847,7 @@ impl Checker {
 
         // Build struct fields using raw pointer array
         const fields_ptr = alloc(0, fields_count * @sizeOf(StructField))
-        var fi: int = 0
-        while (fi < fields_count) {
+        for fi in 0..fields_count {
             const field_idx = self.ast.getData(idx, 4 + fi)
             // field_def: [name_s, type_expr_n, default_val_n, doc_s, span_s, span_e]
             const fname = self.ast.getStr(self.ast.getData(field_idx, 0))
@@ -1907,10 +1861,9 @@ impl Checker {
             sf.offset = total_size
             sf.default_value = fdefault
 
-            total_size = total_size + self.types.sizeOf(ftype)
+            total_size += self.types.sizeOf(ftype)
             // Align to 8 bytes
             total_size = (total_size + 7) / 8 * 8
-            fi += 1
         }
 
         return self.types.add(Type.struct_type(StructType {
@@ -1936,8 +1889,7 @@ impl Checker {
 
         const variants_ptr = alloc(0, variants_count * @sizeOf(EnumVariant))
         var next_value: int = 0
-        var vi: int = 0
-        while (vi < variants_count) {
+        for vi in 0..variants_count {
             const v_idx = self.ast.getData(idx, 4 + vi)
             // enum_variant: [name_s, value_n, span_s, span_e]
             const vname = self.ast.getStr(self.ast.getData(v_idx, 0))
@@ -1953,7 +1905,6 @@ impl Checker {
             ev.name = vname
             ev.value = value
             next_value = value + 1
-            vi += 1
         }
 
         return self.types.add(Type.enum_type(EnumType {
@@ -1970,8 +1921,7 @@ impl Checker {
         const variants_count = self.ast.getData(idx, 2)
 
         const variants_ptr = alloc(0, variants_count * @sizeOf(UnionVariant))
-        var vi: int = 0
-        while (vi < variants_count) {
+        for vi in 0..variants_count {
             const v_idx = self.ast.getData(idx, 3 + vi)
             // union_variant: [name_s, type_expr_n, span_s, span_e]
             const vname = self.ast.getStr(self.ast.getData(v_idx, 0))
@@ -1984,7 +1934,6 @@ impl Checker {
             const uv = @intToPtr(*UnionVariant, variants_ptr + vi * @sizeOf(UnionVariant))
             uv.name = vname
             uv.payload_type = payload_type
-            vi += 1
         }
 
         const tag_type = if (variants_count <= 256) { U8 } else { U16 }
@@ -2002,8 +1951,7 @@ impl Checker {
         const params_count = self.ast.getData(idx, 6)
 
         const params_ptr = alloc(0, params_count * @sizeOf(FuncParam))
-        var pi: int = 0
-        while (pi < params_count) {
+        for pi in 0..params_count {
             const param_idx = self.ast.getData(idx, 7 + pi)
             // field_def: [name_s, type_expr_n, default_val_n, doc_s, span_s, span_e]
             var pname = ""
@@ -2017,7 +1965,6 @@ impl Checker {
             const fp = @intToPtr(*FuncParam, params_ptr + pi * @sizeOf(FuncParam))
             fp.name = pname
             fp.type_idx = ptype
-            pi += 1
         }
 
         var ret_type: int = VOID
@@ -2129,13 +2076,11 @@ impl Checker {
                     const t = self.types.get(type_idx)
                     if (t.tag == TAG_ENUM) {
                         const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
-                        var vi: int = 0
-                        while (vi < et.variant_count) {
+                        for vi in 0..et.variant_count {
                             const ev = @intToPtr(*EnumVariant, et.variants + vi * @sizeOf(EnumVariant))
-                            if (strEqual(ev.name, field_name)) {
+                            if (ev.name == field_name) {
                                 return (1,ev.value)
                             }
-                            vi += 1
                         }
                     }
                 }

@@ -315,7 +315,7 @@ impl Parser {
                 const first_tag = self.ast.getTag(params.get(0))
                 if (first_tag == @intFromEnum(NodeTag.field_def)) {
                     const first_name = self.ast.getStr(self.ast.getData(params.get(0), 0))
-                    if (strEqual(first_name, "self")) {
+                    if (first_name == "self") {
                         needs_self = false
                     }
                 }
@@ -330,10 +330,8 @@ impl Parser {
                 new_params.count = 0
                 new_params.capacity = 0
                 new_params.append(self_param)
-                var pi = 0
-                while (pi < params.count) {
+                for pi in 0..params.count {
                     new_params.append(params.get(pi))
-                    pi += 1
                 }
                 params = new_params
             }
@@ -354,10 +352,8 @@ impl Parser {
         type_param_bounds.capacity = 0
         if (self.tok == @intFromEnum(Token.kw_where) and type_params.len() > 0) {
             // Initialize bounds array with "" for each type param
-            var bi = 0
-            while (bi < type_params.len()) {
+            for bi in 0..type_params.len() {
                 type_param_bounds.append("")
-                bi += 1
             }
             self.advance()  // consume 'where'
             while (self.tok == @intFromEnum(Token.ident)) {
@@ -373,13 +369,11 @@ impl Parser {
                 const trait_name = self.tok_text
                 self.advance()
                 // Find matching type param and set its bound
-                var wi = 0
-                while (wi < type_params.len()) {
-                    if (strEqual(type_params.get(wi), param_name)) {
+                for wi in 0..type_params.len() {
+                    if (type_params.get(wi) == param_name) {
                         type_param_bounds.set(wi, trait_name)
                         break
                     }
-                    wi += 1
                 }
                 if (!self.match(@intFromEnum(Token.comma))) {
                     break
@@ -1587,7 +1581,7 @@ impl Parser {
                 self.expect(@intFromEnum(Token.fat_arrow))
                 else_body = self.parseExpr()
                 self.match(@intFromEnum(Token.comma))
-            } else if (self.tok == @intFromEnum(Token.ident) and strEqual(self.tok_text, "_")) {
+            } else if (self.tok == @intFromEnum(Token.ident) and self.tok_text == "_") {
                 // Wildcard _ => treat as else (Rust/Zig convention)
                 // Ported from parser.zig:1502-1508
                 self.advance()

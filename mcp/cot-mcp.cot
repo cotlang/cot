@@ -232,7 +232,9 @@ fn syntaxReference() string {
     sb.append("// Stack init (PERIOD prefix, EQUALS sign):\n")
     sb.append("var p = Point { .x = 10, .y = 20 }\n")
     sb.append("// Heap init (NO period, COLON separator):\n")
-    sb.append("var h = new Point { x: 10, y: 20 }\n\n")
+    sb.append("var h = new Point { x: 10, y: 20 }\n")
+    sb.append("// Block-scoped (inside functions/tests):\n")
+    sb.append("test \"local\" { struct Pair { a: i64, b: i64 } }\n\n")
 
     sb.append("## Enums & Unions\n")
     sb.append("const Color = enum { Red, Green, Blue }\n")

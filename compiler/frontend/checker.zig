@@ -266,6 +266,18 @@ pub const Checker = struct {
     /// Check a statement list for unreachable code after return/break/continue.
     /// Zig pattern: compiler warns on statements after `return` in a block.
     fn checkStmtsWithReachability(self: *Checker, stmts: []const NodeIndex) void {
+        // Pre-pass: collect type declarations from statement list
+        // (struct/enum/union decls that appear as Decl nodes in block context)
+        for (stmts) |stmt_idx| {
+            const node = self.tree.getNode(stmt_idx) orelse continue;
+            if (node.asDecl()) |decl| {
+                switch (decl) {
+                    .struct_decl, .enum_decl, .union_decl, .type_alias, .error_set_decl, .trait_decl
+                        => self.collectDecl(stmt_idx) catch {},
+                    else => {},
+                }
+            }
+        }
         var seen_terminal = false;
         var warned = false;
         for (stmts) |stmt_idx| {

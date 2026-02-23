@@ -5,8 +5,7 @@
 /// Each node has a tag (NodeTag), and its data fields are packed
 /// sequentially in the `data` array starting at `offsets[node_idx]`.
 /// String data lives in a separate `strings` array, referenced by index.
-///
-/// This avoids List(union) and List(struct) which have compiler limitations.
+/// This cache-friendly layout matches Zig's own std.zig.Ast design.
 
 import "std/list"
 
@@ -254,10 +253,8 @@ impl Ast {
         const idx = self.addNode(@intFromEnum(NodeTag.call))
         self.addData(callee)
         self.addData(args.count)
-        var i = 0
-        while (i < args.count) {
+        for i in 0..args.count {
             self.addData(args.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -296,10 +293,8 @@ impl Ast {
     fn addArrayLit(elems: List(int), s: Span) int {
         const idx = self.addNode(@intFromEnum(NodeTag.array_literal))
         self.addData(elems.count)
-        var i = 0
-        while (i < elems.count) {
+        for i in 0..elems.count {
             self.addData(elems.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -331,10 +326,8 @@ impl Ast {
         self.addData(subject)
         self.addData(else_body)
         self.addData(cases.count)
-        var i = 0
-        while (i < cases.count) {
+        for i in 0..cases.count {
             self.addData(cases.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -349,10 +342,8 @@ impl Ast {
         self.addData(is_range)
         self.addData(body)
         self.addData(patterns.count)
-        var i = 0
-        while (i < patterns.count) {
+        for i in 0..patterns.count {
             self.addData(patterns.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -363,10 +354,8 @@ impl Ast {
         const idx = self.addNode(@intFromEnum(NodeTag.block_expr))
         self.addData(result_expr)
         self.addData(stmts.count)
-        var i = 0
-        while (i < stmts.count) {
+        for i in 0..stmts.count {
             self.addData(stmts.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -378,16 +367,12 @@ impl Ast {
         const idx = self.addNode(@intFromEnum(NodeTag.struct_init))
         self.addData(str_idx)
         self.addData(fields.count)
-        var i = 0
-        while (i < fields.count) {
+        for i in 0..fields.count {
             self.addData(fields.get(i))
-            i += 1
         }
         self.addData(type_args.count)
-        i = 0
-        while (i < type_args.count) {
+        for i in 0..type_args.count {
             self.addData(type_args.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -400,22 +385,16 @@ impl Ast {
         self.addData(str_idx)
         self.addData(is_ctor)
         self.addData(fields.count)
-        var fi = 0
-        while (fi < fields.count) {
+        for fi in 0..fields.count {
             self.addData(fields.get(fi))
-            fi += 1
         }
         self.addData(type_args.count)
-        var ti = 0
-        while (ti < type_args.count) {
+        for ti in 0..type_args.count {
             self.addData(type_args.get(ti))
-            ti += 1
         }
         self.addData(ctor_args.count)
-        var ci = 0
-        while (ci < ctor_args.count) {
+        for ci in 0..ctor_args.count {
             self.addData(ctor_args.get(ci))
-            ci += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -427,10 +406,8 @@ impl Ast {
         self.addData(kind)
         self.addData(type_arg)
         self.addData(args.count)
-        var i = 0
-        while (i < args.count) {
+        for i in 0..args.count {
             self.addData(args.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -440,10 +417,8 @@ impl Ast {
     fn addStringInterp(segments: List(int), s: Span) int {
         const idx = self.addNode(@intFromEnum(NodeTag.string_interp))
         self.addData(segments.count)
-        var i = 0
-        while (i < segments.count) {
+        for i in 0..segments.count {
             self.addData(segments.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -501,10 +476,8 @@ impl Ast {
         self.addData(ret_type)
         self.addData(body)
         self.addData(params.count)
-        var i = 0
-        while (i < params.count) {
+        for i in 0..params.count {
             self.addData(params.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -514,10 +487,8 @@ impl Ast {
     fn addTupleLit(elems: List(int), s: Span) int {
         const idx = self.addNode(@intFromEnum(NodeTag.tuple_literal))
         self.addData(elems.count)
-        var i = 0
-        while (i < elems.count) {
+        for i in 0..elems.count {
             self.addData(elems.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -560,10 +531,8 @@ impl Ast {
         const idx = self.addNode(@intFromEnum(NodeTag.generic_instance))
         self.addData(str_idx)
         self.addData(type_args.count)
-        var i = 0
-        while (i < type_args.count) {
+        for i in 0..type_args.count {
             self.addData(type_args.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -645,25 +614,19 @@ impl Ast {
         self.addData(is_async)
         self.addData(doc_idx)
         self.addData(params.count)
-        var i = 0
-        while (i < params.count) {
+        for i in 0..params.count {
             self.addData(params.get(i))
-            i += 1
         }
         self.addData(type_params.count)
-        i = 0
-        while (i < type_params.count) {
+        for i in 0..type_params.count {
             const tp_str = self.addStr(type_params.get(i))
             self.addData(tp_str)
-            i += 1
         }
         // Where clause bounds: one per type param, "" = no bound
         self.addData(type_param_bounds.count)
-        i = 0
-        while (i < type_param_bounds.count) {
+        for i in 0..type_param_bounds.count {
             const bound_str = self.addStr(type_param_bounds.get(i))
             self.addData(bound_str)
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -692,23 +655,17 @@ impl Ast {
         self.addData(layout)
         self.addData(doc_idx)
         self.addData(fields.count)
-        var i = 0
-        while (i < fields.count) {
+        for i in 0..fields.count {
             self.addData(fields.get(i))
-            i += 1
         }
         self.addData(type_params.count)
-        i = 0
-        while (i < type_params.count) {
+        for i in 0..type_params.count {
             const tp_str = self.addStr(type_params.get(i))
             self.addData(tp_str)
-            i += 1
         }
         self.addData(nested.count)
-        i = 0
-        while (i < nested.count) {
+        for i in 0..nested.count {
             self.addData(nested.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -723,10 +680,8 @@ impl Ast {
         self.addData(backing_type)
         self.addData(doc_idx)
         self.addData(variants.count)
-        var i = 0
-        while (i < variants.count) {
+        for i in 0..variants.count {
             self.addData(variants.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -740,10 +695,8 @@ impl Ast {
         self.addData(name_idx)
         self.addData(doc_idx)
         self.addData(variants.count)
-        var i = 0
-        while (i < variants.count) {
+        for i in 0..variants.count {
             self.addData(variants.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -778,17 +731,13 @@ impl Ast {
         self.addData(name_idx)
         self.addData(doc_idx)
         self.addData(methods.count)
-        var i = 0
-        while (i < methods.count) {
+        for i in 0..methods.count {
             self.addData(methods.get(i))
-            i += 1
         }
         self.addData(type_params.count)
-        i = 0
-        while (i < type_params.count) {
+        for i in 0..type_params.count {
             const tp_str = self.addStr(type_params.get(i))
             self.addData(tp_str)
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -802,10 +751,8 @@ impl Ast {
         self.addData(name_idx)
         self.addData(doc_idx)
         self.addData(methods.count)
-        var i = 0
-        while (i < methods.count) {
+        for i in 0..methods.count {
             self.addData(methods.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -821,17 +768,13 @@ impl Ast {
         self.addData(tt_idx)
         self.addData(doc_idx)
         self.addData(methods.count)
-        var i = 0
-        while (i < methods.count) {
+        for i in 0..methods.count {
             self.addData(methods.get(i))
-            i += 1
         }
         self.addData(type_params.count)
-        i = 0
-        while (i < type_params.count) {
+        for i in 0..type_params.count {
             const tp_str = self.addStr(type_params.get(i))
             self.addData(tp_str)
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -845,11 +788,9 @@ impl Ast {
         self.addData(name_idx)
         self.addData(doc_idx)
         self.addData(variants.count)
-        var i = 0
-        while (i < variants.count) {
+        for i in 0..variants.count {
             const v_str = self.addStr(variants.get(i))
             self.addData(v_str)
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -971,10 +912,8 @@ impl Ast {
     fn addBlockStmt(stmts: List(int), s: Span) int {
         const idx = self.addNode(@intFromEnum(NodeTag.block_stmt))
         self.addData(stmts.count)
-        var i = 0
-        while (i < stmts.count) {
+        for i in 0..stmts.count {
             self.addData(stmts.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)
@@ -1013,10 +952,8 @@ impl Ast {
         self.addData(value)
         self.addData(is_const)
         self.addData(bindings.count)
-        var i = 0
-        while (i < bindings.count) {
+        for i in 0..bindings.count {
             self.addData(bindings.get(i))
-            i += 1
         }
         self.addData(s.start)
         self.addData(s.end)

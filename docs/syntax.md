@@ -123,6 +123,31 @@ struct Point { x: i64, y: i64 }
 struct Pair(T, U) { first: T, second: U }
 ```
 
+### Block-Scoped Structs and Unions
+
+Structs and unions can be declared inside function bodies, test blocks, or any block scope (Zig pattern):
+
+```cot
+test "local struct" {
+    struct Pair { a: i64, b: i64 }
+    const p = Pair { .a = 10, .b = 20 }
+    @assertEq(p.a, 10)
+}
+
+test "local union" {
+    union Shape { circle: i64, rect: i64 }
+    var s: Shape = Shape.circle(5)
+    @assertEq(s.circle, 5)
+}
+
+test "packed in block" {
+    packed struct Flags { a: i8, b: i8 }
+    const f = Flags { .a = 1, .b = 2 }
+}
+```
+
+Block-scoped types are data-only — `impl` blocks remain top-level. Use unique names to avoid collisions with other block-scoped types.
+
 ## Struct Init — TWO Syntaxes
 
 **Stack (value type):** period prefix `.field`, equals `=`

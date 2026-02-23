@@ -42,6 +42,7 @@ These Zig features have direct Cot equivalents:
 | `??` nullish coalesce | Same as Zig's `orelse` | 150+ |
 | `@trap()` | Same as Zig's `unreachable` | 50+ |
 | `@fmin`, `@fmax` | Same (float) | 30+ |
+| Block-scoped types (`const T = struct { ... }`) | `struct T { ... }` in blocks (data-only, no impl) | 10+ |
 
 ---
 
