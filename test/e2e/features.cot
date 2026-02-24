@@ -392,6 +392,25 @@ test "union_struct_payload_capture" {
     @assertEq(cy, 20)
 }
 
+test "union_switch_expr_no_payload" {
+    var s = State.Running
+    const val = switch (s) {
+        State.Init => 1,
+        State.Running => 2,
+        State.Done => 3,
+    }
+    @assertEq(val, 2)
+}
+
+test "union_switch_expr_no_payload_else" {
+    var e = Event.Hover
+    const matched = switch (e) {
+        Event.Hover => true,
+        else => false,
+    }
+    @assertEq(matched, true)
+}
+
 // ============================================================================
 // Tests: Error unions
 // ============================================================================

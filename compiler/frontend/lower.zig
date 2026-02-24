@@ -106,7 +106,8 @@ pub const Lowerer = struct {
     /// value references that cause native codegen issues (select + native regalloc).
     /// Reference: Zig AIR — optional orelse uses conditional branch, not select.
     fn lowerCompoundOrelse(self: *Lowerer, fb: *ir.FuncBuilder, left: ir.NodeIndex, bin: ast.Binary, left_type_idx: TypeIndex, left_type: anytype, result_type: TypeIndex) Error!ir.NodeIndex {
-        const opt_local = try fb.addLocalWithSize("__orelse_opt", left_type_idx, false, 16);
+        const opt_size = self.type_reg.sizeOf(left_type_idx);
+        const opt_local = try fb.addLocalWithSize("__orelse_opt", left_type_idx, false, opt_size);
         _ = try fb.emitStoreLocal(opt_local, left, bin.span);
         const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
         const zero_tag = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
@@ -177,12 +178,15 @@ pub const Lowerer = struct {
             const arm_type = self.inferExprType(ast_idx);
             const arm_info = self.type_reg.get(arm_type);
             if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
-                const tmp = try fb.addLocalWithSize("__opt_fap_tmp", arm_type, false, 16);
+                const arm_size = self.type_reg.sizeOf(arm_type);
+                const num_words: u32 = arm_size / 8;
+                const tmp = try fb.addLocalWithSize("__opt_fap_tmp", arm_type, false, arm_size);
                 _ = try fb.emitStoreLocal(tmp, val, span);
-                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-                const payload = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
-                _ = try fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag, span);
-                _ = try fb.emitStoreFieldValue(ptr, field_idx + 1, field_offset + 8, payload, span);
+                for (0..num_words) |i| {
+                    const offset: i64 = @intCast(i * 8);
+                    const field = try fb.emitFieldLocal(tmp, @intCast(i), offset, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreFieldValue(ptr, field_idx + @as(u32, @intCast(i)), field_offset + offset, field, span);
+                }
             } else {
                 const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
                 _ = try fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag_one, span);
@@ -204,13 +208,16 @@ pub const Lowerer = struct {
             const arm_type = self.inferExprType(ast_idx);
             const arm_info = self.type_reg.get(arm_type);
             if (arm_info == .optional and !self.isPtrLikeOptional(arm_type)) {
-                // Already compound optional — copy both words
-                const tmp = try fb.addLocalWithSize("__opt_field_tmp", arm_type, false, 16);
+                // Already compound optional — copy all words
+                const arm_size = self.type_reg.sizeOf(arm_type);
+                const num_words: u32 = arm_size / 8;
+                const tmp = try fb.addLocalWithSize("__opt_field_tmp", arm_type, false, arm_size);
                 _ = try fb.emitStoreLocal(tmp, val, span);
-                const tag = try fb.emitFieldLocal(tmp, 0, 0, TypeRegistry.I64, span);
-                const payload = try fb.emitFieldLocal(tmp, 1, 8, TypeRegistry.I64, span);
-                _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag, span);
-                _ = try fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, payload, span);
+                for (0..num_words) |i| {
+                    const offset: i64 = @intCast(i * 8);
+                    const field = try fb.emitFieldLocal(tmp, @intCast(i), offset, TypeRegistry.I64, span);
+                    _ = try fb.emitStoreLocalField(local_idx, field_idx + @as(u32, @intCast(i)), field_offset + offset, field, span);
+                }
             } else {
                 // Plain T → wrap as tag=1, payload=value
                 const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, span);
@@ -1363,10 +1370,12 @@ pub const Lowerer = struct {
                             const ret_expr_type = self.inferExprType(ret.value);
                             const ret_expr_info = self.type_reg.get(ret_expr_type);
                             if (ret_expr_info == .optional) {
-                                // Returning an existing optional → forward compound (copy 2 words)
-                                const tmp_local = try fb.addLocalWithSize("__ret_opt_src", sret_type, false, 16);
+                                // Returning an existing optional → forward compound (copy all words)
+                                const sret_size = self.type_reg.sizeOf(sret_type);
+                                const num_words: u32 = sret_size / 8;
+                                const tmp_local = try fb.addLocalWithSize("__ret_opt_src", sret_type, false, sret_size);
                                 _ = try fb.emitStoreLocal(tmp_local, lowered, ret.span);
-                                for (0..2) |i| {
+                                for (0..num_words) |i| {
                                     const offset: i64 = @intCast(i * 8);
                                     const field = try fb.emitFieldLocal(tmp_local, @intCast(i), offset, TypeRegistry.I64, ret.span);
                                     _ = try fb.emitStoreField(sret_ptr_opt, @intCast(i), offset, field, ret.span);
@@ -1787,19 +1796,7 @@ pub const Lowerer = struct {
                     }
                 }
             } else {
-                const type_info = self.type_reg.get(type_idx);
-                const is_compound_copy = (type_info == .struct_type or type_info == .tuple) and value_expr != null and
-                    (value_expr.? == .field_access or value_expr.? == .index or value_expr.? == .deref);
-                const is_struct_copy = is_compound_copy;
-                if (is_struct_copy) {
-                    const src_addr = try self.lowerExprNode(var_stmt.value);
-                    if (src_addr == ir.null_node) return;
-                    const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
-                    const dst_addr = try fb.emitAddrLocal(local_idx, ptr_type, var_stmt.span);
-                    const size_node = try fb.emitConstInt(@intCast(size), TypeRegistry.I64, var_stmt.span);
-                    var args = [_]ir.NodeIndex{ dst_addr, src_addr, size_node };
-                    _ = try fb.emitCall("memcpy", &args, false, TypeRegistry.VOID, var_stmt.span);
-                } else {
+                {
                     const value_node = try self.lowerExprNode(var_stmt.value);
                     if (value_node == ir.null_node) return;
                     _ = try fb.emitStoreLocal(local_idx, value_node, var_stmt.span);
@@ -2656,7 +2653,7 @@ pub const Lowerer = struct {
 
         const is_non_null = if (is_compound_opt) blk: {
             // Compound optional: store to temp, read tag at field 0
-            const opt_local = try fb.addLocalWithSize("__opt_if", opt_type_idx, false, 16);
+            const opt_local = try fb.addLocalWithSize("__opt_if", opt_type_idx, false, self.type_reg.sizeOf(opt_type_idx));
             _ = try fb.emitStoreLocal(opt_local, opt_val, if_stmt.span);
             const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, if_stmt.span);
             const zero = try fb.emitConstInt(0, TypeRegistry.I64, if_stmt.span);
@@ -3331,7 +3328,7 @@ pub const Lowerer = struct {
                 const str_idx = try fb.addStringLiteral(copied);
                 return try fb.emitConstSlice(str_idx, lit.span);
             },
-            .char => return try fb.emitConstInt(@intCast(parseCharLiteral(lit.value)), TypeRegistry.U8, lit.span),
+            .char => return try fb.emitConstInt(@intCast(parseCharLiteral(lit.value)), TypeRegistry.I64, lit.span),
         }
     }
 
@@ -3493,7 +3490,7 @@ pub const Lowerer = struct {
 
             // x == null / x != null where x is compound optional
             if (left_is_compound_opt and right_is_null) {
-                const opt_local = try fb.addLocalWithSize("__opt_cmp", left_type_idx, false, 16);
+                const opt_local = try fb.addLocalWithSize("__opt_cmp", left_type_idx, false, self.type_reg.sizeOf(left_type_idx));
                 _ = try fb.emitStoreLocal(opt_local, left, bin.span);
                 const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
                 const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
@@ -3501,7 +3498,7 @@ pub const Lowerer = struct {
             }
             // null == x / null != x where x is compound optional
             if (right_is_compound_opt and left_is_null) {
-                const opt_local = try fb.addLocalWithSize("__opt_cmp", right_type_idx, false, 16);
+                const opt_local = try fb.addLocalWithSize("__opt_cmp", right_type_idx, false, self.type_reg.sizeOf(right_type_idx));
                 _ = try fb.emitStoreLocal(opt_local, right, bin.span);
                 const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
                 const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
@@ -3510,7 +3507,7 @@ pub const Lowerer = struct {
             // x == value / x != value where x is compound optional (e.g., ?i64 == 42)
             // Result: (tag != 0) AND (payload == value) for eql; NOT that for neq
             if (left_is_compound_opt and !right_is_null) {
-                const opt_local = try fb.addLocalWithSize("__opt_vcmp", left_type_idx, false, 16);
+                const opt_local = try fb.addLocalWithSize("__opt_vcmp", left_type_idx, false, self.type_reg.sizeOf(left_type_idx));
                 _ = try fb.emitStoreLocal(opt_local, left, bin.span);
                 const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, bin.span);
                 const zero = try fb.emitConstInt(0, TypeRegistry.I64, bin.span);
@@ -3571,7 +3568,7 @@ pub const Lowerer = struct {
 
         // Compound optional unwrap: ?T (non-pointer-like) — read tag + payload from compound
         if (un.op == .question and operand_type == .optional and !self.isPtrLikeOptional(operand_type_idx)) {
-            const opt_local = try fb.addLocalWithSize("__unwrap_opt", operand_type_idx, false, 16);
+            const opt_local = try fb.addLocalWithSize("__unwrap_opt", operand_type_idx, false, self.type_reg.sizeOf(operand_type_idx));
             _ = try fb.emitStoreLocal(opt_local, operand, un.span);
 
             // Runtime safety: null check on tag
@@ -4795,7 +4792,7 @@ pub const Lowerer = struct {
 
         // Check if non-null
         const is_non_null = if (is_compound_opt) blk: {
-            const opt_local = try fb.addLocalWithSize("__opt_ifx", opt_type_idx, false, 16);
+            const opt_local = try fb.addLocalWithSize("__opt_ifx", opt_type_idx, false, self.type_reg.sizeOf(opt_type_idx));
             _ = try fb.emitStoreLocal(opt_local, opt_val, if_expr.span);
             const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, if_expr.span);
             const zero = try fb.emitConstInt(0, TypeRegistry.I64, if_expr.span);
@@ -4866,9 +4863,10 @@ pub const Lowerer = struct {
         }
         const subject_type = self.inferExprType(se.subject);
         const is_union = self.type_reg.get(subject_type) == .union_type;
-        // Union switches with captures use a dedicated handler that supports both
-        // statement form (void result) and expression form (value result).
-        if (is_union and self.hasCapture(se)) {
+        // Union switches always use the dedicated handler that compares tags
+        // (tag extraction + integer equality). The generic select/block paths
+        // compare full union values which fails for multi-word types.
+        if (is_union) {
             const ut = self.type_reg.get(subject_type).union_type;
             return try self.lowerUnionSwitch(se, subject_type, ut, result_type);
         }
@@ -5110,7 +5108,11 @@ pub const Lowerer = struct {
 
                 if (is_expr) {
                     const case_val = try self.lowerExprNode(case.body);
-                    if (case_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+                    // Only store if arm actually produces a value (not void/diverging).
+                    // Arms like @panic() return void but don't diverge from the user's
+                    // perspective — they abort. Don't try to local.set a void result.
+                    const arm_type = self.inferExprType(case.body);
+                    if (case_val != ir.null_node and arm_type != TypeRegistry.VOID) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
                     if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
                 } else {
                     if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
@@ -5119,7 +5121,8 @@ pub const Lowerer = struct {
             } else {
                 if (is_expr) {
                     const case_val = try self.lowerExprNode(case.body);
-                    if (case_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+                    const arm_type = self.inferExprType(case.body);
+                    if (case_val != ir.null_node and arm_type != TypeRegistry.VOID) _ = try fb.emitStoreLocal(result_local, case_val, se.span);
                     if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
                 } else {
                     if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
@@ -5132,7 +5135,8 @@ pub const Lowerer = struct {
         if (se.else_body != null_node) {
             if (is_expr) {
                 const else_val = try self.lowerExprNode(se.else_body);
-                if (else_val != ir.null_node) _ = try fb.emitStoreLocal(result_local, else_val, se.span);
+                const else_type = self.inferExprType(se.else_body);
+                if (else_val != ir.null_node and else_type != TypeRegistry.VOID) _ = try fb.emitStoreLocal(result_local, else_val, se.span);
                 if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
             } else {
                 if (!try self.lowerBlockNode(se.else_body)) _ = try fb.emitJump(merge_block, se.span);

@@ -399,7 +399,7 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.release)] = .{ .name = "Release", .arg_len = 1, .has_side_effects = true };
 
     // Move
-    table[@intFromEnum(Op.move)] = .{ .name = "Move", .arg_len = 3, .aux_type = .int64, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.move)] = .{ .name = "Move", .arg_len = 2, .aux_type = .int64, .writes_memory = true, .has_side_effects = true };
 
     // ARM64 ops (machine-specific, not generic)
     for ([_]Op{ .arm64_add, .arm64_adds, .arm64_sub, .arm64_subs, .arm64_mul, .arm64_sdiv, .arm64_udiv, .arm64_madd, .arm64_msub }) |op| {
@@ -607,7 +607,7 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.wasm_return)] = .{ .name = "WasmReturn", .generic = false, .has_side_effects = true };
 
     // Lowered operations
-    table[@intFromEnum(Op.wasm_lowered_move)] = .{ .name = "WasmLoweredMove", .generic = false, .arg_len = 1, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.wasm_lowered_move)] = .{ .name = "WasmLoweredMove", .generic = false, .arg_len = 2, .writes_memory = true, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_lowered_zero)] = .{ .name = "WasmLoweredZero", .generic = false, .aux_type = .int64, .writes_memory = true, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_lowered_nil_check)] = .{ .name = "WasmLoweredNilCheck", .generic = false, .arg_len = 1, .nil_check = true, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_lowered_static_call)] = .{ .name = "WasmLoweredStaticCall", .generic = false, .arg_len = -1, .aux_type = .call, .call = true, .has_side_effects = true };

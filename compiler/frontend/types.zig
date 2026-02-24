@@ -298,7 +298,11 @@ pub const TypeRegistry = struct {
                 for (tup.element_types) |et| total += ((self.sizeOf(et) + 7) / 8) * 8;
                 break :blk total;
             },
-            .optional => 16,
+            .optional => |opt| blk: {
+                const elem_size = self.sizeOf(opt.elem);
+                const payload_size: u32 = if (elem_size <= 8) 8 else ((elem_size + 7) / 8) * 8;
+                break :blk 8 + payload_size;
+            },
             .error_union => |eu| blk: {
                 // 8 bytes for tag + payload (min 8 bytes to match !void / !i64 layout)
                 const elem_size = self.sizeOf(eu.elem);

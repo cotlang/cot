@@ -86,18 +86,25 @@ fn scheduleBlock(allocator: std.mem.Allocator, block: *Block, f: *Func) !void {
         }
     }
 
-    // Memory ordering: chain stores, loads, and calls.
-    // Calls are memory barriers: they may read/write any memory (via pointers).
-    // Go reference: schedule.go treats calls as both reads and writes.
+    // Memory ordering: chain stores and calls linearly via last_mem.
+    // Loads get an edge from last_mem but do NOT update it (loads don't chain
+    // to each other). Go reference: schedule.go uses nextMem for store chain,
+    // loads only get edges to the next store.
     var last_mem: ?*Value = null;
     for (values) |v| {
+        // IR-level sized ops (load8..load64, store8..store64) exist at schedule time.
+        // Wasm-level ops (wasm_i64_load8_u, etc.) exist after lower_wasm (schedule
+        // runs first, so these are listed for completeness but rarely match here).
         if (v.op == .store or v.op == .store_reg or
+            v.op == .store8 or v.op == .store16 or v.op == .store32 or v.op == .store64 or
             v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
             v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32)
         {
             if (last_mem) |lm| try edges.append(allocator, .{ .x = lm, .y = v });
             last_mem = v;
         } else if (v.op == .load or v.op == .load_reg or
+            v.op == .load8 or v.op == .load16 or v.op == .load32 or v.op == .load64 or
+            v.op == .load8s or v.op == .load16s or v.op == .load32s or
             v.op == .wasm_i64_load or v.op == .wasm_i64_load8_u or
             v.op == .wasm_i64_load16_u or v.op == .wasm_i64_load32_u or
             v.op == .wasm_i64_load8_s or v.op == .wasm_i64_load16_s or
