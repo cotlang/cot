@@ -1661,6 +1661,39 @@ test "list_struct" {
     @assertEq(list.get(1).y, 40)
 }
 
+struct BigStruct {
+    name: string,
+    age: int,
+    score: int,
+    active: bool,
+    level: int,
+    health: int,
+    mana: int,
+    speed: int,
+}
+
+test "list_struct_8_fields" {
+    var list: List(BigStruct) = .{}
+    defer list.free()
+    const s1 = BigStruct { .name = "alice", .age = 30, .score = 100, .active = true, .level = 5, .health = 200, .mana = 50, .speed = 10 }
+    const s2 = BigStruct { .name = "bob", .age = 25, .score = 80, .active = false, .level = 3, .health = 150, .mana = 30, .speed = 8 }
+    list.append(s1)
+    list.append(s2)
+    @assertEq(list.len(), 2)
+    @assertEq(list.get(0).name, "alice")
+    @assertEq(list.get(0).age, 30)
+    @assertEq(list.get(0).score, 100)
+    @assertEq(list.get(0).active, true)
+    @assertEq(list.get(0).level, 5)
+    @assertEq(list.get(0).health, 200)
+    @assertEq(list.get(0).mana, 50)
+    @assertEq(list.get(0).speed, 10)
+    @assertEq(list.get(1).name, "bob")
+    @assertEq(list.get(1).age, 25)
+    @assertEq(list.get(1).active, false)
+    @assertEq(list.get(1).speed, 8)
+}
+
 // ============================================================================
 // Comptime target builtins
 // ============================================================================
@@ -3648,4 +3681,43 @@ test "block_scoped_packed_struct" {
     const f = Flags { .a = 1, .b = 2 }
     @assertEq(f.a, 1)
     @assertEq(f.b, 2)
+}
+
+// -- Switch expression tests --
+
+fn switch_returns_int(x: int) int { return x + 1 }
+fn switch_returns_void(x: int) void { }
+
+fn switch_void_mixed(tag: int) void {
+    switch (tag) {
+        0 => { switch_returns_int(10) },
+        1 => switch_returns_void(20),
+        else => {},
+    }
+}
+
+test "switch_void_mixed_arms" {
+    switch_void_mixed(0)
+    switch_void_mixed(1)
+    switch_void_mixed(2)
+}
+
+fn switch_block_trailing(x: int) int {
+    return switch (x) {
+        0 => {
+            const a = 10
+            a + 5
+        },
+        1 => {
+            const b = 20
+            b * 2
+        },
+        else => 0,
+    }
+}
+
+test "switch_expr_block_trailing" {
+    @assertEq(switch_block_trailing(0), 15)
+    @assertEq(switch_block_trailing(1), 40)
+    @assertEq(switch_block_trailing(2), 0)
 }

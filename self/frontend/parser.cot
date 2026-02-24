@@ -183,7 +183,7 @@ impl Parser {
             Token.kw_import => self.parseImportDecl(),
             Token.kw_test => self.parseTestDecl(),
             Token.kw_bench => self.parseBenchDecl(),
-            Token.kw_fn => self.parseFnDecl(0, 0),
+            Token.kw_fn => self.parseFnDecl(0, 0, 0),
             Token.kw_const => self.parseVarDecl(1),
             Token.kw_var => self.parseVarDecl(0),
             Token.kw_let => self.parseVarDecl(0),
@@ -245,7 +245,7 @@ impl Parser {
     }
 
     /// fn name(T)(params) return_type { body }
-    fn parseFnDecl(is_extern: int, is_async: int) int {
+    fn parseFnDecl(is_extern: int, is_async: int, is_static: int) int {
         const start = self.tok_start
         const doc = self.consumeDocComment()
         self.advance()  // consume 'fn'
@@ -308,7 +308,7 @@ impl Parser {
         }
 
         // @safe implicit self: inject `self: TypeName` if in impl block
-        if (self.safe_mode and @lenOf(self.current_impl_type) > 0 and !self.current_impl_is_generic) {
+        if (self.safe_mode and @lenOf(self.current_impl_type) > 0 and !self.current_impl_is_generic and is_static == 0) {
             // Check if first param is already named "self"
             var needs_self = true
             if (params.count > 0) {
@@ -695,7 +695,7 @@ impl Parser {
         const start = self.tok_start
         self.advance()  // consume 'extern'
         if (self.tok == @intFromEnum(Token.kw_fn)) {
-            return self.parseFnDecl(1, 0)
+            return self.parseFnDecl(1, 0, 0)
         }
         if (self.tok == @intFromEnum(Token.kw_struct)) {
             return self.parseStructDecl(2)  // extern layout
@@ -755,6 +755,12 @@ impl Parser {
         const start = self.tok_start
         const doc = self.consumeDocComment()
         self.advance()  // consume 'union'
+        // Parse optional name: union Name { ... }
+        var name = ""
+        if (self.tok == @intFromEnum(Token.ident)) {
+            name = self.tok_text
+            self.advance()
+        }
         if (!self.expect(@intFromEnum(Token.lbrace))) {
             return null_node
         }
@@ -778,7 +784,7 @@ impl Parser {
             self.match(@intFromEnum(Token.comma))
         }
         self.expect(@intFromEnum(Token.rbrace))
-        return self.ast.addUnionDecl("", doc, variants, self.spanSE(start, self.tok_end))
+        return self.ast.addUnionDecl(name, doc, variants, self.spanSE(start, self.tok_end))
     }
 
     /// impl Type { methods }  or  impl Type(T) { methods }  or  impl Trait for Type { methods }
@@ -840,8 +846,19 @@ impl Parser {
 
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
             self.collectDocComment()
-            if (self.tok == @intFromEnum(Token.kw_fn)) {
-                const m = self.parseFnDecl(0, 0)
+            if (self.tok == @intFromEnum(Token.kw_static)) {
+                self.advance()  // consume 'static'
+                if (self.tok != @intFromEnum(Token.kw_fn)) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
+                    self.advance()
+                } else {
+                    const m = self.parseFnDecl(0, 0, 1)
+                    if (m != null_node) {
+                        methods.append(m)
+                    }
+                }
+            } else if (self.tok == @intFromEnum(Token.kw_fn)) {
+                const m = self.parseFnDecl(0, 0, 0)
                 if (m != null_node) {
                     methods.append(m)
                 }
@@ -850,8 +867,13 @@ impl Parser {
                 if (m != null_node) {
                     methods.append(m)
                 }
+            } else if (self.tok == @intFromEnum(Token.kw_const)) {
+                const c = self.parseVarDecl(1)
+                if (c != null_node) {
+                    methods.append(c)
+                }
             } else {
-                self.errors.report(self.tok_start, ErrorCode.e200, "expected method in impl block")
+                self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn', 'static fn', or 'const' in impl block")
                 self.advance()
             }
         }
@@ -891,8 +913,19 @@ impl Parser {
 
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
             self.collectDocComment()
-            if (self.tok == @intFromEnum(Token.kw_fn)) {
-                const m = self.parseFnDecl(0, 0)
+            if (self.tok == @intFromEnum(Token.kw_static)) {
+                self.advance()
+                if (self.tok != @intFromEnum(Token.kw_fn)) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
+                    self.advance()
+                } else {
+                    const m = self.parseFnDecl(0, 0, 1)
+                    if (m != null_node) {
+                        methods.append(m)
+                    }
+                }
+            } else if (self.tok == @intFromEnum(Token.kw_fn)) {
+                const m = self.parseFnDecl(0, 0, 0)
                 if (m != null_node) {
                     methods.append(m)
                 }
@@ -929,7 +962,7 @@ impl Parser {
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
             self.collectDocComment()
             if (self.tok == @intFromEnum(Token.kw_fn)) {
-                const m = self.parseFnDecl(0, 0)
+                const m = self.parseFnDecl(0, 0, 0)
                 if (m != null_node) {
                     methods.append(m)
                 }
@@ -967,7 +1000,7 @@ impl Parser {
             self.errors.report(self.tok_start, ErrorCode.e200, "expected fn after async")
             return null_node
         }
-        return self.parseFnDecl(0, 1)
+        return self.parseFnDecl(0, 1, 0)
     }
 
     /// Parse a field definition: name: Type or name: Type = default
@@ -1091,14 +1124,22 @@ impl Parser {
         // Postfix loop
         while (true) {
             const tok = @as(Token, @enumFromInt(self.tok))
-            if (tok == Token.period) {
+            if (tok == Token.period_star) {
+                // .* dereference (single token)
+                self.advance()
+                node = self.ast.addDeref(node, self.spanSE(self.tok_start, self.tok_end))
+            } else if (tok == Token.period_question) {
+                // .? optional unwrap (single token)
+                self.advance()
+                node = self.ast.addUnary(@intFromEnum(Token.question), node, self.spanSE(self.tok_start, self.tok_end))
+            } else if (tok == Token.period) {
                 self.advance()
                 if (self.tok == @intFromEnum(Token.mul)) {
-                    // .*  dereference
+                    // .*  dereference (two tokens)
                     self.advance()
                     node = self.ast.addDeref(node, self.spanSE(self.tok_start, self.tok_end))
                 } else if (self.tok == @intFromEnum(Token.question)) {
-                    // .?  optional unwrap
+                    // .?  optional unwrap (two tokens)
                     self.advance()
                     node = self.ast.addUnary(@intFromEnum(Token.question), node, self.spanSE(self.tok_start, self.tok_end))
                 } else if (self.tok == @intFromEnum(Token.ident) or self.tok == @intFromEnum(Token.int_lit)) {
@@ -1140,8 +1181,8 @@ impl Parser {
                 }
                 self.expect(@intFromEnum(Token.rparen))
                 node = self.ast.addCallNode(node, args, self.spanSE(self.tok_start, self.tok_end))
-            } else if (self.peekNextIsPeriod() or (self.safe_mode and self.peekNextIsIdentColon())) {
-                // Struct init: Type { .x = 1 } or Type { x: 1 } (@safe)
+            } else if (self.peekNextIsPeriod() or self.peekNextIsIdentColon()) {
+                // Struct init: Type { .x = 1 } or Type { x: 1 }
                 node = self.parseStructInitFrom(node)
             } else {
                 break
@@ -1484,7 +1525,7 @@ impl Parser {
             type_name = self.ast.getStr(self.ast.getData(preceding, 0))
         }
         // Determine syntax: period vs colon
-        const use_colon = self.safe_mode and self.peekNextIsIdentColon()
+        const use_colon = self.peekNextIsIdentColon()
         self.advance()  // consume {
         var fields: List(int) = undefined
         fields.items = 0
@@ -1662,9 +1703,13 @@ impl Parser {
         stmts.capacity = 0
         var result_expr = null_node
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+            const prev_pos = self.tok_start
             const s = self.parseStmt()
             if (s != null_node) {
                 stmts.append(s)
+            } else if (self.tok_start == prev_pos) {
+                // No progress — skip token to prevent infinite loop
+                self.advance()
             }
         }
         // If last stmt is expr_stmt, extract as result
@@ -1679,33 +1724,88 @@ impl Parser {
         return self.ast.addBlockExpr(result_expr, stmts, self.spanSE(start, self.tok_end))
     }
 
-    /// @builtin(args)
+    /// @builtin(args) — dispatches per-builtin to parse type vs expr args.
+    /// Ported from parser.zig:1348-1436
     fn parseBuiltinCall() int {
         const start = self.tok_start
         self.advance()  // consume @
-        if (self.tok != @intFromEnum(Token.ident)) {
+        if (self.tok != @intFromEnum(Token.ident) and self.tok != @intFromEnum(Token.kw_string)) {
             self.errors.report(start, ErrorCode.e200, "expected builtin name after @")
             return null_node
         }
-        const name = self.tok_text
+        const name = if (self.tok == @intFromEnum(Token.kw_string)) { "string" } else { self.tok_text }
         const kind = builtinFromString(name)
         self.advance()
-        // Optional type arg: @sizeOf(Type)
+        if (!self.expect(@intFromEnum(Token.lparen))) {
+            return null_node
+        }
         var type_arg = null_node
         var args: List(int) = undefined
         args.items = 0
         args.count = 0
         args.capacity = 0
-        if (self.match(@intFromEnum(Token.lparen))) {
-            while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
-                args.append(self.parseExpr())
-                if (!self.match(@intFromEnum(Token.comma))) {
-                    break
-                }
-            }
-            self.expect(@intFromEnum(Token.rparen))
-        }
         const kind_val = kind orelse 0
+        const bk = @as(BuiltinKind, @enumFromInt(kind_val))
+        switch (bk) {
+            // 0 args
+            .trap, .target, .targetOs, .targetArch => {},
+            // 1 type arg only: @sizeOf(T), @alignOf(T), @enumLen(T), @typeName(T), @typeInfo(T), @enumName(T)
+            .size_of, .align_of, .enum_len, .type_name, .enum_name, .type_info => {
+                type_arg = self.parseType()
+            },
+            // 1 type + 1 value: @intCast(T, v), @ptrCast(T, v), @intToPtr(T, v), @as(T, v), etc.
+            .int_cast, .float_cast, .float_from_int, .ptr_cast, .int_to_ptr, .has_field,
+            .bit_cast, .truncate, .@"as", .offset_of, .align_cast => {
+                type_arg = self.parseType()
+                self.expect(@intFromEnum(Token.comma))
+                args.append(self.parseExpr())
+            },
+            // @enumFromInt: try 2-arg (Type, val) else 1-arg (val)
+            .enum_from_int => {
+                // Simple approach: try parsing as type, if comma follows it's 2-arg
+                const saved_pos = self.scanner.pos
+                const saved_ch = self.scanner.ch
+                const saved_tok = self.tok
+                const saved_text = self.tok_text
+                const saved_start = self.tok_start
+                const saved_end = self.tok_end
+                const saved_peek = self.has_peek
+                type_arg = self.parseType()
+                if (self.tok == @intFromEnum(Token.comma)) {
+                    // 2-arg form confirmed
+                    self.advance()
+                    args.append(self.parseExpr())
+                } else {
+                    // 1-arg form — what we parsed as type_arg is actually the value
+                    // Re-parse as expression
+                    self.scanner.pos = saved_pos
+                    self.scanner.ch = saved_ch
+                    self.tok = saved_tok
+                    self.tok_text = saved_text
+                    self.tok_start = saved_start
+                    self.tok_end = saved_end
+                    self.has_peek = saved_peek
+                    type_arg = null_node
+                    args.append(self.parseExpr())
+                }
+            },
+            // 1 value arg
+            .ptr_to_int, .assert, .ptr_of, .len_of, .compile_error,
+            .abs, .ceil, .floor, .trunc, .round, .sqrt,
+            .embed_file, .type_of,
+            .int_from_enum, .tag_name, .error_name, .int_from_bool,
+            .const_cast, .int_from_float,
+            .arcRetain, .arcRelease, .panic, .ctz, .clz, .pop_count => {
+                args.append(self.parseExpr())
+            },
+            // 2 value args
+            .@"string", .assertEq, .fmin, .fmax, .field, .min, .max => {
+                args.append(self.parseExpr())
+                self.expect(@intFromEnum(Token.comma))
+                args.append(self.parseExpr())
+            },
+        }
+        self.expect(@intFromEnum(Token.rparen))
         return self.ast.addBuiltinCall(kind_val, type_arg, args, self.spanSE(start, self.tok_end))
     }
 
@@ -2101,9 +2201,13 @@ impl Parser {
         stmts.count = 0
         stmts.capacity = 0
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+            const prev_pos = self.tok_start
             const s = self.parseStmt()
             if (s != null_node) {
                 stmts.append(s)
+            } else if (self.tok_start == prev_pos) {
+                // No progress — skip token to prevent infinite loop
+                self.advance()
             }
         }
         self.expect(@intFromEnum(Token.rbrace))
@@ -2142,6 +2246,30 @@ impl Parser {
             self.expect(@intFromEnum(Token.rbrack))
             const elem = self.parseType()
             return self.ast.addTypeExpr(5, elem, size_expr, self.spanSE(start, self.tok_end))  // kind=5 array
+        }
+        // Tuple type: (T1, T2, ...)
+        if (self.tok == @intFromEnum(Token.lparen)) {
+            self.advance()  // consume (
+            const first = self.parseType()
+            if (self.match(@intFromEnum(Token.comma))) {
+                // It's a tuple type
+                var elems: List(int) = undefined
+                elems.items = 0
+                elems.count = 0
+                elems.capacity = 0
+                elems.append(first)
+                while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+                    elems.append(self.parseType())
+                    if (!self.match(@intFromEnum(Token.comma))) {
+                        break
+                    }
+                }
+                self.expect(@intFromEnum(Token.rparen))
+                return self.ast.addTupleType(elems, self.spanSE(start, self.tok_end))
+            }
+            // Single type in parens — just grouping
+            self.expect(@intFromEnum(Token.rparen))
+            return first
         }
         // Named type or keyword type
         if (self.tok == @intFromEnum(Token.ident) or @as(Token, @enumFromInt(self.tok)).isTypeKeyword()) {

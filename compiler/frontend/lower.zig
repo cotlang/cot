@@ -5233,7 +5233,7 @@ pub const Lowerer = struct {
             if (case_cond != ir.null_node) _ = try fb.emitBranch(case_cond, case_block, next_block, se.span);
             fb.setBlock(case_block);
             const case_val = try self.lowerExprNode(case.body);
-            if (case_val != ir.null_node) {
+            if (case_val != ir.null_node and fb.nodes.items[case_val].type_idx != TypeRegistry.VOID) {
                 if (is_compound_opt) {
                     try self.storeCompoundOptArm(fb, result_local, case_val, case.body, se.span);
                 } else {
@@ -5247,7 +5247,7 @@ pub const Lowerer = struct {
         // Else arm
         if (se.else_body != null_node) {
             const else_val = try self.lowerExprNode(se.else_body);
-            if (else_val != ir.null_node) {
+            if (else_val != ir.null_node and fb.nodes.items[else_val].type_idx != TypeRegistry.VOID) {
                 if (is_compound_opt) {
                     try self.storeCompoundOptArm(fb, result_local, else_val, se.else_body, se.span);
                 } else {

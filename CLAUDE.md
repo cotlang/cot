@@ -1,5 +1,16 @@
 # Claude AI Instructions
 
+## 🚨🚨🚨 ABSOLUTE #1 RULE — NEVER WORKAROUND, NEVER SIMPLIFY 🚨🚨🚨
+
+**NEVER implement workarounds for missing Cot language features.** If the Cot compiler doesn't support a pattern you need (e.g. variable declarations in switch arms, a missing operator, a type system gap), **STOP and ask the user** to implement the missing feature in the Zig compiler first. The self-hosted compiler must use idiomatic Cot — every workaround is tech debt that defeats the purpose of dogfooding.
+
+- **NO** restructuring code to avoid a language limitation
+- **NO** extracting logic to helper functions just because a construct doesn't compile
+- **NO** falling back to if-else chains because switch doesn't support something
+- **NO** simplifying data structures because generics don't work for a case
+- **ALWAYS** identify the exact compiler limitation and report it to the user
+- The user will fix the Zig compiler. That is the correct workflow.
+
 ## 🚨 CRITICAL RULES
 
 ### 1. Never Invent — Always Copy Reference Implementations
@@ -31,6 +42,8 @@ Read `claude/BR_TABLE_ARCHITECTURE.md` if confused. br_table is copied from Go's
 **Cot** is a Wasm-first compiled language for full-stack web development.
 **Pitch:** Write like TypeScript, run like Rust, deploy anywhere, never think about memory.
 **Compiler:** Written in Zig (permanent, like Deno's Rust dependency).
+
+**Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 
 ---
 

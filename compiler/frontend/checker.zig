@@ -2722,10 +2722,16 @@ pub const Checker = struct {
         defer block_scope.deinit();
         const old_scope = self.scope;
         self.scope = &block_scope;
+        // Zig RLS pattern: expected_type flows to the block's result expression,
+        // not to intermediate statements. Clear for stmts, restore for result.
+        const saved_expected = self.expected_type;
+        self.expected_type = invalid_type;
         self.checkStmtsWithReachability(b.stmts);
+        self.expected_type = saved_expected;
+        const result = if (b.expr != null_node) try self.checkExpr(b.expr) else TypeRegistry.VOID;
         if (self.lint_mode) self.checkScopeUnused(&block_scope);
         self.scope = old_scope;
-        return if (b.expr != null_node) try self.checkExpr(b.expr) else TypeRegistry.VOID;
+        return result;
     }
 
     fn checkBlockExpr(self: *Checker, idx: NodeIndex) CheckError!void {

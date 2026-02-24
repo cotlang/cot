@@ -435,6 +435,20 @@ impl Ast {
         return idx
     }
 
+    /// Tuple type: (T1, T2, ...) — kind=6
+    /// Layout: [kind=6, elem_count, ...elem_nodes, span_s, span_e]
+    fn addTupleType(elems: List(int), s: Span) int {
+        const idx = self.addNode(@intFromEnum(NodeTag.type_expr))
+        self.addData(6)
+        self.addData(elems.count)
+        for i in 0..elems.count {
+            self.addData(elems.get(i))
+        }
+        self.addData(s.start)
+        self.addData(s.end)
+        return idx
+    }
+
     fn addTryExpr(operand: int, s: Span) int {
         const idx = self.addNode(@intFromEnum(NodeTag.try_expr))
         self.addData(operand)
@@ -979,7 +993,7 @@ const BuiltinKind = enum {
     // Comptime reflection
     type_name, enum_name, type_info,
     // Math unary
-    abs, ceil, floor, trunc, round,
+    abs, ceil, floor, trunc, round, sqrt,
     // Math binary
     fmin, fmax, min, max,
     // Casts
@@ -1020,6 +1034,7 @@ fn builtinFromString(name: string) ?int {
         "floor" => @intFromEnum(BuiltinKind.floor),
         "trunc" => @intFromEnum(BuiltinKind.trunc),
         "round" => @intFromEnum(BuiltinKind.round),
+        "sqrt" => @intFromEnum(BuiltinKind.sqrt),
         "fmin" => @intFromEnum(BuiltinKind.fmin),
         "fmax" => @intFromEnum(BuiltinKind.fmax),
         "min" => @intFromEnum(BuiltinKind.min),
@@ -1093,7 +1108,7 @@ test "LiteralKind enum" {
 }
 
 test "BuiltinKind enum count" {
-    @assertEq(@enumLen(BuiltinKind), 53)
+    @assertEq(@enumLen(BuiltinKind), 54)
 }
 
 test "builtinFromString known" {

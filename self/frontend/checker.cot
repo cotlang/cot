@@ -97,30 +97,52 @@ fn makeConstSymbol(name: string, type_idx: int, node: int, value: int) Symbol {
 }
 
 // ============================================================================
-// Checker — type checking state
+// GenericImplEntry — stored during collection for deferred instantiation
 // ============================================================================
 
-// Symbol and Scope are stored via raw alloc'd arrays (not List(Struct))
-// due to native codegen bug with List(T) where T has 2+ fields.
-// Scope names stored as heap-allocated Map pointers in List(int).
+struct GenericImplEntry {
+    base_name: string,
+    node_idx: int,
+    tp_count: int,
+    methods_count: int,
+}
+
+// Error set variant — stores name for dedup in mergeErrorSets.
+// Same allocation pattern as EnumVariant/UnionVariant.
+struct ErrorVariant {
+    name: string,
+}
+
+// ============================================================================
+// Checker — type checking state
+// ============================================================================
 
 struct Checker {
     types: *TypeRegistry,
     ast: *Ast,
     err: *ErrorReporter,
-    // Symbol table (raw alloc'd array)
-    sym_data: int,
-    sym_count: int,
-    sym_cap: int,
+    symbols: List(Symbol),
     // Scope chain (parallel List(int) arrays)
     scope_parents: List(int),
     scope_maps: List(int),       // raw pointers to heap-allocated Map(string, int)
     current_scope: int,
     global_scope: int,
     expr_types: Map(int, int),
+    trait_defs: Map(string, int),   // trait name → AST node index
     current_return_type: int,
     in_loop: bool,
     safe_mode: bool,
+    // Generic support
+    generic_structs: Map(string, int),        // name → struct_decl node_idx
+    generic_functions: Map(string, int),      // name → fn_decl node_idx
+    generic_impl_entries: List(GenericImplEntry),
+    instantiation_cache: Map(string, int),    // "List(5)" → concrete type_idx
+    type_sub_keys: List(string),             // parallel lists = active substitution map
+    type_sub_vals: List(int),
+    trait_impls: Map(string, string),        // "Trait:Type" → trait_name
+    // Type flow
+    expected_type: int,                       // Zig RLS pattern
+    current_switch_enum_type: int,            // for .variant shorthand
 }
 
 impl Checker {
@@ -132,6 +154,18 @@ impl Checker {
         expr_types.count = 0
         expr_types.capacity = 0
 
+        var trait_defs: Map(string, int) = undefined
+        trait_defs.keys = 0
+        trait_defs.values = 0
+        trait_defs.states = 0
+        trait_defs.count = 0
+        trait_defs.capacity = 0
+
+        var symbols: List(Symbol) = undefined
+        symbols.items = 0
+        symbols.count = 0
+        symbols.capacity = 0
+
         var scope_parents: List(int) = undefined
         scope_parents.items = 0
         scope_parents.count = 0
@@ -142,6 +176,49 @@ impl Checker {
         scope_maps.count = 0
         scope_maps.capacity = 0
 
+        var generic_structs: Map(string, int) = undefined
+        generic_structs.keys = 0
+        generic_structs.values = 0
+        generic_structs.states = 0
+        generic_structs.count = 0
+        generic_structs.capacity = 0
+
+        var generic_functions: Map(string, int) = undefined
+        generic_functions.keys = 0
+        generic_functions.values = 0
+        generic_functions.states = 0
+        generic_functions.count = 0
+        generic_functions.capacity = 0
+
+        var instantiation_cache: Map(string, int) = undefined
+        instantiation_cache.keys = 0
+        instantiation_cache.values = 0
+        instantiation_cache.states = 0
+        instantiation_cache.count = 0
+        instantiation_cache.capacity = 0
+
+        var generic_impl_entries: List(GenericImplEntry) = undefined
+        generic_impl_entries.items = 0
+        generic_impl_entries.count = 0
+        generic_impl_entries.capacity = 0
+
+        var type_sub_keys: List(string) = undefined
+        type_sub_keys.items = 0
+        type_sub_keys.count = 0
+        type_sub_keys.capacity = 0
+
+        var type_sub_vals: List(int) = undefined
+        type_sub_vals.items = 0
+        type_sub_vals.count = 0
+        type_sub_vals.capacity = 0
+
+        var trait_impls: Map(string, string) = undefined
+        trait_impls.keys = 0
+        trait_impls.values = 0
+        trait_impls.states = 0
+        trait_impls.count = 0
+        trait_impls.capacity = 0
+
         // Create global scope (index 0)
         var global_map = allocMap()
         scope_parents.append(-1)
@@ -151,17 +228,25 @@ impl Checker {
             types: types,
             ast: ast,
             err: err,
-            sym_data: 0,
-            sym_count: 0,
-            sym_cap: 0,
+            symbols: symbols,
             scope_parents: scope_parents,
             scope_maps: scope_maps,
             current_scope: 0,
             global_scope: 0,
             expr_types: expr_types,
+            trait_defs: trait_defs,
             current_return_type: VOID,
             in_loop: false,
             safe_mode: false,
+            generic_structs: generic_structs,
+            generic_functions: generic_functions,
+            generic_impl_entries: generic_impl_entries,
+            instantiation_cache: instantiation_cache,
+            type_sub_keys: type_sub_keys,
+            type_sub_vals: type_sub_vals,
+            trait_impls: trait_impls,
+            expected_type: invalid_type,
+            current_switch_enum_type: invalid_type,
         }
     }
 
@@ -180,30 +265,33 @@ impl Checker {
         self.current_scope = self.scope_parents.get(self.current_scope)
     }
 
-    fn defineSymbol(sym: Symbol) void {
-        const idx = self.sym_count
-        // Grow symbol array if needed
-        if (self.sym_count >= self.sym_cap) {
-            var new_cap: int = self.sym_cap * 2
-            if (self.sym_cap == 0) { new_cap = 64 }
-            const new_size = new_cap * @sizeOf(Symbol)
-            if (self.sym_data == 0) {
-                self.sym_data = alloc(0, new_size)
-            } else {
-                self.sym_data = realloc(self.sym_data, new_size)
+    // ---- Type substitution (active during generic instantiation) ----
+
+    fn hasTypeSubstitution() bool {
+        return self.type_sub_keys.count > 0
+    }
+
+    fn lookupTypeSub(name: string) int {
+        // Search in reverse: last-pushed wins (inner generic shadows outer)
+        // Matches Zig pattern where each instantiation replaces the entire map
+        var i = self.type_sub_keys.count
+        while (i > 0) {
+            i -= 1
+            if (self.type_sub_keys.get(i) == name) {
+                return self.type_sub_vals.get(i)
             }
-            self.sym_cap = new_cap
         }
-        var ptr = @intToPtr(*Symbol, self.sym_data + idx * @sizeOf(Symbol))
-        ptr.name = sym.name
-        ptr.type_idx = sym.type_idx
-        ptr.node = sym.node
-        ptr.mutable = sym.mutable
-        ptr.is_func = sym.is_func
-        ptr.is_type = sym.is_type
-        ptr.is_const_val = sym.is_const_val
-        ptr.const_value = sym.const_value
-        self.sym_count += 1
+        return -1
+    }
+
+    fn pushTypeSub(key: string, val: int) void {
+        self.type_sub_keys.append(key)
+        self.type_sub_vals.append(val)
+    }
+
+    fn defineSymbol(sym: Symbol) void {
+        const idx = self.symbols.count
+        self.symbols.append(sym)
         // Register in current scope's map
         var map = @intToPtr(*Map(string, int), self.scope_maps.get(self.current_scope))
         map.set(sym.name, idx)
@@ -227,7 +315,7 @@ impl Checker {
     }
 
     fn getSymbol(idx: int) *Symbol {
-        return @intToPtr(*Symbol, self.sym_data + idx * @sizeOf(Symbol))
+        return @intToPtr(*Symbol, self.symbols.items + idx * @sizeOf(Symbol))
     }
 
     // ---- Main entry point ----
@@ -254,28 +342,26 @@ impl Checker {
     // ---- Declaration collection (pass 1 & 2) ----
 
     fn collectTypeDecl(idx: int) void {
-        const tag = self.ast.getTag(idx)
-        if (tag == @intFromEnum(NodeTag.struct_decl)) {
-            self.collectStructDecl(idx)
-        } else if (tag == @intFromEnum(NodeTag.enum_decl)) {
-            self.collectEnumDecl(idx)
-        } else if (tag == @intFromEnum(NodeTag.union_decl)) {
-            self.collectUnionDecl(idx)
-        } else if (tag == @intFromEnum(NodeTag.type_alias)) {
-            self.collectTypeAlias(idx)
-        } else if (tag == @intFromEnum(NodeTag.error_set_decl)) {
-            self.collectErrorSetDecl(idx)
+        const tag = @as(NodeTag, @enumFromInt(self.ast.getTag(idx)))
+        switch (tag) {
+            .struct_decl => self.collectStructDecl(idx),
+            .enum_decl => self.collectEnumDecl(idx),
+            .union_decl => self.collectUnionDecl(idx),
+            .type_alias => self.collectTypeAlias(idx),
+            .error_set_decl => self.collectErrorSetDecl(idx),
+            .trait_decl => self.collectTraitDecl(idx),
+            else => {},
         }
     }
 
     fn collectNonTypeDecl(idx: int) void {
-        const tag = self.ast.getTag(idx)
-        if (tag == @intFromEnum(NodeTag.fn_decl)) {
-            self.collectFnDecl(idx)
-        } else if (tag == @intFromEnum(NodeTag.var_decl)) {
-            self.collectVarDecl(idx)
-        } else if (tag == @intFromEnum(NodeTag.impl_block)) {
-            self.collectImplBlock(idx)
+        const tag = @as(NodeTag, @enumFromInt(self.ast.getTag(idx)))
+        switch (tag) {
+            .fn_decl => self.collectFnDecl(idx),
+            .var_decl => self.collectVarDecl(idx),
+            .impl_block => self.collectImplBlock(idx),
+            .impl_trait => self.collectImplTrait(idx),
+            else => {},
         }
     }
 
@@ -288,9 +374,10 @@ impl Checker {
         }
         const fields_count = self.ast.getData(idx, 3)
 
-        // Skip generic structs (tp_count > 0)
+        // Generic structs: store definition, don't build concrete type yet
         const tp_count = self.ast.getData(idx, 4 + fields_count)
         if (tp_count > 0) {
+            self.generic_structs.set(name, idx)
             self.defineSymbol(makeTypeSymbol(name, invalid_type, idx))
             return
         }
@@ -298,6 +385,75 @@ impl Checker {
         const struct_type = self.buildStructType(idx, name)
         self.defineSymbol(makeTypeSymbol(name, struct_type, idx))
         self.types.registerNamed(name, struct_type)
+
+        // Register nested declarations with qualified names (Parent_Child)
+        const nested_offset = 4 + fields_count + 1 + tp_count
+        const nested_count = self.ast.getData(idx, nested_offset)
+        for ni in 0..nested_count {
+            const nested_idx = self.ast.getData(idx, nested_offset + 1 + ni)
+            self.collectNestedDecl(name, nested_idx)
+        }
+    }
+
+    fn collectNestedDecl(parent_name: string, nested_idx: int) void {
+        const ntag = @as(NodeTag, @enumFromInt(self.ast.getTag(nested_idx)))
+        switch (ntag) {
+            .error_set_decl => {
+                const child_name = self.ast.getStr(self.ast.getData(nested_idx, 0))
+                const qualified = "${parent_name}_${child_name}"
+                self.collectErrorSetDeclAs(nested_idx, qualified)
+            },
+            .enum_decl => {
+                const child_name = self.ast.getStr(self.ast.getData(nested_idx, 0))
+                const qualified = "${parent_name}_${child_name}"
+                const enum_type = self.buildEnumType(nested_idx)
+                self.defineSymbol(makeTypeSymbol(qualified, enum_type, nested_idx))
+                self.types.registerNamed(qualified, enum_type)
+            },
+            .struct_decl => {
+                const child_name = self.ast.getStr(self.ast.getData(nested_idx, 0))
+                const qualified = "${parent_name}_${child_name}"
+                const ns_type = self.buildStructType(nested_idx, qualified)
+                self.defineSymbol(makeTypeSymbol(qualified, ns_type, nested_idx))
+                self.types.registerNamed(qualified, ns_type)
+            },
+            .type_alias => {
+                const child_name = self.ast.getStr(self.ast.getData(nested_idx, 0))
+                const qualified = "${parent_name}_${child_name}"
+                const target_n = self.ast.getData(nested_idx, 1)
+                const target_type = self.resolveTypeExpr(target_n)
+                self.defineSymbol(makeTypeSymbol(qualified, target_type, nested_idx))
+                self.types.registerNamed(qualified, target_type)
+            },
+            .var_decl => {
+                const child_name = self.ast.getStr(self.ast.getData(nested_idx, 0))
+                const qualified = "${parent_name}_${child_name}"
+                const is_const = self.ast.getData(nested_idx, 3)
+                self.defineSymbol(makeSymbol(qualified, invalid_type, nested_idx, is_const == 0))
+            },
+            else => {},
+        }
+    }
+
+    fn collectErrorSetDeclAs(idx: int, qualified_name: string) void {
+        // error_set_decl: [name_s, doc_s, variants_count, ...variant_strings, span_s, span_e]
+        const variants_count = self.ast.getData(idx, 2)
+        var variant_names_ptr: int = 0
+        if (variants_count > 0) {
+            variant_names_ptr = alloc(0, variants_count * @sizeOf(ErrorVariant))
+            for vi in 0..variants_count {
+                const v_str = self.ast.getStr(self.ast.getData(idx, 3 + vi))
+                const ev = @intToPtr(*ErrorVariant, variant_names_ptr + vi * @sizeOf(ErrorVariant))
+                ev.name = v_str
+            }
+        }
+        const es_type = self.types.add(Type.error_set(ErrorSetType {
+            name: qualified_name,
+            variant_count: variants_count,
+            variant_names: variant_names_ptr,
+        }))
+        self.defineSymbol(makeTypeSymbol(qualified_name, es_type, idx))
+        self.types.registerNamed(qualified_name, es_type)
     }
 
     fn collectEnumDecl(idx: int) void {
@@ -344,12 +500,21 @@ impl Checker {
             self.reportError(idx, ErrorCode.e302, "redefined identifier")
             return
         }
-        // Build error set type
+        // Build error set type with variant names (Zig checker.zig:435-439)
         const variants_count = self.ast.getData(idx, 2)
+        var variant_names_ptr: int = 0
+        if (variants_count > 0) {
+            variant_names_ptr = alloc(0, variants_count * @sizeOf(ErrorVariant))
+            for vi in 0..variants_count {
+                const v_str = self.ast.getStr(self.ast.getData(idx, 3 + vi))
+                const ev = @intToPtr(*ErrorVariant, variant_names_ptr + vi * @sizeOf(ErrorVariant))
+                ev.name = v_str
+            }
+        }
         const es_type = self.types.add(Type.error_set(ErrorSetType {
             name: name,
             variant_count: variants_count,
-            variant_names: 0,
+            variant_names: variant_names_ptr,
         }))
         self.defineSymbol(makeTypeSymbol(name, es_type, idx))
         self.types.registerNamed(name, es_type)
@@ -365,9 +530,10 @@ impl Checker {
         }
         const params_count = self.ast.getData(idx, 6)
 
-        // Skip generic functions (tp_count > 0)
+        // Generic functions: store definition, don't build concrete type yet
         const tp_count = self.ast.getData(idx, 7 + params_count)
         if (tp_count > 0) {
+            self.generic_functions.set(name, idx)
             self.defineSymbol(makeTypeSymbol(name, invalid_type, idx))
             return
         }
@@ -392,16 +558,27 @@ impl Checker {
         const type_name = self.ast.getStr(self.ast.getData(idx, 0))
         const methods_count = self.ast.getData(idx, 2)
 
-        // Skip generic impl blocks
+        // Generic impl blocks: store for deferred instantiation
         const tp_count = self.ast.getData(idx, 3 + methods_count)
         if (tp_count > 0) {
+            self.generic_impl_entries.append(GenericImplEntry {
+                base_name: type_name,
+                node_idx: idx,
+                tp_count: tp_count,
+                methods_count: methods_count,
+            })
             return
         }
 
         for mi in 0..methods_count {
-            const method_idx = self.ast.getData(idx, 3 + mi)
-            const method_tag = self.ast.getTag(method_idx)
-            if (method_tag == @intFromEnum(NodeTag.fn_decl)) {
+            self.collectImplMethod(type_name, self.ast.getData(idx, 3 + mi))
+        }
+    }
+
+    fn collectImplMethod(type_name: string, method_idx: int) void {
+        const method_tag = @as(NodeTag, @enumFromInt(self.ast.getTag(method_idx)))
+        switch (method_tag) {
+            .fn_decl => {
                 const method_name = self.ast.getStr(self.ast.getData(method_idx, 0))
                 const synth_name = "${type_name}_${method_name}"
                 const func_type = self.buildFuncType(method_idx)
@@ -411,12 +588,15 @@ impl Checker {
                 var is_static = true
                 if (m_params_count > 0) {
                     const first_param = self.ast.getData(method_idx, 7)
-                    const first_tag = self.ast.getTag(first_param)
-                    if (first_tag == @intFromEnum(NodeTag.field_def)) {
-                        const pname = self.ast.getStr(self.ast.getData(first_param, 0))
-                        if (pname == "self") {
-                            is_static = false
-                        }
+                    const first_param_tag = @as(NodeTag, @enumFromInt(self.ast.getTag(first_param)))
+                    switch (first_param_tag) {
+                        .field_def => {
+                            const pname = self.ast.getStr(self.ast.getData(first_param, 0))
+                            if (pname == "self") {
+                                is_static = false
+                            }
+                        },
+                        else => {},
                     }
                 }
 
@@ -427,36 +607,87 @@ impl Checker {
                     func_type: func_type,
                     receiver_is_ptr: !is_static,
                 })
-
-                // Also define associated constants (var_decl inside impl)
-            } else if (method_tag == @intFromEnum(NodeTag.var_decl)) {
+            },
+            .var_decl => {
                 const const_name = self.ast.getStr(self.ast.getData(method_idx, 0))
                 const synth_name = "${type_name}_${const_name}"
                 const is_const = self.ast.getData(method_idx, 3)
                 self.defineSymbol(makeSymbol(synth_name, invalid_type, method_idx, is_const == 0))
+            },
+            else => {},
+        }
+    }
+
+    fn collectTraitDecl(idx: int) void {
+        // trait_decl: [name_s, doc_s, methods_count, ...method_nodes, span_s, span_e]
+        const name = self.ast.getStr(self.ast.getData(idx, 0))
+        self.trait_defs.set(name, idx)
+    }
+
+    fn collectImplTrait(idx: int) void {
+        // impl_trait: [trait_name_s, target_type_s, doc_s, methods_count, ...method_nodes, tp_count, ...tp_strings, span_s, span_e]
+        const trait_name = self.ast.getStr(self.ast.getData(idx, 0))
+        const target_type = self.ast.getStr(self.ast.getData(idx, 1))
+        const methods_count = self.ast.getData(idx, 3)
+
+        // Validate trait exists
+        if (self.trait_defs.has(trait_name) == 0) {
+            self.reportError(idx, ErrorCode.e301, "undefined trait")
+            return
+        }
+
+        // Validate all required methods are provided
+        const trait_idx = self.trait_defs.get(trait_name)
+        const trait_methods_count = self.ast.getData(trait_idx, 2)
+        for ti in 0..trait_methods_count {
+            const trait_method_idx = self.ast.getData(trait_idx, 3 + ti)
+            if (self.ast.getTag(trait_method_idx) == @intFromEnum(NodeTag.fn_decl)) {
+                const required_name = self.ast.getStr(self.ast.getData(trait_method_idx, 0))
+                var found = false
+                for mi in 0..methods_count {
+                    const impl_method_idx = self.ast.getData(idx, 4 + mi)
+                    if (self.ast.getTag(impl_method_idx) == @intFromEnum(NodeTag.fn_decl)) {
+                        const impl_name = self.ast.getStr(self.ast.getData(impl_method_idx, 0))
+                        if (impl_name == required_name) {
+                            found = true
+                        }
+                    }
+                }
+                if (!found) {
+                    self.reportError(idx, ErrorCode.e300, "missing required trait method")
+                    return
+                }
             }
+        }
+
+        // Register trait impl for trait bound validation
+        const impl_key = "${trait_name}:${target_type}"
+        self.trait_impls.set(impl_key, trait_name)
+
+        // Register methods (same pattern as impl_block)
+        for mi in 0..methods_count {
+            self.collectImplMethod(target_type, self.ast.getData(idx, 4 + mi))
         }
     }
 
     // ---- Declaration checking (pass 3) ----
 
     fn checkDecl(idx: int) void {
-        const tag = self.ast.getTag(idx)
-        if (tag == @intFromEnum(NodeTag.fn_decl)) {
-            // Skip generic functions
-            const params_count = self.ast.getData(idx, 6)
-            const tp_count = self.ast.getData(idx, 7 + params_count)
-            if (tp_count > 0) { return }
-            const name = self.ast.getStr(self.ast.getData(idx, 0))
-            self.checkFnDeclBody(idx, name)
-        } else if (tag == @intFromEnum(NodeTag.var_decl)) {
-            self.checkTopVarDecl(idx)
-        } else if (tag == @intFromEnum(NodeTag.impl_block)) {
-            self.checkImplBlock(idx)
-        } else if (tag == @intFromEnum(NodeTag.test_decl)) {
-            self.checkTestDecl(idx)
-        } else if (tag == @intFromEnum(NodeTag.bench_decl)) {
-            self.checkTestDecl(idx)
+        const tag = @as(NodeTag, @enumFromInt(self.ast.getTag(idx)))
+        switch (tag) {
+            .fn_decl => {
+                // Skip generic functions
+                const params_count = self.ast.getData(idx, 6)
+                const tp_count = self.ast.getData(idx, 7 + params_count)
+                if (tp_count > 0) { return }
+                const name = self.ast.getStr(self.ast.getData(idx, 0))
+                self.checkFnDeclBody(idx, name)
+            },
+            .var_decl => self.checkTopVarDecl(idx),
+            .impl_block => self.checkImplBlock(idx),
+            .impl_trait => self.checkImplTraitBodies(idx),
+            .test_decl, .bench_decl => self.checkTestDecl(idx),
+            else => {},
         }
     }
 
@@ -472,6 +703,19 @@ impl Checker {
             if (self.ast.getTag(method_idx) == @intFromEnum(NodeTag.fn_decl)) {
                 const method_name = self.ast.getStr(self.ast.getData(method_idx, 0))
                 self.checkFnDeclBody(method_idx, "${type_name}_${method_name}")
+            }
+        }
+    }
+
+    fn checkImplTraitBodies(idx: int) void {
+        // impl_trait: [trait_name_s, target_type_s, doc_s, methods_count, ...method_nodes, ...]
+        const target_type = self.ast.getStr(self.ast.getData(idx, 1))
+        const methods_count = self.ast.getData(idx, 3)
+        for mi in 0..methods_count {
+            const method_idx = self.ast.getData(idx, 4 + mi)
+            if (self.ast.getTag(method_idx) == @intFromEnum(NodeTag.fn_decl)) {
+                const method_name = self.ast.getStr(self.ast.getData(method_idx, 0))
+                self.checkFnDeclBody(method_idx, "${target_type}_${method_name}")
             }
         }
     }
@@ -513,7 +757,7 @@ impl Checker {
         const old_ret = self.current_return_type
         self.current_return_type = return_type
 
-        // Define parameters in scope
+        // Define parameters in scope (same substitution-aware @safe as buildFuncType)
         for pi in 0..params_count {
             const param_idx = self.ast.getData(idx, 7 + pi)
             // field_def: [name_s, type_expr_n, default_val_n, doc_s, span_s, span_e]
@@ -521,6 +765,31 @@ impl Checker {
                 const pname = self.ast.getStr(self.ast.getData(param_idx, 0))
                 const ptype_n = self.ast.getData(param_idx, 1)
                 var ptype = self.resolveTypeExpr(ptype_n)
+                // Don't auto-ref params whose type is a substituted generic type parameter
+                var is_substituted = false
+                if (self.hasTypeSubstitution() and ptype_n != null_node) {
+                    const ptype_tag = self.ast.getTag(ptype_n)
+                    if (ptype_tag == @intFromEnum(NodeTag.ident)) {
+                        const ptname = self.ast.getStr(self.ast.getData(ptype_n, 0))
+                        if (self.lookupTypeSub(ptname) >= 0) {
+                            is_substituted = true
+                        }
+                    } else if (ptype_tag == @intFromEnum(NodeTag.type_expr)) {
+                        const kind = self.ast.getData(ptype_n, 0)
+                        if (kind == TYPE_NAMED) {
+                            const inner_n = self.ast.getData(ptype_n, 1)
+                            if (inner_n != null_node and self.ast.getTag(inner_n) == @intFromEnum(NodeTag.ident)) {
+                                const inner_name = self.ast.getStr(self.ast.getData(inner_n, 0))
+                                if (self.lookupTypeSub(inner_name) >= 0) {
+                                    is_substituted = true
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!is_substituted) {
+                    ptype = self.safeWrapType(ptype)
+                }
                 self.defineSymbol(makeSymbol(pname, ptype, idx, false))
             }
         }
@@ -565,6 +834,16 @@ impl Checker {
             }
             self.updateSymbolType(sym_idx, var_type)
         }
+
+        // Register error set consts as named types for use in type positions
+        // Enables: const AllErrors = FileError || NetError
+        // Zig checker.zig:694-698
+        if (is_const != 0 and var_type != invalid_type) {
+            const vt = self.types.get(var_type)
+            if (vt.tag == TAG_ERROR_SET) {
+                self.types.registerNamed(name, var_type)
+            }
+        }
     }
 
     fn updateSymbolType(sym_idx: int, type_idx: int) void {
@@ -582,38 +861,21 @@ impl Checker {
 
     fn checkStmt(idx: int) void {
         if (idx == null_node) { return }
-        const tag = self.ast.getTag(idx)
-
-        if (tag == @intFromEnum(NodeTag.expr_stmt)) {
-            // expr_stmt: [expr_n, span_s, span_e]
-            self.checkExpr(self.ast.getData(idx, 0))
-        } else if (tag == @intFromEnum(NodeTag.return_stmt)) {
-            self.checkReturn(idx)
-        } else if (tag == @intFromEnum(NodeTag.var_stmt)) {
-            self.checkVarStmt(idx)
-        } else if (tag == @intFromEnum(NodeTag.assign_stmt)) {
-            self.checkAssign(idx)
-        } else if (tag == @intFromEnum(NodeTag.if_stmt)) {
-            self.checkIfStmt(idx)
-        } else if (tag == @intFromEnum(NodeTag.while_stmt)) {
-            self.checkWhileStmt(idx)
-        } else if (tag == @intFromEnum(NodeTag.for_stmt)) {
-            self.checkForStmt(idx)
-        } else if (tag == @intFromEnum(NodeTag.block_stmt)) {
-            self.checkBlockStmt(idx)
-        } else if (tag == @intFromEnum(NodeTag.break_stmt)) {
-            if (!self.in_loop) {
-                self.reportError(idx, ErrorCode.e400, "break outside loop")
-            }
-        } else if (tag == @intFromEnum(NodeTag.continue_stmt)) {
-            if (!self.in_loop) {
-                self.reportError(idx, ErrorCode.e401, "continue outside loop")
-            }
-        } else if (tag == @intFromEnum(NodeTag.defer_stmt)) {
-            // defer_stmt: [expr_n, is_errdefer, span_s, span_e]
-            self.checkExpr(self.ast.getData(idx, 0))
-        } else if (tag == @intFromEnum(NodeTag.destructure_stmt)) {
-            self.checkDestructureStmt(idx)
+        const tag = @as(NodeTag, @enumFromInt(self.ast.getTag(idx)))
+        switch (tag) {
+            .expr_stmt => { self.checkExpr(self.ast.getData(idx, 0)) },
+            .return_stmt => self.checkReturn(idx),
+            .var_stmt => self.checkVarStmt(idx),
+            .assign_stmt => self.checkAssign(idx),
+            .if_stmt => self.checkIfStmt(idx),
+            .while_stmt => self.checkWhileStmt(idx),
+            .for_stmt => self.checkForStmt(idx),
+            .block_stmt => self.checkBlockStmt(idx),
+            .break_stmt => { if (!self.in_loop) { self.reportError(idx, ErrorCode.e400, "break outside loop") } },
+            .continue_stmt => { if (!self.in_loop) { self.reportError(idx, ErrorCode.e401, "continue outside loop") } },
+            .defer_stmt => { self.checkExpr(self.ast.getData(idx, 0)) },
+            .destructure_stmt => self.checkDestructureStmt(idx),
+            else => {},
         }
     }
 
@@ -621,7 +883,10 @@ impl Checker {
         // return_stmt: [value_n, span_s, span_e]
         const value = self.ast.getData(idx, 0)
         if (value != null_node) {
+            const saved_expected = self.expected_type
+            self.expected_type = self.current_return_type
             const val_type = self.checkExpr(value)
+            self.expected_type = saved_expected
             if (self.current_return_type == VOID) {
                 self.reportError(idx, ErrorCode.e402, "void function should not return a value")
             } else if (!self.types.isAssignable(val_type, self.current_return_type)) {
@@ -652,7 +917,10 @@ impl Checker {
         if (value_n != null_node) {
             // Check for undefined literal
             if (self.ast.getTag(value_n) != @intFromEnum(NodeTag.literal) or self.getLiteralKind(value_n) != @intFromEnum(LiteralKind.undefined_lit)) {
+                const saved_expected = self.expected_type
+                if (var_type != invalid_type) { self.expected_type = var_type }
                 const val_type = self.checkExpr(value_n)
+                self.expected_type = saved_expected
                 if (var_type == invalid_type) {
                     var_type = self.materializeType(val_type)
                 } else if (!self.types.isAssignable(val_type, var_type)) {
@@ -870,13 +1138,11 @@ impl Checker {
 
     fn checkBlockBody(idx: int) void {
         if (idx == null_node) { return }
-        const tag = self.ast.getTag(idx)
-        if (tag == @intFromEnum(NodeTag.block_stmt)) {
-            self.checkBlockStmt(idx)
-        } else if (tag == @intFromEnum(NodeTag.block_expr)) {
-            self.checkBlockExprVoid(idx)
-        } else {
-            self.checkStmt(idx)
+        const tag = @as(NodeTag, @enumFromInt(self.ast.getTag(idx)))
+        switch (tag) {
+            .block_stmt => self.checkBlockStmt(idx),
+            .block_expr => self.checkBlockExprVoid(idx),
+            else => self.checkStmt(idx),
         }
     }
 
@@ -899,8 +1165,8 @@ impl Checker {
     fn checkExpr(idx: int) int {
         if (idx == null_node) { return invalid_type }
 
-        // Check cache
-        if (self.expr_types.has(idx) != 0) {
+        // During generic instantiation, skip cache — shared AST nodes need fresh checking
+        if (!self.hasTypeSubstitution() and self.expr_types.has(idx) != 0) {
             return self.expr_types.get(idx)
         }
 
@@ -910,59 +1176,35 @@ impl Checker {
     }
 
     fn checkExprInner(idx: int) int {
-        const tag = self.ast.getTag(idx)
-
-        if (tag == @intFromEnum(NodeTag.ident)) {
-            return self.checkIdentifier(idx)
-        } else if (tag == @intFromEnum(NodeTag.literal)) {
-            return self.checkLiteral(idx)
-        } else if (tag == @intFromEnum(NodeTag.binary)) {
-            return self.checkBinary(idx)
-        } else if (tag == @intFromEnum(NodeTag.unary)) {
-            return self.checkUnary(idx)
-        } else if (tag == @intFromEnum(NodeTag.call)) {
-            return self.checkCall(idx)
-        } else if (tag == @intFromEnum(NodeTag.index_expr)) {
-            return self.checkIndex(idx)
-        } else if (tag == @intFromEnum(NodeTag.field_access)) {
-            return self.checkFieldAccess(idx)
-        } else if (tag == @intFromEnum(NodeTag.struct_init)) {
-            return self.checkStructInit(idx)
-        } else if (tag == @intFromEnum(NodeTag.new_expr)) {
-            return self.checkNewExpr(idx)
-        } else if (tag == @intFromEnum(NodeTag.array_literal)) {
-            return self.checkArrayLiteral(idx)
-        } else if (tag == @intFromEnum(NodeTag.paren)) {
-            // paren: [inner_n, span_s, span_e]
-            return self.checkExpr(self.ast.getData(idx, 0))
-        } else if (tag == @intFromEnum(NodeTag.if_expr)) {
-            return self.checkIfExpr(idx)
-        } else if (tag == @intFromEnum(NodeTag.switch_expr)) {
-            return self.checkSwitchExpr(idx)
-        } else if (tag == @intFromEnum(NodeTag.block_expr)) {
-            return self.checkBlockExpr(idx)
-        } else if (tag == @intFromEnum(NodeTag.builtin_call)) {
-            return self.checkBuiltinCall(idx)
-        } else if (tag == @intFromEnum(NodeTag.string_interp)) {
-            return self.checkStringInterp(idx)
-        } else if (tag == @intFromEnum(NodeTag.try_expr)) {
-            return self.checkTryExpr(idx)
-        } else if (tag == @intFromEnum(NodeTag.catch_expr)) {
-            return self.checkCatchExpr(idx)
-        } else if (tag == @intFromEnum(NodeTag.error_literal)) {
-            return self.current_return_type
-        } else if (tag == @intFromEnum(NodeTag.addr_of)) {
-            return self.checkAddrOf(idx)
-        } else if (tag == @intFromEnum(NodeTag.deref)) {
-            return self.checkDeref(idx)
-        } else if (tag == @intFromEnum(NodeTag.tuple_literal)) {
-            return self.checkTupleLiteral(idx)
-        } else if (tag == @intFromEnum(NodeTag.slice_expr)) {
-            return self.checkSliceExpr(idx)
-        } else if (tag == @intFromEnum(NodeTag.zero_init)) {
-            return VOID
+        const tag = @as(NodeTag, @enumFromInt(self.ast.getTag(idx)))
+        return switch (tag) {
+            .ident => self.checkIdentifier(idx),
+            .literal => self.checkLiteral(idx),
+            .binary => self.checkBinary(idx),
+            .unary => self.checkUnary(idx),
+            .call => self.checkCall(idx),
+            .index_expr => self.checkIndex(idx),
+            .field_access => self.checkFieldAccess(idx),
+            .struct_init => self.checkStructInit(idx),
+            .new_expr => self.checkNewExpr(idx),
+            .array_literal => self.checkArrayLiteral(idx),
+            .paren => self.checkExpr(self.ast.getData(idx, 0)),
+            .if_expr => self.checkIfExpr(idx),
+            .switch_expr => self.checkSwitchExpr(idx),
+            .block_expr => self.checkBlockExpr(idx),
+            .builtin_call => self.checkBuiltinCall(idx),
+            .string_interp => self.checkStringInterp(idx),
+            .try_expr => self.checkTryExpr(idx),
+            .catch_expr => self.checkCatchExpr(idx),
+            .closure_expr => self.checkClosureExpr(idx),
+            .error_literal => self.current_return_type,
+            .addr_of => self.checkAddrOf(idx),
+            .deref => self.checkDeref(idx),
+            .tuple_literal => self.checkTupleLiteral(idx),
+            .slice_expr => self.checkSliceExpr(idx),
+            .zero_init => VOID,
+            else => invalid_type,
         }
-        return invalid_type
     }
 
     fn checkIdentifier(idx: int) int {
@@ -1011,57 +1253,140 @@ impl Checker {
         const right_n = self.ast.getData(idx, 2)
         const left_type = self.checkExpr(left_n)
         const right_type = self.checkExpr(right_n)
+        const left_t = self.types.get(left_type)
+        const right_t = self.types.get(right_type)
 
         // Concat: ++
         if (op == @intFromEnum(Token.concat)) {
             if (left_type == STRING and right_type == STRING) { return STRING }
-            self.reportError(idx, ErrorCode.e300, "'++' requires matching types")
+            // [N]T ++ [M]T → [N+M]T (array concat)
+            if (left_t.tag == TAG_ARRAY and right_t.tag == TAG_ARRAY) {
+                const la = switch (left_t) { Type.array |a| => a, else => ArrayType { elem: invalid_type, length: 0 } }
+                const ra = switch (right_t) { Type.array |a| => a, else => ArrayType { elem: invalid_type, length: 0 } }
+                if (la.elem == ra.elem) {
+                    return self.types.makeArray(la.elem, la.length + ra.length)
+                }
+                self.reportError(idx, ErrorCode.e300, "'++' requires matching element types")
+                return invalid_type
+            }
+            // []T ++ []T → []T (slice concat)
+            if (left_t.tag == TAG_SLICE and right_t.tag == TAG_SLICE) {
+                const ls = switch (left_t) { Type.slice |s| => s, else => SliceType { elem: invalid_type } }
+                const rs = switch (right_t) { Type.slice |s| => s, else => SliceType { elem: invalid_type } }
+                if (ls.elem == rs.elem) { return left_type }
+                self.reportError(idx, ErrorCode.e300, "'++' requires matching element types")
+                return invalid_type
+            }
+            self.reportError(idx, ErrorCode.e300, "'++' requires two strings, arrays, or slices of the same type")
             return invalid_type
         }
 
         // Orelse
         if (op == @intFromEnum(Token.kw_orelse)) {
-            const lt = self.types.get(left_type)
-            if (lt.tag == TAG_OPTIONAL) {
-                return switch (lt) { Type.optional |o| => o.elem, else => left_type }
+            if (left_t.tag == TAG_OPTIONAL) {
+                return switch (left_t) { Type.optional |o| => o.elem, else => left_type }
             }
             return left_type
         }
 
-        // Comparison operators → bool
-        if (op == @intFromEnum(Token.eql) or op == @intFromEnum(Token.neq) or
-            op == @intFromEnum(Token.lss) or op == @intFromEnum(Token.leq) or
-            op == @intFromEnum(Token.gtr) or op == @intFromEnum(Token.geq)) {
-            return BOOL
-        }
-
-        // Logical operators → bool
-        if (op == @intFromEnum(Token.kw_and) or op == @intFromEnum(Token.kw_or) or
-            op == @intFromEnum(Token.land) or op == @intFromEnum(Token.lor)) {
-            return BOOL
-        }
-
-        // Arithmetic and bitwise → common type
-        if (op == @intFromEnum(Token.add) or op == @intFromEnum(Token.sub) or
-            op == @intFromEnum(Token.mul) or op == @intFromEnum(Token.quo) or
-            op == @intFromEnum(Token.rem)) {
-            // String + String in safe mode
-            if (op == @intFromEnum(Token.add) and left_type == STRING and right_type == STRING) {
+        // Add: string/array/slice concat in @safe, pointer arithmetic, numeric
+        if (op == @intFromEnum(Token.add)) {
+            if (left_type == STRING and right_type == STRING) {
                 if (self.safe_mode) { return STRING }
                 self.reportError(idx, ErrorCode.e300, "'+' cannot concatenate strings; use '++'")
                 return invalid_type
             }
+            // Array + Array: @safe desugars to ++
+            if (left_t.tag == TAG_ARRAY and right_t.tag == TAG_ARRAY) {
+                const la = switch (left_t) { Type.array |a| => a, else => ArrayType { elem: invalid_type, length: 0 } }
+                const ra = switch (right_t) { Type.array |a| => a, else => ArrayType { elem: invalid_type, length: 0 } }
+                if (la.elem == ra.elem) {
+                    if (self.safe_mode) { return self.types.makeArray(la.elem, la.length + ra.length) }
+                    self.reportError(idx, ErrorCode.e300, "'+' cannot concatenate arrays; use '++'")
+                    return invalid_type
+                }
+            }
+            // Slice + Slice: @safe desugars to ++
+            if (left_t.tag == TAG_SLICE and right_t.tag == TAG_SLICE) {
+                const ls = switch (left_t) { Type.slice |s| => s, else => SliceType { elem: invalid_type } }
+                const rs = switch (right_t) { Type.slice |s| => s, else => SliceType { elem: invalid_type } }
+                if (ls.elem == rs.elem) {
+                    if (self.safe_mode) { return left_type }
+                    self.reportError(idx, ErrorCode.e300, "'+' cannot concatenate slices; use '++'")
+                    return invalid_type
+                }
+            }
+            // Pointer arithmetic: ptr + int or int + ptr
+            if (left_t.tag == TAG_POINTER and self.isIntegerType(right_type)) { return left_type }
+            if (self.isIntegerType(left_type) and right_t.tag == TAG_POINTER) { return right_type }
             if (!self.isNumericType(left_type) or !self.isNumericType(right_type)) {
-                self.reportError(idx, ErrorCode.e303, "invalid operation")
+                self.reportError(idx, ErrorCode.e300, "invalid operation")
                 return invalid_type
             }
             return TypeRegistry.commonType(left_type, right_type)
         }
 
-        // Bitwise
+        // Sub: pointer arithmetic, numeric
+        if (op == @intFromEnum(Token.sub)) {
+            if (left_t.tag == TAG_POINTER and self.isIntegerType(right_type)) { return left_type }
+            if (!self.isNumericType(left_type) or !self.isNumericType(right_type)) {
+                self.reportError(idx, ErrorCode.e300, "invalid operation")
+                return invalid_type
+            }
+            return TypeRegistry.commonType(left_type, right_type)
+        }
+
+        // Mul, Quo, Rem
+        if (op == @intFromEnum(Token.mul) or op == @intFromEnum(Token.quo) or
+            op == @intFromEnum(Token.rem)) {
+            if (!self.isNumericType(left_type) or !self.isNumericType(right_type)) {
+                self.reportError(idx, ErrorCode.e300, "invalid operation")
+                return invalid_type
+            }
+            return TypeRegistry.commonType(left_type, right_type)
+        }
+
+        // Comparison operators → bool (with validation)
+        if (op == @intFromEnum(Token.eql) or op == @intFromEnum(Token.neq) or
+            op == @intFromEnum(Token.lss) or op == @intFromEnum(Token.leq) or
+            op == @intFromEnum(Token.gtr) or op == @intFromEnum(Token.geq)) {
+            if (!self.isComparable(left_type, right_type)) {
+                self.reportError(idx, ErrorCode.e300, "invalid comparison")
+                return invalid_type
+            }
+            return BOOL
+        }
+
+        // Logical AND/OR → bool (validate operands are bool)
+        if (op == @intFromEnum(Token.kw_and) or op == @intFromEnum(Token.kw_or) or
+            op == @intFromEnum(Token.land)) {
+            if (!self.isBoolType(left_type) or !self.isBoolType(right_type)) {
+                self.reportError(idx, ErrorCode.e300, "invalid operation")
+                return invalid_type
+            }
+            return BOOL
+        }
+
+        // Logical OR (||): also handles error set merge
+        if (op == @intFromEnum(Token.lor)) {
+            // Error set merge: FileError || NetError
+            if (left_t.tag == TAG_ERROR_SET and right_t.tag == TAG_ERROR_SET) {
+                return self.mergeErrorSets(left_type, right_type)
+            }
+            // Bool logical OR
+            if (self.isBoolType(left_type) and self.isBoolType(right_type)) { return BOOL }
+            self.reportError(idx, ErrorCode.e300, "invalid operation")
+            return invalid_type
+        }
+
+        // Bitwise (require integer operands)
         if (op == @intFromEnum(Token.@"and") or op == @intFromEnum(Token.@"or") or
             op == @intFromEnum(Token.xor) or op == @intFromEnum(Token.shl) or
             op == @intFromEnum(Token.shr)) {
+            if (!self.isIntegerType(left_type) or !self.isIntegerType(right_type)) {
+                self.reportError(idx, ErrorCode.e300, "invalid operation")
+                return invalid_type
+            }
             return TypeRegistry.commonType(left_type, right_type)
         }
 
@@ -1082,9 +1407,17 @@ impl Checker {
             return operand_type
         }
         if (op == @intFromEnum(Token.lnot) or op == @intFromEnum(Token.kw_not)) {
+            if (!self.isBoolType(operand_type)) {
+                self.reportError(idx, ErrorCode.e303, "unary '!' requires bool operand")
+                return invalid_type
+            }
             return BOOL
         }
         if (op == @intFromEnum(Token.@"not")) {
+            if (!self.isIntegerType(operand_type)) {
+                self.reportError(idx, ErrorCode.e303, "unary '~' requires integer operand")
+                return invalid_type
+            }
             return operand_type
         }
         // .? optional unwrap (period_question token)
@@ -1096,7 +1429,7 @@ impl Checker {
             self.reportError(idx, ErrorCode.e303, "'.?' requires optional operand")
             return invalid_type
         }
-        return operand_type
+        return invalid_type
     }
 
     fn checkCall(idx: int) int {
@@ -1120,6 +1453,10 @@ impl Checker {
                     self.checkExpr(self.ast.getData(idx, 2))
                 }
                 return INT
+            }
+            // Generic function instantiation: max(i64) where max is generic
+            if (self.generic_functions.has(name) != 0) {
+                return self.instantiateGenericFunc(idx, name)
             }
         }
 
@@ -1162,10 +1499,34 @@ impl Checker {
         // Check argument types
         const param_offset = if (is_method) { 1 } else { 0 }
         for ai in 0..args_count {
-            const arg_type = self.checkExpr(self.ast.getData(idx, 2 + ai))
+            // Zig Sema pattern: set expected_type from param type for result location inference
+            const saved_expected = self.expected_type
             const param = @intToPtr(*FuncParam, func_info.params + (ai + param_offset) * @sizeOf(FuncParam))
+            self.expected_type = param.type_idx
+            const arg_type = self.checkExpr(self.ast.getData(idx, 2 + ai))
+            self.expected_type = saved_expected
             if (!self.types.isAssignable(arg_type, param.type_idx)) {
-                self.reportError(idx, ErrorCode.e300, "type mismatch")
+                // @safe coercion: Struct arg → *Struct param (safeWrapType wraps struct params)
+                const pt = self.types.get(param.type_idx)
+                var is_safe_struct = false
+                if (self.safe_mode and pt.tag == TAG_POINTER) {
+                    const ptr_elem = switch (pt) { Type.pointer |p| => p.elem, else => invalid_type }
+                    if (self.types.get(ptr_elem).tag == TAG_STRUCT and self.types.isAssignable(arg_type, ptr_elem)) {
+                        is_safe_struct = true
+                    }
+                }
+                // @safe reverse coercion: *Struct arg → Struct param (generic methods keep T as value)
+                const at = self.types.get(arg_type)
+                var is_safe_deref = false
+                if (self.safe_mode and at.tag == TAG_POINTER) {
+                    const arg_elem = switch (at) { Type.pointer |p| => p.elem, else => invalid_type }
+                    if (self.types.get(arg_elem).tag == TAG_STRUCT and self.types.isAssignable(arg_elem, param.type_idx)) {
+                        is_safe_deref = true
+                    }
+                }
+                if (!is_safe_struct and !is_safe_deref) {
+                    self.reportError(idx, ErrorCode.e300, "type mismatch")
+                }
             }
         }
 
@@ -1235,6 +1596,24 @@ impl Checker {
         // field_access: [base_n, field_s, span_s, span_e]
         const base_n = self.ast.getData(idx, 0)
         const field_name = self.ast.getStr(self.ast.getData(idx, 1))
+
+        // Zig Sema pattern: .variant shorthand in switch — resolve from switch subject type
+        if (base_n == null_node) {
+            if (self.current_switch_enum_type != invalid_type) {
+                const enum_info = self.types.get(self.current_switch_enum_type)
+                if (enum_info.tag == TAG_ENUM) {
+                    const et = switch (enum_info) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                    for vi in 0..et.variant_count {
+                        const ev = @intToPtr(*EnumVariant, et.variants + vi * @sizeOf(EnumVariant))
+                        if (ev.name == field_name) {
+                            return self.current_switch_enum_type
+                        }
+                    }
+                    self.reportError(idx, ErrorCode.e306, "undefined variant")
+                }
+            }
+            return invalid_type
+        }
 
         // Nested type namespace: TypeName.Nested
         if (self.ast.getTag(base_n) == @intFromEnum(NodeTag.ident)) {
@@ -1311,11 +1690,35 @@ impl Checker {
         if (base.tag == TAG_UNION) {
             const ut = switch (base) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
             if (field_name == "tag") { return I64 }
+            // Check if base is a type name (constructor) vs value (extraction)
+            var is_type_access = false
+            if (self.ast.getTag(base_n) == @intFromEnum(NodeTag.ident)) {
+                const ident_name = self.ast.getStr(self.ast.getData(base_n, 0))
+                const sym_idx = self.lookupSymbol(ident_name)
+                if (sym_idx >= 0) {
+                    if (self.getSymbol(sym_idx).is_type) {
+                        is_type_access = true
+                    }
+                }
+            }
             for vi in 0..ut.variant_count {
                 const uv = @intToPtr(*UnionVariant, ut.variants + vi * @sizeOf(UnionVariant))
                 if (uv.name == field_name) {
                     if (uv.payload_type == invalid_type) { return base_type }
-                    return uv.payload_type
+                    if (!is_type_access) {
+                        // Payload extraction: r.Ok returns the payload type
+                        return uv.payload_type
+                    }
+                    // Constructor: Result.Ok returns function type (payload → union)
+                    const ctor_params = alloc(0, @sizeOf(FuncParam))
+                    const fp = @intToPtr(*FuncParam, ctor_params)
+                    fp.name = "payload"
+                    fp.type_idx = uv.payload_type
+                    return self.types.add(Type.func(FuncType {
+                        param_count: 1,
+                        params: ctor_params,
+                        return_type: base_type,
+                    }))
                 }
             }
             self.reportError(idx, ErrorCode.e306, "field not found")
@@ -1356,6 +1759,24 @@ impl Checker {
         const type_name = self.ast.getStr(self.ast.getData(idx, 0))
         const fi_count = self.ast.getData(idx, 1)
 
+        // Check for type arguments (generic struct init)
+        const ta_count = self.ast.getData(idx, 2 + fi_count)
+        if (ta_count > 0) {
+            const struct_type_idx = self.resolveGenericStructInit(idx, type_name, fi_count, ta_count)
+            self.validateStructFields(idx, struct_type_idx, fi_count, 2)
+            return struct_type_idx
+        }
+
+        // Anonymous struct literal: resolve from expected_type
+        if (@lenOf(type_name) == 0) {
+            if (self.expected_type != invalid_type and self.types.get(self.expected_type).tag == TAG_STRUCT) {
+                self.validateStructFields(idx, self.expected_type, fi_count, 2)
+                return self.expected_type
+            }
+            self.reportError(idx, ErrorCode.e300, "cannot infer type for anonymous struct literal")
+            return invalid_type
+        }
+
         const struct_type_idx = self.types.lookupByName(type_name)
         if (struct_type_idx < 0) {
             self.reportError(idx, ErrorCode.e301, "undefined type")
@@ -1367,20 +1788,84 @@ impl Checker {
             return invalid_type
         }
 
-        // Check field initializers
+        self.validateStructFields(idx, struct_type_idx, fi_count, 2)
+        return struct_type_idx
+    }
+
+    /// Validate field initializers against struct type definition.
+    /// Port from Zig checker lines 2467-2489.
+    fn validateStructFields(idx: int, struct_type_idx: int, fi_count: int, fi_offset: int) void {
+        const st_t = self.types.get(struct_type_idx)
+        if (st_t.tag != TAG_STRUCT) { return }
+        const st = switch (st_t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+
+        // Check each field initializer: name exists and value type matches
         for fi in 0..fi_count {
-            const fi_idx = self.ast.getData(idx, 2 + fi)
+            const fi_idx = self.ast.getData(idx, fi_offset + fi)
             // field_init_node: [name_s, value_n, span_s, span_e]
+            const fname = self.ast.getStr(self.ast.getData(fi_idx, 0))
             const value_n = self.ast.getData(fi_idx, 1)
-            self.checkExpr(value_n)
+            const val_type = self.checkExpr(value_n)
+
+            var found = false
+            for si in 0..st.field_count {
+                const sf = @intToPtr(*StructField, st.fields + si * @sizeOf(StructField))
+                if (sf.name == fname) {
+                    found = true
+                    if (!self.types.isAssignable(val_type, sf.type_idx)) {
+                        // @safe coercion: *Struct → Struct in field init
+                        var is_safe_deref = false
+                        if (self.safe_mode) {
+                            const vt = self.types.get(val_type)
+                            if (vt.tag == TAG_POINTER) {
+                                const ptr_elem = switch (vt) { Type.pointer |p| => p.elem, else => invalid_type }
+                                if (self.types.isAssignable(ptr_elem, sf.type_idx)) {
+                                    is_safe_deref = true
+                                }
+                            }
+                        }
+                        if (!is_safe_deref) {
+                            self.reportError(fi_idx, ErrorCode.e300, "type mismatch in field")
+                        }
+                    }
+                }
+            }
+            if (!found) {
+                self.reportError(fi_idx, ErrorCode.e306, "unknown field")
+            }
         }
 
-        return struct_type_idx
+        // Check that all required fields (no default) are provided
+        for si in 0..st.field_count {
+            const sf = @intToPtr(*StructField, st.fields + si * @sizeOf(StructField))
+            if (sf.default_value != null_node) { continue }  // has default, ok to omit
+            var provided = false
+            for fi in 0..fi_count {
+                const fi_idx = self.ast.getData(idx, fi_offset + fi)
+                const fname = self.ast.getStr(self.ast.getData(fi_idx, 0))
+                if (sf.name == fname) {
+                    provided = true
+                }
+            }
+            if (!provided) {
+                self.reportError(idx, ErrorCode.e300, "missing field in struct init")
+            }
+        }
     }
 
     fn checkNewExpr(idx: int) int {
         // new_expr: [type_name_s, is_ctor, fi_count, ...fi_nodes, ta_count, ...ta_nodes, ca_count, ...ca_nodes, span_s, span_e]
         const type_name = self.ast.getStr(self.ast.getData(idx, 0))
+        const is_ctor = self.ast.getData(idx, 1)
+        const fi_count = self.ast.getData(idx, 2)
+
+        // Check for type arguments (generic new expr)
+        const ta_count = self.ast.getData(idx, 3 + fi_count)
+        if (ta_count > 0) {
+            const struct_type_idx = self.resolveGenericNewExpr(idx, type_name, fi_count, ta_count)
+            self.validateStructFields(idx, struct_type_idx, fi_count, 3)
+            return self.types.makePointer(struct_type_idx)
+        }
 
         const struct_type_idx = self.types.lookupByName(type_name)
         if (struct_type_idx < 0) {
@@ -1393,13 +1878,19 @@ impl Checker {
             return invalid_type
         }
 
-        // Check field initializers
-        const fi_count = self.ast.getData(idx, 2)
-        for fi in 0..fi_count {
-            const fi_idx = self.ast.getData(idx, 3 + fi)
-            const value_n = self.ast.getData(fi_idx, 1)
-            self.checkExpr(value_n)
+        // Constructor sugar: new Point(10, 20) calls init()
+        if (is_ctor != 0) {
+            // Check constructor args — look up init method
+            const ca_offset = 3 + fi_count + 1 + ta_count
+            const ca_count = self.ast.getData(idx, ca_offset)
+            for ci in 0..ca_count {
+                self.checkExpr(self.ast.getData(idx, ca_offset + 1 + ci))
+            }
+            return self.types.makePointer(struct_type_idx)
         }
+
+        // Validate field initializers
+        self.validateStructFields(idx, struct_type_idx, fi_count, 3)
 
         // Return pointer to struct (heap-allocated)
         return self.types.makePointer(struct_type_idx)
@@ -1475,26 +1966,123 @@ impl Checker {
         const else_body_n = self.ast.getData(idx, 1)
         const cases_count = self.ast.getData(idx, 2)
 
-        self.checkExpr(subject_n)
+        const subject_type = self.checkExpr(subject_n)
+        const subject_t = self.types.get(subject_type)
+        const is_union = subject_t.tag == TAG_UNION
+        const is_enum = subject_t.tag == TAG_ENUM
 
-        var result_type: int = VOID
-        var first = true
+        // Set current enum type for .variant shorthand resolution
+        const old_switch_enum = self.current_switch_enum_type
+        if (is_enum) {
+            self.current_switch_enum_type = subject_type
+        }
+
+        // Zig result location: use expected_type so untyped literals materialize correctly
+        var result_type: int = if (self.expected_type != invalid_type) { self.expected_type } else { VOID }
+        var first = self.expected_type != invalid_type  // skip first-arm inference if expected type known
 
         for ci in 0..cases_count {
             const case_idx = self.ast.getData(idx, 3 + ci)
             // switch_case: [capture_s, guard_n, is_range, body_n, patterns_count, ...patterns, span_s, span_e]
+            const capture_s = self.ast.getData(case_idx, 0)
+            const capture = self.ast.getStr(capture_s)
+            const guard_n = self.ast.getData(case_idx, 1)
             const body_n = self.ast.getData(case_idx, 3)
-            const body_type = self.checkExpr(body_n)
-            if (first) {
-                result_type = self.materializeType(body_type)
-                first = false
+            const patterns_count = self.ast.getData(case_idx, 4)
+
+            // Check pattern expressions
+            for pi in 0..patterns_count {
+                self.checkExpr(self.ast.getData(case_idx, 5 + pi))
+            }
+
+            // Check guard expression (must be boolean)
+            if (guard_n != null_node) {
+                self.checkExpr(guard_n)
+            }
+
+            // If union switch with capture, define capture variable in a new scope
+            if (is_union and @lenOf(capture) > 0) {
+                const payload_type = self.resolveUnionCaptureType(subject_type, case_idx, patterns_count)
+                self.pushScope()
+                self.defineSymbol(makeSymbol(capture, payload_type, null_node, false))
+                const body_type = self.checkExpr(body_n)
+                self.popScope()
+                if (!first) {
+                    result_type = self.materializeType(body_type)
+                    first = true
+                }
+            } else {
+                const body_type = self.checkExpr(body_n)
+                if (!first) {
+                    result_type = self.materializeType(body_type)
+                    first = true
+                }
             }
         }
         if (else_body_n != null_node) {
             self.checkExpr(else_body_n)
         }
 
+        // Enum switch exhaustiveness check (Zig pattern: must be exhaustive or have else)
+        // Port from Zig checker lines 2666-2698.
+        if (is_enum and else_body_n == null_node) {
+            const et = switch (subject_t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+            // Build coverage set: track which variants are covered by unguarded cases.
+            // Use a parallel list of variant names (Map would be cleaner but we track by name).
+            var covered: List(string) = undefined
+            covered.items = 0
+            covered.count = 0
+            covered.capacity = 0
+            for ci in 0..cases_count {
+                const case_idx = self.ast.getData(idx, 3 + ci)
+                const guard_n2 = self.ast.getData(case_idx, 1)
+                if (guard_n2 != null_node) { continue }  // guarded cases don't guarantee coverage
+                const pat_count = self.ast.getData(case_idx, 4)
+                for pi in 0..pat_count {
+                    const pat_idx = self.ast.getData(case_idx, 5 + pi)
+                    if (self.ast.getTag(pat_idx) == @intFromEnum(NodeTag.field_access)) {
+                        const variant_name = self.ast.getStr(self.ast.getData(pat_idx, 1))
+                        // Dedup: only add if not already covered
+                        var already_covered = false
+                        for ci2 in 0..covered.count {
+                            if (covered.get(ci2) == variant_name) {
+                                already_covered = true
+                            }
+                        }
+                        if (!already_covered) {
+                            covered.append(variant_name)
+                        }
+                    }
+                }
+            }
+            if (covered.count < et.variant_count) {
+                self.reportError(idx, ErrorCode.e300, "non-exhaustive enum switch requires else branch")
+            }
+        }
+
+        self.current_switch_enum_type = old_switch_enum
         return result_type
+    }
+
+    /// Resolve the payload type for a union switch case capture from its patterns.
+    /// Port from Zig checker lines 2704-2718.
+    fn resolveUnionCaptureType(subject_type: int, case_idx: int, patterns_count: int) int {
+        if (patterns_count == 0) { return VOID }
+        const subject_t = self.types.get(subject_type)
+        if (subject_t.tag != TAG_UNION) { return VOID }
+        const ut = switch (subject_t) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
+
+        // Use first pattern to determine the variant
+        const pat_idx = self.ast.getData(case_idx, 5)
+        if (self.ast.getTag(pat_idx) != @intFromEnum(NodeTag.field_access)) { return VOID }
+        const field_name = self.ast.getStr(self.ast.getData(pat_idx, 1))
+        for vi in 0..ut.variant_count {
+            const uv = @intToPtr(*UnionVariant, ut.variants + vi * @sizeOf(UnionVariant))
+            if (uv.name == field_name) {
+                return uv.payload_type
+            }
+        }
+        return VOID
     }
 
     fn checkBlockExpr(idx: int) int {
@@ -1514,199 +2102,504 @@ impl Checker {
         return result
     }
 
+    /// Port from Zig checker.zig:1830-2204 — per-builtin type validation.
     fn checkBuiltinCall(idx: int) int {
         // builtin_call: [kind, type_arg_n, args_count, ...arg_nodes, span_s, span_e]
-        const kind = self.ast.getData(idx, 0)
+        const kind = @as(BuiltinKind, @enumFromInt(self.ast.getData(idx, 0)))
         const type_arg_n = self.ast.getData(idx, 1)
         const args_count = self.ast.getData(idx, 2)
 
-        // @sizeOf, @alignOf → I64
-        if (kind == @intFromEnum(BuiltinKind.size_of) or kind == @intFromEnum(BuiltinKind.align_of)) {
-            if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) }
-            return I64
-        }
-        // @enumLen → I64
-        if (kind == @intFromEnum(BuiltinKind.enum_len)) {
-            if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) }
-            return I64
-        }
-        // @assert, @assertEq → VOID
-        if (kind == @intFromEnum(BuiltinKind.assert)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return VOID
-        }
-        if (kind == @intFromEnum(BuiltinKind.assertEq)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            if (args_count >= 2) { self.checkExpr(self.ast.getData(idx, 4)) }
-            return VOID
-        }
-        // @intFromEnum → I64
-        if (kind == @intFromEnum(BuiltinKind.int_from_enum)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return I64
-        }
-        // @enumFromInt → target type
-        if (kind == @intFromEnum(BuiltinKind.enum_from_int)) {
-            if (type_arg_n != null_node) {
-                const target = self.resolveTypeExpr(type_arg_n)
+        return switch (kind) {
+            // @sizeOf(T), @alignOf(T) — Zig checker.zig:1832-1836
+            .size_of, .align_of => {
+                const type_idx = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (type_idx == invalid_type) {
+                    self.reportError(idx, ErrorCode.e300, "requires valid type")
+                    return invalid_type
+                }
+                I64
+            },
+            // @enumLen(T) — Zig checker.zig:1837-1843
+            .enum_len => {
+                const type_idx = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (type_idx == invalid_type) {
+                    self.reportError(idx, ErrorCode.e300, "@enumLen requires valid type")
+                    return invalid_type
+                }
+                const info = self.types.get(type_idx)
+                if (info.tag != TAG_ENUM) {
+                    self.reportError(idx, ErrorCode.e300, "@enumLen requires enum type")
+                    return invalid_type
+                }
+                I64
+            },
+            // @string(ptr, len) — Zig checker.zig:1845-1848
+            .@"string" => {
                 if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-                return target
-            }
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return invalid_type
-        }
-        // @as → target type
-        if (kind == @intFromEnum(BuiltinKind.@"as")) {
-            if (type_arg_n != null_node) {
-                const target = self.resolveTypeExpr(type_arg_n)
+                if (args_count >= 2) { self.checkExpr(self.ast.getData(idx, 4)) }
+                STRING
+            },
+            // @intCast(T, val) — Zig checker.zig:1850-1855: target must be integer
+            .int_cast => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (!self.isIntegerType(target_type)) {
+                    self.reportError(idx, ErrorCode.e300, "@intCast target must be integer type")
+                    return invalid_type
+                }
                 if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-                return target
-            }
-            return invalid_type
-        }
-        // @intCast → target type
-        if (kind == @intFromEnum(BuiltinKind.int_cast)) {
-            if (type_arg_n != null_node) {
-                const target = self.resolveTypeExpr(type_arg_n)
+                target_type
+            },
+            // @floatCast(T, val) — Zig checker.zig:1857-1866: target must be float
+            .float_cast => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (!self.isFloatType(target_type)) {
+                    self.reportError(idx, ErrorCode.e300, "@floatCast target must be float type")
+                    return invalid_type
+                }
                 if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-                return target
-            }
-            return invalid_type
-        }
-        // @intToPtr → target type
-        if (kind == @intFromEnum(BuiltinKind.int_to_ptr)) {
-            if (type_arg_n != null_node) {
-                const target = self.resolveTypeExpr(type_arg_n)
+                target_type
+            },
+            // @floatFromInt(T, val) — Zig checker.zig:1868-1872
+            .float_from_int => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
                 if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-                return target
-            }
-            return invalid_type
-        }
-        // @ptrOf → I64
-        if (kind == @intFromEnum(BuiltinKind.ptr_of)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return I64
-        }
-        // @lenOf → I64
-        if (kind == @intFromEnum(BuiltinKind.len_of)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return I64
-        }
-        // @string → STRING
-        if (kind == @intFromEnum(BuiltinKind.@"string")) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            if (args_count >= 2) { self.checkExpr(self.ast.getData(idx, 4)) }
-            return STRING
-        }
-        // @trap, @panic → NORETURN
-        if (kind == @intFromEnum(BuiltinKind.trap) or kind == @intFromEnum(BuiltinKind.panic)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return NORETURN
-        }
-        // @targetOs, @targetArch, @target → STRING
-        if (kind == @intFromEnum(BuiltinKind.targetOs) or kind == @intFromEnum(BuiltinKind.targetArch) or kind == @intFromEnum(BuiltinKind.target)) {
-            return STRING
-        }
-        // @ptrToInt → I64
-        if (kind == @intFromEnum(BuiltinKind.ptr_to_int)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return I64
-        }
-        // @intFromBool → I64
-        if (kind == @intFromEnum(BuiltinKind.int_from_bool)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return I64
-        }
-        // @ptrCast → target type
-        if (kind == @intFromEnum(BuiltinKind.ptr_cast)) {
-            if (type_arg_n != null_node) {
-                const target = self.resolveTypeExpr(type_arg_n)
+                target_type
+            },
+            // @intFromFloat(val) — Zig checker.zig:1874-1881: arg must be float
+            .int_from_float => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    if (!self.isFloatType(arg_type)) {
+                        self.reportError(idx, ErrorCode.e300, "@intFromFloat operand must be a float type")
+                    }
+                }
+                I64
+            },
+            // @ptrCast(T, val) — Zig checker.zig:1883-1887: target must be pointer
+            .ptr_cast => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (self.types.get(target_type).tag != TAG_POINTER) {
+                    self.reportError(idx, ErrorCode.e300, "@ptrCast target must be pointer")
+                    return invalid_type
+                }
                 if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-                return target
-            }
-            return invalid_type
-        }
-        // @bitCast, @truncate → target type
-        if (kind == @intFromEnum(BuiltinKind.bit_cast) or kind == @intFromEnum(BuiltinKind.truncate)) {
-            if (type_arg_n != null_node) {
-                const target = self.resolveTypeExpr(type_arg_n)
+                target_type
+            },
+            // @ptrToInt(ptr) — Zig checker.zig:1889-1897: arg must be pointer or I64
+            .ptr_to_int => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    const arg_info = self.types.get(arg_type)
+                    if (arg_info.tag != TAG_POINTER and arg_type != I64) {
+                        self.reportError(idx, ErrorCode.e300, "@ptrToInt operand must be a pointer")
+                        return invalid_type
+                    }
+                }
+                I64
+            },
+            // @intToPtr(T, val) — Zig checker.zig:1899-1903: target must be pointer
+            .int_to_ptr => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (self.types.get(target_type).tag != TAG_POINTER) {
+                    self.reportError(idx, ErrorCode.e300, "@intToPtr target must be pointer")
+                    return invalid_type
+                }
                 if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-                return target
-            }
-            return invalid_type
-        }
-        // @floatCast, @floatFromInt → target type
-        if (kind == @intFromEnum(BuiltinKind.float_cast) or kind == @intFromEnum(BuiltinKind.float_from_int)) {
-            if (type_arg_n != null_node) {
-                const target = self.resolveTypeExpr(type_arg_n)
+                target_type
+            },
+            // @assert(cond) — Zig checker.zig:1905-1907
+            .assert => {
                 if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-                return target
-            }
-            return invalid_type
+                VOID
+            },
+            // @assertEq(a, b) — Zig checker.zig:1909-1912
+            .assertEq => {
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                if (args_count >= 2) { self.checkExpr(self.ast.getData(idx, 4)) }
+                VOID
+            },
+            // @ptrOf(s) — Zig checker.zig:1914-1917: arg must be string
+            .ptr_of => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    if (arg_type != STRING) {
+                        self.reportError(idx, ErrorCode.e300, "@ptrOf requires string argument")
+                        return invalid_type
+                    }
+                }
+                I64
+            },
+            // @lenOf(s) — Zig checker.zig:1919-1922: arg must be string
+            .len_of => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    if (arg_type != STRING) {
+                        self.reportError(idx, ErrorCode.e300, "@lenOf requires string argument")
+                        return invalid_type
+                    }
+                }
+                I64
+            },
+            // @trap — Zig checker.zig:1924
+            .trap => NORETURN,
+            // @targetOs, @targetArch, @target — Zig checker.zig:1925
+            .targetOs, .targetArch, .target => STRING,
+            // @compileError("msg") — Zig checker.zig:1926-1929
+            .compile_error => {
+                // Extract compile error message from string literal argument
+                var msg = "compile error"
+                if (args_count >= 1) {
+                    const arg_n = self.ast.getData(idx, 3)
+                    if (self.ast.getTag(arg_n) == @intFromEnum(NodeTag.literal)) {
+                        const lit_kind = self.ast.getData(arg_n, 0)
+                        if (lit_kind == @intFromEnum(LiteralKind.@"string")) {
+                            msg = self.ast.getStr(self.ast.getData(arg_n, 1))
+                        }
+                    }
+                }
+                self.reportError(idx, ErrorCode.e300, msg)
+                NORETURN
+            },
+            // @embedFile(path) — Zig checker.zig:1931-1941: arg must be string literal
+            .embed_file => {
+                if (args_count >= 1) {
+                    const arg_n = self.ast.getData(idx, 3)
+                    if (self.ast.getTag(arg_n) != @intFromEnum(NodeTag.literal)) {
+                        self.reportError(idx, ErrorCode.e300, "@embedFile requires a string literal path")
+                    } else {
+                        const lit_kind = self.ast.getData(arg_n, 0)
+                        if (lit_kind != @intFromEnum(LiteralKind.@"string")) {
+                            self.reportError(idx, ErrorCode.e300, "@embedFile requires a string literal path")
+                        }
+                    }
+                }
+                STRING
+            },
+            // @abs, @ceil, @floor, @trunc, @round, @sqrt — Zig checker.zig:1943-1949: arg must be float
+            .abs, .ceil, .floor, .trunc, .round, .sqrt => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    if (!self.isFloatType(arg_type)) {
+                        self.reportError(idx, ErrorCode.e300, "math builtin requires float argument")
+                        return invalid_type
+                    }
+                }
+                F64
+            },
+            // @fmin, @fmax — Zig checker.zig:1951-1960: both args must be float
+            .fmin, .fmax => {
+                var a1_float = false
+                var a2_float = false
+                if (args_count >= 1) {
+                    const a1_type = self.checkExpr(self.ast.getData(idx, 3))
+                    a1_float = self.isFloatType(a1_type)
+                }
+                if (args_count >= 2) {
+                    const a2_type = self.checkExpr(self.ast.getData(idx, 4))
+                    a2_float = self.isFloatType(a2_type)
+                }
+                if (!a1_float or !a2_float) {
+                    self.reportError(idx, ErrorCode.e300, "@fmin/@fmax require float arguments")
+                    return invalid_type
+                }
+                F64
+            },
+            // @hasField(T, "name") — Zig checker.zig:1962-1975
+            .has_field => {
+                if (type_arg_n != null_node) {
+                    const type_idx = self.resolveTypeExpr(type_arg_n)
+                    if (type_idx == invalid_type) {
+                        self.reportError(idx, ErrorCode.e300, "@hasField requires valid type")
+                        return invalid_type
+                    }
+                }
+                // Validate field name is a string literal
+                if (args_count >= 1) {
+                    self.checkExpr(self.ast.getData(idx, 3))
+                    const field_arg = self.ast.getData(idx, 3)
+                    if (self.ast.getTag(field_arg) != @intFromEnum(NodeTag.literal)) {
+                        self.reportError(idx, ErrorCode.e300, "@hasField requires string literal field name")
+                        return invalid_type
+                    }
+                    const lit_kind = self.ast.getData(field_arg, 0)
+                    if (lit_kind != @intFromEnum(LiteralKind.@"string")) {
+                        self.reportError(idx, ErrorCode.e300, "@hasField requires string literal field name")
+                        return invalid_type
+                    }
+                }
+                BOOL
+            },
+            // @TypeOf(expr) — Zig checker.zig:1977-1980
+            .type_of => {
+                if (args_count >= 1) { return self.checkExpr(self.ast.getData(idx, 3)) }
+                invalid_type
+            },
+            // @field(value, "name") — Zig checker.zig:1982-2005
+            .field => {
+                if (args_count < 2) {
+                    self.reportError(idx, ErrorCode.e300, "@field requires two arguments")
+                    return invalid_type
+                }
+                var base_type = self.checkExpr(self.ast.getData(idx, 3))
+                // Auto-deref pointers
+                while (self.types.get(base_type).tag == TAG_POINTER) {
+                    base_type = self.types.pointerElem(base_type)
+                }
+                self.checkExpr(self.ast.getData(idx, 4))
+                // Validate base is struct and look up field
+                const info = self.types.get(base_type)
+                if (info.tag == TAG_STRUCT) {
+                    // Field lookup requires string literal — check if arg is literal
+                    const field_arg = self.ast.getData(idx, 4)
+                    if (self.ast.getTag(field_arg) == @intFromEnum(NodeTag.literal)) {
+                        const lit_kind = self.ast.getData(field_arg, 0)
+                        if (lit_kind == @intFromEnum(LiteralKind.@"string")) {
+                            const field_name = self.ast.getStr(self.ast.getData(field_arg, 1))
+                            const st = switch (info) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+                            for fi in 0..st.field_count {
+                                const sf = @intToPtr(*StructField, st.fields + fi * @sizeOf(StructField))
+                                if (sf.name == field_name) { return sf.type_idx }
+                            }
+                            self.reportError(idx, ErrorCode.e300, "struct has no field with this name")
+                            return invalid_type
+                        }
+                    }
+                    // Non-literal field name — can't validate at compile time
+                    return invalid_type
+                }
+                self.reportError(idx, ErrorCode.e300, "@field requires struct type")
+                invalid_type
+            },
+            // @intFromEnum(e) — Zig checker.zig:2007-2014: arg must be enum
+            .int_from_enum => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    if (self.types.get(arg_type).tag != TAG_ENUM) {
+                        self.reportError(idx, ErrorCode.e300, "@intFromEnum requires enum argument")
+                        return invalid_type
+                    }
+                }
+                I64
+            },
+            // @enumFromInt(T, val) — Zig checker.zig:2016-2040: target must be enum
+            .enum_from_int => {
+                var target_type = invalid_type
+                if (type_arg_n != null_node) {
+                    target_type = self.resolveTypeExpr(type_arg_n)
+                } else if (self.expected_type != invalid_type) {
+                    target_type = self.expected_type
+                } else {
+                    self.reportError(idx, ErrorCode.e300, "@enumFromInt requires type argument or type context")
+                    return invalid_type
+                }
+                const target_info = self.types.get(target_type)
+                if (target_info.tag != TAG_ENUM) {
+                    self.reportError(idx, ErrorCode.e300, "@enumFromInt target must be enum type")
+                    return invalid_type
+                }
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                target_type
+            },
+            // @tagName(val) — Zig checker.zig:2042-2050: arg must be enum or union
+            .tag_name => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    const info = self.types.get(arg_type)
+                    if (info.tag != TAG_ENUM and info.tag != TAG_UNION) {
+                        self.reportError(idx, ErrorCode.e300, "@tagName requires enum or union argument")
+                        return invalid_type
+                    }
+                }
+                STRING
+            },
+            // @errorName(err) — Zig checker.zig:2052-2061: arg must be error_set or error_union
+            .error_name => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    const arg_info = self.types.get(arg_type)
+                    if (arg_info.tag != TAG_ERROR_SET and arg_info.tag != TAG_ERROR_UNION) {
+                        self.reportError(idx, ErrorCode.e300, "@errorName operand must be error type")
+                        return invalid_type
+                    }
+                }
+                STRING
+            },
+            // @intFromBool(b) — Zig checker.zig:2063-2070: arg must be bool
+            .int_from_bool => {
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    if (arg_type != BOOL and arg_type != UNTYPED_BOOL) {
+                        self.reportError(idx, ErrorCode.e300, "@intFromBool requires bool argument")
+                        return invalid_type
+                    }
+                }
+                I64
+            },
+            // @bitCast(T, val) — Zig checker.zig:2072-2094: no ptr/enum, same size
+            .bit_cast => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (args_count >= 1) {
+                    const arg_type = self.checkExpr(self.ast.getData(idx, 3))
+                    const target_info = self.types.get(target_type)
+                    const arg_info = self.types.get(arg_type)
+                    if (target_info.tag == TAG_POINTER or target_info.tag == TAG_ENUM) {
+                        self.reportError(idx, ErrorCode.e300, "@bitCast target cannot be pointer or enum type")
+                        return invalid_type
+                    }
+                    if (arg_info.tag == TAG_POINTER or arg_info.tag == TAG_ENUM) {
+                        self.reportError(idx, ErrorCode.e300, "@bitCast source cannot be pointer or enum type")
+                        return invalid_type
+                    }
+                    const target_size = self.types.sizeOf(target_type)
+                    const arg_size = self.types.sizeOf(arg_type)
+                    if (target_size != arg_size) {
+                        self.reportError(idx, ErrorCode.e300, "@bitCast requires same-size types")
+                        return invalid_type
+                    }
+                }
+                target_type
+            },
+            // @truncate(T, val) — Zig checker.zig:2096-2105: target must be integer
+            .truncate => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                if (!self.isIntegerType(target_type)) {
+                    self.reportError(idx, ErrorCode.e300, "@truncate target must be integer type")
+                    return invalid_type
+                }
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                target_type
+            },
+            // @as(T, val) — Zig checker.zig:2107-2115: propagate expected_type
+            .@"as" => {
+                const target_type = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                // Propagate expected type to inner expression (enables @as(MyEnum, @enumFromInt(val)))
+                const saved_expected = self.expected_type
+                self.expected_type = target_type
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                self.expected_type = saved_expected
+                target_type
+            },
+            // @offsetOf(T, "field") — Zig checker.zig:2117-2137: struct + field exists
+            .offset_of => {
+                const type_idx = if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) } else { invalid_type }
+                const info = self.types.get(type_idx)
+                if (info.tag != TAG_STRUCT) {
+                    self.reportError(idx, ErrorCode.e300, "@offsetOf requires struct type")
+                    return invalid_type
+                }
+                // Validate field name is string literal and field exists
+                if (args_count >= 1) {
+                    self.checkExpr(self.ast.getData(idx, 3))
+                    const field_arg = self.ast.getData(idx, 3)
+                    if (self.ast.getTag(field_arg) == @intFromEnum(NodeTag.literal)) {
+                        const lit_kind = self.ast.getData(field_arg, 0)
+                        if (lit_kind == @intFromEnum(LiteralKind.@"string")) {
+                            const field_name = self.ast.getStr(self.ast.getData(field_arg, 1))
+                            const st = switch (info) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+                            var found = false
+                            for fi in 0..st.field_count {
+                                const sf = @intToPtr(*StructField, st.fields + fi * @sizeOf(StructField))
+                                if (sf.name == field_name) { found = true }
+                            }
+                            if (!found) {
+                                self.reportError(idx, ErrorCode.e300, "struct has no field with this name")
+                                return invalid_type
+                            }
+                        } else {
+                            self.reportError(idx, ErrorCode.e300, "@offsetOf requires string literal field name")
+                            return invalid_type
+                        }
+                    } else {
+                        self.reportError(idx, ErrorCode.e300, "@offsetOf requires string literal field name")
+                        return invalid_type
+                    }
+                }
+                I64
+            },
+            // @min(a, b), @max(a, b) — Zig checker.zig:2139-2152: both must be numeric
+            .min, .max => {
+                var a_type: int = I64
+                var b_type: int = I64
+                if (args_count >= 1) { a_type = self.checkExpr(self.ast.getData(idx, 3)) }
+                if (args_count >= 2) { b_type = self.checkExpr(self.ast.getData(idx, 4)) }
+                if (!self.isNumericType(a_type) or !self.isNumericType(b_type)) {
+                    self.reportError(idx, ErrorCode.e300, "@min/@max requires numeric types")
+                    return invalid_type
+                }
+                TypeRegistry.commonType(a_type, b_type)
+            },
+            // @alignCast — Zig checker.zig:2154-2158
+            .align_cast => {
+                if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) }
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                I64
+            },
+            // @constCast — Zig checker.zig:2160-2163
+            .const_cast => {
+                if (args_count >= 1) { return self.checkExpr(self.ast.getData(idx, 3)) }
+                invalid_type
+            },
+            // @arcRetain, @arcRelease — Zig checker.zig:2165-2170
+            .arcRetain, .arcRelease => {
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                VOID
+            },
+            // @panic — Zig checker.zig:2172-2175
+            .panic => {
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                NORETURN
+            },
+            // @ctz, @clz, @popCount — Zig checker.zig:2177-2180
+            .ctz, .clz, .pop_count => {
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                I64
+            },
+            // @typeName(T) — Zig checker.zig:2182-2185
+            .type_name => {
+                if (type_arg_n != null_node) {
+                    const type_idx = self.resolveTypeExpr(type_arg_n)
+                    if (type_idx == invalid_type) {
+                        self.reportError(idx, ErrorCode.e300, "@typeName requires valid type")
+                        return invalid_type
+                    }
+                }
+                STRING
+            },
+            // @enumName(T, val) — Zig checker.zig:2187-2193
+            .enum_name => {
+                if (type_arg_n != null_node) {
+                    const type_idx = self.resolveTypeExpr(type_arg_n)
+                    if (type_idx == invalid_type) {
+                        self.reportError(idx, ErrorCode.e300, "@enumName requires valid type")
+                        return invalid_type
+                    }
+                    const info = self.types.get(type_idx)
+                    if (info.tag != TAG_ENUM) {
+                        self.reportError(idx, ErrorCode.e300, "@enumName requires enum type")
+                        return invalid_type
+                    }
+                }
+                if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
+                STRING
+            },
+            // @typeInfo(T) — Zig checker.zig:2195-2201
+            .type_info => {
+                if (type_arg_n != null_node) {
+                    const type_idx = self.resolveTypeExpr(type_arg_n)
+                    if (type_idx == invalid_type) {
+                        self.reportError(idx, ErrorCode.e300, "@typeInfo requires valid type")
+                        return invalid_type
+                    }
+                }
+                I64
+            },
+            else => {
+                for ai in 0..args_count {
+                    self.checkExpr(self.ast.getData(idx, 3 + ai))
+                }
+                invalid_type
+            },
         }
-        // @intFromFloat → I64
-        if (kind == @intFromEnum(BuiltinKind.int_from_float)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return I64
-        }
-        // @arcRetain, @arcRelease → VOID
-        if (kind == @intFromEnum(BuiltinKind.arcRetain) or kind == @intFromEnum(BuiltinKind.arcRelease)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return VOID
-        }
-        // @typeName, @enumName, @tagName, @errorName → STRING
-        if (kind == @intFromEnum(BuiltinKind.type_name) or kind == @intFromEnum(BuiltinKind.enum_name) or
-            kind == @intFromEnum(BuiltinKind.tag_name) or kind == @intFromEnum(BuiltinKind.error_name)) {
-            if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) }
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return STRING
-        }
-        // @ctz, @clz, @popCount → I64
-        if (kind == @intFromEnum(BuiltinKind.ctz) or kind == @intFromEnum(BuiltinKind.clz) or kind == @intFromEnum(BuiltinKind.pop_count)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return I64
-        }
-        // @min, @max → check both args, return common type
-        if (kind == @intFromEnum(BuiltinKind.min) or kind == @intFromEnum(BuiltinKind.max)) {
-            var a_type: int = I64
-            var b_type: int = I64
-            if (args_count >= 1) { a_type = self.checkExpr(self.ast.getData(idx, 3)) }
-            if (args_count >= 2) { b_type = self.checkExpr(self.ast.getData(idx, 4)) }
-            return TypeRegistry.commonType(a_type, b_type)
-        }
-        // @hasField → BOOL
-        if (kind == @intFromEnum(BuiltinKind.has_field)) {
-            if (type_arg_n != null_node) { self.resolveTypeExpr(type_arg_n) }
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return BOOL
-        }
-        // @compileError → NORETURN
-        if (kind == @intFromEnum(BuiltinKind.compile_error)) {
-            return NORETURN
-        }
-        // @embedFile → STRING
-        if (kind == @intFromEnum(BuiltinKind.embed_file)) {
-            return STRING
-        }
-        // Math builtins: @abs, @ceil, @floor, @trunc, @round → F64
-        if (kind == @intFromEnum(BuiltinKind.abs) or kind == @intFromEnum(BuiltinKind.ceil) or
-            kind == @intFromEnum(BuiltinKind.floor) or kind == @intFromEnum(BuiltinKind.trunc) or
-            kind == @intFromEnum(BuiltinKind.round)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            return F64
-        }
-        // @fmin, @fmax → F64
-        if (kind == @intFromEnum(BuiltinKind.fmin) or kind == @intFromEnum(BuiltinKind.fmax)) {
-            if (args_count >= 1) { self.checkExpr(self.ast.getData(idx, 3)) }
-            if (args_count >= 2) { self.checkExpr(self.ast.getData(idx, 4)) }
-            return F64
-        }
-
-        // Check all args as fallback
-        for ai in 0..args_count {
-            self.checkExpr(self.ast.getData(idx, 3 + ai))
-        }
-        return invalid_type
     }
 
     fn checkStringInterp(idx: int) int {
@@ -1745,8 +2638,11 @@ impl Checker {
         const elem_type = switch (ot) { Type.error_union |eu| => eu.elem, else => invalid_type }
 
         if (@lenOf(capture) > 0) {
+            // Catch capture: catch |err| — bind err to error set type (Zig checker.zig:2793)
+            const eu = switch (ot) { Type.error_union |eu| => eu, else => ErrorUnionType { elem: invalid_type, error_set: invalid_type } }
+            const err_type = if (eu.error_set != invalid_type) { eu.error_set } else { I64 }
             self.pushScope()
-            self.defineSymbol(makeSymbol(capture, I64, null_node, false))
+            self.defineSymbol(makeSymbol(capture, err_type, null_node, false))
             self.checkExpr(fallback_n)
             self.popScope()
         } else {
@@ -1771,6 +2667,60 @@ impl Checker {
         return invalid_type
     }
 
+    fn checkClosureExpr(idx: int) int {
+        // closure_expr: [ret_type_n, body_n, params_count, ...param_nodes, span_s, span_e]
+        const ret_type_n = self.ast.getData(idx, 0)
+        const body_n = self.ast.getData(idx, 1)
+        const params_count = self.ast.getData(idx, 2)
+
+        // Build function type from closure signature
+        const params_ptr = alloc(0, params_count * @sizeOf(FuncParam))
+        for pi in 0..params_count {
+            const param_idx = self.ast.getData(idx, 3 + pi)
+            var pname = ""
+            var ptype: int = invalid_type
+            if (self.ast.getTag(param_idx) == @intFromEnum(NodeTag.field_def)) {
+                pname = self.ast.getStr(self.ast.getData(param_idx, 0))
+                const ptype_n = self.ast.getData(param_idx, 1)
+                ptype = self.resolveTypeExpr(ptype_n)
+                ptype = self.safeWrapType(ptype)
+            }
+            const fp = @intToPtr(*FuncParam, params_ptr + pi * @sizeOf(FuncParam))
+            fp.name = pname
+            fp.type_idx = ptype
+        }
+
+        var ret_type: int = VOID
+        if (ret_type_n != null_node) {
+            ret_type = self.resolveTypeExpr(ret_type_n)
+        }
+
+        const func_type = self.types.add(Type.func(FuncType {
+            param_count: params_count,
+            params: params_ptr,
+            return_type: ret_type,
+        }))
+
+        // Check body in a child scope with params defined
+        // Reuse already-resolved param types from the func type (avoid double resolution)
+        if (body_n != null_node) {
+            self.pushScope()
+            const old_ret = self.current_return_type
+            self.current_return_type = ret_type
+            for pi in 0..params_count {
+                const fp = @intToPtr(*FuncParam, params_ptr + pi * @sizeOf(FuncParam))
+                if (@lenOf(fp.name) > 0) {
+                    self.defineSymbol(makeSymbol(fp.name, fp.type_idx, idx, false))
+                }
+            }
+            self.checkBlockBody(body_n)
+            self.current_return_type = old_ret
+            self.popScope()
+        }
+
+        return func_type
+    }
+
     // ---- Type resolution ----
 
     fn resolveTypeExpr(idx: int) int {
@@ -1780,6 +2730,11 @@ impl Checker {
         // Named type (ident node used in type position)
         if (tag == @intFromEnum(NodeTag.ident)) {
             const name = self.ast.getStr(self.ast.getData(idx, 0))
+            // Check type substitution first (active during generic instantiation)
+            if (self.hasTypeSubstitution()) {
+                const sub = self.lookupTypeSub(name)
+                if (sub >= 0) { return sub }
+            }
             const type_idx = self.types.lookupByName(name)
             if (type_idx >= 0) { return type_idx }
             // Check scope for type aliases
@@ -1790,6 +2745,12 @@ impl Checker {
             }
             self.reportError(idx, ErrorCode.e301, "undefined type")
             return invalid_type
+        }
+
+        // generic_instance: [name_s, ta_count, ...ta_nodes, span_s, span_e]
+        if (tag == @intFromEnum(NodeTag.generic_instance)) {
+            const gi_name = self.ast.getStr(self.ast.getData(idx, 0))
+            return self.resolveGenericInstance(idx, gi_name)
         }
 
         // type_expr node: [kind, data1, data2, span_s, span_e]
@@ -1814,6 +2775,21 @@ impl Checker {
         }
         if (kind == TYPE_SLICE) {
             return self.types.makeSlice(self.resolveTypeExpr(d1))
+        }
+        if (kind == TYPE_FUNCTION) {
+            // fn(params...) RetType — d1 is ret_type_n
+            // Note: parser currently discards param type nodes, so we build
+            // a func type with just the return type. Full param storage is a
+            // parser improvement tracked separately.
+            var ret_type: int = VOID
+            if (d1 != null_node) {
+                ret_type = self.resolveTypeExpr(d1)
+            }
+            return self.types.add(Type.func(FuncType {
+                param_count: 0,
+                params: 0,
+                return_type: ret_type,
+            }))
         }
         if (kind == TYPE_ARRAY) {
             const elem = self.resolveTypeExpr(d1)
@@ -1945,6 +2921,366 @@ impl Checker {
         }))
     }
 
+    fn safeWrapType(type_idx: int) int {
+        if (!self.safe_mode) { return type_idx }
+        const t = self.types.get(type_idx)
+        if (t.tag == TAG_STRUCT) {
+            return self.types.makePointer(type_idx)
+        }
+        if (t.tag == TAG_ERROR_UNION) {
+            const eu = switch (t) { Type.error_union |e| => e, else => ErrorUnionType { elem: invalid_type, error_set: invalid_type } }
+            const elem_t = self.types.get(eu.elem)
+            if (elem_t.tag == TAG_STRUCT) {
+                const wrapped = self.types.makePointer(eu.elem)
+                return self.types.makeErrorUnionWithSet(wrapped, eu.error_set)
+            }
+        }
+        return type_idx
+    }
+
+    // ---- Generic instantiation ----
+
+    /// Build cache key for generic deduplication: "List(5)" or "Pair(5;17)"
+    fn buildGenericCacheKey(name: string, type_args: List(int)) string {
+        var result = "${name}("
+        for i in 0..type_args.count {
+            if (i > 0) {
+                result = "${result};${type_args.get(i)}"
+            } else {
+                result = "${result}${type_args.get(i)}"
+            }
+        }
+        return "${result})"
+    }
+
+    /// Resolve a generic struct instantiation: List(int) → concrete List(5) type.
+    /// Port from Zig checker lines 3268-3333.
+    fn resolveGenericInstance(idx: int, gi_name: string) int {
+        // Look up generic struct definition
+        if (self.generic_structs.has(gi_name) == 0) {
+            self.reportError(idx, ErrorCode.e301, "undefined generic type")
+            return invalid_type
+        }
+        const struct_node = self.generic_structs.get(gi_name)
+
+        // Read type arg count from generic_instance AST
+        // generic_instance: [name_s, ta_count, ...ta_nodes, span_s, span_e]
+        const ta_count = self.ast.getData(idx, 1)
+
+        // Read type param count from struct_decl AST
+        // struct_decl: [name_s, layout, doc_s, fields_count, ...fields, tp_count, ...]
+        const s_fields_count = self.ast.getData(struct_node, 3)
+        const tp_count = self.ast.getData(struct_node, 4 + s_fields_count)
+
+        if (ta_count != tp_count) {
+            self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
+            return invalid_type
+        }
+
+        // Resolve each type argument
+        var resolved_args: List(int) = undefined
+        resolved_args.items = 0
+        resolved_args.count = 0
+        resolved_args.capacity = 0
+        for i in 0..ta_count {
+            const arg_node = self.ast.getData(idx, 2 + i)
+            const arg_type = self.resolveTypeExpr(arg_node)
+            resolved_args.append(arg_type)
+        }
+
+        // Build cache key and check cache
+        const cache_key = self.buildGenericCacheKey(gi_name, resolved_args)
+        if (self.instantiation_cache.has(cache_key) != 0) {
+            return self.instantiation_cache.get(cache_key)
+        }
+
+        // Set up type substitution: read param names from struct_decl
+        const old_sub_count = self.type_sub_keys.count
+        for i in 0..tp_count {
+            const tp_str_idx = self.ast.getData(struct_node, 4 + s_fields_count + 1 + i)
+            const tp_name = self.ast.getStr(tp_str_idx)
+            self.pushTypeSub(tp_name, resolved_args.get(i))
+        }
+
+        // Build concrete struct type with substituted fields
+        const concrete_type = self.buildStructType(struct_node, cache_key)
+
+        // Restore substitution
+        self.type_sub_keys.count = old_sub_count
+        self.type_sub_vals.count = old_sub_count
+
+        // Register and cache
+        self.types.registerNamed(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
+
+        // Instantiate generic impl block methods
+        self.instantiateGenericImplMethods(gi_name, cache_key, resolved_args)
+
+        return concrete_type
+    }
+
+    /// Instantiate all methods from generic impl blocks for a concrete struct type.
+    /// Two-pass: register signatures, then check bodies (so sibling methods are visible).
+    /// Port from Zig checker lines 3344-3429.
+    fn instantiateGenericImplMethods(base_name: string, concrete_name: string, resolved_args: List(int)) void {
+        for ei in 0..self.generic_impl_entries.count {
+            const entry = @intToPtr(*GenericImplEntry, self.generic_impl_entries.items + ei * @sizeOf(GenericImplEntry))
+            if (entry.base_name != base_name) { continue }
+            if (entry.tp_count != resolved_args.count) { continue }
+
+            // impl_block: [type_name_s, doc_s, methods_count, ...method_nodes, tp_count, ...tp_strings, ...]
+            const impl_idx = entry.node_idx
+            const methods_count = entry.methods_count
+
+            // Set up type substitution
+            const old_sub_count = self.type_sub_keys.count
+            for i in 0..entry.tp_count {
+                const tp_str_idx = self.ast.getData(impl_idx, 3 + methods_count + 1 + i)
+                const tp_name = self.ast.getStr(tp_str_idx)
+                self.pushTypeSub(tp_name, resolved_args.get(i))
+            }
+
+            // Pass 1: Register all method signatures
+            for mi in 0..methods_count {
+                const method_idx = self.ast.getData(impl_idx, 3 + mi)
+                if (self.ast.getTag(method_idx) != @intFromEnum(NodeTag.fn_decl)) { continue }
+
+                const method_name = self.ast.getStr(self.ast.getData(method_idx, 0))
+                const synth_name = "${concrete_name}_${method_name}"
+                const func_type = self.buildFuncType(method_idx)
+
+                // Define in global scope
+                const old_scope = self.current_scope
+                self.current_scope = self.global_scope
+                if (!self.isDefined(synth_name)) {
+                    self.defineSymbol(makeFuncSymbol(synth_name, func_type, method_idx))
+                }
+                self.current_scope = old_scope
+
+                // Register method
+                self.types.registerMethod(concrete_name, MethodInfo {
+                    name: method_name,
+                    func_name: synth_name,
+                    func_type: func_type,
+                    receiver_is_ptr: true,
+                })
+            }
+
+            // Pass 2: Check all method bodies
+            for mi in 0..methods_count {
+                const method_idx = self.ast.getData(impl_idx, 3 + mi)
+                if (self.ast.getTag(method_idx) != @intFromEnum(NodeTag.fn_decl)) { continue }
+
+                const method_name = self.ast.getStr(self.ast.getData(method_idx, 0))
+                const synth_name = "${concrete_name}_${method_name}"
+                self.checkFnDeclBody(method_idx, synth_name)
+            }
+
+            // Restore substitution
+            self.type_sub_keys.count = old_sub_count
+            self.type_sub_vals.count = old_sub_count
+        }
+    }
+
+    /// Instantiate a generic function: max(i64) → concrete max(5) func.
+    /// Port from Zig checker lines 3434-3540.
+    fn instantiateGenericFunc(idx: int, name: string) int {
+        // Look up generic function definition
+        const fn_node = self.generic_functions.get(name)
+
+        // fn_decl: [name_s, ret_type_n, body_n, is_extern, is_async, doc_s,
+        //           params_count, ...param_nodes, tp_count, ...tp_strings, bounds_count, ...bounds, ...]
+        const params_count = self.ast.getData(fn_node, 6)
+        const tp_count = self.ast.getData(fn_node, 7 + params_count)
+
+        // call: [callee_n, args_count, ...arg_nodes, span_s, span_e]
+        const call_args_count = self.ast.getData(idx, 1)
+
+        if (call_args_count != tp_count) {
+            self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
+            return invalid_type
+        }
+
+        // Resolve each type argument (call args ARE type args for generic calls)
+        var resolved_args: List(int) = undefined
+        resolved_args.items = 0
+        resolved_args.count = 0
+        resolved_args.capacity = 0
+        for i in 0..call_args_count {
+            const arg_node = self.ast.getData(idx, 2 + i)
+            const arg_type = self.resolveTypeExpr(arg_node)
+            if (arg_type == invalid_type) {
+                // Try as identifier in type registry
+                if (self.ast.getTag(arg_node) == @intFromEnum(NodeTag.ident)) {
+                    const arg_name = self.ast.getStr(self.ast.getData(arg_node, 0))
+                    const tidx = self.types.lookupByName(arg_name)
+                    if (tidx >= 0) {
+                        resolved_args.append(tidx)
+                        continue
+                    }
+                }
+                self.reportError(idx, ErrorCode.e300, "expected type argument")
+                return invalid_type
+            }
+            resolved_args.append(arg_type)
+        }
+
+        // Validate trait bounds (Zig lines 3460-3474)
+        // fn_decl: [..., tp_count, ...tp_strings, bounds_count, ...bounds, ...]
+        const bounds_offset = 7 + params_count + 1 + tp_count
+        const bounds_count = self.ast.getData(fn_node, bounds_offset)
+        if (bounds_count > 0) {
+            for bi in 0..bounds_count {
+                const bound_str_idx = self.ast.getData(fn_node, bounds_offset + 1 + bi)
+                const bound_name = self.ast.getStr(bound_str_idx)
+                if (@lenOf(bound_name) > 0) {
+                    const type_name = self.types.typeName(resolved_args.get(bi))
+                    const impl_key = "${bound_name}:${type_name}"
+                    if (self.trait_impls.has(impl_key) == 0) {
+                        self.reportError(idx, ErrorCode.e300, "type does not satisfy trait bound")
+                        return invalid_type
+                    }
+                }
+            }
+        }
+
+        // Build cache key
+        const cache_key = self.buildGenericCacheKey(name, resolved_args)
+
+        // Check if already instantiated — return cached func type
+        const cached_sym = self.lookupSymbol(cache_key)
+        if (cached_sym >= 0) {
+            return self.getSymbol(cached_sym).type_idx
+        }
+
+        // Set up type substitution
+        const old_sub_count = self.type_sub_keys.count
+        for i in 0..tp_count {
+            const tp_str_idx = self.ast.getData(fn_node, 7 + params_count + 1 + i)
+            const tp_name = self.ast.getStr(tp_str_idx)
+            self.pushTypeSub(tp_name, resolved_args.get(i))
+        }
+
+        // Build concrete function type
+        const func_type = self.buildFuncType(fn_node)
+
+        // Define in global scope
+        const old_scope = self.current_scope
+        self.current_scope = self.global_scope
+        if (!self.isDefined(cache_key)) {
+            self.defineSymbol(makeFuncSymbol(cache_key, func_type, fn_node))
+        }
+        self.current_scope = old_scope
+
+        // Check the function body
+        self.checkFnDeclBody(fn_node, cache_key)
+
+        // Restore substitution
+        self.type_sub_keys.count = old_sub_count
+        self.type_sub_vals.count = old_sub_count
+
+        return func_type
+    }
+
+    /// Resolve generic struct init: Pair(int, string) { .a = 1, .b = "hi" }
+    fn resolveGenericStructInit(idx: int, type_name: string, fi_count: int, ta_count: int) int {
+        if (self.generic_structs.has(type_name) == 0) {
+            self.reportError(idx, ErrorCode.e301, "undefined generic type")
+            return invalid_type
+        }
+        const struct_node = self.generic_structs.get(type_name)
+        const s_fields_count = self.ast.getData(struct_node, 3)
+        const tp_count = self.ast.getData(struct_node, 4 + s_fields_count)
+
+        if (ta_count != tp_count) {
+            self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
+            return invalid_type
+        }
+
+        // Resolve type args
+        var resolved_args: List(int) = undefined
+        resolved_args.items = 0
+        resolved_args.count = 0
+        resolved_args.capacity = 0
+        for i in 0..ta_count {
+            const arg_node = self.ast.getData(idx, 2 + fi_count + 1 + i)
+            const arg_type = self.resolveTypeExpr(arg_node)
+            resolved_args.append(arg_type)
+        }
+
+        const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
+        if (self.instantiation_cache.has(cache_key) != 0) {
+            return self.instantiation_cache.get(cache_key)
+        }
+
+        // Set up substitution + build + register + instantiate
+        const old_sub_count = self.type_sub_keys.count
+        for i in 0..tp_count {
+            const tp_str_idx = self.ast.getData(struct_node, 4 + s_fields_count + 1 + i)
+            const tp_name = self.ast.getStr(tp_str_idx)
+            self.pushTypeSub(tp_name, resolved_args.get(i))
+        }
+
+        const concrete_type = self.buildStructType(struct_node, cache_key)
+        self.type_sub_keys.count = old_sub_count
+        self.type_sub_vals.count = old_sub_count
+
+        self.types.registerNamed(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
+        self.instantiateGenericImplMethods(type_name, cache_key, resolved_args)
+
+        return concrete_type
+    }
+
+    /// Resolve generic new expr: new Pair(int, string) { a: 1, b: "hi" }
+    fn resolveGenericNewExpr(idx: int, type_name: string, fi_count: int, ta_count: int) int {
+        if (self.generic_structs.has(type_name) == 0) {
+            self.reportError(idx, ErrorCode.e301, "undefined generic type")
+            return invalid_type
+        }
+        const struct_node = self.generic_structs.get(type_name)
+        const s_fields_count = self.ast.getData(struct_node, 3)
+        const tp_count = self.ast.getData(struct_node, 4 + s_fields_count)
+
+        if (ta_count != tp_count) {
+            self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
+            return invalid_type
+        }
+
+        // Resolve type args
+        var resolved_args: List(int) = undefined
+        resolved_args.items = 0
+        resolved_args.count = 0
+        resolved_args.capacity = 0
+        for i in 0..ta_count {
+            const arg_node = self.ast.getData(idx, 3 + fi_count + 1 + i)
+            const arg_type = self.resolveTypeExpr(arg_node)
+            resolved_args.append(arg_type)
+        }
+
+        const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
+        if (self.instantiation_cache.has(cache_key) != 0) {
+            return self.instantiation_cache.get(cache_key)
+        }
+
+        const old_sub_count = self.type_sub_keys.count
+        for i in 0..tp_count {
+            const tp_str_idx = self.ast.getData(struct_node, 4 + s_fields_count + 1 + i)
+            const tp_name = self.ast.getStr(tp_str_idx)
+            self.pushTypeSub(tp_name, resolved_args.get(i))
+        }
+
+        const concrete_type = self.buildStructType(struct_node, cache_key)
+        self.type_sub_keys.count = old_sub_count
+        self.type_sub_vals.count = old_sub_count
+
+        self.types.registerNamed(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
+        self.instantiateGenericImplMethods(type_name, cache_key, resolved_args)
+
+        return concrete_type
+    }
+
     fn buildFuncType(idx: int) int {
         // fn_decl: [name_s, ret_type_n, body_n, is_extern, is_async, doc_s, params_count, ...param_nodes, ...]
         const ret_type_n = self.ast.getData(idx, 1)
@@ -1960,6 +3296,34 @@ impl Checker {
                 pname = self.ast.getStr(self.ast.getData(param_idx, 0))
                 const ptype_n = self.ast.getData(param_idx, 1)
                 ptype = self.resolveTypeExpr(ptype_n)
+                // Don't auto-ref parameters whose type is a generic type parameter.
+                // Generic functions are written with value semantics for T; wrapping T
+                // to *T when T=struct would break body code.
+                // Type params can appear as either .ident or .type_expr(.named)
+                var is_substituted = false
+                if (self.hasTypeSubstitution() and ptype_n != null_node) {
+                    const ptype_tag = self.ast.getTag(ptype_n)
+                    if (ptype_tag == @intFromEnum(NodeTag.ident)) {
+                        const ptype_name = self.ast.getStr(self.ast.getData(ptype_n, 0))
+                        if (self.lookupTypeSub(ptype_name) >= 0) {
+                            is_substituted = true
+                        }
+                    } else if (ptype_tag == @intFromEnum(NodeTag.type_expr)) {
+                        const kind = self.ast.getData(ptype_n, 0)
+                        if (kind == TYPE_NAMED) {
+                            const inner_n = self.ast.getData(ptype_n, 1)
+                            if (inner_n != null_node and self.ast.getTag(inner_n) == @intFromEnum(NodeTag.ident)) {
+                                const inner_name = self.ast.getStr(self.ast.getData(inner_n, 0))
+                                if (self.lookupTypeSub(inner_name) >= 0) {
+                                    is_substituted = true
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!is_substituted) {
+                    ptype = self.safeWrapType(ptype)
+                }
             }
 
             const fp = @intToPtr(*FuncParam, params_ptr + pi * @sizeOf(FuncParam))
@@ -1983,111 +3347,98 @@ impl Checker {
 
     fn evalConstExpr(idx: int) (int, int) {
         if (idx == null_node) { return (0, 0) }
-        const tag = self.ast.getTag(idx)
-
-        if (tag == @intFromEnum(NodeTag.literal)) {
-            const kind = self.ast.getData(idx, 0)
-            if (kind == @intFromEnum(LiteralKind.@"int")) {
-                const val_str = self.ast.getStr(self.ast.getData(idx, 1))
-                return (1,parseInt(val_str))
-            }
-            if (kind == @intFromEnum(LiteralKind.true_lit)) { return (1,1) }
-            if (kind == @intFromEnum(LiteralKind.false_lit)) { return (1,0) }
-            return (0, 0)
-        }
-
-        if (tag == @intFromEnum(NodeTag.unary)) {
-            const op = self.ast.getData(idx, 0)
-            const inner = self.evalConstExpr(self.ast.getData(idx, 1))
-            if (inner.0 == 0) { return (0, 0) }
-            if (op == @intFromEnum(Token.sub)) { return (1,0 - inner.1) }
-            if (op == @intFromEnum(Token.lnot)) { return (1,if (inner.1 == 0) { 1 } else { 0 }) }
-            return (0, 0)
-        }
-
-        if (tag == @intFromEnum(NodeTag.binary)) {
-            const op = self.ast.getData(idx, 0)
-            const lv = self.evalConstExpr(self.ast.getData(idx, 1))
-            const rv = self.evalConstExpr(self.ast.getData(idx, 2))
-            if (lv.0 == 0 or rv.0 == 0) { return (0, 0) }
-            const l = lv.1
-            const r = rv.1
-            if (op == @intFromEnum(Token.add)) { return (1,l + r) }
-            if (op == @intFromEnum(Token.sub)) { return (1,l - r) }
-            if (op == @intFromEnum(Token.mul)) { return (1,l * r) }
-            if (op == @intFromEnum(Token.quo) and r != 0) { return (1,l / r) }
-            if (op == @intFromEnum(Token.rem) and r != 0) { return (1,l % r) }
-            if (op == @intFromEnum(Token.eql)) { return (1,if (l == r) { 1 } else { 0 }) }
-            if (op == @intFromEnum(Token.neq)) { return (1,if (l != r) { 1 } else { 0 }) }
-            if (op == @intFromEnum(Token.lss)) { return (1,if (l < r) { 1 } else { 0 }) }
-            if (op == @intFromEnum(Token.leq)) { return (1,if (l <= r) { 1 } else { 0 }) }
-            if (op == @intFromEnum(Token.gtr)) { return (1,if (l > r) { 1 } else { 0 }) }
-            if (op == @intFromEnum(Token.geq)) { return (1,if (l >= r) { 1 } else { 0 }) }
-            return (0, 0)
-        }
-
-        if (tag == @intFromEnum(NodeTag.paren)) {
-            return self.evalConstExpr(self.ast.getData(idx, 0))
-        }
-
-        if (tag == @intFromEnum(NodeTag.ident)) {
-            const name = self.ast.getStr(self.ast.getData(idx, 0))
-            const sym_idx = self.lookupSymbol(name)
-            if (sym_idx >= 0) {
-                const sym = self.getSymbol(sym_idx)
-                if (sym.is_const_val) {
-                    return (1,sym.const_value)
+        const tag = @as(NodeTag, @enumFromInt(self.ast.getTag(idx)))
+        switch (tag) {
+            .literal => {
+                const kind = self.ast.getData(idx, 0)
+                if (kind == @intFromEnum(LiteralKind.@"int")) {
+                    const val_str = self.ast.getStr(self.ast.getData(idx, 1))
+                    return (1, parseInt(val_str))
                 }
-            }
-            return (0, 0)
-        }
-
-        // @sizeOf(T) comptime
-        if (tag == @intFromEnum(NodeTag.builtin_call)) {
-            const kind = self.ast.getData(idx, 0)
-            const type_arg_n = self.ast.getData(idx, 1)
-            if (kind == @intFromEnum(BuiltinKind.size_of) and type_arg_n != null_node) {
-                const type_idx = self.resolveTypeExpr(type_arg_n)
-                if (type_idx != invalid_type) {
-                    return (1,self.types.sizeOf(type_idx))
-                }
-            }
-            if (kind == @intFromEnum(BuiltinKind.enum_len) and type_arg_n != null_node) {
-                const type_idx = self.resolveTypeExpr(type_arg_n)
-                if (type_idx != invalid_type) {
-                    const t = self.types.get(type_idx)
-                    if (t.tag == TAG_ENUM) {
-                        const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
-                        return (1,et.variant_count)
+                if (kind == @intFromEnum(LiteralKind.true_lit)) { return (1, 1) }
+                if (kind == @intFromEnum(LiteralKind.false_lit)) { return (1, 0) }
+            },
+            .unary => {
+                const op = self.ast.getData(idx, 0)
+                const inner = self.evalConstExpr(self.ast.getData(idx, 1))
+                if (inner.0 == 0) { return (0, 0) }
+                if (op == @intFromEnum(Token.sub)) { return (1, 0 - inner.1) }
+                if (op == @intFromEnum(Token.lnot)) { return (1, if (inner.1 == 0) { 1 } else { 0 }) }
+            },
+            .binary => {
+                const op = self.ast.getData(idx, 0)
+                const lv = self.evalConstExpr(self.ast.getData(idx, 1))
+                const rv = self.evalConstExpr(self.ast.getData(idx, 2))
+                if (lv.0 == 0 or rv.0 == 0) { return (0, 0) }
+                const l = lv.1
+                const r = rv.1
+                if (op == @intFromEnum(Token.add)) { return (1, l + r) }
+                if (op == @intFromEnum(Token.sub)) { return (1, l - r) }
+                if (op == @intFromEnum(Token.mul)) { return (1, l * r) }
+                if (op == @intFromEnum(Token.quo) and r != 0) { return (1, l / r) }
+                if (op == @intFromEnum(Token.rem) and r != 0) { return (1, l % r) }
+                if (op == @intFromEnum(Token.eql)) { return (1, if (l == r) { 1 } else { 0 }) }
+                if (op == @intFromEnum(Token.neq)) { return (1, if (l != r) { 1 } else { 0 }) }
+                if (op == @intFromEnum(Token.lss)) { return (1, if (l < r) { 1 } else { 0 }) }
+                if (op == @intFromEnum(Token.leq)) { return (1, if (l <= r) { 1 } else { 0 }) }
+                if (op == @intFromEnum(Token.gtr)) { return (1, if (l > r) { 1 } else { 0 }) }
+                if (op == @intFromEnum(Token.geq)) { return (1, if (l >= r) { 1 } else { 0 }) }
+            },
+            .paren => {
+                return self.evalConstExpr(self.ast.getData(idx, 0))
+            },
+            .ident => {
+                const name = self.ast.getStr(self.ast.getData(idx, 0))
+                const sym_idx = self.lookupSymbol(name)
+                if (sym_idx >= 0) {
+                    const sym = self.getSymbol(sym_idx)
+                    if (sym.is_const_val) {
+                        return (1, sym.const_value)
                     }
                 }
-            }
-            return (0, 0)
-        }
-
-        // Enum field access: Color.Red → variant value
-        if (tag == @intFromEnum(NodeTag.field_access)) {
-            const base_n = self.ast.getData(idx, 0)
-            const field_name = self.ast.getStr(self.ast.getData(idx, 1))
-            if (self.ast.getTag(base_n) == @intFromEnum(NodeTag.ident)) {
-                const base_name = self.ast.getStr(self.ast.getData(base_n, 0))
-                const type_idx = self.types.lookupByName(base_name)
-                if (type_idx >= 0) {
-                    const t = self.types.get(type_idx)
-                    if (t.tag == TAG_ENUM) {
-                        const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
-                        for vi in 0..et.variant_count {
-                            const ev = @intToPtr(*EnumVariant, et.variants + vi * @sizeOf(EnumVariant))
-                            if (ev.name == field_name) {
-                                return (1,ev.value)
+            },
+            .builtin_call => {
+                const bk = self.ast.getData(idx, 0)
+                const type_arg_n = self.ast.getData(idx, 1)
+                if (bk == @intFromEnum(BuiltinKind.size_of) and type_arg_n != null_node) {
+                    const type_idx = self.resolveTypeExpr(type_arg_n)
+                    if (type_idx != invalid_type) {
+                        return (1, self.types.sizeOf(type_idx))
+                    }
+                }
+                if (bk == @intFromEnum(BuiltinKind.enum_len) and type_arg_n != null_node) {
+                    const type_idx = self.resolveTypeExpr(type_arg_n)
+                    if (type_idx != invalid_type) {
+                        const t = self.types.get(type_idx)
+                        if (t.tag == TAG_ENUM) {
+                            const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                            return (1, et.variant_count)
+                        }
+                    }
+                }
+            },
+            .field_access => {
+                const base_n = self.ast.getData(idx, 0)
+                const field_name = self.ast.getStr(self.ast.getData(idx, 1))
+                if (self.ast.getTag(base_n) == @intFromEnum(NodeTag.ident)) {
+                    const base_name = self.ast.getStr(self.ast.getData(base_n, 0))
+                    const type_idx = self.types.lookupByName(base_name)
+                    if (type_idx >= 0) {
+                        const t = self.types.get(type_idx)
+                        if (t.tag == TAG_ENUM) {
+                            const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                            for vi in 0..et.variant_count {
+                                const ev = @intToPtr(*EnumVariant, et.variants + vi * @sizeOf(EnumVariant))
+                                if (ev.name == field_name) {
+                                    return (1, ev.value)
+                                }
                             }
                         }
                     }
                 }
-            }
-            return (0, 0)
+            },
+            else => {},
         }
-
         return (0, 0)
     }
 
@@ -2114,6 +3465,90 @@ impl Checker {
         return idx == I8 or idx == I16 or idx == I32 or idx == I64 or
                idx == U8 or idx == U16 or idx == U32 or idx == U64 or
                idx == UNTYPED_INT
+    }
+
+    fn isFloatType(idx: int) bool {
+        return idx == F32 or idx == F64 or idx == UNTYPED_FLOAT
+    }
+
+    /// Port from Zig checker lines 3696-3714.
+    fn isComparable(a: int, b: int) bool {
+        if (self.types.isAssignable(a, b) or self.types.isAssignable(b, a)) { return true }
+        const ta = self.types.get(a)
+        const tb = self.types.get(b)
+        if (self.isNumericType(a) and self.isNumericType(b)) { return true }
+        // String-string comparison (slice(u8) == slice(u8))
+        if (a == STRING and b == STRING) { return true }
+        // Optional-null comparison
+        if (ta.tag == TAG_OPTIONAL and b == UNTYPED_NULL) { return true }
+        if (tb.tag == TAG_OPTIONAL and a == UNTYPED_NULL) { return true }
+        // Pointer-null comparison
+        if (ta.tag == TAG_POINTER and b == UNTYPED_NULL) { return true }
+        if (tb.tag == TAG_POINTER and a == UNTYPED_NULL) { return true }
+        // Enum-integer comparison
+        if (ta.tag == TAG_ENUM and self.isIntegerType(b)) { return true }
+        if (tb.tag == TAG_ENUM and self.isIntegerType(a)) { return true }
+        // Optional-to-value comparison
+        if (ta.tag == TAG_OPTIONAL) {
+            const elem = switch (ta) { Type.optional |o| => o.elem, else => invalid_type }
+            if (self.isComparable(elem, b)) { return true }
+        }
+        if (tb.tag == TAG_OPTIONAL) {
+            const elem = switch (tb) { Type.optional |o| => o.elem, else => invalid_type }
+            if (self.isComparable(a, elem)) { return true }
+        }
+        return false
+    }
+
+    /// Merge two error sets into a new error set with deduplicated variants.
+    /// Port from Zig checker.zig:1662-1677.
+    fn mergeErrorSets(a_idx: int, b_idx: int) int {
+        const a = self.types.get(a_idx)
+        const b = self.types.get(b_idx)
+        const a_es = switch (a) { Type.error_set |e| => e, else => ErrorSetType { name: "", variant_count: 0, variant_names: 0 } }
+        const b_es = switch (b) { Type.error_set |e| => e, else => ErrorSetType { name: "", variant_count: 0, variant_names: 0 } }
+
+        // Build merged variant list with dedup (Zig: ArrayListUnmanaged + string compare)
+        var merged: List(string) = undefined
+        merged.items = 0
+        merged.count = 0
+        merged.capacity = 0
+
+        // Add all from a
+        for ai in 0..a_es.variant_count {
+            const av = @intToPtr(*ErrorVariant, a_es.variant_names + ai * @sizeOf(ErrorVariant))
+            merged.append(av.name)
+        }
+
+        // Add from b, skip duplicates
+        for bi in 0..b_es.variant_count {
+            const bv = @intToPtr(*ErrorVariant, b_es.variant_names + bi * @sizeOf(ErrorVariant))
+            var found = false
+            for mi in 0..merged.count {
+                if (merged.get(mi) == bv.name) {
+                    found = true
+                    break
+                }
+            }
+            if (!found) { merged.append(bv.name) }
+        }
+
+        // Allocate merged variant array
+        var merged_ptr: int = 0
+        if (merged.count > 0) {
+            merged_ptr = alloc(0, merged.count * @sizeOf(ErrorVariant))
+            for i in 0..merged.count {
+                const dest = @intToPtr(*ErrorVariant, merged_ptr + i * @sizeOf(ErrorVariant))
+                dest.name = merged.get(i)
+            }
+        }
+
+        const merged_name = "${a_es.name}||${b_es.name}"
+        return self.types.add(Type.error_set(ErrorSetType {
+            name: merged_name,
+            variant_count: merged.count,
+            variant_names: merged_ptr,
+        }))
     }
 
     fn reportError(idx: int, code: ErrorCode, msg: string) void {
@@ -2404,4 +3839,128 @@ test "checker literal types" {
 
     const true_lit = ast.addLiteral(@intFromEnum(LiteralKind.true_lit), "true", s)
     @assertEq(c.checkExpr(true_lit), UNTYPED_BOOL)
+}
+
+test "checker trait collection" {
+    const src = "trait Drawable { fn draw(self: *Drawable) void }\nstruct Circle { radius: int }\nimpl Drawable for Circle { fn draw(self: *Circle) void { } }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errs = ErrorReporter.init()
+    var p = Parser.init(s, ast, errs)
+    p.parseFile()
+    @assertEq(errs.hasErrors(), false)
+
+    var types = TypeRegistry.init()
+    var c = Checker.init(ast, types, errs)
+    c.checkFile()
+    @assertEq(errs.hasErrors(), false)
+    // Trait should be registered
+    @assertEq(c.trait_defs.has("Drawable") != 0, true)
+}
+
+test "checker safe wrap type" {
+    var ast = Ast.init("test.cot")
+    var types = TypeRegistry.init()
+    var errs = ErrorReporter.init()
+    var c = Checker.init(ast, types, errs)
+
+    // Not in safe mode — should not wrap
+    c.safe_mode = false
+    @assertEq(c.safeWrapType(I64), I64)
+
+    // In safe mode — should wrap struct to pointer
+    c.safe_mode = true
+    const st = types.add(Type.struct_type(StructType { name: "Foo", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 }))
+    const wrapped = c.safeWrapType(st)
+    @assert(wrapped != st)  // Should be different (pointer type)
+
+    // Non-struct should not be wrapped
+    @assertEq(c.safeWrapType(I64), I64)
+    @assertEq(c.safeWrapType(STRING), STRING)
+}
+
+test "checker type substitution" {
+    var ast = Ast.init("test.cot")
+    var types = TypeRegistry.init()
+    var errs = ErrorReporter.init()
+    var c = Checker.init(ast, types, errs)
+
+    // No substitution active
+    @assertEq(c.hasTypeSubstitution(), false)
+    @assertEq(c.lookupTypeSub("T"), -1)
+
+    // Push a substitution T → I64
+    c.pushTypeSub("T", I64)
+    @assert(c.hasTypeSubstitution())
+    @assertEq(c.lookupTypeSub("T"), I64)
+    @assertEq(c.lookupTypeSub("U"), -1)
+
+    // Push another: U → STRING
+    c.pushTypeSub("U", STRING)
+    @assertEq(c.lookupTypeSub("T"), I64)
+    @assertEq(c.lookupTypeSub("U"), STRING)
+
+    // Restore by truncation
+    c.type_sub_keys.count = 1
+    c.type_sub_vals.count = 1
+    @assert(c.hasTypeSubstitution())
+    @assertEq(c.lookupTypeSub("T"), I64)
+    @assertEq(c.lookupTypeSub("U"), -1)
+
+    // Full restore
+    c.type_sub_keys.count = 0
+    c.type_sub_vals.count = 0
+    @assertEq(c.hasTypeSubstitution(), false)
+}
+
+test "checker generic cache key" {
+    var ast = Ast.init("test.cot")
+    var types = TypeRegistry.init()
+    var errs = ErrorReporter.init()
+    var c = Checker.init(ast, types, errs)
+
+    // Single arg
+    var args1: List(int) = undefined
+    args1.items = 0
+    args1.count = 0
+    args1.capacity = 0
+    args1.append(5)
+    @assertEq(c.buildGenericCacheKey("List", args1), "List(5)")
+
+    // Two args
+    var args2: List(int) = undefined
+    args2.items = 0
+    args2.count = 0
+    args2.capacity = 0
+    args2.append(5)
+    args2.append(17)
+    @assertEq(c.buildGenericCacheKey("Pair", args2), "Pair(5;17)")
+}
+
+test "checker generic struct registration" {
+    const src = "struct Box(T) { value: T }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errs = ErrorReporter.init()
+    var p = Parser.init(s, ast, errs)
+    p.parseFile()
+    @assertEq(errs.hasErrors(), false)
+
+    var types = TypeRegistry.init()
+    var c = Checker.init(ast, types, errs)
+    c.checkFile()
+    @assertEq(errs.hasErrors(), false)
+    // Generic struct should be stored in generic_structs map
+    @assert(c.generic_structs.has("Box") != 0)
+    // But not yet in the type registry (no concrete instantiation)
+    @assertEq(types.lookupByName("Box"), -1)
+}
+
+test "checker expected type init" {
+    var ast = Ast.init("test.cot")
+    var types = TypeRegistry.init()
+    var errs = ErrorReporter.init()
+    var c = Checker.init(ast, types, errs)
+    @assertEq(c.expected_type, invalid_type)
+    @assertEq(c.current_switch_enum_type, invalid_type)
 }
