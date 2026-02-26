@@ -186,7 +186,11 @@ impl Scanner {
     fn scanFloatPart() int {
         // Decimal point (but not ".." range)
         if (self.ch) |c| {
-            if (c == '.' and self.peek(1) != '.') {
+            var is_range = false
+            if (self.peek(1)) |p| {
+                if (p == '.') { is_range = true }
+            }
+            if (c == '.' and !is_range) {
                 self.advance()
                 while (self.ch) |cc| {
                     if (isDigit(cc) or cc == '_') { self.advance() } else { break }
