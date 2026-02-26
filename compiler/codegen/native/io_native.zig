@@ -747,8 +747,13 @@ fn generateTime(
     _ = try ins.call(func_ref, &[_]clif.Value{ tv_addr, v_null });
 
     // Load tv_sec and tv_usec from stack
+    // tv_sec is always 8 bytes (time_t = long on both macOS and Linux).
+    // tv_usec is 4 bytes on macOS (suseconds_t = int32_t) but 8 bytes on Linux
+    // (suseconds_t = long). Load as I32 and extend — safe on both platforms since
+    // microseconds max at 999999 (fits in 20 bits).
     const tv_sec = try ins.stackLoad(clif.Type.I64, tv_slot, 0);
-    const tv_usec = try ins.stackLoad(clif.Type.I64, tv_slot, 8);
+    const tv_usec_i32 = try ins.stackLoad(clif.Type.I32, tv_slot, 8);
+    const tv_usec = try ins.uextend(clif.Type.I64, tv_usec_i32);
 
     // Compute: tv_sec * 1_000_000_000 + tv_usec * 1_000
     const billion = try ins.iconst(clif.Type.I64, 1_000_000_000);
