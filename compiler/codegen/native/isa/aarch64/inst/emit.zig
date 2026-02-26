@@ -1150,9 +1150,10 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
 
             switch (payload.size) {
                 .size64 => {
-                    std.debug.assert(payload.rd.toReg().bits != stackReg().bits);
-                    if (payload.rm.bits == stackReg().bits) {
-                        // Use add rd, sp, #0 instead of ORR
+                    if (payload.rd.toReg().bits == stackReg().bits or payload.rm.bits == stackReg().bits) {
+                        // When either operand is SP, use ADD rd, rn, #0.
+                        // On ARM64, register 31 in ORR context means ZR (zero register),
+                        // but in ADD context it means SP. So moves involving SP must use ADD.
                         const imm12 = Imm12.maybeFromU64(0).?;
                         try sink.put4(encArithRrImm12(
                             0b100_10001,
