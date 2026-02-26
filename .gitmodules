@@ -37,3 +37,6 @@
 [submodule "stdlib"]
 	path = stdlib
 	url = https://github.com/cotlang/std.git
+[submodule "references/kotlin"]
+	path = references/kotlin
+	url = https://github.com/JetBrains/kotlin.git

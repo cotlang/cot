@@ -350,6 +350,10 @@ pub const Parser = struct {
             if (!self.check(.ident)) {
                 if (self.tok.tok.isKeyword()) {
                     self.err.errorWithCode(self.pos(), .e203, try std.fmt.allocPrint(self.allocator, "'{s}' is a reserved keyword and cannot be used as a name", .{self.tok.tok.string()}));
+                    // Skip to closing delimiter to prevent error cascade
+                    while (!self.check(end_tok) and !self.check(.lbrace) and !self.check(.eof)) {
+                        self.advance();
+                    }
                 }
                 break;
             }
