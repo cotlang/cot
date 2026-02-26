@@ -921,8 +921,9 @@ pub const Driver = struct {
         var func_names = std.ArrayListUnmanaged([]const u8){};
         defer func_names.deinit(self.allocator);
 
-        // Track main function index
+        // Track main function index and whether it returns void
         var main_func_index: ?usize = null;
+        var main_returns_void: bool = false;
 
         // String offsets (for rewritegeneric pass) and string data blob
         var string_offsets = std.StringHashMap(i32).init(self.allocator);
@@ -1057,6 +1058,7 @@ pub const Driver = struct {
 
             if (std.mem.eql(u8, ir_func.name, "main")) {
                 main_func_index = func_idx;
+                main_returns_void = (ir_func.return_type == types_mod.TypeRegistry.VOID);
             }
             try func_names.append(self.allocator, ir_func.name);
 
@@ -1179,6 +1181,7 @@ pub const Driver = struct {
             compiled_funcs.items,
             func_names.items,
             main_func_index,
+            main_returns_void,
             string_data.items,
             string_data_symbol_idx,
             ctxt_symbol_idx,
@@ -1200,6 +1203,7 @@ pub const Driver = struct {
         compiled_funcs: []const native_compile.CompiledCode,
         func_names: []const []const u8,
         main_func_index: ?usize,
+        main_returns_void: bool,
         string_data: []const u8,
         string_data_symbol_idx: ?u32,
         ctxt_symbol_idx: u32,
@@ -1366,55 +1370,113 @@ pub const Driver = struct {
             // ARM64 _main wrapper: store argc/argv/envp to globals, call __cot_main, return
             // C runtime passes: x0=argc, x1=argv, x2=envp (Apple extension)
             if (self.target.arch == .arm64) {
-                const wrapper = [_]u8{
-                    0xFD, 0x7B, 0xBF, 0xA9, //  0: stp x29, x30, [sp, #-16]!
-                    0xFD, 0x03, 0x00, 0x91, //  4: mov x29, sp
-                    0x08, 0x00, 0x00, 0x90, //  8: adrp x8, _cot_argc@PAGE
-                    0x08, 0x01, 0x00, 0x91, // 12: add x8, x8, _cot_argc@PAGEOFF
-                    0x00, 0x01, 0x00, 0xF9, // 16: str x0, [x8]
-                    0x08, 0x00, 0x00, 0x90, // 20: adrp x8, _cot_argv@PAGE
-                    0x08, 0x01, 0x00, 0x91, // 24: add x8, x8, _cot_argv@PAGEOFF
-                    0x01, 0x01, 0x00, 0xF9, // 28: str x1, [x8]
-                    0x08, 0x00, 0x00, 0x90, // 32: adrp x8, _cot_envp@PAGE
-                    0x08, 0x01, 0x00, 0x91, // 36: add x8, x8, _cot_envp@PAGEOFF
-                    0x02, 0x01, 0x00, 0xF9, // 40: str x2, [x8]
-                    0x00, 0x00, 0x00, 0x94, // 44: bl __cot_main
-                    0xFD, 0x7B, 0xC1, 0xA8, // 48: ldp x29, x30, [sp], #16
-                    0xC0, 0x03, 0x5F, 0xD6, // 52: ret
-                };
                 const main_idx: u32 = @intCast(main_func_index.?);
-                const relocs = [_]buffer_mod.FinalizedMachReloc{
-                    .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
-                    .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
-                    .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
-                    .{ .offset = 24, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
-                    .{ .offset = 32, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
-                    .{ .offset = 36, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
-                    .{ .offset = 44, .kind = .Arm64Call, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = 0 },
-                };
-                try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+
+                if (main_returns_void) {
+                    // main() void — set x0=0 after call so process exits with code 0
+                    const wrapper = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, //  0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, //  4: mov x29, sp
+                        0x08, 0x00, 0x00, 0x90, //  8: adrp x8, _cot_argc@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 12: add x8, x8, _cot_argc@PAGEOFF
+                        0x00, 0x01, 0x00, 0xF9, // 16: str x0, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 20: adrp x8, _cot_argv@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 24: add x8, x8, _cot_argv@PAGEOFF
+                        0x01, 0x01, 0x00, 0xF9, // 28: str x1, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 32: adrp x8, _cot_envp@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 36: add x8, x8, _cot_envp@PAGEOFF
+                        0x02, 0x01, 0x00, 0xF9, // 40: str x2, [x8]
+                        0x00, 0x00, 0x00, 0x94, // 44: bl __cot_main
+                        0x00, 0x00, 0x80, 0xD2, // 48: mov x0, #0
+                        0xFD, 0x7B, 0xC1, 0xA8, // 52: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 56: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 24, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 32, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 36, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 44, .kind = .Arm64Call, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = 0 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                } else {
+                    // main() i64 — return value in x0 is the exit code
+                    const wrapper = [_]u8{
+                        0xFD, 0x7B, 0xBF, 0xA9, //  0: stp x29, x30, [sp, #-16]!
+                        0xFD, 0x03, 0x00, 0x91, //  4: mov x29, sp
+                        0x08, 0x00, 0x00, 0x90, //  8: adrp x8, _cot_argc@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 12: add x8, x8, _cot_argc@PAGEOFF
+                        0x00, 0x01, 0x00, 0xF9, // 16: str x0, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 20: adrp x8, _cot_argv@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 24: add x8, x8, _cot_argv@PAGEOFF
+                        0x01, 0x01, 0x00, 0xF9, // 28: str x1, [x8]
+                        0x08, 0x00, 0x00, 0x90, // 32: adrp x8, _cot_envp@PAGE
+                        0x08, 0x01, 0x00, 0x91, // 36: add x8, x8, _cot_envp@PAGEOFF
+                        0x02, 0x01, 0x00, 0xF9, // 40: str x2, [x8]
+                        0x00, 0x00, 0x00, 0x94, // 44: bl __cot_main
+                        0xFD, 0x7B, 0xC1, 0xA8, // 48: ldp x29, x30, [sp], #16
+                        0xC0, 0x03, 0x5F, 0xD6, // 52: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 8, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 12, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 20, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 24, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 32, .kind = .Aarch64AdrPrelPgHi21, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 36, .kind = .Aarch64AddAbsLo12Nc, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = 0 },
+                        .{ .offset = 44, .kind = .Arm64Call, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = 0 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                }
             } else {
                 // x64 _main wrapper: store argc/argv/envp to globals, call __cot_main, return
                 // System V ABI: edi=argc, rsi=argv, rdx=envp
                 const main_idx: u32 = @intCast(main_func_index.?);
-                const wrapper = [_]u8{
-                    0x55, //  0: push rbp
-                    0x48, 0x89, 0xE5, //  1: mov rbp, rsp
-                    0x48, 0x63, 0xC7, //  4: movsxd rax, edi (sign-extend argc)
-                    0x48, 0x89, 0x05, 0x00, 0x00, 0x00, 0x00, //  7: mov [rip+disp32], rax (_cot_argc)
-                    0x48, 0x89, 0x35, 0x00, 0x00, 0x00, 0x00, // 14: mov [rip+disp32], rsi (_cot_argv)
-                    0x48, 0x89, 0x15, 0x00, 0x00, 0x00, 0x00, // 21: mov [rip+disp32], rdx (_cot_envp)
-                    0xE8, 0x00, 0x00, 0x00, 0x00, // 28: call __cot_main
-                    0x5D, // 33: pop rbp
-                    0xC3, // 34: ret
-                };
-                const relocs = [_]buffer_mod.FinalizedMachReloc{
-                    .{ .offset = 10, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = -4 },
-                    .{ .offset = 17, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = -4 },
-                    .{ .offset = 24, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = -4 },
-                    .{ .offset = 29, .kind = .X86CallPCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = -4 },
-                };
-                try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+
+                if (main_returns_void) {
+                    // main() void — set eax=0 after call so process exits with code 0
+                    const wrapper = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x63, 0xC7, //  4: movsxd rax, edi (sign-extend argc)
+                        0x48, 0x89, 0x05, 0x00, 0x00, 0x00, 0x00, //  7: mov [rip+disp32], rax (_cot_argc)
+                        0x48, 0x89, 0x35, 0x00, 0x00, 0x00, 0x00, // 14: mov [rip+disp32], rsi (_cot_argv)
+                        0x48, 0x89, 0x15, 0x00, 0x00, 0x00, 0x00, // 21: mov [rip+disp32], rdx (_cot_envp)
+                        0xE8, 0x00, 0x00, 0x00, 0x00, // 28: call __cot_main
+                        0x31, 0xC0, // 33: xor eax, eax
+                        0x5D, // 35: pop rbp
+                        0xC3, // 36: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 10, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 17, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 24, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 29, .kind = .X86CallPCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = -4 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                } else {
+                    // main() i64 — return value in rax is the exit code
+                    const wrapper = [_]u8{
+                        0x55, //  0: push rbp
+                        0x48, 0x89, 0xE5, //  1: mov rbp, rsp
+                        0x48, 0x63, 0xC7, //  4: movsxd rax, edi (sign-extend argc)
+                        0x48, 0x89, 0x05, 0x00, 0x00, 0x00, 0x00, //  7: mov [rip+disp32], rax (_cot_argc)
+                        0x48, 0x89, 0x35, 0x00, 0x00, 0x00, 0x00, // 14: mov [rip+disp32], rsi (_cot_argv)
+                        0x48, 0x89, 0x15, 0x00, 0x00, 0x00, 0x00, // 21: mov [rip+disp32], rdx (_cot_envp)
+                        0xE8, 0x00, 0x00, 0x00, 0x00, // 28: call __cot_main
+                        0x5D, // 33: pop rbp
+                        0xC3, // 34: ret
+                    };
+                    const relocs = [_]buffer_mod.FinalizedMachReloc{
+                        .{ .offset = 10, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argc_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 17, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = argv_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 24, .kind = .X86PCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = envp_symbol_idx } } }, .addend = -4 },
+                        .{ .offset = 29, .kind = .X86CallPCRel4, .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } }, .addend = -4 },
+                    };
+                    try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+                }
             }
         }
 
