@@ -178,6 +178,15 @@ impl Parser {
 
     /// Parse a top-level declaration.
     fn parseDecl() int {
+        // Handle 'export' modifier: consume it and parse the declaration
+        if (self.tok == @intFromEnum(Token.kw_export)) {
+            self.advance()
+            if (self.tok == @intFromEnum(Token.kw_fn)) {
+                return self.parseFnDecl(0, 0, 0)
+            }
+            self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'export'")
+            return null_node
+        }
         const tok = @as(Token, @enumFromInt(self.tok))
         return switch (tok) {
             Token.kw_import => self.parseImportDecl(),
@@ -889,7 +898,7 @@ impl Parser {
     /// type_params already parsed by parseImplBlock, trait_name is actually the first ident
     fn parseImplTraitBlock(trait_name: string, type_params: List(string), doc: string, start: int) int {
         self.advance()  // consume 'for'
-        if (self.tok != @intFromEnum(Token.ident)) {
+        if (self.tok != @intFromEnum(Token.ident) and !@as(Token, @enumFromInt(self.tok)).isTypeKeyword()) {
             self.errors.report(self.tok_start, ErrorCode.e203, "expected type name after for")
             return null_node
         }
@@ -1596,16 +1605,19 @@ impl Parser {
         return self.ast.addIfExpr(cond, then_br, else_br, capture, self.spanSE(start, self.tok_end))
     }
 
-    /// switch (subject) { cases }
+    /// switch (subject) { cases } or switch subject { cases }
     fn parseSwitchExpr() int {
         const start = self.tok_start
         self.advance()  // consume 'switch'
-        if (!self.expect(@intFromEnum(Token.lparen))) {
-            return null_node
-        }
-        const subject = self.parseExpr()
-        if (!self.expect(@intFromEnum(Token.rparen))) {
-            return null_node
+        var subject = null_node
+        if (self.tok == @intFromEnum(Token.lparen)) {
+            self.advance()
+            subject = self.parseExpr()
+            if (!self.expect(@intFromEnum(Token.rparen))) {
+                return null_node
+            }
+        } else {
+            subject = self.parseExpr()
         }
         if (!self.expect(@intFromEnum(Token.lbrace))) {
             return null_node
@@ -2133,7 +2145,12 @@ impl Parser {
     fn parseDeferStmt(is_errdefer: int) int {
         const start = self.tok_start
         self.advance()  // consume 'defer'/'errdefer'
-        const expr = if (self.tok == @intFromEnum(Token.lbrace)) { self.parseBlock() } else { self.parseExpr() }
+        var expr = null_node
+        if (self.tok == @intFromEnum(Token.lbrace)) {
+            expr = self.parseBlock()
+        } else {
+            expr = self.parseExpr()
+        }
         self.match(@intFromEnum(Token.semicolon))
         return self.ast.addDeferStmt(expr, is_errdefer, self.spanSE(start, self.tok_end))
     }
@@ -2290,7 +2307,21 @@ impl Parser {
                     }
                 }
                 self.expect(@intFromEnum(Token.rparen))
+                // Check for GenericType!T (named error union with generic error set)
+                if (self.tok == @intFromEnum(Token.lnot)) {
+                    const error_set = self.ast.addGenericInst(name, type_args, self.spanSE(start, self.tok_end))
+                    self.advance()
+                    const inner = self.parseType()
+                    return self.ast.addTypeExpr(3, inner, error_set, self.spanSE(start, self.tok_end))
+                }
                 return self.ast.addGenericInst(name, type_args, self.spanSE(start, self.tok_end))
+            }
+            // Check for E!T (named error union)
+            if (self.tok == @intFromEnum(Token.lnot)) {
+                const error_set = self.ast.addIdent(name, self.spanSE(start, self.tok_end))
+                self.advance()
+                const inner = self.parseType()
+                return self.ast.addTypeExpr(3, inner, error_set, self.spanSE(start, self.tok_end))
             }
             return self.ast.addIdent(name, self.spanSE(start, self.tok_end))
         }

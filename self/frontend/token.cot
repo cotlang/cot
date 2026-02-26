@@ -30,7 +30,7 @@ const Token = enum(u8) {
     // Keywords (keyword_beg..keyword_end)
     keyword_beg,
     kw_fn, kw_var, kw_let, kw_const, kw_struct, kw_impl, kw_trait, kw_where,
-    kw_enum, kw_union, kw_type, kw_import, kw_extern, kw_test, kw_bench,
+    kw_enum, kw_union, kw_type, kw_import, kw_extern, kw_export, kw_test, kw_bench,
     kw_if, kw_else, kw_switch, kw_while, kw_for, kw_in,
     kw_return, kw_break, kw_continue, kw_defer, kw_errdefer, kw_try, kw_catch, kw_orelse, kw_error,
     kw_true, kw_false, kw_null, kw_new, kw_undefined,
@@ -127,6 +127,7 @@ const token_strings = comptime {
     s[@intFromEnum(Token.kw_type)] = "type"
     s[@intFromEnum(Token.kw_import)] = "import"
     s[@intFromEnum(Token.kw_extern)] = "extern"
+    s[@intFromEnum(Token.kw_export)] = "export"
     s[@intFromEnum(Token.kw_test)] = "test"
     s[@intFromEnum(Token.kw_bench)] = "bench"
     s[@intFromEnum(Token.kw_if)] = "if"
@@ -248,6 +249,7 @@ fn lookup(name: string) Token {
         "type" => Token.kw_type,
         "import" => Token.kw_import,
         "extern" => Token.kw_extern,
+        "export" => Token.kw_export,
         "test" => Token.kw_test,
         "bench" => Token.kw_bench,
         "if" => Token.kw_if,
