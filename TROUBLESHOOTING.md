@@ -31,6 +31,7 @@ Every line of Cot is ported from somewhere. There are NO exceptions.
 | SSA Passes | `compiler/ssa/passes/` | Go SSA passes | `references/go/src/cmd/compile/internal/ssa/rewrite*.go` |
 | SSA → Wasm Ops | `compiler/ssa/passes/lower_wasm.zig` | Go Wasm backend | `references/go/src/cmd/compile/internal/wasm/ssa.go` |
 | Wasm Ops → Binary | `compiler/codegen/wasm/` | Go Wasm asm | `references/go/src/cmd/internal/obj/wasm/wasmobj.go` |
+| **SSA → CLIF (direct)** | `compiler/codegen/native/ssa_to_clif.zig` | **rustc_codegen_cranelift** | `references/rust/compiler/rustc_codegen_cranelift/src/` |
 | Wasm Binary → CLIF | `compiler/codegen/native/wasm_to_clif/` | Cranelift Wasm | `references/wasmtime/crates/cranelift/src/translate/` |
 | CLIF IR Types | `compiler/ir/clif/` | Cranelift IR | `references/wasmtime/cranelift/codegen/src/ir/` |
 | CLIF → MachInst | `compiler/codegen/native/machinst/` | Cranelift machinst | `references/wasmtime/cranelift/codegen/src/machinst/` |
@@ -39,6 +40,29 @@ Every line of Cot is ported from somewhere. There are NO exceptions.
 | Register Alloc | `compiler/codegen/native/regalloc/` | regalloc2 | `references/wasmtime/cranelift/codegen/src/machinst/reg.rs` + regalloc2 crate |
 | **ARC Insertion** | `compiler/frontend/arc_insertion.zig` | **Swift SILGen** | `references/swift/lib/SILGen/` (ManagedValue.h, Cleanup.h, SILGenExpr.cpp) |
 | ARC Runtime | `compiler/codegen/wasm/arc.zig` | Swift ARC | `references/swift/stdlib/public/runtime/HeapObject.cpp` |
+
+### Three Reference Codebases
+
+The compiler draws from three distinct reference implementations. Know which one to use:
+
+| Reference | Language | What It Covers | When to Use |
+|-----------|----------|---------------|-------------|
+| **Go compiler** | Go | Frontend → SSA → Wasm bytecode | SSA passes, Wasm ops, Wasm binary format |
+| **Cranelift** (wasmtime) | Rust | Wasm → CLIF → MachInst → emit | Wasm-to-CLIF translation, ISA backends (ARM64/x64), register allocation, instruction emission |
+| **rustc_codegen_cranelift** (cg_clif) | Rust | SSA → CLIF (direct native path) | `ssa_to_clif.zig` — how to build CLIF IR from a compiler's SSA IR using FunctionBuilder |
+
+**For native codegen bugs:**
+- If the bug is in **CLIF → machine code** (lowering, regalloc, emit): reference is **Cranelift** at `references/wasmtime/cranelift/codegen/src/`
+- If the bug is in **SSA → CLIF translation** (building CLIF IR, signatures, loads/stores, function calls): reference is **cg_clif** at `references/rust/compiler/rustc_codegen_cranelift/src/`
+- If the bug is in **Wasm → CLIF translation** (the indirect path): reference is **Cranelift Wasm frontend** at `references/wasmtime/crates/cranelift/src/translate/`
+
+**Key cg_clif files:**
+| File | What It Shows |
+|------|---------------|
+| `base.rs` | Core MIR→CLIF translation loop (block iteration, statement dispatch) |
+| `value_and_place.rs` | CValue/CPlace — how values live in regs vs memory |
+| `pointer.rs` | Pointer struct with Offset32 — how load/store offsets work |
+| `abi/mod.rs` | Function signatures, call conventions, return handling |
 
 ### ARC Implementation: MUST Copy Swift
 
@@ -73,22 +97,28 @@ When a test fails, first determine WHERE in the pipeline it fails:
 Cot Source
     ↓ (frontend)
 SSA IR
-    ↓ (lower_wasm)
-Wasm SSA Ops
-    ↓ (wasm codegen)
-Wasm Binary (.wasm)
-    ↓ (wasm_to_clif)      ← If error mentions CLIF/blocks/values
-CLIF IR
-    ↓ (machinst/lower)    ← If error mentions MachInst/VCode
-VCode
-    ↓ (regalloc)          ← If error mentions registers/liveness
-Allocated VCode
-    ↓ (emit)              ← If error mentions encoding/bytes
-Native Binary
+    ├── Indirect path (default):
+    │   ↓ (lower_wasm)
+    │   Wasm SSA Ops
+    │   ↓ (wasm codegen)
+    │   Wasm Binary (.wasm)
+    │   ↓ (wasm_to_clif)      ← If error mentions CLIF/blocks/values
+    │   CLIF IR ─────────────────┐
+    │                            │
+    └── Direct path (--direct-native):
+        ↓ (ssa_to_clif)        ← If error mentions CLIF/blocks/values
+        CLIF IR ─────────────────┤
+                                 ↓
+                          (machinst/lower)    ← If error mentions MachInst/VCode
+                          VCode
+                          ↓ (regalloc)        ← If error mentions registers/liveness
+                          Allocated VCode
+                          ↓ (emit)            ← If error mentions encoding/bytes
+                          Native Binary
 ```
 
 **How to identify the stage:**
-- Error mentions "block", "value", "params" → CLIF level (wasm_to_clif or ir/clif)
+- Error mentions "block", "value", "params" → CLIF level (ssa_to_clif, wasm_to_clif, or ir/clif)
 - Error mentions "VCode", "MachInst", "BlockIndex" → machinst level
 - Error mentions "vreg", "liveness", "regalloc" → register allocation
 - Error mentions "emit", "encoding" → emission level

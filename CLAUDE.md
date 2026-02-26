@@ -90,15 +90,14 @@ cot help [command]              # Print help (per-subcommand help available)
 
 ## Architecture
 
-**ALL code goes through Wasm first.** Native is AOT-compiled FROM Wasm via Cranelift-port.
+Two native compilation paths exist. The direct path (`--direct-native`) bypasses Wasm entirely.
 
 ```
 Cot Source → Scanner → Parser → Checker → IR → SSA
-  → lower_wasm.zig (SSA → Wasm ops) → wasm/ (Wasm bytecode)
-      ├── --target=wasm32 → .wasm file
-      └── --target=native (default) → wasm_parser → wasm_to_clif/
-          → ir/clif/ → machinst/lower.zig → isa/{aarch64,x64}/
-          → emit.zig → .o → linker → executable
+  ├── --target=wasm32 → lower_wasm.zig → wasm/ → .wasm file
+  ├── --target=native (default, indirect) → lower_wasm.zig → wasm/ → wasm_parser
+  │     → wasm_to_clif/ → ir/clif/ → machinst/ → isa/ → emit → .o → linker → executable
+  └── --direct-native → ssa_to_clif.zig → ir/clif/ → machinst/ → isa/ → emit → .o → linker → executable
 ```
 
 **Key directories:**
@@ -109,7 +108,8 @@ Cot Source → Scanner → Parser → Checker → IR → SSA
 | `compiler/frontend/` | Scanner, parser, checker, lowerer | — |
 | `compiler/ssa/passes/` | rewritegeneric, decompose, rewritedec, schedule, layout, lower_wasm | Go `ssa/*.go` |
 | `compiler/codegen/wasm/` | Wasm bytecode generation + linking | Go `wasm/ssa.go`, `wasmobj.go` |
-| `compiler/codegen/native/wasm_to_clif/` | Wasm → CLIF IR translation | Cranelift `cranelift/src/translate/` |
+| `compiler/codegen/native/ssa_to_clif.zig` | SSA → CLIF IR (direct native path) | `rustc_codegen_cranelift` `src/base.rs`, `pointer.rs` |
+| `compiler/codegen/native/wasm_to_clif/` | Wasm → CLIF IR translation (indirect path) | Cranelift `cranelift/src/translate/` |
 | `compiler/codegen/native/machinst/` | CLIF → MachInst lowering | Cranelift `machinst/` |
 | `compiler/codegen/native/isa/aarch64/` | ARM64 backend | Cranelift `isa/aarch64/` |
 | `compiler/codegen/native/isa/x64/` | x64 backend | Cranelift `isa/x64/` |
@@ -122,7 +122,8 @@ Cot Source → Scanner → Parser → Checker → IR → SSA
 | Component | Reference Location |
 |-----------|-------------------|
 | Cot → Wasm | `references/go/src/cmd/compile/internal/wasm/` |
-| Wasm → CLIF | `references/wasmtime/crates/cranelift/src/translate/` |
+| SSA → CLIF (direct native) | `references/rust/compiler/rustc_codegen_cranelift/src/` |
+| Wasm → CLIF (indirect path) | `references/wasmtime/crates/cranelift/src/translate/` |
 | CLIF → ARM64 | `references/wasmtime/cranelift/codegen/src/isa/aarch64/` |
 | Language semantics | Zig (error unions, defer, comptime) |
 

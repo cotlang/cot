@@ -189,6 +189,18 @@ pub const OperandVisitor = union(enum) {
         }
     }
 
+    /// Mark a fixed physical register as used, with a mutable reference to the register.
+    /// Like regFixedUse but allows the callback to update the register in-place
+    /// (needed when the register field is stored in an instruction struct).
+    pub fn regFixedUseRef(self: *OperandVisitor, reg: *Reg, preg: PReg) void {
+        switch (self.*) {
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = reg.*, .preg = preg, .kind = .use, .pos = .early,
+            }) catch unreachable,
+            .callback => |cb| cb.func(cb.ctx, reg, .fixed_reg, .use, .early),
+        }
+    }
+
     /// Mark a fixed physical register as defined.
     /// Reference: reg.rs:476 fn reg_fixed_def
     pub fn regFixedDef(self: *OperandVisitor, vreg: Writable(Reg), preg: PReg) void {
@@ -476,9 +488,10 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         // Port of Cranelift's call_ind operand handling from aarch64/inst/mod.rs
         .call_ind => |p| {
             const info = p.info;
-            // The destination register is a use - pass reference to actual field
-            // so allocation callback can mutate it (not a local copy)
-            visitor.regUse(&info.dest);
+            // Pin callee to x16 (IP0) to avoid conflicts with argument registers
+            // (x0-x7). x16/x17 are AAPCS64 intra-procedure-call scratch registers.
+            // Uses regFixedUseRef to allow regalloc callback to update info.dest.
+            visitor.regFixedUseRef(&info.dest, regs.xregPreg(16));
             // Add argument uses
             for (info.uses.items) |use| {
                 visitor.regFixedUse(use.vreg, use.preg);

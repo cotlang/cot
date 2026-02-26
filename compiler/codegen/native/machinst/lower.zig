@@ -1392,6 +1392,9 @@ pub fn Lower(comptime I: type) type {
                 try self.finishBb();
             }
 
+            // Pass sized stackslots size to VCode for frame allocation.
+            self.vcode.vcode.sized_stackslots_size = self.stackslots_size;
+
             // Build and return the VCode.
             return try self.vcode.build(&self.vregs);
         }

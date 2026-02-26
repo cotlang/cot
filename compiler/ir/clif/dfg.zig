@@ -947,12 +947,9 @@ pub const DataFlowGraph = struct {
 
     /// Get the controlling type for a polymorphic instruction.
     pub fn ctrlType(self: *const Self, inst: Inst) Type {
-        const data = self.getInst(inst);
-        return switch (data.*) {
-            .unary_imm => |d| d.imm_type(),
-            .binary_imm64 => |d| d.imm_type(),
-            else => Type.INVALID,
-        };
+        _ = self;
+        _ = inst;
+        return Type.INVALID;
     }
 
     // ------------------------------------------------------------------------

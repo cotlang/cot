@@ -346,6 +346,11 @@ pub const Opcode = enum {
     urem,
     /// Signed integer remainder.
     srem,
+    /// Integer add immediate.
+    ///
+    /// Same as `iadd`, but with an immediate operand (binary_imm64 format).
+    /// Port of cranelift/codegen/meta/src/shared/instructions.rs iadd_imm.
+    iadd_imm,
     /// Integer addition with overflow check.
     iadd_overflow,
     /// Integer subtraction with overflow check.
@@ -460,6 +465,16 @@ pub const Opcode = enum {
     stack_load,
     /// Store to stack slot.
     stack_store,
+
+    /// Get the address of a stack slot.
+    ///
+    /// Compute the absolute address of a byte in a stack slot. The offset must
+    /// refer to a byte inside the stack slot:
+    /// `0 <= Offset < sizeof(SS)`.
+    ///
+    /// Port of cranelift/codegen/meta/src/shared/instructions.rs:1238-1253
+    /// Uses stack_load InstructionData format (slot + offset, no value arg).
+    stack_addr,
 
     // ------------------------------------------------------------------------
     // Global Values

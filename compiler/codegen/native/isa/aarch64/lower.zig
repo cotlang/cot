@@ -152,6 +152,7 @@ pub const AArch64LowerBackend = struct {
 
             // Integer arithmetic
             .iadd => self.lowerIadd(ctx, ir_inst),
+            .iadd_imm => self.lowerIaddImm(ctx, ir_inst),
             .isub => self.lowerIsub(ctx, ir_inst),
             .ineg => self.lowerIneg(ctx, ir_inst),
             .imul => self.lowerImul(ctx, ir_inst),
@@ -241,6 +242,7 @@ pub const AArch64LowerBackend = struct {
             // Stack operations
             .stack_load => self.lowerStackLoad(ctx, ir_inst),
             .stack_store => self.lowerStackStore(ctx, ir_inst),
+            .stack_addr => self.lowerStackAddr(ctx, ir_inst),
 
             // Global values
             // Port of cranelift/codegen/src/legalizer/globalvalue.rs
@@ -693,6 +695,151 @@ pub const AArch64LowerBackend = struct {
                 .rd = dst_reg,
                 .rn = lhs_reg,
                 .rm = rhs_reg,
+            },
+        }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    // =========================================================================
+    // Integer add immediate
+    // =========================================================================
+
+    /// Lower an iadd_imm instruction.
+    ///
+    /// Port of cranelift aarch64 lower.isle iadd_imm rules.
+    /// Extracts the i64 immediate from the binary_imm64 instruction data
+    /// and emits ADD with imm12 when possible, otherwise materializes
+    /// the constant into a register and emits ADD rrr.
+    fn lowerIaddImm(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        const size = operandSizeFromType(ty) orelse return null;
+
+        // Get the value operand
+        const lhs = ctx.putInputInRegs(ir_inst, 0);
+        const lhs_reg = lhs.onlyReg() orelse return null;
+
+        // Get the immediate from instruction data
+        const inst_data = ctx.data(ir_inst);
+        const imm = inst_data.getImmediate() orelse return null;
+
+        // Allocate destination register
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        // Try imm12 form first (fits in 12-bit unsigned immediate)
+        if (imm >= 0) {
+            if (Imm12.maybeFromU64(@intCast(imm))) |imm12| {
+                ctx.emit(Inst{
+                    .alu_rr_imm12 = .{
+                        .alu_op = .add,
+                        .size = size,
+                        .rd = dst_reg,
+                        .rn = lhs_reg,
+                        .imm12 = imm12,
+                    },
+                }) catch return null;
+
+                var output = InstOutput{};
+                output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+                return output;
+            }
+        }
+
+        // Negative immediate: use SUB with positive imm12 if it fits
+        if (imm < 0) {
+            const neg_imm: u64 = @intCast(-imm);
+            if (Imm12.maybeFromU64(neg_imm)) |imm12| {
+                ctx.emit(Inst{
+                    .alu_rr_imm12 = .{
+                        .alu_op = .sub,
+                        .size = size,
+                        .rd = dst_reg,
+                        .rn = lhs_reg,
+                        .imm12 = imm12,
+                    },
+                }) catch return null;
+
+                var output = InstOutput{};
+                output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+                return output;
+            }
+        }
+
+        // Fallback: materialize constant into a register, then ADD rrr
+        const tmp = ctx.allocTmp(ty) catch return null;
+        const tmp_reg = tmp.onlyReg() orelse return null;
+
+        const value: u64 = @bitCast(imm);
+        if (MoveWideConst.maybeFromU64(value)) |mwc| {
+            ctx.emit(Inst{
+                .mov_wide = .{
+                    .op = .movz,
+                    .rd = tmp_reg,
+                    .imm = mwc,
+                    .size = size,
+                },
+            }) catch return null;
+        } else {
+            // Multi-step: movz low 16 bits, movk higher halfwords
+            ctx.emit(Inst{
+                .mov_wide = .{
+                    .op = .movz,
+                    .rd = tmp_reg,
+                    .imm = MoveWideConst.maybeWithShift(@truncate(value & 0xFFFF), 0) orelse return null,
+                    .size = size,
+                },
+            }) catch return null;
+
+            const bits_16_31: u16 = @truncate((value >> 16) & 0xFFFF);
+            if (bits_16_31 != 0) {
+                ctx.emit(Inst{
+                    .mov_wide = .{
+                        .op = .movk,
+                        .rd = tmp_reg,
+                        .imm = MoveWideConst.maybeWithShift(bits_16_31, 16) orelse return null,
+                        .size = size,
+                    },
+                }) catch return null;
+            }
+
+            if (size == .size64) {
+                const bits_32_47: u16 = @truncate((value >> 32) & 0xFFFF);
+                if (bits_32_47 != 0) {
+                    ctx.emit(Inst{
+                        .mov_wide = .{
+                            .op = .movk,
+                            .rd = tmp_reg,
+                            .imm = MoveWideConst.maybeWithShift(bits_32_47, 32) orelse return null,
+                            .size = size,
+                        },
+                    }) catch return null;
+                }
+
+                const bits_48_63: u16 = @truncate((value >> 48) & 0xFFFF);
+                if (bits_48_63 != 0) {
+                    ctx.emit(Inst{
+                        .mov_wide = .{
+                            .op = .movk,
+                            .rd = tmp_reg,
+                            .imm = MoveWideConst.maybeWithShift(bits_48_63, 48) orelse return null,
+                            .size = size,
+                        },
+                    }) catch return null;
+                }
+            }
+        }
+
+        ctx.emit(Inst{
+            .alu_rrr = .{
+                .alu_op = .add,
+                .size = size,
+                .rd = dst_reg,
+                .rn = lhs_reg,
+                .rm = tmp_reg.toReg(),
             },
         }) catch return null;
 
@@ -1957,7 +2104,17 @@ pub const AArch64LowerBackend = struct {
         const dst = ctx.allocTmp(ty) catch return null;
         const dst_reg = dst.onlyReg() orelse return null;
 
-        const mem = AMode.reg(addr_reg);
+        // Reference: rustc_codegen_cranelift/src/pointer.rs:109-114
+        // Pointer.load() passes self.offset to ins().load(), so the backend
+        // must honor the offset field on load instructions.
+        // Reference: rustc_codegen_cranelift/src/pointer.rs:109-114
+        // Pointer.load() passes self.offset to ins().load(), so the backend
+        // must honor the offset field on load instructions.
+        const offset = ctx.data(ir_inst).getOffset() orelse 0;
+        const mem = if (offset != 0)
+            AMode{ .reg_offset = .{ .rn = addr_reg, .offset = offset, .ty = typeFromClif(ty) } }
+        else
+            AMode.reg(addr_reg);
         const flags = MemFlags.empty;
 
         ctx.emit(Inst.genLoad(dst_reg, mem, typeFromClif(ty), flags)) catch return null;
@@ -1976,7 +2133,12 @@ pub const AArch64LowerBackend = struct {
         const val_reg = val.onlyReg() orelse return null;
         const addr_reg = addr.onlyReg() orelse return null;
 
-        const mem = AMode.reg(addr_reg);
+        // Reference: rustc_codegen_cranelift/src/pointer.rs:117-127
+        const offset = ctx.data(ir_inst).getOffset() orelse 0;
+        const mem = if (offset != 0)
+            AMode{ .reg_offset = .{ .rn = addr_reg, .offset = offset, .ty = typeFromClif(val_ty) } }
+        else
+            AMode.reg(addr_reg);
         const flags = MemFlags.empty;
 
         ctx.emit(Inst.genStore(mem, val_reg, typeFromClif(val_ty), flags)) catch return null;
@@ -2237,6 +2399,9 @@ pub const AArch64LowerBackend = struct {
         while (i < 32) : (i += 1) {
             clobbers = clobbers.with(regs.vregPreg(i));
         }
+        // Remove x16 from clobbers — used as the callee register for BLR.
+        // regalloc2 requires clobbers and uses must not collide.
+        clobbers.remove(regs.xregPreg(16));
         // NOTE: clobbers will be assigned to call_ind_info AFTER removing return regs
 
         // Build uses list: gen_call_args(abi, args)
@@ -2395,22 +2560,36 @@ pub const AArch64LowerBackend = struct {
     // =========================================================================
 
     fn lowerFuncAddr(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        // Get function address as a pointer value.
+        // Port of Cranelift's func_addr lowering — uses ADRP+ADD for colocated functions.
         _ = self;
-        _ = ir_inst;
+
+        const inst_data = ctx.data(ir_inst);
+        const func_ref = inst_data.getFuncRef() orelse return null;
+        const ext_func = ctx.extFuncData(func_ref) orelse return null;
 
         const dst = ctx.allocTmp(ClifType.I64) catch return null;
         const dst_reg = dst.onlyReg() orelse return null;
 
-        // TODO: Load actual function address
-        // This is a placeholder using adr
-        // TODO: Load actual function address from GOT
-        // For now, use a placeholder pc-relative offset
-        ctx.emit(Inst{
-            .adr = .{
+        const symbol_idx: u32 = switch (ext_func.name) {
+            .user => |u| u.index,
+            .libcall => 0,
+        };
+
+        if (ext_func.colocated) {
+            // Colocated: ADRP + ADD (same object file)
+            ctx.emit(Inst{ .load_ext_name_near = .{
                 .rd = dst_reg,
-                .label = .{ .pc_rel = 0 },
-            },
-        }) catch return null;
+                .symbol_idx = symbol_idx,
+                .offset = 0,
+            } }) catch return null;
+        } else {
+            // Non-colocated: ADRP + LDR via GOT (external symbol)
+            ctx.emit(Inst{ .load_ext_name_got = .{
+                .rd = dst_reg,
+                .symbol_idx = symbol_idx,
+            } }) catch return null;
+        }
 
         var output = InstOutput{};
         output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
@@ -2442,6 +2621,45 @@ pub const AArch64LowerBackend = struct {
         const flags = MemFlags.empty;
 
         ctx.emit(Inst.genLoad(dst_reg, mem, typeFromClif(ty), flags)) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    /// Lower a stack_addr instruction.
+    ///
+    /// Port of cranelift aarch64 lower.isle:2854-2857
+    /// (rule (lower (stack_addr stack_slot offset))
+    ///       (compute_stack_addr stack_slot offset))
+    ///
+    /// Port of cranelift aarch64 inst.isle:4519-4525 (compute_stack_addr)
+    /// Port of cranelift machinst/abi.rs:2160-2170 (sized_stackslot_addr)
+    /// Port of cranelift aarch64 abi.rs:492-496 (gen_get_stack_addr → LoadAddr)
+    ///
+    /// Computes the absolute address of a stack slot + offset into a register.
+    /// Emits load_addr (ADD rd, sp, #offset) instead of genLoad (LDR rd, [sp, #offset]).
+    fn lowerStackAddr(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        // Get stack slot from instruction data
+        const inst_data = ctx.data(ir_inst);
+        const slot = inst_data.getStackSlot() orelse return null;
+        const extra_offset = inst_data.getOffset() orelse 0;
+
+        // Get the slot's byte offset from computed stackslot offsets
+        // Port of cranelift/codegen/src/machinst/abi.rs Callee::sized_stackslot_addr
+        const slot_base_offset = ctx.sizedStackslotOffset(slot);
+        const slot_byte_offset = @as(i32, @intCast(slot_base_offset)) + extra_offset;
+
+        // Emit load_addr (ADD rd, sp, #offset) instead of genLoad (LDR rd, [sp, #offset])
+        // Port of cranelift aarch64 abi.rs gen_get_stack_addr: Inst::LoadAddr { rd, mem }
+        const mem = AMode{ .sp_offset = .{ .offset = slot_byte_offset } };
+        ctx.emit(Inst{ .load_addr = .{ .rd = dst_reg, .mem = mem } }) catch return null;
 
         var output = InstOutput{};
         output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
@@ -2593,12 +2811,28 @@ pub const AArch64LowerBackend = struct {
                 ctx.emit(Inst.genLoad(dst_reg, mem, d.global_type, MemFlags.empty)) catch return null;
             },
 
-            .symbol => {
-                // Symbol: For now, just load a placeholder address
-                // Full implementation would emit relocation
+            .symbol => |s| {
                 // Port of cranelift/codegen/src/legalizer/globalvalue.rs symbol
-                const placeholder_addr: u64 = 0;
-                emitLoadConstant(ctx, dst_reg, placeholder_addr, .size64) catch return null;
+                // Reference: cg_clif constant.rs:152-157 — symbol_value → ADRP+ADD for colocated
+                const symbol_idx: u32 = switch (s.name) {
+                    .user => |u| u.index,
+                    .libcall => 0, // Libcall symbols resolved separately
+                };
+                if (s.colocated) {
+                    // Colocated: ADRP + ADD (direct, within same object file)
+                    // Cranelift: load_ext_name_near emits relocations for linker
+                    ctx.emit(Inst{ .load_ext_name_near = .{
+                        .rd = dst_reg,
+                        .symbol_idx = symbol_idx,
+                        .offset = s.offset,
+                    } }) catch return null;
+                } else {
+                    // Non-colocated: ADRP + LDR via GOT (external/dynamic symbol)
+                    ctx.emit(Inst{ .load_ext_name_got = .{
+                        .rd = dst_reg,
+                        .symbol_idx = symbol_idx,
+                    } }) catch return null;
+                }
             },
 
             .dyn_scale_target_const => {

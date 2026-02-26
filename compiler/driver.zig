@@ -20,6 +20,12 @@ const rewritegeneric = @import("ssa/passes/rewritegeneric.zig");
 const decompose_builtin = @import("ssa/passes/decompose.zig");
 const rewritedec = @import("ssa/passes/rewritedec.zig");
 const lower_wasm = @import("ssa/passes/lower_wasm.zig");
+const lower_native = @import("ssa/passes/lower_native.zig");
+const ssa_to_clif = @import("codegen/native/ssa_to_clif.zig");
+const arc_native = @import("codegen/native/arc_native.zig");
+const io_native = @import("codegen/native/io_native.zig");
+const print_native = @import("codegen/native/print_native.zig");
+const test_native_rt = @import("codegen/native/test_native.zig");
 const target_mod = @import("frontend/target.zig");
 const pipeline_debug = @import("pipeline_debug.zig");
 
@@ -69,6 +75,7 @@ pub const Driver = struct {
     bench_n: ?i64 = null,
     release_mode: bool = false,
     lib_mode: bool = false,
+    direct_native: bool = false, // Use direct SSA → CLIF path (bypass Wasm)
     project_safe: ?bool = null, // cached cot.json "safe" field, loaded lazily
     // Debug info: source file/text and IR funcs for DWARF generation
     debug_source_file: []const u8 = "",
@@ -594,11 +601,20 @@ pub const Driver = struct {
 
     /// Unified code generation for all architectures.
     fn generateCode(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry, source_file: []const u8, source_text: []const u8) ![]u8 {
-        _ = globals;
 
         // Wasm target: use Wasm codegen pipeline
         if (self.target.isWasm()) {
             return self.generateWasmCode(funcs, type_reg);
+        }
+
+        // Store source info for DWARF debug generation in generateMachO/generateElf
+        self.debug_source_file = source_file;
+        self.debug_source_text = source_text;
+        self.debug_ir_funcs = funcs;
+
+        // Direct native path: SSA → CLIF → native (bypass Wasm entirely)
+        if (self.direct_native) {
+            return self.generateNativeCodeDirect(funcs, globals, type_reg);
         }
 
         // Native target: AOT compilation path (Wasm → Native)
@@ -612,11 +628,6 @@ pub const Driver = struct {
         // 5. Run register allocation
         // 6. Emit machine code
         // 7. Link into object file
-
-        // Store source info for DWARF debug generation in generateMachO/generateElf
-        self.debug_source_file = source_file;
-        self.debug_source_text = source_text;
-        self.debug_ir_funcs = funcs;
 
         // Step 1: Generate Wasm bytecode first
         pipeline_debug.log(.codegen, "driver: generating Wasm for native AOT compilation", .{});
@@ -872,7 +883,7 @@ pub const Driver = struct {
         pipeline_debug.log(.codegen, "driver: generating object file for {d} functions", .{compiled_funcs.items.len});
 
         const object_bytes = switch (self.target.os) {
-            .macos => try self.generateMachO(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals),
+            .macos => try self.generateMachO(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals, wasm_module.funcs, wasm_module.types),
             .linux => try self.generateElf(compiled_funcs.items, wasm_module.exports, wasm_module.data_segments, wasm_module.globals),
             .freestanding, .wasi => return error.UnsupportedObjectFormat,
         };
@@ -880,9 +891,453 @@ pub const Driver = struct {
         return object_bytes;
     }
 
+    /// Direct SSA → CLIF → native code generation (bypass Wasm entirely).
+    ///
+    /// Pipeline: IR funcs → SSA → passes → lower_native → ssa_to_clif → CLIF →
+    ///           compile.zig → CompiledCode → object file
+    ///
+    /// This produces the same CompiledCode output as the Wasm path, but without
+    /// encoding/decoding Wasm, without vmctx, and with native pointers.
+    fn generateNativeCodeDirect(self: *Driver, funcs: []const ir_mod.Func, globals: []const ir_mod.Global, type_reg: *types_mod.TypeRegistry) ![]u8 {
+        pipeline_debug.log(.codegen, "driver: direct native path for {d} functions", .{funcs.len});
+
+        // Select ISA based on target
+        const isa = switch (self.target.arch) {
+            .arm64 => native_compile.TargetIsa{ .aarch64 = native_compile.AArch64Backend.default },
+            .amd64 => native_compile.TargetIsa{ .x64 = native_compile.X64Backend.default },
+            .wasm32 => return error.InvalidTargetForNative,
+        };
+
+        var ctrl_plane = native_compile.ControlPlane.init();
+
+        // Compiled functions list
+        var compiled_funcs = std.ArrayListUnmanaged(native_compile.CompiledCode){};
+        defer {
+            for (compiled_funcs.items) |*cf| cf.deinit();
+            compiled_funcs.deinit(self.allocator);
+        }
+
+        // Function names for object file generation
+        var func_names = std.ArrayListUnmanaged([]const u8){};
+        defer func_names.deinit(self.allocator);
+
+        // Track main function index
+        var main_func_index: ?usize = null;
+
+        // String offsets (for rewritegeneric pass) and string data blob
+        var string_offsets = std.StringHashMap(i32).init(self.allocator);
+        defer string_offsets.deinit();
+        var string_data = std.ArrayListUnmanaged(u8){};
+        defer string_data.deinit(self.allocator);
+
+        // Phase 1: Collect string literals — build actual data blob with proper byte offsets
+        for (funcs) |*ir_func| {
+            for (ir_func.string_literals) |str| {
+                if (!string_offsets.contains(str)) {
+                    const offset: i32 = @intCast(string_data.items.len);
+                    try string_offsets.put(str, offset);
+                    try string_data.appendSlice(self.allocator, str);
+                    // Align to 8 bytes for next string
+                    const padding = (8 - (str.len % 8)) % 8;
+                    for (0..padding) |_| {
+                        try string_data.append(self.allocator, 0);
+                    }
+                }
+            }
+        }
+
+        // Build function name → index map for call relocations
+        // Indices: 0..N-1 = user functions, N..N+R-1 = runtime functions
+        var func_index_map = std.StringHashMapUnmanaged(u32){};
+        defer func_index_map.deinit(self.allocator);
+        for (funcs, 0..) |*ir_func, idx| {
+            try func_index_map.put(self.allocator, ir_func.name, @intCast(idx));
+        }
+
+        // Pre-register runtime function names so ssa_to_clif can emit calls to them.
+        // These will be defined later as CLIF IR functions compiled to native code.
+        // Reference: cg_clif abi/mod.rs:97-115 — import_function for runtime symbols
+        // IMPORTANT: Order must match the order functions are appended to compiled_funcs.
+        // Compiled functions: arc → io → print → test.
+        // Uncompiled runtime stubs and libc externals come after.
+        const runtime_func_names = [_][]const u8{
+            // ARC runtime (arc_native.generate order)
+            "alloc",         "dealloc",        "retain",        "release",
+            "realloc",       "string_concat",  "string_eq",
+            // I/O runtime (io_native.generate order)
+            "fd_write",      "fd_read",        "fd_close",      "exit",
+            "fd_seek",       "memset_zero",
+            // Print runtime (print_native.generate order)
+            "print_int",     "eprint_int",
+            // Test runtime (test_native.generate order)
+            "__test_begin",  "__test_print_name", "__test_pass",
+            "__test_fail",   "__test_summary",    "__test_store_fail_values",
+            // NOT yet compiled as CLIF IR — registered for index allocation only
+            "fd_open",       "time",           "random",
+            "int_to_string", "growslice",      "nextslicecap",
+            // libc symbols — external references resolved by linker (-lSystem/-lc)
+            // "memcpy" is here because the Cot signature (dst,src,len)→void is
+            // ABI-compatible with libc memcpy(dst,src,n)→void* (return ignored).
+            "write",         "malloc",         "free",          "memset",
+            "memcmp",        "memcpy",         "read",          "close",
+            "open",          "lseek",          "_exit",         "gettimeofday",
+            "getentropy",    "isatty",
+        };
+        const runtime_start_idx: u32 = @intCast(funcs.len);
+        for (runtime_func_names, 0..) |name, i| {
+            if (!func_index_map.contains(name)) {
+                try func_index_map.put(self.allocator, name, runtime_start_idx + @as(u32, @intCast(i)));
+            }
+        }
+
+        // String data symbol index — used by ssa_to_clif for globalValue references
+        // This index is registered in external_names in generateMachODirect
+        const string_data_symbol_idx: ?u32 = if (string_data.items.len > 0)
+            runtime_start_idx + @as(u32, @intCast(runtime_func_names.len))
+        else
+            null;
+
+        // CTXT global symbol index — used by closure calls to pass context pointer.
+        // Mirrors Wasm's CTXT global (index 1). Native uses a data section variable.
+        const ctxt_base_idx = runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + @as(u32, if (string_data.items.len > 0) 1 else 0);
+        const ctxt_symbol_idx: u32 = ctxt_base_idx;
+
+        // Global variable symbol indices — each module-level var gets a data section entry.
+        // Maps global name → external name index for globalValue references in ssa_to_clif.
+        var global_symbol_map = std.StringHashMapUnmanaged(u32){};
+        defer global_symbol_map.deinit(self.allocator);
+        const globals_base_idx: u32 = ctxt_symbol_idx + 1;
+        for (globals, 0..) |g, i| {
+            try global_symbol_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
+        }
+
+        // Phase 2: For each function, build SSA → run passes → translate → compile
+        for (funcs, 0..) |*ir_func, func_idx| {
+            pipeline_debug.log(.codegen, "driver: direct native: compiling '{s}' ({d}/{d})", .{
+                ir_func.name, func_idx + 1, funcs.len,
+            });
+
+            if (std.mem.eql(u8, ir_func.name, "main")) {
+                main_func_index = func_idx;
+            }
+            try func_names.append(self.allocator, ir_func.name);
+
+            // Build SSA from IR
+            var ssa_builder = try ssa_builder_mod.SSABuilder.init(self.allocator, ir_func, type_reg, self.target);
+            errdefer ssa_builder.deinit();
+
+            const ssa_func = try ssa_builder.build();
+            defer {
+                ssa_func.deinit();
+                self.allocator.destroy(ssa_func);
+            }
+            ssa_builder.deinit();
+
+            // Set function type for CLIF signature building (not set by SSA builder)
+            ssa_func.type_idx = ir_func.type_idx;
+
+            // Run SSA passes — same as Wasm path except lower_native instead of lower_wasm
+            try rewritegeneric.rewrite(self.allocator, ssa_func, &string_offsets);
+            try decompose_builtin.decompose(self.allocator, ssa_func);
+            try rewritedec.rewrite(self.allocator, ssa_func);
+            try schedule.schedule(ssa_func);
+            try layout.layout(ssa_func);
+            try lower_native.lower(ssa_func);
+
+            // Debug: dump SSA when COT_SSA_DUMP env is set
+            if (std.posix.getenv("COT_SSA_DUMP")) |_| {
+                std.debug.print("\n=== SSA for '{s}' (locals: {d}, params: {d}) ===\n", .{ ir_func.name, ssa_func.local_sizes.len, ir_func.params.len });
+                if (ssa_func.local_sizes.len > 0) {
+                    std.debug.print("  local_sizes:", .{});
+                    for (ssa_func.local_sizes) |s| std.debug.print(" {d}", .{s});
+                    std.debug.print("\n", .{});
+                }
+                for (ssa_func.blocks.items) |blk| {
+                    std.debug.print("  Block b{d} (kind={s}, succs={d}, preds={d}):\n", .{
+                        blk.id, @tagName(blk.kind), blk.succs.len, blk.preds.len,
+                    });
+                    for (blk.values.items) |val| {
+                        std.debug.print("    v{d}: {s}", .{ val.id, @tagName(val.op) });
+                        for (val.args) |a| std.debug.print(" v{d}", .{a.id});
+                        std.debug.print(" aux={d} type={d}\n", .{ val.aux_int, val.type_idx });
+                    }
+                    if (blk.controls[0]) |c| {
+                        std.debug.print("    controls: v{d}", .{c.id});
+                        if (blk.controls[1]) |c2| std.debug.print(" v{d}", .{c2.id});
+                        std.debug.print("\n", .{});
+                    }
+                }
+            }
+
+            // Translate SSA → CLIF IR
+            var clif_func = clif.Function.init(self.allocator);
+            defer clif_func.deinit();
+
+            ssa_to_clif.translate(ssa_func, &clif_func, type_reg, ir_func.params, ir_func.return_type, &func_index_map, funcs, self.allocator, string_data_symbol_idx, ctxt_symbol_idx, &global_symbol_map) catch |e| {
+                pipeline_debug.log(.codegen, "driver: SSA→CLIF translation error for '{s}': {any}", .{ ir_func.name, e });
+                return error.SsaToClifError;
+            };
+
+            const num_blocks = clif_func.dfg.blocks.items.len;
+            const num_insts = clif_func.dfg.insts.items.len;
+            pipeline_debug.log(.codegen, "driver: translated '{s}' to CLIF ({d} blocks, {d} insts)", .{ ir_func.name, num_blocks, num_insts });
+
+            // Compile CLIF → native machine code
+            const compiled = native_compile.compile(self.allocator, &clif_func, isa, &ctrl_plane) catch |e| {
+                pipeline_debug.log(.codegen, "driver: compile error for '{s}': {any}", .{ ir_func.name, e });
+                return error.NativeCompileError;
+            };
+
+            try compiled_funcs.append(self.allocator, compiled);
+            pipeline_debug.log(.codegen, "driver: compiled '{s}': {d} bytes", .{
+                ir_func.name, compiled.codeSize(),
+            });
+        }
+
+        // Phase 3: Generate runtime functions as CLIF IR
+        // Reference: cg_clif abi/mod.rs (lib_call pattern), Swift HeapObject.cpp (ARC semantics)
+        {
+            // ARC runtime: alloc, dealloc, retain, release
+            var arc_funcs = try arc_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer arc_funcs.deinit(self.allocator);
+            for (arc_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+            // I/O runtime: fd_write, fd_read, fd_close, exit, fd_seek, memcpy, memset_zero
+            var io_funcs = try io_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer io_funcs.deinit(self.allocator);
+            for (io_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+            // Print runtime: print_int, eprint_int
+            var print_funcs = try print_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer print_funcs.deinit(self.allocator);
+            for (print_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+            // Test runtime: __test_begin, __test_print_name, __test_pass, __test_fail, __test_summary
+            if (self.test_mode) {
+                var test_funcs = try test_native_rt.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+                defer test_funcs.deinit(self.allocator);
+                for (test_funcs.items) |rf| {
+                    try compiled_funcs.append(self.allocator, rf.compiled);
+                    try func_names.append(self.allocator, rf.name);
+                }
+            }
+
+            pipeline_debug.log(.codegen, "driver: compiled {d} total functions (user + runtime)", .{compiled_funcs.items.len});
+        }
+
+        // Phase 4: Generate object file
+        pipeline_debug.log(.codegen, "driver: generating object file for {d} direct-native functions", .{compiled_funcs.items.len});
+
+        const object_bytes = try self.generateMachODirect(
+            compiled_funcs.items,
+            func_names.items,
+            main_func_index,
+            string_data.items,
+            string_data_symbol_idx,
+            ctxt_symbol_idx,
+            &func_index_map,
+            globals,
+            globals_base_idx,
+        );
+        return object_bytes;
+    }
+
+    /// Generate Mach-O/ELF object file from direct-native compiled functions.
+    /// Includes data section for string literals and external name registration
+    /// for runtime functions and libc symbols.
+    fn generateMachODirect(
+        self: *Driver,
+        compiled_funcs: []const native_compile.CompiledCode,
+        func_names: []const []const u8,
+        main_func_index: ?usize,
+        string_data: []const u8,
+        string_data_symbol_idx: ?u32,
+        ctxt_symbol_idx: u32,
+        func_index_map: *const std.StringHashMapUnmanaged(u32),
+        globals: []const ir_mod.Global,
+        globals_base_idx: u32,
+    ) ![]u8 {
+        const arch: object_module.TargetArch = switch (self.target.arch) {
+            .arm64 => .aarch64,
+            .amd64 => .x86_64,
+            .wasm32 => return error.InvalidTargetForNative,
+        };
+        const os_fmt: object_module.TargetOS = switch (self.target.os) {
+            .macos => .macos,
+            .linux => .linux,
+            else => return error.UnsupportedObjectFormat,
+        };
+        var module = object_module.ObjectModule.initWithTarget(self.allocator, os_fmt, arch);
+        defer module.deinit();
+
+        // Pass 1: Declare all functions
+        var func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
+        defer self.allocator.free(func_ids);
+
+        for (func_names, 0..) |name, i| {
+            const is_main = std.mem.eql(u8, name, "main");
+            const is_export = blk: {
+                for (self.debug_ir_funcs) |ir_func| {
+                    if (std.mem.eql(u8, ir_func.name, name) and ir_func.is_export) break :blk true;
+                }
+                break :blk false;
+            };
+
+            // MachO C ABI: all symbols get _ prefix
+            const mangled_name = if (is_main)
+                try self.allocator.dupe(u8, "__cot_main")
+            else
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{name});
+            defer self.allocator.free(mangled_name);
+
+            const linkage: object_module.Linkage = if (is_main)
+                .Local
+            else if (is_export)
+                .Export
+            else
+                .Local;
+
+            func_ids[i] = try module.declareFunction(mangled_name, linkage);
+            try module.declareExternalName(@intCast(i), mangled_name);
+        }
+
+        // Pass 2: Define all functions
+        for (compiled_funcs, 0..) |*cf, i| {
+            try module.defineFunction(func_ids[i], cf);
+        }
+
+        // Pass 3: Add string data section
+        // Reference: cg_clif constant.rs:461 — data.define(bytes)
+        if (string_data.len > 0) {
+            const data_sym_name = "_cot_string_data";
+            const data_id = try module.declareData(data_sym_name, .Local, false);
+            try module.defineData(data_id, string_data);
+
+            // Register string data symbol for relocations from code
+            if (string_data_symbol_idx) |idx| {
+                try module.declareExternalName(idx, data_sym_name);
+            }
+        }
+
+        // Pass 3b: Add CTXT global variable (8 bytes, for closure context pointer)
+        // Mirrors Wasm global 1 (CTXT). Used by closure_call to pass captured environment.
+        {
+            const ctxt_sym_name = "_cot_ctxt";
+            const ctxt_data_id = try module.declareData(ctxt_sym_name, .Local, true);
+            const ctxt_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }; // 8 bytes, zero-initialized
+            try module.defineData(ctxt_data_id, ctxt_data);
+            try module.declareExternalName(ctxt_symbol_idx, ctxt_sym_name);
+        }
+
+        // Pass 3c: Add global variable data section entries.
+        // Each module-level var gets an 8-byte zero-initialized data section entry.
+        for (globals, 0..) |g, i| {
+            const is_macos = self.target.os == .macos;
+            const sym_name = if (is_macos)
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{g.name})
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}", .{g.name});
+            defer self.allocator.free(sym_name);
+            const global_size = @max(g.size, 8);
+            const zero_data = try self.allocator.alloc(u8, global_size);
+            defer self.allocator.free(zero_data);
+            @memset(zero_data, 0);
+            const data_id = try module.declareData(sym_name, .Local, true);
+            try module.defineData(data_id, zero_data);
+            try module.declareExternalName(globals_base_idx + @as(u32, @intCast(i)), sym_name);
+        }
+
+        // Pass 4: Register external names for runtime functions and libc symbols.
+        // Any index used by CLIF code (via ExternalName.User{.index=N}) must have
+        // a corresponding entry in external_names so relocations resolve correctly.
+        // Reference: cg_clif abi/mod.rs:97-115 — import_function pattern
+        {
+            const is_macos = self.target.os == .macos;
+            var iter = func_index_map.iterator();
+            while (iter.next()) |entry| {
+                const name = entry.key_ptr.*;
+                const idx = entry.value_ptr.*;
+                // Skip user functions (already registered in Pass 1)
+                if (idx < func_names.len) continue;
+                // Skip string data symbol (already registered above)
+                if (string_data_symbol_idx != null and idx == string_data_symbol_idx.?) continue;
+                // Skip CTXT symbol (already registered above)
+                if (idx == ctxt_symbol_idx) continue;
+                // Skip global variable symbols (already registered in Pass 3c)
+                if (globals.len > 0 and idx >= globals_base_idx and idx < globals_base_idx + @as(u32, @intCast(globals.len))) continue;
+
+                // Runtime/libc functions: mangle with platform-appropriate prefix
+                const mangled = if (is_macos)
+                    try std.fmt.allocPrint(self.allocator, "_{s}", .{name})
+                else
+                    try self.allocator.dupe(u8, name);
+                defer self.allocator.free(mangled);
+                try module.declareExternalName(idx, mangled);
+            }
+        }
+
+        // Generate _main entry point if we have a main function
+        if (main_func_index != null) {
+            const main_wrapper_id = try module.declareFunction("_main", .Export);
+
+            // ARM64 _main wrapper: call __cot_main and return
+            // This is a minimal stub — no vmctx setup needed
+            if (self.target.arch == .arm64) {
+                const wrapper = [_]u8{
+                    0xFD, 0x7B, 0xBF, 0xA9, // stp x29, x30, [sp, #-16]!
+                    0xFD, 0x03, 0x00, 0x91, // mov x29, sp
+                    0x00, 0x00, 0x00, 0x94, // bl __cot_main (relocation)
+                    0xFD, 0x7B, 0xC1, 0xA8, // ldp x29, x30, [sp], #16
+                    0xC0, 0x03, 0x5F, 0xD6, // ret
+                };
+                // Relocation for the bl instruction at offset 8
+                const main_idx: u32 = @intCast(main_func_index.?);
+                const relocs = [_]buffer_mod.FinalizedMachReloc{.{
+                    .offset = 8,
+                    .kind = .Arm64Call,
+                    .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } },
+                    .addend = 0,
+                }};
+                try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+            } else {
+                // x64 _main wrapper
+                const main_idx: u32 = @intCast(main_func_index.?);
+                const wrapper = [_]u8{
+                    0x55, // push rbp
+                    0x48, 0x89, 0xE5, // mov rbp, rsp
+                    0xE8, 0x00, 0x00, 0x00, 0x00, // call __cot_main (relocation)
+                    0x5D, // pop rbp
+                    0xC3, // ret
+                };
+                const relocs = [_]buffer_mod.FinalizedMachReloc{.{
+                    .offset = 5,
+                    .kind = .X86CallPCRel4,
+                    .target = .{ .ExternalName = .{ .User = .{ .namespace = 0, .index = main_idx } } },
+                    .addend = -4,
+                }};
+                try module.defineFunctionBytes(main_wrapper_id, &wrapper, &relocs);
+            }
+        }
+
+        // Serialize object file to bytes
+        var output = std.ArrayListUnmanaged(u8){};
+        defer output.deinit(self.allocator);
+        try module.finish(output.writer(self.allocator));
+        return try output.toOwnedSlice(self.allocator);
+    }
+
     /// Generate Mach-O object file from compiled functions.
     /// Uses ObjectModule to bridge CompiledCode to Mach-O format.
-    fn generateMachO(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType) ![]u8 {
+    fn generateMachO(self: *Driver, compiled_funcs: []const native_compile.CompiledCode, exports: []const wasm_parser.Export, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, func_to_type: []const u32, types: []const wasm_parser.FuncType) ![]u8 {
         var module = object_module.ObjectModule.initWithTarget(
             self.allocator,
             .macos,
@@ -930,24 +1385,28 @@ pub const Driver = struct {
 
             // MachO C ABI: all symbols get _ prefix (Zig convention: _funcname in Mach-O)
             // export fn functions use standard C naming — the _ is the platform convention, not mangling.
-            const mangled_name = if (is_main)
-                try self.allocator.dupe(u8, "__wasm_main")
-            else
-                try std.fmt.allocPrint(self.allocator, "_{s}", .{func_name});
-            defer self.allocator.free(mangled_name);
-
-            // Zig pattern: export fn → Export linkage (global visibility), internal fn → Local
+            // In lib mode, exported functions get __wasm suffix (the C-ABI wrapper gets the real name).
             const is_export_fn = blk: {
                 for (self.debug_ir_funcs) |ir_func| {
                     if (std.mem.eql(u8, ir_func.name, func_name) and ir_func.is_export) break :blk true;
                 }
                 break :blk false;
             };
+            const mangled_name = if (is_main)
+                try self.allocator.dupe(u8, "__wasm_main")
+            else if (self.lib_mode and is_export_fn)
+                try std.fmt.allocPrint(self.allocator, "_{s}__wasm", .{func_name})
+            else
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{func_name});
+            defer self.allocator.free(mangled_name);
+
+            // Zig pattern: export fn → Export linkage (global visibility), internal fn → Local
+            // In lib mode, all wasm functions are Local — export wrappers provide the public API.
             const linkage: object_module.Linkage = if (is_main)
                 .Local
             else if (func_name_allocated)
                 .Local
-            else if (self.lib_mode and !is_export_fn)
+            else if (self.lib_mode)
                 .Local
             else
                 .Export;
@@ -1792,9 +2251,12 @@ pub const Driver = struct {
             }
         }
 
-        // If we have a main function, generate the wrapper and static vmctx
-        // Skip in lib mode — shared libraries don't have entry points
-        if (main_func_index != null and !self.lib_mode) {
+        // Generate entry point or library wrappers
+        if (self.lib_mode) {
+            // Shared library: generate vmctx + C-ABI export wrappers
+            try self.generateLibWrappersMachO(&module, exports, func_to_type, types, data_segments, globals, func_ids, @intCast(compiled_funcs.len));
+        } else if (main_func_index != null) {
+            // Executable: generate _main entry point with vmctx init
             try self.generateMainWrapperMachO(&module, data_segments, globals, @intCast(compiled_funcs.len));
         }
 
@@ -2515,6 +2977,225 @@ pub const Driver = struct {
         };
 
         try module.defineFunctionBytes(main_func_id, wrapper_code.items, &main_relocs);
+    }
+
+    /// Generate vmctx data section and C-ABI export wrappers for shared library mode.
+    /// Each exported function gets a thin wrapper that loads vmctx and shifts user args
+    /// before calling the inner __wasm function (which expects Cranelift wasm CC).
+    fn generateLibWrappersMachO(self: *Driver, module: *object_module.ObjectModule, exports: []const wasm_parser.Export, func_to_type: []const u32, types: []const wasm_parser.FuncType, data_segments: []const wasm_parser.DataSegment, globals: []const wasm_parser.GlobalType, _: []const object_module.FuncId, num_funcs: u32) !void {
+        // ARM64 instruction encoding helpers (same as generateMainWrapperMachO)
+        const A64 = struct {
+            fn mov(rd: u32, rm: u32) u32 {
+                return 0xAA0003E0 | (rm << 16) | rd;
+            }
+            fn add_imm_lsl12(rd: u32, rn: u32, imm12: u32) u32 {
+                return 0x91400000 | (imm12 << 10) | (rn << 5) | rd;
+            }
+            fn stp_pre(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 {
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA9800000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn ldp_post(rt1: u32, rt2: u32, rn: u32, imm_bytes: i32) u32 {
+                const imm7: u32 = @as(u32, @bitCast(@divExact(imm_bytes, 8))) & 0x7F;
+                return 0xA8C00000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1;
+            }
+            fn str_imm(rt: u32, rn: u32, imm_bytes: u32) u32 {
+                return 0xF9000000 | ((imm_bytes / 8) << 10) | (rn << 5) | rt;
+            }
+            fn bl() u32 { return 0x94000000; }
+            fn adrp(rd: u32) u32 { return 0x90000000 | rd; }
+            fn add_pageoff(rd: u32, rn: u32) u32 {
+                return 0x91000000 | (rn << 5) | rd;
+            }
+            fn ret() u32 { return 0xD65F03C0; }
+        };
+
+        const appendInst = struct {
+            fn f(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, inst: u32) !void {
+                try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToBig(u32, @byteSwap(inst))));
+            }
+        }.f;
+
+        const FinalizedMachReloc = buffer_mod.FinalizedMachReloc;
+        const FinalizedRelocTarget = buffer_mod.FinalizedRelocTarget;
+        const Reloc = buffer_mod.Reloc;
+        const ExternalName = buffer_mod.ExternalName;
+
+        // =================================================================
+        // Step 1: Create static vmctx data section (same as executable)
+        // =================================================================
+        const vmctx_total: usize = 0x10000000; // 256 MB total virtual memory
+        const vmctx_init_size: usize = 0x100000; // 1 MB for initialized data
+        const vmctx_data = try self.allocator.alloc(u8, vmctx_init_size);
+        defer self.allocator.free(vmctx_data);
+        @memset(vmctx_data, 0);
+
+        // Copy data segments into linear memory area
+        const linear_memory_base: usize = 0x40000;
+        for (data_segments) |segment| {
+            const dest_offset = linear_memory_base + segment.offset;
+            if (dest_offset + segment.data.len <= vmctx_init_size) {
+                @memcpy(vmctx_data[dest_offset..][0..segment.data.len], segment.data);
+            }
+        }
+
+        // Initialize globals
+        const global_base: usize = 0x10000;
+        const global_stride: usize = 16;
+        for (globals, 0..) |g, i| {
+            const offset = global_base + i * global_stride;
+            if (offset + 8 <= vmctx_init_size) {
+                switch (g.val_type) {
+                    .i32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .i64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    .f32 => {
+                        const val: u32 = @bitCast(@as(i32, @truncate(g.init_value)));
+                        @memcpy(vmctx_data[offset..][0..4], std.mem.asBytes(&val));
+                    },
+                    .f64 => {
+                        const val: u64 = @bitCast(g.init_value);
+                        @memcpy(vmctx_data[offset..][0..8], std.mem.asBytes(&val));
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // heap_bound = total virtual size - linear_memory_base
+        const heap_bound: u64 = vmctx_total - 0x40000;
+        @memcpy(vmctx_data[0x20008..][0..8], std.mem.asBytes(&heap_bound));
+
+        const vmctx_data_id = try module.declareData("_vmctx_data", .Local, true);
+        try module.defineData(vmctx_data_id, vmctx_data);
+        module.setBssSize(vmctx_total - vmctx_init_size);
+
+        // External name index for vmctx_data (must not collide with function indices)
+        const vmctx_ext_idx: u32 = num_funcs;
+        const vmctx_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = vmctx_ext_idx } };
+        try module.declareExternalName(vmctx_ext_idx, "_vmctx_data");
+
+        // =================================================================
+        // Step 2: Generate C-ABI wrapper for each exported function
+        // =================================================================
+        // Each wrapper:
+        //   - Saves frame (stp x29, x30)
+        //   - Shifts user args from x0..x(N-1) to x2..x(N+1)
+        //   - Loads vmctx via ADRP+ADD into x0
+        //   - Initializes heap base ptr (idempotent: stores vmctx+0x40000 → [vmctx+0x20000])
+        //   - Sets x1 = x0 (caller_vmctx)
+        //   - Calls inner __wasm function via BL
+        //   - Restores frame and returns (return value in x0 preserved)
+        var next_ext_idx: u32 = vmctx_ext_idx + 1;
+
+        for (exports) |exp| {
+            if (exp.kind != .func) continue;
+
+            // Check if this is a user-exported function (not just a wasm export)
+            const is_export_fn = blk: {
+                for (self.debug_ir_funcs) |ir_func| {
+                    if (std.mem.eql(u8, ir_func.name, exp.name) and ir_func.is_export) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_export_fn) continue;
+
+            // Get the number of user parameters from the wasm type
+            const num_params: u32 = if (exp.index < func_to_type.len) blk: {
+                const type_idx = func_to_type[exp.index];
+                if (type_idx < types.len) {
+                    break :blk @intCast(types[type_idx].params.len);
+                }
+                break :blk 0;
+            } else 0;
+
+            // External name for the inner __wasm function
+            const inner_ext_idx = next_ext_idx;
+            next_ext_idx += 1;
+            const inner_name = try std.fmt.allocPrint(self.allocator, "_{s}__wasm", .{exp.name});
+            defer self.allocator.free(inner_name);
+            const inner_name_ref = ExternalName{ .User = .{ .namespace = 0, .index = inner_ext_idx } };
+            try module.declareExternalName(inner_ext_idx, inner_name);
+
+            // Generate wrapper instructions
+            var code = std.ArrayListUnmanaged(u8){};
+            defer code.deinit(self.allocator);
+
+            // stp x29, x30, [sp, #-16]!
+            try appendInst(&code, self.allocator, A64.stp_pre(29, 30, 31, -16));
+
+            // Shift user args from C ABI positions to wasm CC positions
+            // Must go from highest to lowest to avoid clobbering
+            // C ABI: x0, x1, x2, ... → Wasm CC: x2, x3, x4, ...
+            var p: u32 = num_params;
+            while (p > 0) {
+                p -= 1;
+                try appendInst(&code, self.allocator, A64.mov(p + 2, p));
+            }
+
+            // adrp x0, _vmctx_data@PAGE
+            const adrp_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.adrp(0));
+            // add x0, x0, _vmctx_data@PAGEOFF
+            const add_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.add_pageoff(0, 0));
+
+            // Initialize heap base ptr (idempotent):
+            // add x8, x0, #0x20, lsl #12  (x8 = vmctx + 0x20000)
+            try appendInst(&code, self.allocator, A64.add_imm_lsl12(8, 0, 0x20));
+            // add x9, x0, #0x40, lsl #12  (x9 = vmctx + 0x40000 = linear memory base)
+            try appendInst(&code, self.allocator, A64.add_imm_lsl12(9, 0, 0x40));
+            // str x9, [x8]  (store heap base ptr)
+            try appendInst(&code, self.allocator, A64.str_imm(9, 8, 0));
+
+            // mov x1, x0  (caller_vmctx = vmctx)
+            try appendInst(&code, self.allocator, A64.mov(1, 0));
+
+            // bl inner__wasm function
+            const bl_offset: u32 = @intCast(code.items.len);
+            try appendInst(&code, self.allocator, A64.bl());
+
+            // ldp x29, x30, [sp], #16
+            try appendInst(&code, self.allocator, A64.ldp_post(29, 30, 31, 16));
+            // ret
+            try appendInst(&code, self.allocator, A64.ret());
+
+            // Declare wrapper function with export linkage
+            const wrapper_name = try std.fmt.allocPrint(self.allocator, "_{s}", .{exp.name});
+            defer self.allocator.free(wrapper_name);
+            const wrapper_func_id = try module.declareFunction(wrapper_name, .Export);
+
+            const wrapper_relocs = [_]FinalizedMachReloc{
+                // ADRP x0, _vmctx_data@PAGE
+                .{
+                    .offset = adrp_offset,
+                    .kind = Reloc.Aarch64AdrPrelPgHi21,
+                    .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+                    .addend = 0,
+                },
+                // ADD x0, x0, _vmctx_data@PAGEOFF
+                .{
+                    .offset = add_offset,
+                    .kind = Reloc.Aarch64AddAbsLo12Nc,
+                    .target = FinalizedRelocTarget{ .ExternalName = vmctx_name_ref },
+                    .addend = 0,
+                },
+                // BL inner__wasm
+                .{
+                    .offset = bl_offset,
+                    .kind = Reloc.Arm64Call,
+                    .target = FinalizedRelocTarget{ .ExternalName = inner_name_ref },
+                    .addend = 0,
+                },
+            };
+
+            try module.defineFunctionBytes(wrapper_func_id, code.items, &wrapper_relocs);
+        }
     }
 
     /// Generate ELF object file from compiled functions.

@@ -199,6 +199,7 @@ pub const X64LowerBackend = struct {
 
             // Integer arithmetic
             .iadd => self.lowerIadd(ctx, ir_inst),
+            .iadd_imm => self.lowerIaddImm(ctx, ir_inst),
             .isub => self.lowerIsub(ctx, ir_inst),
             .ineg => self.lowerIneg(ctx, ir_inst),
             .imul => self.lowerImul(ctx, ir_inst),
@@ -289,6 +290,7 @@ pub const X64LowerBackend = struct {
             // Stack operations
             .stack_load => self.lowerStackLoad(ctx, ir_inst),
             .stack_store => self.lowerStackStore(ctx, ir_inst),
+            .stack_addr => self.lowerStackAddr(ctx, ir_inst),
 
             // Global values
             // Port of cranelift/codegen/src/legalizer/globalvalue.rs
@@ -630,6 +632,84 @@ pub const X64LowerBackend = struct {
 
     fn lowerIadd(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         return self.lowerBinaryAlu(ctx, ir_inst, .add);
+    }
+
+    /// Lower an iadd_imm instruction.
+    ///
+    /// Port of cranelift x64 lower.isle iadd_imm rules.
+    /// Extracts the i64 immediate from the binary_imm64 instruction data
+    /// and emits ADD with immediate operand.
+    fn lowerIaddImm(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        const ty = ctx.outputTy(ir_inst, 0);
+        const size = operandSizeFromType(ty);
+
+        // Get the value operand
+        const lhs = ctx.putInputInRegs(ir_inst, 0);
+        const lhs_reg = lhs.onlyReg() orelse return null;
+        const lhs_gpr = Gpr.unwrapNew(lhs_reg);
+
+        // Get the immediate from instruction data
+        const inst_data = ctx.data(ir_inst);
+        const imm = inst_data.getImmediate() orelse return null;
+
+        // Allocate destination register
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
+
+        // MOV src → dst first (x64 ALU ops modify in-place)
+        ctx.emit(Inst{
+            .mov_r_r = .{
+                .size = size,
+                .src = lhs_gpr,
+                .dst = dst_gpr,
+            },
+        }) catch return null;
+
+        // Check if immediate fits in 32-bit sign-extended form (x64 ADD r/m64, imm32)
+        if (imm >= std.math.minInt(i32) and imm <= std.math.maxInt(i32)) {
+            const imm32: u32 = @bitCast(@as(i32, @intCast(imm)));
+            const imm_rmi = GprMemImm{ .inner = RegMemImm{ .imm = imm32 } };
+
+            ctx.emit(Inst{
+                .alu_rmi_r = .{
+                    .size = size,
+                    .op = .add,
+                    .src1 = dst_gpr.toReg(),
+                    .src2 = imm_rmi,
+                    .dst = dst_gpr,
+                },
+            }) catch return null;
+        } else {
+            // Large 64-bit immediate: materialize into a register, then ADD
+            const tmp = ctx.allocTmp(ty) catch return null;
+            const tmp_reg = tmp.onlyReg() orelse return null;
+            const tmp_gpr = WritableGpr.fromReg(Gpr.unwrapNew(tmp_reg.toReg()));
+
+            ctx.emit(Inst{
+                .imm = .{
+                    .dst_size = size,
+                    .simm64 = @bitCast(imm),
+                    .dst = tmp_gpr,
+                },
+            }) catch return null;
+
+            const tmp_rmi = GprMemImm{ .inner = RegMemImm{ .reg = tmp_gpr.toReg().toReg() } };
+
+            ctx.emit(Inst{
+                .alu_rmi_r = .{
+                    .size = size,
+                    .op = .add,
+                    .src1 = dst_gpr.toReg(),
+                    .src2 = tmp_rmi,
+                    .dst = dst_gpr,
+                },
+            }) catch return null;
+        }
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     fn lowerIsub(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
@@ -1593,7 +1673,10 @@ pub const X64LowerBackend = struct {
         const addr_reg = addr.onlyReg() orelse return null;
         const dst_reg = dst.onlyReg() orelse return null;
         const addr_gpr = Gpr.unwrapNew(addr_reg);
-        const amode = SyntheticAmode.real_amode(Amode.immReg(0, addr_gpr.toReg()));
+        // Reference: rustc_codegen_cranelift/src/pointer.rs:109-114
+        // Honor the offset field on load instructions.
+        const offset = ctx.data(ir_inst).getOffset() orelse 0;
+        const amode = SyntheticAmode.real_amode(Amode.immReg(offset, addr_gpr.toReg()));
 
         if (dst_ty.isFloat()) {
             const op: SseOpcode = if (dst_ty.bytes() == 4) .movss else .movsd;
@@ -1632,7 +1715,9 @@ pub const X64LowerBackend = struct {
         const src_reg = src.onlyReg() orelse return null;
         const addr_reg = addr.onlyReg() orelse return null;
         const addr_gpr = Gpr.unwrapNew(addr_reg);
-        const amode = SyntheticAmode.real_amode(Amode.immReg(0, addr_gpr.toReg()));
+        // Reference: rustc_codegen_cranelift/src/pointer.rs:117-127
+        const offset = ctx.data(ir_inst).getOffset() orelse 0;
+        const amode = SyntheticAmode.real_amode(Amode.immReg(offset, addr_gpr.toReg()));
 
         if (src_ty.isFloat()) {
             const op: SseOpcode = if (src_ty.bytes() == 4) .movss else .movsd;
@@ -2166,15 +2251,26 @@ pub const X64LowerBackend = struct {
     }
 
     fn lowerFuncAddr(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        // Get function address as a pointer value.
+        // Port of Cranelift's func_addr lowering for x64.
+        const inst_data = ctx.data(ir_inst);
+        const func_ref = inst_data.getFuncRef() orelse return null;
+        const ext_func = ctx.extFuncData(func_ref) orelse return null;
+
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
         const dst_reg = dst.onlyReg() orelse return null;
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
+        const name: ExternalName = switch (ext_func.name) {
+            .user => |u| ExternalName.initUser(u.namespace, u.index),
+            .libcall => ExternalName.initUser(0, 0),
+        };
+
         ctx.emit(Inst{
             .load_ext_name = .{
                 .dst = dst_gpr,
-                .name = ExternalName.initUser(0, 0),
+                .name = name,
                 .offset = 0,
             },
         }) catch return null;
@@ -2184,16 +2280,36 @@ pub const X64LowerBackend = struct {
         return output;
     }
 
+    /// Lower a stack_addr instruction.
+    ///
+    /// Port of cranelift x64 inst.isle:3810-3816 (stack_addr_impl)
+    /// Port of cranelift machinst/abi.rs:2160-2170 (sized_stackslot_addr)
+    ///
+    /// Computes the absolute address of a stack slot + offset into a register.
+    /// Emits LEA instead of MOV — loads the address, not the value.
     fn lowerStackAddr(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const dst = ctx.allocTmp(dst_ty) catch return null;
         const dst_reg = dst.onlyReg() orelse return null;
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
+        // Get stack slot from instruction data
+        // Same format as stack_load — reuses stack_load InstructionData variant
+        const inst_data = ctx.data(ir_inst);
+        const slot = inst_data.getStackSlot() orelse return null;
+        const extra_offset = inst_data.getOffset() orelse 0;
+
+        // Get the slot's byte offset from computed stackslot offsets
+        // Port of cranelift/codegen/src/machinst/abi.rs Callee::sized_stackslot_addr
+        const slot_base_offset = ctx.sizedStackslotOffset(slot);
+        const slot_byte_offset = @as(i32, @intCast(slot_base_offset)) + extra_offset;
+
+        // Emit LEA rd, [rsp + offset] — load effective address, not value
+        // Port of cranelift x64: uses LEA for stack_addr vs MOV for stack_load
         ctx.emit(Inst{
             .lea = .{
                 .size = .size64,
-                .src = SyntheticAmode.slot_offset(0),
+                .src = SyntheticAmode.slotOffset(slot_byte_offset),
                 .dst = dst_gpr,
             },
         }) catch return null;
@@ -2297,15 +2413,19 @@ pub const X64LowerBackend = struct {
                 }) catch return null;
             },
 
-            .symbol => {
-                // Symbol: For now, just load a placeholder address
-                // Full implementation would emit relocation
+            .symbol => |s| {
                 // Port of cranelift/codegen/src/legalizer/globalvalue.rs symbol
+                // Reference: cg_clif constant.rs:152-157 — LEA for RIP-relative symbol address
+                // Convert GlobalValueData.ExternalName → inst_mod.ExternalName
+                const ext_name: inst_mod.ExternalName = switch (s.name) {
+                    .user => |u| .{ .user = .{ .namespace = u.namespace, .index = u.index } },
+                    .libcall => |l| .{ .libcall = l },
+                };
                 ctx.emit(Inst{
-                    .imm = .{
-                        .dst_size = .size64,
-                        .simm64 = 0,
+                    .load_ext_name = .{
                         .dst = dst_gpr,
+                        .name = ext_name,
+                        .offset = s.offset,
                     },
                 }) catch return null;
             },
@@ -2385,13 +2505,17 @@ pub const X64LowerBackend = struct {
                 }) catch return null;
                 return tmp_reg.toReg();
             },
-            .symbol => {
-                // Load placeholder for symbol
+            .symbol => |s| {
+                // Port of cranelift/codegen/src/legalizer/globalvalue.rs symbol
+                const ext_name: inst_mod.ExternalName = switch (s.name) {
+                    .user => |u| .{ .user = .{ .namespace = u.namespace, .index = u.index } },
+                    .libcall => |l| .{ .libcall = l },
+                };
                 ctx.emit(Inst{
-                    .imm = .{
-                        .dst_size = .size64,
-                        .simm64 = 0,
+                    .load_ext_name = .{
                         .dst = tmp_gpr,
+                        .name = ext_name,
+                        .offset = s.offset,
                     },
                 }) catch return null;
                 return tmp_reg.toReg();

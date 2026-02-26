@@ -561,6 +561,11 @@ pub const FuncInstBuilder = struct {
         return self.buildInst(.{ .binary = .{ .opcode = opcode, .args = .{ a, b } } }, ty);
     }
 
+    /// BinaryImm64 format: one value operand + one i64 immediate (iadd_imm, etc.)
+    fn BinaryImm64(self: Self, opcode: clif.Opcode, ty: Type, arg: Value, imm: i64) !BuildResult {
+        return self.buildInst(.{ .binary_imm64 = .{ .opcode = opcode, .arg = arg, .imm = imm } }, ty);
+    }
+
     /// IntCompare format: integer comparison (icmp)
     fn IntCompare(self: Self, opcode: clif.Opcode, cond: clif.IntCC, a: Value, b: Value) !BuildResult {
         return self.buildInst(.{ .int_compare = .{ .opcode = opcode, .cond = cond, .args = .{ a, b } } }, Type.I8);
@@ -694,6 +699,25 @@ pub const FuncInstBuilder = struct {
         return r.result.?;
     }
 
+    /// Integer negation.
+    ///
+    /// Port of cranelift ineg instruction.
+    pub fn ineg(self: Self, arg: Value) !Value {
+        const ty = self.builder.func.dfg.valueType(arg);
+        const r = try self.Unary(.ineg, ty, arg);
+        return r.result.?;
+    }
+
+    /// Integer add immediate.
+    ///
+    /// Port of cranelift iadd_imm instruction.
+    /// Uses binary_imm64 format: one value operand + one i64 immediate.
+    pub fn iaddImm(self: Self, arg: Value, imm: i64) !Value {
+        const ty = self.builder.func.dfg.valueType(arg);
+        const r = try self.BinaryImm64(.iadd_imm, ty, arg, imm);
+        return r.result.?;
+    }
+
     // ========================================================================
     // Bitwise Operations
     // ========================================================================
@@ -716,6 +740,15 @@ pub const FuncInstBuilder = struct {
     pub fn bxor(self: Self, a: Value, b: Value) !Value {
         const ty = self.builder.func.dfg.valueType(a);
         const r = try self.Binary(.bxor, ty, a, b);
+        return r.result.?;
+    }
+
+    /// Bitwise NOT.
+    ///
+    /// Port of cranelift bnot instruction.
+    pub fn bnot(self: Self, arg: Value) !Value {
+        const ty = self.builder.func.dfg.valueType(arg);
+        const r = try self.Unary(.bnot, ty, arg);
         return r.result.?;
     }
 
@@ -953,6 +986,20 @@ pub const FuncInstBuilder = struct {
         return r.inst;
     }
 
+    /// Get the address of a stack slot.
+    ///
+    /// Compute the absolute address of a byte in a stack slot.
+    /// Returns a pointer-sized value (iAddr / I64).
+    ///
+    /// Port of cranelift stack_addr instruction.
+    /// Reference: cranelift/codegen/meta/src/shared/instructions.rs:1238-1253
+    /// Reference: cranelift/codegen/src/isa/aarch64/inst.isle:4519-4525 (compute_stack_addr)
+    /// Reference: cranelift/codegen/src/isa/x64/inst.isle:3810-3816 (stack_addr_impl)
+    pub fn stackAddr(self: Self, ty: Type, slot: StackSlot, offset: i32) !Value {
+        const r = try self.StackLoad(.stack_addr, ty, slot, offset);
+        return r.result.?;
+    }
+
     // ========================================================================
     // Control Flow
     // ========================================================================
@@ -984,6 +1031,15 @@ pub const FuncInstBuilder = struct {
     }
 
     /// Call a function.
+    /// Get the address of a function as a pointer value.
+    /// Port of Cranelift's func_addr instruction.
+    pub fn funcAddr(self: Self, ty: Type, func_ref: FuncRef) !Value {
+        const r = try self.buildInst(.{
+            .func_addr = .{ .opcode = .func_addr, .func_ref = func_ref },
+        }, ty);
+        return r.result.?;
+    }
+
     pub fn call(self: Self, func_ref: FuncRef, args: []const Value) !struct { inst: Inst, results: []const Value } {
         try self.builder.ensureInsertedBlock();
 
@@ -1018,7 +1074,14 @@ pub const FuncInstBuilder = struct {
         const sig = self.builder.func.getSignature(sig_ref) orelse
             return error.InvalidSignature;
 
-        const vlist = try self.builder.func.dfg.value_lists.alloc(args);
+        // Cranelift pattern: callee is the first element of args, then call arguments.
+        // instArgs()/numInputs() return [callee, arg0, arg1, ...].
+        // The lowering expects input 0 = callee, inputs 1.. = call args.
+        var vlist = clif.ValueList.init();
+        vlist = try self.builder.func.dfg.value_lists.push(vlist, callee);
+        for (args) |v| {
+            vlist = try self.builder.func.dfg.value_lists.push(vlist, v);
+        }
         const inst = try self.builder.func.dfg.makeInst(.{ .call_indirect = .{
             .opcode = .call_indirect,
             .sig_ref = sig_ref,

@@ -366,6 +366,12 @@ pub fn memFinalize(mem: AMode, state: *const EmitState) MemFinalizeResult {
             const basereg = stackReg();
             result.amode = finalizeOffset(off, basereg, &result);
         },
+        .reg_offset => |m| {
+            // Arbitrary offset from a register — resolve to real addressing mode.
+            // Reference: Cranelift inst.isle:1216 "Converted to generation of large
+            // offsets with multiple instructions as necessary during code emission."
+            result.amode = finalizeOffset(m.offset, m.rn, &result);
+        },
         else => {
             // Already a real addressing mode, return as-is
         },
@@ -2602,7 +2608,7 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
 
             // ADD rd, rd, :lo12:X (page offset)
             try sink.addRelocExternalName(.Aarch64AddAbsLo12Nc, .{ .User = buffer.UserExternalNameRef.init(payload.symbol_idx) }, payload.offset);
-            const add_enc: u32 = (0b1_0_0_10001_0 << 22) | // sf=1, op=0, S=0, shift=0
+            const add_enc: u32 = (0b1_0_0_10001_00 << 22) | // sf=1, op=0, S=0, 10001=ADD, shift=00
                 (0 << 10) | // imm12=0, will be patched by relocation
                 (machregToGpr(payload.rd.toReg()) << 5) |
                 machregToGpr(payload.rd.toReg());

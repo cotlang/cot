@@ -556,6 +556,10 @@ pub fn VCode(comptime I: type) type {
         /// Minimum function alignment (log2).
         log2_min_function_alignment: u8,
 
+        /// Total size of all sized stack slots (from CLIF stack_slot declarations).
+        /// Needed in emit to allocate frame space for locals/stack slots.
+        sized_stackslots_size: u32 = 0,
+
         /// Create a new empty VCode.
         pub fn init(allocator: Allocator, n_blocks: usize, log2_min_function_alignment: u8) !Self {
             var self = Self{
@@ -833,8 +837,12 @@ pub fn VCode(comptime I: type) type {
             errdefer bb_offsets.deinit(alloc);
             try bb_offsets.ensureTotalCapacity(alloc, self.numBlocks());
 
-            // Compute frame size from spillslots
-            const frame_size: u32 = @intCast(output.num_spillslots * 8); // 8 bytes per slot
+            // Compute frame size from spillslots + sized stack slots (locals).
+            // Spill slots go above sized stack slots in the frame:
+            //   [sp + sized_stackslots_size .. sp + frame_size] = spill area
+            //   [sp + 0 .. sp + sized_stackslots_size]          = sized stack slots
+            const spill_size: u32 = @intCast(output.num_spillslots * 8); // 8 bytes per slot
+            const frame_size: u32 = spill_size + self.sized_stackslots_size;
 
             // ================================================================
             // Compute function_calls and clobbered callee-saves
@@ -1141,12 +1149,6 @@ pub fn VCode(comptime I: type) type {
                             // Port of Cranelift pattern: emit epilogue before rets
                             // ================================================
                             const is_term_ret = vcode_inst.isTerm() == .ret;
-                            if (is_term_ret) {
-                                pipeline_debug.log(.codegen, "emit: rets instruction at idx {d}, allocs len={d}", .{ inst.idx(), inst_allocs.len });
-                                for (inst_allocs, 0..) |ra, ai| {
-                                    pipeline_debug.log(.codegen, "emit: rets alloc[{d}]: kind={d} index={d} bits=0x{x}", .{ ai, @intFromEnum(ra.kind()), ra.index(), ra.rawBits() });
-                                }
-                            }
                             if (needs_frame and is_term_ret) {
                                 if (is_aarch64) {
                                     // ARM64 epilogue: deallocate spill slot space first
@@ -1210,7 +1212,7 @@ pub fn VCode(comptime I: type) type {
                                     pipeline_debug.log(.codegen, "emit: regalloc edit: move from {any} to {any}", .{ m.from, m.to });
                                     // Generate a move instruction from the ISA
                                     // This is ISA-specific and requires I.genMove()
-                                    try emitMove(I, &buffer, m.from, m.to, emit_info, &emit_state);
+                                    try emitMove(I, &buffer, m.from, m.to, emit_info, &emit_state, self.sized_stackslots_size);
                                 },
                             }
                         },
@@ -1242,6 +1244,7 @@ pub fn VCode(comptime I: type) type {
             to: regalloc_operand.Allocation,
             emit_info: *const Inst.EmitInfo,
             state: *const Inst.EmitState,
+            sized_stackslots_size: u32,
         ) !void {
             const from_kind = from.kind();
             const to_kind = to.kind();
@@ -1270,8 +1273,8 @@ pub fn VCode(comptime I: type) type {
                 const from_slot = from.asStack() orelse return;
                 const to_preg = to.asReg() orelse return;
 
-                // Calculate spillslot byte offset (8 bytes per slot)
-                const slot_offset: i64 = @as(i64, from_slot.bits) * 8;
+                // Calculate spillslot byte offset: spill area sits above sized stack slots
+                const slot_offset: i64 = @as(i64, sized_stackslots_size) + @as(i64, from_slot.bits) * 8;
 
                 // Convert PReg to Reg
                 const to_reg = reg_mod.Writable(reg_mod.Reg).fromReg(reg_mod.Reg.fromPReg(to_preg));
@@ -1287,8 +1290,8 @@ pub fn VCode(comptime I: type) type {
                 const from_preg = from.asReg() orelse return;
                 const to_slot = to.asStack() orelse return;
 
-                // Calculate spillslot byte offset (8 bytes per slot)
-                const slot_offset: i64 = @as(i64, to_slot.bits) * 8;
+                // Calculate spillslot byte offset: spill area sits above sized stack slots
+                const slot_offset: i64 = @as(i64, sized_stackslots_size) + @as(i64, to_slot.bits) * 8;
 
                 // Convert PReg to Reg
                 const from_reg = reg_mod.Reg.fromPReg(from_preg);

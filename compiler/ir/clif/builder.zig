@@ -640,7 +640,11 @@ pub const FuncBuilder = struct {
 
     /// Indirect function call.
     pub fn callIndirect(self: *Self, sig_ref: SigRef, callee: Value, args: []const Value, result_type: ?Type) !struct { inst: Inst, result: ?Value } {
+        // Cranelift pattern: callee is the first element of args, then call arguments.
+        // instArgs()/numInputs() return [callee, arg0, arg1, ...].
+        // The lowering expects input 0 = callee, inputs 1.. = call args.
         var arg_list = ValueList.init();
+        arg_list = try self.dfg.value_lists.push(arg_list, callee);
         for (args) |v| {
             arg_list = try self.dfg.value_lists.push(arg_list, v);
         }
@@ -746,6 +750,17 @@ pub const FuncBuilder = struct {
     pub fn imul(self: *Self, ty: Type, a: Value, b: Value) !Value {
         const r = try self.insertInst(.{
             .binary = .{ .opcode = .imul, .args = .{ a, b } },
+        }, ty);
+        return r.result.?;
+    }
+
+    /// Integer add immediate.
+    ///
+    /// Port of cranelift iadd_imm instruction.
+    /// Uses binary_imm64 format: one value operand + one i64 immediate.
+    pub fn iaddImm(self: *Self, ty: Type, arg: Value, imm: i64) !Value {
+        const r = try self.insertInst(.{
+            .binary_imm64 = .{ .opcode = .iadd_imm, .arg = arg, .imm = imm },
         }, ty);
         return r.result.?;
     }
@@ -1024,6 +1039,22 @@ pub const FuncBuilder = struct {
             .stack_store = .{ .opcode = .stack_store, .arg = val, .slot = slot, .offset = offset },
         }, null);
         return r.inst;
+    }
+
+    /// Get the address of a stack slot.
+    ///
+    /// Compute the absolute address of a byte in a stack slot.
+    /// Returns a pointer-sized value (iAddr / I64).
+    ///
+    /// Port of cranelift stack_addr instruction.
+    /// Reference: cranelift/codegen/meta/src/shared/instructions.rs:1238-1253
+    /// Reference: cranelift/codegen/src/machinst/abi.rs:2160-2170 (sized_stackslot_addr)
+    /// Uses stack_load InstructionData format (same fields: slot + offset).
+    pub fn stackAddr(self: *Self, ty: Type, slot: StackSlot, offset: i32) !Value {
+        const r = try self.insertInst(.{
+            .stack_load = .{ .opcode = .stack_addr, .slot = slot, .offset = offset },
+        }, ty);
+        return r.result.?;
     }
 
     // ========================================================================
