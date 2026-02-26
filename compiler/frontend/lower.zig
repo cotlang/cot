@@ -2035,7 +2035,16 @@ pub const Lowerer = struct {
                         // Compound optional field: wrap T → ?T
                         try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node_ir, field_init.value, span);
                     } else {
-                        _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, value_node_ir, span);
+                        // @safe auto-ref fix: dereference pointer when field expects struct value
+                        var actual_value = value_node_ir;
+                        if (self.chk.safe_mode and field_type == .struct_type) {
+                            const value_type_idx = fb.nodes.items[value_node_ir].type_idx;
+                            const value_type = self.type_reg.get(value_type_idx);
+                            if (value_type == .pointer and self.type_reg.isAssignable(value_type.pointer.elem, struct_field.type_idx)) {
+                                actual_value = try fb.emitPtrLoadValue(value_node_ir, struct_field.type_idx, span);
+                            }
+                        }
+                        _ = try fb.emitStoreLocalField(local_idx, field_idx, field_offset, actual_value, span);
                     }
                     break;
                 }
@@ -4344,7 +4353,17 @@ pub const Lowerer = struct {
                         _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, ptr_ir, si.span);
                         _ = try fb.emitStoreLocalField(temp_idx, field_idx + 1, field_offset + 8, len_ir, si.span);
                     } else {
-                        _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, value_node, si.span);
+                        // @safe auto-ref fix: when value is a pointer to a struct (from auto-ref'd
+                        // parameter) but the field expects the struct value, dereference the pointer.
+                        var actual_value = value_node;
+                        if (self.chk.safe_mode and field_type == .struct_type) {
+                            const value_type_idx = fb.nodes.items[value_node].type_idx;
+                            const value_type = self.type_reg.get(value_type_idx);
+                            if (value_type == .pointer and self.type_reg.isAssignable(value_type.pointer.elem, struct_field.type_idx)) {
+                                actual_value = try fb.emitPtrLoadValue(value_node, struct_field.type_idx, si.span);
+                            }
+                        }
+                        _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, actual_value, si.span);
                     }
                     break;
                 }

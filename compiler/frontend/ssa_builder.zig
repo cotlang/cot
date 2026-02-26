@@ -879,8 +879,9 @@ pub const SSABuilder = struct {
 
     /// Get the address of a struct value (for decomposition)
     fn getStructAddr(_: *SSABuilder, val: *Value, cur: *Block) !*Value {
-        // If the value is already an address (local_addr, off_ptr), use it directly
-        if (val.op == .local_addr or val.op == .off_ptr or val.op == .global_addr) {
+        // If the value is already an address (local_addr, off_ptr), use it directly.
+        // .copy wraps a loaded pointer (from ptr_load_value) — the value IS the struct address.
+        if (val.op == .local_addr or val.op == .off_ptr or val.op == .global_addr or val.op == .copy) {
             return val;
         }
         // If it's a load, use the address that was loaded from
@@ -1431,11 +1432,21 @@ pub const SSABuilder = struct {
             return make_val;
         }
 
-        // Large compound types (structs, tuples, unions > 8 bytes): return pointer directly.
-        // Same pattern as convertLoadLocal — the pointer IS the value representation.
-        // Consumer uses move for bulk copy when storing to a local.
+        // Large compound types (structs, tuples, unions > 8 bytes): the loaded pointer
+        // IS the struct's address in memory. We wrap it in a .copy with the struct type
+        // so that consumers (convertStoreLocalField, getStructAddr) treat the VALUE
+        // as an address rather than extracting .load's args[0] (which would be the
+        // pointer local's address, not the struct's address).
         const type_size = self.type_registry.sizeOf(type_idx);
         if ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) {
+            if (ptr_val.op == .load) {
+                // Loaded pointer: wrap in .copy so convertStoreLocalField/getStructAddr
+                // use the loaded value (= struct address) directly, not .load's args[0].
+                const copy_val = try self.func.newValue(.copy, type_idx, cur, self.cur_pos);
+                copy_val.addArg(ptr_val);
+                try cur.addValue(self.allocator, copy_val);
+                return copy_val;
+            }
             ptr_val.type_idx = type_idx;
             return ptr_val;
         }
