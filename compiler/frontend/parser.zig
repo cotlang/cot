@@ -347,7 +347,12 @@ pub const Parser = struct {
             self.collectDocComment();
             const field_doc = self.consumeDocComment();
             const field_start = self.pos();
-            if (!self.check(.ident)) break;
+            if (!self.check(.ident)) {
+                if (self.tok.tok.isKeyword()) {
+                    self.err.errorWithCode(self.pos(), .e203, try std.fmt.allocPrint(self.allocator, "'{s}' is a reserved keyword and cannot be used as a name", .{self.tok.tok.string()}));
+                }
+                break;
+            }
             const field_name = self.tok.text;
             self.advance();
             if (!self.expect(.colon)) break;
@@ -364,7 +369,14 @@ pub const Parser = struct {
         const doc_comment = self.consumeDocComment();
         const start = self.pos();
         self.advance();
-        if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected variable name"); return null; }
+        if (!self.check(.ident)) {
+            if (self.tok.tok.isKeyword()) {
+                self.err.errorWithCode(self.pos(), .e203, try std.fmt.allocPrint(self.allocator, "'{s}' is a reserved keyword and cannot be used as a variable name", .{self.tok.tok.string()}));
+            } else {
+                self.err.errorWithCode(self.pos(), .e203, "expected variable name");
+            }
+            return null;
+        }
         const name = self.tok.text;
         self.advance();
 
@@ -1686,7 +1698,14 @@ pub const Parser = struct {
     fn parseVarStmt(self: *Parser, is_const: bool, is_weak: bool) ParseError!?NodeIndex {
         const start = self.pos();
         self.advance();
-        if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected variable name"); return null; }
+        if (!self.check(.ident)) {
+            if (self.tok.tok.isKeyword()) {
+                self.err.errorWithCode(self.pos(), .e203, try std.fmt.allocPrint(self.allocator, "'{s}' is a reserved keyword and cannot be used as a variable name", .{self.tok.tok.string()}));
+            } else {
+                self.err.errorWithCode(self.pos(), .e203, "expected variable name");
+            }
+            return null;
+        }
         const name = self.tok.text;
         const name_start = self.pos();
         self.advance();
@@ -1750,7 +1769,14 @@ pub const Parser = struct {
         try bindings.append(self.allocator, .{ .name = first_name, .type_expr = first_type, .span = Span.init(first_start, self.pos()) });
 
         while (self.match(.comma)) {
-            if (!self.check(.ident)) { self.err.errorWithCode(self.pos(), .e203, "expected variable name"); return null; }
+            if (!self.check(.ident)) {
+                if (self.tok.tok.isKeyword()) {
+                    self.err.errorWithCode(self.pos(), .e203, try std.fmt.allocPrint(self.allocator, "'{s}' is a reserved keyword and cannot be used as a variable name", .{self.tok.tok.string()}));
+                } else {
+                    self.err.errorWithCode(self.pos(), .e203, "expected variable name");
+                }
+                return null;
+            }
             const bname = self.tok.text;
             const bstart = self.pos();
             self.advance();
