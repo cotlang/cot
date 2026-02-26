@@ -179,6 +179,9 @@ pub const CallInfo = struct {
     caller_conv: CallConv,
     /// Try-call info for exception handling.
     try_call_info: ?TryCallInfo,
+    /// Bytes of stack space needed for stack arguments.
+    /// Port of Cranelift's sized_stack_arg_space pattern.
+    stack_args_size: u32 = 0,
 
     /// Create an empty CallInfo with minimal fields.
     pub fn init(dest: ExternalName, callee_conv: CallConv, caller_conv: CallConv) CallInfo {
@@ -190,6 +193,7 @@ pub const CallInfo = struct {
             .callee_conv = callee_conv,
             .caller_conv = caller_conv,
             .try_call_info = null,
+            .stack_args_size = 0,
         };
     }
 
@@ -215,6 +219,8 @@ pub const CallIndInfo = struct {
     caller_conv: CallConv,
     /// Try-call info for exception handling.
     try_call_info: ?TryCallInfo,
+    /// Bytes of stack space needed for stack arguments.
+    stack_args_size: u32 = 0,
 
     pub fn deinit(self: *CallIndInfo, allocator: std.mem.Allocator) void {
         self.uses.deinit(allocator);

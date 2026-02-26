@@ -355,14 +355,21 @@ pub fn memFinalize(mem: AMode, state: *const EmitState) MemFinalizeResult {
             result.amode = finalizeOffset(off, basereg, &result);
         },
         .incoming_arg => |m| {
-            // Incoming args are above the frame
+            // Incoming args are above the entire frame (SP-relative).
+            // Stack layout (high to low):
+            //   incoming args     <- what we're accessing
+            //   saved FP, LR     <- setup_area_size (16)
+            //   callee-saves     <- clobber_size
+            //   stack slots       <- stackslots_size
+            //   outgoing args    <- outgoing_args_size
+            //   [SP]
+            // So incoming_arg(N) = [SP + outgoing + stackslots + clobbers + setup + N]
             const fl = state.frame_layout;
-            const total_frame: i64 = @as(i64, fl.setup_area_size) +
-                @as(i64, fl.tail_args_size) +
+            const total_frame: i64 = @as(i64, fl.outgoing_args_size) +
+                @as(i64, fl.stackslots_size) +
                 @as(i64, fl.clobber_size) +
-                @as(i64, fl.fixed_frame_storage_size) +
-                @as(i64, fl.outgoing_args_size);
-            const off = total_frame - m.offset;
+                @as(i64, fl.setup_area_size);
+            const off = total_frame + m.offset;
             const basereg = stackReg();
             result.amode = finalizeOffset(off, basereg, &result);
         },
@@ -1728,6 +1735,16 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, emit_info: *const EmitInfo, st
                         try sink.put4(encArithRrImm12(0b100_10001, imm12.shiftBits(), imm12.immBits(), stackReg(), payload.rd));
                     } else {
                         @panic("load_addr sp_offset too large");
+                    }
+                },
+                .slot_offset => |m| {
+                    // slot_offset adds outgoing_args_size for correct frame-relative addressing
+                    const off = m.offset + @as(i64, state.frame_layout.outgoing_args_size);
+                    if (off >= 0 and off < 4096) {
+                        const imm12 = Imm12.maybeFromU64(@intCast(off)).?;
+                        try sink.put4(encArithRrImm12(0b100_10001, imm12.shiftBits(), imm12.immBits(), stackReg(), payload.rd));
+                    } else {
+                        @panic("load_addr slot_offset too large");
                     }
                 },
                 .fp_offset => |m| {

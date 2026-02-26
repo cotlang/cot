@@ -494,12 +494,20 @@ pub const AArch64LowerBackend = struct {
         // vmctx is typically the first integer parameter (x0)
         const has_vmctx = ctx.f.specialParam(.vmctx) != null;
 
-        // Allocate ArgPairs for each function parameter
+        // Allocate ArgPairs for register arguments (may be fewer than block_params)
+        // Port of x64 genArgSetup pattern: separate register args from stack args
         var arg_pairs = try ctx.allocator.alloc(ArgPair, block_params.len);
+        var arg_pairs_count: usize = 0;
         var int_arg_idx: u8 = 0;
         var float_arg_idx: u8 = 0;
 
-        for (block_params, 0..) |param, i| {
+        // Collect stack arguments to emit loads after the Args instruction
+        var stack_args = try ctx.allocator.alloc(struct { vreg: Reg, offset: i64 }, block_params.len);
+        defer ctx.allocator.free(stack_args);
+        var stack_args_count: usize = 0;
+        var stack_arg_offset: i64 = 0; // Offset into incoming arg area (starts at 0)
+
+        for (block_params) |param| {
             // Get the vreg assigned to this param
             const value_regs = ctx.value_regs.get(param);
             const vreg = value_regs.onlyReg() orelse continue;
@@ -507,30 +515,39 @@ pub const AArch64LowerBackend = struct {
             // Get the type to determine if it's float or int
             const ty = ctx.f.dfg.valueType(param);
 
-            // Determine the physical register for this argument
-            // Internal CC: integers in x0-x15, floats in v0-v7
-            // x0-x15 are all caller-saved; x16-x17 reserved for linker (IP0/IP1)
-            const preg: PReg = if (ty.isFloat())
-                blk: {
-                    std.debug.assert(float_arg_idx < 8);
-                    const idx = float_arg_idx;
+            // AAPCS64: integers in x0-x7, floats in v0-v7
+            // Overflow args go on the stack
+            if (ty.isFloat()) {
+                if (float_arg_idx < 8) {
+                    const preg = regs.vregPreg(float_arg_idx);
                     float_arg_idx += 1;
-                    break :blk regs.vregPreg(idx);
+                    arg_pairs[arg_pairs_count] = ArgPair{
+                        .vreg = Writable(Reg).fromReg(vreg),
+                        .preg = preg,
+                    };
+                    arg_pairs_count += 1;
+                } else {
+                    // Stack argument for float
+                    stack_args[stack_args_count] = .{ .vreg = vreg, .offset = stack_arg_offset };
+                    stack_args_count += 1;
+                    stack_arg_offset += 8;
                 }
-            else
-                blk: {
-                    std.debug.assert(int_arg_idx < 16);
-                    const idx = int_arg_idx;
+            } else {
+                if (int_arg_idx < 8) {
+                    const preg = regs.xregPreg(int_arg_idx);
                     int_arg_idx += 1;
-                    break :blk regs.xregPreg(idx);
-                };
-
-            // Create ArgPair: vreg (def) = preg (fixed physical register)
-            arg_pairs[i] = ArgPair{
-                .vreg = Writable(Reg).fromReg(vreg),
-                .preg = preg,
-            };
-
+                    arg_pairs[arg_pairs_count] = ArgPair{
+                        .vreg = Writable(Reg).fromReg(vreg),
+                        .preg = preg,
+                    };
+                    arg_pairs_count += 1;
+                } else {
+                    // Stack argument for integer
+                    stack_args[stack_args_count] = .{ .vreg = vreg, .offset = stack_arg_offset };
+                    stack_args_count += 1;
+                    stack_arg_offset += 8;
+                }
+            }
         }
 
         // If we have a vmctx parameter, move it to the pinned register (x21)
@@ -551,8 +568,21 @@ pub const AArch64LowerBackend = struct {
             });
         }
 
-        // Emit the Args instruction (regalloc edits may move params around)
-        try ctx.emit(Inst.genArgs(arg_pairs));
+        // Emit the Args instruction for register arguments
+        try ctx.emit(Inst.genArgs(arg_pairs[0..arg_pairs_count]));
+
+        // Emit loads for stack arguments from the incoming argument area.
+        // Uses AMode.incoming_arg which resolves to [SP + total_frame + offset]
+        // in emit.zig's memFinalize.
+        for (stack_args[0..stack_args_count]) |stack_arg| {
+            try ctx.emit(Inst{
+                .uload64 = .{
+                    .rd = Writable(Reg).fromReg(stack_arg.vreg),
+                    .mem = AMode{ .incoming_arg = .{ .offset = stack_arg.offset } },
+                    .flags = MemFlags.empty,
+                },
+            });
+        }
     }
 
     // =========================================================================
@@ -2285,18 +2315,17 @@ pub const AArch64LowerBackend = struct {
     // =========================================================================
 
     fn lowerCall(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
-        // Call lowering.
+        // Call lowering with AAPCS64 stack spilling.
         // Port of cranelift/codegen/src/isa/aarch64/lower.isle:2533-2551
         //
         // AAPCS64 ABI:
-        // - Integer/pointer arguments: X0-X7
-        // - Float arguments: V0-V7
+        // - Integer/pointer arguments: X0-X7 (overflow → stack)
+        // - Float arguments: V0-V7 (overflow → stack)
         // - Return value: X0 (integer), V0 (float)
         // - Caller-saved (clobbered): X0-X17, V0-V31
         //
-        // Cranelift pattern: NO explicit mov instructions for register args/returns.
-        // Instead, populate uses/defs with fixed register constraints.
-        // Regalloc will insert moves as needed to satisfy constraints.
+        // Register args use uses/defs constraints (regalloc handles moves).
+        // Stack args are stored to [SP + offset] in the outgoing args area.
         _ = self;
 
         const inst_data = ctx.data(ir_inst);
@@ -2334,10 +2363,12 @@ pub const AArch64LowerBackend = struct {
 
         // Build uses list: gen_call_args(abi, args)
         // Each argument vreg is constrained to its ABI register
-        // AAPCS64: integers in X0-X15, floats in V0-V7
-        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
+        // AAPCS64: integers in X0-X7, floats in V0-V7
+        // Overflow args spill to the outgoing stack area [SP + offset]
+        // Port of x64 lowerCall stack spilling pattern
         var int_arg_idx: u8 = 0;
         var float_arg_idx: u8 = 0;
+        var stack_offset: u32 = 0;
         for (0..num_args) |idx| {
             const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
@@ -2350,15 +2381,37 @@ pub const AArch64LowerBackend = struct {
                         .preg = regs.vregPreg(float_arg_idx),
                     }) catch return null;
                     float_arg_idx += 1;
+                } else {
+                    // Stack argument for float overflow
+                    ctx.emit(Inst{
+                        .store64 = .{
+                            .rd = arg_reg,
+                            .mem = AMode{ .sp_offset = .{ .offset = @intCast(stack_offset) } },
+                            .flags = MemFlags.empty,
+                        },
+                    }) catch return null;
+                    stack_offset += 8;
                 }
-            } else if (int_arg_idx < 16) {
+            } else if (int_arg_idx < 8) {
+                // Register argument: constrain vreg to its ABI register
                 call_info.uses.append(ctx.allocator, .{
                     .vreg = arg_reg,
                     .preg = regs.xregPreg(int_arg_idx),
                 }) catch return null;
                 int_arg_idx += 1;
+            } else {
+                // Stack argument: store to outgoing args area [SP + offset]
+                ctx.emit(Inst{
+                    .store64 = .{
+                        .rd = arg_reg,
+                        .mem = AMode{ .sp_offset = .{ .offset = @intCast(stack_offset) } },
+                        .flags = MemFlags.empty,
+                    },
+                }) catch return null;
+                stack_offset += 8;
             }
         }
+        call_info.stack_args_size = stack_offset;
 
         // Build defs list: gen_call_rets(abi, output)
         // Each return value vreg is defined in its ABI register
@@ -2408,19 +2461,18 @@ pub const AArch64LowerBackend = struct {
     }
 
     fn lowerCallIndirect(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
-        // Indirect call lowering.
+        // Indirect call lowering with AAPCS64 stack spilling.
         // Port of cranelift/codegen/src/isa/aarch64/lower.isle:2542-2551
         // The callee address is the first input, remaining inputs are arguments.
         //
-        // Internal calling convention (Wasm-internal):
-        // - Integer/pointer arguments: X0-X15 (extended from AAPCS64 X0-X7)
-        // - Float arguments: V0-V7
+        // AAPCS64 ABI:
+        // - Integer/pointer arguments: X0-X7 (overflow → stack)
+        // - Float arguments: V0-V7 (overflow → stack)
         // - Return value: X0 (integer), V0 (float)
         // - Caller-saved (clobbered): X0-X17, V0-V31
         //
-        // Cranelift pattern: NO explicit mov instructions for register args/returns.
-        // Instead, populate uses/defs with fixed register constraints.
-        // Regalloc will insert moves as needed to satisfy constraints.
+        // Register args use uses/defs constraints (regalloc handles moves).
+        // Stack args are stored to [SP + offset] in the outgoing args area.
         _ = self;
 
         const num_inputs = ctx.numInputs(ir_inst);
@@ -2460,10 +2512,11 @@ pub const AArch64LowerBackend = struct {
 
         // Build uses list: gen_call_args(abi, args)
         // Skip first input which is callee, remaining inputs are arguments
-        // AAPCS64: integers in X0-X15, floats in V0-V7
-        // Cranelift does NOT emit explicit mov instructions - regalloc handles it
+        // AAPCS64: integers in X0-X7, floats in V0-V7
+        // Overflow args spill to the outgoing stack area [SP + offset]
         var int_arg_idx: u8 = 0;
         var float_arg_idx: u8 = 0;
+        var stack_offset: u32 = 0;
         for (1..num_inputs) |idx| {
             const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
@@ -2476,15 +2529,36 @@ pub const AArch64LowerBackend = struct {
                         .preg = regs.vregPreg(float_arg_idx),
                     }) catch return null;
                     float_arg_idx += 1;
+                } else {
+                    // Stack argument for float overflow
+                    ctx.emit(Inst{
+                        .store64 = .{
+                            .rd = arg_reg,
+                            .mem = AMode{ .sp_offset = .{ .offset = @intCast(stack_offset) } },
+                            .flags = MemFlags.empty,
+                        },
+                    }) catch return null;
+                    stack_offset += 8;
                 }
-            } else if (int_arg_idx < 16) {
+            } else if (int_arg_idx < 8) {
                 call_ind_info.uses.append(ctx.allocator, .{
                     .vreg = arg_reg,
                     .preg = regs.xregPreg(int_arg_idx),
                 }) catch return null;
                 int_arg_idx += 1;
+            } else {
+                // Stack argument: store to outgoing args area [SP + offset]
+                ctx.emit(Inst{
+                    .store64 = .{
+                        .rd = arg_reg,
+                        .mem = AMode{ .sp_offset = .{ .offset = @intCast(stack_offset) } },
+                        .flags = MemFlags.empty,
+                    },
+                }) catch return null;
+                stack_offset += 8;
             }
         }
+        call_ind_info.stack_args_size = stack_offset;
 
         // Build defs list: gen_call_rets(abi, output)
         // Each return value vreg is defined in its ABI register
@@ -2668,10 +2742,11 @@ pub const AArch64LowerBackend = struct {
 
         // Get the slot's byte offset from computed stackslot offsets
         // Port of cranelift/codegen/src/machinst/abi.rs Callee::sized_stackslot_offsets
+        // Uses slot_offset (not sp_offset) so outgoing_args_size is added at emit time
         const slot_base_offset = ctx.sizedStackslotOffset(slot);
         const slot_byte_offset = @as(i32, @intCast(slot_base_offset)) + extra_offset;
 
-        const mem = AMode{ .sp_offset = .{ .offset = slot_byte_offset } };
+        const mem = AMode{ .slot_offset = .{ .offset = slot_byte_offset } };
         const flags = MemFlags.empty;
 
         ctx.emit(Inst.genLoad(dst_reg, mem, typeFromClif(ty), flags)) catch return null;
@@ -2712,7 +2787,8 @@ pub const AArch64LowerBackend = struct {
 
         // Emit load_addr (ADD rd, sp, #offset) instead of genLoad (LDR rd, [sp, #offset])
         // Port of cranelift aarch64 abi.rs gen_get_stack_addr: Inst::LoadAddr { rd, mem }
-        const mem = AMode{ .sp_offset = .{ .offset = slot_byte_offset } };
+        // Uses slot_offset so outgoing_args_size is added at emit time
+        const mem = AMode{ .slot_offset = .{ .offset = slot_byte_offset } };
         ctx.emit(Inst{ .load_addr = .{ .rd = dst_reg, .mem = mem } }) catch return null;
 
         var output = InstOutput{};
@@ -2734,10 +2810,11 @@ pub const AArch64LowerBackend = struct {
 
         // Get the slot's byte offset from computed stackslot offsets
         // Port of cranelift/codegen/src/machinst/abi.rs Callee::sized_stackslot_offsets
+        // Uses slot_offset so outgoing_args_size is added at emit time
         const slot_base_offset = ctx.sizedStackslotOffset(slot);
         const slot_byte_offset = @as(i32, @intCast(slot_base_offset)) + extra_offset;
 
-        const mem = AMode{ .sp_offset = .{ .offset = slot_byte_offset } };
+        const mem = AMode{ .slot_offset = .{ .offset = slot_byte_offset } };
         const flags = MemFlags.empty;
 
         ctx.emit(Inst.genStore(mem, val_reg, typeFromClif(val_ty), flags)) catch return null;

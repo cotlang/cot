@@ -935,22 +935,36 @@ pub fn VCode(comptime I: type) type {
             // Compute max outgoing args size from call instructions
             // Port of Cranelift's accumulate_outgoing_args_size pattern
             var max_outgoing_args_size: u32 = 0;
-            if (!is_aarch64) {
-                for (self.insts.items) |*inst_item| {
-                    if (@hasField(I, "call_known")) {
-                        switch (inst_item.*) {
-                            .call_known => |ck| {
-                                if (ck.info.stack_args_size > max_outgoing_args_size) {
-                                    max_outgoing_args_size = ck.info.stack_args_size;
-                                }
-                            },
-                            else => {},
-                        }
+            for (self.insts.items) |*inst_item| {
+                if (is_aarch64) {
+                    // AArch64: scan .call and .call_ind instructions
+                    switch (inst_item.*) {
+                        .call => |c| {
+                            if (c.info.stack_args_size > max_outgoing_args_size) {
+                                max_outgoing_args_size = c.info.stack_args_size;
+                            }
+                        },
+                        .call_ind => |ci| {
+                            if (ci.info.stack_args_size > max_outgoing_args_size) {
+                                max_outgoing_args_size = ci.info.stack_args_size;
+                            }
+                        },
+                        else => {},
+                    }
+                } else if (@hasField(I, "call_known")) {
+                    // x64: scan .call_known instructions
+                    switch (inst_item.*) {
+                        .call_known => |ck| {
+                            if (ck.info.stack_args_size > max_outgoing_args_size) {
+                                max_outgoing_args_size = ck.info.stack_args_size;
+                            }
+                        },
+                        else => {},
                     }
                 }
-                // Align to 16 bytes for ABI compliance
-                max_outgoing_args_size = (max_outgoing_args_size + 15) & ~@as(u32, 15);
             }
+            // Align to 16 bytes for ABI compliance
+            max_outgoing_args_size = (max_outgoing_args_size + 15) & ~@as(u32, 15);
 
             // Compute frame layout for x64 (not needed for ARM64 direct emit)
             var frame_layout = if (!is_aarch64 and @hasDecl(I, "FrameLayout")) I.FrameLayout{
@@ -1048,10 +1062,10 @@ pub fn VCode(comptime I: type) type {
                         try buffer.put4(enc);
                     }
 
-                    // Allocate stack space for spill slots (below callee-saves)
+                    // Allocate stack space for spill slots + outgoing args (below callee-saves)
                     // Port of Cranelift's gen_clobber_save stack frame allocation.
                     // Without this, spill slot stores [sp, #N] overlap the callee-save area.
-                    const aligned_frame_size = (frame_size + 15) & ~@as(u32, 15);
+                    const aligned_frame_size = (frame_size + max_outgoing_args_size + 15) & ~@as(u32, 15);
                     if (aligned_frame_size > 0) {
                         if (aligned_frame_size <= 4095) {
                             // sub sp, sp, #imm
@@ -1075,8 +1089,30 @@ pub fn VCode(comptime I: type) type {
             // Port of Cranelift: EmitState is created once and shared across all emissions.
             // This carries frame_layout needed for incoming_arg and slot_offset resolution.
             var emit_state = I.EmitState{};
-            if (!is_aarch64 and @hasDecl(I, "FrameLayout")) {
-                // Copy frame layout fields to EmitState's FrameLayout.
+            if (is_aarch64) {
+                // AArch64: populate frame layout for incoming_arg/slot_offset/sp_offset resolution.
+                // These fields are read by emit.zig's memFinalize to resolve pseudo addressing modes.
+                //
+                // Stack layout (high to low):
+                //   incoming args          <- what incoming_arg resolves to
+                //   saved FP, LR           <- setup_area_size (16)
+                //   callee-saves (STP/STR) <- clobber_size (ceil(N/2) * 16)
+                //   stack slots + padding  <- aligned_frame_size - outgoing_args
+                //   outgoing args          <- outgoing_args_size
+                //   [SP]
+                //
+                // clobber_size: STP pushes pairs in 16-byte chunks, STR for odd reg also 16 bytes
+                const clobber_pairs = (num_clobbered + 1) / 2;
+                const aligned_frame_size = (frame_size + max_outgoing_args_size + 15) & ~@as(u32, 15);
+                emit_state.frame_layout.outgoing_args_size = max_outgoing_args_size;
+                emit_state.frame_layout.setup_area_size = if (needs_frame) 16 else 0; // FP + LR
+                emit_state.frame_layout.clobber_size = @intCast(clobber_pairs * 16);
+                // stackslots_size = aligned total minus outgoing args, so that
+                // incoming_arg(N) = [SP + outgoing + stackslots + clobber + setup + N]
+                // correctly accounts for alignment padding
+                emit_state.frame_layout.stackslots_size = aligned_frame_size - max_outgoing_args_size;
+            } else if (@hasDecl(I, "FrameLayout")) {
+                // x64: Copy frame layout fields to EmitState's FrameLayout.
                 // The two FrameLayout types are structurally compatible but distinct types:
                 // I.FrameLayout (mod.zig) has extra callee-save fields for prologue/epilogue,
                 // EmitState.FrameLayout (emit.zig) has the core fields for address resolution.
@@ -1151,8 +1187,8 @@ pub fn VCode(comptime I: type) type {
                             const is_term_ret = vcode_inst.isTerm() == .ret;
                             if (needs_frame and is_term_ret) {
                                 if (is_aarch64) {
-                                    // ARM64 epilogue: deallocate spill slot space first
-                                    const aligned_frame_size = (frame_size + 15) & ~@as(u32, 15);
+                                    // ARM64 epilogue: deallocate spill slots + outgoing args
+                                    const aligned_frame_size = (frame_size + max_outgoing_args_size + 15) & ~@as(u32, 15);
                                     if (aligned_frame_size > 0) {
                                         if (aligned_frame_size <= 4095) {
                                             // add sp, sp, #imm
