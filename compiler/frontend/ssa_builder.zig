@@ -748,6 +748,74 @@ pub const SSABuilder = struct {
         addr_val.aux = .{ .string = name };
         try cur.addValue(self.allocator, addr_val);
 
+        const value_type = self.type_registry.get(value.type_idx);
+        const type_size = self.type_registry.sizeOf(value.type_idx);
+
+        // String/slice: field-by-field decomposition (same as convertPtrStoreValue)
+        const is_string_or_slice = value.type_idx == TypeRegistry.STRING or value_type == .slice;
+        if (is_string_or_slice) {
+            var ptr_component: *Value = undefined;
+            var len_component: *Value = undefined;
+
+            if ((value.op == .string_make or value.op == .slice_make) and value.args.len >= 2) {
+                ptr_component = value.args[0];
+                len_component = value.args[1];
+            } else {
+                ptr_component = try self.func.newValue(.slice_ptr, TypeRegistry.I64, cur, self.cur_pos);
+                ptr_component.addArg(value);
+                try cur.addValue(self.allocator, ptr_component);
+
+                len_component = try self.func.newValue(.slice_len, TypeRegistry.I64, cur, self.cur_pos);
+                len_component.addArg(value);
+                try cur.addValue(self.allocator, len_component);
+            }
+
+            const ptr_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            ptr_store.addArg2(addr_val, ptr_component);
+            try cur.addValue(self.allocator, ptr_store);
+
+            const len_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+            len_addr.aux_int = 8;
+            len_addr.addArg(addr_val);
+            try cur.addValue(self.allocator, len_addr);
+
+            const len_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+            len_store.addArg2(len_addr, len_component);
+            try cur.addValue(self.allocator, len_store);
+
+            if (value.op == .slice_make and value.args.len >= 3) {
+                const cap_addr = try self.func.newValue(.off_ptr, TypeRegistry.VOID, cur, self.cur_pos);
+                cap_addr.aux_int = 16;
+                cap_addr.addArg(addr_val);
+                try cur.addValue(self.allocator, cap_addr);
+
+                const cap_store = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
+                cap_store.addArg2(cap_addr, value.args[2]);
+                try cur.addValue(self.allocator, cap_store);
+            }
+
+            return value;
+        }
+
+        // Compound optional (non-pointer element): bulk copy (same as convertStoreLocal)
+        const is_compound_opt = value_type == .optional and blk: {
+            const elem_info = self.type_registry.get(value_type.optional.elem);
+            break :blk elem_info != .pointer;
+        };
+
+        // Large struct/tuple/union: bulk .move copy (same as convertStoreLocal)
+        const is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
+
+        if (is_large_struct) {
+            const src_addr = value;
+            const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
+            move_val.addArg2(addr_val, src_addr);
+            move_val.aux_int = @intCast(type_size);
+            try cur.addValue(self.allocator, move_val);
+            return value;
+        }
+
+        // Scalar path — single 8-byte .store (types <= 8 bytes)
         const store_val = try self.func.newValue(.store, TypeRegistry.VOID, cur, self.cur_pos);
         store_val.addArg2(addr_val, value);
         try cur.addValue(self.allocator, store_val);
