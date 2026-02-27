@@ -59,108 +59,116 @@ Cot already has everything a compiler needs:
 | Comptime | `@typeInfo`, `inline for`, `comptime {}` | Compile-time tables |
 | Closures | First-class with capture | Visitor callbacks |
 
-### Self-Hosted Code: 81% Complete
+### Self-Hosted Code: ~47% of `compiler/frontend/` Ported
 
-The `self/` directory contains a nearly-complete compiler frontend in Cot:
+The `self/` directory contains a partial compiler frontend in Cot — parsing and type-checking work, but IR lowering and code generation are not started.
 
 ```
 self/
   cot.json              # Project config (safe: true)
   main.cot              # CLI entry point — parse/check/lex/help/version (318 lines)
   frontend/
-    token.cot           # Token enum + keyword lookup (436 lines)
-    scanner.cot         # Full lexer (736 lines)
-    source.cot          # Source positions + spans (111 lines)
-    errors.cot          # Error reporter (203 lines)
-    ast.cot             # AST nodes + 54 builtins (1,259 lines)
-    parser.cot          # Recursive descent parser (2,691 lines)
-    types.cot           # TypeRegistry + type structs (1,287 lines)
-    checker.cot         # Type checker + SharedCheckerState (4,112 lines)
-  total: 11,153 lines
+    token.cot           # Token enum + keyword lookup (436 lines) — ~100% of token.zig
+    scanner.cot         # Full lexer (736 lines) — ~100% of scanner.zig
+    source.cot          # Source positions + spans (111 lines) — ~95% of source.zig
+    errors.cot          # Error reporter (203 lines) — ~95% of errors.zig
+    ast.cot             # AST nodes, 28/54 builtins (1,259 lines) — ~85% of ast.zig
+    parser.cot          # Recursive descent parser (2,691 lines) — ~75% of parser.zig
+    types.cot           # TypeRegistry + type structs (1,287 lines) — ~85% of types.zig
+    checker.cot         # Type checker + SharedCheckerState (4,112 lines) — ~80% of checker.zig
+  total: 11,153 lines (of ~23,121 in compiler/frontend/)
 ```
 
-**What's done:** Scanner, token, AST, parser, type registry, checker, and multi-file import resolution — all complete. The checker alone is 4,112 lines, covering scope/symbol table, type inference, function/struct/enum/union checking, generics (monomorphization), traits, closures, .variant shorthand, exhaustiveness checking, binary operators, @safe coercion, struct field validation, ErrorSet variant storage, and per-builtin validation. The self-hosted native binary can parse all 9 of its own source files (414KB total). 142 self-hosted tests pass on native.
+**What works:** The self-hosted binary can lex, parse, and type-check Cot source files including multi-file import resolution. 142 tests pass on native.
 
-**What's next:** IR/SSA lowerer port. wasm32 target is broken (multi-file compilation `error.MissingValue`).
+**Frontend gaps (~80% of parse+check ported):**
+- AST: 26/54 builtins missing from BuiltinKind enum
+- Parser: some constructs simplified (export fn type params, error recovery)
+- Checker: comptime block execution incomplete, closure type inference simplified, error set merging simplified
+
+**Backend gaps (0% ported):**
+- `lower.zig` (8,964 lines) — AST → IR lowering, monomorphization, ARC insertion
+- `ir.zig` (606 lines) — IR node definitions
+- `ssa_builder.zig` (2,017 lines) — SSA construction (defVar/useVar, phi nodes)
+- `arc_insertion.zig` (444 lines) — Reference counting insertion
+- `formatter.zig` (1,173 lines) — Code formatting
+- `comptime.zig` (64 lines) — Comptime value infrastructure
+
+**What's next:** Complete the frontend gaps (builtins, parser edge cases, checker features), then port IR + lowerer + SSA builder.
 
 ---
 
 ## The Path Forward
 
-### Phase 1: Scanner + Token + AST + Source + Errors (DONE)
+### Phase 1: Scanner + Token + Source + Errors — ~98% ported
 
-| Component | Lines | Status |
-|-----------|-------|--------|
-| Token enum + keyword lookup | 436 | Done |
-| Full lexer | 736 | Done |
-| Source positions + spans | 111 | Done |
-| Error reporter | 203 | Done |
-| AST nodes + 54 builtins | 1,259 | Done |
+| Component | Cot Lines | Zig Lines | Parity |
+|-----------|-----------|-----------|--------|
+| Token enum + keyword lookup | 436 | 327 | ~100% |
+| Full lexer | 736 | 527 | ~100% |
+| Source positions + spans | 111 | 226 | ~95% |
+| Error reporter | 203 | 337 | ~95% |
 
-**Milestone achieved:** All source files lex correctly.
+**Milestone:** All source files lex correctly.
 
-### Phase 2: Parser (DONE — 2,691 lines)
+### Phase 2: AST + Parser — ~80% ported
 
-| Component | Status |
-|-----------|--------|
-| Expression parsing (precedence climbing) | Done |
-| Statement parsing | Done |
-| Type parsing | Done |
-| Declaration parsing (fn, struct, enum, union, trait, impl) | Done |
-| Pattern matching (switch) | Done |
-| Error recovery | Done |
+| Component | Cot Lines | Zig Lines | Parity |
+|-----------|-----------|-----------|--------|
+| AST nodes | 1,259 | 644 | ~85% — 28/54 builtins ported, 26 missing |
+| Recursive descent parser | 2,691 | 2,020 | ~75% — export fn, error recovery simplified |
 
-**Milestone achieved:** `cot build self/main.cot -o /tmp/selfcot` produces a native binary. Parser self-parses all 9 source files (414KB total).
+**Gaps:** 26 builtins missing from BuiltinKind enum. Some parsing constructs simplified.
 
-### Phase 3: Type Registry + Type Checker (DONE — 5,399 lines)
+**Milestone:** `cot build self/main.cot -o /tmp/selfcot` produces a native binary. Parser self-parses all 9 source files.
 
-| Component | Lines | Status |
-|-----------|-------|--------|
-| TypeRegistry + type structs | 1,287 | Done |
-| Scope/symbol table | ~600 | Done |
-| Type inference | ~800 | Done |
-| Function/struct/enum/union checking | ~1,000 | Done |
-| Generic instantiation (monomorphization) | ~500 | Done |
-| Trait resolution | ~400 | Done |
-| Closures, .variant shorthand, exhaustiveness | ~400 | Done |
-| @safe coercion, struct field validation | ~300 | Done |
+### Phase 3: Type Registry + Type Checker — ~82% ported
 
-**Milestone achieved:** Full type checking with multi-file import resolution works. Next: IR/SSA lowerer.
+| Component | Cot Lines | Zig Lines | Parity |
+|-----------|-----------|-----------|--------|
+| TypeRegistry + type structs | 1,287 | 753 | ~85% |
+| Type checker + SharedCheckerState | 4,112 | 4,024 | ~80% |
 
-### Phase 4: IR + SSA (est. 2,000-3,000 lines)
+**Gaps:** Comptime block execution incomplete, closure type inference simplified, error set merging simplified.
 
-| Component | Est. Lines |
-|-----------|------------|
-| AST → IR lowering | ~800 |
-| SSA construction | ~600 |
-| SSA passes (decompose, schedule, layout) | ~800 |
-| Tests | ~800 |
+**Milestone:** Multi-file type checking with import resolution works. 142 tests pass on native.
 
-**Milestone:** Lowers checked AST to SSA IR.
+### Phase 4: IR + Lowerer + SSA — 0% ported
 
-### Phase 5: Wasm Codegen (est. 2,000-3,000 lines)
+| Component | Zig Lines | Cot Lines | Notes |
+|-----------|-----------|-----------|-------|
+| IR node definitions | 606 | 0 | IR opcodes, instructions, blocks |
+| AST → IR lowering | 8,964 | 0 | Monomorphization, ARC insertion, control flow |
+| SSA construction | 2,017 | 0 | defVar/useVar, phi nodes |
+| ARC insertion | 444 | 0 | Reference counting, cleanup stack |
+| Comptime infrastructure | 64 | 0 | Comptime value helpers |
+| **Subtotal** | **12,095** | **0** | |
 
-| Component | Est. Lines |
-|-----------|------------|
-| SSA → Wasm ops | ~600 |
-| Wasm bytecode emission | ~800 |
-| Linking (functions, memory, exports) | ~400 |
-| Tests | ~400 |
+### Phase 5: Code Generation — 0% ported
 
-**Milestone:** Produces valid `.wasm` from Cot source. **Self-hosting achieved** when this compiles `self/` itself.
+SSA passes (`compiler/ssa/passes/`) and codegen (`compiler/codegen/`) are outside `compiler/frontend/` and not counted here. These are the final stage after IR + SSA.
 
-### Total Estimate
+### Phase 6: Formatter — 0% ported
 
-| Phase | Lines | Cumulative | Status |
-|-------|-------|------------|--------|
-| Scanner + AST + Source + Errors | 2,745 | 2,745 | **Done** |
-| Parser | 2,691 | 5,436 | **Done** |
-| Type Registry + Checker | 5,399 | 10,835 | **Done** |
-| CLI (main.cot) | 318 | 11,153 | **Done** |
-| IR + SSA | ~2,500 | ~13,650 | Planned |
-| Wasm Codegen | ~2,000 | ~15,650 | Planned |
+| Component | Zig Lines | Cot Lines |
+|-----------|-----------|-----------|
+| Code formatter | 1,173 | 0 |
 
-**~15,650 lines total for MVP self-hosting.** 11,153 done (~71% by lines). ~4,500 to go.
+Not blocking for self-hosting, but needed for `cot fmt`.
+
+### Total Status
+
+| Phase | Zig Lines | Cot Lines | Status |
+|-------|-----------|-----------|--------|
+| Scanner + Token + Source + Errors | 1,417 | 1,486 | **~98%** |
+| AST + Parser | 2,664 | 3,950 | **~80%** |
+| Types + Checker | 4,777 | 5,399 | **~82%** |
+| CLI (main.cot) | — | 318 | Done |
+| IR + Lowerer + SSA + ARC | 12,095 | 0 | **0%** |
+| Formatter | 1,173 | 0 | **0%** |
+| **Total frontend** | **~23,121** | **11,153** | **~47%** |
+
+The self-hosted compiler can currently **parse, lex, and type-check** Cot source. It cannot generate executable code.
 
 ---
 
@@ -214,10 +222,10 @@ When Stage 1 and Stage 2 produce identical binaries, self-hosting is verified. T
 
 | Version | Date | Self-Hosting Milestone | Status |
 |---------|------|----------------------|--------|
-| 0.3.2 | Feb 2026 | Full frontend in Cot (11,153 LOC) — scanner, parser, types, checker, multi-file imports | **Done** |
-| 0.4 | TBD | IR lowerer begins | Planned |
-| 0.5-0.6 | TBD | IR + SSA in Cot (~13,400 LOC) | Planned |
-| 0.7-0.9 | TBD | Wasm codegen in Cot (~15,400 LOC) | Planned |
+| 0.3.3 | Feb 2026 | Frontend ~47% ported (11,153 LOC) — scanner, parser, types, checker ~80% each | **Done** |
+| 0.4 | TBD | Complete frontend gaps (missing builtins, parser/checker parity), IR port begins | Planned |
+| 0.5-0.6 | TBD | IR + lowerer + SSA builder ported (12,095 lines of Zig to port) | Planned |
+| 0.7-0.9 | TBD | SSA passes + codegen, self-hosted compiler produces executables | Planned |
 | 0.10 | TBD | **Self-hosted compiler becomes default** | Goal |
 
 ---
@@ -237,7 +245,7 @@ For perspective, here's what Cot achieved in its first 8 weeks:
 - @safe mode for TypeScript-style DX
 - Comptime infrastructure (@typeInfo, inline for, dead branch elimination)
 - MCP server written in Cot
-- Self-hosted frontend (scanner, parser, types, checker, multi-file imports — 11,153 lines)
+- Self-hosted frontend ~47% ported (scanner, parser, types, checker — 11,153 lines of ~23,121 in compiler/frontend/)
 
 Zig took 3 years and 36 contributors to reach a comparable 0.3. The LLM-assisted development model compresses implementation dramatically. The same velocity advantage applies to the self-hosting work ahead — the full frontend was ported in under 2 weeks.
 
