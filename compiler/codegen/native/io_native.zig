@@ -1761,12 +1761,17 @@ fn generateSetNonblocking(
     const ins = builder.ins();
     const fd = builder.blockParams(block_entry)[0];
 
-    // fcntl(fd, F_SETFL, O_NONBLOCK)
+    // fcntl(fd, F_SETFL, O_NONBLOCK) — variadic: int fcntl(int fd, int cmd, ...)
+    // Apple ARM64: pad X2-X7 to force variadic arg onto stack.
     const fcntl_idx = func_index_map.get("fcntl") orelse 0;
     var sig = clif.Signature.init(.system_v);
-    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
+    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // cmd
+    const is_aarch64 = isa == .aarch64;
+    if (is_aarch64) {
+        for (0..6) |_| try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    }
+    try sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // flags
     try sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
     const sig_ref = try builder.importSignature(sig);
     const func_ref = try builder.importFunction(.{
@@ -1776,7 +1781,10 @@ fn generateSetNonblocking(
     });
     const f_setfl = try ins.iconst(clif.Type.I64, 4);
     const o_nonblock = try ins.iconst(clif.Type.I64, 0x0004);
-    const call_result = try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, o_nonblock });
+    const call_result = if (is_aarch64) blk: {
+        const pad = try ins.iconst(clif.Type.I64, 0);
+        break :blk try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, pad, pad, pad, pad, pad, pad, o_nonblock });
+    } else try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, o_nonblock });
     _ = try ins.return_(&[_]clif.Value{call_result.results[0]});
 
     try builder.sealAllBlocks();
@@ -2280,11 +2288,18 @@ fn generateIoctlWinsize(
     const cols_u16 = try ins.ireduce(clif.Type.I16, cols);
     _ = try ins.store(.{}, cols_u16, ws_addr, 2);
 
-    // ioctl(fd, TIOCSWINSZ, &ws)
+    // ioctl(fd, TIOCSWINSZ, &ws) — variadic: int ioctl(int fd, unsigned long request, ...)
+    // Apple ARM64: variadic args must go on the stack, not in registers.
+    // Pad X2-X7 with dummy zeros to force the real variadic arg onto the stack.
+    // Port of rustc_codegen_cranelift adjust_call_for_c_variadic().
     const ioctl_idx = func_index_map.get("ioctl") orelse 0;
     var ioctl_sig = clif.Signature.init(.system_v);
     try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
     try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // request
+    const is_aarch64 = isa == .aarch64;
+    if (is_aarch64) {
+        for (0..6) |_| try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    }
     try ioctl_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // argp
     try ioctl_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
     const ioctl_sig_ref = try builder.importSignature(ioctl_sig);
@@ -2294,7 +2309,10 @@ fn generateIoctlWinsize(
         .colocated = false,
     });
     const tiocswinsz = try ins.iconst(clif.Type.I64, 0x80087467); // macOS TIOCSWINSZ
-    const call_result = try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, ws_addr });
+    const call_result = if (is_aarch64) blk: {
+        const pad = try ins.iconst(clif.Type.I64, 0);
+        break :blk try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, pad, pad, pad, pad, pad, pad, ws_addr });
+    } else try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, ws_addr });
     _ = try ins.return_(&[_]clif.Value{call_result.results[0]});
 
     try builder.sealAllBlocks();
