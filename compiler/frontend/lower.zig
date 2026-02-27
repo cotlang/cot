@@ -73,6 +73,9 @@ pub const Lowerer = struct {
     comptime_value_vars: std.StringHashMap(comptime_mod.ComptimeValue),
     /// Global (top-level) comptime values — persists across functions, not cleared per-function.
     global_comptime_values: std.StringHashMap(comptime_mod.ComptimeValue),
+    /// Track which locals are weak vars — stored value is side_table_ptr, loads go through weak_load_strong.
+    /// Reference: Swift WeakReference.h — weak vars store side table pointers, not object pointers.
+    weak_locals: std.AutoHashMapUnmanaged(ir.LocalIdx, void) = .{},
 
     pub const Error = error{OutOfMemory};
 
@@ -294,6 +297,7 @@ pub const Lowerer = struct {
         self.lowered_generics.deinit();
         self.comptime_value_vars.deinit();
         self.global_comptime_values.deinit();
+        self.weak_locals.deinit(self.allocator);
         self.builder.deinit();
     }
 
@@ -310,6 +314,7 @@ pub const Lowerer = struct {
         // in multi-file builds (same pattern as builder). Caller manages its lifetime.
         self.comptime_value_vars.deinit();
         self.global_comptime_values.deinit();
+        self.weak_locals.deinit(self.allocator);
     }
 
     pub fn lower(self: *Lowerer) !ir.IR {
@@ -1624,6 +1629,16 @@ pub const Lowerer = struct {
                         var args = [_]ir.NodeIndex{value};
                         _ = try fb.emitCall("unowned_release", &args, false, TypeRegistry.VOID, Span.zero);
                     },
+                    .weak_release => {
+                        if (self.target.isWasmGC()) continue;
+                        // Load the side_table_ptr from the local (NOT through weak_load_strong)
+                        const value = if (cleanup.local_idx) |lidx|
+                            try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
+                        else
+                            cleanup.value;
+                        var args = [_]ir.NodeIndex{value};
+                        _ = try fb.emitCall("weak_release", &args, false, TypeRegistry.VOID, Span.zero);
+                    },
                     .defer_expr => {
                         try self.lowerDeferredNode(@intCast(cleanup.value));
                     },
@@ -1852,10 +1867,18 @@ pub const Lowerer = struct {
 
                     // Register cleanup for ARC values.
                     // Reference: Swift's emitManagedRValueWithCleanup (SILGenExpr.cpp:375-390)
-                    // `weak var` skips ARC entirely — no retain, no cleanup.
-                    // `unowned var` increments unowned RC and registers unowned_release cleanup.
-                    // Reference: Swift's `weak` and `unowned` modifiers.
-                    if (!self.target.isWasmGC() and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
+                    // `weak var`: form side table reference, store side_table_ptr, register weak_release.
+                    // `unowned var`: increments unowned RC and registers unowned_release cleanup.
+                    // Reference: Swift's `weak` and `unowned` modifiers + WeakReference.h.
+                    if (!self.target.isWasmGC() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
+                        // weak: allocate/reuse side table, store side_table_ptr in local
+                        var wargs = [_]ir.NodeIndex{value_node};
+                        const side_table_ptr = try fb.emitCall("weak_form_reference", &wargs, false, TypeRegistry.I64, var_stmt.span);
+                        _ = try fb.emitStoreLocal(local_idx, side_table_ptr, var_stmt.span);
+                        const cleanup = arc.Cleanup.initForLocal(.weak_release, side_table_ptr, type_idx, local_idx);
+                        _ = try self.cleanup_stack.push(cleanup);
+                        try self.weak_locals.put(self.allocator, local_idx, {});
+                    } else if (!self.target.isWasmGC() and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
                         // unowned: increment unowned RC, register unowned_release cleanup
                         var uargs = [_]ir.NodeIndex{value_node};
                         _ = try fb.emitCall("unowned_retain", &uargs, false, type_idx, var_stmt.span);
@@ -3489,7 +3512,14 @@ pub const Lowerer = struct {
         if (fb.lookupLocal(ident.name)) |local_idx| {
             const local_type = fb.locals.items[local_idx].type_idx;
             if (self.type_reg.isArray(local_type)) return try fb.emitAddrLocal(local_idx, local_type, ident.span);
-            return try fb.emitLoadLocal(local_idx, local_type, ident.span);
+            const raw_value = try fb.emitLoadLocal(local_idx, local_type, ident.span);
+            // Weak var: stored value is side_table_ptr, must go through weak_load_strong
+            // to get the actual object pointer (or null if deallocated).
+            if (self.weak_locals.contains(local_idx)) {
+                var wargs = [_]ir.NodeIndex{raw_value};
+                return try fb.emitCall("weak_load_strong", &wargs, false, local_type, ident.span);
+            }
+            return raw_value;
         }
         if (self.chk.scope.lookup(ident.name)) |sym| {
             if (sym.kind == .function) return try self.createFuncValue(ident.name, sym.type_idx, ident.span);

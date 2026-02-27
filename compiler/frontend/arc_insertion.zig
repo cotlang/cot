@@ -47,6 +47,9 @@ pub const CleanupKind = enum {
     release,
     /// Decrement unowned RC at scope exit (Swift unowned reference).
     unowned_release,
+    /// Decrement weak RC in side table at scope exit (Swift weak reference).
+    /// Reference: Swift WeakReference.h — weak_release decrements side table weak_rc.
+    weak_release,
     /// End a borrow (not yet used, for future borrow checker).
     end_borrow,
     /// Deferred expression to evaluate at scope exit.

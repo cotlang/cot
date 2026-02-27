@@ -84,6 +84,21 @@ const STRONG_EXTRA_MASK: i64 = @bitCast(@as(u64, 0x7FFFFFFE_00000000)); // bits 
 const USE_SLOW_RC_BIT: i64 = @bitCast(@as(u64, 0x8000000000000000)); // bit 63
 const STRONG_EXTRA_SHIFT: u6 = 33;
 
+// Side table layout (24 bytes, Swift RefCount.h SideTableRefCountBits):
+//   Offset 0:  object_ptr  (i64) — pointer to object's user data (0 when freed)
+//   Offset 8:  refcounts   (i64) — same InlineRefCounts bit layout
+//   Offset 16: weak_rc     (i64) — weak reference count (direct count)
+//
+// Encoding: side_table_ptr is 8-byte aligned (malloc guarantees),
+// so we shift right 3 to fit in 60 bits, then set USE_SLOW_RC_BIT.
+// Decoding: clear bit 63, shift left 3.
+const SIDE_TABLE_OBJECT_OFFSET: i32 = 0;
+const SIDE_TABLE_REFCOUNT_OFFSET: i32 = 8;
+const SIDE_TABLE_WEAK_RC_OFFSET: i32 = 16;
+const SIDE_TABLE_SIZE: i64 = 24;
+const SIDE_TABLE_ALIGN_SHIFT: i64 = 3;
+const USE_SLOW_RC_CLEAR_MASK: i64 = @bitCast(@as(u64, 0x7FFFFFFFFFFFFFFF));
+
 // Metadata struct offsets (when metadata pointer is non-null)
 // Reference: Swift TypeMetadata struct — contains destroy function pointer
 const METADATA_TYPE_ID_OFFSET: i32 = 0; // type_id (i64)
@@ -152,6 +167,24 @@ pub fn generate(
     try result.append(allocator, .{
         .name = "unowned_load_strong",
         .compiled = try generateUnownedLoadStrong(allocator, isa, ctrl_plane, func_index_map),
+    });
+
+    // Weak reference runtime (Phase 3 — side tables)
+    try result.append(allocator, .{
+        .name = "weak_form_reference",
+        .compiled = try generateWeakFormReference(allocator, isa, ctrl_plane, func_index_map),
+    });
+    try result.append(allocator, .{
+        .name = "weak_retain",
+        .compiled = try generateWeakRetain(allocator, isa, ctrl_plane),
+    });
+    try result.append(allocator, .{
+        .name = "weak_release",
+        .compiled = try generateWeakRelease(allocator, isa, ctrl_plane, func_index_map),
+    });
+    try result.append(allocator, .{
+        .name = "weak_load_strong",
+        .compiled = try generateWeakLoadStrong(allocator, isa, ctrl_plane),
     });
 
     return result;
@@ -337,60 +370,112 @@ fn generateRetain(
     const block_return_zero = try builder.createBlock();
     const block_check_immortal = try builder.createBlock();
     const block_return_obj = try builder.createBlock();
-    const block_increment = try builder.createBlock();
+    const block_check_slow = try builder.createBlock();
+    const block_inline_inc = try builder.createBlock();
+    const block_side_table_inc = try builder.createBlock();
+    // Shared increment block: takes rc_addr as block param
+    const block_do_increment = try builder.createBlock();
 
     // Entry: null check
     builder.switchToBlock(block_entry);
     try builder.appendBlockParamsForFunctionParams(block_entry);
     try builder.ensureInsertedBlock();
-
-    const ins = builder.ins();
-    const obj = builder.blockParams(block_entry)[0];
-    const v_zero = try ins.iconst(clif.Type.I64, 0);
-    const is_null = try ins.icmp(.eq, obj, v_zero);
-    _ = try ins.brif(is_null, block_return_zero, &.{}, block_check_immortal, &.{});
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_null = try ins.icmp(.eq, obj, v_zero);
+        _ = try ins.brif(is_null, block_return_zero, &.{}, block_check_immortal, &.{});
+    }
 
     // Return zero (null case)
     builder.switchToBlock(block_return_zero);
     try builder.ensureInsertedBlock();
-    const v_zero2 = try builder.ins().iconst(clif.Type.I64, 0);
-    _ = try builder.ins().return_(&[_]clif.Value{v_zero2});
+    {
+        const v_zero2 = try builder.ins().iconst(clif.Type.I64, 0);
+        _ = try builder.ins().return_(&[_]clif.Value{v_zero2});
+    }
 
     // Check immortal: header_ptr = obj - 24, load refcount
     builder.switchToBlock(block_check_immortal);
     try builder.ensureInsertedBlock();
     {
         const ins3 = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
         const v_header = try ins3.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
         const header_ptr = try ins3.isub(obj, v_header);
         const refcount = try ins3.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
         const v_immortal = try ins3.iconst(clif.Type.I64, IMMORTAL_REFCOUNT);
         const is_immortal = try ins3.icmp(.eq, refcount, v_immortal);
-        _ = try ins3.brif(is_immortal, block_return_obj, &.{}, block_increment, &.{});
+        _ = try ins3.brif(is_immortal, block_return_obj, &.{}, block_check_slow, &[_]clif.Value{refcount});
     }
 
     // Return obj (immortal case)
     builder.switchToBlock(block_return_obj);
     try builder.ensureInsertedBlock();
-    // Need to get obj again — it's from block_entry params. Use a phi/block param.
-    // Actually, obj is available since it was defined in block_entry and dominates.
-    // But we need to reference the same CLIF Value. Since FunctionBuilder handles SSA,
-    // we can define a variable to pass obj through blocks.
-    // Simpler: just return the original obj value (it dominates all blocks).
-    _ = try builder.ins().return_(&[_]clif.Value{obj});
+    {
+        const obj = builder.blockParams(block_entry)[0];
+        _ = try builder.ins().return_(&[_]clif.Value{obj});
+    }
 
-    // Increment block: add STRONG_RC_ONE to bits 33-62
-    builder.switchToBlock(block_increment);
+    // Check UseSlowRC (bit 63)
+    _ = try builder.appendBlockParam(block_check_slow, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_check_slow);
     try builder.ensureInsertedBlock();
     {
-        const ins4 = builder.ins();
-        const v_header = try ins4.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
-        const header_ptr = try ins4.isub(obj, v_header);
-        const refcount = try ins4.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
-        const v_strong_one = try ins4.iconst(clif.Type.I64, STRONG_RC_ONE);
-        const new_rc = try ins4.iadd(refcount, v_strong_one);
-        _ = try ins4.store(clif.MemFlags.DEFAULT, new_rc, header_ptr, REFCOUNT_OFFSET);
-        _ = try ins4.return_(&[_]clif.Value{obj});
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_check_slow)[0];
+        const v_63 = try ins.iconst(clif.Type.I64, 63);
+        const shifted = try ins.ushr(rc_word, v_63);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const use_slow = try ins.band(shifted, v_one);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_slow = try ins.icmp(.ne, use_slow, v_zero);
+        _ = try ins.brif(is_slow, block_side_table_inc, &[_]clif.Value{rc_word}, block_inline_inc, &.{});
+    }
+
+    // Inline increment: rc_addr = header_ptr + REFCOUNT_OFFSET
+    builder.switchToBlock(block_inline_inc);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const header_ptr = try ins.isub(obj, v_header);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(header_ptr, v_rc_off);
+        _ = try ins.jump(block_do_increment, &[_]clif.Value{rc_addr});
+    }
+
+    // Side table increment: decode st_ptr, rc_addr = st_ptr + 8
+    _ = try builder.appendBlockParam(block_side_table_inc, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_side_table_inc);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_side_table_inc)[0];
+        const v_clear = try ins.iconst(clif.Type.I64, USE_SLOW_RC_CLEAR_MASK);
+        const cleared = try ins.band(rc_word, v_clear);
+        const v_shift = try ins.iconst(clif.Type.I64, SIDE_TABLE_ALIGN_SHIFT);
+        const st_ptr = try ins.ishl(cleared, v_shift);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, SIDE_TABLE_REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(st_ptr, v_rc_off);
+        _ = try ins.jump(block_do_increment, &[_]clif.Value{rc_addr});
+    }
+
+    // Shared increment: load from rc_addr, add STRONG_RC_ONE, store back
+    _ = try builder.appendBlockParam(block_do_increment, clif.Type.I64); // rc_addr
+    builder.switchToBlock(block_do_increment);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const rc_addr = builder.blockParams(block_do_increment)[0];
+        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
+        const v_strong_one = try ins.iconst(clif.Type.I64, STRONG_RC_ONE);
+        const new_rc = try ins.iadd(refcount, v_strong_one);
+        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
+        _ = try ins.return_(&[_]clif.Value{obj});
     }
 
     try builder.sealAllBlocks();
@@ -449,6 +534,9 @@ fn generateRelease(
     const block_entry = try builder.createBlock();
     const block_return = try builder.createBlock();
     const block_check_immortal = try builder.createBlock();
+    const block_check_slow = try builder.createBlock();
+    const block_inline_path = try builder.createBlock();
+    const block_side_table_path = try builder.createBlock();
     const block_decrement = try builder.createBlock();
     const block_store_and_return = try builder.createBlock();
     const block_check_destructor = try builder.createBlock();
@@ -483,21 +571,63 @@ fn generateRelease(
         const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
         const v_immortal = try ins.iconst(clif.Type.I64, IMMORTAL_REFCOUNT);
         const is_immortal = try ins.icmp(.eq, refcount, v_immortal);
-        _ = try ins.brif(is_immortal, block_return, &.{}, block_decrement, &.{});
+        _ = try ins.brif(is_immortal, block_return, &.{}, block_check_slow, &[_]clif.Value{refcount});
     }
 
-    // ---- Decrement: subtract STRONG_RC_ONE; if StrongExtra was 0 → last strong ref ----
-    // Swift doDecrementSlow pattern (RefCount.h:1040-1048):
-    //   if (was_last) { newbits = oldbits; newbits.setStrongExtra(0); newbits.setIsDeiniting(true); }
-    //   else { store decremented value; }
-    builder.switchToBlock(block_decrement);
+    // ---- Check UseSlowRC (bit 63) ----
+    _ = try builder.appendBlockParam(block_check_slow, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_check_slow);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_check_slow)[0];
+        const v_63 = try ins.iconst(clif.Type.I64, 63);
+        const shifted = try ins.ushr(rc_word, v_63);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const use_slow = try ins.band(shifted, v_one);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_slow = try ins.icmp(.ne, use_slow, v_zero);
+        _ = try ins.brif(is_slow, block_side_table_path, &[_]clif.Value{rc_word}, block_inline_path, &.{});
+    }
+
+    // ---- Inline path: rc_addr = header_ptr + REFCOUNT_OFFSET ----
+    builder.switchToBlock(block_inline_path);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
         const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
         const header_ptr = try ins.isub(obj, v_header);
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(header_ptr, v_rc_off);
+        _ = try ins.jump(block_decrement, &[_]clif.Value{rc_addr});
+    }
+
+    // ---- Side table path: decode, rc_addr = side_table + 8 ----
+    _ = try builder.appendBlockParam(block_side_table_path, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_side_table_path);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_side_table_path)[0];
+        const v_clear = try ins.iconst(clif.Type.I64, USE_SLOW_RC_CLEAR_MASK);
+        const cleared = try ins.band(rc_word, v_clear);
+        const v_shift = try ins.iconst(clif.Type.I64, SIDE_TABLE_ALIGN_SHIFT);
+        const st_ptr = try ins.ishl(cleared, v_shift);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, SIDE_TABLE_REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(st_ptr, v_rc_off);
+        _ = try ins.jump(block_decrement, &[_]clif.Value{rc_addr});
+    }
+
+    // ---- Decrement: load from rc_addr, check StrongExtra ----
+    // Swift doDecrementSlow pattern (RefCount.h:1040-1048)
+    _ = try builder.appendBlockParam(block_decrement, clif.Type.I64); // rc_addr
+    builder.switchToBlock(block_decrement);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_addr = builder.blockParams(block_decrement)[0];
+        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
 
         // Extract StrongExtra from original: (rc >> 33) & 0x3FFFFFFF
         const v_shift = try ins.iconst(clif.Type.I64, @as(i64, STRONG_EXTRA_SHIFT));
@@ -508,39 +638,34 @@ fn generateRelease(
         // If StrongExtra was 0 → this was the last strong reference
         const v_zero = try ins.iconst(clif.Type.I64, 0);
         const was_last = try ins.icmp(.eq, strong_extra, v_zero);
-        _ = try ins.brif(was_last, block_check_destructor, &.{}, block_store_and_return, &.{});
+        _ = try ins.brif(was_last, block_check_destructor, &[_]clif.Value{rc_addr}, block_store_and_return, &[_]clif.Value{rc_addr});
     }
 
     // ---- Store decremented rc and return (not last strong ref) ----
+    _ = try builder.appendBlockParam(block_store_and_return, clif.Type.I64); // rc_addr
     builder.switchToBlock(block_store_and_return);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
-        const obj = builder.blockParams(block_entry)[0];
-        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
-        const header_ptr = try ins.isub(obj, v_header);
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
+        const rc_addr = builder.blockParams(block_store_and_return)[0];
+        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
         const v_strong_one = try ins.iconst(clif.Type.I64, STRONG_RC_ONE);
         const new_rc = try ins.isub(refcount, v_strong_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, header_ptr, REFCOUNT_OFFSET);
+        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
         _ = try ins.return_(&[_]clif.Value{});
     }
 
-    // ---- Check destructor: clean transition — set StrongExtra=0, IsDeiniting=1 ----
-    // Swift doDecrementSlow (RefCount.h:1046-1048):
-    //   newbits = oldbits;  // Undo failed decrement
-    //   newbits.setStrongExtraRefCount(0);
-    //   newbits.setIsDeiniting(true);
-    // In native path, metadata field stores the destructor function pointer directly
-    // (not a pointer to a metadata struct). Set by ssa_to_clif.zig metadata_addr handler.
+    // ---- Check destructor: set IsDeiniting, check metadata ----
+    // Destructor metadata is ALWAYS in the object header (never in side table).
+    // IsDeiniting is written to rc_addr (may be side table or inline).
+    _ = try builder.appendBlockParam(block_check_destructor, clif.Type.I64); // rc_addr
     builder.switchToBlock(block_check_destructor);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
-        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
-        const header_ptr = try ins.isub(obj, v_header);
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
+        const rc_addr = builder.blockParams(block_check_destructor)[0];
+        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
 
         // Clear StrongExtra (bits 33-62) and UseSlowRC (bit 63), keep low 33 bits
         const v_clear_mask = try ins.iconst(clif.Type.I64, @bitCast(~@as(u64, @bitCast(@as(i64, STRONG_EXTRA_MASK) | USE_SLOW_RC_BIT))));
@@ -549,9 +674,11 @@ fn generateRelease(
         // Set IsDeiniting flag
         const v_deiniting = try ins.iconst(clif.Type.I64, IS_DEINITING_BIT);
         const rc_with_deiniting = try ins.bor(clean_rc, v_deiniting);
-        _ = try ins.store(clif.MemFlags.DEFAULT, rc_with_deiniting, header_ptr, REFCOUNT_OFFSET);
+        _ = try ins.store(clif.MemFlags.DEFAULT, rc_with_deiniting, rc_addr, 0);
 
-        // Load destructor function pointer directly from metadata field
+        // Load destructor function pointer from object header metadata field
+        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const header_ptr = try ins.isub(obj, v_header);
         const destructor_ptr = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, METADATA_OFFSET);
 
         const v_zero = try ins.iconst(clif.Type.I64, 0);
@@ -560,8 +687,6 @@ fn generateRelease(
     }
 
     // ---- Call destructor: call_indirect(destructor_ptr, obj) ----
-    // Reference: arc.zig:985-988 (call_indirect destructor with obj)
-    // Reference: Swift metadata->destroy(object) — HeapObject.cpp:835
     _ = try builder.appendBlockParam(block_call_destructor, clif.Type.I64); // destructor_ptr
     builder.switchToBlock(block_call_destructor);
     try builder.ensureInsertedBlock();
@@ -570,21 +695,15 @@ fn generateRelease(
         const obj = builder.blockParams(block_entry)[0];
         const destructor_ptr = builder.blockParams(block_call_destructor)[0];
 
-        // Destructor signature: (obj: i64) -> void
         var dtor_sig = clif.Signature.init(.system_v);
         try dtor_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
         const dtor_sig_ref = try builder.importSignature(dtor_sig);
-
-        // call_indirect: invoke destructor via function pointer
         _ = try ins.callIndirect(dtor_sig_ref, destructor_ptr, &[_]clif.Value{obj});
 
-        // Fall through to dealloc
         _ = try ins.jump(block_dealloc, &.{});
     }
 
-    // ---- Dealloc block: call unowned_release(obj) to decrement unowned RC ----
-    // Swift pattern: after deinit, decrement unowned count. Memory freed only when unowned hits 0.
-    // Reference: swift/stdlib/public/runtime/HeapObject.cpp:548-552
+    // ---- Dealloc block: call unowned_release(obj) ----
     builder.switchToBlock(block_dealloc);
     try builder.ensureInsertedBlock();
     {
@@ -597,7 +716,7 @@ fn generateRelease(
         const func_ref = try builder.importFunction(.{
             .name = .{ .user = .{ .namespace = 0, .index = unowned_release_idx } },
             .signature = sig_ref,
-            .colocated = true, // Same object file
+            .colocated = true,
         });
         _ = try ins.call(func_ref, &[_]clif.Value{obj});
         _ = try ins.return_(&[_]clif.Value{});
@@ -1048,7 +1167,10 @@ fn generateUnownedRetain(
     const block_entry = try builder.createBlock();
     const block_return = try builder.createBlock();
     const block_check_immortal = try builder.createBlock();
-    const block_increment = try builder.createBlock();
+    const block_check_slow = try builder.createBlock();
+    const block_inline_inc = try builder.createBlock();
+    const block_side_table_inc = try builder.createBlock();
+    const block_do_increment = try builder.createBlock();
 
     // Entry: null check
     builder.switchToBlock(block_entry);
@@ -1078,21 +1200,65 @@ fn generateUnownedRetain(
         const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
         const v_immortal = try ins.iconst(clif.Type.I64, IMMORTAL_REFCOUNT);
         const is_immortal = try ins.icmp(.eq, refcount, v_immortal);
-        _ = try ins.brif(is_immortal, block_return, &.{}, block_increment, &.{});
+        _ = try ins.brif(is_immortal, block_return, &.{}, block_check_slow, &[_]clif.Value{refcount});
     }
 
-    // Increment unowned: rc += UNOWNED_RC_ONE (bits 1-31)
-    builder.switchToBlock(block_increment);
+    // Check UseSlowRC
+    _ = try builder.appendBlockParam(block_check_slow, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_check_slow);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_check_slow)[0];
+        const v_63 = try ins.iconst(clif.Type.I64, 63);
+        const shifted = try ins.ushr(rc_word, v_63);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const use_slow = try ins.band(shifted, v_one);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_slow = try ins.icmp(.ne, use_slow, v_zero);
+        _ = try ins.brif(is_slow, block_side_table_inc, &[_]clif.Value{rc_word}, block_inline_inc, &.{});
+    }
+
+    // Inline path: rc_addr = header_ptr + REFCOUNT_OFFSET
+    builder.switchToBlock(block_inline_inc);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
         const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
         const header_ptr = try ins.isub(obj, v_header);
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(header_ptr, v_rc_off);
+        _ = try ins.jump(block_do_increment, &[_]clif.Value{rc_addr});
+    }
+
+    // Side table path: decode, rc_addr = side_table + 8
+    _ = try builder.appendBlockParam(block_side_table_inc, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_side_table_inc);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_side_table_inc)[0];
+        const v_clear = try ins.iconst(clif.Type.I64, USE_SLOW_RC_CLEAR_MASK);
+        const cleared = try ins.band(rc_word, v_clear);
+        const v_shift = try ins.iconst(clif.Type.I64, SIDE_TABLE_ALIGN_SHIFT);
+        const st_ptr = try ins.ishl(cleared, v_shift);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, SIDE_TABLE_REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(st_ptr, v_rc_off);
+        _ = try ins.jump(block_do_increment, &[_]clif.Value{rc_addr});
+    }
+
+    // Shared increment: load from rc_addr, add UNOWNED_RC_ONE, store back
+    _ = try builder.appendBlockParam(block_do_increment, clif.Type.I64); // rc_addr
+    builder.switchToBlock(block_do_increment);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_addr = builder.blockParams(block_do_increment)[0];
+        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
         const v_unowned_one = try ins.iconst(clif.Type.I64, UNOWNED_RC_ONE);
         const new_rc = try ins.iadd(refcount, v_unowned_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, header_ptr, REFCOUNT_OFFSET);
+        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
         _ = try ins.return_(&[_]clif.Value{});
     }
 
@@ -1129,8 +1295,14 @@ fn generateUnownedRelease(
     const block_entry = try builder.createBlock();
     const block_return = try builder.createBlock();
     const block_check_immortal = try builder.createBlock();
+    const block_check_slow = try builder.createBlock();
+    const block_inline_path = try builder.createBlock();
+    const block_side_table_path = try builder.createBlock();
     const block_decrement = try builder.createBlock();
     const block_dealloc = try builder.createBlock();
+    // Side table cleanup: dealloc obj, zero object_ptr, maybe free side table
+    const block_st_dealloc = try builder.createBlock();
+    const block_st_free = try builder.createBlock();
 
     // Entry: null check
     builder.switchToBlock(block_entry);
@@ -1160,47 +1332,92 @@ fn generateUnownedRelease(
         const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
         const v_immortal = try ins.iconst(clif.Type.I64, IMMORTAL_REFCOUNT);
         const is_immortal = try ins.icmp(.eq, refcount, v_immortal);
-        _ = try ins.brif(is_immortal, block_return, &.{}, block_decrement, &.{});
+        _ = try ins.brif(is_immortal, block_return, &.{}, block_check_slow, &[_]clif.Value{refcount});
     }
 
-    // Decrement unowned: subtract, extract NEW count, check if zero
-    // Swift decrementUnownedShouldFree (RefCount.h:1190-1216):
-    //   newbits.decrementUnownedRefCount(dec);
-    //   if (newbits.getUnownedRefCount() == 0) → free
-    builder.switchToBlock(block_decrement);
+    // Check UseSlowRC
+    _ = try builder.appendBlockParam(block_check_slow, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_check_slow);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_check_slow)[0];
+        const v_63 = try ins.iconst(clif.Type.I64, 63);
+        const shifted = try ins.ushr(rc_word, v_63);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const use_slow = try ins.band(shifted, v_one);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_slow = try ins.icmp(.ne, use_slow, v_zero);
+        _ = try ins.brif(is_slow, block_side_table_path, &[_]clif.Value{rc_word}, block_inline_path, &.{});
+    }
+
+    // Inline path: rc_addr = header_ptr + REFCOUNT_OFFSET
+    builder.switchToBlock(block_inline_path);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
         const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
         const header_ptr = try ins.isub(obj, v_header);
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(header_ptr, v_rc_off);
+        // Pass 0 as st_ptr (no side table in inline path)
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        _ = try ins.jump(block_decrement, &[_]clif.Value{ rc_addr, v_zero });
+    }
+
+    // Side table path: decode, rc_addr = side_table + 8
+    _ = try builder.appendBlockParam(block_side_table_path, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_side_table_path);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_side_table_path)[0];
+        const v_clear = try ins.iconst(clif.Type.I64, USE_SLOW_RC_CLEAR_MASK);
+        const cleared = try ins.band(rc_word, v_clear);
+        const v_shift = try ins.iconst(clif.Type.I64, SIDE_TABLE_ALIGN_SHIFT);
+        const st_ptr = try ins.ishl(cleared, v_shift);
+        const v_rc_off = try ins.iconst(clif.Type.I64, @as(i64, SIDE_TABLE_REFCOUNT_OFFSET));
+        const rc_addr = try ins.iadd(st_ptr, v_rc_off);
+        _ = try ins.jump(block_decrement, &[_]clif.Value{ rc_addr, st_ptr });
+    }
+
+    // Decrement unowned: subtract, extract NEW count, check if zero
+    _ = try builder.appendBlockParam(block_decrement, clif.Type.I64); // rc_addr
+    _ = try builder.appendBlockParam(block_decrement, clif.Type.I64); // st_ptr (0 if inline)
+    builder.switchToBlock(block_decrement);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_addr = builder.blockParams(block_decrement)[0];
+        const st_ptr = builder.blockParams(block_decrement)[1];
+        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
 
         // Subtract UNOWNED_RC_ONE
         const v_unowned_one = try ins.iconst(clif.Type.I64, UNOWNED_RC_ONE);
         const new_rc = try ins.isub(refcount, v_unowned_one);
+        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
 
-        // Store new rc unconditionally (dealloc will free anyway)
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, header_ptr, REFCOUNT_OFFSET);
-
-        // Extract NEW UnownedRefCount after decrement: (new_rc >> 1) & 0x7FFFFFFF
+        // Extract NEW UnownedRefCount: (new_rc >> 1) & 0x7FFFFFFF
         const v_one_shift = try ins.iconst(clif.Type.I64, 1);
         const shifted = try ins.ushr(new_rc, v_one_shift);
         const v_mask = try ins.iconst(clif.Type.I64, 0x7FFFFFFF);
         const new_unowned = try ins.band(shifted, v_mask);
 
-        // If new unowned count == 0 → last unowned ref → free memory
+        // If unowned hits 0 → free memory (dealloc handles side table check)
         const v_zero = try ins.iconst(clif.Type.I64, 0);
         const is_last = try ins.icmp(.eq, new_unowned, v_zero);
-        _ = try ins.brif(is_last, block_dealloc, &.{}, block_return, &.{});
+        _ = try ins.brif(is_last, block_dealloc, &[_]clif.Value{st_ptr}, block_return, &.{});
     }
 
-    // Dealloc block: call dealloc(obj) — free the memory
+    // Dealloc: dealloc(obj), then check if side table cleanup needed
+    _ = try builder.appendBlockParam(block_dealloc, clif.Type.I64); // st_ptr
     builder.switchToBlock(block_dealloc);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
+        const st_ptr = builder.blockParams(block_dealloc)[0];
         const dealloc_idx = func_index_map.get("dealloc") orelse 0;
         var dealloc_sig = clif.Signature.init(.system_v);
         try dealloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
@@ -1211,6 +1428,48 @@ fn generateUnownedRelease(
             .colocated = true,
         });
         _ = try ins.call(dealloc_ref, &[_]clif.Value{obj});
+
+        // If side table exists, do side table cleanup
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const has_st = try ins.icmp(.ne, st_ptr, v_zero);
+        _ = try ins.brif(has_st, block_st_dealloc, &[_]clif.Value{st_ptr}, block_return, &.{});
+    }
+
+    // Side table cleanup: zero object_ptr, check weak_rc
+    _ = try builder.appendBlockParam(block_st_dealloc, clif.Type.I64); // st_ptr
+    builder.switchToBlock(block_st_dealloc);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_st_dealloc)[0];
+
+        // Set object_ptr = 0 (signals "object freed" to weak_load_strong)
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        _ = try ins.store(clif.MemFlags.DEFAULT, v_zero, st_ptr, SIDE_TABLE_OBJECT_OFFSET);
+
+        // Load weak_rc, check if 0 → can free side table
+        const weak_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        const weak_zero = try ins.icmp(.eq, weak_rc, v_zero);
+        _ = try ins.brif(weak_zero, block_st_free, &[_]clif.Value{st_ptr}, block_return, &.{});
+    }
+
+    // Free side table (no more references of any kind)
+    _ = try builder.appendBlockParam(block_st_free, clif.Type.I64); // st_ptr
+    builder.switchToBlock(block_st_free);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_st_free)[0];
+        const free_idx = func_index_map.get("free") orelse func_index_map.get("_free") orelse 0;
+        var free_sig = clif.Signature.init(.system_v);
+        try free_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        const fsig_ref = try builder.importSignature(free_sig);
+        const fref = try builder.importFunction(.{
+            .name = .{ .user = .{ .namespace = 0, .index = free_idx } },
+            .signature = fsig_ref,
+            .colocated = false,
+        });
+        _ = try ins.call(fref, &[_]clif.Value{st_ptr});
         _ = try ins.return_(&[_]clif.Value{});
     }
 
@@ -1318,6 +1577,420 @@ fn generateUnownedLoadStrong(
         });
         const result = try ins.call(func_ref, &[_]clif.Value{obj});
         _ = try ins.return_(&[_]clif.Value{result.results[0]});
+    }
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// weak_form_reference(obj: i64) -> i64  (side_table_ptr)
+//
+// Lazily allocate a side table for the object. If UseSlowRC is already set,
+// the side table exists — just increment its weak_rc. Otherwise, allocate a
+// 24-byte side table, copy refcounts, set UseSlowRC in object header.
+//
+// Reference: Swift allocateSideTable (HeapObject.cpp:782-812)
+// Reference: Swift swift_weakInit (WeakReference.h)
+// ============================================================================
+
+fn generateWeakFormReference(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (obj: i64) -> i64 (side_table_ptr)
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    const block_return_null = try builder.createBlock();
+    const block_load_rc = try builder.createBlock();
+    const block_existing_st = try builder.createBlock();
+    const block_check_deiniting = try builder.createBlock();
+    const block_alloc_st = try builder.createBlock();
+
+    // ---- Entry: null check ----
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_null = try ins.icmp(.eq, obj, v_zero);
+        _ = try ins.brif(is_null, block_return_null, &.{}, block_load_rc, &.{});
+    }
+
+    // ---- Return null (obj was null, or deiniting) ----
+    builder.switchToBlock(block_return_null);
+    try builder.ensureInsertedBlock();
+    {
+        const v_zero = try builder.ins().iconst(clif.Type.I64, 0);
+        _ = try builder.ins().return_(&[_]clif.Value{v_zero});
+    }
+
+    // ---- Load rc_word, check UseSlowRC ----
+    builder.switchToBlock(block_load_rc);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const header_ptr = try ins.isub(obj, v_header);
+        const rc_word = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, REFCOUNT_OFFSET);
+
+        // Check UseSlowRC (bit 63): (rc_word >> 63) & 1
+        const v_63 = try ins.iconst(clif.Type.I64, 63);
+        const shifted = try ins.ushr(rc_word, v_63);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const use_slow = try ins.band(shifted, v_one);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_slow = try ins.icmp(.ne, use_slow, v_zero);
+        _ = try ins.brif(is_slow, block_existing_st, &[_]clif.Value{rc_word}, block_check_deiniting, &[_]clif.Value{rc_word});
+    }
+
+    // ---- Check IsDeiniting before allocating (Swift allocateSideTable(failIfDeiniting=true)) ----
+    // Reference: RefCount.cpp:32-34 — "Already past the start of deinit. Do nothing."
+    _ = try builder.appendBlockParam(block_check_deiniting, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_check_deiniting);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_check_deiniting)[0];
+        // Extract IsDeiniting: (rc_word >> 32) & 1
+        const v_32 = try ins.iconst(clif.Type.I64, 32);
+        const shifted = try ins.ushr(rc_word, v_32);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const is_deiniting_val = try ins.band(shifted, v_one);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_deiniting = try ins.icmp(.ne, is_deiniting_val, v_zero);
+        _ = try ins.brif(is_deiniting, block_return_null, &.{}, block_alloc_st, &[_]clif.Value{rc_word});
+    }
+
+    // ---- Existing side table: decode, increment weak_rc, return ----
+    _ = try builder.appendBlockParam(block_existing_st, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_existing_st);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const rc_word = builder.blockParams(block_existing_st)[0];
+
+        // Decode: side_table_ptr = (rc_word & 0x7FFF...) << 3
+        const v_clear = try ins.iconst(clif.Type.I64, USE_SLOW_RC_CLEAR_MASK);
+        const cleared = try ins.band(rc_word, v_clear);
+        const v_shift = try ins.iconst(clif.Type.I64, SIDE_TABLE_ALIGN_SHIFT);
+        const st_ptr = try ins.ishl(cleared, v_shift);
+
+        // Increment weak_rc
+        const weak_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const new_weak_rc = try ins.iadd(weak_rc, v_one);
+        _ = try ins.store(clif.MemFlags.DEFAULT, new_weak_rc, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+
+        _ = try ins.return_(&[_]clif.Value{st_ptr});
+    }
+
+    // ---- Allocate new side table ----
+    _ = try builder.appendBlockParam(block_alloc_st, clif.Type.I64); // rc_word
+    builder.switchToBlock(block_alloc_st);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const rc_word = builder.blockParams(block_alloc_st)[0];
+
+        // malloc(24) for side table
+        const malloc_idx = func_index_map.get("malloc") orelse 0;
+        var malloc_sig = clif.Signature.init(.system_v);
+        try malloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        try malloc_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+        const msig_ref = try builder.importSignature(malloc_sig);
+        const mref = try builder.importFunction(.{
+            .name = .{ .user = .{ .namespace = 0, .index = malloc_idx } },
+            .signature = msig_ref,
+            .colocated = false,
+        });
+        const v_size = try ins.iconst(clif.Type.I64, SIDE_TABLE_SIZE);
+        const malloc_result = try ins.call(mref, &[_]clif.Value{v_size});
+        const st_ptr = malloc_result.results[0];
+
+        // Init side table: { obj, rc_word, 1 }
+        _ = try ins.store(clif.MemFlags.DEFAULT, obj, st_ptr, SIDE_TABLE_OBJECT_OFFSET);
+        _ = try ins.store(clif.MemFlags.DEFAULT, rc_word, st_ptr, SIDE_TABLE_REFCOUNT_OFFSET);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        _ = try ins.store(clif.MemFlags.DEFAULT, v_one, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+
+        // Encode side table pointer in object header:
+        // encoded = (st_ptr >> 3) | USE_SLOW_RC_BIT
+        const v_shift = try ins.iconst(clif.Type.I64, SIDE_TABLE_ALIGN_SHIFT);
+        const shifted_ptr = try ins.ushr(st_ptr, v_shift);
+        const v_use_slow = try ins.iconst(clif.Type.I64, USE_SLOW_RC_BIT);
+        const encoded = try ins.bor(shifted_ptr, v_use_slow);
+
+        // Store encoded value in object's refcount field
+        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const header_ptr = try ins.isub(obj, v_header);
+        _ = try ins.store(clif.MemFlags.DEFAULT, encoded, header_ptr, REFCOUNT_OFFSET);
+
+        _ = try ins.return_(&[_]clif.Value{st_ptr});
+    }
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// weak_retain(side_table_ptr: i64) -> void
+//
+// Increment weak reference count in side table.
+// Reference: Swift swift_weakRetain (HeapObject.cpp)
+// ============================================================================
+
+fn generateWeakRetain(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (i64) -> void
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    const block_return = try builder.createBlock();
+    const block_increment = try builder.createBlock();
+
+    // Entry: null check
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_null = try ins.icmp(.eq, st_ptr, v_zero);
+        _ = try ins.brif(is_null, block_return, &.{}, block_increment, &.{});
+    }
+
+    // Return
+    builder.switchToBlock(block_return);
+    try builder.ensureInsertedBlock();
+    _ = try builder.ins().return_(&[_]clif.Value{});
+
+    // Increment weak_rc
+    builder.switchToBlock(block_increment);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const weak_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const new_weak_rc = try ins.iadd(weak_rc, v_one);
+        _ = try ins.store(clif.MemFlags.DEFAULT, new_weak_rc, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        _ = try ins.return_(&[_]clif.Value{});
+    }
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// weak_release(side_table_ptr: i64) -> void
+//
+// Decrement weak reference count. If weak_rc hits 0 AND object_ptr is 0
+// (object already freed), free the side table.
+// Reference: Swift swift_weakRelease (HeapObject.cpp)
+// ============================================================================
+
+fn generateWeakRelease(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (i64) -> void
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    const block_return = try builder.createBlock();
+    const block_decrement = try builder.createBlock();
+    const block_check_free = try builder.createBlock();
+    const block_free_st = try builder.createBlock();
+
+    // Entry: null check
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_null = try ins.icmp(.eq, st_ptr, v_zero);
+        _ = try ins.brif(is_null, block_return, &.{}, block_decrement, &.{});
+    }
+
+    // Return
+    builder.switchToBlock(block_return);
+    try builder.ensureInsertedBlock();
+    _ = try builder.ins().return_(&[_]clif.Value{});
+
+    // Decrement weak_rc, check if zero
+    builder.switchToBlock(block_decrement);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const weak_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const new_weak_rc = try ins.isub(weak_rc, v_one);
+        _ = try ins.store(clif.MemFlags.DEFAULT, new_weak_rc, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_last = try ins.icmp(.eq, new_weak_rc, v_zero);
+        _ = try ins.brif(is_last, block_check_free, &.{}, block_return, &.{});
+    }
+
+    // Check if object_ptr == 0 (object already freed) → free side table
+    builder.switchToBlock(block_check_free);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const obj_ptr = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_OBJECT_OFFSET);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const obj_freed = try ins.icmp(.eq, obj_ptr, v_zero);
+        _ = try ins.brif(obj_freed, block_free_st, &.{}, block_return, &.{});
+    }
+
+    // Free side table
+    builder.switchToBlock(block_free_st);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const free_idx = func_index_map.get("free") orelse func_index_map.get("_free") orelse 0;
+        var free_sig = clif.Signature.init(.system_v);
+        try free_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        const fsig_ref = try builder.importSignature(free_sig);
+        const fref = try builder.importFunction(.{
+            .name = .{ .user = .{ .namespace = 0, .index = free_idx } },
+            .signature = fsig_ref,
+            .colocated = false,
+        });
+        _ = try ins.call(fref, &[_]clif.Value{st_ptr});
+        _ = try ins.return_(&[_]clif.Value{});
+    }
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// weak_load_strong(side_table_ptr: i64) -> i64 (obj_or_null)
+//
+// Load a strong reference from a weak reference's side table.
+// Returns the object pointer if alive, 0 (null) if deiniting/freed.
+// Does NOT retain — safe in single-threaded; will add retain for concurrency.
+//
+// Reference: Swift swift_weakLoadStrong (HeapObject.cpp:856-880)
+// ============================================================================
+
+fn generateWeakLoadStrong(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (i64) -> i64
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    const block_return_null = try builder.createBlock();
+    const block_check = try builder.createBlock();
+    const block_return_obj = try builder.createBlock();
+
+    // Entry: null check
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_null = try ins.icmp(.eq, st_ptr, v_zero);
+        _ = try ins.brif(is_null, block_return_null, &.{}, block_check, &.{});
+    }
+
+    // Return null
+    builder.switchToBlock(block_return_null);
+    try builder.ensureInsertedBlock();
+    {
+        const v_zero = try builder.ins().iconst(clif.Type.I64, 0);
+        _ = try builder.ins().return_(&[_]clif.Value{v_zero});
+    }
+
+    // Check: load refcount from side table, check IsDeiniting
+    builder.switchToBlock(block_check);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_REFCOUNT_OFFSET);
+
+        // Check IsDeiniting: (rc >> 32) & 1
+        const v_32 = try ins.iconst(clif.Type.I64, 32);
+        const shifted = try ins.ushr(refcount, v_32);
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const is_deiniting_val = try ins.band(shifted, v_one);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_deiniting = try ins.icmp(.ne, is_deiniting_val, v_zero);
+        _ = try ins.brif(is_deiniting, block_return_null, &.{}, block_return_obj, &.{});
+    }
+
+    // Return object pointer (alive)
+    builder.switchToBlock(block_return_obj);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const st_ptr = builder.blockParams(block_entry)[0];
+        const obj_ptr = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_OBJECT_OFFSET);
+        _ = try ins.return_(&[_]clif.Value{obj_ptr});
     }
 
     try builder.sealAllBlocks();

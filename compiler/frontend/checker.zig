@@ -2927,6 +2927,12 @@ pub const Checker = struct {
                 self.err.errorWithCode(vs.span.start, .e300, "'unowned' can only be used with ARC-managed pointer types");
             }
         }
+        // Validate weak: must target an ARC-managed pointer type
+        if (vs.is_weak) {
+            if (!self.types.couldBeARC(var_type)) {
+                self.err.errorWithCode(vs.span.start, .e300, "'weak' can only be used with ARC-managed pointer types");
+            }
+        }
         // Store const_value for comptime const-folding (Zig Sema pattern: local const propagation)
         if (vs.is_const and vs.value != null_node) {
             if (self.evalConstExpr(vs.value)) |cv| {

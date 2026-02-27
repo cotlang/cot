@@ -966,6 +966,7 @@ pub const Driver = struct {
             "alloc",         "dealloc",        "retain",        "release",
             "realloc",       "string_concat",  "string_eq",
             "unowned_retain", "unowned_release", "unowned_load_strong",
+            "weak_form_reference", "weak_retain", "weak_release", "weak_load_strong",
             // I/O runtime (io_native.generate order)
             "fd_write",      "fd_read",        "fd_close",      "exit",
             "fd_seek",       "memset_zero",    "fd_open",       "time",
