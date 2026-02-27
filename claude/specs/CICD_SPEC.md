@@ -17,7 +17,7 @@ Set up GitHub Actions CI/CD, automated releases with pre-built binaries, and a c
 - **Version:** `VERSION` file → `build.zig` → `build_options.version` → `cot version` (working)
 - **Build:** `zig build` → `zig-out/bin/cot` (single command, ~10-30s)
 - **Tests:** `zig build test` (163 compiler tests) + `./test/run_all.sh` (~914 Cot tests across 35 files)
-- **Targets:** native, arm64-macos, amd64-linux, wasm32, wasm32-wasi, wasm32-gc
+- **Targets:** native, arm64-macos, amd64-linux, wasm32, wasm32-wasi
 - **CI:** None
 - **Releases:** None
 - **Distribution:** Build from source only
@@ -306,7 +306,7 @@ git push origin main --tags
 ### Added
 - Buffered I/O (`stdlib/io.cot`)
 - JSON parser + encoder (`stdlib/json.cot`)
-- WasmGC target (`--target=wasm32-gc`)
+- WasmGC (wasm32 target now uses WasmGC by default)
 - Comptime evaluation (Tier 1 + Tier 2)
 - Sort stdlib module
 

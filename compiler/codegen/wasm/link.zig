@@ -76,6 +76,8 @@ pub const WasmFunc = struct {
 pub const GcFieldType = struct {
     val_type: c.ValType,
     mutable: bool,
+    /// If non-null, this field is a GC ref type (ref null $gc_ref_idx)
+    gc_ref: ?u32 = null,
 };
 
 /// WasmGC struct type definition
@@ -355,7 +357,13 @@ pub const Linker = struct {
                     try assemble.writeULEB128(self.allocator, &type_buf, st.field_count);
                     const fields = self.gc_field_storage.items[st.field_offset .. st.field_offset + st.field_count];
                     for (fields) |f| {
-                        try type_buf.append(self.allocator, @intFromEnum(f.val_type));
+                        if (f.gc_ref) |gc_idx| {
+                            // Field is a GC ref type: (ref null $typeidx)
+                            try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x63
+                            try assemble.writeULEB128(self.allocator, &type_buf, gc_idx);
+                        } else {
+                            try type_buf.append(self.allocator, @intFromEnum(f.val_type));
+                        }
                         try type_buf.append(self.allocator, if (f.mutable) c.GC_FIELD_MUT else c.GC_FIELD_IMMUT);
                     }
                 }
@@ -369,7 +377,7 @@ pub const Linker = struct {
                     try assemble.writeULEB128(self.allocator, &type_buf, t_params.len);
                     for (t_params) |p| {
                         if (p.gc_ref) |gc_idx| {
-                            try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x64
+                            try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x63
                             try assemble.writeULEB128(self.allocator, &type_buf, gc_idx);
                         } else {
                             try type_buf.append(self.allocator, @intFromEnum(p.val));
@@ -378,7 +386,7 @@ pub const Linker = struct {
                     try assemble.writeULEB128(self.allocator, &type_buf, t_results.len);
                     for (t_results) |r| {
                         if (r.gc_ref) |gc_idx| {
-                            try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x64
+                            try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x63
                             try assemble.writeULEB128(self.allocator, &type_buf, gc_idx);
                         } else {
                             try type_buf.append(self.allocator, @intFromEnum(r.val));

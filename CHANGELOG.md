@@ -52,7 +52,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Added
 - Buffered I/O module (`std/io`): `BufferedReader`, `BufferedWriter`, `readLine`, `readByte`
 - MCP server example app (`mcp/cot-mcp.cot`) demonstrating stdlib usage
-- WasmGC target (`--target=wasm32-gc`): all structs as GC-managed objects
+- WasmGC: all Wasm structs as GC-managed objects (wasm32 target)
 - JSON parser + encoder (`std/json`): recursive descent parser, StringBuilder-based encoder
 - Sort module (`std/sort`): insertion sort + reverse for `List(T)`
 - File I/O module (`std/fs`): `File` struct, `openFile`, `createFile`, `readFile`, `writeFile`

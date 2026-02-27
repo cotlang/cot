@@ -159,7 +159,7 @@ pub fn assemble(allocator: std.mem.Allocator, sym: *Symbol) !AssembledFunc {
         // GC ref locals: each declared as (ref null $typeidx)
         for (gc_ref_locals) |gc_type_idx| {
             try writeULEB128(allocator, &w, 1); // 1 local of this ref type
-            try w.append(allocator, c.GC_REF_TYPE_NULL); // 0x64 = (ref null ...)
+            try w.append(allocator, c.GC_REF_TYPE_NULL); // 0x63 = (ref null ...)
             try writeULEB128(allocator, &w, gc_type_idx); // type index
         }
     }
@@ -171,8 +171,10 @@ pub fn assemble(allocator: std.mem.Allocator, sym: *Symbol) !AssembledFunc {
     // may be read in blocks before the linear code flow sets them. The GC spec
     // requires ref locals to be provably initialized before use. This must be
     // emitted BEFORE the dispatch loop (which wraps the Prog chain), not inside it.
-    // Note: struct.new_default (0xFB 0x01) produces (ref $T) — non-nullable.
-    // ref.null (0xD0) produces (ref null $T) which wasmtime rejects for local.set.
+    // Initialize GC ref locals at function entry using struct.new_default.
+    // struct.new_default (0xFB 0x01) produces (ref $T) — non-nullable, which
+    // satisfies wasmtime's validation for struct.get instructions on the local.
+    // br_table dispatch loop means ref locals may be read before linear set.
     if (gc_ref_locals.len > 0) {
         const ref_local_start: u64 = if (has_dispatch_loop) param_count + 1 + i64_value_locals + float_count else param_count + i64_value_locals + float_count;
         for (gc_ref_locals, 0..) |gc_type_idx, i| {

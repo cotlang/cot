@@ -243,7 +243,7 @@ rec subtype*          = 0x4E (-50)    -- recursive type group
 
 **Packed field types:** `i8` (0x78), `i16` (0x77)
 
-**Cot will NOT use WasmGC for its own objects** (Cot has ARC). But WasmGC interop may be needed to consume objects from Kotlin/Wasm, Dart, Java, or Scheme modules. This becomes relevant when Cot adds package/module interop.
+**Cot uses WasmGC for all Wasm struct objects.** `--target=wasm32` produces WasmGC output where structs are GC-managed (`struct.new`, `struct.get`, `struct.set`). ARC is only used on native targets. WasmGC interop with Kotlin/Wasm, Dart, Java, or Scheme modules becomes relevant when Cot adds package/module interop.
 
 ---
 

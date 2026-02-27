@@ -81,8 +81,12 @@ pub const Lowerer = struct {
     /// Reference: references/zig/src/codegen/wasm/CodeGen.zig:1354 firstParamSRet()
     fn needsSret(self: *const Lowerer, type_idx: TypeIndex) bool {
         const info = self.type_reg.get(type_idx);
-        if ((info == .struct_type or info == .tuple or info == .union_type) and self.type_reg.sizeOf(type_idx) > 8)
+        if ((info == .struct_type or info == .tuple or info == .union_type) and self.type_reg.sizeOf(type_idx) > 8) {
+            // WasmGC: structs are GC refs — return directly as (ref null $T), no SRET
+            // Tuples and unions still use linear memory, so keep SRET for them
+            if (self.target.isWasmGC() and info == .struct_type) return false;
             return true;
+        }
         // Non-pointer-like optionals use compound return (tag+payload = 16 bytes).
         // Pointer-like optionals (?*T) use null=0 sentinel — no SRET needed.
         // Reference: Zig type.zig:1604 — optional layout is [payload][null_flag]
@@ -1332,6 +1336,7 @@ pub const Lowerer = struct {
                     _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, ret.span);
                     // Check if payload is compound (string = ptr+len)
                     const eu_elem = ret_type_info.error_union.elem;
+                    const eu_elem_info = self.type_reg.get(eu_elem);
                     if (eu_elem == TypeRegistry.STRING) {
                         // Compound: decompose string into ptr (field 1, offset 8) + len (field 2, offset 16)
                         const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
@@ -1339,6 +1344,21 @@ pub const Lowerer = struct {
                         const len_val = try fb.emitSliceLen(lowered, ret.span);
                         _ = try fb.emitStoreLocalField(tmp_local, 1, 8, ptr_val, ret.span);
                         _ = try fb.emitStoreLocalField(tmp_local, 2, 16, len_val, ret.span);
+                    } else if (self.target.isWasmGC() and eu_elem_info == .struct_type) {
+                        // WasmGC: GC refs can't be stored in linear memory — decompose struct
+                        // fields and store each chunk as a primitive in the EU buffer
+                        const st = eu_elem_info.struct_type;
+                        var gc_ci: u32 = 0;
+                        var mem_ci: u32 = 0;
+                        for (st.fields) |field| {
+                            const n_chunks = self.gcFieldChunks(field.type_idx);
+                            for (0..n_chunks) |_| {
+                                const chunk_val = try fb.emitGcStructGet(lowered, st.name, gc_ci, TypeRegistry.I64, ret.span);
+                                _ = try fb.emitStoreLocalField(tmp_local, mem_ci + 1, @intCast(8 + mem_ci * 8), chunk_val, ret.span);
+                                gc_ci += 1;
+                                mem_ci += 1;
+                            }
+                        }
                     } else {
                         _ = try fb.emitStoreLocalField(tmp_local, 1, 8, lowered, ret.span);
                     }
@@ -1586,6 +1606,7 @@ pub const Lowerer = struct {
             if (cleanup.isActive()) {
                 switch (cleanup.kind) {
                     .release => {
+                        if (self.target.isWasmGC()) continue; // GC handles lifetimes
                         // For locals: reload current value (may have been reassigned)
                         const value = if (cleanup.local_idx) |lidx|
                             try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
@@ -1678,6 +1699,24 @@ pub const Lowerer = struct {
             const is_undefined = if (value_expr) |e| (e == .literal and e.literal.kind == .undefined_lit) else false;
             const is_zero_init = if (value_expr) |e| (e == .zero_init) else false;
             if (is_undefined or is_zero_init) {
+                // WasmGC: struct locals are GC refs — use gc_struct_new with default values
+                const type_info = self.type_reg.get(type_idx);
+                if (self.target.isWasmGC() and type_info == .struct_type) {
+                    const struct_type = type_info.struct_type;
+                    var field_values = try self.allocator.alloc(ir.NodeIndex, struct_type.fields.len);
+                    defer self.allocator.free(field_values);
+                    for (struct_type.fields, 0..) |field, i| {
+                        if (field.default_value != null_node) {
+                            field_values[i] = try self.lowerExprNode(field.default_value);
+                        } else {
+                            field_values[i] = try self.emitGcDefaultValue(field.type_idx, var_stmt.span);
+                        }
+                    }
+                    const gc_val = try self.emitGcStructNewExpanded(struct_type.name, struct_type, field_values, type_idx, var_stmt.span);
+                    _ = try fb.emitStoreLocal(local_idx, gc_val, var_stmt.span);
+                    return;
+                }
+
                 const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
                 const local_addr = try fb.emitAddrLocal(local_idx, ptr_type, var_stmt.span);
                 const size_node = try fb.emitConstInt(@intCast(size), TypeRegistry.I64, var_stmt.span);
@@ -1807,7 +1846,7 @@ pub const Lowerer = struct {
                     // `weak var` skips ARC entirely — no retain, no cleanup.
                     // This breaks reference cycles (parent↔child, delegate patterns).
                     // Reference: Swift's `weak` and `unowned` modifiers.
-                    if (!var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
+                    if (!self.target.isWasmGC() and !var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
                         const is_owned = if (value_expr) |e| (e == .new_expr or e == .call) else false;
 
                         if (is_owned) {
@@ -1991,7 +2030,10 @@ pub const Lowerer = struct {
         // WasmGC path: ALL structs are GC objects — no stack allocation
         // Reference: Kotlin/Dart WasmGC strategy — no dual representation
         if (self.target.isWasmGC()) {
-            const type_name = if (struct_init.type_args.len > 0) struct_type.name else struct_init.type_name;
+            // Always use resolved struct_type.name for gc_struct_new — struct_init.type_name
+            // is empty for anonymous inits (.{ .x = 0, .y = 0 }) which causes gc_struct_name_map
+            // to fall back to type index 0.
+            const type_name = struct_type.name;
             var field_values = try self.allocator.alloc(ir.NodeIndex, struct_type.fields.len);
             for (field_values) |*fv| fv.* = ir.null_node;
             for (struct_init.fields) |field_init| {
@@ -2007,11 +2049,11 @@ pub const Lowerer = struct {
                     if (struct_field.default_value != null_node) {
                         field_values[i] = try self.lowerExprNode(struct_field.default_value);
                     } else {
-                        field_values[i] = try fb.emitConstInt(0, struct_field.type_idx, span);
+                        field_values[i] = try self.emitGcDefaultValue(struct_field.type_idx, span);
                     }
                 }
             }
-            const gc_ref = try fb.emitGcStructNew(type_name, field_values, struct_type_idx, span);
+            const gc_ref = try self.emitGcStructNewExpanded(type_name, struct_type, field_values, struct_type_idx, span);
             _ = try fb.emitStoreLocal(local_idx, gc_ref, span);
             return;
         }
@@ -2116,6 +2158,26 @@ pub const Lowerer = struct {
                         // Store payload at offset 8
                         if (call.args.len > 0) {
                             const payload_val = try self.lowerExprNode(call.args[0]);
+                            // WasmGC: struct payloads are GC refs — extract fields as i64 chunks
+                            if (self.target.isWasmGC() and v.payload_type != TypeRegistry.VOID) {
+                                const payload_info = self.type_reg.get(v.payload_type);
+                                if (payload_info == .struct_type) {
+                                    const st = payload_info.struct_type;
+                                    var gc_ci: u32 = 0;
+                                    var mem_ci: u32 = 0;
+                                    for (st.fields) |field| {
+                                        const n_chunks = self.gcFieldChunks(field.type_idx);
+                                        for (0..n_chunks) |_| {
+                                            const field_val = try fb.emitGcStructGet(payload_val, st.name, gc_ci, TypeRegistry.I64, span);
+                                            const offset: i64 = 8 + @as(i64, @intCast(mem_ci * 8));
+                                            _ = try fb.emitStoreLocalField(local_idx, mem_ci + 1, offset, field_val, span);
+                                            gc_ci += 1;
+                                            mem_ci += 1;
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
                             _ = try fb.emitStoreLocalField(local_idx, 1, 8, payload_val, span);
                         }
                         return;
@@ -2394,7 +2456,21 @@ pub const Lowerer = struct {
             for (struct_type.fields, 0..) |field, i| {
                 if (std.mem.eql(u8, field.name, fa.field)) {
                     const base_val = try self.lowerExprNode(fa.base);
-                    _ = try fb.emitGcStructSet(base_val, struct_type.name, @intCast(i), value_node, span);
+                    const gc_idx = self.gcChunkIndex(struct_type, @intCast(i));
+                    const n_chunks = self.gcFieldChunks(field.type_idx);
+                    if (n_chunks > 1 and (field.type_idx == TypeRegistry.STRING or self.type_reg.get(field.type_idx) == .slice)) {
+                        // Compound field: decompose value into chunks
+                        const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+                        const ptr_val = try fb.emitSlicePtr(value_node, ptr_type, span);
+                        const len_val = try fb.emitSliceLen(value_node, span);
+                        _ = try fb.emitGcStructSet(base_val, struct_type.name, gc_idx, ptr_val, span);
+                        _ = try fb.emitGcStructSet(base_val, struct_type.name, gc_idx + 1, len_val, span);
+                        if (n_chunks >= 3) {
+                            _ = try fb.emitGcStructSet(base_val, struct_type.name, gc_idx + 2, len_val, span);
+                        }
+                    } else {
+                        _ = try fb.emitGcStructSet(base_val, struct_type.name, gc_idx, value_node, span);
+                    }
                     return;
                 }
             }
@@ -3283,6 +3359,14 @@ pub const Lowerer = struct {
                 const ptr_node = try self.lowerExprNode(d.operand);
                 const ptr_type = self.inferExprType(d.operand);
                 const elem_type = self.type_reg.pointerElem(ptr_type);
+                // WasmGC: dereferencing a pointer to a GC struct is a no-op —
+                // the GC ref IS the struct value, no memory load needed.
+                if (self.target.isWasmGC()) {
+                    const elem_info = if (elem_type != types.invalid_type) self.type_reg.get(elem_type) else null;
+                    if (elem_info != null and elem_info.? == .struct_type) {
+                        return ptr_node;
+                    }
+                }
                 return try fb.emitPtrLoadValue(ptr_node, if (elem_type == types.invalid_type) TypeRegistry.VOID else elem_type, d.span);
             },
             .field_access => |fa| return try self.lowerFieldAccess(fa),
@@ -3690,6 +3774,14 @@ pub const Lowerer = struct {
         if (operand_expr == .ident) {
             if (fb.lookupLocal(operand_expr.ident.name)) |local_idx| {
                 const local_type = fb.locals.items[local_idx].type_idx;
+                // WasmGC: struct locals are GC refs — &structVar returns the ref itself
+                // *T and T are both (ref null $T) on WasmGC
+                if (self.target.isWasmGC()) {
+                    const lt = self.type_reg.get(local_type);
+                    if (lt == .struct_type) {
+                        return try fb.emitLoadLocal(local_idx, local_type, addr.span);
+                    }
+                }
                 return try fb.emitAddrLocal(local_idx, self.type_reg.makePointer(local_type) catch TypeRegistry.VOID, addr.span);
             }
             if (self.builder.lookupGlobal(operand_expr.ident.name)) |g| {
@@ -3928,7 +4020,15 @@ pub const Lowerer = struct {
         // WasmGC path: use gc_struct_get instead of offset-based loads
         if (self.target.isWasmGC()) {
             const base_val = try self.lowerExprNode(fa.base);
-            return try fb.emitGcStructGet(base_val, struct_type.name, field_idx, field_type, fa.span);
+            const gc_idx = self.gcChunkIndex(struct_type, field_idx);
+            const n_chunks = self.gcFieldChunks(field_type);
+            if (n_chunks > 1 and (field_type == TypeRegistry.STRING or self.type_reg.get(field_type) == .slice)) {
+                // Compound field: read each chunk separately and reconstruct string_header
+                const ptr_val = try fb.emitGcStructGet(base_val, struct_type.name, gc_idx, TypeRegistry.I64, fa.span);
+                const len_val = try fb.emitGcStructGet(base_val, struct_type.name, gc_idx + 1, TypeRegistry.I64, fa.span);
+                return try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = ptr_val, .len = len_val } }, field_type, fa.span));
+            }
+            return try fb.emitGcStructGet(base_val, struct_type.name, gc_idx, field_type, fa.span);
         }
 
         const base_is_pointer = base_type == .pointer;
@@ -4335,6 +4435,34 @@ pub const Lowerer = struct {
         if (struct_type_idx == TypeRegistry.VOID) return ir.null_node;
         const type_info = self.type_reg.get(struct_type_idx);
         const struct_type = if (type_info == .struct_type) type_info.struct_type else return ir.null_node;
+
+        // WasmGC path: emit gc_struct_new directly — no temp local, no memory stores.
+        // Same pattern as lowerStructInit's WasmGC path.
+        if (self.target.isWasmGC()) {
+            // Always use resolved struct_type.name — si.type_name is empty for anonymous inits.
+            const type_name = struct_type.name;
+            var field_values = try self.allocator.alloc(ir.NodeIndex, struct_type.fields.len);
+            for (field_values) |*fv| fv.* = ir.null_node;
+            for (si.fields) |field_init| {
+                for (struct_type.fields, 0..) |struct_field, i| {
+                    if (std.mem.eql(u8, struct_field.name, field_init.name)) {
+                        field_values[i] = try self.lowerExprNode(field_init.value);
+                        break;
+                    }
+                }
+            }
+            for (struct_type.fields, 0..) |struct_field, i| {
+                if (field_values[i] == ir.null_node) {
+                    if (struct_field.default_value != null_node) {
+                        field_values[i] = try self.lowerExprNode(struct_field.default_value);
+                    } else {
+                        field_values[i] = try self.emitGcDefaultValue(struct_field.type_idx, si.span);
+                    }
+                }
+            }
+            return try self.emitGcStructNewExpanded(type_name, struct_type, field_values, struct_type_idx, si.span);
+        }
+
         const size = self.type_reg.sizeOf(struct_type_idx);
         const temp_idx = try fb.addLocalWithSize("__struct_tmp", struct_type_idx, true, size);
 
@@ -4418,6 +4546,112 @@ pub const Lowerer = struct {
         return try fb.emitLoadLocal(temp_idx, tuple_type_idx, tl.span);
     }
 
+    /// Compute the GC chunk index for a semantic field index.
+    /// Compound fields (string=3 chunks, slice=3 chunks) expand in the GC type.
+    fn gcChunkIndex(self: *Lowerer, struct_type: anytype, semantic_idx: u32) u32 {
+        var chunk: u32 = 0;
+        for (struct_type.fields[0..semantic_idx]) |field| {
+            chunk += self.gcFieldChunks(field.type_idx);
+        }
+        return chunk;
+    }
+
+    /// Number of i64 chunks a field occupies in the GC struct.
+    /// Struct-typed fields are GC refs = 1 chunk. Others expand by size.
+    fn gcFieldChunks(self: *Lowerer, type_idx: TypeIndex) u32 {
+        const info = self.type_reg.get(type_idx);
+        if (info == .struct_type) return 1; // GC ref
+        if (info == .pointer) {
+            const elem = self.type_reg.get(info.pointer.elem);
+            if (elem == .struct_type) return 1; // pointer to struct = GC ref
+        }
+        const size = self.type_reg.sizeOf(type_idx);
+        return @max(1, (size + 7) / 8);
+    }
+
+    /// Emit a default value for a WasmGC field. For struct-typed fields,
+    /// recursively creates a gc_struct_new with all fields zeroed/defaulted.
+    /// For compound types (string/slice), emits a proper string_header/slice_header
+    /// with zero ptr+len so it can be decomposed by expandGcFieldValues.
+    /// For primitive fields, emits const 0.
+    fn emitGcDefaultValue(self: *Lowerer, field_type_idx: TypeIndex, span: Span) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const field_info = self.type_reg.get(field_type_idx);
+        if (field_info == .struct_type) {
+            const inner_struct = field_info.struct_type;
+            var inner_values = try self.allocator.alloc(ir.NodeIndex, inner_struct.fields.len);
+            defer self.allocator.free(inner_values);
+            for (inner_struct.fields, 0..) |inner_field, j| {
+                if (inner_field.default_value != null_node) {
+                    inner_values[j] = try self.lowerExprNode(inner_field.default_value);
+                } else {
+                    inner_values[j] = try self.emitGcDefaultValue(inner_field.type_idx, span);
+                }
+            }
+            return try fb.emitGcStructNew(inner_struct.name, inner_values, field_type_idx, span);
+        }
+        // Compound types: emit string_header/slice_header with zeros so
+        // emitGcStructNewExpanded can decompose them properly.
+        if (field_type_idx == TypeRegistry.STRING or field_info == .slice) {
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+            return try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = zero, .len = zero } }, field_type_idx, span));
+        }
+        return try fb.emitConstInt(0, field_type_idx, span);
+    }
+
+    /// Build a gc_struct_new with chunk-expanded field values.
+    /// Semantic field values for compound types (string, slice) are decomposed
+    /// into their constituent i64 chunks (ptr, len, cap). Returns the gc_struct_new node.
+    /// For default/zero values of compound types, emits zeros for all chunks.
+    fn emitGcStructNewExpanded(self: *Lowerer, type_name: []const u8, struct_type: anytype, semantic_values: []const ir.NodeIndex, struct_type_idx: TypeIndex, span: Span) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        // Count total chunks
+        var total_chunks: usize = 0;
+        for (struct_type.fields) |field| {
+            total_chunks += self.gcFieldChunks(field.type_idx);
+        }
+        if (total_chunks == semantic_values.len) {
+            // No expansion needed — all fields are single-chunk
+            return try fb.emitGcStructNew(type_name, semantic_values, struct_type_idx, span);
+        }
+        var expanded = try self.allocator.alloc(ir.NodeIndex, total_chunks);
+        defer self.allocator.free(expanded);
+        var ci: usize = 0;
+        for (struct_type.fields, 0..) |field, fi| {
+            const chunks = self.gcFieldChunks(field.type_idx);
+            if (chunks == 1) {
+                expanded[ci] = semantic_values[fi];
+                ci += 1;
+            } else {
+                // Compound type: decompose into individual chunks
+                const val = semantic_values[fi];
+                const is_string_or_slice = field.type_idx == TypeRegistry.STRING or self.type_reg.get(field.type_idx) == .slice;
+                if (is_string_or_slice) {
+                    // Decompose string/slice into ptr, len, [cap]
+                    const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+                    expanded[ci] = try fb.emitSlicePtr(val, ptr_type, span);
+                    ci += 1;
+                    expanded[ci] = try fb.emitSliceLen(val, span);
+                    ci += 1;
+                    if (chunks >= 3) {
+                        // Cap: use len as cap for string literals
+                        expanded[ci] = try fb.emitSliceLen(val, span);
+                        ci += 1;
+                    }
+                } else {
+                    // Other compound: first chunk gets value, rest get zero
+                    expanded[ci] = val;
+                    ci += 1;
+                    for (1..chunks) |_| {
+                        expanded[ci] = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                        ci += 1;
+                    }
+                }
+            }
+        }
+        return try fb.emitGcStructNew(type_name, expanded, struct_type_idx, span);
+    }
+
     /// Lower heap allocation expression: new Type { field: value, ... }
     /// ARC path: cot_alloc call + field stores via linear memory.
     /// WasmGC path: gc_struct_new with field values (GC-managed object).
@@ -4438,7 +4672,7 @@ pub const Lowerer = struct {
         // WasmGC path: emit gc_struct_new with all field values
         // Reference: Kotlin/Wasm WasmGC codegen — all structs are GC objects
         if (self.target.isWasmGC()) {
-            const type_name = if (ne.type_args.len > 0) struct_type.name else ne.type_name;
+            const type_name = struct_type.name;
             // Collect field values in struct field order
             var field_values = try self.allocator.alloc(ir.NodeIndex, struct_type.fields.len);
             // Initialize to null_node
@@ -4457,11 +4691,11 @@ pub const Lowerer = struct {
                     if (struct_field.default_value != null_node) {
                         field_values[i] = try self.lowerExprNode(struct_field.default_value);
                     } else {
-                        field_values[i] = try fb.emitConstInt(0, struct_field.type_idx, ne.span);
+                        field_values[i] = try self.emitGcDefaultValue(struct_field.type_idx, ne.span);
                     }
                 }
             }
-            return try fb.emitGcStructNew(type_name, field_values, struct_type_idx, ne.span);
+            return try self.emitGcStructNewExpanded(type_name, struct_type, field_values, struct_type_idx, ne.span);
         }
 
         // ARC path (unchanged): cot_alloc + field stores via linear memory
@@ -5148,16 +5382,61 @@ pub const Lowerer = struct {
                 const capture_local = try fb.addLocalWithSize(case.capture, payload_type, false, payload_size);
 
                 // Copy payload from union (after 8-byte tag) to capture local.
-                // Always use i64-chunk copy (Go pattern: field-by-field extraction via
-                // OpStructSelect + OffPtr + Load, never single-field special case).
-                // Using payload_type with emitFieldLocal returns a pointer for struct types
-                // (convertFieldLocal line 906), so we must use I64 chunks for all sizes.
-                const num_chunks = (payload_size + 7) / 8;
-                for (0..num_chunks) |ci| {
-                    const union_offset: i64 = 8 + @as(i64, @intCast(ci * 8));
-                    const cap_offset: i64 = @intCast(ci * 8);
-                    const chunk_val = try fb.emitFieldLocal(subject_local, @intCast(1 + ci), union_offset, TypeRegistry.I64, se.span);
-                    _ = try fb.emitStoreLocalField(capture_local, @intCast(ci), cap_offset, chunk_val, se.span);
+                const payload_info = self.type_reg.get(payload_type);
+                if (self.target.isWasmGC() and payload_info == .struct_type) {
+                    // WasmGC: unions are linear memory, but struct captures must be GC refs.
+                    // Extract i64 chunks from union and build gc_struct_new directly at chunk level.
+                    // Compound fields (string=3 chunks) expand to multiple GC fields.
+                    const struct_type = payload_info.struct_type;
+                    // Count total GC chunks
+                    var total_gc_chunks: usize = 0;
+                    for (struct_type.fields) |field| {
+                        total_gc_chunks += self.gcFieldChunks(field.type_idx);
+                    }
+                    var chunk_values = try self.allocator.alloc(ir.NodeIndex, total_gc_chunks);
+                    defer self.allocator.free(chunk_values);
+                    var gc_ci: usize = 0;
+                    var union_ci: usize = 0;
+                    for (struct_type.fields) |field| {
+                        const field_info = self.type_reg.get(field.type_idx);
+                        if (field_info == .struct_type) {
+                            // Nested struct: extract its chunks and build inner gc_struct_new
+                            const inner_struct = field_info.struct_type;
+                            var inner_total: usize = 0;
+                            for (inner_struct.fields) |inf| inner_total += self.gcFieldChunks(inf.type_idx);
+                            var inner_values = try self.allocator.alloc(ir.NodeIndex, inner_total);
+                            defer self.allocator.free(inner_values);
+                            for (0..inner_total) |ij| {
+                                const union_offset: i64 = 8 + @as(i64, @intCast(union_ci * 8));
+                                inner_values[ij] = try fb.emitFieldLocal(subject_local, @intCast(1 + union_ci), union_offset, TypeRegistry.I64, se.span);
+                                union_ci += 1;
+                            }
+                            chunk_values[gc_ci] = try fb.emitGcStructNew(inner_struct.name, inner_values, field.type_idx, se.span);
+                            gc_ci += 1;
+                        } else {
+                            const n_chunks = self.gcFieldChunks(field.type_idx);
+                            for (0..n_chunks) |_| {
+                                const union_offset: i64 = 8 + @as(i64, @intCast(union_ci * 8));
+                                chunk_values[gc_ci] = try fb.emitFieldLocal(subject_local, @intCast(1 + union_ci), union_offset, TypeRegistry.I64, se.span);
+                                gc_ci += 1;
+                                union_ci += 1;
+                            }
+                        }
+                    }
+                    const gc_val = try fb.emitGcStructNew(struct_type.name, chunk_values, payload_type, se.span);
+                    _ = try fb.emitStoreLocal(capture_local, gc_val, se.span);
+                } else {
+                    // Always use i64-chunk copy (Go pattern: field-by-field extraction via
+                    // OpStructSelect + OffPtr + Load, never single-field special case).
+                    // Using payload_type with emitFieldLocal returns a pointer for struct types
+                    // (convertFieldLocal line 906), so we must use I64 chunks for all sizes.
+                    const num_chunks = (payload_size + 7) / 8;
+                    for (0..num_chunks) |ci| {
+                        const union_offset: i64 = 8 + @as(i64, @intCast(ci * 8));
+                        const cap_offset: i64 = @intCast(ci * 8);
+                        const chunk_val = try fb.emitFieldLocal(subject_local, @intCast(1 + ci), union_offset, TypeRegistry.I64, se.span);
+                        _ = try fb.emitStoreLocalField(capture_local, @intCast(ci), cap_offset, chunk_val, se.span);
+                    }
                 }
 
                 if (is_expr) {
@@ -5559,7 +5838,7 @@ pub const Lowerer = struct {
                         if (arg_i < params.len) {
                             const pt = self.type_reg.get(params[arg_i].type_idx);
                             const ps = self.type_reg.sizeOf(params[arg_i].type_idx);
-                            is_large_compound = (pt == .struct_type or pt == .union_type or pt == .tuple) and ps > 8;
+                            is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple) and ps > 8;
                         }
                     }
                     if (is_large_compound) {
@@ -5653,6 +5932,11 @@ pub const Lowerer = struct {
                             const arg_type = self.inferExprType(arg_idx);
                             const arg_info = self.type_reg.get(arg_type);
                             if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                                // WasmGC: struct values are already GC refs — *Struct and Struct
+                                // are the same thing. No address-taking needed.
+                                if (self.target.isWasmGC()) {
+                                    // arg_node is already the GC ref, pass it directly
+                                } else {
                                 const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
                                 // Try to take address of original lvalue (local or field)
                                 if (ast_expr == .ident) {
@@ -5682,6 +5966,7 @@ pub const Lowerer = struct {
                                     _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
                                     arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
                                 }
+                                }
                             }
                         }
                     }
@@ -5703,7 +5988,7 @@ pub const Lowerer = struct {
                     if (arg_i < params.len) {
                         const pt = self.type_reg.get(params[arg_i].type_idx);
                         const ps = self.type_reg.sizeOf(params[arg_i].type_idx);
-                        is_large_compound = (pt == .struct_type or pt == .union_type or pt == .tuple) and ps > 8;
+                        is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple) and ps > 8;
                     }
                 }
                 if (is_large_compound) {
@@ -6022,6 +6307,10 @@ pub const Lowerer = struct {
                             const arg_type = self.inferExprType(arg_idx);
                             const arg_info = self.type_reg.get(arg_type);
                             if (arg_info == .struct_type and self.type_reg.isAssignable(arg_type, param_info.pointer.elem)) {
+                                // WasmGC: struct values are already GC refs — pass directly
+                                if (self.target.isWasmGC()) {
+                                    // arg_node is already the GC ref, pass it directly
+                                } else {
                                 const ptr_type = self.type_reg.makePointer(arg_type) catch TypeRegistry.I64;
                                 // Try to take address of original lvalue (local or field)
                                 if (ast_expr == .ident) {
@@ -6048,6 +6337,7 @@ pub const Lowerer = struct {
                                     _ = try fb.emitStoreLocal(tmp_local, arg_node, call.span);
                                     arg_node = try fb.emitAddrLocal(tmp_local, ptr_type, call.span);
                                 }
+                                }
                             }
                         }
                     }
@@ -6069,7 +6359,7 @@ pub const Lowerer = struct {
                     if (param_idx < params.len) {
                         const pt = self.type_reg.get(params[param_idx].type_idx);
                         const ps = self.type_reg.sizeOf(params[param_idx].type_idx);
-                        is_large_compound = (pt == .struct_type or pt == .union_type or pt == .tuple) and ps > 8;
+                        is_large_compound = !self.target.isWasmGC() and (pt == .struct_type or pt == .union_type or pt == .tuple) and ps > 8;
                     }
                 }
                 if (is_large_compound) {
@@ -6356,6 +6646,15 @@ pub const Lowerer = struct {
             },
             .ptr_to_int => {
                 const value = try self.lowerExprNode(bc.args[0]);
+                // WasmGC: GC refs have no linear memory address — return 0.
+                // Tests using @ptrToInt on GC refs need restructuring (use ?*T fields).
+                if (self.target.isWasmGC()) {
+                    const arg_type = self.inferExprType(bc.args[0]);
+                    const arg_info = self.type_reg.get(arg_type);
+                    const is_gc_ref = arg_info == .struct_type or
+                        (arg_info == .pointer and self.type_reg.get(arg_info.pointer.elem) == .struct_type);
+                    if (is_gc_ref) return try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+                }
                 return try fb.emitPtrToInt(value, TypeRegistry.I64, bc.span);
             },
             .string => {
@@ -6892,6 +7191,8 @@ pub const Lowerer = struct {
             // In Cot, monomorphization makes the concrete type known at compile time.
             .arc_retain => {
                 const arg = try self.lowerExprNode(bc.args[0]);
+                // WasmGC: GC handles lifetimes — retain is a no-op
+                if (self.target.isWasmGC()) return arg;
                 const arg_type = self.inferExprType(bc.args[0]);
                 if (self.type_reg.couldBeARC(arg_type)) {
                     var args = [_]ir.NodeIndex{arg};
@@ -6900,6 +7201,8 @@ pub const Lowerer = struct {
                 return arg;
             },
             .arc_release => {
+                // WasmGC: GC handles lifetimes — release is a no-op
+                if (self.target.isWasmGC()) return ir.null_node;
                 const arg = try self.lowerExprNode(bc.args[0]);
                 const arg_type = self.inferExprType(bc.args[0]);
                 if (self.type_reg.couldBeARC(arg_type)) {
@@ -7394,6 +7697,28 @@ pub const Lowerer = struct {
 
         // OK block: read the success payload at [ptr + 8]
         fb.setBlock(ok_block);
+        const elem_info = self.type_reg.get(elem_type);
+        if (self.target.isWasmGC() and elem_info == .struct_type) {
+            // WasmGC: reconstruct GC struct from decomposed fields in EU buffer
+            const st = elem_info.struct_type;
+            // Count total GC chunks for chunk-level extraction
+            var total_gc_chunks: usize = 0;
+            for (st.fields) |field| total_gc_chunks += self.gcFieldChunks(field.type_idx);
+            var chunk_values = try self.allocator.alloc(ir.NodeIndex, total_gc_chunks);
+            defer self.allocator.free(chunk_values);
+            var mem_ci: usize = 0;
+            var gc_ci: usize = 0;
+            for (st.fields) |field| {
+                const n_chunks = self.gcFieldChunks(field.type_idx);
+                for (0..n_chunks) |_| {
+                    const field_addr = try fb.emitAddrOffset(eu_ptr, @intCast(8 + mem_ci * 8), TypeRegistry.I64, te.span);
+                    chunk_values[gc_ci] = try fb.emitPtrLoadValue(field_addr, TypeRegistry.I64, te.span);
+                    gc_ci += 1;
+                    mem_ci += 1;
+                }
+            }
+            return try fb.emitGcStructNew(st.name, chunk_values, elem_type, te.span);
+        }
         const payload_addr_ok = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, te.span);
         return try fb.emitPtrLoadValue(payload_addr_ok, elem_type, te.span);
     }
@@ -7545,6 +7870,26 @@ pub const Lowerer = struct {
             const len_val = try fb.emitPtrLoadValue(len_addr, TypeRegistry.I64, ce.span);
             _ = try fb.emitStoreLocalField(result_local, 0, 0, ptr_val, ce.span);
             _ = try fb.emitStoreLocalField(result_local, 1, 8, len_val, ce.span);
+        } else if (self.target.isWasmGC() and self.type_reg.get(elem_type) == .struct_type) {
+            // WasmGC: reconstruct GC struct from decomposed fields in EU buffer
+            const st = self.type_reg.get(elem_type).struct_type;
+            var total_gc_chunks: usize = 0;
+            for (st.fields) |field| total_gc_chunks += self.gcFieldChunks(field.type_idx);
+            var chunk_values = try self.allocator.alloc(ir.NodeIndex, total_gc_chunks);
+            defer self.allocator.free(chunk_values);
+            var mem_ci: usize = 0;
+            var gc_ci: usize = 0;
+            for (st.fields) |field| {
+                const n_chunks = self.gcFieldChunks(field.type_idx);
+                for (0..n_chunks) |_| {
+                    const field_addr = try fb.emitAddrOffset(eu_ptr, @intCast(8 + mem_ci * 8), TypeRegistry.I64, ce.span);
+                    chunk_values[gc_ci] = try fb.emitPtrLoadValue(field_addr, TypeRegistry.I64, ce.span);
+                    gc_ci += 1;
+                    mem_ci += 1;
+                }
+            }
+            const gc_val = try fb.emitGcStructNew(st.name, chunk_values, elem_type, ce.span);
+            _ = try fb.emitStoreLocal(result_local, gc_val, ce.span);
         } else {
             const payload_addr = try fb.emitAddrOffset(eu_ptr, 8, TypeRegistry.I64, ce.span);
             const success_val = try fb.emitPtrLoadValue(payload_addr, elem_type, ce.span);

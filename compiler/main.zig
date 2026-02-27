@@ -242,13 +242,10 @@ fn runOnce(allocator: std.mem.Allocator, input_file: []const u8, compile_target:
         tmp_output;
 
     var run_args = std.ArrayListUnmanaged([]const u8){};
-    if (compile_target.isWasmGC()) {
+    if (compile_target.isWasm()) {
         run_args.append(allocator, "wasmtime") catch {};
         run_args.append(allocator, "-W") catch {};
         run_args.append(allocator, "gc=y") catch {};
-        run_args.append(allocator, run_path) catch {};
-    } else if (compile_target.isWasm()) {
-        run_args.append(allocator, "wasmtime") catch {};
         run_args.append(allocator, run_path) catch {};
     } else {
         run_args.append(allocator, run_path) catch {};
@@ -330,10 +327,8 @@ fn testCommand(allocator: std.mem.Allocator, opts: cli.TestOptions) void {
     else
         tmp_output;
 
-    const argv: []const []const u8 = if (opts.target.isWasmGC())
+    const argv: []const []const u8 = if (opts.target.isWasm())
         &.{ "wasmtime", "-W", "gc=y", run_path }
-    else if (opts.target.isWasm())
-        &.{ "wasmtime", run_path }
     else
         &.{run_path};
 
@@ -405,10 +400,8 @@ fn benchCommand(allocator: std.mem.Allocator, opts: cli.BenchOptions) void {
     else
         tmp_output;
 
-    const argv: []const []const u8 = if (opts.target.isWasmGC())
+    const argv: []const []const u8 = if (opts.target.isWasm())
         &.{ "wasmtime", "-W", "gc=y", run_path }
-    else if (opts.target.isWasm())
-        &.{ "wasmtime", run_path }
     else
         &.{run_path};
 

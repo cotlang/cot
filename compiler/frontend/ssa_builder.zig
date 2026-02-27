@@ -76,7 +76,7 @@ pub const SSABuilder = struct {
         const is_wasm_gc = target.isWasmGC();
         for (ir_func.params, 0..) |param, i| {
             const local_type = type_registry.get(param.type_idx);
-            const is_string_or_slice = !is_wasm_gc and (param.type_idx == TypeRegistry.STRING or local_type == .slice);
+            const is_string_or_slice = param.type_idx == TypeRegistry.STRING or local_type == .slice;
             const type_size = type_registry.sizeOf(param.type_idx);
             const is_large_struct = !is_wasm_gc and (local_type == .struct_type or local_type == .union_type or local_type == .tuple) and type_size > 8;
 
@@ -503,6 +503,7 @@ pub const SSABuilder = struct {
             while (it.next()) |entry| {
                 if (entry.value_ptr.get(local_idx)) |v| return v;
             }
+            // GC ref not found — should not happen if assign() was called properly
             return error.MissingValue;
         }
 
@@ -570,9 +571,14 @@ pub const SSABuilder = struct {
 
         // WasmGC: struct values are GC refs — assign directly to local, no memory store.
         // The Wasm codegen (setReg) emits local.set for the assigned value.
-        if (self.target.isWasmGC() and (value.op == .wasm_gc_struct_new or value_type == .struct_type)) {
-            self.assign(local_idx, value);
-            return value;
+        // Covers: struct.new, call results returning structs, pointer-to-struct.
+        if (self.target.isWasmGC()) {
+            const is_gc_ref = value.op == .wasm_gc_struct_new or value_type == .struct_type or
+                (value_type == .pointer and self.type_registry.get(value_type.pointer.elem) == .struct_type);
+            if (is_gc_ref) {
+                self.assign(local_idx, value);
+                return value;
+            }
         }
 
         // String/slice compound store: decompose into ptr@0, len@8 (and cap@16 for slices).
@@ -820,10 +826,16 @@ pub const SSABuilder = struct {
     /// Must match callee param decomposition in buildSSA.
     /// Go reference: ssagen/ssa.go uses OSPTR()/OLEN() to decompose slice args at call sites.
     fn addCallArg(self: *SSABuilder, call_val: *Value, arg_val: *Value, cur: *Block) !void {
-        // WasmGC: all args (including structs, strings) are single ref values — no decomposition
+        // WasmGC: struct/GC-ref args are single ref values — no decomposition
+        // But strings/slices still decompose to (ptr, len) since they're in linear memory.
         if (self.target.isWasmGC()) {
-            try call_val.addArgAlloc(arg_val, self.allocator);
-            return;
+            const arg_type = self.type_registry.get(arg_val.type_idx);
+            const is_gc_ref = arg_type == .struct_type or
+                (arg_type == .pointer and self.type_registry.get(arg_type.pointer.elem) == .struct_type);
+            if (is_gc_ref) {
+                try call_val.addArgAlloc(arg_val, self.allocator);
+                return;
+            }
         }
 
         const arg_type = self.type_registry.get(arg_val.type_idx);

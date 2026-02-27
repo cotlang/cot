@@ -795,8 +795,8 @@ pub const GC_STRUCT_TYPE: u8 = 0x5F; // struct type tag
 pub const GC_ARRAY_TYPE: u8 = 0x5E; // array type tag
 pub const GC_FIELD_MUT: u8 = 0x01; // mutable field
 pub const GC_FIELD_IMMUT: u8 = 0x00; // immutable field
-pub const GC_REF_TYPE: u8 = 0x63; // (ref $ht) non-nullable
-pub const GC_REF_TYPE_NULL: u8 = 0x64; // (ref null $ht) nullable
+pub const GC_REF_TYPE: u8 = 0x64; // (ref $ht) non-nullable
+pub const GC_REF_TYPE_NULL: u8 = 0x63; // (ref null $ht) nullable
 pub const GC_REC_TYPE: u8 = 0x4E; // rec group wrapper
 pub const GC_SUB_TYPE_FINAL: u8 = 0x4E; // sub final (no inheritance)
 

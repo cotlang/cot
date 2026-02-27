@@ -4802,20 +4802,79 @@ pub const Driver = struct {
         // ====================================================================
         if (is_wasm_gc) {
             const wasm_link = @import("codegen/wasm/link.zig");
+            // First pass: register all struct names so we can resolve field refs
             for (type_reg.types.items) |t| {
                 if (t == .struct_type) {
                     const st = t.struct_type;
-                    var gc_fields = try self.allocator.alloc(wasm_link.GcFieldType, st.fields.len);
+                    // Pre-register with empty fields to get type index
+                    _ = try linker.addGcStructType(st.name, &.{});
+                }
+            }
+            // Second pass: fill in field types (may reference other structs)
+            // Compound fields (string=3 chunks, slice=3 chunks) are expanded to
+            // multiple i64 GC fields so struct.new/get/set operate per-chunk.
+            for (type_reg.types.items) |t| {
+                if (t == .struct_type) {
+                    const st = t.struct_type;
+                    // Count total chunks across all fields
+                    var total_chunks: usize = 0;
+                    for (st.fields) |field| {
+                        const field_info = type_reg.get(field.type_idx);
+                        if (field_info == .struct_type) {
+                            total_chunks += 1; // GC ref = 1 chunk
+                        } else {
+                            const field_size = type_reg.sizeOf(field.type_idx);
+                            total_chunks += @max(1, (field_size + 7) / 8);
+                        }
+                    }
+                    var gc_fields = try self.allocator.alloc(wasm_link.GcFieldType, total_chunks);
                     defer self.allocator.free(gc_fields);
-                    for (st.fields, 0..) |field, fi| {
+                    var chunk_idx: usize = 0;
+                    for (st.fields) |field| {
                         const is_float = field.type_idx == types_mod.TypeRegistry.F64 or
                             field.type_idx == types_mod.TypeRegistry.F32;
-                        gc_fields[fi] = .{
-                            .val_type = if (is_float) .f64 else .i64,
-                            .mutable = true,
+                        const field_info = type_reg.get(field.type_idx);
+                        // Check if field is a struct type (or pointer to struct) → GC ref
+                        const field_struct_name: ?[]const u8 = switch (field_info) {
+                            .struct_type => |fst| fst.name,
+                            .pointer => |ptr| switch (type_reg.get(ptr.elem)) {
+                                .struct_type => |fst| fst.name,
+                                else => null,
+                            },
+                            else => null,
                         };
+                        const gc_ref: ?u32 = if (field_struct_name) |name|
+                            linker.gc_struct_name_map.get(name)
+                        else
+                            null;
+                        if (gc_ref != null) {
+                            // Struct field: single GC ref
+                            gc_fields[chunk_idx] = .{
+                                .val_type = .i64,
+                                .mutable = true,
+                                .gc_ref = gc_ref,
+                            };
+                            chunk_idx += 1;
+                        } else {
+                            // Primitive or compound field: expand to i64 chunks
+                            const field_size = type_reg.sizeOf(field.type_idx);
+                            const num_chunks = @max(1, (field_size + 7) / 8);
+                            for (0..num_chunks) |ci| {
+                                gc_fields[chunk_idx] = .{
+                                    .val_type = if (ci == 0 and is_float) .f64 else .i64,
+                                    .mutable = true,
+                                    .gc_ref = null,
+                                };
+                                chunk_idx += 1;
+                            }
+                        }
                     }
-                    _ = try linker.addGcStructType(st.name, gc_fields);
+                    // Update the existing struct type's fields
+                    const type_idx = linker.gc_struct_name_map.get(st.name).?;
+                    const gs = &linker.gc_struct_types.items[type_idx];
+                    gs.field_offset = @intCast(linker.gc_field_storage.items.len);
+                    gs.field_count = @intCast(gc_fields.len);
+                    try linker.gc_field_storage.appendSlice(self.allocator, gc_fields);
                 }
             }
         }
@@ -5101,15 +5160,15 @@ pub const Driver = struct {
             var params: [32]wasm.ValType = undefined;
             // WasmGC: parallel array for GC-aware param types (ref types for structs)
             var gc_params: [32]wasm.WasmType = undefined;
+            var wasm_param_idx: usize = 0;
             {
                 // Build Wasm param types, decomposing compound types (slice, string)
                 // into 2 separate i64 entries (ptr, len). This must match the SSA
                 // builder's arg decomposition in ssa_builder.zig.
                 // WasmGC: no decomposition — structs are single (ref null $T) values.
-                var wasm_param_idx: usize = 0;
                 for (ir_func.params) |param| {
                     const param_type = type_reg.get(param.type_idx);
-                    const is_string_or_slice = !is_wasm_gc and (param.type_idx == types_mod.TypeRegistry.STRING or param_type == .slice);
+                    const is_string_or_slice = param.type_idx == types_mod.TypeRegistry.STRING or param_type == .slice;
                     const type_size = type_reg.sizeOf(param.type_idx);
                     const is_large_struct = !is_wasm_gc and (param_type == .struct_type or param_type == .union_type or param_type == .tuple) and type_size > 8;
 
@@ -5158,7 +5217,7 @@ pub const Driver = struct {
             // to match the param decomposition pattern above.
             // WasmGC: no decomposition — compound returns are single ref values.
             const ret_type_info = type_reg.get(ir_func.return_type);
-            const ret_is_compound = !is_wasm_gc and (ir_func.return_type == types_mod.TypeRegistry.STRING or ret_type_info == .slice);
+            const ret_is_compound = ir_func.return_type == types_mod.TypeRegistry.STRING or ret_type_info == .slice;
             const results: []const wasm.ValType = if (!has_return)
                 &[_]wasm.ValType{}
             else if (ret_is_compound)
@@ -5171,10 +5230,24 @@ pub const Driver = struct {
             // Add function type to linker
             // WasmGC: use addTypeWasm for GC-aware type registration (ref type params)
             const type_idx = if (is_wasm_gc) blk: {
-                // Convert results to WasmType
+                // Convert results to WasmType, handling GC ref returns
                 var gc_results: [4]wasm.WasmType = undefined;
-                for (results, 0..) |r, ri| gc_results[ri] = wasm.WasmType.fromVal(r);
-                break :blk try linker.addTypeWasm(gc_params[0..param_count], gc_results[0..results.len]);
+                var gc_results_len: usize = results.len;
+                // WasmGC: struct returns become (ref null $T) result types
+                const is_gc_struct_return = ret_type_info == .struct_type or
+                    (ret_type_info == .pointer and type_reg.get(ret_type_info.pointer.elem) == .struct_type);
+                if (has_return and is_gc_struct_return) {
+                    const st = if (ret_type_info == .struct_type)
+                        ret_type_info.struct_type
+                    else
+                        type_reg.get(ret_type_info.pointer.elem).struct_type;
+                    const gc_type_idx_ret = linker.gc_struct_name_map.get(st.name) orelse 0;
+                    gc_results[0] = wasm.WasmType.gcRefNull(gc_type_idx_ret);
+                    gc_results_len = 1;
+                } else {
+                    for (results, 0..) |r, ri| gc_results[ri] = wasm.WasmType.fromVal(r);
+                }
+                break :blk try linker.addTypeWasm(gc_params[0..wasm_param_idx], gc_results[0..gc_results_len]);
             } else try linker.addType(params[0..param_count], results);
 
             // Register this function's Wasm type index for call_indirect resolution
@@ -5209,14 +5282,15 @@ pub const Driver = struct {
                         else
                             &[_]wasm.ValType{.i64};
                         const call_type_idx = try linker.addType(cp[0..n_params], res);
-                        sv.aux_int = @intCast(call_type_idx);
+                        sv.aux_int = @intCast(linker.funcTypeIndex(call_type_idx));
                     }
                 }
             }
 
             // Generate function body code using Go-style two-pass architecture
             const gc_name_map = if (is_wasm_gc) &linker.gc_struct_name_map else null;
-            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets, &metadata_addrs, &func_table_indices, gc_name_map);
+            const gc_type_reg = if (is_wasm_gc) type_reg else null;
+            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets, &metadata_addrs, &func_table_indices, gc_name_map, gc_type_reg);
             errdefer self.allocator.free(body);
 
             // Export all functions for AOT compatibility

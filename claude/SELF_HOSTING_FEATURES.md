@@ -356,7 +356,7 @@ var c = Config { .name = "test" }  // debug=false, level=0 filled in
 
 **Status**: **Fully implemented.** Parser stores `default_value` on Field, checker validates
 missing fields have defaults, lowerer emits default values in all 5 init paths (stack struct,
-stack struct expr, new expr ARC, new expr WasmGC, new expr heap). Empty struct init `Config {}`
+stack struct expr, new expr heap, new expr WasmGC). Empty struct init `Config {}`
 supported when all fields have defaults.
 
 **Why**: Used on 100+ struct definitions in the compiler. Almost every struct has at least

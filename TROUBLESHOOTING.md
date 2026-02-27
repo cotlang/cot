@@ -38,17 +38,19 @@ Every line of Cot is ported from somewhere. There are NO exceptions.
 | MachInst x64 | `compiler/codegen/native/isa/x64/` | Cranelift x64 | `references/wasmtime/cranelift/codegen/src/isa/x86/` |
 | Register Alloc | `compiler/codegen/native/regalloc/` | regalloc2 | `references/wasmtime/cranelift/codegen/src/machinst/reg.rs` + regalloc2 crate |
 | **ARC Insertion** | `compiler/frontend/arc_insertion.zig` | **Swift SILGen** | `references/swift/lib/SILGen/` (ManagedValue.h, Cleanup.h, SILGenExpr.cpp) |
-| ARC Runtime | `compiler/codegen/wasm/arc.zig` | Swift ARC | `references/swift/stdlib/public/runtime/HeapObject.cpp` |
+| ARC Runtime (native) | `compiler/codegen/native/arc_native.zig` | Swift ARC | `references/swift/stdlib/public/runtime/HeapObject.cpp` |
+| **WasmGC codegen** | `compiler/codegen/wasm/gen.zig`, `driver.zig` | **Kotlin/Wasm** | `references/kotlin/compiler/ir/backend.wasm/src/org/jetbrains/kotlin/backend/wasm/` |
 
-### Three Reference Codebases
+### Four Reference Codebases
 
-The compiler draws from three distinct reference implementations. Know which one to use:
+The compiler draws from four distinct reference implementations. Know which one to use:
 
 | Reference | Language | What It Covers | When to Use |
 |-----------|----------|---------------|-------------|
 | **Go compiler** | Go | Frontend → SSA → Wasm bytecode | SSA passes, Wasm ops, Wasm binary format |
 | **Cranelift** (wasmtime) | Rust | Wasm → CLIF → MachInst → emit | Wasm-to-CLIF translation, ISA backends (ARM64/x64), register allocation, instruction emission |
 | **rustc_codegen_cranelift** (cg_clif) | Rust | SSA → CLIF (native path) | `ssa_to_clif.zig` — how to build CLIF IR from a compiler's SSA IR using FunctionBuilder |
+| **Kotlin/Wasm** | Kotlin | WasmGC codegen | WasmGC struct types, ref types, struct.new/get/set, GC type encoding, function signatures with GC refs |
 
 **For native codegen bugs:**
 - If the bug is in **CLIF → machine code** (lowering, regalloc, emit): reference is **Cranelift** at `references/wasmtime/cranelift/codegen/src/`

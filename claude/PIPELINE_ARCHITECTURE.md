@@ -108,15 +108,15 @@ This document maps **every stage of the Cot compilation pipeline** to its refere
 - `references/go/src/cmd/internal/obj/wasm/wasmobj.go` — Wasm binary format encoding
 - `references/go/src/cmd/link/internal/wasm/asm.go` — Wasm section layout, import handling
 
-**Wasm-target ARC runtime functions** (`cot_alloc`, `cot_retain`, `cot_release`) are generated as Wasm bytecode by `arc.zig`. They become regular Wasm functions in the module. The ARC pattern is ported from **Swift** (`HeapObject.cpp`), but the implementation is Wasm bytecode using Go's codegen patterns.
+**Wasm uses WasmGC** — structs are GC-managed objects (`struct.new`, `struct.get`, `struct.set`), not ARC. Linear memory allocation functions (`cot_alloc`, `cot_dealloc`, `cot_realloc`) are still generated as Wasm bytecode by `arc.zig` for string buffers and List backing arrays, but `cot_retain`/`cot_release` are dead code on Wasm.
 
-| ARC Function | Reference | What It Does |
-|-------------|-----------|--------------|
-| `cot_alloc` | Swift `swift_allocObject` + Go `sbrk` | Freelist-first allocator with memory.grow fallback. Wasm: 16-byte header `[total_size:i32][metadata:i32][refcount:i64]`. Native: 24-byte header `[total_size:i64][metadata:i64][refcount:i64]` |
-| `cot_dealloc` | Swift `swift_deallocObject` | Return freed block to freelist for reuse |
-| `cot_realloc` | C `realloc` semantics | Shrink in-place or alloc+copy+dealloc. Used by growable containers |
-| `cot_retain` | Swift `swift_retain` (HeapObject.cpp:476) | Increment refcount (null-safe, immortal-safe) |
-| `cot_release` | Swift `swift_release` (HeapObject.cpp:835) | Decrement refcount, call destructor at zero, then dealloc |
+| Runtime Function | Target | Reference | What It Does |
+|-----------------|--------|-----------|--------------|
+| `cot_alloc` | Native + Wasm | Swift `swift_allocObject` + Go `sbrk` | Freelist-first allocator. Native: 24-byte header `[total_size:i64][metadata:i64][refcount:i64]`. Wasm: linear memory for string/List buffers |
+| `cot_dealloc` | Native + Wasm | Swift `swift_deallocObject` | Return freed block to freelist for reuse |
+| `cot_realloc` | Native + Wasm | C `realloc` semantics | Shrink in-place or alloc+copy+dealloc. Used by growable containers |
+| `cot_retain` | Native only | Swift `swift_retain` (HeapObject.cpp:476) | Increment refcount (null-safe, immortal-safe) |
+| `cot_release` | Native only | Swift `swift_release` (HeapObject.cpp:835) | Decrement refcount, call destructor at zero, then dealloc |
 
 **Networking runtime functions** are generated as WASI stubs (return -1) by `wasi_runtime.zig` for Wasm targets. On native, they are generated as CLIF IR by `io_native.zig` and call libc directly.
 
@@ -346,10 +346,10 @@ Extern functions become undefined symbols in the object file via `declareExterna
 
 **Reference: Swift's `swift_allocObject` (simplified)**
 
-`cot_alloc` is a **freelist allocator** generated as Wasm bytecode by `arc.zig`. It:
+`cot_alloc` is a **freelist allocator**. On Wasm it is generated as Wasm bytecode by `arc.zig` (used for string buffers and List backing arrays — structs use WasmGC). On native it is generated as CLIF IR by `arc_native.zig` (used for all heap allocations including ARC objects). It:
 1. Checks the freelist for a reusable block (first-fit)
-2. If no block found, bumps the heap pointer (with `memory.grow` if needed — Go's `sbrk` pattern)
-3. Writes a 16-byte header: `[total_size:i32][metadata:i32][refcount:i64]`
+2. If no block found, bumps the heap pointer (with `memory.grow` on Wasm — Go's `sbrk` pattern)
+3. Writes a header: native 24-byte `[total_size:i64][metadata:i64][refcount:i64]`, Wasm 16-byte `[total_size:i32][metadata:i32][refcount:i64]`
 4. Returns pointer to user data after the header
 5. On dealloc, pushes block onto freelist for reuse
 
@@ -374,7 +374,7 @@ Allocation header (16 bytes):
 
 ### How it works on native
 
-On native, ARC runtime functions (`alloc`, `dealloc`, `realloc`, `retain`, `release`) are generated directly as CLIF IR by `arc_native.zig`. They use libc `malloc`/`free` for heap allocation instead of the Wasm freelist allocator. The native ARC header is 24 bytes: `[total_size:i64][metadata:i64][refcount:i64]` (vs 16 bytes on Wasm where fields are i32+i32+i64).
+On native, ARC runtime functions (`alloc`, `dealloc`, `realloc`, `retain`, `release`) are generated directly as CLIF IR by `arc_native.zig`. They use libc `malloc`/`free` for heap allocation instead of the Wasm freelist allocator. The native ARC header is 24 bytes: `[total_size:i64][metadata:i64][refcount:i64]`. (Wasm does not use ARC — structs are WasmGC-managed.)
 
 The native binary has a 16MB pre-allocated vmctx region for global variables. Global variables use a fixed 16-byte stride (Cranelift's `VMGlobalDefinition` pattern). Init values are written to vmctx_data before execution (Cranelift's `initialize_globals` pattern).
 
@@ -385,7 +385,7 @@ The allocator supports full memory management:
 - **Freelist**: Freed blocks added to singly-linked list for reuse (first-fit)
 - **`cot_dealloc`**: Returns blocks to freelist (Swift's `swift_deallocObject` pattern)
 - **`cot_realloc`**: Shrink in-place or alloc+copy+dealloc (C `realloc` semantics)
-- **`memory.grow`**: Go's `sbrk` pattern on Wasm (pages), Cranelift inline pattern on native (bounds check against pre-allocated 16MB)
+- **`memory.grow`**: Go's `sbrk` pattern on Wasm linear memory (pages), Cranelift inline pattern on native (bounds check against pre-allocated 16MB)
 - **`@alloc(size)`/`@dealloc(ptr)`/`@realloc(ptr, size)`**: Builtins for manual memory control
 - **Null sentinel**: 8 bytes of zeros at data offset 0 (C convention — metadata_ptr=0 is distinguishable from valid metadata)
 - **Deinit/destructors**: `TypeName_deinit` functions called via `call_indirect` when refcount reaches 0

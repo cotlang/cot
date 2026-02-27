@@ -775,9 +775,8 @@ const project_info_text =
     \\
     \\## Targets
     \\native (default)     ARM64/x64 native binary
-    \\wasm32               WebAssembly module
-    \\wasm32-wasi          WebAssembly with WASI imports
-    \\wasm32-gc            WebAssembly with GC-managed structs
+    \\wasm32               WebAssembly module (WasmGC)
+    \\wasm32-wasi          WebAssembly with WASI imports (WasmGC)
     \\
     \\## Architecture
     \\Cot -> Scanner -> Parser -> Checker -> IR -> SSA

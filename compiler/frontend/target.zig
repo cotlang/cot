@@ -35,9 +35,8 @@ pub const Target = struct {
 
     pub const arm64_macos = Target{ .arch = .arm64, .os = .macos };
     pub const amd64_linux = Target{ .arch = .amd64, .os = .linux };
-    pub const wasm32 = Target{ .arch = .wasm32, .os = .freestanding };
-    pub const wasm32_wasi = Target{ .arch = .wasm32, .os = .wasi };
-    pub const wasm32_gc = Target{ .arch = .wasm32, .os = .freestanding, .gc = true };
+    pub const wasm32 = Target{ .arch = .wasm32, .os = .freestanding, .gc = true };
+    pub const wasm32_wasi = Target{ .arch = .wasm32, .os = .wasi, .gc = true };
 
     pub fn native() Target {
         const arch: Arch = switch (builtin.cpu.arch) {
@@ -58,7 +57,6 @@ pub const Target = struct {
     }
 
     pub fn name(self: Target) []const u8 {
-        if (self.arch == .wasm32 and self.gc) return "wasm32-gc";
         if (self.arch == .wasm32 and self.os == .wasi) return "wasm32-wasi";
         if (self.arch == .wasm32) return "wasm32";
         if (self.arch == .arm64 and self.os == .macos) return "arm64-macos";
@@ -69,7 +67,6 @@ pub const Target = struct {
     }
 
     pub fn parse(s: []const u8) ?Target {
-        if (std.mem.eql(u8, s, "wasm32-gc") or std.mem.eql(u8, s, "wasm-gc")) return wasm32_gc;
         if (std.mem.eql(u8, s, "wasm32-wasi") or std.mem.eql(u8, s, "wasi")) return wasm32_wasi;
         if (std.mem.eql(u8, s, "wasm32") or std.mem.eql(u8, s, "wasm")) return wasm32;
         if (std.mem.eql(u8, s, "arm64-macos")) return arm64_macos;
@@ -122,19 +119,22 @@ test "Target.parse" {
 }
 
 test "Target.isWasmGC" {
-    try std.testing.expect(Target.wasm32_gc.isWasmGC());
-    try std.testing.expect(Target.wasm32_gc.isWasm());
-    try std.testing.expect(!Target.wasm32.isWasmGC());
+    // All wasm targets are GC
+    try std.testing.expect(Target.wasm32.isWasmGC());
+    try std.testing.expect(Target.wasm32.isWasm());
+    try std.testing.expect(Target.wasm32.gc);
     try std.testing.expect(!Target.arm64_macos.isWasmGC());
-    try std.testing.expectEqualStrings("wasm32-gc", Target.wasm32_gc.name());
+    try std.testing.expectEqualStrings("wasm32", Target.wasm32.name());
 }
 
-test "Target.parse wasm32-gc" {
-    const t = Target.parse("wasm32-gc").?;
+test "Target.parse wasm32" {
+    const t = Target.parse("wasm32").?;
     try std.testing.expect(t.isWasmGC());
     try std.testing.expect(t.gc);
-    const t2 = Target.parse("wasm-gc").?;
+    try std.testing.expectEqualStrings("wasm32", t.name());
+    const t2 = Target.parse("wasm").?;
     try std.testing.expect(t2.isWasmGC());
+    try std.testing.expect(Target.parse("wasm32-gc") == null);
 }
 
 test "Target.usesMachO" {

@@ -92,6 +92,9 @@ pub const GenState = struct {
     /// Maps struct type names to GC struct type indices (for WasmGC)
     gc_struct_name_map: ?*const std.StringHashMapUnmanaged(u32) = null,
 
+    /// Type registry for resolving type_idx to type info (needed for WasmGC local allocation)
+    type_reg: ?*const TypeRegistry = null,
+
     /// Maps function names to Wasm type section indices (for call_indirect type)
     /// Go reference: wasmobj.go:1286-1291 (type index from instruction)
     func_type_indices: ?*const std.StringHashMap(u32) = null,
@@ -130,6 +133,10 @@ pub const GenState = struct {
 
     pub fn setGcStructNameMap(self: *GenState, map: *const std.StringHashMapUnmanaged(u32)) void {
         self.gc_struct_name_map = map;
+    }
+
+    pub fn setTypeReg(self: *GenState, reg: *const TypeRegistry) void {
+        self.type_reg = reg;
     }
 
     pub fn setFuncTypeIndices(self: *GenState, indices: *const std.StringHashMap(u32)) void {
@@ -1270,10 +1277,15 @@ pub const GenState = struct {
         const is_compound_ret = is_call and (v.type_idx == TypeRegistry.STRING);
         if (is_compound_ret) {
             // Stack: [ptr, len] — store len first (top of stack), then ptr
-            const len_local = self.next_local;
-            self.next_local += 1;
+            // Len local is pre-allocated in Pass 1 of allocateLocals.
+            const len_local = self.compound_len_locals.get(v.id) orelse blk: {
+                // Fallback: allocate on the fly (shouldn't happen if allocateLocals ran)
+                const l = self.next_local;
+                self.next_local += 1;
+                try self.compound_len_locals.put(self.allocator, v.id, l);
+                break :blk l;
+            };
             _ = try self.builder.appendTo(.local_set, prog_mod.constAddr(len_local));
-            try self.compound_len_locals.put(self.allocator, v.id, len_local);
             if (v.uses > 0) {
                 try self.setReg(v); // stores ptr to v's main local
             }
@@ -1283,6 +1295,10 @@ pub const GenState = struct {
             // Side-effect call with discarded non-void return: drop from Wasm stack.
             // Without this, the return value remains on the Wasm value stack and
             // causes "values remaining on stack at end of block" validation errors.
+            _ = try self.builder.append(.drop);
+        } else if (v.op == .wasm_gc_struct_new) {
+            // GC struct.new with uses=0: result left on stack must be dropped.
+            // struct.new has side_effects=true so it's emitted, but nobody reads the ref.
             _ = try self.builder.append(.drop);
         }
     }
@@ -1325,10 +1341,21 @@ pub const GenState = struct {
                     v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set) continue;
                 if (isFloatType(v.type_idx)) continue; // Skip floats for pass 2
                 if (v.op == .wasm_gc_struct_new) continue; // Skip GC refs for pass 3
+                if (isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map)) continue; // Skip GC ref results for pass 3
 
                 const local_idx = self.next_local;
                 self.next_local += 1;
                 try self.value_to_local.put(self.allocator, v.id, local_idx);
+
+                // Pre-allocate compound return len local: calls returning STRING push
+                // 2 values (ptr, len). The len local must be allocated here in Pass 1
+                // (not during code gen) so it comes before GC ref locals in Pass 3.
+                const is_call_p1 = v.op == .wasm_call or v.op == .wasm_lowered_static_call;
+                if (is_call_p1 and v.type_idx == TypeRegistry.STRING) {
+                    const len_local = self.next_local;
+                    self.next_local += 1;
+                    try self.compound_len_locals.put(self.allocator, v.id, len_local);
+                }
             }
         }
 
@@ -1353,14 +1380,41 @@ pub const GenState = struct {
         // Pass 3: Allocate GC ref locals (reference-typed, after f64 locals)
         for (self.func.blocks.items) |block| {
             for (block.values.items) |v| {
-                if (v.op != .wasm_gc_struct_new) continue;
-                if (v.uses == 0 and !v.hasSideEffects()) continue;
+                if (v.op == .arg) continue;
+                if (v.uses == 0) continue; // GC ref locals only needed if value is actually read
+
+                const is_gc_struct_new = v.op == .wasm_gc_struct_new;
+                const is_gc_ref = isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map);
+                if (!is_gc_struct_new and !is_gc_ref) continue;
+
+                // Already allocated (e.g., by pass 1 before gc ref check was added)
+                if (self.value_to_local.contains(v.id)) continue;
 
                 const local_idx = self.next_local;
                 self.next_local += 1;
-                // Resolve type name → GC type index from linker
-                const type_name = v.aux.string;
-                const gc_type_idx: u32 = if (self.gc_struct_name_map) |m| m.get(type_name) orelse 0 else 0;
+                // Resolve GC type index: gc_struct_new has name in aux, others use type_reg
+                const gc_type_idx: u32 = blk: {
+                    if (is_gc_struct_new) {
+                        const type_name = v.aux.string;
+                        break :blk if (self.gc_struct_name_map) |m| m.get(type_name) orelse 0 else 0;
+                    }
+                    // For call results etc., look up type name from type_reg
+                    if (self.type_reg) |reg| {
+                        const t = reg.get(v.type_idx);
+                        const name = switch (t) {
+                            .struct_type => |st| st.name,
+                            .pointer => |ptr| switch (reg.get(ptr.elem)) {
+                                .struct_type => |st| st.name,
+                                else => null,
+                            },
+                            else => null,
+                        };
+                        if (name) |n| {
+                            break :blk if (self.gc_struct_name_map) |m| m.get(n) orelse 0 else 0;
+                        }
+                    }
+                    break :blk 0;
+                };
                 try self.gc_ref_locals.append(self.allocator, gc_type_idx);
                 try self.value_to_local.put(self.allocator, v.id, local_idx);
             }
@@ -1447,6 +1501,24 @@ fn isCmp(v: *const SsaValue) bool {
 
 fn isFloatType(type_idx: @import("../../ssa/value.zig").TypeIndex) bool {
     return type_idx == TypeRegistry.F64 or type_idx == TypeRegistry.F32 or type_idx == TypeRegistry.UNTYPED_FLOAT;
+}
+
+/// Check if a type_idx is a GC struct type (requires type_reg and gc_struct_name_map)
+fn isGcRefType(type_idx: @import("../../ssa/value.zig").TypeIndex, type_reg: ?*const TypeRegistry, gc_map: ?*const std.StringHashMapUnmanaged(u32)) bool {
+    const reg = type_reg orelse return false;
+    const map = gc_map orelse return false;
+    const t = reg.get(type_idx);
+    return switch (t) {
+        .struct_type => |st| map.contains(st.name),
+        .pointer => |ptr| blk: {
+            const elem = reg.get(ptr.elem);
+            break :blk switch (elem) {
+                .struct_type => |st| map.contains(st.name),
+                else => false,
+            };
+        },
+        else => false,
+    };
 }
 
 // ============================================================================

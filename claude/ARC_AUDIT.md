@@ -7,7 +7,7 @@
 
 | Cot File | Swift Reference | Purpose |
 |----------|----------------|---------|
-| `compiler/codegen/wasm/arc.zig` | `references/swift/stdlib/public/runtime/HeapObject.cpp` | ARC runtime (retain/release/dealloc) |
+| `compiler/codegen/native/arc_native.zig` | `references/swift/stdlib/public/runtime/HeapObject.cpp` | ARC runtime (retain/release/dealloc) — native only. Wasm uses WasmGC. |
 | `compiler/frontend/arc_insertion.zig` | `references/swift/lib/SILGen/Cleanup.h` | Cleanup stack, managed values |
 | `compiler/frontend/lower.zig` | `references/swift/lib/SILGen/SILGenExpr.cpp` | ARC insertion during lowering |
 
