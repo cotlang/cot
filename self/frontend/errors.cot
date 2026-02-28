@@ -15,9 +15,7 @@ const WarningCode = enum(u16) {
     w003 = 3,
     w004 = 4,
     w005 = 5,
-}
 
-impl WarningCode {
     fn code() int {
         return @intFromEnum(self)
     }
@@ -45,9 +43,7 @@ const ErrorCode = enum(u16) {
     e305 = 305, e306 = 306,
     // Semantic
     e400 = 400, e401 = 401, e402 = 402, e403 = 403,
-}
 
-impl ErrorCode {
     /// Return the numeric error code.
     fn code() int {
         return @intFromEnum(self)
@@ -178,9 +174,7 @@ struct ErrorReporter {
     // instead of being printed to stderr.
     collect_mode: bool,
     collected_errors: List(Error),
-}
 
-impl ErrorReporter {
     /// Create a fresh reporter with no errors (no source — for tests).
     static fn init() ErrorReporter {
         var collected: List(Error) = .{}

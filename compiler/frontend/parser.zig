@@ -212,6 +212,11 @@ pub const Parser = struct {
             .kw_export => self.parseExportFn(),
             .kw_packed => self.parseStructDeclWithLayout(.@"packed"),
             .kw_fn => self.parseFnDecl(false, false, false, false),
+            .kw_static => blk: {
+                self.advance();
+                if (!self.check(.kw_fn)) { self.syntaxError("expected 'fn' after 'static'"); break :blk null; }
+                break :blk self.parseFnDecl(false, false, true, false);
+            },
             .kw_async => self.parseAsyncFn(),
             .kw_var => self.parseVarDecl(false),
             .kw_const => self.parseVarDecl(true),
@@ -349,10 +354,17 @@ pub const Parser = struct {
             const field_start = self.pos();
             if (!self.check(.ident)) {
                 if (self.tok.tok.isKeyword()) {
-                    self.err.errorWithCode(self.pos(), .e203, try std.fmt.allocPrint(self.allocator, "'{s}' is a reserved keyword and cannot be used as a name", .{self.tok.tok.string()}));
-                    // Skip to closing delimiter to prevent error cascade
-                    while (!self.check(end_tok) and !self.check(.lbrace) and !self.check(.eof)) {
-                        self.advance();
+                    // Allow nested-decl keywords to terminate field list cleanly
+                    // (they may be method/const/type declarations in struct bodies)
+                    const t = self.tok.tok;
+                    if (t != .kw_fn and t != .kw_static and t != .kw_const and
+                        t != .kw_enum and t != .kw_type and t != .kw_struct)
+                    {
+                        self.err.errorWithCode(self.pos(), .e203, try std.fmt.allocPrint(self.allocator, "'{s}' is a reserved keyword and cannot be used as a name", .{self.tok.tok.string()}));
+                        // Skip to closing delimiter to prevent error cascade
+                        while (!self.check(end_tok) and !self.check(.lbrace) and !self.check(.eof)) {
+                            self.advance();
+                        }
                     }
                 }
                 break;
@@ -417,9 +429,29 @@ pub const Parser = struct {
                         if (!self.expect(.rparen)) return null;
                     } else if (self.match(.colon)) backing_type = try self.parseType() orelse null_node;
                     if (!self.expect(.lbrace)) return null;
+                    // Set current_impl_type for @safe implicit self injection
+                    const saved_impl_type = self.current_impl_type;
+                    const saved_impl_is_generic = self.current_impl_is_generic;
+                    self.current_impl_type = name;
+                    self.current_impl_is_generic = false;
+                    defer {
+                        self.current_impl_type = saved_impl_type;
+                        self.current_impl_is_generic = saved_impl_is_generic;
+                    }
                     var enum_variants = std.ArrayListUnmanaged(ast.EnumVariant){};
                     defer enum_variants.deinit(self.allocator);
+                    var enum_nested_decls = std.ArrayListUnmanaged(NodeIndex){};
+                    defer enum_nested_decls.deinit(self.allocator);
                     while (!self.check(.rbrace) and !self.check(.eof)) {
+                        // Collect doc comments before checking for decl keywords
+                        self.collectDocComment();
+                        // Nested decls: fn, static fn, const
+                        if (self.check(.kw_fn) or self.check(.kw_static) or self.check(.kw_const)) {
+                            if (try self.parseDecl()) |nested_idx| {
+                                try enum_nested_decls.append(self.allocator, nested_idx);
+                            }
+                            continue;
+                        }
                         const var_start = self.pos();
                         if (!self.check(.ident)) break;
                         const var_name = self.tok.text;
@@ -430,7 +462,14 @@ pub const Parser = struct {
                         if (!self.match(.comma)) break;
                     }
                     if (!self.expect(.rbrace)) return null;
-                    return try self.tree.addDecl(.{ .enum_decl = .{ .name = name, .backing_type = backing_type, .variants = try self.allocator.dupe(ast.EnumVariant, enum_variants.items), .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
+                    return try self.tree.addDecl(.{ .enum_decl = .{
+                        .name = name,
+                        .backing_type = backing_type,
+                        .variants = try self.allocator.dupe(ast.EnumVariant, enum_variants.items),
+                        .nested_decls = if (enum_nested_decls.items.len > 0) try self.allocator.dupe(NodeIndex, enum_nested_decls.items) else &.{},
+                        .doc_comment = doc_comment,
+                        .span = Span.init(start, self.pos()),
+                    } });
                 }
             }
             // Not a type declaration, restore full parser+scanner state
@@ -478,13 +517,26 @@ pub const Parser = struct {
 
         if (!self.expect(.lbrace)) return null;
 
-        // Parse nested declarations (const, enum, struct, type, fn) before fields
+        // Set current_impl_type so @safe implicit self injection works for methods inside struct bodies
+        const saved_impl_type = self.current_impl_type;
+        const saved_impl_is_generic = self.current_impl_is_generic;
+        self.current_impl_type = name;
+        self.current_impl_is_generic = (type_params.len > 0);
+        defer {
+            self.current_impl_type = saved_impl_type;
+            self.current_impl_is_generic = saved_impl_is_generic;
+        }
+
+        // Parse nested declarations (const, enum, struct, type, fn, static fn) before fields
         var nested_decls = std.ArrayListUnmanaged(NodeIndex){};
         defer nested_decls.deinit(self.allocator);
         while (!self.check(.rbrace) and !self.check(.eof)) {
+            // Collect doc comments before checking for decl keywords (same pattern as parseFile)
+            self.collectDocComment();
             // Nested decls start with declaration keywords; fields start with ident followed by ':'
             if (self.check(.kw_const) or self.check(.kw_enum) or self.check(.kw_type) or
-                self.check(.kw_fn) or (self.check(.kw_struct) and self.peekToken().tok == .ident))
+                self.check(.kw_fn) or self.check(.kw_static) or
+                (self.check(.kw_struct) and self.peekToken().tok == .ident))
             {
                 if (try self.parseDecl()) |nested_idx| {
                     try nested_decls.append(self.allocator, nested_idx);
@@ -493,6 +545,21 @@ pub const Parser = struct {
         }
 
         const fields = try self.parseFieldList(.rbrace);
+
+        // Parse nested declarations after fields (methods, static fn, etc.)
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            // Collect doc comments before checking for decl keywords
+            self.collectDocComment();
+            if (self.check(.kw_const) or self.check(.kw_enum) or self.check(.kw_type) or
+                self.check(.kw_fn) or self.check(.kw_static) or
+                (self.check(.kw_struct) and self.peekToken().tok == .ident))
+            {
+                if (try self.parseDecl()) |nested_idx| {
+                    try nested_decls.append(self.allocator, nested_idx);
+                }
+            } else break;
+        }
+
         if (!self.expect(.rbrace)) return null;
         return try self.tree.addDecl(.{ .struct_decl = .{
             .name = name,
@@ -638,9 +705,30 @@ pub const Parser = struct {
         } else if (self.match(.colon)) backing_type = try self.parseType() orelse null_node;
         if (!self.expect(.lbrace)) return null;
 
+        // Set current_impl_type so @safe implicit self injection works for methods inside enum bodies
+        const saved_impl_type = self.current_impl_type;
+        const saved_impl_is_generic = self.current_impl_is_generic;
+        self.current_impl_type = name;
+        self.current_impl_is_generic = false;
+        defer {
+            self.current_impl_type = saved_impl_type;
+            self.current_impl_is_generic = saved_impl_is_generic;
+        }
+
         var variants = std.ArrayListUnmanaged(ast.EnumVariant){};
         defer variants.deinit(self.allocator);
+        var nested_decls_list = std.ArrayListUnmanaged(NodeIndex){};
+        defer nested_decls_list.deinit(self.allocator);
         while (!self.check(.rbrace) and !self.check(.eof)) {
+            // Collect doc comments before checking for decl keywords
+            self.collectDocComment();
+            // Nested decls: fn, static fn, const
+            if (self.check(.kw_fn) or self.check(.kw_static) or self.check(.kw_const)) {
+                if (try self.parseDecl()) |nested_idx| {
+                    try nested_decls_list.append(self.allocator, nested_idx);
+                }
+                continue;
+            }
             const var_start = self.pos();
             if (!self.check(.ident)) break;
             const var_name = self.tok.text;
@@ -651,7 +739,14 @@ pub const Parser = struct {
             if (!self.match(.comma)) break;
         }
         if (!self.expect(.rbrace)) return null;
-        return try self.tree.addDecl(.{ .enum_decl = .{ .name = name, .backing_type = backing_type, .variants = try self.allocator.dupe(ast.EnumVariant, variants.items), .doc_comment = doc_comment, .span = Span.init(start, self.pos()) } });
+        return try self.tree.addDecl(.{ .enum_decl = .{
+            .name = name,
+            .backing_type = backing_type,
+            .variants = try self.allocator.dupe(ast.EnumVariant, variants.items),
+            .nested_decls = if (nested_decls_list.items.len > 0) try self.allocator.dupe(NodeIndex, nested_decls_list.items) else &.{},
+            .doc_comment = doc_comment,
+            .span = Span.init(start, self.pos()),
+        } });
     }
 
     fn parseUnionDecl(self: *Parser) ParseError!?NodeIndex {

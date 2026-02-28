@@ -59,9 +59,7 @@ const BasicKind = enum(u8) {
     void_type,
     noreturn_type,
     untyped_int, untyped_float, untyped_bool, untyped_null,
-}
 
-impl BasicKind {
     fn name() string {
         return switch (self) {
             .invalid => "invalid",
@@ -155,6 +153,10 @@ struct ErrorSetType {
     name: string,
     variant_count: int,
     variant_names: int,    // raw pointer to ErrorVariant array
+
+    fn getVariant(idx: int) *ErrorVariant {
+        return @intToPtr(*ErrorVariant, self.variant_names + idx * @sizeOf(ErrorVariant))
+    }
 }
 
 struct ErrorUnionType {
@@ -165,6 +167,10 @@ struct ErrorUnionType {
 struct TupleType {
     elem_count: int,
     elem_types: int,    // raw pointer to int array
+
+    fn getElemType(idx: int) int {
+        return @intToPtr(*int, self.elem_types + idx * 8).*
+    }
 }
 
 struct StructField {
@@ -181,6 +187,10 @@ struct StructType {
     size: int,
     alignment: int,
     layout: int,
+
+    fn getField(idx: int) *StructField {
+        return @intToPtr(*StructField, self.fields + idx * @sizeOf(StructField))
+    }
 }
 
 struct EnumVariant {
@@ -193,6 +203,10 @@ struct EnumType {
     variant_count: int,
     variants: int,      // raw pointer to EnumVariant array
     backing_type: int,
+
+    fn getVariant(idx: int) *EnumVariant {
+        return @intToPtr(*EnumVariant, self.variants + idx * @sizeOf(EnumVariant))
+    }
 }
 
 struct UnionVariant {
@@ -205,6 +219,10 @@ struct UnionType {
     variant_count: int,
     variants: int,      // raw pointer to UnionVariant array
     tag_type: int,
+
+    fn getVariant(idx: int) *UnionVariant {
+        return @intToPtr(*UnionVariant, self.variants + idx * @sizeOf(UnionVariant))
+    }
 }
 
 struct FuncParam {
@@ -216,6 +234,10 @@ struct FuncType {
     param_count: int,
     params: int,        // raw pointer to FuncParam array
     return_type: int,
+
+    fn getParam(idx: int) *FuncParam {
+        return @intToPtr(*FuncParam, self.params + idx * @sizeOf(FuncParam))
+    }
 }
 
 struct MethodInfo {
@@ -224,46 +246,6 @@ struct MethodInfo {
     func_type: int,
     receiver_is_ptr: bool,
     is_static: bool,
-}
-
-// ============================================================================
-// Type accessor methods — centralize raw pointer arithmetic
-// ============================================================================
-
-impl StructType {
-    fn getField(idx: int) *StructField {
-        return @intToPtr(*StructField, self.fields + idx * @sizeOf(StructField))
-    }
-}
-
-impl EnumType {
-    fn getVariant(idx: int) *EnumVariant {
-        return @intToPtr(*EnumVariant, self.variants + idx * @sizeOf(EnumVariant))
-    }
-}
-
-impl UnionType {
-    fn getVariant(idx: int) *UnionVariant {
-        return @intToPtr(*UnionVariant, self.variants + idx * @sizeOf(UnionVariant))
-    }
-}
-
-impl FuncType {
-    fn getParam(idx: int) *FuncParam {
-        return @intToPtr(*FuncParam, self.params + idx * @sizeOf(FuncParam))
-    }
-}
-
-impl ErrorSetType {
-    fn getVariant(idx: int) *ErrorVariant {
-        return @intToPtr(*ErrorVariant, self.variant_names + idx * @sizeOf(ErrorVariant))
-    }
-}
-
-impl TupleType {
-    fn getElemType(idx: int) int {
-        return @intToPtr(*int, self.elem_types + idx * 8).*
-    }
 }
 
 // ============================================================================
@@ -319,9 +301,7 @@ struct TypeRegistry {
     types: List(Type),
     name_map: Map(string, int),
     methods: List(MethodEntry),
-}
 
-impl TypeRegistry {
     // Pre-registered basic type indices (accessible as TypeRegistry.BOOL etc.)
     const INVALID: int = 0
     const BOOL: int = 1

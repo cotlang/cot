@@ -23,9 +23,7 @@ struct Scanner {
     in_interp_string: bool,
     interp_brace_depth: int,
     err: ?*ErrorReporter,
-}
 
-impl Scanner {
     /// Create a new scanner for the given source content (no error reporting).
     static fn init(content: string) Scanner {
         return Scanner.make(content, null, null)

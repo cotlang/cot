@@ -35,9 +35,7 @@ struct Parser {
     current_impl_is_generic: bool,
     nest_level: int,
     pending_doc: string,
-}
 
-impl Parser {
     /// Create a new parser. Primes the first token automatically.
     static fn init(scanner: *Scanner, ast: *Ast, errors: *ErrorReporter) Parser {
         var p = Parser {
@@ -197,6 +195,14 @@ impl Parser {
             Token.kw_test => self.parseTestDecl(),
             Token.kw_bench => self.parseBenchDecl(),
             Token.kw_fn => self.parseFnDecl(0, 0, 0, 0),
+            Token.kw_static => {
+                self.advance()
+                if (self.tok != @intFromEnum(Token.kw_fn)) {
+                    self.errors.report(self.tok_start, ErrorCode.e200, "expected 'fn' after 'static'")
+                    return null_node
+                }
+                self.parseFnDecl(0, 0, 1, 0)
+            },
             Token.kw_const => self.parseVarDecl(1),
             Token.kw_var => self.parseVarDecl(0),
             Token.kw_let => self.parseVarDecl(0),
@@ -640,13 +646,18 @@ impl Parser {
             return null_node
         }
 
-        // Parse nested declarations (const, enum, struct, type, fn) before fields
-        // Ported from parser.zig:458-470
+        // Set current_impl_type so @safe implicit self injection works for methods inside struct bodies
+        const saved_impl = self.current_impl_type
+        const saved_impl_generic = self.current_impl_is_generic
+        self.current_impl_type = name
+        self.current_impl_is_generic = (type_params.count > 0)
+
+        // Parse nested declarations (const, enum, struct, type, fn, static fn) before fields
         var nested: List(int) = .{}
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
             const tok = @as(Token, @enumFromInt(self.tok))
             if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
-                tok == Token.kw_fn) {
+                tok == Token.kw_fn or tok == Token.kw_static) {
                 const nested_decl = self.parseDecl()
                 if (nested_decl != null_node) {
                     nested.append(nested_decl)
@@ -659,6 +670,12 @@ impl Parser {
         // Fields
         var fields: List(int) = .{}
         while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+            // Break on nested-decl keywords (methods after fields)
+            const ftok = @as(Token, @enumFromInt(self.tok))
+            if (ftok == Token.kw_fn or ftok == Token.kw_static or ftok == Token.kw_const or
+                ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct) {
+                break
+            }
             self.collectDocComment()
             const fd = self.parseFieldDef()
             if (fd != null_node) {
@@ -666,6 +683,24 @@ impl Parser {
             }
             self.match(@intFromEnum(Token.comma))
         }
+
+        // Parse nested declarations after fields (methods, static fn, etc.)
+        while (self.tok != @intFromEnum(Token.rbrace) and self.tok != @intFromEnum(Token.eof)) {
+            const tok = @as(Token, @enumFromInt(self.tok))
+            if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
+                tok == Token.kw_fn or tok == Token.kw_static) {
+                const nested_decl = self.parseDecl()
+                if (nested_decl != null_node) {
+                    nested.append(nested_decl)
+                }
+            } else {
+                break
+            }
+        }
+
+        self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_impl_generic
+
         self.expect(@intFromEnum(Token.rbrace))
 
         return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = fields, .layout = layout, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))

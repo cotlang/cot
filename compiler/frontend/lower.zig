@@ -486,7 +486,18 @@ pub const Lowerer = struct {
             .impl_trait => |d| try self.lowerImplTraitBlock(d),
             .test_decl => |d| if (self.test_mode) try self.lowerTestDecl(d),
             .bench_decl => |d| if (self.bench_mode) try self.lowerBenchDecl(d),
-            .trait_decl, .enum_decl, .union_decl, .type_alias, .import_decl, .error_set_decl, .bad_decl => {},
+            .enum_decl => |ed| {
+                for (ed.nested_decls) |nested_idx| {
+                    const nested_node = self.tree.getNode(nested_idx) orelse continue;
+                    const nested_decl = nested_node.asDecl() orelse continue;
+                    if (nested_decl == .fn_decl) {
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ ed.name, nested_decl.fn_decl.name });
+                        const is_dtor = std.mem.eql(u8, nested_decl.fn_decl.name, "deinit");
+                        try self.lowerMethodWithName(nested_decl.fn_decl, synth_name, is_dtor);
+                    }
+                }
+            },
+            .trait_decl, .union_decl, .type_alias, .import_decl, .error_set_decl, .bad_decl => {},
         }
     }
 
@@ -966,7 +977,27 @@ pub const Lowerer = struct {
                     const ns_type = self.type_reg.lookupByName(qualified) orelse TypeRegistry.VOID;
                     try self.builder.addStruct(.{ .name = qualified, .type_idx = ns_type, .span = ns.span });
                 },
-                .fn_decl => |fd| try self.lowerFnDecl(fd),
+                .fn_decl => |fd| {
+                    const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ struct_decl.name, fd.name });
+                    const is_dtor = std.mem.eql(u8, fd.name, "deinit");
+                    if (self.current_func != null) {
+                        // Inside a function/test body: save/restore builder state.
+                        // lowerMethodWithName replaces current_func which would clobber
+                        // the active function context.
+                        const saved_builder_func = self.builder.current_func;
+                        const saved_current_func = self.current_func;
+                        const saved_cleanup_items = self.cleanup_stack.items;
+                        self.cleanup_stack.items = .{};
+                        try self.lowerMethodWithName(fd, synth_name, is_dtor);
+                        self.cleanup_stack.items.deinit(self.cleanup_stack.allocator);
+                        self.cleanup_stack.items = saved_cleanup_items;
+                        self.builder.current_func = saved_builder_func;
+                        self.current_func = saved_current_func;
+                    } else {
+                        // Top-level struct: lower immediately
+                        try self.lowerMethodWithName(fd, synth_name, is_dtor);
+                    }
+                },
                 else => {},
             }
         }

@@ -171,9 +171,7 @@ struct GenericImplEntry {
     tp_count: int,
     methods_count: int,
     ast_ptr: int,  // @ptrToInt of declaring file's *Ast
-}
 
-impl GenericImplEntry {
     fn getAst() *Ast {
         return @intToPtr(*Ast, self.ast_ptr)
     }
@@ -185,9 +183,7 @@ impl GenericImplEntry {
 struct GenericInfo {
     node_idx: int,
     ast_ptr: int,  // @ptrToInt of declaring file's *Ast
-}
 
-impl GenericInfo {
     fn getAst() *Ast {
         return @intToPtr(*Ast, self.ast_ptr)
     }
@@ -201,9 +197,7 @@ struct GenericInstInfo {
     generic_node: int,        // NodeIndex of the original generic fn_decl/method
     type_args_str: string,    // serialized type args, e.g. "5" or "5;17"
     ast_ptr: int,             // @ptrToInt of defining file's *Ast
-}
 
-impl GenericInstInfo {
     fn getAst() *Ast {
         return @intToPtr(*Ast, self.ast_ptr)
     }
@@ -225,9 +219,7 @@ struct SharedCheckerState {
     generic_impl_entries: List(GenericImplEntry),
     trait_defs: Map(string, int),
     trait_impls: Map(string, string),
-}
 
-impl SharedCheckerState {
     static fn init() SharedCheckerState {
         var symbols: List(Symbol) = .{}
         var generic_structs: Map(string, int) = .{}
@@ -249,7 +241,6 @@ impl SharedCheckerState {
             trait_impls: trait_impls,
         }
     }
-
 }
 
 // ============================================================================
@@ -290,9 +281,7 @@ struct Checker {
     // Comptime
     comptime_vars: Map(string, int),
     in_comptime: bool,
-}
 
-impl Checker {
     static fn init(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter) Checker {
         var symbols: List(Symbol) = .{}
         var scope_parents: List(int) = .{}
@@ -566,6 +555,8 @@ impl Checker {
                 const qualified = "${parent_name}_${v.name}"
                 self.defineSymbol(makeSymbol(qualified, invalid_type, nested_idx, !v.is_const))
             }, else => {} }, else => {} }
+        } else if (ntag == "fn_decl") {
+            self.collectImplMethod(parent_name, nested_idx)
         }
     }
 
@@ -879,9 +870,27 @@ impl Checker {
             }, else => {} }, else => {} }
         }
         else if (tag == "var_decl") { self.checkTopVarDecl(idx) }
+        else if (tag == "struct_decl") { self.checkStructNestedMethods(idx) }
         else if (tag == "impl_block") { self.checkImplBlock(idx) }
         else if (tag == "impl_trait") { self.checkImplTraitBodies(idx) }
         else if (tag == "test_decl" or tag == "bench_decl") { self.checkTestDecl(idx) }
+    }
+
+    fn checkStructNestedMethods(idx: int) void {
+        const node = self.ast.getNode(idx)
+        switch (node) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => {
+            if (sd.type_params.count > 0) { return }
+            for ni in 0..sd.nested_decls.count {
+                const nested_idx = sd.nested_decls.get(ni)
+                if (nodeTag(self.ast, nested_idx) == "fn_decl") {
+                    const m_node = self.ast.getNode(nested_idx)
+                    switch (m_node) { Node.decl |md| => switch (md) { Decl.fn_decl |mf| => {
+                        if (mf.type_params.count > 0) { continue }
+                        self.checkFnDeclBody(nested_idx, "${sd.name}_${mf.name}")
+                    }, else => {} }, else => {} }
+                }
+            }
+        }, else => {} }, else => {} }
     }
 
     fn checkImplBlock(idx: int) void {

@@ -307,6 +307,14 @@ pub const Checker = struct {
                 }
             }
         }
+        // Post-collect: check method bodies for block-scoped structs
+        // (collectDecl registers types+methods, checkDecl checks fn bodies)
+        for (stmts) |stmt_idx| {
+            const node = self.tree.getNode(stmt_idx) orelse continue;
+            if (node.asDecl()) |decl| {
+                if (decl == .struct_decl) self.checkDecl(stmt_idx) catch {};
+            }
+        }
         var seen_terminal = false;
         var warned = false;
         for (stmts) |stmt_idx| {
@@ -415,6 +423,20 @@ pub const Checker = struct {
                 if (s.type_params.len > 0) {
                     try self.generics.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx, .tree = self.tree, .scope = self.scope });
                     try self.defineInFileScope(Symbol.init(s.name, .type_name, invalid_type, idx, false));
+                    // Register nested fn_decls as generic impl block (inferred impl on generic struct)
+                    if (s.nested_decls.len > 0) {
+                        var method_indices = std.ArrayListUnmanaged(NodeIndex){};
+                        defer method_indices.deinit(self.allocator);
+                        for (s.nested_decls) |nested_idx| {
+                            const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                            if (nested == .fn_decl) try method_indices.append(self.allocator, nested_idx);
+                        }
+                        if (method_indices.items.len > 0) {
+                            const gop = try self.generics.generic_impl_blocks.getOrPut(s.name);
+                            if (!gop.found_existing) gop.value_ptr.* = .{};
+                            try gop.value_ptr.append(self.allocator, .{ .type_params = s.type_params, .methods = try self.allocator.dupe(NodeIndex, method_indices.items), .tree = self.tree, .scope = self.scope });
+                        }
+                    }
                     return;
                 }
                 const struct_type = try self.buildStructTypeWithLayout(s.name, s.fields, s.layout);
@@ -452,6 +474,20 @@ pub const Checker = struct {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, v.name });
                             try self.defineInFileScope(Symbol.init(qualified, if (v.is_const) .constant else .variable, invalid_type, nested_idx, !v.is_const));
                         },
+                        .fn_decl => |f| {
+                            const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, f.name });
+                            const func_type = try self.buildFuncType(f.params, f.return_type);
+                            var is_ptr = !f.is_static;
+                            if (!f.is_static) {
+                                const func_info = self.types.get(func_type);
+                                if (func_info == .func and func_info.func.params.len > 0) {
+                                    const first_param_type = self.types.get(func_info.func.params[0].type_idx);
+                                    if (first_param_type != .pointer) is_ptr = false;
+                                }
+                            }
+                            try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
+                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static });
+                        },
                         else => {},
                     }
                 }
@@ -461,6 +497,31 @@ pub const Checker = struct {
                 const enum_type = try self.buildEnumType(e);
                 try self.defineInFileScope(Symbol.init(e.name, .type_name, enum_type, idx, false));
                 try self.types.registerNamed(e.name, enum_type);
+                // Register nested declarations (inferred impl: fn/static fn/const inside enum body)
+                for (e.nested_decls) |nested_idx| {
+                    const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                    switch (nested) {
+                        .fn_decl => |f| {
+                            const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, f.name });
+                            const func_type = try self.buildFuncType(f.params, f.return_type);
+                            var is_ptr = !f.is_static;
+                            if (!f.is_static) {
+                                const func_info = self.types.get(func_type);
+                                if (func_info == .func and func_info.func.params.len > 0) {
+                                    const first_param_type = self.types.get(func_info.func.params[0].type_idx);
+                                    if (first_param_type != .pointer) is_ptr = false;
+                                }
+                            }
+                            try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
+                            try self.types.registerMethod(e.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static });
+                        },
+                        .var_decl => |v| {
+                            const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, v.name });
+                            try self.defineInFileScope(Symbol.init(qualified, if (v.is_const) .constant else .variable, invalid_type, nested_idx, !v.is_const));
+                        },
+                        else => {},
+                    }
+                }
             },
             .union_decl => |u| {
                 if (self.scope.isDefined(u.name)) { self.reportRedefined(u.span.start, u.name); return; }
@@ -625,6 +686,28 @@ pub const Checker = struct {
                         const f = method_decl.fn_decl;
                         const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ it.target_type, f.name });
                         try self.checkFnDeclWithName(f, method_idx, synth_name);
+                    }
+                }
+            },
+            .struct_decl => |s| {
+                if (s.type_params.len > 0) return;
+                for (s.nested_decls) |nested_idx| {
+                    const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                    if (nested == .fn_decl) {
+                        const f = nested.fn_decl;
+                        if (f.type_params.len > 0) continue;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, f.name });
+                        try self.checkFnDeclWithName(f, nested_idx, synth_name);
+                    }
+                }
+            },
+            .enum_decl => |e| {
+                for (e.nested_decls) |nested_idx| {
+                    const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+                    if (nested == .fn_decl) {
+                        const f = nested.fn_decl;
+                        const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, f.name });
+                        try self.checkFnDeclWithName(f, nested_idx, synth_name);
                     }
                 }
             },

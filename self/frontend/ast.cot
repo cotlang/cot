@@ -573,9 +573,7 @@ struct Ast {
     file_decls: List(int),
     filename: string,
     safe_mode: bool,
-}
 
-impl Ast {
     static fn init(filename: string) Ast {
         var nodes: List(Node) = .{}
         var file_decls: List(int) = .{}

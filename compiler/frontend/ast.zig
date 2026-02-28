@@ -66,7 +66,7 @@ pub const TraitDecl = struct { name: []const u8, methods: []const NodeIndex, doc
 pub const ImplTraitBlock = struct { trait_name: []const u8, target_type: []const u8, type_params: []const []const u8 = &.{}, methods: []const NodeIndex, doc_comment: []const u8 = "", span: Span };
 pub const TestDecl = struct { name: []const u8, body: NodeIndex, span: Span };
 pub const BenchDecl = struct { name: []const u8, body: NodeIndex, span: Span };
-pub const EnumDecl = struct { name: []const u8, backing_type: NodeIndex, variants: []const EnumVariant, doc_comment: []const u8 = "", span: Span };
+pub const EnumDecl = struct { name: []const u8, backing_type: NodeIndex, variants: []const EnumVariant, nested_decls: []const NodeIndex = &.{}, doc_comment: []const u8 = "", span: Span };
 pub const UnionDecl = struct { name: []const u8, variants: []const UnionVariant, doc_comment: []const u8 = "", span: Span };
 pub const TypeAlias = struct { name: []const u8, target: NodeIndex, doc_comment: []const u8 = "", span: Span };
 pub const ImportDecl = struct { path: []const u8, span: Span };
@@ -508,7 +508,10 @@ pub const Ast = struct {
                         if (s.type_params.len > 0) self.allocator.free(s.type_params);
                         if (s.nested_decls.len > 0) self.allocator.free(s.nested_decls);
                     },
-                    .enum_decl => |e| if (e.variants.len > 0) self.allocator.free(e.variants),
+                    .enum_decl => |e| {
+                        if (e.variants.len > 0) self.allocator.free(e.variants);
+                        if (e.nested_decls.len > 0) self.allocator.free(e.nested_decls);
+                    },
                     .union_decl => |u| if (u.variants.len > 0) self.allocator.free(u.variants),
                     .error_set_decl => |e| if (e.variants.len > 0) self.allocator.free(e.variants),
                     .impl_block => |ib| {

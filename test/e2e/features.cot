@@ -3791,3 +3791,67 @@ test "switch_expr_block_trailing" {
     @assertEq(switch_block_trailing(1), 40)
     @assertEq(switch_block_trailing(2), 0)
 }
+
+test "inferred impl - static fn in struct body" {
+    struct InlCounter {
+        value: i64,
+        static fn create(v: i64) InlCounter { return InlCounter { .value = v } }
+    }
+    var c = InlCounter.create(10)
+    @assertEq(c.value, 10)
+}
+
+test "inferred impl - method in struct body" {
+    struct InlVec2 {
+        x: i64,
+        y: i64,
+        fn sum(self: *InlVec2) i64 { return self.x + self.y }
+        static fn zero() InlVec2 { return InlVec2 { .x = 0, .y = 0 } }
+    }
+    var v = InlVec2 { .x = 3, .y = 4 }
+    @assertEq(v.sum(), 7)
+    var z = InlVec2.zero()
+    @assertEq(z.sum(), 0)
+}
+
+test "inferred impl - multiple methods in struct body" {
+    struct InlWidget {
+        name: i64,
+        static fn init(n: i64) InlWidget { return InlWidget { .name = n } }
+        fn get(self: *InlWidget) i64 { return self.name }
+        fn doubled(self: *InlWidget) i64 { return self.name * 2 }
+    }
+    var w = InlWidget.init(42)
+    @assertEq(w.get(), 42)
+    @assertEq(w.doubled(), 84)
+}
+
+// --- Enum inferred impl ---
+
+const InlTestColor = enum {
+    Red, Green, Blue,
+
+    fn isWarm(self: InlTestColor) bool {
+        return switch (self) {
+            .Red => true,
+            .Green => false,
+            .Blue => false,
+        }
+    }
+
+    static fn defaultColor() InlTestColor {
+        return InlTestColor.Green
+    }
+}
+
+test "inferred impl - enum method" {
+    var c = InlTestColor.Red
+    @assertEq(c.isWarm(), true)
+    var b = InlTestColor.Blue
+    @assertEq(b.isWarm(), false)
+}
+
+test "inferred impl - enum static fn" {
+    var d = InlTestColor.defaultColor()
+    @assertEq(d.isWarm(), false)
+}

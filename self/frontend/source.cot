@@ -7,9 +7,7 @@ import "std/string"
 /// Byte offset into source text.
 struct Pos {
     offset: int,
-}
 
-impl Pos {
     /// Zero position (offset 0).
     static fn zero() Pos {
         return Pos { offset: 0 }
@@ -27,9 +25,7 @@ struct Position {
     offset: int,
     line: int,
     column: int,
-}
 
-impl Position {
     /// Format as "filename:line:column".
     fn toString() string {
         return "${self.filename}:${self.line}:${self.column}"
@@ -41,9 +37,7 @@ impl Position {
 struct Span {
     start: int,
     end: int,
-}
 
-impl Span {
     /// Zero span (offset 0, length 0).
     static fn zero() Span {
         return Span { start: 0, end: 0 }
@@ -84,9 +78,7 @@ struct Source {
     content: string,
     line_offsets: List(int),
     line_offsets_computed: bool,
-}
 
-impl Source {
     /// Create a source with filename and content.
     static fn init(filename: string, content: string) Source {
         var offsets: List(int) = .{}

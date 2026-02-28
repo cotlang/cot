@@ -46,6 +46,52 @@ const Token = enum(u8) {
     kw_int, kw_float, kw_bool, kw_string, kw_byte, kw_void, kw_noreturn,
     kw_i8, kw_i16, kw_i32, kw_i64, kw_u8, kw_u16, kw_u32, kw_u64, kw_f32, kw_f64,
     keyword_end,
+
+    /// Return operator precedence (0 = not an operator).
+    fn precedence() u8 {
+        return switch (self) {
+            .kw_orelse => 1,
+            .lor, .kw_or => 2,
+            .land, .kw_and => 3,
+            .eql, .neq, .lss, .leq, .gtr, .geq => 4,
+            .add, .sub, .@"or", .xor, .concat => 5,
+            .mul, .quo, .rem, .@"and", .shl, .shr => 6,
+            else => 0,
+        }
+    }
+
+    /// Whether this token is a literal (ident, int, float, string, char).
+    fn isLiteral() bool {
+        return self > Token.literal_beg and self < Token.literal_end
+    }
+
+    /// Whether this token is an operator or punctuation.
+    fn isOperator() bool {
+        return self > Token.operator_beg and self < Token.operator_end
+    }
+
+    /// Whether this token is a keyword.
+    fn isKeyword() bool {
+        return self > Token.keyword_beg and self < Token.keyword_end
+    }
+
+    /// Whether this token is a type keyword (int, f64, string, etc).
+    fn isTypeKeyword() bool {
+        return switch (self) {
+            .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte, .kw_void, .kw_noreturn,
+            .kw_i8, .kw_i16, .kw_i32, .kw_i64, .kw_u8, .kw_u16, .kw_u32, .kw_u64, .kw_f32, .kw_f64 => true,
+            else => false,
+        }
+    }
+
+    /// Whether this token is an assignment operator (=, +=, -=, etc).
+    fn isAssignment() bool {
+        return switch (self) {
+            .assign, .add_assign, .sub_assign, .mul_assign, .quo_assign,
+            .rem_assign, .and_assign, .or_assign, .xor_assign => true,
+            else => false,
+        }
+    }
 }
 
 /// Comptime string table: maps every Token variant to its display string.
@@ -183,56 +229,11 @@ const token_strings = comptime {
     s
 }
 
+// toString requires token_strings (defined above), so it must be in a separate impl block
 impl Token {
     /// Return the display string for this token.
     fn toString() string {
         return token_strings[@intFromEnum(self)]
-    }
-
-    /// Return operator precedence (0 = not an operator).
-    fn precedence() u8 {
-        return switch (self) {
-            .kw_orelse => 1,
-            .lor, .kw_or => 2,
-            .land, .kw_and => 3,
-            .eql, .neq, .lss, .leq, .gtr, .geq => 4,
-            .add, .sub, .@"or", .xor, .concat => 5,
-            .mul, .quo, .rem, .@"and", .shl, .shr => 6,
-            else => 0,
-        }
-    }
-
-    /// Whether this token is a literal (ident, int, float, string, char).
-    fn isLiteral() bool {
-        return self > Token.literal_beg and self < Token.literal_end
-    }
-
-    /// Whether this token is an operator or punctuation.
-    fn isOperator() bool {
-        return self > Token.operator_beg and self < Token.operator_end
-    }
-
-    /// Whether this token is a keyword.
-    fn isKeyword() bool {
-        return self > Token.keyword_beg and self < Token.keyword_end
-    }
-
-    /// Whether this token is a type keyword (int, f64, string, etc).
-    fn isTypeKeyword() bool {
-        return switch (self) {
-            .kw_int, .kw_float, .kw_bool, .kw_string, .kw_byte, .kw_void, .kw_noreturn,
-            .kw_i8, .kw_i16, .kw_i32, .kw_i64, .kw_u8, .kw_u16, .kw_u32, .kw_u64, .kw_f32, .kw_f64 => true,
-            else => false,
-        }
-    }
-
-    /// Whether this token is an assignment operator (=, +=, -=, etc).
-    fn isAssignment() bool {
-        return switch (self) {
-            .assign, .add_assign, .sub_assign, .mul_assign, .quo_assign,
-            .rem_assign, .and_assign, .or_assign, .xor_assign => true,
-            else => false,
-        }
     }
 }
 

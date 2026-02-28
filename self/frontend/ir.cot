@@ -30,9 +30,7 @@ const BinaryOp = enum(u8) {
     fmin, fmax,
     lt_u, le_u, gt_u, ge_u,
     atomic_store, atomic_add, atomic_exchange,
-}
 
-impl BinaryOp {
     fn isComparison() bool {
         return switch (self) {
             .eq, .ne, .lt, .le, .gt, .ge, .lt_u, .le_u, .gt_u, .ge_u => true,
@@ -302,9 +300,7 @@ struct Node {
     type_idx: int,
     span: Span,
     block: int,
-}
 
-impl Node {
     static fn init(data: Data, type_idx: int, span: Span) Node {
         return Node { data: data, type_idx: type_idx, span: span, block: null_block }
     }
@@ -377,9 +373,7 @@ struct Block {
     succs: List(int),
     nodes: List(int),
     label: string,
-}
 
-impl Block {
     static fn init(index: int) Block {
         var preds: List(int) = .{}
         var succs: List(int) = .{}
@@ -401,9 +395,7 @@ struct Local {
     size: int,
     alignment: int,
     offset: int,
-}
 
-impl Local {
     static fn init(name: string, type_idx: int, mutable: bool) Local {
         return Local { name: name, type_idx: type_idx, mutable: mutable, is_param: false, param_idx: 0, size: 8, alignment: 8, offset: 0 }
     }
@@ -427,9 +419,7 @@ struct Global {
     is_const: bool,
     span: Span,
     size: int,
-}
 
-impl Global {
     static fn init(name: string, type_idx: int, is_const: bool, span: Span) Global {
         return Global { name: name, type_idx: type_idx, is_const: is_const, span: span, size: 8 }
     }
@@ -467,9 +457,7 @@ struct Func {
     string_literals: List(string),
     is_destructor: bool,
     is_export: bool,
-}
 
-impl Func {
     fn getNode(idx: int) Node { return self.nodes.get(idx) }
     fn getLocal(idx: int) Local { return self.locals.get(idx) }
     fn getBlock(idx: int) Block { return self.blocks.get(idx) }
@@ -503,9 +491,7 @@ struct FuncBuilder {
     sret_return_type: ?int,
     is_destructor: bool,
     is_export: bool,
-}
 
-impl FuncBuilder {
     static fn init(name: string, type_idx: int, return_type: int, span: Span) FuncBuilder {
         var locals: List(Local) = .{}
         var blocks: List(Block) = .{}
@@ -940,9 +926,7 @@ struct IR {
     funcs: List(Func),
     globals: List(Global),
     structs: List(StructDef),
-}
 
-impl IR {
     static fn init() IR {
         var funcs: List(Func) = .{}
         var globals: List(Global) = .{}
@@ -985,9 +969,7 @@ struct Builder {
     funcs: List(Func),
     globals: List(Global),
     structs: List(StructDef),
-}
 
-impl Builder {
     static fn init() Builder {
         var funcs: List(Func) = .{}
         var globals: List(Global) = .{}

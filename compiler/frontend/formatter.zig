@@ -346,7 +346,12 @@ pub const Formatter = struct {
                 self.write(" = ") catch {};
                 self.printNode(v.value);
             }
-            if (i + 1 < d.variants.len) self.write(",") catch {};
+            if (i + 1 < d.variants.len or d.nested_decls.len > 0) self.write(",") catch {};
+            self.newline() catch {};
+        }
+        for (d.nested_decls) |nested_idx| {
+            const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
+            self.printDecl(nested);
             self.newline() catch {};
         }
         self.indent -= 1;

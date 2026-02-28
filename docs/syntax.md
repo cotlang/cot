@@ -202,10 +202,12 @@ switch (op) {
 
 ### Enum Methods
 
-Enums can have methods via `impl` blocks (value receiver, not pointer):
+Enums can have methods directly in the body (preferred) or via `impl` blocks. Enum methods use a value receiver, not a pointer:
 
 ```cot
-impl Color {
+const Color = enum {
+    Red, Green, Blue,
+
     fn isWarm(self: Color) bool {
         return switch (self) {
             .Red => true,
@@ -279,52 +281,53 @@ Duplicate variants are automatically deduplicated.
 type Coord = Point
 ```
 
-## Impl Blocks
+## Methods in Type Bodies (Inferred Impl)
+
+Methods, static functions, and constants can be declared directly inside struct and enum bodies. This is the **preferred** style for methods on your own types:
 
 ```cot
-impl Point {
-    fn add(self: *Point, other: *Point) Point {
-        return Point { .x = self.x + other.x, .y = self.y + other.y }
+// Preferred: methods inside struct body
+struct Point {
+    x: i64, y: i64
+
+    static fn origin() Point { return Point { .x = 0, .y = 0 } }
+
+    fn translate(self: *Point, dx: i64, dy: i64) void {
+        self.x = self.x + dx
+        self.y = self.y + dy
     }
 }
 
-// Generic impl:
-impl List(T) {
-    fn append(self: *List(T), value: T) void { ... }
+// Enum methods inside body
+const Direction = enum {
+    North, South, East, West,
+
+    fn isVertical(self: Direction) bool {
+        return switch (self) {
+            .North => true,
+            .South => true,
+            .East => false,
+            .West => false,
+        }
+    }
+
+    static fn defaultDir() Direction { return Direction.North }
 }
+
+var p = Point.origin()       // static call
+p.translate(1, 2)            // method call
+var d = Direction.North
+@assert(d.isVertical())
 ```
 
-### Static Methods
-
-Methods declared with `static fn` have no receiver (`self`). Called as `Type.method()`.
-
-```cot
-impl Counter {
-    static fn create(initial: int) Counter {
-        return Counter { .value = initial }
-    }
-
-    static fn zero() Counter {
-        return Counter { .value = 0 }
-    }
-
-    fn getValue(self: *Counter) int {
-        return self.value
-    }
-}
-
-var c = Counter.create(42)   // static call — no receiver
-c.getValue()                 // instance call — c is receiver
-```
-
-In `@safe` mode, `static fn` skips the implicit self injection that normal `fn` gets.
+Methods declared with `static fn` have no receiver (`self`). Called as `Type.method()`. In `@safe` mode, `static fn` skips the implicit self injection that normal `fn` gets.
 
 ### Associated Constants
 
-`const` declarations inside `impl` blocks. Accessed as `Type.CONSTANT`.
+`const` declarations inside type bodies (or `impl` blocks). Accessed as `Type.CONSTANT`.
 
 ```cot
-impl TypeRegistry {
+struct TypeRegistry {
     const BOOL: int = 1
     const I64: int = 5
     const STRING: int = 17
@@ -334,6 +337,27 @@ impl TypeRegistry {
 
 @assertEq(TypeRegistry.BOOL, 1)
 @assertEq(TypeRegistry.STRING, 17)
+```
+
+## Impl Blocks
+
+For methods on your own types, prefer placing them inside the struct/enum body (see above). Use explicit `impl` blocks for **trait implementations** and **extending types defined in other modules**.
+
+```cot
+// Explicit impl — for trait implementations
+impl Printable for Point {
+    fn toString(self: *Point) string { ... }
+}
+
+// Explicit impl — for extending imported types
+impl ImportedType {
+    fn customMethod(self: *ImportedType) i64 { ... }
+}
+
+// Generic impl:
+impl List(T) {
+    fn append(self: *List(T), value: T) void { ... }
+}
 ```
 
 ## Traits
