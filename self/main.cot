@@ -307,16 +307,16 @@ test "ir builder integration" {
     @assertEq(f.locals.count, 0)
     @assertEq(f.blocks.count, 1)
     @assertEq(f.entry, 0)
-    // NOTE: f.nodes.count is inaccessible in multi-file context due to a
-    // large struct return value bug (field offset 112+ corrupted). The same
-    // operations work in ir.cot's standalone tests. Track separately.
+    // All 13 Func fields accessible (type dedup + scope resolution fixed this)
+    @assertEq(f.nodes.count, 0)
+    @assertEq(f.span.start, 0)
+    @assertEq(f.span.end, 0)
+    @assertEq(f.string_literals.count, 0)
 }
 
 test "ir builder with blocks and branches" {
-    // Test block/branch creation via FuncBuilder directly (not through Builder)
-    // because Builder.func() returns ?FuncBuilder by VALUE — optional capture
-    // |fb| creates a copy, so mutations (newBlock, emit) are lost when
-    // endFunc() builds from the original self.current_func.
+    // FuncBuilder used directly: Builder.func() returns ?FuncBuilder by VALUE,
+    // so optional capture |fb| gets a copy and mutations are lost on endFunc().
     var fb = FuncBuilder.init("branch_test", 0, INT, Span.zero())
     const cond = fb.emitConstBool(true, Span.zero())
     const then_block = fb.newBlock("then")
@@ -334,6 +334,9 @@ test "ir builder with blocks and branches" {
     const f = fb.build()
     @assertEq(f.name, "branch_test")
     @assertEq(f.blocks.count, 3)
+    // Verify all Func fields accessible (type dedup fixed large struct return)
+    @assertEq(f.nodes.count, 6)
+    @assertEq(f.params.count, 0)
 }
 
 test "ir scope management integration" {
