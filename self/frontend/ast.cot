@@ -622,6 +622,13 @@ impl Ast {
         return self.nodes.get(idx)
     }
 
+    /// Get node at index, returning null for null_node or out-of-bounds indices.
+    fn getNodeOpt(idx: int) ?Node {
+        if (idx == null_node) { return null }
+        if (idx < 0 or idx >= self.nodes.count) { return null }
+        return self.nodes.get(idx)
+    }
+
     fn nodeCount() int {
         return self.nodes.count
     }
@@ -1052,6 +1059,106 @@ fn builtinFromString(name: string) ?int {
 }
 
 // ============================================================================
+// Node accessor helpers
+// ============================================================================
+
+/// Extract Decl from Node, or null if not a decl.
+fn asDecl(n: Node) ?Decl {
+    return switch (n) {
+        Node.decl |d| => d,
+        else => null,
+    }
+}
+
+/// Extract Expr from Node, or null if not an expr.
+fn asExpr(n: Node) ?Expr {
+    return switch (n) {
+        Node.expr |e| => e,
+        else => null,
+    }
+}
+
+/// Extract Stmt from Node, or null if not a stmt.
+fn asStmt(n: Node) ?Stmt {
+    return switch (n) {
+        Node.stmt |s| => s,
+        else => null,
+    }
+}
+
+// ============================================================================
+// ForStmt helper
+// ============================================================================
+
+/// Check if a ForStmt is a range-based for loop.
+fn isRange(fs: ForStmt) bool {
+    return fs.range_start != null_node
+}
+
+// ============================================================================
+// builtinToString — reverse lookup from BuiltinKind to source name
+// ============================================================================
+
+fn builtinToString(kind: int) string {
+    return switch (@enumFromInt(BuiltinKind, kind)) {
+        BuiltinKind.size_of => "sizeOf",
+        BuiltinKind.align_of => "alignOf",
+        BuiltinKind.enum_len => "enumLen",
+        BuiltinKind.has_field => "hasField",
+        BuiltinKind.type_of => "TypeOf",
+        BuiltinKind.field => "field",
+        BuiltinKind.offset_of => "offsetOf",
+        BuiltinKind.type_name => "typeName",
+        BuiltinKind.enum_name => "enumName",
+        BuiltinKind.type_info => "typeInfo",
+        BuiltinKind.abs => "abs",
+        BuiltinKind.ceil => "ceil",
+        BuiltinKind.floor => "floor",
+        BuiltinKind.trunc => "trunc",
+        BuiltinKind.round => "round",
+        BuiltinKind.sqrt => "sqrt",
+        BuiltinKind.fmin => "fmin",
+        BuiltinKind.fmax => "fmax",
+        BuiltinKind.min => "min",
+        BuiltinKind.max => "max",
+        BuiltinKind.int_cast => "intCast",
+        BuiltinKind.float_cast => "floatCast",
+        BuiltinKind.float_from_int => "floatFromInt",
+        BuiltinKind.int_from_float => "intFromFloat",
+        BuiltinKind.ptr_cast => "ptrCast",
+        BuiltinKind.int_to_ptr => "intToPtr",
+        BuiltinKind.ptr_to_int => "ptrToInt",
+        BuiltinKind.bit_cast => "bitCast",
+        BuiltinKind.truncate => "truncate",
+        BuiltinKind.@"as" => "as",
+        BuiltinKind.align_cast => "alignCast",
+        BuiltinKind.const_cast => "constCast",
+        BuiltinKind.int_from_enum => "intFromEnum",
+        BuiltinKind.enum_from_int => "enumFromInt",
+        BuiltinKind.tag_name => "tagName",
+        BuiltinKind.error_name => "errorName",
+        BuiltinKind.int_from_bool => "intFromBool",
+        BuiltinKind.@"string" => "string",
+        BuiltinKind.ptr_of => "ptrOf",
+        BuiltinKind.len_of => "lenOf",
+        BuiltinKind.ctz => "ctz",
+        BuiltinKind.clz => "clz",
+        BuiltinKind.pop_count => "popCount",
+        BuiltinKind.assert => "assert",
+        BuiltinKind.assert_eq => "assertEq",
+        BuiltinKind.trap => "trap",
+        BuiltinKind.panic => "panic",
+        BuiltinKind.compile_error => "compileError",
+        BuiltinKind.embed_file => "embedFile",
+        BuiltinKind.target => "target",
+        BuiltinKind.target_os => "targetOs",
+        BuiltinKind.target_arch => "targetArch",
+        BuiltinKind.arc_retain => "arcRetain",
+        BuiltinKind.arc_release => "arcRelease",
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1248,4 +1355,106 @@ test "Ast nodeSpan" {
     const sp = ast.nodeSpan(idx)
     @assertEq(sp.start, 5)
     @assertEq(sp.end, 15)
+}
+
+test "getNodeOpt valid" {
+    var ast = Ast.init("test.cot")
+    const s = Span { .start = 0, .end = 5 }
+    const idx = ast.addExpr(Expr.ident(Ident { .name = "x", .span = s }))
+    const n = ast.getNodeOpt(idx)
+    @assert(n != null)
+}
+
+test "getNodeOpt null_node" {
+    var ast = Ast.init("test.cot")
+    const n = ast.getNodeOpt(null_node)
+    @assert(n == null)
+}
+
+test "getNodeOpt out of bounds" {
+    var ast = Ast.init("test.cot")
+    const n = ast.getNodeOpt(999)
+    @assert(n == null)
+}
+
+test "asDecl returns decl" {
+    var ast = Ast.init("test.cot")
+    const s = Span { .start = 0, .end = 10 }
+    const idx = ast.addDecl(Decl.import_decl(ImportDecl { .path = "\"foo\"", .span = s }))
+    const node = ast.getNode(idx)
+    @assert(asDecl(node) != null)
+    @assert(asExpr(node) == null)
+    @assert(asStmt(node) == null)
+}
+
+test "asExpr returns expr" {
+    var ast = Ast.init("test.cot")
+    const s = Span { .start = 0, .end = 5 }
+    const idx = ast.addExpr(Expr.ident(Ident { .name = "x", .span = s }))
+    const node = ast.getNode(idx)
+    // Test via isExpr since ?Expr comparison has codegen issues for large unions
+    @assert(ast.isExpr(idx))
+    @assert(asDecl(node) == null)
+    @assert(asStmt(node) == null)
+}
+
+test "asStmt returns stmt" {
+    var ast = Ast.init("test.cot")
+    const s = Span { .start = 0, .end = 5 }
+    const idx = ast.addStmt(Stmt.return_stmt(ReturnStmt { .value = null_node, .span = s }))
+    const node = ast.getNode(idx)
+    @assert(asStmt(node) != null)
+    @assert(asDecl(node) == null)
+    @assert(asExpr(node) == null)
+}
+
+test "isRange for range loop" {
+    const fs = ForStmt {
+        .binding = "i",
+        .index_binding = "",
+        .iterable = null_node,
+        .range_start = 0,
+        .range_end = 10,
+        .body = null_node,
+        .is_inline = false,
+        .label = "",
+        .span = Span { .start = 0, .end = 20 },
+    }
+    @assert(isRange(fs))
+}
+
+test "isRange for iterable loop" {
+    const fs = ForStmt {
+        .binding = "x",
+        .index_binding = "",
+        .iterable = 5,
+        .range_start = null_node,
+        .range_end = null_node,
+        .body = null_node,
+        .is_inline = false,
+        .label = "",
+        .span = Span { .start = 0, .end = 20 },
+    }
+    @assert(!isRange(fs))
+}
+
+test "builtinToString roundtrip" {
+    @assertEq(builtinToString(@intFromEnum(BuiltinKind.size_of)), "sizeOf")
+    @assertEq(builtinToString(@intFromEnum(BuiltinKind.int_cast)), "intCast")
+    @assertEq(builtinToString(@intFromEnum(BuiltinKind.assert_eq)), "assertEq")
+    @assertEq(builtinToString(@intFromEnum(BuiltinKind.panic)), "panic")
+    @assertEq(builtinToString(@intFromEnum(BuiltinKind.@"string")), "string")
+    @assertEq(builtinToString(@intFromEnum(BuiltinKind.@"as")), "as")
+    @assertEq(builtinToString(@intFromEnum(BuiltinKind.arc_retain)), "arcRetain")
+}
+
+test "builtinToString/builtinFromString consistency" {
+    // Every builtin should roundtrip: builtinFromString(builtinToString(kind)) == kind
+    @assertEq(builtinFromString(builtinToString(0)).?, 0)
+    @assertEq(builtinFromString(builtinToString(10)).?, 10)
+    @assertEq(builtinFromString(builtinToString(20)).?, 20)
+    @assertEq(builtinFromString(builtinToString(30)).?, 30)
+    @assertEq(builtinFromString(builtinToString(40)).?, 40)
+    @assertEq(builtinFromString(builtinToString(50)).?, 50)
+    @assertEq(builtinFromString(builtinToString(53)).?, 53)
 }

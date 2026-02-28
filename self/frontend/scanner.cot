@@ -4,6 +4,7 @@
 import "std/string"
 import "token"
 import "errors"
+import "source"
 
 /// Result of scanning a single token: token type, span, and text.
 struct TokenInfo {
@@ -16,6 +17,7 @@ struct TokenInfo {
 /// Lexical scanner state: tracks position, current character, and interpolation depth.
 struct Scanner {
     content: string,
+    src: ?*Source,
     pos: int,
     ch: ?int,
     in_interp_string: bool,
@@ -26,24 +28,24 @@ struct Scanner {
 impl Scanner {
     /// Create a new scanner for the given source content (no error reporting).
     static fn init(content: string) Scanner {
-        var s = Scanner {
-            content: content,
-            pos: 0,
-            ch: null,
-            in_interp_string: false,
-            interp_brace_depth: 0,
-            err: null,
-        }
-        if (@lenOf(content) > 0) {
-            s.ch = charAt(content, 0)
-        }
-        return s
+        return Scanner.make(content, null, null)
     }
 
     /// Create a scanner with error reporting.
     static fn initWithErrors(content: string, err: *ErrorReporter) Scanner {
+        return Scanner.make(content, null, err)
+    }
+
+    /// Create a scanner with Source object and error reporting (Zig parity).
+    static fn initWithSource(src: *Source, err: *ErrorReporter) Scanner {
+        return Scanner.make(src.content, src, err)
+    }
+
+    /// Shared constructor — all init variants delegate here.
+    static fn make(content: string, src: ?*Source, err: ?*ErrorReporter) Scanner {
         var s = Scanner {
             content: content,
+            src: src,
             pos: 0,
             ch: null,
             in_interp_string: false,
