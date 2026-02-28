@@ -1123,7 +1123,7 @@ pub const Driver = struct {
             "socket",        "bind",           "listen",        "accept",
             "connect",       "setsockopt",     "kqueue",        "kevent",
             "fcntl",         "fork",           "c_waitpid",     "c_pipe",
-            "dup2",          "execve",
+            "dup2",          "execve",        "kill",
             "c_openpty",     "setsid",        "ioctl",
             // pthread symbols — external references resolved by linker (-lpthread/-lSystem)
             "pthread_create", "pthread_join",  "pthread_detach",
