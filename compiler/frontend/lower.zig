@@ -2210,10 +2210,14 @@ pub const Lowerer = struct {
         const struct_type_idx: TypeIndex = if (struct_init.type_name.len == 0) blk: {
             if (self.chk.expr_types.get(value_idx)) |resolved| break :blk resolved;
             return;
-        } else if (struct_init.type_args.len > 0)
-            self.resolveGenericTypeName(struct_init.type_name, struct_init.type_args)
-        else
-            self.type_reg.lookupByName(struct_init.type_name) orelse return;
+        } else blk: {
+            // Prefer expr_types (per-file scoped) over global name_map.
+            if (self.chk.expr_types.get(value_idx)) |resolved| break :blk resolved;
+            if (struct_init.type_args.len > 0)
+                break :blk self.resolveGenericTypeName(struct_init.type_name, struct_init.type_args)
+            else
+                break :blk self.type_reg.lookupByName(struct_init.type_name) orelse return;
+        };
         if (struct_type_idx == TypeRegistry.VOID) return;
         const type_info = self.type_reg.get(struct_type_idx);
         const struct_type = if (type_info == .struct_type) type_info.struct_type else return;
@@ -3607,9 +3611,14 @@ pub const Lowerer = struct {
     fn lowerExprNode(self: *Lowerer, idx: NodeIndex) Error!ir.NodeIndex {
         const node = self.tree.getNode(idx) orelse return ir.null_node;
         const expr = node.asExpr() orelse return ir.null_node;
-        // Pass node index for anonymous struct init resolution
-        if (expr == .struct_init and expr.struct_init.type_name.len == 0) {
+        // Pass node index for struct init resolution (expr_types has the checker's
+        // per-file type, avoiding global name_map collisions in multi-file builds).
+        if (expr == .struct_init) {
             return try self.lowerStructInitExpr(expr.struct_init, idx);
+        }
+        // Pass node index for new_expr (same per-file scoped resolution as struct_init).
+        if (expr == .new_expr) {
+            return try self.lowerNewExpr(expr.new_expr, idx);
         }
         // Pass node index for switch expressions so lowerSwitchExpr can query
         // the checker's authoritative type (handles ?T when arms mix T and null).
@@ -3656,7 +3665,7 @@ pub const Lowerer = struct {
             .switch_expr => |se| return try self.lowerSwitchExpr(se, null),
             .struct_init => |si| return try self.lowerStructInitExpr(si, null),
             .tuple_literal => |tl| return try self.lowerTupleLiteral(tl),
-            .new_expr => |ne| return try self.lowerNewExpr(ne),
+            .new_expr => |ne| return try self.lowerNewExpr(ne, null),
             .closure_expr => |ce| return try self.lowerClosureExpr(ce),
             .string_interp => |si| return try self.lowerStringInterp(si),
             .comptime_block => |cb| {
@@ -4719,10 +4728,18 @@ pub const Lowerer = struct {
                 if (self.chk.expr_types.get(nidx)) |resolved| break :blk resolved;
             }
             return ir.null_node;
-        } else if (si.type_args.len > 0)
-            self.resolveGenericTypeName(si.type_name, si.type_args)
-        else
-            self.type_reg.lookupByName(si.type_name) orelse return ir.null_node;
+        } else blk: {
+            // Named struct: prefer expr_types (per-file scoped resolution from checker)
+            // over lookupByName (global name_map which can collide in multi-file builds).
+            // Go pattern: types resolved through package scopes, not global registry.
+            if (node_idx) |nidx| {
+                if (self.chk.expr_types.get(nidx)) |resolved| break :blk resolved;
+            }
+            if (si.type_args.len > 0)
+                break :blk self.resolveGenericTypeName(si.type_name, si.type_args)
+            else
+                break :blk self.type_reg.lookupByName(si.type_name) orelse return ir.null_node;
+        };
         if (struct_type_idx == TypeRegistry.VOID) return ir.null_node;
         const type_info = self.type_reg.get(struct_type_idx);
         const struct_type = if (type_info == .struct_type) type_info.struct_type else return ir.null_node;
@@ -4771,6 +4788,9 @@ pub const Lowerer = struct {
                         const len_ir = try fb.emitSliceLen(value_node, si.span);
                         _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, ptr_ir, si.span);
                         _ = try fb.emitStoreLocalField(temp_idx, field_idx + 1, field_offset + 8, len_ir, si.span);
+                    } else if (field_type == .optional and !self.isPtrLikeOptional(struct_field.type_idx)) {
+                        // Compound optional field: wrap T → ?T (must match lowerStructInit pattern)
+                        try self.storeCompoundOptField(fb, temp_idx, field_idx, field_offset, value_node, field_init.value, si.span);
                     } else {
                         // @safe auto-ref fix: when value is a pointer to a struct (from auto-ref'd
                         // parameter) but the field expects the struct value, dereference the pointer.
@@ -4837,6 +4857,9 @@ pub const Lowerer = struct {
                 const len_ir = try fb.emitSliceLen(value_node, si.span);
                 _ = try fb.emitStoreLocalField(temp_idx, field_idx, field_offset, ptr_ir, si.span);
                 _ = try fb.emitStoreLocalField(temp_idx, field_idx + 1, field_offset + 8, len_ir, si.span);
+            } else if (field_type == .optional and !self.isPtrLikeOptional(struct_field.type_idx)) {
+                // Compound optional field: wrap T → ?T (must match lowerStructInit pattern)
+                try self.storeCompoundOptField(fb, temp_idx, field_idx, field_offset, value_node, struct_field.default_value, si.span);
             } else {
                 // ARC Phase 4: Retain +0 managed default values stored in struct fields.
                 // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
@@ -5007,15 +5030,25 @@ pub const Lowerer = struct {
     /// ARC path: cot_alloc call + field stores via linear memory.
     /// WasmGC path: gc_struct_new with field values (GC-managed object).
     /// Reference: Go's walkNew (walk/builtin.go:601-616)
-    fn lowerNewExpr(self: *Lowerer, ne: ast.NewExpr) Error!ir.NodeIndex {
+    fn lowerNewExpr(self: *Lowerer, ne: ast.NewExpr, node_idx: ?NodeIndex) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
-        // Lookup the struct type (generic or non-generic)
-        // Block-scoped structs work via registerNamed in the checker.
-        const struct_type_idx = if (ne.type_args.len > 0)
-            self.resolveGenericTypeName(ne.type_name, ne.type_args)
-        else
-            self.type_reg.lookupByName(ne.type_name) orelse return ir.null_node;
+        // Lookup the struct type — prefer expr_types (per-file scoped) over global name_map.
+        const struct_type_idx: TypeIndex = blk: {
+            if (node_idx) |nidx| {
+                if (self.chk.expr_types.get(nidx)) |resolved| {
+                    // expr_types gives the pointer type (*T); we need the struct type (T).
+                    if (self.type_reg.isPointer(resolved))
+                        break :blk self.type_reg.pointerElem(resolved)
+                    else
+                        break :blk resolved;
+                }
+            }
+            if (ne.type_args.len > 0)
+                break :blk self.resolveGenericTypeName(ne.type_name, ne.type_args)
+            else
+                break :blk self.type_reg.lookupByName(ne.type_name) orelse return ir.null_node;
+        };
         if (struct_type_idx == TypeRegistry.VOID) return ir.null_node;
         const type_info = self.type_reg.get(struct_type_idx);
         const struct_type = if (type_info == .struct_type) type_info.struct_type else return ir.null_node;
@@ -8038,6 +8071,9 @@ pub const Lowerer = struct {
     // ============================================================================
 
     fn resolveTypeNode(self: *Lowerer, idx: NodeIndex) TypeIndex {
+        // Prefer checker's per-file scoped resolution over global name_map.
+        // Go pattern: types resolved through package scopes, not global registry.
+        if (self.chk.expr_types.get(idx)) |resolved| return resolved;
         const node = self.tree.getNode(idx) orelse return TypeRegistry.VOID;
         const expr = node.asExpr() orelse return TypeRegistry.VOID;
         if (expr != .type_expr) return TypeRegistry.VOID;
@@ -8063,7 +8099,9 @@ pub const Lowerer = struct {
                 if (std.mem.eql(u8, name, "f32")) return TypeRegistry.F32;
                 if (std.mem.eql(u8, name, "f64")) return TypeRegistry.F64;
                 if (std.mem.eql(u8, name, "string")) return TypeRegistry.STRING;
-                return self.type_reg.lookupByName(name) orelse TypeRegistry.VOID;
+                // Go pattern: resolve through per-file scope first (avoids global
+                // name_map collisions when multiple files define same-named types).
+                return self.chk.resolveTypeByName(name) orelse TypeRegistry.VOID;
             },
             .pointer => |inner| {
                 const elem = self.resolveTypeNode(inner);

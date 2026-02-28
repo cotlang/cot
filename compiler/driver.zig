@@ -1099,8 +1099,8 @@ pub const Driver = struct {
             // Process runtime (waitpid/pipe need wrappers with different linker names
             // to avoid collision with libc symbols; fork/dup2/execve are libc-only)
             "cot_waitpid",   "cot_pipe",
-            // Terminal PTY runtime (openpty/ioctl_winsize need wrappers)
-            "cot_openpty",   "cot_ioctl_winsize",
+            // Terminal PTY runtime (openpty/ioctl need wrappers)
+            "cot_openpty",   "cot_ioctl_winsize", "cot_ioctl_set_ctty",
             // Print runtime (print_native.generate order)
             "print_int",     "eprint_int",       "int_to_string",
             // Threading runtime (thread_native.generate order) — unconditional, must come before
@@ -1151,6 +1151,9 @@ pub const Driver = struct {
         }
         if (func_index_map.get("cot_ioctl_winsize")) |idx| {
             try func_index_map.put(self.allocator, "ioctl_winsize", idx);
+        }
+        if (func_index_map.get("cot_ioctl_set_ctty")) |idx| {
+            try func_index_map.put(self.allocator, "ioctl_set_ctty", idx);
         }
 
         // String data symbol index — used by ssa_to_clif for globalValue references

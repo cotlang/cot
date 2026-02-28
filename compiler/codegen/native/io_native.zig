@@ -243,6 +243,11 @@ pub fn generate(
         .name = "cot_ioctl_winsize",
         .compiled = try generateIoctlWinsize(allocator, isa, ctrl_plane, func_index_map),
     });
+    // ioctl_set_ctty(fd) → i64 (calls ioctl(fd, TIOCSCTTY, 0) to set controlling terminal)
+    try result.append(allocator, .{
+        .name = "cot_ioctl_set_ctty",
+        .compiled = try generateIoctlSetCtty(allocator, isa, ctrl_plane, func_index_map),
+    });
 
     return result;
 }
@@ -2314,6 +2319,67 @@ fn generateIoctlWinsize(
         break :blk try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, pad, pad, pad, pad, pad, pad, ws_addr });
     } else try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, ws_addr });
     _ = try ins.return_(&[_]clif.Value{call_result.results[0]});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// ioctl_set_ctty(fd) → i64: ioctl(fd, TIOCSCTTY, 0)
+// macOS: TIOCSCTTY = 0x20007461 (_IO('t', 97))
+// Sets the controlling terminal for the current session (after setsid).
+// Required for SIGWINCH delivery on PTY resize.
+// ============================================================================
+
+fn generateIoctlSetCtty(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    const ins_b = builder.ins();
+    const params_b = builder.blockParams(block_entry);
+    const fd_val = params_b[0];
+
+    // ioctl(fd, TIOCSCTTY, 0) — variadic
+    const ioctl_idx_b = func_index_map.get("ioctl") orelse 0;
+    var ioctl_sig_b = clif.Signature.init(.system_v);
+    try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
+    try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // request
+    const is_aarch64_b = isa == .aarch64;
+    if (is_aarch64_b) {
+        for (0..6) |_| try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    }
+    try ioctl_sig_b.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // arg (0)
+    try ioctl_sig_b.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const ioctl_sig_ref_b = try builder.importSignature(ioctl_sig_b);
+    const ioctl_ref_b = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = ioctl_idx_b } },
+        .signature = ioctl_sig_ref_b,
+        .colocated = false,
+    });
+    const tiocsctty = try ins_b.iconst(clif.Type.I64, 0x20007461); // macOS TIOCSCTTY
+    const v_zero_b = try ins_b.iconst(clif.Type.I64, 0);
+    const ioctl_result = if (is_aarch64_b) blk: {
+        const pad_b = try ins_b.iconst(clif.Type.I64, 0);
+        break :blk try ins_b.call(ioctl_ref_b, &[_]clif.Value{ fd_val, tiocsctty, pad_b, pad_b, pad_b, pad_b, pad_b, pad_b, v_zero_b });
+    } else try ins_b.call(ioctl_ref_b, &[_]clif.Value{ fd_val, tiocsctty, v_zero_b });
+    _ = try ins_b.return_(&[_]clif.Value{ioctl_result.results[0]});
 
     try builder.sealAllBlocks();
     builder.finalize();

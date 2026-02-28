@@ -36,44 +36,45 @@ impl Position {
     }
 }
 
-/// Half-open byte range [start_offset, end_offset) in source text.
+/// Half-open byte range [start, end) in source text.
+/// This is THE canonical Span type — imported by ast.cot, errors.cot, etc.
 struct Span {
-    start_offset: int,
-    end_offset: int,
+    start: int,
+    end: int,
 }
 
 impl Span {
     /// Zero span (offset 0, length 0).
     static fn zero() Span {
-        return Span { start_offset: 0, end_offset: 0 }
+        return Span { start: 0, end: 0 }
     }
 
     /// Create a span from start to end offsets.
     static fn init(start: int, end: int) Span {
-        return Span { start_offset: start, end_offset: end }
+        return Span { start: start, end: end }
     }
 
     /// Create a zero-length span at a single offset.
     static fn fromPos(offset: int) Span {
-        return Span { start_offset: offset, end_offset: offset }
+        return Span { start: offset, end: offset }
     }
 
     /// Merge two spans into the smallest span containing both.
     fn merge(other: Span) Span {
-        var s = self.start_offset
-        if (other.start_offset < s) {
-            s = other.start_offset
+        var s = self.start
+        if (other.start < s) {
+            s = other.start
         }
-        var e = self.end_offset
-        if (other.end_offset > e) {
-            e = other.end_offset
+        var e = self.end
+        if (other.end > e) {
+            e = other.end
         }
-        return Span { start_offset: s, end_offset: e }
+        return Span { start: s, end: e }
     }
 
     /// Number of bytes in this span.
     fn len() int {
-        return self.end_offset - self.start_offset
+        return self.end - self.start
     }
 }
 
@@ -95,6 +96,11 @@ impl Source {
             line_offsets: offsets,
             line_offsets_computed: false,
         }
+    }
+
+    /// Free the line_offsets list. Call when done with this source.
+    fn deinit() void {
+        self.line_offsets.clearAndFree()
     }
 
     /// Return the byte at offset, or null if past end.
@@ -119,7 +125,7 @@ impl Source {
 
     /// Return the source text covered by a span.
     fn spanText(s: Span) string {
-        return substring(self.content, s.start_offset, s.end_offset)
+        return substring(self.content, s.start, s.end)
     }
 
     /// Compute line offset array (lazy, computed once on first call).
@@ -206,14 +212,14 @@ test "position struct" {
 
 test "span init" {
     const s = Span.init(5, 10)
-    @assertEq(s.start_offset, 5)
-    @assertEq(s.end_offset, 10)
+    @assertEq(s.start, 5)
+    @assertEq(s.end, 10)
 }
 
 test "span from pos" {
     const s = Span.fromPos(7)
-    @assertEq(s.start_offset, 7)
-    @assertEq(s.end_offset, 7)
+    @assertEq(s.start, 7)
+    @assertEq(s.end, 7)
 }
 
 test "span len" {
@@ -225,16 +231,16 @@ test "span merge" {
     var a = Span.init(5, 10)
     const b = Span.init(8, 15)
     const merged = a.merge(b)
-    @assertEq(merged.start_offset, 5)
-    @assertEq(merged.end_offset, 15)
+    @assertEq(merged.start, 5)
+    @assertEq(merged.end, 15)
 }
 
 test "span merge reversed" {
     var a = Span.init(8, 15)
     const b = Span.init(5, 10)
     const merged = a.merge(b)
-    @assertEq(merged.start_offset, 5)
-    @assertEq(merged.end_offset, 15)
+    @assertEq(merged.start, 5)
+    @assertEq(merged.end, 15)
 }
 
 test "source at" {
@@ -299,8 +305,8 @@ test "pos zero" {
 
 test "span zero" {
     const s = Span.zero()
-    @assertEq(s.start_offset, 0)
-    @assertEq(s.end_offset, 0)
+    @assertEq(s.start, 0)
+    @assertEq(s.end, 0)
 }
 
 test "position toString" {

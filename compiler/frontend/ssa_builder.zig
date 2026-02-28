@@ -1062,7 +1062,7 @@ pub const SSABuilder = struct {
         try cur.addValue(self.allocator, off_val);
 
         const field_type = self.type_registry.get(type_idx);
-        if (field_type == .struct_type or field_type == .array) return off_val;
+        if (field_type == .struct_type or field_type == .array or field_type == .union_type) return off_val;
 
         // Compound optional: return address (like struct), not loaded scalar
         if (field_type == .optional) {
@@ -1149,12 +1149,33 @@ pub const SSABuilder = struct {
         // Large struct/tuple: use OpMove for bulk memory copy (same as convertStoreLocal).
         // Extract source address from load result, copy to dest field offset.
         const type_size = self.type_registry.sizeOf(value.type_idx);
-        const is_large = (value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8;
+        var is_large = (value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8;
+
+        // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
+        // for compound struct/array/union fields), check the IR node's type to determine
+        // if bulk copy is needed. These functions return off_ptr with VOID type for compound
+        // fields — the address is valid but untyped. The IR node knows the expected type.
+        if (!is_large and value.op == .off_ptr and value.type_idx == TypeRegistry.VOID) {
+            const ir_node = self.ir_func.nodes[f.value];
+            const ir_type = self.type_registry.get(ir_node.type_idx);
+            const ir_size = self.type_registry.sizeOf(ir_node.type_idx);
+            const ir_is_compound_opt = ir_type == .optional and blk: {
+                const elem_info = self.type_registry.get(ir_type.optional.elem);
+                break :blk elem_info != .pointer;
+            };
+            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) and ir_size > 8) or ir_is_compound_opt) {
+                is_large = true;
+            }
+        }
+
         if (is_large) {
             const src_addr = if (value.op == .load and value.args.len > 0) value.args[0] else value;
             const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
             move_val.addArg2(off_val, src_addr);
-            move_val.aux_int = @intCast(type_size);
+            // Use value's type_size when available, fall back to IR node's size for
+            // VOID-typed addresses (from convertFieldValue for struct fields).
+            const move_size = if (type_size > 0) type_size else self.type_registry.sizeOf(self.ir_func.nodes[f.value].type_idx);
+            move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
             return move_val;
         }
@@ -1174,7 +1195,7 @@ pub const SSABuilder = struct {
         try cur.addValue(self.allocator, off_val);
 
         const field_type = self.type_registry.get(type_idx);
-        if (field_type == .struct_type or field_type == .array) return off_val;
+        if (field_type == .struct_type or field_type == .array or field_type == .union_type) return off_val;
 
         // Compound optional: return address (like struct), not loaded scalar
         if (field_type == .optional) {
@@ -1265,12 +1286,33 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(value_type.optional.elem);
             break :blk elem_info != .pointer;
         };
-        const is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
+        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
+
+        // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
+        // for compound struct/array/union fields), check the IR node's type to determine
+        // if bulk copy is needed. These functions return off_ptr with VOID type for compound
+        // fields — the address is valid but untyped. The IR node knows the expected type.
+        if (!is_large_struct and value.op == .off_ptr and value.type_idx == TypeRegistry.VOID) {
+            const ir_node = self.ir_func.nodes[f.value];
+            const ir_type = self.type_registry.get(ir_node.type_idx);
+            const ir_size = self.type_registry.sizeOf(ir_node.type_idx);
+            const ir_is_compound_opt = ir_type == .optional and blk: {
+                const elem_info = self.type_registry.get(ir_type.optional.elem);
+                break :blk elem_info != .pointer;
+            };
+            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) and ir_size > 8) or ir_is_compound_opt) {
+                is_large_struct = true;
+            }
+        }
+
         if (is_large_struct) {
             const src_addr = if (value.op == .load and value.args.len > 0) value.args[0] else value;
             const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
             move_val.addArg2(off_val, src_addr);
-            move_val.aux_int = @intCast(type_size);
+            // Use value's type_size when available, fall back to IR node's size for
+            // VOID-typed addresses (from convertFieldValue for struct fields).
+            const move_size = if (type_size > 0) type_size else self.type_registry.sizeOf(self.ir_func.nodes[f.value].type_idx);
+            move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
             return move_val;
         }
@@ -1559,13 +1601,17 @@ pub const SSABuilder = struct {
             return make_val;
         }
 
-        // Large compound types (structs, tuples, unions > 8 bytes): the loaded pointer
-        // IS the struct's address in memory. We wrap it in a .copy with the struct type
-        // so that consumers (convertStoreLocalField, getStructAddr) treat the VALUE
-        // as an address rather than extracting .load's args[0] (which would be the
-        // pointer local's address, not the struct's address).
+        // Large compound types (structs, tuples, unions > 8 bytes, compound optionals):
+        // the loaded pointer IS the struct's address in memory. We wrap it in a .copy
+        // with the struct type so that consumers (convertStoreLocalField, getStructAddr)
+        // treat the VALUE as an address rather than extracting .load's args[0] (which
+        // would be the pointer local's address, not the struct's address).
         const type_size = self.type_registry.sizeOf(type_idx);
-        if ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) {
+        const is_compound_opt_load = value_type == .optional and blk: {
+            const elem_info = self.type_registry.get(value_type.optional.elem);
+            break :blk elem_info != .pointer;
+        };
+        if (((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt_load) {
             if (ptr_val.op == .load) {
                 // Loaded pointer: wrap in .copy so convertStoreLocalField/getStructAddr
                 // use the loaded value (= struct address) directly, not .load's args[0].
@@ -1647,7 +1693,11 @@ pub const SSABuilder = struct {
             return len_store;
         }
 
-        const is_large_struct = (value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8;
+        const is_compound_opt_store = value_type == .optional and blk: {
+            const elem_info = self.type_registry.get(value_type.optional.elem);
+            break :blk elem_info != .pointer;
+        };
+        const is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt_store;
 
         if (is_large_struct) {
             // Use value directly as src_addr — convertPtrLoadValue returns the

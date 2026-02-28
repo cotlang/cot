@@ -255,7 +255,7 @@ pub const Checker = struct {
     /// Go's check.ident() walks the scope chain for type names (typexpr.go:20).
     /// With per-file scopes, scope lookup correctly distinguishes same-named types
     /// from different files, while the global type registry (name_map) does not.
-    fn resolveTypeByName(self: *Checker, name: []const u8) ?TypeIndex {
+    pub fn resolveTypeByName(self: *Checker, name: []const u8) ?TypeIndex {
         if (self.scope.lookup(name)) |sym| {
             if (sym.kind == .type_name) return sym.type_idx;
         }

@@ -193,6 +193,22 @@ impl GenericInfo {
     }
 }
 
+// GenericInstInfo — resolved generic instantiation for the lowerer.
+// Zig: GenericInstInfo { concrete_name, generic_node, type_args, tree, scope }.
+// The lowerer looks these up by concrete name to find the original generic function.
+struct GenericInstInfo {
+    concrete_name: string,    // synthesized name (cache key), e.g. "max(5)" or "List(5)_push"
+    generic_node: int,        // NodeIndex of the original generic fn_decl/method
+    type_args_str: string,    // serialized type args, e.g. "5" or "5;17"
+    ast_ptr: int,             // @ptrToInt of defining file's *Ast
+}
+
+impl GenericInstInfo {
+    fn getAst() *Ast {
+        return @intToPtr(*Ast, self.ast_ptr)
+    }
+}
+
 // ============================================================================
 // SharedCheckerState — persists across Checkers in multi-file mode
 // ============================================================================
@@ -205,6 +221,7 @@ struct SharedCheckerState {
     generic_structs: Map(string, int),
     generic_functions: Map(string, int),
     instantiation_cache: Map(string, int),
+    generic_inst_by_name: Map(string, int),  // concrete_name → @ptrToInt(*GenericInstInfo)
     generic_impl_entries: List(GenericImplEntry),
     trait_defs: Map(string, int),
     trait_impls: Map(string, string),
@@ -216,6 +233,7 @@ impl SharedCheckerState {
         var generic_structs: Map(string, int) = .{}
         var generic_functions: Map(string, int) = .{}
         var instantiation_cache: Map(string, int) = .{}
+        var generic_inst_by_name: Map(string, int) = .{}
         var generic_impl_entries: List(GenericImplEntry) = .{}
         var trait_defs: Map(string, int) = .{}
         var trait_impls: Map(string, string) = .{}
@@ -225,6 +243,7 @@ impl SharedCheckerState {
             generic_structs: generic_structs,
             generic_functions: generic_functions,
             instantiation_cache: instantiation_cache,
+            generic_inst_by_name: generic_inst_by_name,
             generic_impl_entries: generic_impl_entries,
             trait_defs: trait_defs,
             trait_impls: trait_impls,
@@ -257,6 +276,7 @@ struct Checker {
     generic_functions: Map(string, int),      // name → fn_decl node_idx
     generic_impl_entries: List(GenericImplEntry),
     instantiation_cache: Map(string, int),    // "List(5)" → concrete type_idx
+    generic_inst_by_name: Map(string, int),   // concrete_name → @ptrToInt(*GenericInstInfo)
     type_sub_keys: List(string),             // parallel lists = active substitution map
     type_sub_vals: List(int),
     trait_impls: Map(string, string),        // "Trait:Type" → trait_name
@@ -288,6 +308,7 @@ impl Checker {
         var generic_structs: Map(string, int) = .{}
         var generic_functions: Map(string, int) = .{}
         var instantiation_cache: Map(string, int) = .{}
+        var generic_inst_by_name: Map(string, int) = .{}
         var generic_impl_entries: List(GenericImplEntry) = .{}
         var type_sub_keys: List(string) = .{}
         var type_sub_vals: List(int) = .{}
@@ -312,6 +333,7 @@ impl Checker {
             generic_functions: generic_functions,
             generic_impl_entries: generic_impl_entries,
             instantiation_cache: instantiation_cache,
+            generic_inst_by_name: generic_inst_by_name,
             type_sub_keys: type_sub_keys,
             type_sub_vals: type_sub_vals,
             trait_impls: trait_impls,
@@ -343,6 +365,7 @@ impl Checker {
         self.generic_structs = shared.generic_structs
         self.generic_functions = shared.generic_functions
         self.instantiation_cache = shared.instantiation_cache
+        self.generic_inst_by_name = shared.generic_inst_by_name
         self.trait_defs = shared.trait_defs
         self.trait_impls = shared.trait_impls
         self.generic_impl_entries = shared.generic_impl_entries
@@ -354,6 +377,7 @@ impl Checker {
         shared.generic_structs = self.generic_structs
         shared.generic_functions = self.generic_functions
         shared.instantiation_cache = self.instantiation_cache
+        shared.generic_inst_by_name = self.generic_inst_by_name
         shared.generic_impl_entries = self.generic_impl_entries
         shared.trait_defs = self.trait_defs
         shared.trait_impls = self.trait_impls
@@ -3061,6 +3085,79 @@ impl Checker {
             return VOID
         }
 
+        // --- Atomics ---
+
+        if (kind == BuiltinKind.atomic_load) {
+            // @atomicLoad(ptr: *i64) → i64
+            if (argc >= 1) {
+                const at = self.checkExpr(args.get(0))
+                if (self.types.get(at).tag != TAG_POINTER) {
+                    self.reportError(idx, ErrorCode.e300, "@atomicLoad requires pointer argument")
+                    return invalid_type
+                }
+            }
+            return I64
+        }
+        if (kind == BuiltinKind.atomic_store) {
+            // @atomicStore(ptr: *i64, val: i64) → void
+            if (argc >= 1) {
+                const at = self.checkExpr(args.get(0))
+                if (self.types.get(at).tag != TAG_POINTER) {
+                    self.reportError(idx, ErrorCode.e300, "@atomicStore requires pointer argument")
+                    return invalid_type
+                }
+            }
+            if (argc >= 2) {
+                self.checkExpr(args.get(1))
+            }
+            return VOID
+        }
+        if (kind == BuiltinKind.atomic_add) {
+            // @atomicAdd(ptr: *i64, val: i64) → i64 (returns previous value)
+            if (argc >= 1) {
+                const at = self.checkExpr(args.get(0))
+                if (self.types.get(at).tag != TAG_POINTER) {
+                    self.reportError(idx, ErrorCode.e300, "@atomicAdd requires pointer argument")
+                    return invalid_type
+                }
+            }
+            if (argc >= 2) {
+                self.checkExpr(args.get(1))
+            }
+            return I64
+        }
+        if (kind == BuiltinKind.atomic_cas) {
+            // @atomicCAS(ptr: *i64, expected: i64, new: i64) → i64 (returns old value)
+            if (argc >= 1) {
+                const at = self.checkExpr(args.get(0))
+                if (self.types.get(at).tag != TAG_POINTER) {
+                    self.reportError(idx, ErrorCode.e300, "@atomicCAS requires pointer argument")
+                    return invalid_type
+                }
+            }
+            if (argc >= 2) {
+                self.checkExpr(args.get(1))
+            }
+            if (argc >= 3) {
+                self.checkExpr(args.get(2))
+            }
+            return I64
+        }
+        if (kind == BuiltinKind.atomic_exchange) {
+            // @atomicExchange(ptr: *i64, val: i64) → i64 (returns previous value)
+            if (argc >= 1) {
+                const at = self.checkExpr(args.get(0))
+                if (self.types.get(at).tag != TAG_POINTER) {
+                    self.reportError(idx, ErrorCode.e300, "@atomicExchange requires pointer argument")
+                    return invalid_type
+                }
+            }
+            if (argc >= 2) {
+                self.checkExpr(args.get(1))
+            }
+            return I64
+        }
+
         // Default: check all args, return invalid
         for ai in 0..argc {
             self.checkExpr(args.get(ai))
@@ -3597,6 +3694,28 @@ impl Checker {
         return "${result})"
     }
 
+    /// Register a generic instance so the lowerer can find it by concrete name.
+    /// Zig: self.generics.generic_inst_by_name.put(name, inst)
+    fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), ast_ptr: int) void {
+        // Serialize type args: "5" or "5;17"
+        var ta_str = ""
+        for i in 0..type_args.count {
+            if (i > 0) {
+                ta_str = "${ta_str};${type_args.get(i)}"
+            } else {
+                ta_str = "${type_args.get(i)}"
+            }
+        }
+        var inst = new GenericInstInfo {
+            concrete_name: concrete_name,
+            generic_node: generic_node,
+            type_args_str: ta_str,
+            ast_ptr: ast_ptr,
+        }
+        retain(@ptrToInt(inst))
+        self.generic_inst_by_name.set(concrete_name, @ptrToInt(inst))
+    }
+
     /// Resolve a generic struct instantiation: List(int) → concrete List(5) type.
     /// Port from Zig checker lines 3291-3355.
     /// Cross-file: swaps self.ast to defining file's AST (Zig: self.tree = gen_info.tree).
@@ -3746,6 +3865,9 @@ impl Checker {
                     receiver_is_ptr: true,
                     is_static: false,
                 })
+
+                // Register for lowerer (Zig line 3537)
+                self.registerGenericInst(synth_name, method_idx, resolved_args, entry.ast_ptr)
             }
 
             // Pass 2: Check all method bodies
@@ -3897,6 +4019,9 @@ impl Checker {
         // Restore caller's AST and safe_mode
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
+
+        // Register for lowerer: concrete_name → GenericInstInfo (Zig line 3672)
+        self.registerGenericInst(cache_key, fn_node, resolved_args, info.ast_ptr)
 
         return func_type
     }

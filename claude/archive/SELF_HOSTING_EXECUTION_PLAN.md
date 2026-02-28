@@ -1,8 +1,8 @@
 # Self-Hosted Compiler — Execution Plan
 
 **Created:** 2026-02-27
-**Updated:** 2026-02-27
-**Current state:** Frontend 100% (11,229 lines), Backend 0%, Tests 142/142 native, all pass wasm
+**Updated:** 2026-02-28
+**Current state:** Frontend ~80% fidelity (13,381 lines), Backend 0%, Tests 189 native. See `SELF_HOSTING_AUDIT.md` for gap analysis.
 
 ---
 
@@ -27,7 +27,7 @@
 | 1.3 | Fix WASI file reading | Not started | Low priority |
 | 3.1 | Verify checker end-to-end | **NEXT** | selfcot check crashes (SIGBUS) |
 | 3.2 | Self-check milestone | Blocked | Needs 3.1 |
-| 4.1 | Get all tests passing on native | ✅ DONE | 142/142 pass |
+| 4.1 | Get all tests passing on native | ✅ DONE | 189 pass |
 | 4.2 | Add integration tests | Not started | — |
 | 4.3 | Update documentation | ✅ DONE | — |
 
@@ -37,7 +37,7 @@
 
 ### 3.1 Fix selfcot check crash
 
-**Symptom:** `selfcot check self/main.cot` exits with code 132 (signal 4 = SIGILL).
+**Symptom:** `selfcot check self/main.cot` exits with code 132 (signal 4 = SIGILL). Previous SIGBUS (65-symbol) fixed.
 
 - `selfcot parse self/main.cot` → works, exit 0
 - `selfcot check /tmp/trivial.cot` → works, exit 0
@@ -75,7 +75,7 @@ Based on previous testing, the checker logic appears correct (works on wasm). Is
 
 ### 4.1 Get all tests passing on native — ✅ DONE
 
-142/142 tests pass on native. (8 of 150 declared tests are compile-time skipped.)
+189 tests pass on native.
 
 ### 4.2 Add integration tests
 
@@ -113,8 +113,8 @@ Phase 1.3: Fix WASI file reading   ← low priority
 
 - [x] `selfcot parse file.cot` → exit 0 on success, exit 1 on error
 - [ ] `selfcot check file.cot` → exit 0 on success, exit 1 on error ← BLOCKED (SIGBUS)
-- [x] 142/142 tests pass on native (`cot test self/main.cot`)
-- [x] All tests pass on wasm (`cot test self/main.cot --target=wasm32`)
+- [x] 189 tests pass on native (`cot test self/main.cot`)
+- [ ] ~~All tests pass on wasm~~ — wasm32 broken (`error.MissingValue`, pre-existing multi-file issue)
 - [x] All 9 self/ files parse via `selfcot parse`
 - [ ] All 31 stdlib files parse via `selfcot parse`
 - [ ] `selfcot check self/main.cot` → ok (self-check milestone) ← BLOCKED

@@ -2,7 +2,7 @@
 
 ## Current: 0.3.2 (Feb 2026)
 
-Compiler is feature-complete for the core language. 31 stdlib modules, 66 test files (~1,620 tests), LSP with 7 features, @safe mode, comptime infrastructure, ARC memory management. All 6 waves of 0.4 feature work are **DONE**. Runtime builtins moved to stdlib via `extern fn`.
+Compiler is feature-complete for the core language. 31 stdlib modules, 69 test files (~1,700 tests), LSP with 7 features, @safe mode, comptime infrastructure, ARC memory management. All 6 waves of 0.4 feature work are **DONE**. Runtime builtins moved to stdlib via `extern fn`. OS threading primitives (threads, mutex, condition variables, atomics, channels) implemented.
 
 **What ships:** A developer can `cot init`, write an HTTP server with crypto + regex + path handling, `cot test --watch` during development, `cot lint` + `cot check` for fast feedback, `cot bench` for performance, `cot doc` for API docs, and `cot build` for a native binary. Like Deno, but compiled to native with zero runtime overhead.
 
@@ -25,7 +25,7 @@ All language features and stdlib are done. What remains is distribution polish:
 | 7 | Improved `@assert_eq` failure output (expected vs actual diff) | Not started |
 | 8 | Logo & brand assets | Not started |
 | 9 | cot.dev launch (docs site + playground) | Not started |
-| 10 | Self-hosting progress (frontend in Cot) | ~81% (scanner+parser+types+checker done, 10,896 lines) |
+| 10 | Self-hosting progress (frontend in Cot) | ~80% frontend fidelity (13,381 lines, 189 tests). See `SELF_HOSTING_AUDIT.md` |
 
 **Release criteria:** `brew install cotlang/tap/cot` works, VS Code extension on marketplace, all tests pass on native + Wasm.
 
@@ -56,11 +56,12 @@ All language features and stdlib are done. What remains is distribution polish:
 
 | Feature | Description | Reference |
 |---------|-------------|-----------|
-| Spawn + channels | Go-style: `spawn {}`, `Channel(T)`, `select`, work-stealing. | Go goroutines |
-| Atomic ARC | Thread-safe reference counting. | Swift atomic refcounting |
+| ~~Spawn + channels~~ | ~~Go-style: `spawn {}`, `Channel(T)`, `select`, work-stealing.~~ | **DONE** (0.3.x) — OS-level threads, mutex, conditions, atomics, Channel(T). See `threading-design.md` |
+| ~~Atomic ARC~~ | ~~Thread-safe reference counting.~~ | **Foundation DONE** (atomics in 0.3.x). ARC atomic upgrade deferred to scheduler work |
 | Permission system | `--allow-read`, `--allow-net`, `--allow-env`. | Deno permissions |
 | OpenTelemetry | Built-in tracing, auto-instrument HTTP. | Deno 2.2 OTel |
-| `std/sync` | Mutex, RwLock, Atomic(T), WaitGroup. | Go `sync` |
+| `spawn {}` + work-stealing | Lightweight task scheduler on top of OS threads. | Go runtime `proc.go` |
+| `select` statement | Multiplexed channel receive. | Go `select` |
 | SIMD vectors | `@Vector(N, T)` mapped to hardware SIMD. | Zig `@Vector` |
 
 ---

@@ -720,6 +720,7 @@ impl TypeRegistry {
 
     fn sizeOf(idx: int) int {
         if (idx == UNTYPED_INT or idx == UNTYPED_FLOAT) { return 8 }
+        if (idx == STRING) { return 16 }
         const t = self.get(idx)
         return switch (t) {
             Type.basic |k| => k.size(),
@@ -1305,7 +1306,7 @@ test "TypeRegistry sizeOf basics" {
     var reg = TypeRegistry.init()
     @assertEq(reg.sizeOf(BOOL), 1)
     @assertEq(reg.sizeOf(I64), 8)
-    @assertEq(reg.sizeOf(STRING), 24)
+    @assertEq(reg.sizeOf(STRING), 16)
 }
 
 test "TypeRegistry sizeOf pointer" {

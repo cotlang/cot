@@ -8,18 +8,13 @@
 
 import "std/list"
 import "std/string"
+import "source"
 
 // ============================================================================
 // Constants and basic types
 // ============================================================================
 
 const null_node: int = 0xFFFFFFFF
-
-/// Half-open byte range [start, end) in source text.
-struct Span {
-    start: int,
-    end: int,
-}
 
 /// Struct memory layout strategy.
 const StructLayout = enum { auto, @"packed", @"extern" }
@@ -995,6 +990,8 @@ const BuiltinKind = enum {
     compile_error, embed_file, target, target_os, target_arch,
     // ARC management
     arc_retain, arc_release,
+    // Atomics — sequential consistency
+    atomic_load, atomic_store, atomic_add, atomic_cas, atomic_exchange,
 }
 
 /// Look up a builtin name string and return its BuiltinKind index, or null if unknown.
@@ -1054,6 +1051,11 @@ fn builtinFromString(name: string) ?int {
         "targetArch" => @intFromEnum(BuiltinKind.target_arch),
         "arcRetain" => @intFromEnum(BuiltinKind.arc_retain),
         "arcRelease" => @intFromEnum(BuiltinKind.arc_release),
+        "atomicLoad" => @intFromEnum(BuiltinKind.atomic_load),
+        "atomicStore" => @intFromEnum(BuiltinKind.atomic_store),
+        "atomicAdd" => @intFromEnum(BuiltinKind.atomic_add),
+        "atomicCas" => @intFromEnum(BuiltinKind.atomic_cas),
+        "atomicExchange" => @intFromEnum(BuiltinKind.atomic_exchange),
         else => null,
     }
 }
@@ -1155,6 +1157,11 @@ fn builtinToString(kind: int) string {
         BuiltinKind.target_arch => "targetArch",
         BuiltinKind.arc_retain => "arcRetain",
         BuiltinKind.arc_release => "arcRelease",
+        BuiltinKind.atomic_load => "atomicLoad",
+        BuiltinKind.atomic_store => "atomicStore",
+        BuiltinKind.atomic_add => "atomicAdd",
+        BuiltinKind.atomic_cas => "atomicCas",
+        BuiltinKind.atomic_exchange => "atomicExchange",
     }
 }
 
@@ -1189,7 +1196,7 @@ test "LiteralKind enum" {
 }
 
 test "BuiltinKind enum count" {
-    @assertEq(@enumLen(BuiltinKind), 54)
+    @assertEq(@enumLen(BuiltinKind), 59)
 }
 
 test "builtinFromString known" {

@@ -1,9 +1,10 @@
 # Self-Hosted Compiler Status
 
-**Updated:** 2026-02-27
+**Updated:** 2026-02-28
 **Location:** `self/` directory (9 files + `cot.json`)
-**Lines:** ~11,070 total (excluding test blocks)
-**Tests:** 142/142 pass native, all pass wasm
+**Lines:** ~13,381 total (including test blocks)
+**Tests:** 189 pass native
+**Audit:** See `SELF_HOSTING_AUDIT.md` for detailed fidelity analysis (~80% frontend)
 
 ---
 
@@ -28,9 +29,9 @@ The frontend is complete. The self-hosted binary can parse all 9 of its own sour
 | **Multi-file imports** | Complete | Recursive resolution, stdlib walk-up, circular detection |
 | **@safe mode** | Complete | Project-level `cot.json` detection, auto-ref |
 | **Build (Native)** | Working | `cot build self/main.cot -o /tmp/selfcot` → binary |
-| **Tests (Native)** | 142/142 pass | All tests pass (SIGSEGV fixed in `0c341a4`) |
-| **Build (Wasm)** | Working | `cot build self/main.cot --target=wasm32` → 532KB |
-| **Tests (Wasm)** | All pass | `cot test self/main.cot --target=wasm32` |
+| **Tests (Native)** | 189 pass | All tests pass |
+| **Build (Wasm)** | Working | `cot build self/main.cot --target=wasm32` → .wasm |
+| **Tests (Wasm)** | Broken | `error.MissingValue` — pre-existing multi-file wasm issue |
 | **selfcot parse** | Working | `selfcot parse self/main.cot` → exit 0 |
 | **selfcot check** | Crashes | `selfcot check self/main.cot` → exit 132 (SIGILL on `import "std/string"`) |
 
@@ -41,16 +42,16 @@ The frontend is complete. The self-hosted binary can parse all 9 of its own sour
 | File | Lines | Tests | Purpose |
 |------|-------|-------|---------|
 | `cot.json` | — | — | Project config (`"safe": true`) |
-| `main.cot` | 318 | 2 | CLI entry point, multi-file import resolution |
-| `frontend/token.cot` | 436 | 13 | 84 token types, keyword lookup, precedence tables |
-| `frontend/source.cot` | 111 | 7 | `Pos`, `Span`, `Source` structs for source locations |
-| `frontend/errors.cot` | 203 | 10 | `ErrorReporter` with 28 error codes, line:col formatting |
-| `frontend/scanner.cot` | 736 | 17 | Full lexer with string interpolation, number literals |
-| `frontend/ast.cot` | 1,259 | 16 | Flat-encoded AST, 54 `NodeTag` variants, 54 builtins |
-| `frontend/parser.cot` | 2,691 | 37 | Recursive descent parser, all declarations/expressions/statements |
-| `frontend/types.cot` | 1,256 | 26 | `TypeRegistry`, `Type` union with 15 variants, generic instantiation |
-| `frontend/checker.cot` | 4,073 | 22 | Full type checker: generics, traits, error unions, @safe, multi-file |
-| **Total** | **~11,070** | **150** | 142 run on native (8 compile-time skipped) |
+| `main.cot` | 301 | 2 | CLI entry point, multi-file import resolution |
+| `frontend/token.cot` | 440 | 13 | 84 token types, keyword lookup, precedence tables |
+| `frontend/source.cot` | 317 | 7 | `Pos`, `Span`, `Source` structs for source locations |
+| `frontend/errors.cot` | 536 | 10 | `ErrorReporter` with 28 error codes, line:col formatting |
+| `frontend/scanner.cot` | 776 | 17 | Full lexer with string interpolation, number literals |
+| `frontend/ast.cot` | 1,459 | 16 | Flat-encoded AST, 54 `NodeTag` variants, 54 builtins |
+| `frontend/parser.cot` | 2,868 | 37 | Recursive descent parser, all declarations/expressions/statements |
+| `frontend/types.cot` | 1,502 | 26 | `TypeRegistry`, `Type` union with 15 variants, generic instantiation |
+| `frontend/checker.cot` | 5,182 | 22 | Full type checker: generics, traits, error unions, @safe, multi-file |
+| **Total** | **~13,381** | **189** | All run on native |
 
 ---
 
@@ -71,7 +72,7 @@ SSA                 ssa/ (~4,000 L)           —                       ❌
 Codegen (Wasm)      codegen/wasm/ (~7,000 L)  —                       ❌
 ```
 
-Frontend: **~100%** complete (11,229 lines implemented of ~7,200 line Zig frontend — larger due to Cot's more verbose syntax and inline tests)
+Frontend: **~80% fidelity** (13,381 lines implemented of ~7,200 line Zig frontend — larger due to Cot's more verbose syntax and inline tests). See `SELF_HOSTING_AUDIT.md` for detailed gap analysis.
 
 Backend: **0%** (IR + lowerer + SSA + codegen = ~19,800 Zig lines remaining)
 

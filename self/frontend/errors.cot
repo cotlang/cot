@@ -173,11 +173,17 @@ struct ErrorReporter {
     has_source: bool,
     src_filename: string,
     src_content: string,
+    // Error collection mode (for LSP and test harnesses).
+    // When collect_mode is true, errors are stored in collected_errors
+    // instead of being printed to stderr.
+    collect_mode: bool,
+    collected_errors: List(Error),
 }
 
 impl ErrorReporter {
     /// Create a fresh reporter with no errors (no source — for tests).
     static fn init() ErrorReporter {
+        var collected: List(Error) = .{}
         return ErrorReporter {
             count: 0,
             warning_count: 0,
@@ -189,11 +195,14 @@ impl ErrorReporter {
             has_source: false,
             src_filename: "",
             src_content: "",
+            collect_mode: false,
+            collected_errors: collected,
         }
     }
 
     /// Create a reporter with source context (for rendering errors).
     static fn initWithSource(filename: string, content: string) ErrorReporter {
+        var collected: List(Error) = .{}
         return ErrorReporter {
             count: 0,
             warning_count: 0,
@@ -205,6 +214,28 @@ impl ErrorReporter {
             has_source: true,
             src_filename: filename,
             src_content: content,
+            collect_mode: false,
+            collected_errors: collected,
+        }
+    }
+
+    /// Create a reporter in collect mode (for LSP and test harnesses).
+    /// Errors are stored in collected_errors instead of printed to stderr.
+    static fn initCollecting() ErrorReporter {
+        var collected: List(Error) = .{}
+        return ErrorReporter {
+            count: 0,
+            warning_count: 0,
+            suppressed: false,
+            has_first: false,
+            first_msg: "",
+            first_code: ErrorCode.e100,
+            first_offset: 0,
+            has_source: false,
+            src_filename: "",
+            src_content: "",
+            collect_mode: true,
+            collected_errors: collected,
         }
     }
 
@@ -221,8 +252,11 @@ impl ErrorReporter {
     /// Record a warning. Zig: warningWithCode renders to stderr.
     fn warningWithCode(offset: int, wc: WarningCode, msg: string) void {
         self.warning_count += 1
-        if (self.has_source) {
-            self.printErr(warnError(offset, wc, msg))
+        const err = warnError(offset, wc, msg)
+        if (self.collect_mode) {
+            self.collected_errors.append(err)
+        } else if (self.has_source) {
+            self.printErr(err)
         }
     }
 
@@ -231,7 +265,7 @@ impl ErrorReporter {
         if (!self.has_first) {
             self.has_first = true
             self.first_msg = err.msg
-            self.first_offset = err.span.start_offset
+            self.first_offset = err.span.start
             if (err.err_code >= 0) {
                 self.first_code = @enumFromInt(ErrorCode, err.err_code)
             }
@@ -241,13 +275,17 @@ impl ErrorReporter {
         if (self.count > MAX_ERRORS) {
             if (!self.suppressed) {
                 self.suppressed = true
-                const too_many = "error: too many errors, stopping\n"
-                fd_write(2, @ptrOf(too_many), @lenOf(too_many))
+                if (!self.collect_mode) {
+                    const too_many = "error: too many errors, stopping\n"
+                    fd_write(2, @ptrOf(too_many), @lenOf(too_many))
+                }
             }
             return
         }
 
-        if (self.has_source) {
+        if (self.collect_mode) {
+            self.collected_errors.append(err)
+        } else if (self.has_source) {
             self.printErr(err)
         }
     }
@@ -255,7 +293,7 @@ impl ErrorReporter {
     /// Render a diagnostic to stderr with source context.
     /// Zig reference: printError in errors.zig
     fn printErr(err: Error) void {
-        const line, col = offsetToLineCol(self.src_content, err.span.start_offset)
+        const line, col = offsetToLineCol(self.src_content, err.span.start)
 
         // Severity label + code
         if (err.severity == 1) {
@@ -279,7 +317,7 @@ impl ErrorReporter {
         }
 
         // Source line
-        const source_line = getSourceLine(self.src_content, err.span.start_offset)
+        const source_line = getSourceLine(self.src_content, err.span.start)
         const line_output = "    ${source_line}\n"
         fd_write(2, @ptrOf(line_output), @lenOf(line_output))
 
@@ -295,7 +333,7 @@ impl ErrorReporter {
 
         // Note (if present)
         if (err.has_note) {
-            const note_line, note_col = offsetToLineCol(self.src_content, err.note_span.start_offset)
+            const note_line, note_col = offsetToLineCol(self.src_content, err.note_span.start)
             const note_output = "${self.src_filename}:${note_line}:${note_col}: note: ${err.note_msg}\n"
             fd_write(2, @ptrOf(note_output), @lenOf(note_output))
         }
@@ -396,13 +434,13 @@ test "error code descriptions" {
 
 test "note struct" {
     const n = Note { span: Span.fromPos(42), msg: "defined here" }
-    @assertEq(n.span.start_offset, 42)
+    @assertEq(n.span.start, 42)
     @assertEq(n.msg, "defined here")
 }
 
 test "error struct factory at" {
     const err = errorAt(10, "test error")
-    @assertEq(err.span.start_offset, 10)
+    @assertEq(err.span.start, 10)
     @assertEq(err.msg, "test error")
     @assertEq(err.err_code, -1)
     @assertEq(err.severity, 0)
@@ -411,7 +449,7 @@ test "error struct factory at" {
 
 test "error struct factory withCode" {
     const err = errorWithCode(20, ErrorCode.e200, "bad token")
-    @assertEq(err.span.start_offset, 20)
+    @assertEq(err.span.start, 20)
     @assertEq(err.msg, "bad token")
     @assertEq(err.err_code, 200)
     @assertEq(err.severity, 0)
@@ -419,17 +457,17 @@ test "error struct factory withCode" {
 
 test "error struct factory withCodeAndNote" {
     const err = errorWithCodeAndNote(30, ErrorCode.e302, "redefined", 5, "defined here")
-    @assertEq(err.span.start_offset, 30)
+    @assertEq(err.span.start, 30)
     @assertEq(err.msg, "redefined")
     @assertEq(err.err_code, 302)
     @assertEq(err.has_note, true)
-    @assertEq(err.note_span.start_offset, 5)
+    @assertEq(err.note_span.start, 5)
     @assertEq(err.note_msg, "defined here")
 }
 
 test "error struct factory warn" {
     const err = warnError(15, WarningCode.w001, "unused x")
-    @assertEq(err.span.start_offset, 15)
+    @assertEq(err.span.start, 15)
     @assertEq(err.severity, 1)
     @assertEq(err.warning_code, 1)
 }

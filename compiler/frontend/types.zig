@@ -309,8 +309,21 @@ pub const TypeRegistry = struct {
         }
         return self.add(.{ .map = .{ .key = key, .value = value } });
     }
-    pub fn makeList(self: *TypeRegistry, elem: TypeIndex) !TypeIndex { return self.add(.{ .list = .{ .elem = elem } }); }
+    pub fn makeList(self: *TypeRegistry, elem: TypeIndex) !TypeIndex {
+        for (self.types.items, 0..) |t, i| {
+            if (t == .list and t.list.elem == elem) return @intCast(i);
+        }
+        return self.add(.{ .list = .{ .elem = elem } });
+    }
     pub fn makeTuple(self: *TypeRegistry, element_types: []const TypeIndex) !TypeIndex {
+        for (self.types.items, 0..) |t, i| {
+            if (t == .tuple and t.tuple.element_types.len == element_types.len and blk: {
+                for (t.tuple.element_types, element_types) |a, b| {
+                    if (a != b) break :blk false;
+                }
+                break :blk true;
+            }) return @intCast(i);
+        }
         return self.add(.{ .tuple = .{ .element_types = try self.allocator.dupe(TypeIndex, element_types) } });
     }
 
@@ -323,10 +336,21 @@ pub const TypeRegistry = struct {
     }
 
     pub fn makeFunc(self: *TypeRegistry, params: []const FuncParam, ret: TypeIndex) !TypeIndex {
+        for (self.types.items, 0..) |t, i| {
+            if (t == .func and t.func.return_type == ret and t.func.params.len == params.len and blk: {
+                for (t.func.params, params) |a, b| {
+                    if (a.type_idx != b.type_idx) break :blk false;
+                }
+                break :blk true;
+            }) return @intCast(i);
+        }
         return self.add(.{ .func = .{ .params = try self.allocator.dupe(FuncParam, params), .return_type = ret } });
     }
 
     pub fn makeFuture(self: *TypeRegistry, result_type: TypeIndex) !TypeIndex {
+        for (self.types.items, 0..) |t, i| {
+            if (t == .future and t.future.result_type == result_type) return @intCast(i);
+        }
         return self.add(.{ .future = .{ .result_type = result_type } });
     }
 

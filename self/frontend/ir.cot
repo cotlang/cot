@@ -1,0 +1,1347 @@
+/// Strongly Typed Intermediate Representation.
+/// Ported from compiler/frontend/ir.zig
+///
+/// IR data structures: enums, payload structs, tagged Data union,
+/// Node/Block/Local/Func structs, FuncBuilder, and top-level Builder/IR.
+
+import "std/list"
+import "std/map"
+import "std/string"
+import "types"
+import "source"
+
+// ============================================================================
+// Index sentinel constants
+// ============================================================================
+
+const null_node: int = 0xFFFFFFFF
+const null_local: int = 0xFFFFFFFF
+const null_block: int = 0xFFFFFFFF
+
+// ============================================================================
+// BinaryOp — binary operation kind
+// ============================================================================
+
+const BinaryOp = enum(u8) {
+    add, sub, mul, div, mod,
+    eq, ne, lt, le, gt, ge,
+    @"and", @"or",
+    bit_and, bit_or, bit_xor, shl, shr,
+    fmin, fmax,
+    lt_u, le_u, gt_u, ge_u,
+    atomic_store, atomic_add, atomic_exchange,
+}
+
+impl BinaryOp {
+    fn isComparison() bool {
+        return switch (self) {
+            .eq, .ne, .lt, .le, .gt, .ge, .lt_u, .le_u, .gt_u, .ge_u => true,
+            else => false,
+        }
+    }
+
+    fn isArithmetic() bool {
+        return switch (self) {
+            .add, .sub, .mul, .div, .mod => true,
+            else => false,
+        }
+    }
+
+    fn isLogical() bool {
+        return switch (self) {
+            .@"and", .@"or" => true,
+            else => false,
+        }
+    }
+
+    fn isBitwise() bool {
+        return switch (self) {
+            .bit_and, .bit_or, .bit_xor, .shl, .shr => true,
+            else => false,
+        }
+    }
+}
+
+// ============================================================================
+// UnaryOp — unary operation kind
+// ============================================================================
+
+const UnaryOp = enum(u8) {
+    neg, @"not", bit_not,
+    optional_unwrap,
+    abs, ceil, floor, trunc_float, nearest, sqrt,
+    f64_reinterpret_i64, i64_reinterpret_f64,
+    ctz, clz, popcnt,
+    atomic_load,
+}
+
+// ============================================================================
+// Payload structs — grouped by category
+// ============================================================================
+
+// --- Constants ---
+
+struct ConstInt { value: int }
+struct ConstFloat { value: float }
+struct ConstBool { value: bool }
+struct ConstSlice { string_index: int }
+
+// --- Local/global references ---
+
+struct LocalRef { local_idx: int }
+struct GlobalRef { global_idx: int, name: string }
+struct GlobalStore { global_idx: int, name: string, value: int }
+struct FuncAddr { name: string }
+
+// --- Binary/unary ---
+
+struct Binary { op: BinaryOp, left: int, right: int }
+struct Unary { op: UnaryOp, operand: int }
+
+// --- Local stores/loads ---
+
+struct StoreLocal { local_idx: int, value: int }
+struct FieldLocal { local_idx: int, field_idx: int, offset: int }
+struct StoreLocalField { local_idx: int, field_idx: int, offset: int, value: int }
+struct StoreField { base: int, field_idx: int, offset: int, value: int }
+struct FieldValue { base: int, field_idx: int, offset: int }
+
+// --- Index operations ---
+
+struct IndexLocal { local_idx: int, index: int, elem_size: int }
+struct IndexValue { base: int, index: int, elem_size: int }
+struct StoreIndexLocal { local_idx: int, index: int, value: int, elem_size: int }
+struct StoreIndexValue { base: int, index: int, value: int, elem_size: int }
+
+// --- Slice operations ---
+
+struct SliceLocal { local_idx: int, start: int, end: int, elem_size: int }
+struct SliceValue { base: int, start: int, end: int, elem_size: int }
+struct SlicePtr { slice: int }
+struct SliceLen { slice: int }
+struct SliceCap { slice: int }
+
+// --- Pointer operations ---
+
+struct PtrLoad { ptr_local: int }
+struct PtrStore { ptr_local: int, value: int }
+struct PtrField { ptr_local: int, field_idx: int, offset: int }
+struct PtrFieldStore { ptr_local: int, field_idx: int, offset: int, value: int }
+struct PtrLoadValue { ptr: int }
+struct PtrStoreValue { ptr: int, value: int }
+
+// --- Address operations ---
+
+struct AddrLocal { local_idx: int }
+struct AddrOffset { base: int, offset: int }
+struct AddrIndex { base: int, index: int, elem_size: int }
+
+// --- Call/control flow ---
+
+struct Call { func_name: string, args: List(int), is_builtin: bool }
+struct CallIndirect { callee: int, args: List(int) }
+struct ClosureCall { callee: int, context: int, args: List(int) }
+struct Return { value: int }
+struct Jump { target: int }
+struct Branch { condition: int, then_block: int, else_block: int }
+struct PhiSource { block: int, value: int }
+struct Phi { sources: List(PhiSource) }
+struct Select { condition: int, then_value: int, else_value: int }
+struct AtomicCas { ptr: int, expected: int, new_val: int }
+
+// --- Type conversion ---
+
+struct Convert { operand: int, from_type: int, to_type: int }
+
+// --- List/map operations ---
+
+struct ListNew { elem_type: int }
+struct ListPush { handle: int, value: int }
+struct ListGet { handle: int, index: int }
+struct ListSet { handle: int, index: int, value: int }
+struct ListLen { handle: int }
+struct MapNew { key_type: int, value_type: int }
+struct MapSet { handle: int, key: int, value: int }
+struct MapGet { handle: int, key: int }
+struct MapHas { handle: int, key: int }
+
+// --- String/slice headers ---
+
+struct StrConcat { left: int, right: int }
+struct StringHeader { ptr: int, len: int }
+struct SliceHeader { ptr: int, len: int, cap: int }
+
+// --- Union operations ---
+
+struct UnionInit { variant_idx: int, payload: int }
+struct UnionTag { value: int }
+struct UnionPayload { variant_idx: int, value: int }
+
+// --- Casts ---
+
+struct PtrCast { operand: int }
+struct IntToPtr { operand: int }
+struct PtrToInt { operand: int }
+
+// --- Metadata/Wasm ---
+
+struct TypeMetadata { type_name: string }
+struct WasmGlobalRead { global_idx: int }
+
+// --- WasmGC struct operations ---
+
+struct GcStructNew { type_name: string, field_values: List(int) }
+struct GcStructGet { base: int, type_name: string, field_idx: int }
+struct GcStructSet { base: int, type_name: string, field_idx: int, value: int }
+
+// ============================================================================
+// Data — tagged union of all IR node payloads
+// ============================================================================
+
+union Data {
+    // Constants
+    const_int: ConstInt,
+    const_float: ConstFloat,
+    const_bool: ConstBool,
+    const_null,
+    const_slice: ConstSlice,
+    // References
+    local_ref: LocalRef,
+    global_ref: GlobalRef,
+    global_store: GlobalStore,
+    func_addr: FuncAddr,
+    // Address/load/store
+    addr_local: AddrLocal,
+    addr_global: GlobalRef,
+    load_local: LocalRef,
+    store_local: StoreLocal,
+    // Arithmetic
+    binary: Binary,
+    unary: Unary,
+    // Fields
+    field_local: FieldLocal,
+    store_local_field: StoreLocalField,
+    store_field: StoreField,
+    field_value: FieldValue,
+    // Indexing
+    index_local: IndexLocal,
+    index_value: IndexValue,
+    store_index_local: StoreIndexLocal,
+    store_index_value: StoreIndexValue,
+    // Slicing
+    slice_local: SliceLocal,
+    slice_value: SliceValue,
+    slice_ptr: SlicePtr,
+    slice_len: SliceLen,
+    slice_cap: SliceCap,
+    // Pointers
+    ptr_load: PtrLoad,
+    ptr_store: PtrStore,
+    ptr_field: PtrField,
+    ptr_field_store: PtrFieldStore,
+    ptr_load_value: PtrLoadValue,
+    ptr_store_value: PtrStoreValue,
+    // Address arithmetic
+    addr_offset: AddrOffset,
+    addr_index: AddrIndex,
+    // Control flow
+    call: Call,
+    call_indirect: CallIndirect,
+    closure_call: ClosureCall,
+    ret: Return,
+    jump: Jump,
+    branch: Branch,
+    phi: Phi,
+    select: Select,
+    // Conversion
+    convert: Convert,
+    // Collections
+    list_new: ListNew,
+    list_push: ListPush,
+    list_get: ListGet,
+    list_set: ListSet,
+    list_len: ListLen,
+    list_free: ListLen,
+    map_new: MapNew,
+    map_set: MapSet,
+    map_get: MapGet,
+    map_has: MapHas,
+    map_free: ListLen,
+    // Strings/slices
+    str_concat: StrConcat,
+    string_header: StringHeader,
+    slice_header: SliceHeader,
+    // Unions
+    union_init: UnionInit,
+    union_tag: UnionTag,
+    union_payload: UnionPayload,
+    // Casts
+    ptr_cast: PtrCast,
+    int_to_ptr: IntToPtr,
+    ptr_to_int: PtrToInt,
+    // Metadata
+    type_metadata: TypeMetadata,
+    wasm_global_read: WasmGlobalRead,
+    // WasmGC
+    gc_struct_new: GcStructNew,
+    gc_struct_get: GcStructGet,
+    gc_struct_set: GcStructSet,
+    // Atomics
+    atomic_cas: AtomicCas,
+    // Void ops
+    nop,
+    trap,
+}
+
+// ============================================================================
+// Node — single IR instruction
+// ============================================================================
+
+struct Node {
+    data: Data,
+    type_idx: int,
+    span: Span,
+    block: int,
+}
+
+impl Node {
+    static fn init(data: Data, type_idx: int, span: Span) Node {
+        return Node { data: data, type_idx: type_idx, span: span, block: null_block }
+    }
+
+    fn withBlock(block: int) Node {
+        return Node { data: self.data, type_idx: self.type_idx, span: self.span, block: block }
+    }
+
+    fn isTerminator() bool {
+        switch (self.data) {
+            Data.ret => { return true },
+            Data.jump => { return true },
+            Data.branch => { return true },
+            Data.trap => { return true },
+            else => { return false },
+        }
+    }
+
+    fn hasSideEffects() bool {
+        switch (self.data) {
+            Data.store_local => { return true },
+            Data.ptr_store => { return true },
+            Data.ptr_store_value => { return true },
+            Data.ptr_field_store => { return true },
+            Data.store_local_field => { return true },
+            Data.store_field => { return true },
+            Data.call => { return true },
+            Data.call_indirect => { return true },
+            Data.closure_call => { return true },
+            Data.ret => { return true },
+            Data.jump => { return true },
+            Data.branch => { return true },
+            Data.trap => { return true },
+            Data.list_new => { return true },
+            Data.list_push => { return true },
+            Data.list_set => { return true },
+            Data.list_free => { return true },
+            Data.map_new => { return true },
+            Data.map_set => { return true },
+            Data.map_free => { return true },
+            Data.gc_struct_new => { return true },
+            Data.gc_struct_set => { return true },
+            Data.atomic_cas => { return true },
+            Data.store_index_local => { return true },
+            Data.store_index_value => { return true },
+            Data.global_store => { return true },
+            else => { return false },
+        }
+    }
+
+    fn isConstant() bool {
+        switch (self.data) {
+            Data.const_int => { return true },
+            Data.const_float => { return true },
+            Data.const_bool => { return true },
+            Data.const_null => { return true },
+            Data.const_slice => { return true },
+            else => { return false },
+        }
+    }
+}
+
+// ============================================================================
+// Block — basic block in the control flow graph
+// ============================================================================
+
+struct Block {
+    index: int,
+    preds: List(int),
+    succs: List(int),
+    nodes: List(int),
+    label: string,
+}
+
+impl Block {
+    static fn init(index: int) Block {
+        var preds: List(int) = .{}
+        var succs: List(int) = .{}
+        var nodes: List(int) = .{}
+        return Block { index: index, preds: preds, succs: succs, nodes: nodes, label: "" }
+    }
+}
+
+// ============================================================================
+// Local — local variable / parameter
+// ============================================================================
+
+struct Local {
+    name: string,
+    type_idx: int,
+    mutable: bool,
+    is_param: bool,
+    param_idx: int,
+    size: int,
+    alignment: int,
+    offset: int,
+}
+
+impl Local {
+    static fn init(name: string, type_idx: int, mutable: bool) Local {
+        return Local { name: name, type_idx: type_idx, mutable: mutable, is_param: false, param_idx: 0, size: 8, alignment: 8, offset: 0 }
+    }
+
+    static fn initParam(name: string, type_idx: int, param_idx: int, size: int) Local {
+        return Local { name: name, type_idx: type_idx, mutable: false, is_param: true, param_idx: param_idx, size: size, alignment: @min(size, 8), offset: 0 }
+    }
+
+    static fn initWithSize(name: string, type_idx: int, mutable: bool, size: int) Local {
+        return Local { name: name, type_idx: type_idx, mutable: mutable, is_param: false, param_idx: 0, size: size, alignment: @min(size, 8), offset: 0 }
+    }
+}
+
+// ============================================================================
+// Global — module-level variable
+// ============================================================================
+
+struct Global {
+    name: string,
+    type_idx: int,
+    is_const: bool,
+    span: Span,
+    size: int,
+}
+
+impl Global {
+    static fn init(name: string, type_idx: int, is_const: bool, span: Span) Global {
+        return Global { name: name, type_idx: type_idx, is_const: is_const, span: span, size: 8 }
+    }
+
+    static fn initWithSize(name: string, type_idx: int, is_const: bool, span: Span, size: int) Global {
+        return Global { name: name, type_idx: type_idx, is_const: is_const, span: span, size: size }
+    }
+}
+
+// ============================================================================
+// StructDef — struct type definition in the IR
+// ============================================================================
+
+struct StructDef {
+    name: string,
+    type_idx: int,
+    span: Span,
+}
+
+// ============================================================================
+// Func — immutable function representation (built from FuncBuilder)
+// ============================================================================
+
+struct Func {
+    name: string,
+    type_idx: int,
+    return_type: int,
+    params: List(Local),
+    locals: List(Local),
+    blocks: List(Block),
+    entry: int,
+    nodes: List(Node),
+    span: Span,
+    frame_size: int,
+    string_literals: List(string),
+    is_destructor: bool,
+    is_export: bool,
+}
+
+impl Func {
+    fn getNode(idx: int) Node { return self.nodes.get(idx) }
+    fn getLocal(idx: int) Local { return self.locals.get(idx) }
+    fn getBlock(idx: int) Block { return self.blocks.get(idx) }
+}
+
+// ============================================================================
+// ShadowEntry — scope tracking for local variable shadowing
+// ============================================================================
+
+struct ShadowEntry {
+    name: string,
+    old_idx: ?int,
+}
+
+// ============================================================================
+// FuncBuilder — mutable builder for constructing a Func
+// ============================================================================
+
+struct FuncBuilder {
+    name: string,
+    type_idx: int,
+    return_type: int,
+    span: Span,
+    locals: List(Local),
+    blocks: List(Block),
+    nodes: List(Node),
+    string_literals: List(string),
+    current_block: int,
+    local_map: Map(string, int),
+    shadow_stack: List(ShadowEntry),
+    sret_return_type: ?int,
+    is_destructor: bool,
+    is_export: bool,
+}
+
+impl FuncBuilder {
+    static fn init(name: string, type_idx: int, return_type: int, span: Span) FuncBuilder {
+        var locals: List(Local) = .{}
+        var blocks: List(Block) = .{}
+        var nodes: List(Node) = .{}
+        var string_literals: List(string) = .{}
+        var local_map: Map(string, int) = .{}
+        var shadow_stack: List(ShadowEntry) = .{}
+        blocks.append(Block.init(0))
+        return FuncBuilder {
+            name: name,
+            type_idx: type_idx,
+            return_type: return_type,
+            span: span,
+            locals: locals,
+            blocks: blocks,
+            nodes: nodes,
+            string_literals: string_literals,
+            current_block: 0,
+            local_map: local_map,
+            shadow_stack: shadow_stack,
+            sret_return_type: null,
+            is_destructor: false,
+            is_export: false,
+        }
+    }
+
+    // --- Local management ---
+
+    fn addLocal(local: Local) int {
+        const idx = self.locals.count
+        self.locals.append(local)
+        self.local_map.set(local.name, idx)
+        return idx
+    }
+
+    fn addParam(name: string, type_idx: int, size: int) int {
+        const idx = self.locals.count
+        self.locals.append(Local.initParam(name, type_idx, idx, size))
+        self.local_map.set(name, idx)
+        return idx
+    }
+
+    fn addLocalWithSize(name: string, type_idx: int, mutable: bool, size: int) int {
+        const idx = self.locals.count
+        self.locals.append(Local.initWithSize(name, type_idx, mutable, size))
+        self.shadow_stack.append(ShadowEntry { name: name, old_idx: self.local_map.getOrNull(name) })
+        self.local_map.set(name, idx)
+        return idx
+    }
+
+    fn lookupLocal(name: string) ?int {
+        return self.local_map.getOrNull(name)
+    }
+
+    // --- Scope management ---
+
+    fn markScopeEntry() int {
+        return self.shadow_stack.count
+    }
+
+    fn restoreScope(entry_depth: int) void {
+        while (self.shadow_stack.count > entry_depth) {
+            const entry = self.shadow_stack.pop()
+            if (entry.old_idx) |old| {
+                self.local_map.set(entry.name, old)
+            } else {
+                self.local_map.remove(entry.name)
+            }
+        }
+    }
+
+    // --- Block management ---
+
+    fn newBlock(label: string) int {
+        const idx = self.blocks.count
+        var block = Block.init(idx)
+        block.label = label
+        self.blocks.append(block)
+        return idx
+    }
+
+    fn setBlock(block: int) void {
+        self.current_block = block
+    }
+
+    fn currentBlock() int {
+        return self.current_block
+    }
+
+    fn needsTerminator() bool {
+        var last = null_node
+        var i = 0
+        while (i < self.nodes.count) {
+            const node = self.nodes.get(i)
+            if (node.block == self.current_block) {
+                last = i
+            }
+            i += 1
+        }
+        if (last == null_node) {
+            return true
+        }
+        return !self.nodes.get(last).isTerminator()
+    }
+
+    // --- String literals ---
+
+    fn addStringLiteral(str: string) int {
+        var i = 0
+        while (i < self.string_literals.count) {
+            if (self.string_literals.get(i) == str) {
+                return i
+            }
+            i += 1
+        }
+        const idx = self.string_literals.count
+        self.string_literals.append(str)
+        return idx
+    }
+
+    // --- Core emit ---
+
+    fn emit(node: Node) int {
+        const idx = self.nodes.count
+        var n = node
+        n.block = self.current_block
+        self.nodes.append(n)
+        var block = self.blocks.get(self.current_block)
+        block.nodes.append(idx)
+        self.blocks.set(self.current_block, block)
+        return idx
+    }
+
+    // --- Convenience emitters ---
+
+    fn emitConstInt(value: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.const_int(ConstInt { value: value }), type_idx, span))
+    }
+
+    fn emitConstFloat(value: float, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.const_float(ConstFloat { value: value }), type_idx, span))
+    }
+
+    fn emitConstBool(value: bool, span: Span) int {
+        return self.emit(Node.init(Data.const_bool(ConstBool { value: value }), BOOL, span))
+    }
+
+    fn emitConstNull(type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.const_null, type_idx, span))
+    }
+
+    fn emitConstSlice(string_index: int, span: Span) int {
+        return self.emit(Node.init(Data.const_slice(ConstSlice { string_index: string_index }), STRING, span))
+    }
+
+    fn emitFuncAddr(name: string, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.func_addr(FuncAddr { name: name }), type_idx, span))
+    }
+
+    fn emitGlobalRef(global_idx: int, name: string, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.global_ref(GlobalRef { global_idx: global_idx, name: name }), type_idx, span))
+    }
+
+    fn emitGlobalStore(global_idx: int, name: string, value: int, span: Span) int {
+        return self.emit(Node.init(Data.global_store(GlobalStore { global_idx: global_idx, name: name, value: value }), VOID, span))
+    }
+
+    fn emitLoadLocal(local_idx: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.load_local(LocalRef { local_idx: local_idx }), type_idx, span))
+    }
+
+    fn emitStoreLocal(local_idx: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.store_local(StoreLocal { local_idx: local_idx, value: value }), VOID, span))
+    }
+
+    fn emitAddrLocal(local_idx: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.addr_local(AddrLocal { local_idx: local_idx }), type_idx, span))
+    }
+
+    fn emitAddrGlobal(global_idx: int, name: string, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.addr_global(GlobalRef { global_idx: global_idx, name: name }), type_idx, span))
+    }
+
+    fn emitAddrOffset(base: int, offset: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.addr_offset(AddrOffset { base: base, offset: offset }), type_idx, span))
+    }
+
+    fn emitBinary(op: BinaryOp, left: int, right: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.binary(Binary { op: op, left: left, right: right }), type_idx, span))
+    }
+
+    fn emitUnary(op: UnaryOp, operand: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.unary(Unary { op: op, operand: operand }), type_idx, span))
+    }
+
+    fn emitFieldLocal(local_idx: int, field_idx: int, offset: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.field_local(FieldLocal { local_idx: local_idx, field_idx: field_idx, offset: offset }), type_idx, span))
+    }
+
+    fn emitStoreLocalField(local_idx: int, field_idx: int, offset: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.store_local_field(StoreLocalField { local_idx: local_idx, field_idx: field_idx, offset: offset, value: value }), VOID, span))
+    }
+
+    fn emitStoreField(base: int, field_idx: int, offset: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.store_field(StoreField { base: base, field_idx: field_idx, offset: offset, value: value }), VOID, span))
+    }
+
+    fn emitFieldValue(base: int, field_idx: int, offset: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.field_value(FieldValue { base: base, field_idx: field_idx, offset: offset }), type_idx, span))
+    }
+
+    fn emitIndexLocal(local_idx: int, index: int, elem_size: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.index_local(IndexLocal { local_idx: local_idx, index: index, elem_size: elem_size }), type_idx, span))
+    }
+
+    fn emitIndexValue(base: int, index: int, elem_size: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.index_value(IndexValue { base: base, index: index, elem_size: elem_size }), type_idx, span))
+    }
+
+    fn emitStoreIndexLocal(local_idx: int, index: int, value: int, elem_size: int, span: Span) int {
+        return self.emit(Node.init(Data.store_index_local(StoreIndexLocal { local_idx: local_idx, index: index, value: value, elem_size: elem_size }), VOID, span))
+    }
+
+    fn emitStoreIndexValue(base: int, index: int, value: int, elem_size: int, span: Span) int {
+        return self.emit(Node.init(Data.store_index_value(StoreIndexValue { base: base, index: index, value: value, elem_size: elem_size }), VOID, span))
+    }
+
+    fn emitAddrIndex(base: int, index: int, elem_size: int, ptr_type: int, span: Span) int {
+        return self.emit(Node.init(Data.addr_index(AddrIndex { base: base, index: index, elem_size: elem_size }), ptr_type, span))
+    }
+
+    fn emitSliceLocal(local_idx: int, start: int, end: int, elem_size: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.slice_local(SliceLocal { local_idx: local_idx, start: start, end: end, elem_size: elem_size }), type_idx, span))
+    }
+
+    fn emitSliceValue(base: int, start: int, end: int, elem_size: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.slice_value(SliceValue { base: base, start: start, end: end, elem_size: elem_size }), type_idx, span))
+    }
+
+    fn emitSlicePtr(slice: int, ptr_type: int, span: Span) int {
+        return self.emit(Node.init(Data.slice_ptr(SlicePtr { slice: slice }), ptr_type, span))
+    }
+
+    fn emitSliceLen(slice: int, span: Span) int {
+        return self.emit(Node.init(Data.slice_len(SliceLen { slice: slice }), I64, span))
+    }
+
+    fn emitSliceCap(slice: int, span: Span) int {
+        return self.emit(Node.init(Data.slice_cap(SliceCap { slice: slice }), I64, span))
+    }
+
+    fn emitPtrLoad(ptr_local: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_load(PtrLoad { ptr_local: ptr_local }), type_idx, span))
+    }
+
+    fn emitPtrStore(ptr_local: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_store(PtrStore { ptr_local: ptr_local, value: value }), VOID, span))
+    }
+
+    fn emitPtrLoadValue(ptr: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_load_value(PtrLoadValue { ptr: ptr }), type_idx, span))
+    }
+
+    fn emitPtrStoreValue(ptr: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_store_value(PtrStoreValue { ptr: ptr, value: value }), VOID, span))
+    }
+
+    fn emitPtrField(ptr_local: int, field_idx: int, offset: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_field(PtrField { ptr_local: ptr_local, field_idx: field_idx, offset: offset }), type_idx, span))
+    }
+
+    fn emitPtrFieldStore(ptr_local: int, field_idx: int, offset: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_field_store(PtrFieldStore { ptr_local: ptr_local, field_idx: field_idx, offset: offset, value: value }), VOID, span))
+    }
+
+    fn emitCall(func_name: string, args: List(int), is_builtin: bool, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.call(Call { func_name: func_name, args: args, is_builtin: is_builtin }), type_idx, span))
+    }
+
+    fn emitCallIndirect(callee: int, args: List(int), type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.call_indirect(CallIndirect { callee: callee, args: args }), type_idx, span))
+    }
+
+    fn emitClosureCall(callee: int, context: int, args: List(int), type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.closure_call(ClosureCall { callee: callee, context: context, args: args }), type_idx, span))
+    }
+
+    fn emitRet(value: int, span: Span) int {
+        return self.emit(Node.init(Data.ret(Return { value: value }), VOID, span))
+    }
+
+    fn emitJump(target: int, span: Span) int {
+        return self.emit(Node.init(Data.jump(Jump { target: target }), VOID, span))
+    }
+
+    fn emitBranch(condition: int, then_block: int, else_block: int, span: Span) int {
+        return self.emit(Node.init(Data.branch(Branch { condition: condition, then_block: then_block, else_block: else_block }), VOID, span))
+    }
+
+    fn emitSelect(condition: int, then_value: int, else_value: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.select(Select { condition: condition, then_value: then_value, else_value: else_value }), type_idx, span))
+    }
+
+    fn emitConvert(operand: int, from_type: int, to_type: int, span: Span) int {
+        return self.emit(Node.init(Data.convert(Convert { operand: operand, from_type: from_type, to_type: to_type }), to_type, span))
+    }
+
+    fn emitNop(span: Span) int {
+        return self.emit(Node.init(Data.nop, VOID, span))
+    }
+
+    fn emitTrap(span: Span) int {
+        return self.emit(Node.init(Data.trap, VOID, span))
+    }
+
+    // --- Aliases and helpers ---
+
+    fn emitIndirectCall(callee: int, args: List(int), type_idx: int, span: Span) int {
+        return self.emitCallIndirect(callee, args, type_idx, span)
+    }
+
+    fn emitStoreFieldValue(base: int, field_idx: int, offset: int, value: int, span: Span) int {
+        return self.emitStoreField(base, field_idx, offset, value, span)
+    }
+
+    fn emitIntCast(operand: int, target_type: int, span: Span) int {
+        const from_type = self.nodes.get(operand).type_idx
+        return self.emitConvert(operand, from_type, target_type, span)
+    }
+
+    fn emitPtrCast(operand: int, target_type: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_cast(PtrCast { operand: operand }), target_type, span))
+    }
+
+    fn emitIntToPtr(operand: int, target_type: int, span: Span) int {
+        return self.emit(Node.init(Data.int_to_ptr(IntToPtr { operand: operand }), target_type, span))
+    }
+
+    fn emitPtrToInt(operand: int, target_type: int, span: Span) int {
+        return self.emit(Node.init(Data.ptr_to_int(PtrToInt { operand: operand }), target_type, span))
+    }
+
+    fn emitMakeSlice(base_ptr: int, start: int, end: int, elem_size: int, type_idx: int, span: Span) int {
+        return self.emitSliceValue(base_ptr, start, end, elem_size, type_idx, span)
+    }
+
+    fn emitTypeMetadata(type_name: string, span: Span) int {
+        return self.emit(Node.init(Data.type_metadata(TypeMetadata { type_name: type_name }), I64, span))
+    }
+
+    fn emitUnionInit(variant_idx: int, payload: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.union_init(UnionInit { variant_idx: variant_idx, payload: payload }), type_idx, span))
+    }
+
+    fn emitWasmGlobalRead(global_idx: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.wasm_global_read(WasmGlobalRead { global_idx: global_idx }), type_idx, span))
+    }
+
+    fn emitGcStructNew(type_name: string, field_values: List(int), type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_struct_new(GcStructNew { type_name: type_name, field_values: field_values }), type_idx, span))
+    }
+
+    fn emitGcStructGet(base: int, type_name: string, field_idx: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_struct_get(GcStructGet { base: base, type_name: type_name, field_idx: field_idx }), type_idx, span))
+    }
+
+    fn emitGcStructSet(base: int, type_name: string, field_idx: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_struct_set(GcStructSet { base: base, type_name: type_name, field_idx: field_idx, value: value }), VOID, span))
+    }
+
+    // --- Build: freeze into immutable Func ---
+
+    fn build() Func {
+        // Extract params
+        var params: List(Local) = .{}
+        var i = 0
+        while (i < self.locals.count) {
+            const local = self.locals.get(i)
+            if (local.is_param) {
+                params.append(local)
+            }
+            i += 1
+        }
+
+        // Compute frame layout (alignment + offsets)
+        var frame_offset = 0
+        i = 0
+        while (i < self.locals.count) {
+            var local = self.locals.get(i)
+            const local_align = local.alignment
+            const align_mask = local_align - 1
+            frame_offset = (frame_offset + align_mask) & ~align_mask
+            local.offset = 0 - frame_offset - local.size
+            frame_offset = frame_offset + local.size
+            self.locals.set(i, local)
+            i += 1
+        }
+
+        const frame_aligned = (frame_offset + 96 + 15) & ~15
+        return Func {
+            name: self.name,
+            type_idx: self.type_idx,
+            return_type: self.return_type,
+            params: params,
+            locals: self.locals,
+            blocks: self.blocks,
+            entry: 0,
+            nodes: self.nodes,
+            span: self.span,
+            frame_size: frame_aligned,
+            string_literals: self.string_literals,
+            is_destructor: self.is_destructor,
+            is_export: self.is_export,
+        }
+    }
+}
+
+// ============================================================================
+// GlobalLookupResult — return type for Builder.lookupGlobal
+// ============================================================================
+
+struct GlobalLookupResult {
+    idx: int,
+    global: Global,
+}
+
+// ============================================================================
+// IR — immutable container for all IR data
+// ============================================================================
+
+struct IR {
+    funcs: List(Func),
+    globals: List(Global),
+    structs: List(StructDef),
+}
+
+impl IR {
+    static fn init() IR {
+        var funcs: List(Func) = .{}
+        var globals: List(Global) = .{}
+        var structs: List(StructDef) = .{}
+        return IR { funcs: funcs, globals: globals, structs: structs }
+    }
+
+    fn getFunc(name: string) ?int {
+        var i = 0
+        while (i < self.funcs.count) {
+            const f = self.funcs.get(i)
+            if (f.name == name) {
+                return i
+            }
+            i += 1
+        }
+        return null
+    }
+
+    fn getGlobal(name: string) ?int {
+        var i = 0
+        while (i < self.globals.count) {
+            const g = self.globals.get(i)
+            if (g.name == name) {
+                return i
+            }
+            i += 1
+        }
+        return null
+    }
+}
+
+// ============================================================================
+// Builder — mutable builder for constructing IR
+// ============================================================================
+
+struct Builder {
+    ir: IR,
+    current_func: ?FuncBuilder,
+    funcs: List(Func),
+    globals: List(Global),
+    structs: List(StructDef),
+}
+
+impl Builder {
+    static fn init() Builder {
+        var funcs: List(Func) = .{}
+        var globals: List(Global) = .{}
+        var structs: List(StructDef) = .{}
+        return Builder {
+            ir: IR.init(),
+            current_func: null,
+            funcs: funcs,
+            globals: globals,
+            structs: structs,
+        }
+    }
+
+    fn startFunc(name: string, type_idx: int, return_type: int, span: Span) void {
+        self.current_func = FuncBuilder.init(name, type_idx, return_type, span)
+    }
+
+    fn func() ?FuncBuilder {
+        return self.current_func
+    }
+
+    fn endFunc() void {
+        if (self.current_func) |fb| {
+            self.funcs.append(fb.build())
+            self.current_func = null
+        }
+    }
+
+    fn hasFunc(name: string) bool {
+        var i = 0
+        while (i < self.funcs.count) {
+            if (self.funcs.get(i).name == name) {
+                return true
+            }
+            i += 1
+        }
+        return false
+    }
+
+    fn addGlobal(g: Global) void {
+        self.globals.append(g)
+    }
+
+    fn lookupGlobal(name: string) ?GlobalLookupResult {
+        var i = 0
+        while (i < self.globals.count) {
+            const g = self.globals.get(i)
+            if (g.name == name) {
+                return GlobalLookupResult { idx: i, global: g }
+            }
+            i += 1
+        }
+        return null
+    }
+
+    fn addStruct(s: StructDef) void {
+        self.structs.append(s)
+    }
+
+    fn getIR() IR {
+        var result = self.ir
+        result.funcs = self.funcs
+        result.globals = self.globals
+        result.structs = self.structs
+        return result
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "binary op predicates" {
+    var add_op = BinaryOp.add
+    @assert(add_op.isArithmetic())
+    @assert(!add_op.isComparison())
+    @assert(!add_op.isLogical())
+    @assert(!add_op.isBitwise())
+
+    var eq_op = BinaryOp.eq
+    @assert(eq_op.isComparison())
+    @assert(!eq_op.isArithmetic())
+
+    var and_op = BinaryOp.@"and"
+    @assert(and_op.isLogical())
+
+    var bxor = BinaryOp.bit_xor
+    @assert(bxor.isBitwise())
+}
+
+test "node construction" {
+    var span = Span.zero()
+    @assertEq(span.start, 0)
+    var ci = ConstInt { value: 42 }
+    @assertEq(ci.value, 42)
+}
+
+test "data union construction" {
+    var d = Data.const_int(ConstInt { value: 42 })
+    @assertEq(d.tag, 0)
+    var result = 0
+    switch (d) {
+        Data.const_int |ci| => { result = ci.value },
+        else => {},
+    }
+    @assertEq(result, 42)
+}
+
+test "struct with toplevel union field" {
+    // Test Node struct with top-level Data union field
+    var node = Node.init(Data.const_int(ConstInt { value: 42 }), INT, Span.zero())
+    @assertEq(node.type_idx, INT)
+    @assertEq(node.block, null_block)
+}
+
+test "node scalar fields" {
+    var node = Node.init(Data.const_int(ConstInt { value: 42 }), INT, Span.zero())
+    @assertEq(node.type_idx, INT)
+    @assertEq(node.block, null_block)
+}
+
+test "constint size" {
+    @assertEq(@sizeOf(ConstInt), 8)
+}
+
+test "sizes" {
+    @assert(@sizeOf(Call) > 16)
+    @assert(@sizeOf(Data) > 8)
+    @assert(@sizeOf(Node) > 32)
+}
+
+test "node via isTerminator method" {
+    var node = Node { type_idx: INT, span: Span.zero(), block: null_block, data: Data.ret(Return { value: null_node }) }
+    // The method accesses self.data via pointer (implicit self in @safe mode)
+    @assert(node.isTerminator())
+}
+
+test "node isTerminator" {
+    var ret_node = Node.init(Data.ret(Return { value: null_node }), VOID, Span.zero())
+    @assert(ret_node.isTerminator())
+
+    var const_node = Node.init(Data.const_int(ConstInt { value: 42 }), INT, Span.zero())
+    @assert(!const_node.isTerminator())
+    @assert(const_node.isConstant())
+}
+
+test "node isConstant" {
+    var ci = Node.init(Data.const_int(ConstInt { value: 0 }), INT, Span.zero())
+    @assert(ci.isConstant())
+
+    var cf = Node.init(Data.const_float(ConstFloat { value: 3.14 }), FLOAT, Span.zero())
+    @assert(cf.isConstant())
+
+    var cb = Node.init(Data.const_bool(ConstBool { value: true }), BOOL, Span.zero())
+    @assert(cb.isConstant())
+
+    var cn = Node.init(Data.const_null, VOID, Span.zero())
+    @assert(cn.isConstant())
+
+    var bin = Node.init(Data.binary(Binary { op: BinaryOp.add, left: 0, right: 1 }), INT, Span.zero())
+    @assert(!bin.isConstant())
+}
+
+test "local constructors" {
+    var local = Local.init("x", INT, true)
+    @assertEq(local.name, "x")
+    @assert(local.mutable)
+    @assertEq(local.size, 8)
+    @assert(!local.is_param)
+
+    var param = Local.initParam("arg", I32, 0, 4)
+    @assert(param.is_param)
+    @assertEq(param.size, 4)
+    @assertEq(param.alignment, 4)
+
+    var sized = Local.initWithSize("buf", INT, false, 16)
+    @assertEq(sized.size, 16)
+    @assertEq(sized.alignment, 8)
+}
+
+test "func builder init" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    @assertEq(fb.current_block, 0)
+    @assertEq(fb.blocks.count, 1)
+}
+
+test "func builder add local" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    const local_idx = fb.addLocal(Local.init("x", INT, true))
+    @assertEq(local_idx, 0)
+    @assertEq(fb.locals.count, 1)
+}
+
+test "func builder emit" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    const idx = fb.emitConstInt(42, INT, Span.zero())
+    @assertEq(idx, 0)
+    @assertEq(fb.nodes.count, 1)
+}
+
+test "func builder build" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    fb.addLocal(Local.init("x", INT, true))
+    fb.emitConstInt(42, INT, Span.zero())
+    fb.emitRet(0, Span.zero())
+    const f = fb.build()
+    @assertEq(f.name, "test_fn")
+}
+
+test "func builder two blocks" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    fb.addLocal(Local.init("x", INT, true))
+    const block_idx = fb.newBlock("then")
+    @assertEq(block_idx, 1)
+    fb.setBlock(block_idx)
+    @assertEq(fb.currentBlock(), 1)
+    fb.emitConstInt(42, INT, Span.zero())
+    @assertEq(fb.nodes.count, 1)
+    fb.emitRet(0, Span.zero())
+    @assertEq(fb.nodes.count, 2)
+}
+
+test "func builder build with blocks" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    fb.addLocal(Local.init("x", INT, true))
+    fb.newBlock("then")
+    fb.setBlock(1)
+    fb.emitConstInt(42, INT, Span.zero())
+    fb.emitRet(0, Span.zero())
+    const f = fb.build()
+    @assertEq(f.name, "test_fn")
+}
+
+test "func fields access" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    fb.addLocal(Local.init("x", INT, true))
+    fb.emitConstInt(42, INT, Span.zero())
+    const f = fb.build()
+    @assertEq(f.name, "test_fn")
+    @assertEq(f.type_idx, 0)
+    @assertEq(f.return_type, INT)
+    @assertEq(f.entry, 0)
+    @assertEq(f.is_destructor, false)
+    @assertEq(f.is_export, false)
+}
+
+test "func struct direct" {
+    var locals: List(Local) = .{}
+    locals.append(Local.init("x", INT, true))
+    var blocks: List(Block) = .{}
+    blocks.append(Block.init(0))
+    var nodes: List(Node) = .{}
+    nodes.append(Node.init(Data.const_int(ConstInt { value: 42 }), INT, Span.zero()))
+    var params: List(Local) = .{}
+    var strings: List(string) = .{}
+    var f = Func {
+        name: "test",
+        type_idx: 0,
+        return_type: INT,
+        params: params,
+        locals: locals,
+        blocks: blocks,
+        entry: 0,
+        nodes: nodes,
+        span: Span.zero(),
+        frame_size: 0,
+        string_literals: strings,
+        is_destructor: false,
+        is_export: false,
+    }
+    @assertEq(f.name, "test")
+    @assertEq(f.locals.count, 1)
+    @assertEq(f.nodes.count, 1)
+}
+
+test "build returns locals" {
+    var fb = FuncBuilder.init("test_fn", 0, INT, Span.zero())
+    fb.addLocal(Local.init("x", INT, true))
+    fb.emitConstInt(42, INT, Span.zero())
+    // Check fb fields directly before build
+    @assertEq(fb.locals.count, 1)
+    @assertEq(fb.nodes.count, 1)
+    @assertEq(fb.blocks.count, 1)
+    // Now build
+    var f = fb.build()
+    // Check scalar fields
+    @assertEq(f.name, "test_fn")
+    @assertEq(f.return_type, INT)
+    // Check params (newly created list)
+    @assertEq(f.params.count, 0)
+    // Check locals (from self)
+    @assertEq(f.locals.count, 1)
+}
+
+test "func builder params" {
+    var fb = FuncBuilder.init("add", 0, INT, Span.zero())
+    const a = fb.addParam("a", INT, 8)
+    const b = fb.addParam("b", INT, 8)
+
+    const lookup_a = fb.lookupLocal("a")
+    @assert(lookup_a != null)
+    @assertEq(lookup_a.?, a)
+
+    const lookup_b = fb.lookupLocal("b")
+    @assert(lookup_b != null)
+    @assertEq(lookup_b.?, b)
+
+    const f = fb.build()
+    @assertEq(f.params.count, 2)
+}
+
+test "builder workflow" {
+    var builder = Builder.init()
+
+    builder.startFunc("main", 0, INT, Span.zero())
+    if (builder.func()) |fb| {
+        fb.emitConstInt(42, INT, Span.zero())
+        fb.emitRet(0, Span.zero())
+    }
+    builder.endFunc()
+
+    builder.addGlobal(Global.init("counter", INT, false, Span.zero()))
+
+    @assert(builder.hasFunc("main"))
+    @assert(!builder.hasFunc("nonexistent"))
+
+    const lookup = builder.lookupGlobal("counter")
+    @assert(lookup != null)
+    @assertEq(lookup.?.idx, 0)
+
+    const ir = builder.getIR()
+    @assertEq(ir.funcs.count, 1)
+    @assertEq(ir.globals.count, 1)
+}
+
+test "scope management" {
+    var fb = FuncBuilder.init("scoped", 0, VOID, Span.zero())
+    fb.addLocalWithSize("x", INT, true, 8)
+    @assertEq(fb.lookupLocal("x").?, 0)
+
+    const scope = fb.markScopeEntry()
+    fb.addLocalWithSize("x", INT, true, 8)
+    @assertEq(fb.lookupLocal("x").?, 1)
+
+    fb.restoreScope(scope)
+    @assertEq(fb.lookupLocal("x").?, 0)
+}
+
+test "string literal dedup" {
+    var fb = FuncBuilder.init("strings", 0, VOID, Span.zero())
+    const idx1 = fb.addStringLiteral("hello")
+    const idx2 = fb.addStringLiteral("world")
+    const idx3 = fb.addStringLiteral("hello")
+    @assertEq(idx1, 0)
+    @assertEq(idx2, 1)
+    @assertEq(idx3, 0)
+}

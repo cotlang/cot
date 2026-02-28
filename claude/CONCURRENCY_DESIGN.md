@@ -2,7 +2,7 @@
 
 Cot's concurrency roadmap, building on the existing async/await foundation.
 
-**Status:** Phase 1 (async/await) is complete. Phases 2 and 3 are planned for 0.5+.
+**Status:** Phase 1 (async/await) complete. Phase 3 (OS-level primitives) **DONE** — see `threading-design.md`. Phase 2 (spawn + work-stealing) planned.
 
 ---
 
@@ -29,8 +29,8 @@ Phase 2: spawn + channels (0.5)
   Go-style lightweight tasks. True parallelism across CPU cores.
   Message-passing via channels. No shared mutable state.
 
-Phase 3: Low-level primitives (0.6+)
-  Mutex, RwLock, Atomics. For library authors.
+Phase 3: Low-level primitives (DONE — 0.3.x)
+  Thread, Mutex, Condition, Atomics, Channel(T). See threading-design.md.
 ```
 
 ---
@@ -192,9 +192,11 @@ Wasm doesn't have OS threads (yet). The Wasm threads proposal adds shared memory
 
 ---
 
-## Phase 3: Low-Level Primitives
+## Phase 3: Low-Level Primitives — DONE
 
-For library authors and advanced use cases. Exposed through `std/sync`.
+**Implemented in 0.3.x.** See `threading-design.md` for full design, implementation audit, and reference faithfulness proof.
+
+Exposed through `std/thread` and `std/channel`. Compiler builtins for atomics (`@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicCAS`, `@atomicExchange`).
 
 ### Synchronization Types
 
@@ -238,11 +240,14 @@ On Wasm, these are no-ops or single-threaded stubs (same as spawn).
 
 ### Deliverables
 
-- [ ] `Mutex` type with `lock()`, `unlock()`, `tryLock()`
-- [ ] `RwLock` with `readLock()`, `writeLock()`
-- [ ] `Atomic(T)` with `load`, `store`, `fetchAdd`, `fetchSub`, `compareAndSwap`
-- [ ] `WaitGroup` with `add`, `done`, `wait`
-- [ ] `std/sync` stdlib module
+- [x] `Thread` with `spawn()`, `join()`, `detach()` — `std/thread`
+- [x] `Mutex` type with `init()`, `lock()`, `unlock()`, `tryLock()`, `destroy()` — `std/thread`
+- [x] `Condition` with `init()`, `wait()`, `signal()`, `broadcast()`, `destroy()` — `std/thread`
+- [x] `Channel(T)` with `init()`, `send()`, `recv()`, `close()`, `destroy()` — `std/channel`
+- [x] Atomic builtins: `@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicCAS`, `@atomicExchange`
+- [ ] `RwLock` with `readLock()`, `writeLock()` — future
+- [ ] `WaitGroup` with `add`, `done`, `wait` — future
+- [ ] `Atomic(T)` wrapper struct — future (builtins work directly for now)
 
 ---
 

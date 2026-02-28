@@ -18,6 +18,7 @@ A phased execution plan for adding OS threading to Cot, designed so Cotty can ad
 8. [Cotty Adoption Plan](#cotty-adoption-plan)
 9. [File Change Summary](#file-change-summary)
 10. [Wasm Considerations](#wasm-considerations)
+11. [Implementation Audit — Reference Faithfulness](#implementation-audit--reference-faithfulness)
 
 ---
 
@@ -1605,3 +1606,125 @@ Both share the same compiler foundation:
 - Phase 5 here (Channel) is a simpler version of the channels in `CONCURRENCY_DESIGN.md`
 
 **Implementation order:** This document first (OS-level primitives), then `CONCURRENCY_DESIGN.md` Phase 2 builds on top.
+
+---
+
+## Implementation Audit — Reference Faithfulness
+
+**All 5 phases implemented and passing.** Commit `7589340` (parent repo) + `ee1d26b` (stdlib). 14 E2E tests in `test/e2e/threading.cot`, 69/69 full suite green.
+
+### Files Changed
+
+| Phase | New Files | Modified Files |
+|-------|-----------|----------------|
+| 1-3 | `compiler/codegen/native/thread_native.zig`, `stdlib/thread.cot` | `compiler/driver.zig`, `stdlib/sys.cot` |
+| 4 | — | `ast.zig`, `checker.zig`, `lower.zig`, `op.zig`, `ssa_to_clif.zig`, `aarch64/lower.zig`, `x64/lower.zig`, `x64/inst/mod.zig`, `x64/inst/emit.zig`, `ir/clif/instructions.zig` |
+| 5 | `stdlib/channel.cot` | — |
+
+### Reference Correspondence — Proof of Faithfulness
+
+#### Phase 1-3: Runtime Functions (thread_native.zig)
+
+**Reference: `io_native.zig` (existing CLIF IR runtime pattern)**
+
+| Pattern | io_native.zig | thread_native.zig | Match |
+|---------|---------------|-------------------|-------|
+| Function signature | `generate(allocator, isa, ctrl_plane, func_index_map) → RuntimeFunctions` | Identical | Exact |
+| Stack slot allocation | `createSizedStackSlot` for out-params (e.g., `generatePipe`) | `createSizedStackSlot(8, align=8)` for `pthread_t` in `thread_spawn` | Exact |
+| Simple forwarding | `generateForward1`/`generateForward2` helpers | `generateForward1Void`, `generateForward1Ret`, `generateForward2Void` | Exact pattern |
+| Destroy + free | `fd_close` pattern (call destructor, return) | `generateDestroyAndFree` (call pthread_*_destroy, then free) | Extended correctly |
+| malloc + init | `generateFdOpen` (multi-call function) | `mutex_init`: malloc(64) → memset(0) → pthread_mutex_init → return ptr | Same complexity |
+| driver.zig registration | `runtime_func_names` + `func_index_map` + generation chain | Identical pattern, placed before conditional test runtime | Exact |
+
+**Mutex/condition sizes:** 64 bytes (mutex) and 48 bytes (cond) cover both macOS and Linux. Go uses the same overallocation pattern for portable pthread wrappers.
+
+#### Phase 4: Atomic Operations
+
+**Reference: Cranelift ISA backends**
+
+##### Frontend (ast.zig, checker.zig, lower.zig)
+
+**Reference: Existing builtin pattern (e.g., `@sizeOf`, `@lenOf`)**
+
+| Pattern | Existing builtins | Atomic builtins | Match |
+|---------|-------------------|-----------------|-------|
+| BuiltinKind enum | `size_of`, `len_of`, ... | `atomic_load`, `atomic_store`, `atomic_add`, `atomic_cas`, `atomic_exchange` | Exact |
+| String map | `"sizeOf" → .size_of` | `"atomicLoad" → .atomic_load` | Exact |
+| Checker type validation | Check arg count, validate arg types, return result type | Validates pointer arg, correct return types (I64 or VOID) | Exact |
+| Lowerer emission | `emitUnary`/`emitBinary`/custom for 3-arg | `emitUnary(.atomic_load)`, `emitBinary(.atomic_store)`, custom for CAS (3-arg) | Exact |
+
+##### SSA (op.zig)
+
+| Flag | Cranelift atomic semantics | Cot op.zig | Match |
+|------|----------------------------|------------|-------|
+| `has_side_effects` | Prevents DCE of atomics | `true` for all 10 ops | Exact |
+| `reads_memory` | Prevents load reordering | `true` for load, add, cas, exchange | Exact |
+| `writes_memory` | Prevents store reordering | `true` for store, add, cas, exchange | Exact |
+| `arg_len` | Type-dependent | 1 (load), 2 (store/add/exchange), 3 (cas) | Exact |
+
+##### ARM64 Backend (aarch64/lower.zig)
+
+**Reference: `references/wasmtime/cranelift/codegen/src/isa/aarch64/lower.isle`**
+
+| CLIF Op | Cranelift ISLE Rule | Cot Emission | Match |
+|---------|---------------------|--------------|-------|
+| `atomic_load` | `(load_acquire ty flags addr)` → LDAR | `Inst{ .ldar = ... }` | Exact — LDAR (load-acquire) |
+| `atomic_store` | `(store_release ty flags addr val)` → STLR | `Inst{ .stlr = ... }` | Exact — STLR (store-release) |
+| `atomic_rmw(.add)` | `(lse_atomic_rmw (AtomicRMWOp.Add) ...)` → LDADDAL | `Inst{ .atomic_rmw = .{ .op = .add } }` → LDADDAL | Exact — LSE instruction |
+| `atomic_rmw(.exchange)` | `(lse_atomic_rmw (AtomicRMWOp.Xchg) ...)` → SWPAL | `Inst{ .atomic_rmw = .{ .op = .swp } }` → SWPAL | Exact — LSE instruction |
+| `atomic_cas` | `(lse_atomic_cas addr src1 src2 ty)` → CASAL | `Inst{ .atomic_cas = ... }` → CASAL | Exact — LSE instruction |
+
+All ARM64 atomics use LSE (Large System Extensions) hardware atomics — matching Cranelift's modern ARM64 lowering, not the legacy LL/SC loop path.
+
+##### x64 Backend (x64/lower.zig)
+
+**Reference: Cranelift x64 + x86-TSO memory model**
+
+| CLIF Op | Cranelift x64 Pattern | Cot Emission | Match |
+|---------|----------------------|--------------|-------|
+| `atomic_load` | Plain MOV (x86-TSO: all loads are acquire) | `lowerLoad()` (regular MOV) | Exact |
+| `atomic_store` | MOV + MFENCE (store + barrier for seq-cst) | `mov_r_m` + `fence(.mfence)` | Exact |
+| `atomic_rmw(.add)` | LOCK XADD (or CAS loop) | `atomic_rmw_seq` (CAS loop) | Correct but suboptimal (uses loop instead of LOCK XADD) |
+| `atomic_rmw(.exchange)` | XCHG (implicit lock) | `atomic_rmw_seq` (CAS loop) | Correct but suboptimal (uses loop instead of XCHG) |
+| `atomic_cas` | LOCK CMPXCHG | `lock_cmpxchg` | Exact |
+
+**Note on x64 RMW:** The CAS-loop approach (`atomic_rmw_seq`) is semantically correct — Cranelift also supports this path for operations where hardware LOCK isn't available. The dedicated LOCK XADD/XCHG instructions would be a performance optimization for a future pass.
+
+#### Phase 5: Channel(T)
+
+**Reference: Ghostty `BlockingQueue` + Go channels**
+
+| Pattern | Ghostty BlockingQueue | Channel(T) | Match |
+|---------|----------------------|------------|-------|
+| Data structure | Ring buffer (fixed capacity) | Ring buffer (head/tail/count/capacity) | Exact |
+| Synchronization | Mutex + 2 condition variables | Mutex + not_full + not_empty | Exact |
+| Send (full) | `cond_not_full.wait(&mutex)` | `not_full.wait(self.mtx)` while count == capacity | Exact |
+| Recv (empty) | `cond_not_empty.wait(&mutex)` | `not_empty.wait(self.mtx)` while count == 0 and !closed | Exact |
+| Close | Set closed flag + broadcast | Set closed flag + not_empty.broadcast() | Exact |
+| Buffer indexing | `tail % capacity` / `head % capacity` | `self.tail % self.capacity` / `self.head % self.capacity` | Exact |
+
+### Bug Fixes During Implementation
+
+Two pre-existing compiler bugs were discovered and fixed:
+
+1. **Generic static method calls** (`Channel(i64).init(16)` → E301): `checkFieldAccess()` didn't handle `base_expr == .call` for generic type instantiation. Fixed by resolving generic instance and looking up static method. Follows Zig Sema pattern where `ArrayList(u8).init(allocator)` resolves generic → looks up method on concrete type.
+
+2. **Generic struct SRET return** (SIGSEGV): `resolveTypeArgNode()` didn't check `type_substitution` during generic function lowering. Type param `T` resolved to VOID instead of the concrete type, corrupting struct init. Fixed by adding `type_substitution` lookup at the top of `resolveTypeArgNode()`, matching the existing pattern in `resolveTypeNode()`.
+
+### Known Limitations
+
+- **64-bit atomics only:** Frontend hard-codes I64 for all atomic operations. 32-bit atomics (`@atomicLoad` on `*i32`) are defined in SSA op.zig but unreachable from the frontend. Sufficient for current use (thread handles, counters, flags are all i64).
+- **x64 RMW uses CAS loop:** `atomic_rmw_seq` instead of dedicated LOCK XADD/XCHG. Semantically correct, ~2x slower under contention. Can be optimized later.
+- **Wasm atomics not implemented:** Atomics lower to regular loads/stores on single-threaded Wasm. Correct for now (no Wasm threads support).
+
+### Test Coverage
+
+14 tests in `test/e2e/threading.cot`:
+
+| Phase | Tests | What's Verified |
+|-------|-------|-----------------|
+| 1 | 2 | Thread spawn + join, argument passing |
+| 2 | 2 | Mutex-protected counter (2 threads x 1000), tryLock |
+| 3 | 1 | Condition variable producer-consumer signaling |
+| 4 | 5 | atomicAdd (2 threads x 1000), atomicLoad/Store, atomicExchange, atomicCAS success, atomicCAS failure |
+| 5 | 4 | Channel producer-consumer (multi-threaded), single-thread send/recv, close/isClosed, isEmpty |

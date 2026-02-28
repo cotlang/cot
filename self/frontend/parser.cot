@@ -1768,11 +1768,21 @@ impl Parser {
             .embed_file, .type_of,
             .int_from_enum, .tag_name, .error_name, .int_from_bool,
             .const_cast, .int_from_float,
-            .arc_retain, .arc_release, .panic, .ctz, .clz, .pop_count => {
+            .arc_retain, .arc_release, .panic, .ctz, .clz, .pop_count,
+            .atomic_load => {
                 args.append(self.parseExpr())
             },
             // 2 value args
-            .@"string", .assert_eq, .fmin, .fmax, .field, .min, .max => {
+            .@"string", .assert_eq, .fmin, .fmax, .field, .min, .max,
+            .atomic_store, .atomic_add, .atomic_exchange => {
+                args.append(self.parseExpr())
+                self.expect(@intFromEnum(Token.comma))
+                args.append(self.parseExpr())
+            },
+            // 3 value args
+            .atomic_cas => {
+                args.append(self.parseExpr())
+                self.expect(@intFromEnum(Token.comma))
                 args.append(self.parseExpr())
                 self.expect(@intFromEnum(Token.comma))
                 args.append(self.parseExpr())
