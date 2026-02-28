@@ -29,6 +29,13 @@ import "parser"
 // Symbol — named binding in scope
 // ============================================================================
 
+// C18: Symbol kind constants (Zig checker.zig:38-39)
+const SYM_VARIABLE: int = 0
+const SYM_CONSTANT: int = 1
+const SYM_FUNCTION: int = 2
+const SYM_TYPE: int = 3
+const SYM_PARAMETER: int = 4
+
 struct Symbol {
     name: string,
     type_idx: int,
@@ -38,6 +45,8 @@ struct Symbol {
     is_type: bool,
     is_const_val: bool,
     const_value: int,
+    float_const_value: int,  // C19: f64 bits stored as int (Zig checker.zig:47)
+    kind: int,               // C18: SYM_VARIABLE/CONSTANT/FUNCTION/TYPE/PARAMETER
     is_extern: bool,
     is_export: bool,
     used: bool,
@@ -53,6 +62,8 @@ fn makeSymbol(name: string, type_idx: int, node: int, mutable: bool) Symbol {
         is_type: false,
         is_const_val: false,
         const_value: 0,
+        float_const_value: 0,
+        kind: SYM_VARIABLE,
         is_extern: false,
         is_export: false,
         used: false,
@@ -69,6 +80,8 @@ fn makeFuncSymbol(name: string, type_idx: int, node: int) Symbol {
         is_type: false,
         is_const_val: false,
         const_value: 0,
+        float_const_value: 0,
+        kind: SYM_FUNCTION,
         is_extern: false,
         is_export: false,
         used: false,
@@ -85,6 +98,8 @@ fn makeExternFuncSymbol(name: string, type_idx: int, node: int) Symbol {
         is_type: false,
         is_const_val: false,
         const_value: 0,
+        float_const_value: 0,
+        kind: SYM_FUNCTION,
         is_extern: true,
         is_export: false,
         used: false,
@@ -101,6 +116,8 @@ fn makeTypeSymbol(name: string, type_idx: int, node: int) Symbol {
         is_type: true,
         is_const_val: false,
         const_value: 0,
+        float_const_value: 0,
+        kind: SYM_TYPE,
         is_extern: false,
         is_export: false,
         used: false,
@@ -117,6 +134,26 @@ fn makeConstSymbol(name: string, type_idx: int, node: int, value: int) Symbol {
         is_type: false,
         is_const_val: true,
         const_value: value,
+        float_const_value: 0,
+        kind: SYM_CONSTANT,
+        is_extern: false,
+        is_export: false,
+        used: false,
+    }
+}
+
+fn makeParamSymbol(name: string, type_idx: int, node: int) Symbol {
+    return Symbol {
+        name: name,
+        type_idx: type_idx,
+        node: node,
+        mutable: false,
+        is_func: false,
+        is_type: false,
+        is_const_val: false,
+        const_value: 0,
+        float_const_value: 0,
+        kind: SYM_PARAMETER,
         is_extern: false,
         is_export: false,
         used: false,
@@ -937,7 +974,7 @@ impl Checker {
                         if (!is_substituted) {
                             ptype = self.safeWrapType(ptype)
                         }
-                        self.defineSymbol(makeSymbol(pname, ptype, idx, false))
+                        self.defineSymbol(makeParamSymbol(pname, ptype, idx))
                     }, else => {} }, else => {} }
                 }
             }
@@ -1055,8 +1092,30 @@ impl Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.stmt |s| => switch (s) { Stmt.var_stmt |vs| => {
             if (self.isDefined(vs.name)) {
-                self.reportError(idx, ErrorCode.e302, "redefined identifier")
+                // "previously defined here" note (Zig ref: checker.zig:562-570)
+                const prev_sym_idx = self.lookupSymbol(vs.name)
+                if (prev_sym_idx >= 0) {
+                    const prev_sym = self.getSymbol(prev_sym_idx)
+                    if (prev_sym.node != null_node) {
+                        const prev_span = self.ast.nodeSpan(prev_sym.node)
+                        var offset: int = 0
+                        if (idx != null_node) { offset = self.ast.nodeSpan(idx).start }
+                        self.err.reportWithNote(offset, ErrorCode.e302, "redefined identifier", prev_span.start, "previously defined here")
+                    } else {
+                        self.reportError(idx, ErrorCode.e302, "redefined identifier")
+                    }
+                } else {
+                    self.reportError(idx, ErrorCode.e302, "redefined identifier")
+                }
                 return
+            }
+
+            // Shadow warning W003 (Zig ref: checker.zig:2897-2901)
+            if (self.lint_mode) {
+                const shadow_idx = self.lookupSymbol(vs.name)
+                if (shadow_idx >= 0) {
+                    self.err.warningWithCode(self.ast.nodeSpan(idx).start, WarningCode.w003, vs.name)
+                }
             }
 
             var var_type: int = invalid_type
@@ -1065,6 +1124,11 @@ impl Checker {
             }
 
             if (vs.value != null_node) {
+                // Zero-init requires type annotation (Zig ref: checker.zig:2921-2923)
+                if (nodeTag(self.ast, vs.value) == "zero_init" and var_type == invalid_type) {
+                    self.reportError(idx, ErrorCode.e300, "zero init requires type annotation")
+                    return
+                }
                 // Check for undefined literal
                 if (nodeTag(self.ast, vs.value) != "literal" or self.getLiteralKind(vs.value) != @intFromEnum(LiteralKind.undefined_lit)) {
                     const saved_expected = self.expected_type
@@ -1074,8 +1138,31 @@ impl Checker {
                     if (var_type == invalid_type) {
                         var_type = self.materializeType(val_type)
                     } else if (!self.types.isAssignable(val_type, var_type)) {
-                        self.reportError(idx, ErrorCode.e300, "type mismatch")
+                        // @safe coercion: Foo accepts *Foo (Zig ref: checker.zig:2910-2918)
+                        var coerced = false
+                        if (self.safe_mode) {
+                            const var_t = self.types.get(var_type)
+                            const val_t = self.types.get(val_type)
+                            if (var_t.tag == TAG_STRUCT and val_t.tag == TAG_POINTER) {
+                                const pointee = switch (val_t) { Type.pointer |p| => p.elem, else => invalid_type }
+                                if (pointee == var_type) {
+                                    var_type = val_type
+                                    coerced = true
+                                }
+                            }
+                        }
+                        if (!coerced) {
+                            self.reportError(idx, ErrorCode.e300, "type mismatch")
+                        }
                     }
+                }
+            }
+
+            // Unowned/weak validation (Zig ref: checker.zig:2925-2935)
+            if (vs.is_unowned or vs.is_weak) {
+                if (!self.types.couldBeARC(var_type)) {
+                    const qual = if (vs.is_unowned) { "unowned" } else { "weak" }
+                    self.reportError(idx, ErrorCode.e300, "${qual} requires ARC-managed type")
                 }
             }
 
@@ -1094,11 +1181,19 @@ impl Checker {
     fn checkAssign(idx: int) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.stmt |s| => switch (s) { Stmt.assign_stmt |asgn| => {
+            // Validate assignment target (Zig ref: checker.zig:2988-2998)
+            const target_tag = nodeTag(self.ast, asgn.target)
+            if (target_tag != "ident" and target_tag != "index_expr" and
+                target_tag != "field_access" and target_tag != "deref") {
+                self.reportError(idx, ErrorCode.e303, "invalid assignment target")
+                return
+            }
+
             const target_type = self.checkExpr(asgn.target)
             const value_type = self.checkExpr(asgn.value)
 
             // Check mutability for identifier targets
-            if (nodeTag(self.ast, asgn.target) == "ident") {
+            if (target_tag == "ident") {
                 const t_node = self.ast.getNode(asgn.target)
                 switch (t_node) { Node.expr |e| => switch (e) { Expr.ident |id| => {
                     const sym_idx = self.lookupSymbol(id.name)
@@ -1157,7 +1252,10 @@ impl Checker {
 
             self.warnEmptyBlock(idx, ifs.then_branch)
             self.checkStmt(ifs.then_branch)
-            if (ifs.else_branch != null_node) { self.checkStmt(ifs.else_branch) }
+            if (ifs.else_branch != null_node) {
+                self.warnEmptyBlock(idx, ifs.else_branch)
+                self.checkStmt(ifs.else_branch)
+            }
         }, else => {} }, else => {} }
     }
 
@@ -1193,6 +1291,10 @@ impl Checker {
             const old_in_loop = self.in_loop
             self.in_loop = true
             self.checkStmt(ws.body)
+            // Check continue expression (Zig ref: checker.zig:3059, 3072)
+            if (ws.continue_expr != null_node) {
+                self.checkExpr(ws.continue_expr)
+            }
             self.in_loop = old_in_loop
         }, else => {} }, else => {} }
     }
@@ -1225,6 +1327,12 @@ impl Checker {
                     elem_type = switch (iter_t) { Type.array |a| => a.elem, else => invalid_type }
                 } else if (iter_t.tag == TAG_SLICE) {
                     elem_type = switch (iter_t) { Type.slice |sl| => sl.elem, else => invalid_type }
+                } else if (iter_t.tag == TAG_MAP) {
+                    // Map iteration: elem = value type, index = key type (Zig ref: checker.zig:3108-3127)
+                    const mt = switch (iter_t) { Type.map_type |m| => m, else => CotMapType { key: 0, value: 0 } }
+                    elem_type = mt.value
+                } else if (iter_t.tag == TAG_LIST) {
+                    elem_type = switch (iter_t) { Type.list_type |l| => l.elem, else => invalid_type }
                 } else {
                     self.reportError(idx, ErrorCode.e300, "cannot iterate over this type")
                 }
@@ -1233,7 +1341,18 @@ impl Checker {
             self.pushScope()
             self.defineSymbol(makeSymbol(fs.binding, elem_type, null_node, false))
             if (@lenOf(fs.index_binding) > 0) {
-                self.defineSymbol(makeSymbol(fs.index_binding, I64, null_node, false))
+                // Map iteration: index_binding = key type (Zig ref: checker.zig:3108-3127)
+                var idx_type: int = I64
+                if (fs.iterable != null_node) {
+                    const iter_type2 = self.expr_types.get(fs.iterable)
+                    if (iter_type2 != 0) {
+                        const iter_t2 = self.types.get(iter_type2)
+                        if (iter_t2.tag == TAG_MAP) {
+                            idx_type = switch (iter_t2) { Type.map_type |m| => m.key, else => I64 }
+                        }
+                    }
+                }
+                self.defineSymbol(makeSymbol(fs.index_binding, idx_type, null_node, false))
             }
             self.warnEmptyBlock(idx, fs.body)
             const old_in_loop = self.in_loop
@@ -1336,6 +1455,14 @@ impl Checker {
                 switch (b_node) { Node.expr |e| => switch (e) { Expr.destructure_bind |db| => {
                     var elem_type = tup.getElemType(i)
                     elem_type = self.materializeType(elem_type)
+                    // Per-binding type annotation (Zig ref: checker.zig:2946-2986)
+                    if (db.type_expr != null_node) {
+                        const annotated = self.resolveTypeExpr(db.type_expr)
+                        if (!self.types.isAssignable(elem_type, annotated)) {
+                            self.reportError(bind_idx, ErrorCode.e300, "type mismatch in destructuring")
+                        }
+                        elem_type = annotated
+                    }
                     self.defineSymbol(makeSymbol(db.name, elem_type, idx, !dts.is_const))
                 }, else => {} }, else => {} }
             }
@@ -1425,11 +1552,21 @@ impl Checker {
             if (t.tag == TAG_ENUM or t.tag == TAG_UNION or t.tag == TAG_ERROR_SET) {
                 return type_idx
             }
+            // Type name used as expression (Zig ref: checker.zig:1540-1547)
+            if (t.tag == TAG_STRUCT) {
+                self.reportError(idx, ErrorCode.e300, "type '${name}' used as expression")
+                return invalid_type
+            }
         }
 
         const sym_idx = self.lookupSymbol(name)
         if (sym_idx >= 0) {
             const sym = self.getSymbol(sym_idx)
+            // Generic function used without type args (Zig ref: checker.zig:1550-1553)
+            if (self.generic_functions.has(name) != 0 and !self.hasTypeSubstitution()) {
+                self.reportError(idx, ErrorCode.e300, "generic function '${name}' requires type arguments")
+                return invalid_type
+            }
             return sym.type_idx
         }
         // Try to suggest a similar name
@@ -1833,7 +1970,12 @@ impl Checker {
                             return self.current_switch_enum_type
                         }
                     }
-                    self.reportError(idx, ErrorCode.e306, "undefined variant")
+                    const sw_suggestion = self.findSimilarVariant(field_name, self.current_switch_enum_type)
+                    if (sw_suggestion) |ss| {
+                        self.reportError(idx, ErrorCode.e306, "undefined variant '${field_name}', did you mean '${ss}'?")
+                    } else {
+                        self.reportError(idx, ErrorCode.e306, "undefined variant")
+                    }
                 }
             }
             return invalid_type
@@ -1889,7 +2031,13 @@ impl Checker {
             if (mi >= 0) {
                 return self.types.getMethodInfo(mi).func_type
             }
-            self.reportError(idx, ErrorCode.e306, "field not found")
+            // "did you mean" for fields (Zig ref: checker.zig:3838-3897)
+            const field_suggestion = self.findSimilarField(field_name, base_type)
+            if (field_suggestion) |fs| {
+                self.reportError(idx, ErrorCode.e306, "no field '${field_name}', did you mean '${fs}'?")
+            } else {
+                self.reportError(idx, ErrorCode.e306, "field not found")
+            }
             return invalid_type
         }
 
@@ -1907,7 +2055,12 @@ impl Checker {
             if (mi >= 0) {
                 return self.types.getMethodInfo(mi).func_type
             }
-            self.reportError(idx, ErrorCode.e306, "field not found")
+            const variant_suggestion = self.findSimilarVariant(field_name, base_type)
+            if (variant_suggestion) |vs| {
+                self.reportError(idx, ErrorCode.e306, "no variant '${field_name}', did you mean '${vs}'?")
+            } else {
+                self.reportError(idx, ErrorCode.e306, "field not found")
+            }
             return invalid_type
         }
 
@@ -1947,14 +2100,25 @@ impl Checker {
                     }))
                 }
             }
-            self.reportError(idx, ErrorCode.e306, "field not found")
+            const union_suggestion = self.findSimilarVariant(field_name, base_type)
+            if (union_suggestion) |us| {
+                self.reportError(idx, ErrorCode.e306, "no variant '${field_name}', did you mean '${us}'?")
+            } else {
+                self.reportError(idx, ErrorCode.e306, "field not found")
+            }
             return invalid_type
         }
 
-        // Slice fields: .ptr, .len
+        // Slice fields: .ptr, .len (Zig ref: checker.zig:2395-2437)
         if (base.tag == TAG_SLICE or base_type == STRING) {
             if (field_name == "len") { return I64 }
-            if (field_name == "ptr") { return I64 }
+            if (field_name == "ptr") {
+                if (base.tag == TAG_SLICE) {
+                    const sl = switch (base) { Type.slice |s| => s, else => SliceType { elem: invalid_type } }
+                    return self.types.makePointer(sl.elem)
+                }
+                return self.types.makePointer(U8)  // string ptr → *u8
+            }
             // String methods
             if (base_type == STRING) {
                 const mi = self.types.lookupMethod("string", field_name)
@@ -1964,16 +2128,42 @@ impl Checker {
             }
         }
 
-        // Map/List methods
+        // Map methods — return proper func types (Zig ref: checker.zig:2395-2437)
         if (base.tag == TAG_MAP) {
-            if (field_name == "set" or field_name == "get" or field_name == "has") {
-                return I64  // simplified — would need func type construction
+            const mt = switch (base) { Type.map_type |m| => m, else => CotMapType { key: 0, value: 0 } }
+            if (field_name == "get") {
+                var params: List(FuncParam) = .{}
+                params.append(FuncParam { name: "key", type_idx: mt.key })
+                return self.types.makeFunc(params, mt.value)
             }
+            if (field_name == "set") {
+                var params: List(FuncParam) = .{}
+                params.append(FuncParam { name: "key", type_idx: mt.key })
+                params.append(FuncParam { name: "value", type_idx: mt.value })
+                return self.types.makeFunc(params, VOID)
+            }
+            if (field_name == "has") {
+                var params: List(FuncParam) = .{}
+                params.append(FuncParam { name: "key", type_idx: mt.key })
+                return self.types.makeFunc(params, BOOL)
+            }
+            if (field_name == "count") { return I64 }
+            if (field_name == "capacity") { return I64 }
         }
+        // List methods — return proper func types
         if (base.tag == TAG_LIST) {
-            if (field_name == "append" or field_name == "get" or field_name == "len") {
-                return I64  // simplified
+            const lt = switch (base) { Type.list_type |l| => l, else => CotListType { elem: 0 } }
+            if (field_name == "get") {
+                var params: List(FuncParam) = .{}
+                params.append(FuncParam { name: "index", type_idx: I64 })
+                return self.types.makeFunc(params, lt.elem)
             }
+            if (field_name == "append") {
+                var params: List(FuncParam) = .{}
+                params.append(FuncParam { name: "value", type_idx: lt.elem })
+                return self.types.makeFunc(params, VOID)
+            }
+            if (field_name == "len" or field_name == "count") { return I64 }
         }
 
         self.reportError(idx, ErrorCode.e306, "field not found")
@@ -2120,11 +2310,27 @@ impl Checker {
         }
 
         // Constructor sugar: new Point(10, 20) calls init()
+        // Zig ref: checker.zig:2548-2570
         if (is_ctor) {
-            // Check constructor args — look up init method
             const ca_count = ne_ctor_args.count
+            // Check arg expressions first
+            var arg_types: List(int) = .{}
             for ci in 0..ca_count {
-                self.checkExpr(ne_ctor_args.get(ci))
+                arg_types.append(self.checkExpr(ne_ctor_args.get(ci)))
+            }
+            // Validate against init method
+            const init_mi = self.types.lookupMethod(type_name, "init")
+            if (init_mi >= 0) {
+                const init_info = self.types.getMethodInfo(init_mi)
+                const init_ft = self.types.get(init_info.func_type)
+                if (init_ft.tag == TAG_FUNC) {
+                    const ft = switch (init_ft) { Type.func |f| => f, else => FuncType { param_count: 0, params: 0, return_type: VOID } }
+                    // param_count includes self, so expected args = param_count - 1
+                    const expected_args = ft.param_count - 1
+                    if (ca_count != expected_args) {
+                        self.reportError(idx, ErrorCode.e300, "init() expects ${expected_args} arguments, got ${ca_count}")
+                    }
+                }
             }
             return self.types.makePointer(struct_type_idx)
         }
@@ -2155,12 +2361,17 @@ impl Checker {
         var tl_elements: List(int) = .{}
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.tuple_literal |tl| => { tl_elements = tl.elements }, else => {} }, else => {} }
         const count = tl_elements.count
-        // For self-hosted we simplified tuple type representation
-        // Just check all elements
-        for i in 0..count {
-            self.checkExpr(tl_elements.get(i))
+        if (count < 2) {
+            self.reportError(idx, ErrorCode.e300, "tuple requires at least 2 elements")
+            return invalid_type
         }
-        return I64  // simplified
+        // Collect element types for proper tuple type (Zig ref: checker.zig:2585-2594)
+        var elem_types: List(int) = .{}
+        for i in 0..count {
+            const et = self.checkExpr(tl_elements.get(i))
+            elem_types.append(self.materializeType(et))
+        }
+        return self.types.makeTuple(elem_types)
     }
 
     fn checkIfExpr(idx: int) int {
@@ -2299,7 +2510,26 @@ impl Checker {
                 }
             }
             if (covered.count < et.variant_count) {
-                self.reportError(idx, ErrorCode.e300, "non-exhaustive enum switch requires else branch")
+                // List missing variant names (Zig ref: checker.zig:2695-2714)
+                var missing: List(string) = .{}
+                for vi in 0..et.variant_count {
+                    const ev = et.getVariant(vi)
+                    var is_covered = false
+                    for ci2 in 0..covered.count {
+                        if (covered.get(ci2) == ev.name) { is_covered = true }
+                    }
+                    if (!is_covered) { missing.append(ev.name) }
+                }
+                if (missing.count > 0) {
+                    var msg = "non-exhaustive switch, missing: "
+                    for mi in 0..missing.count {
+                        if (mi > 0) { msg = "${msg}, " }
+                        msg = "${msg}.${missing.get(mi)}"
+                    }
+                    self.reportError(idx, ErrorCode.e300, msg)
+                } else {
+                    self.reportError(idx, ErrorCode.e300, "non-exhaustive enum switch requires else branch")
+                }
             }
         }
 
@@ -3084,6 +3314,16 @@ impl Checker {
         if (idx == null_node) { return invalid_type }
         const tag = nodeTag(self.ast, idx)
 
+        // @TypeOf in type position (Zig ref: checker.zig:3284-3289)
+        if (tag == "builtin_call") {
+            var bk = 0
+            var barg = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.builtin_call |bc| => { bk = bc.kind; barg = bc.type_arg }, else => {} }, else => {} }
+            if (bk == @intFromEnum(BuiltinKind.type_of) and barg != null_node) {
+                return self.checkExpr(barg)
+            }
+        }
+
         // Named type (ident node used in type position)
         if (tag == "ident") {
             var name = ""
@@ -3189,9 +3429,12 @@ impl Checker {
 
     fn buildStructType(idx: int, name: string) int {
         var sd_fields: List(int) = .{}
-        switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_fields = sd.fields }, else => {} }, else => {} }
+        var sd_layout: int = 0
+        switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_fields = sd.fields; sd_layout = sd.layout }, else => {} }, else => {} }
         const fields_count = sd_fields.count
         var total_size: int = 0
+        const is_packed = sd_layout == @intFromEnum(StructLayout.@"packed")
+        const is_extern = sd_layout == @intFromEnum(StructLayout.@"extern")
 
         // Build struct fields using raw pointer array
         const fields_ptr = alloc(0, fields_count * @sizeOf(StructField))
@@ -3209,18 +3452,24 @@ impl Checker {
             sf.offset = total_size
             sf.default_value = fdefault
 
-            total_size += self.types.sizeOf(ftype)
-            // Align to 8 bytes
-            total_size = (total_size + 7) / 8 * 8
+            const field_size = self.types.sizeOf(ftype)
+            total_size += field_size
+            // Packed: no alignment padding. Extern/Auto: align to 8 bytes (Zig ref: checker.zig:3633-3674)
+            if (!is_packed) {
+                total_size = (total_size + 7) / 8 * 8
+            }
         }
+
+        // Packed structs have alignment 1, extern/auto have 8
+        const alignment = if (is_packed) { 1 } else { 8 }
 
         return self.types.add(Type.struct_type(StructType {
             name: name,
             field_count: fields_count,
             fields: fields_ptr,
             size: total_size,
-            alignment: 8,
-            layout: 0,
+            alignment: alignment,
+            layout: sd_layout,
         }))
     }
 
@@ -3872,6 +4121,8 @@ impl Checker {
         if (inner.0 == 0) { return (0, 0) }
         if (op == @intFromEnum(Token.sub)) { return (1, 0 - inner.1) }
         if (op == @intFromEnum(Token.lnot)) { return (1, if (inner.1 == 0) { 1 } else { 0 }) }
+        // Bitwise not (Zig ref: checker.zig:742)
+        if (op == @intFromEnum(Token.@"not")) { return (1, ~inner.1) }
         return (0, 0)
     }
 
@@ -3882,7 +4133,19 @@ impl Checker {
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.binary |bin| => { op = bin.op; left_n = bin.left; right_n = bin.right }, else => {} }, else => {} }
         const lv = self.evalConstExpr(left_n)
         const rv = self.evalConstExpr(right_n)
-        if (lv.0 == 0 or rv.0 == 0) { return (0, 0) }
+        if (lv.0 == 0 or rv.0 == 0) {
+            // String equality comparison (Zig ref: checker.zig:782-793)
+            if (op == @intFromEnum(Token.eql) or op == @intFromEnum(Token.neq)) {
+                const ls = self.evalConstString(left_n)
+                const rs = self.evalConstString(right_n)
+                if (ls.0 != 0 and rs.0 != 0) {
+                    const eq = if (ls.1 == rs.1) { 1 } else { 0 }
+                    if (op == @intFromEnum(Token.eql)) { return (1, eq) }
+                    return (1, if (eq == 1) { 0 } else { 1 })
+                }
+            }
+            return (0, 0)
+        }
         const l = lv.1
         const r = rv.1
         if (op == @intFromEnum(Token.add)) { return (1, l + r) }
@@ -3896,6 +4159,12 @@ impl Checker {
         if (op == @intFromEnum(Token.leq)) { return (1, if (l <= r) { 1 } else { 0 }) }
         if (op == @intFromEnum(Token.gtr)) { return (1, if (l > r) { 1 } else { 0 }) }
         if (op == @intFromEnum(Token.geq)) { return (1, if (l >= r) { 1 } else { 0 }) }
+        // Bitwise operators (Zig ref: checker.zig:765-769)
+        if (op == @intFromEnum(Token.@"and")) { return (1, l & r) }
+        if (op == @intFromEnum(Token.@"or")) { return (1, l | r) }
+        if (op == @intFromEnum(Token.xor)) { return (1, l ^ r) }
+        if (op == @intFromEnum(Token.shl)) { return (1, l << r) }
+        if (op == @intFromEnum(Token.shr)) { return (1, l >> r) }
         return (0, 0)
     }
 
@@ -3967,6 +4236,35 @@ impl Checker {
             }
         }
         return (0, 0)
+    }
+
+    /// Evaluate a constant string expression.
+    /// Returns (1, value) for success, (0, "") for failure.
+    /// Zig ref: checker.zig:1435-1454
+    fn evalConstString(idx: int) (int, string) {
+        if (idx == null_node) { return (0, "") }
+        const tag = nodeTag(self.ast, idx)
+        if (tag == "literal") {
+            var kind = 0
+            var val_str = ""
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.literal |lit| => { kind = lit.kind; val_str = lit.value }, else => {} }, else => {} }
+            if (kind == @intFromEnum(LiteralKind.@"string")) {
+                return (1, val_str)
+            }
+        }
+        if (tag == "paren") {
+            var inner_n = null_node
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.paren |p| => { inner_n = p.inner }, else => {} }, else => {} }
+            return self.evalConstString(inner_n)
+        }
+        if (tag == "builtin_call") {
+            var bk = 0
+            switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.builtin_call |bc| => { bk = bc.kind }, else => {} }, else => {} }
+            if (bk == @intFromEnum(BuiltinKind.target_os)) { return (1, "macos") }
+            if (bk == @intFromEnum(BuiltinKind.target_arch)) { return (1, "aarch64") }
+            if (bk == @intFromEnum(BuiltinKind.target)) { return (1, "aarch64-macos") }
+        }
+        return (0, "")
     }
 
     /// Evaluate a comptime if expression: if (const_cond) then_val else else_val
@@ -4139,6 +4437,18 @@ impl Checker {
         if (idx == UNTYPED_INT) { return INT }
         if (idx == UNTYPED_FLOAT) { return FLOAT }
         if (idx == UNTYPED_BOOL) { return BOOL }
+        // Recursive array/slice materialization (Zig ref: checker.zig:3709-3717)
+        const t = self.types.get(idx)
+        if (t.tag == TAG_ARRAY) {
+            const arr = switch (t) { Type.array |a| => a, else => ArrayType { elem: invalid_type, length: 0 } }
+            const new_elem = self.materializeType(arr.elem)
+            if (new_elem != arr.elem) { return self.types.makeArray(new_elem, arr.length) }
+        }
+        if (t.tag == TAG_SLICE) {
+            const sl = switch (t) { Type.slice |s| => s, else => SliceType { elem: invalid_type } }
+            const new_elem = self.materializeType(sl.elem)
+            if (new_elem != sl.elem) { return self.types.makeSlice(new_elem) }
+        }
         return idx
     }
 
@@ -4404,6 +4714,56 @@ impl Checker {
             }
         }
 
+        return best
+    }
+
+    /// Find similar struct field name for "did you mean" suggestions.
+    /// Zig ref: checker.zig:3838-3858
+    fn findSimilarField(name: string, struct_type_idx: int) ?string {
+        const t = self.types.get(struct_type_idx)
+        if (t.tag != TAG_STRUCT) { return null }
+        const st = switch (t) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+        var best: ?string = null
+        var best_dist = 999
+        for fi in 0..st.field_count {
+            const sf = st.getField(fi)
+            const d = self.editDistance(name, sf.name)
+            if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {
+                best_dist = d
+                best = sf.name
+            }
+        }
+        return best
+    }
+
+    /// Find similar enum/union variant name for "did you mean" suggestions.
+    /// Zig ref: checker.zig:3860-3880
+    fn findSimilarVariant(name: string, type_idx: int) ?string {
+        const t = self.types.get(type_idx)
+        var best: ?string = null
+        var best_dist = 999
+        if (t.tag == TAG_ENUM) {
+            const et = switch (t) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+            for vi in 0..et.variant_count {
+                const ev = et.getVariant(vi)
+                const d = self.editDistance(name, ev.name)
+                if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {
+                    best_dist = d
+                    best = ev.name
+                }
+            }
+        }
+        if (t.tag == TAG_UNION) {
+            const ut = switch (t) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
+            for vi in 0..ut.variant_count {
+                const uv = ut.getVariant(vi)
+                const d = self.editDistance(name, uv.name)
+                if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {
+                    best_dist = d
+                    best = uv.name
+                }
+            }
+        }
         return best
     }
 

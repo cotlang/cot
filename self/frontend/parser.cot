@@ -109,12 +109,15 @@ impl Parser {
     }
 
     /// Expect a specific token. Consume it and return true, or report error.
+    /// P10: include expected token string in error message (Zig parser.zig:119-127)
     fn expect(t: int) bool {
         if (self.tok == t) {
             self.advance()
             return true
         }
-        self.errors.report(self.tok_start, ErrorCode.e200, "unexpected token")
+        const expected = @as(Token, @enumFromInt(t)).toString()
+        const got = @as(Token, @enumFromInt(self.tok)).toString()
+        self.errors.report(self.tok_start, ErrorCode.e200, "expected '${expected}', got '${got}'")
         return false
     }
 
@@ -404,6 +407,11 @@ impl Parser {
         const doc = self.consumeDocComment()
         self.advance()  // consume const/var/let
         if (self.tok != @intFromEnum(Token.ident)) {
+            // P11: keyword-as-name error (Zig parser.zig:376-383)
+            if (@as(Token, @enumFromInt(self.tok)).isKeyword()) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "keyword cannot be used as variable name")
+                return null_node
+            }
             // Could be destructuring: const a, b = ...
             return self.parseDestructureDecl(is_const, start, doc)
         }
@@ -1773,18 +1781,51 @@ impl Parser {
         var ctor_args: List(int) = .{}
         var fields: List(int) = .{}
 
-        // Constructor args or type args
+        // P5: Type-arg vs constructor-arg disambiguation (Zig parser.zig:1114-1202)
+        // In safe_mode: peek at first token after (. If type-like → type args. Else → ctor args.
+        // Non-safe: ( = type args always.
         var is_ctor = 0
         if (self.tok == @intFromEnum(Token.lparen)) {
-            is_ctor = 1
-            self.advance()
-            while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
-                ctor_args.append(self.parseExpr())
-                if (!self.match(@intFromEnum(Token.comma))) {
-                    break
+            if (self.safe_mode) {
+                // Peek to disambiguate: uppercase ident, *, ?, [, type keyword = type args
+                const pk = self.peekToken()
+                const is_type_like = @as(Token, @enumFromInt(pk)).isTypeKeyword() or
+                    pk == @intFromEnum(Token.mul) or
+                    pk == @intFromEnum(Token.question) or
+                    pk == @intFromEnum(Token.lbrack)
+                if (is_type_like) {
+                    // Type args
+                    self.advance()  // consume (
+                    while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+                        type_args.append(self.parseType())
+                        if (!self.match(@intFromEnum(Token.comma))) {
+                            break
+                        }
+                    }
+                    self.expect(@intFromEnum(Token.rparen))
+                } else {
+                    // Constructor args
+                    is_ctor = 1
+                    self.advance()
+                    while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+                        ctor_args.append(self.parseExpr())
+                        if (!self.match(@intFromEnum(Token.comma))) {
+                            break
+                        }
+                    }
+                    self.expect(@intFromEnum(Token.rparen))
                 }
+            } else {
+                // Non-safe: ( is always type args
+                self.advance()
+                while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
+                    type_args.append(self.parseType())
+                    if (!self.match(@intFromEnum(Token.comma))) {
+                        break
+                    }
+                }
+                self.expect(@intFromEnum(Token.rparen))
             }
-            self.expect(@intFromEnum(Token.rparen))
         }
 
         // Field initializers
@@ -1910,7 +1951,12 @@ impl Parser {
         const start = self.tok_start
         self.advance()  // consume const/var/let
         if (self.tok != @intFromEnum(Token.ident)) {
-            self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+            // P11: keyword-as-name error (Zig parser.zig:1711-1717)
+            if (@as(Token, @enumFromInt(self.tok)).isKeyword()) {
+                self.errors.report(self.tok_start, ErrorCode.e203, "keyword cannot be used as variable name")
+            } else {
+                self.errors.report(self.tok_start, ErrorCode.e203, "expected variable name")
+            }
             return null_node
         }
         const name = self.tok_text
@@ -1998,13 +2044,21 @@ impl Parser {
             }
             self.expect(@intFromEnum(Token.@"or"))
         }
-        const then_br = self.parseBlock()
+        // P8: braceless then/else support (Zig parser.zig:1818-1826)
+        var then_br = null_node
+        if (self.tok == @intFromEnum(Token.lbrace)) {
+            then_br = self.parseBlock()
+        } else {
+            then_br = self.parseStmt()
+        }
         var else_br = null_node
         if (self.match(@intFromEnum(Token.kw_else))) {
             if (self.tok == @intFromEnum(Token.kw_if)) {
                 else_br = self.parseIfStmt()
-            } else {
+            } else if (self.tok == @intFromEnum(Token.lbrace)) {
                 else_br = self.parseBlock()
+            } else {
+                else_br = self.parseStmt()
             }
         }
         return self.ast.addStmt(Stmt.if_stmt(IfStmt { .condition = cond, .then_branch = then_br, .else_branch = else_br, .capture = capture, .span = self.spanSE(start, self.tok_end) }))
@@ -2030,10 +2084,18 @@ impl Parser {
             }
             self.expect(@intFromEnum(Token.@"or"))
         }
+        // P6: continue expression with assignment (Zig parser.zig:1841-1852)
         var cont = null_node
         if (self.match(@intFromEnum(Token.colon))) {
             if (self.match(@intFromEnum(Token.lparen))) {
                 cont = self.parseExpr()
+                // Check for assignment in continue expr: : (x = x + 1)
+                if (@as(Token, @enumFromInt(self.tok)).isAssignment()) {
+                    const op = self.tok
+                    self.advance()
+                    const rhs = self.parseExpr()
+                    cont = self.ast.addStmt(Stmt.assign_stmt(AssignStmt { .target = cont, .op = op, .value = rhs, .span = self.spanSE(start, self.tok_end) }))
+                }
                 self.expect(@intFromEnum(Token.rparen))
             }
         }
@@ -2087,15 +2149,20 @@ impl Parser {
         return self.parseForStmt("", 1)
     }
 
+    /// P9: fix colon-label syntax (Zig parser.zig:1631-1636)
     fn parseBreakStmt() int {
         const start = self.tok_start
         self.advance()  // consume 'break'
         var label = ""
-        if (self.tok == @intFromEnum(Token.colon) or self.tok == @intFromEnum(Token.ident)) {
+        if (self.tok == @intFromEnum(Token.colon)) {
+            self.advance()  // consume ':'
             if (self.tok == @intFromEnum(Token.ident)) {
                 label = self.tok_text
                 self.advance()
             }
+        } else if (self.tok == @intFromEnum(Token.ident)) {
+            label = self.tok_text
+            self.advance()
         }
         self.match(@intFromEnum(Token.semicolon))
         return self.ast.addStmt(Stmt.break_stmt(BreakStmt { .label = label, .span = self.spanSE(start, self.tok_end) }))
@@ -2113,6 +2180,7 @@ impl Parser {
         return self.ast.addStmt(Stmt.continue_stmt(ContinueStmt { .label = label, .span = self.spanSE(start, self.tok_end) }))
     }
 
+    /// P1: defer with assignment support (Zig parser.zig:1645-1670)
     fn parseDeferStmt(is_errdefer: int) int {
         const start = self.tok_start
         self.advance()  // consume 'defer'/'errdefer'
@@ -2121,6 +2189,13 @@ impl Parser {
             expr = self.parseBlock()
         } else {
             expr = self.parseExpr()
+            // Check for assignment after expression (defer x = y)
+            if (@as(Token, @enumFromInt(self.tok)).isAssignment()) {
+                const op = self.tok
+                self.advance()
+                const rhs = self.parseExpr()
+                expr = self.ast.addStmt(Stmt.assign_stmt(AssignStmt { .target = expr, .op = op, .value = rhs, .span = self.spanSE(start, self.tok_end) }))
+            }
         }
         self.match(@intFromEnum(Token.semicolon))
         return self.ast.addStmt(Stmt.defer_stmt(DeferStmt { .expr = expr, .is_errdefer = is_errdefer == 1, .span = self.spanSE(start, self.tok_end) }))
@@ -2199,6 +2274,10 @@ impl Parser {
     /// Parse a type expression.
     fn parseType() int {
         const start = self.tok_start
+        // P3: @TypeOf(expr) in type position (Zig parser.zig:757-759)
+        if (self.tok == @intFromEnum(Token.at)) {
+            return self.parseBuiltinCall()
+        }
         // Optional prefix: ?, *, !
         if (self.tok == @intFromEnum(Token.question)) {
             self.advance()
@@ -2252,8 +2331,16 @@ impl Parser {
         }
         // Named type or keyword type
         if (self.tok == @intFromEnum(Token.ident) or @as(Token, @enumFromInt(self.tok)).isTypeKeyword()) {
-            const name = self.tok_text
+            var name = self.tok_text
             self.advance()
+            // P2: Nested type namespace: Outer.Inner (Zig parser.zig:765-771)
+            if (self.tok == @intFromEnum(Token.period) and self.peekToken() == @intFromEnum(Token.ident)) {
+                const outer = name
+                self.advance()  // consume '.'
+                const inner = self.tok_text
+                self.advance()  // consume inner ident
+                name = "${outer}_${inner}"
+            }
             // Check for generic: Type(Args)
             if (self.tok == @intFromEnum(Token.lparen)) {
                 const name_node = self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
@@ -2292,15 +2379,18 @@ impl Parser {
         return null_node
     }
 
+    /// P4: parseFnType stores param type nodes (Zig parser.zig:831-844)
+    /// Params encoded as: data2 = param_count, param type nodes added as consecutive
+    /// exprs before the fn type node, recoverable by offset from the fn type node index.
     fn parseFnType(start: int) int {
         // Ported from parser.zig:800-812: fn(Type, Type) -> RetType
         self.advance()  // consume 'fn'
         self.expect(@intFromEnum(Token.lparen))
-        // Parse function type parameter types
-        var param_count = 0
+        // Parse function type parameter types and store them as nodes
+        var param_types: List(int) = .{}
         while (self.tok != @intFromEnum(Token.rparen) and self.tok != @intFromEnum(Token.eof)) {
-            self.parseType()
-            param_count += 1
+            const pt = self.parseType()
+            param_types.append(pt)
             if (!self.match(@intFromEnum(Token.comma))) {
                 break
             }
@@ -2311,7 +2401,7 @@ impl Parser {
         if (self.match(@intFromEnum(Token.arrow))) {
             ret = self.parseType()
         }
-        return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_FUNCTION, .data1 = ret, .data2 = param_count, .span = self.spanSE(start, self.tok_end) }))
+        return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_FUNCTION, .data1 = ret, .data2 = param_types.count, .span = self.spanSE(start, self.tok_end) }))
     }
 
     // ================================================================

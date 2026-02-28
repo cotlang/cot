@@ -514,38 +514,113 @@ impl TypeRegistry {
     // ---- Factory methods ----
 
     fn makePointer(elem: int) int {
-        return self.add(Type.pointer(PointerType { elem: elem, managed: true }))
+        // Dedup: check for existing matching pointer type (Zig types.zig:258-265)
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_POINTER) {
+                const p = switch (t) { Type.pointer |p| => p, else => PointerType { elem: 0, managed: false } }
+                if (p.elem == elem and p.managed) { return i }
+            }
+        }
+        // Managed based on pointee type (Zig types.zig:260)
+        const pointee = self.get(elem)
+        const is_managed = pointee.tag == TAG_STRUCT or pointee.tag == TAG_ENUM or pointee.tag == TAG_UNION
+        return self.add(Type.pointer(PointerType { elem: elem, managed: is_managed }))
     }
 
     fn makeRawPointer(elem: int) int {
+        // Dedup: check for existing matching raw pointer type
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_POINTER) {
+                const p = switch (t) { Type.pointer |p| => p, else => PointerType { elem: 0, managed: false } }
+                if (p.elem == elem and !p.managed) { return i }
+            }
+        }
         return self.add(Type.pointer(PointerType { elem: elem, managed: false }))
     }
 
     fn makeOptional(elem: int) int {
+        // Dedup: check for existing matching optional type
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_OPTIONAL) {
+                const o = switch (t) { Type.optional |o| => o, else => OptionalType { elem: 0 } }
+                if (o.elem == elem) { return i }
+            }
+        }
         return self.add(Type.optional(OptionalType { elem: elem }))
     }
 
     fn makeErrorUnion(elem: int) int {
+        // Dedup: check for existing matching error union type
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_ERROR_UNION) {
+                const eu = switch (t) { Type.error_union |eu| => eu, else => ErrorUnionType { elem: 0, error_set: 0 } }
+                if (eu.elem == elem and eu.error_set == invalid_type) { return i }
+            }
+        }
         return self.add(Type.error_union(ErrorUnionType { elem: elem, error_set: invalid_type }))
     }
 
     fn makeErrorUnionWithSet(elem: int, error_set: int) int {
+        // Dedup: check for existing matching error union with set
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_ERROR_UNION) {
+                const eu = switch (t) { Type.error_union |eu| => eu, else => ErrorUnionType { elem: 0, error_set: 0 } }
+                if (eu.elem == elem and eu.error_set == error_set) { return i }
+            }
+        }
         return self.add(Type.error_union(ErrorUnionType { elem: elem, error_set: error_set }))
     }
 
     fn makeSlice(elem: int) int {
+        // Dedup: check for existing matching slice type
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_SLICE) {
+                const s = switch (t) { Type.slice |s| => s, else => SliceType { elem: 0 } }
+                if (s.elem == elem) { return i }
+            }
+        }
         return self.add(Type.slice(SliceType { elem: elem }))
     }
 
     fn makeArray(elem: int, length: int) int {
+        // Dedup: check for existing matching array type
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_ARRAY) {
+                const a = switch (t) { Type.array |a| => a, else => ArrayType { elem: 0, length: 0 } }
+                if (a.elem == elem and a.length == length) { return i }
+            }
+        }
         return self.add(Type.array(ArrayType { elem: elem, length: length }))
     }
 
     fn makeMap(key: int, value: int) int {
+        // Dedup: check for existing matching map type
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_MAP) {
+                const m = switch (t) { Type.map_type |m| => m, else => CotMapType { key: 0, value: 0 } }
+                if (m.key == key and m.value == value) { return i }
+            }
+        }
         return self.add(Type.map_type(CotMapType { key: key, value: value }))
     }
 
     fn makeList(elem: int) int {
+        // Dedup: check for existing matching list type
+        for i in FIRST_USER_TYPE..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_LIST) {
+                const l = switch (t) { Type.list_type |l| => l, else => CotListType { elem: 0 } }
+                if (l.elem == elem) { return i }
+            }
+        }
         return self.add(Type.list_type(CotListType { elem: elem }))
     }
 
@@ -653,7 +728,13 @@ impl TypeRegistry {
             Type.func |_| => 8,
             Type.error_set |_| => 8,
             Type.future |_| => 8,
-            Type.optional |_| => 16,
+            Type.optional |opt| => {
+                // Zig types.zig:350-354: tag (8) + payload aligned
+                const es = self.sizeOf(opt.elem)
+                var ps: int = 8
+                if (es > 8) { ps = ((es + 7) / 8) * 8 }
+                return 8 + ps
+            },
             Type.slice |_| => 24,
             Type.array |a| => self.sizeOf(a.elem) * a.length,
             Type.struct_type |s| => s.size,
@@ -711,6 +792,20 @@ impl TypeRegistry {
             Type.struct_type |s| => s.alignment,
             Type.enum_type |e| => self.alignmentOf(e.backing_type),
         }
+    }
+
+    /// T7: Compute byte offset of element `index` in a tuple type (Zig types.zig:318-323).
+    /// Each element is 8-byte aligned.
+    fn tupleElementOffset(type_idx: int, index: int) int {
+        const t = self.get(type_idx)
+        if (t.tag != TAG_TUPLE) { return 0 }
+        const tup = switch (t) { Type.tuple |tup| => tup, else => TupleType { elem_count: 0, elem_types: 0 } }
+        var offset: int = 0
+        for i in 0..index {
+            const elem_size = self.sizeOf(tup.getElemType(i))
+            offset += ((elem_size + 7) / 8) * 8
+        }
+        return offset
     }
 
     // ---- ARC predicates ----
@@ -877,6 +972,21 @@ impl TypeRegistry {
                     else => false,
                 }
             },
+            // T4: Tuple equality — compare elem count and each element type (Zig types.zig:528-534)
+            Type.tuple |ta_tup| => {
+                return switch (tb) {
+                    Type.tuple |tb_tup| => {
+                        if (ta_tup.elem_count != tb_tup.elem_count) { return false }
+                        for i in 0..ta_tup.elem_count {
+                            if (!self.equal(ta_tup.getElemType(i), tb_tup.getElemType(i))) { return false }
+                        }
+                        return true
+                    },
+                    else => false,
+                }
+            },
+            // T6: Function types are not structurally compared (Zig types.zig:535)
+            Type.func |_| => false,
             else => false,
         }
     }
@@ -1035,7 +1145,32 @@ impl TypeRegistry {
             return self.equal(ff.return_type, tf.return_type)
         }
 
+        // T5: Tuple assignability — same count, each element assignable (Zig types.zig:606-613)
+        if (from_t.tag == TAG_TUPLE and to_t.tag == TAG_TUPLE) {
+            const ft = switch (from_t) { Type.tuple |t| => t, else => TupleType { elem_count: 0, elem_types: 0 } }
+            const tt = switch (to_t) { Type.tuple |t| => t, else => TupleType { elem_count: 0, elem_types: 0 } }
+            if (ft.elem_count != tt.elem_count) { return false }
+            for i in 0..ft.elem_count {
+                if (!self.isAssignable(ft.getElemType(i), tt.getElemType(i))) { return false }
+            }
+            return true
+        }
+
         return false
+    }
+
+    /// T8: Free raw pointer allocations for tuple elem arrays, func param arrays (Zig types.zig:202-208).
+    fn deinit() void {
+        for i in 0..self.types.count {
+            const t = self.get(i)
+            if (t.tag == TAG_TUPLE) {
+                const tup = switch (t) { Type.tuple |tup| => tup, else => TupleType { elem_count: 0, elem_types: 0 } }
+                if (tup.elem_types != 0) { dealloc(tup.elem_types) }
+            } else if (t.tag == TAG_FUNC) {
+                const f = switch (t) { Type.func |f| => f, else => FuncType { param_count: 0, params: 0, return_type: 0 } }
+                if (f.params != 0) { dealloc(f.params) }
+            }
+        }
     }
 }
 
@@ -1321,10 +1456,12 @@ test "TypeRegistry makeRawPointer" {
     const managed = switch (t) { Type.pointer |p| => p.managed, else => true }
     @assertEq(managed, false)
 
+    // T2: makePointer managed flag depends on pointee type
+    // I32 is a basic type, so managed should be false
     const mgd = reg.makePointer(I32)
     const t2 = reg.get(mgd)
-    const managed2 = switch (t2) { Type.pointer |p| => p.managed, else => false }
-    @assert(managed2)
+    const managed2 = switch (t2) { Type.pointer |p| => p.managed, else => true }
+    @assertEq(managed2, false)
 }
 
 test "TypeRegistry makeTuple" {
