@@ -26,6 +26,7 @@ const arc_native = @import("codegen/native/arc_native.zig");
 const io_native = @import("codegen/native/io_native.zig");
 const print_native = @import("codegen/native/print_native.zig");
 const test_native_rt = @import("codegen/native/test_native.zig");
+const thread_native = @import("codegen/native/thread_native.zig");
 const target_mod = @import("frontend/target.zig");
 const pipeline_debug = @import("pipeline_debug.zig");
 
@@ -1102,6 +1103,13 @@ pub const Driver = struct {
             "cot_openpty",   "cot_ioctl_winsize",
             // Print runtime (print_native.generate order)
             "print_int",     "eprint_int",       "int_to_string",
+            // Threading runtime (thread_native.generate order) — unconditional, must come before
+            // conditional test runtime to avoid index gaps when test_mode=false
+            "thread_spawn",  "thread_join",    "thread_detach",
+            "mutex_init",    "mutex_lock",     "mutex_unlock",
+            "mutex_trylock", "mutex_destroy",
+            "cond_init",     "cond_wait",      "cond_signal",
+            "cond_broadcast", "cond_destroy",
             // Test runtime (test_native.generate order)
             "__test_begin",  "__test_print_name", "__test_pass",
             "__test_fail",   "__test_summary",    "__test_store_fail_values",
@@ -1117,6 +1125,12 @@ pub const Driver = struct {
             "fcntl",         "fork",           "c_waitpid",     "c_pipe",
             "dup2",          "execve",
             "c_openpty",     "setsid",        "ioctl",
+            // pthread symbols — external references resolved by linker (-lpthread/-lSystem)
+            "pthread_create", "pthread_join",  "pthread_detach",
+            "pthread_mutex_init", "pthread_mutex_lock", "pthread_mutex_unlock",
+            "pthread_mutex_trylock", "pthread_mutex_destroy",
+            "pthread_cond_init", "pthread_cond_wait", "pthread_cond_signal",
+            "pthread_cond_broadcast", "pthread_cond_destroy",
         };
         const runtime_start_idx: u32 = @intCast(funcs.len);
         for (runtime_func_names, 0..) |name, i| {
@@ -1273,6 +1287,15 @@ pub const Driver = struct {
             var print_funcs = try print_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
             defer print_funcs.deinit(self.allocator);
             for (print_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
+            // Threading runtime: thread_spawn, thread_join, thread_detach, mutex_*, cond_*
+            // Must come before conditional test runtime to avoid index gaps
+            var thread_funcs = try thread_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
+            defer thread_funcs.deinit(self.allocator);
+            for (thread_funcs.items) |rf| {
                 try compiled_funcs.append(self.allocator, rf.compiled);
                 try func_names.append(self.allocator, rf.name);
             }

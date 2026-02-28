@@ -258,6 +258,13 @@ pub const X64LowerBackend = struct {
             .load => self.lowerLoad(ctx, ir_inst),
             .store => self.lowerStore(ctx, ir_inst),
 
+            // Atomic operations
+            .atomic_load => self.lowerAtomicLoad(ctx, ir_inst),
+            .atomic_store => self.lowerAtomicStore(ctx, ir_inst),
+            .atomic_rmw_add => self.lowerAtomicRmwAdd(ctx, ir_inst),
+            .atomic_rmw_xchg => self.lowerAtomicRmwXchg(ctx, ir_inst),
+            .atomic_cas => self.lowerAtomicCas(ctx, ir_inst),
+
             // Select
             .select => self.lowerSelect(ctx, ir_inst),
 
@@ -1743,6 +1750,156 @@ pub const X64LowerBackend = struct {
         }
 
         return InstOutput{};
+    }
+
+    // =========================================================================
+    // Atomic Operations
+    // x64 TSO: aligned loads are acquire, stores need MFENCE or XCHG
+    // =========================================================================
+
+    fn lowerAtomicLoad(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        // x64 TSO: all aligned MOV loads have acquire semantics.
+        // Just do a regular load.
+        return self.lowerLoad(ctx, ir_inst);
+    }
+
+    fn lowerAtomicStore(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        // store format: args[0] = val, args[1] = addr
+        const src_ty = ctx.inputTy(ir_inst, 0);
+        const src = ctx.putInputInRegs(ir_inst, 0);
+        const addr = ctx.putInputInRegs(ir_inst, 1);
+        const src_reg = src.onlyReg() orelse return null;
+        const addr_reg = addr.onlyReg() orelse return null;
+        const addr_gpr = Gpr.unwrapNew(addr_reg);
+        const amode = SyntheticAmode.real_amode(Amode.immReg(0, addr_gpr.toReg()));
+
+        const src_gpr = Gpr.unwrapNew(src_reg);
+
+        // Regular MOV store
+        ctx.emit(Inst{
+            .mov_r_m = .{
+                .size = operandSizeFromType(src_ty),
+                .src = src_gpr,
+                .dst = amode,
+            },
+        }) catch return null;
+
+        // MFENCE for sequential consistency
+        ctx.emit(Inst{ .fence = .{ .kind = .mfence } }) catch return null;
+
+        return InstOutput{};
+    }
+
+    fn lowerAtomicRmwAdd(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        // binary format: args[0] = addr, args[1] = val
+        const addr = ctx.putInputInRegs(ir_inst, 0);
+        const val = ctx.putInputInRegs(ir_inst, 1);
+        const addr_reg = addr.onlyReg() orelse return null;
+        const val_reg = val.onlyReg() orelse return null;
+
+        const addr_gpr = Gpr.unwrapNew(addr_reg);
+        const val_gpr = Gpr.unwrapNew(val_reg);
+        const amode = SyntheticAmode.real_amode(Amode.immReg(0, addr_gpr.toReg()));
+
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
+
+        const tmp = ctx.allocTmp(ty) catch return null;
+        const tmp_reg = tmp.onlyReg() orelse return null;
+        const tmp_gpr = WritableGpr.fromReg(Gpr.unwrapNew(tmp_reg.toReg()));
+
+        ctx.emit(Inst{ .atomic_rmw_seq = .{
+            .ty = ty,
+            .op = .add,
+            .mem = amode,
+            .operand = val_gpr,
+            .dst_old = dst_gpr,
+            .tmp = tmp_gpr,
+        } }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    fn lowerAtomicRmwXchg(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        const addr = ctx.putInputInRegs(ir_inst, 0);
+        const val = ctx.putInputInRegs(ir_inst, 1);
+        const addr_reg = addr.onlyReg() orelse return null;
+        const val_reg = val.onlyReg() orelse return null;
+
+        const addr_gpr = Gpr.unwrapNew(addr_reg);
+        const val_gpr = Gpr.unwrapNew(val_reg);
+        const amode = SyntheticAmode.real_amode(Amode.immReg(0, addr_gpr.toReg()));
+
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
+
+        const tmp = ctx.allocTmp(ty) catch return null;
+        const tmp_reg = tmp.onlyReg() orelse return null;
+        const tmp_gpr = WritableGpr.fromReg(Gpr.unwrapNew(tmp_reg.toReg()));
+
+        ctx.emit(Inst{ .atomic_rmw_seq = .{
+            .ty = ty,
+            .op = .xchg,
+            .mem = amode,
+            .operand = val_gpr,
+            .dst_old = dst_gpr,
+            .tmp = tmp_gpr,
+        } }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    fn lowerAtomicCas(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        // ternary format: args[0] = addr, args[1] = expected, args[2] = new
+        const addr = ctx.putInputInRegs(ir_inst, 0);
+        const expected = ctx.putInputInRegs(ir_inst, 1);
+        const new_val = ctx.putInputInRegs(ir_inst, 2);
+        const addr_reg = addr.onlyReg() orelse return null;
+        const expected_reg = expected.onlyReg() orelse return null;
+        const new_val_reg = new_val.onlyReg() orelse return null;
+
+        const addr_gpr = Gpr.unwrapNew(addr_reg);
+        const new_val_gpr = Gpr.unwrapNew(new_val_reg);
+        const amode = SyntheticAmode.real_amode(Amode.immReg(0, addr_gpr.toReg()));
+
+        // LOCK CMPXCHG expects 'expected' in RAX
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+        const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
+
+        // Move expected to dst (will be RAX after regalloc)
+        ctx.emit(Inst{
+            .mov_r_r = .{
+                .size = operandSizeFromType(ty),
+                .src = Gpr.unwrapNew(expected_reg),
+                .dst = dst_gpr,
+            },
+        }) catch return null;
+
+        // LOCK CMPXCHG [addr], new_val
+        ctx.emit(Inst{ .lock_cmpxchg = .{
+            .ty = ty,
+            .mem = amode,
+            .new_val = new_val_gpr,
+            .dst_old = dst_gpr,
+        } }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================

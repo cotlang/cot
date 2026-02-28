@@ -1592,6 +1592,36 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
         },
 
         //---------------------------------------------------------------------
+        // Atomic CAS: LOCK CMPXCHG
+        // Expected value in RAX. If [mem] == RAX, store new_val to [mem].
+        // Actual old value always ends up in RAX.
+        //---------------------------------------------------------------------
+        .lock_cmpxchg => |cmpxchg| {
+            const new_enc = cmpxchg.new_val.hwEnc();
+            const finalized = memFinalize(cmpxchg.mem, state);
+
+            const size_byte: bool = cmpxchg.ty.bits() == 8;
+            const size_word: bool = cmpxchg.ty.bits() == 16;
+            const size_qword: bool = cmpxchg.ty.bits() == 64;
+
+            // LOCK prefix
+            try sink.put1(0xF0);
+            if (size_word) try sink.put1(0x66);
+            {
+                const rex = RexPrefix.memOp(new_enc, getBaseEnc(finalized.amode), size_qword, false);
+                try rex.encode(sink);
+            }
+            if (size_byte) {
+                try sink.put1(0x0F);
+                try sink.put1(0xB0); // CMPXCHG r/m8, r8
+            } else {
+                try sink.put1(0x0F);
+                try sink.put1(0xB1); // CMPXCHG r/m, r
+            }
+            try emitModrmSibDisp(sink, new_enc, finalized.amode, 0, null);
+        },
+
+        //---------------------------------------------------------------------
         // CMOVcc
         //---------------------------------------------------------------------
         .cmove => |cmov| {

@@ -421,6 +421,17 @@ pub const SSABuilder = struct {
             },
 
             .select => |s| try self.convertSelect(s, node.type_idx, cur),
+            .atomic_cas => |ac| blk: {
+                const ptr = try self.convertNode(ac.ptr) orelse return error.MissingValue;
+                const expected = try self.convertNode(ac.expected) orelse return error.MissingValue;
+                const new_val = try self.convertNode(ac.new_val) orelse return error.MissingValue;
+                const val = try self.func.newValue(.atomic_cas64, node.type_idx, cur, self.cur_pos);
+                val.addArg(ptr);
+                val.addArg(expected);
+                val.addArg(new_val);
+                try cur.addValue(self.allocator, val);
+                break :blk val;
+            },
             .convert => |c| try self.convertConvert(c, node.type_idx, cur),
             .phi => null, // Handled by insertPhis
             .nop => null,
@@ -867,6 +878,7 @@ pub const SSABuilder = struct {
             .mod => return error.MissingValue, // No float modulo in Wasm
             .bit_and, .bit_or, .bit_xor, .shl, .shr => return error.MissingValue, // Bitwise ops don't apply to floats
             .lt_u, .le_u, .gt_u, .ge_u => return error.MissingValue, // Unsigned ops don't apply to floats
+            .atomic_store, .atomic_add, .atomic_exchange => return error.MissingValue, // Atomics are integer-only
             .@"and", .@"or" => unreachable,
         } else switch (b.op) {
             .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod,
@@ -874,6 +886,7 @@ pub const SSABuilder = struct {
             .lt_u => .ult, .le_u => .ule, .gt_u => .ugt, .ge_u => .uge,
             .bit_and => .and_, .bit_or => .or_, .bit_xor => .xor, .shl => .shl, .shr => .shr,
             .fmin => .wasm_f64_min, .fmax => .wasm_f64_max, // Always float ops
+            .atomic_store => .atomic_store64, .atomic_add => .atomic_add64, .atomic_exchange => .atomic_exchange64,
             .@"and", .@"or" => unreachable, // Handled by convertLogicalOp
         };
 
@@ -903,6 +916,7 @@ pub const SSABuilder = struct {
             .ctz => .ctz64,
             .clz => .clz64,
             .popcnt => .popcnt64,
+            .atomic_load => .atomic_load64,
         };
         const val = try self.func.newValue(op_kind, type_idx, cur, self.cur_pos);
         val.addArg(operand);

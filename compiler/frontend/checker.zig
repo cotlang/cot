@@ -1926,7 +1926,7 @@ pub const Checker = struct {
                 // Ref: Zig zirPtrToInt — validate operand is pointer type
                 const arg_type = try self.checkExpr(bc.args[0]);
                 const arg_info = self.types.get(arg_type);
-                if (arg_info != .pointer and arg_type != TypeRegistry.I64) {
+                if (arg_info != .pointer and arg_info != .func and arg_type != TypeRegistry.I64) {
                     self.err.errorWithCode(bc.span.start, .e300, "@ptrToInt operand must be a pointer");
                     return invalid_type;
                 }
@@ -2239,6 +2239,46 @@ pub const Checker = struct {
                 if (type_idx == invalid_type) { self.err.errorWithCode(bc.span.start, .e300, "@typeInfo requires valid type"); return invalid_type; }
                 return TypeRegistry.I64;
             },
+            .atomic_load => {
+                // @atomicLoad(ptr: *i64) → i64
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicLoad requires pointer argument"); return invalid_type; }
+                return TypeRegistry.I64;
+            },
+            .atomic_store => {
+                // @atomicStore(ptr: *i64, val: i64) → void
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicStore requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.VOID;
+            },
+            .atomic_add => {
+                // @atomicAdd(ptr: *i64, val: i64) → i64 (returns previous value)
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicAdd requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
+            .atomic_cas => {
+                // @atomicCAS(ptr: *i64, expected: i64, new: i64) → i64 (returns actual old value)
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicCAS requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                _ = try self.checkExpr(bc.args[2]);
+                return TypeRegistry.I64;
+            },
+            .atomic_exchange => {
+                // @atomicExchange(ptr: *i64, val: i64) → i64 (returns previous value)
+                const arg_type = try self.checkExpr(bc.args[0]);
+                const arg_info = self.types.get(arg_type);
+                if (arg_info != .pointer) { self.err.errorWithCode(bc.span.start, .e300, "@atomicExchange requires pointer argument"); return invalid_type; }
+                _ = try self.checkExpr(bc.args[1]);
+                return TypeRegistry.I64;
+            },
         }
     }
 
@@ -2356,6 +2396,38 @@ pub const Checker = struct {
                                             try self.expr_types.put(f.base, base_type_idx);
                                         }
                                         return sym.type_idx;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Generic static method: GenericType(ConcreteArgs).method
+                // Zig pattern: ArrayList(u8).init(allocator)
+                if (base_expr == .call) {
+                    const gen_call = base_expr.call;
+                    if (self.tree.getNode(gen_call.callee)) |callee_node| {
+                        if (callee_node.asExpr()) |callee_expr| {
+                            if (callee_expr == .ident) {
+                                const gen_name = callee_expr.ident.name;
+                                if (self.generics.generic_structs.contains(gen_name)) {
+                                    const gi = ast.GenericInstance{
+                                        .name = gen_name,
+                                        .type_args = gen_call.args,
+                                    };
+                                    const concrete_type = try self.resolveGenericInstance(gi, gen_call.span);
+                                    if (concrete_type != invalid_type) {
+                                        try self.expr_types.put(f.base, concrete_type);
+                                        const concrete_info = self.types.get(concrete_type);
+                                        if (concrete_info == .struct_type) {
+                                            if (self.lookupMethod(concrete_info.struct_type.name, f.field)) |m| {
+                                                if (m.is_static) return m.func_type;
+                                            }
+                                            // Non-static method on type name — error
+                                            for (concrete_info.struct_type.fields) |field| {
+                                                if (std.mem.eql(u8, field.name, f.field)) return field.type_idx;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3449,7 +3521,8 @@ pub const Checker = struct {
                     .name = f.name,
                     .func_name = synth_name,
                     .func_type = func_type,
-                    .receiver_is_ptr = true,
+                    .receiver_is_ptr = !f.is_static,
+                    .is_static = f.is_static,
                 });
 
                 // Add to generic_inst_by_name so the lowerer can find and lower it

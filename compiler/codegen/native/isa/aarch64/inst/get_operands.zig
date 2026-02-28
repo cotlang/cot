@@ -167,9 +167,13 @@ pub const OperandVisitor = union(enum) {
                 }) catch unreachable;
             },
             .callback => |cb| {
-                // Order: def first, then use (matching collector order).
+                // Save the virtual register before the def callback resolves it
+                // to a physical register. Without this, the use callback would see
+                // an already-physical register and skip without consuming its
+                // allocation entry, causing an off-by-one for all subsequent operands.
+                var use_reg = reg.toReg();
                 cb.func(cb.ctx, reg.regMut(), .reuse, .def, .late);
-                cb.func(cb.ctx, reg.regMut(), .reuse, .use, .early);
+                cb.func(cb.ctx, &use_reg, .reuse, .use, .early);
             },
         }
     }

@@ -796,6 +796,11 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
             visitor.gprDef(&p.dst_old);
             visitor.gprDef(&p.tmp);
         },
+        .lock_cmpxchg => |*p| {
+            syntheticAmodeOperands(&p.mem, visitor);
+            visitor.gprUse(&p.new_val);
+            visitor.gprDef(&p.dst_old);
+        },
         .atomic_128_rmw_seq => |*p| {
             syntheticAmodeOperands(&p.mem, visitor);
             visitor.gprUse(&p.operand_low);

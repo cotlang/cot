@@ -992,6 +992,39 @@ pub const FuncInstBuilder = struct {
         return r.inst;
     }
 
+    /// Atomic load with acquire semantics.
+    pub fn atomicLoad(self: Self, ty: Type, addr: Value) !Value {
+        const r = try self.Load(.atomic_load, ty, clif.MemFlags.DEFAULT, addr, 0);
+        return r.result.?;
+    }
+
+    /// Atomic store with release semantics.
+    pub fn atomicStore(self: Self, val: Value, addr: Value) !Inst {
+        const r = try self.Store(.atomic_store, clif.MemFlags.DEFAULT, val, addr, 0);
+        return r.inst;
+    }
+
+    /// Atomic read-modify-write add. Returns previous value.
+    pub fn atomicRmwAdd(self: Self, ty: Type, addr: Value, val: Value) !Value {
+        const r = try self.Binary(.atomic_rmw_add, ty, addr, val);
+        return r.result.?;
+    }
+
+    /// Atomic read-modify-write exchange. Returns previous value.
+    pub fn atomicRmwXchg(self: Self, ty: Type, addr: Value, val: Value) !Value {
+        const r = try self.Binary(.atomic_rmw_xchg, ty, addr, val);
+        return r.result.?;
+    }
+
+    /// Atomic compare-and-swap. Returns actual old value.
+    pub fn atomicCas(self: Self, ty: Type, addr: Value, expected: Value, new_val: Value) !Value {
+        const r = try self.buildInst(.{ .ternary = .{
+            .opcode = .atomic_cas,
+            .args = .{ addr, expected, new_val },
+        } }, ty);
+        return r.result.?;
+    }
+
     /// Load from stack slot.
     pub fn stackLoad(self: Self, ty: Type, slot: StackSlot, offset: i32) !Value {
         const r = try self.StackLoad(.stack_load, ty, slot, offset);

@@ -230,6 +230,12 @@ pub const BuiltinKind = enum {
     type_name,
     enum_name,
     type_info,
+    // Atomics — sequential consistency
+    atomic_load,
+    atomic_store,
+    atomic_add,
+    atomic_cas,
+    atomic_exchange,
 
     const map = std.StaticStringMap(BuiltinKind).initComptime(.{
         .{ "sizeOf", .size_of },
@@ -286,6 +292,11 @@ pub const BuiltinKind = enum {
         .{ "typeName", .type_name },
         .{ "enumName", .enum_name },
         .{ "typeInfo", .type_info },
+        .{ "atomicLoad", .atomic_load },
+        .{ "atomicStore", .atomic_store },
+        .{ "atomicAdd", .atomic_add },
+        .{ "atomicCAS", .atomic_cas },
+        .{ "atomicExchange", .atomic_exchange },
     });
 
     pub fn fromString(s: []const u8) ?BuiltinKind {
@@ -348,6 +359,11 @@ pub const BuiltinKind = enum {
             .type_name => "typeName",
             .enum_name => "enumName",
             .type_info => "typeInfo",
+            .atomic_load => "atomicLoad",
+            .atomic_store => "atomicStore",
+            .atomic_add => "atomicAdd",
+            .atomic_cas => "atomicCAS",
+            .atomic_exchange => "atomicExchange",
         };
     }
 };

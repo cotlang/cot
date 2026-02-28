@@ -756,6 +756,40 @@ const SsaToClifTranslator = struct {
             },
 
             // ============================================================
+            // Atomic operations — sequential consistency
+            // ============================================================
+            .atomic_load64 => {
+                const addr = self.getClif(v.args[0]);
+                const result = try ins.atomicLoad(clif.Type.I64, addr);
+                try self.putValue(v.id, result);
+            },
+            .atomic_store64 => {
+                // args[0] = ptr, args[1] = value
+                const addr = self.getClif(v.args[0]);
+                const val = self.getClif(v.args[1]);
+                _ = try ins.atomicStore(val, addr);
+            },
+            .atomic_add64 => {
+                const addr = self.getClif(v.args[0]);
+                const val = self.getClif(v.args[1]);
+                const result = try ins.atomicRmwAdd(clif.Type.I64, addr, val);
+                try self.putValue(v.id, result);
+            },
+            .atomic_cas64 => {
+                const addr = self.getClif(v.args[0]);
+                const expected = self.getClif(v.args[1]);
+                const new_val = self.getClif(v.args[2]);
+                const result = try ins.atomicCas(clif.Type.I64, addr, expected, new_val);
+                try self.putValue(v.id, result);
+            },
+            .atomic_exchange64 => {
+                const addr = self.getClif(v.args[0]);
+                const val = self.getClif(v.args[1]);
+                const result = try ins.atomicRmwXchg(clif.Type.I64, addr, val);
+                try self.putValue(v.id, result);
+            },
+
+            // ============================================================
             // Address computation — native pointers, no heap_base
             // ============================================================
             .off_ptr => {

@@ -398,6 +398,18 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.retain)] = .{ .name = "Retain", .arg_len = 1, .has_side_effects = true };
     table[@intFromEnum(Op.release)] = .{ .name = "Release", .arg_len = 1, .has_side_effects = true };
 
+    // Atomic operations — all have side effects to prevent reordering
+    table[@intFromEnum(Op.atomic_load32)] = .{ .name = "AtomicLoad32", .arg_len = 1, .reads_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_load64)] = .{ .name = "AtomicLoad64", .arg_len = 1, .reads_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_store32)] = .{ .name = "AtomicStore32", .arg_len = 2, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_store64)] = .{ .name = "AtomicStore64", .arg_len = 2, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_add32)] = .{ .name = "AtomicAdd32", .arg_len = 2, .reads_memory = true, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_add64)] = .{ .name = "AtomicAdd64", .arg_len = 2, .reads_memory = true, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_cas32)] = .{ .name = "AtomicCas32", .arg_len = 3, .reads_memory = true, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_cas64)] = .{ .name = "AtomicCas64", .arg_len = 3, .reads_memory = true, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_exchange32)] = .{ .name = "AtomicExchange32", .arg_len = 2, .reads_memory = true, .writes_memory = true, .has_side_effects = true };
+    table[@intFromEnum(Op.atomic_exchange64)] = .{ .name = "AtomicExchange64", .arg_len = 2, .reads_memory = true, .writes_memory = true, .has_side_effects = true };
+
     // Move
     table[@intFromEnum(Op.move)] = .{ .name = "Move", .arg_len = 2, .aux_type = .int64, .writes_memory = true, .has_side_effects = true };
 

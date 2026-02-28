@@ -26,6 +26,8 @@ pub const BinaryOp = enum(u8) {
     fmin, fmax,
     // Unsigned comparison ops (for @min/@max with unsigned types)
     lt_u, le_u, gt_u, ge_u,
+    // Atomics — 2-arg: (ptr, val)
+    atomic_store, atomic_add, atomic_exchange,
 
     pub fn isComparison(self: BinaryOp) bool { return switch (self) { .eq, .ne, .lt, .le, .gt, .ge, .lt_u, .le_u, .gt_u, .ge_u => true, else => false }; }
     pub fn isArithmetic(self: BinaryOp) bool { return switch (self) { .add, .sub, .mul, .div, .mod => true, else => false }; }
@@ -33,7 +35,7 @@ pub const BinaryOp = enum(u8) {
     pub fn isBitwise(self: BinaryOp) bool { return switch (self) { .bit_and, .bit_or, .bit_xor, .shl, .shr => true, else => false }; }
 };
 
-pub const UnaryOp = enum(u8) { neg, not, bit_not, optional_unwrap, abs, ceil, floor, trunc_float, nearest, sqrt, f64_reinterpret_i64, i64_reinterpret_f64, ctz, clz, popcnt };
+pub const UnaryOp = enum(u8) { neg, not, bit_not, optional_unwrap, abs, ceil, floor, trunc_float, nearest, sqrt, f64_reinterpret_i64, i64_reinterpret_f64, ctz, clz, popcnt, atomic_load };
 
 // Typed operation payloads
 pub const ConstInt = struct { value: i64 };
@@ -78,6 +80,7 @@ pub const Branch = struct { condition: NodeIndex, then_block: BlockIndex, else_b
 pub const PhiSource = struct { block: BlockIndex, value: NodeIndex };
 pub const Phi = struct { sources: []const PhiSource };
 pub const Select = struct { condition: NodeIndex, then_value: NodeIndex, else_value: NodeIndex };
+pub const AtomicCas = struct { ptr: NodeIndex, expected: NodeIndex, new_val: NodeIndex };
 pub const Convert = struct { operand: NodeIndex, from_type: TypeIndex, to_type: TypeIndex };
 pub const ListNew = struct { elem_type: TypeIndex };
 pub const ListPush = struct { handle: NodeIndex, value: NodeIndex };
@@ -134,6 +137,7 @@ pub const Node = struct {
         gc_struct_new: GcStructNew,
         gc_struct_get: GcStructGet,
         gc_struct_set: GcStructSet,
+        atomic_cas: AtomicCas,
         nop: void,
         trap: void,
     };
@@ -141,7 +145,7 @@ pub const Node = struct {
     pub fn init(data: Data, type_idx: TypeIndex, span: Span) Node { return .{ .type_idx = type_idx, .span = span, .block = null_block, .data = data }; }
     pub fn withBlock(self: Node, block: BlockIndex) Node { var n = self; n.block = block; return n; }
     pub fn isTerminator(self: *const Node) bool { return switch (self.data) { .ret, .jump, .branch, .trap => true, else => false }; }
-    pub fn hasSideEffects(self: *const Node) bool { return switch (self.data) { .store_local, .ptr_store, .ptr_store_value, .ptr_field_store, .store_local_field, .call, .call_indirect, .closure_call, .ret, .jump, .branch, .trap, .list_new, .list_push, .list_set, .list_free, .map_new, .map_set, .map_free, .gc_struct_new, .gc_struct_set => true, else => false }; }
+    pub fn hasSideEffects(self: *const Node) bool { return switch (self.data) { .store_local, .ptr_store, .ptr_store_value, .ptr_field_store, .store_local_field, .call, .call_indirect, .closure_call, .ret, .jump, .branch, .trap, .list_new, .list_push, .list_set, .list_free, .map_new, .map_set, .map_free, .gc_struct_new, .gc_struct_set, .atomic_cas => true, else => false }; }
     pub fn isConstant(self: *const Node) bool { return switch (self.data) { .const_int, .const_float, .const_bool, .const_null, .const_slice => true, else => false }; }
 };
 

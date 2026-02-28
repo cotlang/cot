@@ -1440,6 +1440,7 @@ pub const Parser = struct {
             .int_from_enum, .tag_name, .error_name, .int_from_bool, .const_cast, .int_from_float,
             .arc_retain, .arc_release,
             .panic, .ctz, .clz, .pop_count,
+            .atomic_load,
             => {
                 const arg = try self.parseExpr() orelse return null;
                 if (!self.expect(.rparen)) return null;
@@ -1449,12 +1450,23 @@ pub const Parser = struct {
             .string, .assert_eq, .fmin, .fmax,
             .field,
             .min, .max,
+            .atomic_store, .atomic_add, .atomic_exchange,
             => {
                 const a1 = try self.parseExpr() orelse return null;
                 if (!self.expect(.comma)) return null;
                 const a2 = try self.parseExpr() orelse return null;
                 if (!self.expect(.rparen)) return null;
                 return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ a1, a2, null_node }, .span = Span.init(start, self.pos()) } });
+            },
+            // 3 value args
+            .atomic_cas => {
+                const a1 = try self.parseExpr() orelse return null;
+                if (!self.expect(.comma)) return null;
+                const a2 = try self.parseExpr() orelse return null;
+                if (!self.expect(.comma)) return null;
+                const a3 = try self.parseExpr() orelse return null;
+                if (!self.expect(.rparen)) return null;
+                return try self.tree.addExpr(.{ .builtin_call = .{ .kind = kind, .type_arg = null_node, .args = .{ a1, a2, a3 }, .span = Span.init(start, self.pos()) } });
             },
         }
     }

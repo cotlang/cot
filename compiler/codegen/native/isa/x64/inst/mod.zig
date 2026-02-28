@@ -827,6 +827,16 @@ pub const Inst = union(enum) {
         dst_old_high: WritableGpr,
     },
 
+    /// Atomic compare-and-swap: LOCK CMPXCHG.
+    /// Expected in RAX (dst_old), stores new_val if match.
+    /// Result (actual old value) ends up in RAX.
+    lock_cmpxchg: struct {
+        ty: Type,
+        mem: SyntheticAmode,
+        new_val: Gpr,
+        dst_old: WritableGpr, // Must be RAX
+    },
+
     /// Memory fence.
     fence: struct {
         kind: FenceKind,
@@ -1665,6 +1675,13 @@ pub const Inst = union(enum) {
             .atomic_128_xchg_seq => |p| {
                 try writer.print("atomic128_xchg {s}", .{
                     p.mem.prettyPrint(16),
+                });
+            },
+            .lock_cmpxchg => |p| {
+                const size: u8 = @intCast(p.ty.bytes());
+                try writer.print("lock cmpxchg {s}, {s}", .{
+                    p.mem.prettyPrint(size),
+                    regs.prettyPrintReg(p.new_val.toReg(), size),
                 });
             },
             .fence => |p| {

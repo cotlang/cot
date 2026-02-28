@@ -1,0 +1,28 @@
+import "std/sys"
+import "std/thread"
+
+var worker_ran: i64 = 0
+
+fn simple_worker(arg: i64) void {
+    worker_ran = 1
+}
+
+test "spawn and join" {
+    worker_ran = 0
+    var t = Thread.spawn(@ptrToInt(simple_worker), 0)
+    t.join()
+    @assertEq(worker_ran, 1)
+}
+
+var arg_received: i64 = 0
+
+fn arg_worker(arg: i64) void {
+    arg_received = arg
+}
+
+test "thread receives argument" {
+    arg_received = 0
+    var t = Thread.spawn(@ptrToInt(arg_worker), 42)
+    t.join()
+    @assertEq(arg_received, 42)
+}

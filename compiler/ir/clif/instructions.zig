@@ -507,6 +507,22 @@ pub const Opcode = enum {
     // Miscellaneous
     // ------------------------------------------------------------------------
 
+    // ------------------------------------------------------------------------
+    // Atomic Operations
+    // Port of cranelift/codegen/meta/src/shared/instructions.rs atomics
+    // ------------------------------------------------------------------------
+
+    /// Atomic load with acquire semantics.
+    atomic_load,
+    /// Atomic store with release semantics.
+    atomic_store,
+    /// Atomic read-modify-write add. Returns previous value.
+    atomic_rmw_add,
+    /// Atomic read-modify-write exchange. Returns previous value.
+    atomic_rmw_xchg,
+    /// Atomic compare-and-swap. Returns actual old value.
+    atomic_cas,
+
     /// No operation.
     nop,
     /// Function address.

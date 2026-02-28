@@ -7155,12 +7155,28 @@ pub const Lowerer = struct {
                 return try fb.emitIntToPtr(value, target_type, bc.span);
             },
             .ptr_to_int => {
+                // For function types: emit raw funcAddr directly (not a closure struct).
+                // lowerExprNode on a function name creates a heap-allocated closure wrapper,
+                // but @ptrToInt needs the raw code address for use with thread_spawn etc.
+                const arg_type = self.inferExprType(bc.args[0]);
+                const arg_info = self.type_reg.get(arg_type);
+                if (arg_info == .func) {
+                    if (self.tree.getNode(bc.args[0])) |arg_node| {
+                        if (arg_node.asExpr()) |arg_expr| {
+                            if (arg_expr == .ident) {
+                                if (self.chk.scope.lookup(arg_expr.ident.name)) |sym| {
+                                    if (sym.kind == .function) {
+                                        return try fb.emitFuncAddr(arg_expr.ident.name, TypeRegistry.I64, bc.span);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 const value = try self.lowerExprNode(bc.args[0]);
                 // WasmGC: GC refs have no linear memory address — return 0.
                 // Tests using @ptrToInt on GC refs need restructuring (use ?*T fields).
                 if (self.target.isWasmGC()) {
-                    const arg_type = self.inferExprType(bc.args[0]);
-                    const arg_info = self.type_reg.get(arg_type);
                     const is_gc_ref = arg_info == .struct_type or
                         (arg_info == .pointer and arg_info.pointer.managed and self.type_reg.get(arg_info.pointer.elem) == .struct_type);
                     if (is_gc_ref) return try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
@@ -7813,6 +7829,32 @@ pub const Lowerer = struct {
                 }
                 return ir.null_node;
             },
+            // Atomics — sequential consistency
+            .atomic_load => {
+                const ptr = try self.lowerExprNode(bc.args[0]);
+                return try fb.emitUnary(.atomic_load, ptr, TypeRegistry.I64, bc.span);
+            },
+            .atomic_store => {
+                const ptr = try self.lowerExprNode(bc.args[0]);
+                const val = try self.lowerExprNode(bc.args[1]);
+                return try fb.emitBinary(.atomic_store, ptr, val, TypeRegistry.VOID, bc.span);
+            },
+            .atomic_add => {
+                const ptr = try self.lowerExprNode(bc.args[0]);
+                const val = try self.lowerExprNode(bc.args[1]);
+                return try fb.emitBinary(.atomic_add, ptr, val, TypeRegistry.I64, bc.span);
+            },
+            .atomic_cas => {
+                const ptr = try self.lowerExprNode(bc.args[0]);
+                const expected = try self.lowerExprNode(bc.args[1]);
+                const new_val = try self.lowerExprNode(bc.args[2]);
+                return try fb.emit(ir.Node.init(.{ .atomic_cas = .{ .ptr = ptr, .expected = expected, .new_val = new_val } }, TypeRegistry.I64, bc.span));
+            },
+            .atomic_exchange => {
+                const ptr = try self.lowerExprNode(bc.args[0]);
+                const val = try self.lowerExprNode(bc.args[1]);
+                return try fb.emitBinary(.atomic_exchange, ptr, val, TypeRegistry.I64, bc.span);
+            },
         }
     }
 
@@ -8116,6 +8158,10 @@ pub const Lowerer = struct {
         // Handle ident nodes (type keywords parsed as idents in expression context)
         if (expr == .ident) {
             const name = expr.ident.name;
+            // Check type substitution first (active during generic instantiation)
+            if (self.type_substitution) |sub| {
+                if (sub.get(name)) |substituted| return substituted;
+            }
             if (std.mem.eql(u8, name, "void")) return TypeRegistry.VOID;
             if (std.mem.eql(u8, name, "bool")) return TypeRegistry.BOOL;
             if (std.mem.eql(u8, name, "i8")) return TypeRegistry.I8;

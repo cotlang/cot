@@ -214,6 +214,13 @@ pub const AArch64LowerBackend = struct {
             .load => self.lowerLoad(ctx, ir_inst),
             .store => self.lowerStore(ctx, ir_inst),
 
+            // Atomic operations
+            .atomic_load => self.lowerAtomicLoad(ctx, ir_inst),
+            .atomic_store => self.lowerAtomicStore(ctx, ir_inst),
+            .atomic_rmw_add => self.lowerAtomicRmwAdd(ctx, ir_inst),
+            .atomic_rmw_xchg => self.lowerAtomicRmwXchg(ctx, ir_inst),
+            .atomic_cas => self.lowerAtomicCas(ctx, ir_inst),
+
             // Select
             .select => self.lowerSelect(ctx, ir_inst),
 
@@ -2229,6 +2236,132 @@ pub const AArch64LowerBackend = struct {
 
         // Stores have no output
         return InstOutput{};
+    }
+
+    // =========================================================================
+    // Atomic Operations
+    // Port of cranelift/codegen/src/isa/aarch64/lower.zig atomics
+    // =========================================================================
+
+    fn lowerAtomicLoad(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        const addr = ctx.putInputInRegs(ir_inst, 0);
+        const addr_reg = addr.onlyReg() orelse return null;
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        // LDAR — load-acquire (sequential consistency)
+        ctx.emit(Inst{ .ldar = .{
+            .rt = dst_reg,
+            .rn = addr_reg,
+            .ty = typeFromClif(ty),
+        } }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    fn lowerAtomicStore(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        // store format: args[0] = val, args[1] = addr
+        const val_ty = ctx.inputTy(ir_inst, 0);
+        const val = ctx.putInputInRegs(ir_inst, 0);
+        const addr = ctx.putInputInRegs(ir_inst, 1);
+        const val_reg = val.onlyReg() orelse return null;
+        const addr_reg = addr.onlyReg() orelse return null;
+
+        // STLR — store-release (sequential consistency)
+        ctx.emit(Inst{ .stlr = .{
+            .rt = val_reg,
+            .rn = addr_reg,
+            .ty = typeFromClif(val_ty),
+        } }) catch return null;
+
+        return InstOutput{};
+    }
+
+    fn lowerAtomicRmwAdd(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        // binary format: args[0] = addr, args[1] = val
+        const addr = ctx.putInputInRegs(ir_inst, 0);
+        const val = ctx.putInputInRegs(ir_inst, 1);
+        const addr_reg = addr.onlyReg() orelse return null;
+        const val_reg = val.onlyReg() orelse return null;
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        // LDADDAL — atomic add, returns old value (LSE)
+        ctx.emit(Inst{ .atomic_rmw = .{
+            .op = .add,
+            .rs = val_reg,
+            .rt = dst_reg,
+            .rn = addr_reg,
+            .ty = typeFromClif(ty),
+        } }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    fn lowerAtomicRmwXchg(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        const addr = ctx.putInputInRegs(ir_inst, 0);
+        const val = ctx.putInputInRegs(ir_inst, 1);
+        const addr_reg = addr.onlyReg() orelse return null;
+        const val_reg = val.onlyReg() orelse return null;
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        // SWPAL — atomic exchange, returns old value (LSE)
+        ctx.emit(Inst{ .atomic_rmw = .{
+            .op = .swp,
+            .rs = val_reg,
+            .rt = dst_reg,
+            .rn = addr_reg,
+            .ty = typeFromClif(ty),
+        } }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    fn lowerAtomicCas(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const ty = ctx.outputTy(ir_inst, 0);
+        // ternary format: args[0] = addr, args[1] = expected, args[2] = new
+        const addr = ctx.putInputInRegs(ir_inst, 0);
+        const expected = ctx.putInputInRegs(ir_inst, 1);
+        const new_val = ctx.putInputInRegs(ir_inst, 2);
+        const addr_reg = addr.onlyReg() orelse return null;
+        const expected_reg = expected.onlyReg() orelse return null;
+        const new_val_reg = new_val.onlyReg() orelse return null;
+
+        // CASAL reads expected from rd, writes actual old value back to rd
+        // We need to copy expected to dst first, then CASAL overwrites dst
+        const dst = ctx.allocTmp(ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        // Move expected → dst (CASAL uses rd as both input/output)
+        ctx.emit(Inst.genMove(dst_reg, expected_reg, typeFromClif(ty))) catch return null;
+
+        // CASAL dst(=expected), new, [addr] → dst(=actual old)
+        ctx.emit(Inst{ .atomic_cas = .{
+            .rd = dst_reg,
+            .rs = expected_reg,
+            .rt = new_val_reg,
+            .rn = addr_reg,
+            .ty = typeFromClif(ty),
+        } }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
     }
 
     // =========================================================================
