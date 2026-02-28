@@ -64,6 +64,11 @@ const ParsedFile = struct {
     tree: ast_mod.Ast,
 };
 
+const CheckedFileEntry = struct {
+    scope: *checker_mod.Scope,
+    tree: *const ast_mod.Ast,
+};
+
 pub const Driver = struct {
     allocator: Allocator,
     target: Target = Target.native(),
@@ -191,9 +196,24 @@ pub const Driver = struct {
         var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
         defer generic_ctx.deinit(self.allocator);
 
+        // Incremental per-file scopes: create scope → copy imports → check → store
+        var checked_scopes = std.StringHashMap(CheckedFileEntry).init(self.allocator);
+        defer checked_scopes.deinit();
+        var file_scopes = std.ArrayListUnmanaged(*checker_mod.Scope){};
+        defer {
+            for (file_scopes.items) |fs| {
+                fs.deinit();
+                self.allocator.destroy(fs);
+            }
+            file_scopes.deinit(self.allocator);
+        }
+
         for (parsed_files.items) |*pf| {
+            const file_scope = try self.createFileScope(pf, &global_scope, &checked_scopes);
+            try file_scopes.append(self.allocator, file_scope);
+
             var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
-            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, &global_scope, &generic_ctx, self.target);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, file_scope, &global_scope, &generic_ctx, self.target);
             defer chk.deinit();
             chk.checkFile() catch |e| {
                 return e;
@@ -201,6 +221,9 @@ pub const Driver = struct {
             if (err_reporter.hasErrors()) {
                 return error.TypeCheckError;
             }
+
+            // Store checked scope for later files to import from
+            try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
         }
         // Success — no errors found
     }
@@ -242,10 +265,25 @@ pub const Driver = struct {
         var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
         defer generic_ctx.deinit(self.allocator);
 
+        // Incremental per-file scopes: create scope → copy imports → check → store
+        var checked_scopes = std.StringHashMap(CheckedFileEntry).init(self.allocator);
+        defer checked_scopes.deinit();
+        var file_scopes = std.ArrayListUnmanaged(*checker_mod.Scope){};
+        defer {
+            for (file_scopes.items) |fs| {
+                fs.deinit();
+                self.allocator.destroy(fs);
+            }
+            file_scopes.deinit(self.allocator);
+        }
+
         var total_warnings: u32 = 0;
         for (parsed_files.items) |*pf| {
+            const file_scope = try self.createFileScope(pf, &global_scope, &checked_scopes);
+            try file_scopes.append(self.allocator, file_scope);
+
             var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
-            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, &global_scope, &generic_ctx, self.target);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, file_scope, &global_scope, &generic_ctx, self.target);
             chk.lint_mode = true;
             chk.checkFile() catch |e| {
                 chk.deinit();
@@ -258,6 +296,9 @@ pub const Driver = struct {
             chk.runLintChecks();
             total_warnings += err_reporter.warning_count;
             chk.deinit();
+
+            // Store checked scope for later files to import from
+            try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
         }
         return total_warnings;
     }
@@ -283,7 +324,7 @@ pub const Driver = struct {
         defer global_scope.deinit();
         var generic_ctx = checker_mod.SharedGenericContext.init(self.allocator);
         defer generic_ctx.deinit(self.allocator);
-        var chk = checker_mod.Checker.init(self.allocator, &tree, &type_reg, &err_reporter, &global_scope, &generic_ctx, self.target);
+        var chk = checker_mod.Checker.init(self.allocator, &tree, &type_reg, &err_reporter, &global_scope, &global_scope, &generic_ctx, self.target);
         defer chk.deinit();
         try chk.checkFile();
         if (err_reporter.hasErrors()) return error.TypeCheckError;
@@ -353,9 +394,24 @@ pub const Driver = struct {
             checkers.deinit(self.allocator);
         }
 
+        // Incremental per-file scopes: create scope → copy imports → check → store
+        var checked_scopes = std.StringHashMap(CheckedFileEntry).init(self.allocator);
+        defer checked_scopes.deinit();
+        var file_scopes = std.ArrayListUnmanaged(*checker_mod.Scope){};
+        defer {
+            for (file_scopes.items) |fs| {
+                fs.deinit();
+                self.allocator.destroy(fs);
+            }
+            file_scopes.deinit(self.allocator);
+        }
+
         for (parsed_files.items) |*pf| {
+            const file_scope = try self.createFileScope(pf, &global_scope, &checked_scopes);
+            try file_scopes.append(self.allocator, file_scope);
+
             var err_reporter = errors_mod.ErrorReporter.init(&pf.source, null);
-            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, &global_scope, &generic_ctx, self.target);
+            var chk = checker_mod.Checker.init(self.allocator, &pf.tree, &type_reg, &err_reporter, file_scope, &global_scope, &generic_ctx, self.target);
             chk.checkFile() catch |e| {
                 chk.deinit();
                 return e;
@@ -365,6 +421,9 @@ pub const Driver = struct {
                 return error.TypeCheckError;
             }
             try checkers.append(self.allocator, chk);
+
+            // Store checked scope for later files to import from
+            try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
         }
 
         // Phase 3: Lower all files to IR with shared builder
@@ -511,6 +570,53 @@ pub const Driver = struct {
 
     fn normalizePath(self: *Driver, path: []const u8) ![]const u8 {
         return std.fs.cwd().realpathAlloc(self.allocator, path) catch try self.allocator.dupe(u8, path);
+    }
+
+    /// Go resolver.go pattern: create a per-file scope and copy imported symbols.
+    fn createFileScope(self: *Driver, pf: *ParsedFile, global_scope: *checker_mod.Scope, checked_scopes: *std.StringHashMap(CheckedFileEntry)) !*checker_mod.Scope {
+        const file_scope = try self.allocator.create(checker_mod.Scope);
+        file_scope.* = checker_mod.Scope.init(self.allocator, global_scope);
+
+        // Copy direct imports' OWN symbols into this file's scope
+        const imports = try pf.tree.getImports(self.allocator);
+        defer self.allocator.free(imports);
+        const file_dir = std.fs.path.dirname(pf.path) orelse ".";
+
+        for (imports) |import_path| {
+            // Resolve import path to canonical path (same logic as parseFileRecursive)
+            const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
+                try self.resolveStdImport(import_path, file_dir)
+            else blk: {
+                const name = if (std.mem.endsWith(u8, import_path, ".cot"))
+                    import_path
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
+                break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+            };
+            defer self.allocator.free(full_path);
+            const canonical = try self.normalizePath(full_path);
+            defer self.allocator.free(canonical);
+
+            // Find imported file's scope (already checked) and copy its OWN symbols
+            if (checked_scopes.get(canonical)) |imported| {
+                var it = imported.scope.symbols.iterator();
+                while (it.next()) |entry| {
+                    const sym = entry.value_ptr.*;
+                    // Only copy symbols defined in the imported file (not its transitive imports)
+                    if (sym.source_tree) |st| {
+                        if (st == imported.tree) {
+                            try file_scope.define(sym);
+                        }
+                    } else {
+                        // No source_tree (e.g., stdlib extern fns) — copy all
+                        try file_scope.define(sym);
+                    }
+                }
+            }
+        }
+
+        return file_scope;
     }
 
     fn parseFileRecursive(self: *Driver, path: []const u8, parsed_files: *std.ArrayListUnmanaged(ParsedFile), seen_files: *std.StringHashMap(void), in_progress: *std.StringHashMap(void)) !void {

@@ -159,6 +159,7 @@ const token_strings = comptime {
     s[@intFromEnum(Token.kw_packed)] = "packed"
     s[@intFromEnum(Token.kw_weak)] = "weak"
     s[@intFromEnum(Token.kw_unowned)] = "unowned"
+    s[@intFromEnum(Token.kw_static)] = "static"
     s[@intFromEnum(Token.kw_and)] = "and"
     s[@intFromEnum(Token.kw_or)] = "or"
     s[@intFromEnum(Token.kw_not)] = "not"

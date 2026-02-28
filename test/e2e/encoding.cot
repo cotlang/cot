@@ -1,4 +1,5 @@
 import "std/encoding"
+import "std/string"
 import "std/sys"
 
 // ============================================================================

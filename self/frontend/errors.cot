@@ -3,6 +3,7 @@
 
 import "std/string"
 import "std/sys"
+import "source"
 
 /// Severity level for diagnostics.
 const Severity = enum { err, warning, note }

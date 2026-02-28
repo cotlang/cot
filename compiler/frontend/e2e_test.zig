@@ -57,7 +57,7 @@ fn runPipeline(backing: std.mem.Allocator, code: []const u8) !PipelineResult {
     var global_scope = checker.Scope.init(allocator, null);
     var generic_ctx = checker.SharedGenericContext.init(allocator);
     const target = @import("target.zig").Target.native();
-    var check = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx, target);
+    var check = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &global_scope, &generic_ctx, target);
     check.checkFile() catch {
         return .{ .arena = arena, .has_errors = true, .ir_funcs = &.{}, .ssa_funcs = &.{}, .type_reg = type_reg };
     };

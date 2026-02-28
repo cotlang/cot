@@ -10,6 +10,11 @@ struct Pos {
 }
 
 impl Pos {
+    /// Zero position (offset 0).
+    static fn zero() Pos {
+        return Pos { offset: 0 }
+    }
+
     /// Return a new Pos advanced by n bytes.
     fn advance(n: int) Pos {
         return Pos { offset: self.offset + n }
@@ -24,6 +29,13 @@ struct Position {
     column: int,
 }
 
+impl Position {
+    /// Format as "filename:line:column".
+    fn toString() string {
+        return "${self.filename}:${self.line}:${self.column}"
+    }
+}
+
 /// Half-open byte range [start_offset, end_offset) in source text.
 struct Span {
     start_offset: int,
@@ -31,6 +43,11 @@ struct Span {
 }
 
 impl Span {
+    /// Zero span (offset 0, length 0).
+    static fn zero() Span {
+        return Span { start_offset: 0, end_offset: 0 }
+    }
+
     /// Create a span from start to end offsets.
     static fn init(start: int, end: int) Span {
         return Span { start_offset: start, end_offset: end }
@@ -71,10 +88,11 @@ struct Source {
 impl Source {
     /// Create a source with filename and content.
     static fn init(filename: string, content: string) Source {
+        var offsets: List(int) = .{}
         return Source {
             filename: filename,
             content: content,
-            line_offsets: .{},
+            line_offsets: offsets,
             line_offsets_computed: false,
         }
     }
@@ -87,9 +105,16 @@ impl Source {
         return charAt(self.content, offset)
     }
 
-    /// Return a substring [start, end) of the source content.
+    /// Return a substring [start, end) of the source content (bounds-clamped).
     fn slice(start: int, end: int) string {
-        return substring(self.content, start, end)
+        var s = start
+        var e = end
+        const clen = @lenOf(self.content)
+        if (s < 0) { s = 0 }
+        if (s > clen) { s = clen }
+        if (e > clen) { e = clen }
+        if (s >= e) { return "" }
+        return substring(self.content, s, e)
     }
 
     /// Return the source text covered by a span.
@@ -265,4 +290,28 @@ test "source getLine" {
 test "source lineCount" {
     var src = Source.init("test.cot", "line 1\nline 2\nline 3")
     @assertEq(src.lineCount(), 3)
+}
+
+test "pos zero" {
+    const p = Pos.zero()
+    @assertEq(p.offset, 0)
+}
+
+test "span zero" {
+    const s = Span.zero()
+    @assertEq(s.start_offset, 0)
+    @assertEq(s.end_offset, 0)
+}
+
+test "position toString" {
+    var pos = Position { filename: "main.cot", offset: 0, line: 3, column: 7 }
+    @assertEq(pos.toString(), "main.cot:3:7")
+}
+
+test "source slice bounds clamping" {
+    var src = Source.init("test.cot", "hello")
+    @assertEq(src.slice(0, 100), "hello")
+    @assertEq(src.slice(-5, 3), "hel")
+    @assertEq(src.slice(10, 20), "")
+    @assertEq(src.slice(3, 2), "")
 }

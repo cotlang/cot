@@ -151,7 +151,7 @@ pub fn analyze(parent_allocator: std.mem.Allocator, text: []const u8, filename: 
     var checker: ?Checker = null;
     if (parse_ok) {
         const target = @import("../frontend/target.zig").Target.native();
-        var c = Checker.init(allocator, &tree, &type_reg, &err_reporter, &global_scope, &generics, target);
+        var c = Checker.init(allocator, &tree, &type_reg, &err_reporter, &global_scope, &global_scope, &generics, target);
         c.checkFile() catch {};
         checker = c;
     }
@@ -253,7 +253,7 @@ pub fn analyzeWithImports(parent_allocator: std.mem.Allocator, text: []const u8,
         }
 
         var dep_err_reporter = ErrorReporter.init(&dep_files[dep_idx].src, null); // discard dep errors
-        var dep_checker = Checker.init(allocator, &dep_files[dep_idx].tree, &type_reg, &dep_err_reporter, &global_scope, &generics, target);
+        var dep_checker = Checker.init(allocator, &dep_files[dep_idx].tree, &type_reg, &dep_err_reporter, &global_scope, &global_scope, &generics, target);
         dep_checker.checkFile() catch {};
         dep_checker.deinit();
 
@@ -269,7 +269,7 @@ pub fn analyzeWithImports(parent_allocator: std.mem.Allocator, text: []const u8,
     // Check main file with the shared scope (errors collected for diagnostics)
     var checker: ?Checker = null;
     if (parse_ok) {
-        var c = Checker.init(allocator, &tree, &type_reg, &err_reporter, &global_scope, &generics, target);
+        var c = Checker.init(allocator, &tree, &type_reg, &err_reporter, &global_scope, &global_scope, &generics, target);
         c.checkFile() catch {};
         checker = c;
     }

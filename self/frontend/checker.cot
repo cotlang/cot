@@ -8,6 +8,7 @@
 import "std/list"
 import "std/map"
 import "std/string"
+import "std/sys"
 import "ast"
 import "errors"
 import "types"

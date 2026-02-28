@@ -47,6 +47,8 @@ pub const Symbol = struct {
     float_const_value: ?f64 = null,
     comptime_val: ?ComptimeValue = null,
     used: bool = false,
+    /// Tracks which AST (file) defined this symbol, for cross-file redefinition checks.
+    source_tree: ?*const Ast = null,
 
     pub fn init(name: []const u8, kind: SymbolKind, type_idx: TypeIndex, node: NodeIndex, mutable: bool) Symbol {
         return .{ .name = name, .kind = kind, .type_idx = type_idx, .node = node, .mutable = mutable };
@@ -102,6 +104,7 @@ pub const GenericInfo = struct {
     type_param_bounds: []const ?[]const u8 = &.{}, // parallel array, null = unbounded
     node_idx: NodeIndex,
     tree: *const Ast, // which file's AST this node_idx belongs to (for cross-file generics)
+    scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution)
 };
 
 /// Info about a resolved generic function instantiation for the lowerer.
@@ -111,6 +114,7 @@ pub const GenericInstInfo = struct {
     type_args: []const TypeIndex,
     type_param_names: []const []const u8 = &.{}, // For impl block methods (type params come from impl, not fn)
     tree: *const Ast, // which file's AST this generic_node belongs to (for cross-file generics)
+    scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution in lowerer re-check)
 };
 
 /// Info about a trait definition.
@@ -161,6 +165,7 @@ pub const GenericImplInfo = struct {
     type_params: []const []const u8,
     methods: []const NodeIndex,
     tree: *const Ast, // which file's AST these method NodeIndexes belong to (for cross-file generics)
+    scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution)
 };
 
 /// Parse type arguments from a monomorphized Map name like "Map(5;5)" → [K, V] TypeIndex values.
@@ -214,10 +219,12 @@ pub const Checker = struct {
     /// Zig Sema: ComptimeAlloc list holds mutable values, runtime_index prevents time travel.
     comptime_vars: ?std.StringHashMap(ComptimeValue) = null,
 
-    pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, global_scope: *Scope, generic_ctx: *SharedGenericContext, target: target_mod.Target) Checker {
+    /// Go resolver.go pattern: file_scope is per-file, global_scope is shared across all files.
+    /// Single-file callers pass the same scope for both.
+    pub fn init(allocator: std.mem.Allocator, tree: *const Ast, type_reg: *TypeRegistry, reporter: *ErrorReporter, file_scope: *Scope, global_scope: *Scope, generic_ctx: *SharedGenericContext, target: target_mod.Target) Checker {
         return .{
             .types = type_reg,
-            .scope = global_scope,
+            .scope = file_scope,
             .global_scope = global_scope,
             .err = reporter,
             .tree = tree,
@@ -235,10 +242,31 @@ pub const Checker = struct {
         // SharedGenericContext is owned by the driver, not the checker
     }
 
-    /// Run lint checks on the global scope (top-level unused functions/vars).
+    /// Define a symbol in scope with source_tree tracking (Go resolver.go pattern).
+    /// source_tree enables import filtering: when copying imported symbols, only
+    /// symbols owned by the imported file (source_tree == file's tree) are copied.
+    fn defineInFileScope(self: *Checker, sym: Symbol) !void {
+        var s = sym;
+        s.source_tree = self.tree;
+        try self.scope.define(s);
+    }
+
+    /// Go pattern: resolve a type name through scope chain first, then type registry.
+    /// Go's check.ident() walks the scope chain for type names (typexpr.go:20).
+    /// With per-file scopes, scope lookup correctly distinguishes same-named types
+    /// from different files, while the global type registry (name_map) does not.
+    fn resolveTypeByName(self: *Checker, name: []const u8) ?TypeIndex {
+        if (self.scope.lookup(name)) |sym| {
+            if (sym.kind == .type_name) return sym.type_idx;
+        }
+        return self.types.lookupByName(name);
+    }
+
+    /// Run lint checks on the file scope (top-level unused functions/vars).
     /// Function-local lint checks are emitted inline during checkFnDeclWithName.
+    /// Go resolver.go pattern: lint checks run on file_scope (self.scope at top level).
     pub fn runLintChecks(self: *Checker) void {
-        self.checkScopeUnused(self.global_scope);
+        self.checkScopeUnused(self.scope);
     }
 
     /// Emit warnings for unused symbols in a scope.
@@ -359,9 +387,9 @@ pub const Checker = struct {
                 }
                 // Generic functions: store definition, don't build concrete type yet
                 if (f.type_params.len > 0) {
-                    try self.generics.generic_functions.put(f.name, .{ .type_params = f.type_params, .type_param_bounds = f.type_param_bounds, .node_idx = idx, .tree = self.tree });
+                    try self.generics.generic_functions.put(f.name, .{ .type_params = f.type_params, .type_param_bounds = f.type_param_bounds, .node_idx = idx, .tree = self.tree, .scope = self.scope });
                     // Register as a type_name so checkIdentifier knows it's generic
-                    try self.scope.define(Symbol.init(f.name, .type_name, invalid_type, idx, false));
+                    try self.defineInFileScope(Symbol.init(f.name, .type_name, invalid_type, idx, false));
                     return;
                 }
                 var func_type = try self.buildFuncType(f.params, f.return_type);
@@ -373,24 +401,24 @@ pub const Checker = struct {
                 }
                 var sym = Symbol.initExtern(f.name, .function, func_type, idx, false, f.is_extern);
                 sym.is_export = f.is_export;
-                try self.scope.define(sym);
+                try self.defineInFileScope(sym);
                 if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "self"))
                     try self.registerMethod(f.name, f.params[0].type_expr, func_type);
             },
             .var_decl => |v| {
                 if (self.scope.isDefined(v.name)) { self.reportRedefined(v.span.start, v.name); return; }
-                try self.scope.define(Symbol.init(v.name, if (v.is_const) .constant else .variable, invalid_type, idx, !v.is_const));
+                try self.defineInFileScope(Symbol.init(v.name, if (v.is_const) .constant else .variable, invalid_type, idx, !v.is_const));
             },
             .struct_decl => |s| {
                 if (self.scope.isDefined(s.name)) { self.reportRedefined(s.span.start, s.name); return; }
                 // Generic structs: store definition, don't build concrete type yet
                 if (s.type_params.len > 0) {
-                    try self.generics.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx, .tree = self.tree });
-                    try self.scope.define(Symbol.init(s.name, .type_name, invalid_type, idx, false));
+                    try self.generics.generic_structs.put(s.name, .{ .type_params = s.type_params, .node_idx = idx, .tree = self.tree, .scope = self.scope });
+                    try self.defineInFileScope(Symbol.init(s.name, .type_name, invalid_type, idx, false));
                     return;
                 }
                 const struct_type = try self.buildStructTypeWithLayout(s.name, s.fields, s.layout);
-                try self.scope.define(Symbol.init(s.name, .type_name, struct_type, idx, false));
+                try self.defineInFileScope(Symbol.init(s.name, .type_name, struct_type, idx, false));
                 try self.types.registerNamed(s.name, struct_type);
                 // Register nested declarations with qualified names (e.g. Parser.Error → Parser_Error)
                 for (s.nested_decls) |nested_idx| {
@@ -399,30 +427,30 @@ pub const Checker = struct {
                         .error_set_decl => |es| {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, es.name });
                             const es_type = try self.types.add(.{ .error_set = .{ .name = qualified, .variants = es.variants } });
-                            try self.scope.define(Symbol.init(qualified, .type_name, es_type, nested_idx, false));
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, es_type, nested_idx, false));
                             try self.types.registerNamed(qualified, es_type);
                         },
                         .enum_decl => |e| {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, e.name });
                             const enum_type = try self.buildEnumType(e);
-                            try self.scope.define(Symbol.init(qualified, .type_name, enum_type, nested_idx, false));
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, enum_type, nested_idx, false));
                             try self.types.registerNamed(qualified, enum_type);
                         },
                         .struct_decl => |ns| {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, ns.name });
                             const ns_type = try self.buildStructTypeWithLayout(qualified, ns.fields, ns.layout);
-                            try self.scope.define(Symbol.init(qualified, .type_name, ns_type, nested_idx, false));
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, ns_type, nested_idx, false));
                             try self.types.registerNamed(qualified, ns_type);
                         },
                         .type_alias => |t| {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, t.name });
                             const target_type = self.resolveTypeExpr(t.target) catch invalid_type;
-                            try self.scope.define(Symbol.init(qualified, .type_name, target_type, nested_idx, false));
+                            try self.defineInFileScope(Symbol.init(qualified, .type_name, target_type, nested_idx, false));
                             try self.types.registerNamed(qualified, target_type);
                         },
                         .var_decl => |v| {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ s.name, v.name });
-                            try self.scope.define(Symbol.init(qualified, if (v.is_const) .constant else .variable, invalid_type, nested_idx, !v.is_const));
+                            try self.defineInFileScope(Symbol.init(qualified, if (v.is_const) .constant else .variable, invalid_type, nested_idx, !v.is_const));
                         },
                         else => {},
                     }
@@ -431,26 +459,26 @@ pub const Checker = struct {
             .enum_decl => |e| {
                 if (self.scope.isDefined(e.name)) { self.reportRedefined(e.span.start, e.name); return; }
                 const enum_type = try self.buildEnumType(e);
-                try self.scope.define(Symbol.init(e.name, .type_name, enum_type, idx, false));
+                try self.defineInFileScope(Symbol.init(e.name, .type_name, enum_type, idx, false));
                 try self.types.registerNamed(e.name, enum_type);
             },
             .union_decl => |u| {
                 if (self.scope.isDefined(u.name)) { self.reportRedefined(u.span.start, u.name); return; }
                 const union_type = try self.buildUnionType(u);
-                try self.scope.define(Symbol.init(u.name, .type_name, union_type, idx, false));
+                try self.defineInFileScope(Symbol.init(u.name, .type_name, union_type, idx, false));
                 try self.types.registerNamed(u.name, union_type);
             },
             .error_set_decl => |es| {
                 if (self.scope.isDefined(es.name)) { self.reportRedefined(es.span.start, es.name); return; }
                 const es_type = try self.types.add(.{ .error_set = .{ .name = es.name, .variants = es.variants } });
-                try self.scope.define(Symbol.init(es.name, .type_name, es_type, idx, false));
+                try self.defineInFileScope(Symbol.init(es.name, .type_name, es_type, idx, false));
                 try self.types.registerNamed(es.name, es_type);
             },
             // Go reference: types2/alias.go - Alias stores RHS and resolves through it
             .type_alias => |t| {
                 if (self.scope.isDefined(t.name)) { self.reportRedefined(t.span.start, t.name); return; }
                 const target_type = self.resolveTypeExpr(t.target) catch invalid_type;
-                try self.scope.define(Symbol.init(t.name, .type_name, target_type, idx, false));
+                try self.defineInFileScope(Symbol.init(t.name, .type_name, target_type, idx, false));
                 try self.types.registerNamed(t.name, target_type);
             },
             .impl_block => |impl_b| {
@@ -458,7 +486,7 @@ pub const Checker = struct {
                 if (impl_b.type_params.len > 0) {
                     const gop = try self.generics.generic_impl_blocks.getOrPut(impl_b.type_name);
                     if (!gop.found_existing) gop.value_ptr.* = .{};
-                    try gop.value_ptr.append(self.allocator, .{ .type_params = impl_b.type_params, .methods = impl_b.methods, .tree = self.tree });
+                    try gop.value_ptr.append(self.allocator, .{ .type_params = impl_b.type_params, .methods = impl_b.methods, .tree = self.tree, .scope = self.scope });
                     return;
                 }
                 // Register associated constants with qualified names: TypeName_ConstName
@@ -469,7 +497,7 @@ pub const Checker = struct {
                         var const_type: TypeIndex = invalid_type;
                         if (v.type_expr != null_node) const_type = self.resolveTypeExpr(v.type_expr) catch invalid_type;
                         const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ impl_b.type_name, v.name });
-                        try self.scope.define(Symbol.init(qualified, .constant, const_type, const_idx, false));
+                        try self.defineInFileScope(Symbol.init(qualified, .constant, const_type, const_idx, false));
                     }
                 }
                 for (impl_b.methods) |method_idx| {
@@ -487,7 +515,7 @@ pub const Checker = struct {
                                 if (first_param_type != .pointer) is_ptr = false;
                             }
                         }
-                        try self.scope.define(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
+                        try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
                         try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static });
                     }
                 }
@@ -524,7 +552,7 @@ pub const Checker = struct {
                         const f = method_decl.fn_decl;
                         const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ it.target_type, f.name });
                         const func_type = try self.buildFuncType(f.params, f.return_type);
-                        try self.scope.define(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
+                        try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
                         try self.types.registerMethod(it.target_type, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = true });
                     }
                 }
@@ -1366,7 +1394,7 @@ pub const Checker = struct {
                 const base_node = self.tree.getNode(fa.base) orelse return null;
                 const base_expr = base_node.asExpr() orelse return null;
                 if (base_expr == .ident) {
-                    const type_idx = self.types.lookupByName(base_expr.ident.name) orelse return null;
+                    const type_idx = self.resolveTypeByName(base_expr.ident.name) orelse return null;
                     const info = self.types.get(type_idx);
                     if (info == .enum_type) {
                         for (info.enum_type.variants) |v| {
@@ -1537,7 +1565,7 @@ pub const Checker = struct {
     }
 
     fn checkIdentifier(self: *Checker, id: ast.Ident) TypeIndex {
-        if (self.types.lookupByName(id.name)) |type_idx| {
+        if (self.resolveTypeByName(id.name)) |type_idx| {
             const t = self.types.get(type_idx);
             // Allow enum, union, and error_set types to be used as expressions
             // (enum/union for variant access, error_set for merge with ||)
@@ -2302,7 +2330,7 @@ pub const Checker = struct {
                     var buf: [512]u8 = undefined;
                     const qualified = std.fmt.bufPrint(&buf, "{s}_{s}", .{ base_name, f.field }) catch "";
                     if (qualified.len > 0) {
-                        if (self.types.lookupByName(qualified)) |nested_type_idx| {
+                        if (self.resolveTypeByName(qualified)) |nested_type_idx| {
                             return nested_type_idx;
                         }
                         // Also check scope for associated constants and static methods
@@ -2324,7 +2352,7 @@ pub const Checker = struct {
                             if (sym.kind == .function and sym.type_idx != invalid_type) {
                                 if (self.lookupMethod(base_name, f.field)) |m| {
                                     if (m.is_static) {
-                                        if (self.types.lookupByName(base_name)) |base_type_idx| {
+                                        if (self.resolveTypeByName(base_name)) |base_type_idx| {
                                             try self.expr_types.put(f.base, base_type_idx);
                                         }
                                         return sym.type_idx;
@@ -2469,7 +2497,7 @@ pub const Checker = struct {
         } else if (si.type_args.len > 0)
             try self.resolveGenericInstance(.{ .name = si.type_name, .type_args = si.type_args }, si.span)
         else
-            self.types.lookupByName(si.type_name) orelse {
+            self.resolveTypeByName(si.type_name) orelse {
                 self.errWithSuggestion(si.span.start, "undefined type", self.findSimilarType(si.type_name));
                 return invalid_type;
             };
@@ -2508,7 +2536,7 @@ pub const Checker = struct {
         const struct_type_idx = if (ne.type_args.len > 0)
             try self.resolveGenericInstance(.{ .name = ne.type_name, .type_args = ne.type_args }, ne.span)
         else
-            self.types.lookupByName(ne.type_name) orelse {
+            self.resolveTypeByName(ne.type_name) orelse {
                 self.errWithSuggestion(ne.span.start, "undefined type", self.findSimilarType(ne.type_name));
                 return invalid_type;
             };
@@ -3220,8 +3248,7 @@ pub const Checker = struct {
             if (self.type_substitution) |sub| {
                 if (sub.get(expr.ident.name)) |substituted| return substituted;
             }
-            if (self.types.lookupByName(expr.ident.name)) |tidx| return tidx;
-            if (self.scope.lookup(expr.ident.name)) |sym| if (sym.kind == .type_name) return sym.type_idx;
+            if (self.resolveTypeByName(expr.ident.name)) |tidx| return tidx;
             self.errWithSuggestion(expr.ident.span.start, "undefined type", self.findSimilarType(expr.ident.name));
             return invalid_type;
         }
@@ -3240,10 +3267,14 @@ pub const Checker = struct {
                 if (self.type_substitution) |sub| {
                     if (sub.get(n)) |substituted| break :blk substituted;
                 }
-                break :blk self.types.lookupByName(n) orelse if (self.scope.lookup(n)) |s| if (s.kind == .type_name) s.type_idx else invalid_type else {
-                    self.errWithSuggestion(te.span.start, "undefined type", self.findSimilarType(n));
-                    return invalid_type;
-                };
+                // Go pattern: scope-first, then type registry, then silent invalid
+                // During collectDecl, consts like "const AllErrors = FileErr || NetErr"
+                // exist in scope as .constant (not .type_name) before checkVarDecl runs.
+                // Return invalid_type silently in that case (resolved later during checking).
+                if (self.resolveTypeByName(n)) |tidx| break :blk tidx;
+                if (self.scope.lookup(n) != null) break :blk invalid_type;
+                self.errWithSuggestion(te.span.start, "undefined type", self.findSimilarType(n));
+                break :blk invalid_type;
             },
             .pointer => |e| self.types.makePointer(try self.resolveTypeExpr(e)),
             .optional => |e| self.types.makeOptional(try self.resolveTypeExpr(e)),
@@ -3321,17 +3352,18 @@ pub const Checker = struct {
             try sub_map.put(param_name, resolved_args.items[i]);
         }
 
-        // Swap to the defining file's AST and safe_mode for cross-file generic resolution
-        // Must swap safe_mode so safeWrapType() uses the defining file's mode when
-        // building method signatures (e.g. List(Foo).append where T=struct).
-        // Pattern copied from instantiateGenericImplMethods().
+        // Swap to the defining file's AST, safe_mode, and scope for cross-file generic resolution.
+        // Go resolver.go pattern: generic instantiation uses the declaring file's environment.
         const saved_tree = self.tree;
         const saved_safe_mode = self.safe_mode;
+        const saved_scope = self.scope;
         self.tree = gen_info.tree;
         if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        if (gen_info.scope) |s| self.scope = s;
         defer {
             self.tree = saved_tree;
             self.safe_mode = saved_safe_mode;
+            self.scope = saved_scope;
         }
 
         // Get the struct declaration AST node
@@ -3376,14 +3408,18 @@ pub const Checker = struct {
             // Validate type param count matches (Go: named.go:489 checks RecvTypeParams.Len == targs.Len)
             if (impl_info.type_params.len != resolved_args.len) continue;
 
-            // Swap to the defining file's AST and safe_mode for cross-file generic resolution
+            // Swap to the defining file's AST, safe_mode, and scope for cross-file generic resolution.
+            // Go resolver.go pattern: generic instantiation uses the declaring file's environment.
             const saved_tree = self.tree;
             const saved_safe_mode = self.safe_mode;
+            const saved_scope = self.scope;
             self.tree = impl_info.tree;
             if (impl_info.tree.file) |file| self.safe_mode = file.safe_mode;
+            if (impl_info.scope) |s| self.scope = s;
             defer {
                 self.tree = saved_tree;
                 self.safe_mode = saved_safe_mode;
+                self.scope = saved_scope;
             }
 
             // Build type substitution map: T -> concrete type
@@ -3423,6 +3459,7 @@ pub const Checker = struct {
                     .type_args = try self.allocator.dupe(TypeIndex, resolved_args),
                     .type_param_names = impl_info.type_params,
                     .tree = impl_info.tree,
+                    .scope = impl_info.scope,
                 };
                 try self.generics.generic_inst_by_name.put(synth_name, inst);
             }
@@ -3469,7 +3506,7 @@ pub const Checker = struct {
             if (arg_type == invalid_type) {
                 const expr = (self.tree.getNode(arg_node) orelse return invalid_type).asExpr() orelse return invalid_type;
                 if (expr == .ident) {
-                    if (self.types.lookupByName(expr.ident.name)) |tidx| {
+                    if (self.resolveTypeByName(expr.ident.name)) |tidx| {
                         try resolved_args.append(self.allocator, tidx);
                         continue;
                     }
@@ -3499,17 +3536,18 @@ pub const Checker = struct {
         // Go pattern: context.go:87-102 — hash-based dedup with identity verification
         const cache_key = try self.buildGenericCacheKey(name, resolved_args.items);
 
-        // Swap to the defining file's AST and safe_mode for cross-file generic resolution
-        // Must swap safe_mode so safeWrapType() uses the defining file's mode when
-        // building function signatures (e.g. generic fn with T=struct params).
-        // Pattern copied from instantiateGenericImplMethods().
+        // Swap to the defining file's AST, safe_mode, and scope for cross-file generic resolution.
+        // Go resolver.go pattern: generic instantiation uses the declaring file's environment.
         const saved_tree = self.tree;
         const saved_safe_mode = self.safe_mode;
+        const saved_scope = self.scope;
         self.tree = gen_info.tree;
         if (gen_info.tree.file) |file| self.safe_mode = file.safe_mode;
+        if (gen_info.scope) |s| self.scope = s;
         defer {
             self.tree = saved_tree;
             self.safe_mode = saved_safe_mode;
+            self.scope = saved_scope;
         }
 
         // Get the fn_decl AST node
@@ -3554,6 +3592,7 @@ pub const Checker = struct {
             .generic_node = gen_info.node_idx,
             .type_args = try self.allocator.dupe(TypeIndex, resolved_args.items),
             .tree = gen_info.tree,
+            .scope = gen_info.scope,
         };
         try self.generic_instantiations.put(c.callee, inst);
         // Also store by concrete name (never overwritten, for nested generic calls)

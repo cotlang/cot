@@ -61,7 +61,7 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
     var global_scope = checker.Scope.init(allocator, null);
     var generic_ctx = checker.SharedGenericContext.init(allocator);
     const target = @import("../frontend/target.zig").Target.native();
-    var check = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx, target);
+    var check = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &global_scope, &generic_ctx, target);
     check.checkFile() catch {
         return .{ .arena = arena, .has_errors = true, .wasm_bytes = &.{} };
     };

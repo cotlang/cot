@@ -6506,14 +6506,18 @@ pub const Lowerer = struct {
         const saved_tree = self.tree;
         const saved_chk_tree = self.chk.tree;
         const saved_safe_mode = self.chk.safe_mode;
+        const saved_scope = self.chk.scope;
         self.tree = inst_info.tree;
         self.chk.tree = inst_info.tree;
         // Use the defining file's @safe mode, not the calling file's
         if (inst_info.tree.file) |file| self.chk.safe_mode = file.safe_mode;
+        // Use the defining file's scope so re-check resolves identifiers correctly
+        if (inst_info.scope) |s| self.chk.scope = s;
         defer {
             self.tree = saved_tree;
             self.chk.tree = saved_chk_tree;
             self.chk.safe_mode = saved_safe_mode;
+            self.chk.scope = saved_scope;
         }
 
         const fn_node = self.tree.getNode(inst_info.generic_node) orelse return;
@@ -8521,7 +8525,7 @@ test "Lowerer basic init" {
     var generic_ctx = checker.SharedGenericContext.init(allocator);
     defer generic_ctx.deinit(allocator);
     const target = target_mod.Target.native();
-    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &scope, &generic_ctx, target);
+    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &scope, &scope, &generic_ctx, target);
     defer chk.deinit();
     var lowerer = Lowerer.init(allocator, &tree, &type_reg, &err, &chk, target);
     defer lowerer.deinit();
@@ -8566,7 +8570,7 @@ fn testPipeline(backing: std.mem.Allocator, code: []const u8) !TestResult {
     var global_scope = checker.Scope.init(allocator, null);
     var generic_ctx = checker.SharedGenericContext.init(allocator);
     const target = target_mod.Target.native();
-    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &generic_ctx, target);
+    var chk = checker.Checker.init(allocator, &tree, &type_reg, &err, &global_scope, &global_scope, &generic_ctx, target);
 
     chk.checkFile() catch |e| {
         std.debug.print("Check error: {}\n", .{e});
