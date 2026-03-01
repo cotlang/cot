@@ -168,6 +168,44 @@ pub const Lowerer = struct {
         return self.qualifyName(type_name);
     }
 
+    /// Go LinkFuncName for methods: resolve a method's IR name via the TYPE's defining module.
+    /// Method synth names (e.g., "Mutex_lock") aren't scope symbols, so resolveCallName's
+    /// scope lookup fails and falls through to qualifyName with the WRONG module.
+    /// Instead, look up the TYPE name in scope to find which module defined it,
+    /// then qualify the method func_name with that module.
+    /// Go parallel: method `m` on type `T` in package `foo` → `foo.T.m`
+    fn resolveMethodName(self: *Lowerer, type_name: []const u8, func_name: []const u8) ![]const u8 {
+        if (self.module_name.len == 0) return func_name;
+        if (shouldSkipQualification(func_name)) return func_name;
+        // Strategy 1: Look up the TYPE symbol to find its defining module.
+        // Works for user-defined types (structs, enums) imported from other modules.
+        if (self.chk.scope.lookup(type_name)) |sym| {
+            if (sym.is_extern or sym.is_export) return func_name;
+            if (sym.source_tree) |st| {
+                if (self.tree_module_map) |map| {
+                    if (map.get(st)) |target_module| {
+                        return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ target_module, func_name });
+                    }
+                }
+            }
+        }
+        // Strategy 2: Look up the FUNCTION synth name in scope.
+        // Handles trait impls for primitive types (e.g., i64_hash from impl Hashable for i64)
+        // where the type name isn't a scope symbol but the method function is.
+        if (self.chk.scope.lookup(func_name)) |sym| {
+            if (sym.is_extern or sym.is_export) return func_name;
+            if (sym.source_tree) |st| {
+                if (self.tree_module_map) |map| {
+                    if (map.get(st)) |target_module| {
+                        return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ target_module, func_name });
+                    }
+                }
+            }
+        }
+        // Fallback: qualify with current module (locally-defined type)
+        return self.qualifyName(func_name);
+    }
+
     /// Functions that must keep bare names (entry points, compiler-generated, runtime).
     fn shouldSkipQualification(name: []const u8) bool {
         if (std.mem.eql(u8, name, "main")) return true;
@@ -1857,7 +1895,7 @@ pub const Lowerer = struct {
             const qualified_deinit = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
                 method_info.func_name // generic instance: keep bare
             else
-                try self.resolveCallName(method_info.func_name);
+                try self.resolveMethodName(struct_name, method_info.func_name);
             const cleanup = arc.Cleanup.initScopeDestroy(local_idx, type_idx, qualified_deinit);
             _ = try self.cleanup_stack.push(cleanup);
         } else {
@@ -5684,7 +5722,7 @@ pub const Lowerer = struct {
                 const init_link_name = if (self.chk.generics.generic_inst_by_name.contains(init_method.func_name))
                     init_method.func_name
                 else
-                    try self.resolveCallName(init_method.func_name);
+                    try self.resolveMethodName(type_name, init_method.func_name);
                 _ = try fb.emitCall(init_link_name, init_args.items, false, TypeRegistry.VOID, ne.span);
             }
         }
@@ -6664,7 +6702,7 @@ pub const Lowerer = struct {
                 };
                 if (type_name) |name| {
                     if (self.chk.lookupMethod(name, fa.field)) |method_info| {
-                        return try self.lowerMethodCall(call, fa, method_info);
+                        return try self.lowerMethodCall(call, fa, method_info, name);
                     }
                 }
 
@@ -7226,7 +7264,7 @@ pub const Lowerer = struct {
         try self.builder.endFunc();
     }
 
-    fn lowerMethodCall(self: *Lowerer, call: ast.Call, fa: ast.FieldAccess, method_info: types.MethodInfo) Error!ir.NodeIndex {
+    fn lowerMethodCall(self: *Lowerer, call: ast.Call, fa: ast.FieldAccess, method_info: types.MethodInfo, receiver_type_name: []const u8) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
 
         // Queue generic impl method for deferred lowering (like ensureGenericFnQueued for regular generics)
@@ -7410,7 +7448,7 @@ pub const Lowerer = struct {
         const method_link_name = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
             method_info.func_name // generic instance: keep bare (TypeIndex makes it unique)
         else
-            try self.resolveCallName(method_info.func_name);
+            try self.resolveMethodName(receiver_type_name, method_info.func_name);
         // SRET for method calls returning large types
         if (self.needsSret(return_type)) {
             const ret_size = self.type_reg.sizeOf(return_type);

@@ -10,6 +10,20 @@ impl Tracker {
     }
 }
 
+struct Counter {
+    value: i64
+}
+
+impl Counter {
+    fn increment(self: *Counter) {
+        self.value += 1
+    }
+
+    fn get(self: *Counter) i64 {
+        return self.value
+    }
+}
+
 fn compute() i64 {
     return 100
 }

@@ -12,3 +12,10 @@ test "cross-module new calls correct destructor" {
     }
     @assertEq(getDeinitMarker(), 42)
 }
+
+test "cross-module method calls resolve correctly" {
+    var c = Counter { .value = 10 }
+    c.increment()
+    c.increment()
+    @assertEq(c.get(), 12)
+}

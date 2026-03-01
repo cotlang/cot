@@ -1556,8 +1556,12 @@ const SsaToClifTranslator = struct {
         }
 
         const sig_ref = try self.builder.importSignature(sig);
-        // Look up the target function's index in the object file
-        const func_idx = self.func_index_map.get(name) orelse 0;
+        // Look up the target function's index in the object file.
+        // Fatal on miss: silent fallback to index 0 causes wrong-function calls (DYLIB_STARTUP_CRASH_BUG).
+        const func_idx = self.func_index_map.get(name) orelse {
+            std.debug.print("FATAL: func_index_map miss for '{s}' — no such function in IR\n", .{name});
+            return error.FunctionNotFound;
+        };
         const func_ref = try self.builder.importFunction(.{
             .name = .{ .user = .{ .namespace = 0, .index = func_idx } },
             .signature = sig_ref,
