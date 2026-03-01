@@ -7,17 +7,17 @@
 //! Data structures (heap-allocated):
 //!
 //!   Scheduler (global singleton, 88 bytes):
-//!     offset 0:   initialized  (i64) — 0 or 1
+//!     offset 0:   (reserved)   (i64)
 //!     offset 8:   num_workers  (i64)
 //!     offset 16:  workers_ptr  (i64) — pointer to array of thread handles
 //!     offset 24:  queue_head   (i64) — linked list head (Task*)
 //!     offset 32:  queue_tail   (i64) — linked list tail (Task*)
-//!     offset 40:  queue_size   (i64)
-//!     offset 48:  queue_mutex  (i64) — mutex ptr
+//!     offset 40:  (reserved)   (i64)
+//!     offset 48:  queue_mutex  (i64) — mutex ptr (also used for condvar wait)
 //!     offset 56:  active_tasks (i64) — atomic outstanding task count
 //!     offset 64:  shutdown     (i64) — atomic shutdown flag
-//!     offset 72:  idle_mutex   (i64) — mutex ptr for idle waiting
-//!     offset 80:  idle_cond    (i64) — condition var ptr
+//!     offset 72:  (reserved)   (i64)
+//!     offset 80:  idle_cond    (i64) — condition var ptr (paired with queue_mutex)
 //!
 //!   Task (24 bytes, heap-allocated per spawn):
 //!     offset 0:   fn_ptr   (i64) — function pointer to spawn body
@@ -44,16 +44,16 @@ const GlobalValueData = @import("../../ir/clif/globalvalue.zig").GlobalValueData
 const gv_ExternalName = @import("../../ir/clif/globalvalue.zig").ExternalName;
 
 // Scheduler struct offsets
-const SCHED_INITIALIZED: i32 = 0;
+const SCHED_INITIALIZED: i32 = 0; // legacy — set but not checked (CAS on BSS handles init)
 const SCHED_NUM_WORKERS: i32 = 8;
 const SCHED_WORKERS_PTR: i32 = 16;
 const SCHED_QUEUE_HEAD: i32 = 24;
 const SCHED_QUEUE_TAIL: i32 = 32;
-const SCHED_QUEUE_SIZE: i32 = 40;
+// offset 40: reserved (formerly queue_size)
 const SCHED_QUEUE_MUTEX: i32 = 48;
 const SCHED_ACTIVE_TASKS: i32 = 56;
 const SCHED_SHUTDOWN: i32 = 64;
-const SCHED_IDLE_MUTEX: i32 = 72;
+// offset 72: reserved (formerly idle_mutex — condvar now uses queue_mutex)
 const SCHED_IDLE_COND: i32 = 80;
 const SCHED_SIZE: i64 = 88;
 
@@ -63,8 +63,12 @@ const TASK_ENV_PTR: i32 = 8;
 const TASK_NEXT: i32 = 16;
 const TASK_SIZE: i64 = 24;
 
-// macOS sysconf constant
-const SC_NPROCESSORS_ONLN: i64 = 58;
+// sysconf constant — platform-dependent
+const SC_NPROCESSORS_ONLN: i64 = switch (@import("builtin").os.tag) {
+    .macos => 58,
+    .linux => 84,
+    else => 84, // Default to Linux value for other Unix-like systems
+};
 
 /// Generate all scheduler runtime functions as compiled native code.
 /// sched_symbol_idx: external name index for the _cot_sched_ptr BSS symbol.
@@ -176,19 +180,37 @@ fn generateSchedSpawn(
     const block_do_init = try builder.createBlock();
     const block_post_init = try builder.createBlock();
 
-    // --- Entry: load global scheduler ptr, check initialized ---
+    const block_spin_wait = try builder.createBlock();
+
+    // --- Entry: CAS-based lazy init (thread-safe) ---
+    // Atomically try to swap _cot_sched_ptr from 0 → -1 (sentinel).
+    // If CAS returns 0: we won the race, call sched_init, store real pointer.
+    // If CAS returns -1: another thread is initializing, spin until ready.
+    // If CAS returns other: already initialized, proceed.
     builder.switchToBlock(block_entry);
     try builder.appendBlockParamsForFunctionParams(block_entry);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
-        const sched_ptr = try loadSchedPtr(&clif_func, &builder, sched_symbol_idx);
+        // Get address of _cot_sched_ptr for CAS
+        const gv = try clif_func.createGlobalValue(GlobalValueData{
+            .symbol = .{
+                .name = gv_ExternalName.initUser(0, sched_symbol_idx),
+                .offset = 0,
+                .colocated = true,
+                .tls = false,
+            },
+        });
+        const sched_global_addr = try ins.globalValue(clif.Type.I64, gv);
         const v_zero = try ins.iconst(clif.Type.I64, 0);
-        const needs_init = try ins.icmp(.eq, sched_ptr, v_zero);
-        _ = try ins.brif(needs_init, block_do_init, &.{}, block_post_init, &[_]clif.Value{sched_ptr});
+        const v_sentinel = try ins.iconst(clif.Type.I64, -1);
+        // CAS: try to swap 0 → -1 (returns old value)
+        const old_val = try ins.atomicCas(clif.Type.I64, sched_global_addr, v_zero, v_sentinel);
+        const was_null = try ins.icmp(.eq, old_val, v_zero);
+        _ = try ins.brif(was_null, block_do_init, &.{}, block_spin_wait, &[_]clif.Value{old_val});
     }
 
-    // --- Call sched_init, reload pointer ---
+    // --- We won the init race: call sched_init, store real pointer ---
     builder.switchToBlock(block_do_init);
     try builder.ensureInsertedBlock();
     {
@@ -202,9 +224,37 @@ fn generateSchedSpawn(
             .colocated = true,
         });
         _ = try ins.call(init_ref, &[_]clif.Value{});
-        // Reload sched_ptr after init
+        // Reload sched_ptr after init (sched_init stores the real pointer)
         const sched_ptr = try loadSchedPtr(&clif_func, &builder, sched_symbol_idx);
         _ = try ins.jump(block_post_init, &[_]clif.Value{sched_ptr});
+    }
+
+    // --- Spin wait: another thread is initializing (CAS returned -1) or already done ---
+    _ = try builder.appendBlockParam(block_spin_wait, clif.Type.I64); // old CAS result
+    builder.switchToBlock(block_spin_wait);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const old_val = builder.blockParams(block_spin_wait)[0];
+        const v_sentinel = try ins.iconst(clif.Type.I64, -1);
+        const is_sentinel = try ins.icmp(.eq, old_val, v_sentinel);
+        // If sentinel (another thread initializing): spin-load until real pointer appears
+        // If valid pointer: proceed directly
+        const block_spin_loop = try builder.createBlock();
+        _ = try ins.brif(is_sentinel, block_spin_loop, &.{}, block_post_init, &[_]clif.Value{old_val});
+
+        // Spin loop: reload _cot_sched_ptr until non-sentinel
+        builder.switchToBlock(block_spin_loop);
+        try builder.ensureInsertedBlock();
+        {
+            const spin_ins = builder.ins();
+            const v_usleep_arg = try spin_ins.iconst(clif.Type.I64, 10);
+            _ = try callLibc1(allocator, &builder, func_index_map, "usleep", v_usleep_arg);
+            const sched_ptr = try loadSchedPtr(&clif_func, &builder, sched_symbol_idx);
+            const v_sentinel2 = try spin_ins.iconst(clif.Type.I64, -1);
+            const still_sentinel = try spin_ins.icmp(.eq, sched_ptr, v_sentinel2);
+            _ = try spin_ins.brif(still_sentinel, block_spin_loop, &.{}, block_post_init, &[_]clif.Value{sched_ptr});
+        }
     }
 
     // --- Post-init: allocate task, push to queue, signal ---
@@ -259,17 +309,14 @@ fn generateSchedSpawn(
         _ = try ins.store(clif.MemFlags.DEFAULT, task_ptr, store_addr, 0);
         // Update tail = task
         _ = try ins.store(clif.MemFlags.DEFAULT, task_ptr, sched_ptr, SCHED_QUEUE_TAIL);
-        // Increment size
-        const old_size = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_QUEUE_SIZE);
-        const new_size = try ins.iadd(old_size, v_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_size, sched_ptr, SCHED_QUEUE_SIZE);
+
+        // Signal one idle worker BEFORE unlocking (avoids lost-wakeup race).
+        // POSIX: signal under mutex ensures worker in cond_wait sees the new task.
+        const idle_cond = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_IDLE_COND);
+        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_cond_signal", idle_cond);
 
         // Unlock queue mutex
         _ = try callLibc1(allocator, &builder, func_index_map, "pthread_mutex_unlock", queue_mutex);
-
-        // Signal one idle worker
-        const idle_cond = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_IDLE_COND);
-        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_cond_signal", idle_cond);
 
         _ = try ins.return_(&[_]clif.Value{});
     }
@@ -319,7 +366,14 @@ fn generateSchedInit(
         });
         const v_sc = try ins.iconst(clif.Type.I64, SC_NPROCESSORS_ONLN);
         const cpu_result = try ins.call(sysconf_ref, &[_]clif.Value{v_sc});
-        const num_cpus = cpu_result.results[0];
+        const raw_cpus = cpu_result.results[0];
+
+        // num_workers = max(1, num_cpus - 1) — reserve one core for the main thread
+        // Reference: Rayon defaults to num_cpus - 1 (main thread participates)
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const cpus_minus_one = try ins.isub(raw_cpus, v_one);
+        const need_clamp = try ins.icmp(.slt, cpus_minus_one, v_one);
+        const num_cpus = try ins.select(clif.Type.I64, need_clamp, v_one, cpus_minus_one);
 
         // malloc(SCHED_SIZE)
         const malloc_idx = func_index_map.get("malloc") orelse 0;
@@ -350,10 +404,7 @@ fn generateSchedInit(
         const queue_mutex = try callRuntimeNoArgs(allocator, &builder, func_index_map, "mutex_init");
         _ = try ins.store(clif.MemFlags.DEFAULT, queue_mutex, sched_ptr, SCHED_QUEUE_MUTEX);
 
-        // Create idle mutex and condvar
-        const idle_mutex = try callRuntimeNoArgs(allocator, &builder, func_index_map, "mutex_init");
-        _ = try ins.store(clif.MemFlags.DEFAULT, idle_mutex, sched_ptr, SCHED_IDLE_MUTEX);
-
+        // Create condvar for idle worker signaling (uses queue_mutex, not a separate idle_mutex)
         const idle_cond = try callRuntimeNoArgs(allocator, &builder, func_index_map, "cond_init");
         _ = try ins.store(clif.MemFlags.DEFAULT, idle_cond, sched_ptr, SCHED_IDLE_COND);
 
@@ -376,8 +427,7 @@ fn generateSchedInit(
         });
         _ = try ins.call(ws_ref, &[_]clif.Value{ sched_ptr, num_cpus });
 
-        // Set initialized = 1
-        const v_one = try ins.iconst(clif.Type.I64, 1);
+        // Set initialized = 1 (reuse v_one from above)
         _ = try ins.store(clif.MemFlags.DEFAULT, v_one, sched_ptr, SCHED_INITIALIZED);
 
         // Register sched_shutdown as atexit handler so it runs at process exit
@@ -638,29 +688,54 @@ fn generateWorkerLoop(
         const v_neg_one = try ins.iconst(clif.Type.I64, -1);
         _ = try ins.atomicRmwAdd(clif.Type.I64, active_addr, v_neg_one);
 
-        // Signal condvar (in case shutdown is waiting)
-        const idle_cond = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_IDLE_COND);
-        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_cond_broadcast", idle_cond);
-
         _ = try ins.jump(block_loop, &.{});
     }
 
-    // --- No task: unlock, sleep briefly, retry ---
+    // --- No task: wait on condvar (releases queue_mutex atomically) ---
+    // POSIX producer-consumer: cond_wait(idle_cond, queue_mutex) atomically releases
+    // the mutex and blocks. When signaled, it re-acquires the mutex before returning.
+    // Reference: Go stopm/notesleep pattern, standard POSIX condvar usage.
     _ = try builder.appendBlockParam(block_no_task, clif.Type.I64); // queue_mutex
     builder.switchToBlock(block_no_task);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
+        const sched_ptr = builder.blockParams(block_entry)[0];
         const queue_mutex = builder.blockParams(block_no_task)[0];
 
-        // Unlock queue mutex
-        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_mutex_unlock", queue_mutex);
+        // Check shutdown before blocking (avoid waiting after shutdown signal)
+        const v_shutdown_off = try ins.iconst(clif.Type.I64, @as(i64, SCHED_SHUTDOWN));
+        const shutdown_addr = try ins.iadd(sched_ptr, v_shutdown_off);
+        const shutdown = try ins.atomicLoad(clif.Type.I64, shutdown_addr);
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        const is_shutdown = try ins.icmp(.ne, shutdown, v_zero);
 
-        // Brief sleep to avoid busy-spinning (100 microseconds)
-        const v_sleep = try ins.iconst(clif.Type.I64, 100);
-        _ = try callLibc1(allocator, &builder, func_index_map, "usleep", v_sleep);
+        const block_do_wait = try builder.createBlock();
+        const block_after_wait = try builder.createBlock();
+        _ = try ins.brif(is_shutdown, block_after_wait, &[_]clif.Value{queue_mutex}, block_do_wait, &[_]clif.Value{queue_mutex});
 
-        _ = try ins.jump(block_loop, &.{});
+        // Block: do the condvar wait
+        _ = try builder.appendBlockParam(block_do_wait, clif.Type.I64); // queue_mutex
+        builder.switchToBlock(block_do_wait);
+        try builder.ensureInsertedBlock();
+        {
+            const wait_ins = builder.ins();
+            const qm = builder.blockParams(block_do_wait)[0];
+            const idle_cond = try wait_ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_IDLE_COND);
+            _ = try callLibc2(allocator, &builder, func_index_map, "pthread_cond_wait", idle_cond, qm);
+            _ = try wait_ins.jump(block_after_wait, &[_]clif.Value{qm});
+        }
+
+        // After wait (or skip): unlock mutex and re-enter main loop
+        _ = try builder.appendBlockParam(block_after_wait, clif.Type.I64); // queue_mutex
+        builder.switchToBlock(block_after_wait);
+        try builder.ensureInsertedBlock();
+        {
+            const after_ins = builder.ins();
+            const qm = builder.blockParams(block_after_wait)[0];
+            _ = try callLibc1(allocator, &builder, func_index_map, "pthread_mutex_unlock", qm);
+            _ = try after_ins.jump(block_loop, &.{});
+        }
     }
 
     // --- Exit: return 0 ---
@@ -716,7 +791,8 @@ fn generateSchedShutdown(
     try builder.ensureInsertedBlock();
     _ = try builder.ins().return_(&[_]clif.Value{});
 
-    // --- Wait loop: set shutdown, spin until active_tasks == 0 ---
+    // --- Shutdown: set flag, broadcast to wake idle workers, wait for tasks ---
+    // Reference: Rayon Registry::terminate pattern.
     _ = try builder.appendBlockParam(block_wait_loop, clif.Type.I64); // sched_ptr
     builder.switchToBlock(block_wait_loop);
     try builder.ensureInsertedBlock();
@@ -730,17 +806,34 @@ fn generateSchedShutdown(
         const v_one = try ins.iconst(clif.Type.I64, 1);
         _ = try ins.atomicStore(v_one, shutdown_addr);
 
-        // Brief sleep to let workers notice the shutdown flag
-        const v_sleep = try ins.iconst(clif.Type.I64, 1000);
-        _ = try callLibc1(allocator, &builder, func_index_map, "usleep", v_sleep);
+        // Broadcast on idle_cond to wake all parked workers (they'll see shutdown flag).
+        // Lock queue_mutex first — workers cond_wait on (idle_cond, queue_mutex).
+        const queue_mutex = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_QUEUE_MUTEX);
+        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_mutex_lock", queue_mutex);
+        const idle_cond = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_IDLE_COND);
+        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_cond_broadcast", idle_cond);
+        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_mutex_unlock", queue_mutex);
 
-        // Check active_tasks
+        // Check active_tasks — if 0, proceed to join
         const v_active_off = try ins.iconst(clif.Type.I64, @as(i64, SCHED_ACTIVE_TASKS));
         const active_addr = try ins.iadd(sched_ptr, v_active_off);
         const active = try ins.atomicLoad(clif.Type.I64, active_addr);
         const v_zero = try ins.iconst(clif.Type.I64, 0);
         const all_done = try ins.icmp(.eq, active, v_zero);
-        _ = try ins.brif(all_done, block_join, &[_]clif.Value{sched_ptr}, block_wait_loop, &[_]clif.Value{sched_ptr});
+        // If tasks still running, brief sleep then re-broadcast (tasks may complete and park)
+        const block_sleep = try builder.createBlock();
+        _ = try ins.brif(all_done, block_join, &[_]clif.Value{sched_ptr}, block_sleep, &[_]clif.Value{sched_ptr});
+
+        _ = try builder.appendBlockParam(block_sleep, clif.Type.I64);
+        builder.switchToBlock(block_sleep);
+        try builder.ensureInsertedBlock();
+        {
+            const sleep_ins = builder.ins();
+            const v_sleep = try sleep_ins.iconst(clif.Type.I64, 1000);
+            _ = try callLibc1(allocator, &builder, func_index_map, "usleep", v_sleep);
+            const sp = builder.blockParams(block_sleep)[0];
+            _ = try sleep_ins.jump(block_wait_loop, &[_]clif.Value{sp});
+        }
     }
 
     // --- Join all workers ---
@@ -762,6 +855,21 @@ fn generateSchedShutdown(
             .colocated = true,
         });
         _ = try ins.call(join_ref, &[_]clif.Value{sched_ptr});
+
+        // Destroy condvar and mutex
+        const idle_cond = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_IDLE_COND);
+        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_cond_destroy", idle_cond);
+        const queue_mutex = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_QUEUE_MUTEX);
+        _ = try callLibc1(allocator, &builder, func_index_map, "pthread_mutex_destroy", queue_mutex);
+
+        // Free workers array and scheduler struct
+        const workers_ptr = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, sched_ptr, SCHED_WORKERS_PTR);
+        _ = try callLibc1(allocator, &builder, func_index_map, "free", workers_ptr);
+        _ = try callLibc1(allocator, &builder, func_index_map, "free", sched_ptr);
+
+        // Clear _cot_sched_ptr so re-initialization is safe
+        const v_zero = try ins.iconst(clif.Type.I64, 0);
+        try storeSchedPtr(&clif_func, &builder, sched_symbol_idx, v_zero);
 
         _ = try ins.return_(&[_]clif.Value{});
     }

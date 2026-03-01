@@ -337,7 +337,11 @@ const TokenCollector = struct {
             },
             .try_expr => |t| self.walkNode(t.operand),
             .await_expr => |a| self.walkNode(a.operand),
-            .spawn_expr => |s| self.walkNode(s.body),
+            .spawn_expr => |s| {
+                // Emit "spawn" keyword token (contextual keyword — scanner produces .ident)
+                self.emitName(s.span, "spawn", .keyword, 0);
+                self.walkNode(s.body);
+            },
             .string_interp => |s| {
                 for (s.segments) |seg| switch (seg) {
                     .expr => |e| self.walkNode(e),

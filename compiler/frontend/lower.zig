@@ -5787,14 +5787,16 @@ pub const Lowerer = struct {
         self.spawn_counter += 1;
         const spawn_name = try self.qualifyName(spawn_bare);
 
-        // Save parent function builder state
+        // Save parent function builder state (including cleanup stack)
         const saved_builder_func = self.builder.current_func;
+        const saved_current_func = self.current_func;
+        const saved_cleanup_items = self.cleanup_stack.items;
+        self.cleanup_stack.items = .{};
 
         // Create the spawn body function: (env_ptr: i64) -> void
         self.builder.startFunc(spawn_name, TypeRegistry.VOID, TypeRegistry.VOID, se.span);
         if (self.builder.func()) |spawn_fb| {
             self.current_func = spawn_fb;
-            self.cleanup_stack.clear();
 
             // Add env_ptr parameter
             const env_param_idx = try spawn_fb.addParam("__env_ptr", TypeRegistry.I64, 8);
@@ -5819,13 +5821,14 @@ pub const Lowerer = struct {
                     _ = try spawn_fb.emitRet(null, se.span);
                 }
             }
-
-            self.cleanup_stack.clear();
         }
         try self.builder.endFunc();
-        // Restore parent function builder
+
+        // Restore parent function builder state
+        self.cleanup_stack.items.deinit(self.cleanup_stack.allocator);
+        self.cleanup_stack.items = saved_cleanup_items;
         self.builder.current_func = saved_builder_func;
-        self.current_func = if (self.builder.current_func) |*bfb| bfb else null;
+        self.current_func = saved_current_func;
 
         // In parent function: allocate env struct and fill captures, then call sched_spawn
         const num_captures = captures.items.len;
@@ -6051,7 +6054,42 @@ pub const Lowerer = struct {
                 .new_expr => |ne| {
                     for (ne.fields) |f| try self.detectCaptures(f.value, parent_fb, captures);
                 },
-                else => {},
+                .slice_expr => |se| {
+                    try self.detectCaptures(se.base, parent_fb, captures);
+                    if (se.start != null_node) try self.detectCaptures(se.start, parent_fb, captures);
+                    if (se.end != null_node) try self.detectCaptures(se.end, parent_fb, captures);
+                },
+                .array_literal => |al| {
+                    for (al.elements) |elem| try self.detectCaptures(elem, parent_fb, captures);
+                },
+                .string_interp => |si| {
+                    for (si.segments) |seg| switch (seg) {
+                        .expr => |e| try self.detectCaptures(e, parent_fb, captures),
+                        .text => {},
+                    };
+                },
+                .switch_expr => |se| {
+                    try self.detectCaptures(se.subject, parent_fb, captures);
+                    for (se.cases) |case| {
+                        for (case.patterns) |p| try self.detectCaptures(p, parent_fb, captures);
+                        if (case.guard != null_node) try self.detectCaptures(case.guard, parent_fb, captures);
+                        try self.detectCaptures(case.body, parent_fb, captures);
+                    }
+                    if (se.else_body != null_node) try self.detectCaptures(se.else_body, parent_fb, captures);
+                },
+                .try_expr => |te| try self.detectCaptures(te.operand, parent_fb, captures),
+                .await_expr => |ae| try self.detectCaptures(ae.operand, parent_fb, captures),
+                .spawn_expr => |se| try self.detectCaptures(se.body, parent_fb, captures),
+                .catch_expr => |ce| {
+                    try self.detectCaptures(ce.operand, parent_fb, captures);
+                    if (ce.fallback != null_node) try self.detectCaptures(ce.fallback, parent_fb, captures);
+                },
+                .tuple_literal => |tl| {
+                    for (tl.elements) |elem| try self.detectCaptures(elem, parent_fb, captures);
+                },
+                .deref => |d| try self.detectCaptures(d.operand, parent_fb, captures),
+                // No variable references possible:
+                .literal, .error_literal, .type_expr, .comptime_block, .zero_init, .bad_expr => {},
             },
             .stmt => |stmt| switch (stmt) {
                 .expr_stmt => |es| try self.detectCaptures(es.expr, parent_fb, captures),
@@ -6073,9 +6111,12 @@ pub const Lowerer = struct {
                 .while_stmt => |ws| {
                     try self.detectCaptures(ws.condition, parent_fb, captures);
                     try self.detectCaptures(ws.body, parent_fb, captures);
+                    if (ws.continue_expr != null_node) try self.detectCaptures(ws.continue_expr, parent_fb, captures);
                 },
                 .for_stmt => |fs| {
                     if (fs.iterable != null_node) try self.detectCaptures(fs.iterable, parent_fb, captures);
+                    if (fs.range_start != null_node) try self.detectCaptures(fs.range_start, parent_fb, captures);
+                    if (fs.range_end != null_node) try self.detectCaptures(fs.range_end, parent_fb, captures);
                     try self.detectCaptures(fs.body, parent_fb, captures);
                 },
                 .block_stmt => |bs| {
