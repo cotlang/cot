@@ -1599,6 +1599,7 @@ pub const Checker = struct {
             .string_interp => |si| self.checkStringInterp(si),
             .try_expr => |te| self.checkTryExpr(te),
             .await_expr => |ae| self.checkAwaitExpr(ae),
+            .spawn_expr => |se| self.checkSpawnExpr(se),
             .catch_expr => |ce| self.checkCatchExpr(ce),
             .error_literal => |el| self.checkErrorLiteral(el),
             .closure_expr => |ce| self.checkClosureExpr(ce),
@@ -2980,6 +2981,12 @@ pub const Checker = struct {
         // In sync context, it blocks until the future completes (like block_on).
         // No function coloring — any code can await a Future.
         return operand_info.future.result_type;
+    }
+
+    fn checkSpawnExpr(self: *Checker, se: ast.SpawnExpr) CheckError!TypeIndex {
+        // spawn { body } — dispatches body to thread pool, returns void (fire-and-forget)
+        _ = try self.checkExpr(se.body);
+        return TypeRegistry.VOID;
     }
 
     fn checkCatchExpr(self: *Checker, ce: ast.CatchExpr) CheckError!TypeIndex {

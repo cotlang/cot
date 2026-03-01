@@ -35,7 +35,7 @@ pub const Token = enum(u8) {
     kw_return, kw_break, kw_continue, kw_defer, kw_errdefer, kw_try, kw_catch, kw_orelse, kw_error,
     kw_true, kw_false, kw_null, kw_new, kw_undefined,
     kw_comptime,
-    kw_async, kw_await,
+    kw_async, kw_await, kw_spawn,
     kw_inline,
     kw_unreachable,
     kw_packed,
@@ -199,6 +199,7 @@ const token_strings = blk: {
     s[@intFromEnum(Token.kw_comptime)] = "comptime";
     s[@intFromEnum(Token.kw_async)] = "async";
     s[@intFromEnum(Token.kw_await)] = "await";
+    s[@intFromEnum(Token.kw_spawn)] = "spawn";
     s[@intFromEnum(Token.kw_inline)] = "inline";
     s[@intFromEnum(Token.kw_unreachable)] = "unreachable";
     s[@intFromEnum(Token.kw_packed)] = "packed";
@@ -240,6 +241,8 @@ pub const keywords = std.StaticStringMap(Token).initComptime(.{
     .{ "true", .kw_true }, .{ "false", .kw_false }, .{ "null", .kw_null }, .{ "new", .kw_new },
     .{ "undefined", .kw_undefined }, .{ "comptime", .kw_comptime },
     .{ "async", .kw_async }, .{ "await", .kw_await },
+    // Note: "spawn" is NOT a keyword — it's a contextual keyword handled in parser.
+    // This avoids breaking Thread.spawn and other uses of "spawn" as an identifier.
     .{ "inline", .kw_inline },
     .{ "unreachable", .kw_unreachable },
     .{ "packed", .kw_packed },

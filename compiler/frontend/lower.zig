@@ -46,6 +46,7 @@ pub const Lowerer = struct {
     bench_names: std.ArrayListUnmanaged([]const u8),
     bench_display_names: std.ArrayListUnmanaged([]const u8),
     closure_counter: u32 = 0,
+    spawn_counter: u32 = 0,
     lowered_generics: std.StringHashMap(void),
     type_substitution: ?std.StringHashMap(TypeIndex) = null,
     /// Compilation target — used for @targetOs(), @targetArch(), @target() comptime builtins
@@ -557,7 +558,6 @@ pub const Lowerer = struct {
                 _ = try fb.emitStoreLocal(fail_count, new_fail, span);
 
                 if (self.fail_fast) {
-                    // --fail-fast: print summary and exit immediately after first failure
                     const ff_pass = try fb.emitLoadLocal(pass_count, TypeRegistry.I64, span);
                     const ff_fail = try fb.emitLoadLocal(fail_count, TypeRegistry.I64, span);
                     var ff_summary_args = [_]ir.NodeIndex{ ff_pass, ff_fail };
@@ -4032,6 +4032,7 @@ pub const Lowerer = struct {
             .slice_expr => |se| return try self.lowerSliceExpr(se),
             .try_expr => |te| return try self.lowerTryExpr(te),
             .await_expr => |ae| return try self.lowerAwaitExpr(ae),
+            .spawn_expr => |se| return try self.lowerSpawnExpr(se),
             .catch_expr => |ce| return try self.lowerCatchExpr(ce),
             .error_literal => |el| return try self.lowerErrorLiteral(el),
             .builtin_call => |bc| return try self.lowerBuiltinCall(bc),
@@ -5768,6 +5769,114 @@ pub const Lowerer = struct {
         return try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, span);
     }
 
+    /// Lower spawn { body } — detect captures, create body function, call sched_spawn.
+    /// Closely follows lowerClosureExpr but:
+    ///   - Body function has signature (env_ptr: i64) -> void
+    ///   - Captures loaded from env_ptr parameter (NOT CTXT global)
+    ///   - Parent emits sched_spawn(fn_ptr, env_ptr) instead of returning closure struct
+    fn lowerSpawnExpr(self: *Lowerer, se: ast.SpawnExpr) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        // Detect captured variables from parent scope
+        var captures = std.ArrayListUnmanaged(CaptureInfo){};
+        defer captures.deinit(self.allocator);
+        try self.detectCaptures(se.body, fb, &captures);
+
+        // Generate unique name for spawn body function
+        const spawn_bare = try std.fmt.allocPrint(self.allocator, "__spawn_{d}", .{self.spawn_counter});
+        self.spawn_counter += 1;
+        const spawn_name = try self.qualifyName(spawn_bare);
+
+        // Save parent function builder state
+        const saved_builder_func = self.builder.current_func;
+
+        // Create the spawn body function: (env_ptr: i64) -> void
+        self.builder.startFunc(spawn_name, TypeRegistry.VOID, TypeRegistry.VOID, se.span);
+        if (self.builder.func()) |spawn_fb| {
+            self.current_func = spawn_fb;
+            self.cleanup_stack.clear();
+
+            // Add env_ptr parameter
+            const env_param_idx = try spawn_fb.addParam("__env_ptr", TypeRegistry.I64, 8);
+
+            // Load captures from env_ptr
+            if (captures.items.len > 0) {
+                const env_ptr = try spawn_fb.emitLoadLocal(env_param_idx, TypeRegistry.I64, se.span);
+                for (captures.items, 0..) |cap, i| {
+                    const offset: i64 = @intCast(i * 8);
+                    const cap_addr = try spawn_fb.emitAddrOffset(env_ptr, offset, TypeRegistry.I64, se.span);
+                    const cap_val = try spawn_fb.emitPtrLoadValue(cap_addr, cap.type_idx, se.span);
+                    const local_idx = try spawn_fb.addLocalWithSize(cap.name, cap.type_idx, true, 8);
+                    _ = try spawn_fb.emitStoreLocal(local_idx, cap_val, se.span);
+                }
+            }
+
+            // Lower body block
+            if (se.body != null_node) {
+                _ = try self.lowerBlockNode(se.body);
+                if (spawn_fb.needsTerminator()) {
+                    try self.emitCleanups(0);
+                    _ = try spawn_fb.emitRet(null, se.span);
+                }
+            }
+
+            self.cleanup_stack.clear();
+        }
+        try self.builder.endFunc();
+        // Restore parent function builder
+        self.builder.current_func = saved_builder_func;
+        self.current_func = if (self.builder.current_func) |*bfb| bfb else null;
+
+        // In parent function: allocate env struct and fill captures, then call sched_spawn
+        const num_captures = captures.items.len;
+
+        if (num_captures > 0) {
+            // Allocate env struct: alloc(0, num_captures * 8)
+            const metadata_node = try fb.emitConstInt(0, TypeRegistry.I64, se.span);
+            const size_node = try fb.emitConstInt(@intCast(num_captures * 8), TypeRegistry.I64, se.span);
+            var alloc_args = [_]ir.NodeIndex{ metadata_node, size_node };
+            const alloc_result = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, se.span);
+
+            // Store in temp
+            const temp_name = try std.fmt.allocPrint(self.allocator, "__spawn_env_{d}", .{self.temp_counter});
+            self.temp_counter += 1;
+            const temp_idx = try fb.addLocalWithSize(temp_name, TypeRegistry.I64, true, 8);
+            _ = try fb.emitStoreLocal(temp_idx, alloc_result, se.span);
+
+            // Fill captures
+            for (captures.items, 0..) |cap, i| {
+                const offset: i64 = @intCast(i * 8);
+                const reload_ptr = try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, se.span);
+                const cap_addr = try fb.emitAddrOffset(reload_ptr, offset, TypeRegistry.I64, se.span);
+                const cap_val = try fb.emitLoadLocal(cap.local_idx, cap.type_idx, se.span);
+                _ = try fb.emitPtrStoreValue(cap_addr, cap_val, se.span);
+            }
+
+            // Build func type for fn_ptr: (i64) -> void
+            const spawn_func_type = try self.type_reg.add(.{ .func = .{
+                .params = try self.allocator.dupe(types.FuncParam, &[_]types.FuncParam{.{ .name = "__env_ptr", .type_idx = TypeRegistry.I64 }}),
+                .return_type = TypeRegistry.VOID,
+            } });
+            const fn_ptr = try fb.emitFuncAddr(spawn_name, spawn_func_type, se.span);
+            const env_ptr = try fb.emitLoadLocal(temp_idx, TypeRegistry.I64, se.span);
+            var spawn_args = [_]ir.NodeIndex{ fn_ptr, env_ptr };
+            _ = try fb.emitCall("sched_spawn", &spawn_args, false, TypeRegistry.VOID, se.span);
+        } else {
+            // No captures: env_ptr = 0 (null)
+            const spawn_func_type = try self.type_reg.add(.{ .func = .{
+                .params = try self.allocator.dupe(types.FuncParam, &[_]types.FuncParam{.{ .name = "__env_ptr", .type_idx = TypeRegistry.I64 }}),
+                .return_type = TypeRegistry.VOID,
+            } });
+            const fn_ptr = try fb.emitFuncAddr(spawn_name, spawn_func_type, se.span);
+            const env_null = try fb.emitConstInt(0, TypeRegistry.I64, se.span);
+            var spawn_args = [_]ir.NodeIndex{ fn_ptr, env_null };
+            _ = try fb.emitCall("sched_spawn", &spawn_args, false, TypeRegistry.VOID, se.span);
+        }
+
+        // spawn is fire-and-forget, returns void
+        return ir.null_node;
+    }
+
     /// Lower a closure expression: detect captures, create body function, allocate struct.
     fn lowerClosureExpr(self: *Lowerer, ce: ast.ClosureExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
@@ -5926,6 +6035,21 @@ pub const Lowerer = struct {
                 .block_expr => |b| {
                     for (b.stmts) |s| try self.detectCaptures(s, parent_fb, captures);
                     if (b.expr != null_node) try self.detectCaptures(b.expr, parent_fb, captures);
+                },
+                .builtin_call => |bc| {
+                    for (bc.args) |arg| {
+                        if (arg != null_node) try self.detectCaptures(arg, parent_fb, captures);
+                    }
+                },
+                .addr_of => |ao| try self.detectCaptures(ao.operand, parent_fb, captures),
+                .closure_expr => |ce| {
+                    try self.detectCaptures(ce.body, parent_fb, captures);
+                },
+                .struct_init => |si| {
+                    for (si.fields) |f| try self.detectCaptures(f.value, parent_fb, captures);
+                },
+                .new_expr => |ne| {
+                    for (ne.fields) |f| try self.detectCaptures(f.value, parent_fb, captures);
                 },
                 else => {},
             },

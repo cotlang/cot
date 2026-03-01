@@ -1168,7 +1168,17 @@ pub const Parser = struct {
     fn parseOperand(self: *Parser) ParseError!?NodeIndex {
         const start = self.pos();
         switch (self.tok.tok) {
-            .ident => { const n = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .ident = .{ .name = n, .span = Span.init(start, self.pos()) } }); },
+            .ident => {
+                // Contextual keyword: spawn { ... }
+                if (std.mem.eql(u8, self.tok.text, "spawn") and self.peekToken().tok == .lbrace) {
+                    self.advance();
+                    const body = try self.parseBlockExpr() orelse return null;
+                    return try self.tree.addExpr(.{ .spawn_expr = .{ .body = body, .span = Span.init(start, self.pos()) } });
+                }
+                const n = self.tok.text;
+                self.advance();
+                return try self.tree.addExpr(.{ .ident = .{ .name = n, .span = Span.init(start, self.pos()) } });
+            },
             .int_lit => { const v = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .int, .value = v, .span = Span.init(start, self.pos()) } }); },
             .float_lit => { const v = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .float, .value = v, .span = Span.init(start, self.pos()) } }); },
             .string_lit => { const v = self.tok.text; self.advance(); return try self.tree.addExpr(.{ .literal = .{ .kind = .string, .value = v, .span = Span.init(start, self.pos()) } }); },

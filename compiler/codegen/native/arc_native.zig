@@ -505,7 +505,9 @@ fn generateRetain(
         _ = try ins.jump(block_do_increment, &[_]clif.Value{rc_addr});
     }
 
-    // Shared increment: load from rc_addr, add STRONG_RC_ONE, store back
+    // Shared increment: atomic add STRONG_RC_ONE to refcount
+    // Swift HeapObject.cpp:474-489 — swift_retain uses __atomic_fetch_add_n relaxed.
+    // ARM64 ldaddal is acquire+release, x64 lock xadd is seq_cst — both sufficient.
     _ = try builder.appendBlockParam(block_do_increment, clif.Type.I64); // rc_addr
     builder.switchToBlock(block_do_increment);
     try builder.ensureInsertedBlock();
@@ -513,10 +515,8 @@ fn generateRetain(
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
         const rc_addr = builder.blockParams(block_do_increment)[0];
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
         const v_strong_one = try ins.iconst(clif.Type.I64, STRONG_RC_ONE);
-        const new_rc = try ins.iadd(refcount, v_strong_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
+        _ = try ins.atomicRmwAdd(clif.Type.I64, rc_addr, v_strong_one);
         _ = try ins.return_(&[_]clif.Value{obj});
     }
 
@@ -581,7 +581,6 @@ fn generateRelease(
     const block_inline_path = try builder.createBlock();
     const block_side_table_path = try builder.createBlock();
     const block_decrement = try builder.createBlock();
-    const block_store_and_return = try builder.createBlock();
     const block_check_destructor = try builder.createBlock();
     const block_call_destructor = try builder.createBlock();
     const block_dealloc = try builder.createBlock();
@@ -676,41 +675,35 @@ fn generateRelease(
         _ = try ins.jump(block_decrement, &[_]clif.Value{rc_addr});
     }
 
-    // ---- Decrement: load from rc_addr, check StrongExtra ----
+    // ---- Decrement: atomic fetch-sub, check if was last strong ref ----
     // Swift doDecrementSlow pattern (RefCount.h:1040-1048)
+    // swift_release uses __atomic_fetch_sub_n release + acquire fence before dealloc.
+    // ARM64 ldaddal is acquire+release, x64 lock xadd is seq_cst — both cover the fence.
     _ = try builder.appendBlockParam(block_decrement, clif.Type.I64); // rc_addr
     builder.switchToBlock(block_decrement);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const rc_addr = builder.blockParams(block_decrement)[0];
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
 
-        // Extract StrongExtra from original: (rc >> 33) & 0x3FFFFFFF
+        // Atomic fetch-sub: old_rc = atomicRmwAdd(rc_addr, -STRONG_RC_ONE)
+        const v_neg_strong_one = try ins.iconst(clif.Type.I64, -STRONG_RC_ONE);
+        const old_rc = try ins.atomicRmwAdd(clif.Type.I64, rc_addr, v_neg_strong_one);
+
+        // Extract StrongExtra from OLD value: (old_rc >> 33) & 0x3FFFFFFF
         const v_shift = try ins.iconst(clif.Type.I64, @as(i64, STRONG_EXTRA_SHIFT));
-        const shifted = try ins.ushr(refcount, v_shift);
+        const shifted = try ins.ushr(old_rc, v_shift);
         const v_mask = try ins.iconst(clif.Type.I64, 0x3FFFFFFF);
         const strong_extra = try ins.band(shifted, v_mask);
 
-        // If StrongExtra was 0 → this was the last strong reference
+        // If StrongExtra was 0 in OLD → this was the last strong reference
+        // (old had exactly 1 logical strong ref, now decremented to 0)
         const v_zero = try ins.iconst(clif.Type.I64, 0);
         const was_last = try ins.icmp(.eq, strong_extra, v_zero);
-        _ = try ins.brif(was_last, block_check_destructor, &[_]clif.Value{rc_addr}, block_store_and_return, &[_]clif.Value{rc_addr});
+        _ = try ins.brif(was_last, block_check_destructor, &[_]clif.Value{rc_addr}, block_return, &.{});
     }
 
-    // ---- Store decremented rc and return (not last strong ref) ----
-    _ = try builder.appendBlockParam(block_store_and_return, clif.Type.I64); // rc_addr
-    builder.switchToBlock(block_store_and_return);
-    try builder.ensureInsertedBlock();
-    {
-        const ins = builder.ins();
-        const rc_addr = builder.blockParams(block_store_and_return)[0];
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
-        const v_strong_one = try ins.iconst(clif.Type.I64, STRONG_RC_ONE);
-        const new_rc = try ins.isub(refcount, v_strong_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
-        _ = try ins.return_(&[_]clif.Value{});
-    }
+    // block_store_and_return is no longer needed — atomic decrement already stored
 
     // ---- Check destructor: set IsDeiniting, check metadata ----
     // Destructor metadata is ALWAYS in the object header (never in side table).
@@ -1305,17 +1298,16 @@ fn generateUnownedRetain(
         _ = try ins.jump(block_do_increment, &[_]clif.Value{rc_addr});
     }
 
-    // Shared increment: load from rc_addr, add UNOWNED_RC_ONE, store back
+    // Shared increment: atomic add UNOWNED_RC_ONE to refcount
+    // Same atomic pattern as strong retain — thread-safe unowned ref increment.
     _ = try builder.appendBlockParam(block_do_increment, clif.Type.I64); // rc_addr
     builder.switchToBlock(block_do_increment);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const rc_addr = builder.blockParams(block_do_increment)[0];
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
         const v_unowned_one = try ins.iconst(clif.Type.I64, UNOWNED_RC_ONE);
-        const new_rc = try ins.iadd(refcount, v_unowned_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
+        _ = try ins.atomicRmwAdd(clif.Type.I64, rc_addr, v_unowned_one);
         _ = try ins.return_(&[_]clif.Value{});
     }
 
@@ -1439,7 +1431,8 @@ fn generateUnownedRelease(
         _ = try ins.jump(block_decrement, &[_]clif.Value{ rc_addr, st_ptr });
     }
 
-    // Decrement unowned: subtract, extract NEW count, check if zero
+    // Decrement unowned: atomic fetch-sub, check if was last unowned ref
+    // Same atomic pattern as strong release — thread-safe unowned ref decrement.
     _ = try builder.appendBlockParam(block_decrement, clif.Type.I64); // rc_addr
     _ = try builder.appendBlockParam(block_decrement, clif.Type.I64); // st_ptr (0 if inline)
     builder.switchToBlock(block_decrement);
@@ -1448,12 +1441,14 @@ fn generateUnownedRelease(
         const ins = builder.ins();
         const rc_addr = builder.blockParams(block_decrement)[0];
         const st_ptr = builder.blockParams(block_decrement)[1];
-        const refcount = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
 
-        // Subtract UNOWNED_RC_ONE
+        // Atomic fetch-sub: old_rc = atomicRmwAdd(rc_addr, -UNOWNED_RC_ONE)
+        const v_neg_unowned_one = try ins.iconst(clif.Type.I64, -UNOWNED_RC_ONE);
+        const old_rc = try ins.atomicRmwAdd(clif.Type.I64, rc_addr, v_neg_unowned_one);
+
+        // Compute new value to extract NEW UnownedRefCount
         const v_unowned_one = try ins.iconst(clif.Type.I64, UNOWNED_RC_ONE);
-        const new_rc = try ins.isub(refcount, v_unowned_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_rc, rc_addr, 0);
+        const new_rc = try ins.isub(old_rc, v_unowned_one);
 
         // Extract NEW UnownedRefCount: (new_rc >> 1) & 0x7FFFFFFF
         const v_one_shift = try ins.iconst(clif.Type.I64, 1);

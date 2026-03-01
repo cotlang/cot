@@ -871,6 +871,10 @@ pub const Formatter = struct {
                 self.write("await ") catch {};
                 self.printNode(e.operand);
             },
+            .spawn_expr => |e| {
+                self.write("spawn ") catch {};
+                self.printNode(e.body);
+            },
             .catch_expr => |e| {
                 self.printNode(e.operand);
                 self.write(" catch ") catch {};

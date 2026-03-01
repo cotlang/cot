@@ -27,6 +27,7 @@ const io_native = @import("codegen/native/io_native.zig");
 const print_native = @import("codegen/native/print_native.zig");
 const test_native_rt = @import("codegen/native/test_native.zig");
 const thread_native = @import("codegen/native/thread_native.zig");
+const scheduler_native = @import("codegen/native/scheduler_native.zig");
 const target_mod = @import("frontend/target.zig");
 const pipeline_debug = @import("pipeline_debug.zig");
 
@@ -1251,6 +1252,10 @@ pub const Driver = struct {
             "mutex_trylock", "mutex_destroy",
             "cond_init",     "cond_wait",      "cond_signal",
             "cond_broadcast", "cond_destroy",
+            // Scheduler runtime (scheduler_native.generate order)
+            "sched_spawn",   "sched_shutdown", "sched_get_num_workers",
+            "sched_init",    "sched_worker_spawn", "sched_worker_loop",
+            "sched_join_workers",
             // Test runtime (test_native.generate order)
             "__test_begin",  "__test_print_name", "__test_pass",
             "__test_fail",   "__test_summary",    "__test_store_fail_values",
@@ -1274,6 +1279,12 @@ pub const Driver = struct {
             "pthread_mutex_trylock", "pthread_mutex_destroy",
             "pthread_cond_init", "pthread_cond_wait", "pthread_cond_signal",
             "pthread_cond_broadcast", "pthread_cond_destroy",
+            // sysconf — used by scheduler to query CPU count
+            "sysconf",
+            // atexit — used by scheduler to register sched_shutdown
+            "atexit",
+            // usleep — used by scheduler for worker idle polling
+            "usleep",
         };
         const runtime_start_idx: u32 = @intCast(funcs.len);
         for (runtime_func_names, 0..) |name, i| {
@@ -1334,11 +1345,14 @@ pub const Driver = struct {
         const argv_symbol_idx: u32 = argc_symbol_idx + 1;
         const envp_symbol_idx: u32 = argv_symbol_idx + 1;
 
+        // Scheduler global symbol index — _cot_sched_ptr BSS data for scheduler singleton.
+        const sched_symbol_idx: u32 = envp_symbol_idx + 1;
+
         // Global variable symbol indices — each module-level var gets a data section entry.
         // Maps global name → external name index for globalValue references in ssa_to_clif.
         var global_symbol_map = std.StringHashMapUnmanaged(u32){};
         defer global_symbol_map.deinit(self.allocator);
-        const globals_base_idx: u32 = envp_symbol_idx + 1;
+        const globals_base_idx: u32 = sched_symbol_idx + 1;
         for (globals, 0..) |g, i| {
             try global_symbol_map.put(self.allocator, g.name, globals_base_idx + @as(u32, @intCast(i)));
         }
@@ -1463,6 +1477,14 @@ pub const Driver = struct {
                 try func_names.append(self.allocator, rf.name);
             }
 
+            // Scheduler runtime: sched_spawn, sched_shutdown, sched_get_num_workers, internals
+            var sched_funcs = try scheduler_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, sched_symbol_idx);
+            defer sched_funcs.deinit(self.allocator);
+            for (sched_funcs.items) |rf| {
+                try compiled_funcs.append(self.allocator, rf.compiled);
+                try func_names.append(self.allocator, rf.name);
+            }
+
             // Test runtime: __test_begin, __test_print_name, __test_pass, __test_fail, __test_summary
             if (self.test_mode) {
                 var test_funcs = try test_native_rt.generate(self.allocator, isa, &ctrl_plane, &func_index_map);
@@ -1490,6 +1512,7 @@ pub const Driver = struct {
             argc_symbol_idx,
             argv_symbol_idx,
             envp_symbol_idx,
+            sched_symbol_idx,
             &func_index_map,
             globals,
             globals_base_idx,
@@ -1512,6 +1535,7 @@ pub const Driver = struct {
         argc_symbol_idx: u32,
         argv_symbol_idx: u32,
         envp_symbol_idx: u32,
+        sched_symbol_idx: u32,
         func_index_map: *const std.StringHashMapUnmanaged(u32),
         globals: []const ir_mod.Global,
         globals_base_idx: u32,
@@ -1621,6 +1645,16 @@ pub const Driver = struct {
             }
         }
 
+        // Pass 3b3: Add _cot_sched_ptr global (8 bytes, zero-init).
+        // Scheduler singleton pointer — lazy-initialized by sched_init().
+        {
+            const sched_sym_name = "_cot_sched_ptr";
+            const sched_data_id = try module.declareData(sched_sym_name, .Local, true);
+            const sched_data = &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+            try module.defineData(sched_data_id, sched_data);
+            try module.declareExternalName(sched_symbol_idx, sched_sym_name);
+        }
+
         // Pass 3c: Add global variable data section entries.
         // Each module-level var gets an 8-byte zero-initialized data section entry.
         for (globals, 0..) |g, i| {
@@ -1657,6 +1691,8 @@ pub const Driver = struct {
                 if (idx == ctxt_symbol_idx) continue;
                 // Skip argc/argv/envp symbols (already registered in Pass 3b2)
                 if (idx == argc_symbol_idx or idx == argv_symbol_idx or idx == envp_symbol_idx) continue;
+                // Skip scheduler global symbol (already registered in Pass 3b3)
+                if (idx == sched_symbol_idx) continue;
                 // Skip global variable symbols (already registered in Pass 3c)
                 if (globals.len > 0 and idx >= globals_base_idx and idx < globals_base_idx + @as(u32, @intCast(globals.len))) continue;
 

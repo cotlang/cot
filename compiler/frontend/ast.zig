@@ -100,6 +100,7 @@ pub const Expr = union(enum) {
     type_expr: TypeExpr,
     try_expr: TryExpr,
     await_expr: AwaitExpr,
+    spawn_expr: SpawnExpr,
     catch_expr: CatchExpr,
     error_literal: ErrorLiteral,
     closure_expr: ClosureExpr,
@@ -388,6 +389,7 @@ pub const TypeKind = union(enum) {
 };
 pub const TryExpr = struct { operand: NodeIndex, span: Span };
 pub const AwaitExpr = struct { operand: NodeIndex, span: Span };
+pub const SpawnExpr = struct { body: NodeIndex, span: Span };
 pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, capture_is_ptr: bool = false, fallback: NodeIndex, span: Span };
 pub const ErrorLiteral = struct { error_name: []const u8, span: Span };
 pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, span: Span };
