@@ -2,7 +2,7 @@
 
 Cot's concurrency roadmap, building on the existing async/await foundation.
 
-**Status:** Phase 1 (async/await) complete. Phase 3 (OS-level primitives) **DONE** — see `threading-design.md`. Phase 2 (spawn + work-stealing) planned.
+**Status:** Phase 1 (async/await) complete. Phase 3 (OS-level primitives) **DONE** — see `threading-design.md`. Phase 2 (spawn + work-stealing) **DONE** (MVP — global queue, no per-worker local queues yet).
 
 ---
 
@@ -159,17 +159,22 @@ Operations:
 
 On Wasm target, channels work synchronously (single-threaded — send blocks until recv in same event loop tick, or errors). On native, they use OS mutexes and condition variables.
 
-### Atomic ARC
+### Atomic ARC — DONE (strong/unowned), TODO (weak)
 
-Current ARC (`compiler/codegen/arc.zig`) uses non-atomic refcount operations. For multi-threaded programs:
+Native ARC (`compiler/codegen/native/arc_native.zig`) now uses atomic refcount operations for strong and unowned references, matching Swift's `HeapObject.cpp` pattern:
 
-**Wasm target:** No change needed. Wasm is single-threaded (shared memory + atomics exist in Wasm threads proposal, but not yet in Cot's target).
+- `retain`: `atomicRmwAdd(&refcount, STRONG_RC_ONE)` — relaxed ordering (Swift pattern)
+- `release`: `atomicRmwAdd(&refcount, -STRONG_RC_ONE)` — ARM64 `ldaddal` (acquire-release), x64 `lock xadd` (seq-cst)
+- `unowned_retain` / `unowned_release`: same atomic pattern with `UNOWNED_RC_ONE`
 
-**Native target:** Replace refcount increment/decrement with atomic operations:
-- `retain`: `@atomicRmw(.Add, &header.refcount, 1, .monotonic)`
-- `release`: `@atomicRmw(.Sub, &header.refcount, 1, .release)` + acquire fence on free
+**Wasm target:** No change needed. Wasm is single-threaded.
 
-This matches Swift's ARC implementation. The Zig code in `arc.zig` already compiles to native — switching to atomics is a targeted change to the retain/release functions.
+**Known gap — weak references still non-atomic:**
+- `generateWeakRetain` (arc_native.zig ~line 1814): uses non-atomic load/iadd/store for weak refcount increment
+- `generateWeakRelease` (arc_native.zig ~line 1877): uses non-atomic load/isub/store for weak refcount decrement
+- `generateWeakFormReference` (arc_native.zig ~line 1651): non-atomic weak_rc increment on existing side table; non-atomic side table pointer install (Swift uses CAS via `allocateSideTable` in `RefCounts.h`)
+- **Risk**: Two threads forming/releasing weak references to the same object concurrently will corrupt the weak refcount. Currently safe because weak references are rare and not used in spawn contexts.
+- **Fix**: Same `atomicRmwAdd` pattern as strong/unowned. Side table install needs `atomicCas` to handle the race where two threads allocate side tables simultaneously.
 
 ### Wasm Considerations
 
@@ -181,14 +186,15 @@ Wasm doesn't have OS threads (yet). The Wasm threads proposal adds shared memory
 
 ### Deliverables
 
-- [ ] `spawn` keyword parsing and AST node
-- [ ] Closure-style environment capture for spawn blocks
-- [ ] `@spawn` runtime builtin (Wasm stub + native override)
+- [x] `spawn` keyword parsing and AST node (contextual keyword)
+- [x] Closure-style environment capture for spawn blocks (`lowerSpawnExpr` in lower.zig)
+- [x] `sched_spawn` runtime function (CLIF IR in `scheduler_native.zig`)
 - [ ] `Channel(T)` type with `new`, `send`, `recv`, `close`
 - [ ] `select` statement parsing and lowering
-- [ ] Work-stealing scheduler in `compiler/codegen/scheduler.zig`
-- [ ] Atomic ARC for native target
-- [ ] Tests: parallel computation, channel ping-pong, producer-consumer
+- [x] Scheduler runtime: global queue MVP (`scheduler_native.zig` — CAS init, condvar, atexit shutdown)
+- [ ] Work-stealing: per-worker local queues + steal-half (Go `runqsteal` pattern)
+- [x] Atomic ARC for native target (strong/unowned — weak refs still TODO)
+- [x] Tests: `test/e2e/spawn.cot` — 5 tests (basic, capture, parallel 100 tasks, multi-capture, no-capture)
 
 ---
 

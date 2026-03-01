@@ -670,19 +670,23 @@ pub const SSABuilder = struct {
         };
         var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
 
-        // When the value is a VOID-typed address (from convertFieldValue for compound struct
-        // fields), check the TARGET local's type to determine if bulk copy is needed.
-        // convertFieldValue returns off_ptr with VOID type for struct/array fields — the
-        // address is valid but untyped. The local knows the expected compound type.
+        // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
+        // for compound struct/array/union fields), check the TARGET local's type to determine
+        // if bulk copy is needed. convertFieldLocal returns off_ptr with VOID type for
+        // struct/array/union fields — the address is valid but untyped. The local knows
+        // the expected compound type.
+        // NOTE: includes ALL struct/tuple/union sizes (not just >8), because the value is
+        // an address, not a loaded scalar. Even single-field structs (8 bytes) need OpMove
+        // to dereference the address and copy the data. Without this, the address itself
+        // gets stored as the scalar value, corrupting the local's contents.
         if (!is_large_struct and value.op == .off_ptr and value.type_idx == TypeRegistry.VOID) {
             const local_type_idx = self.ir_func.locals[local_idx].type_idx;
             const local_type = self.type_registry.get(local_type_idx);
-            const local_size = self.ir_func.locals[local_idx].size;
             const local_is_compound_opt = local_type == .optional and blk: {
                 const elem_info = self.type_registry.get(local_type.optional.elem);
                 break :blk elem_info != .pointer;
             };
-            if (((local_type == .struct_type or local_type == .tuple or local_type == .union_type) and local_size > 8) or local_is_compound_opt) {
+            if ((local_type == .struct_type or local_type == .tuple or local_type == .union_type) or local_is_compound_opt) {
                 is_large_struct = true;
             }
         }
@@ -820,22 +824,21 @@ pub const SSABuilder = struct {
         // Large struct/tuple/union: bulk .move copy (same as convertStoreLocal)
         var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt;
 
-        // When the value is a VOID-typed address (from convertFieldValue for compound struct
-        // fields), check the TARGET global's type to determine if bulk copy is needed.
-        // convertFieldValue returns off_ptr with VOID type for struct/array fields — the
-        // address is valid but untyped. The global knows the expected compound type.
-        // (Same pattern as convertStoreLocal lines 663-674, but using ir_globals instead of ir_func.locals)
+        // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
+        // for compound struct/array/union fields), check the TARGET global's type to determine
+        // if bulk copy is needed. These functions return off_ptr with VOID type for compound
+        // fields — the address is valid but untyped. The global knows the expected compound type.
+        // NOTE: includes ALL struct/tuple/union sizes (not just >8) — same fix as convertStoreLocal.
         if (!is_large_struct and value.op == .off_ptr and value.type_idx == TypeRegistry.VOID) {
             const g_idx: usize = @intCast(global_idx);
             if (g_idx < self.ir_globals.len) {
                 const global_type_idx = self.ir_globals[g_idx].type_idx;
                 const global_type = self.type_registry.get(global_type_idx);
-                const global_size = self.ir_globals[g_idx].size;
                 const global_is_compound_opt = global_type == .optional and blk: {
                     const elem_info = self.type_registry.get(global_type.optional.elem);
                     break :blk elem_info != .pointer;
                 };
-                if (((global_type == .struct_type or global_type == .tuple or global_type == .union_type) and global_size > 8) or global_is_compound_opt) {
+                if ((global_type == .struct_type or global_type == .tuple or global_type == .union_type) or global_is_compound_opt) {
                     is_large_struct = true;
                 }
             }
@@ -1292,15 +1295,15 @@ pub const SSABuilder = struct {
         // for compound struct/array/union fields), check the IR node's type to determine
         // if bulk copy is needed. These functions return off_ptr with VOID type for compound
         // fields — the address is valid but untyped. The IR node knows the expected type.
+        // NOTE: includes ALL struct/tuple/union sizes (not just >8) — same fix as convertStoreLocal.
         if (!is_large_struct and value.op == .off_ptr and value.type_idx == TypeRegistry.VOID) {
             const ir_node = self.ir_func.nodes[f.value];
             const ir_type = self.type_registry.get(ir_node.type_idx);
-            const ir_size = self.type_registry.sizeOf(ir_node.type_idx);
             const ir_is_compound_opt = ir_type == .optional and blk: {
                 const elem_info = self.type_registry.get(ir_type.optional.elem);
                 break :blk elem_info != .pointer;
             };
-            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) and ir_size > 8) or ir_is_compound_opt) {
+            if ((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) or ir_is_compound_opt) {
                 is_large_struct = true;
             }
         }
