@@ -112,6 +112,10 @@ pub const MethodInfo = struct {
     func_type: TypeIndex,
     receiver_is_ptr: bool,
     is_static: bool = false,
+    /// Go LinkFuncName: pointer to the AST that defined this method.
+    /// Used by resolveMethodName to find the defining module for cross-module calls.
+    /// Stored as anyopaque to avoid circular import with ast.zig.
+    source_tree: ?*const anyopaque = null,
 };
 
 pub const TypeRegistry = struct {

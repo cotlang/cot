@@ -486,7 +486,7 @@ pub const Checker = struct {
                                 }
                             }
                             try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
-                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static });
+                            try self.types.registerMethod(s.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static, .source_tree = self.tree });
                         },
                         else => {},
                     }
@@ -513,7 +513,7 @@ pub const Checker = struct {
                                 }
                             }
                             try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, nested_idx, false, false));
-                            try self.types.registerMethod(e.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static });
+                            try self.types.registerMethod(e.name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static, .source_tree = self.tree });
                         },
                         .var_decl => |v| {
                             const qualified = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ e.name, v.name });
@@ -577,7 +577,7 @@ pub const Checker = struct {
                             }
                         }
                         try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
-                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static });
+                        try self.types.registerMethod(impl_b.type_name, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .is_static = f.is_static, .source_tree = self.tree });
                     }
                 }
             },
@@ -614,7 +614,7 @@ pub const Checker = struct {
                         const synth_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ it.target_type, f.name });
                         const func_type = try self.buildFuncType(f.params, f.return_type);
                         try self.defineInFileScope(Symbol.initExtern(synth_name, .function, func_type, method_idx, false, false));
-                        try self.types.registerMethod(it.target_type, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = true });
+                        try self.types.registerMethod(it.target_type, types.MethodInfo{ .name = f.name, .func_name = synth_name, .func_type = func_type, .receiver_is_ptr = true, .source_tree = self.tree });
                     }
                 }
                 const impl_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ it.trait_name, it.target_type });
@@ -640,7 +640,7 @@ pub const Checker = struct {
             },
             else => return,
         }
-        try self.types.registerMethod(receiver_name, types.MethodInfo{ .name = func_name, .func_name = func_name, .func_type = func_type, .receiver_is_ptr = is_ptr });
+        try self.types.registerMethod(receiver_name, types.MethodInfo{ .name = func_name, .func_name = func_name, .func_type = func_type, .receiver_is_ptr = is_ptr, .source_tree = self.tree });
     }
 
     pub fn lookupMethod(self: *const Checker, type_name: []const u8, method_name: []const u8) ?types.MethodInfo {
@@ -3634,6 +3634,7 @@ pub const Checker = struct {
                     .func_type = func_type,
                     .receiver_is_ptr = !f.is_static,
                     .is_static = f.is_static,
+                    .source_tree = self.tree,
                 });
 
                 // Add to generic_inst_by_name so the lowerer can find and lower it

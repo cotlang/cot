@@ -1,5 +1,6 @@
 import "module_a"
 import "module_b"
+import "module_c"
 
 test "module-qualified function names prevent collision" {
     @assertEq(getA(), 100)
@@ -18,4 +19,12 @@ test "cross-module method calls resolve correctly" {
     c.increment()
     c.increment()
     @assertEq(c.get(), 12)
+}
+
+test "transitive import method calls resolve correctly" {
+    var w = makeWrapper(5)
+    w.counter.increment()
+    w.counter.increment()
+    w.counter.increment()
+    @assertEq(w.counter.get(), 8)
 }

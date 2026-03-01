@@ -168,17 +168,24 @@ pub const Lowerer = struct {
         return self.qualifyName(type_name);
     }
 
-    /// Go LinkFuncName for methods: resolve a method's IR name via the TYPE's defining module.
-    /// Method synth names (e.g., "Mutex_lock") aren't scope symbols, so resolveCallName's
-    /// scope lookup fails and falls through to qualifyName with the WRONG module.
-    /// Instead, look up the TYPE name in scope to find which module defined it,
-    /// then qualify the method func_name with that module.
-    /// Go parallel: method `m` on type `T` in package `foo` → `foo.T.m`
-    fn resolveMethodName(self: *Lowerer, type_name: []const u8, func_name: []const u8) ![]const u8 {
+    /// Go LinkFuncName for methods: resolve a method's IR name via the defining module.
+    /// Go parallel: method `m` on type `T` in package `foo` → `foo.T_m`
+    /// Uses MethodInfo.source_tree (set at registration) for direct lookup — works for
+    /// both direct and transitive imports without requiring scope visibility.
+    fn resolveMethodName(self: *Lowerer, type_name: []const u8, func_name: []const u8, method_source_tree: ?*const anyopaque) ![]const u8 {
         if (self.module_name.len == 0) return func_name;
         if (shouldSkipQualification(func_name)) return func_name;
-        // Strategy 1: Look up the TYPE symbol to find its defining module.
-        // Works for user-defined types (structs, enums) imported from other modules.
+        // Primary: use the method's source_tree recorded at registration time.
+        // This is the Go pattern — the defining package is stored with the method,
+        // not resolved via scope at the call site. Works for transitive imports.
+        if (method_source_tree) |st| {
+            if (self.tree_module_map) |map| {
+                if (map.get(@ptrCast(@alignCast(st)))) |target_module| {
+                    return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ target_module, func_name });
+                }
+            }
+        }
+        // Fallback 1: Look up the TYPE symbol in scope (pre-source_tree compatibility).
         if (self.chk.scope.lookup(type_name)) |sym| {
             if (sym.is_extern or sym.is_export) return func_name;
             if (sym.source_tree) |st| {
@@ -189,9 +196,8 @@ pub const Lowerer = struct {
                 }
             }
         }
-        // Strategy 2: Look up the FUNCTION synth name in scope.
-        // Handles trait impls for primitive types (e.g., i64_hash from impl Hashable for i64)
-        // where the type name isn't a scope symbol but the method function is.
+        // Fallback 2: Look up the FUNCTION synth name in scope.
+        // Handles trait impls for primitive types (e.g., i64_hash from impl Hashable for i64).
         if (self.chk.scope.lookup(func_name)) |sym| {
             if (sym.is_extern or sym.is_export) return func_name;
             if (sym.source_tree) |st| {
@@ -1895,7 +1901,7 @@ pub const Lowerer = struct {
             const qualified_deinit = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
                 method_info.func_name // generic instance: keep bare
             else
-                try self.resolveMethodName(struct_name, method_info.func_name);
+                try self.resolveMethodName(struct_name, method_info.func_name, method_info.source_tree);
             const cleanup = arc.Cleanup.initScopeDestroy(local_idx, type_idx, qualified_deinit);
             _ = try self.cleanup_stack.push(cleanup);
         } else {
@@ -5722,7 +5728,7 @@ pub const Lowerer = struct {
                 const init_link_name = if (self.chk.generics.generic_inst_by_name.contains(init_method.func_name))
                     init_method.func_name
                 else
-                    try self.resolveMethodName(type_name, init_method.func_name);
+                    try self.resolveMethodName(type_name, init_method.func_name, init_method.source_tree);
                 _ = try fb.emitCall(init_link_name, init_args.items, false, TypeRegistry.VOID, ne.span);
             }
         }
@@ -7448,7 +7454,7 @@ pub const Lowerer = struct {
         const method_link_name = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
             method_info.func_name // generic instance: keep bare (TypeIndex makes it unique)
         else
-            try self.resolveMethodName(receiver_type_name, method_info.func_name);
+            try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
         // SRET for method calls returning large types
         if (self.needsSret(return_type)) {
             const ret_size = self.type_reg.sizeOf(return_type);

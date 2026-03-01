@@ -1,0 +1,9 @@
+import "module_a"
+
+struct Wrapper {
+    counter: Counter
+}
+
+fn makeWrapper(start: i64) Wrapper {
+    return Wrapper { .counter = Counter { .value = start } }
+}
