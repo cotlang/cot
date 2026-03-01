@@ -341,6 +341,9 @@ pub const Driver = struct {
         try lowerer.emitPendingAutoDeinits();
         if (err_reporter.hasErrors()) return error.LowerError;
 
+        // Go init function pattern: emit __cot_init_globals after all decls are lowered
+        try lowerer.generateGlobalInits();
+
         // Generate test runner if in test mode
         if (self.test_mode and lowerer.test_names.items.len > 0) {
             try lowerer.generateTestRunner();
@@ -469,6 +472,19 @@ pub const Driver = struct {
                 shared_lowered_generics = lowerer.lowered_generics;
                 lowerer.deinitWithoutBuilder();
                 return error.LowerError;
+            }
+
+            // Go init function pattern: emit __cot_init_globals for this file's globals.
+            // Only generates the function if this file has pending inits or is the last file
+            // (last file always generates it so entry points have something to call).
+            if (lowerer.pending_global_inits.items.len > 0 or i == parsed_files.items.len - 1) {
+                if (!shared_builder.hasFunc("__cot_init_globals")) {
+                    lowerer.generateGlobalInits() catch |e| {
+                        shared_lowered_generics = lowerer.lowered_generics;
+                        lowerer.deinitWithoutBuilder();
+                        return e;
+                    };
+                }
             }
 
             if (self.test_mode) {

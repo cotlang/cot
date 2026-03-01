@@ -80,6 +80,10 @@ pub const Lowerer = struct {
     /// Structs with ARC fields but no user-defined deinit get a synthetic destructor
     /// that releases all ARC fields. Reference: Swift value witness table destroy function.
     pending_auto_deinits: std.ArrayListUnmanaged([]const u8) = .{},
+    /// Go pattern: queue non-folded global initializers for emission in __cot_init_globals.
+    /// Integer/float consts are folded at compile time; everything else (strings, expressions)
+    /// needs runtime initialization via a generated init function called from entry points.
+    pending_global_inits: std.ArrayListUnmanaged(GlobalInit) = .{},
 
     pub const Error = error{OutOfMemory};
 
@@ -282,6 +286,14 @@ pub const Lowerer = struct {
         label: ?[]const u8 = null,
     };
 
+    const GlobalInit = struct {
+        global_idx: ir.GlobalIdx,
+        value_node: NodeIndex,
+        type_idx: TypeIndex,
+        name: []const u8,
+        span: Span,
+    };
+
     pub fn init(allocator: Allocator, tree: *const Ast, type_reg: *TypeRegistry, err: *ErrorReporter, chk: *checker.Checker, target: target_mod.Target) Lowerer {
         return initWithBuilder(allocator, tree, type_reg, err, chk, ir.Builder.init(allocator, type_reg), target);
     }
@@ -340,6 +352,7 @@ pub const Lowerer = struct {
         self.global_comptime_values.deinit();
         self.weak_locals.deinit(self.allocator);
         self.pending_auto_deinits.deinit(self.allocator);
+        self.pending_global_inits.deinit(self.allocator);
         self.builder.deinit();
     }
 
@@ -358,6 +371,7 @@ pub const Lowerer = struct {
         self.global_comptime_values.deinit();
         self.weak_locals.deinit(self.allocator);
         self.pending_auto_deinits.deinit(self.allocator);
+        self.pending_global_inits.deinit(self.allocator);
     }
 
     pub fn lower(self: *Lowerer) !ir.IR {
@@ -383,6 +397,12 @@ pub const Lowerer = struct {
             self.current_func = fb;
             const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
             const err_void_type = self.type_reg.makeErrorUnion(TypeRegistry.VOID) catch TypeRegistry.VOID;
+
+            // Initialize globals before any test code runs
+            {
+                var init_args = [_]ir.NodeIndex{};
+                _ = try fb.emitCall("__cot_init_globals", &init_args, false, TypeRegistry.VOID, span);
+            }
 
             // fail_count local — counts test failures, returned as exit code
             const fail_count = try fb.addLocalWithSize("__fail_count", TypeRegistry.I64, true, 8);
@@ -539,6 +559,11 @@ pub const Lowerer = struct {
                 var param_type = self.resolveTypeNode(param.type_expr);
                 param_type = self.chk.safeWrapType(param_type) catch param_type;
                 _ = try fb.addParam(param.name, param_type, self.type_reg.sizeOf(param_type));
+            }
+            // Initialize globals before user code in main()
+            if (std.mem.eql(u8, fn_decl.name, "main")) {
+                var no_init_args = [_]ir.NodeIndex{};
+                _ = try fb.emitCall("__cot_init_globals", &no_init_args, false, TypeRegistry.VOID, fn_decl.span);
             }
             if (fn_decl.body != null_node) {
                 _ = try self.lowerBlockNode(fn_decl.body);
@@ -944,6 +969,22 @@ pub const Lowerer = struct {
         }
         const type_size: u32 = @intCast(self.type_reg.sizeOf(type_idx));
         try self.builder.addGlobal(ir.Global.initWithSize(var_decl.name, type_idx, var_decl.is_const, var_decl.span, type_size));
+        // Queue non-folded initializers for __cot_init_globals (Go init function pattern).
+        // Const values that were folded above already returned early.
+        // Skip type-level constructs (error sets, etc.) — they're resolved at compile time.
+        if (var_decl.value != null_node) {
+            const ti = self.type_reg.get(type_idx);
+            const is_type_alias = (ti == .error_set);
+            if (!is_type_alias and type_idx != TypeRegistry.VOID) {
+                try self.pending_global_inits.append(self.allocator, .{
+                    .global_idx = @as(ir.GlobalIdx, @intCast(self.builder.globals.items.len - 1)),
+                    .value_node = var_decl.value,
+                    .type_idx = type_idx,
+                    .name = var_decl.name,
+                    .span = var_decl.span,
+                });
+            }
+        }
     }
 
     fn evalFloatLiteral(self: *Lowerer, idx: NodeIndex) ?f64 {
@@ -1168,6 +1209,12 @@ pub const Lowerer = struct {
             self.current_func = fb;
             const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
 
+            // Initialize globals before any bench code runs
+            {
+                var init_args = [_]ir.NodeIndex{};
+                _ = try fb.emitCall("__cot_init_globals", &init_args, false, TypeRegistry.VOID, span);
+            }
+
             // Temp local for discarding bench function return values
             const discard_local = try fb.addLocalWithSize("__bench_discard", TypeRegistry.I64, true, 8);
             // Loop counter
@@ -1271,6 +1318,24 @@ pub const Lowerer = struct {
             // Return 0
             const ret_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
             _ = try fb.emitRet(ret_zero, span);
+            self.current_func = null;
+        }
+        try self.builder.endFunc();
+    }
+
+    /// Go init function pattern: generate __cot_init_globals containing global_store
+    /// operations for each non-folded initializer. Called from entry points (main, test runner,
+    /// bench runner) before user code runs.
+    pub fn generateGlobalInits(self: *Lowerer) !void {
+        const span = Span.init(Pos.zero, Pos.zero);
+        self.builder.startFunc("__cot_init_globals", TypeRegistry.VOID, TypeRegistry.VOID, span);
+        if (self.builder.func()) |fb| {
+            self.current_func = fb;
+            for (self.pending_global_inits.items) |gi| {
+                const value = try self.lowerExpr(self.tree.getNode(gi.value_node).?.asExpr().?);
+                _ = try fb.emitGlobalStore(gi.global_idx, gi.name, value, gi.span);
+            }
+            _ = try fb.emitRet(null, span);
             self.current_func = null;
         }
         try self.builder.endFunc();
