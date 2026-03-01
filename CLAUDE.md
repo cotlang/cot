@@ -68,6 +68,8 @@ cot help [command]              # Print help (per-subcommand help available)
 
 **cot.json integration:** All file-requiring commands (`build`, `run`, `test`, `bench`, `check`, `lint`, `fmt`) read `cot.json` from CWD when no input file is given. If `main` field is set, it's used as the input file. `cot init myapp && cd myapp && cot run` just works.
 
+**Native library linking:** `"libs": ["sqlite3"]` in `cot.json` appends `-lsqlite3` to the linker invocation. Parsed by `project.zig:getLibs()`, wired in `main.zig:compileAndLinkFull()`. User-declared `extern fn` names are collected from checker scopes by `driver.zig:collectExternFns()` and registered in `func_index_map` (Cranelift `Linkage::Import` pattern).
+
 **Output naming:** Strip path, strip `.cot`, append `.wasm` for wasm targets. `app.cot` → `./app` (native) or `./app.wasm` (wasm). Override with `-o`.
 
 ---
