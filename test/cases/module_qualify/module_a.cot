@@ -1,0 +1,23 @@
+var deinit_marker: i64 = 0
+
+struct Tracker {
+    value: i64
+}
+
+impl Tracker {
+    fn deinit(self: *Tracker) {
+        deinit_marker = self.value
+    }
+}
+
+fn compute() i64 {
+    return 100
+}
+
+fn getA() i64 {
+    return compute()
+}
+
+fn getDeinitMarker() i64 {
+    return deinit_marker
+}

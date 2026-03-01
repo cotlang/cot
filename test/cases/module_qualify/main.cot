@@ -1,0 +1,14 @@
+import "module_a"
+import "module_b"
+
+test "module-qualified function names prevent collision" {
+    @assertEq(getA(), 100)
+    @assertEq(getB(), 200)
+}
+
+test "cross-module new calls correct destructor" {
+    {
+        var t = new Tracker { value: 42 }
+    }
+    @assertEq(getDeinitMarker(), 42)
+}

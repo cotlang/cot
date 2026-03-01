@@ -84,6 +84,12 @@ pub const Lowerer = struct {
     /// Integer/float consts are folded at compile time; everything else (strings, expressions)
     /// needs runtime initialization via a generated init function called from entry points.
     pending_global_inits: std.ArrayListUnmanaged(GlobalInit) = .{},
+    /// Go LinkFuncName pattern: module name for qualifying IR function names.
+    /// Derived from import path: "std/json" → "std.json". Empty for single-file builds.
+    module_name: []const u8 = "",
+    /// Maps AST tree pointers to module names for cross-module call resolution.
+    /// Built by driver from canonical_path_to_module during compileFile.
+    tree_module_map: ?*const std.AutoHashMap(*const Ast, []const u8) = null,
 
     pub const Error = error{OutOfMemory};
 
@@ -113,6 +119,62 @@ pub const Lowerer = struct {
         const info = self.type_reg.get(type_idx);
         if (info != .optional) return false;
         return self.type_reg.get(info.optional.elem) == .pointer;
+    }
+
+    /// Go LinkFuncName: qualify bare function name with module prefix.
+    /// Returns bare name for single-file builds (module_name is empty).
+    fn qualifyName(self: *Lowerer, bare: []const u8) ![]const u8 {
+        if (self.module_name.len == 0) return bare;
+        return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ self.module_name, bare });
+    }
+
+    /// Resolve the qualified IR name for a function call target.
+    /// Looks up the Symbol in checker scope to find which module defined it.
+    fn resolveCallName(self: *Lowerer, bare: []const u8) ![]const u8 {
+        if (self.module_name.len == 0) return bare;
+        if (shouldSkipQualification(bare)) return bare;
+        // Look up in checker scope to find which module defined this function
+        if (self.chk.scope.lookup(bare)) |sym| {
+            if (sym.is_extern or sym.is_export) return bare; // runtime/extern/export functions keep bare names
+            if (sym.source_tree) |st| {
+                if (self.tree_module_map) |map| {
+                    if (map.get(st)) |target_module| {
+                        return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ target_module, bare });
+                    }
+                }
+            }
+        }
+        // Local function or not found: qualify with own module
+        return self.qualifyName(bare);
+    }
+
+    /// Qualify a type name with its DEFINING module (not necessarily the current module).
+    /// Used for ARC metadata names and auto-deinit function names so the codegen can find
+    /// the destructor regardless of which module does `new Type`.
+    /// Go parallel: LinkFuncName uses Sym.Pkg (the defining package), not the calling package.
+    fn qualifyTypeName(self: *Lowerer, type_name: []const u8) ![]const u8 {
+        if (self.module_name.len == 0) return type_name;
+        // Look up the type symbol to find which module defined it
+        if (self.chk.scope.lookup(type_name)) |sym| {
+            if (sym.source_tree) |st| {
+                if (self.tree_module_map) |map| {
+                    if (map.get(st)) |target_module| {
+                        return std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ target_module, type_name });
+                    }
+                }
+            }
+        }
+        // Fallback: qualify with current module (locally-defined type)
+        return self.qualifyName(type_name);
+    }
+
+    /// Functions that must keep bare names (entry points, compiler-generated, runtime).
+    fn shouldSkipQualification(name: []const u8) bool {
+        if (std.mem.eql(u8, name, "main")) return true;
+        if (std.mem.startsWith(u8, name, "__cot_init")) return true;
+        if (std.mem.startsWith(u8, name, "__test_")) return true;
+        if (std.mem.startsWith(u8, name, "__bench_")) return true;
+        return false;
     }
 
     /// Block-based orelse for compound optionals (Zig pattern).
@@ -540,7 +602,12 @@ pub const Lowerer = struct {
         // SRET: callee receives hidden __sret pointer, returns void at Wasm level
         const uses_sret = self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
-        self.builder.startFunc(fn_decl.name, TypeRegistry.VOID, wasm_return_type, fn_decl.span);
+        // Go LinkFuncName: qualify non-extern/export/main function names with module prefix
+        const link_name = if (fn_decl.is_export or std.mem.eql(u8, fn_decl.name, "main"))
+            fn_decl.name
+        else
+            try self.qualifyName(fn_decl.name);
+        self.builder.startFunc(link_name, TypeRegistry.VOID, wasm_return_type, fn_decl.span);
         if (self.builder.func()) |fb| {
             // Store the original return type for lowerReturn to use
             if (uses_sret) fb.sret_return_type = return_type;
@@ -612,7 +679,8 @@ pub const Lowerer = struct {
 
         // --- Emit constructor function (original name) ---
         // Returns a heap-allocated state pointer (the Future)
-        self.builder.startFunc(fn_decl.name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
+        const async_link_name = try self.qualifyName(fn_decl.name);
+        self.builder.startFunc(async_link_name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             self.cleanup_stack.clear();
@@ -661,7 +729,7 @@ pub const Lowerer = struct {
 
         // --- Emit poll function (FnName_poll) ---
         // Takes state pointer, returns i64 (0=PENDING, 1=READY)
-        const poll_name = try std.fmt.allocPrint(self.allocator, "{s}_poll", .{fn_decl.name});
+        const poll_name = try std.fmt.allocPrint(self.allocator, "{s}_poll", .{async_link_name});
         self.builder.startFunc(poll_name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
@@ -746,7 +814,8 @@ pub const Lowerer = struct {
 
         // --- Emit body function (fn_name_body) — normal function, no state machine ---
         // This preserves the natural call stack for debuggers (Zig lesson: stackful > stackless).
-        const body_name = try std.fmt.allocPrint(self.allocator, "{s}_body", .{fn_decl.name});
+        const fiber_link_name = try self.qualifyName(fn_decl.name);
+        const body_name = try std.fmt.allocPrint(self.allocator, "{s}_body", .{fiber_link_name});
         self.builder.startFunc(body_name, TypeRegistry.VOID, inner_return_type, fn_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
@@ -777,7 +846,7 @@ pub const Lowerer = struct {
 
         // --- Emit constructor (fn_name) — calls body eagerly, stores result in future ---
         // Future struct layout: [state(i64) @ 0, result(i64) @ 8]
-        self.builder.startFunc(fn_decl.name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
+        self.builder.startFunc(fiber_link_name, TypeRegistry.VOID, TypeRegistry.I64, fn_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             self.cleanup_stack.clear();
@@ -1086,7 +1155,8 @@ pub const Lowerer = struct {
         const return_type = if (fn_decl.return_type != null_node) self.resolveTypeNode(fn_decl.return_type) else TypeRegistry.VOID;
         const uses_sret = self.needsSret(return_type);
         const wasm_return_type = if (uses_sret) TypeRegistry.VOID else return_type;
-        self.builder.startFunc(synth_name, TypeRegistry.VOID, wasm_return_type, fn_decl.span);
+        const method_link_name = try self.qualifyName(synth_name);
+        self.builder.startFunc(method_link_name, TypeRegistry.VOID, wasm_return_type, fn_decl.span);
         if (self.builder.func()) |fb| {
             fb.is_destructor = is_destructor;
             if (uses_sret) fb.sret_return_type = return_type;
@@ -1127,12 +1197,14 @@ pub const Lowerer = struct {
 
     fn lowerTestDecl(self: *Lowerer, test_decl: ast.TestDecl) !void {
         const test_name = try self.sanitizeTestName(test_decl.name);
-        try self.test_names.append(self.allocator, test_name);
+        // Qualify test function name with module prefix to avoid collisions across files
+        const qualified_test = try self.qualifyName(test_name);
+        try self.test_names.append(self.allocator, qualified_test);
         try self.test_display_names.append(self.allocator, test_decl.name);
         // Test functions return !void (error union) — Zig pattern: test blocks return errors
         // on assertion failure, runner catches and continues to next test
         const err_void_type = try self.type_reg.makeErrorUnion(TypeRegistry.VOID);
-        self.builder.startFunc(test_name, TypeRegistry.VOID, err_void_type, test_decl.span);
+        self.builder.startFunc(qualified_test, TypeRegistry.VOID, err_void_type, test_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             self.current_test_name = test_decl.name;
@@ -1171,11 +1243,12 @@ pub const Lowerer = struct {
 
     fn lowerBenchDecl(self: *Lowerer, bench_decl: ast.BenchDecl) !void {
         const bench_name = try self.sanitizeBenchName(bench_decl.name);
-        try self.bench_names.append(self.allocator, bench_name);
+        const qualified_bench = try self.qualifyName(bench_name);
+        try self.bench_names.append(self.allocator, qualified_bench);
         try self.bench_display_names.append(self.allocator, bench_decl.name);
         // Bench functions return i64 (matching main convention) to avoid void-return
         // complications in the br_table dispatch pattern
-        self.builder.startFunc(bench_name, TypeRegistry.VOID, TypeRegistry.I64, bench_decl.span);
+        self.builder.startFunc(qualified_bench, TypeRegistry.VOID, TypeRegistry.I64, bench_decl.span);
         if (self.builder.func()) |fb| {
             self.current_func = fb;
             self.cleanup_stack.clear();
@@ -1780,14 +1853,21 @@ pub const Lowerer = struct {
             if (self.chk.generics.generic_inst_by_name.get(method_info.func_name)) |inst_info| {
                 try self.ensureGenericFnQueued(inst_info);
             }
-            const cleanup = arc.Cleanup.initScopeDestroy(local_idx, type_idx, method_info.func_name);
+            // Qualify deinit method name for cross-module consistency
+            const qualified_deinit = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
+                method_info.func_name // generic instance: keep bare
+            else
+                try self.resolveCallName(method_info.func_name);
+            const cleanup = arc.Cleanup.initScopeDestroy(local_idx, type_idx, qualified_deinit);
             _ = try self.cleanup_stack.push(cleanup);
         } else {
             // ARC Phase 4: Check if this struct has a pending auto-generated deinit.
             // Structs with ARC fields but no user deinit get a synthetic destructor.
+            // Use qualifyTypeName to get the TYPE's defining module (not current module).
             for (self.pending_auto_deinits.items) |auto_name| {
                 if (std.mem.eql(u8, auto_name, struct_name)) {
-                    const deinit_name = try std.fmt.allocPrint(self.allocator, "{s}_deinit", .{struct_name});
+                    const qualified_type = try self.qualifyTypeName(struct_name);
+                    const deinit_name = try std.fmt.allocPrint(self.allocator, "{s}_deinit", .{qualified_type});
                     const cleanup = arc.Cleanup.initScopeDestroy(local_idx, type_idx, deinit_name);
                     _ = try self.cleanup_stack.push(cleanup);
                     break;
@@ -1833,7 +1913,10 @@ pub const Lowerer = struct {
             const struct_type = type_info.struct_type;
             const ptr_type = try self.type_reg.makePointer(struct_type_idx);
 
-            const deinit_name = try std.fmt.allocPrint(self.allocator, "{s}_deinit", .{type_name});
+            // Use qualifyTypeName to get the TYPE's defining module (not current module).
+            // This ensures cross-module `new` of imported types finds the right destructor.
+            const qualified_type = try self.qualifyTypeName(type_name);
+            const deinit_name = try std.fmt.allocPrint(self.allocator, "{s}_deinit", .{qualified_type});
             // Skip if already emitted (multi-file dedup — same struct imported in multiple files)
             if (self.builder.hasFunc(deinit_name)) continue;
             self.builder.startFunc(deinit_name, TypeRegistry.VOID, TypeRegistry.VOID, Span.zero);
@@ -4014,7 +4097,10 @@ pub const Lowerer = struct {
             return raw_value;
         }
         if (self.chk.scope.lookup(ident.name)) |sym| {
-            if (sym.kind == .function) return try self.createFuncValue(ident.name, sym.type_idx, ident.span);
+            if (sym.kind == .function) {
+                const link_name = try self.resolveCallName(ident.name);
+                return try self.createFuncValue(link_name, sym.type_idx, ident.span);
+            }
             if (sym.kind == .constant) {
                 if (sym.const_value) |value| return try fb.emitConstInt(value, TypeRegistry.I64, ident.span);
                 if (sym.float_const_value) |fvalue| return try fb.emitConstFloat(fvalue, sym.type_idx, ident.span);
@@ -5429,7 +5515,11 @@ pub const Lowerer = struct {
             }
         }
 
-        const metadata_node = try fb.emitTypeMetadata(metadata_name, ne.span);
+        // Module-qualify the metadata name with the TYPE's defining module (not current module).
+        // This ensures codegen finds the destructor regardless of which module does `new Type`.
+        // e.g., "Tracer" defined in arc.cot → "arc.Tracer" → codegen looks up "arc.Tracer_deinit"
+        const qualified_metadata = try self.qualifyTypeName(metadata_name);
+        const metadata_node = try fb.emitTypeMetadata(qualified_metadata, ne.span);
         const size_node = try fb.emitConstInt(@intCast(total_size), TypeRegistry.I64, ne.span);
         var alloc_args = [_]ir.NodeIndex{ metadata_node, size_node };
         const ptr_type = try self.type_reg.makePointer(struct_type_idx);
@@ -5591,7 +5681,11 @@ pub const Lowerer = struct {
                         try init_args.append(self.allocator, arg_node);
                     }
                 }
-                _ = try fb.emitCall(init_method.func_name, init_args.items, false, TypeRegistry.VOID, ne.span);
+                const init_link_name = if (self.chk.generics.generic_inst_by_name.contains(init_method.func_name))
+                    init_method.func_name
+                else
+                    try self.resolveCallName(init_method.func_name);
+                _ = try fb.emitCall(init_link_name, init_args.items, false, TypeRegistry.VOID, ne.span);
             }
         }
 
@@ -5640,8 +5734,9 @@ pub const Lowerer = struct {
         try self.detectCaptures(ce.body, fb, &captures);
 
         // Generate a unique name for the closure body function
-        const closure_name = try std.fmt.allocPrint(self.allocator, "__closure_{d}", .{self.closure_counter});
+        const closure_bare = try std.fmt.allocPrint(self.allocator, "__closure_{d}", .{self.closure_counter});
         self.closure_counter += 1;
+        const closure_name = try self.qualifyName(closure_bare);
 
         // Save parent function builder state (by value)
         const saved_builder_func = self.builder.current_func;
@@ -6945,6 +7040,9 @@ pub const Lowerer = struct {
             return try fb.emitClosureCall(table_idx, closure_ptr, args.items, return_type, call.span);
         }
 
+        // Go LinkFuncName: resolve qualified name for direct function calls
+        const link_name = try self.resolveCallName(func_name);
+
         // SRET: caller allocates temp, passes address as hidden first arg
         // Zig pattern: firstParamSRet() — caller allocates, callee writes
         if (self.needsSret(return_type)) {
@@ -6957,11 +7055,11 @@ pub const Lowerer = struct {
             try sret_args.append(self.allocator, sret_addr);
             try sret_args.appendSlice(self.allocator, args.items);
             // Call returns void; result is in sret_local
-            _ = try fb.emitCall(func_name, sret_args.items, false, TypeRegistry.VOID, call.span);
+            _ = try fb.emitCall(link_name, sret_args.items, false, TypeRegistry.VOID, call.span);
             return try fb.emitLoadLocal(sret_local, return_type, call.span);
         }
 
-        return try fb.emitCall(func_name, args.items, false, return_type, call.span);
+        return try fb.emitCall(link_name, args.items, false, return_type, call.span);
     }
 
     /// Go pattern: check.later() (types2/call.go:152-166) defers verification to after
@@ -7308,6 +7406,11 @@ pub const Lowerer = struct {
 
         const func_type = self.type_reg.get(method_info.func_type);
         const return_type = if (func_type == .func) func_type.func.return_type else TypeRegistry.VOID;
+        // Go LinkFuncName: qualify method call target (skip for generic instances)
+        const method_link_name = if (self.chk.generics.generic_inst_by_name.contains(method_info.func_name))
+            method_info.func_name // generic instance: keep bare (TypeIndex makes it unique)
+        else
+            try self.resolveCallName(method_info.func_name);
         // SRET for method calls returning large types
         if (self.needsSret(return_type)) {
             const ret_size = self.type_reg.sizeOf(return_type);
@@ -7317,10 +7420,10 @@ pub const Lowerer = struct {
             defer sret_args.deinit(self.allocator);
             try sret_args.append(self.allocator, sret_addr);
             try sret_args.appendSlice(self.allocator, args.items);
-            _ = try fb.emitCall(method_info.func_name, sret_args.items, false, TypeRegistry.VOID, call.span);
+            _ = try fb.emitCall(method_link_name, sret_args.items, false, TypeRegistry.VOID, call.span);
             return try fb.emitLoadLocal(sret_local, return_type, call.span);
         }
-        return try fb.emitCall(method_info.func_name, args.items, false, return_type, call.span);
+        return try fb.emitCall(method_link_name, args.items, false, return_type, call.span);
     }
 
     fn lowerBuiltinLen(self: *Lowerer, call: ast.Call) Error!ir.NodeIndex {
@@ -7590,7 +7693,8 @@ pub const Lowerer = struct {
                             if (arg_expr == .ident) {
                                 if (self.chk.scope.lookup(arg_expr.ident.name)) |sym| {
                                     if (sym.kind == .function) {
-                                        return try fb.emitFuncAddr(arg_expr.ident.name, TypeRegistry.I64, bc.span);
+                                        const link_name = try self.resolveCallName(arg_expr.ident.name);
+                                        return try fb.emitFuncAddr(link_name, TypeRegistry.I64, bc.span);
                                     }
                                 }
                             }
@@ -8802,7 +8906,9 @@ pub const Lowerer = struct {
             const callee_node = self.tree.getNode(expr.call.callee) orelse return null;
             const callee_expr = callee_node.asExpr() orelse return null;
             if (callee_expr == .ident) {
-                return std.fmt.allocPrint(self.allocator, "{s}_poll", .{callee_expr.ident.name}) catch null;
+                // Qualify the async function name, then append _poll suffix
+                const qualified = self.resolveCallName(callee_expr.ident.name) catch return null;
+                return std.fmt.allocPrint(self.allocator, "{s}_poll", .{qualified}) catch null;
             }
         }
         // Case 2: ident — `await f` where f was assigned from an async call

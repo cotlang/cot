@@ -430,6 +430,60 @@ pub const Driver = struct {
             try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
         }
 
+        // Go LinkFuncName pattern: build module name map for qualified IR function names.
+        // This prevents name collisions when two modules export functions with the same name
+        // (e.g., std/json.parse vs std/semver.parse). Each function gets a module-qualified
+        // IR name: "std.json.parse" vs "std.semver.parse".
+        var canonical_path_to_module = std.StringHashMap([]const u8).init(self.allocator);
+        defer canonical_path_to_module.deinit();
+
+        // Main file (last in parsed_files — dependencies first) gets basename as module name
+        {
+            const main_pf = &parsed_files.items[parsed_files.items.len - 1];
+            const main_base = std.fs.path.basename(main_pf.path);
+            const main_module = if (std.mem.endsWith(u8, main_base, ".cot"))
+                try self.allocator.dupe(u8, main_base[0 .. main_base.len - 4])
+            else
+                try self.allocator.dupe(u8, main_base);
+            try canonical_path_to_module.put(main_pf.path, main_module);
+        }
+
+        // Derive module names from import paths for all imported files
+        for (parsed_files.items) |*pf| {
+            const imports = try pf.tree.getImports(self.allocator);
+            defer self.allocator.free(imports);
+            const file_dir = std.fs.path.dirname(pf.path) orelse ".";
+            for (imports) |import_path| {
+                const full_path = if (std.mem.startsWith(u8, import_path, "std/"))
+                    try self.resolveStdImport(import_path, file_dir)
+                else blk: {
+                    const name = if (std.mem.endsWith(u8, import_path, ".cot"))
+                        import_path
+                    else
+                        try std.fmt.allocPrint(self.allocator, "{s}.cot", .{import_path});
+                    defer if (!std.mem.endsWith(u8, import_path, ".cot")) self.allocator.free(name);
+                    break :blk try std.fs.path.join(self.allocator, &.{ file_dir, name });
+                };
+                defer self.allocator.free(full_path);
+                const canonical = try self.normalizePath(full_path);
+                if (!canonical_path_to_module.contains(canonical)) {
+                    const mod_name = try self.deriveModuleName(import_path);
+                    try canonical_path_to_module.put(canonical, mod_name);
+                } else {
+                    self.allocator.free(canonical);
+                }
+            }
+        }
+
+        // Build tree→module map for cross-module call resolution in lowerer
+        var tree_module_map = std.AutoHashMap(*const ast_mod.Ast, []const u8).init(self.allocator);
+        defer tree_module_map.deinit();
+        for (parsed_files.items) |*pf| {
+            if (canonical_path_to_module.get(pf.path)) |mod_name| {
+                try tree_module_map.put(&pf.tree, mod_name);
+            }
+        }
+
         // Phase 3: Lower all files to IR with shared builder
         var shared_builder = ir_mod.Builder.init(self.allocator, &type_reg);
         defer shared_builder.deinit();
@@ -456,6 +510,8 @@ pub const Driver = struct {
             var lower_err = errors_mod.ErrorReporter.init(&pf.source, null);
             var lowerer = lower_mod.Lowerer.initWithBuilder(self.allocator, &pf.tree, &type_reg, &lower_err, &checkers.items[i], shared_builder, self.target);
             lowerer.lowered_generics = shared_lowered_generics;
+            lowerer.module_name = canonical_path_to_module.get(pf.path) orelse "";
+            lowerer.tree_module_map = &tree_module_map;
             lowerer.release_mode = self.release_mode;
             if (self.test_mode) lowerer.setTestMode(true);
             if (self.fail_fast) lowerer.setFailFast(true);
@@ -604,6 +660,26 @@ pub const Driver = struct {
 
     fn normalizePath(self: *Driver, path: []const u8) ![]const u8 {
         return std.fs.cwd().realpathAlloc(self.allocator, path) catch try self.allocator.dupe(u8, path);
+    }
+
+    /// Go PathToPrefix pattern: derive module name from import path.
+    /// "std/json" → "std.json", "frontend/parser" → "frontend.parser"
+    /// Note: Go's PathToPrefix also escapes dots in the final segment (`.` → `%2e`)
+    /// and special characters. Currently not needed since Cot import paths don't contain
+    /// dots (file extensions are stripped). If import paths with dots are ever supported,
+    /// add Go-style escaping to avoid ambiguity with the `module.funcName` separator.
+    fn deriveModuleName(self: *Driver, import_path: []const u8) ![]const u8 {
+        // Strip .cot extension if present
+        const path = if (std.mem.endsWith(u8, import_path, ".cot"))
+            import_path[0 .. import_path.len - 4]
+        else
+            import_path;
+        // Replace '/' with '.'
+        const buf = try self.allocator.dupe(u8, path);
+        for (buf) |*c| {
+            if (c.* == '/') c.* = '.';
+        }
+        return buf;
     }
 
     /// Go resolver.go pattern: create a per-file scope and copy imported symbols.

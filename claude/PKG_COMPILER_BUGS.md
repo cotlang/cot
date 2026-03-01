@@ -37,6 +37,29 @@ Go init function pattern: per-file `__cot_init_file_N` functions containing `glo
 
 ---
 
+## 4. Flat Symbol Namespace — Import Name Collisions
+
+**Priority**: HIGH — blocks use of any two stdlib modules with same-named functions
+**Status**: FIXED
+
+### Description
+
+In multi-file builds (`cot build`), all exported symbols from all transitively imported modules share a single flat namespace. If two modules export a function with the same name and signature, one silently shadows the other.
+
+### Example
+
+`std/json` exports `parse(input: string) i64` and `std/semver` exports `parse(s: string) i64`. When both are transitively imported (even in separate files), `std/semver`'s `parse` shadows `std/json`'s `parse` globally. JSON parsing silently fails (returns 0) because the semver parser is called instead.
+
+### Impact
+
+Cannot use `std/semver` and `std/json` in the same project. Any two stdlib modules with same-named functions will collide. Workaround: manual reimplementation of one module's functionality to avoid the import.
+
+### Suggested Fix
+
+Per-module namespacing or qualified imports (e.g., `semver.parse()` vs `json.parse()`).
+
+---
+
 ## Summary
 
 | Bug | Severity | Status | Root Cause |
@@ -44,3 +67,4 @@ Go init function pattern: per-file `__cot_init_file_N` functions containing `glo
 | Module-level string globals empty | HIGH | FIXED | Missing global init stores → `__cot_init_globals` |
 | Module-level int globals garbage bits | MEDIUM | FIXED | Same root cause |
 | String interpolation broken | N/A | WORKS | Was misdiagnosed — caused by uninitialized globals |
+| Flat symbol namespace collisions | HIGH | FIXED | Go LinkFuncName: module-qualified IR names (`module.funcName`) |

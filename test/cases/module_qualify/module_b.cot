@@ -1,0 +1,7 @@
+fn compute() i64 {
+    return 200
+}
+
+fn getB() i64 {
+    return compute()
+}
