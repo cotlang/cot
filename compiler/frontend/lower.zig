@@ -8853,7 +8853,12 @@ pub const Lowerer = struct {
                 _ = try fb.emitStoreLocal(result_local, fallback_val, ce.span);
             }
         }
-        if (!fallback_is_noreturn) {
+        // Always emit jump to merge if the block hasn't been terminated.
+        // The `fallback_is_noreturn` flag marks void/null fallbacks (like `exit(1)`),
+        // but if the fallback didn't actually terminate the block (e.g. exit() is
+        // void, not noreturn), we still need the jump to prevent fall-through to
+        // the next sequential IR block (which may be completely unrelated code).
+        if (fb.needsTerminator()) {
             _ = try fb.emitJump(merge_block, ce.span);
         }
 
