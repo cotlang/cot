@@ -170,6 +170,21 @@ pub fn generate(
         .compiled = try generateForward1WithErrno(allocator, isa, ctrl_plane, func_index_map, "closedir"),
     });
 
+    // --- Filesystem metadata runtime ---
+
+    // stat_type(path_ptr, path_len) → i64  (1=file, 2=dir, 0=not found)
+    try result.append(allocator, .{
+        .name = "stat_type",
+        .compiled = try generateStatType(allocator, isa, ctrl_plane, func_index_map),
+    });
+
+    // unlink(path_ptr, path_len) → i64  (0=ok, -errno on error)
+    // Named "cot_unlink" to avoid linker collision with libc _unlink
+    try result.append(allocator, .{
+        .name = "cot_unlink",
+        .compiled = try generateUnlink(allocator, isa, ctrl_plane, func_index_map),
+    });
+
     // --- Network runtime ---
 
     // net_socket(family, type, proto) → i64  (calls libc socket)
@@ -2759,6 +2774,302 @@ fn generateDirNext(
 
     // Return name length
     _ = try ins_entry.return_(&[_]clif.Value{name_len});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// stat_type(path_ptr, path_len) → i64
+// Null-terminates path, calls libc stat(path, &stat_buf).
+// Returns: 1 = regular file, 2 = directory, 0 = not found, -1 = error.
+// ============================================================================
+
+fn generateStatType(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (path_ptr: i64, path_len: i64) → i64
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    const ins = builder.ins();
+    const params = builder.blockParams(block_entry);
+    const path_ptr = params[0];
+    const path_len = params[1];
+
+    // Null-terminate path on stack (1024 bytes)
+    const path_slot = try builder.createSizedStackSlot(
+        clif.StackSlotData.explicit(1024, 3),
+    );
+    const buf_addr = try ins.stackAddr(clif.Type.I64, path_slot, 0);
+
+    const memcpy_idx = func_index_map.get("memcpy") orelse 0;
+    var memcpy_sig = clif.Signature.init(.system_v);
+    try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memcpy_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const memcpy_sig_ref = try builder.importSignature(memcpy_sig);
+    const memcpy_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = memcpy_idx } },
+        .signature = memcpy_sig_ref,
+        .colocated = false,
+    });
+    _ = try ins.call(memcpy_ref, &[_]clif.Value{ buf_addr, path_ptr, path_len });
+
+    const null_addr = try ins.iadd(buf_addr, path_len);
+    const v_zero_byte = try ins.iconst(clif.Type.I8, 0);
+    _ = try ins.store(.{}, v_zero_byte, null_addr, 0);
+
+    // Allocate stack slot for struct stat (144 bytes on both macOS and Linux)
+    const stat_slot = try builder.createSizedStackSlot(
+        clif.StackSlotData.explicit(144, 3),
+    );
+    const stat_addr = try ins.stackAddr(clif.Type.I64, stat_slot, 0);
+
+    // Zero-initialize the stat struct
+    const memset_idx = func_index_map.get("memset") orelse 0;
+    var memset_sig = clif.Signature.init(.system_v);
+    try memset_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memset_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memset_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memset_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const memset_sig_ref = try builder.importSignature(memset_sig);
+    const memset_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = memset_idx } },
+        .signature = memset_sig_ref,
+        .colocated = false,
+    });
+    const v_zero_memset = try ins.iconst(clif.Type.I64, 0);
+    const v_stat_size = try ins.iconst(clif.Type.I64, 144);
+    _ = try ins.call(memset_ref, &[_]clif.Value{ stat_addr, v_zero_memset, v_stat_size });
+
+    // Call stat(path, &stat_buf) → int
+    const stat_idx = func_index_map.get("c_stat") orelse 0;
+    var stat_sig = clif.Signature.init(.system_v);
+    try stat_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try stat_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try stat_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const stat_sig_ref = try builder.importSignature(stat_sig);
+    const stat_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = stat_idx } },
+        .signature = stat_sig_ref,
+        .colocated = false,
+    });
+    const call_result = try ins.call(stat_ref, &[_]clif.Value{ buf_addr, stat_addr });
+    const stat_result = call_result.results[0];
+
+    // Check if stat returned < 0 (error / not found)
+    const block_found = try builder.createBlock();
+    const block_not_found = try builder.createBlock();
+
+    const v_zero_check = try ins.iconst(clif.Type.I64, 0);
+    const is_error = try ins.icmp(.slt, stat_result, v_zero_check);
+    _ = try ins.brif(is_error, block_not_found, &[_]clif.Value{}, block_found, &[_]clif.Value{});
+
+    // not found: return 0
+    builder.switchToBlock(block_not_found);
+    try builder.ensureInsertedBlock();
+    var ins_nf = builder.ins();
+    const v_zero_ret = try ins_nf.iconst(clif.Type.I64, 0);
+    _ = try ins_nf.return_(&[_]clif.Value{v_zero_ret});
+
+    // found: extract st_mode and determine type
+    builder.switchToBlock(block_found);
+    try builder.ensureInsertedBlock();
+    var ins_ok = builder.ins();
+
+    // st_mode offset: macOS ARM64 = 4 (u16), Linux x64 = 24 (u32)
+    // S_IFMT = 0xF000, S_IFREG = 0x8000, S_IFDIR = 0x4000
+    const is_aarch64 = isa == .aarch64;
+    const st_mode_offset: i32 = if (is_aarch64) 4 else 24;
+
+    // Load st_mode as u16 on macOS, u32 on Linux, then zero-extend to i64
+    const st_mode_raw = if (is_aarch64)
+        try ins_ok.load(clif.Type.I16, clif.MemFlags.DEFAULT, stat_addr, st_mode_offset)
+    else
+        try ins_ok.load(clif.Type.I32, clif.MemFlags.DEFAULT, stat_addr, st_mode_offset);
+    const st_mode = try ins_ok.uextend(clif.Type.I64, st_mode_raw);
+
+    // Apply S_IFMT mask (0xF000)
+    const v_ifmt = try ins_ok.iconst(clif.Type.I64, 0xF000);
+    const file_type = try ins_ok.band(st_mode, v_ifmt);
+
+    // Check if directory (S_IFDIR = 0x4000)
+    const block_check_file = try builder.createBlock();
+    const block_is_dir = try builder.createBlock();
+
+    const v_ifdir = try ins_ok.iconst(clif.Type.I64, 0x4000);
+    const is_dir = try ins_ok.icmp(.eq, file_type, v_ifdir);
+    _ = try ins_ok.brif(is_dir, block_is_dir, &[_]clif.Value{}, block_check_file, &[_]clif.Value{file_type});
+
+    // is directory: return 2
+    builder.switchToBlock(block_is_dir);
+    try builder.ensureInsertedBlock();
+    var ins_dir = builder.ins();
+    const v_two = try ins_dir.iconst(clif.Type.I64, 2);
+    _ = try ins_dir.return_(&[_]clif.Value{v_two});
+
+    // check if regular file (S_IFREG = 0x8000)
+    builder.switchToBlock(block_check_file);
+    _ = try builder.appendBlockParam(block_check_file, clif.Type.I64);
+    try builder.ensureInsertedBlock();
+    var ins_cf = builder.ins();
+    const ft = builder.blockParams(block_check_file)[0];
+
+    const block_is_file = try builder.createBlock();
+    const block_other = try builder.createBlock();
+
+    const v_ifreg = try ins_cf.iconst(clif.Type.I64, 0x8000);
+    const is_file = try ins_cf.icmp(.eq, ft, v_ifreg);
+    _ = try ins_cf.brif(is_file, block_is_file, &[_]clif.Value{}, block_other, &[_]clif.Value{});
+
+    // is regular file: return 1
+    builder.switchToBlock(block_is_file);
+    try builder.ensureInsertedBlock();
+    var ins_file = builder.ins();
+    const v_one = try ins_file.iconst(clif.Type.I64, 1);
+    _ = try ins_file.return_(&[_]clif.Value{v_one});
+
+    // other type: return -1
+    builder.switchToBlock(block_other);
+    try builder.ensureInsertedBlock();
+    var ins_other = builder.ins();
+    const v_neg_one = try ins_other.iconst(clif.Type.I64, -1);
+    _ = try ins_other.return_(&[_]clif.Value{v_neg_one});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// unlink(path_ptr, path_len) → i64
+// Null-terminates path, calls libc unlink(path).
+// Returns 0 on success, -errno on error.
+// Same pattern as generateMkdir (cot_unlink wrapper to avoid _unlink collision).
+// ============================================================================
+
+fn generateUnlink(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (path_ptr: i64, path_len: i64) → i64
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    const block_entry = try builder.createBlock();
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    const ins = builder.ins();
+    const params = builder.blockParams(block_entry);
+    const path_ptr = params[0];
+    const path_len = params[1];
+
+    // Null-terminate path on stack
+    const path_slot = try builder.createSizedStackSlot(
+        clif.StackSlotData.explicit(1024, 3),
+    );
+    const buf_addr = try ins.stackAddr(clif.Type.I64, path_slot, 0);
+
+    const memcpy_idx = func_index_map.get("memcpy") orelse 0;
+    var memcpy_sig = clif.Signature.init(.system_v);
+    try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memcpy_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try memcpy_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const memcpy_sig_ref = try builder.importSignature(memcpy_sig);
+    const memcpy_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = memcpy_idx } },
+        .signature = memcpy_sig_ref,
+        .colocated = false,
+    });
+    _ = try ins.call(memcpy_ref, &[_]clif.Value{ buf_addr, path_ptr, path_len });
+
+    const null_addr = try ins.iadd(buf_addr, path_len);
+    const v_zero_byte = try ins.iconst(clif.Type.I8, 0);
+    _ = try ins.store(.{}, v_zero_byte, null_addr, 0);
+
+    // Call unlink(buf_addr) → int
+    const unlink_idx = func_index_map.get("c_unlink") orelse 0;
+    var unlink_sig = clif.Signature.init(.system_v);
+    try unlink_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try unlink_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const unlink_sig_ref = try builder.importSignature(unlink_sig);
+    const unlink_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = unlink_idx } },
+        .signature = unlink_sig_ref,
+        .colocated = false,
+    });
+    const call_result = try ins.call(unlink_ref, &[_]clif.Value{buf_addr});
+    const unlink_result = call_result.results[0];
+
+    // Check if result < 0 (error)
+    const block_success = try builder.createBlock();
+    const block_error = try builder.createBlock();
+
+    const v_zero_check = try ins.iconst(clif.Type.I64, 0);
+    const is_error = try ins.icmp(.slt, unlink_result, v_zero_check);
+    _ = try ins.brif(is_error, block_error, &[_]clif.Value{}, block_success, &[_]clif.Value{});
+
+    // success: return 0
+    builder.switchToBlock(block_success);
+    try builder.ensureInsertedBlock();
+    var ins_ok = builder.ins();
+    const v_zero_ret = try ins_ok.iconst(clif.Type.I64, 0);
+    _ = try ins_ok.return_(&[_]clif.Value{v_zero_ret});
+
+    // error: return -errno
+    builder.switchToBlock(block_error);
+    try builder.ensureInsertedBlock();
+    var ins_err = builder.ins();
+
+    const error_idx = func_index_map.get("__error") orelse 0;
+    var error_sig = clif.Signature.init(.system_v);
+    try error_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const error_sig_ref = try builder.importSignature(error_sig);
+    const error_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = error_idx } },
+        .signature = error_sig_ref,
+        .colocated = false,
+    });
+    const error_result = try ins_err.call(error_ref, &[_]clif.Value{});
+    const errno_ptr = error_result.results[0];
+    const errno_i32 = try ins_err.load(clif.Type.I32, clif.MemFlags.DEFAULT, errno_ptr, 0);
+    const errno_i64 = try ins_err.sextend(clif.Type.I64, errno_i32);
+    const neg_errno = try ins_err.ineg(errno_i64);
+    _ = try ins_err.return_(&[_]clif.Value{neg_errno});
 
     try builder.sealAllBlocks();
     builder.finalize();

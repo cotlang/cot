@@ -551,6 +551,12 @@ pub const Lowerer = struct {
                 if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
                     try self.emitCleanups(0);
                     _ = try fb.emitRet(null, fn_decl.span);
+                } else if (fb.needsTerminator()) {
+                    const rti = self.type_reg.get(return_type);
+                    if (rti == .error_union and rti.error_union.elem == TypeRegistry.VOID) {
+                        try self.emitCleanups(0);
+                        try self.emitErrorVoidSuccessReturn(fb, return_type, fn_decl.span);
+                    }
                 }
             }
             self.current_func = null;
@@ -732,6 +738,12 @@ pub const Lowerer = struct {
                 if (inner_return_type == TypeRegistry.VOID and fb.needsTerminator()) {
                     try self.emitCleanups(0);
                     _ = try fb.emitRet(null, fn_decl.span);
+                } else if (fb.needsTerminator()) {
+                    const rti2 = self.type_reg.get(inner_return_type);
+                    if (rti2 == .error_union and rti2.error_union.elem == TypeRegistry.VOID) {
+                        try self.emitCleanups(0);
+                        try self.emitErrorVoidSuccessReturn(fb, inner_return_type, fn_decl.span);
+                    }
                 }
             }
             self.current_func = null;
@@ -1059,6 +1071,12 @@ pub const Lowerer = struct {
                 if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
                     try self.emitCleanups(0);
                     _ = try fb.emitRet(null, fn_decl.span);
+                } else if (fb.needsTerminator()) {
+                    const rti3 = self.type_reg.get(return_type);
+                    if (rti3 == .error_union and rti3.error_union.elem == TypeRegistry.VOID) {
+                        try self.emitCleanups(0);
+                        try self.emitErrorVoidSuccessReturn(fb, return_type, fn_decl.span);
+                    }
                 }
             }
             self.current_func = null;
@@ -1625,12 +1643,39 @@ pub const Lowerer = struct {
                 return;
             }
         }
+
+        // Handle implicit return from error!void functions:
+        // Even though there's no explicit return value, we must return a success
+        // error union (tag=0) so the caller's catch handler sees success, not garbage.
+        if (value_node == null) {
+            const ret_type = fb.return_type;
+            const ret_type_info = self.type_reg.get(ret_type);
+            if (ret_type_info == .error_union) {
+                const eu_size = self.type_reg.sizeOf(ret_type);
+                const tmp_local = try fb.addLocalWithSize("__ret_eu", ret_type, false, eu_size);
+                const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, ret.span);
+                _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, ret.span);
+                value_node = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, ret.span);
+            }
+        }
+
         if (is_error_return) {
             try self.emitCleanupsErrorPath(0);
         } else {
             try self.emitCleanups(0);
         }
         _ = try fb.emitRet(value_node, ret.span);
+    }
+
+    /// Emit a success return for error!void functions (implicit fall-through).
+    /// Creates a 16-byte error union on the stack with tag=0 and returns its address.
+    fn emitErrorVoidSuccessReturn(self: *Lowerer, fb: *ir.FuncBuilder, ret_type: types.TypeIndex, span: anytype) !void {
+        const eu_size = self.type_reg.sizeOf(ret_type);
+        const tmp_local = try fb.addLocalWithSize("__ret_eu", ret_type, false, eu_size);
+        const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+        _ = try fb.emitStoreLocalField(tmp_local, 0, 0, tag_zero, span);
+        const eu_ptr = try fb.emitAddrLocal(tmp_local, TypeRegistry.I64, span);
+        _ = try fb.emitRet(eu_ptr, span);
     }
 
     /// Check if there are any active defer or scope_destroy cleanups on the stack.
@@ -6994,6 +7039,12 @@ pub const Lowerer = struct {
                 if (return_type == TypeRegistry.VOID and fb.needsTerminator()) {
                     try self.emitCleanups(0);
                     _ = try fb.emitRet(null, f.span);
+                } else if (fb.needsTerminator()) {
+                    const rti4 = self.type_reg.get(return_type);
+                    if (rti4 == .error_union and rti4.error_union.elem == TypeRegistry.VOID) {
+                        try self.emitCleanups(0);
+                        try self.emitErrorVoidSuccessReturn(fb, return_type, f.span);
+                    }
                 }
             }
             self.current_func = null;

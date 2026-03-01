@@ -69,6 +69,9 @@ pub const MKDIR_NAME = "mkdir";
 pub const DIR_OPEN_NAME = "dir_open";
 pub const DIR_NEXT_NAME = "dir_next";
 pub const DIR_CLOSE_NAME = "dir_close";
+// Filesystem metadata
+pub const STAT_TYPE_NAME = "stat_type";
+pub const UNLINK_NAME = "unlink";
 
 // WASI scratch memory addresses in linear memory
 // Used by adapter shims to build iov structs and read WASI output params
@@ -130,6 +133,9 @@ pub const WasiFunctions = struct {
     dir_open_idx: u32,
     dir_next_idx: u32,
     dir_close_idx: u32,
+    // Filesystem metadata
+    stat_type_idx: u32,
+    unlink_idx: u32,
 };
 
 // =============================================================================
@@ -505,6 +511,12 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
     const dir_next_idx = try linker.addFunc(.{ .name = DIR_NEXT_NAME, .type_idx = net_3arg_type, .code = dir_next_body, .exported = false });
     const dir_close_body = try generateStubReturnsZero(allocator);
     const dir_close_idx = try linker.addFunc(.{ .name = DIR_CLOSE_NAME, .type_idx = arg_one_type, .code = dir_close_body, .exported = false });
+    // stat_type(ptr, len) → 0 (stub: not found)
+    const stat_type_body = try generateStubReturnsZero(allocator);
+    const stat_type_idx = try linker.addFunc(.{ .name = STAT_TYPE_NAME, .type_idx = net_2arg_type, .code = stat_type_body, .exported = false });
+    // unlink(ptr, len) → -1 (stub: error)
+    const unlink_body = try generateStubReturnsNegOne(allocator);
+    const unlink_idx = try linker.addFunc(.{ .name = UNLINK_NAME, .type_idx = net_2arg_type, .code = unlink_body, .exported = false });
 
     // Return indices: addFunc returns 0-based func indices.
     // Actual Wasm function index = import_count + func_local_index.
@@ -549,6 +561,8 @@ fn addWasiImports(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .dir_open_idx = dir_open_idx + import_count,
         .dir_next_idx = dir_next_idx + import_count,
         .dir_close_idx = dir_close_idx + import_count,
+        .stat_type_idx = stat_type_idx + import_count,
+        .unlink_idx = unlink_idx + import_count,
     };
 }
 
@@ -767,6 +781,12 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
     const dir_next_idx = try linker.addFunc(.{ .name = DIR_NEXT_NAME, .type_idx = net_3arg_type, .code = dir_next_body, .exported = true });
     const dir_close_body = try generateStubReturnsZero(allocator);
     const dir_close_idx = try linker.addFunc(.{ .name = DIR_CLOSE_NAME, .type_idx = fd_close_type, .code = dir_close_body, .exported = true });
+    // stat_type(ptr, len) → 0 (stub: not found)
+    const stat_type_body = try generateStubReturnsZero(allocator);
+    const stat_type_idx = try linker.addFunc(.{ .name = STAT_TYPE_NAME, .type_idx = net_2arg_type, .code = stat_type_body, .exported = true });
+    // unlink(ptr, len) → -1 (stub: error)
+    const unlink_body = try generateStubReturnsNegOne(allocator);
+    const unlink_idx = try linker.addFunc(.{ .name = UNLINK_NAME, .type_idx = net_2arg_type, .code = unlink_body, .exported = true });
 
     return WasiFunctions{
         .fd_write_idx = fd_write_idx,
@@ -809,6 +829,8 @@ fn addNativeStubs(allocator: std.mem.Allocator, linker: *@import("wasm/link.zig"
         .dir_open_idx = dir_open_idx,
         .dir_next_idx = dir_next_idx,
         .dir_close_idx = dir_close_idx,
+        .stat_type_idx = stat_type_idx,
+        .unlink_idx = unlink_idx,
     };
 }
 
