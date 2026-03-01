@@ -447,6 +447,10 @@ pub const Driver = struct {
         defer all_bench_names.deinit(self.allocator);
         var all_bench_display_names = std.ArrayListUnmanaged([]const u8){};
         defer all_bench_display_names.deinit(self.allocator);
+        // Go init function pattern: track per-file init function names for multi-file builds.
+        // Each file with globals gets __cot_init_file_N; master __cot_init_globals calls them all.
+        var init_func_names = std.ArrayListUnmanaged([]const u8){};
+        defer init_func_names.deinit(self.allocator);
 
         for (parsed_files.items, 0..) |*pf, i| {
             var lower_err = errors_mod.ErrorReporter.init(&pf.source, null);
@@ -474,17 +478,15 @@ pub const Driver = struct {
                 return error.LowerError;
             }
 
-            // Go init function pattern: emit __cot_init_globals for this file's globals.
-            // Only generates the function if this file has pending inits or is the last file
-            // (last file always generates it so entry points have something to call).
-            if (lowerer.pending_global_inits.items.len > 0 or i == parsed_files.items.len - 1) {
-                if (!shared_builder.hasFunc("__cot_init_globals")) {
-                    lowerer.generateGlobalInits() catch |e| {
-                        shared_lowered_generics = lowerer.lowered_generics;
-                        lowerer.deinitWithoutBuilder();
-                        return e;
-                    };
-                }
+            // Go init function pattern: generate per-file init function for this file's globals.
+            if (lowerer.pending_global_inits.items.len > 0) {
+                const init_name = try std.fmt.allocPrint(self.allocator, "__cot_init_file_{d}", .{i});
+                lowerer.generateGlobalInitsNamed(init_name) catch |e| {
+                    shared_lowered_generics = lowerer.lowered_generics;
+                    lowerer.deinitWithoutBuilder();
+                    return e;
+                };
+                try init_func_names.append(self.allocator, init_name);
             }
 
             if (self.test_mode) {
@@ -498,6 +500,21 @@ pub const Driver = struct {
             shared_builder = lowerer.builder;
             shared_lowered_generics = lowerer.lowered_generics;
             lowerer.deinitWithoutBuilder();
+        }
+
+        // Go init function pattern: generate master __cot_init_globals that calls all per-file inits.
+        // Uses shared_builder directly (no Lowerer needed — just emitting call + ret IR nodes).
+        {
+            const span = source_mod.Span.init(source_mod.Pos.zero, source_mod.Pos.zero);
+            shared_builder.startFunc("__cot_init_globals", types_mod.TypeRegistry.VOID, types_mod.TypeRegistry.VOID, span);
+            if (shared_builder.func()) |fb| {
+                for (init_func_names.items) |init_name| {
+                    var no_args = [_]ir_mod.NodeIndex{};
+                    _ = try fb.emitCall(init_name, &no_args, false, types_mod.TypeRegistry.VOID, span);
+                }
+                _ = try fb.emitRet(null, span);
+            }
+            try shared_builder.endFunc();
         }
 
         // Filter tests if --filter is specified
