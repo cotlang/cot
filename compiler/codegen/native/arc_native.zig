@@ -42,21 +42,43 @@ const native_compile = @import("compile.zig");
 
 const debug = @import("../../pipeline_debug.zig");
 
-// Native 64-bit ARC header (24 bytes):
-//   Offset 0:  alloc_size (i64) — total allocation size including header
-//   Offset 8:  metadata   (i64) — HeapMetadata* (full 64-bit pointer)
-//   Offset 16: refcount   (i64) — reference count (InlineRefCounts)
-//   Offset 24: user_data  [...] — actual object data
+// Native 64-bit ARC header (32 bytes):
+//   Offset 0:  magic      (i64) — ARC_HEAP_MAGIC sentinel (heap object guard)
+//   Offset 8:  alloc_size (i64) — total allocation size including header
+//   Offset 16: metadata   (i64) — HeapMetadata* (full 64-bit pointer)
+//   Offset 24: refcount   (i64) — reference count (InlineRefCounts)
+//   Offset 32: user_data  [...] — actual object data
 //
-// Wasm path uses 16-byte header with i32 fields (arc.zig).
-// Native needs i64 metadata for 64-bit function pointers in destructor dispatch.
+// Divergence from Swift: Swift's HeapObject is 16 bytes (metadata + refcounts).
+// Swift avoids ARC on stack pointers by making structs value types — there's no
+// way to pass a stack address to swift_retain. Cot allows `&expr` to produce
+// `*T` pointers to stack data, which share the managed pointer type with `new T`.
+// The magic field guards against ARC on these non-heap pointers: retain/release
+// check for ARC_HEAP_MAGIC before touching refcounts, making ARC a safe no-op
+// for stack pointers. Swift's pointer range check ((intptr_t)p > 0) wouldn't
+// help here — stack addresses are also positive in user space.
 //
-// Reference: Swift HeapObject.h — metadata is a full pointer
+// Extra fields vs Swift:
+//   magic      — Cot-specific: heap guard for mixed managed/raw pointer types
+//   alloc_size — Cot-specific: realloc support (Swift uses malloc_size() instead)
+//
+// Wasm path uses 16-byte header with i32 fields (arc.zig) — no magic needed
+// since Wasm linear memory is bounded and &expr doesn't produce native pointers.
+//
+// Reference: Swift HeapObject.h — metadata + InlineRefCounts (16 bytes)
+// Reference: Swift HeapObject.cpp:isValidPointerForNativeRetain — pointer range check
 // Reference: arc.zig — Wasm header layout (SIZE_OFFSET=0/i32, METADATA_OFFSET=4/i32, REFCOUNT_OFFSET=8/i64)
-const HEAP_OBJECT_HEADER_SIZE: i64 = 24;
-const SIZE_OFFSET: i32 = 0; // alloc_size (i64) — needed for realloc copy calculation
-const METADATA_OFFSET: i32 = 8; // HeapMetadata* (i64) — type metadata pointer
-const REFCOUNT_OFFSET: i32 = 16; // InlineRefCounts (i64) — reference count
+const HEAP_OBJECT_HEADER_SIZE: i64 = 32;
+const MAGIC_OFFSET: i32 = 0; // ARC_HEAP_MAGIC sentinel (i64)
+const SIZE_OFFSET: i32 = 8; // alloc_size (i64) — needed for realloc copy calculation
+const METADATA_OFFSET: i32 = 16; // HeapMetadata* (i64) — type metadata pointer
+const REFCOUNT_OFFSET: i32 = 24; // InlineRefCounts (i64) — reference count
+
+// Heap magic sentinel: retain/release check this at (obj - HEADER_SIZE + MAGIC_OFFSET)
+// before touching refcounts. Non-heap pointers (from &expr / addr_of) won't have
+// this value at the expected offset, so ARC operations become safe no-ops.
+// This is Cot-specific — Swift doesn't need this because structs are value types.
+const ARC_HEAP_MAGIC: i64 = @bitCast(@as(u64, 0xC07A_8C00_C07A_8C00));
 
 // Swift InlineRefCounts bit layout (RefCount.h:241-285)
 //
@@ -193,12 +215,13 @@ pub fn generate(
 // ============================================================================
 // alloc(metadata: i64, size: i64) -> i64
 //
-// Native alloc: call malloc(aligned_size), init header, return ptr + 24.
+// Native alloc: call malloc(aligned_size), init header, return ptr + 32.
 //
-// Header init (24-byte native layout):
-//   store alloc_size (i64) at raw + 0
-//   store metadata   (i64) at raw + 8
-//   store refcount=1 (i64) at raw + 16
+// Header init (32-byte native layout):
+//   store magic      (i64) at raw + 0   (ARC_HEAP_MAGIC sentinel)
+//   store alloc_size (i64) at raw + 8
+//   store metadata   (i64) at raw + 16
+//   store refcount=1 (i64) at raw + 24
 //
 // Reference: arc.zig:515-683 (Wasm alloc — similar logic with total_size)
 // Reference: Swift swift_allocObject (HeapObject.cpp:424-440)
@@ -254,10 +277,13 @@ fn generateAlloc(
     const malloc_result = try ins.call(malloc_ref, &[_]clif.Value{alloc_size});
     const raw_ptr = malloc_result.results[0];
 
-    // Init header (24-byte native layout):
-    //   raw_ptr + 0:  alloc_size (i64) — total allocation size
-    //   raw_ptr + 8:  metadata   (i64) — HeapMetadata pointer
-    //   raw_ptr + 16: refcount   (i64) — initial count = 1
+    // Init header (32-byte native layout):
+    //   raw_ptr + 0:  magic      (i64) — ARC_HEAP_MAGIC sentinel
+    //   raw_ptr + 8:  alloc_size (i64) — total allocation size
+    //   raw_ptr + 16: metadata   (i64) — HeapMetadata pointer
+    //   raw_ptr + 24: refcount   (i64) — initial count = 1
+    const v_magic = try ins.iconst(clif.Type.I64, ARC_HEAP_MAGIC);
+    _ = try ins.store(clif.MemFlags.DEFAULT, v_magic, raw_ptr, MAGIC_OFFSET);
     _ = try ins.store(clif.MemFlags.DEFAULT, alloc_size, raw_ptr, SIZE_OFFSET);
     _ = try ins.store(clif.MemFlags.DEFAULT, metadata, raw_ptr, METADATA_OFFSET);
 
@@ -277,7 +303,7 @@ fn generateAlloc(
 // ============================================================================
 // dealloc(obj: i64) -> void
 //
-// Simplified native dealloc: call free(obj - 24).
+// Simplified native dealloc: call free(obj - HEADER_SIZE).
 // Reference: arc.zig:689-748 (simplified, no freelist).
 // ============================================================================
 
@@ -317,7 +343,7 @@ fn generateDealloc(
     try builder.ensureInsertedBlock();
     _ = try builder.ins().return_(&[_]clif.Value{});
 
-    // Free block: header_ptr = obj - 16, call free(header_ptr)
+    // Free block: header_ptr = obj - HEADER_SIZE, call free(header_ptr)
     builder.switchToBlock(block_free);
     try builder.ensureInsertedBlock();
     const ins2 = builder.ins();
@@ -368,6 +394,7 @@ fn generateRetain(
 
     const block_entry = try builder.createBlock();
     const block_return_zero = try builder.createBlock();
+    const block_check_magic = try builder.createBlock();
     const block_check_immortal = try builder.createBlock();
     const block_return_obj = try builder.createBlock();
     const block_check_slow = try builder.createBlock();
@@ -385,7 +412,7 @@ fn generateRetain(
         const obj = builder.blockParams(block_entry)[0];
         const v_zero = try ins.iconst(clif.Type.I64, 0);
         const is_null = try ins.icmp(.eq, obj, v_zero);
-        _ = try ins.brif(is_null, block_return_zero, &.{}, block_check_immortal, &.{});
+        _ = try ins.brif(is_null, block_return_zero, &.{}, block_check_magic, &.{});
     }
 
     // Return zero (null case)
@@ -396,7 +423,22 @@ fn generateRetain(
         _ = try builder.ins().return_(&[_]clif.Value{v_zero2});
     }
 
-    // Check immortal: header_ptr = obj - 24, load refcount
+    // Check magic: verify ARC_HEAP_MAGIC at header to guard against non-heap pointers.
+    // Stack pointers from &expr (addr_of) won't have the magic → return obj unchanged.
+    builder.switchToBlock(block_check_magic);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const header_ptr = try ins.isub(obj, v_header);
+        const magic = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, MAGIC_OFFSET);
+        const v_expected = try ins.iconst(clif.Type.I64, ARC_HEAP_MAGIC);
+        const is_heap = try ins.icmp(.eq, magic, v_expected);
+        _ = try ins.brif(is_heap, block_check_immortal, &.{}, block_return_obj, &.{});
+    }
+
+    // Check immortal: header_ptr = obj - HEADER_SIZE, load refcount
     builder.switchToBlock(block_check_immortal);
     try builder.ensureInsertedBlock();
     {
@@ -533,6 +575,7 @@ fn generateRelease(
 
     const block_entry = try builder.createBlock();
     const block_return = try builder.createBlock();
+    const block_check_magic = try builder.createBlock();
     const block_check_immortal = try builder.createBlock();
     const block_check_slow = try builder.createBlock();
     const block_inline_path = try builder.createBlock();
@@ -552,10 +595,24 @@ fn generateRelease(
         const obj = builder.blockParams(block_entry)[0];
         const v_zero = try ins.iconst(clif.Type.I64, 0);
         const is_null = try ins.icmp(.eq, obj, v_zero);
-        _ = try ins.brif(is_null, block_return, &.{}, block_check_immortal, &.{});
+        _ = try ins.brif(is_null, block_return, &.{}, block_check_magic, &.{});
     }
 
-    // ---- Return block (null, immortal, or rc > 0) ----
+    // ---- Check magic: verify ARC_HEAP_MAGIC to guard against non-heap pointers ----
+    builder.switchToBlock(block_check_magic);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
+        const v_header = try ins.iconst(clif.Type.I64, HEAP_OBJECT_HEADER_SIZE);
+        const header_ptr = try ins.isub(obj, v_header);
+        const magic = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, header_ptr, MAGIC_OFFSET);
+        const v_expected = try ins.iconst(clif.Type.I64, ARC_HEAP_MAGIC);
+        const is_heap = try ins.icmp(.eq, magic, v_expected);
+        _ = try ins.brif(is_heap, block_check_immortal, &.{}, block_return, &.{});
+    }
+
+    // ---- Return block (null, not-heap, immortal, or rc > 0) ----
     builder.switchToBlock(block_return);
     try builder.ensureInsertedBlock();
     _ = try builder.ins().return_(&[_]clif.Value{});

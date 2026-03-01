@@ -1683,11 +1683,17 @@ pub const Lowerer = struct {
             // If the return value is already +1 (new_expr, call, or forwarded from cleanup),
             // skip. Otherwise retain to produce +1. This fixes returning field accesses,
             // parameters, or other borrowed (+0) values.
+            // addr_of expressions (&x, &x.field) produce raw pointers to existing memory
+            // (stack or embedded fields) — NOT heap-allocated ARC objects. Skip retain as
+            // an optimization (the ARC_HEAP_MAGIC guard in arc_native.zig also makes retain
+            // a no-op for non-heap pointers, but avoiding the call is better).
+            // Divergence from Swift: Swift prevents this at the type level (structs are
+            // value types). Cot's *T can be heap or stack — see arc_native.zig header comment.
             if (!self.target.isWasmGC() and value_node != null) {
                 const fn_ret_type = fb.return_type;
                 if (self.type_reg.couldBeARC(fn_ret_type)) {
                     const is_plus_one = forwarded or
-                        (if (ret_node) |n| if (n.asExpr()) |e| (e == .new_expr or e == .call) else false else false);
+                        (if (ret_node) |n| if (n.asExpr()) |e| (e == .new_expr or e == .call or e == .addr_of) else false else false);
                     if (!is_plus_one) {
                         var retain_args = [_]ir.NodeIndex{value_node.?};
                         value_node = try fb.emitCall("retain", &retain_args, false, fn_ret_type, ret.span);
