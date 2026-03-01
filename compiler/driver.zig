@@ -87,6 +87,10 @@ pub const Driver = struct {
     debug_source_file: []const u8 = "",
     debug_source_text: []const u8 = "",
     debug_ir_funcs: []const ir_mod.Func = &.{},
+    // User-declared extern fn names (from imported modules like std/sqlite).
+    // Collected from checker scopes after type checking.
+    // Registered in func_index_map so native backend can resolve calls.
+    user_extern_fns: std.ArrayListUnmanaged([]const u8) = .{},
 
     pub fn init(allocator: Allocator) Driver {
         return .{ .allocator = allocator };
@@ -330,6 +334,9 @@ pub const Driver = struct {
         try chk.checkFile();
         if (err_reporter.hasErrors()) return error.TypeCheckError;
 
+        // Collect user-declared extern fn names for native func_index_map
+        self.collectExternFns(&global_scope);
+
         // Lower to IR
         var lowerer = lower_mod.Lowerer.init(self.allocator, &tree, &type_reg, &err_reporter, &chk, self.target);
         defer lowerer.deinit();
@@ -429,6 +436,12 @@ pub const Driver = struct {
             // Store checked scope for later files to import from
             try checked_scopes.put(pf.path, .{ .scope = file_scope, .tree = &pf.tree });
         }
+
+        // Collect user-declared extern fn names for native func_index_map
+        for (file_scopes.items) |fs| {
+            self.collectExternFns(fs);
+        }
+        self.collectExternFns(&global_scope);
 
         // Go LinkFuncName pattern: build module name map for qualified IR function names.
         // This prevents name collisions when two modules export functions with the same name
@@ -656,6 +669,21 @@ pub const Driver = struct {
             .tree = undefined,
         };
         return self.generateCode(final_ir.funcs, final_ir.globals, &type_reg, main_file.path, main_file.source_text);
+    }
+
+    /// Collect user-declared extern fn names from a checker scope.
+    /// These are functions declared with `extern fn` in user code (e.g. sqlite3_open).
+    /// They need func_index_map entries so the native backend can emit calls to them.
+    /// Reference: cg_clif abi/mod.rs:97-115 — Linkage::Import pattern for external symbols
+    fn collectExternFns(self: *Driver, scope: *const checker_mod.Scope) void {
+        var iter = scope.symbols.iterator();
+        while (iter.next()) |entry| {
+            const sym = entry.value_ptr.*;
+            if (sym.is_extern and sym.kind == .function) {
+                // Skip names already in runtime_func_names (e.g. alloc, dealloc)
+                self.user_extern_fns.append(self.allocator, sym.name) catch {};
+            }
+        }
     }
 
     fn normalizePath(self: *Driver, path: []const u8) ![]const u8 {
@@ -1277,16 +1305,27 @@ pub const Driver = struct {
             try func_index_map.put(self.allocator, "unlink", idx);
         }
 
+        // User-declared extern fn names (from imported modules like std/sqlite).
+        // Same pattern as libc symbols above — linker resolves from -l flags.
+        // Reference: cg_clif abi/mod.rs:97-115 — import_function with Linkage::Import
+        var user_extern_count: u32 = 0;
+        for (self.user_extern_fns.items) |name| {
+            if (!func_index_map.contains(name)) {
+                try func_index_map.put(self.allocator, name, runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count);
+                user_extern_count += 1;
+            }
+        }
+
         // String data symbol index — used by ssa_to_clif for globalValue references
         // This index is registered in external_names in generateMachODirect
         const string_data_symbol_idx: ?u32 = if (string_data.items.len > 0)
-            runtime_start_idx + @as(u32, @intCast(runtime_func_names.len))
+            runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count
         else
             null;
 
         // CTXT global symbol index — used by closure calls to pass context pointer.
         // Mirrors Wasm's CTXT global (index 1). Native uses a data section variable.
-        const ctxt_base_idx = runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + @as(u32, if (string_data.items.len > 0) 1 else 0);
+        const ctxt_base_idx = runtime_start_idx + @as(u32, @intCast(runtime_func_names.len)) + user_extern_count + @as(u32, if (string_data.items.len > 0) 1 else 0);
         const ctxt_symbol_idx: u32 = ctxt_base_idx;
 
         // Argc/argv/envp global symbol indices — used by args and environ runtime functions.

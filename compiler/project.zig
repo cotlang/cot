@@ -85,6 +85,25 @@ pub const LoadedConfig = struct {
         return names.toOwnedSlice(allocator) catch null;
     }
 
+    /// Read the "libs" array from cot.json for native library linking.
+    /// Returns library names (e.g., ["sqlite3"]) or null if not specified.
+    pub fn getLibs(self: *const LoadedConfig, allocator: std.mem.Allocator) ?[]const []const u8 {
+        if (self.file_contents.len == 0) return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, self.file_contents, .{}) catch return null;
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) return null;
+        const libs = root.object.get("libs") orelse return null;
+        if (libs != .array) return null;
+        var names = std.ArrayListUnmanaged([]const u8){};
+        for (libs.array.items) |item| {
+            if (item != .string) continue;
+            names.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+        }
+        if (names.items.len == 0) return null;
+        return names.toOwnedSlice(allocator) catch null;
+    }
+
     pub fn deinit(self: *LoadedConfig) void {
         self.parsed.deinit();
         if (self.file_contents.len > 0) {
@@ -168,4 +187,30 @@ test "loadConfig: invalid json returns error" {
     const allocator = std.testing.allocator;
     const result = parseConfig(allocator, "not json");
     try std.testing.expectError(error.InvalidProjectConfig, result);
+}
+
+test "getLibs reads libs array" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"name":"test","libs":["sqlite3","curl"]}
+    ;
+    const file_contents = try allocator.dupe(u8, json);
+    var loaded = try parseConfig(allocator, json);
+    loaded.file_contents = file_contents;
+    loaded.file_allocator = allocator;
+    defer loaded.deinit();
+    const libs = loaded.getLibs(allocator).?;
+    defer allocator.free(libs);
+    try std.testing.expectEqual(@as(usize, 2), libs.len);
+    try std.testing.expectEqualStrings("sqlite3", libs[0]);
+    try std.testing.expectEqualStrings("curl", libs[1]);
+    allocator.free(libs[0]);
+    allocator.free(libs[1]);
+}
+
+test "getLibs returns null when no libs" {
+    const allocator = std.testing.allocator;
+    var loaded = try parseConfig(allocator, "{}");
+    defer loaded.deinit();
+    try std.testing.expect(loaded.getLibs(allocator) == null);
 }

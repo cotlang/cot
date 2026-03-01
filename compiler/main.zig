@@ -1284,6 +1284,10 @@ fn compileAndLinkFull(
     lib_mode: bool,
     direct_native: bool,
 ) void {
+    // Load cot.json for project-level link settings (libs, etc.)
+    var project_config = project.loadConfig(allocator, null) catch null;
+    defer if (project_config) |*pc| pc.deinit();
+
     var compile_driver = Driver.init(allocator);
     compile_driver.setTarget(compile_target);
     compile_driver.release_mode = release_mode;
@@ -1427,6 +1431,16 @@ fn compileAndLinkFull(
             std.debug.print("Error: Allocation failed\n", .{});
             std.process.exit(1);
         };
+    }
+
+    // Append user-specified native libraries from cot.json "libs" array
+    if (project_config) |*pc| {
+        if (pc.getLibs(allocator)) |libs| {
+            for (libs) |lib_name| {
+                const flag = std.fmt.allocPrint(allocator, "-l{s}", .{lib_name}) catch continue;
+                link_args.append(allocator, flag) catch {};
+            }
+        }
     }
 
     var child = std.process.Child.init(link_args.items, allocator);
