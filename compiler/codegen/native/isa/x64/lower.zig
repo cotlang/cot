@@ -339,10 +339,14 @@ pub const X64LowerBackend = struct {
                 const cond_reg = cond_val.onlyReg() orelse return null;
                 const cond_gpr = Gpr.unwrapNew(cond_reg);
 
-                // Compare with zero using TEST (more efficient than CMP for this case)
+                // Compare with zero using TEST on the low byte only.
+                // SETCC (icmp result) writes only the low byte of the register.
+                // The upper bytes may contain garbage if the register allocator
+                // reuses a register that held a different value. Using size8
+                // ensures we only test the meaningful byte.
                 ctx.emit(Inst{
                     .test_rmi_r = .{
-                        .size = .size64,
+                        .size = .size8,
                         .src = GprMemImm.unwrapNew(RegMemImm.fromReg(cond_gpr.toReg())),
                         .dst = cond_gpr,
                     },
