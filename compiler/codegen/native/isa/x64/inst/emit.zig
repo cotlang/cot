@@ -1521,6 +1521,16 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
         // Call
         //---------------------------------------------------------------------
         .call_known => |call| {
+            // System V AMD64 ABI: set AL = number of XMM args for variadic functions.
+            // Non-variadic functions ignore AL, so always setting it is harmless.
+            {
+                var xmm_count: u8 = 0;
+                for (call.info.uses.items) |use| {
+                    if (use.preg.class() == .float) xmm_count += 1;
+                }
+                try sink.put1(0xB0); // MOV AL, imm8
+                try sink.put1(xmm_count);
+            }
             // Convert CLIF ExternalName to buffer's ExternalName format
             // (same conversion as ARM64 does in its emit.zig)
             const buffer_ext_name: buffer_mod.ExternalName = switch (call.info.dest) {
@@ -1536,15 +1546,46 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
         },
 
         .call_unknown => |call| {
+            // System V AMD64 ABI: set AL = number of XMM args for variadic functions.
+            // For call_unknown (indirect calls), the callee may be in RAX.
+            // mov al, imm8 clobbers the low byte of RAX, so if the callee is
+            // in RAX, we first move it to R11 (scratch) before setting AL.
+            var xmm_count: u8 = 0;
+            for (call.info.uses.items) |use| {
+                if (use.preg.class() == .float) xmm_count += 1;
+            }
             switch (call.info.dest) {
                 .reg => |r| {
                     const enc = r.hwEnc();
-                    const rex = RexPrefix.oneOp(enc, false, false);
-                    try rex.encode(sink);
-                    try sink.put1(0xFF);
-                    try emitModrmReg(sink, 2, enc); // CALL uses /2
+                    if (enc == 0) {
+                        // Callee is in RAX — move to R11 before setting AL
+                        // REX.WB mov r11, rax (49 89 c3)
+                        try sink.put1(0x49); // REX.WB
+                        try sink.put1(0x89); // MOV r/m64, r64
+                        try sink.put1(0xC3); // ModRM: r11=dest, rax=src
+                        // Now set AL safely
+                        try sink.put1(0xB0); // MOV AL, imm8
+                        try sink.put1(xmm_count);
+                        // call *r11
+                        const r11_enc: u8 = 11; // R11
+                        const rex = RexPrefix.oneOp(r11_enc, false, false);
+                        try rex.encode(sink);
+                        try sink.put1(0xFF);
+                        try emitModrmReg(sink, 2, r11_enc); // CALL uses /2
+                    } else {
+                        // Callee not in RAX — safe to set AL directly
+                        try sink.put1(0xB0); // MOV AL, imm8
+                        try sink.put1(xmm_count);
+                        const rex = RexPrefix.oneOp(enc, false, false);
+                        try rex.encode(sink);
+                        try sink.put1(0xFF);
+                        try emitModrmReg(sink, 2, enc); // CALL uses /2
+                    }
                 },
                 .mem => |amode| {
+                    // Memory-indirect call — AL setting doesn't clobber address regs
+                    try sink.put1(0xB0); // MOV AL, imm8
+                    try sink.put1(xmm_count);
                     const finalized = memFinalize(amode, state);
                     const rex = switch (finalized.amode) {
                         .imm_reg => |m| RexPrefix.memOp(2, m.base.hwEnc(), false, false),
@@ -1803,7 +1844,6 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             try rex.encode(sink);
             try sink.put1(0x8D);
             try sink.put1(encodeModrm(0b00, dst_enc & 7, 0b101));
-            try sink.put4(0);
 
             // Convert CLIF ExternalName to buffer's ExternalName format
             const buffer_ext_name: buffer_mod.ExternalName = switch (load.name) {
@@ -1811,8 +1851,10 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
                 .libcall => @panic("libcall not yet supported in x64 load_ext_name emission"),
             };
 
-            // Record relocation for the displacement
-            try sink.addRelocExternalName(buffer_mod.Reloc.X86PCRel4, buffer_ext_name, load.offset);
+            // Record relocation BEFORE emitting displacement (matches call_known pattern)
+            // Addend of -4 accounts for PC-relative addressing being relative to end of instruction
+            try sink.addRelocExternalName(buffer_mod.Reloc.X86PCRel4, buffer_ext_name, load.offset - 4);
+            try sink.put4(0); // Placeholder for displacement (will be patched by linker)
         },
 
         //---------------------------------------------------------------------
@@ -2253,7 +2295,9 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
 
             const operand_enc = atomic.operand.hwEnc();
             const tmp_enc = atomic.tmp.toReg().hwEnc();
-            const dst_old_enc = atomic.dst_old.toReg().hwEnc();
+            // dst_old is fixed to RAX by regFixedDef in get_operands (CMPXCHG implicit).
+            // The field isn't updated in-place by regalloc, so hardcode RAX encoding.
+            const dst_old_enc: u8 = 0; // RAX
             const finalized = memFinalize(atomic.mem, state);
 
             // Determine size and prefix

@@ -20,6 +20,7 @@ const RuntimeFunc = arc_native.RuntimeFunc;
 const GlobalValueData = @import("../../ir/clif/globalvalue.zig").GlobalValueData;
 const gv_ExternalName = @import("../../ir/clif/globalvalue.zig").ExternalName;
 
+const target_mod = @import("../../frontend/target.zig");
 const debug = @import("../../pipeline_debug.zig");
 
 /// Generate all I/O runtime functions as compiled native code.
@@ -32,6 +33,7 @@ pub fn generate(
     argv_symbol_idx: u32,
     envp_symbol_idx: u32,
     lib_mode: bool,
+    target_os: target_mod.Os,
 ) !std.ArrayListUnmanaged(RuntimeFunc) {
     var result = std.ArrayListUnmanaged(RuntimeFunc){};
     errdefer {
@@ -215,38 +217,45 @@ pub fn generate(
     // net_set_reuse_addr(fd) → i64  (calls setsockopt)
     try result.append(allocator, .{
         .name = "net_set_reuse_addr",
-        .compiled = try generateNetSetReuseAddr(allocator, isa, ctrl_plane, func_index_map),
+        .compiled = try generateNetSetReuseAddr(allocator, isa, ctrl_plane, func_index_map, target_os),
     });
     // set_nonblocking(fd) → i64  (calls fcntl)
     try result.append(allocator, .{
         .name = "set_nonblocking",
-        .compiled = try generateSetNonblocking(allocator, isa, ctrl_plane, func_index_map),
+        .compiled = try generateSetNonblocking(allocator, isa, ctrl_plane, func_index_map, target_os),
     });
 
-    // --- Event loop runtime (kqueue on macOS) ---
+    // --- Event loop runtime (kqueue on macOS, stubs on Linux) ---
+    if (target_os == .macos) {
+        // kqueue_create() → i64  (calls libc kqueue)
+        try result.append(allocator, .{
+            .name = "kqueue_create",
+            .compiled = try generateForward0(allocator, isa, ctrl_plane, func_index_map, "kqueue"),
+        });
+        // kevent_add(kq, fd, events) → i64
+        try result.append(allocator, .{
+            .name = "kevent_add",
+            .compiled = try generateKeventAdd(allocator, isa, ctrl_plane, func_index_map),
+        });
+        // kevent_del(kq, fd, events) → i64
+        try result.append(allocator, .{
+            .name = "kevent_del",
+            .compiled = try generateKeventDel(allocator, isa, ctrl_plane, func_index_map),
+        });
+        // kevent_wait(kq, events_buf, timeout) → i64
+        try result.append(allocator, .{
+            .name = "kevent_wait",
+            .compiled = try generateKeventWait(allocator, isa, ctrl_plane, func_index_map),
+        });
+    } else {
+        // Linux: kqueue stubs return -1 (epoll not yet implemented)
+        try result.append(allocator, .{ .name = "kqueue_create", .compiled = try generateReturnsNeg1(allocator, isa, ctrl_plane) });
+        try result.append(allocator, .{ .name = "kevent_add", .compiled = try generateReturnsNeg1_3(allocator, isa, ctrl_plane) });
+        try result.append(allocator, .{ .name = "kevent_del", .compiled = try generateReturnsNeg1_3(allocator, isa, ctrl_plane) });
+        try result.append(allocator, .{ .name = "kevent_wait", .compiled = try generateReturnsNeg1_3(allocator, isa, ctrl_plane) });
+    }
 
-    // kqueue_create() → i64  (calls libc kqueue)
-    try result.append(allocator, .{
-        .name = "kqueue_create",
-        .compiled = try generateForward0(allocator, isa, ctrl_plane, func_index_map, "kqueue"),
-    });
-    // kevent_add(kq, fd, events) → i64
-    try result.append(allocator, .{
-        .name = "kevent_add",
-        .compiled = try generateKeventAdd(allocator, isa, ctrl_plane, func_index_map),
-    });
-    // kevent_del(kq, fd, events) → i64
-    try result.append(allocator, .{
-        .name = "kevent_del",
-        .compiled = try generateKeventDel(allocator, isa, ctrl_plane, func_index_map),
-    });
-    // kevent_wait(kq, events_buf, timeout) → i64
-    try result.append(allocator, .{
-        .name = "kevent_wait",
-        .compiled = try generateKeventWait(allocator, isa, ctrl_plane, func_index_map),
-    });
-
-    // Epoll stubs (return -1 on macOS)
+    // Epoll stubs (return -1 — real epoll implementation is a separate feature)
     try result.append(allocator, .{ .name = "epoll_create", .compiled = try generateReturnsNeg1(allocator, isa, ctrl_plane) });
     try result.append(allocator, .{ .name = "epoll_add", .compiled = try generateReturnsNeg1_3(allocator, isa, ctrl_plane) });
     try result.append(allocator, .{ .name = "epoll_del", .compiled = try generateReturnsNeg1_2(allocator, isa, ctrl_plane) });
@@ -283,12 +292,12 @@ pub fn generate(
     // ioctl_winsize(fd, rows, cols) → i64 (builds winsize struct, calls ioctl)
     try result.append(allocator, .{
         .name = "cot_ioctl_winsize",
-        .compiled = try generateIoctlWinsize(allocator, isa, ctrl_plane, func_index_map),
+        .compiled = try generateIoctlWinsize(allocator, isa, ctrl_plane, func_index_map, target_os),
     });
     // ioctl_set_ctty(fd) → i64 (calls ioctl(fd, TIOCSCTTY, 0) to set controlling terminal)
     try result.append(allocator, .{
         .name = "cot_ioctl_set_ctty",
-        .compiled = try generateIoctlSetCtty(allocator, isa, ctrl_plane, func_index_map),
+        .compiled = try generateIoctlSetCtty(allocator, isa, ctrl_plane, func_index_map, target_os),
     });
 
     return result;
@@ -1730,6 +1739,7 @@ fn generateNetSetReuseAddr(
     isa: native_compile.TargetIsa,
     ctrl_plane: *native_compile.ControlPlane,
     func_index_map: *const std.StringHashMapUnmanaged(u32),
+    target_os: target_mod.Os,
 ) !native_compile.CompiledCode {
     var clif_func = clif.Function.init(allocator);
     defer clif_func.deinit();
@@ -1769,8 +1779,8 @@ fn generateNetSetReuseAddr(
         .signature = sig_ref,
         .colocated = false,
     });
-    const sol_socket = try ins.iconst(clif.Type.I64, 0xFFFF); // SOL_SOCKET on macOS
-    const so_reuse = try ins.iconst(clif.Type.I64, 0x0004); // SO_REUSEADDR
+    const sol_socket = try ins.iconst(clif.Type.I64, if (target_os == .macos) 0xFFFF else 1);
+    const so_reuse = try ins.iconst(clif.Type.I64, if (target_os == .macos) 0x0004 else 2);
     const optlen = try ins.iconst(clif.Type.I64, 4);
     const call_result = try ins.call(func_ref, &[_]clif.Value{ fd, sol_socket, so_reuse, val_addr, optlen });
     _ = try ins.return_(&[_]clif.Value{call_result.results[0]});
@@ -1790,6 +1800,7 @@ fn generateSetNonblocking(
     isa: native_compile.TargetIsa,
     ctrl_plane: *native_compile.ControlPlane,
     func_index_map: *const std.StringHashMapUnmanaged(u32),
+    target_os: target_mod.Os,
 ) !native_compile.CompiledCode {
     var clif_func = clif.Function.init(allocator);
     defer clif_func.deinit();
@@ -1827,7 +1838,7 @@ fn generateSetNonblocking(
         .colocated = false,
     });
     const f_setfl = try ins.iconst(clif.Type.I64, 4);
-    const o_nonblock = try ins.iconst(clif.Type.I64, 0x0004);
+    const o_nonblock = try ins.iconst(clif.Type.I64, if (target_os == .macos) 0x0004 else 0x800);
     const call_result = if (is_aarch64) blk: {
         const pad = try ins.iconst(clif.Type.I64, 0);
         break :blk try ins.call(func_ref, &[_]clif.Value{ fd, f_setfl, pad, pad, pad, pad, pad, pad, o_nonblock });
@@ -2284,6 +2295,7 @@ fn generateIoctlWinsize(
     isa: native_compile.TargetIsa,
     ctrl_plane: *native_compile.ControlPlane,
     func_index_map: *const std.StringHashMapUnmanaged(u32),
+    target_os: target_mod.Os,
 ) !native_compile.CompiledCode {
     var clif_func = clif.Function.init(allocator);
     defer clif_func.deinit();
@@ -2355,7 +2367,7 @@ fn generateIoctlWinsize(
         .signature = ioctl_sig_ref,
         .colocated = false,
     });
-    const tiocswinsz = try ins.iconst(clif.Type.I64, 0x80087467); // macOS TIOCSWINSZ
+    const tiocswinsz = try ins.iconst(clif.Type.I64, if (target_os == .macos) 0x80087467 else 0x5414);
     const call_result = if (is_aarch64) blk: {
         const pad = try ins.iconst(clif.Type.I64, 0);
         break :blk try ins.call(ioctl_ref, &[_]clif.Value{ fd, tiocswinsz, pad, pad, pad, pad, pad, pad, ws_addr });
@@ -2379,6 +2391,7 @@ fn generateIoctlSetCtty(
     isa: native_compile.TargetIsa,
     ctrl_plane: *native_compile.ControlPlane,
     func_index_map: *const std.StringHashMapUnmanaged(u32),
+    target_os: target_mod.Os,
 ) !native_compile.CompiledCode {
     var clif_func = clif.Function.init(allocator);
     defer clif_func.deinit();
@@ -2415,7 +2428,7 @@ fn generateIoctlSetCtty(
         .signature = ioctl_sig_ref_b,
         .colocated = false,
     });
-    const tiocsctty = try ins_b.iconst(clif.Type.I64, 0x20007461); // macOS TIOCSCTTY
+    const tiocsctty = try ins_b.iconst(clif.Type.I64, if (target_os == .macos) 0x20007461 else 0x540E);
     const v_zero_b = try ins_b.iconst(clif.Type.I64, 0);
     const ioctl_result = if (is_aarch64_b) blk: {
         const pad_b = try ins_b.iconst(clif.Type.I64, 0);

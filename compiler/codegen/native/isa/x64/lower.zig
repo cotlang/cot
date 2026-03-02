@@ -51,6 +51,7 @@ const GprEnc = regs.GprEnc;
 const PReg = inst_mod.PReg;
 const CallArgPair = inst_mod.CallArgPair;
 const CallInfo = inst_mod.CallInfo;
+const CallInfoUnknown = inst_mod.CallInfoUnknown;
 const CallRetList = inst_mod.CallRetList;
 const CallRetPair = inst_mod.CallRetPair;
 const PRegSet = inst_mod.PRegSet;
@@ -241,6 +242,8 @@ pub const X64LowerBackend = struct {
             .trunc => self.lowerFpuRound(ctx, ir_inst, .round_zero),
             .nearest => self.lowerFpuRound(ctx, ir_inst, .round_nearest),
             .fcmp => self.lowerFcmp(ctx, ir_inst),
+            .fmin => self.lowerFmin(ctx, ir_inst),
+            .fmax => self.lowerFmax(ctx, ir_inst),
 
             // Conversions
             .uextend => self.lowerUextend(ctx, ir_inst),
@@ -664,16 +667,10 @@ pub const X64LowerBackend = struct {
         const dst_reg = dst.onlyReg() orelse return null;
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
 
-        // MOV src → dst first (x64 ALU ops modify in-place)
-        ctx.emit(Inst{
-            .mov_r_r = .{
-                .size = size,
-                .src = lhs_gpr,
-                .dst = dst_gpr,
-            },
-        }) catch return null;
-
-        // Check if immediate fits in 32-bit sign-extended form (x64 ADD r/m64, imm32)
+        // 3-operand ALU: dst = lhs + imm
+        // alu_rmi_r emit code handles mov lhs→dst internally when src1 != dst.
+        // Do NOT pre-emit a mov and then use dst as src1 — that creates dst == src1
+        // which breaks regalloc (early DEF + early USE of same vreg at same ProgPoint).
         if (imm >= std.math.minInt(i32) and imm <= std.math.maxInt(i32)) {
             const imm32: u32 = @bitCast(@as(i32, @intCast(imm)));
             const imm_rmi = GprMemImm{ .inner = RegMemImm{ .imm = imm32 } };
@@ -682,7 +679,7 @@ pub const X64LowerBackend = struct {
                 .alu_rmi_r = .{
                     .size = size,
                     .op = .add,
-                    .src1 = dst_gpr.toReg(),
+                    .src1 = lhs_gpr,
                     .src2 = imm_rmi,
                     .dst = dst_gpr,
                 },
@@ -707,7 +704,7 @@ pub const X64LowerBackend = struct {
                 .alu_rmi_r = .{
                     .size = size,
                     .op = .add,
-                    .src1 = dst_gpr.toReg(),
+                    .src1 = lhs_gpr,
                     .src2 = tmp_rmi,
                     .dst = dst_gpr,
                 },
@@ -1438,10 +1435,17 @@ pub const X64LowerBackend = struct {
         const src_ty = ctx.inputTy(ir_inst, 0);
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const src = ctx.putInputInRegs(ir_inst, 0);
-        const dst = ctx.allocTmp(dst_ty) catch return null;
-
-        const ext_mode = ExtMode.fromBits(@intCast(src_ty.bits()), @intCast(dst_ty.bits())) orelse return null;
         const src_reg = src.onlyReg() orelse return null;
+
+        // Same-size uextend is a no-op (e.g. i64 → i64)
+        if (src_ty.bits() == dst_ty.bits()) {
+            var output = InstOutput{};
+            output.append(ValueRegs(Reg).one(src_reg)) catch return null;
+            return output;
+        }
+
+        const dst = ctx.allocTmp(dst_ty) catch return null;
+        const ext_mode = ExtMode.fromBits(@intCast(src_ty.bits()), @intCast(dst_ty.bits())) orelse return null;
         const src_gpr = Gpr.unwrapNew(src_reg);
         const dst_reg = dst.onlyReg() orelse return null;
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
@@ -1464,10 +1468,17 @@ pub const X64LowerBackend = struct {
         const src_ty = ctx.inputTy(ir_inst, 0);
         const dst_ty = ctx.outputTy(ir_inst, 0);
         const src = ctx.putInputInRegs(ir_inst, 0);
-        const dst = ctx.allocTmp(dst_ty) catch return null;
-
-        const ext_mode = ExtMode.fromBits(@intCast(src_ty.bits()), @intCast(dst_ty.bits())) orelse return null;
         const src_reg = src.onlyReg() orelse return null;
+
+        // Same-size sextend is a no-op (e.g. i64 → i64)
+        if (src_ty.bits() == dst_ty.bits()) {
+            var output = InstOutput{};
+            output.append(ValueRegs(Reg).one(src_reg)) catch return null;
+            return output;
+        }
+
+        const dst = ctx.allocTmp(dst_ty) catch return null;
+        const ext_mode = ExtMode.fromBits(@intCast(src_ty.bits()), @intCast(dst_ty.bits())) orelse return null;
         const src_gpr = Gpr.unwrapNew(src_reg);
         const dst_reg = dst.onlyReg() orelse return null;
         const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
@@ -2239,8 +2250,9 @@ pub const X64LowerBackend = struct {
     }
 
     fn lowerCallIndirect(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
-        // Indirect call lowering.
+        // Indirect call lowering — mirrors lowerCall but with call_unknown.
         // The callee address is the first input, remaining inputs are arguments.
+        // Uses regalloc constraints (uses/defs/clobbers) instead of explicit moves.
 
         const num_inputs = ctx.numInputs(ir_inst);
         if (num_inputs == 0) return null;
@@ -2249,97 +2261,106 @@ pub const X64LowerBackend = struct {
         const callee_val = ctx.putInputInRegs(ir_inst, 0);
         const callee_reg = callee_val.onlyReg() orelse return null;
 
-        // System V ABI integer argument registers
-        const int_arg_regs = [_]Reg{
-            regs.rdi(),
-            regs.rsi(),
-            regs.rdx(),
-            regs.rcx(),
-            regs.r8(),
-            regs.r9(),
+        // Create CallInfoUnknown structure for indirect call
+        const call_info = ctx.allocator.create(CallInfoUnknown) catch return null;
+        call_info.* = CallInfoUnknown{
+            .dest = RegMem.fromReg(callee_reg),
+            .uses = .{},
+            .defs = .{},
+            .clobbers = PRegSet.empty(),
+            .callee_conv = .system_v,
+            .caller_conv = .system_v,
+            .opcode = null,
+            .try_call_info = null,
         };
 
-        // Move arguments to ABI registers (skip first input which is callee)
-        // System V: integers in RDI,RSI,...; floats in XMM0-XMM7
-        var int_arg_idx: usize = 0;
-        var float_arg_idx: usize = 0;
-        for (1..num_inputs) |i| {
-            const arg_val = ctx.putInputInRegs(ir_inst, i);
+        // Build System V AMD64 clobber set (same as lowerCall)
+        var clobbers = PRegSet.empty()
+            .with(regs.gprPreg(GprEnc.RAX))
+            .with(regs.gprPreg(GprEnc.RCX))
+            .with(regs.gprPreg(GprEnc.RDX))
+            .with(regs.gprPreg(GprEnc.RSI))
+            .with(regs.gprPreg(GprEnc.RDI))
+            .with(regs.gprPreg(GprEnc.R8))
+            .with(regs.gprPreg(GprEnc.R9))
+            .with(regs.gprPreg(GprEnc.R10))
+            .with(regs.gprPreg(GprEnc.R11));
+        for (0..16) |i| {
+            clobbers = clobbers.with(regs.fprPreg(@intCast(i)));
+        }
+
+        // System V ABI integer argument registers
+        const int_arg_pregs = [_]PReg{
+            regs.gprPreg(GprEnc.RDI),
+            regs.gprPreg(GprEnc.RSI),
+            regs.gprPreg(GprEnc.RDX),
+            regs.gprPreg(GprEnc.RCX),
+            regs.gprPreg(GprEnc.R8),
+            regs.gprPreg(GprEnc.R9),
+        };
+
+        // Build uses list (skip first input = callee, rest are arguments)
+        var int_arg_idx: u8 = 0;
+        var float_arg_idx: u8 = 0;
+        for (1..num_inputs) |idx| {
+            const arg_val = ctx.putInputInRegs(ir_inst, idx);
             const arg_reg = arg_val.onlyReg() orelse continue;
-            const arg_ty = ctx.inputTy(ir_inst, i);
+            const arg_ty = ctx.inputTy(ir_inst, idx);
 
             if (arg_ty.isFloat()) {
                 if (float_arg_idx < 8) {
-                    // Move float arg to XMM register
-                    const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(regs.fpr(@intCast(float_arg_idx))));
-                    ctx.emit(Inst{
-                        .xmm_unary_rm_r = .{
-                            .op = if (arg_ty.bytes() == 4) SseOpcode.movss else SseOpcode.movsd,
-                            .src = XmmMem{ .inner = RegMem.fromReg(arg_reg) },
-                            .dst = dst_xmm,
-                        },
+                    call_info.uses.append(ctx.allocator, .{
+                        .vreg = arg_reg,
+                        .preg = regs.fprPreg(float_arg_idx),
                     }) catch return null;
                     float_arg_idx += 1;
                 }
-            } else if (int_arg_idx < int_arg_regs.len) {
-                const dst_reg = int_arg_regs[int_arg_idx];
-                const src_gpr = Gpr.unwrapNew(arg_reg);
-                const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg));
-
-                ctx.emit(Inst{
-                    .mov_r_r = .{
-                        .size = operandSizeFromType(arg_ty),
-                        .src = src_gpr,
-                        .dst = dst_gpr,
-                    },
+            } else if (int_arg_idx < int_arg_pregs.len) {
+                call_info.uses.append(ctx.allocator, .{
+                    .vreg = arg_reg,
+                    .preg = int_arg_pregs[int_arg_idx],
                 }) catch return null;
-
                 int_arg_idx += 1;
             }
         }
 
-        // Emit indirect call through the callee register
-        ctx.emit(Inst{
-            .jmp_unknown = .{
-                .target = RegMem.fromReg(callee_reg),
-            },
-        }) catch return null;
-
-        // Handle return value
+        // Build defs list for return values
+        const x64_ret_regs = [_]u8{ GprEnc.RAX, GprEnc.RDX };
         const num_outputs = ctx.numOutputs(ir_inst);
-        if (num_outputs > 0) {
-            const ret_ty = ctx.outputTy(ir_inst, 0);
+        var output = InstOutput{};
+        var int_ret_idx: u8 = 0;
+        var float_ret_idx: u8 = 0;
+        for (0..num_outputs) |out_idx| {
+            const ret_ty = ctx.outputTy(ir_inst, out_idx);
             const dst = ctx.allocTmp(ret_ty) catch return null;
             const dst_reg = dst.onlyReg() orelse return null;
 
-            if (ret_ty.isFloat()) {
-                // Float return in XMM0
-                const dst_xmm = WritableXmm.fromReg(Xmm.unwrapNew(dst_reg.toReg()));
-                ctx.emit(Inst{
-                    .xmm_unary_rm_r = .{
-                        .op = if (ret_ty.bytes() == 4) SseOpcode.movss else SseOpcode.movsd,
-                        .src = XmmMem{ .inner = RegMem.fromReg(regs.xmm0()) },
-                        .dst = dst_xmm,
-                    },
-                }) catch return null;
-            } else {
-                // Integer return in RAX
-                const dst_gpr = WritableGpr.fromReg(Gpr.unwrapNew(dst_reg.toReg()));
-                ctx.emit(Inst{
-                    .mov_r_r = .{
-                        .size = operandSizeFromType(ret_ty),
-                        .src = Gpr.unwrapNew(regs.rax()),
-                        .dst = dst_gpr,
-                    },
-                }) catch return null;
-            }
+            const ret_preg = if (ret_ty.isFloat()) blk: {
+                const idx = float_ret_idx;
+                float_ret_idx += 1;
+                break :blk regs.fprPreg(idx);
+            } else blk: {
+                const idx = int_ret_idx;
+                int_ret_idx += 1;
+                break :blk regs.gprPreg(x64_ret_regs[idx]);
+            };
+            call_info.defs.append(ctx.allocator, .{
+                .vreg = dst_reg,
+                .location = .{ .reg = ret_preg },
+            }) catch return null;
 
-            var output = InstOutput{};
+            clobbers.remove(ret_preg);
             output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
-            return output;
         }
 
-        return InstOutput{};
+        call_info.clobbers = clobbers;
+
+        // Emit the indirect call (CALL reg, not JMP)
+        ctx.emit(Inst{
+            .call_unknown = .{ .info = call_info },
+        }) catch return null;
+
+        return output;
     }
 
     fn lowerTrap(_: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {

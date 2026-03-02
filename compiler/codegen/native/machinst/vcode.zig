@@ -1148,12 +1148,26 @@ pub fn VCode(comptime I: type) type {
                         // Emit stack allocation: sub rsp, total_stack_size
                         // Includes spill slots + outgoing args area
                         // Port of Cranelift's gen_clobber_save stack allocation
-                        const total_stack_size = frame_size + max_outgoing_args_size;
+                        //
+                        // x86_64 System V ABI requires 16-byte stack alignment at CALL.
+                        // After CALL, RSP ≡ 8 (mod 16). push rbp makes it 16-aligned.
+                        // Each callee-save push subtracts 8. We must ensure:
+                        //   (callee_save_pushes * 8 + sub_rsp) ≡ 0 (mod 16)
+                        const raw_stack = frame_size + max_outgoing_args_size;
+                        const callee_save_bytes = @as(u32, @intCast(x64_num_clobbered)) * 8;
+                        const total_stack_size = ((callee_save_bytes + raw_stack + 15) & ~@as(u32, 15)) - callee_save_bytes;
                         if (total_stack_size > 0) {
                             if (@hasDecl(I, "genStackAlloc")) {
                                 const stack_alloc = I.genStackAlloc(total_stack_size);
                                 try stack_alloc.emit(&buffer, emit_info, &emit_state);
                             }
+                        }
+                        // Update outgoing_args_size in emit state to include alignment
+                        // padding so that slot_offset resolution ([RSP + outgoing_args + N])
+                        // correctly skips over the padding between outgoing args and spill slots.
+                        const alignment_padding = total_stack_size - raw_stack;
+                        if (alignment_padding > 0) {
+                            emit_state.frame_layout.outgoing_args_size += alignment_padding;
                         }
                     }
                 }

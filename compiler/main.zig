@@ -1442,7 +1442,7 @@ fn compileAndLinkFull(
             std.process.exit(1);
         };
     } else if (compile_target.os == .linux) {
-        link_args.append(allocator, "-lc") catch {
+        link_args.appendSlice(allocator, &.{ "-lc", "-lpthread", "-lutil" }) catch {
             std.debug.print("Error: Allocation failed\n", .{});
             std.process.exit(1);
         };

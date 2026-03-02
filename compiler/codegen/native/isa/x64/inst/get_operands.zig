@@ -793,13 +793,21 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         .atomic_rmw_seq => |*p| {
             syntheticAmodeOperands(&p.mem, visitor);
             visitor.gprUse(&p.operand);
-            visitor.gprDef(&p.dst_old);
-            visitor.gprDef(&p.tmp);
+            // CMPXCHG implicitly uses/defines RAX — dst_old MUST be fixed to RAX.
+            // Reference: wasmtime/cranelift/codegen/src/isa/x64/inst/mod.rs:1093-1106
+            visitor.regFixedDef(Writable(Reg).fromReg(p.dst_old.toReg().toReg()), regs.gprPreg(regs.GprEnc.RAX));
+            // tmp must be early def so it overlaps with the address register's early use,
+            // preventing the regalloc from assigning them the same physical register.
+            // The address must survive the entire CAS loop (load + cmpxchg).
+            // Reference: Cranelift uses reg_early_def(temp) for this.
+            visitor.gprEarlyDef(&p.tmp);
         },
         .lock_cmpxchg => |*p| {
             syntheticAmodeOperands(&p.mem, visitor);
             visitor.gprUse(&p.new_val);
-            visitor.gprDef(&p.dst_old);
+            // CMPXCHG implicitly uses/defines RAX — dst_old MUST be fixed to RAX.
+            // Reference: wasmtime/cranelift/codegen/src/isa/x64/inst/mod.rs:1093-1106
+            visitor.regFixedDef(Writable(Reg).fromReg(p.dst_old.toReg().toReg()), regs.gprPreg(regs.GprEnc.RAX));
         },
         .atomic_128_rmw_seq => |*p| {
             syntheticAmodeOperands(&p.mem, visitor);

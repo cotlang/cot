@@ -653,9 +653,13 @@ fn generateFloatToString(
     try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fmt
     const is_aarch64 = isa == .aarch64;
     if (is_aarch64) {
+        // ARM64 variadic: pad to fill x3-x7 registers, then val_bits on stack as i64
         for (0..5) |_| try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+        try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // val_bits
+    } else {
+        // x86_64 variadic: %g expects double in XMM0 — pass as F64 directly
+        try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.F64)); // val
     }
-    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // val_bits
     try snprintf_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
     const snprintf_sig_ref = try builder.importSignature(snprintf_sig);
     const snprintf_ref = try builder.importFunction(.{
@@ -679,15 +683,17 @@ fn generateFloatToString(
         _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, 'g'), fmt_addr, 1);
         _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, 0), fmt_addr, 2);
 
-        // Bitcast f64 → i64 for variadic stack passing
-        const val_bits = try ins.bitcast(clif.Type.I64, f_val);
-
-        // snprintf(buf_ptr, 32, "%g", val_bits)
+        // snprintf(buf_ptr, 32, "%g", val)
         const v_32 = try ins.iconst(clif.Type.I64, 32);
         const len_result = if (is_aarch64) blk: {
+            // ARM64 variadic: bitcast to i64, pad x3-x7, then push on stack
+            const val_bits = try ins.bitcast(clif.Type.I64, f_val);
             const pad = try ins.iconst(clif.Type.I64, 0);
             break :blk try ins.call(snprintf_ref, &[_]clif.Value{ buf_ptr, v_32, fmt_addr, pad, pad, pad, pad, pad, val_bits });
-        } else try ins.call(snprintf_ref, &[_]clif.Value{ buf_ptr, v_32, fmt_addr, val_bits });
+        } else blk: {
+            // x86_64 variadic: pass double directly in XMM0
+            break :blk try ins.call(snprintf_ref, &[_]clif.Value{ buf_ptr, v_32, fmt_addr, f_val });
+        };
         const len = len_result.results[0];
 
         _ = try ins.return_(&[_]clif.Value{len});

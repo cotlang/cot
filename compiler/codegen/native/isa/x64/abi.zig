@@ -1580,8 +1580,9 @@ pub const X64MachineDeps = struct {
             }
         }
 
-        // Allocate the fixed frame
-        const stack_size = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+        // Allocate the fixed frame (aligned to 16 bytes for System V ABI)
+        const raw_stack_size = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+        const stack_size = (raw_stack_size + 15) & ~@as(u32, 15);
         if (stack_size > 0) {
             const adj_insts = genSpRegAdjust(-@as(i32, @intCast(stack_size)));
             for (adj_insts.constSlice()) |adj_inst| {
@@ -1603,8 +1604,9 @@ pub const X64MachineDeps = struct {
         var insts = BoundedArray(Inst, 32){};
         const clobbered = frame_layout.clobberedCalleeSavesByClass();
 
-        // Free the fixed frame
-        const stack_size = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+        // Free the fixed frame (must match prologue alignment)
+        const raw_stack_size = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+        const stack_size = (raw_stack_size + 15) & ~@as(u32, 15);
         if (stack_size > 0) {
             const adj_insts = genSpRegAdjust(@intCast(stack_size));
             for (adj_insts.constSlice()) |adj_inst| {

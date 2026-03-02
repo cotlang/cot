@@ -1455,7 +1455,7 @@ pub const Driver = struct {
             }
 
             // I/O runtime: fd_write, fd_read, fd_close, exit, fd_seek, memcpy, memset_zero
-            var io_funcs = try io_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, argc_symbol_idx, argv_symbol_idx, envp_symbol_idx, self.lib_mode);
+            var io_funcs = try io_native.generate(self.allocator, isa, &ctrl_plane, &func_index_map, argc_symbol_idx, argv_symbol_idx, envp_symbol_idx, self.lib_mode, self.target.os);
             defer io_funcs.deinit(self.allocator);
             for (io_funcs.items) |rf| {
                 try compiled_funcs.append(self.allocator, rf.compiled);
@@ -1705,10 +1705,19 @@ pub const Driver = struct {
                     name[2..]
                 else
                     name;
-                const mangled = if (is_macos)
-                    try std.fmt.allocPrint(self.allocator, "_{s}", .{actual_name})
+                // Platform-specific symbol remapping:
+                // __error → __errno_location on Linux (macOS-internal errno accessor)
+                // __open → open on Linux (macOS non-variadic wrapper)
+                const platform_name = if (!is_macos and std.mem.eql(u8, actual_name, "__error"))
+                    "__errno_location"
+                else if (!is_macos and std.mem.eql(u8, actual_name, "__open"))
+                    "open"
                 else
-                    try self.allocator.dupe(u8, actual_name);
+                    actual_name;
+                const mangled = if (is_macos)
+                    try std.fmt.allocPrint(self.allocator, "_{s}", .{platform_name})
+                else
+                    try self.allocator.dupe(u8, platform_name);
                 defer self.allocator.free(mangled);
                 try module.declareExternalName(idx, mangled);
             }
@@ -1716,7 +1725,8 @@ pub const Driver = struct {
 
         // Generate _main entry point if we have a main function
         if (main_func_index != null) {
-            const main_wrapper_id = try module.declareFunction("_main", .Export);
+            const entry_name = if (self.target.os == .macos) "_main" else "main";
+            const main_wrapper_id = try module.declareFunction(entry_name, .Export);
 
             // ARM64 _main wrapper: store argc/argv/envp to globals, call __cot_main, return
             // C runtime passes: x0=argc, x1=argv, x2=envp (Apple extension)
