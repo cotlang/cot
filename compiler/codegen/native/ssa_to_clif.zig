@@ -1454,7 +1454,15 @@ const SsaToClifTranslator = struct {
 
         const call_result = try self.builder.ins().call(func_ref, call_args.items);
         if (call_result.results.len > 0) {
-            try self.putValue(v.id, call_result.results[0]);
+            var result_val = call_result.results[0];
+            // SSA operates in 64-bit mode — if CLIF call returns a narrow integer
+            // (I8, I16, I32), widen to I64 so downstream ops get consistent types.
+            // Without this, iadd(I64, I32) produces wrong results on x64.
+            const result_clif_ty = self.clif_func.dfg.valueType(result_val);
+            if (result_clif_ty.repr != clif.Type.F32.repr and result_clif_ty.repr != clif.Type.F64.repr and result_clif_ty.bits() < 64) {
+                result_val = try self.builder.ins().sextend(clif.Type.I64, result_val);
+            }
+            try self.putValue(v.id, result_val);
             // For compound return types (string, slice), store second result in compound_extra_map
             if (call_result.results.len > 1) {
                 try self.compound_extra_map.put(self.allocator, v.id, call_result.results[1]);
