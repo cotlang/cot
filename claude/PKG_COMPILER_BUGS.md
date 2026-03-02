@@ -75,21 +75,21 @@ Remove the `local_size > 8` check from the VOID-typed address fallback path in `
 
 ---
 
-## 6. Heap-Allocated Strings Corrupted by `@arcRetain` in List Append — CANNOT REPRODUCE
+## 6. Heap-Allocated Strings Corrupted in Multi-Field Structs in List — FIXED
 
-**Priority**: HIGH — blocks storing `columnString` results in multi-field structs inside Lists
-**Status**: CANNOT REPRODUCE (2026-03-02)
+**Priority**: HIGH — blocks reading 2+ dependencies from SQLite
+**Status**: FIXED (2026-03-02) — same root cause as Bug #5
 **Found**: 2026-03-02
 
-### Investigation
+### Root Cause
 
-Thorough testing with synthetic `alloc(0, n)` + `memcpy` + `@string(buf, n)` strings in multi-field structs in Lists — all pass. The original root cause analysis was incorrect:
+Same as Bug #5. `convertStoreLocal` in `ssa_builder.zig` skipped `OpMove` for struct types exactly 8 bytes (single-field structs), storing the raw memory address instead of dereferencing it. This affected `?Dependency` returns where `Dependency` (2 string fields = 16 bytes) was extracted from compound optionals — the struct field stores via `convertStoreLocalField` had the same `local_size > 8` guard.
 
-1. **`@arcRetain` does NOT walk struct fields.** `couldBeARC(Entry)` returns false for struct types. `@arcRetain(value)` in `List.append` is a no-op for structs and strings.
-2. **`alloc(0, n)` DOES create proper ARC-managed buffers.** `generateAlloc` in `arc_native.zig` allocates `header_size + user_size`, writes a 32-byte ARC header (with `ARC_HEAP_MAGIC`), and returns `ptr + HEADER_SIZE`.
-3. **Likely already fixed** by the ARC_HEAP_MAGIC guard commit (which made retain/release on non-heap pointers into safe no-ops).
+The symptom appeared as SQLite-specific because `columnString` returns heap-allocated strings stored into `Dependency` struct fields, then appended to a `List(Dependency)`. The struct field store corruption only manifested when the struct was part of a compound optional unwrap path.
 
-The bug may have been caused by the `?Struct` corruption in Bug #5 (the pkg registry likely used optional struct returns from SQLite query functions), or by a since-fixed ARC pointer corruption issue. If the issue recurs with actual SQLite, it may be a C FFI calling convention issue rather than ARC.
+### Fix
+
+Remove `local_size > 8` check from `convertStoreLocal`, `convertStoreGlobal`, and `convertStoreLocalField` — all struct/tuple/union types need `OpMove` when the source is a VOID-typed address, regardless of size. Same commit as Bug #5 fix.
 
 ---
 
@@ -102,4 +102,4 @@ The bug may have been caused by the `?Struct` corruption in Bug #5 (the pkg regi
 | String interpolation broken | N/A | WORKS | Was misdiagnosed — caused by uninitialized globals |
 | Flat symbol namespace collisions | HIGH | FIXED | Go LinkFuncName: module-qualified IR names (`module.funcName`) |
 | Optional struct return corrupts fields | HIGH | FIXED | `convertStoreLocal` skipped `OpMove` for single-field structs (8 bytes) |
-| Heap strings corrupted by @arcRetain | HIGH | CANNOT REPRODUCE | Original analysis was wrong; likely fixed by ARC_HEAP_MAGIC or Bug #5 fix |
+| Heap strings corrupted in struct+List | HIGH | FIXED | Same as Bug #5 — `convertStoreLocal/Global/Field` skipped `OpMove` for 8-byte structs |
