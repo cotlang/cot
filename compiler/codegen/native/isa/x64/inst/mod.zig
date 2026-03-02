@@ -952,11 +952,11 @@ pub const Inst = union(enum) {
                 },
             };
         } else {
-            // XMM move
+            // XMM register-to-register move using MOVAPS
             return .{
-                .xmm_mov_m_r = .{
+                .xmm_unary_rm_r = .{
                     .op = .movaps,
-                    .src = SyntheticAmode.real_amode(Amode.immReg(0, src)),
+                    .src = XmmMem.unwrapNew(RegMem{ .reg = src }),
                     .dst = WritableXmm{ .reg = Xmm.unwrapNew(dst.toReg()) },
                 },
             };

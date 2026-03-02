@@ -45,6 +45,8 @@ Read `claude/BR_TABLE_ARCHITECTURE.md` if confused. br_table is copied from Go's
 
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 
+**🚨 SUBMODULE COMMIT RULE:** When committing changes in the parent repo, **NEVER include `stdlib` in `git add`** unless you are intentionally updating the submodule reference. The `stdlib` directory will frequently show as "modified" in `git status`/`git diff` because the local checkout may be ahead of the tracked ref. **Always stage files by explicit name** (e.g., `git add compiler/foo.zig compiler/bar.zig`). **NEVER use `git add .` or `git add -A`**. If you accidentally commit a stdlib ref change pointing to a commit that doesn't exist on the remote, CI will break for ALL jobs because `actions/checkout` can't fetch the submodule.
+
 ---
 
 ## CLI
