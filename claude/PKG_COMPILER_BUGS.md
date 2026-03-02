@@ -75,21 +75,34 @@ Remove the `local_size > 8` check from the VOID-typed address fallback path in `
 
 ---
 
-## 6. Heap-Allocated Strings Corrupted in Multi-Field Structs in List — FIXED
+## 6. Heap-Allocated Strings "Corrupted" in Multi-Field Structs in List — NOT A BUG
 
-**Priority**: HIGH — blocks reading 2+ dependencies from SQLite
-**Status**: FIXED (2026-03-02) — same root cause as Bug #5
+**Priority**: N/A
+**Status**: NOT A BUG (2026-03-02) — SQL ordering issue, not compiler bug
 **Found**: 2026-03-02
 
 ### Root Cause
 
-Same as Bug #5. `convertStoreLocal` in `ssa_builder.zig` skipped `OpMove` for struct types exactly 8 bytes (single-field structs), storing the raw memory address instead of dereferencing it. This affected `?Dependency` returns where `Dependency` (2 string fields = 16 bytes) was extracted from compound optionals — the struct field stores via `convertStoreLocalField` had the same `local_size > 8` guard.
+The `dependencies` table has `PRIMARY KEY (package_name, version_number, dep_name)`. Without an `ORDER BY` clause, SQLite returns rows in primary key index order (alphabetical by `dep_name`), not insertion order. The test inserted `('json', '^1.0.0')` then `('http', '~2.0.0')`, but SQLite returned `http` first (alphabetically before `json`). The test expected insertion order and interpreted the swapped values as "garbage content".
 
-The symptom appeared as SQLite-specific because `columnString` returns heap-allocated strings stored into `Dependency` struct fields, then appended to a `List(Dependency)`. The struct field store corruption only manifested when the struct was part of a compound optional unwrap path.
+### Verification
+
+```cot
+// Without ORDER BY: returns alphabetical by dep_name (PK scan)
+// http < json, so dep0='http', dep1='json'
+var deps = loadDeps(db, "my-lib", "1.0.0")
+@assertEq(deps.get(0).name, "http")   // passes
+@assertEq(deps.get(1).name, "json")   // passes
+
+// With ORDER BY rowid: returns insertion order
+var deps2 = loadDepsOrdered(db, "my-lib", "1.0.0")
+@assertEq(deps2.get(0).name, "json")  // passes
+@assertEq(deps2.get(1).name, "http")  // passes
+```
 
 ### Fix
 
-Remove `local_size > 8` check from `convertStoreLocal`, `convertStoreGlobal`, and `convertStoreLocalField` — all struct/tuple/union types need `OpMove` when the source is a VOID-typed address, regardless of size. Same commit as Bug #5 fix.
+Add `ORDER BY rowid` (or `ORDER BY dep_name`) to the `loadDeps` query in `db.cot`, and update the commented-out test expectations. No compiler change needed.
 
 ---
 
@@ -102,4 +115,4 @@ Remove `local_size > 8` check from `convertStoreLocal`, `convertStoreGlobal`, an
 | String interpolation broken | N/A | WORKS | Was misdiagnosed — caused by uninitialized globals |
 | Flat symbol namespace collisions | HIGH | FIXED | Go LinkFuncName: module-qualified IR names (`module.funcName`) |
 | Optional struct return corrupts fields | HIGH | FIXED | `convertStoreLocal` skipped `OpMove` for single-field structs (8 bytes) |
-| Heap strings corrupted in struct+List | HIGH | FIXED | Same as Bug #5 — `convertStoreLocal/Global/Field` skipped `OpMove` for 8-byte structs |
+| Heap strings "corrupted" in struct+List | N/A | NOT A BUG | SQL ordering — PK scan returns alphabetical, not insertion order |
