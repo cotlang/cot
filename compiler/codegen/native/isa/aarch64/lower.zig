@@ -209,6 +209,7 @@ pub const AArch64LowerBackend = struct {
             .fcvt_from_uint => self.lowerFcvtFromUint(ctx, ir_inst),
             .fpromote => self.lowerFpromote(ctx, ir_inst),
             .fdemote => self.lowerFdemote(ctx, ir_inst),
+            .bitcast => self.lowerBitcast(ctx, ir_inst),
 
             // Memory operations
             .load => self.lowerLoad(ctx, ir_inst),
@@ -2175,6 +2176,63 @@ pub const AArch64LowerBackend = struct {
                 .rn = src_reg,
             },
         }) catch return null;
+
+        var output = InstOutput{};
+        output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;
+        return output;
+    }
+
+    /// Port of Cranelift lower.isle bitcast rules (lines 2794-2823).
+    /// Reinterprets bits between register classes without conversion.
+    fn lowerBitcast(self: *const Self, ctx: *LowerCtx, ir_inst: ClifInst) ?InstOutput {
+        _ = self;
+        const in_ty = ctx.inputTy(ir_inst, 0);
+        const out_ty = ctx.outputTy(ir_inst, 0);
+
+        const src = ctx.putInputInRegs(ir_inst, 0);
+        const src_reg = src.onlyReg() orelse return null;
+
+        const in_is_float = in_ty.isFloat();
+        const out_is_float = out_ty.isFloat();
+
+        // Same register class: no-op, pass through.
+        // Cranelift: GPR <=> GPR (rule 1) and SIMD&FP <=> SIMD&FP (rule 7)
+        if (in_is_float == out_is_float) {
+            var output = InstOutput{};
+            output.append(ValueRegs(Reg).one(src_reg)) catch return null;
+            return output;
+        }
+
+        const dst = ctx.allocTmp(out_ty) catch return null;
+        const dst_reg = dst.onlyReg() orelse return null;
+
+        if (out_is_float) {
+            // GPR → FPU: FMOV Dd, Xn / FMOV Sd, Wn
+            // Cranelift rule 4: (mov_to_fpu x (scalar_size in_ty))
+            const size = scalarSizeFromType(in_ty) orelse return null;
+            ctx.emit(Inst{
+                .mov_to_fpu = .{
+                    .rd = dst_reg,
+                    .rn = src_reg,
+                    .size = size,
+                },
+            }) catch return null;
+        } else {
+            // FPU → GPR: UMOV Xd, Vn.D[0] / UMOV Wd, Vn.S[0]
+            // Cranelift rule 3: (mov_from_vec x 0 (scalar_size out_ty))
+            const vec_size: inst_mod.VectorSize = if (out_ty.bits() == 64)
+                .size64x2
+            else
+                .size32x4;
+            ctx.emit(Inst{
+                .mov_from_vec = .{
+                    .rd = dst_reg,
+                    .rn = src_reg,
+                    .idx = 0,
+                    .size = vec_size,
+                },
+            }) catch return null;
+        }
 
         var output = InstOutput{};
         output.append(ValueRegs(Reg).one(dst_reg.toReg())) catch return null;

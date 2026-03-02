@@ -490,6 +490,41 @@ pub const CodeBuilder = struct {
         try self.buf.append(self.allocator, Op.f64_neg);
     }
 
+    /// Emit f64.abs instruction.
+    pub fn emitF64Abs(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_abs);
+    }
+
+    /// Emit f64.trunc instruction (round toward zero).
+    pub fn emitF64Trunc(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_trunc);
+    }
+
+    /// Emit f64.nearest instruction (round to nearest even).
+    pub fn emitF64Nearest(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_nearest);
+    }
+
+    /// Emit i64.trunc_f64_s instruction (f64 → i64, truncate toward zero).
+    pub fn emitI64TruncF64S(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_trunc_f64_s);
+    }
+
+    /// Emit f64.convert_i64_s instruction (i64 → f64, signed).
+    pub fn emitF64ConvertI64S(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_convert_i64_s);
+    }
+
+    /// Emit f64.reinterpret_i64 instruction (reinterpret bits, no conversion).
+    pub fn emitF64ReinterpretI64(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.f64_reinterpret_i64);
+    }
+
+    /// Emit i64.reinterpret_f64 instruction (reinterpret bits, no conversion).
+    pub fn emitI64ReinterpretF64(self: *CodeBuilder) !void {
+        try self.buf.append(self.allocator, Op.i64_reinterpret_f64);
+    }
+
     /// Emit i32.eqz instruction (for boolean not).
     pub fn emitI32Eqz(self: *CodeBuilder) !void {
         try self.buf.append(self.allocator, Op.i32_eqz);

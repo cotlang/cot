@@ -1,0 +1,51 @@
+// Print builtin tests — verifies print/println/eprint/eprintln for all types.
+
+test "println int" {
+    println(42)
+}
+
+test "println string" {
+    println("hello")
+}
+
+test "println bool true" {
+    println(true)
+}
+
+test "println bool false" {
+    println(false)
+}
+
+test "println float" {
+    println(3.14)
+}
+
+test "println float zero" {
+    println(0.0)
+}
+
+test "println float negative" {
+    println(-2.5)
+}
+
+test "print no newline" {
+    print(42)
+    print(" ")
+    println("done")
+}
+
+test "eprint all types" {
+    eprintln(99)
+    eprintln(true)
+    eprintln(1.5)
+}
+
+test "interp bool" {
+    var x = true
+    println("val: ${x}")
+}
+
+test "interp float" {
+    var pi = 3.14
+    println("pi: ${pi}")
+}

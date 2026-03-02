@@ -50,6 +50,24 @@ pub fn generate(
         .compiled = try generateIntToString(allocator, isa, ctrl_plane),
     });
 
+    // print_float(val_bits: i64) → void  (prints f64 to stdout)
+    try result.append(allocator, .{
+        .name = "print_float",
+        .compiled = try generatePrintFloat(allocator, isa, ctrl_plane, func_index_map, 1),
+    });
+
+    // eprint_float(val_bits: i64) → void  (prints f64 to stderr)
+    try result.append(allocator, .{
+        .name = "eprint_float",
+        .compiled = try generatePrintFloat(allocator, isa, ctrl_plane, func_index_map, 2),
+    });
+
+    // float_to_string(val: f64, buf_ptr: i64) → i64  (returns string length)
+    try result.append(allocator, .{
+        .name = "float_to_string",
+        .compiled = try generateFloatToString(allocator, isa, ctrl_plane, func_index_map),
+    });
+
     return result;
 }
 
@@ -472,6 +490,207 @@ fn generateIntToString(
         const v_20 = try i.iconst(clif.Type.I64, 20);
         const len = try i.isub(v_20, final_idx);
         _ = try i.return_(&[_]clif.Value{len});
+    }
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// print_float(val: f64) → void
+//
+// Formats f64 to decimal string via libc snprintf("%g") and writes to fd.
+// Port of io_native.zig variadic calling pattern (fcntl/ioctl).
+// On Apple ARM64, variadic args are passed on the stack via X3-X7 padding.
+// The f64 value is bitcast to i64 for stack passing — snprintf's va_arg(ap, double)
+// reads the same raw bits correctly.
+// ============================================================================
+
+fn generatePrintFloat(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+    fd: i64,
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: (val: f64) → void
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.F64));
+
+    // Stack slots: 32-byte output buffer, 4-byte format string
+    const ss_buf = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 32,
+        .align_shift = 3,
+    });
+    const ss_fmt = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 8,
+        .align_shift = 3,
+    });
+
+    const block_entry = try builder.createBlock();
+
+    // Import snprintf: int snprintf(char *str, size_t size, const char *format, ...)
+    const snprintf_idx = func_index_map.get("snprintf") orelse 0;
+    var snprintf_sig = clif.Signature.init(.system_v);
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // buf
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // size
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fmt
+    const is_aarch64 = isa == .aarch64;
+    if (is_aarch64) {
+        // Apple ARM64: pad X3-X7 to force variadic args onto stack
+        for (0..5) |_| try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    }
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // val_bits (f64 bitcast to i64)
+    try snprintf_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const snprintf_sig_ref = try builder.importSignature(snprintf_sig);
+    const snprintf_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = snprintf_idx } },
+        .signature = snprintf_sig_ref,
+        .colocated = false,
+    });
+
+    // Import write(fd, buf, len)
+    const write_idx = func_index_map.get("write") orelse 0;
+    var write_sig = clif.Signature.init(.system_v);
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const wsig_ref = try builder.importSignature(write_sig);
+    const wfunc_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = write_idx } },
+        .signature = wsig_ref,
+        .colocated = false,
+    });
+
+    // --- Entry block ---
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const f_val = builder.blockParams(block_entry)[0];
+
+        // Store "%g\0" format string on stack
+        const fmt_addr = try ins.stackAddr(clif.Type.I64, ss_fmt, 0);
+        _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, '%'), fmt_addr, 0);
+        _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, 'g'), fmt_addr, 1);
+        _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, 0), fmt_addr, 2);
+
+        // Bitcast f64 → i64 for variadic stack passing (same raw bits)
+        const val_bits = try ins.bitcast(clif.Type.I64, f_val);
+
+        // snprintf(buf, 32, "%g", val_bits)
+        const buf = try ins.stackAddr(clif.Type.I64, ss_buf, 0);
+        const v_32 = try ins.iconst(clif.Type.I64, 32);
+        const len_result = if (is_aarch64) blk: {
+            const pad = try ins.iconst(clif.Type.I64, 0);
+            break :blk try ins.call(snprintf_ref, &[_]clif.Value{ buf, v_32, fmt_addr, pad, pad, pad, pad, pad, val_bits });
+        } else try ins.call(snprintf_ref, &[_]clif.Value{ buf, v_32, fmt_addr, val_bits });
+        const len = len_result.results[0];
+
+        // write(fd, buf, len)
+        const v_fd = try ins.iconst(clif.Type.I64, fd);
+        _ = try ins.call(wfunc_ref, &[_]clif.Value{ v_fd, buf, len });
+        _ = try ins.return_(&.{});
+    }
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+// ============================================================================
+// float_to_string(val: f64, buf_ptr: i64) → i64
+//
+// Formats f64 to decimal string via libc snprintf("%g") into caller buffer.
+// Returns the number of bytes written.
+// Port of io_native.zig variadic calling pattern (fcntl/ioctl).
+// ============================================================================
+
+fn generateFloatToString(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.F64)); // val: f64
+    try clif_func.signature.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // buf_ptr: i64
+    try clif_func.signature.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+
+    // Stack slot for format string
+    const ss_fmt = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 8,
+        .align_shift = 3,
+    });
+
+    const block_entry = try builder.createBlock();
+
+    // Import snprintf
+    const snprintf_idx = func_index_map.get("snprintf") orelse 0;
+    var snprintf_sig = clif.Signature.init(.system_v);
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // buf
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // size
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fmt
+    const is_aarch64 = isa == .aarch64;
+    if (is_aarch64) {
+        for (0..5) |_| try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    }
+    try snprintf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // val_bits
+    try snprintf_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const snprintf_sig_ref = try builder.importSignature(snprintf_sig);
+    const snprintf_ref = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = snprintf_idx } },
+        .signature = snprintf_sig_ref,
+        .colocated = false,
+    });
+
+    // --- Entry block ---
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+    {
+        const ins = builder.ins();
+        const f_val = builder.blockParams(block_entry)[0];
+        const buf_ptr = builder.blockParams(block_entry)[1];
+
+        // Store "%g\0" format string on stack
+        const fmt_addr = try ins.stackAddr(clif.Type.I64, ss_fmt, 0);
+        _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, '%'), fmt_addr, 0);
+        _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, 'g'), fmt_addr, 1);
+        _ = try ins.store(clif.MemFlags.DEFAULT, try ins.iconst(clif.Type.I8, 0), fmt_addr, 2);
+
+        // Bitcast f64 → i64 for variadic stack passing
+        const val_bits = try ins.bitcast(clif.Type.I64, f_val);
+
+        // snprintf(buf_ptr, 32, "%g", val_bits)
+        const v_32 = try ins.iconst(clif.Type.I64, 32);
+        const len_result = if (is_aarch64) blk: {
+            const pad = try ins.iconst(clif.Type.I64, 0);
+            break :blk try ins.call(snprintf_ref, &[_]clif.Value{ buf_ptr, v_32, fmt_addr, pad, pad, pad, pad, pad, val_bits });
+        } else try ins.call(snprintf_ref, &[_]clif.Value{ buf_ptr, v_32, fmt_addr, val_bits });
+        const len = len_result.results[0];
+
+        _ = try ins.return_(&[_]clif.Value{len});
     }
 
     try builder.sealAllBlocks();

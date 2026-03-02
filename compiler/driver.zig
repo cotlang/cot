@@ -1245,6 +1245,7 @@ pub const Driver = struct {
             "cot_openpty",   "cot_ioctl_winsize", "cot_ioctl_set_ctty",
             // Print runtime (print_native.generate order)
             "print_int",     "eprint_int",       "int_to_string",
+            "print_float",   "eprint_float",     "float_to_string",
             // Threading runtime (thread_native.generate order) — unconditional, must come before
             // conditional test runtime to avoid index gaps when test_mode=false
             "thread_spawn",  "thread_join",    "thread_detach",
@@ -1262,6 +1263,7 @@ pub const Driver = struct {
             // libc symbols — external references resolved by linker (-lSystem/-lc)
             // "memcpy" is here because the Cot signature (dst,src,len)→void is
             // ABI-compatible with libc memcpy(dst,src,n)→void* (return ignored).
+            "snprintf",
             "write",         "malloc",         "free",          "memset",
             "memcmp",        "memcpy",         "read",          "close",
             "__open",        "lseek",          "_exit",         "gettimeofday",
@@ -5348,6 +5350,9 @@ pub const Driver = struct {
         try func_indices.put(self.allocator, print_runtime.PRINT_INT_NAME, print_funcs.print_int_idx);
         try func_indices.put(self.allocator, print_runtime.EPRINT_INT_NAME, print_funcs.eprint_int_idx);
         try func_indices.put(self.allocator, print_runtime.INT_TO_STRING_NAME, print_funcs.int_to_string_idx);
+        try func_indices.put(self.allocator, print_runtime.PRINT_FLOAT_NAME, print_funcs.print_float_idx);
+        try func_indices.put(self.allocator, print_runtime.EPRINT_FLOAT_NAME, print_funcs.eprint_float_idx);
+        try func_indices.put(self.allocator, print_runtime.FLOAT_TO_STRING_NAME, print_funcs.float_to_string_idx);
 
         // Add WASI function names to index map
         try func_indices.put(self.allocator, wasi_runtime.FD_WRITE_NAME, wasi_funcs.fd_write_idx);

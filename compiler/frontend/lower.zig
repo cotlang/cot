@@ -2770,8 +2770,31 @@ pub const Lowerer = struct {
                     if (expr_type == TypeRegistry.STRING) {
                         // String expression: use directly
                         try parts.append(self.allocator, expr_val);
+                    } else if (expr_type == TypeRegistry.BOOL or expr_type == TypeRegistry.UNTYPED_BOOL) {
+                        // Bool expression: select between "true" and "false" literals
+                        const true_idx = try fb.addStringLiteral("true");
+                        const true_str = try fb.emitConstSlice(true_idx, si.span);
+                        const false_idx = try fb.addStringLiteral("false");
+                        const false_str = try fb.emitConstSlice(false_idx, si.span);
+                        const true_ptr = try fb.emitSlicePtr(true_str, ptr_type, si.span);
+                        const true_len = try fb.emitConstInt(4, TypeRegistry.I64, si.span);
+                        const false_ptr = try fb.emitSlicePtr(false_str, ptr_type, si.span);
+                        const false_len = try fb.emitConstInt(5, TypeRegistry.I64, si.span);
+                        const sel_ptr = try fb.emitSelect(expr_val, true_ptr, false_ptr, ptr_type, si.span);
+                        const sel_len = try fb.emitSelect(expr_val, true_len, false_len, TypeRegistry.I64, si.span);
+                        const str_node = try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = sel_ptr, .len = sel_len } }, TypeRegistry.STRING, si.span));
+                        try parts.append(self.allocator, str_node);
+                    } else if (expr_type == TypeRegistry.F32 or expr_type == TypeRegistry.F64 or expr_type == TypeRegistry.FLOAT or expr_type == TypeRegistry.UNTYPED_FLOAT) {
+                        // Float expression: convert via float_to_string
+                        const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 32); // 32 bytes (aligned)
+                        const buf_addr = try fb.emitAddrLocal(buf_local, TypeRegistry.I64, si.span);
+                        var fts_args = [_]ir.NodeIndex{ expr_val, buf_addr };
+                        const str_len = try fb.emitCall("float_to_string", &fts_args, false, TypeRegistry.I64, si.span);
+                        // float_to_string writes from start of buffer, returns length
+                        const str_node = try fb.emit(ir.Node.init(.{ .string_header = .{ .ptr = buf_addr, .len = str_len } }, TypeRegistry.STRING, si.span));
+                        try parts.append(self.allocator, str_node);
                     } else {
-                        // Integer expression: convert via cot_int_to_string
+                        // Integer expression: convert via int_to_string
                         // Allocate 21-byte stack buffer for digit conversion
                         const buf_local = try fb.addLocalWithSize("__interp_buf", TypeRegistry.I64, true, 24); // 24 bytes (aligned)
                         const buf_addr = try fb.emitAddrLocal(buf_local, TypeRegistry.I64, si.span);
@@ -7808,11 +7831,33 @@ pub const Lowerer = struct {
         const ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
         const type_info = self.type_reg.get(arg_type);
         const is_integer = type_info == .enum_type or arg_type == TypeRegistry.I8 or arg_type == TypeRegistry.I16 or arg_type == TypeRegistry.I32 or arg_type == TypeRegistry.I64 or arg_type == TypeRegistry.INT or arg_type == TypeRegistry.U8 or arg_type == TypeRegistry.U16 or arg_type == TypeRegistry.U32 or arg_type == TypeRegistry.U64 or arg_type == TypeRegistry.UNTYPED_INT;
+        const is_bool = arg_type == TypeRegistry.BOOL or arg_type == TypeRegistry.UNTYPED_BOOL;
+        const is_float = arg_type == TypeRegistry.F32 or arg_type == TypeRegistry.F64 or arg_type == TypeRegistry.FLOAT or arg_type == TypeRegistry.UNTYPED_FLOAT;
 
         if (is_integer) {
             const int_val = try self.lowerExprNode(call.args[0]);
             var print_args = [_]ir.NodeIndex{int_val};
             _ = try fb.emitCall(if (fd == 2) "eprint_int" else "print_int", &print_args, false, TypeRegistry.VOID, call.span);
+        } else if (is_bool) {
+            // Inline: select between "true" and "false" string literals, then write
+            const bool_val = try self.lowerExprNode(call.args[0]);
+            const true_idx = try fb.addStringLiteral("true");
+            const true_str = try fb.emit(ir.Node.init(.{ .const_slice = .{ .string_index = true_idx } }, TypeRegistry.STRING, call.span));
+            const true_ptr = try fb.emitSlicePtr(true_str, ptr_type, call.span);
+            const true_len = try fb.emitConstInt(4, TypeRegistry.I64, call.span);
+            const false_idx = try fb.addStringLiteral("false");
+            const false_str = try fb.emit(ir.Node.init(.{ .const_slice = .{ .string_index = false_idx } }, TypeRegistry.STRING, call.span));
+            const false_ptr = try fb.emitSlicePtr(false_str, ptr_type, call.span);
+            const false_len = try fb.emitConstInt(5, TypeRegistry.I64, call.span);
+            const sel_ptr = try fb.emitSelect(bool_val, true_ptr, false_ptr, ptr_type, call.span);
+            const sel_len = try fb.emitSelect(bool_val, true_len, false_len, TypeRegistry.I64, call.span);
+            const fd_val = try fb.emitConstInt(fd, TypeRegistry.I64, call.span);
+            var write_args = [_]ir.NodeIndex{ fd_val, sel_ptr, sel_len };
+            _ = try fb.emitCall("write", &write_args, false, TypeRegistry.I64, call.span);
+        } else if (is_float) {
+            const float_val = try self.lowerExprNode(call.args[0]);
+            var print_args = [_]ir.NodeIndex{float_val};
+            _ = try fb.emitCall(if (fd == 2) "eprint_float" else "print_float", &print_args, false, TypeRegistry.VOID, call.span);
         } else {
             const str_val = try self.lowerExprNode(call.args[0]);
             const ptr_val = try fb.emitSlicePtr(str_val, ptr_type, call.span);
