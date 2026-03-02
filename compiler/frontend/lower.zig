@@ -262,6 +262,45 @@ pub const Lowerer = struct {
         return try fb.emitLoadLocal(result_local, result_type, bin.span);
     }
 
+    /// Short-circuit and/or at IR level: defer right-side lowering until inside the branch.
+    /// Go reference: ssagen/ssa.go:3398-3442 (OANDAND/OOROR expr path).
+    /// Pattern: evaluate left, branch, evaluate right only in appropriate block.
+    /// Same deferred-evaluation approach as lowerCompoundOrelse.
+    fn lowerShortCircuit(self: *Lowerer, fb: *ir.FuncBuilder, left: ir.NodeIndex, bin: ast.Binary) Error!ir.NodeIndex {
+        const is_and = bin.op == .land or bin.op == .kw_and;
+
+        const result_local = try fb.addLocalWithSize("__sc_result", TypeRegistry.BOOL, false, 8);
+        const eval_right_block = try fb.newBlock("sc.eval_right");
+        const short_circuit_block = try fb.newBlock("sc.short");
+        const merge_block = try fb.newBlock("sc.merge");
+
+        if (is_and) {
+            // and: left true → eval right; left false → short circuit (result = false)
+            _ = try fb.emitBranch(left, eval_right_block, short_circuit_block, bin.span);
+        } else {
+            // or: left true → short circuit (result = true); left false → eval right
+            _ = try fb.emitBranch(left, short_circuit_block, eval_right_block, bin.span);
+        }
+
+        // Short circuit block: result = false (for and) or true (for or)
+        fb.setBlock(short_circuit_block);
+        const short_val = try fb.emitConstBool(!is_and, bin.span);
+        _ = try fb.emitStoreLocal(result_local, short_val, bin.span);
+        _ = try fb.emitJump(merge_block, bin.span);
+
+        // Eval right block: lower right operand HERE (deferred, after branch)
+        fb.setBlock(eval_right_block);
+        const right = try self.lowerExprNode(bin.right);
+        if (right != ir.null_node) {
+            _ = try fb.emitStoreLocal(result_local, right, bin.span);
+        }
+        _ = try fb.emitJump(merge_block, bin.span);
+
+        // Merge: load result
+        fb.setBlock(merge_block);
+        return try fb.emitLoadLocal(result_local, TypeRegistry.BOOL, bin.span);
+    }
+
     /// Store a value into a compound optional result local, wrapping T → ?T as needed.
     /// Used by switch/if expressions that produce compound optional results.
     fn storeCompoundOptArm(self: *Lowerer, fb: *ir.FuncBuilder, result_local: ir.LocalIdx, val: ir.NodeIndex, body_idx: NodeIndex, span: Span) !void {
@@ -4198,6 +4237,15 @@ pub const Lowerer = struct {
                 const result_type = left_type.optional.elem;
                 return try self.lowerCompoundOrelse(fb, left, bin, left_type_idx, left_type, result_type);
             }
+        }
+
+        // Short-circuit and/or: defer right-side lowering until inside the branch.
+        // Go reference: ssagen/ssa.go:3398-3442 (OANDAND/OOROR expr path).
+        // Without this, side effects from the right operand (e.g. slice bounds checks)
+        // are emitted eagerly before the branch, defeating short-circuit semantics.
+        // Same deferred-evaluation pattern as lowerCompoundOrelse above.
+        if (bin.op == .land or bin.op == .kw_and or bin.op == .lor or bin.op == .kw_or) {
+            return try self.lowerShortCircuit(fb, left, bin);
         }
 
         const right = try self.lowerExprNode(bin.right);

@@ -3892,3 +3892,53 @@ test "implicit enum-int comparison" {
     @assertEq(c < 3, true)
     @assertEq(c <= 2, true)
 }
+
+// === Short-circuit and/or with slice indexing ===
+// Go reference: ssagen/ssa.go:3398-3442 (OANDAND/OOROR expr path)
+// Bounds checks on right operand must be deferred behind the short-circuit branch.
+
+test "and short-circuit with empty slice" {
+    var s = ""
+    // s.len > 0 is false, so s[0] must NOT be evaluated (would panic: index out of range)
+    if (s.len > 0 and s[0] == 118) {
+        @assert(false)
+    }
+    @assert(true)
+}
+
+test "or short-circuit with empty slice" {
+    var s = ""
+    // s.len == 0 is true, so s[0] must NOT be evaluated
+    var entered = false
+    if (s.len == 0 or s[0] == 118) {
+        entered = true
+    }
+    @assert(entered)
+}
+
+test "and short-circuit while loop idiom" {
+    var s = "hello world"
+    var i: i64 = 0
+    while (i < s.len and s[i] != 32) {
+        i = i + 1
+    }
+    @assertEq(i, 5)
+}
+
+test "and evaluates right side when left is true" {
+    var s = "hello"
+    var result = false
+    if (s.len > 0 and s[0] == 104) {
+        result = true
+    }
+    @assert(result)
+}
+
+test "or evaluates right side when left is false" {
+    var x = 5
+    var result = false
+    if (x == 3 or x == 5) {
+        result = true
+    }
+    @assert(result)
+}
