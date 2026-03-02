@@ -148,6 +148,20 @@ pub const OperandVisitor = union(enum) {
         }
     }
 
+    /// Mark a register as used (read), at late position.
+    /// Use when the register must survive to the end of the instruction
+    /// (e.g., memory address in atomic CAS loops that need the address
+    /// after RAX is clobbered by the implicit CMPXCHG operand).
+    /// Reference: reg.rs:411 fn reg_late_use
+    pub fn regLateUse(self: *OperandVisitor, reg: *Reg) void {
+        switch (self.*) {
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = reg.*, .preg = null, .kind = .use, .pos = .late,
+            }) catch unreachable,
+            .callback => |cb| cb.func(cb.ctx, reg, .any, .use, .late),
+        }
+    }
+
     /// Mark a register as defined (written), at late position.
     /// Reference: reg.rs:417 fn reg_def
     pub fn regDef(self: *OperandVisitor, reg: *Writable(Reg)) void {
@@ -286,6 +300,18 @@ pub const OperandVisitor = union(enum) {
         }
     }
 
+    /// Mark a GPR as used at late position.
+    /// Use when the register must survive to the end of the instruction.
+    /// Reference: Cranelift reg_late_use
+    pub fn gprLateUse(self: *OperandVisitor, gpr: *Gpr) void {
+        switch (self.*) {
+            .collector => |c| c.operands.append(c.allocator, .{
+                .reg = gpr.toReg(), .preg = null, .kind = .use, .pos = .late,
+            }) catch unreachable,
+            .callback => |cb| cb.func(cb.ctx, gpr.regMut(), .any, .use, .late),
+        }
+    }
+
     /// Mark a GPR as defined.
     pub fn gprDef(self: *OperandVisitor, wgpr: *args.WritableGpr) void {
         switch (self.*) {
@@ -395,6 +421,16 @@ fn syntheticAmodeOperands(amode: *SyntheticAmode, visitor: *OperandVisitor) void
     }
 }
 
+/// Collect register operands from a SyntheticAmode at late position.
+/// Use for atomic CAS loops where the address must survive the entire instruction.
+/// Reference: Cranelift mem.get_operands_late(collector)
+fn syntheticAmodeOperandsLate(amode: *SyntheticAmode, visitor: *OperandVisitor) void {
+    switch (amode.*) {
+        .real => |*a| amodeOperandsLate(a, visitor),
+        .incoming_arg, .slot_offset, .constant_offset => {},
+    }
+}
+
 /// Collect register operands from an Amode.
 fn amodeOperands(amode: *Amode, visitor: *OperandVisitor) void {
     switch (amode.*) {
@@ -416,6 +452,27 @@ fn amodeOperands(amode: *Amode, visitor: *OperandVisitor) void {
         .rip_relative => {
             // RIP isn't involved in regalloc.
         },
+    }
+}
+
+/// Collect register operands from an Amode at late position.
+/// Reference: Cranelift Amode::get_operands_late
+fn amodeOperandsLate(amode: *Amode, visitor: *OperandVisitor) void {
+    switch (amode.*) {
+        .imm_reg => |*m| {
+            if (m.base.toRealReg()) |rreg| {
+                const enc = rreg.preg.hwEnc();
+                if (enc == regs.GprEnc.RSP or enc == regs.GprEnc.RBP) {
+                    return;
+                }
+            }
+            visitor.regLateUse(&m.base);
+        },
+        .imm_reg_reg_shift => |*m| {
+            visitor.gprLateUse(&m.base);
+            visitor.gprLateUse(&m.index);
+        },
+        .rip_relative => {},
     }
 }
 
@@ -791,16 +848,21 @@ pub fn getOperands(inst: *Inst, visitor: *OperandVisitor) void {
         // Atomic operations
         //=====================================================================
         .atomic_rmw_seq => |*p| {
-            syntheticAmodeOperands(&p.mem, visitor);
-            visitor.gprUse(&p.operand);
-            // CMPXCHG implicitly uses/defines RAX — dst_old MUST be fixed to RAX.
+            // Operand positions must match Cranelift exactly:
+            //   reg_late_use(operand)      — operand needed throughout CAS loop
+            //   reg_early_def(temp)        — temp written before uses consumed
+            //   reg_fixed_def(dst_old, RAX) — CMPXCHG implicit RAX (late def)
+            //   mem.get_operands_late()    — address needed throughout CAS loop
+            //
+            // The address and operand MUST be late uses so the register allocator
+            // won't assign them to RAX (which is a late def for dst_old). Without
+            // this, the initial `mov (%addr), %rax` clobbers the address register
+            // when it happens to be RAX, causing SIGSEGV in the lock cmpxchg.
             // Reference: wasmtime/cranelift/codegen/src/isa/x64/inst/mod.rs:1093-1106
-            visitor.regFixedDef(Writable(Reg).fromReg(p.dst_old.toReg().toReg()), regs.gprPreg(regs.GprEnc.RAX));
-            // tmp must be early def so it overlaps with the address register's early use,
-            // preventing the regalloc from assigning them the same physical register.
-            // The address must survive the entire CAS loop (load + cmpxchg).
-            // Reference: Cranelift uses reg_early_def(temp) for this.
+            visitor.gprLateUse(&p.operand);
             visitor.gprEarlyDef(&p.tmp);
+            visitor.regFixedDef(Writable(Reg).fromReg(p.dst_old.toReg().toReg()), regs.gprPreg(regs.GprEnc.RAX));
+            syntheticAmodeOperandsLate(&p.mem, visitor);
         },
         .lock_cmpxchg => |*p| {
             syntheticAmodeOperands(&p.mem, visitor);
