@@ -1231,6 +1231,21 @@ fn initCommand(allocator: std.mem.Allocator, opts: cli.InitOptions) void {
         };
     }
 
+    // Write CLAUDE.md (Cot language reference for AI assistants)
+    const claude_path = std.fmt.allocPrint(allocator, "{s}/CLAUDE.md", .{base_dir}) catch {
+        std.debug.print("Error: Allocation failed\n", .{});
+        std.process.exit(1);
+    };
+    // Only write if it doesn't exist (user may have customized it)
+    if (std.fs.cwd().access(claude_path, .{})) |_| {
+        // Already exists, skip
+    } else |_| {
+        std.fs.cwd().writeFile(.{ .sub_path = claude_path, .data = CLAUDE_MD_CONTENT }) catch |e| {
+            std.debug.print("Error: Failed to write CLAUDE.md: {any}\n", .{e});
+            std.process.exit(1);
+        };
+    }
+
     // Print success with next steps (Deno pattern: actionable output)
     const test_file = if (opts.lib) "src/lib_test.cot" else "src/main_test.cot";
     if (in_subdir) {
@@ -1467,6 +1482,209 @@ fn compileAndLinkFull(
 test {
     pipeline_debug.initGlobal();
 }
+
+const CLAUDE_MD_CONTENT =
+    \\# Cot Language Reference
+    \\
+    \\This project is written in [Cot](https://github.com/cotlang/cot). Read this before writing any Cot code.
+    \\
+    \\## CLI
+    \\
+    \\```
+    \\cot build <file.cot>           # Compile to executable
+    \\cot run <file.cot> [-- args]   # Compile + run
+    \\cot test <file.cot>            # Run tests
+    \\cot check <file.cot>           # Type-check only
+    \\```
+    \\
+    \\## Critical Facts
+    \\
+    \\- **No semicolons** — newlines terminate statements
+    \\- **`string` is `[]u8`** (a slice) — use `.len` for length, `[i]` for indexing
+    \\- **`print`/`println` are compiler builtins** — no import needed, work with string, int, float, bool
+    \\- **String interpolation uses `${}`** — `"value: ${x}"`, NOT `{x}`
+    \\- **`++` for concatenation** — strings, arrays, slices. `+` on strings is an error (use `++`)
+    \\- **Parens required** on `if`/`while` — `if (x > 0) { ... }`
+    \\- **`and`/`or`/`not`** keywords (or `&&`/`||`/`!`)
+    \\
+    \\## Types
+    \\
+    \\```
+    \\i8 i16 i32 i64          // signed integers
+    \\u8 u16 u32 u64          // unsigned integers
+    \\f32 f64                  // floating point
+    \\bool                     // true / false
+    \\string                   // alias for []u8
+    \\int                      // alias for i64
+    \\float                    // alias for f64
+    \\*T  ?T  E!T  !T         // pointer, optional, error union
+    \\[]T  [N]T  [K]V  [T]    // slice, array, map, list
+    \\```
+    \\
+    \\## Variables
+    \\
+    \\```cot
+    \\const x = 10             // immutable
+    \\var y = 20               // mutable
+    \\```
+    \\
+    \\## Functions
+    \\
+    \\```cot
+    \\fn add(a: i64, b: i64) i64 { return a + b }
+    \\fn noop() void { }
+    \\```
+    \\
+    \\## Structs
+    \\
+    \\```cot
+    \\struct Point { x: i64, y: i64 }
+    \\
+    \\// Stack init (period + equals):
+    \\var p = Point { .x = 10, .y = 20 }
+    \\
+    \\// Heap init (new, colon, no period):
+    \\var p = new Point { x: 10, y: 20 }
+    \\
+    \\// Methods inside struct body:
+    \\struct Counter {
+    \\    value: i64
+    \\
+    \\    fn increment(self: *Counter) void {
+    \\        self.value = self.value + 1
+    \\    }
+    \\
+    \\    static fn zero() Counter {
+    \\        return Counter { .x = 0, .y = 0 }
+    \\    }
+    \\}
+    \\```
+    \\
+    \\## @safe Mode
+    \\
+    \\Projects with `"safe": true` in cot.json get TypeScript-like ergonomics:
+    \\- Colon struct init: `Point { x: 10, y: 20 }` (no period, no equals)
+    \\- Implicit self: `fn getX() i64 { return self.x }` (self injected)
+    \\- Auto-ref: `foo(myStruct)` — no `&` needed, structs passed by reference
+    \\- Field shorthand: `new Point { x, y }` → `new Point { x: x, y: y }`
+    \\
+    \\## Print (compiler builtins — NO import needed)
+    \\
+    \\```cot
+    \\print(value)             // stdout, no newline
+    \\println(value)           // stdout + newline
+    \\eprint(value)            // stderr, no newline
+    \\eprintln(value)          // stderr + newline
+    \\
+    \\// Works with: string, int, float, bool
+    \\println("hello")
+    \\println(42)
+    \\println(3.14)
+    \\println(true)
+    \\
+    \\// String interpolation:
+    \\println("x = ${x}, y = ${y}")
+    \\```
+    \\
+    \\## Error Handling
+    \\
+    \\```cot
+    \\const MyError = error { Fail, NotFound }
+    \\
+    \\fn mayFail(x: i64) MyError!i64 {
+    \\    if (x < 0) { return error.Fail }
+    \\    return x * 2
+    \\}
+    \\
+    \\var x = try mayFail(5)          // propagate error
+    \\var y = mayFail(-1) catch 99    // handle with fallback
+    \\```
+    \\
+    \\## Control Flow
+    \\
+    \\```cot
+    \\if (x > 0) { ... } else { ... }
+    \\while (x < 10) { x = x + 1 }
+    \\for item in collection { ... }
+    \\for i in 0..10 { ... }
+    \\
+    \\// Optional unwrap:
+    \\if (optional) |val| { use(val) }
+    \\
+    \\// Switch:
+    \\switch (x) {
+    \\    1 => result1,
+    \\    2, 3 => result2,
+    \\    else => default,
+    \\}
+    \\```
+    \\
+    \\## Imports & Stdlib
+    \\
+    \\```cot
+    \\import "std/list"        // List(T) dynamic array
+    \\import "std/map"         // Map(K,V) hash map
+    \\import "std/string"      // string utilities (indexOf, split, trim, etc.)
+    \\import "std/fs"          // File I/O
+    \\import "std/os"          // exit, args
+    \\import "std/json"        // JSON parse/encode
+    \\import "std/http"        // TCP sockets, HTTP
+    \\import "std/fmt"         // ANSI colors, formatting
+    \\import "std/time"        // timestamps
+    \\import "std/io"          // buffered I/O
+    \\import "std/math"        // math functions
+    \\import "std/sys"         // low-level: alloc, dealloc, fd_write, fd_read
+    \\```
+    \\
+    \\## Testing
+    \\
+    \\```cot
+    \\test "my test" {
+    \\    @assertEq(1 + 1, 2)
+    \\    @assert(true)
+    \\}
+    \\```
+    \\
+    \\Run: `cot test file.cot`
+    \\
+    \\## Generics
+    \\
+    \\```cot
+    \\fn max(T)(a: T, b: T) T {
+    \\    if (a > b) { return a }
+    \\    return b
+    \\}
+    \\max(i64)(3, 7)
+    \\```
+    \\
+    \\## Memory
+    \\
+    \\```cot
+    \\var ptr = new Foo { x: 42 }     // heap-allocated, ARC managed
+    \\defer dealloc(addr)              // manual cleanup for raw alloc
+    \\ptr.*                            // dereference
+    \\&expr                            // address-of
+    \\```
+    \\
+    \\## Common Builtins
+    \\
+    \\```
+    \\@sizeOf(T)               // size of type in bytes
+    \\@intCast(T, value)       // integer cast
+    \\@ptrOf(s)                // raw pointer from string
+    \\@lenOf(s)                // length from string (prefer s.len)
+    \\@intToPtr(*T, addr)      // integer to pointer
+    \\@ptrToInt(ptr)           // pointer to integer
+    \\@assert(cond)            // assert (test-only)
+    \\@assertEq(a, b)          // assert equal (test-only)
+    \\@trap()                  // unreachable/abort
+    \\```
+    \\
+    \\## Full Reference
+    \\
+    \\See https://github.com/cotlang/cot/blob/main/docs/syntax.md
+    \\
+;
 
 // Include all tests from submodules
 test {

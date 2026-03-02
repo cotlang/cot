@@ -825,7 +825,7 @@ eprint(42)             // print to stderr, no newline
 eprintln(42)           // print to stderr with newline
 ```
 
-All accept `i64`, `f64`, or `string` arguments.
+All accept `i64`, `f64`, `bool`, or `string` arguments.
 
 ## ARC (Automatic Reference Counting)
 
