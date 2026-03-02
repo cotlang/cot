@@ -1556,6 +1556,7 @@ pub const Driver = struct {
         defer module.deinit();
 
         // Pass 1: Declare all functions
+        const is_macos_obj = self.target.os == .macos;
         var func_ids = try self.allocator.alloc(object_module.FuncId, compiled_funcs.len);
         defer self.allocator.free(func_ids);
 
@@ -1568,11 +1569,13 @@ pub const Driver = struct {
                 break :blk false;
             };
 
-            // MachO C ABI: all symbols get _ prefix
+            // MachO C ABI: symbols get _ prefix. ELF/Linux: no prefix.
             const mangled_name = if (is_main)
                 try self.allocator.dupe(u8, "__cot_main")
+            else if (is_macos_obj)
+                try std.fmt.allocPrint(self.allocator, "_{s}", .{name})
             else
-                try std.fmt.allocPrint(self.allocator, "_{s}", .{name});
+                try self.allocator.dupe(u8, name);
             defer self.allocator.free(mangled_name);
 
             const linkage: object_module.Linkage = if (is_main)

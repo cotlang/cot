@@ -2326,8 +2326,10 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             try sink.bindLabel(again_label);
 
             // 3. Copy old value to temp: mov %rax, %tmp
+            // For MOV r/m, r (0x89): ModR/M.reg = source (dst_old/RAX), ModR/M.rm = dest (tmp)
+            // REX.R extends reg field, REX.B extends rm field — must match ModR/M assignment
             {
-                const rex = RexPrefix.twoOp(tmp_enc, dst_old_enc, need_rex_w, false);
+                const rex = RexPrefix.twoOp(dst_old_enc, tmp_enc, need_rex_w, false);
                 try rex.encode(sink);
                 if (size_byte) {
                     try sink.put1(0x88); // MOV r/m8, r8
@@ -2362,7 +2364,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             // Calculate offset back to again_label (will be negative)
             const jnz_offset = sink.curOffset();
             try sink.useLabelAtOffset(jnz_offset, again_label, .jmp_rel_8);
-            try sink.put1(0xFE); // Placeholder for short jump offset
+            // Addend of -1 accounts for PC being after the 1-byte displacement
+            try sink.put1(@bitCast(@as(i8, -1)));
         },
 
         .atomic_128_rmw_seq => |atomic| {
@@ -2420,7 +2423,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             try sink.put1(0x75); // JNZ rel8
             const jnz_offset = sink.curOffset();
             try sink.useLabelAtOffset(jnz_offset, again_label, .jmp_rel_8);
-            try sink.put1(0xFE); // Placeholder
+            // Addend of -1 accounts for PC being after the 1-byte displacement
+            try sink.put1(@bitCast(@as(i8, -1)));
 
             // Move result to destination registers
             // MOV dst_old_low, RAX
@@ -2469,7 +2473,8 @@ pub fn emit(inst: *const Inst, sink: *MachBuffer, info: *const EmitInfo, state: 
             try sink.put1(0x75); // JNZ rel8
             const jnz_offset = sink.curOffset();
             try sink.useLabelAtOffset(jnz_offset, again_label, .jmp_rel_8);
-            try sink.put1(0xFE); // Placeholder
+            // Addend of -1 accounts for PC being after the 1-byte displacement
+            try sink.put1(@bitCast(@as(i8, -1)));
 
             // Move result to destination registers
             try emitMovRR(sink, dst_old_low_enc, GprEnc.RAX);

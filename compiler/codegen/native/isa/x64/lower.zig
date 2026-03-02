@@ -2035,10 +2035,14 @@ pub const X64LowerBackend = struct {
         const dst_reg = dst.onlyReg() orelse return null;
         const cond_gpr = Gpr.unwrapNew(cond_reg);
 
-        // TEST condition, condition - sets ZF based on condition value
+        // TEST condition, condition - sets ZF based on condition value.
+        // Use size8: SETCC (icmp result) writes only the low byte of the register.
+        // The upper bytes may contain garbage if the register allocator
+        // reuses a register that held a different value. Using size8
+        // ensures we only test the meaningful byte.
         ctx.emit(Inst{
             .test_rmi_r = .{
-                .size = .size64,
+                .size = .size8,
                 .src = GprMemImm.unwrapNew(RegMemImm.fromReg(cond_gpr.toReg())),
                 .dst = cond_gpr,
             },
@@ -2387,9 +2391,10 @@ pub const X64LowerBackend = struct {
         const trap_code = clifToX64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .heap_out_of_bounds);
 
         // TEST reg, reg - AND reg with itself, sets ZF=1 if reg==0, ZF=0 if reg!=0
+        // Use size8: SETCC (icmp result) writes only the low byte of the register.
         ctx.emit(Inst{
             .test_rmi_r = .{
-                .size = .size64,
+                .size = .size8,
                 .src = GprMemImm{ .inner = RegMemImm{ .reg = cond_reg } },
                 .dst = cond_gpr,
             },
@@ -2414,9 +2419,10 @@ pub const X64LowerBackend = struct {
         const trap_code = clifToX64TrapCode(ctx.data(ir_inst).getTrapCode() orelse .heap_out_of_bounds);
 
         // TEST reg, reg - AND reg with itself, sets ZF=1 if reg==0, ZF=0 if reg!=0
+        // Use size8: SETCC (icmp result) writes only the low byte of the register.
         ctx.emit(Inst{
             .test_rmi_r = .{
-                .size = .size64,
+                .size = .size8,
                 .src = GprMemImm{ .inner = RegMemImm{ .reg = cond_reg } },
                 .dst = cond_gpr,
             },
