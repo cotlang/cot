@@ -301,7 +301,6 @@ fn compileAArch64(
     var vcode = try lower_ctx.lower(aarch64.AArch64LowerBackend, &lower_backend);
     defer vcode.deinit();
 
-
     // Phase 4: Run register allocation
     const regalloc_output_val = try runRegalloc(allocator, &vcode, &backend.machine_env);
     defer {

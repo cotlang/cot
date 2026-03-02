@@ -3942,3 +3942,39 @@ test "or evaluates right side when left is false" {
     }
     @assert(result)
 }
+
+test "multiple short-circuit and with slice indexing" {
+    // Regression test: 3+ short-circuit `and` expressions with slice indexing
+    // in the same function previously caused a regalloc crash (EntryLivein).
+    var data = "GET /api HTTP/1.1\r\n"
+    var dlen = data.len
+
+    // First short-circuit while
+    var pos: i64 = 0
+    while (pos < dlen and data[pos] != 32) {
+        pos = pos + 1
+    }
+    @assertEq(pos, 3)
+
+    pos = pos + 1
+
+    // Second short-circuit while
+    var uri_start = pos
+    while (pos < dlen and data[pos] != 32) {
+        pos = pos + 1
+    }
+    @assertEq(pos, 8)
+
+    pos = pos + 1
+
+    // Third short-circuit and with slice indexing
+    var ver_start = pos
+    while (pos < dlen - 1) {
+        if (data[pos] == 13 and data[pos + 1] == 10) {
+            break
+        }
+        pos = pos + 1
+    }
+    @assertEq(pos, 17)
+    @assertEq(ver_start, 9)
+}

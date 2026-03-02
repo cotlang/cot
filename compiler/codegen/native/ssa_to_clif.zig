@@ -1293,24 +1293,20 @@ const SsaToClifTranslator = struct {
                     try self.definePhiArgsForSuccessor(ssa_blk, target_ssa);
                     _ = try ins.jump(target_clif, &.{});
                 } else {
-                    // No explicit successor. Check if this block is a trap-only block
-                    // (e.g., div-by-zero fail block). These blocks contain wasm_unreachable
-                    // as their ONLY value and are branched to as dead ends.
-                    // Important: wasm_unreachable can also appear as a select operand in
-                    // blocks with other values (e.g., switch-else-unreachable) — those
-                    // blocks fall through normally, so only emit trap when the block's
-                    // sole purpose is the unreachable.
+                    // No explicit successor. Check if this block is a trap/noreturn block.
+                    // A block with no successors that contains wasm_unreachable is a dead end
+                    // (e.g., bounds check fail → panic → unreachable, or div-by-zero fail).
+                    // These must emit trap — NOT fall through to the next layout block.
+                    // Previously this only matched blocks where ALL values were
+                    // wasm_unreachable, but bounds check fail blocks have call instructions
+                    // (panic) before the unreachable, creating false fall-through edges.
                     var is_trap_block = false;
                     if (ssa_blk.preds.len > 0) {
-                        // Block is a branch target — check if it only contains unreachable
-                        var non_unreachable_count: usize = 0;
                         for (ssa_blk.values.items) |v| {
-                            if (v.op != .wasm_unreachable) {
-                                non_unreachable_count += 1;
+                            if (v.op == .wasm_unreachable) {
+                                is_trap_block = true;
+                                break;
                             }
-                        }
-                        if (non_unreachable_count == 0 and ssa_blk.values.items.len > 0) {
-                            is_trap_block = true;
                         }
                     }
 

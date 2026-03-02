@@ -13,7 +13,7 @@ SQLite solves all of these: atomic transactions, indexed queries, concurrent rea
 
 ---
 
-## Phase A: Compiler Enhancement — `"libs"` Field in cot.json
+## Phase A: Compiler Enhancement — `"libs"` Field in cot.json [DONE]
 
 ### Goal
 
@@ -143,7 +143,7 @@ test "loadConfig: getLibs returns null when no libs" {
 
 ---
 
-## Phase B: `std/sqlite` — Low-Level FFI Bindings
+## Phase B: `std/sqlite` — Low-Level FFI Bindings [DONE]
 
 ### Goal
 

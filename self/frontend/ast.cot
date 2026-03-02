@@ -83,6 +83,7 @@ struct EnumDecl {
     name: string,
     backing_type: int,
     variants: List(int),
+    nested_decls: List(int),
     doc_comment: string,
     span: Span,
 }

@@ -485,7 +485,8 @@ struct Parser {
                     self.match(Token.comma as int)
                 }
                 self.expect(Token.rbrace as int)
-                return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+                var nested: List(int) = .{}
+                return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
             }
 
             if (self.tok == Token.kw_error) {
@@ -770,7 +771,8 @@ struct Parser {
             self.match(Token.comma as int)
         }
         self.expect(Token.rbrace as int)
-        return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
+        var nested: List(int) = .{}
+        return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
     }
 
     /// union { variants }
