@@ -178,7 +178,7 @@ fn lowerValue(v: *Value) bool {
         // Memory Operations (type-aware for float support)
         // ====================================================================
         .load, .load64 => if (isFloatType(v.type_idx)) .wasm_f64_load else .wasm_i64_load,
-        .load32 => .wasm_i32_load,
+        .load32 => .wasm_i64_load32_u,
         .load32s => .wasm_i64_load32_s,
         .load16 => .wasm_i64_load16_u,
         .load16s => .wasm_i64_load16_s,
