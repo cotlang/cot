@@ -62,7 +62,7 @@ jobs:
           submodules: true
 
       - name: Tag stdlib repo
-        if: secrets.STD_REPO_TOKEN != ''
+        if: ${{ secrets.STD_REPO_TOKEN != '' }}
         env:
           STD_REPO_TOKEN: ${{ secrets.STD_REPO_TOKEN }}
         run: |
