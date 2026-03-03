@@ -9,7 +9,7 @@ Cot uses inline test blocks (Zig syntax) with error-union-based test isolation. 
 | Tier | Command | What it runs | Speed |
 |------|---------|-------------|-------|
 | **Zig compiler tests** | `zig build test` | ~163 Zig-level tests with inline Cot snippets | Fast (<10s) |
-| **Cot language tests** | `./test/run_all.sh` | ~1,658 Cot tests across 70 `.cot` files (69 active) | Slower (~60s) |
+| **Cot language tests** | `./test/run_all.sh` | ~1,670 Cot tests across 72 `.cot` files (71/71 passing) | Slower (~60s) |
 | **Single file** | `cot test file.cot` | Tests in one file | Fast |
 
 ### `zig build test` — Compiler internals
@@ -36,7 +36,7 @@ Discovers all `.cot` files in `test/e2e/` and `test/cases/`, runs each with `cot
 # ...
 # test/cases/arithmetic.cot                    ok  10 passed
 # ...
-# 69/69 files passed
+# 71/71 files passed
 ```
 
 ## Syntax
@@ -124,7 +124,7 @@ test/
     extern.cot, float.cot, functions.cot, loops.cot, memory.cot,
     methods.cot, optional.cot, strings.cot, structs.cot, switch.cot,
     types.cot, union.cot
-  e2e/                  # Comprehensive feature tests (48 files, ~1,536 tests)
+  e2e/                  # Comprehensive feature tests (50 files, ~1,540+ tests)
     arc.cot, async.cot, auto_free.cot, bench_test.cot,
     browser_async.cot, cli.cot, control_flow.cot, crypto.cot,
     debug.cot, dotenv.cot, encoding.cot, event_loop.cot,
@@ -132,7 +132,8 @@ test/
     functions.cot, http.cot, io.cot, json.cot, log.cot, map.cot,
     math.cot, mem.cot, memory.cot, path.cot, process.cot,
     regex.cot, safe_mode.cot, semver.cot, set.cot, sort.cot,
-    static_methods.cot, std_io.cot, std_math.cot, stdlib.cot,
+    spawn.cot, sqlite.cot, static_methods.cot,
+    std_io.cot, std_math.cot, stdlib.cot,
     string_interp.cot, string_map.cot, string_methods.cot,
     testing_utils.cot, thread_basic.cot, threading.cot,
     types.cot, url.cot, uuid.cot,
@@ -162,8 +163,8 @@ test/
 
 ## Known Limitations
 
-- f64 comparison in test mode triggers SIGILL (error-union wrapping issue)
 - Nested struct field access with `undefined` init fails in test mode (4 tests skipped in types.cot)
+- Linux native tests skipped in CI (x64 shift register bug — see `LINUX_X64_PARITY.md`)
 
 ## Future Improvements
 

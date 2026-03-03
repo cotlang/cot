@@ -95,7 +95,7 @@ The cottage metaphor extends naturally through the entire product:
 
 ---
 
-## Current State Audit (0.3.1)
+## Current State Audit (0.3.4)
 
 ### What Works Well
 
@@ -122,23 +122,24 @@ The cottage metaphor extends naturally through the entire product:
 | ~~`cot fmt` doesn't modify in-place by default~~ | ~~Confusing UX~~ | **Done** (Feb 15) |
 | ~~`cot.json` does nothing useful~~ | ~~Scaffolded but fake~~ | **Done** (Feb 15) |
 | ~~No error suggestions ("did you mean X?")~~ | ~~Every modern language has this~~ | **Done** (Feb 15) |
-| No watch mode | Must manually re-run after edits | Days |
-| No `cot doc` | Can't generate API docs | Days |
+| ~~No watch mode~~ | ~~Must manually re-run after edits~~ | **Done** (11e676f) |
+| ~~No `cot doc`~~ | ~~Can't generate API docs~~ | **Done** (11e676f) |
 | No `cot upgrade` | Can't self-update | Days |
 | No shell completions | No `cot <tab>` | Days |
 
 ### Comparison vs Zig and Deno
 
-**What Deno has that Cot doesn't:** 123 lint rules, watch mode on everything, `deno doc --html`, `deno upgrade`, `deno completions`, `deno add` (package manager), REPL, Jupyter kernel, test coverage, JUnit XML export, `deno audit`, multiple test reporters.
+**What Deno has that Cot doesn't:** 123 lint rules, `deno upgrade`, `deno completions`, `deno add` (package manager), REPL, Jupyter kernel, test coverage, JUnit XML export, `deno audit`, multiple test reporters.
 
 **What Zig has that Cot doesn't:** Homebrew formula, cross-compilation to any target, `zig cc` (drop-in C compiler), `zig zen`, incremental compilation.
 
 **What Cot has that neither does:**
-- AOT compilation to native binary from Wasm (no runtime needed)
+- AOT compilation to native binary (ARM64 + x64, no runtime needed)
 - ARC memory management (no GC, no borrow checker)
 - Wasm as first-class browser target
 - MCP server for AI-assisted development
 - Both server-native and browser-Wasm from same source
+- CI/CD with automated releases (aarch64-macos, x86_64-linux)
 
 ---
 
@@ -246,48 +247,31 @@ Before tagging 0.4, all of these must be true:
 1. `brew install cotlang/tap/cot` works on macOS (ARM64 + x86_64)
 2. ~~`cot init myapp && cd myapp && cot run` works end-to-end~~ **Done** (Feb 15)
 3. ~~`cot fmt src/main.cot` modifies the file in-place~~ **Done** (Feb 15)
-4. `cot test` shows colored pass/fail with timing and failure diffs
-5. `cot doc` generates HTML from `///` comments
+4. ~~`cot test` shows colored pass/fail with timing~~ **Done**
+5. ~~`cot doc` generates HTML from `///` comments~~ **Done** (11e676f)
 6. `cot upgrade` updates to the latest release
 7. VS Code marketplace extension installs and provides LSP
 8. ~~Error messages include "did you mean X?" suggestions~~ **Done** (Feb 15)
 9. ~~`cot.json` `main` field is used by all file-requiring commands~~ **Done** (Feb 15)
-10. Watch mode works: `cot run --watch`, `cot test --watch`
+10. ~~Watch mode works: `cot run --watch`, `cot test --watch`~~ **Done** (11e676f)
 11. Shell completions work for zsh and bash
-12. At least `std/path`, `std/crypto`, `std/cli`, `std/process` are added
-13. Doc comments (`///`) are parsed and stored
-14. All existing tests still pass on both native and Wasm targets
+12. ~~At least `std/path`, `std/crypto`, `std/cli`, `std/process` are added~~ **Done** (all 11 Wave 6 stdlib modules)
+13. ~~Doc comments (`///`) are parsed and stored~~ **Done** (11e676f)
+14. ~~All existing tests still pass on both native and Wasm targets~~ **Done** (71/71 native, CI green)
+15. ~~CI/CD: automated testing on push, release binaries on tag~~ **Done** (test.yml + release.yml)
 
-### Implementation Order (Suggested)
+### Remaining Work for 0.4
 
-**Week 1: Distribution + quick wins**
-- D1: Homebrew tap
-- D2: x86_64-macos binary
-- D3: VS Code marketplace
-- ~~P1: `cot fmt` in-place default~~ **Done** (Feb 15)
-- P5: `cot init` improvements
+All language features, stdlib modules, and tooling (Waves 4-6) are **DONE**. CI/CD is **DONE**. What remains is distribution polish:
 
-**Week 2: Polish**
-- ~~P2: Error suggestions ("did you mean")~~ **Done** (Feb 15)
-- ~~P3: `cot.json` integration~~ **Done** (Feb 15)
-- P4: Improved test failure output
-- D4: `cot upgrade`
-- D5: Shell completions
-
-**Week 3: Tooling**
-- T1: Watch mode
-- T2: Doc comments (`///`)
-- T6: `cot task`
-- T4: `cot info`
-
-**Week 4: `cot doc` + stdlib**
-- T3: `cot doc` HTML generation
-- T5: Expanded lint rules
-- Wave 6 stdlib: `std/path`, `std/cli`, `std/process`
-
-**Week 5+: Language features + stdlib**
-- Wave 5 language features (destructuring, `!T`, `@embedFile`, etc.)
-- Wave 6 stdlib continued (`std/crypto`, `std/regex`, `std/fmt`, etc.)
+1. D1: Homebrew tap
+2. D2: x86_64-macos release binary (currently only aarch64-macos + x86_64-linux)
+3. D3: VS Code marketplace
+4. D4: `cot upgrade` (self-update)
+5. D5: Shell completions (zsh/bash/fish)
+6. P5: `cot init` improvements (test template, next-steps)
+7. D6: Logo & brand assets
+8. D7: cot.dev launch
 
 ---
 

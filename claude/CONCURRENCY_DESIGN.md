@@ -2,11 +2,11 @@
 
 Cot's concurrency roadmap, building on the existing async/await foundation.
 
-**Status:** Phase 1 (async/await) complete. Phase 3 (OS-level primitives) **DONE** — see `threading-design.md`. Phase 2 (spawn + work-stealing) **DONE** (MVP — global queue, no per-worker local queues yet).
+**Status:** Phase 1 (async/await) complete. Phase 3 (OS-level primitives) **DONE** — see `threading-design.md`. Phase 2 (spawn + work-stealing) **PARTIAL** — spawn MVP with global queue done, but Channel(T) for Phase 2 (typed high-level channels with `select`) and per-worker local queues still TODO. Note: Phase 3's low-level `Channel(T)` in `std/channel` (mutex+condvar based) is done and usable.
 
 ---
 
-## Current State (0.4)
+## Current State (0.3.4)
 
 Cot has single-threaded async I/O via `async fn` / `await`:
 
@@ -15,7 +15,13 @@ Cot has single-threaded async I/O via `async fn` / `await`:
 - **9 builtins:** kqueue/epoll/fcntl, async accept/read/write/connect
 - **`std/async`:** Platform-abstracted async I/O wrappers
 
-This handles I/O-bound concurrency (HTTP servers, database queries). What's missing is CPU parallelism.
+Additionally, OS-level threading primitives are available (Phase 3):
+
+- **`std/thread`:** Thread spawn/join/detach, Mutex, Condition variables
+- **`std/channel`:** Channel(T) with init/send/recv/close (mutex+condvar based)
+- **Atomic builtins:** `@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicCAS`, `@atomicExchange`
+- **Spawn MVP:** `spawn {}` blocks with global queue scheduler (no per-worker local queues yet)
+- **Atomic ARC:** Strong/unowned refcounts use atomic operations (weak refs still non-atomic)
 
 ---
 
@@ -25,12 +31,13 @@ This handles I/O-bound concurrency (HTTP servers, database queries). What's miss
 Phase 1: async/await (DONE)
   Single-threaded I/O concurrency. Event loop. No parallelism.
 
-Phase 2: spawn + channels (0.5)
-  Go-style lightweight tasks. True parallelism across CPU cores.
-  Message-passing via channels. No shared mutable state.
+Phase 2: spawn + work-stealing scheduler (0.5)
+  Per-worker local queues + steal-half. High-level Channel(T) with
+  select statement. Builds on Phase 3 primitives.
 
 Phase 3: Low-level primitives (DONE — 0.3.x)
   Thread, Mutex, Condition, Atomics, Channel(T). See threading-design.md.
+  Spawn MVP with global queue. Atomic ARC (strong/unowned).
 ```
 
 ---
@@ -189,7 +196,8 @@ Wasm doesn't have OS threads (yet). The Wasm threads proposal adds shared memory
 - [x] `spawn` keyword parsing and AST node (contextual keyword)
 - [x] Closure-style environment capture for spawn blocks (`lowerSpawnExpr` in lower.zig)
 - [x] `sched_spawn` runtime function (CLIF IR in `scheduler_native.zig`)
-- [ ] `Channel(T)` type with `new`, `send`, `recv`, `close`
+- [x] Low-level `Channel(T)` in `std/channel` (mutex+condvar based, init/send/recv/close) — Phase 3
+- [ ] High-level `Channel(T)` type integrated with spawn (typed, bounded, GC-safe)
 - [ ] `select` statement parsing and lowering
 - [x] Scheduler runtime: global queue MVP (`scheduler_native.zig` — CAS init, condvar, atexit shutdown)
 - [ ] Work-stealing: per-worker local queues + steal-half (Go `runqsteal` pattern)

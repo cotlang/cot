@@ -1,10 +1,10 @@
 # Cot Roadmap
 
-## Current: 0.3.4 (Feb 2026)
+## Current: 0.3.4 (Mar 2026)
 
-Compiler is feature-complete for the core language. 32 stdlib modules, 69 test files (~1,658 tests), LSP with 7 features, @safe mode, comptime infrastructure, ARC memory management. All 6 waves of 0.4 feature work are **DONE**. Runtime builtins moved to stdlib via `extern fn`. OS threading primitives (threads, mutex, condition variables, atomics, channels) implemented. Pointer capture `|*val|` across all 5 capture sites. Self-hosted compiler at ~65% frontend parity (15,012 lines, 216 tests), ir.cot backend IR complete.
+Compiler is feature-complete for the core language. 34 stdlib modules, 72 test files (~1,670 tests, 71/71 passing on native), LSP with 7 features, @safe mode, comptime infrastructure, ARC memory management. All 6 waves of 0.4 feature work are **DONE**. Runtime builtins moved to stdlib via `extern fn`. OS threading primitives (threads, mutex, condition variables, atomics, channels) implemented. Pointer capture `|*val|` across all 5 capture sites. CI/CD: GitHub Actions test on push (macOS ARM64 + Linux x64), automated binary releases on tag. Self-hosted compiler at ~65% frontend parity (~15,000 lines, 228 tests), ir.cot backend IR complete, lower.cot ~59% ported (5,479 lines).
 
-**What ships:** A developer can `cot init`, write an HTTP server with crypto + regex + path handling, `cot test --watch` during development, `cot lint` + `cot check` for fast feedback, `cot bench` for performance, `cot doc` for API docs, and `cot build` for a native binary. Like Deno, but compiled to native with zero runtime overhead.
+**What ships:** A developer can `cot init`, write an HTTP server with crypto + regex + path handling + SQLite, `cot test --watch` during development, `cot lint` + `cot check` for fast feedback, `cot bench` for performance, `cot doc` for API docs, and `cot build` for a native binary. Like Deno, but compiled to native with zero runtime overhead.
 
 ---
 
@@ -16,16 +16,16 @@ All language features and stdlib are done. What remains is distribution polish:
 
 | # | Item | Status |
 |---|------|--------|
-| 1 | Homebrew tap | Not started |
-| 2 | x86_64-macos binary | Not started |
-| 3 | VS Code marketplace | Not started |
-| 4 | `cot upgrade` (self-update) | Not started |
-| 5 | Shell completions (zsh/bash/fish) | Not started |
-| 6 | `cot init` improvements (test template, next-steps) | Not started |
-| 7 | Improved `@assert_eq` failure output (expected vs actual diff) | Not started |
+| 1 | CI/CD pipeline | **Done** — test.yml (macOS + Linux), release.yml (binaries on tag) |
+| 2 | Homebrew tap | Not started |
+| 3 | x86_64-macos binary | Not started (release.yml currently: aarch64-macos + x86_64-linux) |
+| 4 | VS Code marketplace | Not started |
+| 5 | `cot upgrade` (self-update) | Not started |
+| 6 | Shell completions (zsh/bash/fish) | Not started |
+| 7 | `cot init` improvements (test template, next-steps) | Not started |
 | 8 | Logo & brand assets | Not started |
 | 9 | cot.dev launch (docs site + playground) | Not started |
-| 10 | Self-hosting progress (frontend in Cot) | ~65% frontend (15,012 lines, 216 tests). ir.cot backend IR complete. lower.zig, ssa_builder.zig, arc_insertion.zig remaining. |
+| 10 | Self-hosting progress (frontend in Cot) | ~65% frontend (~15,000 lines, 228 tests). ir.cot complete, lower.cot ~59% (5,479 lines). ssa_builder.zig, arc_insertion.zig remaining. |
 
 **Release criteria:** `brew install cotlang/tap/cot` works, VS Code extension on marketplace, all tests pass on native + Wasm.
 
@@ -35,18 +35,24 @@ All language features and stdlib are done. What remains is distribution polish:
 
 **Theme: "Share and deploy."**
 
+The centerpiece is the **package ecosystem** — a full port of JSR (jsr.io) to Cot. This includes the registry (cot.land), package manager (integrated into `cot` CLI), and C source bundling so packages can wrap native libraries without bloating the compiler distribution.
+
+**Full vision:** [cot-land/pkg/VISION.md](https://github.com/cot-land/pkg/blob/main/VISION.md)
+
 | Feature | Description | Reference |
 |---------|-------------|-----------|
 | Package manager | `cot add`, `cot remove`, `cot publish`. Lockfile, dependency resolution. | `deno add`, `cargo add` |
-| Package registry | cot.land — browse, search, publish packages. | jsr.io, crates.io |
-| Cross-compilation | `cot build --target=x86_64-linux` from macOS. | Zig cross-compile |
+| Package registry | cot.land — full JSR port. Postgres, cloud storage, CDN. | jsr.io |
+| C source bundling | `"c_sources"` in cot.json — packages bring their own C code, compiler compiles it for any target. Enables sqlite, postgres, image libs as registry packages, not stdlib. | Zig `addCSourceFile`, Go cgo |
+| Cross-compilation | `cot build --target=x86_64-linux` from macOS, including C sources. | Zig cross-compile |
 | Test coverage | `cot coverage` — line/branch, lcov output, HTML report. | `deno coverage` |
-| `std/db` | Database driver — SQLite first, then Postgres. | Go `database/sql` |
 | `std/dom` | Browser DOM API for `--target=wasm32`. | wasm-bindgen |
 | Web framework prototype | `@server`/`@client` annotations, shared types, auto-serialization. | Next.js, Fresh |
 | `std/csv`, `std/toml` | Config file formats. | Deno std |
 | `std/streams` | ReadableStream, WritableStream, pipe, buffer. | WHATWG Streams |
 | `std/net` | DNS, TLS, connection pooling. | Go `net` |
+
+**Key design principle:** Database drivers (SQLite, Postgres) and native library bindings are **registry packages**, not stdlib. `std/sqlite` exists temporarily to bootstrap cot.land, then migrates to a registry package once C source bundling ships. The compiler stays minimal — it provides the C compilation capability, packages provide the C source.
 
 ---
 
@@ -56,11 +62,9 @@ All language features and stdlib are done. What remains is distribution polish:
 
 | Feature | Description | Reference |
 |---------|-------------|-----------|
-| ~~Spawn + channels~~ | ~~Go-style: `spawn {}`, `Channel(T)`, `select`, work-stealing.~~ | **DONE** (0.3.x) — OS-level threads, mutex, conditions, atomics, Channel(T). See `threading-design.md` |
-| ~~Atomic ARC~~ | ~~Thread-safe reference counting.~~ | **Foundation DONE** (atomics in 0.3.x). ARC atomic upgrade deferred to scheduler work |
 | Permission system | `--allow-read`, `--allow-net`, `--allow-env`. | Deno permissions |
 | OpenTelemetry | Built-in tracing, auto-instrument HTTP. | Deno 2.2 OTel |
-| `spawn {}` + work-stealing | Lightweight task scheduler on top of OS threads. | Go runtime `proc.go` |
+| Work-stealing scheduler | Lightweight task scheduler on top of OS threads (spawn MVP done, local queues TODO). | Go runtime `proc.go` |
 | `select` statement | Multiplexed channel receive. | Go `select` |
 | SIMD vectors | `@Vector(N, T)` mapped to hardware SIMD. | Zig `@Vector` |
 

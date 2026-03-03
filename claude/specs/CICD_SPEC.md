@@ -1,6 +1,6 @@
 # CI/CD & Release Pipeline
 
-**Status:** Spec
+**Status:** Phases 1-2 IMPLEMENTED, Phases 3-5 spec only
 **Target:** 0.4
 **Parallel-safe:** Yes — touches only `.github/`, `install.sh`, `CHANGELOG.md`, `README.md`
 
@@ -12,21 +12,25 @@ Set up GitHub Actions CI/CD, automated releases with pre-built binaries, and a c
 
 ---
 
-## Current State
+## Current State (Updated Mar 2, 2026)
 
-- **Version:** `VERSION` file → `build.zig` → `build_options.version` → `cot version` (working)
+- **Version:** `VERSION` file → `build.zig` → `build_options.version` → `cot version` (working). Currently `0.3.4`.
 - **Build:** `zig build` → `zig-out/bin/cot` (single command, ~10-30s)
-- **Tests:** `zig build test` (163 compiler tests) + `./test/run_all.sh` (~914 Cot tests across 35 files)
-- **Targets:** native, arm64-macos, amd64-linux, wasm32, wasm32-wasi
-- **CI:** None
-- **Releases:** None
-- **Distribution:** Build from source only
+- **Tests:** `zig build test` (163 compiler tests) + `./test/run_all.sh` (~1,670 Cot tests across 72 files, 71/71 passing)
+- **Targets:** native (arm64-macos, x86_64-linux), wasm32, wasm32-wasi
+- **CI:** **IMPLEMENTED** — `.github/workflows/test.yml` (macOS ARM64 + Linux x64, on push/PR)
+- **Releases:** **IMPLEMENTED** — `.github/workflows/release.yml` (aarch64-macos + x86_64-linux, on tag)
+- **Distribution:** Build from source, or download from GitHub Releases
 
 ---
 
-## Phase 1: CI Testing (every commit)
+## Phase 1: CI Testing (every commit) — IMPLEMENTED
 
 ### `.github/workflows/test.yml`
+
+**Status:** DONE. Live at `.github/workflows/test.yml`. Uses Zig 0.15.2, wasmtime 29.0.1. macOS runs native + Wasm; Linux runs Wasm only (native x64 blocked by shift register bug).
+
+**Original spec (for reference):**
 
 ```yaml
 name: Test
@@ -91,9 +95,13 @@ The script must `exit $fail_count` or `exit 1` on failure for CI to detect probl
 
 ---
 
-## Phase 2: Release Pipeline (on tag)
+## Phase 2: Release Pipeline (on tag) — IMPLEMENTED
 
 ### `.github/workflows/release.yml`
+
+**Status:** DONE. Live at `.github/workflows/release.yml`. Builds aarch64-macos + x86_64-linux. Missing x86_64-macos (no macOS-13 runner in matrix). Uses `softprops/action-gh-release@v2`.
+
+**Original spec (for reference):**
 
 ```yaml
 name: Release
@@ -197,7 +205,7 @@ const exe = b.addExecutable(.{
 
 ---
 
-## Phase 3: Installer Script
+## Phase 3: Installer Script — NOT YET IMPLEMENTED
 
 ### `install.sh`
 
@@ -392,13 +400,15 @@ macOS notarization + Linux GPG signing for production trust.
 
 ## Prerequisites / Blockers
 
-1. **`build.zig` target option** — Need `b.standardTargetOptions()` for cross-compilation in release builds. Without this, must build on each platform natively (the matrix approach above handles this).
+1. ~~**`build.zig` target option**~~ — Not needed; matrix approach (native builds on each platform) is used.
 
-2. **`run_all.sh` exit code** — Must exit non-zero on test failure. Verify.
+2. ~~**`run_all.sh` exit code**~~ — **Verified working.** Exits non-zero on failure.
 
-3. **`run_all.sh --target=wasm32`** — Must support `--target` flag to pass through to `cot test`. Verify or add.
+3. ~~**`run_all.sh --target=wasm32`**~~ — **Verified working.** `--target` flag passes through to `cot test`.
 
-4. **GitHub repo settings** — Enable Actions (should be enabled by default on public repos).
+4. ~~**GitHub repo settings**~~ — **Done.** Actions enabled on `cotlang/cot`.
+
+5. **x86_64-macos binary** — Release workflow lacks `macos-13` (x86_64) runner. Intel Mac users can't use release binaries. Add to release matrix when needed.
 
 ---
 

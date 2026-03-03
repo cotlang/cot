@@ -1,14 +1,15 @@
 # Linux x86_64 Parity — Complete Investigation Notes
 
 **Date:** 2026-03-02 (updated)
-**Status:** Root cause found. Partial fix applied. More work needed.
+**Status:** Major fixes committed (40d429e, 9130c30, f8ba6b5 and others). Several categories resolved. Shift register bug (Category 1) still blocks ~20 native tests on x64.
 **Goal:** Full test parity on Linux x86_64.
 
 ## Current State
 
-- **Wasm→CLIF path** (current Linux default): 66/70 test files pass
-- 4 failures: `arc.cot`, `spawn.cot`, `thread_basic.cot`, `threading.cot` (Wasm→CLIF translator stack underflow)
-- **Direct native path** (macOS default, not yet enabled on Linux): 38/70 when enabled
+- **CI (test.yml):** Linux runs Wasm tests only (native tests skipped — see comment in test.yml)
+- **Wasm path on Linux:** features.cot passes; full suite with `continue-on-error`
+- **Direct native path** (macOS default, not yet enabled on Linux): blocked by shift_r register bug (Category 1)
+- **Committed fixes:** Categories 2-6 all committed (see below)
 
 ## Critical Discovery This Session: `alu_rmi_r` dst==src1 Bug
 
@@ -213,7 +214,7 @@ try sink.put4(0); // Placeholder (linker patches)
 
 ### Status
 
-**Fix already applied** in this session's working tree (`emit.zig` modified). Verified: `print("hello")` works, RIP-relative addresses resolve correctly.
+**COMMITTED** (40d429e). Verified: `print("hello")` works, RIP-relative addresses resolve correctly.
 
 ---
 
@@ -243,7 +244,7 @@ else
 
 ### Status
 
-**Fix already applied** in this session's working tree.
+**COMMITTED** (40d429e + 9130c30).
 
 ---
 
@@ -276,7 +277,7 @@ const sol_socket = try ins.iconst(clif.Type.I64, if (target_os == .macos) 0xFFFF
 
 ### Status
 
-**Fix already applied** in this session's working tree. All 5 constants are now conditional. The `target_os` parameter has been added to all 4 affected function signatures and call sites.
+**COMMITTED** (40d429e). All 5 constants are now conditional. The `target_os` parameter has been added to all 4 affected function signatures and call sites.
 
 ---
 
@@ -304,7 +305,7 @@ Linux link step only passes `-lc`. Missing:
 
 ### Status
 
-**Fix already applied** in this session's working tree.
+**COMMITTED** (40d429e).
 
 ---
 
@@ -318,7 +319,7 @@ Note: `fmin`, `fmax`, `fcopysign` implementations exist in x64 but were not wire
 
 ### Status
 
-**Fix already applied** in this session's working tree. `.fmin`, `.fmax`, `.fcopysign` are now wired in the x64 dispatch.
+**COMMITTED** (40d429e). `.fmin`, `.fmax`, `.fcopysign` are now wired in the x64 dispatch.
 
 ---
 
@@ -381,9 +382,9 @@ macOS uses kqueue; Linux stubs return -1 for kqueue functions. Real epoll implem
 
 ## Execution Plan
 
-### Phase 1: Fix the Shift Register Bug (Unblocks ~20 tests)
+### Phase 1: Fix the Shift Register Bug (Unblocks ~20 tests) — STILL TODO
 
-This is the critical path. Everything else is already fixed or is a minor issue.
+This is the critical path. Categories 2-6 are all committed. Only the shift register bug remains.
 
 1. **Fix `get_operands.zig:487-498`** — Make `shift_r.value` properly tracked by the register allocator
 2. **Add immediate shift support to `lower.zig:lowerShift()`** — Detect constant shift amounts and avoid CL constraint entirely
@@ -446,17 +447,18 @@ Confirmed by audit — these are correct and complete:
 
 ---
 
-## Files Modified in This Session
+## Committed Fixes
 
-These changes are in the working tree but uncommitted. They implement the fixes described in Categories 2-6:
+All Category 2-6 fixes have been committed across several commits:
 
-| File | Changes |
-|------|---------|
-| `compiler/codegen/native/isa/x64/lower.zig` | Wire `.fmin`, `.fmax`, `.fcopysign` in dispatch |
-| `compiler/codegen/native/isa/x64/inst/emit.zig` | Fix `load_ext_name` relocation ordering + addend |
-| `compiler/codegen/native/io_native.zig` | 5 platform constants → conditional on `target_os` |
-| `compiler/driver.zig` | Add `__open` → `open` symbol remapping |
-| `compiler/main.zig` | Add `-lpthread -lutil` linker flags; enable `force_direct` |
+| Commit | Changes |
+|--------|---------|
+| `40d429e` | Major x64 fixes: ARC, calls, floats, stack alignment, platform constants, linker flags, symbol remapping |
+| `9130c30` | x64 atomics, select/trap TEST size, Linux symbol naming (`_` prefix removal) |
+| `2453c59` | x64 atomic_rmw_seq: late operand positions to prevent RAX aliasing |
+| `b95d1ae` | x64 brif: byte-size TEST for icmp boolean results |
+| `21712fd` | Narrow integer return widening in native x64 call codegen |
+| `f8ba6b5` | x64 genMove for XMM registers |
 
 ---
 

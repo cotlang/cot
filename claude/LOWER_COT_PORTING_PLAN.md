@@ -2,9 +2,11 @@
 
 ## Overview
 
-Port `compiler/frontend/lower.zig` (9,427 lines, 79 functions) to `self/frontend/lower.cot`. This is the AST→IR lowering pass — the bridge between the type-checked AST and the IR representation. It's the largest single file in the backend and the critical dependency for enabling `build`, `run`, and `test` commands in the self-hosted compiler.
+Port `compiler/frontend/lower.zig` (~9,559 lines, 79 functions) to `self/frontend/lower.cot`. This is the AST→IR lowering pass — the bridge between the type-checked AST and the IR representation. It's the largest single file in the backend and the critical dependency for enabling `build`, `run`, and `test` commands in the self-hosted compiler.
 
-**Estimated output**: ~8,000–10,000 lines of Cot (lower.zig is dense Zig; Cot's switch/capture verbosity adds ~15%, but @safe mode removes `&` noise)
+**Current status (Mar 2, 2026):** lower.cot is **~59% ported** — 5,479 lines, 12 tests. See "Progress Update" below for implemented functions.
+
+**Estimated final output**: ~8,000–10,000 lines of Cot (lower.zig is dense Zig; Cot's switch/capture verbosity adds ~15%, but @safe mode removes `&` noise)
 
 **Dependencies satisfied**: ir.cot (1,329 lines, 24 tests) is complete. ast.cot, checker.cot, types.cot, scanner.cot, token.cot, source.cot, errors.cot all exist.
 
@@ -272,11 +274,43 @@ Actual order: **1 → 3 → 2 → 4 → 5 → 6**
 
 ---
 
+## Progress Update (Mar 2, 2026)
+
+**5,479 lines / ~9,559 reference = ~59% ported. 12 tests.**
+
+### Implemented functions (per MEMORY.md):
+- `lowerCall` (5-type dispatch), `lowerMethodCall`, `lowerBuiltinCall` (59 builtins)
+- `lowerSwitchExpr` (union/statement/block), `lowerIfExpr` (simple+optional)
+- `lowerNewExpr`, `lowerTryExpr`, `lowerCatchExpr`, `lowerErrorLiteral`
+- `lowerReturn` (EU wrapping+SRET), `lowerAssign` (field/index/deref/compound)
+- `lowerStringInterp`, `lowerIfOptional` (value+ptr capture), `lowerWhileOptional`
+- `lowerFor` (range+slice+array), `emitCleanups` (defer+errdefer+ARC release+scope_destroy)
+- `lowerGenericFnInstance`, `generateTestRunner`, `generateBenchRunner`, `generateGlobalInits`
+- `lowerClosureExpr+detectCaptures`, `lowerDestructureStmt`
+- `lowerFieldAccess` (optional .?, tuple field), `sanitizeName` (space replacement)
+
+### Still TODO:
+- `lowerForMap`, `lowerInlineFor`, `lowerSwitchAsSelect`
+- Advanced `lowerFieldAccess` (union payload, error field)
+- `lowerLocalVarDecl` upgrades (compound optional init)
+- `lowerGlobalVarDecl` float eval
+- Some edge cases
+
+### Phase status:
+- **Phase 1** (Foundation): DONE
+- **Phase 2** (Statements): ~80% done
+- **Phase 3** (Expressions): ~90% done
+- **Phase 4** (Complex expressions): ~70% done (calls, builtins complete; some switch/select paths TODO)
+- **Phase 5** (Error handling + generics): ~60% done
+- **Phase 6** (Integration): ~50% done (test/bench runners done, multi-file partially)
+
+---
+
 ## Success Criteria
 
-- [ ] `cot test self/frontend/lower.cot` — 100+ unit tests pass
+- [ ] `cot test self/frontend/lower.cot` — 100+ unit tests pass (currently 12)
 - [ ] `cot build self/main.cot -o /tmp/selfcot` — builds with lower.cot included
 - [ ] `/tmp/selfcot build test/e2e/hello.cot` — self-hosted compiler can compile a simple program (requires SSA port too)
-- [ ] All existing 215 self-hosted tests continue to pass
+- [x] All existing self-hosted tests continue to pass (228 tests as of 0.3.4)
 
 **Note**: Full `build` command requires not just lower.cot but also ssa_builder.cot (~2,178 lines) and arc_insertion.cot (~444 lines). This plan covers lower.cot only. The SSA builder and ARC insertion are separate, smaller efforts that follow.
