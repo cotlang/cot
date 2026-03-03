@@ -1456,7 +1456,16 @@ const SsaToClifTranslator = struct {
             // Without this, iadd(I64, I32) produces wrong results on x64.
             const result_clif_ty = self.clif_func.dfg.valueType(result_val);
             if (result_clif_ty.repr != clif.Type.F32.repr and result_clif_ty.repr != clif.Type.F64.repr and result_clif_ty.bits() < 64) {
-                result_val = try self.builder.ins().sextend(clif.Type.I64, result_val);
+                // Use zero-extend for unsigned types, sign-extend for signed
+                const ret_info = self.type_reg.get(v.type_idx);
+                const is_unsigned = switch (ret_info) {
+                    .basic => |k| k.isUnsigned(),
+                    else => false,
+                };
+                result_val = if (is_unsigned)
+                    try self.builder.ins().uextend(clif.Type.I64, result_val)
+                else
+                    try self.builder.ins().sextend(clif.Type.I64, result_val);
             }
             try self.putValue(v.id, result_val);
             // For compound return types (string, slice), store second result in compound_extra_map
@@ -1750,11 +1759,21 @@ const SsaToClifTranslator = struct {
             }
         } else {
             // int → int: extend or reduce based on sizes
-            const from_clif = self.ssaTypeToClifType(from_type);
-            const from_bits = from_clif.bits();
+            // Use actual CLIF value type (may differ from SSA type after load widening)
+            const actual_clif_ty = self.clif_func.dfg.valueType(arg);
+            const from_bits = actual_clif_ty.bits();
             const to_bits = to_clif.bits();
             if (from_bits < to_bits) {
-                const result = try ins.sextend(to_clif, arg);
+                // Use zero-extend for unsigned types, sign-extend for signed
+                const from_info = self.type_reg.get(from_type);
+                const is_unsigned = switch (from_info) {
+                    .basic => |k| k.isUnsigned(),
+                    else => false,
+                };
+                const result = if (is_unsigned)
+                    try ins.uextend(to_clif, arg)
+                else
+                    try ins.sextend(to_clif, arg);
                 try self.putValue(v.id, result);
             } else if (from_bits > to_bits) {
                 const result = try ins.ireduce(to_clif, arg);

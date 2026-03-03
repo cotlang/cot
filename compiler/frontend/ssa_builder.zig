@@ -575,7 +575,12 @@ pub const SSABuilder = struct {
             return addr_val;
         }
 
-        const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+        // Use type-aware load op for integers (sign/zero-extend correctly).
+        // Floats use generic .load — CLIF handles float types directly.
+        const type_info = self.type_registry.get(type_idx);
+        const is_narrow_int = type_info == .basic and type_info.basic.isInteger() and type_info.basic.size() < 8;
+        const load_op: Op = if (is_narrow_int) self.getLoadOp(type_idx) else .load;
+        const load_val = try self.func.newValue(load_op, type_idx, cur, self.cur_pos);
         load_val.addArg(addr_val);
         try cur.addValue(self.allocator, load_val);
         return load_val;
@@ -754,7 +759,12 @@ pub const SSABuilder = struct {
             return slice_val;
         }
 
-        const load_val = try self.func.newValue(.load, type_idx, cur, self.cur_pos);
+        // Use type-aware load op for integers (sign/zero-extend correctly).
+        // Floats use generic .load — CLIF handles float types directly.
+        const gtype_info = self.type_registry.get(type_idx);
+        const g_is_narrow_int = gtype_info == .basic and gtype_info.basic.isInteger() and gtype_info.basic.size() < 8;
+        const gload_op: Op = if (g_is_narrow_int) self.getLoadOp(type_idx) else .load;
+        const load_val = try self.func.newValue(gload_op, type_idx, cur, self.cur_pos);
         load_val.addArg(addr_val);
         try cur.addValue(self.allocator, load_val);
         return load_val;
