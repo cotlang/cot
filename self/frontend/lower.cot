@@ -94,6 +94,10 @@ struct Lowerer {
     comptime_value_vars: Map(string, int),
     global_comptime_values: Map(string, int),
     pending_global_inits: List(GlobalInit),
+    pending_auto_deinits: List(string),
+    module_name: string,
+    tree_module_map: Map(int, string),
+    spawn_counter: int,
     builder: Builder,
 
     fn setTestMode(enabled: bool) void {
@@ -106,6 +110,89 @@ struct Lowerer {
 
     fn setBenchMode(enabled: bool) void {
         self.bench_mode = enabled
+    }
+
+    // ========================================================================
+    // Module qualification (Go LinkFuncName pattern)
+    // ========================================================================
+
+    /// Qualify bare function name with module prefix.
+    /// Returns bare name for single-file builds (module_name is empty).
+    fn qualifyName(bare: string) string {
+        if (self.module_name == "") { return bare }
+        return self.module_name ++ "." ++ bare
+    }
+
+    /// Resolve the qualified IR name for a function call target.
+    /// Looks up the Symbol in checker scope to find which module defined it.
+    fn resolveCallName(bare: string) string {
+        if (self.module_name == "") { return bare }
+        if (shouldSkipQualification(bare)) { return bare }
+        // Look up in checker scope to find which module defined this function
+        const sym_idx = self.chk.lookupSymbol(bare)
+        if (sym_idx >= 0) {
+            const sym = self.chk.getSymbol(sym_idx)
+            if (sym.is_extern or sym.is_export) { return bare }
+            if (sym.source_tree != 0) {
+                if (self.tree_module_map.has(sym.source_tree) != 0) {
+                    return self.tree_module_map.get(sym.source_tree) ++ "." ++ bare
+                }
+            }
+        }
+        // Local function or not found: qualify with own module
+        return self.qualifyName(bare)
+    }
+
+    /// Qualify a type name with its DEFINING module (not necessarily the current module).
+    /// Used for ARC metadata names and auto-deinit function names.
+    fn qualifyTypeName(type_name: string) string {
+        if (self.module_name == "") { return type_name }
+        const sym_idx = self.chk.lookupSymbol(type_name)
+        if (sym_idx >= 0) {
+            const sym = self.chk.getSymbol(sym_idx)
+            if (sym.source_tree != 0) {
+                if (self.tree_module_map.has(sym.source_tree) != 0) {
+                    return self.tree_module_map.get(sym.source_tree) ++ "." ++ type_name
+                }
+            }
+        }
+        return self.qualifyName(type_name)
+    }
+
+    /// Resolve a method's IR name via the defining module.
+    /// Three fallbacks: (1) method's source_tree, (2) type symbol lookup, (3) function name lookup.
+    fn resolveMethodName(type_name: string, func_name: string, method_source_tree: int) string {
+        if (self.module_name == "") { return func_name }
+        if (shouldSkipQualification(func_name)) { return func_name }
+        // Primary: use the method's source_tree recorded at registration time
+        if (method_source_tree != 0) {
+            if (self.tree_module_map.has(method_source_tree) != 0) {
+                return self.tree_module_map.get(method_source_tree) ++ "." ++ func_name
+            }
+        }
+        // Fallback 1: Look up the TYPE symbol in scope
+        const sym_idx = self.chk.lookupSymbol(type_name)
+        if (sym_idx >= 0) {
+            const sym = self.chk.getSymbol(sym_idx)
+            if (sym.is_extern or sym.is_export) { return func_name }
+            if (sym.source_tree != 0) {
+                if (self.tree_module_map.has(sym.source_tree) != 0) {
+                    return self.tree_module_map.get(sym.source_tree) ++ "." ++ func_name
+                }
+            }
+        }
+        // Fallback 2: Look up the FUNCTION synth name in scope
+        const fn_sym_idx = self.chk.lookupSymbol(func_name)
+        if (fn_sym_idx >= 0) {
+            const fn_sym = self.chk.getSymbol(fn_sym_idx)
+            if (fn_sym.is_extern or fn_sym.is_export) { return func_name }
+            if (fn_sym.source_tree != 0) {
+                if (self.tree_module_map.has(fn_sym.source_tree) != 0) {
+                    return self.tree_module_map.get(fn_sym.source_tree) ++ "." ++ func_name
+                }
+            }
+        }
+        return self.qualifyName(func_name)
     }
 
     // ========================================================================
@@ -125,6 +212,7 @@ struct Lowerer {
             self.lowerDecl(decl_idx)
         }
         self.lowerQueuedGenericFunctions()
+        self.emitPendingAutoDeinits()
     }
 
     /// Generate test runner: main() that calls each test and reports pass/fail.
@@ -382,7 +470,8 @@ struct Lowerer {
         const uses_sret = self.needsSret(return_type)
         const wasm_return_type = if (uses_sret) { VOID } else { return_type }
 
-        self.builder.startFunc(fn_decl.name, VOID, wasm_return_type, fn_decl.span)
+        const qualified_name = self.qualifyName(fn_decl.name)
+        self.builder.startFunc(qualified_name, VOID, wasm_return_type, fn_decl.span)
         if (self.builder.func()) |fb| {
             if (uses_sret) { fb.sret_return_type = return_type }
             fb.is_destructor = strEndsWith(fn_decl.name, "_deinit")
@@ -630,13 +719,22 @@ struct Lowerer {
                 }
             }
 
+            // Float consts: parse literal value and store in float_const_values
+            if ((type_idx == F32 or type_idx == F64) and var_decl.value != null_node) {
+                if (self.evalFloatLiteral(var_decl.value)) |fval| {
+                    self.float_const_values.set(var_decl.name, @bitCast(int, fval))
+                    self.float_const_types.set(var_decl.name, type_idx)
+                    return
+                }
+            }
+
             // Comptime block producing structured values
             if (var_decl.value != null_node) {
                 var is_comptime = false
                 switch (self.tree.getNode(var_decl.value)) { Node.expr |e| => switch (e) { Expr.comptime_block |_| => { is_comptime = true }, else => {} }, else => {} }
                 if (is_comptime) {
                     // Store in global_comptime_values for on-demand materialization
-                    // TODO: evalComptimeValue when comptime evaluation is ported
+                    // TODO: evalComptimeValue in checker when comptime evaluation is fully ported
                     return
                 }
             }
@@ -1432,6 +1530,12 @@ struct Lowerer {
 
     fn lowerFor(f: ForStmt) void {
         if (self.builder.func()) |fb| {
+            // Inline for — compile-time unroll
+            if (f.is_inline) {
+                self.lowerInlineFor(f)
+                return
+            }
+
             if (isRange(f)) {
                 self.lowerForRange(fb, f)
                 return
@@ -1439,6 +1543,15 @@ struct Lowerer {
 
             const iter_type = self.inferExprType(f.iterable)
             const iter_info = self.types.get(iter_type)
+
+            // Map iteration
+            if (iter_info.tag == TAG_MAP) {
+                switch (iter_info) {
+                    Type.map_type |mt| => { self.lowerForMap(fb, f, iter_type, mt) },
+                    else => {},
+                }
+                return
+            }
 
             // Array or slice iteration
             var elem_type = VOID
@@ -1596,6 +1709,177 @@ struct Lowerer {
         fb.emitStoreLocal(idx_local, idx_after, f.span)
         fb.emitJump(cond_block, f.span)
 
+        self.loop_stack.pop()
+        fb.setBlock(exit_block)
+    }
+
+    /// Inline for — compile-time loop unrolling.
+    /// Ref: lower.zig:3791-3817
+    fn lowerInlineFor(f: ForStmt) void {
+        // Range case: eval bounds at compile time, emit body N times
+        if (isRange(f)) {
+            const start_val = self.evalConstInt(f.range_start)
+            const end_val = self.evalConstInt(f.range_end)
+            if (start_val == null or end_val == null) { return }
+            var i = start_val.?
+            while (i < end_val.?) {
+                self.const_values.set(f.binding, i)
+                self.lowerBlockNode(f.body)
+                i = i + 1
+            }
+            self.const_values.remove(f.binding)
+            return
+        }
+        // Comptime array iteration — deferred until comptime evaluation is ported
+    }
+
+    /// Try to evaluate an expression as a compile-time constant integer.
+    fn evalConstInt(idx: int) ?int {
+        if (idx == null_node) { return null }
+        switch (self.tree.getNode(idx)) { Node.expr |e| => switch (e) {
+            Expr.literal |l| => {
+                if (l.kind == LiteralKind.@"int") {
+                    return parseIntLit(l.value)
+                }
+            },
+            Expr.ident |id| => {
+                if (self.const_values.has(id.name) != 0) {
+                    return self.const_values.get(id.name)
+                }
+                // Check checker's const symbols
+                const sym_idx = self.chk.lookupSymbol(id.name)
+                if (sym_idx >= 0) {
+                    const sym = self.chk.getSymbol(sym_idx)
+                    if (sym.is_const_val) { return sym.const_value }
+                }
+            },
+            else => {},
+        }, else => {} }
+        return null
+    }
+
+    /// Lower `for k, v in map { }` — iterates occupied slots in hash table.
+    /// Map struct layout: keys(0), values(8), states(16), count(24), capacity(32).
+    /// States: 0=empty, 1=occupied, 2=tombstone.
+    /// Ref: lower.zig:3886-4011
+    fn lowerForMap(fb: *FuncBuilder, f: ForStmt, iter_type: int, map_info: CotMapType) void {
+        const key_type = map_info.key
+        const val_type = map_info.value
+        const key_size = self.types.sizeOf(key_type)
+        const val_size = self.types.sizeOf(val_type)
+
+        // Get the map local
+        var map_name = ""
+        switch (self.tree.getNode(f.iterable)) { Node.expr |e| => switch (e) {
+            Expr.ident |id| => { map_name = id.name },
+            else => {},
+        }, else => {} }
+        if (map_name == "") { return }
+        const map_local_opt = fb.lookupLocal(map_name)
+        if (map_local_opt == null) { return }
+        const map_local = map_local_opt.?
+
+        // Read map fields into locals BEFORE the loop
+        const idx_name = "__map_idx_" ++ intToStr(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const idx_local = fb.addLocalWithSize(idx_name, I64, true, 8)
+        const zero = fb.emitConstInt(0, I64, f.span)
+        fb.emitStoreLocal(idx_local, zero, f.span)
+
+        // Read capacity
+        const cap_name = "__map_cap_" ++ intToStr(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const cap_local = fb.addLocalWithSize(cap_name, I64, false, 8)
+        const cap_field = fb.emitFieldLocal(map_local, 4, 32, I64, f.span)
+        fb.emitStoreLocal(cap_local, cap_field, f.span)
+
+        // Read keys/values/states pointers
+        const keys_name = "__map_keys_" ++ intToStr(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const keys_local = fb.addLocalWithSize(keys_name, I64, false, 8)
+        const keys_field = fb.emitFieldLocal(map_local, 0, 0, I64, f.span)
+        fb.emitStoreLocal(keys_local, keys_field, f.span)
+
+        const vals_name = "__map_vals_" ++ intToStr(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const vals_local = fb.addLocalWithSize(vals_name, I64, false, 8)
+        const vals_field = fb.emitFieldLocal(map_local, 1, 8, I64, f.span)
+        fb.emitStoreLocal(vals_local, vals_field, f.span)
+
+        const states_name = "__map_states_" ++ intToStr(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const states_local = fb.addLocalWithSize(states_name, I64, false, 8)
+        const states_field = fb.emitFieldLocal(map_local, 2, 16, I64, f.span)
+        fb.emitStoreLocal(states_local, states_field, f.span)
+
+        // Create loop blocks
+        const cond_block = fb.newBlock("map.cond")
+        const body_block = fb.newBlock("map.body")
+        const incr_block = fb.newBlock("map.incr")
+        const exit_block = fb.newBlock("map.end")
+
+        fb.emitJump(cond_block, f.span)
+
+        // Condition: idx < capacity
+        fb.setBlock(cond_block)
+        const idx_cond = fb.emitLoadLocal(idx_local, I64, f.span)
+        const cap_cond = fb.emitLoadLocal(cap_local, I64, f.span)
+        const cond = fb.emitBinary(BinaryOp.lt, idx_cond, cap_cond, BOOL, f.span)
+        fb.emitBranch(cond, body_block, exit_block, f.span)
+
+        // Push loop context
+        self.loop_stack.append(LoopContext {
+            cond_block: incr_block,
+            exit_block: exit_block,
+            cleanup_depth: self.cleanup_stack.count,
+            label: f.label,
+        })
+
+        // Body: check state[idx] == 1 (occupied)
+        fb.setBlock(body_block)
+        const cur_idx = fb.emitLoadLocal(idx_local, I64, f.span)
+
+        const states_base = fb.emitLoadLocal(states_local, I64, f.span)
+        const state_val = fb.emitIndexValue(states_base, cur_idx, 8, I64, f.span)
+        const one = fb.emitConstInt(1, I64, f.span)
+        const is_occupied = fb.emitBinary(BinaryOp.eq, state_val, one, BOOL, f.span)
+
+        const occupied_block = fb.newBlock("map.occupied")
+        fb.emitBranch(is_occupied, occupied_block, incr_block, f.span)
+
+        // Occupied block: load key and value, execute body
+        fb.setBlock(occupied_block)
+        const idx_load = fb.emitLoadLocal(idx_local, I64, f.span)
+
+        // Load key and value
+        const keys_base = fb.emitLoadLocal(keys_local, I64, f.span)
+        const key_val = fb.emitIndexValue(keys_base, idx_load, key_size, key_type, f.span)
+        const vals_base = fb.emitLoadLocal(vals_local, I64, f.span)
+        const val_val = fb.emitIndexValue(vals_base, idx_load, val_size, val_type, f.span)
+
+        // Bind value (binding = second name = value)
+        const val_local = fb.addLocalWithSize(f.binding, val_type, false, val_size)
+        fb.emitStoreLocal(val_local, val_val, f.span)
+
+        // Bind key (index_binding = first name = key)
+        if (f.index_binding != "") {
+            const key_local = fb.addLocalWithSize(f.index_binding, key_type, false, key_size)
+            fb.emitStoreLocal(key_local, key_val, f.span)
+        }
+
+        // Execute loop body
+        const body_t = self.lowerBlockNode(f.body)
+        if (!body_t) { fb.emitJump(incr_block, f.span) }
+
+        // Increment: idx += 1
+        fb.setBlock(incr_block)
+        const idx_before = fb.emitLoadLocal(idx_local, I64, f.span)
+        const inc = fb.emitConstInt(1, I64, f.span)
+        const idx_after = fb.emitBinary(BinaryOp.add, idx_before, inc, I64, f.span)
+        fb.emitStoreLocal(idx_local, idx_after, f.span)
+        fb.emitJump(cond_block, f.span)
+
+        // Exit
         self.loop_stack.pop()
         fb.setBlock(exit_block)
     }
@@ -1779,7 +2063,7 @@ struct Lowerer {
             const type_idx = if (self.float_const_types.has(id.name) != 0) {
                 self.float_const_types.get(id.name)
             } else { F64 }
-            const fval = @floatFromInt(f64, val)
+            const fval = @bitCast(f64, val)
             return fb.emitConstFloat(fval, type_idx, id.span)
         }
         // Look up local variable
@@ -2157,6 +2441,25 @@ struct Lowerer {
         const index = self.lowerExprNode(ie.idx)
         if (index == null_node) { return null_node }
 
+        // Bounds check (debug mode only)
+        if (!self.release_mode) {
+            if (type_info.tag == TAG_ARRAY) {
+                var arr_len = 0
+                switch (type_info) { Type.array |a| => { arr_len = a.length }, else => {} }
+                const len_node = fb.emitConstInt(arr_len, I64, ie.span)
+                self.emitBoundsCheck(fb, index, len_node, ie.span)
+            } else if (type_info.tag == TAG_SLICE) {
+                // Need to get the slice value to extract length
+                if (self.extractIdentName(ie.base)) |sl_name| {
+                    if (fb.lookupLocal(sl_name)) |sl_local| {
+                        const sl_val = fb.emitLoadLocal(sl_local, base_type, ie.span)
+                        const len_node = fb.emitSliceLen(sl_val, ie.span)
+                        self.emitBoundsCheck(fb, index, len_node, ie.span)
+                    }
+                }
+            }
+        }
+
         if (self.extractIdentName(ie.base)) |base_name| {
             if (fb.lookupLocal(base_name)) |local_idx| {
                 return fb.emitIndexLocal(local_idx, index, elem_size, elem_type, ie.span)
@@ -2303,6 +2606,30 @@ struct Lowerer {
         // Default start to 0
         if (start == null_node) {
             start = fb.emitConstInt(0, I64, se.span)
+        }
+
+        // Slice bounds checks (debug mode only)
+        if (!self.release_mode) {
+            // Get the source length for checking
+            var source_len = null_node
+            if (type_info.tag == TAG_ARRAY) {
+                var arr_len = 0
+                switch (type_info) { Type.array |a| => { arr_len = a.length }, else => {} }
+                source_len = fb.emitConstInt(arr_len, I64, se.span)
+            } else if (type_info.tag == TAG_SLICE) {
+                if (self.extractIdentName(se.base)) |sl_name| {
+                    if (fb.lookupLocal(sl_name)) |sl_local| {
+                        const sl_val = fb.emitLoadLocal(sl_local, base_type, se.span)
+                        source_len = fb.emitSliceLen(sl_val, se.span)
+                    }
+                }
+            }
+            if (source_len != null_node) {
+                // end <= length (slice end can equal length)
+                self.emitSliceBoundsCheck(fb, end, source_len, se.span)
+                // start <= end
+                self.emitSliceBoundsCheck(fb, start, end, se.span)
+            }
         }
 
         if (self.extractIdentName(se.base)) |base_name| {
@@ -2509,12 +2836,15 @@ struct Lowerer {
             return fb.emitClosureCall(table_idx, closure_ptr, args, return_type, c.span)
         }
 
+        // Module qualification: resolve to defining module's qualified name
+        const resolved_name = self.resolveCallName(func_name)
+
         // SRET: caller allocates temp, passes address as hidden first arg
         if (self.needsSret(return_type)) {
-            return self.emitSretCall(fb, func_name, args, return_type, c.span)
+            return self.emitSretCall(fb, resolved_name, args, return_type, c.span)
         }
 
-        return fb.emitCall(func_name, args, false, return_type, c.span)
+        return fb.emitCall(resolved_name, args, false, return_type, c.span)
     }
 
     // ========================================================================
@@ -2616,12 +2946,29 @@ struct Lowerer {
 
         const return_type = switch (ft_info) { Type.func |ft| => ft.return_type, else => VOID }
 
+        // Resolve the method's qualified name via its defining module
+        // Extract type name from base for fallback resolution
+        const base_type_idx = self.inferExprType(fa.base)
+        const base_info = self.types.get(base_type_idx)
+        var m_type_name = switch (base_info) {
+            Type.struct_type |st| => st.name,
+            Type.enum_type |et| => et.name,
+            Type.pointer |p| => switch (self.types.get(p.elem)) {
+                Type.struct_type |st| => st.name,
+                Type.enum_type |et| => et.name,
+                else => "",
+            },
+            else => "",
+        }
+        if (m_type_name == "" and base_type_idx == STRING) { m_type_name = "string" }
+        const resolved_method = self.resolveMethodName(m_type_name, method_info.func_name, method_info.source_tree)
+
         // SRET for method calls returning large types
         if (self.needsSret(return_type)) {
-            return self.emitSretCall(fb, method_info.func_name, args, return_type, call.span)
+            return self.emitSretCall(fb, resolved_method, args, return_type, call.span)
         }
 
-        return fb.emitCall(method_info.func_name, args, false, return_type, call.span)
+        return fb.emitCall(resolved_method, args, false, return_type, call.span)
     }
 
     // ========================================================================
@@ -3877,9 +4224,146 @@ struct Lowerer {
             return null_node
         }
 
-        // If any arm has calls or is compound optional → block-based
-        // Default to block-based for safety (select-based is an optimization)
-        return self.lowerSwitchValueBlocks(fb, se, idx)
+        // Select arms with calls must use block-based lowering (branches, not selects).
+        // Select-based lowering eagerly evaluates ALL arm bodies — wrong for side effects.
+        if (self.switchArmsHaveCalls(se)) {
+            return self.lowerSwitchValueBlocks(fb, se, idx)
+        }
+        // Compound optionals can't use select (16-byte values)
+        const result_info = self.types.get(result_type)
+        if (result_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(result_type)) {
+            return self.lowerSwitchValueBlocks(fb, se, idx)
+        }
+        return self.lowerSwitchAsSelect(fb, se, result_type)
+    }
+
+    /// Conservative check: do any switch arms potentially have side effects?
+    fn switchArmsHaveCalls(se: SwitchExpr) bool {
+        for i in 0..se.cases.count {
+            const case_idx = se.cases.get(i)
+            if (self.exprMayHaveSideEffects(case_idx)) { return true }
+        }
+        if (se.else_body != null_node) {
+            if (self.exprMayHaveSideEffects(se.else_body)) { return true }
+        }
+        return false
+    }
+
+    /// Returns true for calls, blocks, and other non-pure expressions.
+    fn exprMayHaveSideEffects(idx: int) bool {
+        if (idx == null_node) { return false }
+        switch (self.tree.getNode(idx)) {
+            Node.expr |e| => {
+                return switch (e) {
+                    Expr.call |_| => true,
+                    Expr.builtin_call |_| => true,
+                    Expr.block_expr |_| => true,
+                    Expr.switch_case_node |sc| => self.exprMayHaveSideEffects(sc.body),
+                    else => false,
+                }
+            },
+            else => { return true },  // Statement bodies may have side effects
+        }
+    }
+
+    /// Switch as select — optimized path for simple expression switches.
+    /// Builds nested emitSelect chains instead of block-based branching.
+    /// Ref: lower.zig:6853-6917
+    fn lowerSwitchAsSelect(fb: *FuncBuilder, se: SwitchExpr, result_type: int) int {
+        // Set current enum type for .variant shorthand resolution
+        const old_switch_enum = self.current_switch_enum_type
+        const sel_subject_type = self.inferExprType(se.subject)
+        if (self.types.get(sel_subject_type).tag == TAG_ENUM) {
+            self.current_switch_enum_type = sel_subject_type
+        }
+        const subject = self.lowerExprNode(se.subject)
+
+        // String switch: pre-extract ptr/len
+        const is_string_switch = (sel_subject_type == STRING)
+        var subject_ptr = null_node
+        var subject_len = null_node
+        if (is_string_switch) {
+            const ptr_type = self.types.makePointer(U8)
+            subject_ptr = fb.emitSlicePtr(subject, ptr_type, se.span)
+            subject_len = fb.emitSliceLen(subject, se.span)
+        }
+
+        // Start with else arm as initial result
+        var result = null_node
+        if (se.else_body != null_node) {
+            result = self.lowerExprNode(se.else_body)
+        }
+        if (result == null_node) {
+            result = fb.emitConstInt(0, result_type, se.span)
+        }
+
+        // Build nested selects in reverse case order
+        var i = se.cases.count
+        while (i > 0) {
+            i = i - 1
+            const case_idx = se.cases.get(i)
+            var sc: SwitchCaseNode = undefined
+            var found = false
+            switch (self.tree.getNode(case_idx)) { Node.expr |e| => switch (e) {
+                Expr.switch_case_node |c| => { sc = c; found = true },
+                else => {},
+            }, else => {} }
+            if (!found) { continue }
+
+            var case_cond = null_node
+
+            if (sc.is_range and sc.patterns.count >= 2) {
+                // Range pattern in expression form
+                const range_start = self.lowerExprNode(sc.patterns.get(0))
+                const range_end = self.lowerExprNode(sc.patterns.get(1))
+                const ge_cond = fb.emitBinary(BinaryOp.ge, subject, range_start, BOOL, se.span)
+                const le_cond = fb.emitBinary(BinaryOp.le, subject, range_end, BOOL, se.span)
+                case_cond = fb.emitBinary(BinaryOp.@"and", ge_cond, le_cond, BOOL, se.span)
+            } else {
+                for p in 0..sc.patterns.count {
+                    const pat_idx = sc.patterns.get(p)
+                    const pattern_val = self.lowerExprNode(pat_idx)
+                    if (pattern_val == null_node) { continue }
+                    var pattern_cond = null_node
+                    if (is_string_switch) {
+                        const ptr_type = self.types.makePointer(U8)
+                        const p_ptr = fb.emitSlicePtr(pattern_val, ptr_type, se.span)
+                        const p_len = fb.emitSliceLen(pattern_val, se.span)
+                        var eq_args: List(int) = .{}
+                        eq_args.append(subject_ptr)
+                        eq_args.append(subject_len)
+                        eq_args.append(p_ptr)
+                        eq_args.append(p_len)
+                        const eq_result = fb.emitCall("string_eq", eq_args, false, I64, se.span)
+                        const zero = fb.emitConstInt(0, I64, se.span)
+                        pattern_cond = fb.emitBinary(BinaryOp.ne, eq_result, zero, BOOL, se.span)
+                    } else {
+                        pattern_cond = fb.emitBinary(BinaryOp.eq, subject, pattern_val, BOOL, se.span)
+                    }
+                    if (case_cond == null_node) {
+                        case_cond = pattern_cond
+                    } else {
+                        case_cond = fb.emitBinary(BinaryOp.@"or", case_cond, pattern_cond, BOOL, se.span)
+                    }
+                }
+            }
+
+            // Guard in expression form
+            if (sc.guard != null_node and case_cond != null_node) {
+                const guard_cond = self.lowerExprNode(sc.guard)
+                case_cond = fb.emitBinary(BinaryOp.@"and", case_cond, guard_cond, BOOL, se.span)
+            }
+
+            const case_val = self.lowerExprNode(sc.body)
+            // noreturn arms return null_node — skip select
+            if (case_val == null_node) { continue }
+            if (case_cond != null_node) {
+                result = fb.emitSelect(case_cond, case_val, result, result_type, se.span)
+            }
+        }
+
+        self.current_switch_enum_type = old_switch_enum
+        return result
     }
 
     /// Switch statement (void result) — if-chain over cases
@@ -4188,8 +4672,40 @@ struct Lowerer {
         const header_size = 32  // ARC_HEADER_SIZE with magic guard
         const total_size = header_size + payload_size
 
+        // ARC Phase 4: Queue synthetic deinit for structs with ARC fields but no user deinit
+        const metadata_name = ne.type_name
+        const payload_info = self.types.get(payload_type)
+        if (payload_info.tag == TAG_STRUCT) {
+            var has_arc_fields = false
+            switch (payload_info) {
+                Type.struct_type |st| => {
+                    for fi in 0..st.field_count {
+                        const field = st.getField(fi)
+                        if (self.types.couldBeARC(field.type_idx)) {
+                            has_arc_fields = true
+                            break
+                        }
+                    }
+                },
+                else => {},
+            }
+            if (has_arc_fields and self.types.lookupMethod(metadata_name, "deinit") < 0) {
+                var already_queued = false
+                for qi in 0..self.pending_auto_deinits.count {
+                    if (self.pending_auto_deinits.get(qi) == metadata_name) {
+                        already_queued = true
+                        break
+                    }
+                }
+                if (!already_queued) {
+                    self.pending_auto_deinits.append(metadata_name)
+                }
+            }
+        }
+
         // Emit type metadata + alloc
-        const metadata = fb.emitTypeMetadata(ne.type_name, ne.span)
+        const qualified_metadata = self.qualifyTypeName(metadata_name)
+        const metadata = fb.emitTypeMetadata(qualified_metadata, ne.span)
         const size_val = fb.emitConstInt(total_size, I64, ne.span)
         var alloc_args: List(int) = .{}
         alloc_args.append(metadata)
@@ -4970,6 +5486,87 @@ struct Lowerer {
     }
 
     // ========================================================================
+    // Comptime evaluation
+    // ========================================================================
+
+    /// Look up a comptime value by name — checks function-local vars first, then globals.
+    /// Returns -1 if not found.
+    fn lookupComptimeValue(name: string) int {
+        if (self.comptime_value_vars.has(name) != 0) {
+            return self.comptime_value_vars.get(name)
+        }
+        if (self.global_comptime_values.has(name) != 0) {
+            return self.global_comptime_values.get(name)
+        }
+        return -1
+    }
+
+    /// Emit a comptime value as IR nodes.
+    /// For the self-hosted compiler, comptime values are stored as ints.
+    /// Kind encoding: 0=int, 1=float (as bits), 2=string index, 3=bool.
+    /// Ref: lower.zig:8723-8737
+    fn emitComptimeValue(fb: *FuncBuilder, val: int, span: Span) int {
+        // Simple case: treat as integer constant
+        return fb.emitConstInt(val, I64, span)
+    }
+
+    /// Evaluate a float literal expression at compile time.
+    /// Handles: literal, paren, negation, binary arithmetic (+,-,*,/).
+    /// Ref: lower.zig:1142-1168
+    fn evalFloatLiteral(idx: int) ?float {
+        if (idx == null_node) { return null }
+        switch (self.tree.getNode(idx)) { Node.expr |e| => {
+            return switch (e) {
+                Expr.literal |l| => {
+                    if (l.kind == LiteralKind.@"float") {
+                        return parseFloatLit(l.value)
+                    }
+                    if (l.kind == LiteralKind.@"int") {
+                        return @floatFromInt(f64, parseIntLit(l.value))
+                    }
+                    return null
+                },
+                Expr.paren |p| => self.evalFloatLiteral(p.inner),
+                Expr.unary |un| => {
+                    if (un.op == Token.sub as int) {
+                        if (self.evalFloatLiteral(un.operand)) |v| {
+                            return -v
+                        }
+                    }
+                    return null
+                },
+                Expr.binary |bin| => {
+                    const l = self.evalFloatLiteral(bin.left)
+                    const r = self.evalFloatLiteral(bin.right)
+                    if (l == null or r == null) { return null }
+                    if (bin.op == Token.add) { return l.? + r.? }
+                    if (bin.op == Token.sub) { return l.? - r.? }
+                    if (bin.op == Token.mul) { return l.? * r.? }
+                    if (bin.op == Token.quo) { return l.? / r.? }
+                    return null
+                },
+                else => null,
+            }
+        }, else => { return null } }
+    }
+
+    /// Extract string literal value from a node, stripping surrounding quotes.
+    fn getStringLiteral(idx: int) ?string {
+        if (idx == null_node) { return null }
+        switch (self.tree.getNode(idx)) { Node.expr |e| => switch (e) {
+            Expr.literal |l| => {
+                if (l.kind != LiteralKind.@"string") { return null }
+                const v = l.value
+                if (@lenOf(v) >= 2 and charAt(v, 0) == 34 and charAt(v, @lenOf(v) - 1) == 34) {
+                    return @string(@ptrOf(v) + 1, @lenOf(v) - 2)
+                }
+                return v
+            },
+            else => { return null },
+        }, else => { return null } }
+    }
+
+    // ========================================================================
     // Helper functions
     // ========================================================================
 
@@ -4981,6 +5578,78 @@ struct Lowerer {
         self.comptime_value_vars = empty_comptime
         var empty_weak: Map(int, int) = .{}
         self.weak_locals = empty_weak
+    }
+
+    /// Emit a bounds check: if index >= length, print Go-style panic message and exit.
+    /// Go: runtime/panic.go goPanicIndex — "index out of range [N] with length M"
+    /// Zig: Sema.zig:26482 — addSafetyCheck pattern.
+    /// Ref: lower.zig:8800-8803
+    fn emitBoundsCheck(fb: *FuncBuilder, index_node: int, length_node: int, span: Span) void {
+        // index < length (strict — for element access)
+        const in_bounds = fb.emitBinary(BinaryOp.lt, index_node, length_node, BOOL, span)
+        self.emitBoundsCheckImpl(fb, in_bounds, index_node, length_node, span)
+    }
+
+    /// Emit a slice bounds check: if index > length, panic.
+    /// Slice end index CAN equal length (exclusive upper bound).
+    /// Ref: lower.zig:8808-8811
+    fn emitSliceBoundsCheck(fb: *FuncBuilder, index_node: int, length_node: int, span: Span) void {
+        // index <= length (non-strict — for slice bounds)
+        const in_bounds = fb.emitBinary(BinaryOp.le, index_node, length_node, BOOL, span)
+        self.emitBoundsCheckImpl(fb, in_bounds, index_node, length_node, span)
+    }
+
+    /// Ref: lower.zig:8813-8863
+    fn emitBoundsCheckImpl(fb: *FuncBuilder, in_bounds: int, index_node: int, length_node: int, span: Span) void {
+        const ok_block = fb.newBlock("bounds.ok")
+        const fail_block = fb.newBlock("bounds.fail")
+        fb.emitBranch(in_bounds, ok_block, fail_block, span)
+        fb.setBlock(fail_block)
+
+        const fd = fb.emitConstInt(2, I64, span)  // stderr
+
+        // "panic: index out of range ["
+        const prefix_idx = fb.addStringLiteral("panic: index out of range [")
+        const prefix_val = fb.emitConstSlice(prefix_idx, span)
+        var prefix_args: List(int) = .{}
+        prefix_args.append(fd)
+        prefix_args.append(prefix_val)
+        fb.emitCall("write", prefix_args, true, I64, span)
+
+        // Print the index value
+        var idx_args: List(int) = .{}
+        idx_args.append(index_node)
+        fb.emitCall("eprint_int", idx_args, false, VOID, span)
+
+        // "] with length "
+        const mid_idx = fb.addStringLiteral("] with length ")
+        const mid_val = fb.emitConstSlice(mid_idx, span)
+        var mid_args: List(int) = .{}
+        mid_args.append(fd)
+        mid_args.append(mid_val)
+        fb.emitCall("write", mid_args, true, I64, span)
+
+        // Print the length value
+        var len_args: List(int) = .{}
+        len_args.append(length_node)
+        fb.emitCall("eprint_int", len_args, false, VOID, span)
+
+        // Newline
+        const nl_idx = fb.addStringLiteral("\n")
+        const nl_val = fb.emitConstSlice(nl_idx, span)
+        var nl_args: List(int) = .{}
+        nl_args.append(fd)
+        nl_args.append(nl_val)
+        fb.emitCall("write", nl_args, true, I64, span)
+
+        // Exit with code 2
+        const exit_code = fb.emitConstInt(2, I64, span)
+        var exit_args: List(int) = .{}
+        exit_args.append(exit_code)
+        fb.emitCall("exit", exit_args, false, VOID, span)
+
+        fb.emitTrap(span)
+        fb.setBlock(ok_block)
     }
 
     /// Emit pending cleanups down to the given depth (defer + ARC release).
@@ -5041,8 +5710,59 @@ struct Lowerer {
     }
 
     /// Emit ARC field releases for destructor functions.
-    fn emitFieldReleases(fb: *FuncBuilder, func_name: string, span: Span) void {
-        // TODO: auto-release ARC fields in destructors
+    /// Ref: lower.zig:2011-2019
+    fn emitFieldReleases(fb: *FuncBuilder, type_name: string, span: Span) void {
+        // Look up struct type by name
+        const type_idx = self.types.lookupByName(type_name)
+        if (type_idx < 0) { return }
+        const type_info = self.types.get(type_idx)
+        if (type_info.tag != TAG_STRUCT) { return }
+        switch (type_info) {
+            Type.struct_type |st| => {
+                const ptr_type = self.types.makePointer(type_idx)
+                for i in 0..st.field_count {
+                    const field = st.getField(i)
+                    if (self.types.couldBeARC(field.type_idx)) {
+                        const self_local: int = 0  // first param (self)
+                        const self_ptr = fb.emitLoadLocal(self_local, ptr_type, span)
+                        const field_val = fb.emitFieldValue(self_ptr, i, field.offset, field.type_idx, span)
+                        var release_args: List(int) = .{}
+                        release_args.append(field_val)
+                        fb.emitCall("release", release_args, false, VOID, span)
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Generate synthetic deinit functions for structs with ARC fields but no user deinit.
+    /// Reference: Swift auto-generated memberwise destroy.
+    /// Ref: lower.zig:1991-2026
+    fn emitPendingAutoDeinits() void {
+        for i in 0..self.pending_auto_deinits.count {
+            const type_name = self.pending_auto_deinits.get(i)
+            const struct_type_idx = self.types.lookupByName(type_name)
+            if (struct_type_idx < 0) { continue }
+            const type_info = self.types.get(struct_type_idx)
+            if (type_info.tag != TAG_STRUCT) { continue }
+
+            const qualified_type = self.qualifyTypeName(type_name)
+            const deinit_name = qualified_type ++ "_deinit"
+            // Skip if already emitted (multi-file dedup)
+            if (self.builder.hasFunc(deinit_name)) { continue }
+
+            const ptr_type = self.types.makePointer(struct_type_idx)
+            self.builder.startFunc(deinit_name, VOID, VOID, Span.zero())
+            if (self.builder.func()) |fb| {
+                self.clearPerFunctionState()
+                fb.is_destructor = true
+                fb.addParam("self", ptr_type, 8)
+                self.emitFieldReleases(fb, type_name, Span.zero())
+                fb.emitRet(null_node, Span.zero())
+            }
+            self.builder.endFunc()
+        }
     }
 
     /// SRET: returns true if the type needs struct return (> 8 bytes).
@@ -5071,6 +5791,147 @@ struct Lowerer {
                 return self.types.get(opt.elem).tag == TAG_POINTER
             },
             else => { return false },
+        }
+    }
+
+    // ========================================================================
+    // Compound optional store helpers
+    // ========================================================================
+
+    /// Store a value into a compound optional result local, wrapping T → ?T as needed.
+    /// Used by switch/if expressions that produce compound optional results.
+    /// Ref: lower.zig:306-341
+    fn storeCompoundOptArm(fb: *FuncBuilder, result_local: int, val: int, body_idx: int, span: Span) void {
+        // Check if arm value is a null literal
+        var is_null = false
+        switch (self.tree.getNode(body_idx)) { Node.expr |e| => switch (e) {
+            Expr.literal |l| => { if (l.kind == LiteralKind.null_lit) { is_null = true } },
+            else => {},
+        }, else => {} }
+
+        if (is_null) {
+            // null → tag=0
+            const tag_zero = fb.emitConstInt(0, I64, span)
+            fb.emitStoreLocalField(result_local, 0, 0, tag_zero, span)
+        } else {
+            const arm_type = self.inferExprType(body_idx)
+            const arm_info = self.types.get(arm_type)
+            if (arm_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(arm_type)) {
+                // Already compound optional → compound copy
+                fb.emitStoreLocal(result_local, val, span)
+            } else {
+                // Plain T → wrap as tag=1, payload=value
+                const tag_one = fb.emitConstInt(1, I64, span)
+                fb.emitStoreLocalField(result_local, 0, 0, tag_one, span)
+                const arm_size = self.types.sizeOf(arm_type)
+                if (arm_size > 8) {
+                    // Large T — copy word by word into payload area
+                    const val_tmp = fb.addLocalWithSize("__opt_arm_tmp", arm_type, false, arm_size)
+                    fb.emitStoreLocal(val_tmp, val, span)
+                    const num_words = (arm_size + 7) / 8
+                    for i in 0..num_words {
+                        const off = i * 8
+                        const word = fb.emitFieldLocal(val_tmp, i, off, I64, span)
+                        fb.emitStoreLocalField(result_local, 1 + i, 8 + off, word, span)
+                    }
+                } else {
+                    fb.emitStoreLocalField(result_local, 1, 8, val, span)
+                }
+            }
+        }
+    }
+
+    /// Store compound optional via pointer base (for struct field assign through pointer).
+    /// Ref: lower.zig:344-382
+    fn storeCompoundOptFieldPtr(fb: *FuncBuilder, ptr: int, field_idx: int, field_offset: int, val: int, ast_idx: int, span: Span) void {
+        var is_null = false
+        switch (self.tree.getNode(ast_idx)) { Node.expr |e| => switch (e) {
+            Expr.literal |l| => { if (l.kind == LiteralKind.null_lit) { is_null = true } },
+            else => {},
+        }, else => {} }
+
+        if (is_null) {
+            const tag_zero = fb.emitConstInt(0, I64, span)
+            fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag_zero, span)
+        } else {
+            const arm_type = self.inferExprType(ast_idx)
+            const arm_info = self.types.get(arm_type)
+            if (arm_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(arm_type)) {
+                // Already compound optional — copy all words
+                const arm_size = self.types.sizeOf(arm_type)
+                const num_words = arm_size / 8
+                const tmp = fb.addLocalWithSize("__opt_fap_tmp", arm_type, false, arm_size)
+                fb.emitStoreLocal(tmp, val, span)
+                for i in 0..num_words {
+                    const offset = i * 8
+                    const field = fb.emitFieldLocal(tmp, i, offset, I64, span)
+                    fb.emitStoreFieldValue(ptr, field_idx + i, field_offset + offset, field, span)
+                }
+            } else {
+                const tag_one = fb.emitConstInt(1, I64, span)
+                fb.emitStoreFieldValue(ptr, field_idx, field_offset, tag_one, span)
+                const arm_size = self.types.sizeOf(arm_type)
+                if (arm_size > 8) {
+                    const val_tmp = fb.addLocalWithSize("__opt_fap_val", arm_type, false, arm_size)
+                    fb.emitStoreLocal(val_tmp, val, span)
+                    const num_words = (arm_size + 7) / 8
+                    for i in 0..num_words {
+                        const off = i * 8
+                        const word = fb.emitFieldLocal(val_tmp, i, off, I64, span)
+                        fb.emitStoreFieldValue(ptr, field_idx + 1 + i, field_offset + 8 + off, word, span)
+                    }
+                } else {
+                    fb.emitStoreFieldValue(ptr, field_idx + 1, field_offset + 8, val, span)
+                }
+            }
+        }
+    }
+
+    /// Store a value into a compound optional struct field, wrapping T → ?T as needed.
+    /// Handles struct init fields and default values.
+    /// Ref: lower.zig:386-426
+    fn storeCompoundOptField(fb: *FuncBuilder, local_idx: int, field_idx: int, field_offset: int, val: int, ast_idx: int, span: Span) void {
+        var is_null = false
+        switch (self.tree.getNode(ast_idx)) { Node.expr |e| => switch (e) {
+            Expr.literal |l| => { if (l.kind == LiteralKind.null_lit) { is_null = true } },
+            else => {},
+        }, else => {} }
+
+        if (is_null) {
+            const tag_zero = fb.emitConstInt(0, I64, span)
+            fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag_zero, span)
+        } else {
+            const arm_type = self.inferExprType(ast_idx)
+            const arm_info = self.types.get(arm_type)
+            if (arm_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(arm_type)) {
+                // Already compound optional — copy all words
+                const arm_size = self.types.sizeOf(arm_type)
+                const num_words = arm_size / 8
+                const tmp = fb.addLocalWithSize("__opt_field_tmp", arm_type, false, arm_size)
+                fb.emitStoreLocal(tmp, val, span)
+                for i in 0..num_words {
+                    const offset = i * 8
+                    const field = fb.emitFieldLocal(tmp, i, offset, I64, span)
+                    fb.emitStoreLocalField(local_idx, field_idx + i, field_offset + offset, field, span)
+                }
+            } else {
+                // Plain T → wrap as tag=1, payload=value
+                const tag_one = fb.emitConstInt(1, I64, span)
+                fb.emitStoreLocalField(local_idx, field_idx, field_offset, tag_one, span)
+                const arm_size = self.types.sizeOf(arm_type)
+                if (arm_size > 8) {
+                    const val_tmp = fb.addLocalWithSize("__opt_fld_val", arm_type, false, arm_size)
+                    fb.emitStoreLocal(val_tmp, val, span)
+                    const num_words = (arm_size + 7) / 8
+                    for i in 0..num_words {
+                        const off = i * 8
+                        const word = fb.emitFieldLocal(val_tmp, i, off, I64, span)
+                        fb.emitStoreLocalField(local_idx, field_idx + 1 + i, field_offset + 8 + off, word, span)
+                    }
+                } else {
+                    fb.emitStoreLocalField(local_idx, field_idx + 1, field_offset + 8, val, span)
+                }
+            }
         }
     }
 
@@ -5111,6 +5972,15 @@ struct Lowerer {
 // Free helper functions
 // ============================================================================
 
+/// Functions that must keep bare names (entry points, compiler-generated, runtime).
+fn shouldSkipQualification(name: string) bool {
+    if (name == "main") { return true }
+    if (startsWith(name, "__cot_init")) { return true }
+    if (startsWith(name, "__test_")) { return true }
+    if (startsWith(name, "__bench_")) { return true }
+    return false
+}
+
 /// Sanitize a name for use as an identifier (replace non-alphanum with underscore).
 fn sanitizeName(prefix: string, name: string) string {
     // Replace spaces with underscores. Other non-alphanumeric chars are rare
@@ -5140,8 +6010,9 @@ fn strEndsWith(s: string, suffix: string) bool {
 }
 
 /// Parse an integer literal string to int.
+/// Supports decimal, hex (0x), octal (0o), binary (0b) prefixes.
+/// Ref: lower.zig parseIntLiteral pattern
 fn parseIntLit(s: string) int {
-    // TODO: handle hex (0x), octal (0o), binary (0b) prefixes
     var result = 0
     var negative = false
     var i = 0
@@ -5152,6 +6023,47 @@ fn parseIntLit(s: string) int {
             i = 1
         }
     }
+    // Check for prefix: 0x, 0o, 0b
+    if (i + 1 < @lenOf(s) and charAt(s, i) == 48) {  // '0'
+        const prefix = charAt(s, i + 1)
+        if (prefix == 120 or prefix == 88) {  // 'x' or 'X'
+            i = i + 2
+            while (i < @lenOf(s)) {
+                const c = charAt(s, i)
+                if (c >= 48 and c <= 57) { result = result * 16 + (c - 48) }
+                else if (c >= 97 and c <= 102) { result = result * 16 + (c - 97 + 10) }  // a-f
+                else if (c >= 65 and c <= 70) { result = result * 16 + (c - 65 + 10) }  // A-F
+                else if (c != 95) { break }  // skip '_'
+                i = i + 1
+            }
+            if (negative) { result = -result }
+            return result
+        }
+        if (prefix == 111 or prefix == 79) {  // 'o' or 'O'
+            i = i + 2
+            while (i < @lenOf(s)) {
+                const c = charAt(s, i)
+                if (c >= 48 and c <= 55) { result = result * 8 + (c - 48) }
+                else if (c != 95) { break }
+                i = i + 1
+            }
+            if (negative) { result = -result }
+            return result
+        }
+        if (prefix == 98 or prefix == 66) {  // 'b' or 'B'
+            i = i + 2
+            while (i < @lenOf(s)) {
+                const c = charAt(s, i)
+                if (c == 48) { result = result * 2 }
+                else if (c == 49) { result = result * 2 + 1 }
+                else if (c != 95) { break }
+                i = i + 1
+            }
+            if (negative) { result = -result }
+            return result
+        }
+    }
+    // Decimal
     while (i < @lenOf(s)) {
         const c = charAt(s, i)
         if (c >= 48 and c <= 57) {  // '0'-'9'
@@ -5168,8 +6080,8 @@ fn parseIntLit(s: string) int {
 }
 
 /// Parse a float literal string to float.
+/// Supports scientific notation (e.g., 1.5e3, 2E-4).
 fn parseFloatLit(s: string) float {
-    // Simple float parsing — TODO: handle scientific notation
     var result: float = 0.0
     var frac: float = 0.0
     var frac_div: float = 1.0
@@ -5187,6 +6099,9 @@ fn parseFloatLit(s: string) float {
         const c = charAt(s, i)
         if (c == 46) {  // '.'
             in_frac = true
+        } else if (c == 101 or c == 69) {  // 'e' or 'E' — scientific notation
+            i = i + 1
+            break
         } else if (c >= 48 and c <= 57) {
             const digit = c - 48
             const fdigit = @floatFromInt(f64, digit)
@@ -5204,8 +6119,113 @@ fn parseFloatLit(s: string) float {
         i = i + 1
     }
     result = result + frac
+
+    // Parse exponent if present (after 'e'/'E')
+    if (i < @lenOf(s)) {
+        var exp_neg = false
+        var exp = 0
+        if (charAt(s, i) == 45) { exp_neg = true; i = i + 1 }
+        else if (charAt(s, i) == 43) { i = i + 1 }
+        while (i < @lenOf(s)) {
+            const c = charAt(s, i)
+            if (c >= 48 and c <= 57) { exp = exp * 10 + (c - 48) }
+            else if (c != 95) { break }
+            i = i + 1
+        }
+        var multiplier: float = 1.0
+        for _ in 0..exp { multiplier = multiplier * 10.0 }
+        if (exp_neg) { result = result / multiplier }
+        else { result = result * multiplier }
+    }
+
     if (negative) { result = -result }
     return result
+}
+
+/// Parse a character literal: 'x', '\n', '\xHH'.
+/// Returns the character's integer value, or 0 on error.
+/// Ref: lower.zig:9416-9432
+fn parseCharLiteral(text: string) int {
+    if (@lenOf(text) < 3 or charAt(text, 0) != 39 or charAt(text, @lenOf(text) - 1) != 39) { return 0 }
+    // inner = text[1..len-1]
+    const inner_len = @lenOf(text) - 2
+    if (inner_len == 0) { return 0 }
+    const first = charAt(text, 1)
+    if (first != 92) { return first }  // not backslash
+    if (inner_len < 2) { return 0 }
+    const second = charAt(text, 2)
+    if (second == 110) { return 10 }       // 'n' → newline
+    if (second == 116) { return 9 }        // 't' → tab
+    if (second == 114) { return 13 }       // 'r' → carriage return
+    if (second == 92) { return 92 }        // '\\' → backslash
+    if (second == 39) { return 39 }        // '\'' → single quote
+    if (second == 34) { return 34 }        // '"' → double quote
+    if (second == 48) { return 0 }         // '0' → null
+    if (second == 120 and inner_len >= 4) {  // 'x' → hex
+        return hexDigit(charAt(text, 3)) * 16 + hexDigit(charAt(text, 4))
+    }
+    return second
+}
+
+/// Parse a single hex digit character to its value (0-15).
+fn hexDigit(c: int) int {
+    if (c >= 48 and c <= 57) { return c - 48 }        // '0'-'9'
+    if (c >= 97 and c <= 102) { return c - 97 + 10 }  // 'a'-'f'
+    if (c >= 65 and c <= 70) { return c - 65 + 10 }   // 'A'-'F'
+    return 0
+}
+
+/// Process escape sequences in a raw string (no surrounding quotes).
+/// Returns a new string with escape sequences resolved.
+/// Ref: lower.zig:9437-9469
+fn unescapeString(text: string) string {
+    var result = ""
+    var i = 0
+    var seg_start = 0
+    while (i < @lenOf(text)) {
+        if (charAt(text, i) == 92 and i + 1 < @lenOf(text)) {  // backslash
+            // Append segment before escape
+            if (i > seg_start) {
+                result = result ++ @string(@ptrOf(text) + seg_start, i - seg_start)
+            }
+            const esc = charAt(text, i + 1)
+            if (esc == 110) { result = result ++ "\n" }       // 'n'
+            else if (esc == 116) { result = result ++ "\t" }  // 't'
+            else if (esc == 114) { result = result ++ "\r" }  // 'r'
+            else if (esc == 92) { result = result ++ "\\" }   // '\\'
+            else if (esc == 34) { result = result ++ "\"" }   // '"'
+            else if (esc == 39) { result = result ++ "'" }    // '\''
+            else if (esc == 48) { result = result ++ "\0" }   // '0'
+            else if (esc == 120 and i + 3 < @lenOf(text)) {   // 'x' hex
+                // \xHH — emit single byte (TODO: proper byte append)
+                i = i + 4
+                seg_start = i
+                continue
+            } else {
+                // Unknown escape — keep the escaped char
+                result = result ++ @string(@ptrOf(text) + i + 1, 1)
+            }
+            i = i + 2
+            seg_start = i
+        } else {
+            i = i + 1
+        }
+    }
+    // Append remaining segment
+    if (seg_start < @lenOf(text)) {
+        result = result ++ @string(@ptrOf(text) + seg_start, @lenOf(text) - seg_start)
+    }
+    return result
+}
+
+/// Strip surrounding quotes and unescape a string literal.
+/// Ref: lower.zig:9472-9497
+fn parseStringLiteral(text: string) string {
+    if (@lenOf(text) < 2 or charAt(text, 0) != 34 or charAt(text, @lenOf(text) - 1) != 34) {
+        return text
+    }
+    const inner = @string(@ptrOf(text) + 1, @lenOf(text) - 2)
+    return unescapeString(inner)
 }
 
 /// Convert integer to string (simple decimal).
@@ -5476,4 +6496,123 @@ test "tokenToUnaryOp" {
     @assertEq(tokenToUnaryOp(Token.lnot as int), UnaryOp.@"not")
     @assertEq(tokenToUnaryOp(Token.kw_not as int), UnaryOp.@"not")
     @assertEq(tokenToUnaryOp(Token.question as int), UnaryOp.optional_unwrap)
+}
+
+test "shouldSkipQualification" {
+    @assert(shouldSkipQualification("main"))
+    @assert(shouldSkipQualification("__cot_init_globals"))
+    @assert(shouldSkipQualification("__test_foo"))
+    @assert(shouldSkipQualification("__bench_bar"))
+    @assert(!shouldSkipQualification("myFunc"))
+    @assert(!shouldSkipQualification("main_helper"))
+}
+
+test "parseCharLiteral" {
+    @assertEq(parseCharLiteral("'a'"), 97)
+    @assertEq(parseCharLiteral("'\\n'"), 10)
+    @assertEq(parseCharLiteral("'\\t'"), 9)
+    @assertEq(parseCharLiteral("'\\0'"), 0)
+    @assertEq(parseCharLiteral("''"), 0)
+    @assertEq(parseCharLiteral("'\\\\'"), 92)
+}
+
+test "parseIntLit hex octal binary" {
+    @assertEq(parseIntLit("0xFF"), 255)
+    @assertEq(parseIntLit("0x10"), 16)
+    @assertEq(parseIntLit("0o17"), 15)
+    @assertEq(parseIntLit("0b1010"), 10)
+    @assertEq(parseIntLit("42"), 42)
+    @assertEq(parseIntLit("-10"), -10)
+    @assertEq(parseIntLit("0b0"), 0)
+    @assertEq(parseIntLit("0xA"), 10)
+}
+
+test "parseFloatLit scientific notation" {
+    @assertEq(parseFloatLit("1.5"), 1.5)
+    @assertEq(parseFloatLit("1e2"), 100.0)
+    @assertEq(parseFloatLit("2.5e1"), 25.0)
+    @assertEq(parseFloatLit("-3.0"), -3.0)
+}
+
+test "hexDigit" {
+    @assertEq(hexDigit(48), 0)   // '0'
+    @assertEq(hexDigit(57), 9)   // '9'
+    @assertEq(hexDigit(97), 10)  // 'a'
+    @assertEq(hexDigit(102), 15) // 'f'
+    @assertEq(hexDigit(65), 10)  // 'A'
+}
+
+test "parseStringLiteral" {
+    @assertEq(parseStringLiteral("\"hello\""), "hello")
+    @assertEq(parseStringLiteral("\"\""), "")
+    @assertEq(parseStringLiteral("not_quoted"), "not_quoted")
+}
+
+test "evalFloatLiteral" {
+    var ast = Ast.init("test.cot")
+    var types = TypeRegistry.init()
+    var err = ErrorReporter.init()
+    var chk = Checker.init(&ast, &types, &err)
+
+    var lower: Lowerer = undefined
+    lower.tree = &ast
+    lower.types = &types
+    lower.err = &err
+    lower.chk = &chk
+    initLowererScalars(&lower)
+    initLowererLists(&lower)
+    initLowererMaps(&lower)
+
+    // Add a float literal node
+    const span = Span.zero()
+    const float_idx = ast.addExpr(Expr.literal(Literal { kind: LiteralKind.@"float" as int, value: "3.14", span: span }))
+    if (lower.evalFloatLiteral(float_idx)) |v| {
+        @assert(v > 3.13)
+        @assert(v < 3.15)
+    } else {
+        @panic("expected float value")
+    }
+
+    // Add an int literal node (should be converted to float)
+    const int_idx = ast.addExpr(Expr.literal(Literal { kind: LiteralKind.@"int" as int, value: "42", span: span }))
+    if (lower.evalFloatLiteral(int_idx)) |v| {
+        @assertEq(v, 42.0)
+    } else {
+        @panic("expected float from int")
+    }
+
+    // Null node returns null
+    @assert(lower.evalFloatLiteral(null_node) == null)
+}
+
+test "lookupComptimeValue" {
+    var ast = Ast.init("test.cot")
+    var types = TypeRegistry.init()
+    var err = ErrorReporter.init()
+    var chk = Checker.init(&ast, &types, &err)
+
+    var lower: Lowerer = undefined
+    lower.tree = &ast
+    lower.types = &types
+    lower.err = &err
+    lower.chk = &chk
+    initLowererScalars(&lower)
+    initLowererLists(&lower)
+    initLowererMaps(&lower)
+
+    // No values stored yet
+    @assertEq(lower.lookupComptimeValue("x"), -1)
+
+    // Store in local comptime vars
+    lower.comptime_value_vars.set("x", 42)
+    @assertEq(lower.lookupComptimeValue("x"), 42)
+
+    // Store in global comptime values
+    lower.global_comptime_values.set("y", 99)
+    @assertEq(lower.lookupComptimeValue("y"), 99)
+
+    // Local takes precedence
+    lower.comptime_value_vars.set("z", 10)
+    lower.global_comptime_values.set("z", 20)
+    @assertEq(lower.lookupComptimeValue("z"), 10)
 }

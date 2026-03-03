@@ -246,6 +246,7 @@ struct MethodInfo {
     func_type: int,
     receiver_is_ptr: bool,
     is_static: bool,
+    source_tree: int,  // Defining AST identifier for cross-module method resolution
 }
 
 // ============================================================================
@@ -1477,7 +1478,7 @@ test "TypeRegistry makeFunc" {
 }
 
 test "MethodInfo is_static" {
-    const mi = MethodInfo { name: "create", func_name: "Foo_create", func_type: 0, receiver_is_ptr: false, is_static: true }
+    const mi = MethodInfo { name: "create", func_name: "Foo_create", func_type: 0, receiver_is_ptr: false, is_static: true, source_tree: 0 }
     @assert(mi.is_static)
     @assertEq(mi.receiver_is_ptr, false)
 }

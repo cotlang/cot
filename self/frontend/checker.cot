@@ -51,6 +51,7 @@ struct Symbol {
     is_extern: bool,
     is_export: bool,
     used: bool,
+    source_tree: int,        // Opaque identifier for defining AST (0 = current/none)
 }
 
 fn makeSymbol(name: string, type_idx: int, node: int, mutable: bool) Symbol {
@@ -68,6 +69,7 @@ fn makeSymbol(name: string, type_idx: int, node: int, mutable: bool) Symbol {
         is_extern: false,
         is_export: false,
         used: false,
+        source_tree: 0,
     }
 }
 
@@ -86,6 +88,7 @@ fn makeFuncSymbol(name: string, type_idx: int, node: int) Symbol {
         is_extern: false,
         is_export: false,
         used: false,
+        source_tree: 0,
     }
 }
 
@@ -104,6 +107,7 @@ fn makeExternFuncSymbol(name: string, type_idx: int, node: int) Symbol {
         is_extern: true,
         is_export: false,
         used: false,
+        source_tree: 0,
     }
 }
 
@@ -122,6 +126,7 @@ fn makeTypeSymbol(name: string, type_idx: int, node: int) Symbol {
         is_extern: false,
         is_export: false,
         used: false,
+        source_tree: 0,
     }
 }
 
@@ -140,6 +145,7 @@ fn makeConstSymbol(name: string, type_idx: int, node: int, value: int) Symbol {
         is_extern: false,
         is_export: false,
         used: false,
+        source_tree: 0,
     }
 }
 
@@ -158,6 +164,7 @@ fn makeParamSymbol(name: string, type_idx: int, node: int) Symbol {
         is_extern: false,
         is_export: false,
         used: false,
+        source_tree: 0,
     }
 }
 
@@ -783,6 +790,7 @@ struct Checker {
                     func_type: func_type,
                     receiver_is_ptr: !is_static,
                     is_static: is_static,
+                    source_tree: 0,
                 })
             }, else => {} }, else => {} }
         } else if (mtag == "var_decl") {
@@ -3873,6 +3881,7 @@ struct Checker {
                     func_type: func_type,
                     receiver_is_ptr: true,
                     is_static: false,
+                    source_tree: 0,
                 })
 
                 // Register for lowerer (Zig line 3537)
