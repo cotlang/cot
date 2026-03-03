@@ -59,24 +59,25 @@ Cot already has everything a compiler needs:
 | Comptime | `@typeInfo`, `inline for`, `comptime {}` | Compile-time tables |
 | Closures | First-class with capture | Visitor callbacks |
 
-### Self-Hosted Code: ~65% of `compiler/frontend/` Ported
+### Self-Hosted Code: ~70% of `compiler/frontend/` Ported
 
-The `self/` directory contains a partial compiler frontend in Cot — parsing, type-checking, and backend IR work. IR lowering and code generation are next.
+The `self/` directory contains a partial compiler frontend in Cot — parsing, type-checking, and IR lowering. SSA builder and ARC insertion are next.
 
 ```
 self/
   cot.json              # Project config (safe: true)
-  main.cot              # CLI entry point — parse/check/lex/help/version (318 lines)
+  main.cot              # CLI entry point — parse/check/lex/help/version (380 lines)
   frontend/
-    token.cot           # Token enum + keyword lookup (436 lines) — ~100% of token.zig
-    scanner.cot         # Full lexer (736 lines) — ~100% of scanner.zig
-    source.cot          # Source positions + spans (111 lines) — ~95% of source.zig
-    errors.cot          # Error reporter (203 lines) — ~95% of errors.zig
-    ast.cot             # AST nodes, 28/54 builtins (1,259 lines) — ~85% of ast.zig
-    parser.cot          # Recursive descent parser (2,691 lines) — ~75% of parser.zig
-    types.cot           # TypeRegistry + type structs (1,287 lines) — ~85% of types.zig
-    checker.cot         # Type checker + SharedCheckerState (4,112 lines) — ~80% of checker.zig
-    ir.cot              # IR data structures + FuncBuilder (1,347 lines) — backend IR COMPLETE
+    token.cot           # Token enum + keyword lookup (443 lines) — ~100% of token.zig
+    scanner.cot         # Full lexer (774 lines) — ~100% of scanner.zig
+    source.cot          # Source positions + spans (315 lines) — ~95% of source.zig
+    errors.cot          # Error reporter (568 lines) — ~95% of errors.zig
+    ast.cot             # AST nodes, 59/59 builtins (1,468 lines) — ~100% of ast.zig
+    parser.cot          # Recursive descent parser (2,940 lines) — ~75% of parser.zig
+    types.cot           # TypeRegistry + type structs (1,484 lines) — ~85% of types.zig
+    checker.cot         # Type checker + SharedCheckerState (5,325 lines) — ~80% of checker.zig
+    ir.cot              # IR data structures + FuncBuilder (1,329 lines, 24 tests) — COMPLETE
+    lower.cot           # AST→IR lowering pass (6,618 lines, 20 tests) — ~66% of lower.zig
   total: 15,012 lines (of ~23,121 in compiler/frontend/)
 ```
 

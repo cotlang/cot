@@ -83,3 +83,22 @@ test "spawn no captures" {
     while (@atomicLoad(&no_cap) == 0) {}
     @assertEq(@atomicLoad(&no_cap), 1)
 }
+
+// ============================================================================
+// Spawn stress — 1000 tasks (exercises work-stealing)
+// ============================================================================
+
+var stress_count: i64 = 0
+
+test "spawn 1000 tasks" {
+    stress_count = 0
+    var i: i64 = 0
+    while (i < 1000) {
+        spawn {
+            @atomicAdd(&stress_count, 1)
+        }
+        i = i + 1
+    }
+    while (@atomicLoad(&stress_count) < 1000) {}
+    @assertEq(@atomicLoad(&stress_count), 1000)
+}

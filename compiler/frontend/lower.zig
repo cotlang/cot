@@ -4095,6 +4095,7 @@ pub const Lowerer = struct {
             .try_expr => |te| return try self.lowerTryExpr(te),
             .await_expr => |ae| return try self.lowerAwaitExpr(ae),
             .spawn_expr => |se| return try self.lowerSpawnExpr(se),
+            .select_expr => |se| return try self.lowerSelectExpr(se),
             .catch_expr => |ce| return try self.lowerCatchExpr(ce),
             .error_literal => |el| return try self.lowerErrorLiteral(el),
             .builtin_call => |bc| return try self.lowerBuiltinCall(bc),
@@ -5951,6 +5952,297 @@ pub const Lowerer = struct {
         return ir.null_node;
     }
 
+    /// Lower select expression: Go-style channel select.
+    ///
+    /// Simple case (1 case + default): compiles to tryRecv/trySend + branch.
+    /// General case (N cases, optional default): compiles to sched_select runtime call.
+    fn lowerSelectExpr(self: *Lowerer, se: ast.SelectExpr) Error!ir.NodeIndex {
+        if (self.current_func == null) return ir.null_node;
+
+        if (se.cases.len == 0) {
+            // Empty select with just default — just run the default body
+            if (se.default_body != null_node) {
+                return try self.lowerExprNode(se.default_body);
+            }
+            return ir.null_node;
+        }
+
+        // Simple path: 1 case + default → tryRecv/trySend + branch
+        if (se.cases.len == 1 and se.default_body != null_node) {
+            return try self.lowerSelectSimple(se.cases[0], se.default_body, se.span);
+        }
+
+        // General N-case path
+        return try self.lowerSelectGeneral(se);
+    }
+
+    /// Lower simple select: 1 channel case + default → tryRecv/trySend + branch
+    fn lowerSelectSimple(self: *Lowerer, case: ast.SelectCase, default_body: ast.NodeIndex, span: source.Span) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        switch (case.kind) {
+            .recv => {
+                // tmp = ch.tryRecv()
+                // if (tmp != null) |value| { body } else { default_body }
+                const ch = try self.lowerExprNode(case.channel);
+                if (ch == ir.null_node) return ir.null_node;
+
+                // Resolve tryRecv method name via type registry (same as lowerMethodCall)
+                const ch_type_idx = self.inferExprType(case.channel);
+                const ch_info = self.type_reg.get(ch_type_idx);
+                var method_name: []const u8 = "tryRecv";
+                var opt_type: TypeIndex = self.type_reg.makeOptional(TypeRegistry.I64) catch TypeRegistry.I64;
+                var elem_type: TypeIndex = TypeRegistry.I64;
+                // Find struct type name — channel can be struct value or pointer to struct
+                var struct_name: []const u8 = "";
+                if (ch_info == .pointer) {
+                    const pointee = self.type_reg.get(ch_info.pointer.elem);
+                    if (pointee == .struct_type) struct_name = pointee.struct_type.name;
+                } else if (ch_info == .struct_type) {
+                    struct_name = ch_info.struct_type.name;
+                }
+                if (struct_name.len > 0) {
+                    if (self.type_reg.lookupMethod(struct_name, "tryRecv")) |m| {
+                        // Get qualified name (same pattern as lowerMethodCall line 7944-7948)
+                        method_name = if (self.chk.generics.generic_inst_by_name.contains(m.func_name))
+                            m.func_name
+                        else
+                            try self.resolveMethodName(struct_name, m.func_name, m.source_tree);
+                        // Get return type from method signature
+                        const func_info = self.type_reg.get(m.func_type);
+                        if (func_info == .func) {
+                            opt_type = func_info.func.return_type;
+                            const opt_info = self.type_reg.get(opt_type);
+                            if (opt_info == .optional) elem_type = opt_info.optional.elem;
+                        }
+                        // Queue generic instance if needed
+                        if (self.chk.generics.generic_inst_by_name.get(m.func_name)) |inst_info| {
+                            try self.ensureGenericFnQueued(inst_info);
+                        }
+                    }
+                }
+                // Prepare receiver: if struct value, take address (same as lowerMethodCall)
+                const receiver = if (ch_info == .struct_type) blk: {
+                    const base_node = self.tree.getNode(case.channel) orelse break :blk ch;
+                    const base_expr = base_node.asExpr() orelse break :blk ch;
+                    if (base_expr == .ident) {
+                        if (fb.lookupLocal(base_expr.ident.name)) |local_idx| {
+                            const ptr_type = self.type_reg.makePointer(ch_type_idx) catch TypeRegistry.I64;
+                            break :blk try fb.emitAddrLocal(local_idx, ptr_type, span);
+                        }
+                    }
+                    break :blk ch;
+                } else ch;
+                var args = [_]ir.NodeIndex{receiver};
+                const is_compound = !self.isPtrLikeOptional(opt_type);
+
+                // SRET for compound optional return (same as lowerMethodCall)
+                const result = if (self.needsSret(opt_type)) blk: {
+                    const ret_size = self.type_reg.sizeOf(opt_type);
+                    const sret_local = try fb.addLocalWithSize("__sret_tryrecv", opt_type, false, ret_size);
+                    const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, span);
+                    var sret_args = [_]ir.NodeIndex{ sret_addr, receiver };
+                    _ = try fb.emitCall(method_name, &sret_args, false, TypeRegistry.VOID, span);
+                    break :blk try fb.emitLoadLocal(sret_local, opt_type, span);
+                } else try fb.emitCall(method_name, &args, false, opt_type, span);
+
+                // Store result in temp local
+                const temp_name = try std.fmt.allocPrint(self.allocator, "__select_recv_{d}", .{self.temp_counter});
+                self.temp_counter += 1;
+                const opt_size = self.type_reg.sizeOf(opt_type);
+                const temp_local = try fb.addLocalWithSize(temp_name, opt_type, false, opt_size);
+                _ = try fb.emitStoreLocal(temp_local, result, span);
+
+                // Check if non-null (compound: tag at field 0; ptr-like: compare to null)
+                const is_non_null = if (is_compound) blk: {
+                    const tag = try fb.emitFieldLocal(temp_local, 0, 0, TypeRegistry.I64, span);
+                    const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                    break :blk try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
+                } else blk: {
+                    const recv_val = try fb.emitLoadLocal(temp_local, opt_type, span);
+                    const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, span));
+                    break :blk try fb.emitBinary(.ne, recv_val, null_val, TypeRegistry.BOOL, span);
+                };
+
+                // Branch: if non-null → case body, else → default
+                const then_block = try fb.newBlock("select.recv");
+                const else_block = try fb.newBlock("select.default");
+                const merge_block = try fb.newBlock("select.end");
+                _ = try fb.emitBranch(is_non_null, then_block, else_block, span);
+
+                // Then block: bind capture, execute body
+                fb.setBlock(then_block);
+                if (case.capture.len > 0) {
+                    // Unwrap: compound = payload at field 1 offset 8; ptr-like = identity
+                    const unwrapped = if (is_compound) blk: {
+                        break :blk try fb.emitFieldLocal(temp_local, 1, 8, elem_type, span);
+                    } else blk: {
+                        const loaded = try fb.emitLoadLocal(temp_local, opt_type, span);
+                        break :blk try fb.emitUnary(.optional_unwrap, loaded, elem_type, span);
+                    };
+                    const capture_local = try fb.addLocalWithSize(case.capture, elem_type, false, self.type_reg.sizeOf(elem_type));
+                    _ = try fb.emitStoreLocal(capture_local, unwrapped, span);
+                }
+                _ = try self.lowerExprNode(case.body);
+                if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+
+                // Else block: default body
+                fb.setBlock(else_block);
+                _ = try self.lowerExprNode(default_body);
+                if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+
+                fb.setBlock(merge_block);
+                return ir.null_node;
+            },
+            .send => {
+                // The parser stores the full ch.trySend(val) call as case.channel.
+                // Lower it through normal path — method call resolution handles name qualification.
+                const send_result = try self.lowerExprNode(case.channel);
+                if (send_result == ir.null_node) return ir.null_node;
+
+                // Branch on the bool result of trySend
+                const then_block = try fb.newBlock("select.send");
+                const else_block = try fb.newBlock("select.default");
+                const merge_block = try fb.newBlock("select.end");
+                _ = try fb.emitBranch(send_result, then_block, else_block, span);
+
+                fb.setBlock(then_block);
+                _ = try self.lowerExprNode(case.body);
+                if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+
+                fb.setBlock(else_block);
+                _ = try self.lowerExprNode(default_body);
+                if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, span);
+
+                fb.setBlock(merge_block);
+                return ir.null_node;
+            },
+        }
+    }
+
+    /// Lower general N-case select: builds cases array, calls sched_select runtime.
+    fn lowerSelectGeneral(self: *Lowerer, se: ast.SelectExpr) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+
+        const num_cases = se.cases.len;
+
+        // Allocate cases array on stack: each entry is 24 bytes (channel_ptr, kind, value_ptr)
+        // kind: 0=recv, 1=send
+        const cases_size: i64 = @intCast(num_cases * 24);
+        const meta_node = try fb.emitConstInt(0, TypeRegistry.I64, se.span);
+        const size_node = try fb.emitConstInt(cases_size, TypeRegistry.I64, se.span);
+        var alloc_args = [_]ir.NodeIndex{ meta_node, size_node };
+        const cases_ptr = try fb.emitCall("alloc", &alloc_args, false, TypeRegistry.I64, se.span);
+
+        // Store cases_ptr in temp
+        const cases_temp = try std.fmt.allocPrint(self.allocator, "__select_cases_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const cases_local = try fb.addLocalWithSize(cases_temp, TypeRegistry.I64, true, 8);
+        _ = try fb.emitStoreLocal(cases_local, cases_ptr, se.span);
+
+        // Fill cases array
+        for (se.cases, 0..) |case, i| {
+            const base_offset: i64 = @intCast(i * 24);
+            const cases_reload = try fb.emitLoadLocal(cases_local, TypeRegistry.I64, se.span);
+
+            // Offset 0: channel pointer
+            const ch = try self.lowerExprNode(case.channel);
+            const ch_addr = try fb.emitAddrOffset(cases_reload, base_offset, TypeRegistry.I64, se.span);
+            _ = try fb.emitPtrStoreValue(ch_addr, ch, se.span);
+
+            // Offset 8: kind (0=recv, 1=send)
+            const kind_val: i64 = if (case.kind == .recv) 0 else 1;
+            const kind_node = try fb.emitConstInt(kind_val, TypeRegistry.I64, se.span);
+            const kind_addr = try fb.emitAddrOffset(cases_reload, base_offset + 8, TypeRegistry.I64, se.span);
+            _ = try fb.emitPtrStoreValue(kind_addr, kind_node, se.span);
+
+            // Offset 16: value_ptr (for send, pointer to value; for recv, 0)
+            if (case.kind == .send and case.send_value != null_node) {
+                const send_val = try self.lowerExprNode(case.send_value);
+                const val_addr = try fb.emitAddrOffset(cases_reload, base_offset + 16, TypeRegistry.I64, se.span);
+                _ = try fb.emitPtrStoreValue(val_addr, send_val, se.span);
+            } else {
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, se.span);
+                const val_addr = try fb.emitAddrOffset(cases_reload, base_offset + 16, TypeRegistry.I64, se.span);
+                _ = try fb.emitPtrStoreValue(val_addr, zero, se.span);
+            }
+        }
+
+        // Call sched_select(cases_ptr, num_cases, block)
+        // block: 1 if no default (should block), 0 if has default (non-blocking)
+        const cases_final = try fb.emitLoadLocal(cases_local, TypeRegistry.I64, se.span);
+        const n_cases = try fb.emitConstInt(@intCast(num_cases), TypeRegistry.I64, se.span);
+        const block_flag = try fb.emitConstInt(if (se.default_body != null_node) @as(i64, 0) else @as(i64, 1), TypeRegistry.I64, se.span);
+        var select_args = [_]ir.NodeIndex{ cases_final, n_cases, block_flag };
+        const selected_idx = try fb.emitCall("sched_select", &select_args, false, TypeRegistry.I64, se.span);
+
+        // Store result
+        const result_temp = try std.fmt.allocPrint(self.allocator, "__select_result_{d}", .{self.temp_counter});
+        self.temp_counter += 1;
+        const result_local = try fb.addLocalWithSize(result_temp, TypeRegistry.I64, true, 8);
+        _ = try fb.emitStoreLocal(result_local, selected_idx, se.span);
+
+        // Dispatch: switch on returned index
+        // -1 = default, 0..N-1 = case index
+        const merge_block = try fb.newBlock("select.end");
+
+        // If has default, check for -1 first
+        if (se.default_body != null_node) {
+            const default_block = try fb.newBlock("select.default");
+            const dispatch_block = try fb.newBlock("select.dispatch");
+            const result_val = try fb.emitLoadLocal(result_local, TypeRegistry.I64, se.span);
+            const neg_one = try fb.emitConstInt(-1, TypeRegistry.I64, se.span);
+            const is_default = try fb.emitBinary(.eq, result_val, neg_one, TypeRegistry.BOOL, se.span);
+            _ = try fb.emitBranch(is_default, default_block, dispatch_block, se.span);
+
+            fb.setBlock(default_block);
+            _ = try self.lowerExprNode(se.default_body);
+            if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+
+            fb.setBlock(dispatch_block);
+        }
+
+        // Dispatch cases: chain of if-else comparisons on the selected index
+        for (se.cases, 0..) |case, i| {
+            const case_block = try fb.newBlock("select.case");
+            const next_block = if (i + 1 < se.cases.len)
+                try fb.newBlock("select.next")
+            else
+                merge_block;
+
+            const result_val = try fb.emitLoadLocal(result_local, TypeRegistry.I64, se.span);
+            const case_idx = try fb.emitConstInt(@intCast(i), TypeRegistry.I64, se.span);
+            const is_match = try fb.emitBinary(.eq, result_val, case_idx, TypeRegistry.BOOL, se.span);
+            _ = try fb.emitBranch(is_match, case_block, next_block, se.span);
+
+            fb.setBlock(case_block);
+            // For recv cases with capture, read the value from the recv buffer
+            // The sched_select runtime stores received values in the cases array at offset 16
+            if (case.kind == .recv and case.capture.len > 0) {
+                const recv_offset: i64 = @intCast(i * 24 + 16);
+                const cases_reload = try fb.emitLoadLocal(cases_local, TypeRegistry.I64, se.span);
+                const recv_addr = try fb.emitAddrOffset(cases_reload, recv_offset, TypeRegistry.I64, se.span);
+                const recv_val = try fb.emitPtrLoadValue(recv_addr, TypeRegistry.I64, se.span);
+                const capture_local = try fb.addLocalWithSize(case.capture, TypeRegistry.I64, true, 8);
+                _ = try fb.emitStoreLocal(capture_local, recv_val, se.span);
+            }
+            _ = try self.lowerExprNode(case.body);
+            if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+
+            if (i + 1 < se.cases.len) {
+                fb.setBlock(next_block);
+            }
+        }
+
+        // Free cases array
+        fb.setBlock(merge_block);
+        const cases_to_free = try fb.emitLoadLocal(cases_local, TypeRegistry.I64, se.span);
+        var dealloc_args = [_]ir.NodeIndex{cases_to_free};
+        _ = try fb.emitCall("dealloc", &dealloc_args, false, TypeRegistry.VOID, se.span);
+
+        return ir.null_node;
+    }
+
     /// Lower a closure expression: detect captures, create body function, allocate struct.
     fn lowerClosureExpr(self: *Lowerer, ce: ast.ClosureExpr) Error!ir.NodeIndex {
         const fb = self.current_func orelse return ir.null_node;
@@ -6151,6 +6443,14 @@ pub const Lowerer = struct {
                 .try_expr => |te| try self.detectCaptures(te.operand, parent_fb, captures),
                 .await_expr => |ae| try self.detectCaptures(ae.operand, parent_fb, captures),
                 .spawn_expr => |se| try self.detectCaptures(se.body, parent_fb, captures),
+                .select_expr => |se| {
+                    for (se.cases) |case| {
+                        try self.detectCaptures(case.channel, parent_fb, captures);
+                        if (case.send_value != null_node) try self.detectCaptures(case.send_value, parent_fb, captures);
+                        try self.detectCaptures(case.body, parent_fb, captures);
+                    }
+                    if (se.default_body != null_node) try self.detectCaptures(se.default_body, parent_fb, captures);
+                },
                 .catch_expr => |ce| {
                     try self.detectCaptures(ce.operand, parent_fb, captures);
                     if (ce.fallback != null_node) try self.detectCaptures(ce.fallback, parent_fb, captures);

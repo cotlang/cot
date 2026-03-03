@@ -35,7 +35,7 @@ pub const Token = enum(u8) {
     kw_return, kw_break, kw_continue, kw_defer, kw_errdefer, kw_try, kw_catch, kw_orelse, kw_error,
     kw_true, kw_false, kw_null, kw_new, kw_undefined,
     kw_comptime,
-    kw_async, kw_await, kw_spawn,
+    kw_async, kw_await, kw_spawn, kw_select,
     kw_inline,
     kw_unreachable,
     kw_packed,
@@ -200,6 +200,7 @@ const token_strings = blk: {
     s[@intFromEnum(Token.kw_async)] = "async";
     s[@intFromEnum(Token.kw_await)] = "await";
     s[@intFromEnum(Token.kw_spawn)] = "spawn";
+    s[@intFromEnum(Token.kw_select)] = "select";
     s[@intFromEnum(Token.kw_inline)] = "inline";
     s[@intFromEnum(Token.kw_unreachable)] = "unreachable";
     s[@intFromEnum(Token.kw_packed)] = "packed";

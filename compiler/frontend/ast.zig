@@ -101,6 +101,7 @@ pub const Expr = union(enum) {
     try_expr: TryExpr,
     await_expr: AwaitExpr,
     spawn_expr: SpawnExpr,
+    select_expr: SelectExpr,
     catch_expr: CatchExpr,
     error_literal: ErrorLiteral,
     closure_expr: ClosureExpr,
@@ -390,6 +391,27 @@ pub const TypeKind = union(enum) {
 pub const TryExpr = struct { operand: NodeIndex, span: Span };
 pub const AwaitExpr = struct { operand: NodeIndex, span: Span };
 pub const SpawnExpr = struct { body: NodeIndex, span: Span };
+/// Go-style select over channel operations.
+/// Syntax:
+///   select {
+///       value from ch => { body }
+///       ch.send(42) => { body }
+///       default => { body }
+///   }
+pub const SelectExpr = struct {
+    cases: []const SelectCase,
+    default_body: NodeIndex, // null_node if no default
+    span: Span,
+};
+pub const SelectCase = struct {
+    kind: SelectCaseKind,
+    channel: NodeIndex, // channel expression
+    capture: []const u8 = "", // |value| binding for recv
+    send_value: NodeIndex = null_node, // value to send (send case only)
+    body: NodeIndex,
+    span: Span,
+};
+pub const SelectCaseKind = enum { recv, send };
 pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, capture_is_ptr: bool = false, fallback: NodeIndex, span: Span };
 pub const ErrorLiteral = struct { error_name: []const u8, span: Span };
 pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, span: Span };

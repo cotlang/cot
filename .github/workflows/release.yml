@@ -39,23 +39,38 @@ jobs:
 
       - name: Package
         run: |
-          cd zig-out/bin
-          tar -czf ${{ matrix.artifact }}.tar.gz cot
-          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          mkdir -p staging/bin staging/lib
+          cp zig-out/bin/cot staging/bin/
+          cp -r stdlib staging/lib/std
+          cd staging && tar -czf ../${{ matrix.artifact }}.tar.gz .
+          cd .. && shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            zig-out/bin/${{ matrix.artifact }}.tar.gz
-            zig-out/bin/${{ matrix.artifact }}.tar.gz.sha256
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
 
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Tag stdlib repo
+        if: secrets.STD_REPO_TOKEN != ''
+        env:
+          STD_REPO_TOKEN: ${{ secrets.STD_REPO_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          cd stdlib
+          git tag "$TAG" 2>/dev/null || true
+          git -c url."https://x-access-token:${STD_REPO_TOKEN}@github.com/".insteadOf="https://github.com/" \
+            push origin "$TAG" 2>/dev/null || true
 
       - uses: actions/download-artifact@v4
         with:

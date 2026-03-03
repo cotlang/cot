@@ -1,4 +1,4 @@
-// Threading E2E tests — Phases 1-5
+// Threading E2E tests — Phases 1-8
 import "std/thread"
 import "std/channel"
 import "std/sys"
@@ -215,4 +215,168 @@ test "channel isEmpty" {
     c.recv()
     @assert(c.isEmpty())
     c.destroy()
+}
+
+// ============================================================================
+// Phase 6: RwLock
+// ============================================================================
+
+var rw: RwLock = undefined
+var rw_shared_value: i64 = 0
+
+fn rw_reader(arg: i64) void {
+    var i: i64 = 0
+    while (i < 100) {
+        rw.readLock()
+        // Just read — value should always be consistent
+        @assert(rw_shared_value >= 0)
+        rw.readUnlock()
+        i = i + 1
+    }
+}
+
+fn rw_writer(arg: i64) void {
+    var i: i64 = 0
+    while (i < 100) {
+        rw.writeLock()
+        rw_shared_value = rw_shared_value + 1
+        rw.writeUnlock()
+        i = i + 1
+    }
+}
+
+test "rwlock readers and writer" {
+    rw = RwLock.init()
+    rw_shared_value = 0
+    var r1 = Thread.spawn(@ptrToInt(rw_reader), 0)
+    var r2 = Thread.spawn(@ptrToInt(rw_reader), 0)
+    var w1 = Thread.spawn(@ptrToInt(rw_writer), 0)
+    r1.join()
+    r2.join()
+    w1.join()
+    @assertEq(rw_shared_value, 100)
+    rw.destroy()
+}
+
+test "rwlock multiple concurrent readers" {
+    var lock = RwLock.init()
+    // Multiple read locks should not block each other
+    lock.readLock()
+    lock.readLock()
+    lock.readUnlock()
+    lock.readUnlock()
+    lock.destroy()
+}
+
+test "rwlock write excludes read" {
+    var lock = RwLock.init()
+    lock.writeLock()
+    lock.writeUnlock()
+    lock.readLock()
+    lock.readUnlock()
+    lock.destroy()
+}
+
+// ============================================================================
+// Phase 7: WaitGroup
+// ============================================================================
+
+var wg: WaitGroup = undefined
+var wg_counter: i64 = 0
+
+fn wg_worker(arg: i64) void {
+    @atomicAdd(&wg_counter, 1)
+    wg.done()
+}
+
+test "waitgroup waits for all tasks" {
+    wg = WaitGroup.init()
+    wg_counter = 0
+    wg.add(3)
+    var t1 = Thread.spawn(@ptrToInt(wg_worker), 0)
+    var t2 = Thread.spawn(@ptrToInt(wg_worker), 0)
+    var t3 = Thread.spawn(@ptrToInt(wg_worker), 0)
+    wg.wait()
+    @assertEq(@atomicLoad(&wg_counter), 3)
+    t1.join()
+    t2.join()
+    t3.join()
+    wg.destroy()
+}
+
+test "waitgroup zero count does not block" {
+    var g = WaitGroup.init()
+    g.wait()
+    g.destroy()
+}
+
+test "waitgroup add then done" {
+    var g = WaitGroup.init()
+    g.add(2)
+    g.done()
+    g.done()
+    g.wait()
+    g.destroy()
+}
+
+// ============================================================================
+// Phase 8: Atomic(T)
+// ============================================================================
+
+test "atomic init and load" {
+    var a = Atomic(i64).init(42)
+    @assertEq(a.load(), 42)
+}
+
+test "atomic store" {
+    var a = Atomic(i64).init(0)
+    a.store(99)
+    @assertEq(a.load(), 99)
+}
+
+test "atomic fetchAdd" {
+    var a = Atomic(i64).init(10)
+    var old = a.fetchAdd(5)
+    @assertEq(old, 10)
+    @assertEq(a.load(), 15)
+}
+
+test "atomic compareAndSwap success" {
+    var a = Atomic(i64).init(42)
+    var old = a.compareAndSwap(42, 99)
+    @assertEq(old, 42)
+    @assertEq(a.load(), 99)
+}
+
+test "atomic compareAndSwap failure" {
+    var a = Atomic(i64).init(42)
+    var old = a.compareAndSwap(0, 99)
+    @assertEq(old, 42)
+    @assertEq(a.load(), 42)
+}
+
+test "atomic exchange" {
+    var a = Atomic(i64).init(10)
+    var old = a.exchange(20)
+    @assertEq(old, 10)
+    @assertEq(a.load(), 20)
+}
+
+var shared_atomic: Atomic(i64) = undefined
+
+fn atomic_worker(arg: i64) void {
+    var i: i64 = 0
+    while (i < 1000) {
+        shared_atomic.fetchAdd(1)
+        i = i + 1
+    }
+}
+
+test "atomic multi-threaded fetchAdd" {
+    shared_atomic = Atomic(i64).init(0)
+    var t1 = Thread.spawn(@ptrToInt(atomic_worker), 0)
+    var t2 = Thread.spawn(@ptrToInt(atomic_worker), 0)
+    t1.join()
+    t2.join()
+    @assertEq(shared_atomic.load(), 2000)
 }

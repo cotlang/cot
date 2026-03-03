@@ -1600,6 +1600,7 @@ pub const Checker = struct {
             .try_expr => |te| self.checkTryExpr(te),
             .await_expr => |ae| self.checkAwaitExpr(ae),
             .spawn_expr => |se| self.checkSpawnExpr(se),
+            .select_expr => |se| self.checkSelectExpr(se),
             .catch_expr => |ce| self.checkCatchExpr(ce),
             .error_literal => |el| self.checkErrorLiteral(el),
             .closure_expr => |ce| self.checkClosureExpr(ce),
@@ -2989,6 +2990,56 @@ pub const Checker = struct {
         return TypeRegistry.VOID;
     }
 
+    fn checkSelectExpr(self: *Checker, se: ast.SelectExpr) CheckError!TypeIndex {
+        // Go-style select: each case is a channel operation (recv or send).
+        // Result type: void (select is a statement-like expression).
+        for (se.cases) |case| {
+            switch (case.kind) {
+                .recv => {
+                    // Type-check the channel expression
+                    const ch_type = try self.checkExpr(case.channel);
+                    // Validate it's a pointer to a Channel struct (Channel(T) is monomorphized)
+                    const ch_info = self.types.get(ch_type);
+                    var elem_type: TypeIndex = TypeRegistry.I64; // fallback
+                    if (ch_info == .pointer) {
+                        const pointee_info = self.types.get(ch_info.pointer.elem);
+                        if (pointee_info == .struct_type) {
+                            const name = pointee_info.struct_type.name;
+                            // Validate it's a Channel type
+                            if (name.len < 7 or !std.mem.eql(u8, name[0..7], "Channel")) {
+                                self.err.errorWithCode(case.span.start, .e300, "select recv case requires a Channel type");
+                            }
+                            // Try to extract element type from tryRecv method return type
+                            // (monomorphized Channel(T) has tryRecv returning ?T)
+                            _ = &elem_type;
+                        }
+                    }
+                    // Bind capture variable in case body scope
+                    if (case.capture.len > 0) {
+                        var case_scope = Scope.init(self.allocator, self.scope);
+                        const old_scope = self.scope;
+                        self.scope = &case_scope;
+                        try self.scope.define(Symbol.init(case.capture, .variable, elem_type, null_node, false));
+                        _ = try self.checkExpr(case.body);
+                        self.scope = old_scope;
+                    } else {
+                        _ = try self.checkExpr(case.body);
+                    }
+                },
+                .send => {
+                    // Send case: the channel expr is the full ch.send(value) call
+                    // Type-check it as a regular expression (it's a method call)
+                    _ = try self.checkExpr(case.channel);
+                    _ = try self.checkExpr(case.body);
+                },
+            }
+        }
+        if (se.default_body != null_node) {
+            _ = try self.checkExpr(se.default_body);
+        }
+        return TypeRegistry.VOID;
+    }
+
     fn checkCatchExpr(self: *Checker, ce: ast.CatchExpr) CheckError!TypeIndex {
         const operand_type = try self.checkExpr(ce.operand);
         const operand_info = self.types.get(operand_type);
@@ -3952,6 +4003,7 @@ pub const Checker = struct {
         const ta = self.types.get(a);
         const tb = self.types.get(b);
         if (types.isNumeric(ta) and types.isNumeric(tb)) return true;
+        if (types.isBool(ta) and types.isBool(tb)) return true;
         if (ta == .slice and tb == .slice and ta.slice.elem == TypeRegistry.U8 and tb.slice.elem == TypeRegistry.U8) return true;
         if (ta == .optional and tb == .basic and tb.basic == .untyped_null) return true;
         if (tb == .optional and ta == .basic and ta.basic == .untyped_null) return true;

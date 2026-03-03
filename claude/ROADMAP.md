@@ -1,8 +1,8 @@
 # Cot Roadmap
 
-## Current: 0.3.4 (Mar 2026)
+## Current: 0.3.5 (Mar 2026)
 
-Compiler is feature-complete for the core language. 34 stdlib modules, 72 test files (~1,670 tests, 71/71 passing on native), LSP with 7 features, @safe mode, comptime infrastructure, ARC memory management. All 6 waves of 0.4 feature work are **DONE**. Runtime builtins moved to stdlib via `extern fn`. OS threading primitives (threads, mutex, condition variables, atomics, channels) implemented. Pointer capture `|*val|` across all 5 capture sites. CI/CD: GitHub Actions test on push (macOS ARM64 + Linux x64), automated binary releases on tag. Self-hosted compiler at ~65% frontend parity (~15,000 lines, 228 tests), ir.cot backend IR complete, lower.cot ~59% ported (5,479 lines).
+Concurrency system complete. Go-style `select` statement, work-stealing scheduler with per-worker Chase-Lev deques, Channel tryRecv/trySend/len, atomic weak references, bool equality comparison. 72 test files (~1,700 tests, 72/72 passing on native). Previous: 34 stdlib modules, LSP with 7 features, @safe mode, comptime, ARC, OS threading primitives, CI/CD, C source bundling. Self-hosted compiler at ~70% frontend parity (21,264 lines across 10 files, 237 tests).
 
 **What ships:** A developer can `cot init`, write an HTTP server with crypto + regex + path handling + SQLite, `cot test --watch` during development, `cot lint` + `cot check` for fast feedback, `cot bench` for performance, `cot doc` for API docs, and `cot build` for a native binary. Like Deno, but compiled to native with zero runtime overhead.
 
@@ -25,7 +25,7 @@ All language features and stdlib are done. What remains is distribution polish:
 | 7 | `cot init` improvements (test template, next-steps) | Not started |
 | 8 | Logo & brand assets | Not started |
 | 9 | cot.dev launch (docs site + playground) | Not started |
-| 10 | Self-hosting progress (frontend in Cot) | ~65% frontend (~15,000 lines, 228 tests). ir.cot complete, lower.cot ~59% (5,479 lines). ssa_builder.zig, arc_insertion.zig remaining. |
+| 10 | Self-hosting progress (frontend in Cot) | ~70% frontend (21,264 lines, 237 tests). ir.cot complete, lower.cot ~66% (6,618 lines, 20 tests). ssa_builder.zig (~2,178 lines), arc_insertion.zig (~444 lines) remaining. |
 
 **Release criteria:** `brew install cotlang/tap/cot` works, VS Code extension on marketplace, all tests pass on native + Wasm.
 
@@ -64,8 +64,8 @@ The centerpiece is the **package ecosystem** — a full port of JSR (jsr.io) to 
 |---------|-------------|-----------|
 | Permission system | `--allow-read`, `--allow-net`, `--allow-env`. | Deno permissions |
 | OpenTelemetry | Built-in tracing, auto-instrument HTTP. | Deno 2.2 OTel |
-| Work-stealing scheduler | Lightweight task scheduler on top of OS threads (spawn MVP done, local queues TODO). | Go runtime `proc.go` |
-| `select` statement | Multiplexed channel receive. | Go `select` |
+| ~~Work-stealing scheduler~~ | ~~Done in 0.3.5~~ | Go runtime `proc.go` |
+| ~~`select` statement~~ | ~~Done in 0.3.5~~ | Go `select` |
 | SIMD vectors | `@Vector(N, T)` mapped to hardware SIMD. | Zig `@Vector` |
 
 ---

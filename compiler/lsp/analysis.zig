@@ -346,10 +346,11 @@ fn resolveImportPath(allocator: std.mem.Allocator, import_path: []const u8, sour
 }
 
 /// Resolve stdlib imports: "std/list" -> "<stdlib_dir>/list.cot"
-/// Discovery order (copied from driver.zig:319-342):
+/// Discovery order (mirrors driver.zig resolveStdImport):
 /// 1. COT_STDLIB env var (explicit override)
 /// 2. Walk up from source file looking for stdlib/ directory
-/// 3. CWD fallback (./stdlib/)
+/// 3. Relative to compiler binary (<exe_dir>/../lib/std/)
+/// 4. CWD fallback (./stdlib/)
 fn resolveStdImport(allocator: std.mem.Allocator, import_path: []const u8, source_dir: []const u8) ![]const u8 {
     const module = import_path["std/".len..];
     const filename = try std.fmt.allocPrint(allocator, "{s}.cot", .{module});
@@ -371,7 +372,18 @@ fn resolveStdImport(allocator: std.mem.Allocator, import_path: []const u8, sourc
         dir = std.fs.path.dirname(dir) orelse break;
     }
 
-    // Tier 3: CWD fallback
+    // Tier 3: Relative to compiler binary (Zig findZigLibDirFromSelfExe pattern)
+    // Installed layout: ~/.cot/bin/cot + ~/.cot/lib/std/*.cot
+    var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.fs.selfExeDirPath(&exe_dir_buf)) |exe_dir| {
+        const candidate = try std.fs.path.join(allocator, &.{ exe_dir, "..", "lib", "std", filename });
+        if (std.fs.cwd().access(candidate, .{})) |_| {
+            return candidate;
+        } else |_| {}
+        allocator.free(candidate);
+    } else |_| {}
+
+    // Tier 4: CWD fallback
     return std.fs.path.join(allocator, &.{ "stdlib", filename });
 }
 

@@ -1175,6 +1175,10 @@ pub const Parser = struct {
                     const body = try self.parseBlockExpr() orelse return null;
                     return try self.tree.addExpr(.{ .spawn_expr = .{ .body = body, .span = Span.init(start, self.pos()) } });
                 }
+                // Contextual keyword: select { ... }
+                if (std.mem.eql(u8, self.tok.text, "select") and self.peekToken().tok == .lbrace) {
+                    return try self.parseSelectExpr();
+                }
                 const n = self.tok.text;
                 self.advance();
                 return try self.tree.addExpr(.{ .ident = .{ .name = n, .span = Span.init(start, self.pos()) } });
@@ -1714,6 +1718,87 @@ pub const Parser = struct {
         }
         if (!self.expect(.rbrace)) return null;
         return try self.tree.addExpr(.{ .switch_expr = .{ .subject = subj, .cases = try self.allocator.dupe(ast.SwitchCase, cases.items), .else_body = else_body, .span = Span.init(start, self.pos()) } });
+    }
+
+    /// Parse select expression (Go-style channel select).
+    ///
+    /// Syntax:
+    ///   select {
+    ///       value from ch => { body }     // recv case with capture
+    ///       ch.send(42) => { body }       // send case
+    ///       default => { body }           // non-blocking default
+    ///   }
+    fn parseSelectExpr(self: *Parser) ParseError!?NodeIndex {
+        const start = self.pos();
+        self.advance(); // consume "select"
+        if (!self.expect(.lbrace)) return null;
+
+        var cases = std.ArrayListUnmanaged(ast.SelectCase){};
+        defer cases.deinit(self.allocator);
+        var default_body: NodeIndex = null_node;
+
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            const case_start = self.pos();
+
+            // default => { body }
+            if (self.check(.ident) and std.mem.eql(u8, self.tok.text, "default")) {
+                self.advance();
+                if (!self.expect(.fat_arrow)) return null;
+                default_body = try self.parseExpr() orelse return null;
+                _ = self.match(.comma);
+                continue;
+            }
+
+            // Peek ahead to determine recv vs send:
+            //   recv: <capture> from <channel> => { body }
+            //   send: <channel>.send(<value>) => { body }
+            //
+            // Heuristic: if second token is "from", it's a recv case.
+            if (self.check(.ident) and self.peekToken().tok == .ident) {
+                const peek_text = self.peekToken().text;
+                if (std.mem.eql(u8, peek_text, "from")) {
+                    // Recv case: <capture> from <channel> => { body }
+                    const capture = self.tok.text;
+                    self.advance(); // consume capture name
+                    self.advance(); // consume "from"
+                    const channel = try self.parsePrimaryExpr() orelse return null;
+                    if (!self.expect(.fat_arrow)) return null;
+                    const body = try self.parseExpr() orelse return null;
+                    try cases.append(self.allocator, .{
+                        .kind = .recv,
+                        .channel = channel,
+                        .capture = capture,
+                        .body = body,
+                        .span = Span.init(case_start, self.pos()),
+                    });
+                    _ = self.match(.comma);
+                    continue;
+                }
+            }
+
+            // Send case: <channel>.send(<value>) => { body }
+            const channel_expr = try self.parsePrimaryExpr() orelse return null;
+            // Expect .send(value) — already parsed as a method call on the channel
+            // The parsePrimaryExpr + postfix chain will parse ch.send(42) as a Call node.
+            // We need to decompose it: the callee is a FieldAccess on the channel.
+            if (!self.expect(.fat_arrow)) return null;
+            const body = try self.parseExpr() orelse return null;
+            // The channel_expr is the entire ch.send(value) call.
+            // We store it as-is and decompose in the checker/lowerer.
+            try cases.append(self.allocator, .{
+                .kind = .send,
+                .channel = channel_expr, // This is the full send call expression
+                .body = body,
+                .span = Span.init(case_start, self.pos()),
+            });
+            _ = self.match(.comma);
+        }
+        if (!self.expect(.rbrace)) return null;
+        return try self.tree.addExpr(.{ .select_expr = .{
+            .cases = try self.allocator.dupe(ast.SelectCase, cases.items),
+            .default_body = default_body,
+            .span = Span.init(start, self.pos()),
+        } });
     }
 
     // Statement parsing

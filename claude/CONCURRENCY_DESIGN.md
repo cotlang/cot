@@ -2,7 +2,7 @@
 
 Cot's concurrency roadmap, building on the existing async/await foundation.
 
-**Status:** Phase 1 (async/await) complete. Phase 3 (OS-level primitives) **DONE** — see `threading-design.md`. Phase 2 (spawn + work-stealing) **PARTIAL** — spawn MVP with global queue done, but Channel(T) for Phase 2 (typed high-level channels with `select`) and per-worker local queues still TODO. Note: Phase 3's low-level `Channel(T)` in `std/channel` (mutex+condvar based) is done and usable.
+**Status:** Phase 1 (async/await) **DONE**. Phase 3 (primitives) **DONE** — Thread, Mutex, Condition, RwLock, WaitGroup, Atomic(T), Channel(T) all implemented and tested (27 tests). Phase 2 (spawn + work-stealing) **DONE** — spawn with work-stealing scheduler, `select` statement, Channel tryRecv/trySend/len, atomic weak refs all complete (0.3.5).
 
 ---
 
@@ -17,7 +17,7 @@ Cot has single-threaded async I/O via `async fn` / `await`:
 
 Additionally, OS-level threading primitives are available (Phase 3):
 
-- **`std/thread`:** Thread spawn/join/detach, Mutex, Condition variables
+- **`std/thread`:** Thread, Mutex, Condition, RwLock, WaitGroup, Atomic(T)
 - **`std/channel`:** Channel(T) with init/send/recv/close (mutex+condvar based)
 - **Atomic builtins:** `@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicCAS`, `@atomicExchange`
 - **Spawn MVP:** `spawn {}` blocks with global queue scheduler (no per-worker local queues yet)
@@ -29,15 +29,16 @@ Additionally, OS-level threading primitives are available (Phase 3):
 
 ```
 Phase 1: async/await (DONE)
-  Single-threaded I/O concurrency. Event loop. No parallelism.
+  Single-threaded I/O concurrency. Event loop (kqueue/epoll). No parallelism.
 
-Phase 2: spawn + work-stealing scheduler (0.5)
-  Per-worker local queues + steal-half. High-level Channel(T) with
-  select statement. Builds on Phase 3 primitives.
+Phase 2: spawn + work-stealing scheduler (DONE — 0.3.5)
+  Work-stealing scheduler with per-worker Chase-Lev deques. select statement.
+  Channel tryRecv/trySend/len. Atomic weak references.
 
 Phase 3: Low-level primitives (DONE — 0.3.x)
-  Thread, Mutex, Condition, Atomics, Channel(T). See threading-design.md.
-  Spawn MVP with global queue. Atomic ARC (strong/unowned).
+  Thread, Mutex, Condition, RwLock, WaitGroup, Atomic(T), Channel(T),
+  atomic builtins. Spawn MVP with global queue. Atomic ARC (strong/unowned).
+  27 E2E tests pass. See archive/threading-design.md.
 ```
 
 ---
@@ -166,22 +167,16 @@ Operations:
 
 On Wasm target, channels work synchronously (single-threaded — send blocks until recv in same event loop tick, or errors). On native, they use OS mutexes and condition variables.
 
-### Atomic ARC — DONE (strong/unowned), TODO (weak)
+### Atomic ARC — DONE (strong/unowned/weak)
 
-Native ARC (`compiler/codegen/native/arc_native.zig`) now uses atomic refcount operations for strong and unowned references, matching Swift's `HeapObject.cpp` pattern:
+Native ARC (`compiler/codegen/native/arc_native.zig`) uses atomic refcount operations for all reference types, matching Swift's `HeapObject.cpp` pattern:
 
 - `retain`: `atomicRmwAdd(&refcount, STRONG_RC_ONE)` — relaxed ordering (Swift pattern)
 - `release`: `atomicRmwAdd(&refcount, -STRONG_RC_ONE)` — ARM64 `ldaddal` (acquire-release), x64 `lock xadd` (seq-cst)
 - `unowned_retain` / `unowned_release`: same atomic pattern with `UNOWNED_RC_ONE`
+- `weakRetain` / `weakRelease` / `weakFormReference`: `atomicRmwAdd` for weak refcount (0.3.5)
 
 **Wasm target:** No change needed. Wasm is single-threaded.
-
-**Known gap — weak references still non-atomic:**
-- `generateWeakRetain` (arc_native.zig ~line 1814): uses non-atomic load/iadd/store for weak refcount increment
-- `generateWeakRelease` (arc_native.zig ~line 1877): uses non-atomic load/isub/store for weak refcount decrement
-- `generateWeakFormReference` (arc_native.zig ~line 1651): non-atomic weak_rc increment on existing side table; non-atomic side table pointer install (Swift uses CAS via `allocateSideTable` in `RefCounts.h`)
-- **Risk**: Two threads forming/releasing weak references to the same object concurrently will corrupt the weak refcount. Currently safe because weak references are rare and not used in spawn contexts.
-- **Fix**: Same `atomicRmwAdd` pattern as strong/unowned. Side table install needs `atomicCas` to handle the race where two threads allocate side tables simultaneously.
 
 ### Wasm Considerations
 
@@ -196,30 +191,29 @@ Wasm doesn't have OS threads (yet). The Wasm threads proposal adds shared memory
 - [x] `spawn` keyword parsing and AST node (contextual keyword)
 - [x] Closure-style environment capture for spawn blocks (`lowerSpawnExpr` in lower.zig)
 - [x] `sched_spawn` runtime function (CLIF IR in `scheduler_native.zig`)
-- [x] Low-level `Channel(T)` in `std/channel` (mutex+condvar based, init/send/recv/close) — Phase 3
-- [ ] High-level `Channel(T)` type integrated with spawn (typed, bounded, GC-safe)
-- [ ] `select` statement parsing and lowering
-- [x] Scheduler runtime: global queue MVP (`scheduler_native.zig` — CAS init, condvar, atexit shutdown)
-- [ ] Work-stealing: per-worker local queues + steal-half (Go `runqsteal` pattern)
-- [x] Atomic ARC for native target (strong/unowned — weak refs still TODO)
-- [x] Tests: `test/e2e/spawn.cot` — 5 tests (basic, capture, parallel 100 tasks, multi-capture, no-capture)
+- [x] `Channel(T)` in `std/channel` — init/send/recv/close/tryRecv/trySend/len (mutex+condvar based)
+- [x] `select` statement parsing, type-checking, and lowering (simple path + general N-case)
+- [x] `sched_select` runtime function (CLIF IR, poll-based channel select)
+- [x] Scheduler runtime: work-stealing with per-worker Chase-Lev deques (Go `runqsteal` pattern)
+- [x] Atomic ARC for native target (strong/unowned/weak — all atomic)
+- [x] Tests: `test/e2e/spawn.cot` — 6 tests, `test/e2e/select.cot` — 9 tests
 
 ---
 
-## Phase 3: Low-Level Primitives — DONE
+## Phase 3: Low-Level Primitives — COMPLETE
 
-**Implemented in 0.3.x.** See `threading-design.md` for full design, implementation audit, and reference faithfulness proof.
+**Implemented in 0.3.x.** See `archive/threading-design.md` for full design, implementation audit, and reference faithfulness proof.
 
 Exposed through `std/thread` and `std/channel`. Compiler builtins for atomics (`@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicCAS`, `@atomicExchange`).
 
 ### Synchronization Types
 
 ```cot
-import "std/sync"
+import "std/thread"
 
 fn main() void {
-    var mutex = Mutex.new()
-    var counter = Atomic(i64).new(0)
+    var mutex = Mutex.init()
+    var counter = Atomic(i64).init(0)
 
     spawn {
         mutex.lock()
@@ -235,20 +229,28 @@ fn main() void {
 
 ### Types
 
-| Type | Purpose |
-|------|---------|
-| `Mutex` | Mutual exclusion lock |
-| `RwLock` | Reader-writer lock (multiple readers OR one writer) |
-| `Atomic(T)` | Lock-free atomic operations on primitive types |
-| `WaitGroup` | Wait for N tasks to complete |
-| `Once` | Run initialization exactly once |
+| Type | Purpose | Status |
+|------|---------|--------|
+| `Thread` | OS thread spawn/join/detach | DONE |
+| `Mutex` | Mutual exclusion lock | DONE |
+| `Condition` | Condition variable (wait/signal/broadcast) | DONE |
+| `Channel(T)` | Blocking queue for inter-thread messaging | DONE |
+| `RwLock` | Reader-writer lock (multiple readers OR one writer) | DONE |
+| `WaitGroup` | Wait for N tasks to complete | DONE |
+| `Atomic(T)` | Lock-free atomic operations on primitive types | DONE |
 
 ### Implementation
 
-All synchronization primitives are backed by OS facilities on native:
-- Mutex → `pthread_mutex` (POSIX) or `os_unfair_lock` (macOS)
-- Condition → `pthread_cond`
+Low-level primitives (Thread, Mutex, Condition) are backed by OS facilities on native, generated as CLIF IR in `thread_native.zig`. Higher-level types (RwLock, WaitGroup, Atomic(T), Channel(T)) are pure Cot built on top of the low-level primitives:
+
+- Thread → `pthread_create`/`pthread_join`/`pthread_detach`
+- Mutex → `pthread_mutex_init`/`lock`/`unlock`/`trylock`/`destroy`
+- Condition → `pthread_cond_init`/`wait`/`signal`/`broadcast`/`destroy`
 - Atomics → compiler intrinsics (ARM64 `ldaxr`/`stlxr`, x64 `lock` prefix)
+- RwLock → Mutex + 2 Conditions + reader/writer counters (writer-preferring)
+- WaitGroup → Mutex + Condition + atomic counter (Go pattern)
+- Atomic(T) → wraps `@atomicLoad`/`@atomicStore`/`@atomicAdd`/`@atomicCAS`/`@atomicExchange`
+- Channel(T) → Mutex + 2 Conditions + ring buffer (Go pattern)
 
 On Wasm, these are no-ops or single-threaded stubs (same as spawn).
 
@@ -259,9 +261,9 @@ On Wasm, these are no-ops or single-threaded stubs (same as spawn).
 - [x] `Condition` with `init()`, `wait()`, `signal()`, `broadcast()`, `destroy()` — `std/thread`
 - [x] `Channel(T)` with `init()`, `send()`, `recv()`, `close()`, `destroy()` — `std/channel`
 - [x] Atomic builtins: `@atomicLoad`, `@atomicStore`, `@atomicAdd`, `@atomicCAS`, `@atomicExchange`
-- [ ] `RwLock` with `readLock()`, `writeLock()` — future
-- [ ] `WaitGroup` with `add`, `done`, `wait` — future
-- [ ] `Atomic(T)` wrapper struct — future (builtins work directly for now)
+- [x] `RwLock` with `readLock()`, `readUnlock()`, `writeLock()`, `writeUnlock()`, `destroy()` — `std/thread` (writer-preferring, built on Mutex + Condition, Go sync.RWMutex pattern)
+- [x] `WaitGroup` with `add()`, `done()`, `wait()`, `destroy()` — `std/thread` (Go sync.WaitGroup pattern)
+- [x] `Atomic(T)` with `init()`, `load()`, `store()`, `fetchAdd()`, `compareAndSwap()`, `exchange()` — `std/thread` (wraps atomic builtins)
 
 ---
 

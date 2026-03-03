@@ -826,7 +826,8 @@ pub const Driver = struct {
     /// Discovery order (like Zig's findZigLibDirFromSelfExe):
     /// 1. COT_STDLIB env var (explicit override)
     /// 2. Walk up from source file looking for stdlib/ directory
-    /// 3. CWD fallback (./stdlib/)
+    /// 3. Relative to compiler binary (<exe_dir>/../lib/std/)
+    /// 4. CWD fallback (./stdlib/)
     fn resolveStdImport(self: *Driver, import_path: []const u8, source_dir: []const u8) ![]const u8 {
         const module = import_path["std/".len..];
         const filename = try std.fmt.allocPrint(self.allocator, "{s}.cot", .{module});
@@ -848,7 +849,18 @@ pub const Driver = struct {
             dir = std.fs.path.dirname(dir) orelse break;
         }
 
-        // Tier 3: CWD fallback
+        // Tier 3: Relative to compiler binary (Zig findZigLibDirFromSelfExe pattern)
+        // Installed layout: ~/.cot/bin/cot + ~/.cot/lib/std/*.cot
+        var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExeDirPath(&exe_dir_buf)) |exe_dir| {
+            const candidate = try std.fs.path.join(self.allocator, &.{ exe_dir, "..", "lib", "std", filename });
+            if (std.fs.cwd().access(candidate, .{})) |_| {
+                return candidate;
+            } else |_| {}
+            self.allocator.free(candidate);
+        } else |_| {}
+
+        // Tier 4: CWD fallback
         return std.fs.path.join(self.allocator, &.{ "stdlib", filename });
     }
 
@@ -1256,7 +1268,7 @@ pub const Driver = struct {
             // Scheduler runtime (scheduler_native.generate order)
             "sched_spawn",   "sched_shutdown", "sched_get_num_workers",
             "sched_init",    "sched_worker_spawn", "sched_worker_loop",
-            "sched_join_workers",
+            "sched_join_workers", "sched_select",
             // Test runtime (test_native.generate order)
             "__test_begin",  "__test_print_name", "__test_pass",
             "__test_fail",   "__test_summary",    "__test_store_fail_values",

@@ -1744,11 +1744,11 @@ fn generateWeakFormReference(
         const v_shift = try ins.iconst(clif.Type.I64, SIDE_TABLE_ALIGN_SHIFT);
         const st_ptr = try ins.ishl(cleared, v_shift);
 
-        // Increment weak_rc
-        const weak_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        // Atomic increment weak_rc (thread-safe)
+        const v_weak_off = try ins.iconst(clif.Type.I64, @as(i64, SIDE_TABLE_WEAK_RC_OFFSET));
+        const weak_rc_addr = try ins.iadd(st_ptr, v_weak_off);
         const v_one = try ins.iconst(clif.Type.I64, 1);
-        const new_weak_rc = try ins.iadd(weak_rc, v_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_weak_rc, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        _ = try ins.atomicRmwAdd(clif.Type.I64, weak_rc_addr, v_one);
 
         _ = try ins.return_(&[_]clif.Value{st_ptr});
     }
@@ -1847,16 +1847,16 @@ fn generateWeakRetain(
     try builder.ensureInsertedBlock();
     _ = try builder.ins().return_(&[_]clif.Value{});
 
-    // Increment weak_rc
+    // Atomic increment weak_rc (thread-safe)
     builder.switchToBlock(block_increment);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const st_ptr = builder.blockParams(block_entry)[0];
-        const weak_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        const v_weak_off = try ins.iconst(clif.Type.I64, @as(i64, SIDE_TABLE_WEAK_RC_OFFSET));
+        const weak_rc_addr = try ins.iadd(st_ptr, v_weak_off);
         const v_one = try ins.iconst(clif.Type.I64, 1);
-        const new_weak_rc = try ins.iadd(weak_rc, v_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_weak_rc, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        _ = try ins.atomicRmwAdd(clif.Type.I64, weak_rc_addr, v_one);
         _ = try ins.return_(&[_]clif.Value{});
     }
 
@@ -1913,19 +1913,20 @@ fn generateWeakRelease(
     try builder.ensureInsertedBlock();
     _ = try builder.ins().return_(&[_]clif.Value{});
 
-    // Decrement weak_rc, check if zero
+    // Atomic decrement weak_rc, check if was last ref
     builder.switchToBlock(block_decrement);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const st_ptr = builder.blockParams(block_entry)[0];
-        const weak_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
-        const v_one = try ins.iconst(clif.Type.I64, 1);
-        const new_weak_rc = try ins.isub(weak_rc, v_one);
-        _ = try ins.store(clif.MemFlags.DEFAULT, new_weak_rc, st_ptr, SIDE_TABLE_WEAK_RC_OFFSET);
+        const v_weak_off = try ins.iconst(clif.Type.I64, @as(i64, SIDE_TABLE_WEAK_RC_OFFSET));
+        const weak_rc_addr = try ins.iadd(st_ptr, v_weak_off);
+        const v_neg_one = try ins.iconst(clif.Type.I64, -1);
+        const old_weak_rc = try ins.atomicRmwAdd(clif.Type.I64, weak_rc_addr, v_neg_one);
 
-        const v_zero = try ins.iconst(clif.Type.I64, 0);
-        const is_last = try ins.icmp(.eq, new_weak_rc, v_zero);
+        // old_weak_rc == 1 means we were the last weak ref (now 0)
+        const v_one = try ins.iconst(clif.Type.I64, 1);
+        const is_last = try ins.icmp(.eq, old_weak_rc, v_one);
         _ = try ins.brif(is_last, block_check_free, &.{}, block_return, &.{});
     }
 
