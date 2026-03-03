@@ -1458,6 +1458,24 @@ fn compileAndLinkFull(
         }
     }
 
+    // C flags from cot.json "c_flags" array (must come before C source files)
+    if (project_config) |*pc| {
+        if (pc.getCflags(allocator)) |c_flags| {
+            for (c_flags) |flag| {
+                link_args.append(allocator, flag) catch {};
+            }
+        }
+    }
+
+    // C source files from cot.json "c_sources" array — zig cc compiles and links them
+    if (project_config) |*pc| {
+        if (pc.getCsources(allocator)) |c_files| {
+            for (c_files) |c_file| {
+                link_args.append(allocator, c_file) catch {};
+            }
+        }
+    }
+
     var child = std.process.Child.init(link_args.items, allocator);
     const result = child.spawnAndWait() catch |e| {
         std.debug.print("Linker failed: {any}\n", .{e});

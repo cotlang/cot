@@ -104,6 +104,44 @@ pub const LoadedConfig = struct {
         return names.toOwnedSlice(allocator) catch null;
     }
 
+    /// Read the "c_sources" array from cot.json for bundling C code.
+    /// Returns file paths (e.g., ["vendor/sqlite3.c"]) or null if not specified.
+    pub fn getCsources(self: *const LoadedConfig, allocator: std.mem.Allocator) ?[]const []const u8 {
+        if (self.file_contents.len == 0) return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, self.file_contents, .{}) catch return null;
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) return null;
+        const sources = root.object.get("c_sources") orelse return null;
+        if (sources != .array) return null;
+        var paths = std.ArrayListUnmanaged([]const u8){};
+        for (sources.array.items) |item| {
+            if (item != .string) continue;
+            paths.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+        }
+        if (paths.items.len == 0) return null;
+        return paths.toOwnedSlice(allocator) catch null;
+    }
+
+    /// Read the "c_flags" array from cot.json for C compilation flags.
+    /// Returns flags (e.g., ["-DSQLITE_THREADSAFE=0"]) or null if not specified.
+    pub fn getCflags(self: *const LoadedConfig, allocator: std.mem.Allocator) ?[]const []const u8 {
+        if (self.file_contents.len == 0) return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, self.file_contents, .{}) catch return null;
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) return null;
+        const flags = root.object.get("c_flags") orelse return null;
+        if (flags != .array) return null;
+        var names = std.ArrayListUnmanaged([]const u8){};
+        for (flags.array.items) |item| {
+            if (item != .string) continue;
+            names.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+        }
+        if (names.items.len == 0) return null;
+        return names.toOwnedSlice(allocator) catch null;
+    }
+
     pub fn deinit(self: *LoadedConfig) void {
         self.parsed.deinit();
         if (self.file_contents.len > 0) {
@@ -213,4 +251,56 @@ test "getLibs returns null when no libs" {
     var loaded = try parseConfig(allocator, "{}");
     defer loaded.deinit();
     try std.testing.expect(loaded.getLibs(allocator) == null);
+}
+
+test "getCsources reads c_sources array" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"name":"test","c_sources":["vendor/sqlite3.c","vendor/foo.c"]}
+    ;
+    const file_contents = try allocator.dupe(u8, json);
+    var loaded = try parseConfig(allocator, json);
+    loaded.file_contents = file_contents;
+    loaded.file_allocator = allocator;
+    defer loaded.deinit();
+    const sources = loaded.getCsources(allocator).?;
+    defer allocator.free(sources);
+    try std.testing.expectEqual(@as(usize, 2), sources.len);
+    try std.testing.expectEqualStrings("vendor/sqlite3.c", sources[0]);
+    try std.testing.expectEqualStrings("vendor/foo.c", sources[1]);
+    allocator.free(sources[0]);
+    allocator.free(sources[1]);
+}
+
+test "getCsources returns null when no c_sources" {
+    const allocator = std.testing.allocator;
+    var loaded = try parseConfig(allocator, "{}");
+    defer loaded.deinit();
+    try std.testing.expect(loaded.getCsources(allocator) == null);
+}
+
+test "getCflags reads c_flags array" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"name":"test","c_flags":["-DSQLITE_THREADSAFE=0","-Os"]}
+    ;
+    const file_contents = try allocator.dupe(u8, json);
+    var loaded = try parseConfig(allocator, json);
+    loaded.file_contents = file_contents;
+    loaded.file_allocator = allocator;
+    defer loaded.deinit();
+    const flags = loaded.getCflags(allocator).?;
+    defer allocator.free(flags);
+    try std.testing.expectEqual(@as(usize, 2), flags.len);
+    try std.testing.expectEqualStrings("-DSQLITE_THREADSAFE=0", flags[0]);
+    try std.testing.expectEqualStrings("-Os", flags[1]);
+    allocator.free(flags[0]);
+    allocator.free(flags[1]);
+}
+
+test "getCflags returns null when no c_flags" {
+    const allocator = std.testing.allocator;
+    var loaded = try parseConfig(allocator, "{}");
+    defer loaded.deinit();
+    try std.testing.expect(loaded.getCflags(allocator) == null);
 }
