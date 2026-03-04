@@ -26,6 +26,7 @@ import "frontend/ir"
 import "frontend/lower"
 import "frontend/ssa"
 import "frontend/ssa_builder"
+import "frontend/arc_insertion"
 
 fn main() void {
     if (argsCount() < 2) {
