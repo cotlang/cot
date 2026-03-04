@@ -226,6 +226,7 @@ try list.append(allocator, 42);
 - Make incremental changes, verify each one
 
 **DO NOT:**
+- **Run tests redundantly.** `./test/run_all.sh` takes ~60s. Run it ONCE per task, not multiple times. Do NOT run it just to count tests — use `grep -r 'test "' test/ | wc -l` instead. Do NOT run it multiple times with slightly different grep patterns to extract info. The user runs thousands of agent sessions per month; wasting minutes per session adds up to hours per day. Same applies to `zig build test` — run ONCE after compiler changes, not repeatedly.
 - Skip testing
 - Invent approaches — copy reference implementations
 - Comment out failing tests, leave TODOs, or create "known issues"

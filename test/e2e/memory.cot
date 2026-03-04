@@ -196,3 +196,44 @@ test "035: struct clear" {
     @assertEq(d.b, 0)
     @assertEq(d.c, 0)
 }
+
+// === Nested field addr-of tests ===
+// These test the fix for &x.y.z (2-level nested addr-of) which previously
+// returned null_node, causing SIGSEGV. The fix uses resolveStructFieldAddr
+// recursively. These pass on native; wasm has different struct addr semantics.
+
+struct NfInner { value: int, flag: bool }
+struct NfMiddle { inner: NfInner, count: int }
+struct NfOuter { mid: NfMiddle, extra: int }
+
+fn nf_read_val(p: *NfInner) int { return p.value }
+fn nf_set_val(p: *NfInner, v: int) void { p.value = v }
+
+test "addr of nested field 1-level" {
+    var inner = NfInner { .value = 42, .flag = true }
+    var mid = NfMiddle { .inner = inner, .count = 0 }
+    @assertEq(nf_read_val(&mid.inner), 42)
+    nf_set_val(&mid.inner, 99)
+    @assertEq(mid.inner.value, 99)
+}
+
+test "addr of nested field 2-level" {
+    var inner = NfInner { .value = 42, .flag = true }
+    var mid = NfMiddle { .inner = inner, .count = 0 }
+    var outer = NfOuter { .mid = mid, .extra = 7 }
+    @assertEq(nf_read_val(&outer.mid.inner), 42)
+    nf_set_val(&outer.mid.inner, 99)
+    @assertEq(outer.mid.inner.value, 99)
+}
+
+test "addr of nested field via ptr" {
+    var inner = NfInner { .value = 10, .flag = false }
+    var mid = NfMiddle { .inner = inner, .count = 5 }
+    var outer = NfOuter { .mid = mid, .extra = 3 }
+    var ptr: *NfOuter = &outer
+    @assertEq(nf_read_val(&ptr.mid.inner), 10)
+    nf_set_val(&ptr.mid.inner, 77)
+    @assertEq(ptr.mid.inner.value, 77)
+    @assertEq(ptr.mid.count, 5)
+    @assertEq(ptr.extra, 3)
+}

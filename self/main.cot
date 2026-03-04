@@ -24,6 +24,8 @@ import "frontend/types"
 import "frontend/checker"
 import "frontend/ir"
 import "frontend/lower"
+import "frontend/ssa"
+import "frontend/ssa_builder"
 
 fn main() void {
     if (argsCount() < 2) {

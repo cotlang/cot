@@ -1812,7 +1812,7 @@ const SsaToClifTranslator = struct {
         if (idx == TypeRegistry.I16 or idx == TypeRegistry.U16) return clif.Type.I16;
         if (idx == TypeRegistry.I32 or idx == TypeRegistry.U32) return clif.Type.I32;
 
-        // Check composite types that might be float
+        // Check composite types that might be float or enum
         const t = self.type_reg.get(idx);
         switch (t) {
             .basic => |k| {
@@ -1821,6 +1821,8 @@ const SsaToClifTranslator = struct {
                 if (k == .i16_type or k == .u16_type) return clif.Type.I16;
                 if (k == .i8_type or k == .u8_type or k == .bool_type) return clif.Type.I8;
             },
+            // Enum types: delegate to backing type (e.g. enum(u8) → I8, default enum → I32)
+            .enum_type => |e| return self.ssaTypeToClifType(e.backing_type),
             else => {},
         }
 

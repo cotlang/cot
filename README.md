@@ -28,9 +28,7 @@ struct Task {
     title: string,
     priority: Priority,
     done: bool,
-}
 
-impl Task {
     static fn create(title: string, priority: Priority) Task {
         return Task { title, priority, done: false }     // field shorthand
     }
@@ -50,9 +48,7 @@ impl Task {
 struct TaskApp {
     tasks: List(Task),                                    // generic collections
     name: string,
-}
 
-impl TaskApp {
     static fn init(name: string) TaskApp {
         var tasks: List(Task) = .{}
         return TaskApp { tasks, name }
@@ -119,9 +115,7 @@ struct VtParser {
     state: i64,
     params: List(i64),
     current_param: i64,
-}
 
-impl VtParser {
     static fn init() VtParser { ... }
 
     fn feed(terminal: Terminal, byte: i64) void {
@@ -150,7 +144,7 @@ static fn loadFromFile(path: string) Config {
 }
 ```
 
-### Self-hosted compiler (15,000 lines)
+### Self-hosted compiler (21,000+ lines)
 
 The Cot compiler is being rewritten in Cot itself. The `self/` directory contains a working compiler frontend — scanner, parser, type checker, and IR builder — all in `@safe` mode:
 
@@ -194,7 +188,7 @@ Requires [Zig 0.15+](https://ziglang.org/download/).
 git clone https://github.com/cotlang/cot.git && cd cot
 git submodule update --init stdlib
 zig build
-./zig-out/bin/cot version    # → cot 0.3.4 (arm64-macos)
+./zig-out/bin/cot version    # → cot 0.3.5 (arm64-macos)
 ```
 
 ## Quick Start
@@ -229,7 +223,17 @@ var ratio = 3.14                     // f64 inferred
 ### Structs, Enums, Unions
 
 ```cot
-struct Point { x: i64, y: i64 }
+struct Point {
+    x: i64, y: i64
+
+    fn magnitude(self: *Point) i64 {       // methods inside struct body
+        return self.x * self.x + self.y * self.y
+    }
+
+    static fn origin() Point {              // static methods too
+        return Point { .x = 0, .y = 0 }
+    }
+}
 
 const Color = enum { Red, Green, Blue }
 const Status = enum { Ok = 0, Warning = 50, Error = 100 }
@@ -344,6 +348,31 @@ fn processFile(path: string) !void {
 }
 ```
 
+### Concurrency
+
+```cot
+import "std/channel"
+
+var ch = Channel(i64).init(10)             // buffered channel
+
+spawn {                                     // lightweight goroutine-style tasks
+    ch.send(42)
+}
+
+var value = ch.recv()                       // blocks until value available
+@assertEq(value, 42)
+
+// select statement for multiplexing channels
+var ch1 = Channel(i64).init(1)
+var ch2 = Channel(string).init(1)
+ch1.send(99)
+
+select {
+    ch1.recv() => |val| { println("got ${val}") },
+    ch2.recv() => |msg| { println("got ${msg}") },
+}
+```
+
 ### Async/Await
 
 ```cot
@@ -404,7 +433,7 @@ Native and Wasm targets have independent backend paths from SSA onwards. The nat
 
 ## Standard Library
 
-32 modules, all pure Cot:
+34 modules, all pure Cot:
 
 | Module | Description |
 |--------|-------------|
@@ -420,6 +449,7 @@ Native and Wasm targets have independent backend paths from SSA onwards. The nat
 | `std/time` | Timestamps, `Timer` |
 | `std/http` | TCP sockets, HTTP response builder |
 | `std/async` | Event loop (kqueue/epoll), async I/O |
+| `std/channel` | `Channel(T)` — typed channels for concurrency |
 | `std/crypto` | SHA-256, HMAC |
 | `std/regex` | Regular expressions |
 | `std/io` | Buffered reader/writer, `trait Writer` |
@@ -434,6 +464,7 @@ Native and Wasm targets have independent backend paths from SSA onwards. The nat
 | `std/log` | Structured logging |
 | `std/semver` | Semantic versioning |
 | `std/uuid` | UUID generation |
+| `std/sqlite` | SQLite bindings |
 | `std/dotenv` | `.env` file loading |
 | `std/mem` | Memory utilities |
 | `std/debug` | Debug assertions with messages |
@@ -443,9 +474,9 @@ Native and Wasm targets have independent backend paths from SSA onwards. The nat
 
 ## Project Status
 
-**v0.3.4** — Compiler written in Zig. Both Wasm and native AOT targets working.
+**v0.3.5** — Compiler written in Zig. Both Wasm and native AOT targets working.
 
-~1,658 tests passing across 70 files. Self-hosted compiler at 65% frontend parity (15,012 lines of Cot).
+~1,738 tests passing across 73 files. Self-hosted compiler at ~70% frontend parity (21,264 lines of Cot).
 
 | Component | Status |
 |-----------|--------|
@@ -454,10 +485,12 @@ Native and Wasm targets have independent backend paths from SSA onwards. The nat
 | Wasm backend (bytecode gen + linking) | Complete |
 | Native backend (CLIF IR → regalloc2 → ARM64/x64) | Complete |
 | ARC runtime (retain/release, destructor chains) | Complete |
-| 32-module standard library | Complete |
+| Generics (shape stenciling + dictionary dispatch) | Complete |
+| Concurrency (`spawn`, `Channel(T)`, `select`) | Complete |
+| 34-module standard library | Complete |
 | LSP server (7 features) | Complete |
 | VS Code/Cursor extension | Complete |
-| Self-hosted compiler (`self/`) | 65% — 15,012 lines, 217 tests |
+| Self-hosted compiler (`self/`) | ~70% — 21,264 lines, 237 tests |
 
 ## Why Cot
 

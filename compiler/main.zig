@@ -1283,6 +1283,24 @@ fn compileAndLink(
     compileAndLinkFull(allocator, input_file, output_name, compile_target, test_mode, quiet, test_filter, false, null, null, false, false, false, false);
 }
 
+const LinkerKind = enum { zig_cc, system_cc, none };
+
+fn findLinker(allocator: std.mem.Allocator) LinkerKind {
+    // Try zig first
+    if (canRunCommand(allocator, &.{ "zig", "version" })) return .zig_cc;
+    // Fall back to system cc
+    if (canRunCommand(allocator, &.{ "cc", "--version" })) return .system_cc;
+    return .none;
+}
+
+fn canRunCommand(allocator: std.mem.Allocator, argv: []const []const u8) bool {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    const result = child.spawnAndWait() catch return false;
+    return result.Exited == 0;
+}
+
 fn compileAndLinkFull(
     allocator: std.mem.Allocator,
     input_file: []const u8,
@@ -1402,12 +1420,19 @@ fn compileAndLinkFull(
         return;
     }
 
-    // Link with zig cc
+    // Link with zig cc, falling back to system cc for same-target linking
     const runtime_path = findRuntimePath(allocator, compile_target) catch null;
 
     var link_args = std.ArrayListUnmanaged([]const u8){};
 
-    if (compile_target.arch != Target.native().arch or compile_target.os != Target.native().os) {
+    const is_cross = compile_target.arch != Target.native().arch or compile_target.os != Target.native().os;
+    const linker = findLinker(allocator);
+
+    if (is_cross) {
+        if (linker != .zig_cc) {
+            std.debug.print("Error: cross-compilation requires 'zig'. Install from https://ziglang.org/download/\n", .{});
+            std.process.exit(1);
+        }
         const triple: []const u8 = switch (compile_target.os) {
             .linux => if (compile_target.arch == .amd64) "x86_64-linux-gnu" else "aarch64-linux-gnu",
             .macos => if (compile_target.arch == .arm64) "aarch64-macos" else "x86_64-macos",
@@ -1417,11 +1442,19 @@ fn compileAndLinkFull(
             std.debug.print("Error: Allocation failed\n", .{});
             std.process.exit(1);
         };
-    } else {
+    } else if (linker == .zig_cc) {
         link_args.appendSlice(allocator, &.{ "zig", "cc", "-o", output_name, obj_path }) catch {
             std.debug.print("Error: Allocation failed\n", .{});
             std.process.exit(1);
         };
+    } else if (linker == .system_cc) {
+        link_args.appendSlice(allocator, &.{ "cc", "-o", output_name, obj_path }) catch {
+            std.debug.print("Error: Allocation failed\n", .{});
+            std.process.exit(1);
+        };
+    } else {
+        std.debug.print("Error: no linker found. Install Zig (https://ziglang.org/download/) or a C compiler (gcc/clang).\n", .{});
+        std.process.exit(1);
     }
 
     // Shared library mode: add -shared flag

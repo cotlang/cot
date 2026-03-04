@@ -68,22 +68,20 @@ No existing language offers all of:
 
 ```cot
 struct User {
-    name: []u8
-    email: []u8
-}
+    name: string,
+    email: string,
 
-impl User {
-    fn display(self) []u8 {
-        return self.name + " <" + self.email + ">"
+    fn display(self: *User) string {
+        return self.name ++ " <" ++ self.email ++ ">"
     }
 }
 
-fn greet(name: []u8) []u8 {
-    return "Hello, " + name
+fn greet(name: string) string {
+    return "Hello, " ++ name
 }
 ```
 
-Familiar syntax. No semicolons. Traits and impl blocks. Type inference. No allocator parameters.
+Familiar syntax. No semicolons. Methods inside struct bodies. Type inference. No allocator parameters.
 
 ### 2. ARC Memory Management
 
@@ -217,12 +215,12 @@ Following the Deno model: Deno is written in Rust and runs TypeScript. It's not 
 
 ### Self-Hosting Strategy
 
-Self-hosting is a future goal, not a prerequisite. The plan:
+Self-hosting is actively in progress — 21,264 lines of Cot across 10 files (237 tests), covering ~70% of the frontend. The Zig compiler remains the production compiler while the self-hosted frontend matures.
 
-1. Ship Cot with the Zig compiler
+1. Ship Cot with the Zig compiler (current)
 2. Build real applications in Cot (cot.land, cot.dev)
-3. Stabilize the language
-4. Attempt self-hosting when the language is mature
+3. Complete self-hosted frontend, then backend
+4. Transition when the self-hosted compiler passes all tests
 
 Self-hosting is the graduation ceremony, not the entrance exam.
 
@@ -240,16 +238,16 @@ Both together prove the full-stack story — the same language, shared types, cl
 
 ## Execution Roadmap
 
-See [claude/ROADMAP_1_0.md](claude/ROADMAP_1_0.md) for the detailed roadmap.
+See [claude/ROADMAP.md](claude/ROADMAP.md) for the detailed roadmap.
 
 **Approach:** Zig-style versioning. Versions mark architectural milestones, not feature checklists. 1.0 will take multiple years, but Cot should be viable for projects well before 1.0.
 
 | Version | Theme | Key Deliverables |
 |---------|-------|-----------------|
-| 0.3 | Make the language real | All language features, stdlib, I/O |
-| 0.4 | Deno alternative | Formatter, HTTP server, errdefer, project system, LSP autocomplete |
-| 0.5 | Make it production-capable | Async, concurrency, web framework |
-| 0.6+ | Make it community-ready | Package manager, registry, cot.land |
+| 0.3 | Make the language real | All language features, stdlib, I/O, concurrency, generics optimization |
+| 0.4 | Distribution polish | Homebrew, VS Code marketplace, `cot upgrade`, shell completions |
+| 0.5 | Build real products | Package manager, web framework, database drivers |
+| 0.6+ | Make it community-ready | Package registry (cot.land), cross-compilation, test coverage |
 | 1.0 | Public release | Stable syntax, documentation, ecosystem |
 
 ---

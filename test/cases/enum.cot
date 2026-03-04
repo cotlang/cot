@@ -19,3 +19,27 @@ test "enum explicit value" {
     var s = CeStatus.Error
     @assertEq(s, 100)
 }
+
+// Regression: enum(u8) load/store must use sub-word ops, not full 8-byte load/store.
+// Without this fix, loading an enum(u8) field reads 8 bytes, pulling in adjacent fields.
+const CeFocus = enum(u8) { Query, Replace }
+
+struct CeState {
+    value: int,
+    focus: CeFocus,
+    flag: bool,
+}
+
+test "enum(u8) field load does not bleed into adjacent fields" {
+    var s = CeState { .value = 42, .focus = CeFocus.Query, .flag = true }
+    @assertEq(s.focus == CeFocus.Query, true)
+    @assertEq(s.flag, true)
+}
+
+test "enum(u8) field store does not corrupt adjacent fields" {
+    var s = CeState { .value = 42, .focus = CeFocus.Query, .flag = true }
+    s.focus = CeFocus.Replace
+    @assertEq(s.focus == CeFocus.Replace, true)
+    @assertEq(s.flag, true)
+    @assertEq(s.value, 42)
+}

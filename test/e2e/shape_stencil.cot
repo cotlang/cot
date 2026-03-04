@@ -1,0 +1,342 @@
+// Shape stenciling correctness tests.
+// Verifies that generic functions sharing the same shape (size, alignment, ARC kind)
+// produce correct results when shape-stenciled (deduplicated).
+
+// ============================================================================
+// Generic containers for testing shape deduplication
+// ============================================================================
+
+struct SBox(T) { value: T }
+struct SWrap(T) { data: T, tag: i64 }
+
+impl SBox(T) {
+    fn get(self: *SBox(T)) T {
+        return self.value
+    }
+
+    fn set(self: *SBox(T), v: T) void {
+        self.value = v
+    }
+}
+
+impl SWrap(T) {
+    fn getData(self: *SWrap(T)) T {
+        return self.data
+    }
+
+    fn getTag(self: *SWrap(T)) i64 {
+        return self.tag
+    }
+}
+
+// Free function generics (no impl block)
+fn sid(T)(x: T) T {
+    return x
+}
+
+fn smakeBox(T)(val: T) SBox(T) {
+    return SBox(T) { .value = val }
+}
+
+// ============================================================================
+// Tests: Same-shape value types produce correct results
+// ============================================================================
+
+test "shape stencil: i64 and u64 share shape s8n" {
+    // i64 and u64 both have shape (size=8, align=8, arc=none)
+    var a = SBox(i64) { .value = 42 }
+    var b = SBox(u64) { .value = 99 }
+    @assertEq(a.get(), 42)
+    @assertEq(b.get(), 99)
+    a.set(100)
+    b.set(200)
+    @assertEq(a.get(), 100)
+    @assertEq(b.get(), 200)
+}
+
+test "shape stencil: i32 and u32 share shape s4n" {
+    var a = SBox(i32) { .value = 10 }
+    var b = SBox(u32) { .value = 20 }
+    @assertEq(a.get(), 10)
+    @assertEq(b.get(), 20)
+    a.set(30)
+    b.set(40)
+    @assertEq(a.get(), 30)
+    @assertEq(b.get(), 40)
+}
+
+test "shape stencil: identity function across same-shape types" {
+    @assertEq(sid(i64)(42), 42)
+    @assertEq(sid(u64)(99), 99)
+    @assertEq(sid(i32)(10), 10)
+    @assertEq(sid(u32)(20), 20)
+}
+
+// ============================================================================
+// Tests: Wrapper with tagged data
+// ============================================================================
+
+test "shape stencil: wrapper across types" {
+    var wi = SWrap(i64) { .data = 42, .tag = 1 }
+    var wu = SWrap(u64) { .data = 99, .tag = 2 }
+    @assertEq(wi.getData(), 42)
+    @assertEq(wu.getData(), 99)
+    @assertEq(wi.getTag(), 1)
+    @assertEq(wu.getTag(), 2)
+}
+
+// ============================================================================
+// Tests: Different shapes stay separate
+// ============================================================================
+
+test "shape stencil: i64 and i32 have different shapes" {
+    // i64 is shape s8n, i32 is shape s4n — must NOT alias
+    var a = SBox(i64) { .value = 42 }
+    var b = SBox(i32) { .value = 10 }
+    @assertEq(a.get(), 42)
+    @assertEq(b.get(), 10)
+}
+
+// ============================================================================
+// Tests: makeBox free function
+// ============================================================================
+
+test "shape stencil: makeBox free function" {
+    var b1 = smakeBox(i64)(42)
+    var b2 = smakeBox(u64)(99)
+    @assertEq(b1.value, 42)
+    @assertEq(b2.value, 99)
+}
+
+// ============================================================================
+// Tests: Multiple instances with mixed stencilable/non-stencilable
+// ============================================================================
+
+fn sadd(T)(a: T, b: T) T {
+    return a + b
+}
+
+test "shape stencil: type-dependent ops monomorphize correctly" {
+    // sadd uses + on T — type-dependent, but now dict-stenciled (Tier 2)
+    @assertEq(sadd(i64)(10, 20), 30)
+    @assertEq(sadd(i32)(3, 4), 7)
+}
+
+// ============================================================================
+// Tests: Dictionary dispatch (Tier 2) — binary ops on T
+// ============================================================================
+
+// Dict-stencil: equality across same-shape types
+fn seq(T)(a: T, b: T) bool { return a == b }
+test "dict stencil: equality function shares across i64/u64" {
+    @assertEq(seq(i64)(42, 42), true)
+    @assertEq(seq(u64)(99, 100), false)
+    @assertEq(seq(i64)(0, 0), true)
+    @assertEq(seq(u64)(1, 1), true)
+}
+
+// Dict-stencil: comparison
+fn slt(T)(a: T, b: T) bool { return a < b }
+test "dict stencil: less-than shares across i64/u64" {
+    @assertEq(slt(i64)(1, 2), true)
+    @assertEq(slt(u64)(5, 3), false)
+}
+
+// Dict-stencil: arithmetic
+fn sadd_d(T)(a: T, b: T) T { return a + b }
+test "dict stencil: addition shares across i64/u64" {
+    @assertEq(sadd_d(i64)(10, 20), 30)
+    @assertEq(sadd_d(u64)(100, 200), 300)
+}
+
+// Dict-stencil: struct method using eq on T
+struct SEqBox(T) { value: T }
+impl SEqBox(T) {
+    fn eq(self: *SEqBox(T), other: T) bool { return self.value == other }
+}
+test "dict stencil: method with equality on T" {
+    var a = SEqBox(i64) { .value = 42 }
+    var b = SEqBox(u64) { .value = 99 }
+    @assertEq(a.eq(42), true)
+    @assertEq(a.eq(43), false)
+    @assertEq(b.eq(99), true)
+}
+
+// Mixed tiers: shape-only + dict-stencil on same type
+struct SPair(T) { first: T, second: T }
+impl SPair(T) {
+    fn getFirst(self: *SPair(T)) T { return self.first }
+    fn areEqual(self: *SPair(T)) bool { return self.first == self.second }
+}
+test "dict stencil: mixed tiers on same generic type" {
+    var p1 = SPair(i64) { .first = 10, .second = 10 }
+    var p2 = SPair(u64) { .first = 5, .second = 6 }
+    @assertEq(p1.getFirst(), 10)
+    @assertEq(p2.getFirst(), 5)
+    @assertEq(p1.areEqual(), true)
+    @assertEq(p2.areEqual(), false)
+}
+
+// Dict-stencil: greater-than
+fn sgt(T)(a: T, b: T) bool { return a > b }
+test "dict stencil: greater-than" {
+    @assertEq(sgt(i64)(5, 3), true)
+    @assertEq(sgt(u64)(1, 2), false)
+}
+
+// Dict-stencil: not-equal
+fn sneq(T)(a: T, b: T) bool { return a != b }
+test "dict stencil: not-equal" {
+    @assertEq(sneq(i64)(1, 2), true)
+    @assertEq(sneq(u64)(5, 5), false)
+}
+
+// Dict-stencil: subtraction
+fn ssub_d(T)(a: T, b: T) T { return a - b }
+test "dict stencil: subtraction shares across i64/u64" {
+    @assertEq(ssub_d(i64)(30, 10), 20)
+    @assertEq(ssub_d(u64)(100, 25), 75)
+}
+
+// Dict-stencil: multiplication
+fn smul_d(T)(a: T, b: T) T { return a * b }
+test "dict stencil: multiplication shares across i64/u64" {
+    @assertEq(smul_d(i64)(3, 4), 12)
+    @assertEq(smul_d(u64)(5, 6), 30)
+}
+
+// Dict-stencil: multiple ops in one function
+fn smax(T)(a: T, b: T) T {
+    if (a > b) { return a }
+    return b
+}
+test "dict stencil: max function with comparison on T" {
+    @assertEq(smax(i64)(3, 7), 7)
+    @assertEq(smax(u64)(10, 5), 10)
+    @assertEq(smax(i64)(42, 42), 42)
+}
+
+// ============================================================================
+// Tests: Float/int shape separation (critical: different register classes)
+// ============================================================================
+
+fn seq_ri(T)(a: T, b: T) bool { return a == b }
+test "dict stencil: f64 and i64 must NOT share stencil" {
+    // f64 and i64 both 8 bytes, but different register classes (FPR vs GPR).
+    // Must NOT alias — would produce wrong comparison instructions.
+    @assertEq(seq_ri(i64)(42, 42), true)
+    @assertEq(seq_ri(i64)(1, 2), false)
+    @assertEq(seq_ri(f64)(3.14, 3.14), true)
+    @assertEq(seq_ri(f64)(1.0, 2.0), false)
+}
+
+fn sadd_ri(T)(a: T, b: T) T { return a + b }
+test "dict stencil: f64 arithmetic separate from i64" {
+    @assertEq(sadd_ri(i64)(10, 20), 30)
+    @assertEq(sadd_ri(f64)(1.5, 2.5), 4.0)
+}
+
+fn slt_ri(T)(a: T, b: T) bool { return a < b }
+test "dict stencil: f64 comparison separate from i64" {
+    @assertEq(slt_ri(i64)(1, 2), true)
+    @assertEq(slt_ri(f64)(1.5, 0.5), false)
+    @assertEq(slt_ri(f64)(0.1, 0.2), true)
+}
+
+// ============================================================================
+// Tests: Signed vs unsigned correctness
+// ============================================================================
+
+test "dict stencil: signed vs unsigned comparison correctness" {
+    // For positive values, signed and unsigned < should agree
+    @assertEq(slt(i64)(1, 2), true)
+    @assertEq(slt(u64)(1, 2), true)
+    @assertEq(slt(i64)(5, 3), false)
+    @assertEq(slt(u64)(5, 3), false)
+}
+
+// ============================================================================
+// Tests: Multiple dict entries in one function
+// ============================================================================
+
+fn sclamp(T)(val: T, lo: T, hi: T) T {
+    if (val < lo) { return lo }
+    if (val > hi) { return hi }
+    return val
+}
+test "dict stencil: clamp with two comparison ops" {
+    @assertEq(sclamp(i64)(5, 1, 10), 5)
+    @assertEq(sclamp(i64)(0, 1, 10), 1)
+    @assertEq(sclamp(i64)(15, 1, 10), 10)
+    @assertEq(sclamp(u64)(5, 1, 10), 5)
+    @assertEq(sclamp(u64)(0, 1, 10), 1)
+}
+
+// ============================================================================
+// Tests: Method call dict dispatch (Tier 2)
+// ============================================================================
+
+// Two structs with same shape (8 bytes each) but different methods
+struct SMethA { x: i64 }
+struct SMethB { y: i64 }
+impl SMethA {
+    fn getVal(self: *SMethA) i64 { return self.x }
+    fn setVal(self: *SMethA, v: i64) void { self.x = v }
+    fn isZero(self: *SMethA) bool { return self.x == 0 }
+}
+impl SMethB {
+    fn getVal(self: *SMethB) i64 { return self.y }
+    fn setVal(self: *SMethB, v: i64) void { self.y = v }
+    fn isZero(self: *SMethB) bool { return self.y == 0 }
+}
+
+fn callGetVal(T)(ptr: *T) i64 {
+    return ptr.getVal()
+}
+test "dict stencil: method call on *T shares across same-shape structs" {
+    var a = SMethA { .x = 42 }
+    var b = SMethB { .y = 99 }
+    @assertEq(callGetVal(SMethA)(&a), 42)
+    @assertEq(callGetVal(SMethB)(&b), 99)
+}
+
+fn callSetAndGet(T)(ptr: *T, v: i64) i64 {
+    ptr.setVal(v)
+    return ptr.getVal()
+}
+test "dict stencil: multiple method calls on *T" {
+    var a = SMethA { .x = 0 }
+    var b = SMethB { .y = 0 }
+    @assertEq(callSetAndGet(SMethA)(&a, 10), 10)
+    @assertEq(callSetAndGet(SMethB)(&b, 20), 20)
+}
+
+fn callIsZero(T)(ptr: *T) bool {
+    return ptr.isZero()
+}
+test "dict stencil: method returning bool on *T" {
+    var a = SMethA { .x = 0 }
+    var b = SMethB { .y = 5 }
+    @assertEq(callIsZero(SMethA)(&a), true)
+    @assertEq(callIsZero(SMethB)(&b), false)
+}
+
+// 4-byte structs to test different shape group
+struct SMeth32A { x: i32 }
+struct SMeth32B { y: i32 }
+impl SMeth32A {
+    fn getVal(self: *SMeth32A) i32 { return self.x }
+}
+impl SMeth32B {
+    fn getVal(self: *SMeth32B) i32 { return self.y }
+}
+
+fn callGetVal32(T)(ptr: *T) i32 {
+    return ptr.getVal()
+}
+test "dict stencil: method call on *T with 4-byte shape" {
+    var a = SMeth32A { .x = 10 }
+    var b = SMeth32B { .y = 20 }
+    @assertEq(callGetVal32(SMeth32A)(&a), 10)
+    @assertEq(callGetVal32(SMeth32B)(&b), 20)
+}

@@ -8,20 +8,30 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- **Shape stenciling + dictionary dispatch**: Three-tier generic optimization — shape-only (62%), dict-stenciled with fn-ptr args (30%), full monomorphization (8%). ~92% of generic function bodies shared across types with same shape.
+
+## [0.3.5] - 2026-03-04
+
+### Added
+- **Concurrency system**: Go-style `spawn {}` blocks, `Channel(T)` with send/recv/tryRecv/trySend/len, `select` statement for channel multiplexing, work-stealing scheduler (Chase-Lev deques)
+- **`std/channel`**: Typed channel module for concurrent communication
+- **`std/sqlite`**: SQLite bindings
+- **Inferred impl**: Methods declared directly inside struct and enum bodies (preferred over separate `impl` blocks)
+- **`c_sources`/`c_flags` in cot.json**: Bundle C source files for cross-compilation via `zig cc`
 - **`++` concat operator (Zig parity)**: Works on strings, arrays (`[N]T ++ [M]T → [N+M]T`), and slices (`[]T ++ []T → []T`). `+` on strings/arrays/slices is now an error in normal mode (use `++`); in `@safe` mode, `+` auto-desugars to `++`
-- **`@safe` auto-ref**: Structs passed by reference automatically — no `&` needed. `foo(myStruct)` passes the original, mutations visible to caller. TypeScript/C#-style object semantics.
-- **Self-hosted frontend complete** (10,896 lines): Scanner, parser (2,769 lines), type registry (1,256 lines), and checker (3,966 lines) all ported to Cot. The self-hosted binary can parse all its own source files. 142+ self-hosted tests pass on native + wasm32.
+- **`@safe` auto-ref**: Structs passed by reference automatically — no `&` needed. `foo(myStruct)` passes the original, mutations visible to caller
+- **Self-hosted compiler progress**: 21,264 lines across 10 files, 237 tests. IR builder complete, lowerer ~66% ported, all 10 parity phases done.
 - CI/CD pipeline with GitHub Actions (test on every commit, release on tag)
-- Pre-built binaries for macOS (ARM64, x64) and Linux (x64)
-- Curl installer: `curl -fsSL https://raw.githubusercontent.com/cotlang/cot/main/install.sh | sh`
+- Pre-built binaries for macOS (ARM64) and Linux (x64)
 
 ### Fixed
-- **`@safe` auto-ref correctness**: Auto-ref now takes address of original local variable instead of creating a temporary copy. Previously, mutations through pointer params didn't propagate back to the caller.
-- **Chained pointer field access**: `outer.scanner.pos` where `scanner` is `*Inner` now correctly loads the pointer value before field access (was returning pointer address instead of field value).
-- **SSA schedule pass**: Added IR-level sized load/store ops (load8..load64, store8..store64) to memory ordering chain. Previously only Wasm-level ops were checked (dead code since schedule runs before lower_wasm).
-- **Char literal type**: Char literals in match arms now correctly typed as I64 (was U8, causing type mismatch with switch target).
-- **Union switch void arms**: Per-arm void checking in `lowerUnionSwitch` — only emit `storeLocal` for non-void arms instead of force-VOID for entire switch.
-- **Compound optional `sizeOf`**: Changed from hardcoded 16 to `8 + payload_size` for correct optional sizing with different payload types.
+- **u8/i8 sign-extension**: Unsigned types use `uextend`, signed use `sextend` in SSA and CLIF
+- **Catch block fall-through**: `lowerCatchExpr` uses `fb.needsTerminator()` instead of `fallback_is_noreturn` flag
+- **ARC heap magic guard**: `retain`/`release` check magic sentinel before touching refcounts — stack pointers from `&expr` become safe no-ops
+- **Global var init**: Go init function pattern (`__cot_init_globals`) generated per-file
+- **`@safe` auto-ref correctness**: Auto-ref takes address of original local variable instead of creating a temporary copy
+- **Compound optional `sizeOf`**: Changed from hardcoded 16 to `8 + payload_size`
+- **Wasm codegen**: u32 load mapped to correct `wasm_i32_load` op
 
 ## [0.3.2] - 2026-02-21
 
@@ -105,7 +115,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - LSP server (`cot lsp`): diagnostics, hover, goto-def, document symbols, semantic tokens
 - VS Code/Cursor extension with syntax highlighting + LSP client
 
-[Unreleased]: https://github.com/cotlang/cot/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/cotlang/cot/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/cotlang/cot/compare/v0.3.2...v0.3.5
 [0.3.2]: https://github.com/cotlang/cot/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/cotlang/cot/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/cotlang/cot/releases/tag/v0.3.0

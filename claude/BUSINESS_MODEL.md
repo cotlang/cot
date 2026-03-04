@@ -92,7 +92,7 @@ Cot is not competing with systems languages (Zig, Rust) or scripting languages (
 | Deno | Deno runtime (MIT) | Cloud platform ($21M raised) |
 | JetBrains | Kotlin (Apache) | IDE subscriptions |
 
-**Key insight:** Bun was acquired by Anthropic for ~$1B despite being MIT-licensed. Open source doesn't prevent value creation — the value is in team expertise, community momentum, and technology lead.
+**Key insight:** Open source doesn't prevent value creation — the value is in team expertise, community momentum, and technology lead.
 
 ---
 

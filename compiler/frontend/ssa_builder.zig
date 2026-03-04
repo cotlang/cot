@@ -47,6 +47,12 @@ pub const SSABuilder = struct {
     /// Maps IR local_idx → frame slot offset (in 8-byte units).
     /// Accounts for multi-word locals (structs, tuples) occupying multiple slots.
     local_slot_offsets: []u32,
+    /// Shape stenciling: maps concrete generic names → stenciled function names.
+    /// Resolved in convertCall so aliased functions redirect to the shared stencil.
+    shape_aliases: ?*const std.StringHashMap([]const u8) = null,
+    /// Dict dispatch: maps concrete generic name → list of dict helper fn names (extra args).
+    /// When a call targets a dict-stenciled function, these fn-ptr args are prepended.
+    dict_arg_names: ?*const std.StringHashMap([]const []const u8) = null,
 
     const LoopContext = struct { continue_block: *Block, break_block: *Block };
 
@@ -938,8 +944,24 @@ pub const SSABuilder = struct {
     }
 
     fn convertCall(self: *SSABuilder, func_name: []const u8, args: []const ir.NodeIndex, type_idx: TypeIndex, cur: *Block) !*Value {
+        // Shape stenciling: resolve aliased function names to their stenciled version
+        const resolved_name = if (self.shape_aliases) |aliases| aliases.get(func_name) orelse func_name else func_name;
         const call_val = try self.func.newValue(.static_call, type_idx, cur, self.cur_pos);
-        call_val.aux = .{ .string = func_name };
+        call_val.aux = .{ .string = resolved_name };
+
+        // Dict dispatch: inject fn-ptr args for dict-stenciled functions.
+        // func_name (not resolved_name) is the concrete name that has dict entries.
+        if (self.dict_arg_names) |dan| {
+            if (dan.get(func_name)) |helper_names| {
+                for (helper_names) |helper_name| {
+                    const addr_val = try self.func.newValue(.addr, TypeRegistry.I64, cur, self.cur_pos);
+                    addr_val.aux = .{ .string = helper_name };
+                    try cur.addValue(self.allocator, addr_val);
+                    try call_val.addArgAlloc(addr_val, self.allocator);
+                }
+            }
+        }
+
         for (args) |arg_idx| {
             const arg_val = try self.convertNode(arg_idx) orelse return error.MissingValue;
             try self.addCallArg(call_val, arg_val, cur);
@@ -1414,6 +1436,10 @@ pub const SSABuilder = struct {
                 else => .load,
             };
         }
+        // Enum types: delegate to backing type (e.g. enum(u8) → load8)
+        if (type_info == .enum_type) {
+            return self.getLoadOp(type_info.enum_type.backing_type);
+        }
         return .load;
     }
 
@@ -1428,6 +1454,10 @@ pub const SSABuilder = struct {
                 .i32_type, .u32_type, .f32_type => .store32,
                 else => .store,
             };
+        }
+        // Enum types: delegate to backing type (e.g. enum(u8) → store8)
+        if (type_info == .enum_type) {
+            return self.getStoreOp(type_info.enum_type.backing_type);
         }
         return .store;
     }

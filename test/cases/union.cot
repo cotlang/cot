@@ -41,3 +41,25 @@ test "union switch capture" {
     }
     @assertEq(result, 42)
 }
+
+// Regression: enum payload extraction via function.
+// Default enum backing is I32 (4 bytes). Without ssaTypeToClifType handling
+// enum_type, .load ops read 8 bytes from a 4-byte store, pulling garbage.
+const CuKind = enum { invalid, alpha, beta, gamma, delta }
+struct CuPt { x: int }
+union CuTagged { kind: CuKind, point: CuPt }
+
+fn cu_extract_kind(t: CuTagged) int {
+    return switch (t) { CuTagged.kind |k| => k as int, else => -1 }
+}
+
+test "union enum payload via function" {
+    @assertEq(cu_extract_kind(CuTagged.kind(CuKind.beta)), 2)
+    @assertEq(cu_extract_kind(CuTagged.kind(CuKind.delta)), 4)
+}
+
+test "union enum payload inline" {
+    const t = CuTagged.kind(CuKind.gamma)
+    const val = switch (t) { CuTagged.kind |k| => k as int, else => -1 }
+    @assertEq(val, 3)
+}

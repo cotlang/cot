@@ -95,7 +95,7 @@ The cottage metaphor extends naturally through the entire product:
 
 ---
 
-## Current State Audit (0.3.4)
+## Current State Audit (0.3.5)
 
 ### What Works Well
 
@@ -257,7 +257,7 @@ Before tagging 0.4, all of these must be true:
 11. Shell completions work for zsh and bash
 12. ~~At least `std/path`, `std/crypto`, `std/cli`, `std/process` are added~~ **Done** (all 11 Wave 6 stdlib modules)
 13. ~~Doc comments (`///`) are parsed and stored~~ **Done** (11e676f)
-14. ~~All existing tests still pass on both native and Wasm targets~~ **Done** (71/71 native, CI green)
+14. ~~All existing tests still pass on both native and Wasm targets~~ **Done** (73/73 native, CI green)
 15. ~~CI/CD: automated testing on push, release binaries on tag~~ **Done** (test.yml + release.yml)
 
 ### Remaining Work for 0.4
@@ -300,7 +300,7 @@ All language features, stdlib modules, and tooling (Waves 4-6) are **DONE**. CI/
 
 | Category | Features |
 |----------|----------|
-| Concurrency | `spawn {}` blocks, `Channel(T)`, `select`, work-stealing scheduler |
+| ~~Concurrency~~ | ~~`spawn {}` blocks, `Channel(T)`, `select`, work-stealing scheduler~~ **DONE in 0.3.5** |
 | Safety | Permission system (`--allow-read`, `--allow-net`), atomic ARC |
 | Observability | Built-in OpenTelemetry, auto-instrument HTTP |
 | Performance | SIMD vectors, incremental compilation |
@@ -313,7 +313,7 @@ All language features, stdlib modules, and tooling (Waves 4-6) are **DONE**. CI/
 | Feature | Reason | When |
 |---------|--------|------|
 | REPL | Compiled language, low priority (Zig doesn't have one) | Maybe never |
-| Self-hosting | Active — scanner+AST done (2,054 LOC), parser next. See `VERSION_TRAJECTORY.md` | 0.10 target |
+| Self-hosting | Active — 21,264 LOC across 10 files (237 tests), ~70% of frontend ported. See `VERSION_TRAJECTORY.md` | 0.10 target |
 | `cot deploy` | Needs infrastructure (cot.land) first | 0.6+ |
 | Jupyter kernel | Niche | Maybe never |
 | JUnit XML export | CI integration, low priority | 0.5 |

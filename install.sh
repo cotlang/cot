@@ -2,14 +2,18 @@
 set -e
 
 # Cot installer — downloads pre-built binary from GitHub Releases.
+# Also installs Zig (required for linking until cot is self-hosted).
+#
 # Usage: curl -fsSL https://raw.githubusercontent.com/cotlang/cot/main/install.sh | sh
 #
 # Environment variables:
 #   COT_INSTALL_DIR  Override install location (default: ~/.cot)
 #   COT_VERSION      Pin to specific version (default: latest)
+#   ZIG_VERSION      Pin Zig version (default: 0.15.2)
 
 COT_DIR="${COT_INSTALL_DIR:-$HOME/.cot}"
 BIN_DIR="$COT_DIR/bin"
+ZIG_VERSION="${ZIG_VERSION:-0.15.2}"
 
 OS=$(uname -s)
 ARCH=$(uname -m)
@@ -46,6 +50,30 @@ curl -fsSL "$URL" | tar -xz -C "$COT_DIR"
 chmod +x "$BIN_DIR/cot"
 
 echo "Cot ${COT_VERSION} installed to ${BIN_DIR}/cot"
+
+# Install Zig (needed for linking)
+if command -v zig >/dev/null 2>&1; then
+    echo "Zig already installed: $(zig version)"
+else
+    # Map to Zig's naming convention
+    case "$OS_NAME" in
+        macos) ZIG_OS="macos" ;;
+        linux) ZIG_OS="linux" ;;
+    esac
+    ZIG_ARCH="$ARCH_NAME"
+
+    ZIG_TARBALL="zig-${ZIG_OS}-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
+    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
+    ZIG_DIR="$COT_DIR/zig"
+
+    echo "Installing zig ${ZIG_VERSION}..."
+    rm -rf "$ZIG_DIR"
+    mkdir -p "$ZIG_DIR"
+    curl -fsSL "$ZIG_URL" | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+    ln -sf "$ZIG_DIR/zig" "$BIN_DIR/zig"
+    echo "Zig ${ZIG_VERSION} installed to ${ZIG_DIR}/zig"
+fi
+
 echo ""
 
 # Check if BIN_DIR is already in PATH

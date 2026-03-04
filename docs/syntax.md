@@ -492,6 +492,39 @@ const data = await fetchData("http://example.com") catch "fallback"
 - Wasm: Rust-style stackless state machine (constructor + poll function)
 - Native: Zig-style eager evaluation (body runs as normal function)
 
+## Concurrency
+
+```cot
+import "std/channel"
+
+// spawn — launch a lightweight task (Go-style goroutine)
+spawn {
+    println("hello from spawned task")
+}
+
+// Channel(T) — typed communication between tasks
+var ch = Channel(i64).init(10)    // buffered channel (capacity 10)
+
+spawn {
+    ch.send(42)
+}
+var value = ch.recv()             // blocks until value available
+
+// tryRecv / trySend — non-blocking variants
+var result = ch.tryRecv()         // returns ?T (null if empty)
+var ok = ch.trySend(99)           // returns bool (false if full)
+
+// select — multiplex across channels (Go-style)
+var ch1 = Channel(i64).init(1)
+var ch2 = Channel(string).init(1)
+ch1.send(42)
+
+select {
+    ch1.recv() => |val| { println("int: ${val}") },
+    ch2.recv() => |msg| { println("str: ${msg}") },
+}
+```
+
 ## Closures / Anonymous Functions
 
 ```cot
@@ -917,7 +950,9 @@ import "std/list"          // stdlib modules
 | `process` | `import "std/process"` | run, output — high-level process spawning (native only, uses fork/exec) |
 | `regex` | `import "std/regex"` | Regex struct — match, matchAll, replace, split, test (Thompson NFA) |
 | `testing` | `import "std/testing"` | assertContains, assertStartsWith, assertGt, assertTrue, assertLen |
-| `thread` | `import "std/thread"` | Thread, Mutex, Cond, Atomic(T), Channel(T) — native threading primitives |
+| `thread` | `import "std/thread"` | Thread, Mutex, Cond, Atomic(T) — native threading primitives |
+| `channel` | `import "std/channel"` | Channel(T) — typed channels with send/recv/tryRecv/trySend/len |
+| `sqlite` | `import "std/sqlite"` | SQLite bindings |
 
 ## @safe Mode
 

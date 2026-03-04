@@ -9,7 +9,7 @@ Cot uses inline test blocks (Zig syntax) with error-union-based test isolation. 
 | Tier | Command | What it runs | Speed |
 |------|---------|-------------|-------|
 | **Zig compiler tests** | `zig build test` | ~163 Zig-level tests with inline Cot snippets | Fast (<10s) |
-| **Cot language tests** | `./test/run_all.sh` | ~1,670 Cot tests across 72 `.cot` files (71/71 passing) | Slower (~60s) |
+| **Cot language tests** | `./test/run_all.sh` | ~1,738 Cot tests across 73 `.cot` files (73/73 passing) | Slower (~60s) |
 | **Single file** | `cot test file.cot` | Tests in one file | Fast |
 
 ### `zig build test` — Compiler internals
@@ -36,7 +36,7 @@ Discovers all `.cot` files in `test/e2e/` and `test/cases/`, runs each with `cot
 # ...
 # test/cases/arithmetic.cot                    ok  10 passed
 # ...
-# 71/71 files passed
+# 73/73 files passed
 ```
 
 ## Syntax
@@ -124,7 +124,7 @@ test/
     extern.cot, float.cot, functions.cot, loops.cot, memory.cot,
     methods.cot, optional.cot, strings.cot, structs.cot, switch.cot,
     types.cot, union.cot
-  e2e/                  # Comprehensive feature tests (50 files, ~1,540+ tests)
+  e2e/                  # Comprehensive feature tests (51 files, ~1,600+ tests)
     arc.cot, async.cot, auto_free.cot, bench_test.cot,
     browser_async.cot, cli.cot, control_flow.cot, crypto.cot,
     debug.cot, dotenv.cot, encoding.cot, event_loop.cot,
@@ -137,7 +137,8 @@ test/
     string_interp.cot, string_map.cot, string_methods.cot,
     testing_utils.cot, thread_basic.cot, threading.cot,
     types.cot, url.cot, uuid.cot,
-    variables.cot, wasi_io.cot, wasmgc.cot
+    variables.cot, wasi_io.cot, wasmgc.cot,
+    shape_stencil.cot
   test_inline.cot       # Manual smoke test
   browser/              # Pre-compiled Wasm for manual browser testing
 ```
