@@ -1509,6 +1509,18 @@ fn compileAndLinkFull(
         }
     }
 
+    // Resolve rpaths from cot.json "rpath" array — convert relative paths to absolute
+    // so that binaries run from /tmp/cot-run/ can still find dylibs at their original locations.
+    if (project_config) |*pc| {
+        if (pc.getRpaths(allocator)) |rpaths| {
+            for (rpaths) |rp| {
+                const abs = std.fs.cwd().realpathAlloc(allocator, rp) catch rp;
+                const flag = std.fmt.allocPrint(allocator, "-Wl,-rpath,{s}", .{abs}) catch continue;
+                link_args.append(allocator, flag) catch {};
+            }
+        }
+    }
+
     var child = std.process.Child.init(link_args.items, allocator);
     const result = child.spawnAndWait() catch |e| {
         std.debug.print("Linker failed: {any}\n", .{e});

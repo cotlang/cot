@@ -52,120 +52,62 @@ struct Symbol {
     is_export: bool,
     used: bool,
     source_tree: int,        // Opaque identifier for defining AST (0 = current/none)
+
+    /// Base constructor — all factory functions delegate here.
+    static fn base(name: string, type_idx: int, node: int, kind: int) Symbol {
+        return Symbol {
+            name: name,
+            type_idx: type_idx,
+            node: node,
+            mutable: false,
+            is_func: false,
+            is_type: false,
+            is_const_val: false,
+            const_value: 0,
+            float_const_value: 0,
+            kind: kind,
+            is_extern: false,
+            is_export: false,
+            used: false,
+            source_tree: 0,
+        }
+    }
 }
 
 fn makeSymbol(name: string, type_idx: int, node: int, mutable: bool) Symbol {
-    return Symbol {
-        name: name,
-        type_idx: type_idx,
-        node: node,
-        mutable: mutable,
-        is_func: false,
-        is_type: false,
-        is_const_val: false,
-        const_value: 0,
-        float_const_value: 0,
-        kind: SYM_VARIABLE,
-        is_extern: false,
-        is_export: false,
-        used: false,
-        source_tree: 0,
-    }
+    var sym = Symbol.base(name, type_idx, node, SYM_VARIABLE)
+    sym.mutable = mutable
+    return sym
 }
 
 fn makeFuncSymbol(name: string, type_idx: int, node: int) Symbol {
-    return Symbol {
-        name: name,
-        type_idx: type_idx,
-        node: node,
-        mutable: false,
-        is_func: true,
-        is_type: false,
-        is_const_val: false,
-        const_value: 0,
-        float_const_value: 0,
-        kind: SYM_FUNCTION,
-        is_extern: false,
-        is_export: false,
-        used: false,
-        source_tree: 0,
-    }
+    var sym = Symbol.base(name, type_idx, node, SYM_FUNCTION)
+    sym.is_func = true
+    return sym
 }
 
 fn makeExternFuncSymbol(name: string, type_idx: int, node: int) Symbol {
-    return Symbol {
-        name: name,
-        type_idx: type_idx,
-        node: node,
-        mutable: false,
-        is_func: true,
-        is_type: false,
-        is_const_val: false,
-        const_value: 0,
-        float_const_value: 0,
-        kind: SYM_FUNCTION,
-        is_extern: true,
-        is_export: false,
-        used: false,
-        source_tree: 0,
-    }
+    var sym = Symbol.base(name, type_idx, node, SYM_FUNCTION)
+    sym.is_func = true
+    sym.is_extern = true
+    return sym
 }
 
 fn makeTypeSymbol(name: string, type_idx: int, node: int) Symbol {
-    return Symbol {
-        name: name,
-        type_idx: type_idx,
-        node: node,
-        mutable: false,
-        is_func: false,
-        is_type: true,
-        is_const_val: false,
-        const_value: 0,
-        float_const_value: 0,
-        kind: SYM_TYPE,
-        is_extern: false,
-        is_export: false,
-        used: false,
-        source_tree: 0,
-    }
+    var sym = Symbol.base(name, type_idx, node, SYM_TYPE)
+    sym.is_type = true
+    return sym
 }
 
 fn makeConstSymbol(name: string, type_idx: int, node: int, value: int) Symbol {
-    return Symbol {
-        name: name,
-        type_idx: type_idx,
-        node: node,
-        mutable: false,
-        is_func: false,
-        is_type: false,
-        is_const_val: true,
-        const_value: value,
-        float_const_value: 0,
-        kind: SYM_CONSTANT,
-        is_extern: false,
-        is_export: false,
-        used: false,
-        source_tree: 0,
-    }
+    var sym = Symbol.base(name, type_idx, node, SYM_CONSTANT)
+    sym.is_const_val = true
+    sym.const_value = value
+    return sym
 }
 
 fn makeParamSymbol(name: string, type_idx: int, node: int) Symbol {
-    return Symbol {
-        name: name,
-        type_idx: type_idx,
-        node: node,
-        mutable: false,
-        is_func: false,
-        is_type: false,
-        is_const_val: false,
-        const_value: 0,
-        float_const_value: 0,
-        kind: SYM_PARAMETER,
-        is_extern: false,
-        is_export: false,
-        used: false,
-        source_tree: 0,
-    }
+    return Symbol.base(name, type_idx, node, SYM_PARAMETER)
 }
 
 // ============================================================================
@@ -428,14 +370,14 @@ struct Checker {
 
     fn isDefined(name: string) bool {
         var map = self.getScopeMap(self.current_scope)
-        return map.has(name) != 0
+        return map.contains(name)
     }
 
     fn lookupSymbol(name: string) int {
         var scope_idx = self.current_scope
         while (scope_idx >= 0) {
             var map = self.getScopeMap(scope_idx)
-            if (map.has(name) != 0) {
+            if (map.contains(name)) {
                 const sym_idx = map.get(name)
                 // Mark as used for lint checks
                 self.getSymbol(sym_idx).used = true
@@ -815,7 +757,7 @@ struct Checker {
             const target_type = it.target_type
 
             // Validate trait exists
-            if (self.trait_defs.has(trait_name) == 0) {
+            if (!self.trait_defs.contains(trait_name)) {
                 self.reportError(idx, ErrorCode.e301, "undefined trait")
                 return
             }
@@ -1547,7 +1489,7 @@ struct Checker {
         if (idx == null_node) { return invalid_type }
 
         // During generic instantiation, skip cache — shared AST nodes need fresh checking
-        if (!self.hasTypeSubstitution() and self.expr_types.has(idx) != 0) {
+        if (!self.hasTypeSubstitution() and self.expr_types.contains(idx)) {
             return self.expr_types.get(idx)
         }
 
@@ -1613,7 +1555,7 @@ struct Checker {
         if (sym_idx >= 0) {
             const sym = self.getSymbol(sym_idx)
             // Generic function used without type args (Zig ref: checker.zig:1550-1553)
-            if (self.generic_functions.has(name) != 0 and !self.hasTypeSubstitution()) {
+            if (self.generic_functions.contains(name) and !self.hasTypeSubstitution()) {
                 self.reportError(idx, ErrorCode.e300, "generic function '${name}' requires type arguments")
                 return invalid_type
             }
@@ -1859,7 +1801,7 @@ struct Checker {
                 return INT
             }
             // Generic function instantiation: max(i64) where max is generic
-            if (self.generic_functions.has(name) != 0) {
+            if (self.generic_functions.contains(name)) {
                 return self.instantiateGenericFunc(idx, name)
             }
         }
@@ -1949,7 +1891,7 @@ struct Checker {
         var field_name = ""
         switch (self.ast.getNode(callee_idx)) { Node.expr |e| => switch (e) { Expr.field_access |fa| => { base_n = fa.base; field_name = fa.field }, else => {} }, else => {} }
 
-        if (self.expr_types.has(base_n) == 0) { return -1 }
+        if (!self.expr_types.contains(base_n)) { return -1 }
         var base_type = self.expr_types.get(base_n)
 
         // Auto-deref pointers
@@ -3738,7 +3680,7 @@ struct Checker {
     /// Cross-file: swaps self.ast to defining file's AST (Zig: self.tree = gen_info.tree).
     fn resolveGenericInstance(idx: int, gi_name: string) int {
         // Look up generic struct definition
-        if (self.generic_structs.has(gi_name) == 0) {
+        if (!self.generic_structs.contains(gi_name)) {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
@@ -3780,7 +3722,7 @@ struct Checker {
 
         // Build cache key and check cache
         const cache_key = self.buildGenericCacheKey(gi_name, resolved_args)
-        if (self.instantiation_cache.has(cache_key) != 0) {
+        if (self.instantiation_cache.contains(cache_key)) {
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             return self.instantiation_cache.get(cache_key)
@@ -3978,7 +3920,7 @@ struct Checker {
                 if (@lenOf(bound_name) > 0) {
                     const type_name = self.types.typeName(resolved_args.get(bi))
                     const impl_key = "${bound_name}:${type_name}"
-                    if (self.trait_impls.has(impl_key) == 0) {
+                    if (!self.trait_impls.contains(impl_key)) {
                         self.ast = saved_ast
                         self.safe_mode = saved_safe_mode
                         self.reportError(idx, ErrorCode.e300, "type does not satisfy trait bound")
@@ -4047,7 +3989,7 @@ struct Checker {
     /// Resolve generic struct init: Pair(int, string) { .a = 1, .b = "hi" }
     /// Cross-file: swaps self.ast to defining file's AST.
     fn resolveGenericStructInit(idx: int, type_name: string, fi_count: int, ta_count: int, si_type_args: List(int)) int {
-        if (self.generic_structs.has(type_name) == 0) {
+        if (!self.generic_structs.contains(type_name)) {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
@@ -4083,7 +4025,7 @@ struct Checker {
         }
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
-        if (self.instantiation_cache.has(cache_key) != 0) {
+        if (self.instantiation_cache.contains(cache_key)) {
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             return self.instantiation_cache.get(cache_key)
@@ -4114,7 +4056,7 @@ struct Checker {
     /// Resolve generic new expr: new Pair(int, string) { a: 1, b: "hi" }
     /// Cross-file: swaps self.ast to defining file's AST.
     fn resolveGenericNewExpr(idx: int, type_name: string, fi_count: int, ta_count: int, ne_type_args: List(int)) int {
-        if (self.generic_structs.has(type_name) == 0) {
+        if (!self.generic_structs.contains(type_name)) {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
@@ -4150,7 +4092,7 @@ struct Checker {
         }
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
-        if (self.instantiation_cache.has(cache_key) != 0) {
+        if (self.instantiation_cache.contains(cache_key)) {
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             return self.instantiation_cache.get(cache_key)
@@ -4339,7 +4281,7 @@ struct Checker {
         var name = ""
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.ident |id| => { name = id.name }, else => {} }, else => {} }
         // Check comptime mutable vars first
-        if (self.in_comptime and self.comptime_vars.has(name) != 0) {
+        if (self.in_comptime and self.comptime_vars.contains(name)) {
             return (1, self.comptime_vars.get(name))
         }
         const sym_idx = self.lookupSymbol(name)
@@ -5220,7 +5162,7 @@ test "checker trait collection" {
     c.checkFile()
     @assertEq(errs.hasErrors(), false)
     // Trait should be registered
-    @assertEq(c.trait_defs.has("Drawable") != 0, true)
+    @assert(c.trait_defs.contains("Drawable"))
 }
 
 test "checker safe wrap type" {
@@ -5310,7 +5252,7 @@ test "checker generic struct registration" {
     c.checkFile()
     @assertEq(errs.hasErrors(), false)
     // Generic struct should be stored in generic_structs map
-    @assert(c.generic_structs.has("Box") != 0)
+    @assert(c.generic_structs.contains("Box"))
     // But not yet in the type registry (no concrete instantiation)
     @assertEq(types.lookupByName("Box"), -1)
 }

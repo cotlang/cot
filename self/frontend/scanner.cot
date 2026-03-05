@@ -208,8 +208,8 @@ struct Scanner {
         }
     }
 
-    /// Scan float decimal point and exponent suffix. Returns 1 if float, 0 if int.
-    fn scanFloatPart() int {
+    /// Scan float decimal point and exponent suffix. Returns true if float.
+    fn scanFloatPart() bool {
         // Decimal point (but not ".." range)
         if (self.ch) |c| {
             var is_range = false
@@ -233,7 +233,7 @@ struct Scanner {
                         }
                     }
                 }
-                return 1
+                return true
             }
         }
         // Exponent without decimal (e.g. 1e5)
@@ -246,10 +246,10 @@ struct Scanner {
                 while (self.ch) |cc| {
                     if (isDigit(cc) or cc == '_') { self.advance() } else { break }
                 }
-                return 1
+                return true
             }
         }
-        return 0
+        return false
     }
 
     /// Scan a numeric literal (int, float, hex, octal, binary).
@@ -289,7 +289,7 @@ struct Scanner {
         }
 
         // Float detection (decimal point + exponent) in separate function
-        if (self.scanFloatPart() == 1) {
+        if (self.scanFloatPart()) {
             return self.makeNumberToken(start, true)
         }
         return self.makeNumberToken(start, false)

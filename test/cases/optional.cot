@@ -12,3 +12,54 @@ test "coalesce value" {
     var x: ?i64 = 42
     @assertEq(x orelse 99, 42)
 }
+
+fn orelseReturnA(opt: ?i64) i64 {
+    const val = opt orelse return 0
+    return val * 2
+}
+
+test "orelse return a" {
+    @assertEq(orelseReturnA(5), 10)
+    @assertEq(orelseReturnA(null), 0)
+}
+
+fn orelseReturnB(opt: ?i64) i64 {
+    const val = opt orelse return 77
+    return val + 100
+}
+
+test "orelse return with value" {
+    @assertEq(orelseReturnB(42), 142)
+    @assertEq(orelseReturnB(null), 77)
+}
+
+test "orelse continue" {
+    var sum: i64 = 0
+    var i: i64 = 0
+    while (i < 3) {
+        i = i + 1
+        var opt: ?i64 = null
+        if (i != 2) { opt = i * 10 }
+        const val = opt orelse continue
+        sum = sum + val
+    }
+    @assertEq(sum, 40)
+}
+
+test "orelse break" {
+    var last: i64 = 0
+    var i: i64 = 0
+    while (i < 4) {
+        var opt: ?i64 = null
+        if (i != 2) { opt = i + 1 }
+        last = opt orelse break
+        i = i + 1
+    }
+    @assertEq(last, 2)
+}
+
+test "orelse expr unchanged" {
+    var x: ?i64 = null
+    const y = x orelse 42
+    @assertEq(y, 42)
+}

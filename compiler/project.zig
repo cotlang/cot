@@ -142,6 +142,26 @@ pub const LoadedConfig = struct {
         return names.toOwnedSlice(allocator) catch null;
     }
 
+    /// Read the "rpath" array from cot.json for runtime library search paths.
+    /// Returns paths (e.g., ["vendor"]) or null if not specified.
+    /// The compiler resolves relative paths to absolute based on the project root.
+    pub fn getRpaths(self: *const LoadedConfig, allocator: std.mem.Allocator) ?[]const []const u8 {
+        if (self.file_contents.len == 0) return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, self.file_contents, .{}) catch return null;
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) return null;
+        const rpaths = root.object.get("rpath") orelse return null;
+        if (rpaths != .array) return null;
+        var names = std.ArrayListUnmanaged([]const u8){};
+        for (rpaths.array.items) |item| {
+            if (item != .string) continue;
+            names.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+        }
+        if (names.items.len == 0) return null;
+        return names.toOwnedSlice(allocator) catch null;
+    }
+
     pub fn deinit(self: *LoadedConfig) void {
         self.parsed.deinit();
         if (self.file_contents.len > 0) {
@@ -303,4 +323,30 @@ test "getCflags returns null when no c_flags" {
     var loaded = try parseConfig(allocator, "{}");
     defer loaded.deinit();
     try std.testing.expect(loaded.getCflags(allocator) == null);
+}
+
+test "getRpaths reads rpath array" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"name":"test","rpath":["vendor","lib"]}
+    ;
+    const file_contents = try allocator.dupe(u8, json);
+    var loaded = try parseConfig(allocator, json);
+    loaded.file_contents = file_contents;
+    loaded.file_allocator = allocator;
+    defer loaded.deinit();
+    const rpaths = loaded.getRpaths(allocator).?;
+    defer allocator.free(rpaths);
+    try std.testing.expectEqual(@as(usize, 2), rpaths.len);
+    try std.testing.expectEqualStrings("vendor", rpaths[0]);
+    try std.testing.expectEqualStrings("lib", rpaths[1]);
+    allocator.free(rpaths[0]);
+    allocator.free(rpaths[1]);
+}
+
+test "getRpaths returns null when no rpath" {
+    const allocator = std.testing.allocator;
+    var loaded = try parseConfig(allocator, "{}");
+    defer loaded.deinit();
+    try std.testing.expect(loaded.getRpaths(allocator) == null);
 }

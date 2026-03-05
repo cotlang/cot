@@ -291,8 +291,8 @@ struct SSABuilder {
     }
 
     fn variable(local_idx: int, type_idx: int) int {
-        if (self.vars.has(local_idx) != 0) { return self.vars.get(local_idx) }
-        if (self.fwd_vars.has(local_idx) != 0) { return self.fwd_vars.get(local_idx) }
+        if (self.vars.contains(local_idx)) { return self.vars.get(local_idx) }
+        if (self.fwd_vars.contains(local_idx)) { return self.fwd_vars.get(local_idx) }
         if (self.cur_block == null_block) { return null_value }
         const fwd = self.func.newValue(SsaOp.fwd_ref, type_idx, self.cur_block, self.cur_pos_line, self.cur_pos_col)
         var fwd_v = self.func.getValue(fwd)
@@ -304,7 +304,7 @@ struct SSABuilder {
     }
 
     fn getOrCreateBlock(ir_block_idx: int) int {
-        if (self.block_map.has(ir_block_idx) != 0) {
+        if (self.block_map.contains(ir_block_idx)) {
             return self.block_map.get(ir_block_idx)
         }
         const blk = self.func.newBlock(SsaBlockKind.plain)
@@ -350,7 +350,7 @@ struct SSABuilder {
             const ir_block = self.ir_func.blocks.get(i)
             for j in 0..ir_block.nodes.count {
                 const node_idx = ir_block.nodes.get(j)
-                if (self.logical_operands.has(node_idx) != 0) { continue }
+                if (self.logical_operands.contains(node_idx)) { continue }
                 self.convertNode(node_idx)
             }
         }
@@ -363,7 +363,7 @@ struct SSABuilder {
     // === Dispatch ===
 
     fn convertNode(node_idx: int) int {
-        if (self.node_values.has(node_idx) != 0) { return self.node_values.get(node_idx) }
+        if (self.node_values.contains(node_idx)) { return self.node_values.get(node_idx) }
         const node = self.ir_func.getNode(node_idx)
         const cur = self.cur_block
         if (cur == null_block) { return null_value }
@@ -959,7 +959,7 @@ struct SSABuilder {
         // Shape stenciling: resolve aliased function names
         var resolved_name = func_name
         if (self.shape_aliases) |aliases| {
-            if (aliases.has(func_name) != 0) {
+            if (aliases.contains(func_name)) {
                 resolved_name = aliases.get(func_name)
             }
         }
@@ -970,7 +970,7 @@ struct SSABuilder {
 
         // Dict dispatch: inject fn-ptr args for dict-stenciled functions
         if (self.dict_arg_names) |dan| {
-            if (dan.has(func_name) != 0) {
+            if (dan.contains(func_name)) {
                 const helper_names = dan.get(func_name)
                 for k in 0..helper_names.count {
                     const helper_name = helper_names.get(k)

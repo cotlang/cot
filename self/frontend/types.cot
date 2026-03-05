@@ -456,7 +456,7 @@ struct TypeRegistry {
 
     /// Look up a type index by name. Returns -1 if not found.
     fn lookupByName(n: string) int {
-        if (self.name_map.has(n) != 0) {
+        if (self.name_map.contains(n)) {
             return self.name_map.get(n)
         }
         return -1

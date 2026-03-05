@@ -337,7 +337,7 @@ struct SsaFunc {
     /// Create a constant integer value, deduplicating by value.
     fn constInt(value: int, type_idx: int, block: int, line: int, col: int) int {
         // Dedup: check if we already have this constant
-        if (self.constants.has(value) != 0) {
+        if (self.constants.contains(value)) {
             return self.constants.get(value)
         }
         const idx = self.newValue(SsaOp.const_int, type_idx, block, line, col)

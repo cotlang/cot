@@ -47,3 +47,13 @@ test "nested" {
     var o = CsOuter { .inner = inner, .extra = 10 }
     @assertEq(o.inner.value, 6)
 }
+
+struct MixedNew { a: u8, b: i32, c: i64, d: bool }
+
+test "new mixed type struct fields" {
+    var p = new MixedNew { a: 255, b: 42, c: 999, d: true }
+    @assertEq(p.a, 255)
+    @assertEq(p.b, 42)
+    @assertEq(p.c, 999)
+    @assertEq(p.d, true)
+}

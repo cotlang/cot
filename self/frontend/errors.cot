@@ -175,8 +175,8 @@ struct ErrorReporter {
     collect_mode: bool,
     collected_errors: List(Error),
 
-    /// Create a fresh reporter with no errors (no source — for tests).
-    static fn init() ErrorReporter {
+    /// Internal constructor — all public constructors delegate here.
+    static fn make(has_src: bool, filename: string, content: string, collecting: bool) ErrorReporter {
         var collected: List(Error) = .{}
         return ErrorReporter {
             count: 0,
@@ -186,51 +186,28 @@ struct ErrorReporter {
             first_msg: "",
             first_code: ErrorCode.e100,
             first_offset: 0,
-            has_source: false,
-            src_filename: "",
-            src_content: "",
-            collect_mode: false,
+            has_source: has_src,
+            src_filename: filename,
+            src_content: content,
+            collect_mode: collecting,
             collected_errors: collected,
         }
     }
 
+    /// Create a fresh reporter with no errors (no source — for tests).
+    static fn init() ErrorReporter {
+        return ErrorReporter.make(false, "", "", false)
+    }
+
     /// Create a reporter with source context (for rendering errors).
     static fn initWithSource(filename: string, content: string) ErrorReporter {
-        var collected: List(Error) = .{}
-        return ErrorReporter {
-            count: 0,
-            warning_count: 0,
-            suppressed: false,
-            has_first: false,
-            first_msg: "",
-            first_code: ErrorCode.e100,
-            first_offset: 0,
-            has_source: true,
-            src_filename: filename,
-            src_content: content,
-            collect_mode: false,
-            collected_errors: collected,
-        }
+        return ErrorReporter.make(true, filename, content, false)
     }
 
     /// Create a reporter in collect mode (for LSP and test harnesses).
     /// Errors are stored in collected_errors instead of printed to stderr.
     static fn initCollecting() ErrorReporter {
-        var collected: List(Error) = .{}
-        return ErrorReporter {
-            count: 0,
-            warning_count: 0,
-            suppressed: false,
-            has_first: false,
-            first_msg: "",
-            first_code: ErrorCode.e100,
-            first_offset: 0,
-            has_source: false,
-            src_filename: "",
-            src_content: "",
-            collect_mode: true,
-            collected_errors: collected,
-        }
+        return ErrorReporter.make(false, "", "", true)
     }
 
     /// Record an error (3-arg convenience wrapper — keeps ~100+ call sites unchanged).
@@ -319,7 +296,7 @@ struct ErrorReporter {
         var spaces = ""
         var i = 1
         while (i < col) {
-            spaces = "${spaces} "
+            spaces = spaces ++ " "
             i += 1
         }
         const caret_output = "    ${spaces}^\n"

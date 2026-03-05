@@ -5,6 +5,7 @@
 import "std/list"
 import "std/map"
 import "std/string"
+import "std/fs"
 import "ir"
 import "ast"
 import "types"
@@ -134,7 +135,7 @@ struct Lowerer {
             const sym = self.chk.getSymbol(sym_idx)
             if (sym.is_extern or sym.is_export) { return bare }
             if (sym.source_tree != 0) {
-                if (self.tree_module_map.has(sym.source_tree) != 0) {
+                if (self.tree_module_map.contains(sym.source_tree)) {
                     return self.tree_module_map.get(sym.source_tree) ++ "." ++ bare
                 }
             }
@@ -151,7 +152,7 @@ struct Lowerer {
         if (sym_idx >= 0) {
             const sym = self.chk.getSymbol(sym_idx)
             if (sym.source_tree != 0) {
-                if (self.tree_module_map.has(sym.source_tree) != 0) {
+                if (self.tree_module_map.contains(sym.source_tree)) {
                     return self.tree_module_map.get(sym.source_tree) ++ "." ++ type_name
                 }
             }
@@ -166,7 +167,7 @@ struct Lowerer {
         if (shouldSkipQualification(func_name)) { return func_name }
         // Primary: use the method's source_tree recorded at registration time
         if (method_source_tree != 0) {
-            if (self.tree_module_map.has(method_source_tree) != 0) {
+            if (self.tree_module_map.contains(method_source_tree)) {
                 return self.tree_module_map.get(method_source_tree) ++ "." ++ func_name
             }
         }
@@ -176,7 +177,7 @@ struct Lowerer {
             const sym = self.chk.getSymbol(sym_idx)
             if (sym.is_extern or sym.is_export) { return func_name }
             if (sym.source_tree != 0) {
-                if (self.tree_module_map.has(sym.source_tree) != 0) {
+                if (self.tree_module_map.contains(sym.source_tree)) {
                     return self.tree_module_map.get(sym.source_tree) ++ "." ++ func_name
                 }
             }
@@ -187,7 +188,7 @@ struct Lowerer {
             const fn_sym = self.chk.getSymbol(fn_sym_idx)
             if (fn_sym.is_extern or fn_sym.is_export) { return func_name }
             if (fn_sym.source_tree != 0) {
-                if (self.tree_module_map.has(fn_sym.source_tree) != 0) {
+                if (self.tree_module_map.contains(fn_sym.source_tree)) {
                     return self.tree_module_map.get(fn_sym.source_tree) ++ "." ++ func_name
                 }
             }
@@ -1743,7 +1744,7 @@ struct Lowerer {
                 }
             },
             Expr.ident |id| => {
-                if (self.const_values.has(id.name) != 0) {
+                if (self.const_values.contains(id.name)) {
                     return self.const_values.get(id.name)
                 }
                 // Check checker's const symbols
@@ -1780,33 +1781,33 @@ struct Lowerer {
         const map_local = map_local_opt.?
 
         // Read map fields into locals BEFORE the loop
-        const idx_name = "__map_idx_" ++ intToStr(self.temp_counter)
+        const idx_name = "__map_idx_" ++ intToString(self.temp_counter)
         self.temp_counter = self.temp_counter + 1
         const idx_local = fb.addLocalWithSize(idx_name, I64, true, 8)
         const zero = fb.emitConstInt(0, I64, f.span)
         fb.emitStoreLocal(idx_local, zero, f.span)
 
         // Read capacity
-        const cap_name = "__map_cap_" ++ intToStr(self.temp_counter)
+        const cap_name = "__map_cap_" ++ intToString(self.temp_counter)
         self.temp_counter = self.temp_counter + 1
         const cap_local = fb.addLocalWithSize(cap_name, I64, false, 8)
         const cap_field = fb.emitFieldLocal(map_local, 4, 32, I64, f.span)
         fb.emitStoreLocal(cap_local, cap_field, f.span)
 
         // Read keys/values/states pointers
-        const keys_name = "__map_keys_" ++ intToStr(self.temp_counter)
+        const keys_name = "__map_keys_" ++ intToString(self.temp_counter)
         self.temp_counter = self.temp_counter + 1
         const keys_local = fb.addLocalWithSize(keys_name, I64, false, 8)
         const keys_field = fb.emitFieldLocal(map_local, 0, 0, I64, f.span)
         fb.emitStoreLocal(keys_local, keys_field, f.span)
 
-        const vals_name = "__map_vals_" ++ intToStr(self.temp_counter)
+        const vals_name = "__map_vals_" ++ intToString(self.temp_counter)
         self.temp_counter = self.temp_counter + 1
         const vals_local = fb.addLocalWithSize(vals_name, I64, false, 8)
         const vals_field = fb.emitFieldLocal(map_local, 1, 8, I64, f.span)
         fb.emitStoreLocal(vals_local, vals_field, f.span)
 
-        const states_name = "__map_states_" ++ intToStr(self.temp_counter)
+        const states_name = "__map_states_" ++ intToString(self.temp_counter)
         self.temp_counter = self.temp_counter + 1
         const states_local = fb.addLocalWithSize(states_name, I64, false, 8)
         const states_field = fb.emitFieldLocal(map_local, 2, 16, I64, f.span)
@@ -2053,14 +2054,14 @@ struct Lowerer {
 
     fn lowerIdent(fb: *FuncBuilder, id: Ident) int {
         // Check const_values first (compile-time known constants)
-        if (self.const_values.has(id.name) != 0) {
+        if (self.const_values.contains(id.name)) {
             const val = self.const_values.get(id.name)
             return fb.emitConstInt(val, I64, id.span)
         }
         // Check float const values
-        if (self.float_const_values.has(id.name) != 0) {
+        if (self.float_const_values.contains(id.name)) {
             const val = self.float_const_values.get(id.name)
-            const type_idx = if (self.float_const_types.has(id.name) != 0) {
+            const type_idx = if (self.float_const_types.contains(id.name)) {
                 self.float_const_types.get(id.name)
             } else { F64 }
             const fval = @bitCast(f64, val)
@@ -3045,7 +3046,7 @@ struct Lowerer {
             const arg_node_idx = inner_call.args.get(i)
             const resolved = self.resolveTypeNode(arg_node_idx)
             if (i > 0) { key = key ++ ";" }
-            key = key ++ intToStr(resolved)
+            key = key ++ intToString(resolved)
         }
         key = key ++ ")"
         concrete_name = key
@@ -4076,7 +4077,35 @@ struct Lowerer {
 
         // @embed_file — compile-time file read
         if (kind == BuiltinKind.embed_file) {
-            // TODO: embed_file requires compile-time file I/O
+            if (bc.args.count > 0) {
+                // Extract path from string literal argument
+                var raw_path = ""
+                var found_path = false
+                switch (self.tree.getNode(bc.args.get(0))) { Node.expr |e| => switch (e) {
+                    Expr.literal |lit| => {
+                        if (lit.kind == LiteralKind.@"string") {
+                            raw_path = lit.value
+                            found_path = true
+                        }
+                    },
+                    else => {},
+                }, else => {} }
+
+                if (found_path) {
+                    // Strip quotes
+                    var rel_path = raw_path
+                    if (raw_path.len >= 2 and raw_path[0] == 34 and raw_path[raw_path.len - 1] == 34) {
+                        rel_path = substring(raw_path, 1, raw_path.len - 1)
+                    }
+                    // Read file content
+                    const content = readFile(rel_path) catch {
+                        const str_idx = fb.addStringLiteral("")
+                        return fb.emitConstSlice(str_idx, bc.span)
+                    }
+                    const str_idx = fb.addStringLiteral(content)
+                    return fb.emitConstSlice(str_idx, bc.span)
+                }
+            }
             const empty_idx = fb.addStringLiteral("")
             return fb.emitConstSlice(empty_idx, bc.span)
         }
@@ -4795,6 +4824,409 @@ struct Lowerer {
     }
 
     // ========================================================================
+    // Struct init as expression (returns value, not stored to local)
+    // ========================================================================
+
+    fn lowerStructInitExpr(fb: *FuncBuilder, si: StructInitExpr, node_idx: int) int {
+        // Resolve struct type — prefer expr_types (per-file scoped) over global name_map
+        var struct_type_idx = self.inferExprType(node_idx)
+        if (struct_type_idx == VOID or struct_type_idx == invalid_type) {
+            if (si.type_name.len > 0) {
+                const looked_up = self.types.lookupByName(si.type_name)
+                if (looked_up >= 0) { struct_type_idx = looked_up }
+            }
+        }
+        if (struct_type_idx == VOID or struct_type_idx == invalid_type) { return null_node }
+
+        const type_info = self.types.get(struct_type_idx)
+        if (type_info.tag != TAG_STRUCT) { return null_node }
+
+        const size = self.types.sizeOf(struct_type_idx)
+        const temp_idx = fb.addLocalWithSize("__struct_tmp", struct_type_idx, true, size)
+
+        // Store each explicitly provided field
+        switch (type_info) { Type.struct_type |st| => {
+            for fi in 0..si.fields.count {
+                const field_init_idx = si.fields.get(fi)
+                var fi_name = ""
+                var fi_value = null_node
+                var found = false
+                switch (self.tree.getNode(field_init_idx)) { Node.expr |e| => switch (e) {
+                    Expr.field_init_node |fnode| => { fi_name = fnode.name; fi_value = fnode.value; found = true },
+                    else => {},
+                }, else => {} }
+
+                if (found) {
+                    for j in 0..st.field_count {
+                        const field = st.getField(j)
+                        if (field.name == fi_name) {
+                            const value_node = self.lowerExprNode(fi_value)
+                            const field_type_info = self.types.get(field.type_idx)
+                            const is_string_field = (field.type_idx == STRING or field_type_info.tag == TAG_SLICE)
+                            if (is_string_field) {
+                                const ptr_type = self.types.makePointer(U8)
+                                const ptr_ir = fb.emitSlicePtr(value_node, ptr_type, si.span)
+                                const len_ir = fb.emitSliceLen(value_node, si.span)
+                                fb.emitStoreLocalField(temp_idx, j, field.offset, ptr_ir, si.span)
+                                fb.emitStoreLocalField(temp_idx, j + 1, field.offset + 8, len_ir, si.span)
+                            } else if (field_type_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(field.type_idx)) {
+                                self.storeCompoundOptField(fb, temp_idx, j, field.offset, value_node, fi_value, si.span)
+                            } else {
+                                fb.emitStoreLocalField(temp_idx, j, field.offset, value_node, si.span)
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+
+            // Emit default values for omitted fields
+            for di in 0..st.field_count {
+                const field = st.getField(di)
+                if (field.default_value == null_node) { continue }
+                var provided = false
+                for fi in 0..si.fields.count {
+                    const field_init_idx = si.fields.get(fi)
+                    switch (self.tree.getNode(field_init_idx)) { Node.expr |e| => switch (e) {
+                        Expr.field_init_node |fnode| => { if (fnode.name == field.name) { provided = true } },
+                        else => {},
+                    }, else => {} }
+                }
+                if (provided) { continue }
+                const value_node = self.lowerExprNode(field.default_value)
+                const field_type_info = self.types.get(field.type_idx)
+                const is_string_field = (field.type_idx == STRING or field_type_info.tag == TAG_SLICE)
+                if (is_string_field) {
+                    const ptr_type = self.types.makePointer(U8)
+                    const ptr_ir = fb.emitSlicePtr(value_node, ptr_type, si.span)
+                    const len_ir = fb.emitSliceLen(value_node, si.span)
+                    fb.emitStoreLocalField(temp_idx, di, field.offset, ptr_ir, si.span)
+                    fb.emitStoreLocalField(temp_idx, di + 1, field.offset + 8, len_ir, si.span)
+                } else if (field_type_info.tag == TAG_OPTIONAL and !self.isPtrLikeOptional(field.type_idx)) {
+                    self.storeCompoundOptField(fb, temp_idx, di, field.offset, value_node, field.default_value, si.span)
+                } else {
+                    fb.emitStoreLocalField(temp_idx, di, field.offset, value_node, si.span)
+                }
+            }
+        }, else => {} }
+
+        return fb.emitLoadLocal(temp_idx, struct_type_idx, si.span)
+    }
+
+    // ========================================================================
+    // Array/String/Slice/Union init helpers (store into pre-allocated local)
+    // ========================================================================
+
+    fn lowerArrayInit(fb: *FuncBuilder, local_idx: int, value_idx: int, span: Span) void {
+        switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
+            Expr.array_literal |al| => {
+                if (al.elements.count == 0) { return }
+                const local = fb.locals.get(local_idx)
+                var elem_type = self.inferExprType(al.elements.get(0))
+                const local_info = self.types.get(local.type_idx)
+                if (local_info.tag == TAG_ARRAY) {
+                    switch (local_info) { Type.array |a| => { elem_type = a.elem }, else => {} }
+                }
+                const elem_size = self.types.sizeOf(elem_type)
+                for i in 0..al.elements.count {
+                    const elem_idx = al.elements.get(i)
+                    const elem_node = self.lowerExprNode(elem_idx)
+                    const idx_node = fb.emitConstInt(i, I64, span)
+                    fb.emitStoreIndexLocal(local_idx, idx_node, elem_node, elem_size, span)
+                }
+            },
+            else => {
+                const val = self.lowerExprNode(value_idx)
+                if (val != null_node) { fb.emitStoreLocal(local_idx, val, span) }
+            },
+        }, else => {} }
+    }
+
+    fn lowerStringInit(fb: *FuncBuilder, local_idx: int, value_idx: int, span: Span) void {
+        const str_node = self.lowerExprNode(value_idx)
+        if (str_node == null_node) { return }
+        const ptr_type = self.types.makePointer(U8)
+        const ptr_val = fb.emitSlicePtr(str_node, ptr_type, span)
+        const len_val = fb.emitSliceLen(str_node, span)
+        fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span)
+        fb.emitStoreLocalField(local_idx, 1, 8, len_val, span)
+    }
+
+    fn lowerSliceInit(fb: *FuncBuilder, local_idx: int, value_idx: int, slice_type: int, span: Span) void {
+        const slice_node = self.lowerExprNode(value_idx)
+        if (slice_node == null_node) { return }
+        const slice_info = self.types.get(slice_type)
+        var elem_type = U8
+        switch (slice_info) { Type.slice |s| => { elem_type = s.elem }, else => {} }
+        const ptr_type = self.types.makePointer(elem_type)
+        const ptr_val = fb.emitSlicePtr(slice_node, ptr_type, span)
+        const len_val = fb.emitSliceLen(slice_node, span)
+        const cap_val = fb.emitSliceCap(slice_node, span)
+        fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span)
+        fb.emitStoreLocalField(local_idx, 1, 8, len_val, span)
+        fb.emitStoreLocalField(local_idx, 2, 16, cap_val, span)
+    }
+
+    fn lowerTupleInit(fb: *FuncBuilder, local_idx: int, value_idx: int, span: Span) void {
+        switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
+            Expr.tuple_literal |tl| => {
+                const tuple_type_idx = self.inferExprType(value_idx)
+                for i in 0..tl.elements.count {
+                    const elem_idx = tl.elements.get(i)
+                    const value_ir = self.lowerExprNode(elem_idx)
+                    const offset = self.types.tupleElementOffset(tuple_type_idx, i)
+                    fb.emitStoreLocalField(local_idx, i, offset, value_ir, span)
+                }
+            },
+            else => {},
+        }, else => {} }
+    }
+
+    fn lowerUnionInit(fb: *FuncBuilder, local_idx: int, value_idx: int, type_idx: int, span: Span) void {
+        const type_info = self.types.get(type_idx)
+        if (type_info.tag != TAG_UNION) { return }
+
+        switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
+            Expr.call |call| => {
+                // Payload variant: Result.Ok(42) → store tag + payload
+                switch (self.tree.getNode(call.callee)) { Node.expr |ce| => switch (ce) {
+                    Expr.field_access |fa| => {
+                        switch (type_info) { Type.union_type |ut| => {
+                            for i in 0..ut.variant_count {
+                                const v = ut.getVariant(i)
+                                if (v.name == fa.field) {
+                                    const tag_val = fb.emitConstInt(i, I64, span)
+                                    fb.emitStoreLocalField(local_idx, 0, 0, tag_val, span)
+                                    if (call.args.count > 0) {
+                                        const payload_val = self.lowerExprNode(call.args.get(0))
+                                        fb.emitStoreLocalField(local_idx, 1, 8, payload_val, span)
+                                    }
+                                    return
+                                }
+                            }
+                        }, else => {} }
+                    },
+                    else => {},
+                }, else => {} }
+            },
+            Expr.field_access |fa| => {
+                // Simple variant (no payload): Result.Err → store tag only
+                switch (type_info) { Type.union_type |ut| => {
+                    for i in 0..ut.variant_count {
+                        const v = ut.getVariant(i)
+                        if (v.name == fa.field) {
+                            const tag_val = fb.emitConstInt(i, I64, span)
+                            fb.emitStoreLocalField(local_idx, 0, 0, tag_val, span)
+                            return
+                        }
+                    }
+                }, else => {} }
+            },
+            else => {
+                const val = self.lowerExprNode(value_idx)
+                if (val != null_node) { fb.emitStoreLocal(local_idx, val, span) }
+            },
+        }, else => {} }
+    }
+
+    // ========================================================================
+    // Array/Slice concat operators
+    // ========================================================================
+
+    /// Array concat: [N]T ++ [M]T → [N+M]T — element-by-element copy to temp local
+    fn lowerArrayConcat(fb: *FuncBuilder, left: int, right: int, left_type_idx: int, right_type_idx: int, span: Span) int {
+        const left_info = self.types.get(left_type_idx)
+        const right_info = self.types.get(right_type_idx)
+        if (left_info.tag != TAG_ARRAY or right_info.tag != TAG_ARRAY) { return null_node }
+
+        var elem_type = I64
+        var left_len = 0
+        var right_len = 0
+        switch (left_info) { Type.array |a| => { elem_type = a.elem; left_len = a.length }, else => {} }
+        switch (right_info) { Type.array |a| => { right_len = a.length }, else => {} }
+
+        const elem_size = self.types.sizeOf(elem_type)
+        const result_len = left_len + right_len
+        const result_type = self.types.makeArray(elem_type, result_len)
+        const result_size = self.types.sizeOf(result_type)
+        const temp_name = "__cat_" ++ intToString(fb.locals.count)
+        const local_idx = fb.addLocalWithSize(temp_name, result_type, false, result_size)
+
+        // Copy left array elements
+        for i in 0..left_len {
+            const idx_node = fb.emitConstInt(i, I64, span)
+            const src_elem = fb.emitIndexValue(left, idx_node, elem_size, elem_type, span)
+            fb.emitStoreIndexLocal(local_idx, idx_node, src_elem, elem_size, span)
+        }
+        // Copy right array elements at offset left_len
+        for j in 0..right_len {
+            const src_idx = fb.emitConstInt(j, I64, span)
+            const dst_idx = fb.emitConstInt(left_len + j, I64, span)
+            const src_elem = fb.emitIndexValue(right, src_idx, elem_size, elem_type, span)
+            fb.emitStoreIndexLocal(local_idx, dst_idx, src_elem, elem_size, span)
+        }
+        return fb.emitAddrLocal(local_idx, result_type, span)
+    }
+
+    /// Slice concat: []T ++ []T → []T — via string_concat runtime (alloc + memcpy)
+    fn lowerSliceConcat(fb: *FuncBuilder, left: int, right: int, slice_type_idx: int, span: Span) int {
+        const slice_info = self.types.get(slice_type_idx)
+        var elem_type = U8
+        switch (slice_info) { Type.slice |s| => { elem_type = s.elem }, else => {} }
+        const elem_size = self.types.sizeOf(elem_type)
+        const ptr_type = self.types.makePointer(elem_type)
+
+        // Extract ptr and len from both slices
+        const ptr1 = fb.emitSlicePtr(left, ptr_type, span)
+        const len1 = fb.emitSliceLen(left, span)
+        const ptr2 = fb.emitSlicePtr(right, ptr_type, span)
+        const len2 = fb.emitSliceLen(right, span)
+
+        // Convert to byte lengths for string_concat
+        const elem_size_node = fb.emitConstInt(elem_size, I64, span)
+        const byte_len1 = fb.emitBinary(BinaryOp.mul, len1, elem_size_node, I64, span)
+        const byte_len2 = fb.emitBinary(BinaryOp.mul, len2, elem_size_node, I64, span)
+
+        // Alloc + copy via string_concat(ptr1, byte_len1, ptr2, byte_len2)
+        var args: List(int) = .{}
+        args.append(ptr1)
+        args.append(byte_len1)
+        args.append(ptr2)
+        args.append(byte_len2)
+        const new_ptr = fb.emitCall("string_concat", args, false, I64, span)
+        const new_len = fb.emitBinary(BinaryOp.add, len1, len2, I64, span)
+
+        // Return slice_header(ptr, len, cap=len)
+        return fb.emit(Node.init(Data.slice_header(SliceHeader { ptr: new_ptr, len: new_len, cap: new_len }), slice_type_idx, span))
+    }
+
+    // ========================================================================
+    // Compound orelse: ?T orelse default → branch on tag
+    // ========================================================================
+
+    fn lowerCompoundOrelse(fb: *FuncBuilder, left: int, bin: Binary, left_type_idx: int, result_type: int) int {
+        const opt_size = self.types.sizeOf(left_type_idx)
+        const opt_local = fb.addLocalWithSize("__orelse_opt", left_type_idx, false, opt_size)
+        fb.emitStoreLocal(opt_local, left, bin.span)
+        const tag = fb.emitFieldLocal(opt_local, 0, 0, I64, bin.span)
+        const zero_tag = fb.emitConstInt(0, I64, bin.span)
+        const is_non_null = fb.emitBinary(BinaryOp.ne, tag, zero_tag, BOOL, bin.span)
+
+        const result_size = self.types.sizeOf(result_type)
+        const result_local = fb.addLocalWithSize("__orelse_result", result_type, false, result_size)
+        const then_block = fb.newBlock("orelse.nonnull")
+        const else_block = fb.newBlock("orelse.null")
+        const merge_block = fb.newBlock("orelse.end")
+        fb.emitBranch(is_non_null, then_block, else_block, bin.span)
+
+        // Non-null path: extract payload
+        fb.setBlock(then_block)
+        var payload_type = result_type
+        switch (self.types.get(left_type_idx)) { Type.optional |opt| => { payload_type = opt.elem }, else => {} }
+        const payload = fb.emitFieldLocal(opt_local, 1, 8, payload_type, bin.span)
+        fb.emitStoreLocal(result_local, payload, bin.span)
+        fb.emitJump(merge_block, bin.span)
+
+        // Null path: lower fallback expression
+        fb.setBlock(else_block)
+        const fallback = self.lowerExprNode(bin.right)
+        if (fallback != null_node) {
+            fb.emitStoreLocal(result_local, fallback, bin.span)
+        }
+        fb.emitJump(merge_block, bin.span)
+
+        // Merge: load result
+        fb.setBlock(merge_block)
+        return fb.emitLoadLocal(result_local, result_type, bin.span)
+    }
+
+    // ========================================================================
+    // Labeled loop lookup
+    // ========================================================================
+
+    fn findLabeledLoop(target_label: string) ?LoopContext {
+        var i = self.loop_stack.count - 1
+        while (i >= 0) {
+            const ctx = self.loop_stack.get(i)
+            if (ctx.label == target_label) { return ctx }
+            i = i - 1
+        }
+        return null
+    }
+
+    // ========================================================================
+    // Error handling helpers
+    // ========================================================================
+
+    /// Resolve error pattern to const int or lower as expression.
+    /// Used in switch arms for error matching.
+    fn resolveErrorPatternOrLower(fb: *FuncBuilder, pattern_idx: int, span: Span) int {
+        switch (self.tree.getNode(pattern_idx)) { Node.expr |e| => switch (e) {
+            Expr.error_literal |el| => {
+                const error_idx = self.getGlobalErrorIndex(el.error_name)
+                return fb.emitConstInt(error_idx, I64, span)
+            },
+            else => {},
+        }, else => {} }
+        return self.lowerExprNode(pattern_idx)
+    }
+
+    /// Check if any switch case has a capture variable.
+    fn hasCapture(se: SwitchExpr) bool {
+        for i in 0..se.cases.count {
+            const case_idx = se.cases.get(i)
+            switch (self.tree.getNode(case_idx)) { Node.expr |e| => switch (e) {
+                Expr.switch_case_node |sc| => {
+                    if (sc.capture.len > 0) { return true }
+                },
+                else => {},
+            }, else => {} }
+        }
+        return false
+    }
+
+    /// Store a compound value (string/slice) into a local via field decomposition.
+    /// Used in catch blocks where the caught value needs compound storage.
+    fn storeCatchCompound(fb: *FuncBuilder, local_idx: int, val: int, span: Span) void {
+        const ptr_type = self.types.makePointer(U8)
+        const ptr_val = fb.emitSlicePtr(val, ptr_type, span)
+        const len_val = fb.emitSliceLen(val, span)
+        fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span)
+        fb.emitStoreLocalField(local_idx, 1, 8, len_val, span)
+    }
+
+    // ========================================================================
+    // Function value creation (closure/function pointer)
+    // ========================================================================
+
+    fn createFuncValue(fb: *FuncBuilder, func_name: string, type_idx: int, span: Span) int {
+        const HEAP_HEADER_SIZE = 16
+        const payload_size = 8  // one i64 for table_idx
+        const total_size = HEAP_HEADER_SIZE + payload_size
+
+        // Allocate closure struct: alloc(0, total_size)
+        const metadata_node = fb.emitConstInt(0, I64, span)
+        const size_node = fb.emitConstInt(total_size, I64, span)
+        var alloc_args: List(int) = .{}
+        alloc_args.append(metadata_node)
+        alloc_args.append(size_node)
+        const alloc_result = fb.emitCall("alloc", alloc_args, false, I64, span)
+
+        // Store result in temp
+        const temp_name = "__closure_ptr_" ++ intToString(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const temp_idx = fb.addLocalWithSize(temp_name, I64, true, 8)
+        fb.emitStoreLocal(temp_idx, alloc_result, span)
+        const ptr_node = fb.emitLoadLocal(temp_idx, I64, span)
+
+        // Store func address at offset 0
+        const table_idx_node = fb.emitFuncAddr(func_name, type_idx, span)
+        fb.emitPtrStoreValue(ptr_node, table_idx_node, span)
+
+        return fb.emitLoadLocal(temp_idx, I64, span)
+    }
+
+    // ========================================================================
     // Closure support
     // ========================================================================
 
@@ -4804,7 +5236,7 @@ struct Lowerer {
         self.detectCaptures(ce.body, fb, captures)
 
         // Generate unique name
-        const closure_name = "__closure_" ++ intToStr(self.closure_counter)
+        const closure_name = "__closure_" ++ intToString(self.closure_counter)
         self.closure_counter = self.closure_counter + 1
 
         // Save parent function builder state
@@ -5107,7 +5539,7 @@ struct Lowerer {
 
     /// Get or assign a unique global error index for an error name.
     fn getGlobalErrorIndex(name: string) int {
-        if (self.global_error_table.has(name) != 0) {
+        if (self.global_error_table.contains(name)) {
             return self.global_error_table.get(name)
         }
         self.next_error_idx = self.next_error_idx + 1
@@ -5204,7 +5636,7 @@ struct Lowerer {
 
     /// Ensure a generic function instance is queued for lowering.
     fn ensureGenericFnQueued(inst: *GenericInstInfo) void {
-        if (self.lowered_generics.has(inst.concrete_name) != 0) { return }
+        if (self.lowered_generics.contains(inst.concrete_name)) { return }
         self.lowered_generics.set(inst.concrete_name, 1)
         // Will be processed in lowerQueuedGenericFunctions
     }
@@ -5247,7 +5679,7 @@ struct Lowerer {
             const all_keys = self.chk.generic_inst_by_name.keys()
             for i in 0..all_keys.count {
                 const key = all_keys.get(i)
-                if (self.lowered_generics.has(key) == 0) { continue }
+                if (!self.lowered_generics.contains(key)) { continue }
                 if (self.builder.hasFunc(key)) { continue }
                 pending.append(key)
             }
@@ -5417,7 +5849,7 @@ struct Lowerer {
 
     /// Look up a generic instantiation by concrete name.
     fn lookupGenericInst(name: string) ?*GenericInstInfo {
-        if (self.chk.generic_inst_by_name.has(name) == 0) { return null }
+        if (!self.chk.generic_inst_by_name.contains(name)) { return null }
         const ptr = self.chk.generic_inst_by_name.get(name)
         return @intToPtr(*GenericInstInfo, ptr)
     }
@@ -5492,10 +5924,10 @@ struct Lowerer {
     /// Look up a comptime value by name — checks function-local vars first, then globals.
     /// Returns -1 if not found.
     fn lookupComptimeValue(name: string) int {
-        if (self.comptime_value_vars.has(name) != 0) {
+        if (self.comptime_value_vars.contains(name)) {
             return self.comptime_value_vars.get(name)
         }
-        if (self.global_comptime_values.has(name) != 0) {
+        if (self.global_comptime_values.contains(name)) {
             return self.global_comptime_values.get(name)
         }
         return -1
@@ -5939,7 +6371,7 @@ struct Lowerer {
     fn resolveTypeNode(idx: int) int {
         if (idx == null_node) { return VOID }
         // Prefer checker's per-file scoped resolution
-        if (self.chk.expr_types.has(idx) != 0) {
+        if (self.chk.expr_types.contains(idx)) {
             return self.chk.expr_types.get(idx)
         }
         return self.chk.resolveTypeExpr(idx)
@@ -5947,7 +6379,7 @@ struct Lowerer {
 
     /// Infer the type of an expression from the checker's type map.
     fn inferExprType(idx: int) int {
-        if (self.chk.expr_types.has(idx) != 0) {
+        if (self.chk.expr_types.contains(idx)) {
             return self.chk.expr_types.get(idx)
         }
         return VOID
@@ -6228,25 +6660,6 @@ fn parseStringLiteral(text: string) string {
     return unescapeString(inner)
 }
 
-/// Convert integer to string (simple decimal).
-fn intToStr(n: int) string {
-    if (n == 0) { return "0" }
-    var val = n
-    var negative = false
-    if (val < 0) {
-        negative = true
-        val = -val
-    }
-    const digits = "0123456789"
-    var result = ""
-    while (val > 0) {
-        const digit = val - (val / 10) * 10  // val % 10
-        result = substring(digits, digit, digit + 1) ++ result
-        val = val / 10
-    }
-    if (negative) { result = "-" ++ result }
-    return result
-}
 
 /// Map token op code to IR BinaryOp.
 fn tokenToBinaryOp(tok: int) BinaryOp {
