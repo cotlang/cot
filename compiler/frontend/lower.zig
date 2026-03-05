@@ -4152,6 +4152,7 @@ pub const Lowerer = struct {
             .spawn_expr => |se| return try self.lowerSpawnExpr(se),
             .select_expr => |se| return try self.lowerSelectExpr(se),
             .catch_expr => |ce| return try self.lowerCatchExpr(ce),
+            .orelse_expr => |oe| return try self.lowerOrElseExpr(oe),
             .error_literal => |el| return try self.lowerErrorLiteral(el),
             .builtin_call => |bc| return try self.lowerBuiltinCall(bc),
             .switch_expr => |se| return try self.lowerSwitchExpr(se, null),
@@ -4278,23 +4279,6 @@ pub const Lowerer = struct {
         const left = try self.lowerExprNode(bin.left);
         if (left == ir.null_node) return ir.null_node;
 
-        // Compound optional orelse: must defer right-side lowering until inside else_block.
-        // Block-based approach (Zig pattern) — right is lowered in the null branch,
-        // not before the branch, to avoid cross-block value reference issues on native.
-        if (bin.op == .kw_orelse) {
-            const left_type_idx = self.inferExprType(bin.left);
-            const left_type = self.type_reg.get(left_type_idx);
-            if (left_type == .optional and !self.isPtrLikeOptional(left_type_idx)) {
-                // Result type is the ELEMENT type (i64), not the optional type (?i64).
-                // inferBinaryType returns ?i64 (the left operand type), but orelse unwraps
-                // the optional — the result is the payload type. Using the optional type would
-                // create 16-byte compound locals, causing move/address semantics in the SSA
-                // builder when we only need scalar 8-byte store/load.
-                const result_type = left_type.optional.elem;
-                return try self.lowerCompoundOrelse(fb, left, bin, left_type_idx, left_type, result_type);
-            }
-        }
-
         // Short-circuit and/or: defer right-side lowering until inside the branch.
         // Go reference: ssagen/ssa.go:3398-3442 (OANDAND/OOROR expr path).
         // Without this, side effects from the right operand (e.g. slice bounds checks)
@@ -4362,21 +4346,6 @@ pub const Lowerer = struct {
                 return try fb.emitBinary(.ne, eq_result, zero, TypeRegistry.BOOL, bin.span);
             } else {
                 return try fb.emitBinary(.eq, eq_result, zero, TypeRegistry.BOOL, bin.span);
-            }
-        }
-        if (bin.op == .kw_orelse) {
-            const left_type_idx = self.inferExprType(bin.left);
-            const left_type = self.type_reg.get(left_type_idx);
-            if (left_type == .optional) {
-                // Compound optional case handled early (before right is lowered) via lowerCompoundOrelse
-                if (!self.isPtrLikeOptional(left_type_idx)) unreachable;
-                {
-                    // Pointer-like optional: null=0 sentinel
-                    const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, bin.span));
-                    const condition = try fb.emitBinary(.ne, left, null_val, TypeRegistry.BOOL, bin.span);
-                    const unwrapped = try fb.emitUnary(.optional_unwrap, left, left_type.optional.elem, bin.span);
-                    return try fb.emitSelect(condition, unwrapped, right, result_type, bin.span);
-                }
             }
         }
         // Pointer arithmetic: p + n scales by element size (like Go's PtrIndex)
@@ -5734,11 +5703,12 @@ pub const Lowerer = struct {
                         const u8_ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
                         const ptr_ir = try fb.emitSlicePtr(value_node, u8_ptr_type, ne.span);
                         const len_ir = try fb.emitSliceLen(value_node, ne.span);
-                        // Store ptr at offset
-                        const ptr_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                        // Store ptr at offset (i64-typed pointer for correct store width)
+                        const i64_ptr_type = try self.type_reg.makePointer(TypeRegistry.I64);
+                        const ptr_addr = try fb.emitAddrOffset(ptr_node, field_offset, i64_ptr_type, ne.span);
                         _ = try fb.emitPtrStoreValue(ptr_addr, ptr_ir, ne.span);
                         // Store len at offset+8
-                        const len_addr = try fb.emitAddrOffset(ptr_node, field_offset + 8, ptr_type, ne.span);
+                        const len_addr = try fb.emitAddrOffset(ptr_node, field_offset + 8, i64_ptr_type, ne.span);
                         _ = try fb.emitPtrStoreValue(len_addr, len_ir, ne.span);
                     } else {
                         // Simple field: store value at offset
@@ -5748,7 +5718,8 @@ pub const Lowerer = struct {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
-                            const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                            const field_ptr_type = try self.type_reg.makePointer(struct_field.type_idx);
+                            const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type, ne.span);
                             if (!fi_owned) {
                                 const needs_retain = if (fi_expr) |e| blk: {
                                     if (e == .ident) {
@@ -5772,7 +5743,8 @@ pub const Lowerer = struct {
                                 _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
                             }
                         } else {
-                            const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                            const field_ptr_type2 = try self.type_reg.makePointer(struct_field.type_idx);
+                            const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type2, ne.span);
                             _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
                         }
                     }
@@ -5797,9 +5769,10 @@ pub const Lowerer = struct {
                 const u8_ptr_type = try self.type_reg.makePointer(TypeRegistry.U8);
                 const ptr_ir = try fb.emitSlicePtr(value_node, u8_ptr_type, ne.span);
                 const len_ir = try fb.emitSliceLen(value_node, ne.span);
-                const ptr_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                const i64_ptr_type = try self.type_reg.makePointer(TypeRegistry.I64);
+                const ptr_addr = try fb.emitAddrOffset(ptr_node, field_offset, i64_ptr_type, ne.span);
                 _ = try fb.emitPtrStoreValue(ptr_addr, ptr_ir, ne.span);
-                const len_addr = try fb.emitAddrOffset(ptr_node, field_offset + 8, ptr_type, ne.span);
+                const len_addr = try fb.emitAddrOffset(ptr_node, field_offset + 8, i64_ptr_type, ne.span);
                 _ = try fb.emitPtrStoreValue(len_addr, len_ir, ne.span);
             } else {
                 // ARC Phase 4: Retain +0 ARC default values stored in struct fields.
@@ -5809,7 +5782,8 @@ pub const Lowerer = struct {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
-                    const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                    const field_ptr_type = try self.type_reg.makePointer(struct_field.type_idx);
+                    const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type, ne.span);
                     if (!def_owned) {
                         // +0 value: only retain if source has active ARC cleanup (managed)
                         const needs_retain = if (def_expr) |e| blk: {
@@ -5834,7 +5808,8 @@ pub const Lowerer = struct {
                         _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
                     }
                 } else {
-                    const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, ptr_type, ne.span);
+                    const field_ptr_type2 = try self.type_reg.makePointer(struct_field.type_idx);
+                    const field_addr = try fb.emitAddrOffset(ptr_node, field_offset, field_ptr_type2, ne.span);
                     _ = try fb.emitPtrStoreValue(field_addr, value_node, ne.span);
                 }
             }
@@ -6527,6 +6502,10 @@ pub const Lowerer = struct {
                 .catch_expr => |ce| {
                     try self.detectCaptures(ce.operand, parent_fb, captures);
                     if (ce.fallback != null_node) try self.detectCaptures(ce.fallback, parent_fb, captures);
+                },
+                .orelse_expr => |oe| {
+                    try self.detectCaptures(oe.operand, parent_fb, captures);
+                    if (oe.fallback != null_node) try self.detectCaptures(oe.fallback, parent_fb, captures);
                 },
                 .tuple_literal => |tl| {
                     for (tl.elements) |elem| try self.detectCaptures(elem, parent_fb, captures);
@@ -7602,33 +7581,43 @@ pub const Lowerer = struct {
 
             // T → ?T wrapping: when arg type is T but param type is ?T (compound optional),
             // wrap the value with tag=1 + payload before passing.
+            // For null literals, use tag=0 (matches storeCompoundOptArm pattern at line 325).
             if (param_types) |params| {
                 if (arg_i < params.len) {
                     const param_type = self.type_reg.get(params[arg_i].type_idx);
                     if (param_type == .optional and !self.isPtrLikeOptional(params[arg_i].type_idx)) {
                         const arg_type = self.inferExprType(arg_idx);
-                        const arg_info = self.type_reg.get(arg_type);
-                        // Only wrap if arg is NOT already optional (T → ?T, not ?T → ?T)
-                        if (arg_info != .optional) {
+                        if (arg_type == TypeRegistry.UNTYPED_NULL) {
+                            // null → tag=0, payload=0 (zero-initialized)
                             const opt_size = self.type_reg.sizeOf(params[arg_i].type_idx);
                             const tmp = try fb.addLocalWithSize("__opt_arg", params[arg_i].type_idx, false, opt_size);
-                            const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
-                            _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_one, call.span);
-                            // For large T (struct/union > 8 bytes), copy word by word into payload area
-                            const arg_size = self.type_reg.sizeOf(arg_type);
-                            if (arg_size > 8) {
-                                const val_tmp = try fb.addLocalWithSize("__opt_val", arg_type, false, arg_size);
-                                _ = try fb.emitStoreLocal(val_tmp, arg_node, call.span);
-                                const num_words: u32 = @intCast((arg_size + 7) / 8);
-                                for (0..num_words) |i| {
-                                    const off: i64 = @intCast(i * 8);
-                                    const word = try fb.emitFieldLocal(val_tmp, @intCast(i), off, TypeRegistry.I64, call.span);
-                                    _ = try fb.emitStoreLocalField(tmp, @as(u32, @intCast(1 + i)), @as(i64, 8) + off, word, call.span);
-                                }
-                            } else {
-                                _ = try fb.emitStoreLocalField(tmp, 1, 8, arg_node, call.span);
-                            }
+                            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, call.span);
+                            _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_zero, call.span);
                             arg_node = try fb.emitLoadLocal(tmp, params[arg_i].type_idx, call.span);
+                        } else {
+                            const arg_info = self.type_reg.get(arg_type);
+                            // Only wrap if arg is NOT already optional (T → ?T, not ?T → ?T)
+                            if (arg_info != .optional) {
+                                const opt_size = self.type_reg.sizeOf(params[arg_i].type_idx);
+                                const tmp = try fb.addLocalWithSize("__opt_arg", params[arg_i].type_idx, false, opt_size);
+                                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
+                                _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_one, call.span);
+                                // For large T (struct/union > 8 bytes), copy word by word into payload area
+                                const arg_size = self.type_reg.sizeOf(arg_type);
+                                if (arg_size > 8) {
+                                    const val_tmp = try fb.addLocalWithSize("__opt_val", arg_type, false, arg_size);
+                                    _ = try fb.emitStoreLocal(val_tmp, arg_node, call.span);
+                                    const num_words: u32 = @intCast((arg_size + 7) / 8);
+                                    for (0..num_words) |i| {
+                                        const off: i64 = @intCast(i * 8);
+                                        const word = try fb.emitFieldLocal(val_tmp, @intCast(i), off, TypeRegistry.I64, call.span);
+                                        _ = try fb.emitStoreLocalField(tmp, @as(u32, @intCast(1 + i)), @as(i64, 8) + off, word, call.span);
+                                    }
+                                } else {
+                                    _ = try fb.emitStoreLocalField(tmp, 1, 8, arg_node, call.span);
+                                }
+                                arg_node = try fb.emitLoadLocal(tmp, params[arg_i].type_idx, call.span);
+                            }
                         }
                     }
                 }
@@ -7923,6 +7912,11 @@ pub const Lowerer = struct {
             },
             .try_expr => |te| return self.collectNodeDictEntries(te.operand, tpt, collector),
             .catch_expr => |ce| return self.collectNodeDictEntries(ce.operand, tpt, collector) and self.collectNodeDictEntries(ce.fallback, tpt, collector),
+            .orelse_expr => |oe| {
+                if (!self.collectNodeDictEntries(oe.operand, tpt, collector)) return false;
+                if (oe.fallback != null_node and !self.collectNodeDictEntries(oe.fallback, tpt, collector)) return false;
+                return true;
+            },
             .closure_expr => return false, // Tier 3: closures → not stencilable
             .addr_of => |ao| return self.collectNodeDictEntries(ao.operand, tpt, collector),
             .deref => |d| return self.collectNodeDictEntries(d.operand, tpt, collector),
@@ -10297,6 +10291,101 @@ pub const Lowerer = struct {
         const len_val = try fb.emitSliceLen(val, span);
         _ = try fb.emitStoreLocalField(local_idx, 0, 0, ptr_val, span);
         _ = try fb.emitStoreLocalField(local_idx, 1, 8, len_val, span);
+    }
+
+    fn lowerOrElseExpr(self: *Lowerer, oe: ast.OrElseExpr) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const operand_type_idx = self.inferExprType(oe.operand);
+        const operand_info = self.type_reg.get(operand_type_idx);
+        if (operand_info != .optional) return try self.lowerExprNode(oe.operand);
+        const elem_type = operand_info.optional.elem;
+        const is_ptr_like = self.isPtrLikeOptional(operand_type_idx);
+
+        const operand = try self.lowerExprNode(oe.operand);
+
+        if (!is_ptr_like) {
+            // Compound optional: store to local, extract tag
+            const opt_size = self.type_reg.sizeOf(operand_type_idx);
+            const opt_local = try fb.addLocalWithSize("__orelse_opt", operand_type_idx, false, opt_size);
+            _ = try fb.emitStoreLocal(opt_local, operand, oe.span);
+            const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, oe.span);
+            const zero = try fb.emitConstInt(0, TypeRegistry.I64, oe.span);
+            const is_non_null = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, oe.span);
+
+            const result_size = self.type_reg.sizeOf(elem_type);
+            const result_local = try fb.addLocalWithSize("__orelse_result", elem_type, false, result_size);
+            const then_block = try fb.newBlock("orelse.nonnull");
+            const else_block = try fb.newBlock("orelse.null");
+            const merge_block = try fb.newBlock("orelse.end");
+            _ = try fb.emitBranch(is_non_null, then_block, else_block, oe.span);
+
+            // Non-null: extract payload
+            fb.setBlock(then_block);
+            const payload = try fb.emitFieldLocal(opt_local, 1, 8, elem_type, oe.span);
+            _ = try fb.emitStoreLocal(result_local, payload, oe.span);
+            _ = try fb.emitJump(merge_block, oe.span);
+
+            // Null block: lower fallback (follows lowerCatchExpr error-block pattern, line 10252-10270)
+            fb.setBlock(else_block);
+            switch (oe.fallback_kind) {
+                .expr => {
+                    const fallback = try self.lowerExprNode(oe.fallback);
+                    if (fallback != ir.null_node) _ = try fb.emitStoreLocal(result_local, fallback, oe.span);
+                },
+                .return_void => try self.lowerReturn(.{ .value = null_node, .span = oe.span }),
+                .return_val => try self.lowerReturn(.{ .value = oe.fallback, .span = oe.span }),
+                .break_val => try self.lowerBreak(null),
+                .continue_val => try self.lowerContinue(null),
+            }
+            // Post-hoc terminator check — Zig's endsWithNoReturn() pattern.
+            // Copied from lowerCatchExpr line 10268.
+            if (fb.needsTerminator()) {
+                _ = try fb.emitJump(merge_block, oe.span);
+            }
+
+            fb.setBlock(merge_block);
+            return try fb.emitLoadLocal(result_local, elem_type, oe.span);
+        } else {
+            // Pointer-like optional: null=0 sentinel
+            if (oe.fallback_kind != .expr) {
+                const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, oe.span));
+                const is_non_null = try fb.emitBinary(.ne, operand, null_val, TypeRegistry.BOOL, oe.span);
+
+                const then_block = try fb.newBlock("orelse.nonnull");
+                const else_block = try fb.newBlock("orelse.null");
+                const merge_block = try fb.newBlock("orelse.end");
+                _ = try fb.emitBranch(is_non_null, then_block, else_block, oe.span);
+
+                fb.setBlock(then_block);
+                const unwrapped = try fb.emitUnary(.optional_unwrap, operand, elem_type, oe.span);
+                const result_local = try fb.addLocalWithSize("__orelse_result", elem_type, false, 8);
+                _ = try fb.emitStoreLocal(result_local, unwrapped, oe.span);
+                _ = try fb.emitJump(merge_block, oe.span);
+
+                fb.setBlock(else_block);
+                switch (oe.fallback_kind) {
+                    .return_void => try self.lowerReturn(.{ .value = null_node, .span = oe.span }),
+                    .return_val => try self.lowerReturn(.{ .value = oe.fallback, .span = oe.span }),
+                    .break_val => try self.lowerBreak(null),
+                    .continue_val => try self.lowerContinue(null),
+                    .expr => unreachable,
+                }
+                // Post-hoc terminator check — same as compound path above
+                if (fb.needsTerminator()) {
+                    _ = try fb.emitJump(merge_block, oe.span);
+                }
+
+                fb.setBlock(merge_block);
+                return try fb.emitLoadLocal(result_local, elem_type, oe.span);
+            }
+
+            // Normal expr fallback: use emitSelect (existing path)
+            const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, oe.span));
+            const condition = try fb.emitBinary(.ne, operand, null_val, TypeRegistry.BOOL, oe.span);
+            const unwrapped = try fb.emitUnary(.optional_unwrap, operand, elem_type, oe.span);
+            const fallback = try self.lowerExprNode(oe.fallback);
+            return try fb.emitSelect(condition, unwrapped, fallback, elem_type, oe.span);
+        }
     }
 
     fn inferExprType(self: *Lowerer, idx: NodeIndex) TypeIndex {

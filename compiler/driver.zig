@@ -5666,7 +5666,10 @@ pub const Driver = struct {
                     const param_type = type_reg.get(param.type_idx);
                     const is_string_or_slice = param.type_idx == types_mod.TypeRegistry.STRING or param_type == .slice;
                     const type_size = type_reg.sizeOf(param.type_idx);
-                    const is_large_struct = !is_wasm_gc and (param_type == .struct_type or param_type == .union_type or param_type == .tuple) and type_size > 8;
+                    const is_compound_opt = param_type == .optional and type_reg.get(param_type.optional.elem) != .pointer;
+                    // Compound optionals are always linear memory (not GC refs), decompose on all targets.
+                    // Structs/unions/tuples skip decomposition on WasmGC (they use GC refs).
+                    const is_large_struct = (!is_wasm_gc and (param_type == .struct_type or param_type == .union_type or param_type == .tuple) and type_size > 8) or (is_compound_opt and type_size > 8);
 
                     // WasmGC: struct and managed pointer-to-struct params are single (ref null $typeidx)
                     // Raw pointers (@intToPtr) are i64 linear memory addresses, not GC refs.
@@ -5723,6 +5726,7 @@ pub const Driver = struct {
                 &[_]wasm.ValType{.f64}
             else
                 &[_]wasm.ValType{.i64};
+
 
             // Add function type to linker
             // WasmGC: use addTypeWasm for GC-aware type registration (ref type params)

@@ -86,7 +86,9 @@ pub const SSABuilder = struct {
             const is_string_or_slice = param.type_idx == TypeRegistry.STRING or local_type == .slice;
             const type_size = type_registry.sizeOf(param.type_idx);
             const is_compound_opt = local_type == .optional and type_registry.get(local_type.optional.elem) != .pointer;
-            const is_large_struct = !is_wasm_gc and (local_type == .struct_type or local_type == .union_type or local_type == .tuple or is_compound_opt) and type_size > 8;
+            // Compound optionals are always linear memory (not GC refs), so decompose on all targets.
+            // Structs/unions/tuples skip decomposition on WasmGC (they use GC refs).
+            const is_large_struct = (!is_wasm_gc and (local_type == .struct_type or local_type == .union_type or local_type == .tuple) and type_size > 8) or (is_compound_opt and type_size > 8);
 
             if (is_string_or_slice) {
                 // String/slice: two registers (ptr, len)
