@@ -645,6 +645,10 @@ pub const Formatter = struct {
                     self.write(" :") catch {};
                     self.write(label) catch {};
                 }
+                if (s.value != null_node) {
+                    self.write(" ") catch {};
+                    self.printNode(s.value);
+                }
             },
             .continue_stmt => |s| {
                 self.writeIndent();
@@ -785,6 +789,10 @@ pub const Formatter = struct {
                 self.write("}") catch {};
             },
             .block_expr => |e| {
+                if (e.label) |label| {
+                    self.write(label) catch {};
+                    self.write(": ") catch {};
+                }
                 self.write("{") catch {};
                 self.newline() catch {};
                 self.indent += 1;
@@ -914,6 +922,20 @@ pub const Formatter = struct {
                     self.write("| ") catch {};
                 }
                 self.printNode(e.fallback);
+            },
+            .orelse_expr => |e| {
+                self.printNode(e.operand);
+                self.write(" orelse ") catch {};
+                switch (e.fallback_kind) {
+                    .expr => self.printNode(e.fallback),
+                    .return_void => self.write("return") catch {},
+                    .return_val => {
+                        self.write("return ") catch {};
+                        self.printNode(e.fallback);
+                    },
+                    .break_val => self.write("break") catch {},
+                    .continue_val => self.write("continue") catch {},
+                }
             },
             .error_literal => |e| {
                 self.write("error.") catch {};

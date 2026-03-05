@@ -103,6 +103,7 @@ pub const Expr = union(enum) {
     spawn_expr: SpawnExpr,
     select_expr: SelectExpr,
     catch_expr: CatchExpr,
+    orelse_expr: OrElseExpr,
     error_literal: ErrorLiteral,
     closure_expr: ClosureExpr,
     tuple_literal: TupleLiteral,
@@ -142,7 +143,7 @@ pub const SwitchCase = struct {
     body: NodeIndex,
     span: Span,
 };
-pub const BlockExpr = struct { stmts: []const NodeIndex, expr: NodeIndex, span: Span };
+pub const BlockExpr = struct { stmts: []const NodeIndex, expr: NodeIndex, label: ?[]const u8 = null, span: Span };
 pub const StructInit = struct { type_name: []const u8, type_args: []const NodeIndex = &.{}, fields: []const FieldInit, span: Span };
 pub const FieldInit = struct { name: []const u8, value: NodeIndex, span: Span };
 /// Heap allocation expression: new Type { field: value, ... } or new Type(args...)
@@ -413,6 +414,13 @@ pub const SelectCase = struct {
 };
 pub const SelectCaseKind = enum { recv, send };
 pub const CatchExpr = struct { operand: NodeIndex, capture: []const u8, capture_is_ptr: bool = false, fallback: NodeIndex, span: Span };
+pub const OrElseExpr = struct {
+    operand: NodeIndex, // LHS: the optional expression
+    fallback: NodeIndex, // RHS: expr (.expr), return value (.return_val), or null_node (.return_void/.break_val/.continue_val)
+    fallback_kind: OrElseFallback,
+    span: Span,
+};
+pub const OrElseFallback = enum { expr, return_void, return_val, break_val, continue_val };
 pub const ErrorLiteral = struct { error_name: []const u8, span: Span };
 pub const ClosureExpr = struct { params: []const Field, return_type: NodeIndex, body: NodeIndex, span: Span };
 pub const TupleLiteral = struct { elements: []const NodeIndex, span: Span };
@@ -473,7 +481,7 @@ pub const ForStmt = struct {
     }
 };
 pub const BlockStmt = struct { stmts: []const NodeIndex, span: Span };
-pub const BreakStmt = struct { label: ?[]const u8 = null, span: Span };
+pub const BreakStmt = struct { label: ?[]const u8 = null, value: NodeIndex = null_node, span: Span };
 pub const ContinueStmt = struct { label: ?[]const u8 = null, span: Span };
 pub const DeferStmt = struct { expr: NodeIndex, is_errdefer: bool = false, span: Span };
 pub const BadStmt = struct { span: Span };

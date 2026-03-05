@@ -5767,23 +5767,61 @@ pub const Driver = struct {
                         const has_res = sv.type_idx != types_mod.TypeRegistry.VOID and sv.type_idx != 0;
 
                         // Build Wasm type signature and register with linker
+                        // WasmGC: use WasmType to support GC ref params (same as direct call path)
+                        var gc_cp: [16]wasm.WasmType = undefined;
                         var cp: [16]wasm.ValType = undefined;
                         for (0..n_params) |pi| {
-                            // Check if this arg is a float type
                             const arg_val = sv.args[skip + pi];
                             const is_f = arg_val.type_idx == types_mod.TypeRegistry.F64 or
                                 arg_val.type_idx == types_mod.TypeRegistry.F32;
+                            const arg_type_info = type_reg.get(arg_val.type_idx);
+                            const is_gc_ref = is_wasm_gc and (arg_type_info == .struct_type or
+                                (arg_type_info == .pointer and arg_type_info.pointer.managed and type_reg.get(arg_type_info.pointer.elem) == .struct_type));
+                            if (is_gc_ref) {
+                                const st = if (arg_type_info == .struct_type)
+                                    arg_type_info.struct_type
+                                else
+                                    type_reg.get(arg_type_info.pointer.elem).struct_type;
+                                const gc_idx = linker.gc_struct_name_map.get(st.name) orelse 0;
+                                gc_cp[pi] = wasm.WasmType.gcRefNull(gc_idx);
+                            } else {
+                                gc_cp[pi] = wasm.WasmType.fromVal(if (is_f) .f64 else .i64);
+                            }
                             cp[pi] = if (is_f) .f64 else .i64;
                         }
                         const ret_f = sv.type_idx == types_mod.TypeRegistry.F64 or
                             sv.type_idx == types_mod.TypeRegistry.F32;
-                        const res: []const wasm.ValType = if (!has_res)
-                            &[_]wasm.ValType{}
-                        else if (ret_f)
-                            &[_]wasm.ValType{.f64}
-                        else
-                            &[_]wasm.ValType{.i64};
-                        const call_type_idx = try linker.addType(cp[0..n_params], res);
+
+                        const call_type_idx = if (is_wasm_gc) blk: {
+                            // WasmGC: handle GC ref return types
+                            var gc_res: [2]wasm.WasmType = undefined;
+                            var gc_res_len: usize = 0;
+                            if (has_res) {
+                                const ci_ret_type_info = type_reg.get(sv.type_idx);
+                                const is_gc_ret = ci_ret_type_info == .struct_type or
+                                    (ci_ret_type_info == .pointer and ci_ret_type_info.pointer.managed and type_reg.get(ci_ret_type_info.pointer.elem) == .struct_type);
+                                if (is_gc_ret) {
+                                    const st = if (ci_ret_type_info == .struct_type)
+                                        ci_ret_type_info.struct_type
+                                    else
+                                        type_reg.get(ci_ret_type_info.pointer.elem).struct_type;
+                                    const gc_idx = linker.gc_struct_name_map.get(st.name) orelse 0;
+                                    gc_res[0] = wasm.WasmType.gcRefNull(gc_idx);
+                                } else {
+                                    gc_res[0] = wasm.WasmType.fromVal(if (ret_f) .f64 else .i64);
+                                }
+                                gc_res_len = 1;
+                            }
+                            break :blk try linker.addTypeWasm(gc_cp[0..n_params], gc_res[0..gc_res_len]);
+                        } else blk: {
+                            const res: []const wasm.ValType = if (!has_res)
+                                &[_]wasm.ValType{}
+                            else if (ret_f)
+                                &[_]wasm.ValType{.f64}
+                            else
+                                &[_]wasm.ValType{.i64};
+                            break :blk try linker.addType(cp[0..n_params], res);
+                        };
                         sv.aux_int = @intCast(linker.funcTypeIndex(call_type_idx));
                     }
                 }

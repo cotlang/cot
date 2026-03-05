@@ -110,3 +110,71 @@ test "nested while" {
     }
     @assertEq(count, 6)
 }
+
+// --- Labeled block expressions ---
+
+test "labeled block basic" {
+    const x = blk: {
+        break :blk 42
+    }
+    @assertEq(x, 42)
+}
+
+test "labeled block with conditional" {
+    const cond = true
+    const x = blk: {
+        if (cond) {
+            break :blk 10
+        }
+        break :blk 20
+    }
+    @assertEq(x, 10)
+}
+
+test "labeled block false branch" {
+    const cond = false
+    const x = blk: {
+        if (cond) {
+            break :blk 10
+        }
+        break :blk 20
+    }
+    @assertEq(x, 20)
+}
+
+test "labeled block nested" {
+    const x = outer: {
+        const y = inner: {
+            break :inner 5
+        }
+        break :outer y * 2
+    }
+    @assertEq(x, 10)
+}
+
+test "labeled block in binary expr" {
+    const y = 5 + blk: {
+        break :blk 3
+    }
+    @assertEq(y, 8)
+}
+
+test "labeled block multi-branch" {
+    const n = 3
+    const result = blk: {
+        if (n == 1) { break :blk 100 }
+        if (n == 2) { break :blk 200 }
+        if (n == 3) { break :blk 300 }
+        break :blk 0
+    }
+    @assertEq(result, 300)
+}
+
+test "labeled block with var" {
+    var x: int = 0
+    const result = blk: {
+        x = 42
+        break :blk x
+    }
+    @assertEq(result, 42)
+}

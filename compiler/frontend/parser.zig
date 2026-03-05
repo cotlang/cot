@@ -966,6 +966,55 @@ pub const Parser = struct {
                 left = try self.tree.addExpr(.{ .catch_expr = .{ .operand = left, .capture = capture, .capture_is_ptr = capture_is_ptr, .fallback = fallback, .span = Span.init(left_span.start, self.pos()) } });
                 continue;
             }
+            // Handle orelse as a low-precedence postfix operator (precedence 1)
+            // Supports: orelse expr, orelse return, orelse return expr, orelse break, orelse continue
+            if (self.check(.kw_orelse) and min_prec <= 1) {
+                const left_span = self.tree.getNode(left).?.span();
+                self.advance(); // consume 'orelse'
+
+                if (self.check(.kw_return)) {
+                    self.advance();
+                    // Optional return value: orelse return expr
+                    // Try to parse an expression — if the next token can't start one, ret_val stays null_node
+                    const ret_val = if (!self.check(.eof) and !self.check(.rbrace) and !self.check(.rparen))
+                        try self.parseBinaryExpr(2) orelse ast.null_node
+                    else
+                        ast.null_node;
+                    const kind: ast.OrElseFallback = if (ret_val != ast.null_node) .return_val else .return_void;
+                    left = try self.tree.addExpr(.{ .orelse_expr = .{
+                        .operand = left, .fallback = ret_val, .fallback_kind = kind,
+                        .span = Span.init(left_span.start, self.pos()),
+                    } });
+                    continue;
+                }
+                if (self.check(.kw_break)) {
+                    self.advance();
+                    left = try self.tree.addExpr(.{ .orelse_expr = .{
+                        .operand = left, .fallback = ast.null_node, .fallback_kind = .break_val,
+                        .span = Span.init(left_span.start, self.pos()),
+                    } });
+                    continue;
+                }
+                if (self.check(.kw_continue)) {
+                    self.advance();
+                    left = try self.tree.addExpr(.{ .orelse_expr = .{
+                        .operand = left, .fallback = ast.null_node, .fallback_kind = .continue_val,
+                        .span = Span.init(left_span.start, self.pos()),
+                    } });
+                    continue;
+                }
+
+                // Normal expression fallback: orelse default_value
+                const fallback = try self.parseBinaryExpr(2) orelse {
+                    self.err.errorWithCode(self.pos(), .e201, "expected expression after 'orelse'");
+                    return null;
+                };
+                left = try self.tree.addExpr(.{ .orelse_expr = .{
+                    .operand = left, .fallback = fallback, .fallback_kind = .expr,
+                    .span = Span.init(left_span.start, self.pos()),
+                } });
+                continue;
+            }
             const op = self.tok.tok;
             const prec = op.precedence();
             if (prec < min_prec or prec == 0) break;
@@ -1178,6 +1227,19 @@ pub const Parser = struct {
                 // Contextual keyword: select { ... }
                 if (std.mem.eql(u8, self.tok.text, "select") and self.peekToken().tok == .lbrace) {
                     return try self.parseSelectExpr();
+                }
+                // Labeled block expression: label: { ... break :label value ... }
+                // Zig pattern: blk: { break :blk val; }
+                if (self.peekToken().tok == .colon) {
+                    const label = self.tok.text;
+                    self.advance(); // consume ident
+                    self.advance(); // consume colon
+                    if (self.check(.lbrace)) {
+                        return self.parseLabeledBlockExpr(label);
+                    }
+                    // Not a labeled block — error (colon not valid here otherwise)
+                    self.err.errorWithCode(self.pos(), .e201, "expected '{' after label");
+                    return null;
                 }
                 const n = self.tok.text;
                 self.advance();
@@ -1620,6 +1682,32 @@ pub const Parser = struct {
         return try self.tree.addExpr(.{ .block_expr = .{ .stmts = try self.allocator.dupe(NodeIndex, stmts.items), .expr = result_expr, .span = Span.init(start, self.pos()) } });
     }
 
+    /// Labeled block expression: label: { ... break :label value ... }
+    /// Zig pattern: const x = blk: { break :blk val; };
+    fn parseLabeledBlockExpr(self: *Parser, label: []const u8) ParseError!?NodeIndex {
+        const start = self.pos();
+        if (!self.expect(.lbrace)) return null;
+        var stmts = std.ArrayListUnmanaged(NodeIndex){};
+        defer stmts.deinit(self.allocator);
+        while (!self.check(.rbrace) and !self.check(.eof)) {
+            if (try self.parseStmt()) |s| try stmts.append(self.allocator, s) else self.advance();
+        }
+        if (!self.expect(.rbrace)) return null;
+        var result_expr: NodeIndex = null_node;
+        if (stmts.items.len > 0) {
+            const last = stmts.items[stmts.items.len - 1];
+            if (self.tree.getNode(last)) |node| {
+                if (node.asStmt()) |stmt| {
+                    if (stmt == .expr_stmt) {
+                        result_expr = stmt.expr_stmt.expr;
+                        stmts.items.len -= 1;
+                    }
+                }
+            }
+        }
+        return try self.tree.addExpr(.{ .block_expr = .{ .stmts = try self.allocator.dupe(NodeIndex, stmts.items), .expr = result_expr, .label = label, .span = Span.init(start, self.pos()) } });
+    }
+
     /// Zig pattern: if (expr) |val| { ... }
     /// Parentheses required around condition. `)` terminates expr, so `|val|` is unambiguous.
     fn parseIfExpr(self: *Parser) ParseError!?NodeIndex {
@@ -1851,9 +1939,17 @@ pub const Parser = struct {
             .kw_break => {
                 self.advance();
                 var label: ?[]const u8 = null;
-                if (self.check(.colon)) { self.advance(); if (self.check(.ident)) { label = self.tok.text; self.advance(); } }
+                var value: NodeIndex = null_node;
+                if (self.check(.colon)) {
+                    self.advance();
+                    if (self.check(.ident)) { label = self.tok.text; self.advance(); }
+                    // Labeled break with value: break :label expr
+                    if (!self.check(.rbrace) and !self.check(.semicolon) and !self.check(.eof)) {
+                        value = try self.parseExpr() orelse null_node;
+                    }
+                }
                 _ = self.match(.semicolon);
-                return try self.tree.addStmt(.{ .break_stmt = .{ .label = label, .span = Span.init(start, self.pos()) } });
+                return try self.tree.addStmt(.{ .break_stmt = .{ .label = label, .value = value, .span = Span.init(start, self.pos()) } });
             },
             .kw_continue => {
                 self.advance();

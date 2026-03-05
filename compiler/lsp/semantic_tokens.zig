@@ -296,6 +296,10 @@ const TokenCollector = struct {
                     self.emitName(c.span, c.capture, .variable, MOD_DECLARATION);
                 self.walkNode(c.fallback);
             },
+            .orelse_expr => |c| {
+                self.walkNode(c.operand);
+                if (c.fallback != null_node) self.walkNode(c.fallback);
+            },
             .binary => |b| {
                 self.walkNode(b.left);
                 self.walkNode(b.right);
@@ -414,7 +418,8 @@ const TokenCollector = struct {
                 }
                 self.walkNode(d.value);
             },
-            .break_stmt, .continue_stmt, .bad_stmt => {},
+            .break_stmt => |bs| self.walkNode(bs.value),
+            .continue_stmt, .bad_stmt => {},
         }
     }
 

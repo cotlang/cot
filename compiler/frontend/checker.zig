@@ -199,6 +199,8 @@ pub const Checker = struct {
     /// Expected type for anonymous struct literal resolution
     expected_type: TypeIndex = invalid_type,
     in_loop: bool = false,
+    in_labeled_block: u32 = 0,
+    labeled_block_result_type: TypeIndex = invalid_type,
     in_async_fn: bool = false,
     // Generics support (Zig-style lazy monomorphization + Go checker flow)
     // Shared across all checkers in multi-file mode (owned by driver)
@@ -1602,6 +1604,7 @@ pub const Checker = struct {
             .spawn_expr => |se| self.checkSpawnExpr(se),
             .select_expr => |se| self.checkSelectExpr(se),
             .catch_expr => |ce| self.checkCatchExpr(ce),
+            .orelse_expr => |oe| self.checkOrElseExpr(oe),
             .error_literal => |el| self.checkErrorLiteral(el),
             .closure_expr => |ce| self.checkClosureExpr(ce),
             .addr_of => |ao| self.checkAddrOf(ao),
@@ -1773,7 +1776,6 @@ pub const Checker = struct {
                 self.err.errorWithCode(bin.span.start, .e300, "invalid operation");
                 return invalid_type;
             },
-            .kw_orelse => return if (left == .optional) left.optional.elem else left_type,
             else => return invalid_type,
         }
     }
@@ -2926,13 +2928,29 @@ pub const Checker = struct {
         defer block_scope.deinit();
         const old_scope = self.scope;
         self.scope = &block_scope;
+        const has_label = b.label != null;
+        if (has_label) self.in_labeled_block += 1;
+        const saved_label_result = self.labeled_block_result_type;
+        if (has_label) self.labeled_block_result_type = invalid_type;
+        defer {
+            if (has_label) {
+                self.in_labeled_block -= 1;
+                self.labeled_block_result_type = saved_label_result;
+            }
+        }
         // Zig RLS pattern: expected_type flows to the block's result expression,
         // not to intermediate statements. Clear for stmts, restore for result.
         const saved_expected = self.expected_type;
         self.expected_type = invalid_type;
         self.checkStmtsWithReachability(b.stmts);
         self.expected_type = saved_expected;
-        const result = if (b.expr != null_node) try self.checkExpr(b.expr) else TypeRegistry.VOID;
+        const result = blk: {
+            if (b.expr != null_node) break :blk try self.checkExpr(b.expr);
+            // For labeled blocks, infer type from break values
+            if (has_label and self.labeled_block_result_type != invalid_type)
+                break :blk self.labeled_block_result_type;
+            break :blk TypeRegistry.VOID;
+        };
         if (self.lint_mode) self.checkScopeUnused(&block_scope);
         self.scope = old_scope;
         return result;
@@ -3068,6 +3086,27 @@ pub const Checker = struct {
         return elem_type;
     }
 
+    fn checkOrElseExpr(self: *Checker, oe: ast.OrElseExpr) CheckError!TypeIndex {
+        const operand_type = try self.checkExpr(oe.operand);
+        const operand_info = self.types.get(operand_type);
+        if (operand_info != .optional) {
+            self.err.errorWithCode(oe.span.start, .e300, "orelse requires optional type");
+            return operand_type;
+        }
+        const elem_type = operand_info.optional.elem;
+        switch (oe.fallback_kind) {
+            .expr => {
+                _ = try self.checkExpr(oe.fallback);
+                return elem_type;
+            },
+            .return_val => {
+                if (oe.fallback != ast.null_node) _ = try self.checkExpr(oe.fallback);
+                return elem_type;
+            },
+            .return_void, .break_val, .continue_val => return elem_type,
+        }
+    }
+
     fn checkErrorLiteral(self: *Checker, el: ast.ErrorLiteral) CheckError!TypeIndex {
         // error.X returns an error set type; the specific set is inferred from context
         // First check the function's return type for the error set
@@ -3121,7 +3160,17 @@ pub const Checker = struct {
             .while_stmt => |ws| try self.checkWhileStmt(ws),
             .for_stmt => |fs| try self.checkForStmt(fs),
             .block_stmt => |bs| try self.checkBlockStmt(bs),
-            .break_stmt => |bs| if (!self.in_loop) self.err.errorWithCode(bs.span.start, .e300, "break outside of loop"),
+            .break_stmt => |bs| {
+                if (bs.label != null) {
+                    if (self.in_labeled_block == 0 and !self.in_loop)
+                        self.err.errorWithCode(bs.span.start, .e300, "break label does not match any enclosing labeled block or loop");
+                    if (bs.value != null_node) {
+                        const val_type = try self.checkExpr(bs.value);
+                        if (self.labeled_block_result_type == invalid_type)
+                            self.labeled_block_result_type = val_type;
+                    }
+                } else if (!self.in_loop) self.err.errorWithCode(bs.span.start, .e300, "break outside of loop");
+            },
             .continue_stmt => |cs| if (!self.in_loop) self.err.errorWithCode(cs.span.start, .e300, "continue outside of loop"),
             .defer_stmt => |ds| _ = try self.checkExpr(ds.expr),
             .destructure_stmt => |ds| try self.checkDestructureStmt(ds, idx),

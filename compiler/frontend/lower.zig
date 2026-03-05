@@ -33,6 +33,7 @@ pub const Lowerer = struct {
     current_func: ?*ir.FuncBuilder = null,
     temp_counter: u32 = 0,
     loop_stack: std.ArrayListUnmanaged(LoopContext),
+    labeled_block_stack: std.ArrayListUnmanaged(LabeledBlockContext),
     cleanup_stack: arc.CleanupStack,
     const_values: std.StringHashMap(i64),
     float_const_values: std.StringHashMap(f64),
@@ -451,6 +452,15 @@ pub const Lowerer = struct {
         label: ?[]const u8 = null,
     };
 
+    /// Zig labeled block pattern: result_local + exit_block for break :label value
+    const LabeledBlockContext = struct {
+        label: []const u8,
+        exit_block: ir.BlockIndex,
+        result_local: ir.LocalIdx,
+        result_type: TypeIndex,
+        cleanup_depth: usize,
+    };
+
     const GlobalInit = struct {
         global_idx: ir.GlobalIdx,
         value_node: NodeIndex,
@@ -498,6 +508,7 @@ pub const Lowerer = struct {
             .builder = builder,
             .chk = chk,
             .loop_stack = .{},
+            .labeled_block_stack = .{},
             .cleanup_stack = arc.CleanupStack.init(allocator),
             .const_values = std.StringHashMap(i64).init(allocator),
             .float_const_values = std.StringHashMap(f64).init(allocator),
@@ -535,6 +546,7 @@ pub const Lowerer = struct {
 
     pub fn deinit(self: *Lowerer) void {
         self.loop_stack.deinit(self.allocator);
+        self.labeled_block_stack.deinit(self.allocator);
         self.cleanup_stack.deinit();
         self.const_values.deinit();
         self.float_const_values.deinit();
@@ -559,6 +571,7 @@ pub const Lowerer = struct {
 
     pub fn deinitWithoutBuilder(self: *Lowerer) void {
         self.loop_stack.deinit(self.allocator);
+        self.labeled_block_stack.deinit(self.allocator);
         self.const_values.deinit();
         self.float_const_values.deinit();
         self.float_const_types.deinit();
@@ -1617,7 +1630,7 @@ pub const Lowerer = struct {
                 return false;
             },
             .destructure_stmt => |ds| { try self.lowerDestructureStmt(ds); return false; },
-            .break_stmt => |bs| { try self.lowerBreak(bs.label); return true; },
+            .break_stmt => |bs| { try self.lowerBreak(bs.label, bs.value); return true; },
             .continue_stmt => |cs| { try self.lowerContinue(cs.label); return true; },
             .expr_stmt => |es| { _ = try self.lowerExprNode(es.expr); return false; },
             .defer_stmt => |ds| {
@@ -4065,13 +4078,104 @@ pub const Lowerer = struct {
         fb.setBlock(exit_block);
     }
 
-    fn lowerBreak(self: *Lowerer, target_label: ?[]const u8) !void {
+    fn lowerBreak(self: *Lowerer, target_label: ?[]const u8, value: ast.NodeIndex) !void {
         const fb = self.current_func orelse return;
+
+        // Check labeled block stack first (break :label value)
+        if (target_label) |label| {
+            if (self.findLabeledBlock(label)) |blk_ctx| {
+                // Store value to result local, then jump to exit block
+                if (value != ast.null_node) {
+                    const val = try self.lowerExprNode(value);
+                    if (val != ir.null_node) {
+                        _ = try fb.emitStoreLocal(blk_ctx.result_local, val, Span.fromPos(Pos.zero));
+                    }
+                }
+                try self.emitCleanupsNoPop(blk_ctx.cleanup_depth);
+                _ = try fb.emitJump(blk_ctx.exit_block, Span.fromPos(Pos.zero));
+                return;
+            }
+        }
+
+        // Fall through to loop break handling
         if (self.loop_stack.items.len == 0) return;
         const ctx = if (target_label) |label| self.findLabeledLoop(label) orelse self.loop_stack.items[self.loop_stack.items.len - 1] else self.loop_stack.items[self.loop_stack.items.len - 1];
         // Emit ALL cleanups (defers + releases) without popping — Swift's emitBranchAndCleanups
         try self.emitCleanupsNoPop(ctx.cleanup_depth);
         _ = try fb.emitJump(ctx.exit_block, Span.fromPos(Pos.zero));
+    }
+
+    fn findLabeledBlock(self: *Lowerer, target_label: []const u8) ?LabeledBlockContext {
+        var i: usize = self.labeled_block_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.labeled_block_stack.items[i].label, target_label))
+                return self.labeled_block_stack.items[i];
+        }
+        return null;
+    }
+
+    /// Labeled block expression: label: { ... break :label value ... }
+    /// Zig pattern: const x = blk: { break :blk val; };
+    /// Uses same result-local + merge-block pattern as lowerCatchExpr and lowerIfOptionalExpr.
+    fn lowerLabeledBlockExpr(self: *Lowerer, block: ast.BlockExpr) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const label = block.label orelse return ir.null_node;
+
+        // Infer result type from the block's final expression or default to I64
+        var result_type: TypeIndex = TypeRegistry.I64;
+        if (block.expr != null_node) {
+            result_type = self.inferExprType(block.expr);
+        }
+        const result_size = self.type_reg.sizeOf(result_type);
+
+        // Allocate result local and exit block (same pattern as lowerCatchExpr)
+        const result_local = try fb.addLocalWithSize("__block_result", result_type, false, result_size);
+        const exit_block = try fb.newBlock("block.exit");
+
+        // Push labeled block context
+        try self.labeled_block_stack.append(self.allocator, .{
+            .label = label,
+            .exit_block = exit_block,
+            .result_local = result_local,
+            .result_type = result_type,
+            .cleanup_depth = self.cleanup_stack.getScopeDepth(),
+        });
+
+        // Lower block body
+        const scope_depth = fb.markScopeEntry();
+        for (block.stmts) |stmt_idx| {
+            const stmt_node = self.tree.getNode(stmt_idx) orelse continue;
+            if (stmt_node.asStmt()) |s| {
+                if (try self.lowerStmt(s)) break;
+            } else if (stmt_node.asDecl()) |decl| {
+                switch (decl) {
+                    .struct_decl => |d| try self.lowerStructDecl(d),
+                    else => {},
+                }
+            }
+        }
+
+        // If block has a trailing expression (implicit result), store it
+        if (block.expr != null_node) {
+            const expr_val = try self.lowerExprNode(block.expr);
+            if (expr_val != ir.null_node) {
+                _ = try fb.emitStoreLocal(result_local, expr_val, block.span);
+            }
+        }
+
+        // Clean up and jump to exit (if block didn't terminate via break)
+        try self.emitCleanups(self.cleanup_stack.getScopeDepth());
+        if (fb.needsTerminator()) {
+            _ = try fb.emitJump(exit_block, block.span);
+        }
+
+        fb.restoreScope(scope_depth);
+        _ = self.labeled_block_stack.pop();
+
+        // Merge: load result
+        fb.setBlock(exit_block);
+        return try fb.emitLoadLocal(result_local, result_type, block.span);
     }
 
     fn lowerContinue(self: *Lowerer, target_label: ?[]const u8) !void {
@@ -4196,6 +4300,7 @@ pub const Lowerer = struct {
                 return try fb.emitTrap(cb.span);
             },
             .block_expr => |block| {
+                if (block.label != null) return try self.lowerLabeledBlockExpr(block);
                 const cleanup_depth = self.cleanup_stack.getScopeDepth();
                 const scope_depth = fb.markScopeEntry();
                 for (block.stmts) |stmt_idx| {
@@ -10334,7 +10439,7 @@ pub const Lowerer = struct {
                 },
                 .return_void => try self.lowerReturn(.{ .value = null_node, .span = oe.span }),
                 .return_val => try self.lowerReturn(.{ .value = oe.fallback, .span = oe.span }),
-                .break_val => try self.lowerBreak(null),
+                .break_val => try self.lowerBreak(null, ast.null_node),
                 .continue_val => try self.lowerContinue(null),
             }
             // Post-hoc terminator check — Zig's endsWithNoReturn() pattern.
@@ -10366,7 +10471,7 @@ pub const Lowerer = struct {
                 switch (oe.fallback_kind) {
                     .return_void => try self.lowerReturn(.{ .value = null_node, .span = oe.span }),
                     .return_val => try self.lowerReturn(.{ .value = oe.fallback, .span = oe.span }),
-                    .break_val => try self.lowerBreak(null),
+                    .break_val => try self.lowerBreak(null, ast.null_node),
                     .continue_val => try self.lowerContinue(null),
                     .expr => unreachable,
                 }
