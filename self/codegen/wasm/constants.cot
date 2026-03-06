@@ -1,0 +1,152 @@
+/// Wasm encoding helpers — LEB128, alignment, opcode writing.
+///
+/// Zig reference: compiler/codegen/wasm/assemble.zig (LEB128, alignment, writeOpcode)
+///
+/// 1:1 port of the encoding utilities from assemble.zig.
+/// Only difference: no allocator params (Cot has GC), and >> is logical
+/// shift in Cot (Zig's >> on signed is arithmetic).
+
+import "std/list"
+import "wasm_types"
+
+// ============================================================================
+// LEB128 Encoding Constants (assemble.zig:527-530)
+// ============================================================================
+
+const LEB128_LOW_BITS_MASK: int = 0x7F
+const LEB128_CONTINUATION_BIT: int = 0x80
+const LEB128_SIGN_BIT: int = 0x40
+
+// ============================================================================
+// LEB128 Encoding (assemble.zig:534-562)
+// ============================================================================
+
+/// Unsigned LEB128 encoding
+/// Go: wasmobj.go lines 1423-1437
+fn writeULEB128(w: *List(u8), value: int) void {
+    var v = value
+    while (true) {
+        const b = v & LEB128_LOW_BITS_MASK
+        v = v >> 7
+        if (v == 0) {
+            w.append(b as u8)
+            return
+        }
+        w.append((b | LEB128_CONTINUATION_BIT) as u8)
+    }
+}
+
+/// Signed LEB128 encoding
+/// Go: wasmobj.go lines 1440-1451
+/// Note: Cot >> is logical (unsigned) shift. For negative values we manually
+/// sign-extend after shifting to match Zig's arithmetic >> on i64.
+fn writeSLEB128(w: *List(u8), value: int) void {
+    var v = value
+    while (true) {
+        const b = v & LEB128_LOW_BITS_MASK
+        const s = v & LEB128_SIGN_BIT
+        // Arithmetic right shift by 7: logical shift + sign extension for negatives
+        if (v < 0) {
+            v = (v >> 7) | (-1 << 57)
+        } else {
+            v = v >> 7
+        }
+        const done = (v == 0 and s == 0) or (v == -1 and s != 0)
+        if (done) {
+            w.append(b as u8)
+            return
+        }
+        w.append((b | LEB128_CONTINUATION_BIT) as u8)
+    }
+}
+
+// ============================================================================
+// Alignment (assemble.zig:507-515)
+// ============================================================================
+
+/// Get alignment for load/store instructions
+/// Go: wasmobj.go lines 1408-1421
+fn alignment(instr: As) int {
+    return switch (instr) {
+        .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u, .i32_store8, .i64_store8 => 0,
+        .i32_load16_s, .i32_load16_u, .i64_load16_s, .i64_load16_u, .i32_store16, .i64_store16 => 1,
+        .i32_load, .f32_load, .i64_load32_s, .i64_load32_u, .i32_store, .f32_store, .i64_store32 => 2,
+        .i64_load, .f64_load, .i64_store, .f64_store => 3,
+        else => 0,
+    }
+}
+
+/// Write opcode byte(s) (assemble.zig:518-525)
+fn writeOpcode(w: *List(u8), instr: As) void {
+    if (instr.isFcPrefixed()) {
+        w.append(FC_PREFIX)
+        if (instr.fcOpcode()) |op| {
+            w.append(op as u8)
+        }
+    } else if (instr.opcode()) |op| {
+        w.append(op as u8)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "ULEB128 encoding" {
+    var w: List(u8) = .{}
+
+    writeULEB128(&w, 0)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0) as int, 0x00)
+
+    w.clear()
+    writeULEB128(&w, 127)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0) as int, 0x7F)
+
+    w.clear()
+    writeULEB128(&w, 128)
+    @assertEq(w.count, 2)
+    @assertEq(w.get(0) as int, 0x80)
+    @assertEq(w.get(1) as int, 0x01)
+}
+
+test "ULEB128 larger value" {
+    var w: List(u8) = .{}
+    writeULEB128(&w, 624485)
+    @assertEq(w.count, 3)
+    @assertEq(w.get(0) as int, 0xE5)
+    @assertEq(w.get(1) as int, 0x8E)
+    @assertEq(w.get(2) as int, 0x26)
+}
+
+test "SLEB128 encoding" {
+    var w: List(u8) = .{}
+
+    writeSLEB128(&w, 0)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0) as int, 0x00)
+
+    w.clear()
+    writeSLEB128(&w, -1)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0) as int, 0x7F)
+
+    w.clear()
+    writeSLEB128(&w, 42)
+    @assertEq(w.count, 1)
+    @assertEq(w.get(0) as int, 42)
+
+    w.clear()
+    writeSLEB128(&w, -128)
+    @assertEq(w.count, 2)
+    @assertEq(w.get(0) as int, 0x80)
+    @assertEq(w.get(1) as int, 0x7F)
+}
+
+test "alignment values" {
+    @assertEq(alignment(As.i64_load8_s), 0)
+    @assertEq(alignment(As.i64_load16_s), 1)
+    @assertEq(alignment(As.i32_load), 2)
+    @assertEq(alignment(As.i64_load), 3)
+}

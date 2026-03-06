@@ -1,0 +1,439 @@
+/// CodeBuilder — Wasm bytecode emission helpers.
+///
+/// Zig reference: compiler/codegen/wasm.zig (CodeBuilder struct)
+///
+/// Wraps a List(u8) with typed emit methods for each Wasm instruction.
+/// Uses LEB128 encoding from constants.cot for operands.
+
+import "std/list"
+import "wasm_types"
+import "constants"
+
+// Wasm opcodes (from spec)
+const OP_UNREACHABLE: u8 = 0x00
+const OP_NOP: u8 = 0x01
+const OP_BLOCK: u8 = 0x02
+const OP_LOOP: u8 = 0x03
+const OP_IF: u8 = 0x04
+const OP_ELSE: u8 = 0x05
+const OP_END: u8 = 0x0B
+const OP_BR: u8 = 0x0C
+const OP_BR_IF: u8 = 0x0D
+const OP_BR_TABLE: u8 = 0x0E
+const OP_RETURN: u8 = 0x0F
+const OP_CALL: u8 = 0x10
+const OP_CALL_INDIRECT: u8 = 0x11
+const OP_DROP: u8 = 0x1A
+const OP_SELECT: u8 = 0x1B
+const OP_LOCAL_GET: u8 = 0x20
+const OP_LOCAL_SET: u8 = 0x21
+const OP_LOCAL_TEE: u8 = 0x22
+const OP_GLOBAL_GET: u8 = 0x23
+const OP_GLOBAL_SET: u8 = 0x24
+
+// Memory ops
+const OP_I32_LOAD: u8 = 0x28
+const OP_I64_LOAD: u8 = 0x29
+const OP_F32_LOAD: u8 = 0x2A
+const OP_F64_LOAD: u8 = 0x2B
+const OP_I32_LOAD8_S: u8 = 0x2C
+const OP_I32_LOAD8_U: u8 = 0x2D
+const OP_I32_LOAD16_S: u8 = 0x2E
+const OP_I32_LOAD16_U: u8 = 0x2F
+const OP_I64_LOAD8_S: u8 = 0x30
+const OP_I64_LOAD8_U: u8 = 0x31
+const OP_I64_LOAD16_S: u8 = 0x32
+const OP_I64_LOAD16_U: u8 = 0x33
+const OP_I64_LOAD32_S: u8 = 0x34
+const OP_I64_LOAD32_U: u8 = 0x35
+const OP_I32_STORE: u8 = 0x36
+const OP_I64_STORE: u8 = 0x37
+const OP_F32_STORE: u8 = 0x38
+const OP_F64_STORE: u8 = 0x39
+const OP_I32_STORE8: u8 = 0x3A
+const OP_I32_STORE16: u8 = 0x3B
+const OP_I64_STORE8: u8 = 0x3C
+const OP_I64_STORE16: u8 = 0x3D
+const OP_I64_STORE32: u8 = 0x3E
+const OP_MEMORY_SIZE: u8 = 0x3F
+const OP_MEMORY_GROW: u8 = 0x40
+
+// Constants
+const OP_I32_CONST: u8 = 0x41
+const OP_I64_CONST: u8 = 0x42
+const OP_F32_CONST: u8 = 0x43
+const OP_F64_CONST: u8 = 0x44
+
+// i32 ops
+const OP_I32_EQZ: u8 = 0x45
+const OP_I32_EQ: u8 = 0x46
+const OP_I32_NE: u8 = 0x47
+const OP_I32_LT_S: u8 = 0x48
+const OP_I32_LT_U: u8 = 0x49
+const OP_I32_GT_S: u8 = 0x4A
+const OP_I32_GT_U: u8 = 0x4B
+const OP_I32_LE_S: u8 = 0x4C
+const OP_I32_LE_U: u8 = 0x4D
+const OP_I32_GE_S: u8 = 0x4E
+const OP_I32_GE_U: u8 = 0x4F
+
+// i64 compare
+const OP_I64_EQZ: u8 = 0x50
+const OP_I64_EQ: u8 = 0x51
+const OP_I64_NE: u8 = 0x52
+const OP_I64_LT_S: u8 = 0x53
+const OP_I64_LT_U: u8 = 0x54
+const OP_I64_GT_S: u8 = 0x55
+const OP_I64_GT_U: u8 = 0x56
+const OP_I64_LE_S: u8 = 0x57
+const OP_I64_LE_U: u8 = 0x58
+const OP_I64_GE_S: u8 = 0x59
+const OP_I64_GE_U: u8 = 0x5A
+
+// i32 arithmetic
+const OP_I32_ADD: u8 = 0x6A
+const OP_I32_SUB: u8 = 0x6B
+const OP_I32_MUL: u8 = 0x6C
+
+// i64 arithmetic
+const OP_I64_ADD: u8 = 0x7C
+const OP_I64_SUB: u8 = 0x7D
+const OP_I64_MUL: u8 = 0x7E
+const OP_I64_DIV_S: u8 = 0x7F
+const OP_I64_DIV_U: u8 = 0x80
+const OP_I64_REM_S: u8 = 0x81
+const OP_I64_REM_U: u8 = 0x82
+const OP_I64_AND: u8 = 0x83
+const OP_I64_OR: u8 = 0x84
+const OP_I64_XOR: u8 = 0x85
+const OP_I64_SHL: u8 = 0x86
+const OP_I64_SHR_S: u8 = 0x87
+const OP_I64_SHR_U: u8 = 0x88
+
+// Conversions
+const OP_I32_WRAP_I64: u8 = 0xA7
+const OP_I64_EXTEND_I32_S: u8 = 0xAC
+const OP_I64_EXTEND_I32_U: u8 = 0xAD
+
+// f64 ops
+const OP_F64_EQ: u8 = 0x61
+const OP_F64_NE: u8 = 0x62
+const OP_F64_LT: u8 = 0x63
+const OP_F64_GT: u8 = 0x64
+const OP_F64_LE: u8 = 0x65
+const OP_F64_GE: u8 = 0x66
+const OP_F64_ADD: u8 = 0xA0
+const OP_F64_SUB: u8 = 0xA1
+const OP_F64_MUL: u8 = 0xA2
+const OP_F64_DIV: u8 = 0xA3
+const OP_F64_NEG: u8 = 0x9A
+const OP_F64_SQRT: u8 = 0x9F
+
+// Block type constants (BLOCK_VOID already in wasm_types)
+const BLOCK_I32: u8 = 0x7F
+const BLOCK_I64: u8 = 0x7E
+
+// Memory copy (bulk memory proposal, FC_PREFIX already in wasm_types)
+const FC_MEMORY_COPY: u8 = 0x0A
+
+// SP global index
+const SP_GLOBAL: int = 0
+
+// ============================================================================
+// CodeBuilder
+// ============================================================================
+
+struct CodeBuilder {
+    buf: List(u8),
+    local_count: int,
+
+    static fn init() CodeBuilder {
+        var buf: List(u8) = .{}
+        return CodeBuilder {
+            buf: buf,
+            local_count: 0,
+        }
+    }
+
+    fn setLocalCount(count: int) void {
+        self.local_count = count
+    }
+
+    // Control flow
+    fn emitUnreachable() void { self.buf.append(OP_UNREACHABLE) }
+    fn emitNop() void { self.buf.append(OP_NOP) }
+
+    fn emitBlock(block_type: u8) void {
+        self.buf.append(OP_BLOCK)
+        self.buf.append(block_type)
+    }
+
+    fn emitLoop(block_type: u8) void {
+        self.buf.append(OP_LOOP)
+        self.buf.append(block_type)
+    }
+
+    fn emitIf(block_type: u8) void {
+        self.buf.append(OP_IF)
+        self.buf.append(block_type)
+    }
+
+    fn emitElse() void { self.buf.append(OP_ELSE) }
+    fn emitEnd() void { self.buf.append(OP_END) }
+
+    fn emitBr(depth: int) void {
+        self.buf.append(OP_BR)
+        writeULEB128(self.buf, depth)
+    }
+
+    fn emitBrIf(depth: int) void {
+        self.buf.append(OP_BR_IF)
+        writeULEB128(self.buf, depth)
+    }
+
+    fn emitReturn() void { self.buf.append(OP_RETURN) }
+
+    fn emitCall(func_idx: int) void {
+        self.buf.append(OP_CALL)
+        writeULEB128(self.buf, func_idx)
+    }
+
+    fn emitDrop() void { self.buf.append(OP_DROP) }
+    fn emitSelect() void { self.buf.append(OP_SELECT) }
+
+    // Locals/globals
+    fn emitLocalGet(idx: int) void {
+        self.buf.append(OP_LOCAL_GET)
+        writeULEB128(self.buf, idx)
+    }
+
+    fn emitLocalSet(idx: int) void {
+        self.buf.append(OP_LOCAL_SET)
+        writeULEB128(self.buf, idx)
+    }
+
+    fn emitLocalTee(idx: int) void {
+        self.buf.append(OP_LOCAL_TEE)
+        writeULEB128(self.buf, idx)
+    }
+
+    fn emitGlobalGet(idx: int) void {
+        self.buf.append(OP_GLOBAL_GET)
+        writeULEB128(self.buf, idx)
+    }
+
+    fn emitGlobalSet(idx: int) void {
+        self.buf.append(OP_GLOBAL_SET)
+        writeULEB128(self.buf, idx)
+    }
+
+    // Constants
+    fn emitI32Const(value: int) void {
+        self.buf.append(OP_I32_CONST)
+        writeSLEB128(self.buf, value)
+    }
+
+    fn emitI64Const(value: int) void {
+        self.buf.append(OP_I64_CONST)
+        writeSLEB128(self.buf, value)
+    }
+
+    // Memory loads (align + offset encoded as LEB128)
+    fn emitI32Load(align_val: int, offset: int) void {
+        self.buf.append(OP_I32_LOAD)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Load(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_LOAD)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Load8U(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_LOAD8_U)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Load16U(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_LOAD16_U)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Load32U(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_LOAD32_U)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Load8S(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_LOAD8_S)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Load16S(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_LOAD16_S)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Load32S(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_LOAD32_S)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    // Memory stores
+    fn emitI32Store(align_val: int, offset: int) void {
+        self.buf.append(OP_I32_STORE)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Store(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_STORE)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Store8(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_STORE8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Store16(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_STORE16)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    fn emitI64Store32(align_val: int, offset: int) void {
+        self.buf.append(OP_I64_STORE32)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    // i32 arithmetic
+    fn emitI32Add() void { self.buf.append(OP_I32_ADD) }
+    fn emitI32Sub() void { self.buf.append(OP_I32_SUB) }
+    fn emitI32Mul() void { self.buf.append(OP_I32_MUL) }
+    fn emitI32Eqz() void { self.buf.append(OP_I32_EQZ) }
+
+    // i64 arithmetic
+    fn emitI64Add() void { self.buf.append(OP_I64_ADD) }
+    fn emitI64Sub() void { self.buf.append(OP_I64_SUB) }
+    fn emitI64Mul() void { self.buf.append(OP_I64_MUL) }
+    fn emitI64DivS() void { self.buf.append(OP_I64_DIV_S) }
+    fn emitI64DivU() void { self.buf.append(OP_I64_DIV_U) }
+    fn emitI64RemS() void { self.buf.append(OP_I64_REM_S) }
+    fn emitI64RemU() void { self.buf.append(OP_I64_REM_U) }
+    fn emitI64And() void { self.buf.append(OP_I64_AND) }
+    fn emitI64Or() void { self.buf.append(OP_I64_OR) }
+    fn emitI64Xor() void { self.buf.append(OP_I64_XOR) }
+    fn emitI64Shl() void { self.buf.append(OP_I64_SHL) }
+    fn emitI64ShrS() void { self.buf.append(OP_I64_SHR_S) }
+    fn emitI64ShrU() void { self.buf.append(OP_I64_SHR_U) }
+
+    // i64 comparisons
+    fn emitI64Eqz() void { self.buf.append(OP_I64_EQZ) }
+    fn emitI64Eq() void { self.buf.append(OP_I64_EQ) }
+    fn emitI64Ne() void { self.buf.append(OP_I64_NE) }
+    fn emitI64LtS() void { self.buf.append(OP_I64_LT_S) }
+    fn emitI64LtU() void { self.buf.append(OP_I64_LT_U) }
+    fn emitI64GtS() void { self.buf.append(OP_I64_GT_S) }
+    fn emitI64GtU() void { self.buf.append(OP_I64_GT_U) }
+    fn emitI64LeS() void { self.buf.append(OP_I64_LE_S) }
+    fn emitI64LeU() void { self.buf.append(OP_I64_LE_U) }
+    fn emitI64GeS() void { self.buf.append(OP_I64_GE_S) }
+    fn emitI64GeU() void { self.buf.append(OP_I64_GE_U) }
+
+    // f64 ops
+    fn emitF64Add() void { self.buf.append(OP_F64_ADD) }
+    fn emitF64Sub() void { self.buf.append(OP_F64_SUB) }
+    fn emitF64Mul() void { self.buf.append(OP_F64_MUL) }
+    fn emitF64Div() void { self.buf.append(OP_F64_DIV) }
+    fn emitF64Neg() void { self.buf.append(OP_F64_NEG) }
+    fn emitF64Sqrt() void { self.buf.append(OP_F64_SQRT) }
+    fn emitF64Eq() void { self.buf.append(OP_F64_EQ) }
+    fn emitF64Ne() void { self.buf.append(OP_F64_NE) }
+    fn emitF64Lt() void { self.buf.append(OP_F64_LT) }
+    fn emitF64Gt() void { self.buf.append(OP_F64_GT) }
+    fn emitF64Le() void { self.buf.append(OP_F64_LE) }
+    fn emitF64Ge() void { self.buf.append(OP_F64_GE) }
+
+    // Conversions
+    fn emitI32WrapI64() void { self.buf.append(OP_I32_WRAP_I64) }
+    fn emitI64ExtendI32S() void { self.buf.append(OP_I64_EXTEND_I32_S) }
+    fn emitI64ExtendI32U() void { self.buf.append(OP_I64_EXTEND_I32_U) }
+
+    // Bulk memory
+    fn emitMemoryCopy() void {
+        self.buf.append(FC_PREFIX)
+        self.buf.append(FC_MEMORY_COPY)
+        self.buf.append(0x00 as u8)  // src memory index
+        self.buf.append(0x00 as u8)  // dst memory index
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "CodeBuilder emitI64Const" {
+    var cb = CodeBuilder.init()
+    cb.emitI64Const(42)
+    @assertEq(cb.buf.get(0) as int, 0x42)  // i64.const opcode
+    @assertEq(cb.buf.get(1) as int, 42)     // LEB128(42)
+}
+
+test "CodeBuilder emitI32Const" {
+    var cb = CodeBuilder.init()
+    cb.emitI32Const(100)
+    @assertEq(cb.buf.get(0) as int, 0x41)  // i32.const opcode
+}
+
+test "CodeBuilder emitI64Add" {
+    var cb = CodeBuilder.init()
+    cb.emitI64Add()
+    @assertEq(cb.buf.count, 1)
+    @assertEq(cb.buf.get(0) as int, 0x7C)  // i64.add
+}
+
+test "CodeBuilder emitLocalGet" {
+    var cb = CodeBuilder.init()
+    cb.emitLocalGet(3)
+    @assertEq(cb.buf.get(0) as int, 0x20)  // local.get
+    @assertEq(cb.buf.get(1) as int, 3)      // index
+}
+
+test "CodeBuilder emitCall" {
+    var cb = CodeBuilder.init()
+    cb.emitCall(5)
+    @assertEq(cb.buf.get(0) as int, 0x10)  // call
+    @assertEq(cb.buf.get(1) as int, 5)      // func index
+}
+
+test "CodeBuilder control flow" {
+    var cb = CodeBuilder.init()
+    cb.emitBlock(BLOCK_VOID)
+    cb.emitBr(0)
+    cb.emitEnd()
+    @assertEq(cb.buf.get(0) as int, 0x02)  // block
+    @assertEq(cb.buf.get(1) as int, 0x40)  // void type
+    @assertEq(cb.buf.get(2) as int, 0x0C)  // br
+    @assertEq(cb.buf.get(3) as int, 0)      // depth 0
+    @assertEq(cb.buf.get(4) as int, 0x0B)  // end
+}
+
+test "CodeBuilder memory ops" {
+    var cb = CodeBuilder.init()
+    cb.emitI64Store(3, 0)
+    @assertEq(cb.buf.get(0) as int, 0x37)  // i64.store
+    @assertEq(cb.buf.get(1) as int, 3)      // align
+    @assertEq(cb.buf.get(2) as int, 0)      // offset
+}

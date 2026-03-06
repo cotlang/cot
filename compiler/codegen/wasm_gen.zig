@@ -11,7 +11,6 @@
 //! - ssaGenBlock: emit control flow for block transitions
 
 const std = @import("std");
-const arc = @import("arc.zig");
 
 /// Error set for code generation.
 /// Go uses panic() for errors; Zig needs explicit error handling.
@@ -86,9 +85,6 @@ pub const FuncGen = struct {
     /// Maps function names to Wasm function indices.
     func_indices: ?*const FuncIndexMap,
 
-    /// ARC runtime function indices (null if ARC not enabled).
-    runtime_funcs: ?arc.LegacyRuntimeFunctions,
-
     /// Go's OnWasmStackSkipped counter.
     /// When we skip generating a value (because OnWasmStack=true),
     /// we increment this. When we later generate it, we decrement.
@@ -113,15 +109,9 @@ pub const FuncGen = struct {
             .active_loops = .{},
             .loop_exit_blocks = .{},
             .func_indices = null,
-            .runtime_funcs = null,
             .on_wasm_stack_skipped = 0,
             .frame_size = 0,
         };
-    }
-
-    /// Set ARC runtime function indices.
-    pub fn setRuntimeFunctions(self: *FuncGen, funcs: arc.LegacyRuntimeFunctions) void {
-        self.runtime_funcs = funcs;
     }
 
     pub fn deinit(self: *FuncGen) void {
@@ -555,38 +545,11 @@ pub const FuncGen = struct {
                 }
             },
 
-            // ARC runtime calls (Swift pattern from HeapObject.cpp)
-            .wasm_lowered_retain => {
-                // cot_retain(obj) -> obj
-                // Push object pointer (i32)
-                try self.getValue32(v.args[0]);
-                // Call cot_retain
-                if (self.runtime_funcs) |rt| {
-                    try self.code.emitCall(rt.retain_idx);
-                } else {
-                    // No runtime - this is an error, but emit unreachable for safety
-                    try self.code.emitUnreachable();
-                }
-                // cot_retain returns the object pointer, store if used
-                if (v.uses > 0) {
-                    try self.setReg(v);
-                } else {
-                    try self.code.emitDrop();
-                }
-            },
-
-            .wasm_lowered_release => {
-                // cot_release(obj) -> void
-                // Push object pointer (i32)
-                try self.getValue32(v.args[0]);
-                // Call cot_release
-                if (self.runtime_funcs) |rt| {
-                    try self.code.emitCall(rt.release_idx);
-                } else {
-                    // No runtime - emit unreachable for safety
-                    try self.code.emitUnreachable();
-                }
-                // cot_release returns nothing
+            // ARC retain/release: native-only. Wasm uses WasmGC.
+            // These ops should never appear in the Wasm pipeline.
+            .wasm_lowered_retain, .wasm_lowered_release => {
+                debug.log(.codegen, "    ERROR: ARC op in Wasm pipeline (native-only): {s}", .{@tagName(v.op)});
+                try self.code.emitUnreachable();
             },
 
             // Stores (Go lines 280-284)
@@ -1101,8 +1064,6 @@ pub const FuncGen = struct {
             .local_addr, .global_addr, .off_ptr, .add_ptr, .sub_ptr => true,
             // String/slice pointers produce i32
             .string_ptr, .slice_ptr, .const_string => true,
-            // ARC retain returns object pointer (i32)
-            .wasm_lowered_retain => true,
             // i32 operations
             .wasm_i32_const, .const_32, .wasm_i32_load => true,
             // Comparisons produce i32
@@ -1145,7 +1106,7 @@ pub const FuncGen = struct {
 
 /// Generate Wasm code for an SSA function.
 pub fn genFunc(allocator: std.mem.Allocator, ssa_func: *const SsaFunc) ![]const u8 {
-    return genFuncWithIndices(allocator, ssa_func, null, null);
+    return genFuncWithIndices(allocator, ssa_func, null);
 }
 
 /// Generate Wasm code for an SSA function with function index resolution.
@@ -1153,13 +1114,9 @@ pub fn genFuncWithIndices(
     allocator: std.mem.Allocator,
     ssa_func: *const SsaFunc,
     func_indices: ?*const FuncIndexMap,
-    runtime_funcs: ?arc.LegacyRuntimeFunctions,
 ) ![]const u8 {
     var gen = FuncGen.init(allocator, ssa_func);
     gen.func_indices = func_indices;
-    if (runtime_funcs) |rf| {
-        gen.setRuntimeFunctions(rf);
-    }
     defer gen.deinit();
     return gen.generate();
 }
@@ -2112,133 +2069,3 @@ test "genFunc - string_len from const_string" {
     try testing.expect(found_i64_const);
 }
 
-// ============================================================================
-// M15: ARC (Reference Counting) Tests
-// Reference: Swift's HeapObject.cpp retain/release patterns
-// ============================================================================
-
-test "genFunc - wasm_lowered_retain emits call to cot_retain" {
-    // Test that retain operation emits a call instruction
-    const allocator = testing.allocator;
-
-    // Create a module with ARC runtime to get function indices
-    var module = wasm.Module.init(allocator);
-    defer module.deinit();
-    const runtime_funcs = try arc.addRuntimeFunctions(&module);
-
-    var f = SsaFunc.init(allocator, "test_retain");
-    defer f.deinit();
-
-    const b = try f.newBlock(.ret);
-
-    // Simulate an object pointer (i32 const)
-    const obj_ptr = try f.newValue(.wasm_i32_const, 0, b, .{});
-    obj_ptr.aux_int = 0x10000; // Some memory address
-    obj_ptr.*.uses = 1;
-    try b.addValue(allocator, obj_ptr);
-
-    // wasm_lowered_retain(obj_ptr)
-    const retain = try f.newValue(.wasm_lowered_retain, 0, b, .{});
-    retain.addArg(obj_ptr);
-    retain.*.uses = 1; // Use the result
-    try b.addValue(allocator, retain);
-    b.controls[0] = retain;
-
-    // Generate with ARC runtime
-    const body = try genFuncWithIndices(allocator, &f, null, runtime_funcs);
-    defer allocator.free(body);
-
-    // Should contain a call instruction to retain function
-    try testing.expect(body.len >= 5);
-    var found_call = false;
-    for (body) |byte| {
-        if (byte == Op.call) found_call = true;
-    }
-    try testing.expect(found_call);
-}
-
-test "genFunc - wasm_lowered_release emits call to cot_release" {
-    // Test that release operation emits a call instruction
-    const allocator = testing.allocator;
-
-    // Create a module with ARC runtime
-    var module = wasm.Module.init(allocator);
-    defer module.deinit();
-    const runtime_funcs = try arc.addRuntimeFunctions(&module);
-
-    var f = SsaFunc.init(allocator, "test_release");
-    defer f.deinit();
-
-    const b = try f.newBlock(.ret);
-
-    // Simulate an object pointer
-    const obj_ptr = try f.newValue(.wasm_i32_const, 0, b, .{});
-    obj_ptr.aux_int = 0x10000;
-    obj_ptr.*.uses = 1;
-    try b.addValue(allocator, obj_ptr);
-
-    // wasm_lowered_release(obj_ptr)
-    const release = try f.newValue(.wasm_lowered_release, 0, b, .{});
-    release.addArg(obj_ptr);
-    try b.addValue(allocator, release);
-
-    // Return constant (release has no result)
-    const ret = try f.newValue(.wasm_i64_const, 0, b, .{});
-    ret.aux_int = 0;
-    ret.*.uses = 1;
-    try b.addValue(allocator, ret);
-    b.controls[0] = ret;
-
-    // Generate with ARC runtime
-    const body = try genFuncWithIndices(allocator, &f, null, runtime_funcs);
-    defer allocator.free(body);
-
-    // Should contain a call instruction to release function
-    try testing.expect(body.len >= 5);
-    var found_call = false;
-    for (body) |byte| {
-        if (byte == Op.call) found_call = true;
-    }
-    try testing.expect(found_call);
-}
-
-test "genFunc - retain/release without runtime emits unreachable" {
-    // Test that retain/release without runtime functions traps safely
-    const allocator = testing.allocator;
-
-    var f = SsaFunc.init(allocator, "test_no_runtime");
-    defer f.deinit();
-
-    const b = try f.newBlock(.ret);
-
-    // Object pointer
-    const obj_ptr = try f.newValue(.wasm_i32_const, 0, b, .{});
-    obj_ptr.aux_int = 0x10000;
-    obj_ptr.*.uses = 1;
-    try b.addValue(allocator, obj_ptr);
-
-    // wasm_lowered_retain without runtime - should emit unreachable
-    const retain = try f.newValue(.wasm_lowered_retain, 0, b, .{});
-    retain.addArg(obj_ptr);
-    retain.*.uses = 0; // Don't use result
-    try b.addValue(allocator, retain);
-
-    // Return constant
-    const ret = try f.newValue(.wasm_i64_const, 0, b, .{});
-    ret.aux_int = 0;
-    ret.*.uses = 1;
-    try b.addValue(allocator, ret);
-    b.controls[0] = ret;
-
-    // Generate WITHOUT ARC runtime (runtime_funcs = null)
-    const body = try genFunc(allocator, &f);
-    defer allocator.free(body);
-
-    // Should contain unreachable instruction (0x00)
-    try testing.expect(body.len >= 3);
-    var found_unreachable = false;
-    for (body) |byte| {
-        if (byte == Op.unreachable_op) found_unreachable = true;
-    }
-    try testing.expect(found_unreachable);
-}

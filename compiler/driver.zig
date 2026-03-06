@@ -5364,16 +5364,23 @@ pub const Driver = struct {
         }
 
         // ====================================================================
-        // Add ARC runtime functions first (they get indices 0, 1, 2, ...)
-        // Reference: Swift stdlib HeapObject.cpp
+        // Heap pointer global for linear memory allocation (slice growth, etc.)
+        // WasmGC: no ARC, but slice_runtime still needs a heap pointer for
+        // growslice (linear memory backing store for slices).
+        // Layout: SP(0), CTXT(1), heap_ptr(2)
         // ====================================================================
-        const arc_funcs = try arc.addToLinker(self.allocator, &linker);
+        const heap_ptr_dynamic_idx = try linker.addGlobal(.{
+            .val_type = .i32,
+            .mutable = true,
+            .init_i32 = @intCast(0x800000), // HEAP_START = 8MB
+        });
+        const heap_ptr_global = heap_ptr_dynamic_idx + 1; // Offset by SP
 
         // ====================================================================
         // Add slice runtime functions (Go style)
         // Reference: Go runtime/slice.go
         // ====================================================================
-        const slice_funcs = try slice_runtime.addToLinker(self.allocator, &linker, arc_funcs.heap_ptr_global);
+        const slice_funcs = try slice_runtime.addToLinker(self.allocator, &linker, heap_ptr_global);
 
         // ====================================================================
         // Add print runtime functions (Go style)
@@ -5411,17 +5418,6 @@ pub const Driver = struct {
         // Runtime functions come first, then user functions
         var func_indices = wasm_gen.FuncIndexMap{};
         defer func_indices.deinit(self.allocator);
-
-        // Add ARC function names to index map (Swift)
-        try func_indices.put(self.allocator, arc.ALLOC_NAME, arc_funcs.alloc_idx);
-        try func_indices.put(self.allocator, arc.RETAIN_NAME, arc_funcs.retain_idx);
-        try func_indices.put(self.allocator, arc.RELEASE_NAME, arc_funcs.release_idx);
-        try func_indices.put(self.allocator, arc.DEALLOC_NAME, arc_funcs.dealloc_idx);
-        try func_indices.put(self.allocator, arc.REALLOC_NAME, arc_funcs.realloc_idx);
-        try func_indices.put(self.allocator, arc.STRING_CONCAT_NAME, arc_funcs.string_concat_idx);
-        try func_indices.put(self.allocator, arc.STRING_EQ_NAME, arc_funcs.string_eq_idx);
-        try func_indices.put(self.allocator, arc.MEMSET_ZERO_NAME, arc_funcs.memset_zero_idx);
-        try func_indices.put(self.allocator, arc.MEMCPY_NAME, arc_funcs.memcpy_idx);
 
         // Add slice function names to index map (Go)
         try func_indices.put(self.allocator, slice_runtime.GROWSLICE_NAME, slice_funcs.growslice_idx);
@@ -5518,30 +5514,8 @@ pub const Driver = struct {
         var metadata_addrs = std.StringHashMap(i32).init(self.allocator);
         defer metadata_addrs.deinit();
 
-        if (!is_wasm_gc) {
-            // Reserve table index 0 as null (no destructor)
-            // This ensures actual destructors start at index 1+
-            _ = try linker.addTableFunc(arc_funcs.release_idx); // Placeholder at index 0
-
-            // Find all destructor functions (marked by is_destructor flag during lowering)
-            // and add them to the table. Uses semantic metadata instead of name scanning
-            // to avoid false positives on generic methods like "List(i64)_deinit".
-            for (funcs, 0..) |*ir_func, i| {
-                if (ir_func.is_destructor) {
-                    // Extract type name: "TypeName_deinit" → "TypeName"
-                    if (std.mem.lastIndexOf(u8, ir_func.name, "_")) |sep| {
-                        const type_name = ir_func.name[0..sep];
-                        const func_idx: u32 = @intCast(i + runtime_func_count);
-
-                        // Add to table (table_index starts at 1, 0 is reserved for null)
-                        const table_idx = try linker.addTableFunc(func_idx);
-                        try destructor_table.put(type_name, table_idx);
-
-                        pipeline_debug.log(.codegen, "driver: destructor {s} at table[{d}] = func[{d}]", .{ ir_func.name, table_idx, func_idx });
-                    }
-                }
-            }
-        }
+        // WasmGC: no destructor table needed — GC handles object lifetime
+        // ARC destructors are native-only (handled in compileNative path)
 
         // ====================================================================
         // Build function table: ALL user functions get table entries

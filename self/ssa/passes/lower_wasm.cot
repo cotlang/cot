@@ -1,0 +1,347 @@
+/// Wasm Lowering Pass — Convert generic SSA ops to Wasm-specific ops.
+///
+/// Go reference: cmd/compile/internal/ssa/lower.go
+/// Zig reference: compiler/ssa/passes/lower_wasm.zig
+///
+/// Transforms architecture-independent ops (add, sub, load) into
+/// Wasm-specific ops (wasm_i64_add, wasm_i64_sub, wasm_i64_load).
+///
+/// After this pass, all remaining ops should be either:
+/// - Wasm-specific (wasm_*)
+/// - Control flow (phi, copy)
+/// - Structural (arg, select0, select1, make_tuple)
+
+import "std/list"
+import "../../frontend/ssa"
+import "../../frontend/types"
+
+/// Lower a function's generic ops to Wasm-specific ops.
+fn lower(func: *SsaFunc) void {
+    for bi in 0..func.blocks.count {
+        const blk = func.getBlock(bi)
+        for vi in 0..blk.values.count {
+            const val_idx = blk.values.get(vi)
+            lowerValue(func, val_idx)
+        }
+    }
+}
+
+/// Lower a single value's op from generic to Wasm-specific.
+/// Returns true if the op was changed.
+fn lowerValue(func: *SsaFunc, val_idx: int) bool {
+    var val = func.getValue(val_idx)
+    const new_op = lowerOp(val.op, val.type_idx, func, val_idx)
+
+    if (new_op != SsaOp.invalid) {
+        val.op = new_op
+        func.setValue(val_idx, val)
+        return true
+    }
+    return false
+}
+
+/// Map a generic op to its Wasm-specific equivalent.
+/// Returns SsaOp.invalid if no mapping (op stays as-is).
+fn lowerOp(op: SsaOp, type_idx: int, func: *SsaFunc, val_idx: int) SsaOp {
+    // Type-dependent cases (load/store need float check)
+    if (op == SsaOp.load or op == SsaOp.load64) {
+        if (isFloatType(type_idx)) { return SsaOp.wasm_f64_load }
+        return SsaOp.wasm_i64_load
+    }
+    if (op == SsaOp.store) {
+        if (isStoreFloatType(func, val_idx)) { return SsaOp.wasm_f64_store }
+        return SsaOp.wasm_i64_store
+    }
+
+    return switch (op) {
+        // Constants
+        .const_int, .const_64 => SsaOp.wasm_i64_const,
+        .const_32 => SsaOp.wasm_i32_const,
+        .const_float => SsaOp.wasm_f64_const,
+        .const_8, .const_16 => SsaOp.wasm_i32_const,
+
+        // Integer arithmetic (64-bit)
+        .add, .add64 => SsaOp.wasm_i64_add,
+        .sub, .sub64 => SsaOp.wasm_i64_sub,
+        .mul, .mul64 => SsaOp.wasm_i64_mul,
+        .div => SsaOp.wasm_i64_div_s,
+        .udiv => SsaOp.wasm_i64_div_u,
+        .mod => SsaOp.wasm_i64_rem_s,
+        .umod => SsaOp.wasm_i64_rem_u,
+
+        // Integer arithmetic (32-bit)
+        .add32 => SsaOp.wasm_i32_add,
+        .sub32 => SsaOp.wasm_i32_sub,
+        .mul32 => SsaOp.wasm_i32_mul,
+
+        // Integer arithmetic (8/16-bit → i32)
+        .add8, .add16 => SsaOp.wasm_i32_add,
+        .sub8, .sub16 => SsaOp.wasm_i32_sub,
+        .mul8, .mul16 => SsaOp.wasm_i32_mul,
+
+        // Bitwise (64-bit)
+        .and_, .and64 => SsaOp.wasm_i64_and,
+        .or_, .or64 => SsaOp.wasm_i64_or,
+        .xor, .xor64 => SsaOp.wasm_i64_xor,
+        .shl, .shl64 => SsaOp.wasm_i64_shl,
+        .shr, .shr64 => SsaOp.wasm_i64_shr_u,
+        .sar, .sar64 => SsaOp.wasm_i64_shr_s,
+        .bool_not => SsaOp.wasm_i64_eqz,
+
+        // Bitwise (32-bit)
+        .and32 => SsaOp.wasm_i32_and,
+        .or32 => SsaOp.wasm_i32_or,
+        .xor32 => SsaOp.wasm_i32_xor,
+        .shl32 => SsaOp.wasm_i32_shl,
+        .shr32 => SsaOp.wasm_i32_shr_u,
+        .sar32 => SsaOp.wasm_i32_shr_s,
+
+        // Bitwise (8/16-bit → i32)
+        .and8, .and16 => SsaOp.wasm_i32_and,
+        .or8, .or16 => SsaOp.wasm_i32_or,
+        .xor8, .xor16 => SsaOp.wasm_i32_xor,
+        .shl8, .shl16 => SsaOp.wasm_i32_shl,
+        .shr8, .shr16 => SsaOp.wasm_i32_shr_u,
+        .sar8, .sar16 => SsaOp.wasm_i32_shr_s,
+
+        // Bit counting
+        .clz64 => SsaOp.wasm_i64_clz,
+        .ctz64 => SsaOp.wasm_i64_ctz,
+        .popcnt64 => SsaOp.wasm_i64_popcnt,
+        .clz32 => SsaOp.wasm_i32_clz,
+        .ctz32 => SsaOp.wasm_i32_ctz,
+        .popcnt32 => SsaOp.wasm_i32_popcnt,
+
+        // Integer comparisons (64-bit)
+        .eq, .eq64 => SsaOp.wasm_i64_eq,
+        .ne, .ne64 => SsaOp.wasm_i64_ne,
+        .lt, .lt64 => SsaOp.wasm_i64_lt_s,
+        .le, .le64 => SsaOp.wasm_i64_le_s,
+        .gt, .gt64 => SsaOp.wasm_i64_gt_s,
+        .ge, .ge64 => SsaOp.wasm_i64_ge_s,
+        .ult => SsaOp.wasm_i64_lt_u,
+        .ule => SsaOp.wasm_i64_le_u,
+        .ugt => SsaOp.wasm_i64_gt_u,
+        .uge => SsaOp.wasm_i64_ge_u,
+
+        // Integer comparisons (32-bit)
+        .eq32 => SsaOp.wasm_i32_eq,
+        .ne32 => SsaOp.wasm_i32_ne,
+        .lt32 => SsaOp.wasm_i32_lt_s,
+        .le32 => SsaOp.wasm_i32_le_s,
+        .gt32 => SsaOp.wasm_i32_gt_s,
+        .ge32 => SsaOp.wasm_i32_ge_s,
+
+        // Integer comparisons (8/16-bit → i32)
+        .eq8, .eq16 => SsaOp.wasm_i32_eq,
+        .ne8, .ne16 => SsaOp.wasm_i32_ne,
+
+        // Float arithmetic (f64)
+        .add64f => SsaOp.wasm_f64_add,
+        .sub64f => SsaOp.wasm_f64_sub,
+        .mul64f => SsaOp.wasm_f64_mul,
+        .div64f => SsaOp.wasm_f64_div,
+        .neg64f => SsaOp.wasm_f64_neg,
+        .sqrt64f => SsaOp.wasm_f64_sqrt,
+
+        // Float arithmetic (f32)
+        .add32f => SsaOp.wasm_f32_add,
+        .sub32f => SsaOp.wasm_f32_sub,
+        .mul32f => SsaOp.wasm_f32_mul,
+        .div32f => SsaOp.wasm_f32_div,
+        .neg32f => SsaOp.wasm_f32_neg,
+        .sqrt32f => SsaOp.wasm_f32_sqrt,
+
+        // Float comparisons (f64)
+        .eq64f => SsaOp.wasm_f64_eq,
+        .ne64f => SsaOp.wasm_f64_ne,
+        .lt64f => SsaOp.wasm_f64_lt,
+        .le64f => SsaOp.wasm_f64_le,
+        .gt64f => SsaOp.wasm_f64_gt,
+        .ge64f => SsaOp.wasm_f64_ge,
+
+        // Float comparisons (f32)
+        .eq32f => SsaOp.wasm_f32_eq,
+        .ne32f => SsaOp.wasm_f32_ne,
+        .lt32f => SsaOp.wasm_f32_lt,
+        .le32f => SsaOp.wasm_f32_le,
+        .gt32f => SsaOp.wasm_f32_gt,
+        .ge32f => SsaOp.wasm_f32_ge,
+
+        // Type conversions
+        .sign_ext32to64 => SsaOp.wasm_i64_extend_i32_s,
+        .zero_ext32to64 => SsaOp.wasm_i64_extend_i32_u,
+        .trunc64to32 => SsaOp.wasm_i32_wrap_i64,
+
+        // Memory (non-type-dependent)
+        .load32 => SsaOp.wasm_i64_load32_u,
+        .load32s => SsaOp.wasm_i64_load32_s,
+        .load16 => SsaOp.wasm_i64_load16_u,
+        .load16s => SsaOp.wasm_i64_load16_s,
+        .load8 => SsaOp.wasm_i64_load8_u,
+        .load8s => SsaOp.wasm_i64_load8_s,
+        .store64 => SsaOp.wasm_i64_store,
+        .store32 => SsaOp.wasm_i64_store32,
+        .store16 => SsaOp.wasm_i64_store16,
+        .store8 => SsaOp.wasm_i64_store8,
+
+        // Function calls
+        .static_call => SsaOp.wasm_lowered_static_call,
+        .call => SsaOp.wasm_call,
+        .closure_call => SsaOp.wasm_lowered_closure_call,
+        .inter_call => SsaOp.wasm_lowered_inter_call,
+        .tail_call => SsaOp.wasm_return_call,
+
+        // Safety/checks
+        .nil_check => SsaOp.wasm_lowered_nil_check,
+
+        // Data movement
+        .move => SsaOp.wasm_lowered_move,
+        .zero => SsaOp.wasm_lowered_zero,
+
+        // ARC
+        .retain => SsaOp.wasm_lowered_retain,
+        .release => SsaOp.wasm_lowered_release,
+
+        // Everything else unchanged
+        else => SsaOp.invalid,
+    }
+}
+
+/// Check if a type is a float type.
+fn isFloatType(type_idx: int) bool {
+    return type_idx == F64 or type_idx == F32 or type_idx == UNTYPED_FLOAT
+}
+
+/// Check if a store value's second argument is a float type.
+fn isStoreFloatType(func: *SsaFunc, val_idx: int) bool {
+    const val = func.getValue(val_idx)
+    if (val.args.count >= 2) {
+        const arg1 = func.getValue(val.args.get(1))
+        return isFloatType(arg1.type_idx)
+    }
+    return false
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "lower const_int to wasm_i64_const" {
+    var func = SsaFunc.init("test_const")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const v = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
+    var val = func.getValue(v)
+    val.aux_int = 42
+    func.setValue(v, val)
+    func.addValueToBlock(v, blk)
+
+    lower(&func)
+
+    const result = func.getValue(v)
+    @assertEq(result.op == SsaOp.wasm_i64_const, true)
+    @assertEq(result.aux_int, 42)
+}
+
+test "lower add to wasm_i64_add" {
+    var func = SsaFunc.init("test_add")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const c1 = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
+    func.addValueToBlock(c1, blk)
+    const c2 = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
+    func.addValueToBlock(c2, blk)
+
+    const add_v = func.newValue(SsaOp.add, I64, blk, 0, 0)
+    var add_val = func.getValue(add_v)
+    add_val.addArg2(c1, c2)
+    func.setValue(add_v, add_val)
+    func.addValueToBlock(add_v, blk)
+
+    lower(&func)
+
+    @assertEq(func.getValue(c1).op == SsaOp.wasm_i64_const, true)
+    @assertEq(func.getValue(c2).op == SsaOp.wasm_i64_const, true)
+    @assertEq(func.getValue(add_v).op == SsaOp.wasm_i64_add, true)
+}
+
+test "lower comparisons" {
+    var func = SsaFunc.init("test_cmp")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const lt_v = func.newValue(SsaOp.lt, I64, blk, 0, 0)
+    func.addValueToBlock(lt_v, blk)
+    const ult_v = func.newValue(SsaOp.ult, I64, blk, 0, 0)
+    func.addValueToBlock(ult_v, blk)
+
+    lower(&func)
+
+    @assertEq(func.getValue(lt_v).op == SsaOp.wasm_i64_lt_s, true)
+    @assertEq(func.getValue(ult_v).op == SsaOp.wasm_i64_lt_u, true)
+}
+
+test "lower float arithmetic" {
+    var func = SsaFunc.init("test_float")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const add_f = func.newValue(SsaOp.add64f, F64, blk, 0, 0)
+    func.addValueToBlock(add_f, blk)
+
+    lower(&func)
+
+    @assertEq(func.getValue(add_f).op == SsaOp.wasm_f64_add, true)
+}
+
+test "lower memory operations" {
+    var func = SsaFunc.init("test_mem")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const load_v = func.newValue(SsaOp.load, I64, blk, 0, 0)
+    func.addValueToBlock(load_v, blk)
+    const store_v = func.newValue(SsaOp.store, I64, blk, 0, 0)
+    func.addValueToBlock(store_v, blk)
+
+    lower(&func)
+
+    @assertEq(func.getValue(load_v).op == SsaOp.wasm_i64_load, true)
+    @assertEq(func.getValue(store_v).op == SsaOp.wasm_i64_store, true)
+}
+
+test "lower static_call" {
+    var func = SsaFunc.init("test_call")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const call_v = func.newValue(SsaOp.static_call, I64, blk, 0, 0)
+    func.addValueToBlock(call_v, blk)
+
+    lower(&func)
+
+    @assertEq(func.getValue(call_v).op == SsaOp.wasm_lowered_static_call, true)
+}
+
+test "phi unchanged" {
+    var func = SsaFunc.init("test_phi")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const phi_v = func.newValue(SsaOp.phi, I64, blk, 0, 0)
+    func.addValueToBlock(phi_v, blk)
+
+    lower(&func)
+
+    // phi should remain unchanged
+    @assertEq(func.getValue(phi_v).op == SsaOp.phi, true)
+}
+
+test "wasm ops unchanged" {
+    var func = SsaFunc.init("test_already_wasm")
+    const blk = func.newBlock(SsaBlockKind.first)
+
+    const v = func.newValue(SsaOp.wasm_i64_add, I64, blk, 0, 0)
+    func.addValueToBlock(v, blk)
+
+    lower(&func)
+
+    // Already Wasm — should not change
+    @assertEq(func.getValue(v).op == SsaOp.wasm_i64_add, true)
+}

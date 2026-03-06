@@ -1,0 +1,1103 @@
+/// WasmGen — SSA to Wasm bytecode generator.
+///
+/// Zig reference: compiler/codegen/wasm_gen.zig
+/// Go reference: references/go/src/cmd/compile/internal/wasm/ssa.go
+///
+/// Key functions (matching Go's names):
+/// - ssaGenValue: emit bytecode for a single SSA value
+/// - ssaGenValueOnStack: emit value directly onto wasm stack
+/// - getValue64/getValue32: get value onto stack (from local or generate inline)
+/// - setReg: store top of stack to a local (virtual register)
+/// - ssaGenBlock: emit control flow for block transitions
+
+import "std/list"
+import "std/map"
+import "std/string"
+import "../../frontend/ssa"
+import "code_builder"
+
+// Memory layout constants (SP_GLOBAL imported from code_builder)
+const GLOBAL_BASE: int = 0x20000  // 128KB, after stack and heap start
+
+// ============================================================================
+// FuncGen — Generator state for a single function
+// ============================================================================
+
+struct FuncGen {
+    ssa_func: *SsaFunc,
+    code: CodeBuilder,
+
+    /// Maps SSA value indices to local indices (Go's "registers").
+    value_to_local: Map(int, int),
+
+    /// Maps SSA block indices to their position in the block order.
+    block_to_idx: Map(int, int),
+
+    /// Next available local index.
+    next_local: int,
+
+    /// Number of function parameters.
+    param_count: int,
+
+    /// Current nesting depth for branch targets (Go's currentDepth).
+    block_depth: int,
+
+    /// Maps block index to its nesting depth (Go's blockDepths).
+    block_depths: Map(int, int),
+
+    /// Maps loop header block index to its exit depth (for break).
+    loop_exit_depths: Map(int, int),
+
+    /// Blocks that are loop headers (set: block_idx → 1).
+    loop_headers: Map(int, int),
+
+    /// Stack of active loop header indices (for tracking when to close loops).
+    active_loops: List(int),
+
+    /// Maps exit block index to its loop header index (for closing loops).
+    loop_exit_blocks: Map(int, int),
+
+    /// Maps function names to Wasm function indices.
+    func_indices: *Map(string, int),
+
+    /// Whether func_indices is set.
+    has_func_indices: bool,
+
+    /// Go's OnWasmStackSkipped counter.
+    on_wasm_stack_skipped: int,
+
+    /// Stack frame size in bytes (for SP management).
+    frame_size: int,
+
+    static fn init(func: *SsaFunc) FuncGen {
+        var value_to_local: Map(int, int) = .{}
+        var block_to_idx: Map(int, int) = .{}
+        var block_depths: Map(int, int) = .{}
+        var loop_exit_depths: Map(int, int) = .{}
+        var loop_headers: Map(int, int) = .{}
+        var active_loops: List(int) = .{}
+        var loop_exit_blocks: Map(int, int) = .{}
+        var empty_indices: Map(string, int) = .{}
+        return FuncGen {
+            ssa_func: func,
+            code: CodeBuilder.init(),
+            value_to_local: value_to_local,
+            block_to_idx: block_to_idx,
+            next_local: 0,
+            param_count: 0,
+            block_depth: 0,
+            block_depths: block_depths,
+            loop_exit_depths: loop_exit_depths,
+            loop_headers: loop_headers,
+            active_loops: active_loops,
+            loop_exit_blocks: loop_exit_blocks,
+            func_indices: &empty_indices,
+            has_func_indices: false,
+            on_wasm_stack_skipped: 0,
+            frame_size: 0,
+        }
+    }
+
+    fn setFuncIndices(indices: *Map(string, int)) void {
+        self.func_indices = indices
+        self.has_func_indices = true
+    }
+
+    // ========================================================================
+    // generate — Generate code for the entire function
+    // ========================================================================
+
+    fn generate() List(u8) {
+        // Build block index map
+        for bi in 0..self.ssa_func.blocks.count {
+            var blk = self.ssa_func.getBlock(bi)
+            self.block_to_idx.set(bi, bi)
+        }
+
+        // Count parameters and allocate locals for them
+        self.param_count = self.countParams()
+        self.next_local = self.param_count
+
+        // Pre-allocate locals for all values that need them
+        self.allocateLocals()
+
+        // Compute frame size from local_addr slots
+        self.frame_size = self.computeFrameSize()
+
+        // Find loop headers
+        self.findLoopHeaders()
+
+        // Emit prologue: decrement SP by frame_size
+        if (self.frame_size > 0) {
+            self.code.emitGlobalGet(SP_GLOBAL)
+            self.code.emitI32Const(self.frame_size)
+            self.code.emitI32Sub()
+            self.code.emitGlobalSet(SP_GLOBAL)
+        }
+
+        // Generate code for each block (layout pass already ordered them)
+        for bi in 0..self.ssa_func.blocks.count {
+            const next_bi = bi + 1
+            const has_next = next_bi < self.ssa_func.blocks.count
+            const is_loop = self.loop_headers.contains(bi)
+            self.genBlockWithNext(bi, next_bi, has_next, is_loop)
+        }
+
+        // Close any remaining open loops at end of function
+        while (self.active_loops.count > 0) {
+            self.active_loops.pop()
+            self.code.emitEnd()  // end loop
+            self.block_depth -= 1
+            self.code.emitEnd()  // end outer block
+            self.block_depth -= 1
+        }
+
+        // Set local count (beyond parameters)
+        self.code.setLocalCount(self.next_local - self.param_count)
+
+        return self.code.buf
+    }
+
+    // ========================================================================
+    // allocateLocals — Assign locals to values that need them
+    // ========================================================================
+
+    fn allocateLocals() void {
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            for vi in 0..blk.values.count {
+                const val_idx = blk.values.get(vi)
+                const val = self.ssa_func.getValue(val_idx)
+
+                // Args already have locals (parameter slots)
+                if (val.op == SsaOp.arg) {
+                    self.value_to_local.set(val_idx, val.aux_int)
+                } else if (val.uses == 0 and !self.hasSideEffects(val)) {
+                    // Skip values with no uses (dead code) — do nothing
+                } else if (self.isRematerializable(val)) {
+                    // Rematerializable values don't need locals — do nothing
+                } else if (self.isCmp(val)) {
+                    // Comparisons generated on-demand — do nothing
+                } else if (self.isOnWasmStack(val_idx)) {
+                    // OnWasmStack values stay on stack — do nothing
+                } else if (self.producesValue(val)) {
+                    // Values that produce results need locals
+                    const local_idx = self.next_local
+                    self.next_local += 1
+                    self.value_to_local.set(val_idx, local_idx)
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // computeFrameSize — Frame size from local_addr slots
+    // ========================================================================
+
+    fn computeFrameSize() int {
+        var max_slot: int = -1
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            for vi in 0..blk.values.count {
+                const val_idx = blk.values.get(vi)
+                const val = self.ssa_func.getValue(val_idx)
+                if (val.op == SsaOp.local_addr) {
+                    if (val.aux_int > max_slot) {
+                        max_slot = val.aux_int
+                    }
+                }
+            }
+        }
+        // Frame size = (max_slot + 1) * 8, aligned to 16 bytes
+        if (max_slot < 0) {
+            return 0
+        }
+        const size = (max_slot + 1) * 8
+        return ((size + 15) / 16) * 16
+    }
+
+    // ========================================================================
+    // Helper predicates
+    // ========================================================================
+
+    fn isRematerializable(v: SsaValue) bool {
+        return switch (v.op) {
+            .wasm_i64_const, .wasm_i32_const, .wasm_f64_const,
+            .const_int, .const_32, .const_64, .const_float,
+            .local_addr, .global_addr => true,
+            else => false,
+        }
+    }
+
+    fn isOnWasmStack(val_idx: int) bool {
+        const val = self.ssa_func.getValue(val_idx)
+        if (val.uses != 1) {
+            return false
+        }
+        // Check if this value is used as a block control
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            if (blk.controls.count > 0) {
+                if (blk.controls.get(0) == val_idx) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fn isCmp(v: SsaValue) bool {
+        return switch (v.op) {
+            .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
+            .wasm_i64_gt_s, .wasm_i64_ge_s,
+            .wasm_i64_lt_u, .wasm_i64_le_u, .wasm_i64_gt_u, .wasm_i64_ge_u,
+            .wasm_i64_eqz,
+            .wasm_f64_eq, .wasm_f64_ne, .wasm_f64_lt, .wasm_f64_le,
+            .wasm_f64_gt, .wasm_f64_ge => true,
+            else => false,
+        }
+    }
+
+    fn hasSideEffects(v: SsaValue) bool {
+        return switch (v.op) {
+            .wasm_i64_store, .wasm_i32_store,
+            .wasm_i64_store8, .wasm_i64_store16, .wasm_i64_store32,
+            .wasm_i32_store8, .wasm_i32_store16,
+            .wasm_f64_store, .wasm_f32_store,
+            .wasm_return, .wasm_drop,
+            .wasm_lowered_move, .wasm_lowered_zero,
+            .wasm_lowered_static_call, .wasm_lowered_closure_call, .wasm_lowered_inter_call,
+            .wasm_call, .wasm_call_indirect,
+            .wasm_lowered_retain, .wasm_lowered_release,
+            .wasm_unreachable => true,
+            else => false,
+        }
+    }
+
+    fn producesValue(v: SsaValue) bool {
+        return switch (v.op) {
+            .wasm_i64_store, .wasm_i32_store, .wasm_return, .wasm_drop,
+            .wasm_lowered_move,
+            .init_mem, .phi, .fwd_ref => false,
+            .wasm_call, .wasm_lowered_static_call => v.uses > 0,
+            else => true,
+        }
+    }
+
+    fn producesI32(v: SsaValue) bool {
+        return switch (v.op) {
+            .local_addr, .global_addr, .off_ptr, .add_ptr, .sub_ptr,
+            .string_ptr, .slice_ptr, .const_string,
+            .wasm_i32_const, .const_32, .wasm_i32_load,
+            .wasm_i64_eq, .wasm_i64_ne, .wasm_i64_lt_s, .wasm_i64_le_s,
+            .wasm_i64_gt_s, .wasm_i64_ge_s,
+            .wasm_i64_lt_u, .wasm_i64_le_u, .wasm_i64_gt_u, .wasm_i64_ge_u,
+            .wasm_i64_eqz,
+            .wasm_f64_eq, .wasm_f64_ne, .wasm_f64_lt, .wasm_f64_le,
+            .wasm_f64_gt, .wasm_f64_ge => true,
+            else => false,
+        }
+    }
+
+    // ========================================================================
+    // countParams — Count function parameters
+    // ========================================================================
+
+    fn countParams() int {
+        var max_arg: int = 0
+        var has_args = false
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            for vi in 0..blk.values.count {
+                const val_idx = blk.values.get(vi)
+                const val = self.ssa_func.getValue(val_idx)
+                if (val.op == SsaOp.arg) {
+                    has_args = true
+                    if (val.aux_int + 1 > max_arg) {
+                        max_arg = val.aux_int + 1
+                    }
+                }
+            }
+        }
+        if (has_args) {
+            return max_arg
+        }
+        return 0
+    }
+
+    // ========================================================================
+    // findLoopHeaders — Identify loop headers via back-edges
+    // ========================================================================
+
+    fn findLoopHeaders() void {
+        // First pass: find all loop headers (blocks with back-edges)
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            for si in 0..blk.succs.count {
+                const edge = blk.succs.get(si)
+                if (edge.block <= bi) {
+                    self.loop_headers.set(edge.block, 1)
+                }
+            }
+        }
+        // Second pass: for each loop header, find its exit block
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            if (self.loop_headers.contains(bi)) {
+                if (blk.kind == SsaBlockKind.if_ and blk.succs.count >= 2) {
+                    const exit_edge = blk.succs.get(1)
+                    self.loop_exit_blocks.set(exit_edge.block, bi)
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // genBlockWithNext — Generate code for a block
+    // ========================================================================
+
+    fn genBlockWithNext(bi: int, next_bi: int, has_next: bool, is_loop_header: bool) void {
+        if (is_loop_header) {
+            // Wasm loop pattern for break/continue:
+            // block $exit      ; depth N - break target
+            //   loop $continue ; depth N+1 - continue target
+            //     ... body ...
+            //   end
+            // end
+            self.code.emitBlock(BLOCK_VOID)
+            self.block_depth += 1
+            self.loop_exit_depths.set(bi, self.block_depth)
+
+            self.code.emitLoop(BLOCK_VOID)
+            self.block_depth += 1
+            self.block_depths.set(bi, self.block_depth)
+
+            self.active_loops.append(bi)
+        }
+
+        // Generate values
+        const blk = self.ssa_func.getBlock(bi)
+        for vi in 0..blk.values.count {
+            const val_idx = blk.values.get(vi)
+            self.ssaGenValue(val_idx)
+        }
+
+        // Generate block terminator
+        self.ssaGenBlock(bi, next_bi, has_next)
+    }
+
+    // ========================================================================
+    // ssaGenBlock — Control flow generation
+    // Go reference: ssa.go:169
+    // ========================================================================
+
+    fn ssaGenBlock(bi: int, next_bi: int, has_next: bool) void {
+        const blk = self.ssa_func.getBlock(bi)
+
+        if (blk.kind == SsaBlockKind.plain or blk.kind == SsaBlockKind.first) {
+            if (blk.succs.count > 0) {
+                const succ_edge = blk.succs.get(0)
+                const succ_bi = succ_edge.block
+                const is_next = has_next and next_bi == succ_bi
+                if (!is_next) {
+                    if (self.block_depths.contains(succ_bi)) {
+                        // Back edge to loop — emit br to continue
+                        const target_depth = self.block_depths.get(succ_bi)
+                        const rel_depth = self.block_depth - target_depth
+                        self.code.emitBr(rel_depth)
+                    }
+                    // Forward jumps handled by block layout
+                }
+            }
+        } else if (blk.kind == SsaBlockKind.if_) {
+            if (blk.succs.count < 2) {
+                return
+            }
+
+            const succ0_bi = blk.succs.get(0).block  // true branch
+            const succ1_bi = blk.succs.get(1).block  // false branch
+
+            if (blk.controls.count > 0) {
+                self.getValue32(blk.controls.get(0))
+            }
+
+            if (has_next and next_bi == succ0_bi) {
+                // True is next: if false, jump to succ1
+                self.code.emitI32Eqz()
+                self.code.emitIf(BLOCK_VOID)
+                self.block_depth += 1
+                self.emitBranchTo(succ1_bi)
+                self.code.emitEnd()
+                self.block_depth -= 1
+            } else if (has_next and next_bi == succ1_bi) {
+                // False is next: if true, jump to succ0
+                self.code.emitIf(BLOCK_VOID)
+                self.block_depth += 1
+                self.emitBranchTo(succ0_bi)
+                self.code.emitEnd()
+                self.block_depth -= 1
+            } else {
+                // Neither is next: emit both jumps
+                self.code.emitIf(BLOCK_VOID)
+                self.block_depth += 1
+                self.emitBranchTo(succ0_bi)
+                self.code.emitEnd()
+                self.block_depth -= 1
+                self.emitBranchTo(succ1_bi)
+            }
+        } else if (blk.kind == SsaBlockKind.ret) {
+            if (blk.controls.count > 0) {
+                self.getValue64(blk.controls.get(0))
+            }
+            self.emitReturnWithEpilogue()
+        } else if (blk.kind == SsaBlockKind.exit) {
+            self.emitReturnWithEpilogue()
+        }
+    }
+
+    // ========================================================================
+    // emitReturnWithEpilogue — Emit return with SP restore
+    // ========================================================================
+
+    fn emitReturnWithEpilogue() void {
+        if (self.frame_size > 0) {
+            self.code.emitGlobalGet(SP_GLOBAL)
+            self.code.emitI32Const(self.frame_size)
+            self.code.emitI32Add()
+            self.code.emitGlobalSet(SP_GLOBAL)
+        }
+        self.code.emitReturn()
+    }
+
+    // ========================================================================
+    // emitBranchTo — Emit branch to target block
+    // ========================================================================
+
+    fn emitBranchTo(target_bi: int) void {
+        if (self.block_depths.contains(target_bi)) {
+            const target_depth = self.block_depths.get(target_bi)
+            const rel_depth = self.block_depth - target_depth
+            self.code.emitBr(rel_depth)
+        } else {
+            const target_blk = self.ssa_func.getBlock(target_bi)
+            if (target_blk.kind == SsaBlockKind.ret or target_blk.kind == SsaBlockKind.exit) {
+                // Forward jump to return block — emit the block's code inline
+                for vi in 0..target_blk.values.count {
+                    const val_idx = target_blk.values.get(vi)
+                    self.ssaGenValue(val_idx)
+                }
+                if (target_blk.controls.count > 0) {
+                    self.getValue64(target_blk.controls.get(0))
+                }
+                self.emitReturnWithEpilogue()
+            } else {
+                // Forward jump to non-return block
+                self.code.emitBr(0)
+            }
+        }
+    }
+
+    // ========================================================================
+    // ssaGenValue — Value generation
+    // Go reference: ssa.go:217
+    // ========================================================================
+
+    fn ssaGenValue(val_idx: int) void {
+        const v = self.ssa_func.getValue(val_idx)
+
+        if (v.op == SsaOp.wasm_lowered_static_call) {
+            // Get operands onto stack
+            for ai in 0..v.args.count {
+                self.getValue64(v.args.get(ai))
+            }
+            // Emit call — aux_int holds the function index
+            self.code.emitCall(v.aux_int)
+            if (v.uses > 0) {
+                self.setReg(val_idx)
+            }
+        } else if (v.op == SsaOp.wasm_call) {
+            for ai in 0..v.args.count {
+                self.getValue64(v.args.get(ai))
+            }
+            self.code.emitCall(v.aux_int)
+            if (v.uses > 0) {
+                self.setReg(val_idx)
+            }
+        } else if (v.op == SsaOp.wasm_lowered_retain or v.op == SsaOp.wasm_lowered_release) {
+            // ARC ops are native-only — trap if they appear in Wasm pipeline
+            self.code.emitUnreachable()
+        } else if (v.op == SsaOp.wasm_i64_store) {
+            self.getValue32(v.args.get(0))  // address
+            self.getValue64(v.args.get(1))  // value
+            self.code.emitI64Store(3, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_store) {
+            self.getValue32(v.args.get(0))
+            self.getValue32(v.args.get(1))
+            self.code.emitI32Store(2, v.aux_int)
+        } else if (v.op == SsaOp.wasm_drop) {
+            self.getValue64(v.args.get(0))
+            self.code.emitDrop()
+        } else if (v.op == SsaOp.wasm_return) {
+            if (v.args.count > 0) {
+                self.getValue64(v.args.get(0))
+            }
+            self.code.emitReturn()
+        } else if (v.op == SsaOp.wasm_local_set) {
+            self.getValue64(v.args.get(0))
+            self.code.emitLocalSet(v.aux_int)
+        } else if (v.op == SsaOp.arg) {
+            // Args register their local mapping (already done in allocateLocals)
+        } else if (v.op == SsaOp.wasm_unreachable) {
+            self.code.emitUnreachable()
+        } else if (v.op == SsaOp.wasm_lowered_move) {
+            self.getValue32(v.args.get(0))  // dest addr
+            self.getValue32(v.args.get(1))  // src addr
+            self.code.emitI32Const(v.aux_int)  // size
+            self.code.emitMemoryCopy()
+        } else if (v.op == SsaOp.phi or v.op == SsaOp.init_mem or v.op == SsaOp.fwd_ref) {
+            // Memory ops, control flow — handled elsewhere
+        } else {
+            // Default: generate value and store to local
+            if (v.uses == 0 and !self.hasSideEffects(v)) {
+                return
+            }
+            if (self.isCmp(v)) {
+                return
+            }
+            if (self.isRematerializable(v)) {
+                return
+            }
+            if (self.isOnWasmStack(val_idx)) {
+                return
+            }
+
+            self.ssaGenValueOnStack(val_idx)
+
+            if (v.uses > 0 and !self.isRematerializable(v)) {
+                self.setReg(val_idx)
+            }
+        }
+    }
+
+    // ========================================================================
+    // ssaGenValueOnStack — Generate value directly on wasm stack
+    // Go reference: ssa.go:313
+    // ========================================================================
+
+    fn ssaGenValueOnStack(val_idx: int) void {
+        const v = self.ssa_func.getValue(val_idx)
+
+        if (v.op == SsaOp.wasm_i64_const or v.op == SsaOp.const_int or v.op == SsaOp.const_64) {
+            self.code.emitI64Const(v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_const or v.op == SsaOp.const_32) {
+            self.code.emitI32Const(v.aux_int)
+        } else if (v.op == SsaOp.wasm_f64_const or v.op == SsaOp.const_float) {
+            // f64 const: aux_int holds bit pattern, need to write raw bytes
+            self.code.emitI64Const(v.aux_int)  // placeholder — should be f64.const
+        } else if (v.op == SsaOp.local_addr) {
+            // SP-relative addressing: SP + (slot * 8)
+            const offset = v.aux_int * 8
+            self.code.emitGlobalGet(SP_GLOBAL)
+            if (offset != 0) {
+                self.code.emitI32Const(offset)
+                self.code.emitI32Add()
+            }
+        } else if (v.op == SsaOp.global_addr) {
+            const addr = GLOBAL_BASE + (v.aux_int * 8)
+            self.code.emitI32Const(addr)
+        } else if (v.op == SsaOp.off_ptr) {
+            // off_ptr: base + constant offset
+            self.getValue32(v.args.get(0))
+            if (v.aux_int != 0) {
+                self.code.emitI32Const(v.aux_int)
+                self.code.emitI32Add()
+            }
+        } else if (v.op == SsaOp.add_ptr) {
+            self.getValue32(v.args.get(0))
+            self.getValue32(v.args.get(1))
+            self.code.emitI32Add()
+        } else if (v.op == SsaOp.sub_ptr) {
+            self.getValue32(v.args.get(0))
+            self.getValue32(v.args.get(1))
+            self.code.emitI32Sub()
+        } else if (v.op == SsaOp.wasm_i64_load) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64Load(3, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_load) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI32Load(2, v.aux_int)
+        } else if (v.op == SsaOp.wasm_local_get) {
+            self.code.emitLocalGet(v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_add) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Add()
+        } else if (v.op == SsaOp.wasm_i64_sub) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Sub()
+        } else if (v.op == SsaOp.wasm_i64_mul) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Mul()
+        } else if (v.op == SsaOp.wasm_i64_div_s) {
+            self.emitBinaryI64(v)
+            self.code.emitI64DivS()
+        } else if (v.op == SsaOp.wasm_i64_rem_s) {
+            self.emitBinaryI64(v)
+            self.code.emitI64RemS()
+        } else if (v.op == SsaOp.wasm_i64_and) {
+            self.emitBinaryI64(v)
+            self.code.emitI64And()
+        } else if (v.op == SsaOp.wasm_i64_or) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Or()
+        } else if (v.op == SsaOp.wasm_i64_xor) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Xor()
+        } else if (v.op == SsaOp.wasm_i64_shl) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Shl()
+        } else if (v.op == SsaOp.wasm_i64_shr_s) {
+            self.emitBinaryI64(v)
+            self.code.emitI64ShrS()
+        } else if (v.op == SsaOp.wasm_i64_eq) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Eq()
+        } else if (v.op == SsaOp.wasm_i64_ne) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Ne()
+        } else if (v.op == SsaOp.wasm_i64_lt_s) {
+            self.emitBinaryI64(v)
+            self.code.emitI64LtS()
+        } else if (v.op == SsaOp.wasm_i64_le_s) {
+            self.emitBinaryI64(v)
+            self.code.emitI64LeS()
+        } else if (v.op == SsaOp.wasm_i64_gt_s) {
+            self.emitBinaryI64(v)
+            self.code.emitI64GtS()
+        } else if (v.op == SsaOp.wasm_i64_ge_s) {
+            self.emitBinaryI64(v)
+            self.code.emitI64GeS()
+        } else if (v.op == SsaOp.wasm_i64_lt_u) {
+            self.emitBinaryI64(v)
+            self.code.emitI64LtU()
+        } else if (v.op == SsaOp.wasm_i64_le_u) {
+            self.emitBinaryI64(v)
+            self.code.emitI64LeU()
+        } else if (v.op == SsaOp.wasm_i64_gt_u) {
+            self.emitBinaryI64(v)
+            self.code.emitI64GtU()
+        } else if (v.op == SsaOp.wasm_i64_ge_u) {
+            self.emitBinaryI64(v)
+            self.code.emitI64GeU()
+        } else if (v.op == SsaOp.wasm_i64_eqz) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64Eqz()
+        } else if (v.op == SsaOp.wasm_f64_add) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Add()
+        } else if (v.op == SsaOp.wasm_f64_sub) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Sub()
+        } else if (v.op == SsaOp.wasm_f64_mul) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Mul()
+        } else if (v.op == SsaOp.wasm_f64_div) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Div()
+        } else if (v.op == SsaOp.wasm_f64_neg) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64Neg()
+        } else if (v.op == SsaOp.wasm_f64_eq) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Eq()
+        } else if (v.op == SsaOp.wasm_f64_ne) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Ne()
+        } else if (v.op == SsaOp.wasm_f64_lt) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Lt()
+        } else if (v.op == SsaOp.wasm_f64_le) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Le()
+        } else if (v.op == SsaOp.wasm_f64_gt) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Gt()
+        } else if (v.op == SsaOp.wasm_f64_ge) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Ge()
+        } else if (v.op == SsaOp.bounds_check) {
+            if (v.args.count >= 2) {
+                self.getValue64(v.args.get(0))  // index
+                self.getValue64(v.args.get(1))  // length
+                self.code.emitI64GeU()          // idx >= len (unsigned)
+                self.code.emitIf(BLOCK_VOID)
+                self.code.emitUnreachable()     // trap
+                self.code.emitEnd()
+            }
+        } else if (v.op == SsaOp.copy) {
+            self.getValue64(v.args.get(0))
+        } else if (v.op == SsaOp.slice_ptr) {
+            self.emitSlicePtr(v)
+        } else if (v.op == SsaOp.slice_len) {
+            self.emitSliceLen(v)
+        } else if (v.op == SsaOp.string_ptr) {
+            self.emitStringPtr(v)
+        } else if (v.op == SsaOp.string_len) {
+            self.emitStringLen(v)
+        } else if (v.op == SsaOp.string_make or v.op == SsaOp.slice_make) {
+            if (v.args.count >= 2) {
+                self.getValue32(v.args.get(0))  // ptr
+                self.getValue64(v.args.get(1))  // len
+            }
+        } else if (v.op == SsaOp.const_string) {
+            self.code.emitI32Const(v.aux_int)
+        }
+        // Unhandled ops silently ignored (like Zig's debug.log fallthrough)
+    }
+
+    // ========================================================================
+    // Helpers for ssaGenValueOnStack
+    // ========================================================================
+
+    fn emitBinaryI64(v: SsaValue) void {
+        self.getValue64(v.args.get(0))
+        self.getValue64(v.args.get(1))
+    }
+
+    fn emitSlicePtr(v: SsaValue) void {
+        const slice_idx = v.args.get(0)
+        const slice = self.ssa_func.getValue(slice_idx)
+        if (slice.op == SsaOp.slice_make and slice.args.count >= 1) {
+            self.getValue32(slice.args.get(0))
+        } else {
+            self.getValue32(slice_idx)
+            self.code.emitI64Load(3, 0)
+            self.code.emitI32WrapI64()
+        }
+    }
+
+    fn emitSliceLen(v: SsaValue) void {
+        const slice_idx = v.args.get(0)
+        const slice = self.ssa_func.getValue(slice_idx)
+        if (slice.op == SsaOp.slice_make and slice.args.count >= 2) {
+            self.getValue64(slice.args.get(1))
+        } else {
+            self.getValue32(slice_idx)
+            self.code.emitI64Load(3, 8)
+        }
+    }
+
+    fn emitStringPtr(v: SsaValue) void {
+        const str_idx = v.args.get(0)
+        const str = self.ssa_func.getValue(str_idx)
+        if (str.op == SsaOp.string_make and str.args.count >= 1) {
+            self.getValue32(str.args.get(0))
+        } else if (str.op == SsaOp.const_string) {
+            self.code.emitI32Const(str.aux_int)
+        } else {
+            self.getValue32(str_idx)
+            self.code.emitI64Load(3, 0)
+            self.code.emitI32WrapI64()
+        }
+    }
+
+    fn emitStringLen(v: SsaValue) void {
+        const str_idx = v.args.get(0)
+        const str = self.ssa_func.getValue(str_idx)
+        if (str.op == SsaOp.string_make and str.args.count >= 2) {
+            self.getValue64(str.args.get(1))
+        } else if (str.op == SsaOp.const_string) {
+            // aux_int holds the string index into string_literals
+            const sidx = str.aux_int
+            if (sidx >= 0 and sidx < self.ssa_func.string_literals.count) {
+                const s = self.ssa_func.string_literals.get(sidx)
+                self.code.emitI64Const(@lenOf(s))
+            } else {
+                self.code.emitI64Const(0)
+            }
+        } else {
+            self.getValue32(str_idx)
+            self.code.emitI64Load(3, 8)
+        }
+    }
+
+    // ========================================================================
+    // getValue32 / getValue64 / setReg
+    // Go reference: ssa.go:474-530
+    // ========================================================================
+
+    /// Get value onto stack as i32.
+    fn getValue32(val_idx: int) void {
+        if (self.value_to_local.contains(val_idx)) {
+            const local_idx = self.value_to_local.get(val_idx)
+            self.code.emitLocalGet(local_idx)
+            self.code.emitI32WrapI64()
+            return
+        }
+        // Value not in local — generate inline
+        self.ssaGenValueOnStack(val_idx)
+        const v = self.ssa_func.getValue(val_idx)
+        if (!self.producesI32(v)) {
+            self.code.emitI32WrapI64()
+        }
+    }
+
+    /// Get value onto stack as i64.
+    fn getValue64(val_idx: int) void {
+        if (self.value_to_local.contains(val_idx)) {
+            const local_idx = self.value_to_local.get(val_idx)
+            self.code.emitLocalGet(local_idx)
+            return
+        }
+        // Value not in local — must be rematerializable, generate inline
+        self.ssaGenValueOnStack(val_idx)
+    }
+
+    /// Store top of stack to local (Go's setReg).
+    fn setReg(val_idx: int) void {
+        if (self.value_to_local.contains(val_idx)) {
+            const local_idx = self.value_to_local.get(val_idx)
+            self.code.emitLocalSet(local_idx)
+        }
+    }
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Generate Wasm code for an SSA function.
+fn genFunc(func: *SsaFunc) List(u8) {
+    var gen = FuncGen.init(func)
+    return gen.generate()
+}
+
+/// Generate Wasm code with function index resolution.
+fn genFuncWithIndices(func: *SsaFunc, func_indices: *Map(string, int)) List(u8) {
+    var gen = FuncGen.init(func)
+    gen.setFuncIndices(func_indices)
+    return gen.generate()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "genFunc return constant" {
+    var func = SsaFunc.init("answer")
+    const blk = func.newBlock(SsaBlockKind.ret)
+
+    const c = func.newValue(SsaOp.wasm_i64_const, 0, blk, 0, 0)
+    var cv = func.getValue(c)
+    cv.aux_int = 42
+    cv.uses = 1
+    func.setValue(c, cv)
+    func.addValueToBlock(c, blk)
+
+    // Set block control to the constant
+    var b = func.getBlock(blk)
+    b.setControl(c)
+    func.setBlock(blk, b)
+
+    const body = genFunc(&func)
+    @assertEq(body.count > 0, true)
+    // Last byte should be return (0x0F) from emitReturnWithEpilogue
+    // (No frame so no SP restore — just return)
+}
+
+test "genFunc add two args" {
+    var func = SsaFunc.init("add")
+    const blk = func.newBlock(SsaBlockKind.ret)
+
+    // arg 0
+    const a0 = func.newValue(SsaOp.arg, 0, blk, 0, 0)
+    var a0v = func.getValue(a0)
+    a0v.aux_int = 0
+    a0v.uses = 1
+    func.setValue(a0, a0v)
+    func.addValueToBlock(a0, blk)
+
+    // arg 1
+    const a1 = func.newValue(SsaOp.arg, 0, blk, 0, 0)
+    var a1v = func.getValue(a1)
+    a1v.aux_int = 1
+    a1v.uses = 1
+    func.setValue(a1, a1v)
+    func.addValueToBlock(a1, blk)
+
+    // add
+    const add = func.newValue(SsaOp.wasm_i64_add, 0, blk, 0, 0)
+    var addv = func.getValue(add)
+    addv.uses = 1
+    addv.addArg(a0)
+    addv.addArg(a1)
+    func.setValue(add, addv)
+    func.addValueToBlock(add, blk)
+
+    // Set block control to the add result
+    var b = func.getBlock(blk)
+    b.setControl(add)
+    func.setBlock(blk, b)
+
+    const body = genFunc(&func)
+    @assertEq(body.count > 0, true)
+
+    // Should contain local.get (0x20) for both args
+    var found_local_get = false
+    for i in 0..body.count {
+        if (body.get(i) as int == 0x20) {
+            found_local_get = true
+        }
+    }
+    @assertEq(found_local_get, true)
+}
+
+test "genFunc local_addr generates SP-relative address" {
+    var func = SsaFunc.init("test_local_addr")
+    const blk = func.newBlock(SsaBlockKind.ret)
+
+    // local_addr with slot 1 (offset = 8)
+    const addr = func.newValue(SsaOp.local_addr, 0, blk, 0, 0)
+    var av = func.getValue(addr)
+    av.aux_int = 1
+    av.uses = 1
+    func.setValue(addr, av)
+    func.addValueToBlock(addr, blk)
+
+    var b = func.getBlock(blk)
+    b.setControl(addr)
+    func.setBlock(blk, b)
+
+    const body = genFunc(&func)
+    @assertEq(body.count > 0, true)
+
+    // Should have prologue (SP adjustment) since frame_size > 0
+    // global.get (0x23) should appear
+    var found_global_get = false
+    for i in 0..body.count {
+        if (body.get(i) as int == 0x23) {
+            found_global_get = true
+        }
+    }
+    @assertEq(found_global_get, true)
+}
+
+test "genFunc store and load" {
+    var func = SsaFunc.init("test_store_load")
+    const blk = func.newBlock(SsaBlockKind.ret)
+
+    // local_addr slot 0
+    const addr = func.newValue(SsaOp.local_addr, 0, blk, 0, 0)
+    var av = func.getValue(addr)
+    av.aux_int = 0
+    av.uses = 2
+    func.setValue(addr, av)
+    func.addValueToBlock(addr, blk)
+
+    // constant 42
+    const val = func.newValue(SsaOp.wasm_i64_const, 0, blk, 0, 0)
+    var vv = func.getValue(val)
+    vv.aux_int = 42
+    vv.uses = 1
+    func.setValue(val, vv)
+    func.addValueToBlock(val, blk)
+
+    // store constant to addr
+    const store = func.newValue(SsaOp.wasm_i64_store, 0, blk, 0, 0)
+    var sv = func.getValue(store)
+    sv.aux_int = 0
+    sv.addArg(addr)
+    sv.addArg(val)
+    func.setValue(store, sv)
+    func.addValueToBlock(store, blk)
+
+    // load from addr
+    const load = func.newValue(SsaOp.wasm_i64_load, 0, blk, 0, 0)
+    var lv = func.getValue(load)
+    lv.aux_int = 0
+    lv.uses = 1
+    lv.addArg(addr)
+    func.setValue(load, lv)
+    func.addValueToBlock(load, blk)
+
+    var b = func.getBlock(blk)
+    b.setControl(load)
+    func.setBlock(blk, b)
+
+    const body = genFunc(&func)
+
+    // Find i64.store (0x37) and i64.load (0x29) in the body
+    var found_store = false
+    var found_load = false
+    for i in 0..body.count {
+        if (body.get(i) as int == 0x37) {
+            found_store = true
+        }
+        if (body.get(i) as int == 0x29) {
+            found_load = true
+        }
+    }
+    @assertEq(found_store, true)
+    @assertEq(found_load, true)
+}
+
+test "FuncGen predicates" {
+    var func = SsaFunc.init("test_pred")
+    const blk = func.newBlock(SsaBlockKind.plain)
+    var gen = FuncGen.init(&func)
+
+    // Test isRematerializable
+    const c = func.newValue(SsaOp.wasm_i64_const, 0, blk, 0, 0)
+    @assertEq(gen.isRematerializable(func.getValue(c)), true)
+
+    const a = func.newValue(SsaOp.wasm_i64_add, 0, blk, 0, 0)
+    @assertEq(gen.isRematerializable(func.getValue(a)), false)
+
+    // Test isCmp
+    const cmp = func.newValue(SsaOp.wasm_i64_eq, 0, blk, 0, 0)
+    @assertEq(gen.isCmp(func.getValue(cmp)), true)
+    @assertEq(gen.isCmp(func.getValue(a)), false)
+
+    // Test producesI32
+    const addr = func.newValue(SsaOp.local_addr, 0, blk, 0, 0)
+    @assertEq(gen.producesI32(func.getValue(addr)), true)
+    @assertEq(gen.producesI32(func.getValue(a)), false)
+}
+
+test "FuncGen countParams" {
+    var func = SsaFunc.init("test_params")
+    const blk = func.newBlock(SsaBlockKind.plain)
+
+    // Add 3 args
+    for i in 0..3 {
+        const arg = func.newValue(SsaOp.arg, 0, blk, 0, 0)
+        var av = func.getValue(arg)
+        av.aux_int = i
+        func.setValue(arg, av)
+        func.addValueToBlock(arg, blk)
+    }
+
+    var gen = FuncGen.init(&func)
+    @assertEq(gen.countParams(), 3)
+}
+
+test "FuncGen computeFrameSize" {
+    var func = SsaFunc.init("test_frame")
+    const blk = func.newBlock(SsaBlockKind.plain)
+
+    // local_addr slot 0
+    const a0 = func.newValue(SsaOp.local_addr, 0, blk, 0, 0)
+    var a0v = func.getValue(a0)
+    a0v.aux_int = 0
+    func.setValue(a0, a0v)
+    func.addValueToBlock(a0, blk)
+
+    // local_addr slot 2 -> frame = (2+1)*8 = 24, aligned to 32
+    const a2 = func.newValue(SsaOp.local_addr, 0, blk, 0, 0)
+    var a2v = func.getValue(a2)
+    a2v.aux_int = 2
+    func.setValue(a2, a2v)
+    func.addValueToBlock(a2, blk)
+
+    var gen = FuncGen.init(&func)
+    @assertEq(gen.computeFrameSize(), 32)
+}

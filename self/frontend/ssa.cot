@@ -27,76 +27,161 @@ const null_block: int = -1
 const SsaOp = enum(u16) {
     invalid,
 
-    // --- Constants ---
-    const_bool,
-    const_int,
-    const_float,
-    const_nil,
-    const_string,
+    // === Constants ===
+    const_bool, const_int, const_float, const_nil, const_string, const_ptr,
+    const_8, const_16, const_32, const_64,
 
-    // --- Arithmetic ---
+    // === Integer Arithmetic (Generic) ===
     add, sub, mul, div, udiv, mod, umod, neg,
 
-    // --- Float arithmetic ---
-    add64f, sub64f, mul64f, div64f, neg64f,
+    // === Integer Arithmetic (Sized) ===
+    add8, sub8, mul8, add16, sub16, mul16, add32, sub32, mul32, add64, sub64, mul64,
 
-    // --- Float comparison ---
-    eq64f, ne64f, lt64f, le64f, gt64f, ge64f,
+    // === Bitwise (Generic) ===
+    and_, or_, xor, shl, shr, sar, @"not", bool_not,
 
-    // --- Bitwise ---
-    and_, or_, xor, shl, shr, @"not", bool_not,
+    // === Bitwise (Sized) ===
+    and8, and16, and32, and64, or8, or16, or32, or64, xor8, xor16, xor32, xor64,
+    shl8, shl16, shl32, shl64, shr8, shr16, shr32, shr64, sar8, sar16, sar32, sar64,
+    ctz32, ctz64, clz32, clz64, popcnt32, popcnt64,
 
-    // --- Integer comparison ---
-    eq, ne, lt, le, gt, ge,
-    ult, ule, ugt, uge,
+    // === Comparisons (Generic) ===
+    eq, ne, lt, le, gt, ge, ult, ule, ugt, uge,
 
-    // --- Memory ---
-    load, store,
-    load8, load16, load32,
-    load8s, load16s, load32s,
-    store8, store16, store32,
-    local_addr, global_addr, metadata_addr,
-    off_ptr, add_ptr,
-    addr,
-    move,
+    // === Comparisons (Sized) ===
+    eq8, eq16, eq32, eq64, ne8, ne16, ne32, ne64,
+    lt32, lt64, le32, le64, gt32, gt64, ge32, ge64,
 
-    // --- Control ---
-    phi, copy, fwd_ref, arg, cond_select,
-
-    // --- String/slice ---
-    string_make, string_concat, string_len, string_ptr,
-    slice_make, slice_len, slice_ptr, slice_cap,
-
-    // --- Calls ---
-    static_call, inter_call, closure_call,
-
-    // --- Conversion ---
+    // === Type Conversions ===
+    sign_ext8to16, sign_ext8to32, sign_ext8to64, sign_ext16to32, sign_ext16to64, sign_ext32to64,
+    zero_ext8to16, zero_ext8to32, zero_ext8to64, zero_ext16to32, zero_ext16to64, zero_ext32to64,
+    trunc16to8, trunc32to8, trunc32to16, trunc64to8, trunc64to16, trunc64to32,
     convert,
 
-    // --- ARC ---
+    // === Float Operations ===
+    add32f, sub32f, mul32f, div32f, neg32f, sqrt32f,
+    add64f, sub64f, mul64f, div64f, neg64f, sqrt64f,
+
+    // === Float Comparisons ===
+    eq64f, ne64f, lt64f, le64f, gt64f, ge64f,
+    eq32f, ne32f, lt32f, le32f, gt32f, ge32f,
+
+    // === Memory Operations ===
+    load, store,
+    load8, load16, load32, load64, store8, store16, store32, store64,
+    load8s, load16s, load32s,
+    addr, local_addr, global_addr, metadata_addr, off_ptr, add_ptr, sub_ptr,
+    store_wb, move, zero,
+    var_def, var_live, var_kill,
+
+    // === Control Flow ===
+    phi, copy, fwd_ref, arg,
+    select0, select1, make_tuple, select_n, cond_select,
+    string_len, string_ptr, string_make, slice_len, slice_ptr, slice_cap, slice_make, string_concat,
+
+    // === Function Calls ===
+    call, tail_call, static_call, closure_call, inter_call,
+
+    // === Safety Checks ===
+    nil_check, is_non_nil, is_nil, bounds_check, slice_bounds,
+
+    // === ARC (Reference Counting) ===
     retain, release,
 
-    // --- Atomics ---
-    atomic_load64, atomic_store64, atomic_add64, atomic_exchange64, atomic_cas64,
+    // === Atomics ===
+    atomic_load32, atomic_load64, atomic_store32, atomic_store64,
+    atomic_add32, atomic_add64, atomic_cas32, atomic_cas64, atomic_exchange32, atomic_exchange64,
 
-    // --- Bit manipulation ---
-    ctz64, clz64, popcnt64,
+    // === Meta / Init ===
+    init_mem,
 
-    // --- Float intrinsics ---
-    wasm_f64_abs, wasm_f64_ceil, wasm_f64_floor, wasm_f64_trunc,
-    wasm_f64_nearest, wasm_f64_sqrt,
-    wasm_f64_reinterpret_i64, wasm_i64_reinterpret_f64,
-    wasm_f64_min, wasm_f64_max,
+    // === Wasm-Specific: Constants ===
+    wasm_i64_const, wasm_i32_const, wasm_f64_const, wasm_f32_const,
 
-    // --- Wasm ---
-    wasm_unreachable,
-    wasm_global_get,
+    // === Wasm-Specific: Integer Arithmetic (i64) ===
+    wasm_i64_add, wasm_i64_sub, wasm_i64_mul, wasm_i64_div_s, wasm_i64_div_u,
+    wasm_i64_rem_s, wasm_i64_rem_u,
 
-    // --- WasmGC (placeholder for future) ---
+    // === Wasm-Specific: Integer Arithmetic (i32) ===
+    wasm_i32_add, wasm_i32_sub, wasm_i32_mul, wasm_i32_div_s, wasm_i32_div_u,
+    wasm_i32_rem_s, wasm_i32_rem_u,
+
+    // === Wasm-Specific: Integer Bitwise (i64) ===
+    wasm_i64_and, wasm_i64_or, wasm_i64_xor, wasm_i64_shl, wasm_i64_shr_s, wasm_i64_shr_u,
+    wasm_i64_clz, wasm_i64_ctz, wasm_i64_popcnt, wasm_i64_rotl, wasm_i64_rotr,
+
+    // === Wasm-Specific: Integer Bitwise (i32) ===
+    wasm_i32_and, wasm_i32_or, wasm_i32_xor, wasm_i32_shl, wasm_i32_shr_s, wasm_i32_shr_u,
+    wasm_i32_clz, wasm_i32_ctz, wasm_i32_popcnt, wasm_i32_rotl, wasm_i32_rotr,
+
+    // === Wasm-Specific: Integer Comparison (i64) ===
+    wasm_i64_eqz, wasm_i64_eq, wasm_i64_ne,
+    wasm_i64_lt_s, wasm_i64_lt_u, wasm_i64_gt_s, wasm_i64_gt_u,
+    wasm_i64_le_s, wasm_i64_le_u, wasm_i64_ge_s, wasm_i64_ge_u,
+
+    // === Wasm-Specific: Integer Comparison (i32) ===
+    wasm_i32_eqz, wasm_i32_eq, wasm_i32_ne,
+    wasm_i32_lt_s, wasm_i32_lt_u, wasm_i32_gt_s, wasm_i32_gt_u,
+    wasm_i32_le_s, wasm_i32_le_u, wasm_i32_ge_s, wasm_i32_ge_u,
+
+    // === Wasm-Specific: Float Arithmetic (f64) ===
+    wasm_f64_add, wasm_f64_sub, wasm_f64_mul, wasm_f64_div,
+    wasm_f64_neg, wasm_f64_abs, wasm_f64_sqrt, wasm_f64_ceil, wasm_f64_floor, wasm_f64_trunc, wasm_f64_nearest,
+    wasm_f64_min, wasm_f64_max, wasm_f64_copysign,
+
+    // === Wasm-Specific: Float Arithmetic (f32) ===
+    wasm_f32_add, wasm_f32_sub, wasm_f32_mul, wasm_f32_div,
+    wasm_f32_neg, wasm_f32_abs, wasm_f32_sqrt, wasm_f32_ceil, wasm_f32_floor, wasm_f32_trunc, wasm_f32_nearest,
+    wasm_f32_min, wasm_f32_max, wasm_f32_copysign,
+
+    // === Wasm-Specific: Float Comparison ===
+    wasm_f64_eq, wasm_f64_ne, wasm_f64_lt, wasm_f64_gt, wasm_f64_le, wasm_f64_ge,
+    wasm_f32_eq, wasm_f32_ne, wasm_f32_lt, wasm_f32_gt, wasm_f32_le, wasm_f32_ge,
+
+    // === Wasm-Specific: Conversions ===
+    wasm_i64_trunc_f64_s, wasm_i64_trunc_f64_u, wasm_i64_trunc_f32_s, wasm_i64_trunc_f32_u,
+    wasm_i32_trunc_f64_s, wasm_i32_trunc_f64_u, wasm_i32_trunc_f32_s, wasm_i32_trunc_f32_u,
+    wasm_f64_convert_i64_s, wasm_f64_convert_i64_u, wasm_f64_convert_i32_s, wasm_f64_convert_i32_u,
+    wasm_f32_convert_i64_s, wasm_f32_convert_i64_u, wasm_f32_convert_i32_s, wasm_f32_convert_i32_u,
+    wasm_i64_extend_i32_s, wasm_i64_extend_i32_u,
+    wasm_i32_wrap_i64,
+    wasm_f64_promote_f32, wasm_f32_demote_f64,
+    wasm_i64_reinterpret_f64, wasm_f64_reinterpret_i64,
+    wasm_i32_reinterpret_f32, wasm_f32_reinterpret_i32,
+
+    // === Wasm-Specific: Memory (i64) ===
+    wasm_i64_load, wasm_i64_store,
+    wasm_i64_load8_s, wasm_i64_load8_u, wasm_i64_load16_s, wasm_i64_load16_u,
+    wasm_i64_load32_s, wasm_i64_load32_u,
+    wasm_i64_store8, wasm_i64_store16, wasm_i64_store32,
+
+    // === Wasm-Specific: Memory (i32) ===
+    wasm_i32_load, wasm_i32_store,
+    wasm_i32_load8_s, wasm_i32_load8_u, wasm_i32_load16_s, wasm_i32_load16_u,
+    wasm_i32_store8, wasm_i32_store16,
+
+    // === Wasm-Specific: Memory (float) ===
+    wasm_f64_load, wasm_f64_store,
+    wasm_f32_load, wasm_f32_store,
+
+    // === Wasm-Specific: Variables ===
+    wasm_local_get, wasm_local_set, wasm_local_tee,
+    wasm_global_get, wasm_global_set,
+
+    // === Wasm-Specific: Control Flow ===
+    wasm_call, wasm_call_indirect, wasm_return_call,
+    wasm_drop, wasm_select,
+    wasm_unreachable, wasm_nop,
+    wasm_return,
+
+    // === Wasm-Specific: Lowered Operations ===
+    wasm_lowered_move, wasm_lowered_zero,
+    wasm_lowered_nil_check,
+    wasm_lowered_static_call, wasm_lowered_closure_call, wasm_lowered_inter_call,
+    wasm_lowered_retain, wasm_lowered_release,
+
+    // === WasmGC ===
     wasm_gc_struct_new, wasm_gc_struct_get, wasm_gc_struct_set,
-
-    // --- Meta / init ---
-    init_mem, var_def, var_live, var_kill, store_wb,
 }
 
 // ============================================================================
@@ -118,6 +203,7 @@ struct SsaValue {
     op: SsaOp,
     type_idx: int,
     aux_int: int,
+    aux_float: f64,
     aux: SsaAux,
     args: List(int),      // indices into SsaFunc.values
     block: int,           // index into SsaFunc.blocks
@@ -133,6 +219,7 @@ struct SsaValue {
             op: op,
             type_idx: type_idx,
             aux_int: 0,
+            aux_float: 0.0,
             aux: SsaAux.none,
             args: args,
             block: block,

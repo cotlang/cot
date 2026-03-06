@@ -313,8 +313,7 @@ pub const Linker = struct {
             if (seg_end > offset) offset = seg_end;
         }
         // Align to 8 bytes
-        const arc = @import("../arc.zig");
-        offset = (offset + arc.ALIGN_MINUS_ONE) & arc.ALIGN_MASK;
+        offset = (offset + 7) & -@as(i32, 8);
 
         try self.data_segments.append(self.allocator, .{
             .offset = offset,

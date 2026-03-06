@@ -801,7 +801,7 @@ pub const GenState = struct {
                 _ = try self.builder.appendFrom(.i64_const, prog_mod.constAddr(addr));
             },
 
-            // Type metadata address (for ARC destructor lookup)
+            // Type metadata address (for WasmGC type info)
             // Resolved at link time: metadata_offsets[type_name]
             .metadata_addr => {
                 const type_name = v.aux.string;
@@ -1012,40 +1012,9 @@ pub const GenState = struct {
                 p.to = prog_mod.constAddr(v.aux_int);
             },
 
-            .wasm_lowered_retain => {
-                // ARC retain: call cot_retain(obj) -> obj
-                // Push the object pointer argument
-                try self.getValue64(v.args[0]);
-                // Look up cot_retain function index
-                const func_idx: i64 = if (self.func_indices) |indices| blk: {
-                    if (indices.get("retain")) |idx| {
-                        break :blk @intCast(idx);
-                    }
-                    break :blk 0; // Fallback (should not happen)
-                } else 0;
-                const p = try self.builder.append(.call);
-                p.to = prog_mod.constAddr(func_idx);
-                // Result is on stack, store to local if needed
-                if (self.value_to_local.get(v.id)) |local| {
-                    const set_p = try self.builder.append(.local_set);
-                    set_p.to = prog_mod.constAddr(local);
-                }
-            },
-
-            .wasm_lowered_release => {
-                // ARC release: call cot_release(obj) -> void
-                // Push the object pointer argument
-                try self.getValue64(v.args[0]);
-                // Look up cot_release function index
-                const func_idx: i64 = if (self.func_indices) |indices| blk: {
-                    if (indices.get("release")) |idx| {
-                        break :blk @intCast(idx);
-                    }
-                    break :blk 0; // Fallback (should not happen)
-                } else 0;
-                const p = try self.builder.append(.call);
-                p.to = prog_mod.constAddr(func_idx);
-                // No result (void function)
+            // ARC retain/release: native-only. Wasm uses WasmGC.
+            .wasm_lowered_retain, .wasm_lowered_release => {
+                _ = try self.builder.append(.@"unreachable");
             },
 
             // WasmGC struct operations

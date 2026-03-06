@@ -1,0 +1,409 @@
+/// Prog — Instruction in the assembler chain.
+///
+/// Go reference: cmd/internal/obj/link.go (Prog struct)
+/// Zig reference: compiler/codegen/wasm/prog.zig
+///
+/// A Prog represents a single assembler instruction. Instructions are
+/// stored in a List(Prog) that represents the function body. The preprocess
+/// pass transforms high-level instructions (CALL, RET) into low-level Wasm
+/// instructions.
+///
+/// Difference from Zig: uses List(Prog) instead of linked list,
+/// and indices instead of pointers for branch targets. Matches the
+/// index-based SSA pattern established in ssa.cot.
+
+import "std/list"
+import "wasm_types"
+
+// ============================================================================
+// Address Types
+// ============================================================================
+
+/// Addressing mode (like Go's obj.AddrType)
+const AddrType = enum {
+    none,
+    reg,
+    const_int,
+    const_float,
+    mem,
+    addr,
+    branch,
+}
+
+/// Name type for memory/address operands (like Go's obj.AddrName)
+const AddrName = enum {
+    none,
+    @"extern",
+    @"static",
+    @"auto",
+    param,
+}
+
+// ============================================================================
+// Addr — Operand address (like Go's obj.Addr)
+// ============================================================================
+
+struct Addr {
+    addr_type: AddrType,
+    name: AddrName,
+    reg: Reg,
+    offset: int,
+    sym_name: string,
+    float_val: f64,
+    branch_target: int,
+    br_table: List(int),
+
+    static fn init() Addr {
+        var table: List(int) = .{}
+        return Addr {
+            addr_type: AddrType.none,
+            name: AddrName.none,
+            reg: Reg.none,
+            offset: 0,
+            sym_name: "",
+            float_val: 0.0,
+            branch_target: -1,
+            br_table: table,
+        }
+    }
+
+    static fn initReg(r: Reg) Addr {
+        var a = Addr.init()
+        a.addr_type = AddrType.reg
+        a.reg = r
+        return a
+    }
+
+    static fn initConst(value: int) Addr {
+        var a = Addr.init()
+        a.addr_type = AddrType.const_int
+        a.offset = value
+        return a
+    }
+
+    static fn initFloat(value: f64) Addr {
+        var a = Addr.init()
+        a.addr_type = AddrType.const_float
+        a.float_val = value
+        return a
+    }
+
+    static fn initMem(r: Reg, offset: int) Addr {
+        var a = Addr.init()
+        a.addr_type = AddrType.mem
+        a.reg = r
+        a.offset = offset
+        return a
+    }
+
+    static fn initBranch(target: int) Addr {
+        var a = Addr.init()
+        a.addr_type = AddrType.branch
+        a.branch_target = target
+        return a
+    }
+
+    static fn initAddr(name: string) Addr {
+        var a = Addr.init()
+        a.addr_type = AddrType.addr
+        a.sym_name = name
+        return a
+    }
+}
+
+// ============================================================================
+// Prog — Single assembler instruction (like Go's obj.Prog)
+// ============================================================================
+
+struct Prog {
+    instr: As,
+    from: Addr,
+    to: Addr,
+    pc: int,
+    spadj: int,
+    mark: int,
+
+    static fn init(instr: As) Prog {
+        return Prog {
+            instr: instr,
+            from: Addr.init(),
+            to: Addr.init(),
+            pc: 0,
+            spadj: 0,
+            mark: 0,
+        }
+    }
+
+    static fn initFrom(instr: As, from: Addr) Prog {
+        return Prog {
+            instr: instr,
+            from: from,
+            to: Addr.init(),
+            pc: 0,
+            spadj: 0,
+            mark: 0,
+        }
+    }
+
+    static fn initTo(instr: As, to: Addr) Prog {
+        return Prog {
+            instr: instr,
+            from: Addr.init(),
+            to: to,
+            pc: 0,
+            spadj: 0,
+            mark: 0,
+        }
+    }
+}
+
+// ============================================================================
+// Symbol — Function metadata (like Go's obj.LSym)
+// ============================================================================
+
+struct Symbol {
+    name: string,
+    index: int,
+    size: int,
+    is_func: bool,
+    frame_size: int,
+    args_size: int,
+    locals_size: int,
+    param_count: int,
+    float_local_count: int,
+    gc_ref_locals: List(int),
+    text: List(Prog),
+
+    static fn init(name: string) Symbol {
+        var refs: List(int) = .{}
+        var text: List(Prog) = .{}
+        return Symbol {
+            name: name,
+            index: 0,
+            size: 0,
+            is_func: false,
+            frame_size: 0,
+            args_size: 0,
+            locals_size: 0,
+            param_count: 0,
+            float_local_count: 0,
+            gc_ref_locals: refs,
+            text: text,
+        }
+    }
+}
+
+// ============================================================================
+// ProgBuilder — Instruction list builder
+// ============================================================================
+
+/// Builds a list of Prog instructions for a function body.
+/// Uses List(Prog) instead of Zig's linked list — GC handles cleanup.
+struct ProgBuilder {
+    progs: List(Prog),
+    count: int,
+
+    static fn init() ProgBuilder {
+        var progs: List(Prog) = .{}
+        return ProgBuilder {
+            progs: progs,
+            count: 0,
+        }
+    }
+
+    /// Append a new instruction, return its index.
+    fn append(instr: As) int {
+        const idx = self.count
+        self.progs.append(Prog.init(instr))
+        self.count += 1
+        return idx
+    }
+
+    /// Append a new instruction with from operand, return its index.
+    fn appendFrom(instr: As, from: Addr) int {
+        const idx = self.count
+        self.progs.append(Prog.initFrom(instr, from))
+        self.count += 1
+        return idx
+    }
+
+    /// Append a new instruction with to operand, return its index.
+    fn appendTo(instr: As, to: Addr) int {
+        const idx = self.count
+        self.progs.append(Prog.initTo(instr, to))
+        self.count += 1
+        return idx
+    }
+
+    /// Get a Prog by index.
+    fn get(idx: int) Prog {
+        return self.progs.get(idx)
+    }
+
+    /// Set a Prog by index (for patching).
+    fn set(idx: int, p: Prog) void {
+        self.progs.set(idx, p)
+    }
+
+    /// Insert a new instruction after the given index.
+    /// Returns the index of the inserted instruction.
+    fn insertAfter(after_idx: int, instr: As, from: Addr, to: Addr) int {
+        var p = Prog {
+            instr: instr,
+            from: from,
+            to: to,
+            pc: 0,
+            spadj: 0,
+            mark: 0,
+        }
+        // Inherit PC from preceding instruction
+        p.pc = self.progs.get(after_idx).pc
+        const insert_idx = after_idx + 1
+        self.progs.insert(insert_idx, p)
+        self.count += 1
+        return insert_idx
+    }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Instructions that use the destination operand as their only operand.
+/// (Go: wasmobj.go lines 99-117)
+fn isUnaryDst(instr: As) bool {
+    return switch (instr) {
+        .set, .tee,
+        .call, .call_indirect,
+        .br, .br_if, .br_table,
+        .i32_store, .i64_store, .f32_store, .f64_store,
+        .i32_store8, .i32_store16,
+        .i64_store8, .i64_store16, .i64_store32 => true,
+        else => false,
+    }
+}
+
+/// Create a constant address operand.
+fn constAddr(value: int) Addr {
+    return Addr.initConst(value)
+}
+
+/// Create a register address operand.
+fn regAddr(r: Reg) Addr {
+    return Addr.initReg(r)
+}
+
+/// Create a float address operand.
+fn floatAddr(value: f64) Addr {
+    return Addr.initFloat(value)
+}
+
+/// Create a memory address operand.
+fn memAddr(r: Reg, offset: int) Addr {
+    return Addr.initMem(r, offset)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "Addr init defaults" {
+    const a = Addr.init()
+    @assertEq(a.addr_type == AddrType.none, true)
+    @assertEq(a.offset, 0)
+    @assertEq(a.branch_target, -1)
+}
+
+test "Addr factory functions" {
+    const c = Addr.initConst(42)
+    @assertEq(c.addr_type == AddrType.const_int, true)
+    @assertEq(c.offset, 42)
+
+    const r = Addr.initReg(Reg.sp)
+    @assertEq(r.addr_type == AddrType.reg, true)
+    @assertEq(r.reg == Reg.sp, true)
+
+    const m = Addr.initMem(Reg.sp, 8)
+    @assertEq(m.addr_type == AddrType.mem, true)
+    @assertEq(m.reg == Reg.sp, true)
+    @assertEq(m.offset, 8)
+
+    const b = Addr.initBranch(5)
+    @assertEq(b.addr_type == AddrType.branch, true)
+    @assertEq(b.branch_target, 5)
+}
+
+test "Prog init" {
+    const p = Prog.init(As.i64_add)
+    @assertEq(p.instr == As.i64_add, true)
+    @assertEq(p.from.addr_type == AddrType.none, true)
+    @assertEq(p.to.addr_type == AddrType.none, true)
+    @assertEq(p.pc, 0)
+}
+
+test "Prog initFrom and initTo" {
+    const p1 = Prog.initFrom(As.i64_const, constAddr(42))
+    @assertEq(p1.instr == As.i64_const, true)
+    @assertEq(p1.from.offset, 42)
+
+    const p2 = Prog.initTo(As.br, constAddr(3))
+    @assertEq(p2.instr == As.br, true)
+    @assertEq(p2.to.offset, 3)
+}
+
+test "Symbol init" {
+    const sym = Symbol.init("main")
+    @assertEq(sym.name, "main")
+    @assertEq(sym.index, 0)
+    @assertEq(sym.is_func, false)
+    @assertEq(sym.param_count, 0)
+    @assertEq(sym.text.count, 0)
+}
+
+test "ProgBuilder basic" {
+    var builder = ProgBuilder.init()
+
+    const i0 = builder.append(As.i64_const)
+    const i1 = builder.append(As.i64_add)
+    const i2 = builder.append(As.end)
+
+    @assertEq(builder.count, 3)
+    @assertEq(i0, 0)
+    @assertEq(i1, 1)
+    @assertEq(i2, 2)
+    @assertEq(builder.get(0).instr == As.i64_const, true)
+    @assertEq(builder.get(1).instr == As.i64_add, true)
+    @assertEq(builder.get(2).instr == As.end, true)
+}
+
+test "ProgBuilder with operands" {
+    var builder = ProgBuilder.init()
+
+    const i0 = builder.appendFrom(As.i64_const, constAddr(42))
+    @assertEq(builder.get(i0).from.offset, 42)
+
+    const i1 = builder.appendFrom(As.get, regAddr(Reg.sp))
+    @assertEq(builder.get(i1).from.reg == Reg.sp, true)
+}
+
+test "ProgBuilder set for patching" {
+    var builder = ProgBuilder.init()
+    builder.append(As.nop)
+
+    var p = builder.get(0)
+    p.instr = As.i64_add
+    p.pc = 5
+    builder.set(0, p)
+
+    @assertEq(builder.get(0).instr == As.i64_add, true)
+    @assertEq(builder.get(0).pc, 5)
+}
+
+test "isUnaryDst" {
+    @assertEq(isUnaryDst(As.set), true)
+    @assertEq(isUnaryDst(As.call), true)
+    @assertEq(isUnaryDst(As.br), true)
+    @assertEq(isUnaryDst(As.i64_store), true)
+    @assertEq(isUnaryDst(As.get), false)
+    @assertEq(isUnaryDst(As.i64_add), false)
+}
