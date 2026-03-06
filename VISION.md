@@ -209,13 +209,13 @@ For standalone use (CLI tools, libraries, Wasm modules), the `cot` compiler CLI 
               No runtime needed   Runs in V8        Runs on edge
 ```
 
-### Why Zig for the Compiler?
+### Why Zig for the Bootstrap Compiler?
 
-Following the Deno model: Deno is written in Rust and runs TypeScript. It's not self-hosted, and that's fine. Cot's compiler is written in Zig — a permanent tool, not a bootstrap.
+Zig is the bootstrap language — it compiles the first version of Cot, which then compiles itself. Like Go (bootstrapped from C), Rust (bootstrapped from OCaml), and Zig (bootstrapped from C++), the bootstrap compiler is frozen once self-hosting is achieved.
 
 ### Self-Hosting Strategy
 
-Self-hosting is actively in progress — 21,264 lines of Cot across 10 files (237 tests), covering ~70% of the frontend. The Zig compiler remains the production compiler while the self-hosted frontend matures.
+Full self-hosting is actively in progress — 21,264 lines of Cot across 10 files (237 tests), covering ~70% of the frontend. The goal is complete self-hosting including native codegen (ARM64, x64). Wasm self-compilation comes first (~20K new lines), then native codegen (~71K lines) is ported incrementally.
 
 1. Ship Cot with the Zig compiler (current)
 2. Build real applications in Cot (cot.land, cot.dev)

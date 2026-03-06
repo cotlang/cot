@@ -13,13 +13,18 @@ that Cot doesn't yet support. Counts are from the Zig compiler source (~10,500 l
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **Map `getOrPut`** | **TODO** | Stdlib: add `Map.getOrPut()` returning result struct (~25 call sites) |
-| **Map iterator** | **Partial** | `keys()`/`values()`/`keyAt(n)`/`valueAt(n)` exist; a proper `entries()` iterator would be cleaner (~26 uses) |
+| **Map `getOrPut`** | **Done** | `Map.getOrPut()` returns `GetOrPutResult(K, V)` with `key_ptr`, `value_ptr`, `found_existing` (Zig parity) |
+| **Map iterator** | **Done** | `Map.iterator()` returns `MapIterator(K, V)`, `next()` returns `?MapEntry(K, V)` with `key_ptr`, `value_ptr` (pointer-based, Zig parity) |
+| **StringMap `getOrPut`** | **Done** | `StringMap.getOrPut()` returns `StringMapGetOrPutResult` |
+| **StringMap iterator** | **Done** | `StringMap.iterator()` returns `StringMapIterator`, `next()` returns `?StringMapEntry` |
+| **fs `rename`** | **Done** | `renameFile(oldpath, newpath)` in `stdlib/fs.cot`, `cot_rename` runtime in `io_native.zig` |
 
 ## Completed Features
 
 | Feature | Completed | Notes |
 |---------|-----------|-------|
+| Generic `expr_types` collision fix | Mar 6, 2026 | Nested generic instantiation (e.g. Map→MapIterator) corrupted user `expr_types` — caused SIGSEGV in features.cot. Fix: always save/restore `expr_types` in generic body checking. |
+| WasmGC `call_indirect` type fix | Mar 6, 2026 | Indirect calls (trait methods, fn ptrs) now use GC ref types for struct params. Fixed `expected i64, found (ref null $type)` — features.cot E2E now passes on wasm. |
 | Labeled block expressions | Mar 6, 2026 | `blk: { break :blk val }` — result-local + merge-block pattern, type inference from break values |
 | `orelse return/continue/break` | Mar 6, 2026 | Dedicated `orelse_expr` AST node, compound optional fixes on native+wasm |
 | Parallel `for` | Pre-existing | `for i, item in list { }` — `index_binding` in ForStmt already works |

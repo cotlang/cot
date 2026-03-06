@@ -3671,8 +3671,7 @@ pub const Checker = struct {
         try self.generics.instantiation_cache.put(cache_key, concrete_type);
 
         // Instantiate generic impl block methods for this concrete struct
-        // Pass the host tree (saved before swap) so cross-file detection works correctly
-        try self.instantiateGenericImplMethods(gi.name, cache_key, resolved_args.items, saved_tree);
+        try self.instantiateGenericImplMethods(gi.name, cache_key, resolved_args.items);
 
         return concrete_type;
     }
@@ -3691,7 +3690,6 @@ pub const Checker = struct {
         base_name: []const u8,
         concrete_name: []const u8,
         resolved_args: []const TypeIndex,
-        host_tree: *const Ast,
     ) CheckError!void {
         const impl_list = self.generics.generic_impl_blocks.get(base_name) orelse return;
         for (impl_list.items) |impl_info| {
@@ -3756,19 +3754,16 @@ pub const Checker = struct {
                 try self.generics.generic_inst_by_name.put(synth_name, inst);
             }
 
-            // Pass 2: Check all method bodies (all sibling methods now visible in scope)
-            // Cross-file only: save/restore expr_types because foreign AST NodeIndexes
-            // collide with the host file's NodeIndex space (both start from 0).
-            const is_cross_file = (impl_info.tree != host_tree);
-            var saved_expr_types_2: std.AutoHashMap(NodeIndex, TypeIndex) = undefined;
-            if (is_cross_file) {
-                saved_expr_types_2 = self.expr_types;
-                self.expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
-            }
-            defer if (is_cross_file) {
+            // Pass 2: Check all method bodies — always save/restore expr_types.
+            // Generic method bodies use the declaring file's AST, whose NodeIndexes
+            // can collide with the host file's (or with a parent generic's tree during
+            // nested instantiation, e.g. Map → MapIterator in the same file).
+            const saved_expr_types_2 = self.expr_types;
+            self.expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
+            defer {
                 self.expr_types.deinit();
                 self.expr_types = saved_expr_types_2;
-            };
+            }
             for (impl_info.methods) |method_idx| {
                 const method_decl = (self.tree.getNode(method_idx) orelse continue).asDecl() orelse continue;
                 if (method_decl != .fn_decl) continue;
@@ -3863,17 +3858,16 @@ pub const Checker = struct {
             try self.global_scope.define(Symbol.init(cache_key, .function, func_type, gen_info.node_idx, false));
         }
 
-        // Go pattern: check.later() defers body verification (call.go:152-166).
-        // We check eagerly here since we're single-threaded.
-        // Cross-file only: save/restore expr_types to avoid NodeIndex collision.
-        const is_cross_file = (gen_info.tree != saved_tree);
-        if (is_cross_file) {
+        // Always save/restore expr_types during generic function body checking.
+        // Generic bodies use the declaring file's AST, whose NodeIndexes can collide
+        // with the host file's — even for same-file generics during nested instantiation.
+        {
             const saved_et = self.expr_types;
             self.expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
-            try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
-            self.expr_types.deinit();
-            self.expr_types = saved_et;
-        } else {
+            defer {
+                self.expr_types.deinit();
+                self.expr_types = saved_et;
+            }
             try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
         }
         self.type_substitution = old_sub;

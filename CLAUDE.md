@@ -41,7 +41,7 @@ Read `claude/BR_TABLE_ARCHITECTURE.md` if confused. br_table is copied from Go's
 
 **Cot** is a compiled language for full-stack web development with native and Wasm targets.
 **Pitch:** Write like TypeScript, run like Rust, deploy anywhere, never think about memory.
-**Compiler:** Written in Zig (permanent, like Deno's Rust dependency).
+**Compiler:** Currently written in Zig, being ported to Cot (full self-hosting). Zig becomes bootstrap-only.
 
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 

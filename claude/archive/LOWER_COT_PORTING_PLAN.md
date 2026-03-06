@@ -4,7 +4,7 @@
 
 Port `compiler/frontend/lower.zig` (~9,559 lines, 79 functions) to `self/frontend/lower.cot`. This is the AST→IR lowering pass — the bridge between the type-checked AST and the IR representation. It's the largest single file in the backend and the critical dependency for enabling `build`, `run`, and `test` commands in the self-hosted compiler.
 
-**Current status (Mar 4, 2026):** lower.cot is **~66% ported** — 6,618 lines, 20 tests, all 10 parity phases complete. See "Progress Update" below for details.
+**Current status (Mar 6, 2026):** lower.cot is **~97% non-async parity** — 7,031 lines, 20 tests. Only ~223 lines of small helpers remain. See "Progress Update" below.
 
 **Estimated final output**: ~8,000–10,000 lines of Cot (lower.zig is dense Zig; Cot's switch/capture verbosity adds ~15%, but @safe mode removes `&` noise)
 
@@ -274,44 +274,24 @@ Actual order: **1 → 3 → 2 → 4 → 5 → 6**
 
 ---
 
-## Progress Update (Mar 4, 2026)
+## Progress Update (Mar 6, 2026)
 
-**6,618 lines / ~9,967 reference = ~66% ported. 20 tests. All 10 parity phases COMPLETE.**
+**7,031 lines / ~9,967 reference = ~71% ported. 20 tests. ~97% non-async parity.**
 
-### Original 6 phases: ALL DONE
-- **Phase 1** (Foundation): DONE — Lowerer struct, init, decl dispatch
-- **Phase 2** (Statements): DONE — if/while/for/assign/return/defer/switch/break/continue
-- **Phase 3** (Expressions): DONE — literals, binary/unary, field access, indexing, slicing
-- **Phase 4** (Complex expressions): DONE — calls (5-type dispatch), if-expr, switch-expr, 59 builtins, closures
-- **Phase 5** (Error handling + generics): DONE — try/catch, error sets, generic instantiation, new/ARC
-- **Phase 6** (Integration): DONE — test/bench runners, global inits, multi-file lowering
+### All phases: DONE
+- **Phases 1–6** (Foundation through Integration): DONE
+- **Phases 0–9b** (Parity phases): DONE
+- **Post-parity ports**: lowerArrayInit, lowerTupleInit, lowerUnionInit, lowerStringInit, lowerSliceInit, lowerCompoundOrelse, storeCatchCompound, lowerArrayConcat, lowerSliceConcat, findLabeledLoop, createFuncValue — all DONE
 
-### Additional parity phases (Mar 3): ALL DONE
-- **Phase 0** (Prerequisites): source_tree fields in Symbol/MethodInfo, Lowerer struct fields
-- **Phase 1b** (Module qualification): qualifyName, resolveCallName, qualifyTypeName, resolveMethodName, shouldSkipQualification
-- **Phase 2b** (Compound optional helpers): storeCompoundOptArm, storeCompoundOptFieldPtr, storeCompoundOptField
-- **Phase 3b** (Auto-deinit): emitFieldReleases flesh-out, emitPendingAutoDeinits
-- **Phase 4b** (Bounds checking): emitBoundsCheck, emitSliceBoundsCheck, emitBoundsCheckImpl
-- **Phase 5b** (String parsing): parseCharLiteral, unescapeString, parseStringLiteral, hex/octal/binary ints, scientific floats
-- **Phase 6b** (Switch as select): lowerSwitchAsSelect
-- **Phase 7** (Map iteration): lowerForMap
-- **Phase 8** (Inline for): lowerInlineFor
-- **Phase 9** (Comptime evaluation): emitComptimeValue, evalFloatLiteral, lookupComptimeValue, getStringLiteral
-
-### Remaining gaps (~2,490 reference lines, most deferrable):
+### Remaining gaps:
 
 | Category | Functions | Ref Lines | Status |
 |----------|-----------|-----------|--------|
-| Async/concurrency | lowerSpawnExpr, lowerAsyncStateMachine, lowerAsyncFiber, countAwaitPoints, lowerAwaitExpr | ~1,170 | **Not yet ported** (implemented in Zig compiler, not needed for self-hosting until self-hosted compiler compiles async code) |
-| WasmGC | gcChunkIndex, gcFieldChunks, emitGcDefaultValue, emitGcStructNewExpanded | ~138 | **SKIP** (native only) |
-| Init variants | lowerArrayInit, lowerTupleInit, lowerUnionInit, lowerStringInit, lowerSliceInit | ~177 | May be inline |
-| Compound orelse | lowerCompoundOrelse, storeCatchCompound | ~42 | Edge case |
-| Type resolution | resolveGenericTypeName, resolveTypeArgNode, resolveStructFieldAddr | ~107 | Partially inline |
-| Array/string concat | lowerArrayConcat, lowerSliceConcat | ~48 | Inline in lowerBinary |
-| Cleanup helpers | maybeRegisterScopeDestroy, hasDeferCleanups, baseHasCleanup | ~61 | Partially inline |
-| Misc helpers | createFuncValue, emitComptimeArray, findLabeledLoop, isDivOp | ~94 | Various |
+| **Small helpers** | `resolveGenericTypeName` (17L), `resolveTypeArgNode` (33L), `resolveStructFieldAddr` (57L), `maybeRegisterScopeDestroy` (39L), `hasDeferCleanups` (13L), `baseHasCleanup` (16L), `emitComptimeArray` (41L), `isDivOp` (7L) | **~223** | **Ready to port** — straightforward |
+| Async/concurrency | `lowerSpawnExpr`, `lowerAsyncStateMachine`, `lowerAsyncFiber`, `countAwaitPoints`, `lowerAwaitExpr` | ~1,170 | **Deferred** — not needed until self-hosted compiler compiles async code |
+| WasmGC | `gcChunkIndex`, `gcFieldChunks`, `emitGcDefaultValue`, `emitGcStructNewExpanded` | ~138 | **SKIP** — native only |
 
-**Key observation:** ~1,308 lines are async + WasmGC. Async/await/spawn are fully implemented in the Zig compiler (lower.zig) but not yet ported to lower.cot — they aren't needed until the self-hosted compiler needs to compile async code. Remaining ~1,182 lines are mostly edge cases and helpers, many of which are handled inline in lower.cot rather than as separate functions.
+**~223 lines of small helpers are the only gap for non-async native parity.** Async (~1,170L) and WasmGC (~138L) are deferrable.
 
 ---
 
@@ -320,6 +300,6 @@ Actual order: **1 → 3 → 2 → 4 → 5 → 6**
 - [x] `cot test self/frontend/lower.cot` — 20 tests pass
 - [x] `cot build self/main.cot -o /tmp/selfcot` — builds successfully
 - [ ] `/tmp/selfcot build test/e2e/hello.cot` — self-hosted compiler can compile a program (requires SSA port)
-- [x] All existing self-hosted tests continue to pass (237 tests as of 0.3.4)
+- [x] All existing self-hosted tests continue to pass (266 tests as of 0.3.5)
 
-**Note**: Full `build` command requires not just lower.cot but also ssa_builder.cot (~2,178 lines) and arc_insertion.cot (~444 lines). This plan covers lower.cot only. The SSA builder and ARC insertion are separate, smaller efforts that follow.
+**Note**: ssa_builder.cot (2,099 lines, 7 tests) and ssa.cot (482 lines, 10 tests) are COMPLETE. arc_insertion.cot (~444 lines) is the remaining backend dependency.
