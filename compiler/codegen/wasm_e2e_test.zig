@@ -157,7 +157,7 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
         }
 
         // Generate code with function index resolution and ARC runtime
-        const body = try wasm_gen.genFuncWithIndices(allocator, ssa_func, &func_indices, runtime_funcs);
+        const body = try wasm_gen.genFuncWithIndices(allocator, ssa_func, &func_indices);
         try module.addCode(body);
     }
 
