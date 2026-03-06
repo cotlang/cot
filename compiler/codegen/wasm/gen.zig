@@ -1285,6 +1285,14 @@ pub const GenState = struct {
                     if (arg_idx >= self.param_count) {
                         self.param_count = arg_idx + 1;
                     }
+                    // STRING args occupy two consecutive param locals (ptr, len).
+                    // Register the len local so compound return handling can find it.
+                    if (v.type_idx == TypeRegistry.STRING) {
+                        try self.compound_len_locals.put(self.allocator, v.id, arg_idx + 1);
+                        if (arg_idx + 1 >= self.param_count) {
+                            self.param_count = arg_idx + 2;
+                        }
+                    }
                 }
             }
         }

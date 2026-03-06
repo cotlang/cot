@@ -1,0 +1,895 @@
+/// Link — Write complete Wasm module binary.
+///
+/// Zig reference: compiler/codegen/wasm/link.zig
+/// Go reference: cmd/link/internal/wasm/asm.go
+///
+/// Writes the final WebAssembly module binary with all sections:
+/// 1. Type section: function signatures (GC struct types first, then func types)
+/// 2. Import section: host imports
+/// 3. Function section: function type indices
+/// 4. Table section: indirect call table
+/// 5. Memory section: linear memory
+/// 6. Global section: global variables (SP, etc.)
+/// 7. Export section: exported functions + memory
+/// 8. Element section: table initialization
+/// 9. Data Count section (Wasm 2.0)
+/// 10. Code section: function bodies
+/// 11. Data section: static data
+
+import "std/list"
+import "std/map"
+import "std/string"
+import "assemble"
+import "wasm_types"
+
+// ============================================================================
+// Wasm binary constants (unique to link — shared ones imported from wasm_types)
+// ============================================================================
+
+const WASM_MAGIC_0: int = 0x00
+const WASM_MAGIC_1: int = 0x61
+const WASM_MAGIC_2: int = 0x73
+const WASM_MAGIC_3: int = 0x6D
+
+const WASM_VERSION_0: int = 0x01
+const WASM_VERSION_1: int = 0x00
+const WASM_VERSION_2: int = 0x00
+const WASM_VERSION_3: int = 0x00
+
+const GC_STRUCT_TYPE_TAG: int = 0x5F
+const EXPORT_KIND_FUNC: int = 0x00
+const EXPORT_KIND_MEMORY: int = 0x02
+
+// Section IDs
+const SECTION_TYPE: int = 1
+const SECTION_IMPORT: int = 2
+const SECTION_FUNCTION: int = 3
+const SECTION_TABLE: int = 4
+const SECTION_MEMORY: int = 5
+const SECTION_GLOBAL: int = 6
+const SECTION_EXPORT: int = 7
+const SECTION_ELEMENT: int = 9
+const SECTION_CODE: int = 10
+const SECTION_DATA: int = 11
+const SECTION_DATA_COUNT: int = 12
+
+// ValType constants
+const VALTYPE_I32: int = 0x7F
+const VALTYPE_I64: int = 0x7E
+const VALTYPE_F32: int = 0x7D
+const VALTYPE_F64: int = 0x7C
+const VALTYPE_FUNCREF: int = 0x70
+
+// ============================================================================
+// Function type signature
+// Zig reference: link.zig FuncType struct
+// Uses offset/len into shared type_storage (not per-type List)
+// ============================================================================
+
+struct FuncType {
+    params_offset: int,
+    params_len: int,
+    results_offset: int,
+    results_len: int,
+
+    static fn init(params_offset: int, params_len: int, results_offset: int, results_len: int) FuncType {
+        return FuncType {
+            params_offset: params_offset,
+            params_len: params_len,
+            results_offset: results_offset,
+            results_len: results_len,
+        }
+    }
+
+    /// Compare two FuncTypes using shared type_storage.
+    /// Zig reference: FuncType.eqlWith()
+    fn eqlWith(other: FuncType, storage: List(int)) bool {
+        if (self.params_len != other.params_len) { return false }
+        if (self.results_len != other.results_len) { return false }
+        var i = 0
+        while (i < self.params_len) {
+            if (storage.get(self.params_offset + i) != storage.get(other.params_offset + i)) { return false }
+            i += 1
+        }
+        i = 0
+        while (i < self.results_len) {
+            if (storage.get(self.results_offset + i) != storage.get(other.results_offset + i)) { return false }
+            i += 1
+        }
+        return true
+    }
+}
+
+// ============================================================================
+// Assembled function ready for linking
+// ============================================================================
+
+struct WasmFunc {
+    name: string,
+    type_idx: int,
+    code: List(int),
+    exported: bool,
+
+    static fn init(name: string, type_idx: int, code: List(int), exported: bool) WasmFunc {
+        return WasmFunc { name: name, type_idx: type_idx, code: code, exported: exported }
+    }
+}
+
+// ============================================================================
+// Host import definition
+// ============================================================================
+
+struct WasmImport {
+    module: string,
+    name: string,
+    type_idx: int,
+
+    static fn init(module: string, name: string, type_idx: int) WasmImport {
+        return WasmImport { module: module, name: name, type_idx: type_idx }
+    }
+}
+
+// ============================================================================
+// Global variable definition
+// ============================================================================
+
+struct WasmGlobal {
+    val_type: int,
+    mutable: bool,
+    init_val: int,
+
+    static fn init(val_type: int, mutable: bool, init_val: int) WasmGlobal {
+        return WasmGlobal { val_type: val_type, mutable: mutable, init_val: init_val }
+    }
+}
+
+// ============================================================================
+// Data segment for data section
+// ============================================================================
+
+struct DataSegment {
+    offset: int,
+    data: List(int),
+
+    static fn init(offset: int, data: List(int)) DataSegment {
+        return DataSegment { offset: offset, data: data }
+    }
+}
+
+// ============================================================================
+// WasmGC field type
+// ============================================================================
+
+struct GcFieldType {
+    val_type: int,
+    mutable: bool,
+    gc_ref: ?int,
+
+    static fn init(val_type: int, mutable: bool) GcFieldType {
+        return GcFieldType { val_type: val_type, mutable: mutable, gc_ref: null }
+    }
+
+    static fn initRef(gc_ref_idx: int, mutable: bool) GcFieldType {
+        return GcFieldType { val_type: 0, mutable: mutable, gc_ref: gc_ref_idx }
+    }
+}
+
+// ============================================================================
+// WasmGC struct type
+// Zig reference: link.zig GcStructType — offset/count into gc_field_storage
+// ============================================================================
+
+struct GcStructType {
+    name: string,
+    field_count: int,
+    field_offset: int,
+
+    static fn init(name: string, field_count: int, field_offset: int) GcStructType {
+        return GcStructType { name: name, field_count: field_count, field_offset: field_offset }
+    }
+}
+
+// ============================================================================
+// Linker — Module linker state
+// Zig reference: link.zig Linker struct
+// ============================================================================
+
+struct Linker {
+    types: List(FuncType),
+    type_storage: List(int),
+    imports: List(WasmImport),
+    globals: List(WasmGlobal),
+    funcs: List(WasmFunc),
+    data_segments: List(DataSegment),
+    table_funcs: List(int),
+    table_size: int,
+    memory_min_pages: int,
+    memory_max_pages: ?int,
+    gc_struct_types: List(GcStructType),
+    gc_field_storage: List(GcFieldType),
+    gc_struct_name_map: Map(string, int),
+
+    static fn init() Linker {
+        var types: List(FuncType) = .{}
+        var type_storage: List(int) = .{}
+        var imports: List(WasmImport) = .{}
+        var globals: List(WasmGlobal) = .{}
+        var funcs: List(WasmFunc) = .{}
+        var data_segments: List(DataSegment) = .{}
+        var table_funcs: List(int) = .{}
+        var gc_struct_types: List(GcStructType) = .{}
+        var gc_field_storage: List(GcFieldType) = .{}
+        var gc_struct_name_map: Map(string, int) = .{}
+        return Linker {
+            types: types,
+            type_storage: type_storage,
+            imports: imports,
+            globals: globals,
+            funcs: funcs,
+            data_segments: data_segments,
+            table_funcs: table_funcs,
+            table_size: 0,
+            memory_min_pages: 1,
+            memory_max_pages: null,
+            gc_struct_types: gc_struct_types,
+            gc_field_storage: gc_field_storage,
+            gc_struct_name_map: gc_struct_name_map,
+        }
+    }
+
+    /// Number of GC struct types (offsets function type indices)
+    fn gcTypeCount() int {
+        return self.gc_struct_types.count
+    }
+
+    /// Adjust raw function type index for GC struct types
+    fn funcTypeIndex(raw_idx: int) int {
+        return raw_idx + self.gc_struct_types.count
+    }
+
+    /// Add or find a GC struct type. Returns type index (0..N-1).
+    /// Zig reference: Linker.addGcStructType()
+    fn addGcStructType(name: string, fields: List(GcFieldType)) int {
+        if (self.gc_struct_name_map.getOrNull(name)) |existing| {
+            return existing
+        }
+        const type_idx = self.gc_struct_types.count
+        const field_offset = self.gc_field_storage.count
+        var fi = 0
+        while (fi < fields.count) {
+            self.gc_field_storage.append(fields.get(fi))
+            fi += 1
+        }
+        self.gc_struct_types.append(GcStructType.init(name, fields.count, field_offset))
+        self.gc_struct_name_map.set(name, type_idx)
+        return type_idx
+    }
+
+    /// Add or find a function type. Returns raw index (0-based among func types).
+    /// Zig reference: Linker.addTypeWasm() — store-then-compare with rollback on dedup.
+    fn addType(params: List(int), results: List(int)) int {
+        // Store into shared type_storage first
+        const params_start = self.type_storage.count
+        var pi = 0
+        while (pi < params.count) {
+            self.type_storage.append(params.get(pi))
+            pi += 1
+        }
+        const results_start = self.type_storage.count
+        var ri = 0
+        while (ri < results.count) {
+            self.type_storage.append(results.get(ri))
+            ri += 1
+        }
+
+        const new_type = FuncType.init(params_start, params.count, results_start, results.count)
+
+        // Check for duplicate (compare via shared storage)
+        var i = 0
+        while (i < self.types.count) {
+            if (self.types.get(i).eqlWith(new_type, self.type_storage)) {
+                // Duplicate — rollback type_storage
+                self.type_storage.resize(params_start)
+                return i
+            }
+            i += 1
+        }
+
+        self.types.append(new_type)
+        return self.types.count - 1
+    }
+
+    /// Add a host import. Returns import function index.
+    fn addImport(imp: WasmImport) int {
+        const idx = self.imports.count
+        self.imports.append(imp)
+        return idx
+    }
+
+    /// Number of imports
+    fn numImports() int {
+        return self.imports.count
+    }
+
+    /// Number of functions
+    fn funcCount() int {
+        return self.funcs.count
+    }
+
+    /// Add a global variable. Returns global index.
+    fn addGlobal(global: WasmGlobal) int {
+        const idx = self.globals.count
+        self.globals.append(global)
+        return idx
+    }
+
+    /// Add a function. Returns function index.
+    fn addFunc(func: WasmFunc) int {
+        const idx = self.funcs.count
+        self.funcs.append(func)
+        return idx
+    }
+
+    /// Set memory size
+    fn setMemory(min_pages: int, max_pages: ?int) void {
+        self.memory_min_pages = min_pages
+        self.memory_max_pages = max_pages
+    }
+
+    /// Add function to indirect call table. Returns table index.
+    fn addTableFunc(func_idx: int) int {
+        const table_idx = self.table_funcs.count
+        self.table_funcs.append(func_idx)
+        if (table_idx + 1 > self.table_size) {
+            self.table_size = table_idx + 1
+        }
+        return table_idx
+    }
+
+    /// Set minimum table size
+    fn setTableSize(size: int) void {
+        if (size > self.table_size) {
+            self.table_size = size
+        }
+    }
+
+    /// Add a data segment. Returns offset in memory.
+    fn addDataSegment(data: List(int)) int {
+        var offset = 0
+        var i = 0
+        while (i < self.data_segments.count) {
+            const seg = self.data_segments.get(i)
+            const seg_end = seg.offset + seg.data.count
+            if (seg_end > offset) { offset = seg_end }
+            i += 1
+        }
+        // Align to 8 bytes
+        offset = (offset + 7) & (0 - 8)
+        self.data_segments.append(DataSegment.init(offset, data))
+        return offset
+    }
+
+    /// Emit the complete Wasm module binary.
+    /// Zig reference: Linker.emit()
+    fn emit() List(int) {
+        var output: List(int) = .{}
+
+        // Header: magic + version
+        output.append(WASM_MAGIC_0)
+        output.append(WASM_MAGIC_1)
+        output.append(WASM_MAGIC_2)
+        output.append(WASM_MAGIC_3)
+        output.append(WASM_VERSION_0)
+        output.append(WASM_VERSION_1)
+        output.append(WASM_VERSION_2)
+        output.append(WASM_VERSION_3)
+
+        self.emitTypeSection(&output)
+        self.emitImportSection(&output)
+        self.emitFunctionSection(&output)
+        self.emitTableSection(&output)
+        self.emitMemorySection(&output)
+        self.emitGlobalSection(&output)
+        self.emitExportSection(&output)
+        self.emitElementSection(&output)
+        self.emitDataCountSection(&output)
+        self.emitCodeSection(&output)
+        self.emitDataSection(&output)
+
+        return output
+    }
+
+    // ========================================================================
+    // Section emitters (split to avoid stack overflow — Zig reference pattern)
+    // ========================================================================
+
+    fn emitTypeSection(output: *List(int)) void {
+        const gc_count = self.gc_struct_types.count
+        const func_count = self.types.count
+        const total_count = gc_count + func_count
+        if (total_count == 0) { return }
+
+        var buf: List(int) = .{}
+        writeULEB128(&buf, total_count)
+
+        // GC struct types first (indices 0..N-1)
+        var gi = 0
+        while (gi < gc_count) {
+            const st = self.gc_struct_types.get(gi)
+            buf.append(GC_STRUCT_TYPE_TAG)
+            writeULEB128(&buf, st.field_count)
+            var fi = 0
+            while (fi < st.field_count) {
+                const f = self.gc_field_storage.get(st.field_offset + fi)
+                if (f.gc_ref) |gc_idx| {
+                    buf.append(GC_REF_TYPE_NULL)
+                    writeULEB128(&buf, gc_idx)
+                } else {
+                    buf.append(f.val_type)
+                }
+                buf.append(if (f.mutable) { GC_FIELD_MUT } else { GC_FIELD_IMMUT })
+                fi += 1
+            }
+            gi += 1
+        }
+
+        // Function types (indices N..N+M-1)
+        var ti = 0
+        while (ti < func_count) {
+            const t = self.types.get(ti)
+            buf.append(FUNC_TYPE_TAG)
+            writeULEB128(&buf, t.params_len)
+            var pi = 0
+            while (pi < t.params_len) {
+                buf.append(self.type_storage.get(t.params_offset + pi))
+                pi += 1
+            }
+            writeULEB128(&buf, t.results_len)
+            var ri = 0
+            while (ri < t.results_len) {
+                buf.append(self.type_storage.get(t.results_offset + ri))
+                ri += 1
+            }
+            ti += 1
+        }
+
+        writeSection(output, SECTION_TYPE, buf)
+    }
+
+    fn emitImportSection(output: *List(int)) void {
+        if (self.imports.count == 0) { return }
+
+        var buf: List(int) = .{}
+        writeULEB128(&buf, self.imports.count)
+        var i = 0
+        while (i < self.imports.count) {
+            const imp = self.imports.get(i)
+            writeString(&buf, imp.module)
+            writeString(&buf, imp.name)
+            buf.append(IMPORT_KIND_FUNC)
+            writeULEB128(&buf, imp.type_idx)
+            i += 1
+        }
+        writeSection(output, SECTION_IMPORT, buf)
+    }
+
+    fn emitFunctionSection(output: *List(int)) void {
+        if (self.funcs.count == 0) { return }
+
+        var buf: List(int) = .{}
+        writeULEB128(&buf, self.funcs.count)
+        const gc_offset = self.gcTypeCount()
+        var i = 0
+        while (i < self.funcs.count) {
+            writeULEB128(&buf, self.funcs.get(i).type_idx + gc_offset)
+            i += 1
+        }
+        writeSection(output, SECTION_FUNCTION, buf)
+    }
+
+    fn emitTableSection(output: *List(int)) void {
+        if (self.table_size == 0) { return }
+
+        var buf: List(int) = .{}
+        writeULEB128(&buf, 1)
+        buf.append(VALTYPE_FUNCREF)
+        buf.append(LIMITS_NO_MAX)
+        writeULEB128(&buf, self.table_size)
+        writeSection(output, SECTION_TABLE, buf)
+    }
+
+    fn emitMemorySection(output: *List(int)) void {
+        var buf: List(int) = .{}
+        writeULEB128(&buf, 1)
+        if (self.memory_max_pages) |max| {
+            buf.append(LIMITS_WITH_MAX)
+            writeULEB128(&buf, self.memory_min_pages)
+            writeULEB128(&buf, max)
+        } else {
+            buf.append(LIMITS_NO_MAX)
+            writeULEB128(&buf, self.memory_min_pages)
+        }
+        writeSection(output, SECTION_MEMORY, buf)
+    }
+
+    fn emitGlobalSection(output: *List(int)) void {
+        var buf: List(int) = .{}
+        const total_globals = 1 + self.globals.count
+        writeULEB128(&buf, total_globals)
+
+        // Global 0: SP (stack pointer)
+        buf.append(VALTYPE_I32)
+        buf.append(GLOBAL_MUTABLE)
+        buf.append(0x41)  // i32.const
+        writeSLEB128(&buf, STACK_SIZE)
+        buf.append(0x0B)  // end
+
+        // Dynamic globals
+        var i = 0
+        while (i < self.globals.count) {
+            const g = self.globals.get(i)
+            buf.append(g.val_type)
+            buf.append(if (g.mutable) { GLOBAL_MUTABLE } else { GLOBAL_IMMUTABLE })
+            if (g.val_type == VALTYPE_I32) {
+                buf.append(0x41)  // i32.const
+            } else {
+                buf.append(0x42)  // i64.const
+            }
+            writeSLEB128(&buf, g.init_val)
+            buf.append(0x0B)  // end
+            i += 1
+        }
+        writeSection(output, SECTION_GLOBAL, buf)
+    }
+
+    fn emitExportSection(output: *List(int)) void {
+        var buf: List(int) = .{}
+
+        var export_count = 1  // always export memory
+        var ci = 0
+        while (ci < self.funcs.count) {
+            if (self.funcs.get(ci).exported) { export_count += 1 }
+            ci += 1
+        }
+        writeULEB128(&buf, export_count)
+
+        // Export functions
+        const import_count = self.imports.count
+        var i = 0
+        while (i < self.funcs.count) {
+            const f = self.funcs.get(i)
+            if (f.exported) {
+                writeString(&buf, f.name)
+                buf.append(EXPORT_KIND_FUNC)
+                writeULEB128(&buf, import_count + i)
+            }
+            i += 1
+        }
+
+        // Export memory
+        writeString(&buf, "memory")
+        buf.append(EXPORT_KIND_MEMORY)
+        writeULEB128(&buf, 0)
+
+        writeSection(output, SECTION_EXPORT, buf)
+    }
+
+    fn emitElementSection(output: *List(int)) void {
+        if (self.table_funcs.count == 0) { return }
+
+        var buf: List(int) = .{}
+        writeULEB128(&buf, 1)
+        writeULEB128(&buf, 0)
+        buf.append(0x41)  // i32.const
+        writeSLEB128(&buf, 0)
+        buf.append(0x0B)  // end
+        writeULEB128(&buf, self.table_funcs.count)
+        const import_count = self.imports.count
+        var i = 0
+        while (i < self.table_funcs.count) {
+            writeULEB128(&buf, import_count + self.table_funcs.get(i))
+            i += 1
+        }
+        writeSection(output, SECTION_ELEMENT, buf)
+    }
+
+    fn emitDataCountSection(output: *List(int)) void {
+        if (self.data_segments.count == 0) { return }
+        var buf: List(int) = .{}
+        writeULEB128(&buf, self.data_segments.count)
+        writeSection(output, SECTION_DATA_COUNT, buf)
+    }
+
+    fn emitCodeSection(output: *List(int)) void {
+        if (self.funcs.count == 0) { return }
+
+        var buf: List(int) = .{}
+        writeULEB128(&buf, self.funcs.count)
+        var i = 0
+        while (i < self.funcs.count) {
+            const f = self.funcs.get(i)
+            writeULEB128(&buf, f.code.count)
+            var ci = 0
+            while (ci < f.code.count) {
+                buf.append(f.code.get(ci))
+                ci += 1
+            }
+            i += 1
+        }
+        writeSection(output, SECTION_CODE, buf)
+    }
+
+    fn emitDataSection(output: *List(int)) void {
+        if (self.data_segments.count == 0) { return }
+
+        var buf: List(int) = .{}
+        writeULEB128(&buf, self.data_segments.count)
+        var i = 0
+        while (i < self.data_segments.count) {
+            const seg = self.data_segments.get(i)
+            writeULEB128(&buf, 0)  // memory index 0
+            buf.append(0x41)  // i32.const
+            writeSLEB128(&buf, seg.offset)
+            buf.append(0x0B)  // end
+            writeULEB128(&buf, seg.data.count)
+            var di = 0
+            while (di < seg.data.count) {
+                buf.append(seg.data.get(di))
+                di += 1
+            }
+            i += 1
+        }
+        writeSection(output, SECTION_DATA, buf)
+    }
+}
+
+// ============================================================================
+// Helper: write section header + content
+// ============================================================================
+
+fn writeSection(output: *List(int), section_id: int, content: List(int)) void {
+    output.append(section_id)
+    writeULEB128(output, content.count)
+    var i = 0
+    while (i < content.count) {
+        output.append(content.get(i))
+        i += 1
+    }
+}
+
+// ============================================================================
+// Helper: write string (length-prefixed)
+// ============================================================================
+
+fn writeString(buf: *List(int), s: string) void {
+    writeULEB128(buf, @lenOf(s))
+    var i = 0
+    while (i < @lenOf(s)) {
+        buf.append(@intCast(int, s[i]))
+        i += 1
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "linker basic type dedup" {
+    var linker = Linker.init()
+
+    // Add type () -> i64
+    var params1: List(int) = .{}
+    var results1: List(int) = .{}
+    results1.append(VALTYPE_I64)
+    const idx1 = linker.addType(params1, results1)
+    @assertEq(idx1, 0)
+
+    // Same type should return same index
+    var params2: List(int) = .{}
+    var results2: List(int) = .{}
+    results2.append(VALTYPE_I64)
+    const idx2 = linker.addType(params2, results2)
+    @assertEq(idx2, 0)
+
+    // Different type gets new index
+    var params3: List(int) = .{}
+    params3.append(VALTYPE_I64)
+    params3.append(VALTYPE_I64)
+    var results3: List(int) = .{}
+    results3.append(VALTYPE_I64)
+    const idx3 = linker.addType(params3, results3)
+    @assertEq(idx3, 1)
+}
+
+test "linker emit minimal module" {
+    var linker = Linker.init()
+
+    // Add type () -> i64
+    var params: List(int) = .{}
+    var results: List(int) = .{}
+    results.append(VALTYPE_I64)
+    const type_idx = linker.addType(params, results)
+
+    // Add function: body = [0x00, 0x42, 0x2A, 0x0B] (0 locals, i64.const 42, end)
+    var code: List(int) = .{}
+    code.append(0x00)
+    code.append(0x42)
+    code.append(0x2A)
+    code.append(0x0B)
+    linker.addFunc(WasmFunc.init("_start", type_idx, code, true))
+
+    const output = linker.emit()
+
+    // Verify magic
+    @assertEq(output.get(0), 0x00)
+    @assertEq(output.get(1), 0x61)
+    @assertEq(output.get(2), 0x73)
+    @assertEq(output.get(3), 0x6D)
+    // Verify version
+    @assertEq(output.get(4), 0x01)
+    @assert(output.count > 20)
+}
+
+test "linker gc struct types" {
+    var linker = Linker.init()
+
+    // Add GC struct: Point { x: i64, y: i64 }
+    var fields: List(GcFieldType) = .{}
+    fields.append(GcFieldType.init(VALTYPE_I64, true))
+    fields.append(GcFieldType.init(VALTYPE_I64, true))
+    const idx1 = linker.addGcStructType("Point", fields)
+    @assertEq(idx1, 0)
+
+    // Same name returns same index
+    var fields2: List(GcFieldType) = .{}
+    fields2.append(GcFieldType.init(VALTYPE_I64, true))
+    const idx2 = linker.addGcStructType("Point", fields2)
+    @assertEq(idx2, 0)
+
+    // Different struct gets new index
+    var fields3: List(GcFieldType) = .{}
+    fields3.append(GcFieldType.init(VALTYPE_I64, true))
+    const idx3 = linker.addGcStructType("Foo", fields3)
+    @assertEq(idx3, 1)
+
+    // Function type indices offset by gc count
+    @assertEq(linker.gcTypeCount(), 2)
+    @assertEq(linker.funcTypeIndex(0), 2)
+}
+
+test "linker with imports" {
+    var linker = Linker.init()
+
+    // Add import type: (i64) -> void
+    var imp_params: List(int) = .{}
+    imp_params.append(VALTYPE_I64)
+    var imp_results: List(int) = .{}
+    const imp_type = linker.addType(imp_params, imp_results)
+
+    // Add import
+    const imp_idx = linker.addImport(WasmImport.init("env", "console_log", imp_type))
+    @assertEq(imp_idx, 0)
+    @assertEq(linker.numImports(), 1)
+
+    // Add native function
+    var func_params: List(int) = .{}
+    var func_results: List(int) = .{}
+    func_results.append(VALTYPE_I64)
+    const func_type = linker.addType(func_params, func_results)
+
+    var code: List(int) = .{}
+    code.append(0x00)
+    code.append(0x42)
+    code.append(0x2A)
+    code.append(0x0B)
+    linker.addFunc(WasmFunc.init("_start", func_type, code, true))
+
+    const output = linker.emit()
+
+    // Should contain import section (section ID 2)
+    var found_import = false
+    var i = 8
+    while (i < output.count) {
+        if (output.get(i) == SECTION_IMPORT) {
+            found_import = true
+        }
+        i += 1
+    }
+    @assert(found_import)
+}
+
+test "linker table and elements" {
+    var linker = Linker.init()
+
+    // Add type
+    var params: List(int) = .{}
+    var results: List(int) = .{}
+    const type_idx = linker.addType(params, results)
+
+    // Add function
+    var code: List(int) = .{}
+    code.append(0x00)
+    code.append(0x0B)
+    const func_idx = linker.addFunc(WasmFunc.init("handler", type_idx, code, false))
+
+    // Add to table
+    const table_idx = linker.addTableFunc(func_idx)
+    @assertEq(table_idx, 0)
+    @assertEq(linker.table_size, 1)
+
+    const output = linker.emit()
+    var found_table = false
+    var found_element = false
+    var i = 8
+    while (i < output.count) {
+        if (output.get(i) == SECTION_TABLE) { found_table = true }
+        if (output.get(i) == SECTION_ELEMENT) { found_element = true }
+        i += 1
+    }
+    @assert(found_table)
+    @assert(found_element)
+}
+
+test "linker globals" {
+    var linker = Linker.init()
+
+    linker.addGlobal(WasmGlobal.init(VALTYPE_I32, true, 65536))
+
+    var params: List(int) = .{}
+    var results: List(int) = .{}
+    const type_idx = linker.addType(params, results)
+    var code: List(int) = .{}
+    code.append(0x00)
+    code.append(0x0B)
+    linker.addFunc(WasmFunc.init("_start", type_idx, code, true))
+
+    const output = linker.emit()
+
+    var found_global = false
+    var i = 8
+    while (i < output.count) {
+        if (output.get(i) == SECTION_GLOBAL) { found_global = true }
+        i += 1
+    }
+    @assert(found_global)
+}
+
+test "linker data segments" {
+    var linker = Linker.init()
+
+    var data: List(int) = .{}
+    data.append(0x48)
+    data.append(0x65)
+    data.append(0x6C)
+    data.append(0x6C)
+    data.append(0x6F)
+    const offset = linker.addDataSegment(data)
+    @assertEq(offset, 0)
+
+    // Second segment aligned to 8
+    var data2: List(int) = .{}
+    data2.append(0x21)
+    const offset2 = linker.addDataSegment(data2)
+    @assertEq(offset2, 8)
+
+    var params: List(int) = .{}
+    var results: List(int) = .{}
+    const type_idx = linker.addType(params, results)
+    var code: List(int) = .{}
+    code.append(0x00)
+    code.append(0x0B)
+    linker.addFunc(WasmFunc.init("_start", type_idx, code, true))
+
+    const output = linker.emit()
+
+    var found_data = false
+    var found_data_count = false
+    var i = 8
+    while (i < output.count) {
+        if (output.get(i) == SECTION_DATA) { found_data = true }
+        if (output.get(i) == SECTION_DATA_COUNT) { found_data_count = true }
+        i += 1
+    }
+    @assert(found_data)
+    @assert(found_data_count)
+}

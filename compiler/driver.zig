@@ -36,6 +36,7 @@ const wasm_old = @import("codegen/wasm.zig"); // Old module builder (for CodeBui
 const wasm = @import("codegen/wasm/wasm.zig"); // New Go-style package (for Linker)
 const wasm_gen = @import("codegen/wasm_gen.zig");
 const arc = @import("codegen/arc.zig"); // ARC runtime (Swift)
+const mem_runtime = @import("codegen/mem_runtime.zig"); // Memory utils (memcpy, string_eq, etc.)
 const slice_runtime = @import("codegen/slice_runtime.zig"); // Slice runtime (Go)
 const print_runtime = @import("codegen/print_runtime.zig"); // Print runtime (Go)
 const wasi_runtime = @import("codegen/wasi_runtime.zig"); // WASI runtime (fd_write)
@@ -5377,6 +5378,12 @@ pub const Driver = struct {
         const heap_ptr_global = heap_ptr_dynamic_idx + 1; // Offset by SP
 
         // ====================================================================
+        // Add memory utility functions (memcpy, memset_zero, string_eq, string_concat)
+        // These are non-ARC, needed by stdlib on both ARC and WasmGC paths.
+        // ====================================================================
+        const mem_funcs = try mem_runtime.addToLinker(self.allocator, &linker, heap_ptr_global);
+
+        // ====================================================================
         // Add slice runtime functions (Go style)
         // Reference: Go runtime/slice.go
         // ====================================================================
@@ -5418,6 +5425,15 @@ pub const Driver = struct {
         // Runtime functions come first, then user functions
         var func_indices = wasm_gen.FuncIndexMap{};
         defer func_indices.deinit(self.allocator);
+
+        // Add memory utility function names to index map
+        try func_indices.put(self.allocator, mem_runtime.ALLOC_NAME, mem_funcs.alloc_idx);
+        try func_indices.put(self.allocator, mem_runtime.DEALLOC_NAME, mem_funcs.dealloc_idx);
+        try func_indices.put(self.allocator, mem_runtime.REALLOC_NAME, mem_funcs.realloc_idx);
+        try func_indices.put(self.allocator, mem_runtime.MEMCPY_NAME, mem_funcs.memcpy_idx);
+        try func_indices.put(self.allocator, mem_runtime.MEMSET_ZERO_NAME, mem_funcs.memset_zero_idx);
+        try func_indices.put(self.allocator, mem_runtime.STRING_EQ_NAME, mem_funcs.string_eq_idx);
+        try func_indices.put(self.allocator, mem_runtime.STRING_CONCAT_NAME, mem_funcs.string_concat_idx);
 
         // Add slice function names to index map (Go)
         try func_indices.put(self.allocator, slice_runtime.GROWSLICE_NAME, slice_funcs.growslice_idx);

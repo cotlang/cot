@@ -8,9 +8,10 @@
 /// pass transforms high-level instructions (CALL, RET) into low-level Wasm
 /// instructions.
 ///
-/// Difference from Zig: uses List(Prog) instead of linked list,
-/// and indices instead of pointers for branch targets. Matches the
-/// index-based SSA pattern established in ssa.cot.
+/// Uses List(Prog) with indices instead of linked list because Cot does not
+/// support self-referential struct pointers (?*Prog inside Prog).
+/// All other types match Zig: tagged union for Addr values, optional ints
+/// for nullable fields, ?*Symbol for symbol references.
 
 import "std/list"
 import "wasm_types"
@@ -39,8 +40,22 @@ const AddrName = enum {
     param,
 }
 
+/// Value union for Addr (Zig: prog.zig Value union)
+/// Only one of these is active at a time.
+union AddrVal {
+    none,
+    float_val: f64,
+    br_table: List(int),
+}
+
 // ============================================================================
 // Addr — Operand address (like Go's obj.Addr)
+// Zig reference: prog.zig Addr struct
+//
+// NOTE: sym is stored as int (via @ptrToInt/@intToPtr) because Cot does not
+// support forward-declared types. Zig uses ?*Symbol directly.
+// branch_target uses ?int (optional) instead of Zig's ?*Prog because Cot
+// does not support self-referential struct pointers.
 // ============================================================================
 
 struct Addr {
@@ -48,22 +63,19 @@ struct Addr {
     name: AddrName,
     reg: Reg,
     offset: int,
-    sym_name: string,
-    float_val: f64,
-    branch_target: int,
-    br_table: List(int),
+    sym: int,
+    val: AddrVal,
+    branch_target: ?int,
 
     static fn init() Addr {
-        var table: List(int) = .{}
         return Addr {
             addr_type: AddrType.none,
             name: AddrName.none,
             reg: Reg.none,
             offset: 0,
-            sym_name: "",
-            float_val: 0.0,
-            branch_target: -1,
-            br_table: table,
+            sym: 0,
+            val: AddrVal.none,
+            branch_target: null,
         }
     }
 
@@ -84,7 +96,7 @@ struct Addr {
     static fn initFloat(value: f64) Addr {
         var a = Addr.init()
         a.addr_type = AddrType.const_float
-        a.float_val = value
+        a.val = AddrVal.float_val(value)
         return a
     }
 
@@ -102,17 +114,11 @@ struct Addr {
         a.branch_target = target
         return a
     }
-
-    static fn initAddr(name: string) Addr {
-        var a = Addr.init()
-        a.addr_type = AddrType.addr
-        a.sym_name = name
-        return a
-    }
 }
 
 // ============================================================================
 // Prog — Single assembler instruction (like Go's obj.Prog)
+// Zig reference: prog.zig Prog struct
 // ============================================================================
 
 struct Prog {
@@ -159,6 +165,7 @@ struct Prog {
 
 // ============================================================================
 // Symbol — Function metadata (like Go's obj.LSym)
+// Zig reference: prog.zig Symbol struct
 // ============================================================================
 
 struct Symbol {
@@ -195,10 +202,9 @@ struct Symbol {
 
 // ============================================================================
 // ProgBuilder — Instruction list builder
+// Zig reference: prog.zig ProgBuilder struct
 // ============================================================================
 
-/// Builds a list of Prog instructions for a function body.
-/// Uses List(Prog) instead of Zig's linked list — GC handles cleanup.
 struct ProgBuilder {
     progs: List(Prog),
     count: int,
@@ -211,7 +217,6 @@ struct ProgBuilder {
         }
     }
 
-    /// Append a new instruction, return its index.
     fn append(instr: As) int {
         const idx = self.count
         self.progs.append(Prog.init(instr))
@@ -219,7 +224,6 @@ struct ProgBuilder {
         return idx
     }
 
-    /// Append a new instruction with from operand, return its index.
     fn appendFrom(instr: As, from: Addr) int {
         const idx = self.count
         self.progs.append(Prog.initFrom(instr, from))
@@ -227,7 +231,6 @@ struct ProgBuilder {
         return idx
     }
 
-    /// Append a new instruction with to operand, return its index.
     fn appendTo(instr: As, to: Addr) int {
         const idx = self.count
         self.progs.append(Prog.initTo(instr, to))
@@ -235,31 +238,19 @@ struct ProgBuilder {
         return idx
     }
 
-    /// Get a Prog by index.
     fn get(idx: int) Prog {
         return self.progs.get(idx)
     }
 
-    /// Set a Prog by index (for patching).
     fn set(idx: int, p: Prog) void {
         self.progs.set(idx, p)
     }
 
-    /// Insert a new instruction after the given index.
-    /// Returns the index of the inserted instruction.
-    fn insertAfter(after_idx: int, instr: As, from: Addr, to: Addr) int {
-        var p = Prog {
-            instr: instr,
-            from: from,
-            to: to,
-            pc: 0,
-            spadj: 0,
-            mark: 0,
-        }
-        // Inherit PC from preceding instruction
-        p.pc = self.progs.get(after_idx).pc
+    fn insertAfter(after_idx: int, p: Prog) int {
+        var prog = p
+        prog.pc = self.progs.get(after_idx).pc
         const insert_idx = after_idx + 1
-        self.progs.insert(insert_idx, p)
+        self.progs.insert(insert_idx, prog)
         self.count += 1
         return insert_idx
     }
@@ -283,22 +274,18 @@ fn isUnaryDst(instr: As) bool {
     }
 }
 
-/// Create a constant address operand.
 fn constAddr(value: int) Addr {
     return Addr.initConst(value)
 }
 
-/// Create a register address operand.
 fn regAddr(r: Reg) Addr {
     return Addr.initReg(r)
 }
 
-/// Create a float address operand.
 fn floatAddr(value: f64) Addr {
     return Addr.initFloat(value)
 }
 
-/// Create a memory address operand.
 fn memAddr(r: Reg, offset: int) Addr {
     return Addr.initMem(r, offset)
 }
@@ -311,7 +298,7 @@ test "Addr init defaults" {
     const a = Addr.init()
     @assertEq(a.addr_type == AddrType.none, true)
     @assertEq(a.offset, 0)
-    @assertEq(a.branch_target, -1)
+    @assertEq(a.branch_target == null, true)
 }
 
 test "Addr factory functions" {
@@ -330,7 +317,16 @@ test "Addr factory functions" {
 
     const b = Addr.initBranch(5)
     @assertEq(b.addr_type == AddrType.branch, true)
-    @assertEq(b.branch_target, 5)
+    @assertEq(b.branch_target.?, 5)
+}
+
+test "Addr float and union" {
+    const f = Addr.initFloat(3.14)
+    @assertEq(f.addr_type == AddrType.const_float, true)
+    switch f.val {
+        AddrVal.float_val |v| => { @assertEq(v, 3.14) },
+        else => { @assert(false) },
+    }
 }
 
 test "Prog init" {

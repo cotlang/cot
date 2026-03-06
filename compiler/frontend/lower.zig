@@ -8543,8 +8543,21 @@ pub const Lowerer = struct {
                                 const ptr_type = self.type_reg.makePointer(base_type_idx) catch base_type_idx;
                                 break :blk try fb.emitAddrGlobal(g.idx, base_expr.ident.name, ptr_type, fa.span);
                             }
+                        } else if (base_expr == .field_access) {
+                            // Take address of struct field directly (e.g. self.field.method())
+                            const addr = try self.resolveStructFieldAddr(fa.base);
+                            if (addr != ir.null_node) {
+                                break :blk addr;
+                            }
                         }
-                        break :blk try self.lowerExprNode(fa.base);
+                        // Non-lvalue expression (e.g. function call result) — spill to temp local
+                        // so method gets a valid self pointer. Without this, chaining like
+                        // list.get(i).method() crashes because the temporary has no address.
+                        const val = try self.lowerExprNode(fa.base);
+                        const ptr_type = self.type_reg.makePointer(base_type_idx) catch TypeRegistry.I64;
+                        const tmp_local = try fb.addLocalWithSize("__method_recv", base_type_idx, true, self.type_reg.sizeOf(base_type_idx));
+                        _ = try fb.emitStoreLocal(tmp_local, val, fa.span);
+                        break :blk try fb.emitAddrLocal(tmp_local, ptr_type, fa.span);
                     }
                 } else {
                     if (base_type == .pointer) {

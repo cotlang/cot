@@ -905,7 +905,7 @@ pub const SSABuilder = struct {
             .add => .add, .sub => .sub, .mul => .mul, .div => .div, .mod => .mod,
             .eq => .eq, .ne => .ne, .lt => .lt, .le => .le, .gt => .gt, .ge => .ge,
             .lt_u => .ult, .le_u => .ule, .gt_u => .ugt, .ge_u => .uge,
-            .bit_and => .and_, .bit_or => .or_, .bit_xor => .xor, .shl => .shl, .shr => .shr,
+            .bit_and => .and_, .bit_or => .or_, .bit_xor => .xor, .shl => .shl, .shr => .sar, // >> is arithmetic (Zig parity: signed int)
             .fmin => .wasm_f64_min, .fmax => .wasm_f64_max, // Always float ops
             .atomic_store => .atomic_store64, .atomic_add => .atomic_add64, .atomic_exchange => .atomic_exchange64,
             .@"and", .@"or" => unreachable, // Handled by convertLogicalOp
