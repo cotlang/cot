@@ -322,7 +322,23 @@ struct CodeBuilder {
     fn emitI32Add() void { self.buf.append(OP_I32_ADD) }
     fn emitI32Sub() void { self.buf.append(OP_I32_SUB) }
     fn emitI32Mul() void { self.buf.append(OP_I32_MUL) }
+
+    // i32 comparisons
     fn emitI32Eqz() void { self.buf.append(OP_I32_EQZ) }
+    fn emitI32Eq() void { self.buf.append(OP_I32_EQ) }
+    fn emitI32Ne() void { self.buf.append(OP_I32_NE) }
+    fn emitI32LtS() void { self.buf.append(OP_I32_LT_S) }
+    fn emitI32LtU() void { self.buf.append(OP_I32_LT_U) }
+    fn emitI32GtS() void { self.buf.append(OP_I32_GT_S) }
+    fn emitI32GtU() void { self.buf.append(OP_I32_GT_U) }
+    fn emitI32LeS() void { self.buf.append(OP_I32_LE_S) }
+    fn emitI32LeU() void { self.buf.append(OP_I32_LE_U) }
+    fn emitI32GeS() void { self.buf.append(OP_I32_GE_S) }
+    fn emitI32GeU() void { self.buf.append(OP_I32_GE_U) }
+
+    // i32 bitwise
+    fn emitI32And() void { self.buf.append(0x71 as u8) }
+    fn emitI32Or() void { self.buf.append(0x72 as u8) }
 
     // i64 arithmetic
     fn emitI64Add() void { self.buf.append(OP_I64_ADD) }
@@ -366,10 +382,32 @@ struct CodeBuilder {
     fn emitF64Le() void { self.buf.append(OP_F64_LE) }
     fn emitF64Ge() void { self.buf.append(OP_F64_GE) }
 
+    // f64 extra ops
+    fn emitF64Trunc() void { self.buf.append(0x8D as u8) }
+    fn emitF64Abs() void { self.buf.append(0x99 as u8) }
+
     // Conversions
     fn emitI32WrapI64() void { self.buf.append(OP_I32_WRAP_I64) }
     fn emitI64ExtendI32S() void { self.buf.append(OP_I64_EXTEND_I32_S) }
     fn emitI64ExtendI32U() void { self.buf.append(OP_I64_EXTEND_I32_U) }
+    fn emitI64TruncF64S() void { self.buf.append(0xB0 as u8) }
+    fn emitF64ConvertI64S() void { self.buf.append(0xB9 as u8) }
+    fn emitF64ReinterpretI64() void { self.buf.append(0xBF as u8) }
+
+    // f64 constant (8 bytes, little-endian IEEE 754)
+    fn emitF64Const(value: float) void {
+        self.buf.append(OP_F64_CONST)
+        // Bit-cast float to int and write 8 bytes LE
+        const bits = @bitCast(int, value)
+        self.buf.append((bits & 0xFF) as u8)
+        self.buf.append(((bits >> 8) & 0xFF) as u8)
+        self.buf.append(((bits >> 16) & 0xFF) as u8)
+        self.buf.append(((bits >> 24) & 0xFF) as u8)
+        self.buf.append(((bits >> 32) & 0xFF) as u8)
+        self.buf.append(((bits >> 40) & 0xFF) as u8)
+        self.buf.append(((bits >> 48) & 0xFF) as u8)
+        self.buf.append(((bits >> 56) & 0xFF) as u8)
+    }
 
     // Bulk memory
     fn emitMemoryCopy() void {
@@ -377,6 +415,62 @@ struct CodeBuilder {
         self.buf.append(FC_MEMORY_COPY)
         self.buf.append(0x00 as u8)  // src memory index
         self.buf.append(0x00 as u8)  // dst memory index
+    }
+
+    /// Declare local variables in function body.
+    /// Zig reference: CodeBuilder.declareLocals()
+    /// types: List of ValType values (0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64)
+    /// Each type gets its own declaration group (count=1, type).
+    fn declareLocals(types: List(int)) void {
+        writeULEB128(self.buf, types.count)
+        var i = 0
+        while (i < types.count) {
+            writeULEB128(self.buf, 1)
+            self.buf.append(types.get(i) as u8)
+            i += 1
+        }
+        self.local_count = self.local_count + types.count
+    }
+
+    /// Finish function body: append END opcode, return as List(int).
+    /// Zig reference: CodeBuilder.finish()
+    fn finish() List(int) {
+        self.buf.append(OP_END)
+        var result: List(int) = .{}
+        var i = 0
+        while (i < self.buf.count) {
+            result.append(self.buf.get(i) as int)
+            i += 1
+        }
+        return result
+    }
+
+    /// Emit a byte-copy loop: dest[counter] = src[counter], counter++
+    /// Zig reference: CodeBuilder.emitByteCopyLoop()
+    fn emitByteCopyLoop(dest_local: int, src_local: int, len_local: int, counter_local: int) void {
+        self.emitI32Const(0)
+        self.emitLocalSet(counter_local)
+        self.emitBlock(BLOCK_VOID)
+        self.emitLoop(BLOCK_VOID)
+        self.emitLocalGet(counter_local)
+        self.emitLocalGet(len_local)
+        self.emitI32GeU()
+        self.emitBrIf(1)
+        self.emitLocalGet(dest_local)
+        self.emitLocalGet(counter_local)
+        self.emitI32Add()
+        self.emitLocalGet(src_local)
+        self.emitLocalGet(counter_local)
+        self.emitI32Add()
+        self.emitI64Load8U(0, 0)
+        self.emitI64Store8(0, 0)
+        self.emitLocalGet(counter_local)
+        self.emitI32Const(1)
+        self.emitI32Add()
+        self.emitLocalSet(counter_local)
+        self.emitBr(0)
+        self.emitEnd()
+        self.emitEnd()
     }
 }
 

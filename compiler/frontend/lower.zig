@@ -9499,10 +9499,17 @@ pub const Lowerer = struct {
             },
             // @as(T, val) — Zig Sema.zig:9659: explicit type coercion, delegates to intCast
             .as => {
-                // @as is a pure type annotation — identity at Wasm level (all values are i64)
-                // Ref: Zig @as is type coercion with no codegen
-                _ = self.resolveTypeNode(bc.type_arg);
-                return try self.lowerExprNode(bc.args[0]);
+                // Cast / type coercion. Identity on Wasm (all values are i64).
+                // On native, narrower types (enum(u8), u8, i8, etc.) must be widened.
+                const target_type = self.resolveTypeNode(bc.type_arg);
+                const value = try self.lowerExprNode(bc.args[0]);
+                const src_type = self.inferExprType(bc.args[0]);
+                const src_size = self.type_reg.sizeOf(src_type);
+                const tgt_size = self.type_reg.sizeOf(target_type);
+                if (src_size < tgt_size) {
+                    return try fb.emitIntCast(value, target_type, bc.span);
+                }
+                return value;
             },
             // @offsetOf(T, "field") — Zig Sema.zig:23060: always comptime, byte offset
             .offset_of => {

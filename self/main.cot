@@ -2,8 +2,13 @@
 /// Usage: cot <command> <file.cot>
 ///
 /// Commands:
+///   build <file>  — Compile to .wasm binary [-o name]
+///   run <file>    — Compile and run (via wasmtime)
+///   test <file>   — Compile and run tests (via wasmtime)
+///   bench <file>  — Compile and run benchmarks (via wasmtime)
 ///   parse <file>  — Parse and report syntax errors
 ///   check <file>  — Type-check and report errors
+///   init [name]   — Create a new project
 ///   lex <file>    — Tokenize and print tokens
 ///   help          — Print usage
 
@@ -14,6 +19,7 @@ import "std/string"
 import "std/path"
 import "std/map"
 import "std/debug"
+import "std/process"
 import "frontend/token"
 import "frontend/scanner"
 import "frontend/source"
@@ -27,6 +33,8 @@ import "frontend/lower"
 import "frontend/ssa"
 import "frontend/ssa_builder"
 import "frontend/arc_insertion"
+import "codegen/wasm/driver"
+import "codegen/wasm/link"
 
 fn main() void {
     if (argsCount() < 2) {
@@ -46,6 +54,13 @@ fn main() void {
         return
     }
 
+    if (cmd == "init") {
+        var project_name = ""
+        if (argsCount() >= 3) { project_name = arg(2) }
+        cmdInit(project_name)
+        return
+    }
+
     if (argsCount() < 3) {
         writeErr("error: missing file argument\n")
         printUsage()
@@ -53,6 +68,13 @@ fn main() void {
     }
 
     const path = arg(2)
+
+    // Parse -o flag for build command
+    var output_path = ""
+    if (argsCount() >= 5 and arg(3) == "-o") {
+        output_path = arg(4)
+    }
+
     const content = readFile(path) catch {
         writeErr("error: cannot read file: ${path}\n")
         exit(1)
@@ -62,6 +84,10 @@ fn main() void {
         "parse" => cmdParse(path, content),
         "check" => cmdCheck(path, content),
         "lex" => cmdLex(path, content),
+        "build" => cmdBuildWithOutput(path, output_path),
+        "run" => cmdRun(path),
+        "test" => cmdTest(path),
+        "bench" => cmdBench(path),
         else => {
             writeErr("error: unknown command: ${cmd}\n")
             printUsage()
@@ -117,6 +143,299 @@ fn cmdCheck(path: string, content: string) void {
     }
 
     writeOut("${path}: ok\n")
+}
+
+/// Build a .wasm binary from a Cot source file.
+/// Pipeline: parse → check → lower → SSA → Wasm codegen → write .wasm
+fn cmdBuildWithOutput(path: string, user_output: string) void {
+    // Use -o path if provided, otherwise compute from source path
+    var output_path = user_output
+    if (@lenOf(output_path) == 0) {
+        output_path = computeWasmOutputPath(path)
+    }
+
+    // Multi-file parse + check + lower
+    const result = compileToIR(path)
+
+    // Generate Wasm binary
+    const opts = CompileOptions {
+        is_wasi: true,
+        test_mode: false,
+        bench_mode: false,
+        bench_n: -1,
+    }
+    const wasm_bytes = generateWasmCode(result.ir, result.types, opts)
+
+    // Write .wasm file
+    writeByteList(output_path, wasm_bytes)
+
+    writeErr("Success: ${output_path}\n")
+}
+
+/// Run a Cot source file: compile to /tmp, execute, forward exit code.
+/// Currently Wasm-only: compiles to .wasm, runs via wasmtime.
+fn cmdRun(path: string) void {
+    const tmp_dir = "/tmp/cot-run"
+    mkdir(@ptrOf(tmp_dir), @lenOf(tmp_dir), 493)  // 0o755
+
+    const stem = computeStem(path)
+    const tmp_output = tmp_dir ++ "/" ++ stem ++ ".wasm"
+
+    // Compile to IR and generate Wasm
+    const result = compileToIR(path)
+    const opts = CompileOptions {
+        is_wasi: true,
+        test_mode: false,
+        bench_mode: false,
+        bench_n: -1,
+    }
+    const wasm_bytes = generateWasmCode(result.ir, result.types, opts)
+    writeByteList(tmp_output, wasm_bytes)
+
+    // Execute via wasmtime
+    const exit_code = runWasmtime(tmp_output)
+
+    // Clean up
+    deleteFile(tmp_output)
+
+    // Forward exit code
+    if (exit_code != 0) {
+        exit(exit_code)
+    }
+}
+
+/// Test a Cot source file: compile with test_mode, execute, forward exit code.
+fn cmdTest(path: string) void {
+    const tmp_dir = "/tmp/cot-run"
+    mkdir(@ptrOf(tmp_dir), @lenOf(tmp_dir), 493)  // 0o755
+
+    const stem = computeStem(path)
+    const tmp_output = tmp_dir ++ "/" ++ stem ++ ".wasm"
+
+    // Compile to IR with test mode
+    const result = compileToIR(path)
+    const opts = CompileOptions {
+        is_wasi: true,
+        test_mode: true,
+        bench_mode: false,
+        bench_n: -1,
+    }
+    const wasm_bytes = generateWasmCode(result.ir, result.types, opts)
+    writeByteList(tmp_output, wasm_bytes)
+
+    // Execute via wasmtime
+    const exit_code = runWasmtime(tmp_output)
+
+    // Clean up
+    deleteFile(tmp_output)
+
+    // Forward exit code
+    if (exit_code != 0) {
+        exit(exit_code)
+    }
+}
+
+/// Benchmark a Cot source file: compile with bench_mode, execute, forward exit code.
+fn cmdBench(path: string) void {
+    const tmp_dir = "/tmp/cot-run"
+    mkdir(@ptrOf(tmp_dir), @lenOf(tmp_dir), 493)  // 0o755
+
+    const stem = computeStem(path)
+    const tmp_output = tmp_dir ++ "/" ++ stem ++ ".wasm"
+
+    // Compile to IR with bench mode
+    const result = compileToIR(path)
+    const opts = CompileOptions {
+        is_wasi: true,
+        test_mode: false,
+        bench_mode: true,
+        bench_n: -1,
+    }
+    const wasm_bytes = generateWasmCode(result.ir, result.types, opts)
+    writeByteList(tmp_output, wasm_bytes)
+
+    // Execute via wasmtime
+    const exit_code = runWasmtime(tmp_output)
+
+    // Clean up
+    deleteFile(tmp_output)
+
+    // Forward exit code
+    if (exit_code != 0) {
+        exit(exit_code)
+    }
+}
+
+/// Initialize a new Cot project: cot.json, src/main.cot, .gitignore.
+fn cmdInit(project_name: string) void {
+    var base_dir = "."
+    if (@lenOf(project_name) > 0) {
+        base_dir = project_name
+        mkdir(@ptrOf(base_dir), @lenOf(base_dir), 493)
+    }
+
+    // Determine display name
+    var display_name = project_name
+    if (@lenOf(display_name) == 0) {
+        display_name = "myapp"
+    }
+
+    // Create src/ directory
+    const src_dir = base_dir ++ "/src"
+    mkdir(@ptrOf(src_dir), @lenOf(src_dir), 493)
+
+    // Write cot.json
+    const manifest_path = base_dir ++ "/cot.json"
+    const manifest = "{\n    \"name\": \"${display_name}\",\n    \"version\": \"0.1.0\",\n    \"main\": \"src/main.cot\",\n    \"safe\": true\n}\n"
+    writeFile(manifest_path, manifest) catch {
+        writeErr("error: failed to write cot.json\n")
+        exit(1)
+    }
+
+    // Write src/main.cot
+    const main_path = base_dir ++ "/src/main.cot"
+    const main_content = "fn main() i64 {\n    println(\"Hello, world!\")\n    return 0\n}\n"
+    writeFile(main_path, main_content) catch {
+        writeErr("error: failed to write src/main.cot\n")
+        exit(1)
+    }
+
+    // Write .gitignore
+    const gitignore_path = base_dir ++ "/.gitignore"
+    const gitignore = "# Build output\n*.wasm\n*.o\ncot-out/\n\n# Editor\n.vscode/\n.idea/\n"
+    writeFile(gitignore_path, gitignore) catch {
+        writeErr("error: failed to write .gitignore\n")
+        exit(1)
+    }
+
+    if (@lenOf(project_name) > 0) {
+        writeErr("Created project '${project_name}'\n")
+    } else {
+        writeErr("Initialized project in current directory\n")
+    }
+}
+
+/// Run a .wasm file via wasmtime with WasmGC enabled.
+fn runWasmtime(wasm_path: string) i64 {
+    var wasmtime_args: List(string) = .{}
+    wasmtime_args.append("-W")
+    wasmtime_args.append("gc=y")
+    wasmtime_args.append(wasm_path)
+    return runWithArgs("wasmtime", &wasmtime_args)
+}
+
+/// Extract filename stem: "/path/to/foo.cot" → "foo"
+fn computeStem(path: string) string {
+    const base = basename(path)
+    if (endsWith(base, ".cot")) {
+        return substring(base, 0, @lenOf(base) - 4)
+    }
+    return base
+}
+
+/// Result of compilation to IR.
+struct CompileResult {
+    ir: IR,
+    types: *TypeRegistry,
+}
+
+/// Compile a source file to IR (parse + check + lower across all imports).
+fn compileToIR(path: string) CompileResult {
+    var seen: Map(string, int) = .{}
+    var in_progress: Map(string, int) = .{}
+
+    var types = TypeRegistry.init()
+    var shared = SharedCheckerState.init()
+    const project_safe = isProjectSafe(path)
+
+    // Recursive parse + check
+    const file_data = compileFileRecursive(path, &shared, &types, &seen, &in_progress, project_safe)
+
+    // Lower checked AST to IR
+    var lower_inst: Lowerer = undefined
+    lower_inst.tree = file_data.ast
+    lower_inst.types = &types
+    lower_inst.err = file_data.errs
+    lower_inst.chk = file_data.chk
+    lower_inst.module_name = ""
+    initLowererScalars(&lower_inst)
+    initLowererLists(&lower_inst)
+    initLowererMaps(&lower_inst)
+
+    const ir = lower_inst.lower()
+
+    return CompileResult { ir: ir, types: &types }
+}
+
+/// Result of recursive file compilation (AST + checker state for lowering).
+struct FileCompileData {
+    ast: *Ast,
+    errs: *ErrorReporter,
+    chk: *Checker,
+}
+
+/// Compile a single file with recursive import resolution.
+/// Returns the compile data for the TOP-LEVEL file (for subsequent lowering).
+fn compileFileRecursive(file_path: string, shared: *SharedCheckerState, types: *TypeRegistry, seen: *Map(string, int), in_progress: *Map(string, int), project_safe: bool) FileCompileData {
+    checkFileRecursive(file_path, shared, types, seen, in_progress, project_safe)
+
+    // Re-parse and re-check the top-level file to get the AST+Checker for lowering.
+    // (checkFileRecursive already validated correctness — this pass produces the objects.)
+    const content = readFile(file_path) catch {
+        writeErr("error: cannot read file: ${file_path}\n")
+        exit(1)
+    }
+
+    var errs = ErrorReporter.initWithSource(file_path, content)
+    var s = Scanner.initWithErrors(content, &errs)
+    var ast = Ast.initHeap(file_path)
+    var p = Parser.init(s, ast, errs)
+    if (project_safe) { p.safe_mode = true }
+    p.parseFile()
+    ast.safe_mode = p.safe_mode
+
+    var check_errs = ErrorReporter.initWithSource(file_path, content)
+    var checker = Checker.initShared(ast, types, check_errs, shared.global_map)
+    checker.loadSharedState(shared)
+    checker.checkFile()
+
+    return FileCompileData { ast: ast, errs: &check_errs, chk: &checker }
+}
+
+/// Compute .wasm output path from source path.
+/// "foo.cot" → "foo.wasm", "bar" → "bar.wasm"
+fn computeWasmOutputPath(path: string) string {
+    if (endsWith(path, ".cot")) {
+        return substring(path, 0, @lenOf(path) - 4) ++ ".wasm"
+    }
+    return path ++ ".wasm"
+}
+
+/// Write a List(int) of byte values to a file.
+fn writeByteList(path: string, bytes: List(int)) void {
+    const fd = fd_open(@ptrOf(path), @lenOf(path), 577)  // O_WRONLY | O_CREAT | O_TRUNC
+    if (fd < 0) {
+        writeErr("error: cannot open file for writing: ${path}\n")
+        exit(1)
+    }
+    // Write bytes in chunks — convert to a temp buffer
+    var i = 0
+    while (i < bytes.count) {
+        // Process up to 4096 bytes at a time
+        var chunk_size = bytes.count - i
+        if (chunk_size > 4096) { chunk_size = 4096 }
+        // Pack bytes into memory via alloc (metadata=0, size=chunk_size)
+        const buf_ptr = alloc(0, chunk_size)
+        var j = 0
+        while (j < chunk_size) {
+            const addr = buf_ptr + j
+            @intToPtr(*u8, addr).* = @intCast(u8, bytes.get(i + j))
+            j += 1
+        }
+        fd_write(fd, buf_ptr, chunk_size)
+        i += chunk_size
+    }
+    fd_close(fd)
 }
 
 /// Multi-file check: recursively parse and check all imports.
@@ -263,8 +582,13 @@ fn printUsage() void {
     writeErr("Usage: cot <command> <file.cot>\n")
     writeErr("\n")
     writeErr("Commands:\n")
+    writeErr("  build <file>    Compile to .wasm binary [-o name]\n")
+    writeErr("  run <file>      Compile and run (via wasmtime)\n")
+    writeErr("  test <file>     Compile and run tests (via wasmtime)\n")
+    writeErr("  bench <file>    Compile and run benchmarks (via wasmtime)\n")
     writeErr("  parse <file>    Parse and report syntax errors\n")
     writeErr("  check <file>    Type-check and report errors\n")
+    writeErr("  init [name]     Create a new project\n")
     writeErr("  lex <file>      Tokenize and print tokens\n")
     writeErr("  version         Print version\n")
     writeErr("  help            Print this help\n")

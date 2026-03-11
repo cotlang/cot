@@ -91,7 +91,7 @@ fn compileToWasm(backing: std.mem.Allocator, code: []const u8) !WasmResult {
 
     // Add ARC runtime functions (they get indices 0-4)
     // Note: heap_ptr global will be at index 1
-    const runtime_funcs = try arc.addRuntimeFunctions(&module);
+    _ = try arc.addRuntimeFunctions(&module);
 
     // Count runtime functions for index offset
     // Runtime functions: alloc, retain, dealloc, release, retain_count, is_unique = 6 functions

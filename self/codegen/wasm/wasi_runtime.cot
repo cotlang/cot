@@ -1,0 +1,932 @@
+/// WASI Runtime for Cot (WebAssembly).
+///
+/// Zig reference: compiler/codegen/wasi_runtime.zig
+///
+/// Two modes:
+///   - Native/freestanding: Wasm stub functions (return 0 or trap)
+///   - WASI target: Real WASI host imports + adapter shim functions
+
+import "std/list"
+import "code_builder"
+import "link"
+import "wasm_types"
+
+// ValType constants
+const VT_I32: int = 0x7F
+const VT_I64: int = 0x7E
+
+// WASI scratch memory addresses
+const SCRATCH_BASE: int = 0xE0000
+const SCRATCH_NWRITTEN: int = 0xE0008
+const SCRATCH_RESULT: int = 0xE000C
+const SCRATCH_ARGV: int = 0xE1000
+const SCRATCH_ARGV_BUF: int = 0xE2000
+const SCRATCH_ENVIRON: int = 0xE4000
+const SCRATCH_ENVIRON_BUF: int = 0xE5000
+
+// Function names
+const FD_WRITE_NAME: string = "wasi_fd_write"
+const FD_WRITE_SIMPLE_NAME: string = "fd_write"
+const FD_READ_SIMPLE_NAME: string = "fd_read"
+const FD_CLOSE_NAME: string = "fd_close"
+const FD_SEEK_NAME: string = "fd_seek"
+const FD_OPEN_NAME: string = "fd_open"
+const TIME_NAME: string = "time"
+const RANDOM_NAME: string = "random"
+const EXIT_NAME: string = "exit"
+const ARGS_COUNT_NAME: string = "args_count"
+const ARG_LEN_NAME: string = "arg_len"
+const ARG_PTR_NAME: string = "arg_ptr"
+const ENVIRON_COUNT_NAME: string = "environ_count"
+const ENVIRON_LEN_NAME: string = "environ_len"
+const ENVIRON_PTR_NAME: string = "environ_ptr"
+const NET_SOCKET_NAME: string = "net_socket"
+const NET_BIND_NAME: string = "net_bind"
+const NET_LISTEN_NAME: string = "net_listen"
+const NET_ACCEPT_NAME: string = "net_accept"
+const NET_CONNECT_NAME: string = "net_connect"
+const NET_SET_REUSE_ADDR_NAME: string = "net_set_reuse_addr"
+const KQUEUE_CREATE_NAME: string = "kqueue_create"
+const KEVENT_ADD_NAME: string = "kevent_add"
+const KEVENT_DEL_NAME: string = "kevent_del"
+const KEVENT_WAIT_NAME: string = "kevent_wait"
+const EPOLL_CREATE_NAME: string = "epoll_create"
+const EPOLL_ADD_NAME: string = "epoll_add"
+const EPOLL_DEL_NAME: string = "epoll_del"
+const EPOLL_WAIT_NAME: string = "epoll_wait"
+const SET_NONBLOCK_NAME: string = "set_nonblocking"
+const FORK_NAME: string = "fork"
+const EXECVE_NAME: string = "execve"
+const WAITPID_NAME: string = "waitpid"
+const PIPE_NAME: string = "pipe"
+const DUP2_NAME: string = "dup2"
+const ISATTY_NAME: string = "isatty"
+const MKDIR_NAME: string = "mkdir"
+const DIR_OPEN_NAME: string = "dir_open"
+const DIR_NEXT_NAME: string = "dir_next"
+const DIR_CLOSE_NAME: string = "dir_close"
+const STAT_TYPE_NAME: string = "stat_type"
+const UNLINK_NAME: string = "unlink"
+
+struct WasiFunctions {
+    fd_write_idx: int,
+    fd_write_simple_idx: int,
+    fd_read_simple_idx: int,
+    fd_close_idx: int,
+    fd_seek_idx: int,
+    fd_open_idx: int,
+    time_idx: int,
+    random_idx: int,
+    exit_idx: int,
+    args_count_idx: int,
+    arg_len_idx: int,
+    arg_ptr_idx: int,
+    environ_count_idx: int,
+    environ_len_idx: int,
+    environ_ptr_idx: int,
+    net_socket_idx: int,
+    net_bind_idx: int,
+    net_listen_idx: int,
+    net_accept_idx: int,
+    net_connect_idx: int,
+    net_set_reuse_addr_idx: int,
+    kqueue_create_idx: int,
+    kevent_add_idx: int,
+    kevent_del_idx: int,
+    kevent_wait_idx: int,
+    epoll_create_idx: int,
+    epoll_add_idx: int,
+    epoll_del_idx: int,
+    epoll_wait_idx: int,
+    set_nonblocking_idx: int,
+    fork_idx: int,
+    execve_idx: int,
+    waitpid_idx: int,
+    pipe_idx: int,
+    dup2_idx: int,
+    isatty_idx: int,
+    mkdir_idx: int,
+    dir_open_idx: int,
+    dir_next_idx: int,
+    dir_close_idx: int,
+    stat_type_idx: int,
+    unlink_idx: int,
+}
+
+/// Add WASI runtime functions to linker.
+/// is_wasi: true for WASI target (real imports), false for native stubs.
+fn addWasiRuntime(linker: *Linker, is_wasi: bool) WasiFunctions {
+    if (is_wasi) {
+        return addWasiImports(linker)
+    }
+    return addNativeStubs(linker)
+}
+
+// ============================================================================
+// WASI target: import real WASI functions + create adapter shims
+// ============================================================================
+
+/// WASI import indices returned from addWasiHostImports.
+struct WasiImportIndices {
+    fd_write: int,
+    fd_read: int,
+    fd_close: int,
+    fd_seek: int,
+    path_open: int,
+    proc_exit: int,
+    args_sizes_get: int,
+    args_get: int,
+    clock_time_get: int,
+    random_get: int,
+    environ_sizes_get: int,
+    environ_get: int,
+}
+
+fn addWasiHostImports(linker: *Linker) WasiImportIndices {
+    const WASI_MODULE = "wasi_snapshot_preview1"
+
+    var params_4i32: List(int) = .{}
+    params_4i32.append(VT_I32)
+    params_4i32.append(VT_I32)
+    params_4i32.append(VT_I32)
+    params_4i32.append(VT_I32)
+    var results_i32: List(int) = .{}
+    results_i32.append(VT_I32)
+    const type_4i32_i32 = linker.addType(params_4i32, results_i32)
+
+    var params_1i32: List(int) = .{}
+    params_1i32.append(VT_I32)
+    const type_1i32_i32 = linker.addType(params_1i32, results_i32)
+
+    var params_fd_seek: List(int) = .{}
+    params_fd_seek.append(VT_I32)
+    params_fd_seek.append(VT_I64)
+    params_fd_seek.append(VT_I32)
+    params_fd_seek.append(VT_I32)
+    const type_fd_seek = linker.addType(params_fd_seek, results_i32)
+
+    var params_path_open: List(int) = .{}
+    params_path_open.append(VT_I32)
+    params_path_open.append(VT_I32)
+    params_path_open.append(VT_I32)
+    params_path_open.append(VT_I32)
+    params_path_open.append(VT_I32)
+    params_path_open.append(VT_I64)
+    params_path_open.append(VT_I64)
+    params_path_open.append(VT_I32)
+    params_path_open.append(VT_I32)
+    const type_path_open = linker.addType(params_path_open, results_i32)
+
+    var results_void: List(int) = .{}
+    const type_1i32_void = linker.addType(params_1i32, results_void)
+
+    var params_2i32: List(int) = .{}
+    params_2i32.append(VT_I32)
+    params_2i32.append(VT_I32)
+    const type_2i32_i32 = linker.addType(params_2i32, results_i32)
+
+    var params_clock: List(int) = .{}
+    params_clock.append(VT_I32)
+    params_clock.append(VT_I64)
+    params_clock.append(VT_I32)
+    const type_clock = linker.addType(params_clock, results_i32)
+
+    return WasiImportIndices {
+        fd_write: linker.addImport(WasmImport.init(WASI_MODULE, "fd_write", type_4i32_i32)),
+        fd_read: linker.addImport(WasmImport.init(WASI_MODULE, "fd_read", type_4i32_i32)),
+        fd_close: linker.addImport(WasmImport.init(WASI_MODULE, "fd_close", type_1i32_i32)),
+        fd_seek: linker.addImport(WasmImport.init(WASI_MODULE, "fd_seek", type_fd_seek)),
+        path_open: linker.addImport(WasmImport.init(WASI_MODULE, "path_open", type_path_open)),
+        proc_exit: linker.addImport(WasmImport.init(WASI_MODULE, "proc_exit", type_1i32_void)),
+        args_sizes_get: linker.addImport(WasmImport.init(WASI_MODULE, "args_sizes_get", type_2i32_i32)),
+        args_get: linker.addImport(WasmImport.init(WASI_MODULE, "args_get", type_2i32_i32)),
+        clock_time_get: linker.addImport(WasmImport.init(WASI_MODULE, "clock_time_get", type_clock)),
+        random_get: linker.addImport(WasmImport.init(WASI_MODULE, "random_get", type_2i32_i32)),
+        environ_sizes_get: linker.addImport(WasmImport.init(WASI_MODULE, "environ_sizes_get", type_2i32_i32)),
+        environ_get: linker.addImport(WasmImport.init(WASI_MODULE, "environ_get", type_2i32_i32)),
+    }
+}
+
+fn addWasiImportsCore(linker: *Linker, imp: *WasiImportIndices, t: *StubTypes, ic: int, result: *WasiFunctions) void {
+    result.fd_write_idx = linker.addFunc(WasmFunc.init(FD_WRITE_NAME, t.type_4i64_i64, generateWasiFdWriteShim(imp.fd_write), false)) + ic
+    result.fd_write_simple_idx = linker.addFunc(WasmFunc.init(FD_WRITE_SIMPLE_NAME, t.type_3i64_i64, generateWasiWriteSimpleShim(imp.fd_write), false)) + ic
+    result.fd_read_simple_idx = linker.addFunc(WasmFunc.init(FD_READ_SIMPLE_NAME, t.type_3i64_i64, generateWasiReadSimpleShim(imp.fd_read), false)) + ic
+    result.fd_close_idx = linker.addFunc(WasmFunc.init(FD_CLOSE_NAME, t.type_1i64_i64, generateWasiFdCloseShim(imp.fd_close), false)) + ic
+    result.fd_seek_idx = linker.addFunc(WasmFunc.init(FD_SEEK_NAME, t.type_3i64_i64, generateWasiFdSeekShim(imp.fd_seek), false)) + ic
+    result.fd_open_idx = linker.addFunc(WasmFunc.init(FD_OPEN_NAME, t.type_3i64_i64, generateWasiPathOpenShim(imp.path_open), false)) + ic
+    result.time_idx = linker.addFunc(WasmFunc.init(TIME_NAME, t.type_void_i64, generateWasiTimeShim(imp.clock_time_get), false)) + ic
+    result.random_idx = linker.addFunc(WasmFunc.init(RANDOM_NAME, t.type_2i64_i64, generateWasiRandomShim(imp.random_get), false)) + ic
+    result.exit_idx = linker.addFunc(WasmFunc.init(EXIT_NAME, t.type_1i64_void, generateWasiExitShim(imp.proc_exit), false)) + ic
+}
+
+fn addWasiImportsArgs(linker: *Linker, imp: *WasiImportIndices, t: *StubTypes, ic: int, result: *WasiFunctions) void {
+    result.args_count_idx = linker.addFunc(WasmFunc.init(ARGS_COUNT_NAME, t.type_void_i64, generateWasiArgsCountShim(imp.args_sizes_get), false)) + ic
+    result.arg_len_idx = linker.addFunc(WasmFunc.init(ARG_LEN_NAME, t.type_1i64_i64, generateWasiArgLenShim(imp.args_sizes_get, imp.args_get), false)) + ic
+    result.arg_ptr_idx = linker.addFunc(WasmFunc.init(ARG_PTR_NAME, t.type_1i64_i64, generateWasiArgPtrShim(imp.args_sizes_get, imp.args_get), false)) + ic
+    result.environ_count_idx = linker.addFunc(WasmFunc.init(ENVIRON_COUNT_NAME, t.type_void_i64, generateWasiEnvironCountShim(imp.environ_sizes_get), false)) + ic
+    result.environ_len_idx = linker.addFunc(WasmFunc.init(ENVIRON_LEN_NAME, t.type_1i64_i64, generateWasiEnvironLenShim(imp.environ_sizes_get, imp.environ_get), false)) + ic
+    result.environ_ptr_idx = linker.addFunc(WasmFunc.init(ENVIRON_PTR_NAME, t.type_1i64_i64, generateWasiEnvironPtrShim(imp.environ_sizes_get, imp.environ_get), false)) + ic
+}
+
+fn addWasiImportsStubsNet(linker: *Linker, t: *StubTypes, ic: int, result: *WasiFunctions) void {
+    result.net_socket_idx = linker.addFunc(WasmFunc.init(NET_SOCKET_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.net_bind_idx = linker.addFunc(WasmFunc.init(NET_BIND_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.net_listen_idx = linker.addFunc(WasmFunc.init(NET_LISTEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.net_accept_idx = linker.addFunc(WasmFunc.init(NET_ACCEPT_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.net_connect_idx = linker.addFunc(WasmFunc.init(NET_CONNECT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.net_set_reuse_addr_idx = linker.addFunc(WasmFunc.init(NET_SET_REUSE_ADDR_NAME, t.type_1i64_i64, generateStubReturnsZero(), false)) + ic
+}
+
+fn addWasiImportsStubsEventLoop(linker: *Linker, t: *StubTypes, ic: int, result: *WasiFunctions) void {
+    result.kqueue_create_idx = linker.addFunc(WasmFunc.init(KQUEUE_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
+    result.kevent_add_idx = linker.addFunc(WasmFunc.init(KEVENT_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.kevent_del_idx = linker.addFunc(WasmFunc.init(KEVENT_DEL_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.kevent_wait_idx = linker.addFunc(WasmFunc.init(KEVENT_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.epoll_create_idx = linker.addFunc(WasmFunc.init(EPOLL_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
+    result.epoll_add_idx = linker.addFunc(WasmFunc.init(EPOLL_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.epoll_del_idx = linker.addFunc(WasmFunc.init(EPOLL_DEL_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.epoll_wait_idx = linker.addFunc(WasmFunc.init(EPOLL_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.set_nonblocking_idx = linker.addFunc(WasmFunc.init(SET_NONBLOCK_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false)) + ic
+}
+
+fn addWasiImportsStubsProcess(linker: *Linker, t: *StubTypes, ic: int, result: *WasiFunctions) void {
+    result.fork_idx = linker.addFunc(WasmFunc.init(FORK_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
+    result.execve_idx = linker.addFunc(WasmFunc.init(EXECVE_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.waitpid_idx = linker.addFunc(WasmFunc.init(WAITPID_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.pipe_idx = linker.addFunc(WasmFunc.init(PIPE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
+    result.dup2_idx = linker.addFunc(WasmFunc.init(DUP2_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.isatty_idx = linker.addFunc(WasmFunc.init(ISATTY_NAME, t.type_1i64_i64, generateStubReturnsZero(), false)) + ic
+    result.mkdir_idx = linker.addFunc(WasmFunc.init(MKDIR_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.dir_open_idx = linker.addFunc(WasmFunc.init(DIR_OPEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
+    result.dir_next_idx = linker.addFunc(WasmFunc.init(DIR_NEXT_NAME, t.type_3i64_i64, generateStubReturnsZero(), false)) + ic
+    result.dir_close_idx = linker.addFunc(WasmFunc.init(DIR_CLOSE_NAME, t.type_1i64_i64, generateStubReturnsZero(), false)) + ic
+    result.stat_type_idx = linker.addFunc(WasmFunc.init(STAT_TYPE_NAME, t.type_2i64_i64, generateStubReturnsZero(), false)) + ic
+    result.unlink_idx = linker.addFunc(WasmFunc.init(UNLINK_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
+}
+
+fn addWasiImports(linker: *Linker) WasiFunctions {
+    var imp = addWasiHostImports(linker)
+    const ic = linker.numImports()
+    var t = makeStubTypes(linker)
+
+    var result: WasiFunctions = WasiFunctions {
+        fd_write_idx: 0, fd_write_simple_idx: 0, fd_read_simple_idx: 0,
+        fd_close_idx: 0, fd_seek_idx: 0, fd_open_idx: 0,
+        time_idx: 0, random_idx: 0, exit_idx: 0,
+        args_count_idx: 0, arg_len_idx: 0, arg_ptr_idx: 0,
+        environ_count_idx: 0, environ_len_idx: 0, environ_ptr_idx: 0,
+        net_socket_idx: 0, net_bind_idx: 0, net_listen_idx: 0,
+        net_accept_idx: 0, net_connect_idx: 0, net_set_reuse_addr_idx: 0,
+        kqueue_create_idx: 0, kevent_add_idx: 0, kevent_del_idx: 0,
+        kevent_wait_idx: 0, epoll_create_idx: 0, epoll_add_idx: 0,
+        epoll_del_idx: 0, epoll_wait_idx: 0, set_nonblocking_idx: 0,
+        fork_idx: 0, execve_idx: 0, waitpid_idx: 0, pipe_idx: 0, dup2_idx: 0,
+        isatty_idx: 0, mkdir_idx: 0, dir_open_idx: 0,
+        dir_next_idx: 0, dir_close_idx: 0, stat_type_idx: 0, unlink_idx: 0,
+    }
+    addWasiImportsCore(linker, &imp, &t, ic, &result)
+    addWasiImportsArgs(linker, &imp, &t, ic, &result)
+    addWasiImportsStubsNet(linker, &t, ic, &result)
+    addWasiImportsStubsEventLoop(linker, &t, ic, &result)
+    addWasiImportsStubsProcess(linker, &t, ic, &result)
+    return result
+}
+
+// ============================================================================
+// Native/freestanding: stub functions
+// Split into sub-functions to avoid stack overflow from too many locals.
+// ============================================================================
+
+/// Common Wasm types used by stubs. Stored as struct to pass between helpers.
+struct StubTypes {
+    type_4i64_i64: int,
+    type_3i64_i64: int,
+    type_2i64_i64: int,
+    type_1i64_i64: int,
+    type_void_i64: int,
+    type_1i64_void: int,
+}
+
+fn makeStubTypes(linker: *Linker) StubTypes {
+    var params_4i64: List(int) = .{}
+    params_4i64.append(VT_I64)
+    params_4i64.append(VT_I64)
+    params_4i64.append(VT_I64)
+    params_4i64.append(VT_I64)
+    var results_i64: List(int) = .{}
+    results_i64.append(VT_I64)
+
+    var params_3i64: List(int) = .{}
+    params_3i64.append(VT_I64)
+    params_3i64.append(VT_I64)
+    params_3i64.append(VT_I64)
+
+    var params_2i64: List(int) = .{}
+    params_2i64.append(VT_I64)
+    params_2i64.append(VT_I64)
+
+    var params_1i64: List(int) = .{}
+    params_1i64.append(VT_I64)
+
+    var params_void: List(int) = .{}
+    var results_void: List(int) = .{}
+
+    return StubTypes {
+        type_4i64_i64: linker.addType(params_4i64, results_i64),
+        type_3i64_i64: linker.addType(params_3i64, results_i64),
+        type_2i64_i64: linker.addType(params_2i64, results_i64),
+        type_1i64_i64: linker.addType(params_1i64, results_i64),
+        type_void_i64: linker.addType(params_void, results_i64),
+        type_1i64_void: linker.addType(params_1i64, results_void),
+    }
+}
+
+fn addNativeStubsCore(linker: *Linker, t: *StubTypes, result: *WasiFunctions) void {
+    result.fd_write_idx = linker.addFunc(WasmFunc.init(FD_WRITE_NAME, t.type_4i64_i64, generateFdWriteStubBody(), true))
+    result.fd_write_simple_idx = linker.addFunc(WasmFunc.init(FD_WRITE_SIMPLE_NAME, t.type_3i64_i64, generateStubReturnsZero(), true))
+    result.fd_read_simple_idx = linker.addFunc(WasmFunc.init(FD_READ_SIMPLE_NAME, t.type_3i64_i64, generateStubReturnsZero(), true))
+    result.fd_close_idx = linker.addFunc(WasmFunc.init(FD_CLOSE_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+    result.fd_seek_idx = linker.addFunc(WasmFunc.init(FD_SEEK_NAME, t.type_3i64_i64, generateStubReturnsZero(), true))
+    result.fd_open_idx = linker.addFunc(WasmFunc.init(FD_OPEN_NAME, t.type_3i64_i64, generateStubReturnsZero(), true))
+    result.time_idx = linker.addFunc(WasmFunc.init(TIME_NAME, t.type_void_i64, generateStubReturnsZero(), true))
+    result.random_idx = linker.addFunc(WasmFunc.init(RANDOM_NAME, t.type_2i64_i64, generateStubReturnsZero(), true))
+    result.exit_idx = linker.addFunc(WasmFunc.init(EXIT_NAME, t.type_1i64_void, generateStubTrap(), true))
+    result.args_count_idx = linker.addFunc(WasmFunc.init(ARGS_COUNT_NAME, t.type_void_i64, generateStubReturnsZero(), true))
+    result.arg_len_idx = linker.addFunc(WasmFunc.init(ARG_LEN_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+    result.arg_ptr_idx = linker.addFunc(WasmFunc.init(ARG_PTR_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+    result.environ_count_idx = linker.addFunc(WasmFunc.init(ENVIRON_COUNT_NAME, t.type_void_i64, generateStubReturnsZero(), true))
+    result.environ_len_idx = linker.addFunc(WasmFunc.init(ENVIRON_LEN_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+    result.environ_ptr_idx = linker.addFunc(WasmFunc.init(ENVIRON_PTR_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+}
+
+fn addNativeStubsNet(linker: *Linker, t: *StubTypes, result: *WasiFunctions) void {
+    result.net_socket_idx = linker.addFunc(WasmFunc.init(NET_SOCKET_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.net_bind_idx = linker.addFunc(WasmFunc.init(NET_BIND_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.net_listen_idx = linker.addFunc(WasmFunc.init(NET_LISTEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), true))
+    result.net_accept_idx = linker.addFunc(WasmFunc.init(NET_ACCEPT_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), true))
+    result.net_connect_idx = linker.addFunc(WasmFunc.init(NET_CONNECT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.net_set_reuse_addr_idx = linker.addFunc(WasmFunc.init(NET_SET_REUSE_ADDR_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+}
+
+fn addNativeStubsEventLoop(linker: *Linker, t: *StubTypes, result: *WasiFunctions) void {
+    result.kqueue_create_idx = linker.addFunc(WasmFunc.init(KQUEUE_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), true))
+    result.kevent_add_idx = linker.addFunc(WasmFunc.init(KEVENT_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.kevent_del_idx = linker.addFunc(WasmFunc.init(KEVENT_DEL_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.kevent_wait_idx = linker.addFunc(WasmFunc.init(KEVENT_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.epoll_create_idx = linker.addFunc(WasmFunc.init(EPOLL_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), true))
+    result.epoll_add_idx = linker.addFunc(WasmFunc.init(EPOLL_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.epoll_del_idx = linker.addFunc(WasmFunc.init(EPOLL_DEL_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), true))
+    result.epoll_wait_idx = linker.addFunc(WasmFunc.init(EPOLL_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.set_nonblocking_idx = linker.addFunc(WasmFunc.init(SET_NONBLOCK_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), true))
+}
+
+fn addNativeStubsProcess(linker: *Linker, t: *StubTypes, result: *WasiFunctions) void {
+    result.fork_idx = linker.addFunc(WasmFunc.init(FORK_NAME, t.type_void_i64, generateStubReturnsNegOne(), true))
+    result.execve_idx = linker.addFunc(WasmFunc.init(EXECVE_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.waitpid_idx = linker.addFunc(WasmFunc.init(WAITPID_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), true))
+    result.pipe_idx = linker.addFunc(WasmFunc.init(PIPE_NAME, t.type_void_i64, generateStubReturnsNegOne(), true))
+    result.dup2_idx = linker.addFunc(WasmFunc.init(DUP2_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), true))
+    result.isatty_idx = linker.addFunc(WasmFunc.init(ISATTY_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+    result.mkdir_idx = linker.addFunc(WasmFunc.init(MKDIR_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), true))
+    result.dir_open_idx = linker.addFunc(WasmFunc.init(DIR_OPEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), true))
+    result.dir_next_idx = linker.addFunc(WasmFunc.init(DIR_NEXT_NAME, t.type_3i64_i64, generateStubReturnsZero(), true))
+    result.dir_close_idx = linker.addFunc(WasmFunc.init(DIR_CLOSE_NAME, t.type_1i64_i64, generateStubReturnsZero(), true))
+    result.stat_type_idx = linker.addFunc(WasmFunc.init(STAT_TYPE_NAME, t.type_2i64_i64, generateStubReturnsZero(), true))
+    result.unlink_idx = linker.addFunc(WasmFunc.init(UNLINK_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), true))
+}
+
+fn addNativeStubs(linker: *Linker) WasiFunctions {
+    var t = makeStubTypes(linker)
+    var result: WasiFunctions = WasiFunctions {
+        fd_write_idx: 0, fd_write_simple_idx: 0, fd_read_simple_idx: 0,
+        fd_close_idx: 0, fd_seek_idx: 0, fd_open_idx: 0,
+        time_idx: 0, random_idx: 0, exit_idx: 0,
+        args_count_idx: 0, arg_len_idx: 0, arg_ptr_idx: 0,
+        environ_count_idx: 0, environ_len_idx: 0, environ_ptr_idx: 0,
+        net_socket_idx: 0, net_bind_idx: 0, net_listen_idx: 0,
+        net_accept_idx: 0, net_connect_idx: 0, net_set_reuse_addr_idx: 0,
+        kqueue_create_idx: 0, kevent_add_idx: 0, kevent_del_idx: 0,
+        kevent_wait_idx: 0, epoll_create_idx: 0, epoll_add_idx: 0,
+        epoll_del_idx: 0, epoll_wait_idx: 0, set_nonblocking_idx: 0,
+        fork_idx: 0, execve_idx: 0, waitpid_idx: 0, pipe_idx: 0, dup2_idx: 0,
+        isatty_idx: 0, mkdir_idx: 0, dir_open_idx: 0,
+        dir_next_idx: 0, dir_close_idx: 0, stat_type_idx: 0, unlink_idx: 0,
+    }
+    addNativeStubsCore(linker, &t, &result)
+    addNativeStubsNet(linker, &t, &result)
+    addNativeStubsEventLoop(linker, &t, &result)
+    addNativeStubsProcess(linker, &t, &result)
+    return result
+}
+
+// ============================================================================
+// WASI adapter shim generators
+// ============================================================================
+
+/// wasi_fd_write shim: wraps 4-arg i64 to WASI i32
+fn generateWasiFdWriteShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitLocalGet(2)
+    code.emitI32WrapI64()
+    code.emitLocalGet(3)
+    code.emitI32WrapI64()
+    code.emitCall(wasi_func_idx)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// fd_write_simple shim: (fd:i64, ptr:i64, len:i64) -> i64
+fn generateWasiWriteSimpleShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // Build iov at SCRATCH_BASE
+    code.emitI32Const(SCRATCH_BASE)
+    code.emitLocalGet(1) // ptr
+    code.emitI32WrapI64()
+    code.emitI32Store(2, 0)
+
+    code.emitI32Const(SCRATCH_BASE)
+    code.emitLocalGet(2) // len
+    code.emitI32WrapI64()
+    code.emitI32Store(2, 4)
+
+    // Call WASI fd_write
+    code.emitLocalGet(0) // fd
+    code.emitI32WrapI64()
+    code.emitI32Const(SCRATCH_BASE)
+    code.emitI32Const(1) // iovs_len
+    code.emitI32Const(SCRATCH_NWRITTEN)
+    code.emitCall(wasi_func_idx)
+    code.emitDrop()
+
+    // Return nwritten
+    code.emitI32Const(SCRATCH_NWRITTEN)
+    code.emitI32Load(2, 0)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// fd_read_simple shim: (fd:i64, buf:i64, len:i64) -> i64
+fn generateWasiReadSimpleShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    code.emitI32Const(SCRATCH_BASE)
+    code.emitLocalGet(1) // buf
+    code.emitI32WrapI64()
+    code.emitI32Store(2, 0)
+
+    code.emitI32Const(SCRATCH_BASE)
+    code.emitLocalGet(2) // len
+    code.emitI32WrapI64()
+    code.emitI32Store(2, 4)
+
+    code.emitLocalGet(0) // fd
+    code.emitI32WrapI64()
+    code.emitI32Const(SCRATCH_BASE)
+    code.emitI32Const(1)
+    code.emitI32Const(SCRATCH_NWRITTEN)
+    code.emitCall(wasi_func_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_NWRITTEN)
+    code.emitI32Load(2, 0)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// fd_close shim: (fd:i64) -> i64
+fn generateWasiFdCloseShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitCall(wasi_func_idx)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// fd_seek shim: (fd:i64, offset:i64, whence:i64) -> i64
+fn generateWasiFdSeekShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitLocalGet(0) // fd
+    code.emitI32WrapI64()
+    code.emitLocalGet(1) // offset (i64 in WASI)
+    code.emitLocalGet(2) // whence
+    code.emitI32WrapI64()
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitCall(wasi_func_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI64Load(3, 0)
+    return code.finish()
+}
+
+/// fd_open shim: (path_ptr:i64, path_len:i64, flags:i64) -> i64
+fn generateWasiPathOpenShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitI32Const(3) // dirfd = preopened dir
+    code.emitI32Const(1) // dirflags = SYMLINK_FOLLOW
+    code.emitLocalGet(0) // path_ptr
+    code.emitI32WrapI64()
+    code.emitLocalGet(1) // path_len
+    code.emitI32WrapI64()
+    code.emitLocalGet(2) // oflags
+    code.emitI32WrapI64()
+    code.emitI64Const(0x1FFFFFFF) // fs_rights_base
+    code.emitI64Const(0x1FFFFFFF) // fs_rights_inheriting
+    code.emitI32Const(0) // fdflags
+    code.emitI32Const(SCRATCH_RESULT) // opened_fd output
+    code.emitCall(wasi_func_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Load(2, 0)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// time shim: () -> i64
+fn generateWasiTimeShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitI32Const(0) // CLOCK_REALTIME
+    code.emitI64Const(1) // precision = 1ns
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitCall(wasi_func_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI64Load(3, 0)
+    return code.finish()
+}
+
+/// random shim: (buf:i64, len:i64) -> i64
+fn generateWasiRandomShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitLocalGet(0) // buf
+    code.emitI32WrapI64()
+    code.emitLocalGet(1) // len
+    code.emitI32WrapI64()
+    code.emitCall(wasi_func_idx)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// exit shim: (code:i64) -> void
+fn generateWasiExitShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitCall(wasi_func_idx)
+    code.emitUnreachable()
+    return code.finish()
+}
+
+/// args_count shim: () -> i64
+fn generateWasiArgsCountShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Const(SCRATCH_RESULT + 4)
+    code.emitCall(wasi_func_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Load(2, 0)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// arg_len shim: (n:i64) -> i64
+fn generateWasiArgLenShim(wasi_args_sizes_get_idx: int, wasi_args_get_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 1 = counter (i32), local 2 = base_ptr (i32)
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    // args_sizes_get
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Const(SCRATCH_RESULT + 4)
+    code.emitCall(wasi_args_sizes_get_idx)
+    code.emitDrop()
+
+    // args_get
+    code.emitI32Const(SCRATCH_ARGV)
+    code.emitI32Const(SCRATCH_ARGV_BUF)
+    code.emitCall(wasi_args_get_idx)
+    code.emitDrop()
+
+    // Load argv[n] pointer
+    code.emitI32Const(SCRATCH_ARGV)
+    code.emitLocalGet(0) // n
+    code.emitI32WrapI64()
+    code.emitI32Const(4)
+    code.emitI32Mul()
+    code.emitI32Add()
+    code.emitI32Load(2, 0)
+    code.emitLocalTee(1)
+    code.emitLocalSet(2) // base_ptr = argv[n]
+
+    // strlen loop
+    code.emitBlock(BLOCK_VOID)
+    code.emitLoop(BLOCK_VOID)
+    code.emitLocalGet(1)
+    code.emitI32Load(0, 0)
+    code.emitI32Const(0xFF)
+    code.emitI32And()
+    code.emitI32Eqz()
+    code.emitBrIf(1) // break if null
+    code.emitLocalGet(1)
+    code.emitI32Const(1)
+    code.emitI32Add()
+    code.emitLocalSet(1)
+    code.emitBr(0) // continue
+    code.emitEnd() // end loop
+    code.emitEnd() // end block
+
+    // Return strlen = counter - base_ptr
+    code.emitLocalGet(1)
+    code.emitLocalGet(2)
+    code.emitI32Sub()
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// arg_ptr shim: (n:i64) -> i64
+fn generateWasiArgPtrShim(wasi_args_sizes_get_idx: int, wasi_args_get_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Const(SCRATCH_RESULT + 4)
+    code.emitCall(wasi_args_sizes_get_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_ARGV)
+    code.emitI32Const(SCRATCH_ARGV_BUF)
+    code.emitCall(wasi_args_get_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_ARGV)
+    code.emitLocalGet(0) // n
+    code.emitI32WrapI64()
+    code.emitI32Const(4)
+    code.emitI32Mul()
+    code.emitI32Add()
+    code.emitI32Load(2, 0)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// environ_count shim: () -> i64
+fn generateWasiEnvironCountShim(wasi_func_idx: int) List(int) {
+    var code = CodeBuilder.init()
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Const(SCRATCH_RESULT + 4)
+    code.emitCall(wasi_func_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Load(2, 0)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// environ_len shim: (n:i64) -> i64
+fn generateWasiEnvironLenShim(wasi_environ_sizes_get_idx: int, wasi_environ_get_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+    // param 0 = n, local 1 = ptr, local 2 = base
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Const(SCRATCH_RESULT + 4)
+    code.emitCall(wasi_environ_sizes_get_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_ENVIRON)
+    code.emitI32Const(SCRATCH_ENVIRON_BUF)
+    code.emitCall(wasi_environ_get_idx)
+    code.emitDrop()
+
+    // Load environ[n] pointer
+    code.emitI32Const(SCRATCH_ENVIRON)
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitI32Const(4)
+    code.emitI32Mul()
+    code.emitI32Add()
+    code.emitI32Load(2, 0)
+    code.emitLocalTee(1)
+    code.emitLocalSet(2) // base = ptr
+
+    // strlen loop
+    code.emitBlock(BLOCK_VOID)
+    code.emitLoop(BLOCK_VOID)
+    code.emitLocalGet(1)
+    code.emitI32Load(0, 0)
+    code.emitI32Const(0xFF)
+    code.emitI32And()
+    code.emitI32Eqz()
+    code.emitBrIf(1)
+    code.emitLocalGet(1)
+    code.emitI32Const(1)
+    code.emitI32Add()
+    code.emitLocalSet(1)
+    code.emitBr(0)
+    code.emitEnd()
+    code.emitEnd()
+
+    code.emitLocalGet(1)
+    code.emitLocalGet(2)
+    code.emitI32Sub()
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+/// environ_ptr shim: (n:i64) -> i64
+fn generateWasiEnvironPtrShim(wasi_environ_sizes_get_idx: int, wasi_environ_get_idx: int) List(int) {
+    var code = CodeBuilder.init()
+
+    code.emitI32Const(SCRATCH_RESULT)
+    code.emitI32Const(SCRATCH_RESULT + 4)
+    code.emitCall(wasi_environ_sizes_get_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_ENVIRON)
+    code.emitI32Const(SCRATCH_ENVIRON_BUF)
+    code.emitCall(wasi_environ_get_idx)
+    code.emitDrop()
+
+    code.emitI32Const(SCRATCH_ENVIRON)
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitI32Const(4)
+    code.emitI32Mul()
+    code.emitI32Add()
+    code.emitI32Load(2, 0)
+    code.emitI64ExtendI32U()
+    return code.finish()
+}
+
+// ============================================================================
+// Stub body generators
+// ============================================================================
+
+fn generateFdWriteStubBody() List(int) {
+    var code = CodeBuilder.init()
+    code.emitI64Const(52) // ENOSYS
+    return code.finish()
+}
+
+fn generateStubReturnsZero() List(int) {
+    var code = CodeBuilder.init()
+    code.emitI64Const(0)
+    return code.finish()
+}
+
+fn generateStubReturnsNegOne() List(int) {
+    var code = CodeBuilder.init()
+    code.emitI64Const(-1)
+    return code.finish()
+}
+
+fn generateStubTrap() List(int) {
+    var code = CodeBuilder.init()
+    code.emitUnreachable()
+    return code.finish()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "stub bodies produce valid bytecode" {
+    const zero = generateStubReturnsZero()
+    @assert(zero.count >= 2)
+    @assertEq(zero.get(zero.count - 1), 0x0B)
+
+    const neg1 = generateStubReturnsNegOne()
+    @assert(neg1.count >= 2)
+    @assertEq(neg1.get(neg1.count - 1), 0x0B)
+
+    const trap = generateStubTrap()
+    @assert(trap.count >= 2)
+    @assertEq(trap.get(trap.count - 1), 0x0B)
+
+    const enosys = generateFdWriteStubBody()
+    @assert(enosys.count >= 2)
+    @assertEq(enosys.get(enosys.count - 1), 0x0B)
+}
+
+test "WASI shim bodies produce valid bytecode" {
+    const fd_write = generateWasiFdWriteShim(0)
+    @assert(fd_write.count > 5)
+    @assertEq(fd_write.get(fd_write.count - 1), 0x0B)
+
+    const write_simple = generateWasiWriteSimpleShim(0)
+    @assert(write_simple.count > 10)
+    @assertEq(write_simple.get(write_simple.count - 1), 0x0B)
+
+    const read_simple = generateWasiReadSimpleShim(0)
+    @assert(read_simple.count > 10)
+    @assertEq(read_simple.get(read_simple.count - 1), 0x0B)
+
+    const fd_close = generateWasiFdCloseShim(0)
+    @assert(fd_close.count > 3)
+    @assertEq(fd_close.get(fd_close.count - 1), 0x0B)
+
+    const fd_seek = generateWasiFdSeekShim(0)
+    @assert(fd_seek.count > 5)
+    @assertEq(fd_seek.get(fd_seek.count - 1), 0x0B)
+
+    const path_open = generateWasiPathOpenShim(0)
+    @assert(path_open.count > 10)
+    @assertEq(path_open.get(path_open.count - 1), 0x0B)
+
+    const time = generateWasiTimeShim(0)
+    @assert(time.count > 5)
+    @assertEq(time.get(time.count - 1), 0x0B)
+
+    const random = generateWasiRandomShim(0)
+    @assert(random.count > 3)
+    @assertEq(random.get(random.count - 1), 0x0B)
+
+    const exit = generateWasiExitShim(0)
+    @assert(exit.count > 3)
+    @assertEq(exit.get(exit.count - 1), 0x0B)
+
+    const args_count = generateWasiArgsCountShim(0)
+    @assert(args_count.count > 5)
+    @assertEq(args_count.get(args_count.count - 1), 0x0B)
+
+    const arg_len = generateWasiArgLenShim(0, 1)
+    @assert(arg_len.count > 20)
+    @assertEq(arg_len.get(arg_len.count - 1), 0x0B)
+
+    const arg_ptr = generateWasiArgPtrShim(0, 1)
+    @assert(arg_ptr.count > 10)
+    @assertEq(arg_ptr.get(arg_ptr.count - 1), 0x0B)
+
+    const environ_count = generateWasiEnvironCountShim(0)
+    @assert(environ_count.count > 5)
+    @assertEq(environ_count.get(environ_count.count - 1), 0x0B)
+
+    const environ_len = generateWasiEnvironLenShim(0, 1)
+    @assert(environ_len.count > 20)
+    @assertEq(environ_len.get(environ_len.count - 1), 0x0B)
+
+    const environ_ptr = generateWasiEnvironPtrShim(0, 1)
+    @assert(environ_ptr.count > 10)
+    @assertEq(environ_ptr.get(environ_ptr.count - 1), 0x0B)
+}
+
+test "addNativeStubs registers all functions" {
+    var linker = Linker.init()
+    const funcs = addNativeStubs(&linker)
+    @assert(funcs.fd_write_idx >= 0)
+    @assert(funcs.fd_write_simple_idx >= 0)
+    @assert(funcs.time_idx >= 0)
+    @assert(funcs.exit_idx >= 0)
+    @assert(funcs.net_socket_idx >= 0)
+    @assert(funcs.kqueue_create_idx >= 0)
+    @assert(funcs.fork_idx >= 0)
+    @assert(funcs.isatty_idx >= 0)
+    @assert(funcs.mkdir_idx >= 0)
+    @assert(funcs.stat_type_idx >= 0)
+    @assert(funcs.unlink_idx >= 0)
+    // All should be different
+    @assert(funcs.fd_write_idx != funcs.time_idx)
+    @assert(funcs.exit_idx != funcs.net_socket_idx)
+}
+
+test "addWasiImports registers all functions with imports" {
+    var linker = Linker.init()
+    const funcs = addWasiImports(&linker)
+    @assert(funcs.fd_write_idx >= 0)
+    @assert(funcs.fd_write_simple_idx >= 0)
+    @assert(funcs.time_idx >= 0)
+    @assert(funcs.exit_idx >= 0)
+    // WASI indices should include import offset
+    @assert(linker.numImports() > 0)
+    @assert(funcs.fd_write_idx >= linker.numImports())
+}
+
+test "addWasiRuntime dispatches correctly" {
+    var linker1 = Linker.init()
+    const native = addWasiRuntime(&linker1, false)
+    @assert(native.fd_write_idx >= 0)
+    @assert(linker1.numImports() == 0)
+
+    var linker2 = Linker.init()
+    const wasi = addWasiRuntime(&linker2, true)
+    @assert(wasi.fd_write_idx >= 0)
+    @assert(linker2.numImports() > 0)
+}

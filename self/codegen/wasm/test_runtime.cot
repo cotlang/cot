@@ -1,0 +1,538 @@
+/// Test runtime functions for Wasm.
+///
+/// Zig reference: compiler/codegen/test_runtime.zig
+///
+/// Timing architecture (Deno pattern):
+///   Timing is measured INSIDE the runtime functions, not in the generated test runner IR.
+///   __test_print_name calls cot_time() and stores start in a Wasm global.
+///   __test_pass/__test_fail call cot_time() and compute elapsed internally.
+///
+/// Two Wasm globals for timing:
+///   test_start_global:  per-test start timestamp (i64, ns)
+///   total_start_global: total start timestamp (i64, ns)
+///
+/// Six functions:
+///   __test_begin() -> void
+///   __test_print_name(ptr, len) -> void
+///   __test_pass() -> void
+///   __test_fail() -> void
+///   __test_store_fail_values(left, right, is_string, left_len, right_len) -> void
+///   __test_summary(passed, failed) -> void
+
+import "std/list"
+import "code_builder"
+import "link"
+import "wasm_types"
+
+// ValType constants
+const VT_I32: int = 0x7F
+const VT_I64: int = 0x7E
+
+// Function names
+const TEST_BEGIN_NAME: string = "__test_begin"
+const TEST_PRINT_NAME_NAME: string = "__test_print_name"
+const TEST_PASS_NAME: string = "__test_pass"
+const TEST_FAIL_NAME: string = "__test_fail"
+const TEST_SUMMARY_NAME: string = "__test_summary"
+const TEST_STORE_FAIL_VALUES_NAME: string = "__test_store_fail_values"
+
+struct TestFunctions {
+    test_begin_idx: int,
+    test_print_name_idx: int,
+    test_pass_idx: int,
+    test_fail_idx: int,
+    test_summary_idx: int,
+    test_store_fail_values_idx: int,
+}
+
+/// Add test runtime functions to linker.
+fn addTestRuntime(linker: *Linker, write_func_idx: int, eprint_int_func_idx: int, time_func_idx: int) TestFunctions {
+    // Add timing globals (offset by 1 for SP at index 0)
+    const test_start_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const total_start_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+
+    // Add assertEq failure value globals
+    const fail_left_val_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const fail_right_val_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const fail_left_len_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const fail_right_len_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const fail_is_string_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+    const fail_has_values_global = linker.addGlobal(WasmGlobal { val_type: VT_I64, mutable: true, init_val: 0 }) + 1
+
+    // Type: () -> void
+    var params_void: List(int) = .{}
+    var results_void: List(int) = .{}
+    const void_type = linker.addType(params_void, results_void)
+
+    // Type: (i64, i64) -> void
+    var params_2i64: List(int) = .{}
+    params_2i64.append(VT_I64)
+    params_2i64.append(VT_I64)
+    const type_2i64_void = linker.addType(params_2i64, results_void)
+
+    // Type: (i64, i64, i64, i64, i64) -> void
+    var params_5i64: List(int) = .{}
+    params_5i64.append(VT_I64)
+    params_5i64.append(VT_I64)
+    params_5i64.append(VT_I64)
+    params_5i64.append(VT_I64)
+    params_5i64.append(VT_I64)
+    const type_5i64_void = linker.addType(params_5i64, results_void)
+
+    // __test_begin
+    const begin_body = generateTestBeginBody(time_func_idx, total_start_global)
+    const test_begin_idx = linker.addFunc(WasmFunc.init(TEST_BEGIN_NAME, void_type, begin_body, true))
+
+    // __test_print_name
+    const print_name_body = generateTestPrintNameBody(write_func_idx, time_func_idx, test_start_global, total_start_global)
+    const test_print_name_idx = linker.addFunc(WasmFunc.init(TEST_PRINT_NAME_NAME, type_2i64_void, print_name_body, false))
+
+    // __test_pass
+    const pass_body = generateTestPassBody(write_func_idx, eprint_int_func_idx, time_func_idx, test_start_global)
+    const test_pass_idx = linker.addFunc(WasmFunc.init(TEST_PASS_NAME, void_type, pass_body, false))
+
+    // __test_fail
+    const fail_body = generateTestFailBody(write_func_idx, eprint_int_func_idx, time_func_idx, test_start_global, fail_has_values_global, fail_left_val_global, fail_right_val_global, fail_left_len_global, fail_right_len_global, fail_is_string_global)
+    const test_fail_idx = linker.addFunc(WasmFunc.init(TEST_FAIL_NAME, void_type, fail_body, false))
+
+    // __test_store_fail_values
+    const store_fail_body = generateTestStoreFailValuesBody(fail_left_val_global, fail_right_val_global, fail_is_string_global, fail_left_len_global, fail_right_len_global, fail_has_values_global)
+    const test_store_fail_values_idx = linker.addFunc(WasmFunc.init(TEST_STORE_FAIL_VALUES_NAME, type_5i64_void, store_fail_body, false))
+
+    // __test_summary
+    const summary_body = generateTestSummaryBody(write_func_idx, eprint_int_func_idx, time_func_idx, total_start_global)
+    const test_summary_idx = linker.addFunc(WasmFunc.init(TEST_SUMMARY_NAME, type_2i64_void, summary_body, false))
+
+    return TestFunctions {
+        test_begin_idx: test_begin_idx,
+        test_print_name_idx: test_print_name_idx,
+        test_pass_idx: test_pass_idx,
+        test_fail_idx: test_fail_idx,
+        test_summary_idx: test_summary_idx,
+        test_store_fail_values_idx: test_store_fail_values_idx,
+    }
+}
+
+// ============================================================================
+// Helper: emit a string literal to stderr via write function
+// Packs bytes into i64 chunks (8 bytes each), stores to buf, then calls write.
+// ============================================================================
+
+fn emitWriteStr(code: *CodeBuilder, write_func_idx: int, buf_local: int, s: string) void {
+    const ptr = @ptrOf(s)
+    const len = @lenOf(s)
+    var offset = 0
+    while (offset < len) {
+        var remaining = len - offset
+        var chunk_len = 8
+        if (remaining < 8) {
+            chunk_len = remaining
+        }
+
+        // Pack up to 8 bytes into a single i64
+        var val = 0
+        var j = 0
+        while (j < chunk_len) {
+            const b = @intCast(int, @intToPtr(*u8, ptr + offset + j).*)
+            val = val | (b << (j * 8))
+            j += 1
+        }
+
+        code.emitLocalGet(buf_local)
+        code.emitI64Const(val)
+        code.emitI64Store(3, offset)
+        offset += 8
+    }
+
+    code.emitI64Const(2) // fd = stderr
+    code.emitLocalGet(buf_local)
+    code.emitI64ExtendI32U()
+    code.emitI64Const(len)
+    code.emitCall(write_func_idx)
+    code.emitDrop()
+}
+
+// ============================================================================
+// Helper: compute elapsed_ms = (cot_time() - global_start) / 1_000_000
+// Leaves elapsed_ms (i64) on the Wasm stack
+// ============================================================================
+
+fn emitComputeElapsedMs(code: *CodeBuilder, time_func_idx: int, start_global: int) void {
+    code.emitCall(time_func_idx)
+    code.emitGlobalGet(start_global)
+    code.emitI64Sub()
+    code.emitI64Const(1000000)
+    code.emitI64DivS()
+}
+
+// ============================================================================
+// __test_begin — stores total start time in global
+// ============================================================================
+
+fn generateTestBeginBody(time_func_idx: int, total_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    code.emitCall(time_func_idx)
+    code.emitGlobalSet(total_start_global)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __test_print_name — stores per-test start time, writes: test "name" ...
+// ============================================================================
+
+fn generateTestPrintNameBody(write_func_idx: int, time_func_idx: int, test_start_global: int, total_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // param 0 = ptr, param 1 = len, local 2 = buf_ptr
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    // Store per-test start time
+    code.emitCall(time_func_idx)
+    code.emitGlobalSet(test_start_global)
+
+    // Lazy-initialize total start time on first test
+    code.emitGlobalGet(total_start_global)
+    code.emitI64Eqz()
+    code.emitIf(BLOCK_VOID)
+    code.emitGlobalGet(test_start_global)
+    code.emitGlobalSet(total_start_global)
+    code.emitEnd()
+
+    // Allocate 16 bytes on Wasm stack
+    code.emitGlobalGet(0)
+    code.emitI32Const(16)
+    code.emitI32Sub()
+    code.emitLocalTee(2)
+    code.emitGlobalSet(0)
+
+    // Write 'test "'
+    emitWriteStr(&code, write_func_idx, 2, "test \"")
+
+    // Write name bytes (ptr, len from params)
+    code.emitI64Const(2) // fd = stderr
+    code.emitLocalGet(0) // ptr
+    code.emitLocalGet(1) // len
+    code.emitCall(write_func_idx)
+    code.emitDrop()
+
+    // Write '" ... '
+    emitWriteStr(&code, write_func_idx, 2, "\" ... ")
+
+    // Restore stack pointer
+    code.emitLocalGet(2)
+    code.emitI32Const(16)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __test_pass — computes elapsed, writes green "ok (Nms)\n"
+// ============================================================================
+
+fn generateTestPassBody(write_func_idx: int, eprint_int_func_idx: int, time_func_idx: int, test_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: buf_ptr (i32), local 1: elapsed_ms (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // Compute elapsed_ms
+    emitComputeElapsedMs(&code, time_func_idx, test_start_global)
+    code.emitLocalSet(1)
+
+    // Allocate 24 bytes on stack
+    code.emitGlobalGet(0)
+    code.emitI32Const(24)
+    code.emitI32Sub()
+    code.emitLocalTee(0)
+    code.emitGlobalSet(0)
+
+    // Write "\x1b[1;32mok\x1b[0m ("
+    emitWriteStr(&code, write_func_idx, 0, "\x1b[1;32mok\x1b[0m (")
+
+    // Print elapsed_ms
+    code.emitLocalGet(1)
+    code.emitCall(eprint_int_func_idx)
+
+    // Write "ms)\n"
+    emitWriteStr(&code, write_func_idx, 0, "ms)\n")
+
+    // Restore stack pointer
+    code.emitLocalGet(0)
+    code.emitI32Const(24)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __test_fail — computes elapsed, writes red "FAIL (Nms)\n", shows values
+// ============================================================================
+
+fn generateTestFailBody(write_func_idx: int, eprint_int_func_idx: int, time_func_idx: int, test_start_global: int, fail_has_values_global: int, fail_left_val_global: int, fail_right_val_global: int, fail_left_len_global: int, fail_right_len_global: int, fail_is_string_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: buf_ptr (i32), local 1: elapsed_ms (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // Compute elapsed_ms
+    emitComputeElapsedMs(&code, time_func_idx, test_start_global)
+    code.emitLocalSet(1)
+
+    // Allocate 32 bytes on stack
+    code.emitGlobalGet(0)
+    code.emitI32Const(32)
+    code.emitI32Sub()
+    code.emitLocalTee(0)
+    code.emitGlobalSet(0)
+
+    // Write "\x1b[1;31mFAIL\x1b[0m ("
+    emitWriteStr(&code, write_func_idx, 0, "\x1b[1;31mFAIL\x1b[0m (")
+
+    // Print elapsed_ms
+    code.emitLocalGet(1)
+    code.emitCall(eprint_int_func_idx)
+
+    // Write "ms)\n"
+    emitWriteStr(&code, write_func_idx, 0, "ms)\n")
+
+    // If fail values are stored, print expected vs actual
+    code.emitGlobalGet(fail_has_values_global)
+    code.emitI64Const(0)
+    code.emitI64Ne()
+    code.emitIf(BLOCK_VOID)
+
+    // Check if string comparison
+    code.emitGlobalGet(fail_is_string_global)
+    code.emitI64Const(0)
+    code.emitI64Ne()
+    code.emitIf(BLOCK_VOID)
+
+    // String values: write expected + left string
+    emitWriteStr(&code, write_func_idx, 0, "  expected: \"")
+    code.emitI64Const(2) // fd = stderr
+    code.emitGlobalGet(fail_left_val_global)
+    code.emitGlobalGet(fail_left_len_global)
+    code.emitCall(write_func_idx)
+    code.emitDrop()
+    emitWriteStr(&code, write_func_idx, 0, "\"\n")
+
+    // Write received + right string
+    emitWriteStr(&code, write_func_idx, 0, "  received: \"")
+    code.emitI64Const(2) // fd = stderr
+    code.emitGlobalGet(fail_right_val_global)
+    code.emitGlobalGet(fail_right_len_global)
+    code.emitCall(write_func_idx)
+    code.emitDrop()
+    emitWriteStr(&code, write_func_idx, 0, "\"\n")
+
+    code.emitElse()
+
+    // Integer values: write expected + int
+    emitWriteStr(&code, write_func_idx, 0, "  expected: ")
+    code.emitGlobalGet(fail_left_val_global)
+    code.emitCall(eprint_int_func_idx)
+    emitWriteStr(&code, write_func_idx, 0, "\n")
+
+    // Write received + int
+    emitWriteStr(&code, write_func_idx, 0, "  received: ")
+    code.emitGlobalGet(fail_right_val_global)
+    code.emitCall(eprint_int_func_idx)
+    emitWriteStr(&code, write_func_idx, 0, "\n")
+
+    code.emitEnd() // end if is_string
+
+    // Reset fail_has_values
+    code.emitI64Const(0)
+    code.emitGlobalSet(fail_has_values_global)
+
+    code.emitEnd() // end if has_values
+
+    // Restore stack pointer
+    code.emitLocalGet(0)
+    code.emitI32Const(32)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __test_store_fail_values — stores assertEq left/right values in globals
+// ============================================================================
+
+fn generateTestStoreFailValuesBody(fail_left_val_global: int, fail_right_val_global: int, fail_is_string_global: int, fail_left_len_global: int, fail_right_len_global: int, fail_has_values_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // param 0: left_val, param 1: right_val, param 2: is_string
+    // param 3: left_len, param 4: right_len
+
+    code.emitLocalGet(0)
+    code.emitGlobalSet(fail_left_val_global)
+
+    code.emitLocalGet(1)
+    code.emitGlobalSet(fail_right_val_global)
+
+    code.emitLocalGet(2)
+    code.emitGlobalSet(fail_is_string_global)
+
+    code.emitLocalGet(3)
+    code.emitGlobalSet(fail_left_len_global)
+
+    code.emitLocalGet(4)
+    code.emitGlobalSet(fail_right_len_global)
+
+    // Mark that values are available
+    code.emitI64Const(1)
+    code.emitGlobalSet(fail_has_values_global)
+
+    return code.finish()
+}
+
+// ============================================================================
+// __test_summary — Deno-style: "\nok | N passed | M failed (Xms)\n"
+// ============================================================================
+
+fn generateTestSummaryBody(write_func_idx: int, eprint_int_func_idx: int, time_func_idx: int, total_start_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // param 0: passed, param 1: failed
+    // local 2: buf_ptr (i32), local 3: total_ms (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // Compute total_ms
+    emitComputeElapsedMs(&code, time_func_idx, total_start_global)
+    code.emitLocalSet(3)
+
+    // Allocate 32 bytes on stack
+    code.emitGlobalGet(0)
+    code.emitI32Const(32)
+    code.emitI32Sub()
+    code.emitLocalTee(2)
+    code.emitGlobalSet(0)
+
+    // Write "\n"
+    emitWriteStr(&code, write_func_idx, 2, "\n")
+
+    // Status: green "ok" or red "FAILED"
+    code.emitLocalGet(1) // failed count
+    code.emitI64Const(0)
+    code.emitI64GtS()
+    code.emitIf(BLOCK_VOID)
+    emitWriteStr(&code, write_func_idx, 2, "\x1b[1;31mFAILED\x1b[0m")
+    code.emitElse()
+    emitWriteStr(&code, write_func_idx, 2, "\x1b[1;32mok\x1b[0m")
+    code.emitEnd()
+
+    // Write " | "
+    emitWriteStr(&code, write_func_idx, 2, " | ")
+
+    // Print passed count + " passed"
+    code.emitLocalGet(0)
+    code.emitCall(eprint_int_func_idx)
+    emitWriteStr(&code, write_func_idx, 2, " passed")
+
+    // If failed > 0: write " | " + failed count + " failed"
+    code.emitLocalGet(1)
+    code.emitI64Const(0)
+    code.emitI64GtS()
+    code.emitIf(BLOCK_VOID)
+    emitWriteStr(&code, write_func_idx, 2, " | ")
+    code.emitLocalGet(1)
+    code.emitCall(eprint_int_func_idx)
+    emitWriteStr(&code, write_func_idx, 2, " failed")
+    code.emitEnd()
+
+    // Write " (" + total_ms + "ms)\n"
+    emitWriteStr(&code, write_func_idx, 2, " (")
+    code.emitLocalGet(3)
+    code.emitCall(eprint_int_func_idx)
+    emitWriteStr(&code, write_func_idx, 2, "ms)\n")
+
+    // Restore stack pointer
+    code.emitLocalGet(2)
+    code.emitI32Const(32)
+    code.emitI32Add()
+    code.emitGlobalSet(0)
+
+    return code.finish()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "generateTestBeginBody produces valid bytecode" {
+    const body = generateTestBeginBody(5, 3)
+    @assert(body.count > 2)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateTestPrintNameBody produces valid bytecode" {
+    const body = generateTestPrintNameBody(1, 5, 3, 4)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateTestPassBody produces valid bytecode" {
+    const body = generateTestPassBody(1, 2, 5, 3)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateTestFailBody produces valid bytecode" {
+    const body = generateTestFailBody(1, 2, 5, 3, 10, 6, 7, 8, 9, 11)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateTestStoreFailValuesBody produces valid bytecode" {
+    const body = generateTestStoreFailValuesBody(6, 7, 11, 8, 9, 10)
+    @assert(body.count > 10)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateTestSummaryBody produces valid bytecode" {
+    const body = generateTestSummaryBody(1, 2, 5, 4)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "addTestRuntime registers all 6 functions" {
+    var linker = Linker.init()
+    const funcs = addTestRuntime(&linker, 0, 1, 2)
+    @assert(funcs.test_begin_idx >= 0)
+    @assert(funcs.test_print_name_idx >= 0)
+    @assert(funcs.test_pass_idx >= 0)
+    @assert(funcs.test_fail_idx >= 0)
+    @assert(funcs.test_summary_idx >= 0)
+    @assert(funcs.test_store_fail_values_idx >= 0)
+    // All indices should be different
+    @assert(funcs.test_begin_idx != funcs.test_print_name_idx)
+    @assert(funcs.test_pass_idx != funcs.test_fail_idx)
+    @assert(funcs.test_summary_idx != funcs.test_store_fail_values_idx)
+}
+
+test "emitWriteStr packs bytes correctly" {
+    var code = CodeBuilder.init()
+    emitWriteStr(&code, 0, 1, "ok")
+    const result = code.finish()
+    // Should have: local.get 1, i64.const <packed>, i64.store, i64.const 2, local.get 1, i64.extend_i32_u, i64.const 2, call 0, drop, end
+    @assert(result.count > 5)
+    @assertEq(result.get(result.count - 1), 0x0B) // end
+}

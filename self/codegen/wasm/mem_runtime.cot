@@ -1,0 +1,556 @@
+/// Memory runtime functions for Wasm (non-ARC).
+///
+/// Zig reference: compiler/codegen/mem_runtime.zig
+///
+/// These are general-purpose memory operations needed by stdlib
+/// (string.cot, list.cot, etc.) regardless of ARC.
+/// WasmGC path uses bump allocator for linear memory.
+///
+/// Functions: alloc, dealloc, realloc, memcpy, memset_zero, string_eq, string_concat
+
+import "std/list"
+import "code_builder"
+import "link"
+import "wasm_types"
+
+// ValType constants for local declarations
+const VT_I32: int = 0x7F
+const VT_I64: int = 0x7E
+
+// Function names (match Zig: mem_runtime.ALLOC_NAME etc.)
+const ALLOC_NAME: string = "alloc"
+const DEALLOC_NAME: string = "dealloc"
+const REALLOC_NAME: string = "realloc"
+const MEMCPY_NAME: string = "memcpy"
+const MEMSET_ZERO_NAME: string = "memset_zero"
+const STRING_EQ_NAME: string = "string_eq"
+const STRING_CONCAT_NAME: string = "string_concat"
+
+struct MemFunctions {
+    alloc_idx: int,
+    dealloc_idx: int,
+    realloc_idx: int,
+    memcpy_idx: int,
+    memset_zero_idx: int,
+    string_eq_idx: int,
+    string_concat_idx: int,
+}
+
+/// Add all memory runtime functions to the linker.
+/// Zig reference: mem_runtime.addToLinker()
+fn addMemRuntime(linker: *Linker, heap_ptr_global: int) MemFunctions {
+    // Type: (i64, i64) -> i64
+    var params_2i64: List(int) = .{}
+    params_2i64.append(VT_I64)
+    params_2i64.append(VT_I64)
+    var results_i64: List(int) = .{}
+    results_i64.append(VT_I64)
+    var results_void: List(int) = .{}
+    const i64_2i64_type = linker.addType(params_2i64, results_i64)
+
+    // alloc(metadata: i64, size: i64) -> i64
+    const alloc_body = generateAllocBody(heap_ptr_global)
+    const alloc_idx = linker.addFunc(WasmFunc.init(ALLOC_NAME, i64_2i64_type, alloc_body, false))
+
+    // dealloc(ptr: i64) -> void
+    var params_1i64: List(int) = .{}
+    params_1i64.append(VT_I64)
+    const void_1i64_type = linker.addType(params_1i64, results_void)
+    const dealloc_body = generateVoidStubBody()
+    const dealloc_idx = linker.addFunc(WasmFunc.init(DEALLOC_NAME, void_1i64_type, dealloc_body, false))
+
+    // realloc(ptr: i64, new_size: i64) -> i64
+    const realloc_body = generateReallocBody(heap_ptr_global)
+    const realloc_idx = linker.addFunc(WasmFunc.init(REALLOC_NAME, i64_2i64_type, realloc_body, false))
+
+    // memset_zero(ptr: i64, size: i64) -> void
+    const void_2i64_type = linker.addType(params_2i64, results_void)
+    const memset_zero_body = generateMemsetZeroBody()
+    const memset_zero_idx = linker.addFunc(WasmFunc.init(MEMSET_ZERO_NAME, void_2i64_type, memset_zero_body, false))
+
+    // memcpy(dst: i64, src: i64, num_bytes: i64) -> void
+    var params_3i64: List(int) = .{}
+    params_3i64.append(VT_I64)
+    params_3i64.append(VT_I64)
+    params_3i64.append(VT_I64)
+    const void_3i64_type = linker.addType(params_3i64, results_void)
+    const memcpy_body = generateMemcpyBody()
+    const memcpy_idx = linker.addFunc(WasmFunc.init(MEMCPY_NAME, void_3i64_type, memcpy_body, false))
+
+    // string_eq(s1_ptr, s1_len, s2_ptr, s2_len) -> i64
+    var params_4i64: List(int) = .{}
+    params_4i64.append(VT_I64)
+    params_4i64.append(VT_I64)
+    params_4i64.append(VT_I64)
+    params_4i64.append(VT_I64)
+    const i64_4i64_type = linker.addType(params_4i64, results_i64)
+    const string_eq_body = generateStringEqBody()
+    const string_eq_idx = linker.addFunc(WasmFunc.init(STRING_EQ_NAME, i64_4i64_type, string_eq_body, false))
+
+    // string_concat(s1_ptr, s1_len, s2_ptr, s2_len) -> new_ptr (i64)
+    const string_concat_body = generateStringConcatBody(heap_ptr_global)
+    const string_concat_idx = linker.addFunc(WasmFunc.init(STRING_CONCAT_NAME, i64_4i64_type, string_concat_body, false))
+
+    return MemFunctions {
+        alloc_idx: alloc_idx,
+        dealloc_idx: dealloc_idx,
+        realloc_idx: realloc_idx,
+        memcpy_idx: memcpy_idx,
+        memset_zero_idx: memset_zero_idx,
+        string_eq_idx: string_eq_idx,
+        string_concat_idx: string_concat_idx,
+    }
+}
+
+// ============================================================================
+// alloc(metadata: i64, size: i64) -> i64
+// Simple bump allocator. Ignores metadata (no ARC header).
+// Zig reference: mem_runtime.generateAllocBody()
+// ============================================================================
+
+fn generateAllocBody(heap_ptr_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: metadata (i64, ignored), local 1: size (i64)
+    // local 2: result_ptr (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // result_ptr = heap_ptr (as i64)
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitI64ExtendI32U()
+    code.emitLocalSet(2)
+
+    // heap_ptr += size
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitI32Add()
+    code.emitGlobalSet(heap_ptr_global)
+
+    // return result_ptr
+    code.emitLocalGet(2)
+
+    return code.finish()
+}
+
+// ============================================================================
+// Void stub body (single `end` opcode). Used for dealloc no-op.
+// ============================================================================
+
+fn generateVoidStubBody() List(int) {
+    var code = CodeBuilder.init()
+    return code.finish()
+}
+
+// ============================================================================
+// realloc(ptr: i64, new_size: i64) -> i64
+// Bump allocator: always allocates new block, does NOT copy old data.
+// Zig reference: mem_runtime.generateReallocBody()
+// ============================================================================
+
+fn generateReallocBody(heap_ptr_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: ptr (i64, ignored), local 1: new_size (i64)
+    // local 2: result_ptr (i64)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    code.declareLocals(locals)
+
+    // result_ptr = heap_ptr (as i64)
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitI64ExtendI32U()
+    code.emitLocalSet(2)
+
+    // heap_ptr += new_size
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitI32Add()
+    code.emitGlobalSet(heap_ptr_global)
+
+    // return result_ptr
+    code.emitLocalGet(2)
+
+    return code.finish()
+}
+
+// ============================================================================
+// memset_zero(ptr: i64, size: i64) -> void
+// Zig reference: mem_runtime.generateMemsetZeroBody()
+// ============================================================================
+
+fn generateMemsetZeroBody() List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: ptr (i64), local 1: size (i64)
+    // local 2: addr_i32, local 3: len_i32, local 4: counter
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitLocalSet(2)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitLocalSet(3)
+
+    code.emitI32Const(0)
+    code.emitLocalSet(4)
+    code.emitBlock(BLOCK_VOID)
+    code.emitLoop(BLOCK_VOID)
+    code.emitLocalGet(4)
+    code.emitLocalGet(3)
+    code.emitI32GeU()
+    code.emitBrIf(1)
+    code.emitLocalGet(2)
+    code.emitLocalGet(4)
+    code.emitI32Add()
+    code.emitI64Const(0)
+    code.emitI64Store8(0, 0)
+    code.emitLocalGet(4)
+    code.emitI32Const(1)
+    code.emitI32Add()
+    code.emitLocalSet(4)
+    code.emitBr(0)
+    code.emitEnd()
+    code.emitEnd()
+
+    return code.finish()
+}
+
+// ============================================================================
+// memcpy(dst: i64, src: i64, num_bytes: i64) -> void
+// Handles overlapping regions (memmove semantics).
+// Zig reference: mem_runtime.generateMemcpyBody()
+// ============================================================================
+
+fn generateMemcpyBody() List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: dst, local 1: src, local 2: num_bytes (all i64)
+    // local 3: dst_i32, local 4: src_i32, local 5: len_i32, local 6: counter
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitLocalSet(3)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitLocalSet(4)
+    code.emitLocalGet(2)
+    code.emitI32WrapI64()
+    code.emitLocalSet(5)
+
+    // if (len == 0) return
+    code.emitLocalGet(5)
+    code.emitI32Eqz()
+    code.emitIf(BLOCK_VOID)
+    code.emitReturn()
+    code.emitEnd()
+
+    // if dst > src: backward copy
+    code.emitLocalGet(3)
+    code.emitLocalGet(4)
+    code.emitI32GtU()
+    code.emitIf(BLOCK_VOID)
+
+    // Backward: counter = len-1; while(counter >= 0) { dst[c] = src[c]; c-- }
+    code.emitLocalGet(5)
+    code.emitI32Const(1)
+    code.emitI32Sub()
+    code.emitLocalSet(6)
+    code.emitBlock(BLOCK_VOID)
+    code.emitLoop(BLOCK_VOID)
+    code.emitLocalGet(6)
+    code.emitI32Const(0)
+    code.emitI32LtS()
+    code.emitBrIf(1)
+    code.emitLocalGet(3)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitLocalGet(4)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Load8U(0, 0)
+    code.emitI64Store8(0, 0)
+    code.emitLocalGet(6)
+    code.emitI32Const(1)
+    code.emitI32Sub()
+    code.emitLocalSet(6)
+    code.emitBr(0)
+    code.emitEnd()
+    code.emitEnd()
+
+    code.emitElse()
+
+    // Forward: counter = 0; while(counter < len) { dst[c] = src[c]; c++ }
+    code.emitI32Const(0)
+    code.emitLocalSet(6)
+    code.emitBlock(BLOCK_VOID)
+    code.emitLoop(BLOCK_VOID)
+    code.emitLocalGet(6)
+    code.emitLocalGet(5)
+    code.emitI32GeU()
+    code.emitBrIf(1)
+    code.emitLocalGet(3)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitLocalGet(4)
+    code.emitLocalGet(6)
+    code.emitI32Add()
+    code.emitI64Load8U(0, 0)
+    code.emitI64Store8(0, 0)
+    code.emitLocalGet(6)
+    code.emitI32Const(1)
+    code.emitI32Add()
+    code.emitLocalSet(6)
+    code.emitBr(0)
+    code.emitEnd()
+    code.emitEnd()
+
+    code.emitEnd() // end if/else
+
+    return code.finish()
+}
+
+// ============================================================================
+// string_eq(s1_ptr, s1_len, s2_ptr, s2_len) -> i64 (1=equal, 0=not)
+// Zig reference: mem_runtime.generateStringEqBody()
+// ============================================================================
+
+fn generateStringEqBody() List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0-3: params (i64)
+    // local 4: len_i32, local 5: p1_i32, local 6: p2_i32, local 7: counter
+    var locals: List(int) = .{}
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    // if (s1_len != s2_len) return 0
+    code.emitLocalGet(1)
+    code.emitLocalGet(3)
+    code.emitI64Ne()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(0)
+    code.emitReturn()
+    code.emitEnd()
+
+    // Pointer equality fast path
+    code.emitLocalGet(0)
+    code.emitLocalGet(2)
+    code.emitI64Eq()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(1)
+    code.emitReturn()
+    code.emitEnd()
+
+    // len_i32 = (i32)s1_len
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitLocalSet(4)
+
+    // if (len == 0) return 1
+    code.emitLocalGet(4)
+    code.emitI32Eqz()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(1)
+    code.emitReturn()
+    code.emitEnd()
+
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitLocalSet(5)
+    code.emitLocalGet(2)
+    code.emitI32WrapI64()
+    code.emitLocalSet(6)
+
+    // Byte-compare loop
+    code.emitI32Const(0)
+    code.emitLocalSet(7)
+    code.emitBlock(BLOCK_VOID)
+    code.emitLoop(BLOCK_VOID)
+    code.emitLocalGet(7)
+    code.emitLocalGet(4)
+    code.emitI32GeU()
+    code.emitBrIf(1)
+    code.emitLocalGet(5)
+    code.emitLocalGet(7)
+    code.emitI32Add()
+    code.emitI64Load8U(0, 0)
+    code.emitLocalGet(6)
+    code.emitLocalGet(7)
+    code.emitI32Add()
+    code.emitI64Load8U(0, 0)
+    code.emitI64Ne()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(0)
+    code.emitReturn()
+    code.emitEnd()
+    code.emitLocalGet(7)
+    code.emitI32Const(1)
+    code.emitI32Add()
+    code.emitLocalSet(7)
+    code.emitBr(0)
+    code.emitEnd()
+    code.emitEnd()
+
+    code.emitI64Const(1)
+
+    return code.finish()
+}
+
+// ============================================================================
+// string_concat(s1_ptr, s1_len, s2_ptr, s2_len) -> new_ptr (i64)
+// Uses bump allocator via heap_ptr_global — no ARC header.
+// Zig reference: mem_runtime.generateStringConcatBody()
+// ============================================================================
+
+fn generateStringConcatBody(heap_ptr_global: int) List(int) {
+    var code = CodeBuilder.init()
+
+    // local 0: s1_ptr, local 1: s1_len, local 2: s2_ptr, local 3: s2_len (all i64)
+    // local 4: new_len_i64, local 5: new_ptr_i64
+    // local 6: tmp_src (i32), local 7: tmp_len (i32), local 8: tmp_dest (i32), local 9: counter (i32)
+    var locals: List(int) = .{}
+    locals.append(VT_I64)
+    locals.append(VT_I64)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    locals.append(VT_I32)
+    code.declareLocals(locals)
+
+    // new_len = s1_len + s2_len
+    code.emitLocalGet(1)
+    code.emitLocalGet(3)
+    code.emitI64Add()
+    code.emitLocalSet(4)
+
+    // if (new_len == 0) return 0
+    code.emitLocalGet(4)
+    code.emitI64Eqz()
+    code.emitIf(BLOCK_VOID)
+    code.emitI64Const(0)
+    code.emitReturn()
+    code.emitEnd()
+
+    // Bump allocate: new_ptr = heap_ptr; heap_ptr += new_len
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitI64ExtendI32U()
+    code.emitLocalSet(5)
+
+    code.emitGlobalGet(heap_ptr_global)
+    code.emitLocalGet(4)
+    code.emitI32WrapI64()
+    code.emitI32Add()
+    code.emitGlobalSet(heap_ptr_global)
+
+    // Copy s1: byte_copy(dest=new_ptr, src=s1_ptr, len=s1_len)
+    code.emitLocalGet(5)
+    code.emitI32WrapI64()
+    code.emitLocalSet(8)
+    code.emitLocalGet(0)
+    code.emitI32WrapI64()
+    code.emitLocalSet(6)
+    code.emitLocalGet(1)
+    code.emitI32WrapI64()
+    code.emitLocalSet(7)
+    code.emitByteCopyLoop(8, 6, 7, 9)
+
+    // Copy s2: byte_copy(dest=new_ptr+s1_len, src=s2_ptr, len=s2_len)
+    code.emitLocalGet(5)
+    code.emitLocalGet(1)
+    code.emitI64Add()
+    code.emitI32WrapI64()
+    code.emitLocalSet(8)
+    code.emitLocalGet(2)
+    code.emitI32WrapI64()
+    code.emitLocalSet(6)
+    code.emitLocalGet(3)
+    code.emitI32WrapI64()
+    code.emitLocalSet(7)
+    code.emitByteCopyLoop(8, 6, 7, 9)
+
+    // Return new_ptr
+    code.emitLocalGet(5)
+
+    return code.finish()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "generateAllocBody produces valid bytecode" {
+    const body = generateAllocBody(2)
+    @assert(body.count > 0)
+    // Last byte should be END opcode
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateVoidStubBody produces minimal body" {
+    const body = generateVoidStubBody()
+    // Should be just the END opcode (possibly with empty local decl)
+    @assert(body.count >= 1)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateReallocBody produces valid bytecode" {
+    const body = generateReallocBody(2)
+    @assert(body.count > 0)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateMemsetZeroBody produces valid bytecode" {
+    const body = generateMemsetZeroBody()
+    @assert(body.count > 10)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateMemcpyBody produces valid bytecode" {
+    const body = generateMemcpyBody()
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateStringEqBody produces valid bytecode" {
+    const body = generateStringEqBody()
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "generateStringConcatBody produces valid bytecode" {
+    const body = generateStringConcatBody(2)
+    @assert(body.count > 20)
+    @assertEq(body.get(body.count - 1), 0x0B)
+}
+
+test "addMemRuntime registers all 7 functions" {
+    var linker = Linker.init()
+    const funcs = addMemRuntime(&linker, 2)
+    @assert(funcs.alloc_idx >= 0)
+    @assert(funcs.dealloc_idx >= 0)
+    @assert(funcs.realloc_idx >= 0)
+    @assert(funcs.memcpy_idx >= 0)
+    @assert(funcs.memset_zero_idx >= 0)
+    @assert(funcs.string_eq_idx >= 0)
+    @assert(funcs.string_concat_idx >= 0)
+    // All indices should be unique
+    @assert(funcs.alloc_idx != funcs.dealloc_idx)
+    @assert(funcs.dealloc_idx != funcs.realloc_idx)
+}

@@ -1,0 +1,551 @@
+/// Preprocess — Transform high-level instructions to low-level Wasm.
+///
+/// Go reference: cmd/internal/obj/wasm/wasmobj.go preprocess()
+/// Zig reference: compiler/codegen/wasm/preprocess.zig
+///
+/// This pass performs critical transformations:
+/// 1. AJMP -> i32.const + set PC_B + br
+/// 2. ARET -> SP restoration + return
+/// 3. Get/Load expansion for address modes
+/// 4. MOV pseudo-instruction expansion
+/// 5. Dispatch loop (br_table) for resume points
+/// 6. Branch depth resolution
+///
+/// Split into sub-functions to avoid stack overflow (Cot allocates all
+/// locals simultaneously — see MEMORY.md stack overflow pitfall).
+
+import "std/list"
+import "prog"
+import "wasm_types"
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Insert a Prog after `after_idx` in the list, return new index.
+fn insertAfter(text: *List(Prog), after_idx: int, p: Prog) int {
+    var prog = p
+    prog.pc = text.get(after_idx).pc
+    const new_idx = after_idx + 1
+    text.insert(new_idx, prog)
+    return new_idx
+}
+
+/// Check if an instruction is a load instruction.
+fn isLoadInstr(instr: As) bool {
+    return switch (instr) {
+        .i32_load, .i64_load, .f32_load, .f64_load,
+        .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
+        .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u,
+        .i64_load32_s, .i64_load32_u => true,
+        else => false,
+    }
+}
+
+// ============================================================================
+// Pass 1: Count resume points and assign PC values
+// Go: wasmobj.go lines 265-319
+// ============================================================================
+
+fn pass1CountResumePoints(sym: *Symbol) (int, List(int)) {
+    var numResumePoints = 0
+    var pc = 0
+    var tableIdxs: List(int) = .{}
+    var tablePC = 0
+    var explicitBlockDepth = 0
+
+    for i in 0..sym.text.count {
+        var p = sym.text.get(i)
+
+        if (p.instr == As.block or p.instr == As.loop or p.instr == As.@"if") {
+            explicitBlockDepth += 1
+        } else if (p.instr == As.end) {
+            if (explicitBlockDepth > 0) {
+                explicitBlockDepth -= 1
+            }
+        } else if (p.instr == As.resume_point) {
+            if (explicitBlockDepth == 0) {
+                p.instr = As.end
+                while (tablePC <= pc) {
+                    tableIdxs.append(numResumePoints)
+                    tablePC += 1
+                }
+                numResumePoints += 1
+                pc += 1
+            } else {
+                p.instr = As.end
+            }
+        } else if (p.instr == As.call) {
+            pc += 1
+        } else if (p.instr == As.nop or p.instr == As.text) {
+            pc += 1
+        }
+        p.pc = pc
+        sym.text.set(i, p)
+    }
+
+    tableIdxs.append(numResumePoints)
+    return (numResumePoints, tableIdxs)
+}
+
+// ============================================================================
+// Pass 2: Prologue — Allocate stack frame
+// Go: wasmobj.go lines 207-214
+// ============================================================================
+
+fn pass2Prologue(sym: *Symbol) void {
+    if (sym.frame_size <= 0) { return }
+    var insert = 0
+    insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(Reg.sp)))
+    insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i32_const, constAddr(sym.frame_size)))
+    insert = insertAfter(&sym.text, insert, Prog.init(As.i32_sub))
+    var set_sp = Prog.initTo(As.set, regAddr(Reg.sp))
+    set_sp.spadj = sym.frame_size
+    insert = insertAfter(&sym.text, insert, set_sp)
+}
+
+// ============================================================================
+// Pass 3: Transform instructions
+// Go: wasmobj.go lines 380-687
+// ============================================================================
+
+fn pass3Transform(sym: *Symbol) List(int) {
+    var entryPointLoopBranches: List(int) = .{}
+    const framesize = sym.frame_size
+
+    var i = 0
+    while (i < sym.text.count) {
+        var p = sym.text.get(i)
+
+        if (p.instr == As.jmp) {
+            transformJmp(sym, i, &entryPointLoopBranches)
+        } else if (p.instr == As.aret) {
+            transformAret(sym, i, framesize)
+        } else if (p.instr == As.return_call and framesize > 0) {
+            transformReturnCall(sym, i, framesize)
+        } else if (p.instr == As.get and p.from.addr_type == AddrType.addr) {
+            expandGetAddr(sym, i)
+        } else if (isLoadInstr(p.instr) and p.from.addr_type == AddrType.mem) {
+            expandLoadMem(sym, i)
+        } else if (p.instr == As.mov_b or p.instr == As.mov_h or p.instr == As.mov_w or p.instr == As.mov_d) {
+            expandMov(sym, i, framesize)
+        }
+
+        i += 1
+    }
+
+    return entryPointLoopBranches
+}
+
+fn transformJmp(sym: *Symbol, idx: int, branches: *List(int)) void {
+    var p = sym.text.get(idx)
+    const target_idx = p.to.branch_target
+    p.instr = As.nop
+    sym.text.set(idx, p)
+
+    if (target_idx) |tidx| {
+        const target_pc = sym.text.get(tidx).pc
+        var insert = idx
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i32_const, constAddr(target_pc)))
+        insert = insertAfter(&sym.text, insert, Prog.initTo(As.set, regAddr(Reg.pc_b)))
+        var br_prog = Prog.init(As.br)
+        br_prog.to.addr_type = AddrType.branch
+        br_prog.to.branch_target = null
+        insert = insertAfter(&sym.text, insert, br_prog)
+        branches.append(insert)
+    }
+}
+
+fn transformAret(sym: *Symbol, idx: int, framesize: int) void {
+    var p = sym.text.get(idx)
+    p.instr = As.nop
+    sym.text.set(idx, p)
+
+    var insert = idx
+    if (framesize > 0) {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(Reg.sp)))
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i32_const, constAddr(framesize)))
+        insert = insertAfter(&sym.text, insert, Prog.init(As.i32_add))
+        insert = insertAfter(&sym.text, insert, Prog.initTo(As.set, regAddr(Reg.sp)))
+    }
+    insert = insertAfter(&sym.text, insert, Prog.init(As.@"return"))
+}
+
+fn transformReturnCall(sym: *Symbol, idx: int, framesize: int) void {
+    var p = sym.text.get(idx)
+    const saved_to = p.to
+    p.instr = As.nop
+    p.to = Addr.init()
+    sym.text.set(idx, p)
+
+    var insert = idx
+    insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(Reg.sp)))
+    insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i32_const, constAddr(framesize)))
+    insert = insertAfter(&sym.text, insert, Prog.init(As.i32_add))
+    insert = insertAfter(&sym.text, insert, Prog.initTo(As.set, regAddr(Reg.sp)))
+    var rc = Prog.init(As.return_call)
+    rc.to = saved_to
+    insert = insertAfter(&sym.text, insert, rc)
+}
+
+// ============================================================================
+// Pass 4: Adjust offsets for auto/param variables
+// Go: wasmobj.go lines 547-562
+// ============================================================================
+
+fn pass4AdjustOffsets(sym: *Symbol) void {
+    const framesize = sym.frame_size
+    for j in 0..sym.text.count {
+        var p = sym.text.get(j)
+        var changed = false
+
+        if (p.from.name == AddrName.@"auto") {
+            p.from.offset += framesize
+            changed = true
+        } else if (p.from.name == AddrName.param) {
+            p.from.reg = Reg.sp
+            p.from.offset += framesize + 8
+            changed = true
+        }
+
+        if (p.to.name == AddrName.@"auto") {
+            p.to.offset += framesize
+            changed = true
+        } else if (p.to.name == AddrName.param) {
+            p.to.reg = Reg.sp
+            p.to.offset += framesize + 8
+            changed = true
+        }
+
+        if (changed) {
+            sym.text.set(j, p)
+        }
+    }
+}
+
+// ============================================================================
+// Pass 5: Create dispatch loop structure
+// Go: wasmobj.go lines 690-724
+// ============================================================================
+
+fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), entryPointLoopBranches: *List(int)) int {
+    var entryPointLoopIdx: ?int = null
+    var insert_point = 0
+
+    if (entryPointLoopBranches.count > 0) {
+        insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.loop))
+        entryPointLoopIdx = insert_point
+    }
+
+    if (numResumePoints > 0) {
+        for k in 0..numResumePoints + 1 {
+            insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.block))
+        }
+        insert_point = insertAfter(&sym.text, insert_point, Prog.initFrom(As.get, regAddr(Reg.pc_b)))
+
+        var bt_addr = Addr.init()
+        bt_addr.val = AddrVal.br_table(tableIdxs.*)
+        insert_point = insertAfter(&sym.text, insert_point, Prog.initTo(As.br_table, bt_addr))
+        insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.end))
+    }
+
+    if (entryPointLoopBranches.count > 0) {
+        sym.text.append(Prog.init(As.end))
+    }
+
+    sym.text.append(Prog.init(As.@"unreachable"))
+
+    if (entryPointLoopIdx) |idx| { return idx }
+    return -1
+}
+
+// ============================================================================
+// Pass 6: Compute relative branch depths
+// Go: wasmobj.go lines 726-747
+// ============================================================================
+
+fn pass6ResolveBranches(sym: *Symbol, entryPointLoopIdx: int, entryPointLoopBranches: *List(int)) void {
+    var currentDepth = 0
+    var blockDepths: List(int) = .{}
+    for n in 0..sym.text.count {
+        blockDepths.append(-1)
+    }
+
+    for j in 0..sym.text.count {
+        var p = sym.text.get(j)
+
+        if (p.instr == As.block or p.instr == As.loop or p.instr == As.@"if") {
+            currentDepth += 1
+            blockDepths.set(j, currentDepth)
+        } else if (p.instr == As.end) {
+            currentDepth -= 1
+        }
+
+        if (p.instr == As.br or p.instr == As.br_if) {
+            if (p.to.addr_type == AddrType.branch) {
+                if (p.to.branch_target) |target| {
+                    const blockDepth = blockDepths.get(target)
+                    if (blockDepth >= 0) {
+                        p.to = constAddr(currentDepth - blockDepth)
+                        sym.text.set(j, p)
+                    }
+                }
+            }
+        }
+    }
+
+    if (entryPointLoopIdx >= 0) {
+        const loopDepth = blockDepths.get(entryPointLoopIdx)
+        for b in 0..entryPointLoopBranches.count {
+            const br_idx = entryPointLoopBranches.get(b)
+            var depth_at_br = 0
+            for d in 0..br_idx + 1 {
+                const instr = sym.text.get(d).instr
+                if (instr == As.block or instr == As.loop or instr == As.@"if") {
+                    depth_at_br += 1
+                } else if (instr == As.end) {
+                    depth_at_br -= 1
+                }
+            }
+            var br_prog = sym.text.get(br_idx)
+            br_prog.to = constAddr(depth_at_br - loopDepth)
+            sym.text.set(br_idx, br_prog)
+        }
+    }
+}
+
+// ============================================================================
+// preprocess — Main entry point
+// ============================================================================
+
+fn preprocess(sym: *Symbol) void {
+    if (sym.frame_size < 0) { return }
+    if (sym.text.count == 0) { return }
+
+    const result = pass1CountResumePoints(sym)
+    const numResumePoints = result.0
+    const tableIdxs = result.1
+
+    pass2Prologue(sym)
+    var entryPointLoopBranches = pass3Transform(sym)
+    pass4AdjustOffsets(sym)
+    var tblIdxs = tableIdxs
+    const loopIdx = pass5DispatchLoop(sym, numResumePoints, &tblIdxs, &entryPointLoopBranches)
+    pass6ResolveBranches(sym, loopIdx, &entryPointLoopBranches)
+}
+
+// ============================================================================
+// Instruction expansion helpers
+// ============================================================================
+
+fn expandGetAddr(sym: *Symbol, idx: int) void {
+    var p = sym.text.get(idx)
+    const from = p.from
+    p.instr = As.nop
+    sym.text.set(idx, p)
+
+    var insert = idx
+    if (from.name == AddrName.@"extern") {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i64_const, from))
+    } else {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(from.reg)))
+        if (from.reg == Reg.sp) {
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i64_extend_i32_u))
+        }
+        if (from.offset != 0) {
+            insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i64_const, constAddr(from.offset)))
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i64_add))
+        }
+    }
+}
+
+fn expandLoadMem(sym: *Symbol, idx: int) void {
+    var p = sym.text.get(idx)
+    const load_instr = p.instr
+    const from = p.from
+
+    p.instr = As.get
+    p.from = regAddr(from.reg)
+    p.to = Addr.init()
+    sym.text.set(idx, p)
+
+    var insert = idx
+    if (from.reg != Reg.sp) {
+        insert = insertAfter(&sym.text, insert, Prog.init(As.i32_wrap_i64))
+    }
+    insert = insertAfter(&sym.text, insert, Prog.initFrom(load_instr, constAddr(from.offset)))
+}
+
+fn expandMov(sym: *Symbol, idx: int, framesize: int) void {
+    var p = sym.text.get(idx)
+    const mov_instr = p.instr
+    const from = p.from
+    const to = p.to
+
+    const load_as = switch (mov_instr) {
+        .mov_b => As.i64_load8_u,
+        .mov_h => As.i64_load16_u,
+        .mov_w => As.i64_load32_u,
+        .mov_d => As.i64_load,
+        else => As.i64_load,
+    }
+    const store_as = switch (mov_instr) {
+        .mov_b => As.i64_store8,
+        .mov_h => As.i64_store16,
+        .mov_w => As.i64_store32,
+        .mov_d => As.i64_store,
+        else => As.i64_store,
+    }
+
+    p.instr = As.nop
+    sym.text.set(idx, p)
+    var insert = idx
+
+    if (to.addr_type == AddrType.mem) {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(to.reg)))
+        if (to.reg != Reg.sp) {
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i32_wrap_i64))
+        }
+    }
+
+    if (from.addr_type == AddrType.const_int) {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i64_const, constAddr(from.offset)))
+    } else if (from.addr_type == AddrType.reg) {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, from))
+        if (from.reg == Reg.sp) {
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i64_extend_i32_u))
+        }
+    } else if (from.addr_type == AddrType.mem) {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(from.reg)))
+        if (from.reg != Reg.sp) {
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i32_wrap_i64))
+        }
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(load_as, constAddr(from.offset)))
+    } else if (from.addr_type == AddrType.addr) {
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.get, regAddr(from.reg)))
+        if (from.reg == Reg.sp) {
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i64_extend_i32_u))
+        }
+        if (from.offset != 0) {
+            insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i64_const, constAddr(from.offset)))
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i64_add))
+        }
+    }
+
+    if (to.addr_type == AddrType.reg) {
+        if (to.reg == Reg.sp) {
+            insert = insertAfter(&sym.text, insert, Prog.init(As.i32_wrap_i64))
+        }
+        insert = insertAfter(&sym.text, insert, Prog.initTo(As.set, to))
+    } else if (to.addr_type == AddrType.mem) {
+        insert = insertAfter(&sym.text, insert, Prog.initTo(store_as, constAddr(to.offset)))
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "preprocess empty function" {
+    var sym = Symbol.init("test")
+    sym.frame_size = 0
+    sym.text.append(Prog.init(As.text))
+    preprocess(&sym)
+    @assert(sym.text.count >= 2)
+    const last = sym.text.get(sym.text.count - 1)
+    @assertEq(last.instr == As.@"unreachable", true)
+}
+
+test "preprocess with frame allocation" {
+    var sym = Symbol.init("test")
+    sym.frame_size = 16
+    sym.text.append(Prog.init(As.text))
+    sym.text.append(Prog.init(As.@"return"))
+    preprocess(&sym)
+    @assert(sym.text.count >= 7)
+    @assertEq(sym.text.get(1).instr == As.get, true)
+    @assertEq(sym.text.get(2).instr == As.i32_const, true)
+    @assertEq(sym.text.get(2).from.offset, 16)
+}
+
+test "preprocess ARET becomes return" {
+    var sym = Symbol.init("test")
+    sym.frame_size = 8
+    sym.text.append(Prog.init(As.text))
+    sym.text.append(Prog.init(As.aret))
+    preprocess(&sym)
+    var has_return = false
+    for i in 0..sym.text.count {
+        if (sym.text.get(i).instr == As.@"return") {
+            has_return = true
+        }
+    }
+    @assertEq(has_return, true)
+}
+
+test "preprocess resume point creates br_table" {
+    var sym = Symbol.init("test")
+    sym.frame_size = 0
+    sym.text.append(Prog.init(As.text))
+    sym.text.append(Prog.init(As.resume_point))
+    sym.text.append(Prog.init(As.@"return"))
+    preprocess(&sym)
+    var has_block = false
+    var has_br_table = false
+    for i in 0..sym.text.count {
+        const instr = sym.text.get(i).instr
+        if (instr == As.block) { has_block = true }
+        if (instr == As.br_table) { has_br_table = true }
+    }
+    @assertEq(has_block, true)
+    @assertEq(has_br_table, true)
+}
+
+test "isLoadInstr" {
+    @assertEq(isLoadInstr(As.i64_load), true)
+    @assertEq(isLoadInstr(As.i32_load8_s), true)
+    @assertEq(isLoadInstr(As.i64_load32_u), true)
+    @assertEq(isLoadInstr(As.i64_store), false)
+    @assertEq(isLoadInstr(As.nop), false)
+}
+
+test "expandMov helpers" {
+    const load_b = switch (As.mov_b) {
+        .mov_b => As.i64_load8_u,
+        .mov_h => As.i64_load16_u,
+        .mov_w => As.i64_load32_u,
+        .mov_d => As.i64_load,
+        else => As.i64_load,
+    }
+    @assertEq(load_b == As.i64_load8_u, true)
+
+    const load_d = switch (As.mov_d) {
+        .mov_b => As.i64_load8_u,
+        .mov_h => As.i64_load16_u,
+        .mov_w => As.i64_load32_u,
+        .mov_d => As.i64_load,
+        else => As.i64_load,
+    }
+    @assertEq(load_d == As.i64_load, true)
+}
+
+test "transformJmp with entries" {
+    var sym = Symbol.init("t")
+    sym.text.append(Prog.init(As.text))
+    sym.text.append(Prog.init(As.nop))
+    var jmp = Prog.init(As.jmp)
+    jmp.to = Addr.initBranch(1)
+    sym.text.append(jmp)
+    sym.text.append(Prog.init(As.@"return"))
+
+    for i in 0..sym.text.count {
+        var p = sym.text.get(i)
+        p.pc = i
+        sym.text.set(i, p)
+    }
+
+    var branches: List(int) = .{}
+    transformJmp(&sym, 2, &branches)
+    @assertEq(sym.text.count, 7)
+    @assertEq(branches.count, 1)
+}
