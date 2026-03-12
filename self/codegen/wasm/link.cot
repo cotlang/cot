@@ -311,9 +311,9 @@ struct Linker {
         return self.imports.count
     }
 
-    /// Number of functions
+    /// Total function count (imports + module funcs) for index offsetting.
     fn funcCount() int {
-        return self.funcs.count
+        return self.imports.count + self.funcs.count
     }
 
     /// Add a global variable. Returns global index.
@@ -323,9 +323,10 @@ struct Linker {
         return idx
     }
 
-    /// Add a function. Returns function index.
+    /// Add a function. Returns global function index (imports + module funcs).
+    /// Call sites that previously added import_count manually must be updated.
     fn addFunc(func: WasmFunc) int {
-        const idx = self.funcs.count
+        const idx = self.imports.count + self.funcs.count
         self.funcs.append(func)
         return idx
     }
@@ -584,10 +585,10 @@ struct Linker {
         writeSLEB128(&buf, 0)
         buf.append(0x0B)  // end
         writeULEB128(&buf, self.table_funcs.count)
-        const import_count = self.imports.count
         var i = 0
         while (i < self.table_funcs.count) {
-            writeULEB128(&buf, import_count + self.table_funcs.get(i))
+            // table_funcs already stores global function indices (imports + module funcs)
+            writeULEB128(&buf, self.table_funcs.get(i))
             i += 1
         }
         writeSection(output, SECTION_ELEMENT, buf)

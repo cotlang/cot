@@ -122,11 +122,13 @@ fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int
 
 /// Register all runtime modules with the linker.
 fn addAllRuntimeFunctions(linker: *Linker, heap_ptr_global: int, opts: CompileOptions) RuntimeIndices {
-    // Order matters: each module's indices depend on prior registrations
+    // WASI host imports MUST be registered FIRST — Wasm requires imports at
+    // indices 0..N-1, module functions at N onwards. addFunc() returns
+    // imports.count + funcs.count, so imports must exist before any addFunc call.
+    const ws = addWasiRuntime(linker, opts.is_wasi)
     const mem = addMemRuntime(linker, heap_ptr_global)
     const sl = addSliceRuntime(linker, heap_ptr_global)
     const pr = addPrintRuntime(linker)
-    const ws = addWasiRuntime(linker, opts.is_wasi)
     const tf = addTestRuntime(linker, pr.write_idx, pr.eprint_int_idx, ws.time_idx)
     const bf = addBenchRuntime(linker, pr.write_idx, pr.eprint_int_idx, ws.time_idx, opts.bench_n)
 

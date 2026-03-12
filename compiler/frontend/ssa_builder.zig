@@ -1742,7 +1742,23 @@ pub const SSABuilder = struct {
             const elem_info = self.type_registry.get(value_type.optional.elem);
             break :blk elem_info != .pointer;
         };
-        const is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt_store;
+        var is_large_struct = ((value_type == .struct_type or value_type == .tuple or value_type == .union_type) and type_size > 8) or is_compound_opt_store;
+
+        // When the value is a VOID-typed address (from convertFieldValue/convertFieldLocal
+        // for compound struct/array/union fields), check the IR node's type to determine
+        // if bulk copy is needed. Same pattern as convertStoreLocalField.
+        if (!is_large_struct and value.op == .off_ptr and value.type_idx == TypeRegistry.VOID) {
+            const ir_node = self.ir_func.nodes[p.value];
+            const ir_type = self.type_registry.get(ir_node.type_idx);
+            const ir_size = self.type_registry.sizeOf(ir_node.type_idx);
+            const ir_is_compound_opt = ir_type == .optional and blk: {
+                const elem_info = self.type_registry.get(ir_type.optional.elem);
+                break :blk elem_info != .pointer;
+            };
+            if (((ir_type == .struct_type or ir_type == .tuple or ir_type == .union_type) and ir_size > 8) or ir_is_compound_opt) {
+                is_large_struct = true;
+            }
+        }
 
         if (is_large_struct) {
             // Use value directly as src_addr — convertPtrLoadValue returns the
@@ -1751,7 +1767,10 @@ pub const SSABuilder = struct {
             const src_addr = value;
             const move_val = try self.func.newValue(.move, TypeRegistry.VOID, cur, self.cur_pos);
             move_val.addArg2(ptr_val, src_addr);
-            move_val.aux_int = @intCast(type_size);
+            // Use value's type_size when available, fall back to IR node's size for
+            // VOID-typed addresses (from convertFieldValue for struct fields).
+            const move_size = if (type_size > 0) type_size else self.type_registry.sizeOf(self.ir_func.nodes[p.value].type_idx);
+            move_val.aux_int = @intCast(move_size);
             try cur.addValue(self.allocator, move_val);
             return move_val;
         }

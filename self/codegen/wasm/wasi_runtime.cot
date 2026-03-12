@@ -207,66 +207,65 @@ fn addWasiHostImports(linker: *Linker) WasiImportIndices {
     }
 }
 
-fn addWasiImportsCore(linker: *Linker, imp: *WasiImportIndices, t: *StubTypes, ic: int, result: *WasiFunctions) void {
-    result.fd_write_idx = linker.addFunc(WasmFunc.init(FD_WRITE_NAME, t.type_4i64_i64, generateWasiFdWriteShim(imp.fd_write), false)) + ic
-    result.fd_write_simple_idx = linker.addFunc(WasmFunc.init(FD_WRITE_SIMPLE_NAME, t.type_3i64_i64, generateWasiWriteSimpleShim(imp.fd_write), false)) + ic
-    result.fd_read_simple_idx = linker.addFunc(WasmFunc.init(FD_READ_SIMPLE_NAME, t.type_3i64_i64, generateWasiReadSimpleShim(imp.fd_read), false)) + ic
-    result.fd_close_idx = linker.addFunc(WasmFunc.init(FD_CLOSE_NAME, t.type_1i64_i64, generateWasiFdCloseShim(imp.fd_close), false)) + ic
-    result.fd_seek_idx = linker.addFunc(WasmFunc.init(FD_SEEK_NAME, t.type_3i64_i64, generateWasiFdSeekShim(imp.fd_seek), false)) + ic
-    result.fd_open_idx = linker.addFunc(WasmFunc.init(FD_OPEN_NAME, t.type_3i64_i64, generateWasiPathOpenShim(imp.path_open), false)) + ic
-    result.time_idx = linker.addFunc(WasmFunc.init(TIME_NAME, t.type_void_i64, generateWasiTimeShim(imp.clock_time_get), false)) + ic
-    result.random_idx = linker.addFunc(WasmFunc.init(RANDOM_NAME, t.type_2i64_i64, generateWasiRandomShim(imp.random_get), false)) + ic
-    result.exit_idx = linker.addFunc(WasmFunc.init(EXIT_NAME, t.type_1i64_void, generateWasiExitShim(imp.proc_exit), false)) + ic
+fn addWasiImportsCore(linker: *Linker, imp: *WasiImportIndices, t: *StubTypes, result: *WasiFunctions) void {
+    result.fd_write_idx = linker.addFunc(WasmFunc.init(FD_WRITE_NAME, t.type_4i64_i64, generateWasiFdWriteShim(imp.fd_write), false))
+    result.fd_write_simple_idx = linker.addFunc(WasmFunc.init(FD_WRITE_SIMPLE_NAME, t.type_3i64_i64, generateWasiWriteSimpleShim(imp.fd_write), false))
+    result.fd_read_simple_idx = linker.addFunc(WasmFunc.init(FD_READ_SIMPLE_NAME, t.type_3i64_i64, generateWasiReadSimpleShim(imp.fd_read), false))
+    result.fd_close_idx = linker.addFunc(WasmFunc.init(FD_CLOSE_NAME, t.type_1i64_i64, generateWasiFdCloseShim(imp.fd_close), false))
+    result.fd_seek_idx = linker.addFunc(WasmFunc.init(FD_SEEK_NAME, t.type_3i64_i64, generateWasiFdSeekShim(imp.fd_seek), false))
+    result.fd_open_idx = linker.addFunc(WasmFunc.init(FD_OPEN_NAME, t.type_3i64_i64, generateWasiPathOpenShim(imp.path_open), false))
+    result.time_idx = linker.addFunc(WasmFunc.init(TIME_NAME, t.type_void_i64, generateWasiTimeShim(imp.clock_time_get), false))
+    result.random_idx = linker.addFunc(WasmFunc.init(RANDOM_NAME, t.type_2i64_i64, generateWasiRandomShim(imp.random_get), false))
+    result.exit_idx = linker.addFunc(WasmFunc.init(EXIT_NAME, t.type_1i64_void, generateWasiExitShim(imp.proc_exit), false))
 }
 
-fn addWasiImportsArgs(linker: *Linker, imp: *WasiImportIndices, t: *StubTypes, ic: int, result: *WasiFunctions) void {
-    result.args_count_idx = linker.addFunc(WasmFunc.init(ARGS_COUNT_NAME, t.type_void_i64, generateWasiArgsCountShim(imp.args_sizes_get), false)) + ic
-    result.arg_len_idx = linker.addFunc(WasmFunc.init(ARG_LEN_NAME, t.type_1i64_i64, generateWasiArgLenShim(imp.args_sizes_get, imp.args_get), false)) + ic
-    result.arg_ptr_idx = linker.addFunc(WasmFunc.init(ARG_PTR_NAME, t.type_1i64_i64, generateWasiArgPtrShim(imp.args_sizes_get, imp.args_get), false)) + ic
-    result.environ_count_idx = linker.addFunc(WasmFunc.init(ENVIRON_COUNT_NAME, t.type_void_i64, generateWasiEnvironCountShim(imp.environ_sizes_get), false)) + ic
-    result.environ_len_idx = linker.addFunc(WasmFunc.init(ENVIRON_LEN_NAME, t.type_1i64_i64, generateWasiEnvironLenShim(imp.environ_sizes_get, imp.environ_get), false)) + ic
-    result.environ_ptr_idx = linker.addFunc(WasmFunc.init(ENVIRON_PTR_NAME, t.type_1i64_i64, generateWasiEnvironPtrShim(imp.environ_sizes_get, imp.environ_get), false)) + ic
+fn addWasiImportsArgs(linker: *Linker, imp: *WasiImportIndices, t: *StubTypes, result: *WasiFunctions) void {
+    result.args_count_idx = linker.addFunc(WasmFunc.init(ARGS_COUNT_NAME, t.type_void_i64, generateWasiArgsCountShim(imp.args_sizes_get), false))
+    result.arg_len_idx = linker.addFunc(WasmFunc.init(ARG_LEN_NAME, t.type_1i64_i64, generateWasiArgLenShim(imp.args_sizes_get, imp.args_get), false))
+    result.arg_ptr_idx = linker.addFunc(WasmFunc.init(ARG_PTR_NAME, t.type_1i64_i64, generateWasiArgPtrShim(imp.args_sizes_get, imp.args_get), false))
+    result.environ_count_idx = linker.addFunc(WasmFunc.init(ENVIRON_COUNT_NAME, t.type_void_i64, generateWasiEnvironCountShim(imp.environ_sizes_get), false))
+    result.environ_len_idx = linker.addFunc(WasmFunc.init(ENVIRON_LEN_NAME, t.type_1i64_i64, generateWasiEnvironLenShim(imp.environ_sizes_get, imp.environ_get), false))
+    result.environ_ptr_idx = linker.addFunc(WasmFunc.init(ENVIRON_PTR_NAME, t.type_1i64_i64, generateWasiEnvironPtrShim(imp.environ_sizes_get, imp.environ_get), false))
 }
 
-fn addWasiImportsStubsNet(linker: *Linker, t: *StubTypes, ic: int, result: *WasiFunctions) void {
-    result.net_socket_idx = linker.addFunc(WasmFunc.init(NET_SOCKET_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.net_bind_idx = linker.addFunc(WasmFunc.init(NET_BIND_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.net_listen_idx = linker.addFunc(WasmFunc.init(NET_LISTEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.net_accept_idx = linker.addFunc(WasmFunc.init(NET_ACCEPT_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.net_connect_idx = linker.addFunc(WasmFunc.init(NET_CONNECT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.net_set_reuse_addr_idx = linker.addFunc(WasmFunc.init(NET_SET_REUSE_ADDR_NAME, t.type_1i64_i64, generateStubReturnsZero(), false)) + ic
+fn addWasiImportsStubsNet(linker: *Linker, t: *StubTypes, result: *WasiFunctions) void {
+    result.net_socket_idx = linker.addFunc(WasmFunc.init(NET_SOCKET_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.net_bind_idx = linker.addFunc(WasmFunc.init(NET_BIND_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.net_listen_idx = linker.addFunc(WasmFunc.init(NET_LISTEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false))
+    result.net_accept_idx = linker.addFunc(WasmFunc.init(NET_ACCEPT_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false))
+    result.net_connect_idx = linker.addFunc(WasmFunc.init(NET_CONNECT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.net_set_reuse_addr_idx = linker.addFunc(WasmFunc.init(NET_SET_REUSE_ADDR_NAME, t.type_1i64_i64, generateStubReturnsZero(), false))
 }
 
-fn addWasiImportsStubsEventLoop(linker: *Linker, t: *StubTypes, ic: int, result: *WasiFunctions) void {
-    result.kqueue_create_idx = linker.addFunc(WasmFunc.init(KQUEUE_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
-    result.kevent_add_idx = linker.addFunc(WasmFunc.init(KEVENT_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.kevent_del_idx = linker.addFunc(WasmFunc.init(KEVENT_DEL_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.kevent_wait_idx = linker.addFunc(WasmFunc.init(KEVENT_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.epoll_create_idx = linker.addFunc(WasmFunc.init(EPOLL_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
-    result.epoll_add_idx = linker.addFunc(WasmFunc.init(EPOLL_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.epoll_del_idx = linker.addFunc(WasmFunc.init(EPOLL_DEL_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.epoll_wait_idx = linker.addFunc(WasmFunc.init(EPOLL_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.set_nonblocking_idx = linker.addFunc(WasmFunc.init(SET_NONBLOCK_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false)) + ic
+fn addWasiImportsStubsEventLoop(linker: *Linker, t: *StubTypes, result: *WasiFunctions) void {
+    result.kqueue_create_idx = linker.addFunc(WasmFunc.init(KQUEUE_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false))
+    result.kevent_add_idx = linker.addFunc(WasmFunc.init(KEVENT_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.kevent_del_idx = linker.addFunc(WasmFunc.init(KEVENT_DEL_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.kevent_wait_idx = linker.addFunc(WasmFunc.init(KEVENT_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.epoll_create_idx = linker.addFunc(WasmFunc.init(EPOLL_CREATE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false))
+    result.epoll_add_idx = linker.addFunc(WasmFunc.init(EPOLL_ADD_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.epoll_del_idx = linker.addFunc(WasmFunc.init(EPOLL_DEL_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false))
+    result.epoll_wait_idx = linker.addFunc(WasmFunc.init(EPOLL_WAIT_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.set_nonblocking_idx = linker.addFunc(WasmFunc.init(SET_NONBLOCK_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false))
 }
 
-fn addWasiImportsStubsProcess(linker: *Linker, t: *StubTypes, ic: int, result: *WasiFunctions) void {
-    result.fork_idx = linker.addFunc(WasmFunc.init(FORK_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
-    result.execve_idx = linker.addFunc(WasmFunc.init(EXECVE_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.waitpid_idx = linker.addFunc(WasmFunc.init(WAITPID_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.pipe_idx = linker.addFunc(WasmFunc.init(PIPE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false)) + ic
-    result.dup2_idx = linker.addFunc(WasmFunc.init(DUP2_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.isatty_idx = linker.addFunc(WasmFunc.init(ISATTY_NAME, t.type_1i64_i64, generateStubReturnsZero(), false)) + ic
-    result.mkdir_idx = linker.addFunc(WasmFunc.init(MKDIR_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.dir_open_idx = linker.addFunc(WasmFunc.init(DIR_OPEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
-    result.dir_next_idx = linker.addFunc(WasmFunc.init(DIR_NEXT_NAME, t.type_3i64_i64, generateStubReturnsZero(), false)) + ic
-    result.dir_close_idx = linker.addFunc(WasmFunc.init(DIR_CLOSE_NAME, t.type_1i64_i64, generateStubReturnsZero(), false)) + ic
-    result.stat_type_idx = linker.addFunc(WasmFunc.init(STAT_TYPE_NAME, t.type_2i64_i64, generateStubReturnsZero(), false)) + ic
-    result.unlink_idx = linker.addFunc(WasmFunc.init(UNLINK_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false)) + ic
+fn addWasiImportsStubsProcess(linker: *Linker, t: *StubTypes, result: *WasiFunctions) void {
+    result.fork_idx = linker.addFunc(WasmFunc.init(FORK_NAME, t.type_void_i64, generateStubReturnsNegOne(), false))
+    result.execve_idx = linker.addFunc(WasmFunc.init(EXECVE_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.waitpid_idx = linker.addFunc(WasmFunc.init(WAITPID_NAME, t.type_1i64_i64, generateStubReturnsNegOne(), false))
+    result.pipe_idx = linker.addFunc(WasmFunc.init(PIPE_NAME, t.type_void_i64, generateStubReturnsNegOne(), false))
+    result.dup2_idx = linker.addFunc(WasmFunc.init(DUP2_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false))
+    result.isatty_idx = linker.addFunc(WasmFunc.init(ISATTY_NAME, t.type_1i64_i64, generateStubReturnsZero(), false))
+    result.mkdir_idx = linker.addFunc(WasmFunc.init(MKDIR_NAME, t.type_3i64_i64, generateStubReturnsNegOne(), false))
+    result.dir_open_idx = linker.addFunc(WasmFunc.init(DIR_OPEN_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false))
+    result.dir_next_idx = linker.addFunc(WasmFunc.init(DIR_NEXT_NAME, t.type_3i64_i64, generateStubReturnsZero(), false))
+    result.dir_close_idx = linker.addFunc(WasmFunc.init(DIR_CLOSE_NAME, t.type_1i64_i64, generateStubReturnsZero(), false))
+    result.stat_type_idx = linker.addFunc(WasmFunc.init(STAT_TYPE_NAME, t.type_2i64_i64, generateStubReturnsZero(), false))
+    result.unlink_idx = linker.addFunc(WasmFunc.init(UNLINK_NAME, t.type_2i64_i64, generateStubReturnsNegOne(), false))
 }
 
 fn addWasiImports(linker: *Linker) WasiFunctions {
     var imp = addWasiHostImports(linker)
-    const ic = linker.numImports()
     var t = makeStubTypes(linker)
 
     var result: WasiFunctions = WasiFunctions {
@@ -284,11 +283,11 @@ fn addWasiImports(linker: *Linker) WasiFunctions {
         isatty_idx: 0, mkdir_idx: 0, dir_open_idx: 0,
         dir_next_idx: 0, dir_close_idx: 0, stat_type_idx: 0, unlink_idx: 0,
     }
-    addWasiImportsCore(linker, &imp, &t, ic, &result)
-    addWasiImportsArgs(linker, &imp, &t, ic, &result)
-    addWasiImportsStubsNet(linker, &t, ic, &result)
-    addWasiImportsStubsEventLoop(linker, &t, ic, &result)
-    addWasiImportsStubsProcess(linker, &t, ic, &result)
+    addWasiImportsCore(linker, &imp, &t, &result)
+    addWasiImportsArgs(linker, &imp, &t, &result)
+    addWasiImportsStubsNet(linker, &t, &result)
+    addWasiImportsStubsEventLoop(linker, &t, &result)
+    addWasiImportsStubsProcess(linker, &t, &result)
     return result
 }
 

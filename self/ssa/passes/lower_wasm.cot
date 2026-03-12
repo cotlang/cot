@@ -223,6 +223,14 @@ fn isStoreFloatType(func: *SsaFunc, val_idx: int) bool {
     return false
 }
 
+/// Optimize tail calls by replacing call+return with return_call.
+/// DISABLED — causes SIGILL on native for many-param calls.
+/// Kept as stub for parity with lower_wasm.zig.
+fn optimizeTailCalls(func: *SsaFunc) void {
+    // TODO: fix native return_call translation before enabling
+    if (func.blocks.count > 0) {}  // suppress unused parameter warning
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

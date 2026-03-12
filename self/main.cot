@@ -50,7 +50,7 @@ fn main() void {
     }
 
     if (cmd == "version" or cmd == "--version") {
-        writeOut("cot 0.3.4 (self-hosted)\n")
+        println("cot 0.3.4 (self-hosted)")
         return
     }
 
@@ -62,7 +62,7 @@ fn main() void {
     }
 
     if (argsCount() < 3) {
-        writeErr("error: missing file argument\n")
+        eprintln("error: missing file argument")
         printUsage()
         exit(1)
     }
@@ -75,8 +75,15 @@ fn main() void {
         output_path = arg(4)
     }
 
+    // Compile pipeline commands (read file internally)
+    if (cmd == "build") { cmdBuildWithOutput(path, output_path); return }
+    if (cmd == "run") { cmdRun(path); return }
+    if (cmd == "test") { cmdTest(path); return }
+    if (cmd == "bench") { cmdBench(path); return }
+
+    // Diagnostic commands (need file content upfront)
     const content = readFile(path) catch {
-        writeErr("error: cannot read file: ${path}\n")
+        eprintln("error: cannot read file: ${path}")
         exit(1)
     }
 
@@ -84,12 +91,8 @@ fn main() void {
         "parse" => cmdParse(path, content),
         "check" => cmdCheck(path, content),
         "lex" => cmdLex(path, content),
-        "build" => cmdBuildWithOutput(path, output_path),
-        "run" => cmdRun(path),
-        "test" => cmdTest(path),
-        "bench" => cmdBench(path),
         else => {
-            writeErr("error: unknown command: ${cmd}\n")
+            eprintln("error: unknown command: ${cmd}")
             printUsage()
             exit(1)
         },
@@ -109,7 +112,7 @@ fn cmdParse(path: string, content: string) void {
         exit(1)
     }
 
-    writeOut("${path}: ok (${ast.file_decls.len()} declarations)\n")
+    println("${path}: ok (${ast.file_decls.len()} declarations)")
 }
 
 /// Type-check a file and all its imports.
@@ -142,7 +145,7 @@ fn cmdCheck(path: string, content: string) void {
         exit(1)
     }
 
-    writeOut("${path}: ok\n")
+    println("${path}: ok")
 }
 
 /// Build a .wasm binary from a Cot source file.
@@ -154,8 +157,31 @@ fn cmdBuildWithOutput(path: string, user_output: string) void {
         output_path = computeWasmOutputPath(path)
     }
 
-    // Multi-file parse + check + lower
-    const result = compileToIR(path)
+    const content = readFile(path) catch {
+        eprintln("error: cannot read file: ${path}")
+        exit(1)
+    }
+
+    // Parse
+    var types = TypeRegistry.init()
+    const project_safe = isProjectSafe(path)
+    var errs = ErrorReporter.initWithSource(path, content)
+    var s = Scanner.initWithErrors(content, &errs)
+    var ast = Ast.initHeap(path)
+    var p = Parser.init(s, ast, errs)
+    if (project_safe) { p.safe_mode = true }
+    p.parseFile()
+    ast.safe_mode = p.safe_mode
+    if (errs.hasErrors()) { exit(1) }
+
+    // Check
+    var check_errs = ErrorReporter.initWithSource(path, content)
+    var checker = Checker.init(ast, types, check_errs)
+    checker.checkFile()
+    if (check_errs.hasErrors()) { exit(1) }
+
+    // Lower (in separate function to keep Lowerer off this stack frame)
+    const result = lowerChecked(ast, &types, &check_errs, &checker)
 
     // Generate Wasm binary
     const opts = CompileOptions {
@@ -169,7 +195,7 @@ fn cmdBuildWithOutput(path: string, user_output: string) void {
     // Write .wasm file
     writeByteList(output_path, wasm_bytes)
 
-    writeErr("Success: ${output_path}\n")
+    eprintln("Success: ${output_path}")
 }
 
 /// Run a Cot source file: compile to /tmp, execute, forward exit code.
@@ -181,8 +207,13 @@ fn cmdRun(path: string) void {
     const stem = computeStem(path)
     const tmp_output = tmp_dir ++ "/" ++ stem ++ ".wasm"
 
+    const content = readFile(path) catch {
+        eprintln("error: cannot read file: ${path}")
+        exit(1)
+    }
+
     // Compile to IR and generate Wasm
-    const result = compileToIR(path)
+    const result = compileToIR(path, content)
     const opts = CompileOptions {
         is_wasi: true,
         test_mode: false,
@@ -212,8 +243,13 @@ fn cmdTest(path: string) void {
     const stem = computeStem(path)
     const tmp_output = tmp_dir ++ "/" ++ stem ++ ".wasm"
 
+    const content = readFile(path) catch {
+        eprintln("error: cannot read file: ${path}")
+        exit(1)
+    }
+
     // Compile to IR with test mode
-    const result = compileToIR(path)
+    const result = compileToIR(path, content)
     const opts = CompileOptions {
         is_wasi: true,
         test_mode: true,
@@ -243,8 +279,13 @@ fn cmdBench(path: string) void {
     const stem = computeStem(path)
     const tmp_output = tmp_dir ++ "/" ++ stem ++ ".wasm"
 
+    const content = readFile(path) catch {
+        eprintln("error: cannot read file: ${path}")
+        exit(1)
+    }
+
     // Compile to IR with bench mode
-    const result = compileToIR(path)
+    const result = compileToIR(path, content)
     const opts = CompileOptions {
         is_wasi: true,
         test_mode: false,
@@ -288,7 +329,7 @@ fn cmdInit(project_name: string) void {
     const manifest_path = base_dir ++ "/cot.json"
     const manifest = "{\n    \"name\": \"${display_name}\",\n    \"version\": \"0.1.0\",\n    \"main\": \"src/main.cot\",\n    \"safe\": true\n}\n"
     writeFile(manifest_path, manifest) catch {
-        writeErr("error: failed to write cot.json\n")
+        eprintln("error: failed to write cot.json")
         exit(1)
     }
 
@@ -296,7 +337,7 @@ fn cmdInit(project_name: string) void {
     const main_path = base_dir ++ "/src/main.cot"
     const main_content = "fn main() i64 {\n    println(\"Hello, world!\")\n    return 0\n}\n"
     writeFile(main_path, main_content) catch {
-        writeErr("error: failed to write src/main.cot\n")
+        eprintln("error: failed to write src/main.cot")
         exit(1)
     }
 
@@ -304,14 +345,14 @@ fn cmdInit(project_name: string) void {
     const gitignore_path = base_dir ++ "/.gitignore"
     const gitignore = "# Build output\n*.wasm\n*.o\ncot-out/\n\n# Editor\n.vscode/\n.idea/\n"
     writeFile(gitignore_path, gitignore) catch {
-        writeErr("error: failed to write .gitignore\n")
+        eprintln("error: failed to write .gitignore")
         exit(1)
     }
 
     if (@lenOf(project_name) > 0) {
-        writeErr("Created project '${project_name}'\n")
+        eprintln("Created project '${project_name}'")
     } else {
-        writeErr("Initialized project in current directory\n")
+        eprintln("Initialized project in current directory")
     }
 }
 
@@ -340,31 +381,78 @@ struct CompileResult {
 }
 
 /// Compile a source file to IR (parse + check + lower across all imports).
-fn compileToIR(path: string) CompileResult {
-    var seen: Map(string, int) = .{}
-    var in_progress: Map(string, int) = .{}
-
+fn compileToIR(path: string, content: string) CompileResult {
     var types = TypeRegistry.init()
-    var shared = SharedCheckerState.init()
     const project_safe = isProjectSafe(path)
 
-    // Recursive parse + check
-    const file_data = compileFileRecursive(path, &shared, &types, &seen, &in_progress, project_safe)
+    // Parse
+    var errs = ErrorReporter.initWithSource(path, content)
+    var s = Scanner.initWithErrors(content, &errs)
+    var ast = Ast.initHeap(path)
+    var p = Parser.init(s, ast, errs)
+    if (project_safe) { p.safe_mode = true }
+    p.parseFile()
+    ast.safe_mode = p.safe_mode
 
-    // Lower checked AST to IR
+    if (errs.hasErrors()) { exit(1) }
+
+    // Check imports recursively first
+    var imports = ast.getImports()
+    if (imports.count > 0) {
+        return compileWithImports(path, content, ast, &types, &imports, project_safe)
+    }
+
+    // Single-file: check and lower directly (no shared state)
+    return compileSingleFile(path, content, ast, &types)
+}
+
+/// Compile a file that has imports — check imports first, then check+lower top-level.
+/// Separated to avoid stack overflow from large Lowerer struct.
+fn compileWithImports(path: string, content: string, ast: *Ast, types: *TypeRegistry, imports: *List(string), project_safe: bool) CompileResult {
+    var seen: Map(string, int) = .{}
+    var in_progress: Map(string, int) = .{}
+    var shared = SharedCheckerState.init()
+    const source_dir = dirname(path)
+    for i in 0..imports.count {
+        const resolved = resolveImportPath(imports.get(i), source_dir)
+        checkFileRecursive(resolved, &shared, types, &seen, &in_progress, project_safe)
+    }
+
+    // Check top-level file with shared state from imports
+    var check_errs = ErrorReporter.initWithSource(path, content)
+    var checker = Checker.initShared(ast, types, check_errs, shared.global_map)
+    checker.loadSharedState(&shared)
+    checker.checkFile()
+    if (check_errs.hasErrors()) { exit(1) }
+
+    return lowerChecked(ast, types, &check_errs, &checker)
+}
+
+/// Compile a single-file program (no imports).
+/// Separated to avoid stack overflow from large Lowerer struct.
+fn compileSingleFile(path: string, content: string, ast: *Ast, types: *TypeRegistry) CompileResult {
+    var check_errs = ErrorReporter.initWithSource(path, content)
+    var checker = Checker.init(ast, types, check_errs)
+    checker.checkFile()
+    if (check_errs.hasErrors()) { exit(1) }
+
+    return lowerChecked(ast, types, &check_errs, &checker)
+}
+
+/// Lower a checked AST to IR. Separated into own function to keep Lowerer
+/// off the caller's stack frame (avoids stack overflow).
+fn lowerChecked(ast: *Ast, types: *TypeRegistry, errs: *ErrorReporter, checker: *Checker) CompileResult {
     var lower_inst: Lowerer = undefined
-    lower_inst.tree = file_data.ast
-    lower_inst.types = &types
-    lower_inst.err = file_data.errs
-    lower_inst.chk = file_data.chk
+    lower_inst.tree = ast
+    lower_inst.types = types
+    lower_inst.err = errs
+    lower_inst.chk = checker
     lower_inst.module_name = ""
     initLowererScalars(&lower_inst)
     initLowererLists(&lower_inst)
     initLowererMaps(&lower_inst)
-
     const ir = lower_inst.lower()
-
-    return CompileResult { ir: ir, types: &types }
+    return CompileResult { ir: ir, types: types }
 }
 
 /// Result of recursive file compilation (AST + checker state for lowering).
@@ -382,7 +470,7 @@ fn compileFileRecursive(file_path: string, shared: *SharedCheckerState, types: *
     // Re-parse and re-check the top-level file to get the AST+Checker for lowering.
     // (checkFileRecursive already validated correctness — this pass produces the objects.)
     const content = readFile(file_path) catch {
-        writeErr("error: cannot read file: ${file_path}\n")
+        eprintln("error: cannot read file: ${file_path}")
         exit(1)
     }
 
@@ -415,7 +503,7 @@ fn computeWasmOutputPath(path: string) string {
 fn writeByteList(path: string, bytes: List(int)) void {
     const fd = fd_open(@ptrOf(path), @lenOf(path), 577)  // O_WRONLY | O_CREAT | O_TRUNC
     if (fd < 0) {
-        writeErr("error: cannot open file for writing: ${path}\n")
+        eprintln("error: cannot open file for writing: ${path}")
         exit(1)
     }
     // Write bytes in chunks — convert to a temp buffer
@@ -449,7 +537,7 @@ fn cmdCheckMultiFile(path: string) void {
 
     checkFileRecursive(path, &shared, &types, &seen, &in_progress, project_safe)
 
-    writeOut("${path}: ok\n")
+    println("${path}: ok")
 }
 
 /// Recursively parse and type-check a file and all its imports.
@@ -457,7 +545,7 @@ fn cmdCheckMultiFile(path: string) void {
 fn checkFileRecursive(file_path: string, shared: *SharedCheckerState, types: *TypeRegistry, seen: *Map(string, int), in_progress: *Map(string, int), project_safe: bool) void {
     // Circular import detection (must check BEFORE seen)
     if (in_progress.getOrDefault(file_path, 0) == 1) {
-        println("error: circular import detected: ${file_path}")
+        eprintln("error: circular import detected: ${file_path}")
         exit(1)
     }
 
@@ -469,7 +557,7 @@ fn checkFileRecursive(file_path: string, shared: *SharedCheckerState, types: *Ty
     in_progress.set(file_path, 1)
 
     const content = readFile(file_path) catch {
-        println("error: cannot read file: ${file_path}")
+        eprintln("error: cannot read file: ${file_path}")
         exit(1)
     }
 
@@ -568,40 +656,30 @@ fn cmdLex(path: string, content: string) void {
         const tok = @enumFromInt(Token, t.tok)
         const name = tok.toString()
         if (@lenOf(t.text) > 0) {
-            writeOut("${name} \"${t.text}\"\n")
+            println("${name} \"${t.text}\"")
         } else {
-            writeOut("${name}\n")
+            println(name)
         }
         if (tok == Token.eof) { break }
     }
 }
 
 fn printUsage() void {
-    writeErr("Cot 0.3 (self-hosted)\n")
-    writeErr("\n")
-    writeErr("Usage: cot <command> <file.cot>\n")
-    writeErr("\n")
-    writeErr("Commands:\n")
-    writeErr("  build <file>    Compile to .wasm binary [-o name]\n")
-    writeErr("  run <file>      Compile and run (via wasmtime)\n")
-    writeErr("  test <file>     Compile and run tests (via wasmtime)\n")
-    writeErr("  bench <file>    Compile and run benchmarks (via wasmtime)\n")
-    writeErr("  parse <file>    Parse and report syntax errors\n")
-    writeErr("  check <file>    Type-check and report errors\n")
-    writeErr("  init [name]     Create a new project\n")
-    writeErr("  lex <file>      Tokenize and print tokens\n")
-    writeErr("  version         Print version\n")
-    writeErr("  help            Print this help\n")
-}
-
-/// Write to stdout.
-fn writeOut(msg: string) void {
-    fd_write(1, @ptrOf(msg), @lenOf(msg))
-}
-
-/// Write to stderr.
-fn writeErr(msg: string) void {
-    fd_write(2, @ptrOf(msg), @lenOf(msg))
+    eprintln("Cot 0.3 (self-hosted)")
+    eprintln("")
+    eprintln("Usage: cot <command> <file.cot>")
+    eprintln("")
+    eprintln("Commands:")
+    eprintln("  build <file>    Compile to .wasm binary [-o name]")
+    eprintln("  run <file>      Compile and run (via wasmtime)")
+    eprintln("  test <file>     Compile and run tests (via wasmtime)")
+    eprintln("  bench <file>    Compile and run benchmarks (via wasmtime)")
+    eprintln("  parse <file>    Parse and report syntax errors")
+    eprintln("  check <file>    Type-check and report errors")
+    eprintln("  init [name]     Create a new project")
+    eprintln("  lex <file>      Tokenize and print tokens")
+    eprintln("  version         Print version")
+    eprintln("  help            Print this help")
 }
 
 // ============================================================================
@@ -636,7 +714,9 @@ test "ir builder integration" {
     @assertEq(f.blocks.count, 1)
     @assertEq(f.entry, 0)
     // All 13 Func fields accessible (type dedup + scope resolution fixed this)
-    @assertEq(f.nodes.count, 0)
+    // With pointer-based Builder.func(), mutations propagate correctly:
+    // emitConstInt + emitRet = 2 nodes
+    @assertEq(f.nodes.count, 2)
     @assertEq(f.span.start, 0)
     @assertEq(f.span.end, 0)
     @assertEq(f.string_literals.count, 0)

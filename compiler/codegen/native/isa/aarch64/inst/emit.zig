@@ -406,28 +406,36 @@ fn finalizeOffset(off: i64, basereg: Reg, result: *MemFinalizeResult) AMode {
     const tmp = spilltmpReg();
     const tmp_wr = Writable(Reg).fromReg(tmp);
 
-    // Generate MOVZ/MOVK sequence to load the offset
-    // For now, handle 16-bit positive offsets with MOVZ
-    if (off >= 0 and off <= 0xFFFF) {
-        const imm = MoveWideConst.maybeFromU64(@intCast(off)).?;
-        result.pre_insts[0] = Inst{ .mov_wide = .{
-            .op = .movz,
-            .rd = tmp_wr,
-            .imm = imm,
-            .size = .size64,
-        } };
-        result.pre_inst_count = 1;
-    } else {
-        // For larger offsets, we'd need MOVZ + MOVK sequence
-        // For now, just use MOVZ with truncated value (TODO: fix for large frames)
-        const imm = MoveWideConst.maybeFromU64(@intCast(off & 0xFFFF)).?;
-        result.pre_insts[0] = Inst{ .mov_wide = .{
-            .op = .movz,
-            .rd = tmp_wr,
-            .imm = imm,
-            .size = .size64,
-        } };
-        result.pre_inst_count = 1;
+    // Generate MOVZ/MOVK sequence to load the offset into spilltmp.
+    // Port of Cranelift's large-offset path (emit.rs:3316-3395).
+    // Same pattern as emitLoadAddr() below.
+    const abs_off: u64 = if (off >= 0) @intCast(off) else @intCast(-off);
+    var remaining = abs_off;
+    var first = true;
+    var shift: u8 = 0;
+    while (remaining != 0 or first) : (shift += 16) {
+        const hw: u16 = @truncate(remaining);
+        remaining >>= 16;
+        if (hw != 0 or first) {
+            if (first) {
+                result.pre_insts[result.pre_inst_count] = Inst{ .mov_wide = .{
+                    .op = .movz,
+                    .rd = tmp_wr,
+                    .imm = MoveWideConst{ .bits_val = hw, .shift = shift / 16 },
+                    .size = .size64,
+                } };
+                first = false;
+            } else {
+                result.pre_insts[result.pre_inst_count] = Inst{ .movk = .{
+                    .rd = tmp_wr,
+                    .rn = tmp,
+                    .imm = MoveWideConst{ .bits_val = hw, .shift = shift / 16 },
+                    .size = .size64,
+                } };
+            }
+            result.pre_inst_count += 1;
+        }
+        if (shift >= 48) break;
     }
 
     return AMode{ .reg_extended = .{

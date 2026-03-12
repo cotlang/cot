@@ -46,12 +46,38 @@ struct LoopContext {
     label: string,
 }
 
+struct LabeledBlockCtx {
+    label: string,
+    exit_block: int,
+    result_local: int,
+    result_type: int,
+    cleanup_depth: int,
+}
+
 /// Captured variable info for closures.
 struct CaptureInfo {
     name: string,
     local_idx: int,
     type_idx: int,
 }
+
+/// Dict entry: a type-dependent operation (binary op or method call) in a generic body.
+/// Copied from lower.zig:474-482
+const DICT_BINARY_OP: int = 0
+const DICT_METHOD_CALL: int = 1
+
+struct DictEntry {
+    kind: int,               // DICT_BINARY_OP or DICT_METHOD_CALL
+    op: int,                 // BinaryOp enum value (for binary_op)
+    method_name: string,     // method name (for method_call)
+    type_param_idx: int,     // which type param this entry applies to
+}
+
+/// Stencil analysis results (3-tier).
+/// Copied from lower.zig:488-496
+const STENCIL_SHAPE_ONLY: int = 0      // Tier 1: no type-dependent ops (alias only)
+const STENCIL_DICT: int = 1            // Tier 2: binary ops/method calls (share body + fn-ptr args)
+const STENCIL_NOT_STENCILABLE: int = 2 // Tier 3: closures, async, switch on T (full mono)
 
 /// Global init entry for __cot_init_globals.
 struct GlobalInit {
@@ -60,6 +86,26 @@ struct GlobalInit {
     type_idx: int,
     name: string,
     span: Span,
+}
+
+/// Map IR BinaryOp to dict helper name suffix.
+/// Copied from lower.zig:8375-8390
+fn dictOpName(op: int) string {
+    const bop = @enumFromInt(op) as BinaryOp
+    return switch (bop) {
+        BinaryOp.eq => "eq",
+        BinaryOp.ne => "ne",
+        BinaryOp.lt => "lt",
+        BinaryOp.gt => "gt",
+        BinaryOp.le => "le",
+        BinaryOp.ge => "ge",
+        BinaryOp.add => "add",
+        BinaryOp.sub => "sub",
+        BinaryOp.mul => "mul",
+        BinaryOp.div => "div",
+        BinaryOp.mod => "mod",
+        else => "unknown",
+    }
 }
 
 // ============================================================================
@@ -81,6 +127,7 @@ struct Lowerer {
     next_error_idx: int,
     release_mode: bool,
     loop_stack: List(LoopContext),
+    labeled_block_stack: List(LabeledBlockCtx),
     cleanup_stack: List(CleanupEntry),
     const_values: Map(string, int),
     float_const_values: Map(string, int),
@@ -99,6 +146,10 @@ struct Lowerer {
     module_name: string,
     tree_module_map: Map(int, string),
     spawn_counter: int,
+    // Shape stenciling state
+    shape_stencils: Map(string, string),      // shape_key → first stencil name
+    shape_aliases: Map(string, string),       // concrete_name → stencil name (alias)
+    generated_dict_helpers: Map(string, int), // dedup: helper_name → 1
     builder: Builder,
 
     fn setTestMode(enabled: bool) void {
@@ -463,6 +514,12 @@ struct Lowerer {
         if (fn_decl.is_extern) { return }
         if (fn_decl.type_params.count > 0) { return }  // Generic — lowered on demand
         if ((self.test_mode or self.bench_mode) and fn_decl.name == "main") { return }
+
+        // Async functions get special lowering (native fiber pattern)
+        if (fn_decl.is_async) {
+            self.lowerAsyncFiber(fn_decl)
+            return
+        }
 
         const return_type = if (fn_decl.return_type != null_node) {
             self.resolveTypeNode(fn_decl.return_type)
@@ -867,7 +924,7 @@ struct Lowerer {
                 return false
             },
             Stmt.break_stmt |bs| => {
-                self.lowerBreak(bs.label)
+                self.lowerBreak(bs.label, bs.value)
                 return true
             },
             Stmt.continue_stmt |cs| => {
@@ -1885,8 +1942,30 @@ struct Lowerer {
         fb.setBlock(exit_block)
     }
 
-    fn lowerBreak(label: string) void {
+    fn lowerBreak(label: string, value: int) void {
         if (self.builder.func()) |fb| {
+            // Check labeled block stack first (break :label value)
+            if (label != "") {
+                var bi = self.labeled_block_stack.count - 1
+                while (bi >= 0) {
+                    const blk_ctx = self.labeled_block_stack.get(bi)
+                    if (blk_ctx.label == label) {
+                        // Store value to result local, then jump to exit block
+                        if (value != null_node) {
+                            const val = self.lowerExprNode(value)
+                            if (val != null_node) {
+                                fb.emitStoreLocal(blk_ctx.result_local, val, Span.zero())
+                            }
+                        }
+                        self.emitCleanupsNoPop(blk_ctx.cleanup_depth)
+                        fb.emitJump(blk_ctx.exit_block, Span.zero())
+                        return
+                    }
+                    bi = bi - 1
+                }
+            }
+
+            // Fall through to loop break handling
             if (self.loop_stack.count == 0) { return }
             // Find matching loop context
             var i = self.loop_stack.count - 1
@@ -2009,12 +2088,16 @@ struct Lowerer {
                 Expr.string_interp |si| => { return self.lowerStringInterp(fb, si, idx) },
                 Expr.try_expr |te| => { return self.lowerTryExpr(fb, te, idx) },
                 Expr.catch_expr |ce| => { return self.lowerCatchExpr(fb, ce, idx) },
+                Expr.orelse_expr |oe| => { return self.lowerOrElseExpr(fb, oe, idx) },
                 Expr.error_literal |el| => { return self.lowerErrorLiteral(fb, el, idx) },
                 Expr.builtin_call |bc| => { return self.lowerBuiltinCall(fb, bc, idx) },
                 Expr.switch_expr |se| => { return self.lowerSwitchExpr(fb, se, idx) },
                 Expr.new_expr |ne| => { return self.lowerNewExpr(fb, ne, idx) },
                 Expr.tuple_literal |tl| => { return self.lowerTupleLiteral(fb, tl, idx) },
                 Expr.closure_expr |ce| => { return self.lowerClosureExpr(fb, ce) },
+                Expr.spawn_expr |se| => { return self.lowerSpawnExpr(fb, se) },
+                Expr.select_expr |se| => { return self.lowerSelectExpr(fb, se) },
+                Expr.await_expr |ae| => { return self.lowerAwaitExpr(fb, ae, idx) },
                 else => {
                     return null_node
                 },
@@ -5240,7 +5323,7 @@ struct Lowerer {
         self.closure_counter = self.closure_counter + 1
 
         // Save parent function builder state
-        const saved_builder_func = self.builder.current_func
+        const saved_builder_func = self.builder.current_func_ptr
 
         // Create closure body function
         var return_type = VOID
@@ -5288,7 +5371,7 @@ struct Lowerer {
         self.builder.endFunc()
 
         // Restore parent function builder
-        self.builder.current_func = saved_builder_func
+        self.builder.current_func_ptr = saved_builder_func
 
         // Now in parent function: allocate closure struct [table_idx][cap0][cap1]...
         const num_captures = captures.count
@@ -5373,6 +5456,24 @@ struct Lowerer {
                     }
                     if (b.result_expr != null_node) { self.detectCaptures(b.result_expr, parent_fb, captures) }
                 },
+                Expr.spawn_expr |se| => { self.detectCaptures(se.body, parent_fb, captures) },
+                Expr.select_expr |se| => {
+                    for i in 0..se.cases.count {
+                        const sc = self.tree.getSelectCase(se.cases.get(i))
+                        self.detectCaptures(sc.channel, parent_fb, captures)
+                        if (sc.send_value != null_node) { self.detectCaptures(sc.send_value, parent_fb, captures) }
+                        self.detectCaptures(sc.body, parent_fb, captures)
+                    }
+                    if (se.default_body != null_node) { self.detectCaptures(se.default_body, parent_fb, captures) }
+                },
+                Expr.catch_expr |ce| => {
+                    self.detectCaptures(ce.operand, parent_fb, captures)
+                    if (ce.fallback != null_node) { self.detectCaptures(ce.fallback, parent_fb, captures) }
+                },
+                Expr.orelse_expr |oe| => {
+                    self.detectCaptures(oe.operand, parent_fb, captures)
+                    if (oe.fallback != null_node) { self.detectCaptures(oe.fallback, parent_fb, captures) }
+                },
                 else => {},
             },
             Node.stmt |stmt| => switch (stmt) {
@@ -5408,6 +5509,931 @@ struct Lowerer {
                 else => {},
             },
             else => {},
+        }
+    }
+
+    // ========================================================================
+    // Spawn / Select
+    // ========================================================================
+
+    /// Lower spawn { body } — fire-and-forget concurrent dispatch.
+    /// Copied from lower.zig:6002-6106
+    fn lowerSpawnExpr(fb: *FuncBuilder, se: SpawnExpr) int {
+        // Detect captured variables from parent scope
+        var captures: List(CaptureInfo) = .{}
+        self.detectCaptures(se.body, fb, captures)
+
+        // Generate unique name
+        const spawn_bare = "__spawn_" ++ intToString(self.spawn_counter)
+        self.spawn_counter = self.spawn_counter + 1
+        const spawn_name = self.qualifyName(spawn_bare)
+
+        // Save parent function builder state
+        const saved_builder_func = self.builder.current_func_ptr
+
+        // Create spawn body function: (env_ptr: i64) -> void
+        self.builder.startFunc(spawn_name, VOID, VOID, se.span)
+        if (self.builder.func()) |spawn_fb| {
+            self.clearPerFunctionState()
+
+            // Add env_ptr parameter
+            const env_param_idx = spawn_fb.addParam("__env_ptr", I64, 8)
+
+            // Load captures from env_ptr
+            if (captures.count > 0) {
+                const env_ptr = spawn_fb.emitLoadLocal(env_param_idx, I64, se.span)
+                for i in 0..captures.count {
+                    const cap = captures.get(i)
+                    const offset = i * 8
+                    const cap_addr = spawn_fb.emitAddrOffset(env_ptr, offset, I64, se.span)
+                    const cap_val = spawn_fb.emitPtrLoadValue(cap_addr, cap.type_idx, se.span)
+                    const local_idx = spawn_fb.addLocalWithSize(cap.name, cap.type_idx, true, 8)
+                    spawn_fb.emitStoreLocal(local_idx, cap_val, se.span)
+                }
+            }
+
+            // Lower body block
+            if (se.body != null_node) {
+                self.lowerBlockNode(se.body)
+                if (spawn_fb.needsTerminator()) {
+                    self.emitCleanups(0)
+                    spawn_fb.emitRet(null_node, se.span)
+                }
+            }
+        }
+        self.builder.endFunc()
+
+        // Restore parent function builder
+        self.builder.current_func_ptr = saved_builder_func
+
+        // In parent function: allocate env struct and fill captures, then call sched_spawn
+        if (captures.count > 0) {
+            // Allocate env struct
+            const metadata_node = fb.emitConstInt(0, I64, se.span)
+            const size_node = fb.emitConstInt(captures.count * 8, I64, se.span)
+            var alloc_args: List(int) = .{}
+            alloc_args.append(metadata_node)
+            alloc_args.append(size_node)
+            const alloc_result = fb.emitCall("alloc", alloc_args, false, I64, se.span)
+
+            const temp_name = "__spawn_env_" ++ intToString(self.temp_counter)
+            self.temp_counter = self.temp_counter + 1
+            const temp_idx = fb.addLocalWithSize(temp_name, I64, true, 8)
+            fb.emitStoreLocal(temp_idx, alloc_result, se.span)
+
+            // Fill captures
+            for i in 0..captures.count {
+                const cap = captures.get(i)
+                const offset = i * 8
+                const reload_ptr = fb.emitLoadLocal(temp_idx, I64, se.span)
+                const cap_addr = fb.emitAddrOffset(reload_ptr, offset, I64, se.span)
+                const cap_val = fb.emitLoadLocal(cap.local_idx, cap.type_idx, se.span)
+                fb.emitPtrStoreValue(cap_addr, cap_val, se.span)
+            }
+
+            // Get func addr and env ptr, call sched_spawn
+            const fn_ptr = fb.emitFuncAddr(spawn_name, I64, se.span)
+            const env_ptr = fb.emitLoadLocal(temp_idx, I64, se.span)
+            var spawn_args: List(int) = .{}
+            spawn_args.append(fn_ptr)
+            spawn_args.append(env_ptr)
+            fb.emitCall("sched_spawn", spawn_args, false, VOID, se.span)
+        } else {
+            // No captures: env_ptr = 0 (null)
+            const fn_ptr = fb.emitFuncAddr(spawn_name, I64, se.span)
+            const env_null = fb.emitConstInt(0, I64, se.span)
+            var spawn_args: List(int) = .{}
+            spawn_args.append(fn_ptr)
+            spawn_args.append(env_null)
+            fb.emitCall("sched_spawn", spawn_args, false, VOID, se.span)
+        }
+
+        return null_node
+    }
+
+    /// Lower select expression: Go-style channel select.
+    /// Copied from lower.zig:6112-6130
+    fn lowerSelectExpr(fb: *FuncBuilder, se: SelectExpr) int {
+        if (se.cases.count == 0) {
+            // Empty select with just default
+            if (se.default_body != null_node) {
+                return self.lowerExprNode(se.default_body)
+            }
+            return null_node
+        }
+
+        // Simple path: 1 case + default
+        if (se.cases.count == 1 and se.default_body != null_node) {
+            const sc = self.tree.getSelectCase(se.cases.get(0))
+            return self.lowerSelectSimple(fb, sc, se.default_body, se.span)
+        }
+
+        // General N-case path
+        return self.lowerSelectGeneral(fb, se)
+    }
+
+    /// Lower simple select: 1 channel case + default → tryRecv/trySend + branch
+    /// Copied from lower.zig:6133-6274
+    fn lowerSelectSimple(fb: *FuncBuilder, sc: SelectCase, default_body: int, span: Span) int {
+        if (sc.kind == SELECT_RECV) {
+            // tmp = ch.tryRecv(); if (tmp != null) { body } else { default }
+            const ch = self.lowerExprNode(sc.channel)
+            if (ch == null_node) { return null_node }
+
+            // For recv, call tryRecv as method on channel
+            // Simplified: emit as direct call with channel as arg
+            var args: List(int) = .{}
+            args.append(ch)
+            const opt_type = self.types.makeOptional(I64)
+            const result = fb.emitCall("tryRecv", args, false, opt_type, span)
+
+            const temp_name = "__select_recv_" ++ intToString(self.temp_counter)
+            self.temp_counter = self.temp_counter + 1
+            const opt_size = self.types.sizeOf(opt_type)
+            const temp_local = fb.addLocalWithSize(temp_name, opt_type, false, opt_size)
+            fb.emitStoreLocal(temp_local, result, span)
+
+            // Check if non-null: compound optional tag at field 0
+            const is_compound = !self.isPtrLikeOptional(opt_type)
+            var is_non_null = null_node
+            if (is_compound) {
+                const tag = fb.emitFieldLocal(temp_local, 0, 0, I64, span)
+                const zero = fb.emitConstInt(0, I64, span)
+                is_non_null = fb.emitBinary(BinaryOp.ne, tag, zero, BOOL, span)
+            } else {
+                const recv_val = fb.emitLoadLocal(temp_local, opt_type, span)
+                const null_val = fb.emitConstNull(UNTYPED_NULL, span)
+                is_non_null = fb.emitBinary(BinaryOp.ne, recv_val, null_val, BOOL, span)
+            }
+
+            const then_block = fb.newBlock("select.recv")
+            const else_block = fb.newBlock("select.default")
+            const merge_block = fb.newBlock("select.end")
+            fb.emitBranch(is_non_null, then_block, else_block, span)
+
+            // Then block: bind capture, execute body
+            fb.setBlock(then_block)
+            if (sc.capture.len > 0) {
+                var unwrapped = null_node
+                if (is_compound) {
+                    unwrapped = fb.emitFieldLocal(temp_local, 1, 8, I64, span)
+                } else {
+                    const loaded = fb.emitLoadLocal(temp_local, opt_type, span)
+                    unwrapped = fb.emitUnary(UnaryOp.optional_unwrap, loaded, I64, span)
+                }
+                const capture_local = fb.addLocalWithSize(sc.capture, I64, false, 8)
+                fb.emitStoreLocal(capture_local, unwrapped, span)
+            }
+            self.lowerExprNode(sc.body)
+            if (fb.needsTerminator()) { fb.emitJump(merge_block, span) }
+
+            // Else block: default body
+            fb.setBlock(else_block)
+            self.lowerExprNode(default_body)
+            if (fb.needsTerminator()) { fb.emitJump(merge_block, span) }
+
+            fb.setBlock(merge_block)
+            return null_node
+        } else {
+            // Send case: lower the full ch.trySend(val) call
+            const send_result = self.lowerExprNode(sc.channel)
+            if (send_result == null_node) { return null_node }
+
+            const then_block = fb.newBlock("select.send")
+            const else_block = fb.newBlock("select.default")
+            const merge_block = fb.newBlock("select.end")
+            fb.emitBranch(send_result, then_block, else_block, span)
+
+            fb.setBlock(then_block)
+            self.lowerExprNode(sc.body)
+            if (fb.needsTerminator()) { fb.emitJump(merge_block, span) }
+
+            fb.setBlock(else_block)
+            self.lowerExprNode(default_body)
+            if (fb.needsTerminator()) { fb.emitJump(merge_block, span) }
+
+            fb.setBlock(merge_block)
+            return null_node
+        }
+    }
+
+    /// Lower general N-case select: builds cases array, calls sched_select runtime.
+    /// Copied from lower.zig:6277-6397
+    fn lowerSelectGeneral(fb: *FuncBuilder, se: SelectExpr) int {
+        const num_cases = se.cases.count
+
+        // Allocate cases array: each entry 24 bytes (channel_ptr, kind, value_ptr)
+        const cases_size = num_cases * 24
+        const meta_node = fb.emitConstInt(0, I64, se.span)
+        const size_node = fb.emitConstInt(cases_size, I64, se.span)
+        var alloc_args: List(int) = .{}
+        alloc_args.append(meta_node)
+        alloc_args.append(size_node)
+        const cases_ptr = fb.emitCall("alloc", alloc_args, false, I64, se.span)
+
+        const cases_temp = "__select_cases_" ++ intToString(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const cases_local = fb.addLocalWithSize(cases_temp, I64, true, 8)
+        fb.emitStoreLocal(cases_local, cases_ptr, se.span)
+
+        // Fill cases array
+        for i in 0..num_cases {
+            const sc = self.tree.getSelectCase(se.cases.get(i))
+            const base_offset = i * 24
+            const cases_reload = fb.emitLoadLocal(cases_local, I64, se.span)
+
+            // Offset 0: channel pointer
+            const ch = self.lowerExprNode(sc.channel)
+            const ch_addr = fb.emitAddrOffset(cases_reload, base_offset, I64, se.span)
+            fb.emitPtrStoreValue(ch_addr, ch, se.span)
+
+            // Offset 8: kind (0=recv, 1=send)
+            const kind_val = if (sc.kind == SELECT_RECV) { 0 } else { 1 }
+            const kind_node = fb.emitConstInt(kind_val, I64, se.span)
+            const kind_addr = fb.emitAddrOffset(cases_reload, base_offset + 8, I64, se.span)
+            fb.emitPtrStoreValue(kind_addr, kind_node, se.span)
+
+            // Offset 16: value_ptr (for send) or 0 (for recv)
+            if (sc.kind == SELECT_SEND and sc.send_value != null_node) {
+                const send_val = self.lowerExprNode(sc.send_value)
+                const val_addr = fb.emitAddrOffset(cases_reload, base_offset + 16, I64, se.span)
+                fb.emitPtrStoreValue(val_addr, send_val, se.span)
+            } else {
+                const zero = fb.emitConstInt(0, I64, se.span)
+                const val_addr = fb.emitAddrOffset(cases_reload, base_offset + 16, I64, se.span)
+                fb.emitPtrStoreValue(val_addr, zero, se.span)
+            }
+        }
+
+        // Call sched_select(cases_ptr, num_cases, block)
+        const cases_final = fb.emitLoadLocal(cases_local, I64, se.span)
+        const n_cases = fb.emitConstInt(num_cases, I64, se.span)
+        const block_flag = if (se.default_body != null_node) { fb.emitConstInt(0, I64, se.span) } else { fb.emitConstInt(1, I64, se.span) }
+        var select_args: List(int) = .{}
+        select_args.append(cases_final)
+        select_args.append(n_cases)
+        select_args.append(block_flag)
+        const selected_idx = fb.emitCall("sched_select", select_args, false, I64, se.span)
+
+        const result_temp = "__select_result_" ++ intToString(self.temp_counter)
+        self.temp_counter = self.temp_counter + 1
+        const result_local = fb.addLocalWithSize(result_temp, I64, true, 8)
+        fb.emitStoreLocal(result_local, selected_idx, se.span)
+
+        // Dispatch: switch on returned index (-1 = default, 0..N-1 = case index)
+        const merge_block = fb.newBlock("select.end")
+
+        // If has default, check for -1 first
+        if (se.default_body != null_node) {
+            const default_block = fb.newBlock("select.default")
+            const dispatch_block = fb.newBlock("select.dispatch")
+            const result_val = fb.emitLoadLocal(result_local, I64, se.span)
+            const neg_one = fb.emitConstInt(-1, I64, se.span)
+            const is_default = fb.emitBinary(BinaryOp.eq, result_val, neg_one, BOOL, se.span)
+            fb.emitBranch(is_default, default_block, dispatch_block, se.span)
+
+            fb.setBlock(default_block)
+            self.lowerExprNode(se.default_body)
+            if (fb.needsTerminator()) { fb.emitJump(merge_block, se.span) }
+
+            fb.setBlock(dispatch_block)
+        }
+
+        // Dispatch cases: chain of if-else comparisons
+        for i in 0..num_cases {
+            const case_block = fb.newBlock("select.case")
+            const next_block = if (i + 1 < num_cases) { fb.newBlock("select.next") } else { merge_block }
+
+            const result_val = fb.emitLoadLocal(result_local, I64, se.span)
+            const case_idx = fb.emitConstInt(i, I64, se.span)
+            const is_match = fb.emitBinary(BinaryOp.eq, result_val, case_idx, BOOL, se.span)
+            fb.emitBranch(is_match, case_block, next_block, se.span)
+
+            fb.setBlock(case_block)
+            // For recv with capture, read value from cases array at offset 16
+            const sc = self.tree.getSelectCase(se.cases.get(i))
+            if (sc.kind == SELECT_RECV and sc.capture.len > 0) {
+                const recv_offset = i * 24 + 16
+                const cases_reload = fb.emitLoadLocal(cases_local, I64, se.span)
+                const recv_addr = fb.emitAddrOffset(cases_reload, recv_offset, I64, se.span)
+                const recv_val = fb.emitPtrLoadValue(recv_addr, I64, se.span)
+                const capture_local = fb.addLocalWithSize(sc.capture, I64, true, 8)
+                fb.emitStoreLocal(capture_local, recv_val, se.span)
+            }
+            self.lowerExprNode(sc.body)
+            if (fb.needsTerminator()) { fb.emitJump(merge_block, se.span) }
+
+            if (i + 1 < num_cases) {
+                fb.setBlock(next_block)
+            }
+        }
+
+        // Free cases array
+        fb.setBlock(merge_block)
+        const cases_to_free = fb.emitLoadLocal(cases_local, I64, se.span)
+        var dealloc_args: List(int) = .{}
+        dealloc_args.append(cases_to_free)
+        fb.emitCall("dealloc", dealloc_args, false, VOID, se.span)
+
+        return null_node
+    }
+
+    // ========================================================================
+    // Async/Await
+    // ========================================================================
+
+    /// Count await expressions in an AST subtree.
+    /// Copied from lower.zig:1090-1145
+    fn countAwaitPoints(idx: int) int {
+        if (idx == null_node) { return 0 }
+        var count = 0
+        const node = self.tree.getNode(idx)
+        switch (node) {
+            Node.expr |expr| => switch (expr) {
+                Expr.await_expr |_| => { count = count + 1 },
+                Expr.binary |b| => {
+                    count = count + self.countAwaitPoints(b.left)
+                    count = count + self.countAwaitPoints(b.right)
+                },
+                Expr.unary |u| => { count = count + self.countAwaitPoints(u.operand) },
+                Expr.call |c| => {
+                    count = count + self.countAwaitPoints(c.callee)
+                    for i in 0..c.args.count {
+                        count = count + self.countAwaitPoints(c.args.get(i))
+                    }
+                },
+                Expr.if_expr |ie| => {
+                    count = count + self.countAwaitPoints(ie.condition)
+                    count = count + self.countAwaitPoints(ie.then_branch)
+                    if (ie.else_branch != null_node) { count = count + self.countAwaitPoints(ie.else_branch) }
+                },
+                Expr.block_expr |be| => {
+                    for i in 0..be.stmts.count {
+                        count = count + self.countAwaitPoints(be.stmts.get(i))
+                    }
+                    if (be.result_expr != null_node) { count = count + self.countAwaitPoints(be.result_expr) }
+                },
+                Expr.paren |p| => { count = count + self.countAwaitPoints(p.inner) },
+                Expr.try_expr |t| => { count = count + self.countAwaitPoints(t.operand) },
+                else => {},
+            },
+            Node.stmt |stmt| => switch (stmt) {
+                Stmt.expr_stmt |es| => { count = count + self.countAwaitPoints(es.expr) },
+                Stmt.return_stmt |rs| => {
+                    if (rs.value != null_node) { count = count + self.countAwaitPoints(rs.value) }
+                },
+                Stmt.var_stmt |vs| => {
+                    if (vs.value != null_node) { count = count + self.countAwaitPoints(vs.value) }
+                },
+                Stmt.assign_stmt |as_stmt| => { count = count + self.countAwaitPoints(as_stmt.value) },
+                Stmt.if_stmt |is_stmt| => {
+                    count = count + self.countAwaitPoints(is_stmt.condition)
+                    count = count + self.countAwaitPoints(is_stmt.then_branch)
+                    if (is_stmt.else_branch != null_node) { count = count + self.countAwaitPoints(is_stmt.else_branch) }
+                },
+                Stmt.while_stmt |ws| => {
+                    count = count + self.countAwaitPoints(ws.condition)
+                    count = count + self.countAwaitPoints(ws.body)
+                },
+                Stmt.block_stmt |bs| => {
+                    for i in 0..bs.stmts.count {
+                        count = count + self.countAwaitPoints(bs.stmts.get(i))
+                    }
+                },
+                Stmt.defer_stmt |ds| => { count = count + self.countAwaitPoints(ds.expr) },
+                else => {},
+            },
+            else => {},
+        }
+        return count
+    }
+
+    /// Lower await expression — extract result from Future.
+    /// Native: eager evaluation — result already stored in future[8].
+    /// Copied from lower.zig:10222-10299
+    fn lowerAwaitExpr(fb: *FuncBuilder, ae: AwaitExpr, idx: int) int {
+        // Get the future type from the operand
+        const operand_type = self.inferExprType(ae.operand)
+        const ot = self.types.get(operand_type)
+        if (ot.tag != TAG_FUTURE) {
+            return self.lowerExprNode(ae.operand)
+        }
+        const result_type = switch (ot) { Type.future |ft| => ft.result_type, else => I64 }
+
+        // Lower the future operand (gives us the state/fiber pointer)
+        const future_ptr = self.lowerExprNode(ae.operand)
+
+        // Check if compound result
+        const result_size = self.types.sizeOf(result_type)
+        const is_compound = result_size > 8
+
+        // Native (eager): result is already at future[8]
+        if (is_compound) {
+            const num_words = (result_size + 7) / 8
+            const result_local = fb.addLocalWithSize("__await_result", result_type, false, result_size)
+            for w in 0..num_words {
+                const src_offset = 8 + w * 8
+                const src_addr = fb.emitAddrOffset(future_ptr, src_offset, I64, ae.span)
+                const word = fb.emitPtrLoadValue(src_addr, I64, ae.span)
+                fb.emitStoreLocalField(result_local, w, w * 8, word, ae.span)
+            }
+            return fb.emitAddrLocal(result_local, I64, ae.span)
+        }
+        const result_addr = fb.emitAddrOffset(future_ptr, 8, I64, ae.span)
+        return fb.emitPtrLoadValue(result_addr, result_type, ae.span)
+    }
+
+    /// Lower async function declaration — native fiber pattern (eager execution).
+    /// Emits: body function (fn_name_body) + constructor (fn_name) returning Future pointer.
+    /// Copied from lower.zig:963-1087
+    fn lowerAsyncFiber(fn_decl: FnDecl) void {
+        const inner_return_type = if (fn_decl.return_type != null_node) {
+            self.resolveTypeNode(fn_decl.return_type)
+        } else { VOID }
+
+        // --- Emit body function (fn_name_body) ---
+        const fiber_link_name = self.qualifyName(fn_decl.name)
+        const body_name = fiber_link_name ++ "_body"
+        self.builder.startFunc(body_name, VOID, inner_return_type, fn_decl.span)
+        if (self.builder.func()) |body_fb| {
+            self.clearPerFunctionState()
+
+            for i in 0..fn_decl.params.count {
+                const param_idx = fn_decl.params.get(i)
+                self.addParamFromNode(body_fb, param_idx)
+            }
+
+            if (fn_decl.body != null_node) {
+                self.lowerBlockNode(fn_decl.body)
+                if (inner_return_type == VOID and body_fb.needsTerminator()) {
+                    self.emitCleanups(0)
+                    body_fb.emitRet(null_node, fn_decl.span)
+                }
+            }
+        }
+        self.builder.endFunc()
+
+        // --- Emit constructor (fn_name) — calls body eagerly, stores result in future ---
+        self.builder.startFunc(fiber_link_name, VOID, I64, fn_decl.span)
+        if (self.builder.func()) |fb| {
+            self.clearPerFunctionState()
+
+            // Add params matching declared signature
+            for i in 0..fn_decl.params.count {
+                const param_idx = fn_decl.params.get(i)
+                self.addParamFromNode(fb, param_idx)
+            }
+
+            // Compute future size: state(8) + result
+            var result_size = 0
+            if (inner_return_type != VOID) { result_size = self.types.sizeOf(inner_return_type) }
+            const future_size = 8 + result_size
+
+            // Allocate future struct
+            const metadata = fb.emitConstInt(0, I64, fn_decl.span)
+            const size_val = fb.emitConstInt(future_size, I64, fn_decl.span)
+            var alloc_args: List(int) = .{}
+            alloc_args.append(metadata)
+            alloc_args.append(size_val)
+            const future_ptr = fb.emitCall("alloc", alloc_args, false, I64, fn_decl.span)
+            const future_local = fb.addLocalWithSize("__future", I64, false, 8)
+            fb.emitStoreLocal(future_local, future_ptr, fn_decl.span)
+
+            // Call body function with same args — eager evaluation
+            var body_args: List(int) = .{}
+            for i in 0..fn_decl.params.count {
+                const param_idx = fn_decl.params.get(i)
+                var pname = ""
+                switch (self.tree.getNode(param_idx)) { Node.expr |e| => switch (e) {
+                    Expr.field_def |fd| => { pname = fd.name },
+                    else => {},
+                }, else => {} }
+                if (pname.len > 0) {
+                    if (fb.lookupLocal(pname)) |local_idx| {
+                        const param_type = fb.locals.get(local_idx).type_idx
+                        const pi = self.types.get(param_type)
+                        if (param_type == STRING or pi.tag == TAG_SLICE) {
+                            const val = fb.emitLoadLocal(local_idx, param_type, fn_decl.span)
+                            body_args.append(fb.emitSlicePtr(val, I64, fn_decl.span))
+                            body_args.append(fb.emitSliceLen(val, fn_decl.span))
+                        } else {
+                            body_args.append(fb.emitLoadLocal(local_idx, I64, fn_decl.span))
+                        }
+                    }
+                }
+            }
+            const result = fb.emitCall(body_name, body_args, false, inner_return_type, fn_decl.span)
+
+            // Store result at future[8]
+            if (inner_return_type != VOID) {
+                const fp = fb.emitLoadLocal(future_local, I64, fn_decl.span)
+                const result_addr = fb.emitAddrOffset(fp, 8, I64, fn_decl.span)
+                fb.emitPtrStoreValue(result_addr, result, fn_decl.span)
+            }
+
+            // Set state = 1 (DONE) at future[0]
+            const fp2 = fb.emitLoadLocal(future_local, I64, fn_decl.span)
+            const one = fb.emitConstInt(1, I64, fn_decl.span)
+            fb.emitPtrStoreValue(fp2, one, fn_decl.span)
+
+            // Return future pointer
+            const ret_val = fb.emitLoadLocal(future_local, I64, fn_decl.span)
+            fb.emitRet(ret_val, fn_decl.span)
+        }
+        self.builder.endFunc()
+    }
+
+    // ========================================================================
+    // Shape Stenciling / Dict Helpers
+    // ========================================================================
+
+    /// Generate a dict helper name for a type-dependent operation.
+    /// Format: __cot_dict_{type_name}_{op_name}
+    /// Copied from lower.zig:8360-8372
+    fn dictHelperName(concrete_type: int, entry: DictEntry) string {
+        const type_name = self.types.typeName(concrete_type)
+        if (entry.kind == DICT_BINARY_OP) {
+            return "__cot_dict_" ++ type_name ++ "_" ++ dictOpName(entry.op)
+        }
+        return "__cot_dict_" ++ type_name ++ "_" ++ entry.method_name
+    }
+
+    /// Generate a binary op helper function.
+    /// Emits: __cot_dict_{type}_{op}(a: T, b: T) -> T or bool
+    /// Copied from lower.zig:8411-8443
+    fn generateBinaryOpHelper(name: string, concrete_type: int, op: int) void {
+        // Comparison ops return bool, arithmetic returns T
+        const bop = @enumFromInt(op) as BinaryOp
+        const return_type = switch (bop) {
+            BinaryOp.eq, BinaryOp.ne, BinaryOp.lt, BinaryOp.gt, BinaryOp.le, BinaryOp.ge => BOOL,
+            else => concrete_type,
+        }
+        const sz = self.types.sizeOf(concrete_type)
+        const span = Span { start: 0, end: 0 }
+        self.builder.startFunc(name, VOID, return_type, span)
+        if (self.builder.func()) |fb| {
+            const param_a = fb.addParam("a", concrete_type, sz)
+            const param_b = fb.addParam("b", concrete_type, sz)
+            const a_val = fb.emitLoadLocal(param_a, concrete_type, span)
+            const b_val = fb.emitLoadLocal(param_b, concrete_type, span)
+            const result = fb.emitBinary(bop, a_val, b_val, return_type, span)
+            fb.emitRet(result, span)
+        }
+        self.builder.endFunc()
+    }
+
+    /// Generate a method call helper function.
+    /// Emits: __cot_dict_{type}_{method}(args...) -> R { return concrete_method(args...) }
+    /// Copied from lower.zig:8447-8500
+    fn generateMethodCallHelper(name: string, concrete_type: int, method_name: string) void {
+        const type_name = self.types.typeName(concrete_type)
+        const mi_idx = self.types.lookupMethod(type_name, method_name)
+        if (mi_idx < 0) { return }
+        const mi = self.types.getMethodInfo(mi_idx)
+        const func_info = self.types.get(mi.func_type)
+        var return_type = VOID
+        switch (func_info) {
+            Type.func |f| => { return_type = f.return_type },
+            else => {},
+        }
+        const uses_sret = self.needsSret(return_type)
+        const ir_return_type = if (uses_sret) { VOID } else { return_type }
+
+        const span = Span { start: 0, end: 0 }
+        self.builder.startFunc(name, VOID, ir_return_type, span)
+        if (self.builder.func()) |fb| {
+            if (uses_sret) { fb.sret_return_type = return_type }
+
+            // SRET hidden first param
+            if (uses_sret) { fb.addParam("__sret", I64, 8) }
+
+            // Add params and build forward call args
+            var call_args: List(int) = .{}
+            if (uses_sret) {
+                if (fb.lookupLocal("__sret")) |sret_idx| {
+                    call_args.append(fb.emitLoadLocal(sret_idx, I64, span))
+                }
+            }
+
+            const ff = switch (func_info) { Type.func |f| => f, else => FuncType { param_count: 0, params: 0, return_type: VOID } }
+            for i in 0..ff.param_count {
+                const p = ff.getParam(i)
+                const local = fb.addParam(p.name, p.type_idx, self.types.sizeOf(p.type_idx))
+                call_args.append(fb.emitLoadLocal(local, p.type_idx, span))
+            }
+
+            // Resolve concrete method name
+            const concrete_method = self.resolveMethodName(type_name, mi.func_name, mi.source_tree)
+
+            if (uses_sret) {
+                fb.emitCall(concrete_method, call_args, false, VOID, span)
+                fb.emitRet(null_node, span)
+            } else {
+                const result = fb.emitCall(concrete_method, call_args, false, return_type, span)
+                fb.emitRet(result, span)
+            }
+        }
+        self.builder.endFunc()
+    }
+
+    /// Check if a type matches one of the type parameter concrete types.
+    /// Returns the index or -1.
+    /// Copied from lower.zig:7864-7869
+    fn typeParamIndex(type_param_types: List(int), ty: int) int {
+        for i in 0..type_param_types.count {
+            if (type_param_types.get(i) == ty) { return i }
+        }
+        return -1
+    }
+
+    /// Analyze a generic function body for stencilability.
+    /// Returns STENCIL_SHAPE_ONLY, STENCIL_DICT, or STENCIL_NOT_STENCILABLE.
+    /// Copied from lower.zig:7825-7860
+    fn analyzeStencilability(body_node: int, type_param_types: List(int)) int {
+        if (type_param_types.count == 0) { return STENCIL_NOT_STENCILABLE }
+
+        var collector: List(DictEntry) = .{}
+        const ok = self.collectNodeDictEntries(body_node, type_param_types, &collector)
+        if (!ok) { return STENCIL_NOT_STENCILABLE }
+        if (collector.count == 0) { return STENCIL_SHAPE_ONLY }
+
+        // Deduplicate
+        var deduped: List(DictEntry) = .{}
+        for i in 0..collector.count {
+            const entry = collector.get(i)
+            var found = false
+            for j in 0..deduped.count {
+                const existing = deduped.get(j)
+                if (existing.kind == entry.kind and existing.op == entry.op
+                    and existing.type_param_idx == entry.type_param_idx
+                    and existing.method_name == entry.method_name) {
+                    found = true
+                }
+            }
+            if (!found) { deduped.append(entry) }
+        }
+        return STENCIL_DICT
+    }
+
+    /// Recursive AST walk: collect DictEntry for Tier 2 ops.
+    /// Returns false if Tier 3 (not stencilable) found.
+    /// Copied from lower.zig:7877-8043
+    fn collectNodeDictEntries(node_idx: int, tpt: List(int), collector: *List(DictEntry)) bool {
+        if (node_idx == null_node) { return true }
+        const node = self.tree.getNode(node_idx)
+        var result = true
+        switch (node) {
+            Node.expr |expr| => { result = self.collectExprDictEntries(expr, node_idx, tpt, collector) },
+            Node.stmt |stmt| => { result = self.collectStmtDictEntries(stmt, tpt, collector) },
+            Node.decl |_| => {},
+        }
+        return result
+    }
+
+    /// Collect dict entries from an expression.
+    /// Copied from lower.zig:7887-8043
+    fn collectExprDictEntries(expr: Expr, node_idx: int, tpt: List(int), collector: *List(DictEntry)) bool {
+        // Use tag string to dispatch — avoids return-in-switch-arm limitation
+        const tag1 = exprTagStr1(expr)
+        const tag = if (@lenOf(tag1) > 0) { tag1 } else { exprTagStr2(expr) }
+
+        if (tag == "binary") {
+            var bin_left = 0
+            var bin_right = 0
+            var bin_op = 0
+            switch (expr) { Expr.binary |bin| => { bin_left = bin.left; bin_right = bin.right; bin_op = bin.op }, else => {} }
+            const left_type = self.chk.expr_types.getOrNull(bin_left) orelse -1
+            const right_type = self.chk.expr_types.getOrNull(bin_right) orelse -1
+            const left_pi = self.typeParamIndex(tpt, left_type)
+            const right_pi = self.typeParamIndex(tpt, right_type)
+            if (left_pi >= 0 or right_pi >= 0) {
+                const bop = @enumFromInt(bin_op) as BinaryOp
+                const is_dict_op = bop.isComparison() or bop.isArithmetic()
+                if (!is_dict_op) { return false }
+                const pi = if (left_pi >= 0) { left_pi } else { right_pi }
+                collector.append(DictEntry { kind: DICT_BINARY_OP, op: bin_op, method_name: "", type_param_idx: pi })
+            }
+            if (!self.collectNodeDictEntries(bin_left, tpt, collector)) { return false }
+            return self.collectNodeDictEntries(bin_right, tpt, collector)
+        }
+
+        if (tag == "call") {
+            var callee_n = 0
+            var call_args: List(int) = .{}
+            switch (expr) { Expr.call |c| => { callee_n = c.callee; call_args = c.args }, else => {} }
+            // Check method calls on T-typed receiver
+            const callee_node = self.tree.getNode(callee_n)
+            switch (callee_node) { Node.expr |ce| => switch (ce) {
+                Expr.field_access |fa| => {
+                    const recv_type = self.chk.expr_types.getOrNull(fa.base) orelse -1
+                    var pi = self.typeParamIndex(tpt, recv_type)
+                    if (pi < 0 and recv_type >= 0 and self.types.isPointer(recv_type)) {
+                        pi = self.typeParamIndex(tpt, self.types.pointerElem(recv_type))
+                    }
+                    if (pi >= 0) {
+                        collector.append(DictEntry { kind: DICT_METHOD_CALL, op: 0, method_name: fa.field, type_param_idx: pi })
+                    }
+                },
+                else => {},
+            }, else => {} }
+            if (!self.collectNodeDictEntries(callee_n, tpt, collector)) { return false }
+            for i in 0..call_args.count {
+                if (!self.collectNodeDictEntries(call_args.get(i), tpt, collector)) { return false }
+            }
+            return true
+        }
+
+        if (tag == "if_expr") {
+            var cond = 0
+            var then_br = 0
+            var else_br = null_node
+            switch (expr) { Expr.if_expr |ie| => { cond = ie.condition; then_br = ie.then_branch; else_br = ie.else_branch }, else => {} }
+            if (!self.collectNodeDictEntries(cond, tpt, collector)) { return false }
+            if (!self.collectNodeDictEntries(then_br, tpt, collector)) { return false }
+            return self.collectNodeDictEntries(else_br, tpt, collector)
+        }
+
+        if (tag == "block_expr") {
+            var stmts: List(int) = .{}
+            var result_n = null_node
+            switch (expr) { Expr.block_expr |be| => { stmts = be.stmts; result_n = be.result_expr }, else => {} }
+            for i in 0..stmts.count {
+                if (!self.collectNodeDictEntries(stmts.get(i), tpt, collector)) { return false }
+            }
+            return self.collectNodeDictEntries(result_n, tpt, collector)
+        }
+
+        if (tag == "unary") {
+            var operand = 0
+            switch (expr) { Expr.unary |u| => { operand = u.operand }, else => {} }
+            return self.collectNodeDictEntries(operand, tpt, collector)
+        }
+
+        if (tag == "paren") {
+            var inner = 0
+            switch (expr) { Expr.paren |p| => { inner = p.inner }, else => {} }
+            return self.collectNodeDictEntries(inner, tpt, collector)
+        }
+
+        if (tag == "field_access") {
+            var base = 0
+            switch (expr) { Expr.field_access |fa| => { base = fa.base }, else => {} }
+            return self.collectNodeDictEntries(base, tpt, collector)
+        }
+
+        if (tag == "index_expr") {
+            var base = 0
+            var idx = 0
+            switch (expr) { Expr.index_expr |ix| => { base = ix.base; idx = ix.idx }, else => {} }
+            if (!self.collectNodeDictEntries(base, tpt, collector)) { return false }
+            return self.collectNodeDictEntries(idx, tpt, collector)
+        }
+
+        if (tag == "try_expr") {
+            var operand = 0
+            switch (expr) { Expr.try_expr |te| => { operand = te.operand }, else => {} }
+            return self.collectNodeDictEntries(operand, tpt, collector)
+        }
+
+        if (tag == "catch_expr") {
+            var operand = 0
+            var fallback = null_node
+            switch (expr) { Expr.catch_expr |ce| => { operand = ce.operand; fallback = ce.fallback }, else => {} }
+            if (!self.collectNodeDictEntries(operand, tpt, collector)) { return false }
+            return self.collectNodeDictEntries(fallback, tpt, collector)
+        }
+
+        if (tag == "orelse_expr") {
+            var operand = 0
+            var fallback = null_node
+            switch (expr) { Expr.orelse_expr |oe| => { operand = oe.operand; fallback = oe.fallback }, else => {} }
+            if (!self.collectNodeDictEntries(operand, tpt, collector)) { return false }
+            if (fallback != null_node) {
+                if (!self.collectNodeDictEntries(fallback, tpt, collector)) { return false }
+            }
+            return true
+        }
+
+        if (tag == "addr_of") {
+            var operand = 0
+            switch (expr) { Expr.addr_of |ao| => { operand = ao.operand }, else => {} }
+            return self.collectNodeDictEntries(operand, tpt, collector)
+        }
+
+        if (tag == "deref") {
+            var operand = 0
+            switch (expr) { Expr.deref |d| => { operand = d.operand }, else => {} }
+            return self.collectNodeDictEntries(operand, tpt, collector)
+        }
+
+        // Tier 3: closures, async, spawn, select → not stencilable
+        if (tag == "closure_expr" or tag == "spawn_expr" or tag == "select_expr" or tag == "await_expr") {
+            return false
+        }
+
+        // Safe leaf nodes (ident, literal, etc.)
+        return true
+    }
+
+    /// Collect dict entries from a statement.
+    /// Copied from lower.zig:8046-8105
+    fn collectStmtDictEntries(stmt: Stmt, tpt: List(int), collector: *List(DictEntry)) bool {
+        const tag = stmtTagStr(stmt)
+
+        if (tag == "expr_stmt") {
+            var expr_node = 0
+            switch (stmt) { Stmt.expr_stmt |es| => { expr_node = es.expr }, else => {} }
+            return self.collectNodeDictEntries(expr_node, tpt, collector)
+        }
+
+        if (tag == "return_stmt") {
+            var value = 0
+            switch (stmt) { Stmt.return_stmt |rs| => { value = rs.value }, else => {} }
+            if (value != null_node) { return self.collectNodeDictEntries(value, tpt, collector) }
+            return true
+        }
+
+        if (tag == "var_stmt") {
+            var value = 0
+            switch (stmt) { Stmt.var_stmt |vs| => { value = vs.value }, else => {} }
+            if (value != null_node) { return self.collectNodeDictEntries(value, tpt, collector) }
+            return true
+        }
+
+        if (tag == "assign_stmt") {
+            var target = 0
+            var value = 0
+            switch (stmt) { Stmt.assign_stmt |as_stmt| => { target = as_stmt.target; value = as_stmt.value }, else => {} }
+            return self.collectNodeDictEntries(target, tpt, collector)
+                and self.collectNodeDictEntries(value, tpt, collector)
+        }
+
+        if (tag == "if_stmt") {
+            var condition = 0
+            var then_branch = 0
+            var else_branch = 0
+            switch (stmt) { Stmt.if_stmt |is_stmt| => { condition = is_stmt.condition; then_branch = is_stmt.then_branch; else_branch = is_stmt.else_branch }, else => {} }
+            if (!self.collectNodeDictEntries(condition, tpt, collector)) { return false }
+            if (!self.collectNodeDictEntries(then_branch, tpt, collector)) { return false }
+            if (else_branch != null_node) {
+                if (!self.collectNodeDictEntries(else_branch, tpt, collector)) { return false }
+            }
+            return true
+        }
+
+        if (tag == "while_stmt") {
+            var condition = 0
+            var body = 0
+            switch (stmt) { Stmt.while_stmt |ws| => { condition = ws.condition; body = ws.body }, else => {} }
+            return self.collectNodeDictEntries(condition, tpt, collector)
+                and self.collectNodeDictEntries(body, tpt, collector)
+        }
+
+        if (tag == "for_stmt") {
+            var iterable = 0
+            var body = 0
+            switch (stmt) { Stmt.for_stmt |fs| => { iterable = fs.iterable; body = fs.body }, else => {} }
+            if (iterable != null_node) {
+                if (!self.collectNodeDictEntries(iterable, tpt, collector)) { return false }
+            }
+            return self.collectNodeDictEntries(body, tpt, collector)
+        }
+
+        if (tag == "block_stmt") {
+            var ok = true
+            switch (stmt) { Stmt.block_stmt |bs| => {
+                for i in 0..bs.stmts.count {
+                    if (!self.collectNodeDictEntries(bs.stmts.get(i), tpt, collector)) { ok = false }
+                }
+            }, else => {} }
+            return ok
+        }
+
+        if (tag == "defer_stmt") {
+            var expr_node = 0
+            switch (stmt) { Stmt.defer_stmt |ds| => { expr_node = ds.expr }, else => {} }
+            return self.collectNodeDictEntries(expr_node, tpt, collector)
+        }
+
+        // All other statement types: safe
+        return true
+    }
+
+    /// Generate all dict helpers for a generic instance.
+    /// Copied from lower.zig:8395-8408
+    fn generateDictHelpers(concrete_type: int, dict_entries: List(DictEntry)) void {
+        for i in 0..dict_entries.count {
+            const entry = dict_entries.get(i)
+            const helper_name = self.dictHelperName(concrete_type, entry)
+            // Dedup
+            if (self.generated_dict_helpers.contains(helper_name)) { continue }
+            self.generated_dict_helpers.set(helper_name, 1)
+
+            if (entry.kind == DICT_BINARY_OP) {
+                self.generateBinaryOpHelper(helper_name, concrete_type, entry.op)
+            } else {
+                self.generateMethodCallHelper(helper_name, concrete_type, entry.method_name)
+            }
         }
     }
 
@@ -5515,6 +6541,106 @@ struct Lowerer {
 
         fb.setBlock(merge_block)
         return fb.emitLoadLocal(result_local, result_type, ce.span)
+    }
+
+    fn lowerOrElseExpr(fb: *FuncBuilder, oe: OrElseExpr, idx: int) int {
+        const operand = self.lowerExprNode(oe.operand)
+        if (operand == null_node) { return null_node }
+
+        const operand_type_idx = self.inferExprType(oe.operand)
+        const elem_type = self.inferExprType(idx)
+        const is_compound = !self.isPtrLikeOptional(operand_type_idx)
+
+        if (is_compound) {
+            // Compound optional: [tag:i64][payload:i64]
+            const opt_size = self.types.sizeOf(operand_type_idx)
+            const opt_local = fb.addLocalWithSize("__orelse_opt", operand_type_idx, false, opt_size)
+            fb.emitStoreLocal(opt_local, operand, oe.span)
+
+            const tag = fb.emitFieldLocal(opt_local, 0, 0, I64, oe.span)
+            const zero = fb.emitConstInt(0, I64, oe.span)
+            const is_non_null = fb.emitBinary(BinaryOp.ne, tag, zero, BOOL, oe.span)
+
+            const result_size = self.types.sizeOf(elem_type)
+            const result_local = fb.addLocalWithSize("__orelse_result", elem_type, false, result_size)
+            const then_block = fb.newBlock("orelse.nonnull")
+            const else_block = fb.newBlock("orelse.null")
+            const merge_block = fb.newBlock("orelse.end")
+            fb.emitBranch(is_non_null, then_block, else_block, oe.span)
+
+            // Non-null: extract payload
+            fb.setBlock(then_block)
+            const payload = fb.emitFieldLocal(opt_local, 1, 8, elem_type, oe.span)
+            fb.emitStoreLocal(result_local, payload, oe.span)
+            fb.emitJump(merge_block, oe.span)
+
+            // Null: lower fallback
+            fb.setBlock(else_block)
+            if (oe.fallback_kind == ORELSE_EXPR) {
+                const fallback = self.lowerExprNode(oe.fallback)
+                if (fallback != null_node) {
+                    fb.emitStoreLocal(result_local, fallback, oe.span)
+                }
+            } else if (oe.fallback_kind == ORELSE_RETURN_VOID) {
+                self.lowerReturn(ReturnStmt { .value = null_node, .span = oe.span })
+            } else if (oe.fallback_kind == ORELSE_RETURN_VAL) {
+                self.lowerReturn(ReturnStmt { .value = oe.fallback, .span = oe.span })
+            } else if (oe.fallback_kind == ORELSE_BREAK_VAL) {
+                self.lowerBreak("", null_node)
+            } else if (oe.fallback_kind == ORELSE_CONTINUE_VAL) {
+                self.lowerContinue("")
+            }
+
+            if (fb.needsTerminator()) {
+                fb.emitJump(merge_block, oe.span)
+            }
+
+            fb.setBlock(merge_block)
+            return fb.emitLoadLocal(result_local, elem_type, oe.span)
+        }
+
+        // Pointer-like optional: null=0 sentinel
+        if (oe.fallback_kind == ORELSE_EXPR) {
+            // Simple case: emitSelect
+            const null_val = fb.emitConstNull(UNTYPED_NULL, oe.span)
+            const condition = fb.emitBinary(BinaryOp.ne, operand, null_val, BOOL, oe.span)
+            const unwrapped = fb.emitUnary(UnaryOp.optional_unwrap, operand, elem_type, oe.span)
+            const fallback = self.lowerExprNode(oe.fallback)
+            return fb.emitSelect(condition, unwrapped, fallback, elem_type, oe.span)
+        }
+
+        // Pointer-like with non-expr fallback: needs 3-block pattern
+        const null_val = fb.emitConstNull(UNTYPED_NULL, oe.span)
+        const is_non_null = fb.emitBinary(BinaryOp.ne, operand, null_val, BOOL, oe.span)
+
+        const then_block = fb.newBlock("orelse.nonnull")
+        const else_block = fb.newBlock("orelse.null")
+        const merge_block = fb.newBlock("orelse.end")
+        fb.emitBranch(is_non_null, then_block, else_block, oe.span)
+
+        fb.setBlock(then_block)
+        const unwrapped = fb.emitUnary(UnaryOp.optional_unwrap, operand, elem_type, oe.span)
+        const result_local = fb.addLocalWithSize("__orelse_result", elem_type, false, 8)
+        fb.emitStoreLocal(result_local, unwrapped, oe.span)
+        fb.emitJump(merge_block, oe.span)
+
+        fb.setBlock(else_block)
+        if (oe.fallback_kind == ORELSE_RETURN_VOID) {
+            self.lowerReturn(ReturnStmt { .value = null_node, .span = oe.span })
+        } else if (oe.fallback_kind == ORELSE_RETURN_VAL) {
+            self.lowerReturn(ReturnStmt { .value = oe.fallback, .span = oe.span })
+        } else if (oe.fallback_kind == ORELSE_BREAK_VAL) {
+            self.lowerBreak("", null_node)
+        } else if (oe.fallback_kind == ORELSE_CONTINUE_VAL) {
+            self.lowerContinue("")
+        }
+
+        if (fb.needsTerminator()) {
+            fb.emitJump(merge_block, oe.span)
+        }
+
+        fb.setBlock(merge_block)
+        return fb.emitLoadLocal(result_local, elem_type, oe.span)
     }
 
     fn lowerErrorLiteral(fb: *FuncBuilder, el: ErrorLiteralExpr, idx: int) int {
@@ -5642,7 +6768,11 @@ struct Lowerer {
     }
 
     fn lowerBlockExpr(fb: *FuncBuilder, be: BlockExpr) int {
-        // Lower block contents, return result
+        // Labeled block: label: { ... break :label value ... }
+        if (be.label != "") {
+            return self.lowerLabeledBlockExpr(fb, be)
+        }
+        // Regular block: lower contents, return result
         const scope_depth = fb.markScopeEntry()
         for i in 0..be.stmts.count {
             const stmt_idx = be.stmts.get(i)
@@ -5660,6 +6790,54 @@ struct Lowerer {
         }
         fb.restoreScope(scope_depth)
         return result
+    }
+
+    fn lowerLabeledBlockExpr(fb: *FuncBuilder, be: BlockExpr) int {
+        // Infer result type — default to I64
+        var result_type = I64
+        if (be.result_expr != null_node) {
+            result_type = self.inferExprType(be.result_expr)
+        }
+        const result_size = self.types.sizeOf(result_type)
+
+        const result_local = fb.addLocalWithSize("__block_result", result_type, false, result_size)
+        const exit_block = fb.newBlock("block.exit")
+
+        // Push labeled block context
+        self.labeled_block_stack.append(LabeledBlockCtx {
+            .label = be.label,
+            .exit_block = exit_block,
+            .result_local = result_local,
+            .result_type = result_type,
+            .cleanup_depth = self.cleanup_stack.count,
+        })
+
+        const scope_depth = fb.markScopeEntry()
+        for i in 0..be.stmts.count {
+            const stmt_idx = be.stmts.get(i)
+            const maybe_stmt = asStmt(self.tree.getNode(stmt_idx))
+            if (maybe_stmt) |s| {
+                self.lowerStmt(s)
+            }
+        }
+
+        // If block has a trailing expression (implicit result), store it
+        if (be.result_expr != null_node) {
+            const expr_val = self.lowerExprNode(be.result_expr)
+            if (expr_val != null_node) {
+                fb.emitStoreLocal(result_local, expr_val, be.span)
+            }
+        }
+
+        if (fb.needsTerminator()) {
+            fb.emitJump(exit_block, be.span)
+        }
+
+        fb.restoreScope(scope_depth)
+        self.labeled_block_stack.pop()
+
+        fb.setBlock(exit_block)
+        return fb.emitLoadLocal(result_local, result_type, be.span)
     }
 
     // ========================================================================
@@ -6712,6 +7890,8 @@ fn initLowererScalars(lower: *Lowerer) void {
 fn initLowererLists(lower: *Lowerer) void {
     var ls: List(LoopContext) = .{}
     lower.loop_stack = ls
+    var lbs: List(LabeledBlockCtx) = .{}
+    lower.labeled_block_stack = lbs
     var cs: List(CleanupEntry) = .{}
     lower.cleanup_stack = cs
     var tn: List(string) = .{}
@@ -6722,6 +7902,10 @@ fn initLowererLists(lower: *Lowerer) void {
     lower.bench_names = bn
     var bdn: List(string) = .{}
     lower.bench_display_names = bdn
+    var pgi: List(GlobalInit) = .{}
+    lower.pending_global_inits = pgi
+    var pad: List(string) = .{}
+    lower.pending_auto_deinits = pad
 }
 
 /// Initialize Lowerer maps — step 3.
@@ -6742,6 +7926,15 @@ fn initLowererMaps(lower: *Lowerer) void {
     lower.comptime_value_vars = cvv
     var gcv: Map(string, int) = .{}
     lower.global_comptime_values = gcv
+    var tmm: Map(int, string) = .{}
+    lower.tree_module_map = tmm
+    lower.spawn_counter = 0
+    var ss: Map(string, string) = .{}
+    lower.shape_stencils = ss
+    var sa: Map(string, string) = .{}
+    lower.shape_aliases = sa
+    var gdh: Map(string, int) = .{}
+    lower.generated_dict_helpers = gdh
 }
 
 // ============================================================================
@@ -7028,4 +8221,64 @@ test "lookupComptimeValue" {
     lower.comptime_value_vars.set("z", 10)
     lower.global_comptime_values.set("z", 20)
     @assertEq(lower.lookupComptimeValue("z"), 10)
+}
+
+test "dictOpName" {
+    @assertEq(dictOpName(BinaryOp.eq as int), "eq")
+    @assertEq(dictOpName(BinaryOp.ne as int), "ne")
+    @assertEq(dictOpName(BinaryOp.lt as int), "lt")
+    @assertEq(dictOpName(BinaryOp.add as int), "add")
+    @assertEq(dictOpName(BinaryOp.sub as int), "sub")
+    @assertEq(dictOpName(BinaryOp.mul as int), "mul")
+    @assertEq(dictOpName(BinaryOp.div as int), "div")
+    @assertEq(dictOpName(BinaryOp.mod as int), "mod")
+}
+
+test "DictEntry struct" {
+    const entry = DictEntry {
+        kind: DICT_BINARY_OP,
+        op: BinaryOp.eq as int,
+        method_name: "",
+        type_param_idx: 0,
+    }
+    @assertEq(entry.kind, DICT_BINARY_OP)
+    @assertEq(entry.type_param_idx, 0)
+
+    const method_entry = DictEntry {
+        kind: DICT_METHOD_CALL,
+        op: 0,
+        method_name: "toString",
+        type_param_idx: 1,
+    }
+    @assertEq(method_entry.kind, DICT_METHOD_CALL)
+    @assertEq(method_entry.method_name, "toString")
+}
+
+test "shape stencil maps init" {
+    var ast = Ast.init("test.cot")
+    var types = TypeRegistry.init()
+    var err = ErrorReporter.init()
+    var chk = Checker.init(&ast, &types, &err)
+
+    var lower: Lowerer = undefined
+    lower.tree = &ast
+    lower.types = &types
+    lower.err = &err
+    lower.chk = &chk
+    initLowererScalars(&lower)
+    initLowererLists(&lower)
+    initLowererMaps(&lower)
+
+    // Stencil maps should be empty initially
+    @assert(!lower.shape_stencils.contains("test"))
+    @assert(!lower.shape_aliases.contains("test"))
+    @assert(!lower.generated_dict_helpers.contains("test"))
+
+    // Can register shape stencils
+    lower.shape_stencils.set("List$s8in", "List__i64__push")
+    @assert(lower.shape_stencils.contains("List$s8in"))
+
+    // Can register aliases
+    lower.shape_aliases.set("List__u64__push", "List__i64__push")
+    @assert(lower.shape_aliases.contains("List__u64__push"))
 }

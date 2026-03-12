@@ -229,6 +229,7 @@ struct SSABuilder {
         var fwd_vars: Map(int, int) = .{}
         var defvars: List(DefvarEntry) = .{}
         var block_map: Map(int, int) = .{}
+        block_map.set(0, entry)
         var node_values: Map(int, int) = .{}
         var loop_stack: List(LoopContext) = .{}
         var logical_operands: Map(int, int) = .{}
@@ -376,192 +377,212 @@ struct SSABuilder {
             Data.const_bool |c| => self.emitConst(SsaOp.const_bool, node.type_idx, if (c.value) { 1 } else { 0 }),
             Data.const_null => self.emitConst(SsaOp.const_nil, node.type_idx, 0),
             Data.const_slice |c| => self.emitConst(SsaOp.const_string, node.type_idx, c.string_index),
-
             Data.load_local |l| => self.convertLoadLocal(l.local_idx, node.type_idx),
             Data.store_local |s| => self.convertStoreLocal(s.local_idx, s.value),
             Data.local_ref |l| => self.emitLocalAddr(l.local_idx, node.type_idx),
             Data.addr_local |l| => self.emitLocalAddr(l.local_idx, node.type_idx),
-
             Data.global_ref |g| => self.convertGlobalRef(g.name, node.type_idx),
             Data.global_store |g| => self.convertGlobalStore(g.name, g.global_idx, g.value),
-            Data.addr_global |g| => {
-                const val = self.func.newValue(SsaOp.global_addr, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                var v = self.func.getValue(val)
-                v.aux = SsaAux.str(g.name)
-                self.func.setValue(val, v)
-                self.func.addValueToBlock(val, cur)
-                val
-            },
-            Data.type_metadata |m| => {
-                const val = self.func.newValue(SsaOp.metadata_addr, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                var v = self.func.getValue(val)
-                v.aux = SsaAux.str(m.type_name)
-                self.func.setValue(val, v)
-                self.func.addValueToBlock(val, cur)
-                val
-            },
-            Data.wasm_global_read |g| => {
-                const val = self.func.newValue(SsaOp.wasm_global_get, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                var v = self.func.getValue(val)
-                v.aux_int = g.global_idx
-                self.func.setValue(val, v)
-                self.func.addValueToBlock(val, cur)
-                val
-            },
-
+            Data.addr_global |g| => self.convertAddrGlobal(g.name, node.type_idx),
+            Data.type_metadata |m| => self.convertTypeMetadata(m.type_name, node.type_idx),
+            Data.wasm_global_read |g| => self.convertWasmGlobalRead(g.global_idx, node.type_idx),
             Data.binary |b| => self.convertBinary(b, node.type_idx),
             Data.unary |u| => self.convertUnary(u, node.type_idx),
-
             Data.call |c| => self.convertCall(c.func_name, c.args, node.type_idx),
             Data.call_indirect |c| => self.convertCallIndirect(c.callee, c.args, node.type_idx),
             Data.closure_call |c| => self.convertClosureCall(c.callee, c.context, c.args, node.type_idx),
-
-            Data.ret |r| => {
-                var blk = self.func.getBlock(cur)
-                blk.kind = SsaBlockKind.ret
-                if (r.value != null_node) {
-                    const ret_val = self.convertNode(r.value)
-                    blk.setControl(ret_val)
-                }
-                self.func.setBlock(cur, blk)
-                self.endBlock()
-                null_value
-            },
-            Data.jump |j| => {
-                const target = self.getOrCreateBlock(j.target)
-                var blk = self.func.getBlock(cur)
-                blk.addEdgeTo(target, &self.func.blocks)
-                self.func.setBlock(cur, blk)
-                self.endBlock()
-                null_value
-            },
-            Data.branch |br| => {
-                const cond = self.convertNode(br.condition)
-                const then_block = self.getOrCreateBlock(br.then_block)
-                const else_block = self.getOrCreateBlock(br.else_block)
-                var blk = self.func.getBlock(cur)
-                blk.kind = SsaBlockKind.if_
-                blk.setControl(cond)
-                blk.addEdgeTo(then_block, &self.func.blocks)
-                blk.addEdgeTo(else_block, &self.func.blocks)
-                self.func.setBlock(cur, blk)
-                self.endBlock()
-                null_value
-            },
-
+            Data.ret |r| => self.convertRet(r),
+            Data.jump |j| => self.convertJump(j),
+            Data.branch |br| => self.convertBranch(br),
+            Data.select |s| => self.convertSelect(s, node.type_idx),
+            Data.convert |c| => self.convertConvert(c, node.type_idx),
+            Data.phi => null_value,
+            Data.nop => null_value,
+            Data.trap => self.convertTrap(node.type_idx),
             Data.field_local |f| => self.convertFieldLocal(f, node.type_idx),
             Data.store_local_field |f| => self.convertStoreLocalField(f),
             Data.field_value |f| => self.convertFieldValue(f, node.type_idx),
             Data.store_field |f| => self.convertStoreField(f),
-
             Data.index_local |idx| => self.convertIndexLocal(idx, node.type_idx),
             Data.index_value |idx| => self.convertIndexValue(idx, node.type_idx),
             Data.store_index_local |s| => self.convertStoreIndexLocal(s),
             Data.store_index_value |s| => self.convertStoreIndexValue(s),
-
             Data.slice_local |s| => self.convertSliceLocal(s, node.type_idx),
             Data.slice_value |s| => self.convertSliceValue(s, node.type_idx),
             Data.slice_ptr |s| => self.convertSliceOp(SsaOp.slice_ptr, s.slice, node.type_idx),
             Data.slice_len |s| => self.convertSliceOp(SsaOp.slice_len, s.slice, node.type_idx),
             Data.slice_cap |s| => self.convertSliceOp(SsaOp.slice_cap, s.slice, node.type_idx),
-
             Data.ptr_load |p| => self.convertPtrLoad(p.ptr_local, node.type_idx),
             Data.ptr_store |p| => self.convertPtrStore(p),
             Data.ptr_load_value |p| => self.convertPtrLoadValue(p.ptr, node.type_idx),
             Data.ptr_store_value |p| => self.convertPtrStoreValue(p),
             Data.ptr_field |p| => self.convertPtrField(p, node.type_idx),
             Data.ptr_field_store |p| => self.convertPtrFieldStore(p),
-
-            Data.func_addr |f| => {
-                const val = self.func.newValue(SsaOp.addr, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                var v = self.func.getValue(val)
-                v.aux = SsaAux.str(f.name)
-                self.func.setValue(val, v)
-                self.func.addValueToBlock(val, cur)
-                val
-            },
-            Data.addr_offset |ao| => {
-                const base_val = self.convertNode(ao.base)
-                const val = self.func.newValue(SsaOp.off_ptr, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                var v = self.func.getValue(val)
-                v.addArg(base_val)
-                v.aux_int = ao.offset
-                self.func.setValue(val, v)
-                self.func.addValueToBlock(val, cur)
-                val
-            },
-            Data.addr_index |ai| => {
-                const base = self.convertNode(ai.base)
-                const idx = self.convertNode(ai.index)
-                // Multiply index by element size
-                const elem_size = self.func.newValue(SsaOp.const_int, I64, cur, self.cur_pos_line, self.cur_pos_col)
-                var es = self.func.getValue(elem_size)
-                es.aux_int = ai.elem_size
-                self.func.setValue(elem_size, es)
-                self.func.addValueToBlock(elem_size, cur)
-
-                const scaled_idx = self.func.newValue(SsaOp.mul, I64, cur, self.cur_pos_line, self.cur_pos_col)
-                var si = self.func.getValue(scaled_idx)
-                si.addArg2(idx, elem_size)
-                self.func.setValue(scaled_idx, si)
-                self.func.addValueToBlock(scaled_idx, cur)
-
-                const val = self.func.newValue(SsaOp.add_ptr, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                var v = self.func.getValue(val)
-                v.addArg2(base, scaled_idx)
-                self.func.setValue(val, v)
-                self.func.addValueToBlock(val, cur)
-                val
-            },
-
-            Data.select |s| => self.convertSelect(s, node.type_idx),
-            Data.atomic_cas |ac| => {
-                const ptr = self.convertNode(ac.ptr)
-                const expected = self.convertNode(ac.expected)
-                const new_val = self.convertNode(ac.new_val)
-                const val = self.func.newValue(SsaOp.atomic_cas64, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                var v = self.func.getValue(val)
-                v.addArg(ptr)
-                v.addArg(expected)
-                v.addArg(new_val)
-                self.func.setValue(val, v)
-                self.func.addValueToBlock(val, cur)
-                val
-            },
-            Data.convert |c| => self.convertConvert(c, node.type_idx),
-            Data.phi => null_value,  // Handled by insertPhis
-            Data.nop => null_value,
-            Data.trap => {
-                const val = self.func.newValue(SsaOp.wasm_unreachable, node.type_idx, cur, self.cur_pos_line, self.cur_pos_col)
-                self.func.addValueToBlock(val, cur)
-                null_value
-            },
-
+            Data.func_addr |f| => self.convertFuncAddr(f.name, node.type_idx),
+            Data.addr_offset |ao| => self.convertAddrOffset(ao, node.type_idx),
+            Data.addr_index |ai| => self.convertAddrIndex(ai, node.type_idx),
+            Data.atomic_cas |ac| => self.convertAtomicCas(ac, node.type_idx),
             Data.str_concat |s| => self.convertStrConcat(s, node.type_idx),
             Data.string_header |s| => self.convertStringHeader(s, node.type_idx),
             Data.slice_header |s| => self.convertSliceHeader(s, node.type_idx),
-
             Data.union_init |u| => self.convertUnionInit(u, node.type_idx),
             Data.union_tag |u| => self.convertUnionTag(u, node.type_idx),
             Data.union_payload |u| => self.convertUnionPayload(u, node.type_idx),
-
             Data.list_new, Data.list_push, Data.list_get, Data.list_set, Data.list_len, Data.list_free,
             Data.map_new, Data.map_set, Data.map_get, Data.map_has, Data.map_free => null_value,
-
             Data.ptr_cast |p| => self.convertCast(p.operand, node.type_idx),
             Data.int_to_ptr |p| => self.convertCast(p.operand, node.type_idx),
             Data.ptr_to_int |p| => self.convertCast(p.operand, node.type_idx),
-
-            // WasmGC struct operations — TODO: WasmGC
             Data.gc_struct_new |gc| => self.convertGcStructNew(gc, node.type_idx),
             Data.gc_struct_get |gc| => self.convertGcStructGet(gc, node.type_idx),
             Data.gc_struct_set |gc| => self.convertGcStructSet(gc),
-
-            else => null_value,
         }
 
         if (result != null_value) { self.node_values.set(node_idx, result) }
         return result
+    }
+
+    // --- Extracted inline block handlers ---
+
+    fn convertAddrGlobal(name: string, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.global_addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertTypeMetadata(type_name: string, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.metadata_addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(type_name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertWasmGlobalRead(global_idx: int, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_global_get, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux_int = global_idx
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertFuncAddr(name: string, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertRet(r: Return) int {
+        const cur = self.cur_block
+        // Convert return value BEFORE reading the block — convertNode may
+        // add values to the current block (e.g. constants, loads).
+        // Reading the block first then overwriting it erases those values.
+        var ret_val = null_value
+        if (r.value != null_node) {
+            ret_val = self.convertNode(r.value)
+        }
+        // Now read the block (captures any values convertNode added)
+        var blk = self.func.getBlock(cur)
+        blk.kind = SsaBlockKind.ret
+        if (ret_val != null_value) {
+            blk.setControl(ret_val)
+        }
+        self.func.setBlock(cur, blk)
+        self.endBlock()
+        return null_value
+    }
+
+    fn convertJump(j: Jump) int {
+        const cur = self.cur_block
+        const target = self.getOrCreateBlock(j.target)
+        var blk = self.func.getBlock(cur)
+        blk.addEdgeTo(target, &self.func.blocks)
+        self.func.setBlock(cur, blk)
+        self.endBlock()
+        return null_value
+    }
+
+    fn convertBranch(br: Branch) int {
+        const cur = self.cur_block
+        const cond = self.convertNode(br.condition)
+        const then_block = self.getOrCreateBlock(br.then_block)
+        const else_block = self.getOrCreateBlock(br.else_block)
+        var blk = self.func.getBlock(cur)
+        blk.kind = SsaBlockKind.if_
+        blk.setControl(cond)
+        blk.addEdgeTo(then_block, &self.func.blocks)
+        blk.addEdgeTo(else_block, &self.func.blocks)
+        self.func.setBlock(cur, blk)
+        self.endBlock()
+        return null_value
+    }
+
+    fn convertTrap(type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_unreachable, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        self.func.addValueToBlock(val, cur)
+        return null_value
+    }
+
+    fn convertAddrOffset(ao: AddrOffset, type_idx: int) int {
+        const cur = self.cur_block
+        const base_val = self.convertNode(ao.base)
+        const val = self.func.newValue(SsaOp.off_ptr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(base_val)
+        v.aux_int = ao.offset
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertAddrIndex(ai: AddrIndex, type_idx: int) int {
+        const cur = self.cur_block
+        const base = self.convertNode(ai.base)
+        const idx = self.convertNode(ai.index)
+        const elem_size = self.func.newValue(SsaOp.const_int, I64, cur, self.cur_pos_line, self.cur_pos_col)
+        var es = self.func.getValue(elem_size)
+        es.aux_int = ai.elem_size
+        self.func.setValue(elem_size, es)
+        self.func.addValueToBlock(elem_size, cur)
+        const scaled_idx = self.func.newValue(SsaOp.mul, I64, cur, self.cur_pos_line, self.cur_pos_col)
+        var si = self.func.getValue(scaled_idx)
+        si.addArg2(idx, elem_size)
+        self.func.setValue(scaled_idx, si)
+        self.func.addValueToBlock(scaled_idx, cur)
+        const val = self.func.newValue(SsaOp.add_ptr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg2(base, scaled_idx)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertAtomicCas(ac: AtomicCas, type_idx: int) int {
+        const cur = self.cur_block
+        const ptr = self.convertNode(ac.ptr)
+        const expected = self.convertNode(ac.expected)
+        const new_val = self.convertNode(ac.new_val)
+        const val = self.func.newValue(SsaOp.atomic_cas64, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.addArg(ptr)
+        v.addArg(expected)
+        v.addArg(new_val)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
     }
 
     // === Helper emit functions ===

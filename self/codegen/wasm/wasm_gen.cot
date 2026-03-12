@@ -15,6 +15,7 @@ import "std/map"
 import "std/string"
 import "../../frontend/ssa"
 import "code_builder"
+import "constants"
 
 // Memory layout constants (SP_GLOBAL imported from code_builder)
 const GLOBAL_BASE: int = 0x20000  // 128KB, after stack and heap start
@@ -66,8 +67,16 @@ struct FuncGen {
     /// Go's OnWasmStackSkipped counter.
     on_wasm_stack_skipped: int,
 
+    /// Maps GC struct type names to Wasm GC type indices.
+    gc_struct_name_map: ?*Map(string, int),
+
     /// Stack frame size in bytes (for SP management).
     frame_size: int,
+
+    /// Pending block-end markers: list of (block_idx) where wrapping blocks should close.
+    /// Used for forward jumps to non-return blocks — we wrap regions in block...end
+    /// so that br can target the merge point.
+    pending_block_ends: List(int),
 
     static fn init(func: *SsaFunc) FuncGen {
         var value_to_local: Map(int, int) = .{}
@@ -78,6 +87,7 @@ struct FuncGen {
         var active_loops: List(int) = .{}
         var loop_exit_blocks: Map(int, int) = .{}
         var empty_indices: Map(string, int) = .{}
+        var pending_ends: List(int) = .{}
         return FuncGen {
             ssa_func: func,
             code: CodeBuilder.init(),
@@ -95,12 +105,33 @@ struct FuncGen {
             has_func_indices: false,
             on_wasm_stack_skipped: 0,
             frame_size: 0,
+            pending_block_ends: pending_ends,
+            gc_struct_name_map: null,
         }
     }
 
     fn setFuncIndices(indices: *Map(string, int)) void {
         self.func_indices = indices
         self.has_func_indices = true
+    }
+
+    fn setGcStructNameMap(m: *Map(string, int)) void {
+        self.gc_struct_name_map = m
+    }
+
+    /// Resolve function call index: look up aux.string name in func_indices,
+    /// fall back to aux_int. Zig reference: gen.zig lines 943-954.
+    fn resolveCallIndex(v: SsaValue) int {
+        if (self.has_func_indices) {
+            const name = switch (v.aux) {
+                SsaAux.str |s| => s,
+                else => "",
+            }
+            if (@lenOf(name) > 0 and self.func_indices.contains(name)) {
+                return self.func_indices.get(name)
+            }
+        }
+        return v.aux_int
     }
 
     // ========================================================================
@@ -113,6 +144,10 @@ struct FuncGen {
             var blk = self.ssa_func.getBlock(bi)
             self.block_to_idx.set(bi, bi)
         }
+
+        // Compute use counts — self-hosted SSA doesn't track uses automatically
+        // (Zig SSA does it in addArg/setControl via pointer mutations)
+        self.computeUses()
 
         // Count parameters and allocate locals for them
         self.param_count = self.countParams()
@@ -137,6 +172,9 @@ struct FuncGen {
 
         // Generate code for each block (layout pass already ordered them)
         for bi in 0..self.ssa_func.blocks.count {
+            // Close any wrapping blocks that end at this block index
+            self.closePendingBlocks(bi)
+
             const next_bi = bi + 1
             const has_next = next_bi < self.ssa_func.blocks.count
             const is_loop = self.loop_headers.contains(bi)
@@ -152,10 +190,61 @@ struct FuncGen {
             self.block_depth -= 1
         }
 
-        // Set local count (beyond parameters)
-        self.code.setLocalCount(self.next_local - self.param_count)
+        // Build complete function body: [locals_declaration][instructions][END]
+        // Zig reference: assemble.zig lines 104-165
+        const declared_locals = self.next_local - self.param_count
+        var body: List(u8) = .{}
 
-        return self.code.buf
+        // Local declarations: all i64 (one group)
+        if (declared_locals > 0) {
+            writeULEB128(&body, 1)              // 1 local group
+            writeULEB128(&body, declared_locals) // N locals
+            body.append(0x7E as u8)             // i64 type
+        } else {
+            writeULEB128(&body, 0)              // 0 local groups
+        }
+
+        // Append instruction bytecode
+        var i = 0
+        while (i < self.code.buf.count) {
+            body.append(self.code.buf.get(i))
+            i += 1
+        }
+
+        // Append END opcode
+        body.append(0x0B as u8)
+
+        return body
+    }
+
+    // ========================================================================
+    // computeUses — Count how many times each SSA value is referenced
+    // Zig SSA tracks uses automatically via pointer-based addArg/setControl.
+    // Self-hosted SSA uses integer indices, so we compute uses in a pass.
+    // ========================================================================
+
+    fn computeUses() void {
+        for bi in 0..self.ssa_func.blocks.count {
+            const blk = self.ssa_func.getBlock(bi)
+            // Count uses from value args
+            for vi in 0..blk.values.count {
+                const val_idx = blk.values.get(vi)
+                const val = self.ssa_func.getValue(val_idx)
+                for ai in 0..val.args.count {
+                    const arg_idx = val.args.get(ai)
+                    var arg_val = self.ssa_func.getValue(arg_idx)
+                    arg_val.uses += 1
+                    self.ssa_func.setValue(arg_idx, arg_val)
+                }
+            }
+            // Count uses from block controls
+            for ci in 0..blk.controls.count {
+                const ctrl_idx = blk.controls.get(ci)
+                var ctrl_val = self.ssa_func.getValue(ctrl_idx)
+                ctrl_val.uses += 1
+                self.ssa_func.setValue(ctrl_idx, ctrl_val)
+            }
+        }
     }
 
     // ========================================================================
@@ -423,19 +512,43 @@ struct FuncGen {
 
             if (has_next and next_bi == succ0_bi) {
                 // True is next: if false, jump to succ1
-                self.code.emitI32Eqz()
-                self.code.emitIf(BLOCK_VOID)
-                self.block_depth += 1
-                self.emitBranchTo(succ1_bi)
-                self.code.emitEnd()
-                self.block_depth -= 1
+                // If succ1 needs a forward jump (non-return, non-loop), wrap in block
+                if (self.needsWrappingBlock(succ1_bi)) {
+                    self.code.emitBlock(BLOCK_VOID)
+                    self.block_depth += 1
+                    self.pending_block_ends.append(succ1_bi)
+                    self.code.emitI32Eqz()
+                    self.code.emitIf(BLOCK_VOID)
+                    self.block_depth += 1
+                    self.code.emitBr(1)  // exit if + wrapping block → land at succ1
+                    self.code.emitEnd()
+                    self.block_depth -= 1
+                } else {
+                    self.code.emitI32Eqz()
+                    self.code.emitIf(BLOCK_VOID)
+                    self.block_depth += 1
+                    self.emitBranchTo(succ1_bi)
+                    self.code.emitEnd()
+                    self.block_depth -= 1
+                }
             } else if (has_next and next_bi == succ1_bi) {
                 // False is next: if true, jump to succ0
-                self.code.emitIf(BLOCK_VOID)
-                self.block_depth += 1
-                self.emitBranchTo(succ0_bi)
-                self.code.emitEnd()
-                self.block_depth -= 1
+                if (self.needsWrappingBlock(succ0_bi)) {
+                    self.code.emitBlock(BLOCK_VOID)
+                    self.block_depth += 1
+                    self.pending_block_ends.append(succ0_bi)
+                    self.code.emitIf(BLOCK_VOID)
+                    self.block_depth += 1
+                    self.code.emitBr(1)  // exit if + wrapping block → land at succ0
+                    self.code.emitEnd()
+                    self.block_depth -= 1
+                } else {
+                    self.code.emitIf(BLOCK_VOID)
+                    self.block_depth += 1
+                    self.emitBranchTo(succ0_bi)
+                    self.code.emitEnd()
+                    self.block_depth -= 1
+                }
             } else {
                 // Neither is next: emit both jumps
                 self.code.emitIf(BLOCK_VOID)
@@ -491,8 +604,52 @@ struct FuncGen {
                 }
                 self.emitReturnWithEpilogue()
             } else {
-                // Forward jump to non-return block
-                self.code.emitBr(0)
+                // Forward jump to non-return block — should be handled by
+                // wrapping block pattern in ssaGenBlock. Emit return as fallback.
+                self.emitReturnWithEpilogue()
+            }
+        }
+    }
+
+    // ========================================================================
+    // needsWrappingBlock — Check if a forward jump target needs a block wrapper
+    // ========================================================================
+
+    fn needsWrappingBlock(target_bi: int) bool {
+        if (self.block_depths.contains(target_bi)) {
+            return false  // Already reachable via back edge
+        }
+        if (target_bi >= self.ssa_func.blocks.count) {
+            return false
+        }
+        const target_blk = self.ssa_func.getBlock(target_bi)
+        // Return/exit blocks are inlined — no wrapping needed
+        if (target_blk.kind == SsaBlockKind.ret or target_blk.kind == SsaBlockKind.exit) {
+            return false
+        }
+        return true
+    }
+
+    // ========================================================================
+    // closePendingBlocks — Close wrapping blocks that end at this block index
+    // ========================================================================
+
+    fn closePendingBlocks(bi: int) void {
+        // Count and close all wrapping blocks ending at bi
+        var i = 0
+        while (i < self.pending_block_ends.count) {
+            if (self.pending_block_ends.get(i) == bi) {
+                self.code.emitEnd()
+                self.block_depth -= 1
+                // Remove by swapping with last element
+                const last = self.pending_block_ends.count - 1
+                if (i < last) {
+                    self.pending_block_ends.set(i, self.pending_block_ends.get(last))
+                }
+                self.pending_block_ends.pop()
+                // Don't increment i — check the swapped element
+            } else {
+                i += 1
             }
         }
     }
@@ -510,8 +667,10 @@ struct FuncGen {
             for ai in 0..v.args.count {
                 self.getValue64(v.args.get(ai))
             }
-            // Emit call — aux_int holds the function index
-            self.code.emitCall(v.aux_int)
+            // Resolve function index from name via func_indices map
+            // Zig reference: gen.zig lines 943-954
+            const func_idx = self.resolveCallIndex(v)
+            self.code.emitCall(func_idx)
             if (v.uses > 0) {
                 self.setReg(val_idx)
             }
@@ -519,7 +678,8 @@ struct FuncGen {
             for ai in 0..v.args.count {
                 self.getValue64(v.args.get(ai))
             }
-            self.code.emitCall(v.aux_int)
+            const func_idx_2 = self.resolveCallIndex(v)
+            self.code.emitCall(func_idx_2)
             if (v.uses > 0) {
                 self.setReg(val_idx)
             }
@@ -554,6 +714,39 @@ struct FuncGen {
             self.getValue32(v.args.get(1))  // src addr
             self.code.emitI32Const(v.aux_int)  // size
             self.code.emitMemoryCopy()
+        } else if (v.op == SsaOp.wasm_gc_struct_new) {
+            // WasmGC struct.new: push all field values, emit struct.new $typeidx
+            for ai in 0..v.args.count {
+                self.getValue64(v.args.get(ai))
+            }
+            const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+            var gc_type_idx = 0
+            if (self.gc_struct_name_map) |m| {
+                if (m.contains(type_name)) { gc_type_idx = m.get(type_name) }
+            }
+            self.code.emitGcStructNew(gc_type_idx)
+            if (v.uses > 0) { self.setReg(val_idx) }
+        } else if (v.op == SsaOp.wasm_gc_struct_get) {
+            // WasmGC struct.get: push ref, emit struct.get $typeidx $fieldidx
+            self.getValue64(v.args.get(0))
+            const type_name2 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+            var gc_type_idx2 = 0
+            if (self.gc_struct_name_map) |m| {
+                if (m.contains(type_name2)) { gc_type_idx2 = m.get(type_name2) }
+            }
+            self.code.emitGcStructGet(gc_type_idx2, v.aux_int)
+            if (v.uses > 0) { self.setReg(val_idx) }
+        } else if (v.op == SsaOp.wasm_gc_struct_set) {
+            // WasmGC struct.set: push ref + value, emit struct.set $typeidx $fieldidx
+            self.getValue64(v.args.get(0))  // ref
+            self.getValue64(v.args.get(1))  // value
+            const type_name3 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+            var gc_type_idx3 = 0
+            if (self.gc_struct_name_map) |m| {
+                if (m.contains(type_name3)) { gc_type_idx3 = m.get(type_name3) }
+            }
+            self.code.emitGcStructSet(gc_type_idx3, v.aux_int)
+            // No result (void)
         } else if (v.op == SsaOp.phi or v.op == SsaOp.init_mem or v.op == SsaOp.fwd_ref) {
             // Memory ops, control flow — handled elsewhere
         } else {
@@ -593,7 +786,7 @@ struct FuncGen {
             self.code.emitI32Const(v.aux_int)
         } else if (v.op == SsaOp.wasm_f64_const or v.op == SsaOp.const_float) {
             // f64 const: aux_int holds bit pattern, need to write raw bytes
-            self.code.emitI64Const(v.aux_int)  // placeholder — should be f64.const
+            self.code.emitF64Const(@bitCast(float, v.aux_int))
         } else if (v.op == SsaOp.local_addr) {
             // SP-relative addressing: SP + (slot * 8)
             const offset = v.aux_int * 8

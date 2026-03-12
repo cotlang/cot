@@ -518,6 +518,29 @@ struct FuncBuilder {
         }
     }
 
+    /// Heap-allocate a FuncBuilder so mutations through a pointer persist.
+    /// Matches Zig's ?*FuncBuilder pattern in Builder.func().
+    static fn initHeap(name: string, type_idx: int, return_type: int, span: Span) *FuncBuilder {
+        var fb = FuncBuilder.init(name, type_idx, return_type, span)
+        const ptr = new FuncBuilder {
+            name: fb.name,
+            type_idx: fb.type_idx,
+            return_type: fb.return_type,
+            span: Span { start: span.start, end: span.end },
+            locals: fb.locals,
+            blocks: fb.blocks,
+            nodes: fb.nodes,
+            string_literals: fb.string_literals,
+            current_block: 0,
+            local_map: fb.local_map,
+            shadow_stack: fb.shadow_stack,
+            sret_return_type: null,
+            is_destructor: false,
+            is_export: false,
+        }
+        return ptr
+    }
+
     // --- Local management ---
 
     fn addLocal(local: Local) int {
@@ -619,6 +642,10 @@ struct FuncBuilder {
         var n = node
         n.block = self.current_block
         self.nodes.append(n)
+        if (self.current_block >= self.blocks.count) {
+            eprintln("BUG: emit current_block=${self.current_block} >= blocks.count=${self.blocks.count}")
+            @panic("emit: current_block out of bounds")
+        }
         var block = self.blocks.get(self.current_block)
         block.nodes.append(idx)
         self.blocks.set(self.current_block, block)
@@ -965,7 +992,7 @@ struct IR {
 
 struct Builder {
     ir: IR,
-    current_func: ?FuncBuilder,
+    current_func_ptr: ?*FuncBuilder,
     funcs: List(Func),
     globals: List(Global),
     structs: List(StructDef),
@@ -976,7 +1003,7 @@ struct Builder {
         var structs: List(StructDef) = .{}
         return Builder {
             ir: IR.init(),
-            current_func: null,
+            current_func_ptr: null,
             funcs: funcs,
             globals: globals,
             structs: structs,
@@ -984,17 +1011,17 @@ struct Builder {
     }
 
     fn startFunc(name: string, type_idx: int, return_type: int, span: Span) void {
-        self.current_func = FuncBuilder.init(name, type_idx, return_type, span)
+        self.current_func_ptr = FuncBuilder.initHeap(name, type_idx, return_type, span)
     }
 
-    fn func() ?FuncBuilder {
-        return self.current_func
+    fn func() ?*FuncBuilder {
+        return self.current_func_ptr
     }
 
     fn endFunc() void {
-        if (self.current_func) |fb| {
+        if (self.current_func_ptr) |fb| {
             self.funcs.append(fb.build())
-            self.current_func = null
+            self.current_func_ptr = null
         }
     }
 

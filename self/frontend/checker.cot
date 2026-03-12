@@ -1522,8 +1522,11 @@ struct Checker {
         if (tag == "string_interp") { return self.checkStringInterp(idx) }
         if (tag == "try_expr") { return self.checkTryExpr(idx) }
         if (tag == "catch_expr") { return self.checkCatchExpr(idx) }
+        if (tag == "orelse_expr") { return self.checkOrElseExpr(idx) }
+        if (tag == "spawn_expr") { return self.checkSpawnExpr(idx) }
+        if (tag == "select_expr") { return self.checkSelectExpr(idx) }
         if (tag == "closure_expr") { return self.checkClosureExpr(idx) }
-        if (tag == "error_literal") { return self.current_return_type }
+        if (tag == "error_literal") { return self.checkErrorLiteral(idx) }
         if (tag == "addr_of") { return self.checkAddrOf(idx) }
         if (tag == "deref") { return self.checkDeref(idx) }
         if (tag == "tuple_literal") { return self.checkTupleLiteral(idx) }
@@ -2197,7 +2200,12 @@ struct Checker {
 
         const struct_type_idx = self.types.lookupByName(type_name)
         if (struct_type_idx < 0) {
-            self.reportError(idx, ErrorCode.e301, "undefined type")
+            const type_suggestion = self.findSimilarType(type_name)
+            if (type_suggestion) |ts| {
+                self.reportError(idx, ErrorCode.e301, "undefined type '${type_name}', did you mean '${ts}'?")
+            } else {
+                self.reportError(idx, ErrorCode.e301, "undefined type '${type_name}'")
+            }
             return invalid_type
         }
         const st = self.types.get(struct_type_idx)
@@ -2292,7 +2300,12 @@ struct Checker {
 
         const struct_type_idx = self.types.lookupByName(type_name)
         if (struct_type_idx < 0) {
-            self.reportError(idx, ErrorCode.e301, "undefined type")
+            const type_suggestion = self.findSimilarType(type_name)
+            if (type_suggestion) |ts| {
+                self.reportError(idx, ErrorCode.e301, "undefined type '${type_name}', did you mean '${ts}'?")
+            } else {
+                self.reportError(idx, ErrorCode.e301, "undefined type '${type_name}'")
+            }
             return invalid_type
         }
         const st = self.types.get(struct_type_idx)
@@ -3309,6 +3322,132 @@ struct Checker {
         return elem_type
     }
 
+    fn checkErrorLiteral(idx: int) int {
+        var error_name = ""
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.error_literal |el| => { error_name = el.error_name }, else => {} }, else => {} }
+
+        // Check function return type for matching error set
+        const ret_info = self.types.get(self.current_return_type)
+        if (ret_info.tag == TAG_ERROR_UNION) {
+            const eu = switch (ret_info) { Type.error_union |eu| => eu, else => ErrorUnionType { elem: invalid_type, error_set: invalid_type } }
+            if (eu.error_set != invalid_type) {
+                const es_info = self.types.get(eu.error_set)
+                if (es_info.tag == TAG_ERROR_SET) {
+                    const es = switch (es_info) { Type.error_set |es| => es, else => ErrorSetType { name: "", variant_count: 0, variant_names: 0 } }
+                    for i in 0..es.variant_count {
+                        if (es.getVariant(i).name == error_name) { return eu.error_set }
+                    }
+                }
+            }
+        }
+
+        // Check expected_type (for var init: var e: MyError!i64 = error.Foo)
+        if (self.expected_type != invalid_type) {
+            const exp_info = self.types.get(self.expected_type)
+            if (exp_info.tag == TAG_ERROR_UNION) {
+                const eu = switch (exp_info) { Type.error_union |eu| => eu, else => ErrorUnionType { elem: invalid_type, error_set: invalid_type } }
+                if (eu.error_set != invalid_type) {
+                    const es_info = self.types.get(eu.error_set)
+                    if (es_info.tag == TAG_ERROR_SET) {
+                        const es = switch (es_info) { Type.error_set |es| => es, else => ErrorSetType { name: "", variant_count: 0, variant_names: 0 } }
+                        for i in 0..es.variant_count {
+                            if (es.getVariant(i).name == error_name) { return eu.error_set }
+                        }
+                    }
+                }
+            }
+            // expected_type might be an error_set directly
+            if (exp_info.tag == TAG_ERROR_SET) {
+                const es = switch (exp_info) { Type.error_set |es| => es, else => ErrorSetType { name: "", variant_count: 0, variant_names: 0 } }
+                for i in 0..es.variant_count {
+                    if (es.getVariant(i).name == error_name) { return self.expected_type }
+                }
+            }
+        }
+
+        return self.current_return_type
+    }
+
+    /// spawn { body } — fire-and-forget, returns void
+    /// Copied from checker.zig:3005-3009
+    fn checkSpawnExpr(idx: int) int {
+        var body_n = null_node
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.spawn_expr |se| => { body_n = se.body }, else => {} }, else => {} }
+        self.checkExpr(body_n)
+        return VOID
+    }
+
+    /// select { recv/send cases } — Go-style channel select, returns void
+    /// Copied from checker.zig:3011-3059
+    fn checkSelectExpr(idx: int) int {
+        var cases: List(int) = .{}
+        var default_body = null_node
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.select_expr |se| => { cases = se.cases; default_body = se.default_body }, else => {} }, else => {} }
+
+        var i = 0
+        while (i < cases.count) {
+            const sc = self.ast.getSelectCase(cases.get(i))
+            if (sc.kind == SELECT_RECV) {
+                // Type-check channel expression
+                const ch_type = self.checkExpr(sc.channel)
+                var elem_type = I64  // fallback
+                if (self.types.isPointer(ch_type)) {
+                    const pointee = self.types.pointerElem(ch_type)
+                    const pt = self.types.get(pointee)
+                    if (pt.tag == TAG_STRUCT) {
+                        const sname = switch (pt) { Type.struct_type |st| => st.name, else => "" }
+                        if (sname.len >= 7 and substring(sname, 0, 7) == "Channel") {
+                            // Channel(T) — elem_type derived from tryRecv return type
+                        } else {
+                            self.reportError(idx, ErrorCode.e300, "select recv case requires a Channel type")
+                        }
+                    }
+                }
+                // Bind capture in case body scope
+                if (sc.capture.len > 0) {
+                    self.pushScope()
+                    self.defineSymbol(makeSymbol(sc.capture, elem_type, null_node, false))
+                    self.checkExpr(sc.body)
+                    self.popScope()
+                } else {
+                    self.checkExpr(sc.body)
+                }
+            } else {
+                // Send case: channel expr is full ch.send(value) call
+                self.checkExpr(sc.channel)
+                self.checkExpr(sc.body)
+            }
+            i += 1
+        }
+        if (default_body != null_node) {
+            self.checkExpr(default_body)
+        }
+        return VOID
+    }
+
+    fn checkOrElseExpr(idx: int) int {
+        var operand_n = null_node
+        var fallback_n = null_node
+        var fallback_kind = ORELSE_EXPR
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.orelse_expr |oe| => { operand_n = oe.operand; fallback_n = oe.fallback; fallback_kind = oe.fallback_kind }, else => {} }, else => {} }
+
+        const operand_type = self.checkExpr(operand_n)
+        const ot = self.types.get(operand_type)
+        if (ot.tag != TAG_OPTIONAL) {
+            self.reportError(idx, ErrorCode.e300, "orelse requires optional type")
+            return operand_type
+        }
+        const elem_type = switch (ot) { Type.optional |opt| => opt.elem, else => invalid_type }
+        if (fallback_kind == ORELSE_EXPR) {
+            self.checkExpr(fallback_n)
+        } else if (fallback_kind == ORELSE_RETURN_VAL) {
+            if (fallback_n != null_node) {
+                self.checkExpr(fallback_n)
+            }
+        }
+        return elem_type
+    }
+
     fn checkAddrOf(idx: int) int {
         var ao_operand = null_node
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.addr_of |ao| => { ao_operand = ao.operand }, else => {} }, else => {} }
@@ -3415,7 +3554,12 @@ struct Checker {
                 const sym = self.getSymbol(sym_idx)
                 if (sym.is_type) { return sym.type_idx }
             }
-            self.reportError(idx, ErrorCode.e301, "undefined type")
+            const type_suggestion = self.findSimilarType(name)
+            if (type_suggestion) |ts| {
+                self.reportError(idx, ErrorCode.e301, "undefined type '${name}', did you mean '${ts}'?")
+            } else {
+                self.reportError(idx, ErrorCode.e301, "undefined type '${name}'")
+            }
             return invalid_type
         }
 
@@ -4867,6 +5011,40 @@ struct Checker {
                 }
             }
         }
+        return best
+    }
+
+    /// Search type names for the closest match (for "did you mean" on undefined types).
+    /// Zig ref: checker.zig:4194-4223
+    fn findSimilarType(name: string) ?string {
+        var best: ?string = null
+        var best_dist = 999
+
+        // Search type registry name_map
+        for ki in 0..self.types.name_map.capacity {
+            if (@intToPtr(*u8, self.types.name_map.states + ki).* != 1) { continue }
+            const candidate = @intToPtr(*string, self.types.name_map.keys + ki * @sizeOf(string)).*
+            if (candidate == name) { continue }
+            if (!self.isUserVisibleName(candidate)) { continue }
+            const d = self.editDistance(name, candidate)
+            if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {
+                best_dist = d
+                best = candidate
+            }
+        }
+
+        // Also check generic struct names
+        for ki in 0..self.generic_structs.capacity {
+            if (@intToPtr(*u8, self.generic_structs.states + ki).* != 1) { continue }
+            const candidate = @intToPtr(*string, self.generic_structs.keys + ki * @sizeOf(string)).*
+            if (candidate == name) { continue }
+            const d = self.editDistance(name, candidate)
+            if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {
+                best_dist = d
+                best = candidate
+            }
+        }
+
         return best
     }
 

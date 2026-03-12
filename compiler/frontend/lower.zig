@@ -8655,6 +8655,52 @@ pub const Lowerer = struct {
                 }
             }
 
+            // T → ?T wrapping: when arg type is T but param type is ?T (compound optional),
+            // wrap the value with tag=1 + payload before passing.
+            // For null literals, use tag=0 (matches storeCompoundOptArm pattern).
+            // Copied from lowerCall (line 7687) — must be identical logic.
+            if (param_types) |params| {
+                const param_idx_opt = arg_i + receiver_offset;
+                if (param_idx_opt < params.len) {
+                    const param_type = self.type_reg.get(params[param_idx_opt].type_idx);
+                    if (param_type == .optional and !self.isPtrLikeOptional(params[param_idx_opt].type_idx)) {
+                        const arg_type = self.inferExprType(arg_idx);
+                        if (arg_type == TypeRegistry.UNTYPED_NULL) {
+                            // null → tag=0, payload=0 (zero-initialized)
+                            const opt_size = self.type_reg.sizeOf(params[param_idx_opt].type_idx);
+                            const tmp = try fb.addLocalWithSize("__opt_arg", params[param_idx_opt].type_idx, false, opt_size);
+                            const tag_zero = try fb.emitConstInt(0, TypeRegistry.I64, call.span);
+                            _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_zero, call.span);
+                            arg_node = try fb.emitLoadLocal(tmp, params[param_idx_opt].type_idx, call.span);
+                        } else {
+                            const arg_info = self.type_reg.get(arg_type);
+                            // Only wrap if arg is NOT already optional (T → ?T, not ?T → ?T)
+                            if (arg_info != .optional) {
+                                const opt_size = self.type_reg.sizeOf(params[param_idx_opt].type_idx);
+                                const tmp = try fb.addLocalWithSize("__opt_arg", params[param_idx_opt].type_idx, false, opt_size);
+                                const tag_one = try fb.emitConstInt(1, TypeRegistry.I64, call.span);
+                                _ = try fb.emitStoreLocalField(tmp, 0, 0, tag_one, call.span);
+                                // For large T (struct/union > 8 bytes), copy word by word into payload area
+                                const arg_size = self.type_reg.sizeOf(arg_type);
+                                if (arg_size > 8) {
+                                    const val_tmp = try fb.addLocalWithSize("__opt_val", arg_type, false, arg_size);
+                                    _ = try fb.emitStoreLocal(val_tmp, arg_node, call.span);
+                                    const num_words: u32 = @intCast((arg_size + 7) / 8);
+                                    for (0..num_words) |i| {
+                                        const off: i64 = @intCast(i * 8);
+                                        const word = try fb.emitFieldLocal(val_tmp, @intCast(i), off, TypeRegistry.I64, call.span);
+                                        _ = try fb.emitStoreLocalField(tmp, @as(u32, @intCast(1 + i)), @as(i64, 8) + off, word, call.span);
+                                    }
+                                } else {
+                                    _ = try fb.emitStoreLocalField(tmp, 1, 8, arg_node, call.span);
+                                }
+                                arg_node = try fb.emitLoadLocal(tmp, params[param_idx_opt].type_idx, call.span);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Go pattern: decompose compound types (slice/string) into (ptr, len)
             // at call sites. Reference: Go's OSPTR()/OLEN() in walk/builtin.go
             if (param_is_compound) {

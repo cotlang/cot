@@ -1059,6 +1059,50 @@ struct Parser {
 
         while (true) {
             const tok = @enumFromInt(self.tok) as Token
+            // Handle orelse specially (lowest precedence, right-associative)
+            if (tok == Token.kw_orelse) {
+                if (min_prec > 1) {
+                    break
+                }
+                const op_start = self.tok_start
+                self.advance()  // consume 'orelse'
+
+                // orelse return [expr]
+                if (self.tok == Token.kw_return as int) {
+                    self.advance()
+                    // Check if there's a return value expression
+                    var ret_val = null_node
+                    if (self.tok != Token.eof as int and self.tok != Token.rbrace as int and self.tok != Token.rparen as int) {
+                        ret_val = self.parseBinaryExpr(2)
+                    }
+                    const kind = if (ret_val != null_node) { ORELSE_RETURN_VAL } else { ORELSE_RETURN_VOID }
+                    left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = ret_val, .fallback_kind = kind, .span = self.spanSE(op_start, self.tok_end) }))
+                    continue
+                }
+
+                // orelse break
+                if (self.tok == Token.kw_break as int) {
+                    self.advance()
+                    left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = null_node, .fallback_kind = ORELSE_BREAK_VAL, .span = self.spanSE(op_start, self.tok_end) }))
+                    continue
+                }
+
+                // orelse continue
+                if (self.tok == Token.kw_continue as int) {
+                    self.advance()
+                    left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = null_node, .fallback_kind = ORELSE_CONTINUE_VAL, .span = self.spanSE(op_start, self.tok_end) }))
+                    continue
+                }
+
+                // orelse expr (normal fallback)
+                const fallback = self.parseBinaryExpr(2)
+                if (fallback == null_node) {
+                    self.errors.report(self.tok_start, ErrorCode.e201, "expected expression after 'orelse'")
+                }
+                left = self.ast.addExpr(Expr.orelse_expr(OrElseExpr { .operand = left, .fallback = fallback, .fallback_kind = ORELSE_EXPR, .span = self.spanSE(op_start, self.tok_end) }))
+                continue
+            }
+
             // Handle catch specially (low precedence, right-associative)
             if (tok == Token.kw_catch) {
                 if (min_prec > 1) {
@@ -1230,6 +1274,34 @@ struct Parser {
     fn parseOperand() int {
         const tok = @enumFromInt(self.tok) as Token
         const start = self.tok_start
+
+        // Contextual keyword: spawn { ... }
+        if (tok == Token.ident and self.tok_text == "spawn" and self.peekToken() == Token.lbrace as int) {
+            self.advance()  // consume "spawn"
+            const body = self.parseBlockExpr()
+            if (body == null_node) {
+                return null_node
+            }
+            return self.ast.addExpr(Expr.spawn_expr(SpawnExpr { .body = body, .span = self.spanSE(start, self.tok_end) }))
+        }
+
+        // Contextual keyword: select { ... }
+        if (tok == Token.ident and self.tok_text == "select" and self.peekToken() == Token.lbrace as int) {
+            return self.parseSelectExpr(start)
+        }
+
+        // Labeled block: label: { ... break :label value ... }
+        if (tok == Token.ident and self.peekToken() == Token.colon as int) {
+            const label = self.tok_text
+            self.advance()  // consume ident
+            self.advance()  // consume ':'
+            if (self.tok == Token.lbrace) {
+                return self.parseLabeledBlockExpr(label)
+            }
+            // Not a labeled block — rewind not possible, report error
+            self.errors.report(self.tok_start, ErrorCode.e201, "expected '{' after label")
+            return null_node
+        }
 
         // Identifiers
         if (tok == Token.ident) {
@@ -1749,7 +1821,124 @@ struct Parser {
             }
         }
         self.expect(Token.rbrace as int)
-        return self.ast.addExpr(Expr.block_expr(BlockExpr { .stmts = stmts, .result_expr = result_expr, .span = self.spanSE(start, self.tok_end) }))
+        return self.ast.addExpr(Expr.block_expr(BlockExpr { .stmts = stmts, .result_expr = result_expr, .label = "", .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Labeled block expression: label: { stmts; break :label value }
+    fn parseLabeledBlockExpr(label: string) int {
+        const start = self.tok_start
+        self.advance()  // consume {
+        var stmts: List(int) = .{}
+        var result_expr = null_node
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            const prev_pos = self.tok_start
+            const s = self.parseStmt()
+            if (s != null_node) {
+                stmts.append(s)
+            } else if (self.tok_start == prev_pos) {
+                self.advance()
+            }
+        }
+        // If last stmt is expr_stmt, extract as result
+        if (stmts.count > 0) {
+            const last_inner = nodeExprStmtExpr(self.ast, stmts.get(stmts.count - 1))
+            if (last_inner != null_node) {
+                result_expr = last_inner
+                stmts.count -= 1
+            }
+        }
+        self.expect(Token.rbrace as int)
+        return self.ast.addExpr(Expr.block_expr(BlockExpr { .stmts = stmts, .result_expr = result_expr, .label = label, .span = self.spanSE(start, self.tok_end) }))
+    }
+
+    /// Parse select expression (Go-style channel select).
+    /// Copied from parser.zig:1819-1890
+    fn parseSelectExpr(start: int) int {
+        self.advance()  // consume "select"
+        if (!self.expect(Token.lbrace as int)) {
+            return null_node
+        }
+
+        var cases: List(int) = .{}
+        var default_body = null_node
+
+        while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            const case_start = self.tok_start
+
+            // default => { body }
+            if (self.tok == Token.ident and self.tok_text == "default") {
+                self.advance()
+                if (!self.expect(Token.fat_arrow as int)) {
+                    return null_node
+                }
+                default_body = self.parseExpr()
+                if (default_body == null_node) {
+                    return null_node
+                }
+                if (self.match(Token.comma as int)) {}
+                continue
+            }
+
+            // Peek ahead: if second token is "from", it's a recv case
+            // recv: <capture> from <channel> => { body }
+            if (self.tok == Token.ident and self.peekToken() == Token.ident as int) {
+                if (self.peek_text == "from") {
+                    const capture = self.tok_text
+                    self.advance()  // consume capture name
+                    self.advance()  // consume "from"
+                    const channel = self.parsePrimaryExpr()
+                    if (channel == null_node) {
+                        return null_node
+                    }
+                    if (!self.expect(Token.fat_arrow as int)) {
+                        return null_node
+                    }
+                    const body = self.parseExpr()
+                    if (body == null_node) {
+                        return null_node
+                    }
+                    const case_node = self.ast.addSelectCase(SelectCase {
+                        .kind = SELECT_RECV,
+                        .channel = channel,
+                        .capture = capture,
+                        .send_value = null_node,
+                        .body = body,
+                        .span = self.spanSE(case_start, self.tok_end),
+                    })
+                    cases.append(case_node)
+                    if (self.match(Token.comma as int)) {}
+                    continue
+                }
+            }
+
+            // Send case: <channel>.send(<value>) => { body }
+            const channel_expr = self.parsePrimaryExpr()
+            if (channel_expr == null_node) {
+                return null_node
+            }
+            if (!self.expect(Token.fat_arrow as int)) {
+                return null_node
+            }
+            const body = self.parseExpr()
+            if (body == null_node) {
+                return null_node
+            }
+            const case_node = self.ast.addSelectCase(SelectCase {
+                .kind = SELECT_SEND,
+                .channel = channel_expr,
+                .capture = "",
+                .send_value = null_node,
+                .body = body,
+                .span = self.spanSE(case_start, self.tok_end),
+            })
+            cases.append(case_node)
+            if (self.match(Token.comma as int)) {}
+        }
+
+        if (!self.expect(Token.rbrace as int)) {
+            return null_node
+        }
+        return self.ast.addExpr(Expr.select_expr(SelectExpr { .cases = cases, .default_body = default_body, .span = self.spanSE(start, self.tok_end) }))
     }
 
     /// @builtin(args) — dispatches per-builtin to parse type vs expr args.
@@ -2245,18 +2434,23 @@ struct Parser {
         const start = self.tok_start
         self.advance()  // consume 'break'
         var label = ""
+        var value = null_node
         if (self.tok == Token.colon) {
             self.advance()  // consume ':'
             if (self.tok == Token.ident) {
                 label = self.tok_text
                 self.advance()
             }
+            // Labeled break with value: break :label expr
+            if (self.tok != Token.rbrace and self.tok != Token.semicolon as int and self.tok != Token.eof) {
+                value = self.parseExpr()
+            }
         } else if (self.tok == Token.ident) {
             label = self.tok_text
             self.advance()
         }
         self.match(Token.semicolon as int)
-        return self.ast.addStmt(Stmt.break_stmt(BreakStmt { .label = label, .span = self.spanSE(start, self.tok_end) }))
+        return self.ast.addStmt(Stmt.break_stmt(BreakStmt { .label = label, .value = value, .span = self.spanSE(start, self.tok_end) }))
     }
 
     fn parseContinueStmt() int {
@@ -2856,6 +3050,30 @@ test "parse generic impl block" {
     @assertEq(errors.errorCount(), 0)
     @assertEq(ast.file_decls.count, 1)
     @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "impl_block")
+}
+
+test "parse orelse expr" {
+    const src = "fn f(x: ?int) int { return x orelse 0 }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
+}
+
+test "parse orelse return" {
+    const src = "fn f(x: ?int) int { const v = x orelse return }"
+    var s = Scanner.init(src)
+    var ast = Ast.init("test.cot")
+    var errors = ErrorReporter.init()
+    var p = Parser.init(s, ast, errors)
+    p.parseFile()
+    @assertEq(errors.errorCount(), 0)
+    @assertEq(ast.file_decls.count, 1)
+    @assertEq(nodeDeclTag(ast, ast.file_decls.get(0)), "fn_decl")
 }
 
 test "parse impl trait for type" {

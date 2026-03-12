@@ -134,6 +134,50 @@ const BasicKind = enum(u8) {
 }
 
 // ============================================================================
+// Shape (generic deduplication — 3-tier stenciling)
+// ============================================================================
+
+/// ARC category for a type.
+/// Copied from types.zig:678-685
+const ARC_NONE: int = 0      // Value types (i8-i64, u8-u64, f32, f64, bool)
+const ARC_POINTER: int = 1   // All *T types (uniform ARC via header)
+const ARC_SLICE: int = 2     // All []T and string (ARC on backing buffer)
+
+/// Register class for a type.
+/// Copied from types.zig:688-692
+const RC_INT: int = 0        // i8-i64, u8-u64, bool, enum, pointer (GPR)
+const RC_FLOAT: int = 1      // f32, f64 (FPR)
+const RC_COMPOUND: int = 2   // structs, slices, etc. (memory or multi-reg)
+
+/// Memory footprint descriptor for generic deduplication.
+/// Two types with the same Shape can share a single function body (stenciling).
+/// Copied from types.zig:668-747
+struct Shape {
+    size: int,
+    alignment: int,
+    arc_kind: int,
+    reg_class: int,
+
+    fn eql(other: Shape) bool {
+        return self.size == other.size and self.alignment == other.alignment
+            and self.arc_kind == other.arc_kind and self.reg_class == other.reg_class
+    }
+
+    /// Generate unique suffix for function naming.
+    /// Format: s{size}{rc_char}{arc_char}
+    /// Copied from types.zig:722-737
+    fn key() string {
+        var rc_char = "i"
+        if (self.reg_class == RC_FLOAT) { rc_char = "f" }
+        else if (self.reg_class == RC_COMPOUND) { rc_char = "c" }
+        var arc_char = "n"
+        if (self.arc_kind == ARC_POINTER) { arc_char = "p" }
+        else if (self.arc_kind == ARC_SLICE) { arc_char = "s" }
+        return "s" ++ intToString(self.size) ++ rc_char ++ arc_char
+    }
+}
+
+// ============================================================================
 // Composite type structs
 // ============================================================================
 
@@ -775,6 +819,40 @@ struct TypeRegistry {
             Type.struct_type |s| => s.alignment,
             Type.enum_type |e| => self.alignmentOf(e.backing_type),
         }
+    }
+
+    /// Compute Shape for a concrete type.
+    /// Copied from types.zig:695-714
+    fn shapeOf(idx: int) Shape {
+        const t = self.get(idx)
+        // Pointer types: uniform 8 bytes, ARC via header
+        if (t.tag == TAG_POINTER) {
+            return Shape { size: 8, alignment: 8, arc_kind: ARC_POINTER, reg_class: RC_INT }
+        }
+        // Slice types (and string): 24 bytes compound, ARC on buffer
+        if (t.tag == TAG_SLICE or idx == STRING) {
+            return Shape { size: self.sizeOf(idx), alignment: 8, arc_kind: ARC_SLICE, reg_class: RC_COMPOUND }
+        }
+        // Basic types: check float vs int
+        if (t.tag == TAG_BASIC) {
+            const bk = switch (t) { Type.basic |k| => k, else => BasicKind.void_type }
+            const sz = bk.size()
+            if (bk.isFloat()) {
+                return Shape { size: sz, alignment: sz, arc_kind: ARC_NONE, reg_class: RC_FLOAT }
+            }
+            var al = sz
+            if (al == 0) { al = 1 }
+            return Shape { size: sz, alignment: al, arc_kind: ARC_NONE, reg_class: RC_INT }
+        }
+        // Enum types: delegate to backing type
+        if (t.tag == TAG_ENUM) {
+            const backing = switch (t) { Type.enum_type |e| => e.backing_type, else => I64 }
+            var s = self.shapeOf(backing)
+            s.arc_kind = ARC_NONE
+            return s
+        }
+        // Everything else: compound (structs, optionals, error unions, etc.)
+        return Shape { size: self.sizeOf(idx), alignment: self.alignmentOf(idx), arc_kind: ARC_NONE, reg_class: RC_COMPOUND }
     }
 
     /// T7: Compute byte offset of element `index` in a tuple type (Zig types.zig:318-323).
@@ -1481,4 +1559,51 @@ test "MethodInfo is_static" {
     const mi = MethodInfo { name: "create", func_name: "Foo_create", func_type: 0, receiver_is_ptr: false, is_static: true, source_tree: 0 }
     @assert(mi.is_static)
     @assertEq(mi.receiver_is_ptr, false)
+}
+
+test "Shape.fromType basic types" {
+    var reg = TypeRegistry.init()
+    // i64 and u64 share shape (same size, int register class)
+    const s_i64 = reg.shapeOf(I64)
+    const s_u64 = reg.shapeOf(U64)
+    @assert(s_i64.eql(s_u64))
+    @assertEq(s_i64.size, 8)
+    @assertEq(s_i64.reg_class, RC_INT)
+    @assertEq(s_i64.arc_kind, ARC_NONE)
+    // f64 has different reg_class
+    const s_f64 = reg.shapeOf(F64)
+    @assert(!s_i64.eql(s_f64))
+    @assertEq(s_f64.reg_class, RC_FLOAT)
+    // i32 has different size
+    const s_i32 = reg.shapeOf(I32)
+    @assertEq(s_i32.size, 4)
+    @assert(!s_i64.eql(s_i32))
+}
+
+test "Shape.fromType pointers and slices" {
+    var reg = TypeRegistry.init()
+    // All pointers share the same shape
+    const p1 = reg.makePointer(I64)
+    const p2 = reg.makePointer(F64)
+    @assert(reg.shapeOf(p1).eql(reg.shapeOf(p2)))
+    @assertEq(reg.shapeOf(p1).arc_kind, ARC_POINTER)
+    // String has slice shape
+    const s_str = reg.shapeOf(STRING)
+    @assertEq(s_str.arc_kind, ARC_SLICE)
+    @assertEq(s_str.reg_class, RC_COMPOUND)
+}
+
+test "Shape.key format" {
+    var reg = TypeRegistry.init()
+    // i64: 8 bytes, int reg, no ARC → "s8in"
+    @assertEq(reg.shapeOf(I64).key(), "s8in")
+    // f64: 8 bytes, float reg, no ARC → "s8fn"
+    @assertEq(reg.shapeOf(F64).key(), "s8fn")
+    // i32: 4 bytes, int reg, no ARC → "s4in"
+    @assertEq(reg.shapeOf(I32).key(), "s4in")
+    // pointer: 8 bytes, int reg, pointer ARC → "s8ip"
+    const p = reg.makePointer(I64)
+    @assertEq(reg.shapeOf(p).key(), "s8ip")
+    // string: 16 bytes, compound reg, slice ARC → "s16cs"
+    @assertEq(reg.shapeOf(STRING).key(), "s16cs")
 }

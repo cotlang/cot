@@ -146,12 +146,14 @@ const SP_GLOBAL: int = 0
 struct CodeBuilder {
     buf: List(u8),
     local_count: int,
+    locals_declared: bool,
 
     static fn init() CodeBuilder {
         var buf: List(u8) = .{}
         return CodeBuilder {
             buf: buf,
             local_count: 0,
+            locals_declared: false,
         }
     }
 
@@ -383,7 +385,7 @@ struct CodeBuilder {
     fn emitF64Ge() void { self.buf.append(OP_F64_GE) }
 
     // f64 extra ops
-    fn emitF64Trunc() void { self.buf.append(0x8D as u8) }
+    fn emitF64Trunc() void { self.buf.append(0x9D as u8) }
     fn emitF64Abs() void { self.buf.append(0x99 as u8) }
 
     // Conversions
@@ -417,6 +419,27 @@ struct CodeBuilder {
         self.buf.append(0x00 as u8)  // dst memory index
     }
 
+    // WasmGC struct operations (GC proposal, 0xFB prefix)
+    fn emitGcStructNew(type_idx: int) void {
+        self.buf.append(0xFB as u8)  // GC_PREFIX
+        self.buf.append(0x00 as u8)  // GC_STRUCT_NEW
+        writeULEB128(self.buf, type_idx)
+    }
+
+    fn emitGcStructGet(type_idx: int, field_idx: int) void {
+        self.buf.append(0xFB as u8)  // GC_PREFIX
+        self.buf.append(0x02 as u8)  // GC_STRUCT_GET
+        writeULEB128(self.buf, type_idx)
+        writeULEB128(self.buf, field_idx)
+    }
+
+    fn emitGcStructSet(type_idx: int, field_idx: int) void {
+        self.buf.append(0xFB as u8)  // GC_PREFIX
+        self.buf.append(0x05 as u8)  // GC_STRUCT_SET
+        writeULEB128(self.buf, type_idx)
+        writeULEB128(self.buf, field_idx)
+    }
+
     /// Declare local variables in function body.
     /// Zig reference: CodeBuilder.declareLocals()
     /// types: List of ValType values (0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64)
@@ -430,18 +453,29 @@ struct CodeBuilder {
             i += 1
         }
         self.local_count = self.local_count + types.count
+        self.locals_declared = true
     }
 
-    /// Finish function body: append END opcode, return as List(int).
-    /// Zig reference: CodeBuilder.finish()
+    /// Finish function body: prepend locals declaration if needed,
+    /// append END opcode, return as List(int).
+    /// Zig reference: CodeBuilder.finish() + assemble.zig local declarations
     fn finish() List(int) {
-        self.buf.append(OP_END)
         var result: List(int) = .{}
+
+        // If declareLocals() was never called, emit "0 local groups"
+        if (!self.locals_declared) {
+            result.append(0)  // 0 local groups (ULEB128 for 0 = single byte 0x00)
+        }
+
+        // Copy instruction bytecode
         var i = 0
         while (i < self.buf.count) {
             result.append(self.buf.get(i) as int)
             i += 1
         }
+
+        // Append END opcode
+        result.append(OP_END as int)
         return result
     }
 

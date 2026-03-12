@@ -237,6 +237,7 @@ struct SwitchExpr {
 struct BlockExpr {
     stmts: List(int),
     result_expr: int,
+    label: string,
     span: Span,
 }
 
@@ -285,10 +286,48 @@ struct AwaitExpr {
     span: Span,
 }
 
+struct SpawnExpr {
+    body: int,
+    span: Span,
+}
+
+/// Go-style select over channel operations.
+const SELECT_RECV: int = 0
+const SELECT_SEND: int = 1
+
+struct SelectCase {
+    kind: int,
+    channel: int,
+    capture: string,
+    send_value: int,
+    body: int,
+    span: Span,
+}
+
+struct SelectExpr {
+    cases: List(int),      // indices to SelectCase nodes
+    default_body: int,
+    span: Span,
+}
+
 struct CatchExpr {
     operand: int,
     capture: string,
     fallback: int,
+    span: Span,
+}
+
+/// Fallback kinds for orelse: `x orelse expr`, `x orelse return`, etc.
+const ORELSE_EXPR: int = 0
+const ORELSE_RETURN_VOID: int = 1
+const ORELSE_RETURN_VAL: int = 2
+const ORELSE_BREAK_VAL: int = 3
+const ORELSE_CONTINUE_VAL: int = 4
+
+struct OrElseExpr {
+    operand: int,
+    fallback: int,
+    fallback_kind: int,
     span: Span,
 }
 
@@ -457,6 +496,7 @@ struct BlockStmt {
 
 struct BreakStmt {
     label: string,
+    value: int,
     span: Span,
 }
 
@@ -524,7 +564,10 @@ union Expr {
     type_expr: TypeExprNode,
     try_expr: TryExpr,
     await_expr: AwaitExpr,
+    spawn_expr: SpawnExpr,
+    select_expr: SelectExpr,
     catch_expr: CatchExpr,
+    orelse_expr: OrElseExpr,
     error_literal: ErrorLiteralExpr,
     closure_expr: ClosureExpr,
     tuple_literal: TupleLiteral,
@@ -572,15 +615,18 @@ union Node {
 struct Ast {
     nodes: List(Node),
     file_decls: List(int),
+    select_cases: List(SelectCase),
     filename: string,
     safe_mode: bool,
 
     static fn init(filename: string) Ast {
         var nodes: List(Node) = .{}
         var file_decls: List(int) = .{}
+        var select_cases: List(SelectCase) = .{}
         return Ast {
             nodes: nodes,
             file_decls: file_decls,
+            select_cases: select_cases,
             filename: filename,
             safe_mode: false,
         }
@@ -589,9 +635,11 @@ struct Ast {
     static fn initHeap(filename: string) *Ast {
         var nodes: List(Node) = .{}
         var file_decls: List(int) = .{}
+        var select_cases: List(SelectCase) = .{}
         return new Ast {
             nodes: nodes,
             file_decls: file_decls,
+            select_cases: select_cases,
             filename: filename,
             safe_mode: false,
         }
@@ -613,6 +661,16 @@ struct Ast {
 
     fn addStmt(s: Stmt) int {
         return self.addNode(Node.stmt(s))
+    }
+
+    fn addSelectCase(sc: SelectCase) int {
+        const idx = self.select_cases.count
+        self.select_cases.append(sc)
+        return idx
+    }
+
+    fn getSelectCase(idx: int) SelectCase {
+        return self.select_cases.get(idx)
     }
 
     fn getNode(idx: int) Node {
@@ -737,7 +795,10 @@ fn exprSpan(e: Expr) Span {
         Expr.type_expr |v| => v.span,
         Expr.try_expr |v| => v.span,
         Expr.await_expr |v| => v.span,
+        Expr.spawn_expr |v| => v.span,
+        Expr.select_expr |v| => v.span,
         Expr.catch_expr |v| => v.span,
+        Expr.orelse_expr |v| => v.span,
         Expr.error_literal |v| => v.span,
         Expr.closure_expr |v| => v.span,
         Expr.tuple_literal |v| => v.span,
@@ -906,7 +967,10 @@ fn exprTagStr2(e: Expr) string {
     return switch (e) {
         Expr.try_expr |_| => "try_expr",
         Expr.await_expr |_| => "await_expr",
+        Expr.spawn_expr |_| => "spawn_expr",
+        Expr.select_expr |_| => "select_expr",
         Expr.catch_expr |_| => "catch_expr",
+        Expr.orelse_expr |_| => "orelse_expr",
         Expr.error_literal |_| => "error_literal",
         Expr.closure_expr |_| => "closure_expr",
         Expr.tuple_literal |_| => "tuple_literal",
