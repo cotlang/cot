@@ -400,7 +400,6 @@ struct Checker {
 
     fn checkFile() void {
         self.safe_mode = self.ast.safe_mode
-
         // Pass 1: collect type declarations (struct, enum, union, type alias)
         for i in 0..self.ast.file_decls.count {
             self.collectTypeDecl(self.ast.file_decls.get(i))
@@ -3619,14 +3618,18 @@ struct Checker {
 
         // type_expr node: kind, data1, data2
         if (tag != "type_expr") { return invalid_type }
+        return self.resolveTypeExprNode(idx)
+    }
 
+    /// Resolve a type_expr AST node (pointer, optional, error_union, slice, array, fn, named).
+    /// Split from resolveTypeExpr to keep stack frames small and avoid native codegen crashes.
+    fn resolveTypeExprNode(idx: int) int {
         var kind = 0
         var d1 = null_node
         var d2 = null_node
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.type_expr |te| => { kind = te.kind; d1 = te.data1; d2 = te.data2 }, else => {} }, else => {} }
 
         if (kind == TYPE_NAMED) {
-            // Named type: d1 is an ident node (or null_node for void)
             return self.resolveTypeExpr(d1)
         }
         if (kind == TYPE_POINTER) {
@@ -3642,9 +3645,6 @@ struct Checker {
             return self.types.makeSlice(self.resolveTypeExpr(d1))
         }
         if (kind == TYPE_FUNCTION) {
-            // fn(params...) -> RetType — d1 is ret_type_n, d2 is param_count
-            // Parser stores param count but not individual param types.
-            // We create a func type with correct count but null params pointer.
             var ret_type: int = VOID
             if (d1 != null_node) {
                 ret_type = self.resolveTypeExpr(d1)
@@ -3656,27 +3656,30 @@ struct Checker {
             }))
         }
         if (kind == TYPE_ARRAY) {
-            const elem = self.resolveTypeExpr(d1)
-            // Evaluate array size
-            var size: int = 0
-            const cv = self.evalConstExpr(d2)
-            if (cv.0 != 0 and cv.1 > 0) {
-                size = cv.1
-            } else {
-                // Try literal
-                if (nodeTag(self.ast, d2) == "literal") {
-                    var lit_kind = 0
-                    var lit_val = ""
-                    switch (self.ast.getNode(d2)) { Node.expr |e| => switch (e) { Expr.literal |lit| => { lit_kind = lit.kind; lit_val = lit.value }, else => {} }, else => {} }
-                    if (lit_kind == LiteralKind.@"int") {
-                        size = parseInt(lit_val)
-                    }
-                }
-            }
-            return self.types.makeArray(elem, size)
+            return self.resolveArrayType(d1, d2)
         }
 
         return invalid_type
+    }
+
+    /// Resolve array type: element type + const size expression.
+    fn resolveArrayType(elem_node: int, size_node: int) int {
+        const elem = self.resolveTypeExpr(elem_node)
+        var size: int = 0
+        const cv = self.evalConstExpr(size_node)
+        if (cv.0 != 0 and cv.1 > 0) {
+            size = cv.1
+        } else {
+            if (nodeTag(self.ast, size_node) == "literal") {
+                var lit_kind = 0
+                var lit_val = ""
+                switch (self.ast.getNode(size_node)) { Node.expr |e| => switch (e) { Expr.literal |lit| => { lit_kind = lit.kind; lit_val = lit.value }, else => {} }, else => {} }
+                if (lit_kind == LiteralKind.@"int") {
+                    size = parseInt(lit_val)
+                }
+            }
+        }
+        return self.types.makeArray(elem, size)
     }
 
     // ---- Type building ----
@@ -4327,50 +4330,7 @@ struct Checker {
 
         const params_ptr = alloc(0, params_count * @sizeOf(FuncParam))
         for pi in 0..params_count {
-            const param_idx = fn_params.get(pi)
-            var pname = ""
-            var ptype: int = invalid_type
-            if (nodeTag(self.ast, param_idx) == "field_def") {
-                var ptype_n = null_node
-                switch (self.ast.getNode(param_idx)) { Node.expr |pe| => switch (pe) { Expr.field_def |fd| => { pname = fd.name; ptype_n = fd.type_expr }, else => {} }, else => {} }
-                ptype = self.resolveTypeExpr(ptype_n)
-                // Don't auto-ref parameters whose type is a generic type parameter.
-                // Generic functions are written with value semantics for T; wrapping T
-                // to *T when T=struct would break body code.
-                // Type params can appear as either .ident or .type_expr(.named)
-                var is_substituted = false
-                if (self.hasTypeSubstitution() and ptype_n != null_node) {
-                    const ptype_tag = nodeTag(self.ast, ptype_n)
-                    if (ptype_tag == "ident") {
-                        var ptype_name = ""
-                        switch (self.ast.getNode(ptype_n)) { Node.expr |pe2| => switch (pe2) { Expr.ident |pid| => { ptype_name = pid.name }, else => {} }, else => {} }
-                        if (self.lookupTypeSub(ptype_name) >= 0) {
-                            is_substituted = true
-                        }
-                    } else if (ptype_tag == "type_expr") {
-                        var te_kind = 0
-                        var te_d1 = null_node
-                        switch (self.ast.getNode(ptype_n)) { Node.expr |pe3| => switch (pe3) { Expr.type_expr |te| => { te_kind = te.kind; te_d1 = te.data1 }, else => {} }, else => {} }
-                        if (te_kind == TYPE_NAMED) {
-                            const inner_n = te_d1
-                            if (inner_n != null_node and nodeTag(self.ast, inner_n) == "ident") {
-                                var inner_name = ""
-                                switch (self.ast.getNode(inner_n)) { Node.expr |pe4| => switch (pe4) { Expr.ident |iid| => { inner_name = iid.name }, else => {} }, else => {} }
-                                if (self.lookupTypeSub(inner_name) >= 0) {
-                                    is_substituted = true
-                                }
-                            }
-                        }
-                    }
-                }
-                if (!is_substituted) {
-                    ptype = self.safeWrapType(ptype)
-                }
-            }
-
-            const fp = @intToPtr(*FuncParam, params_ptr + pi * @sizeOf(FuncParam))
-            fp.name = pname
-            fp.type_idx = ptype
+            self.buildFuncParam(fn_params.get(pi), params_ptr, pi)
         }
 
         var ret_type: int = VOID
@@ -4383,6 +4343,45 @@ struct Checker {
             params: params_ptr,
             return_type: ret_type,
         }))
+    }
+
+    /// Build a single function parameter. Split from buildFuncType to avoid stack corruption.
+    fn buildFuncParam(param_idx: int, params_ptr: int, pi: int) void {
+        var pname = ""
+        var ptype: int = invalid_type
+        if (nodeTag(self.ast, param_idx) == "field_def") {
+            var ptype_n = null_node
+            switch (self.ast.getNode(param_idx)) { Node.expr |pe| => switch (pe) { Expr.field_def |fd| => { pname = fd.name; ptype_n = fd.type_expr }, else => {} }, else => {} }
+            ptype = self.resolveTypeExpr(ptype_n)
+            if (!self.isSubstitutedTypeParam(ptype_n)) {
+                ptype = self.safeWrapType(ptype)
+            }
+        }
+        const fp = @intToPtr(*FuncParam, params_ptr + pi * @sizeOf(FuncParam))
+        fp.name = pname
+        fp.type_idx = ptype
+    }
+
+    /// Check if a type expression refers to a substituted generic type parameter.
+    fn isSubstitutedTypeParam(ptype_n: int) bool {
+        if (!self.hasTypeSubstitution() or ptype_n == null_node) { return false }
+        const ptype_tag = nodeTag(self.ast, ptype_n)
+        if (ptype_tag == "ident") {
+            var ptype_name = ""
+            switch (self.ast.getNode(ptype_n)) { Node.expr |pe2| => switch (pe2) { Expr.ident |pid| => { ptype_name = pid.name }, else => {} }, else => {} }
+            return self.lookupTypeSub(ptype_name) >= 0
+        }
+        if (ptype_tag == "type_expr") {
+            var te_kind = 0
+            var te_d1 = null_node
+            switch (self.ast.getNode(ptype_n)) { Node.expr |pe3| => switch (pe3) { Expr.type_expr |te| => { te_kind = te.kind; te_d1 = te.data1 }, else => {} }, else => {} }
+            if (te_kind == TYPE_NAMED and te_d1 != null_node and nodeTag(self.ast, te_d1) == "ident") {
+                var inner_name = ""
+                switch (self.ast.getNode(te_d1)) { Node.expr |pe4| => switch (pe4) { Expr.ident |iid| => { inner_name = iid.name }, else => {} }, else => {} }
+                return self.lookupTypeSub(inner_name) >= 0
+            }
+        }
+        return false
     }
 
     // ---- Const evaluation ----
