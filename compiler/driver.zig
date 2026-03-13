@@ -5287,12 +5287,21 @@ pub const Driver = struct {
         // ====================================================================
         if (is_wasm_gc) {
             const wasm_link = @import("codegen/wasm/link.zig");
-            // First pass: register all struct names so we can resolve field refs
+            // First pass: register all struct/union base type names
             for (type_reg.types.items) |t| {
                 if (t == .struct_type) {
                     const st = t.struct_type;
                     // Pre-register with empty fields to get type index
                     _ = try linker.addGcStructType(st.name, &.{});
+                } else if (t == .union_type) {
+                    const ut = t.union_type;
+                    // Register empty base type for the union
+                    _ = try linker.addGcStructType(ut.name, &.{});
+                    // Register variant subtypes: __union_Name_variant
+                    for (ut.variants) |v| {
+                        const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ ut.name, v.name });
+                        _ = try linker.addGcStructType(variant_name, &.{});
+                    }
                 }
             }
             // Second pass: fill in field types (may reference other structs)
@@ -5360,6 +5369,96 @@ pub const Driver = struct {
                     gs.field_offset = @intCast(linker.gc_field_storage.items.len);
                     gs.field_count = @intCast(gc_fields.len);
                     try linker.gc_field_storage.appendSlice(self.allocator, gc_fields);
+                }
+            }
+
+            // Third pass: fill in union variant subtype fields + set super_type
+            for (type_reg.types.items) |t| {
+                if (t == .union_type) {
+                    const ut = t.union_type;
+                    const base_idx = linker.gc_struct_name_map.get(ut.name) orelse continue;
+
+                    for (ut.variants) |v| {
+                        const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ ut.name, v.name });
+                        const variant_idx = linker.gc_struct_name_map.get(variant_name) orelse continue;
+
+                        // Set super_type to base union type
+                        linker.gc_struct_types.items[variant_idx].super_type = base_idx;
+
+                        // Build fields for variant payload
+                        if (v.payload_type == types_mod.TypeRegistry.VOID) {
+                            // Unit variant: no fields (empty struct subtype)
+                            continue;
+                        }
+
+                        const payload_info = type_reg.get(v.payload_type);
+                        if (payload_info == .struct_type) {
+                            // Struct payload: expand fields same as struct type registration
+                            const pst = payload_info.struct_type;
+                            var total_chunks: usize = 0;
+                            for (pst.fields) |field| {
+                                const fi = type_reg.get(field.type_idx);
+                                if (fi == .struct_type) {
+                                    total_chunks += 1;
+                                } else {
+                                    const fs = type_reg.sizeOf(field.type_idx);
+                                    total_chunks += @max(1, (fs + 7) / 8);
+                                }
+                            }
+                            var gc_fields = try self.allocator.alloc(wasm_link.GcFieldType, total_chunks);
+                            defer self.allocator.free(gc_fields);
+                            var ci: usize = 0;
+                            for (pst.fields) |field| {
+                                const is_float = field.type_idx == types_mod.TypeRegistry.F64 or
+                                    field.type_idx == types_mod.TypeRegistry.F32;
+                                const fi = type_reg.get(field.type_idx);
+                                const field_struct_name: ?[]const u8 = switch (fi) {
+                                    .struct_type => |fst| fst.name,
+                                    .pointer => |ptr| switch (type_reg.get(ptr.elem)) {
+                                        .struct_type => |fst| fst.name,
+                                        else => null,
+                                    },
+                                    else => null,
+                                };
+                                const gc_ref: ?u32 = if (field_struct_name) |name|
+                                    linker.gc_struct_name_map.get(name)
+                                else
+                                    null;
+                                if (gc_ref != null) {
+                                    gc_fields[ci] = .{ .val_type = .i64, .mutable = true, .gc_ref = gc_ref };
+                                    ci += 1;
+                                } else {
+                                    const fs = type_reg.sizeOf(field.type_idx);
+                                    const nc = @max(1, (fs + 7) / 8);
+                                    for (0..nc) |cj| {
+                                        gc_fields[ci] = .{
+                                            .val_type = if (cj == 0 and is_float) .f64 else .i64,
+                                            .mutable = true,
+                                            .gc_ref = null,
+                                        };
+                                        ci += 1;
+                                    }
+                                }
+                            }
+                            const gv = &linker.gc_struct_types.items[variant_idx];
+                            gv.field_offset = @intCast(linker.gc_field_storage.items.len);
+                            gv.field_count = @intCast(gc_fields.len);
+                            try linker.gc_field_storage.appendSlice(self.allocator, gc_fields);
+                        } else {
+                            // Primitive payload: single i64 field
+                            const is_float = v.payload_type == types_mod.TypeRegistry.F64 or
+                                v.payload_type == types_mod.TypeRegistry.F32;
+                            const gc_field = wasm_link.GcFieldType{
+                                .val_type = if (is_float) .f64 else .i64,
+                                .mutable = true,
+                                .gc_ref = null,
+                            };
+                            const gv = &linker.gc_struct_types.items[variant_idx];
+                            gv.field_offset = @intCast(linker.gc_field_storage.items.len);
+                            gv.field_count = 1;
+                            try linker.gc_field_storage.append(self.allocator, gc_field);
+                        }
+                    }
                 }
             }
         }

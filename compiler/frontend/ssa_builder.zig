@@ -710,7 +710,8 @@ pub const SSABuilder = struct {
             const is_gc_ref = value.op == .wasm_gc_struct_new or
                 value.op == .wasm_gc_array_new or value.op == .wasm_gc_array_new_default or
                 value.op == .wasm_gc_array_new_fixed or
-                value_type == .struct_type or
+                value.op == .wasm_gc_ref_cast or
+                value_type == .struct_type or value_type == .union_type or
                 (value_type == .pointer and value_type.pointer.managed and self.type_registry.get(value_type.pointer.elem) == .struct_type);
             if (is_gc_ref) {
                 self.assign(local_idx, value);
@@ -2347,9 +2348,8 @@ pub const SSABuilder = struct {
     // === WasmGC reference conversion helpers ===
 
     fn convertGcRefNull(self: *SSABuilder, gc: ir.GcRefNull, type_idx: TypeIndex, cur: *Block) !*Value {
-        _ = gc;
         const val = try self.func.newValue(.wasm_gc_ref_null, type_idx, cur, self.cur_pos);
-        val.aux_int = 0; // heap type resolved at codegen
+        val.aux = .{ .string = gc.type_name };
         try cur.addValue(self.allocator, val);
         return val;
     }
@@ -2373,8 +2373,7 @@ pub const SSABuilder = struct {
 
     fn convertGcRefCast(self: *SSABuilder, gc: ir.GcRefCast, type_idx: TypeIndex, cur: *Block) !*Value {
         const val = try self.func.newValue(.wasm_gc_ref_cast, type_idx, cur, self.cur_pos);
-        val.aux_int = 0; // heap type resolved at codegen
-        _ = gc.type_name; // used at codegen to resolve heap type idx
+        val.aux = .{ .string = gc.type_name };
         const ref_val = try self.convertNode(gc.value) orelse return val;
         val.addArg(ref_val);
         try cur.addValue(self.allocator, val);
@@ -2383,8 +2382,7 @@ pub const SSABuilder = struct {
 
     fn convertGcRefTest(self: *SSABuilder, gc: ir.GcRefTest, cur: *Block) !*Value {
         const val = try self.func.newValue(.wasm_gc_ref_test, TypeRegistry.BOOL, cur, self.cur_pos);
-        val.aux_int = 0; // heap type resolved at codegen
-        _ = gc.type_name; // used at codegen to resolve heap type idx
+        val.aux = .{ .string = gc.type_name };
         const ref_val = try self.convertNode(gc.value) orelse return val;
         val.addArg(ref_val);
         try cur.addValue(self.allocator, val);

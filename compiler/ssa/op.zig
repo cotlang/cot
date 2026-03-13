@@ -662,10 +662,10 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.wasm_gc_array_copy)] = .{ .name = "WasmGcArrayCopy", .generic = false, .arg_len = 5, .aux_type = .string, .has_side_effects = true };
 
     // WasmGC reference ops
-    table[@intFromEnum(Op.wasm_gc_ref_test)] = .{ .name = "WasmGcRefTest", .generic = false, .arg_len = 1, .aux_type = .int64 };
-    table[@intFromEnum(Op.wasm_gc_ref_cast)] = .{ .name = "WasmGcRefCast", .generic = false, .arg_len = 1, .aux_type = .int64 };
+    table[@intFromEnum(Op.wasm_gc_ref_test)] = .{ .name = "WasmGcRefTest", .generic = false, .arg_len = 1, .aux_type = .string };
+    table[@intFromEnum(Op.wasm_gc_ref_cast)] = .{ .name = "WasmGcRefCast", .generic = false, .arg_len = 1, .aux_type = .string };
     table[@intFromEnum(Op.wasm_gc_br_on_cast)] = .{ .name = "WasmGcBrOnCast", .generic = false, .arg_len = 1, .aux_type = .string, .has_side_effects = true };
-    table[@intFromEnum(Op.wasm_gc_ref_null)] = .{ .name = "WasmGcRefNull", .generic = false, .aux_type = .int64 };
+    table[@intFromEnum(Op.wasm_gc_ref_null)] = .{ .name = "WasmGcRefNull", .generic = false, .aux_type = .string };
     table[@intFromEnum(Op.wasm_gc_ref_is_null)] = .{ .name = "WasmGcRefIsNull", .generic = false, .arg_len = 1 };
     table[@intFromEnum(Op.wasm_gc_ref_eq)] = .{ .name = "WasmGcRefEq", .generic = false, .arg_len = 2 };
 

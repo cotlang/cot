@@ -2794,6 +2794,80 @@ pub const Lowerer = struct {
         const value_node_ast = self.tree.getNode(value_idx) orelse return;
         const value_expr = value_node_ast.asExpr() orelse return;
 
+        // ================================================================
+        // WasmGC path: union variants are GC struct subtypes.
+        // Construction = gc_struct_new of the variant subtype.
+        // No tag field — the Wasm type IS the discriminator.
+        // ================================================================
+        if (self.target.isWasmGC()) {
+            // Case 1: Payload variant call - Result.Ok(42)
+            if (value_expr == .call) {
+                const call = value_expr.call;
+                const callee_node_ast = self.tree.getNode(call.callee) orelse return;
+                const callee_expr = callee_node_ast.asExpr() orelse return;
+                if (callee_expr == .field_access) {
+                    const fa = callee_expr.field_access;
+                    for (union_type.variants) |v| {
+                        if (std.mem.eql(u8, v.name, fa.field)) {
+                            const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ union_type.name, v.name });
+                            if (call.args.len > 0 and v.payload_type != TypeRegistry.VOID) {
+                                const payload_val = try self.lowerExprNode(call.args[0]);
+                                const payload_info = self.type_reg.get(v.payload_type);
+                                if (payload_info == .struct_type) {
+                                    // Struct payload: extract GC fields and pass to variant struct.new
+                                    const st = payload_info.struct_type;
+                                    var field_values = std.ArrayListUnmanaged(ir.NodeIndex){};
+                                    defer field_values.deinit(self.allocator);
+                                    var gc_ci: u32 = 0;
+                                    for (st.fields) |field| {
+                                        const n_chunks = self.gcFieldChunks(field.type_idx);
+                                        for (0..n_chunks) |_| {
+                                            const fv = try fb.emitGcStructGet(payload_val, st.name, gc_ci, TypeRegistry.I64, span);
+                                            try field_values.append(self.allocator, fv);
+                                            gc_ci += 1;
+                                        }
+                                    }
+                                    const ref = try fb.emitGcStructNew(variant_name, field_values.items, type_idx, span);
+                                    _ = try fb.emitStoreLocal(local_idx, ref, span);
+                                } else {
+                                    // Primitive payload: single field
+                                    const ref = try fb.emitGcStructNew(variant_name, &.{payload_val}, type_idx, span);
+                                    _ = try fb.emitStoreLocal(local_idx, ref, span);
+                                }
+                            } else {
+                                // Unit variant (no payload)
+                                const ref = try fb.emitGcStructNew(variant_name, &.{}, type_idx, span);
+                                _ = try fb.emitStoreLocal(local_idx, ref, span);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Case 2: Unit variant - State.Running
+            if (value_expr == .field_access) {
+                const fa = value_expr.field_access;
+                for (union_type.variants) |v| {
+                    if (std.mem.eql(u8, v.name, fa.field)) {
+                        const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ union_type.name, v.name });
+                        const ref = try fb.emitGcStructNew(variant_name, &.{}, type_idx, span);
+                        _ = try fb.emitStoreLocal(local_idx, ref, span);
+                        return;
+                    }
+                }
+            }
+
+            // Fallback: generic store
+            const val = try self.lowerExprNode(value_idx);
+            if (val != ir.null_node) _ = try fb.emitStoreLocal(local_idx, val, span);
+            return;
+        }
+
+        // ================================================================
+        // Linear memory path (non-WasmGC): tag + payload in memory
+        // ================================================================
+
         // Case 1: Payload variant call - Result.Ok(42)
         if (value_expr == .call) {
             const call = value_expr.call;
@@ -7075,6 +7149,17 @@ pub const Lowerer = struct {
         const result_info = self.type_reg.get(result_type);
         const is_compound_opt = result_info == .optional and !self.isPtrLikeOptional(result_type);
 
+        // ================================================================
+        // WasmGC path: use ref.test for type dispatch, ref.cast for capture
+        // ================================================================
+        if (self.target.isWasmGC()) {
+            return try self.lowerUnionSwitchGC(se, subject_type, ut, result_type);
+        }
+
+        // ================================================================
+        // Linear memory path
+        // ================================================================
+
         // Allocate result local for expression form (same pattern as lowerSwitchValueBlocks)
         var result_local: ir.LocalIdx = 0;
         if (is_expr) {
@@ -7283,6 +7368,176 @@ pub const Lowerer = struct {
         }
         fb.endOverlapGroup();
         fb.setBlock(merge_block);
+        if (is_expr) return try fb.emitLoadLocal(result_local, result_type, se.span);
+        return ir.null_node;
+    }
+
+    /// WasmGC union switch: use ref.test for dispatch, ref.cast + struct.get for capture.
+    /// Each variant is a GC struct subtype of the union base type.
+    fn lowerUnionSwitchGC(self: *Lowerer, se: ast.SwitchExpr, subject_type: TypeIndex, ut: types.UnionType, result_type: TypeIndex) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const is_expr = result_type != TypeRegistry.VOID;
+        const result_info_gc = self.type_reg.get(result_type);
+        const is_compound_opt_gc = result_info_gc == .optional and !self.isPtrLikeOptional(result_type);
+
+        var result_local: ir.LocalIdx = 0;
+        if (is_expr) {
+            const result_size = self.type_reg.sizeOf(result_type);
+            result_local = try fb.addLocalWithSize("__switch_result", result_type, true, result_size);
+        }
+
+        // Evaluate subject (a GC ref to the base union type)
+        const subject_ref = try self.lowerExprNode(se.subject);
+        const merge_block = try fb.newBlock("switch.end");
+
+        fb.beginOverlapGroup();
+
+        var i: usize = 0;
+        while (i < se.cases.len) : (i += 1) {
+            fb.nextOverlapArm();
+            const case = se.cases[i];
+            var case_cond: ir.NodeIndex = ir.null_node;
+
+            for (case.patterns) |pattern_idx| {
+                const variant_idx = self.resolveUnionVariantIndex(pattern_idx, ut);
+                if (variant_idx) |vidx| {
+                    const variant = ut.variants[vidx];
+                    const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ ut.name, variant.name });
+                    // ref.test — returns i32 (1 if ref is this subtype)
+                    const test_val = try fb.emitGcRefTest(subject_ref, variant_name, se.span);
+                    case_cond = if (case_cond == ir.null_node) test_val else try fb.emitBinary(.@"or", case_cond, test_val, TypeRegistry.BOOL, se.span);
+                }
+            }
+
+            const case_block = try fb.newBlock("switch.case");
+            const next_block = if (i + 1 < se.cases.len) try fb.newBlock("switch.next") else if (se.else_body != ast.null_node) try fb.newBlock("switch.else") else merge_block;
+            if (case_cond != ir.null_node) _ = try fb.emitBranch(case_cond, case_block, next_block, se.span);
+            fb.setBlock(case_block);
+
+            // Handle capture: cast ref to variant subtype, then extract fields
+            if (case.capture.len > 0) {
+                const scope_depth = fb.markScopeEntry();
+                const payload_type = self.resolveUnionPayloadType(case.patterns, ut);
+                const payload_size = self.type_reg.sizeOf(payload_type);
+
+                // Find the variant name for this case
+                const first_vidx = self.resolveUnionVariantIndex(case.patterns[0], ut) orelse 0;
+                const variant = ut.variants[first_vidx];
+                const variant_name = try std.fmt.allocPrint(self.allocator, "__union_{s}_{s}", .{ ut.name, variant.name });
+
+                if (case.capture_is_ptr) {
+                    // Pointer capture not supported in WasmGC mode (no linear memory addresses)
+                    // Fall back to value capture
+                    const capture_local = try fb.addLocalWithSize(case.capture, payload_type, false, payload_size);
+                    if (variant.payload_type != TypeRegistry.VOID) {
+                        const casted = try fb.emitGcRefCast(subject_ref, variant_name, subject_type, se.span);
+                        const payload_info = self.type_reg.get(payload_type);
+                        if (payload_info == .struct_type) {
+                            // Struct payload: extract fields from variant and build new struct
+                            const st = payload_info.struct_type;
+                            var field_values = std.ArrayListUnmanaged(ir.NodeIndex){};
+                            defer field_values.deinit(self.allocator);
+                            var gc_fi: u32 = 0;
+                            for (st.fields) |field| {
+                                const nc = self.gcFieldChunks(field.type_idx);
+                                for (0..nc) |_| {
+                                    const fv = try fb.emitGcStructGet(casted, variant_name, gc_fi, TypeRegistry.I64, se.span);
+                                    try field_values.append(self.allocator, fv);
+                                    gc_fi += 1;
+                                }
+                            }
+                            const gc_val = try fb.emitGcStructNew(st.name, field_values.items, payload_type, se.span);
+                            _ = try fb.emitStoreLocal(capture_local, gc_val, se.span);
+                        } else {
+                            // Primitive payload: single field at index 0
+                            const payload_val = try fb.emitGcStructGet(casted, variant_name, 0, payload_type, se.span);
+                            _ = try fb.emitStoreLocal(capture_local, payload_val, se.span);
+                        }
+                    }
+                } else {
+                    // Value capture
+                    const capture_local = try fb.addLocalWithSize(case.capture, payload_type, false, payload_size);
+                    if (variant.payload_type != TypeRegistry.VOID) {
+                        const casted = try fb.emitGcRefCast(subject_ref, variant_name, subject_type, se.span);
+                        const payload_info = self.type_reg.get(payload_type);
+                        if (payload_info == .struct_type) {
+                            const st = payload_info.struct_type;
+                            var field_values = std.ArrayListUnmanaged(ir.NodeIndex){};
+                            defer field_values.deinit(self.allocator);
+                            var gc_fi: u32 = 0;
+                            for (st.fields) |field| {
+                                const nc = self.gcFieldChunks(field.type_idx);
+                                for (0..nc) |_| {
+                                    const fv = try fb.emitGcStructGet(casted, variant_name, gc_fi, TypeRegistry.I64, se.span);
+                                    try field_values.append(self.allocator, fv);
+                                    gc_fi += 1;
+                                }
+                            }
+                            const gc_val = try fb.emitGcStructNew(st.name, field_values.items, payload_type, se.span);
+                            _ = try fb.emitStoreLocal(capture_local, gc_val, se.span);
+                        } else {
+                            const payload_val = try fb.emitGcStructGet(casted, variant_name, 0, payload_type, se.span);
+                            _ = try fb.emitStoreLocal(capture_local, payload_val, se.span);
+                        }
+                    }
+                }
+
+                if (is_expr) {
+                    const case_val = try self.lowerExprNode(case.body);
+                    const arm_type = self.inferExprType(case.body);
+                    if (case_val != ir.null_node and arm_type != TypeRegistry.VOID) {
+                        if (is_compound_opt_gc) {
+                            try self.storeCompoundOptArm(fb, result_local, case_val, case.body, se.span);
+                        } else {
+                            _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+                        }
+                    }
+                    if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+                } else {
+                    if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
+                }
+                fb.restoreScope(scope_depth);
+            } else {
+                // No capture — just run the body
+                if (is_expr) {
+                    const case_val = try self.lowerExprNode(case.body);
+                    const arm_type = self.inferExprType(case.body);
+                    if (case_val != ir.null_node and arm_type != TypeRegistry.VOID) {
+                        if (is_compound_opt_gc) {
+                            try self.storeCompoundOptArm(fb, result_local, case_val, case.body, se.span);
+                        } else {
+                            _ = try fb.emitStoreLocal(result_local, case_val, se.span);
+                        }
+                    }
+                    if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+                } else {
+                    if (!try self.lowerBlockNode(case.body)) _ = try fb.emitJump(merge_block, se.span);
+                }
+            }
+            fb.setBlock(next_block);
+        }
+
+        // Else branch
+        if (se.else_body != ast.null_node) {
+            if (is_expr) {
+                const else_val = try self.lowerExprNode(se.else_body);
+                const arm_type = self.inferExprType(se.else_body);
+                if (else_val != ir.null_node and arm_type != TypeRegistry.VOID) {
+                    if (is_compound_opt_gc) {
+                        try self.storeCompoundOptArm(fb, result_local, else_val, se.else_body, se.span);
+                    } else {
+                        _ = try fb.emitStoreLocal(result_local, else_val, se.span);
+                    }
+                }
+                if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
+            } else {
+                if (!try self.lowerBlockNode(se.else_body)) _ = try fb.emitJump(merge_block, se.span);
+            }
+        }
+
+        fb.endOverlapGroup();
+        fb.setBlock(merge_block);
+
         if (is_expr) return try fb.emitLoadLocal(result_local, result_type, se.span);
         return ir.null_node;
     }

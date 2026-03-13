@@ -1140,20 +1140,24 @@ pub const GenState = struct {
             // WasmGC reference operations
             .wasm_gc_ref_test => {
                 try self.getValue64(v.args[0]);
-                const heap_type = v.aux_int;
+                // Resolve type name → GC struct type index for heap type
+                const type_name = v.aux.string;
+                const heap_type: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else v.aux_int;
                 const p = try self.builder.append(.ref_test);
                 p.from = prog_mod.constAddr(heap_type);
             },
 
             .wasm_gc_ref_cast => {
                 try self.getValue64(v.args[0]);
-                const heap_type = v.aux_int;
+                const type_name = v.aux.string;
+                const heap_type: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else v.aux_int;
                 const p = try self.builder.append(.ref_cast);
                 p.from = prog_mod.constAddr(heap_type);
             },
 
             .wasm_gc_ref_null => {
-                const heap_type = v.aux_int;
+                const type_name = v.aux.string;
+                const heap_type: i64 = if (self.gc_struct_name_map) |m| @intCast(m.get(type_name) orelse 0) else v.aux_int;
                 const p = try self.builder.append(.ref_null);
                 p.from = prog_mod.constAddr(heap_type);
             },
