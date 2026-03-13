@@ -65,14 +65,89 @@ pub const SSABuilder = struct {
 
         // Compute local slot offsets: each IR local gets a frame slot
         // Multi-word locals (structs, tuples) occupy multiple 8-byte slots
+        //
+        // Overlap group support: locals in the same overlap_group but different
+        // overlap_arm are mutually exclusive (e.g., switch arms) and share the
+        // same stack region. The region is sized to the max arm total.
         const num_locals = ir_func.locals.len;
         const slot_offsets = try allocator.alloc(u32, num_locals);
         {
-            var next_slot: u32 = 0;
-            for (ir_func.locals, 0..) |local, idx| {
-                slot_offsets[idx] = next_slot;
-                const num_slots = @max(1, (local.size + 7) / 8);
-                next_slot += num_slots;
+            // Check if any locals use overlap groups
+            var has_overlap = false;
+            for (ir_func.locals) |local| {
+                if (local.overlap_group > 0) { has_overlap = true; break; }
+            }
+
+            if (!has_overlap) {
+                // Fast path: no overlap groups, sequential allocation
+                var next_slot: u32 = 0;
+                for (ir_func.locals, 0..) |local, idx| {
+                    slot_offsets[idx] = next_slot;
+                    const num_slots = @max(1, (local.size + 7) / 8);
+                    next_slot += num_slots;
+                }
+            } else {
+                // Overlap group path: compute max arm sizes, share stack regions
+                // Pass 1: compute per-arm sizes within each group
+                // Key: (group << 16 | arm), Value: total 8-byte slots for that arm
+                var arm_sizes = std.AutoHashMapUnmanaged(u32, u32){};
+                defer arm_sizes.deinit(allocator);
+                for (ir_func.locals) |local| {
+                    if (local.overlap_group > 0) {
+                        const key = (@as(u32, local.overlap_group) << 16) | @as(u32, local.overlap_arm);
+                        const num_slots = @max(1, (local.size + 7) / 8);
+                        const arm_entry = try arm_sizes.getOrPut(allocator, key);
+                        if (arm_entry.found_existing) {
+                            arm_entry.value_ptr.* += num_slots;
+                        } else {
+                            arm_entry.value_ptr.* = num_slots;
+                        }
+                    }
+                }
+
+                // Pass 2: compute max size per group
+                var group_max = std.AutoHashMapUnmanaged(u16, u32){};
+                defer group_max.deinit(allocator);
+                var arm_it = arm_sizes.iterator();
+                while (arm_it.next()) |arm_size_entry| {
+                    const group: u16 = @intCast(arm_size_entry.key_ptr.* >> 16);
+                    const arm_total = arm_size_entry.value_ptr.*;
+                    const gentry = try group_max.getOrPut(allocator, group);
+                    if (gentry.found_existing) {
+                        gentry.value_ptr.* = @max(gentry.value_ptr.*, arm_total);
+                    } else {
+                        gentry.value_ptr.* = arm_total;
+                    }
+                }
+
+                // Pass 3: assign offsets — group locals share a region
+                var group_base = std.AutoHashMapUnmanaged(u16, u32){};
+                defer group_base.deinit(allocator);
+                // Track per-arm running offset: (group << 16 | arm) → offset within group
+                var arm_offsets = std.AutoHashMapUnmanaged(u32, u32){};
+                defer arm_offsets.deinit(allocator);
+                var next_slot: u32 = 0;
+                for (ir_func.locals, 0..) |local, idx| {
+                    if (local.overlap_group == 0) {
+                        slot_offsets[idx] = next_slot;
+                        const num_slots = @max(1, (local.size + 7) / 8);
+                        next_slot += num_slots;
+                    } else {
+                        // First time seeing this group? Allocate its region.
+                        const gentry = try group_base.getOrPut(allocator, local.overlap_group);
+                        if (!gentry.found_existing) {
+                            gentry.value_ptr.* = next_slot;
+                            next_slot += group_max.get(local.overlap_group) orelse 0;
+                        }
+                        const base = gentry.value_ptr.*;
+                        const key = (@as(u32, local.overlap_group) << 16) | @as(u32, local.overlap_arm);
+                        const aentry = try arm_offsets.getOrPut(allocator, key);
+                        if (!aentry.found_existing) aentry.value_ptr.* = 0;
+                        slot_offsets[idx] = base + aentry.value_ptr.*;
+                        const num_slots = @max(1, (local.size + 7) / 8);
+                        aentry.value_ptr.* += num_slots;
+                    }
+                }
             }
         }
 
@@ -253,11 +328,24 @@ pub const SSABuilder = struct {
     }
 
     pub fn build(self: *SSABuilder) !*Func {
-        // Copy local sizes for stack allocation
+        // Copy local sizes and overlap metadata for stack allocation
         if (self.ir_func.locals.len > 0) {
-            const sizes = try self.allocator.alloc(u32, self.ir_func.locals.len);
-            for (self.ir_func.locals, 0..) |local, i| sizes[i] = local.size;
+            const n = self.ir_func.locals.len;
+            const sizes = try self.allocator.alloc(u32, n);
+            const groups = try self.allocator.alloc(u16, n);
+            const arms = try self.allocator.alloc(u16, n);
+            for (self.ir_func.locals, 0..) |local, i| {
+                sizes[i] = local.size;
+                groups[i] = local.overlap_group;
+                arms[i] = local.overlap_arm;
+            }
             self.func.local_sizes = sizes;
+            self.func.local_overlap_groups = groups;
+            self.func.local_overlap_arms = arms;
+            // Copy pre-computed slot offsets (overlap-aware) for native backend
+            const offsets = try self.allocator.alloc(u32, n);
+            for (0..n) |i| offsets[i] = self.local_slot_offsets[i];
+            self.func.local_slot_offsets = offsets;
         }
         if (self.ir_func.string_literals.len > 0) {
             self.func.string_literals = self.ir_func.string_literals;

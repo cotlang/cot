@@ -365,16 +365,62 @@ const SsaToClifTranslator = struct {
         // (e.g., const_bool produces I64, store writes 8 bytes).
         // Without this, types like UNTYPED_BOOL (sizeOf=0) create 0-byte slots
         // that overlap with adjacent slots.
-        var next_slot_offset: u32 = 0;
-        for (self.ssa_func.local_sizes) |size| {
-            const actual_size = @max(size, 8);
-            const align_shift: u8 = if (actual_size <= 1) 0 else if (actual_size <= 2) 1 else if (actual_size <= 4) 2 else 3;
-            const slot = try self.builder.createSizedStackSlot(
-                clif.StackSlotData.explicit(actual_size, align_shift),
-            );
-            try self.stack_slot_map.put(self.allocator, next_slot_offset, slot);
-            const num_8byte_slots = @max(1, (size + 7) / 8);
-            next_slot_offset += num_8byte_slots;
+        //
+        // Overlap groups: the SSA builder pre-computes slot offsets with overlap
+        // awareness — locals in mutually-exclusive switch arms share the same
+        // offset range. Multiple locals may map to the same slot_offset, so we
+        // deduplicate and use the max size at each offset.
+
+        const has_precomputed = self.ssa_func.local_slot_offsets.len == self.ssa_func.local_sizes.len and
+            self.ssa_func.local_slot_offsets.len > 0;
+
+        // First pass: compute max size needed at each unique slot_offset
+        var slot_max_sizes = std.AutoHashMapUnmanaged(u32, u32){};
+        defer slot_max_sizes.deinit(self.allocator);
+
+        if (has_precomputed) {
+            for (self.ssa_func.local_sizes, self.ssa_func.local_slot_offsets) |size, offset| {
+                const actual_size = @max(size, 8);
+                const entry = try slot_max_sizes.getOrPut(self.allocator, offset);
+                if (entry.found_existing) {
+                    entry.value_ptr.* = @max(entry.value_ptr.*, actual_size);
+                } else {
+                    entry.value_ptr.* = actual_size;
+                }
+            }
+        } else {
+            var next_off: u32 = 0;
+            for (self.ssa_func.local_sizes) |size| {
+                const actual_size = @max(size, 8);
+                try slot_max_sizes.put(self.allocator, next_off, actual_size);
+                next_off += @max(1, (size + 7) / 8);
+            }
+        }
+
+        // Second pass: create CLIF stack slots for each unique offset
+        if (has_precomputed) {
+            for (self.ssa_func.local_slot_offsets) |offset| {
+                if (!self.stack_slot_map.contains(offset)) {
+                    const actual_size = slot_max_sizes.get(offset) orelse 8;
+                    const align_shift: u8 = if (actual_size <= 1) 0 else if (actual_size <= 2) 1 else if (actual_size <= 4) 2 else 3;
+                    const slot = try self.builder.createSizedStackSlot(
+                        clif.StackSlotData.explicit(actual_size, align_shift),
+                    );
+                    try self.stack_slot_map.put(self.allocator, offset, slot);
+                }
+            }
+        } else {
+            var next_slot_offset: u32 = 0;
+            for (self.ssa_func.local_sizes) |size| {
+                const actual_size = @max(size, 8);
+                const align_shift: u8 = if (actual_size <= 1) 0 else if (actual_size <= 2) 1 else if (actual_size <= 4) 2 else 3;
+                const slot = try self.builder.createSizedStackSlot(
+                    clif.StackSlotData.explicit(actual_size, align_shift),
+                );
+                try self.stack_slot_map.put(self.allocator, next_slot_offset, slot);
+                const num_8byte_slots = @max(1, (size + 7) / 8);
+                next_slot_offset += num_8byte_slots;
+            }
         }
     }
 
@@ -1046,29 +1092,62 @@ const SsaToClifTranslator = struct {
             // Move/zero for large types
             // ============================================================
             .move => {
-                // memcpy — inline load/store pairs with direct offsets
+                // memmove — load all values first, then store all.
+                // This handles overlapping src/dst correctly (e.g. List.insert shifting
+                // elements right where dst > src). Interleaved load/store would corrupt
+                // overlapping source data before it's read.
                 // SSA convention: args[0] = dest addr, args[1] = src addr, aux = byte size
-                // Reference: rustc_codegen_cranelift Pointer.load/store use offset directly
                 if (v.args.len >= 2) {
                     const dst = self.getClif(v.args[0]);
                     const src = self.getClif(v.args[1]);
                     const size: u32 = @intCast(v.aux_int);
-
-                    var offset: i32 = 0;
                     const end: i32 = @intCast(size);
+
+                    // Phase 1: Load all values into SSA temporaries
+                    const num_i64 = @as(u32, @intCast(end)) / 8;
+                    const tail_bytes = @as(u32, @intCast(end)) % 8;
+                    const num_i32 = tail_bytes / 4;
+                    const num_i8 = tail_bytes % 4;
+                    const total_loads = num_i64 + num_i32 + num_i8;
+
+                    // Use a bounded stack buffer for temporaries (max 256 loads = 2048 bytes)
+                    var tmp_buf: [256]clif.Value = undefined;
+                    const tmps = tmp_buf[0..total_loads];
+
+                    var load_idx: u32 = 0;
+                    var offset: i32 = 0;
                     while (offset + 8 <= end) {
-                        const val = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, src, offset);
-                        _ = try ins.store(clif.MemFlags.DEFAULT, val, dst, offset);
+                        tmps[load_idx] = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, src, offset);
+                        load_idx += 1;
                         offset += 8;
                     }
                     while (offset + 4 <= end) {
-                        const val = try ins.load(clif.Type.I32, clif.MemFlags.DEFAULT, src, offset);
-                        _ = try ins.store(clif.MemFlags.DEFAULT, val, dst, offset);
+                        tmps[load_idx] = try ins.load(clif.Type.I32, clif.MemFlags.DEFAULT, src, offset);
+                        load_idx += 1;
                         offset += 4;
                     }
                     while (offset + 1 <= end) {
-                        const val = try ins.load(clif.Type.I8, clif.MemFlags.DEFAULT, src, offset);
-                        _ = try ins.store(clif.MemFlags.DEFAULT, val, dst, offset);
+                        tmps[load_idx] = try ins.load(clif.Type.I8, clif.MemFlags.DEFAULT, src, offset);
+                        load_idx += 1;
+                        offset += 1;
+                    }
+
+                    // Phase 2: Store all values from temporaries
+                    var store_idx: u32 = 0;
+                    offset = 0;
+                    while (offset + 8 <= end) {
+                        _ = try ins.store(clif.MemFlags.DEFAULT, tmps[store_idx], dst, offset);
+                        store_idx += 1;
+                        offset += 8;
+                    }
+                    while (offset + 4 <= end) {
+                        _ = try ins.store(clif.MemFlags.DEFAULT, tmps[store_idx], dst, offset);
+                        store_idx += 1;
+                        offset += 4;
+                    }
+                    while (offset + 1 <= end) {
+                        _ = try ins.store(clif.MemFlags.DEFAULT, tmps[store_idx], dst, offset);
+                        store_idx += 1;
                         offset += 1;
                     }
                 }

@@ -168,6 +168,11 @@ pub const Local = struct {
     size: u32 = 8,
     alignment: u32 = 8,
     offset: i32 = 0,
+    /// Overlap group for stack slot sharing. Locals with the same overlap_group > 0
+    /// but different overlap_arm are in mutually-exclusive switch/if-else arms and
+    /// can share the same stack region. 0 = no overlap (independent slot).
+    overlap_group: u16 = 0,
+    overlap_arm: u16 = 0,
 
     pub fn init(name: []const u8, type_idx: TypeIndex, mutable: bool) Local { return .{ .name = name, .type_idx = type_idx, .mutable = mutable }; }
     pub fn initParam(name: []const u8, type_idx: TypeIndex, param_idx: ParamIdx, size: u32) Local { return .{ .name = name, .type_idx = type_idx, .mutable = false, .is_param = true, .param_idx = param_idx, .size = size, .alignment = @min(size, 8) }; }
@@ -214,6 +219,10 @@ pub const FuncBuilder = struct {
     /// without scanning function names (which false-positives on generic methods).
     is_destructor: bool = false,
     is_export: bool = false,
+    /// Overlap group tracking for stack slot sharing across mutually-exclusive arms.
+    current_overlap_group: u16 = 0,
+    current_overlap_arm: u16 = 0,
+    next_overlap_group: u16 = 1,
 
     const ShadowEntry = struct { name: []const u8, old_idx: ?LocalIdx };
 
@@ -234,7 +243,10 @@ pub const FuncBuilder = struct {
 
     pub fn addLocal(self: *FuncBuilder, local: Local) !LocalIdx {
         const idx: LocalIdx = @intCast(self.locals.items.len);
-        try self.locals.append(self.allocator, local);
+        var l = local;
+        l.overlap_group = self.current_overlap_group;
+        l.overlap_arm = self.current_overlap_arm;
+        try self.locals.append(self.allocator, l);
         try self.local_map.put(local.name, idx);
         return idx;
     }
@@ -248,7 +260,10 @@ pub const FuncBuilder = struct {
 
     pub fn addLocalWithSize(self: *FuncBuilder, name: []const u8, type_idx: TypeIndex, mutable: bool, size: u32) !LocalIdx {
         const idx: LocalIdx = @intCast(self.locals.items.len);
-        try self.locals.append(self.allocator, Local.initWithSize(name, type_idx, mutable, size));
+        var local = Local.initWithSize(name, type_idx, mutable, size);
+        local.overlap_group = self.current_overlap_group;
+        local.overlap_arm = self.current_overlap_arm;
+        try self.locals.append(self.allocator, local);
         try self.shadow_stack.append(self.allocator, .{ .name = name, .old_idx = self.local_map.get(name) });
         try self.local_map.put(name, idx);
         return idx;
@@ -256,6 +271,23 @@ pub const FuncBuilder = struct {
 
     pub fn lookupLocal(self: *const FuncBuilder, name: []const u8) ?LocalIdx { return self.local_map.get(name); }
     pub fn markScopeEntry(self: *const FuncBuilder) usize { return self.shadow_stack.items.len; }
+
+    /// Begin an overlap group for mutually-exclusive arms (switch/if-else).
+    /// All locals created while a group is active share stack space across arms.
+    pub fn beginOverlapGroup(self: *FuncBuilder) void {
+        self.current_overlap_group = self.next_overlap_group;
+        self.current_overlap_arm = 0;
+        self.next_overlap_group += 1;
+    }
+    /// Advance to the next arm within the current overlap group.
+    pub fn nextOverlapArm(self: *FuncBuilder) void {
+        self.current_overlap_arm += 1;
+    }
+    /// End the current overlap group.
+    pub fn endOverlapGroup(self: *FuncBuilder) void {
+        self.current_overlap_group = 0;
+        self.current_overlap_arm = 0;
+    }
 
     pub fn restoreScope(self: *FuncBuilder, entry_depth: usize) void {
         while (self.shadow_stack.items.len > entry_depth) {

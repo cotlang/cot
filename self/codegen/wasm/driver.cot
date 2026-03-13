@@ -23,6 +23,8 @@ import "ssa_passes"
 import "ssa_passes_dec"
 import "link"
 import "wasm_gen"
+import "preprocess"
+import "assemble"
 import "mem_runtime"
 import "slice_runtime"
 import "print_runtime"
@@ -95,7 +97,8 @@ fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int
     linker.setTableSize(1)
 
     // Build function table: all user functions get table entries
-    addUserTableEntries(&linker, ir, rt.runtime_func_count)
+    var func_table_indices: Map(string, int) = .{}
+    addUserTableEntries(&linker, ir, rt.runtime_func_count, &func_table_indices)
 
     // Collect string literals from all functions
     var string_offsets: Map(string, int) = .{}
@@ -111,7 +114,7 @@ fn generateWasmCode(ir: IR, types: *TypeRegistry, opts: CompileOptions) List(int
     linker.addDataSegment(null_data)
 
     // Generate code for each function
-    generateAllFunctions(&linker, ir, types, &func_indices, &string_offsets, rt.runtime_func_count)
+    generateAllFunctions(&linker, ir, types, &func_indices, &string_offsets, &func_table_indices, rt.runtime_func_count)
 
     return linker.emit()
 }
@@ -283,12 +286,13 @@ fn populateUserFuncIndicesFromIR(func_indices: *Map(string, int), ir: IR, runtim
 // Function table entries
 // ============================================================================
 
-/// Add all user functions to the indirect call table.
-fn addUserTableEntries(linker: *Linker, ir: IR, runtime_func_count: int) void {
+/// Add all user functions to the indirect call table, building table index map.
+fn addUserTableEntries(linker: *Linker, ir: IR, runtime_func_count: int, func_table_indices: *Map(string, int)) void {
     var i = 0
     while (i < ir.funcs.count) {
         const func_idx = i + runtime_func_count
-        linker.addTableFunc(func_idx)
+        const table_idx = linker.addTableFunc(func_idx)
+        func_table_indices.set(ir.funcs.get(i).name, table_idx)
         i += 1
     }
 }
@@ -335,17 +339,17 @@ fn stringToData(s: string) List(int) {
 // ============================================================================
 
 /// Generate code for all IR functions and add them to the linker.
-fn generateAllFunctions(linker: *Linker, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), runtime_func_count: int) void {
+fn generateAllFunctions(linker: *Linker, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int), runtime_func_count: int) void {
     var i = 0
     while (i < ir.funcs.count) {
         const ir_func = ir.funcs.get(i)
-        generateAndAddFunc(linker, ir_func, ir, types, func_indices, string_offsets)
+        generateAndAddFunc(linker, ir_func, ir, types, func_indices, string_offsets, func_table_indices)
         i += 1
     }
 }
 
 /// Build SSA, run passes, generate Wasm bytecode, and add function to linker.
-fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int)) void {
+fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int)) void {
     // Build SSA from IR
     var builder = SSABuilder.init(ir_func, ir.globals, types)
     const ssa_func = builder.build()
@@ -364,26 +368,18 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     // 6. lower_wasm — generic → wasm ops
     lower(ssa_func)
 
+
+
     // Determine function type
     const type_idx = registerFuncType(linker, ir_func, types)
 
-    // Generate Wasm bytecode (returns List(u8), convert to List(int))
-    const body_u8 = genFuncWithIndices(ssa_func, func_indices)
-    const body = u8ListToIntList(body_u8)
+    // Generate Prog chain → preprocess (dispatch loop) → assemble (bytecode)
+    var sym = generateFunc(ssa_func, func_indices, string_offsets, func_table_indices)
+    preprocess(&sym)
+    const body = assemble(&sym)
 
     // Add to linker
     linker.addFunc(WasmFunc.init(ir_func.name, type_idx, body, true))
-}
-
-/// Convert List(u8) to List(int) for WasmFunc.code compatibility.
-fn u8ListToIntList(src: List(u8)) List(int) {
-    var result: List(int) = .{}
-    var i = 0
-    while (i < src.count) {
-        result.append(@intCast(int, src.get(i)))
-        i += 1
-    }
-    return result
 }
 
 /// Register a function's type signature with the linker.
@@ -472,18 +468,6 @@ test "stringToData converts string bytes" {
 test "stringToData empty string" {
     const data = stringToData("")
     @assertEq(data.count, 0)
-}
-
-test "u8ListToIntList converts" {
-    var src: List(u8) = .{}
-    src.append(0x00)
-    src.append(0x61)
-    src.append(0x0B)
-    const result = u8ListToIntList(src)
-    @assertEq(result.count, 3)
-    @assertEq(result.get(0), 0)
-    @assertEq(result.get(1), 0x61)
-    @assertEq(result.get(2), 0x0B)
 }
 
 test "buildFuncResults void returns nothing" {

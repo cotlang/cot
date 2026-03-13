@@ -2,14 +2,23 @@
 
 ## 🚨🚨🚨 ABSOLUTE #1 RULE — NEVER WORKAROUND, NEVER SIMPLIFY 🚨🚨🚨
 
-**NEVER implement workarounds for missing Cot language features.** If the Cot compiler doesn't support a pattern you need (e.g. variable declarations in switch arms, a missing operator, a type system gap), **STOP and ask the user** to implement the missing feature in the Zig compiler first. The self-hosted compiler must use idiomatic Cot — every workaround is tech debt that defeats the purpose of dogfooding.
+**NEVER implement workarounds for Cot compiler bugs or missing features.** If the Cot compiler doesn't support a pattern you need, or if compiled code behaves incorrectly at runtime, **STOP and report the bug to the user** so they can fix the Zig compiler. The self-hosted compiler must use idiomatic Cot — every workaround is tech debt that defeats the purpose of dogfooding.
+
+This applies to ALL compiler issues, including:
+- **Missing language features** (syntax, type system, generics)
+- **Codegen bugs** (wrong code generated for correct source — e.g. union tags corrupted after memcpy, struct layout wrong, ARC miscompilation)
+- **Runtime crashes** (stack overflow from over-allocation of locals, SIGSEGV in compiled code)
 
 - **NO** restructuring code to avoid a language limitation
 - **NO** extracting logic to helper functions just because a construct doesn't compile
 - **NO** falling back to if-else chains because switch doesn't support something
 - **NO** simplifying data structures because generics don't work for a case
+- **NO** moving data to different structs to avoid a codegen bug (e.g. moving union data out of a struct because the union tag gets corrupted)
+- **NO** splitting functions just because the native codegen overflows the stack
 - **ALWAYS** identify the exact compiler limitation and report it to the user
 - The user will fix the Zig compiler. That is the correct workflow.
+
+**The whole point of self-hosting is to find and fix compiler bugs.** When you encounter a bug, that IS the work — diagnose it precisely and report it so the Zig compiler can be fixed.
 
 ## 🚨 CRITICAL RULES
 

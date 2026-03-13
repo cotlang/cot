@@ -6989,8 +6989,12 @@ pub const Lowerer = struct {
             subject_len = try fb.emitSliceLen(subject, se.span);
         }
 
+        // Mark overlap group so arm locals share stack space (mutually exclusive)
+        fb.beginOverlapGroup();
+
         var i: usize = 0;
         while (i < se.cases.len) : (i += 1) {
+            fb.nextOverlapArm();
             const case = se.cases[i];
             var case_cond: ir.NodeIndex = ir.null_node;
 
@@ -7035,8 +7039,10 @@ pub const Lowerer = struct {
         }
 
         if (se.else_body != null_node) {
+            fb.nextOverlapArm();
             if (!try self.lowerBlockNode(se.else_body)) _ = try fb.emitJump(merge_block, se.span);
         }
+        fb.endOverlapGroup();
         fb.setBlock(merge_block);
         return ir.null_node;
     }
@@ -7105,8 +7111,12 @@ pub const Lowerer = struct {
         const tag_val = try fb.emitFieldLocal(subject_local, 0, 0, TypeRegistry.I64, se.span);
         const merge_block = try fb.newBlock("switch.end");
 
+        // Mark overlap group so arm locals share stack space (mutually exclusive)
+        fb.beginOverlapGroup();
+
         var i: usize = 0;
         while (i < se.cases.len) : (i += 1) {
+            fb.nextOverlapArm();
             const case = se.cases[i];
             var case_cond: ir.NodeIndex = ir.null_node;
 
@@ -7255,6 +7265,7 @@ pub const Lowerer = struct {
         }
 
         if (se.else_body != null_node) {
+            fb.nextOverlapArm();
             if (is_expr) {
                 const else_val = try self.lowerExprNode(se.else_body);
                 const else_type = self.inferExprType(se.else_body);
@@ -7270,6 +7281,7 @@ pub const Lowerer = struct {
                 if (!try self.lowerBlockNode(se.else_body)) _ = try fb.emitJump(merge_block, se.span);
             }
         }
+        fb.endOverlapGroup();
         fb.setBlock(merge_block);
         if (is_expr) return try fb.emitLoadLocal(result_local, result_type, se.span);
         return ir.null_node;
@@ -7328,8 +7340,12 @@ pub const Lowerer = struct {
             subject_len = try fb.emitSliceLen(subject, se.span);
         }
 
+        // Mark overlap group so arm locals share stack space (mutually exclusive)
+        fb.beginOverlapGroup();
+
         var i: usize = 0;
         while (i < se.cases.len) : (i += 1) {
+            fb.nextOverlapArm();
             const case = se.cases[i];
             var case_cond: ir.NodeIndex = ir.null_node;
 
@@ -7378,6 +7394,7 @@ pub const Lowerer = struct {
 
         // Else arm
         if (se.else_body != null_node) {
+            fb.nextOverlapArm();
             const else_val = try self.lowerExprNode(se.else_body);
             if (else_val != ir.null_node and fb.nodes.items[else_val].type_idx != TypeRegistry.VOID) {
                 if (is_compound_opt) {
@@ -7388,6 +7405,7 @@ pub const Lowerer = struct {
             }
             if (fb.needsTerminator()) _ = try fb.emitJump(merge_block, se.span);
         }
+        fb.endOverlapGroup();
         fb.setBlock(merge_block);
         return try fb.emitLoadLocal(result_local, result_type, se.span);
     }

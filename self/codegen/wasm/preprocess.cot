@@ -93,6 +93,23 @@ fn pass1CountResumePoints(sym: *Symbol) (int, List(int)) {
 // Go: wasmobj.go lines 207-214
 // ============================================================================
 
+/// After pass1 assigns pc values, convert branch_target from list indices
+/// to pc values. This makes targets stable across list insertions in pass2/3.
+/// (Zig uses pointer-based targets which are inherently stable; Cot uses
+/// index-based targets which break when insertAfter shifts the list.)
+fn convertBranchTargetsToPc(sym: *Symbol) void {
+    for i in 0..sym.text.count {
+        var p = sym.text.get(i)
+        if (p.instr == As.jmp) {
+            if (p.to.branch_target) |tidx| {
+                const target_pc = sym.text.get(tidx).pc
+                p.to.branch_target = target_pc
+                sym.text.set(i, p)
+            }
+        }
+    }
+}
+
 fn pass2Prologue(sym: *Symbol) void {
     if (sym.frame_size <= 0) { return }
     var insert = 0
@@ -139,14 +156,14 @@ fn pass3Transform(sym: *Symbol) List(int) {
 
 fn transformJmp(sym: *Symbol, idx: int, branches: *List(int)) void {
     var p = sym.text.get(idx)
-    const target_idx = p.to.branch_target
+    // branch_target stores a pc value (converted from index by convertBranchTargetsToPc)
+    const target_pc = p.to.branch_target
     p.instr = As.nop
     sym.text.set(idx, p)
 
-    if (target_idx) |tidx| {
-        const target_pc = sym.text.get(tidx).pc
+    if (target_pc) |tpc| {
         var insert = idx
-        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i32_const, constAddr(target_pc)))
+        insert = insertAfter(&sym.text, insert, Prog.initFrom(As.i32_const, constAddr(tpc)))
         insert = insertAfter(&sym.text, insert, Prog.initTo(As.set, regAddr(Reg.pc_b)))
         var br_prog = Prog.init(As.br)
         br_prog.to.addr_type = AddrType.branch
@@ -243,8 +260,14 @@ fn pass5DispatchLoop(sym: *Symbol, numResumePoints: int, tableIdxs: *List(int), 
         }
         insert_point = insertAfter(&sym.text, insert_point, Prog.initFrom(As.get, regAddr(Reg.pc_b)))
 
+        // br_table with indices — store directly in Prog's AddrVal union
+        // (Zig reference: preprocess.zig line 336-340)
+        var bt_indices: List(int) = .{}
+        for ti in 0..tableIdxs.count {
+            bt_indices.append(tableIdxs.get(ti))
+        }
         var bt_addr = Addr.init()
-        bt_addr.val = AddrVal.br_table(tableIdxs.*)
+        bt_addr.val = AddrVal.br_table(bt_indices)
         insert_point = insertAfter(&sym.text, insert_point, Prog.initTo(As.br_table, bt_addr))
         insert_point = insertAfter(&sym.text, insert_point, Prog.init(As.end))
     }
@@ -325,6 +348,9 @@ fn preprocess(sym: *Symbol) void {
     const result = pass1CountResumePoints(sym)
     const numResumePoints = result.0
     const tableIdxs = result.1
+
+    // Convert index-based branch targets to pc-based BEFORE any insertions
+    convertBranchTargetsToPc(sym)
 
     pass2Prologue(sym)
     var entryPointLoopBranches = pass3Transform(sym)
@@ -500,6 +526,7 @@ test "preprocess resume point creates br_table" {
     @assertEq(has_block, true)
     @assertEq(has_br_table, true)
 }
+
 
 test "isLoadInstr" {
     @assertEq(isLoadInstr(As.i64_load), true)

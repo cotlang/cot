@@ -403,3 +403,71 @@ test "isUnaryDst" {
     @assertEq(isUnaryDst(As.get), false)
     @assertEq(isUnaryDst(As.i64_add), false)
 }
+
+test "struct sizes" {
+    @assert(@sizeOf(AddrVal) > 0)
+    @assert(@sizeOf(Addr) > 0)
+    @assert(@sizeOf(Prog) > 0)
+    // AddrVal: tag(8) + max(none=0, f64=8, List=24) = 32
+    // Addr: 6 fields(48) + AddrVal(32) + ?int(16) = 96
+    // Prog: As(8) + 2*Addr(192) + 3*int(24) = 224
+    // Verify minimum sizes
+    @assert(@sizeOf(AddrVal) >= 16)
+    @assert(@sizeOf(Addr) >= 64)
+    @assert(@sizeOf(Prog) >= 128)
+}
+
+test "AddrVal br_table survives Prog list" {
+    var idxs: List(int) = .{}
+    idxs.append(0)
+    idxs.append(1)
+    idxs.append(2)
+
+    var bt_addr = Addr.init()
+    bt_addr.val = AddrVal.br_table(idxs)
+    const p = Prog.initTo(As.br_table, bt_addr)
+
+    var progs: List(Prog) = .{}
+    progs.append(Prog.init(As.nop))
+    progs.append(p)
+    progs.append(Prog.init(As.end))
+
+    const p2 = progs.get(1)
+    @assertEq(p2.instr == As.br_table, true)
+    switch (p2.to.val) {
+        AddrVal.br_table |vals| => {
+            @assertEq(vals.count, 3)
+        },
+        else => { @assert(false) },
+    }
+}
+
+test "AddrVal br_table survives insert" {
+    var idxs: List(int) = .{}
+    idxs.append(0)
+    idxs.append(1)
+
+    var bt_addr = Addr.init()
+    bt_addr.val = AddrVal.br_table(idxs)
+    const p = Prog.initTo(As.br_table, bt_addr)
+
+    var progs: List(Prog) = .{}
+    progs.append(Prog.init(As.nop))
+    progs.append(p)
+
+    // Insert after the br_table — shifts nothing
+    progs.insert(2, Prog.init(As.end))
+
+    // Insert before the br_table — shifts it!
+    progs.insert(0, Prog.init(As.text))
+
+    // Now br_table is at index 2
+    const p2 = progs.get(2)
+    @assertEq(p2.instr == As.br_table, true)
+    switch (p2.to.val) {
+        AddrVal.br_table |vals| => {
+            @assertEq(vals.count, 2)
+        },
+        else => { @assert(false) },
+    }
+}

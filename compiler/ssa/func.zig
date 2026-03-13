@@ -38,6 +38,14 @@ pub const Func = struct {
     is_export: bool = false,
     local_sizes: []u32 = &.{},
     local_offsets: []i32 = &.{},
+    /// Overlap group/arm metadata for stack slot sharing. Parallel to local_sizes.
+    /// Locals with the same overlap_group > 0 but different overlap_arm are
+    /// mutually exclusive and can share stack space.
+    local_overlap_groups: []u16 = &.{},
+    local_overlap_arms: []u16 = &.{},
+    /// Slot offsets for each local (computed with overlap awareness).
+    /// Used by native backend to create CLIF stack slots at the right offsets.
+    local_slot_offsets: []u32 = &.{},
     string_literals: []const []const u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8) Func {
@@ -62,6 +70,9 @@ pub const Func = struct {
         if (self.reg_alloc.len > 0) self.allocator.free(self.reg_alloc);
         if (self.local_sizes.len > 0) self.allocator.free(self.local_sizes);
         if (self.local_offsets.len > 0) self.allocator.free(self.local_offsets);
+        if (self.local_overlap_groups.len > 0) self.allocator.free(self.local_overlap_groups);
+        if (self.local_overlap_arms.len > 0) self.allocator.free(self.local_overlap_arms);
+        if (self.local_slot_offsets.len > 0) self.allocator.free(self.local_slot_offsets);
 
         var const_it = self.constants.valueIterator();
         while (const_it.next()) |list| list.deinit(self.allocator);

@@ -8028,11 +8028,45 @@ struct Lowerer {
     /// Resolve a type expression AST node to a type index.
     fn resolveTypeNode(idx: int) int {
         if (idx == null_node) { return VOID }
-        // Prefer checker's per-file scoped resolution
+        // Prefer checker's per-file scoped resolution (Zig lower.zig:10060)
         if (self.chk.expr_types.contains(idx)) {
             return self.chk.expr_types.get(idx)
         }
-        return self.chk.resolveTypeExpr(idx)
+        // Fallback: only resolve type_expr nodes (not idents/literals/etc.)
+        // Zig lower.zig:10061-10063: if not a type_expr, return VOID
+        // NOTE: Self-hosted AST stores inner types as idents (not nested type_exprs),
+        // so compound kinds use chk.resolveTypeExpr (handles both idents and type_exprs).
+        var kind = -1
+        var d1 = null_node
+        var d2 = null_node
+        switch (self.tree.getNode(idx)) { Node.expr |e| => switch (e) { Expr.type_expr |te| => { kind = te.kind; d1 = te.data1; d2 = te.data2 }, else => {} }, else => {} }
+        if (kind < 0) { return VOID }
+        // Resolve type_expr by kind (Zig lower.zig:10066-10136)
+        if (kind == TYPE_NAMED) {
+            return self.chk.resolveTypeExpr(d1)
+        }
+        if (kind == TYPE_POINTER) {
+            return self.types.makePointer(self.chk.resolveTypeExpr(d1))
+        }
+        if (kind == TYPE_OPTIONAL) {
+            return self.types.makeOptional(self.chk.resolveTypeExpr(d1))
+        }
+        if (kind == TYPE_ERROR_UNION) {
+            return self.types.makeErrorUnion(self.chk.resolveTypeExpr(d1))
+        }
+        if (kind == TYPE_SLICE) {
+            return self.types.makeSlice(self.chk.resolveTypeExpr(d1))
+        }
+        if (kind == TYPE_ARRAY) {
+            return self.chk.resolveArrayType(d1, d2)
+        }
+        if (kind == TYPE_FUNCTION) {
+            return self.chk.resolveTypeExprNode(idx)
+        }
+        if (kind == TYPE_TUPLE) {
+            return self.chk.resolveTupleType(idx)
+        }
+        return VOID
     }
 
     /// Infer the type of an expression from the checker's type map.

@@ -17,6 +17,7 @@ import "std/fs"
 import "std/sys"
 import "std/string"
 import "std/path"
+import "std/list"
 import "std/map"
 import "std/debug"
 import "std/process"
@@ -166,7 +167,8 @@ fn cmdBuildWithOutput(path: string, user_output: string) void {
     }
 
     // Compile to IR (handles imports via compileToIR → compileWithImports)
-    const result = compileToIR(path, content)
+    const lo = LowerOptions { test_mode: false, bench_mode: false, fail_fast: false }
+    const result = compileToIR(path, content, lo)
 
     // Generate Wasm binary
     const opts = CompileOptions {
@@ -198,7 +200,8 @@ fn cmdRun(path: string) void {
     }
 
     // Compile to IR and generate Wasm
-    const result = compileToIR(path, content)
+    const lo = LowerOptions { test_mode: false, bench_mode: false, fail_fast: false }
+    const result = compileToIR(path, content, lo)
     const opts = CompileOptions {
         is_wasi: true,
         test_mode: false,
@@ -234,7 +237,8 @@ fn cmdTest(path: string) void {
     }
 
     // Compile to IR with test mode
-    const result = compileToIR(path, content)
+    const lo = LowerOptions { test_mode: true, bench_mode: false, fail_fast: false }
+    const result = compileToIR(path, content, lo)
     const opts = CompileOptions {
         is_wasi: true,
         test_mode: true,
@@ -270,7 +274,8 @@ fn cmdBench(path: string) void {
     }
 
     // Compile to IR with bench mode
-    const result = compileToIR(path, content)
+    const lo = LowerOptions { test_mode: false, bench_mode: true, fail_fast: false }
+    const result = compileToIR(path, content, lo)
     const opts = CompileOptions {
         is_wasi: true,
         test_mode: false,
@@ -359,6 +364,13 @@ fn computeStem(path: string) string {
     return base
 }
 
+/// Options controlling lowering behavior (test mode, bench mode, fail-fast).
+struct LowerOptions {
+    test_mode: bool,
+    bench_mode: bool,
+    fail_fast: bool,
+}
+
 /// Result of compilation to IR.
 struct CompileResult {
     ir: IR,
@@ -366,7 +378,7 @@ struct CompileResult {
 }
 
 /// Compile a source file to IR (parse + check + lower across all imports).
-fn compileToIR(path: string, content: string) CompileResult {
+fn compileToIR(path: string, content: string, lower_opts: LowerOptions) CompileResult {
     var types = TypeRegistry.init()
     const project_safe = isProjectSafe(path)
 
@@ -383,20 +395,20 @@ fn compileToIR(path: string, content: string) CompileResult {
     // Multi-file path: check + lower all files with shared state
     var imports = ast.getImports()
     if (imports.count > 0) {
-        return compileWithImports(path, project_safe)
+        return compileWithImports(path, project_safe, lower_opts)
     }
 
     // Single-file: check and lower directly (no shared state)
-    return compileSingleFile(path, content, ast, types)
+    return compileSingleFile(path, content, ast, types, lower_opts)
 }
 
 /// Compile a file that has imports — check ALL files, then lower ALL files.
 /// This matches the Zig compiler's driver.zig pattern: shared builder + shared
 /// lowered_generics across all files prevents duplicate generic emissions.
-fn compileWithImports(path: string, project_safe: bool) CompileResult {
+fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions) CompileResult {
     var types = TypeRegistry.init()
-    var seen: Map(string, int) = .{}
-    var in_progress: Map(string, int) = .{}
+    var seen: List(string) = .{}
+    var in_progress: List(string) = .{}
     var shared = SharedCheckerState.init()
     var lower_shared = SharedLowerState {
         builder: Builder.init(),
@@ -406,30 +418,101 @@ fn compileWithImports(path: string, project_safe: bool) CompileResult {
         generated_dict_helpers: .{},
         dict_arg_names: .{},
         shape_analysis_cache: .{},
+        init_func_names: .{},
+        file_counter: 0,
+        all_test_names: .{},
+        all_test_display_names: .{},
+        all_bench_names: .{},
+        all_bench_display_names: .{},
     }
 
     // Check and lower each file immediately (avoids use-after-free of stack locals)
     var checked_scopes: Map(string, CheckedScopeEntry) = .{}
-    checkAndLowerRecursive(path, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes)
+    checkAndLowerRecursive(path, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, lower_opts)
+
+    // Go init function pattern: generate master __cot_init_globals that calls all per-file inits.
+    const span = Span.zero()
+    lower_shared.builder.startFunc("__cot_init_globals", VOID, VOID, span)
+    if (lower_shared.builder.func()) |fb| {
+        for i in 0..lower_shared.init_func_names.count {
+            var no_args: List(int) = .{}
+            fb.emitCall(lower_shared.init_func_names.get(i), no_args, false, VOID, span)
+        }
+        fb.emitRet(null_node, span)
+    }
+    lower_shared.builder.endFunc()
+
+    // Generate test runner if in test mode (uses a temporary Lowerer for the runner methods)
+    if (lower_opts.test_mode and lower_shared.all_test_names.count > 0) {
+        generateMultiFileTestRunner(lower_shared, types, lower_opts)
+    }
+
+    // Generate bench runner if in bench mode
+    if (lower_opts.bench_mode and lower_shared.all_bench_names.count > 0) {
+        generateMultiFileBenchRunner(lower_shared, types)
+    }
 
     const ir = lower_shared.builder.getIR()
     return CompileResult { ir: ir, types: types }
 }
 
+/// Generate test runner for multi-file builds using a temporary Lowerer.
+/// Copies all collected test names into the Lowerer, then calls generateTestRunner().
+fn generateMultiFileTestRunner(lower_shared: SharedLowerState, types: TypeRegistry, lower_opts: LowerOptions) void {
+    var lower_inst: Lowerer = undefined
+    // Minimal init — only needs builder, types, and test name lists
+    lower_inst.types = types
+    lower_inst.module_name = ""
+    initLowererScalars(lower_inst)
+    lower_inst.builder = lower_shared.builder
+    initLowererLists(lower_inst)
+    initLowererMaps(lower_inst)
+    lower_inst.setFailFast(lower_opts.fail_fast)
+
+    // Copy collected test names
+    for i in 0..lower_shared.all_test_names.count {
+        lower_inst.test_names.append(lower_shared.all_test_names.get(i))
+        lower_inst.test_display_names.append(lower_shared.all_test_display_names.get(i))
+    }
+
+    lower_inst.generateTestRunner()
+    lower_shared.builder = lower_inst.builder
+}
+
+/// Generate bench runner for multi-file builds using a temporary Lowerer.
+fn generateMultiFileBenchRunner(lower_shared: SharedLowerState, types: TypeRegistry) void {
+    var lower_inst: Lowerer = undefined
+    lower_inst.types = types
+    lower_inst.module_name = ""
+    initLowererScalars(lower_inst)
+    lower_inst.builder = lower_shared.builder
+    initLowererLists(lower_inst)
+    initLowererMaps(lower_inst)
+
+    // Copy collected bench names
+    for i in 0..lower_shared.all_bench_names.count {
+        lower_inst.bench_names.append(lower_shared.all_bench_names.get(i))
+        lower_inst.bench_display_names.append(lower_shared.all_bench_display_names.get(i))
+    }
+
+    lower_inst.generateBenchRunner()
+    lower_shared.builder = lower_inst.builder
+}
+
 /// Compile a single-file program (no imports).
 /// Separated to avoid stack overflow from large Lowerer struct.
-fn compileSingleFile(path: string, content: string, ast: *Ast, types: TypeRegistry) CompileResult {
+fn compileSingleFile(path: string, content: string, ast: *Ast, types: TypeRegistry, lower_opts: LowerOptions) CompileResult {
     var check_errs = ErrorReporter.initWithSource(path, content)
     var checker = Checker.init(ast, types, check_errs)
     checker.checkFile()
     if (check_errs.hasErrors()) { exit(1) }
 
-    return lowerChecked(ast, types, check_errs, checker)
+    return lowerChecked(ast, types, check_errs, checker, lower_opts)
 }
 
 /// Lower a checked AST to IR. Separated into own function to keep Lowerer
 /// off the caller's stack frame (avoids stack overflow).
-fn lowerChecked(ast: *Ast, types: TypeRegistry, errs: ErrorReporter, checker: Checker) CompileResult {
+fn lowerChecked(ast: *Ast, types: TypeRegistry, errs: ErrorReporter, checker: Checker, lower_opts: LowerOptions) CompileResult {
     var lower_inst: Lowerer = undefined
     lower_inst.tree = ast
     lower_inst.types = types
@@ -439,7 +522,29 @@ fn lowerChecked(ast: *Ast, types: TypeRegistry, errs: ErrorReporter, checker: Ch
     initLowererScalars(lower_inst)
     initLowererLists(lower_inst)
     initLowererMaps(lower_inst)
-    const ir = lower_inst.lower()
+
+    // Set modes before lowering
+    lower_inst.setTestMode(lower_opts.test_mode)
+    lower_inst.setBenchMode(lower_opts.bench_mode)
+    lower_inst.setFailFast(lower_opts.fail_fast)
+
+    // Lower all declarations
+    lower_inst.lowerToBuilder()
+
+    // Generate global init function (Go init pattern)
+    lower_inst.generateGlobalInits()
+
+    // Generate test runner if in test mode
+    if (lower_opts.test_mode and lower_inst.test_names.count > 0) {
+        lower_inst.generateTestRunner()
+    }
+
+    // Generate bench runner if in bench mode
+    if (lower_opts.bench_mode and lower_inst.bench_names.count > 0) {
+        lower_inst.generateBenchRunner()
+    }
+
+    const ir = lower_inst.builder.getIR()
     return CompileResult { ir: ir, types: types }
 }
 
@@ -460,11 +565,18 @@ struct SharedLowerState {
     generated_dict_helpers: Map(string, int),
     dict_arg_names: Map(string, string),
     shape_analysis_cache: Map(int, int),
+    // Multi-file pipeline tracking (Go init function pattern)
+    init_func_names: List(string),
+    file_counter: int,
+    all_test_names: List(string),
+    all_test_display_names: List(string),
+    all_bench_names: List(string),
+    all_bench_display_names: List(string),
 }
 
 /// Lower a single checked file into the shared builder.
 /// Separated to keep large Lowerer struct off the caller's stack frame.
-fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState) void {
+fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, lower_opts: LowerOptions) void {
     var lower_inst: Lowerer = undefined
     lower_inst.tree = cf.ast
     lower_inst.types = types
@@ -482,7 +594,36 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState) 
     lower_inst.dict_arg_names = shared.dict_arg_names
     lower_inst.shape_analysis_cache = shared.shape_analysis_cache
 
+    // Set modes before lowering
+    lower_inst.setTestMode(lower_opts.test_mode)
+    lower_inst.setBenchMode(lower_opts.bench_mode)
+    lower_inst.setFailFast(lower_opts.fail_fast)
+
     lower_inst.lowerToBuilder()
+
+    // Go init function pattern: generate per-file init function for this file's globals
+    if (lower_inst.pending_global_inits.count > 0) {
+        const init_name = "__cot_init_file_" ++ intToString(shared.file_counter)
+        lower_inst.generateGlobalInitsNamed(init_name)
+        shared.init_func_names.append(init_name)
+        shared.file_counter = shared.file_counter + 1
+    }
+
+    // Collect test names for multi-file test runner
+    if (lower_opts.test_mode) {
+        for i in 0..lower_inst.test_names.count {
+            shared.all_test_names.append(lower_inst.test_names.get(i))
+            shared.all_test_display_names.append(lower_inst.test_display_names.get(i))
+        }
+    }
+
+    // Collect bench names for multi-file bench runner
+    if (lower_opts.bench_mode) {
+        for i in 0..lower_inst.bench_names.count {
+            shared.all_bench_names.append(lower_inst.bench_names.get(i))
+            shared.all_bench_display_names.append(lower_inst.bench_display_names.get(i))
+        }
+    }
 
     // Propagate back via field mutation (auto-ref propagates)
     shared.builder = lower_inst.builder
@@ -538,8 +679,8 @@ struct CheckedScopeEntry {
 }
 
 fn cmdCheckMultiFile(path: string) void {
-    var seen: Map(string, int) = .{}
-    var in_progress: Map(string, int) = .{}
+    var seen: List(string) = .{}
+    var in_progress: List(string) = .{}
     var checked_scopes: Map(string, CheckedScopeEntry) = .{}
 
     var types = TypeRegistry.init()
@@ -554,19 +695,19 @@ fn cmdCheckMultiFile(path: string) void {
 /// Recursively parse and type-check a file and all its imports.
 /// Dependencies are checked first (depth-first), matching driver.zig pattern.
 /// Per-file scoping: each file gets its own scope; imported symbols are copied in.
-fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: Map(string, int), in_progress: Map(string, int), project_safe: bool, checked_scopes: Map(string, CheckedScopeEntry)) void {
+fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: List(string), in_progress: List(string), project_safe: bool, checked_scopes: Map(string, CheckedScopeEntry)) void {
     // Circular import detection (must check BEFORE seen)
-    if (in_progress.getOrDefault(file_path, 0) == 1) {
+    if (listContainsStr(in_progress, file_path)) {
         eprintln("error: circular import detected: ${file_path}")
         exit(1)
     }
 
     // Already processed
-    if (seen.has(file_path) != 0) { return }
+    if (listContainsStr(seen, file_path)) { return }
 
     // Mark as seen and in-progress
-    seen.set(file_path, 1)
-    in_progress.set(file_path, 1)
+    seen.append(file_path)
+    in_progress.append(file_path)
 
     const content = readFile(file_path) catch {
         eprintln("error: cannot read file: ${file_path}")
@@ -596,7 +737,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
     }
 
     // Done with this file's imports — unmark in-progress
-    in_progress.set(file_path, 0)
+    in_progress.pop()
 
     // Type check with shared state (all dependencies already checked)
     var check_errs = ErrorReporter.initWithSource(file_path, content)
@@ -607,7 +748,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
     checker.pushFileScope()
     for i in 0..imports.count {
         const resolved = resolveImportPath(imports.get(i), source_dir)
-        if (checked_scopes.has(resolved) != 0) {
+        if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
             checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
         }
@@ -627,16 +768,24 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
     }
 }
 
+/// Check if a string is in a List (linear search workaround for Map.has() native codegen bug).
+fn listContainsStr(list: List(string), s: string) bool {
+    for i in 0..list.count {
+        if (list.get(i) == s) { return true }
+    }
+    return false
+}
+
 /// Recursively check and lower a file and all its imports.
 /// Each file is lowered immediately after checking, while checker/errs are still on the stack.
-fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: Map(string, int), in_progress: Map(string, int), project_safe: bool, lower_shared: SharedLowerState, checked_scopes: Map(string, CheckedScopeEntry)) void {
-    if (in_progress.getOrDefault(file_path, 0) == 1) {
+fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: List(string), in_progress: List(string), project_safe: bool, lower_shared: SharedLowerState, checked_scopes: Map(string, CheckedScopeEntry), lower_opts: LowerOptions) void {
+    if (listContainsStr(in_progress, file_path)) {
         eprintln("error: circular import detected: ${file_path}")
         exit(1)
     }
-    if (seen.has(file_path) != 0) { return }
-    seen.set(file_path, 1)
-    in_progress.set(file_path, 1)
+    if (listContainsStr(seen, file_path)) { return }
+    seen.append(file_path)
+    in_progress.append(file_path)
 
     const content = readFile(file_path) catch {
         eprintln("error: cannot read file: ${file_path}")
@@ -657,9 +806,9 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
     const source_dir = dirname(file_path)
     for i in 0..imports.count {
         const resolved = resolveImportPath(imports.get(i), source_dir)
-        checkAndLowerRecursive(resolved, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes)
+        checkAndLowerRecursive(resolved, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, lower_opts)
     }
-    in_progress.set(file_path, 0)
+    in_progress.pop()
 
     // Check with shared state + per-file scope
     var check_errs = ErrorReporter.initWithSource(file_path, content)
@@ -670,7 +819,7 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
     checker.pushFileScope()
     for i in 0..imports.count {
         const resolved = resolveImportPath(imports.get(i), source_dir)
-        if (checked_scopes.has(resolved) != 0) {
+        if (checked_scopes.contains(resolved)) {
             const entry = checked_scopes.get(resolved)
             checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
         }
@@ -687,7 +836,7 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
     if (check_errs.hasErrors()) { exit(1) }
 
     // Lower immediately while checker/errs are still on the stack
-    lowerOneFile(CheckedFile { ast: ast, errs: &check_errs, chk: &checker }, types, lower_shared)
+    lowerOneFile(CheckedFile { ast: ast, errs: &check_errs, chk: &checker }, types, lower_shared, lower_opts)
 }
 
 /// Resolve an import path to a file path.
