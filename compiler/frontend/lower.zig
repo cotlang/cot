@@ -2658,13 +2658,21 @@ pub const Lowerer = struct {
                         // Compound optional field: wrap T → ?T
                         try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node_ir, field_init.value, span);
                     } else {
-                        // @safe auto-ref fix: dereference pointer when field expects struct value
+                        // @safe auto-ref: dereference pointer when field expects struct value
                         var actual_value = value_node_ir;
                         if (self.chk.safe_mode and field_type == .struct_type) {
                             const value_type_idx = fb.nodes.items[value_node_ir].type_idx;
                             const value_type = self.type_reg.get(value_type_idx);
                             if (value_type == .pointer and self.type_reg.isAssignable(value_type.pointer.elem, struct_field.type_idx)) {
                                 actual_value = try fb.emitPtrLoadValue(value_node_ir, struct_field.type_idx, span);
+                            }
+                        }
+                        // @safe auto-ref: take address when field expects *Struct and value is Struct
+                        if (self.chk.safe_mode and field_type == .pointer) {
+                            const value_type_idx = fb.nodes.items[value_node_ir].type_idx;
+                            const value_type = self.type_reg.get(value_type_idx);
+                            if (value_type == .struct_type and self.type_reg.isAssignable(value_type_idx, field_type.pointer.elem)) {
+                                actual_value = try self.autoRefValue(fb, value_node_ir, field_init.value, struct_field.type_idx, span);
                             }
                         }
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
@@ -3323,6 +3331,36 @@ pub const Lowerer = struct {
         }
 
         return ir.null_node;
+    }
+
+    /// @safe auto-ref: take address of a struct value to produce *Struct.
+    /// Tries lvalue path first (local/global/field address), falls back to temp copy.
+    /// Matches lowerCall auto-ref pattern (C#/TypeScript reference semantics).
+    fn autoRefValue(self: *Lowerer, fb: *ir.FuncBuilder, value_ir: ir.NodeIndex, ast_idx: NodeIndex, _: TypeIndex, span: Span) !ir.NodeIndex {
+        if (self.target.isWasmGC()) return value_ir; // GC refs need no address-taking
+        const value_type_idx = fb.nodes.items[value_ir].type_idx;
+        const ptr_type = self.type_reg.makePointer(value_type_idx) catch TypeRegistry.I64;
+        // Try lvalue path (avoid unnecessary copies)
+        if (ast_idx != null_node) {
+            if (self.tree.getNode(ast_idx)) |node| {
+                if (node.asExpr()) |expr| {
+                    if (expr == .ident) {
+                        if (fb.lookupLocal(expr.ident.name)) |local_idx| {
+                            return fb.emitAddrLocal(local_idx, ptr_type, span);
+                        } else if (self.builder.lookupGlobal(expr.ident.name)) |g| {
+                            return fb.emitAddrGlobal(g.idx, expr.ident.name, ptr_type, span);
+                        }
+                    } else if (expr == .field_access) {
+                        const addr = try self.resolveStructFieldAddr(ast_idx);
+                        if (addr != ir.null_node) return addr;
+                    }
+                }
+            }
+        }
+        // Fallback: temp copy for non-lvalue expressions
+        const tmp_local = try fb.addLocalWithSize("__safe_ref", value_type_idx, true, self.type_reg.sizeOf(value_type_idx));
+        _ = try fb.emitStoreLocal(tmp_local, value_ir, span);
+        return fb.emitAddrLocal(tmp_local, ptr_type, span);
     }
 
     fn lowerIndexAssign(self: *Lowerer, idx: ast.Index, value_node: ir.NodeIndex, rhs_ast: NodeIndex, span: Span) !void {
@@ -4219,7 +4257,47 @@ pub const Lowerer = struct {
         if (expr == .switch_expr) {
             return try self.lowerSwitchExpr(expr.switch_expr, idx);
         }
+        // .{} as expression: create zero-initialized value of the inferred type
+        if (expr == .zero_init) {
+            return try self.lowerZeroInitExpr(expr.zero_init, idx);
+        }
         return try self.lowerExpr(expr);
+    }
+
+    /// Lower .{} (zero_init) used as an expression value.
+    /// Creates a zero-initialized temp of the checker-inferred type.
+    fn lowerZeroInitExpr(self: *Lowerer, zi: ast.ZeroInit, idx: NodeIndex) Error!ir.NodeIndex {
+        const fb = self.current_func orelse return ir.null_node;
+        const zi_type = self.inferExprType(idx);
+        if (zi_type != types.invalid_type and zi_type != TypeRegistry.VOID) {
+            const type_info = self.type_reg.get(zi_type);
+            // WasmGC: use gc_struct_new with default values
+            if (self.target.isWasmGC() and type_info == .struct_type) {
+                const struct_type = type_info.struct_type;
+                var field_values = try self.allocator.alloc(ir.NodeIndex, struct_type.fields.len);
+                defer self.allocator.free(field_values);
+                for (struct_type.fields, 0..) |field, i| {
+                    if (field.default_value != null_node) {
+                        field_values[i] = try self.lowerExprNode(field.default_value);
+                    } else {
+                        field_values[i] = try self.emitGcDefaultValue(field.type_idx, zi.span);
+                    }
+                }
+                return try self.emitGcStructNewExpanded(struct_type.name, struct_type, field_values, zi_type, zi.span);
+            }
+            const size = self.type_reg.sizeOf(zi_type);
+            if (size > 0) {
+                const tmp_local = try fb.addLocalWithSize("__zero_tmp", zi_type, true, size);
+                const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+                const local_addr = try fb.emitAddrLocal(tmp_local, ptr_type, zi.span);
+                const size_node = try fb.emitConstInt(@intCast(size), TypeRegistry.I64, zi.span);
+                var args = [_]ir.NodeIndex{ local_addr, size_node };
+                _ = try fb.emitCall("memset_zero", &args, false, TypeRegistry.VOID, zi.span);
+                return try fb.emitLoadLocal(tmp_local, zi_type, zi.span);
+            }
+        }
+        // Fallback: scalar zero
+        return try fb.emitConstInt(0, TypeRegistry.I64, zi.span);
     }
 
     fn lowerExpr(self: *Lowerer, expr: ast.Expr) Error!ir.NodeIndex {
@@ -5452,14 +5530,21 @@ pub const Lowerer = struct {
                         // Compound optional field: wrap T → ?T (must match lowerStructInit pattern)
                         try self.storeCompoundOptField(fb, temp_idx, field_idx, field_offset, value_node, field_init.value, si.span);
                     } else {
-                        // @safe auto-ref fix: when value is a pointer to a struct (from auto-ref'd
-                        // parameter) but the field expects the struct value, dereference the pointer.
+                        // @safe auto-ref: dereference pointer when field expects struct value
                         var actual_value = value_node;
                         if (self.chk.safe_mode and field_type == .struct_type) {
                             const value_type_idx = fb.nodes.items[value_node].type_idx;
                             const value_type = self.type_reg.get(value_type_idx);
                             if (value_type == .pointer and self.type_reg.isAssignable(value_type.pointer.elem, struct_field.type_idx)) {
                                 actual_value = try fb.emitPtrLoadValue(value_node, struct_field.type_idx, si.span);
+                            }
+                        }
+                        // @safe auto-ref: take address when field expects *Struct and value is Struct
+                        if (self.chk.safe_mode and field_type == .pointer) {
+                            const value_type_idx = fb.nodes.items[value_node].type_idx;
+                            const value_type = self.type_reg.get(value_type_idx);
+                            if (value_type == .struct_type and self.type_reg.isAssignable(value_type_idx, field_type.pointer.elem)) {
+                                actual_value = try self.autoRefValue(fb, value_node, field_init.value, struct_field.type_idx, si.span);
                             }
                         }
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.

@@ -1647,7 +1647,7 @@ pub const Checker = struct {
                 }
                 return body_type;
             },
-            .zero_init => TypeRegistry.VOID, // Type inferred from var decl context
+            .zero_init => if (self.expected_type != invalid_type) self.expected_type else TypeRegistry.VOID,
             .type_expr, .bad_expr => invalid_type,
         };
     }
@@ -2666,13 +2666,21 @@ pub const Checker = struct {
             var found = false;
             for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi.name)) {
                 found = true;
+                // Propagate field type as expected_type (enables .{} inference for Map, List, etc.)
+                const saved_expected = self.expected_type;
+                self.expected_type = sf.type_idx;
                 const vt = try self.checkExpr(fi.value);
+                self.expected_type = saved_expected;
                 if (!self.types.isAssignable(vt, sf.type_idx)) {
                     // @safe coercion: *Struct → Struct when value is an auto-reffed param
                     const vt_t = self.types.get(vt);
                     const is_safe_deref = self.safe_mode and vt_t == .pointer and
                         self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
-                    if (!is_safe_deref) self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
+                    // @safe coercion: Struct → *Struct when field expects a pointer (auto-ref)
+                    const sf_t = self.types.get(sf.type_idx);
+                    const is_safe_ref = self.safe_mode and sf_t == .pointer and
+                        self.types.isAssignable(vt, sf_t.pointer.elem);
+                    if (!is_safe_deref and !is_safe_ref) self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
                 }
                 break;
             };
@@ -2738,9 +2746,18 @@ pub const Checker = struct {
             var found = false;
             for (struct_type.struct_type.fields) |sf| if (std.mem.eql(u8, sf.name, fi.name)) {
                 found = true;
+                const saved_expected = self.expected_type;
+                self.expected_type = sf.type_idx;
                 const vt = try self.checkExpr(fi.value);
+                self.expected_type = saved_expected;
                 if (!self.types.isAssignable(vt, sf.type_idx)) {
-                    self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
+                    const vt_t = self.types.get(vt);
+                    const is_safe_deref = self.safe_mode and vt_t == .pointer and
+                        self.types.isAssignable(vt_t.pointer.elem, sf.type_idx);
+                    const sf_t = self.types.get(sf.type_idx);
+                    const is_safe_ref = self.safe_mode and sf_t == .pointer and
+                        self.types.isAssignable(vt, sf_t.pointer.elem);
+                    if (!is_safe_deref and !is_safe_ref) self.err.errorWithCode(fi.span.start, .e300, "type mismatch in field");
                 }
                 break;
             };
