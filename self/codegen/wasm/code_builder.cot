@@ -209,6 +209,12 @@ struct CodeBuilder {
         writeULEB128(self.buf, func_idx)
     }
 
+    // Wasm 3.0 tail call (opcode 0x12)
+    fn emitReturnCall(func_idx: int) void {
+        self.buf.append(0x12 as u8)
+        writeULEB128(self.buf, func_idx)
+    }
+
     fn emitDrop() void { self.buf.append(OP_DROP) }
     fn emitSelect() void { self.buf.append(OP_SELECT) }
 

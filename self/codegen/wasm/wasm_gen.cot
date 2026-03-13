@@ -686,6 +686,15 @@ struct FuncGen {
                     self.setReg(val_idx)
                 }
             },
+            // Wasm 3.0 tail call — return_call (opcode 0x12)
+            // Same as wasm_lowered_static_call but emits return_call
+            SsaOp.wasm_return_call => {
+                for ai in 0..v.args.count {
+                    self.getValue64(v.args.get(ai))
+                }
+                const rc_func_idx = self.resolveCallIndex(v)
+                self.code.emitReturnCall(rc_func_idx)
+            },
             SsaOp.wasm_lowered_retain, SsaOp.wasm_lowered_release => {
                 // ARC ops are native-only — trap if they appear in Wasm pipeline
                 self.code.emitUnreachable()
@@ -819,6 +828,12 @@ struct FuncGen {
             SsaOp.global_addr => {
                 const addr = GLOBAL_BASE + (v.aux_int * 8)
                 self.code.emitI32Const(addr)
+            },
+            // Type metadata address (for ARC/GC type info)
+            // Resolved via metadata_offsets map if available
+            SsaOp.metadata_addr => {
+                // For now, emit 0 (no metadata) — metadata_offsets not yet wired
+                self.code.emitI64Const(0)
             },
             SsaOp.off_ptr => {
                 // off_ptr: base + constant offset
