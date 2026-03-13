@@ -442,6 +442,7 @@ test "string switch keyword lookup" {
     @assertEq(lookup("async"), Token.kw_async)
     @assertEq(lookup("await"), Token.kw_await)
     @assertEq(lookup("u8"), Token.kw_u8)
+    @assertEq(lookup("u16"), Token.kw_u16)
     @assertEq(lookup("f64"), Token.kw_f64)
     @assertEq(lookup("xyz"), Token.ident)
 }

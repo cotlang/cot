@@ -1460,6 +1460,10 @@ const SsaToClifTranslator = struct {
                 const ret_info = self.type_reg.get(v.type_idx);
                 const is_unsigned = switch (ret_info) {
                     .basic => |k| k.isUnsigned(),
+                    .enum_type => |e| blk: {
+                        const backing = self.type_reg.get(e.backing_type);
+                        break :blk backing == .basic and backing.basic.isUnsigned();
+                    },
                     else => false,
                 };
                 result_val = if (is_unsigned)
@@ -1768,6 +1772,10 @@ const SsaToClifTranslator = struct {
                 const from_info = self.type_reg.get(from_type);
                 const is_unsigned = switch (from_info) {
                     .basic => |k| k.isUnsigned(),
+                    .enum_type => |e| blk: {
+                        const backing = self.type_reg.get(e.backing_type);
+                        break :blk backing == .basic and backing.basic.isUnsigned();
+                    },
                     else => false,
                 };
                 const result = if (is_unsigned)
