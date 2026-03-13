@@ -2,7 +2,7 @@
 
 **Date:** March 13, 2026 (full re-audit)
 **Scope:** File-by-file comparison of `self/` vs `compiler/` (Zig reference)
-**Total self-hosted:** 40,231 lines across 36 files, 398 tests pass
+**Total self-hosted:** 40,409 lines across 36 files, 398 tests pass
 
 ---
 
@@ -21,11 +21,11 @@
 | SSA Builder | 1 | 2,130 | **95%** | None |
 | SSA Data | 1 | 577 | **95%** | None |
 | SSA Passes | 6 | 1,896 | **92%** | lower_wasm ~90% (LOC gap is explicit null arms), rewritedec 100% |
-| Wasm Codegen | 16 | 10,541 | **88%** | wasm_types.cot vs constants.zig ~72%, wasm_gen edge cases |
+| Wasm Codegen | 16 | 10,719 | **91%** | wasm_types.cot vs constants.zig ~72%, minor edge cases |
 | Source/Errors | 2 | 860 | **100%** | None |
 | Main/CLI | 1 | 788 | **100%** | None |
 
-**Overall: ~90% feature-complete. 40,231 lines across 36 files.**
+**Overall: ~92% feature-complete. 40,409 lines across 36 files.**
 
 **Remaining gaps by priority:**
 1. **HIGH**: Token keywords (5 LOC), lower_wasm pass gaps (~205 LOC), rewritedec gaps (~130 LOC)
@@ -179,14 +179,14 @@ actually MORE correct (includes F64/F32 checks missing from Zig).
 
 ---
 
-## 10. Wasm Codegen — 85%
+## 10. Wasm Codegen — 91%
 
-**14+ files, 10,541 total lines**
+**14+ files, 10,719 total lines**
 
 | Component | LOC | Parity | Notes |
 |-----------|-----|--------|-------|
-| wasm_gen.cot | 1,898 | **85%** | Switch-based dispatch, ~90 op handlers, emitBinaryI32 |
-| code_builder.cot | 699 | **90%** | ~100 emit methods for all Wasm instructions |
+| wasm_gen.cot | 2,017 | **92%** | All call types, convert, cond_select, globals, addr, ~100 op handlers |
+| code_builder.cot | 731 | **95%** | ~115 emit methods incl. saturation truncate, return_call, memory.fill |
 | assemble.cot | 806 | **90%** | LEB128, alignment, opcode emission |
 | link.cot | 896 | **95%** | Module imports/exports, type dedup |
 | preprocess.cot | 551 | **79%** | String/metadata preprocessing |
