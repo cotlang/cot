@@ -4905,10 +4905,36 @@ struct Checker {
         return tag == "return_stmt" or tag == "break_stmt" or tag == "continue_stmt"
     }
 
+    /// Check if node is a type declaration (struct/enum/union/type_alias/error_set/trait).
+    fn isDeclNode(idx: int) bool {
+        const tag = nodeTag(self.ast, idx)
+        return tag == "struct_decl" or tag == "enum_decl" or tag == "union_decl"
+            or tag == "type_alias" or tag == "error_set_decl" or tag == "trait_decl"
+    }
+
+    /// Check if node is a struct declaration.
+    fn isStructDeclNode(idx: int) bool {
+        return nodeTag(self.ast, idx) == "struct_decl"
+    }
+
     /// Check a list of statements with reachability analysis.
     /// Warns on unreachable code after return/break/continue.
     /// Zig ref: checker.zig:267-308
     fn checkStmtsWithReachability(stmts: List(int)) void {
+        // Pre-pass: collect block-scoped type declarations (struct/enum/union/type_alias/error_set/trait)
+        for i in 0..stmts.count {
+            const stmt_idx = stmts.get(i)
+            if (self.isDeclNode(stmt_idx)) {
+                self.collectNestedDecl("", stmt_idx)
+            }
+        }
+        // Post-collect: check method bodies for block-scoped structs
+        for i in 0..stmts.count {
+            const stmt_idx = stmts.get(i)
+            if (self.isStructDeclNode(stmt_idx)) {
+                self.checkDecl(stmt_idx)
+            }
+        }
         var seen_terminal = false
         var warned = false
         for i in 0..stmts.count {
