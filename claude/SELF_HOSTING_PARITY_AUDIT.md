@@ -14,7 +14,7 @@
 | AST | 1 | 1,532 | **95%** | None (SelectExpr already present) |
 | Parser | 1 | 3,158 | **87%** | Spawn/select token defs block integration |
 | Types | 1 | 1,609 | **85%** | Shape stenciling struct (~80 LOC) |
-| Checker | 1 | 5,520 | **85%** | `evalComptimeValue` rich union |
+| Checker | 1 | 5,546 | **86%** | `evalComptimeValue` rich union |
 | IR | 1 | 1,356 | **100%** | None |
 | ARC Insertion | 1 | 443 | **100%** | None |
 | Lowerer | 1 | 8,750+ | **80%** | WasmGC helpers, async (~1,170L) |
@@ -83,9 +83,9 @@ generic optimization (same-shape types share code). All other type infrastructur
 
 ---
 
-## 6. Checker — 82%
+## 6. Checker — 86%
 
-**File:** `checker.cot` (5,501 lines)
+**File:** `checker.cot` (5,546 lines)
 **Reference:** `checker.zig` (4,350 lines)
 
 ### 6.1 Complete
@@ -100,18 +100,19 @@ generic optimization (same-shape types share code). All other type infrastructur
 - RLS (Result Location Semantics) via expected_type save/restore
 - collectNestedDecl — switch on Decl union (matches Zig pattern)
 - Multi-file scope management (loadSharedState/syncToShared)
+- **checkStmtsWithReachability** — full type pre-pass for block-scoped decls + reachability
 
 ### 6.2 Missing
 
 | Function | LOC | Priority | Description |
 |----------|-----|----------|-------------|
 | `evalComptimeValue()` | ~300 | LOW | Rich comptime value union (array/struct construction) |
-| `checkStmtsWithReachability()` | ~59 | LOW | Full type pre-pass + reachability |
 | Typo suggestions | ~60 | LOW | editDistSuggest, errWithSuggestion |
 
 **Previously missing, now complete:**
 - `buildStructTypeWithLayout()` — correct packed/extern/auto field offset calculation
 - `checkBenchDecl()` — handled by checkTestDecl (supports both test_decl and bench_decl)
+- `checkStmtsWithReachability()` — type decl pre-pass + struct method body checking
 
 ---
 
