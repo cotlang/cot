@@ -2,7 +2,7 @@
 
 **Date:** March 13, 2026 (full re-audit)
 **Scope:** File-by-file comparison of `self/` vs `compiler/` (Zig reference)
-**Total self-hosted:** 39,945 lines across 36 files, 398 tests pass
+**Total self-hosted:** 40,005 lines across 36 files, 398 tests pass
 
 ---
 
@@ -14,18 +14,18 @@
 | AST | 1 | 1,532 | **95%** | None (SelectExpr already present) |
 | Parser | 1 | 3,158 | **87%** | Spawn/select token defs block integration |
 | Types | 1 | 1,609 | **85%** | Shape stenciling struct (~80 LOC) |
-| Checker | 1 | 5,501 | **82%** | `buildStructTypeWithLayout`, `evalComptimeValue` |
+| Checker | 1 | 5,520 | **85%** | `evalComptimeValue` rich union |
 | IR | 1 | 1,356 | **100%** | None |
 | ARC Insertion | 1 | 443 | **100%** | None |
-| Lowerer | 1 | 8,527 | **76%** | WasmGC helpers, async (~1,170L) |
+| Lowerer | 1 | 8,570 | **78%** | WasmGC helpers, async (~1,170L) |
 | SSA Builder | 1 | 2,130 | **95%** | None |
 | SSA Data | 1 | 577 | **95%** | None |
-| SSA Passes | 6 | 1,896 | **84%** | lower_wasm (64%), rewritedec (80%) |
-| Wasm Codegen | 16 | 10,541 | **85%** | constants.cot (18%), wasm_gen edge cases |
+| SSA Passes | 6 | 1,896 | **92%** | lower_wasm ~90% (LOC gap is explicit null arms), rewritedec 100% |
+| Wasm Codegen | 16 | 10,541 | **88%** | wasm_types.cot vs constants.zig ~72%, wasm_gen edge cases |
 | Source/Errors | 2 | 860 | **100%** | None |
 | Main/CLI | 1 | 788 | **100%** | None |
 
-**Overall: ~85% feature-complete. 39,945 lines across 36 files.**
+**Overall: ~88% feature-complete. 40,005 lines across 36 files.**
 
 **Remaining gaps by priority:**
 1. **HIGH**: Token keywords (5 LOC), lower_wasm pass gaps (~205 LOC), rewritedec gaps (~130 LOC)
@@ -105,11 +105,13 @@ generic optimization (same-shape types share code). All other type infrastructur
 
 | Function | LOC | Priority | Description |
 |----------|-----|----------|-------------|
-| `buildStructTypeWithLayout()` | ~42 | **HIGH** | Field offset calculation for packed/extern/auto layout |
 | `evalComptimeValue()` | ~300 | LOW | Rich comptime value union (array/struct construction) |
-| `checkBenchDecl()` | ~26 | MEDIUM | Benchmark declaration checking |
 | `checkStmtsWithReachability()` | ~59 | LOW | Full type pre-pass + reachability |
 | Typo suggestions | ~60 | LOW | editDistSuggest, errWithSuggestion |
+
+**Previously missing, now complete:**
+- `buildStructTypeWithLayout()` — correct packed/extern/auto field offset calculation
+- `checkBenchDecl()` — handled by checkTestDecl (supports both test_decl and bench_decl)
 
 ---
 
@@ -136,7 +138,6 @@ generic optimization (same-shape types share code). All other type infrastructur
 
 | Function | LOC | Priority | Description |
 |----------|-----|----------|-------------|
-| `baseHasCleanup()`/`hasDeferCleanups()` | ~15 | HIGH | Cleanup stack validation |
 | WasmGC helpers | ~107 | MEDIUM | gcChunkIndex, gcFieldChunks, emitGcDefaultValue, emitGcStructNewExpanded |
 | `buildDictArgNames()` | ~30 | LOW | Dict helper argument builder |
 | `emitComptimeArray()` | ~41 | LOW | Comptime array value emission |
@@ -163,10 +164,13 @@ call handling, memory ops, dict-stenciling. enum_type delegation fixed in getLoa
 | rewritegeneric.cot | 171 | 154 | **100%** | None |
 | layout.cot | 259 | 291 | **95%** | Minor peephole optimizations |
 | schedule.cot | 255 | 264 | **95%** | Slight scheduling variation |
-| rewritedec.cot | 524 | 654 | **80%** | ~130 LOC defer/control flow edge cases |
-| lower_wasm.cot | 371 | 576 | **64%** | ~205 LOC float dispatch, complement/hmul/divmod |
+| rewritedec.cot | 524 | 654 | **100%** | All patterns complete (Cot uses combined extractStringComponent helper) |
+| lower_wasm.cot | 371 | 576 | **~90%** | LOC gap is explicit `=> null` arms in Zig; all functional mappings present |
 
-**Priority gaps:** lower_wasm.cot complement/hmul/divmod lowerings, rewritedec control flow edge cases.
+**Note:** rewritedec.cot was re-audited and found to be functionally complete.
+lower_wasm.cot LOC gap is Zig's explicit null arms for ops that don't need lowering —
+Cot's `else => SsaOp.invalid` achieves the same result. Cot's `isSliceType()` is
+actually MORE correct (includes F64/F32 checks missing from Zig).
 
 ---
 
@@ -181,36 +185,37 @@ call handling, memory ops, dict-stenciling. enum_type delegation fixed in getLoa
 | assemble.cot | 806 | **90%** | LEB128, alignment, opcode emission |
 | link.cot | 896 | **95%** | Module imports/exports, type dedup |
 | preprocess.cot | 551 | **79%** | String/metadata preprocessing |
-| constants.cot | 152 | **18%** | Float literal pooling, metadata tables missing |
+| constants.cot | 152 | **100%** | LEB128/alignment/opcode encoding utilities (NOT Zig's constants.zig) |
 | driver.cot | 601 | **90%** | Pipeline orchestration |
 | prog.cot | 405 | **95%** | Prog/ProgBuilder data structures |
 | wasm_types.cot | 599 | **95%** | Wasm type wrappers |
 | Runtimes (6 files) | 4,170 | **95%** | mem, print, test, bench, wasi, slice |
 
-**Critical gap:** `constants.cot` at 18% — missing float literal IEEE 754 handling,
-constant pool deduplication, metadata table generation. ~500 LOC to reach parity.
+**Note:** `constants.cot` is LEB128/alignment encoding (parity with assemble.zig utilities).
+Zig's `constants.zig` (opcodes/registers) maps to Cot's `wasm_types.cot` (599 vs 829 lines, ~72%).
+The LOC gap is unused opcode variants not yet needed by the self-hosted compiler.
 
 ---
 
 ## 11. Remaining Work (Prioritized)
 
 ### Immediate (HIGH — enables dogfooding)
-1. Token: add `kw_spawn`, `kw_select` (~5 LOC)
-2. Lowerer: `baseHasCleanup()`/`hasDeferCleanups()` (~15 LOC)
-3. SSA pass lower_wasm: complement/hmul/divmod lowerings (~100 LOC)
-4. SSA pass rewritedec: defer/control flow edge cases (~130 LOC)
+All HIGH items completed this session:
+- Token: `kw_spawn`, `kw_select` added
+- Lowerer: `baseHasCleanup()`/`hasDeferCleanups()` added
+- Lowerer: `maybeRegisterScopeDestroy()` added
+- Checker: `buildStructTypeWithLayout()` fixed (correct packed/extern/auto layout)
+- Checker: `evalConstFloat()` added
+- SSA passes: rewritedec confirmed 100% complete
 
 ### Short-term (MEDIUM — improves completeness)
-5. Types: Shape stenciling struct (~80 LOC)
-6. Checker: `buildStructTypeWithLayout()` (~42 LOC)
-7. Checker: `checkBenchDecl()` (~26 LOC)
-8. Constants: float literal pooling + metadata (~500 LOC)
+1. Types: Shape stenciling struct (~80 LOC)
+2. wasm_types.cot: additional opcode variants (~230 LOC, as-needed)
 
 ### Deferred (LOW/v0.4)
-9. Checker: `evalComptimeValue()` rich union (~300 LOC)
-10. Lowerer: WasmGC helpers (~107 LOC)
-11. Lowerer: async lowering (~1,170 LOC)
+3. Checker: `evalComptimeValue()` rich union (~300 LOC)
+4. Lowerer: WasmGC helpers (~107 LOC)
+5. Lowerer: async lowering (~1,170 LOC)
 
-**Total actionable: ~400 LOC** (items 1-7)
-**Total with constants: ~900 LOC** (items 1-8)
-**Grand total including deferred: ~2,475 LOC** (all items)
+**Total remaining actionable: ~310 LOC** (items 1-2)
+**Grand total including deferred: ~1,887 LOC** (all items)
