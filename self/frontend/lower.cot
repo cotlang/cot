@@ -2596,6 +2596,73 @@ struct Lowerer {
         return fb.emitAddrLocal(tmp, struct_type, si.span)
     }
 
+    // Recursively resolve address of nested struct fields (e.g. &obj.field.inner)
+    // Zig reference: lower.zig:3271-3326
+    fn resolveStructFieldAddr(fb: *FuncBuilder, node_idx: int) int {
+        // Check if node is an ident — base case
+        if (self.extractIdentName(node_idx)) |name| {
+            if (fb.lookupLocal(name)) |local_idx| {
+                const local_type = fb.locals.get(local_idx).type_idx
+                const ptr_type = self.types.makePointer(local_type)
+                return fb.emitAddrLocal(local_idx, ptr_type, Span { start: 0, end: 0 })
+            }
+            if (self.builder.lookupGlobal(name)) |g| {
+                const ptr_type = self.types.makePointer(g.global.type_idx)
+                return fb.emitAddrGlobal(g.idx, name, ptr_type, Span { start: 0, end: 0 })
+            }
+            return null_node
+        }
+
+        // Check if node is a field_access
+        var fa_opt: ?FieldAccessExpr = null
+        switch (self.tree.getNode(node_idx)) { Node.expr |e| => switch (e) {
+            Expr.field_access |fa| => { fa_opt = fa },
+            else => {},
+        }, else => {} }
+
+        if (fa_opt) |fa| {
+            const base_type_idx = self.inferExprType(fa.base)
+            const base_type = self.types.get(base_type_idx)
+
+            // Get struct type (direct or through pointer)
+            var struct_type_idx = VOID
+            var is_ptr = false
+            if (base_type.tag == TAG_STRUCT) {
+                struct_type_idx = base_type_idx
+            } else if (base_type.tag == TAG_POINTER) {
+                is_ptr = true
+                const elem = switch (base_type) { Type.pointer |p| => p.elem, else => VOID }
+                const elem_info = self.types.get(elem)
+                if (elem_info.tag == TAG_STRUCT) {
+                    struct_type_idx = elem
+                }
+            }
+            if (struct_type_idx == VOID) { return null_node }
+
+            // Get base address: pointer → load value, struct → recurse
+            const base_addr = if (is_ptr) {
+                self.lowerExprNode(fa.base)
+            } else {
+                self.resolveStructFieldAddr(fb, fa.base)
+            }
+            if (base_addr == null_node) { return null_node }
+
+            // Find field and emit offset
+            const field_idx = self.findStructFieldIdx(struct_type_idx, fa.field)
+            if (field_idx >= 0) {
+                if (self.getStructField(struct_type_idx, field_idx)) |field| {
+                    const field_offset = field.offset
+                    if (field_offset == 0) { return base_addr }
+                    const field_ptr_type = self.types.makePointer(field.type_idx)
+                    return fb.emitAddrOffset(base_addr, field_offset, field_ptr_type, fa.span)
+                }
+            }
+            return null_node
+        }
+
+        return null_node
+    }
+
     fn lowerAddrOf(fb: *FuncBuilder, ao: AddrOf, idx: int) int {
         const operand_type = self.inferExprType(ao.operand)
         const ptr_type = self.types.makePointer(operand_type)
@@ -2605,6 +2672,17 @@ struct Lowerer {
             if (fb.lookupLocal(op_name)) |local_idx| {
                 return fb.emitAddrLocal(local_idx, ptr_type, ao.span)
             }
+        }
+
+        // Check if operand is a field_access — use resolveStructFieldAddr
+        var is_field_access = false
+        switch (self.tree.getNode(ao.operand)) { Node.expr |e| => switch (e) {
+            Expr.field_access => { is_field_access = true },
+            else => {},
+        }, else => {} }
+        if (is_field_access) {
+            const result = self.resolveStructFieldAddr(fb, ao.operand)
+            if (result != null_node) { return result }
         }
 
         // For non-ident operands, lower and store to temp
@@ -7030,6 +7108,91 @@ struct Lowerer {
         if (!self.chk.generic_inst_by_name.contains(name)) { return null }
         const ptr = self.chk.generic_inst_by_name.get(name)
         return @intToPtr(*GenericInstInfo, ptr)
+    }
+
+    /// Execute a deferred cleanup expression (defer/errdefer body).
+    /// Zig reference: lower.zig:2117-2124
+    fn lowerDeferredNode(node_idx: int) void {
+        switch (self.tree.getNode(node_idx)) {
+            Node.stmt |stmt| => {
+                self.lowerStmt(stmt)
+            },
+            Node.expr => {
+                self.lowerExprNode(node_idx)
+            },
+            else => {},
+        }
+    }
+
+    /// Check if a binary operator is division or modulo.
+    /// Used to route div/mod to special handlers (zero-check injection).
+    /// Zig reference: lower.zig:4573-4578
+    fn isDivOp(op: int) bool {
+        return op == Token.quo or op == Token.rem
+    }
+
+    /// Find a labeled block by name in the labeled_block_stack.
+    /// Zig reference: lower.zig:4108-4116
+    fn findLabeledBlock(target_label: string) ?LabeledBlockCtx {
+        var i = self.labeled_block_stack.count
+        while (i > 0) {
+            i = i - 1
+            const blk_ctx = self.labeled_block_stack.get(i)
+            if (blk_ctx.label == target_label) {
+                return blk_ctx
+            }
+        }
+        return null
+    }
+
+    /// Resolve a type argument node into a TypeIndex.
+    /// Handles type keywords as idents, type substitution, and complex type_expr nodes.
+    /// Zig reference: lower.zig:10092-10120
+    fn resolveTypeArgNode(idx: int) int {
+        if (self.extractIdentName(idx)) |name| {
+            // Check type substitution first (active during generic instantiation)
+            if (self.chk.hasTypeSubstitution()) {
+                const sub = self.chk.lookupTypeSub(name)
+                if (sub >= 0) { return sub }
+            }
+            // Check type keywords
+            if (name == "void") { return VOID }
+            if (name == "bool") { return BOOL }
+            if (name == "i8") { return I8 }
+            if (name == "i16") { return I16 }
+            if (name == "i32") { return I32 }
+            if (name == "i64") { return I64 }
+            if (name == "int") { return I64 }
+            if (name == "u8") { return U8 }
+            if (name == "u16") { return U16 }
+            if (name == "u32") { return U32 }
+            if (name == "u64") { return U64 }
+            if (name == "f32") { return F32 }
+            if (name == "f64") { return F64 }
+            if (name == "string") { return STRING }
+            // Named type lookup
+            const named = self.types.lookupByName(name)
+            if (named >= 0) { return named }
+            return VOID
+        }
+        // Fall through to standard type_expr resolution
+        return self.resolveTypeNode(idx)
+    }
+
+    /// Construct a mangled generic type name and look it up.
+    /// E.g. List(i64) → "List(42)" where 42 is the TypeIndex for i64.
+    /// Zig reference: lower.zig:10075-10088
+    fn resolveGenericTypeName(base_name: string, type_args: List(int)) int {
+        var buf = base_name ++ "("
+        for i in 0..type_args.count {
+            if (i > 0) { buf = buf ++ ";" }
+            const arg_type = self.resolveTypeArgNode(type_args.get(i))
+            buf = buf ++ intToString(arg_type)
+        }
+        buf = buf ++ ")"
+        const result = self.types.lookupByName(buf)
+        if (result >= 0) { return result }
+        return VOID
     }
 
     // ========================================================================

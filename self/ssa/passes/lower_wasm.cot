@@ -168,10 +168,26 @@ fn lowerOp(op: SsaOp, type_idx: int, func: *SsaFunc, val_idx: int) SsaOp {
         .gt32f => SsaOp.wasm_f32_gt,
         .ge32f => SsaOp.wasm_f32_ge,
 
-        // Type conversions
+        // Type conversions (integer widening/narrowing)
         .sign_ext32to64 => SsaOp.wasm_i64_extend_i32_s,
         .zero_ext32to64 => SsaOp.wasm_i64_extend_i32_u,
         .trunc64to32 => SsaOp.wasm_i32_wrap_i64,
+
+        // Float conversions (int → float)
+        .cvt64to64f => SsaOp.wasm_f64_convert_i64_s,
+        .cvt32to64f => SsaOp.wasm_f64_convert_i32_s,
+        .cvt64to32f => SsaOp.wasm_f32_convert_i64_s,
+        .cvt32to32f => SsaOp.wasm_f32_convert_i32_s,
+
+        // Float conversions (float → int)
+        .cvt64fto64 => SsaOp.wasm_i64_trunc_f64_s,
+        .cvt64fto32 => SsaOp.wasm_i32_trunc_f64_s,
+        .cvt32fto64 => SsaOp.wasm_i64_trunc_f32_s,
+        .cvt32fto32 => SsaOp.wasm_i32_trunc_f32_s,
+
+        // Float conversions (float ↔ float)
+        .cvt32fto64f => SsaOp.wasm_f64_promote_f32,
+        .cvt64fto32f => SsaOp.wasm_f32_demote_f64,
 
         // Memory (non-type-dependent)
         .load32 => SsaOp.wasm_i64_load32_u,

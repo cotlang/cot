@@ -638,6 +638,11 @@ struct SSABuilder {
                 else => SsaOp.load,
             }
         }
+        // enum_type: delegate to backing type (Zig ssa_builder.zig:1441-1443)
+        if (type_info.tag == TAG_ENUM) {
+            const backing = switch (type_info) { Type.enum_type |e| => e.backing_type, else => I64 }
+            return self.getLoadOp(backing)
+        }
         return SsaOp.load
     }
 
@@ -651,6 +656,11 @@ struct SSABuilder {
                 BasicKind.i32_type, BasicKind.u32_type, BasicKind.f32_type => SsaOp.store32,
                 else => SsaOp.store,
             }
+        }
+        // enum_type: delegate to backing type (Zig ssa_builder.zig:1465-1467)
+        if (type_info.tag == TAG_ENUM) {
+            const backing = switch (type_info) { Type.enum_type |e| => e.backing_type, else => I64 }
+            return self.getStoreOp(backing)
         }
         return SsaOp.store
     }

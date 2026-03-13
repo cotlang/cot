@@ -384,17 +384,149 @@ struct CodeBuilder {
     fn emitF64Le() void { self.buf.append(OP_F64_LE) }
     fn emitF64Ge() void { self.buf.append(OP_F64_GE) }
 
+    // i32 arithmetic/bitwise (missing ops)
+    fn emitI32DivS() void { self.buf.append(0x6D as u8) }
+    fn emitI32DivU() void { self.buf.append(0x6E as u8) }
+    fn emitI32RemS() void { self.buf.append(0x6F as u8) }
+    fn emitI32RemU() void { self.buf.append(0x70 as u8) }
+    fn emitI32Xor() void { self.buf.append(0x73 as u8) }
+    fn emitI32Shl() void { self.buf.append(0x74 as u8) }
+    fn emitI32ShrS() void { self.buf.append(0x75 as u8) }
+    fn emitI32ShrU() void { self.buf.append(0x76 as u8) }
+    fn emitI32Rotl() void { self.buf.append(0x77 as u8) }
+    fn emitI32Rotr() void { self.buf.append(0x78 as u8) }
+    fn emitI32Clz() void { self.buf.append(0x67 as u8) }
+    fn emitI32Ctz() void { self.buf.append(0x68 as u8) }
+    fn emitI32Popcnt() void { self.buf.append(0x69 as u8) }
+
+    // i64 rotation
+    fn emitI64Rotl() void { self.buf.append(0x89 as u8) }
+    fn emitI64Rotr() void { self.buf.append(0x8A as u8) }
+    fn emitI64Clz() void { self.buf.append(0x79 as u8) }
+    fn emitI64Ctz() void { self.buf.append(0x7A as u8) }
+    fn emitI64Popcnt() void { self.buf.append(0x7B as u8) }
+
+    // i32 memory
+    fn emitI32Load8S(align_val: int, offset: int) void {
+        self.buf.append(0x2C as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitI32Load8U(align_val: int, offset: int) void {
+        self.buf.append(0x2D as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitI32Load16S(align_val: int, offset: int) void {
+        self.buf.append(0x2E as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitI32Load16U(align_val: int, offset: int) void {
+        self.buf.append(0x2F as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitI32Store8(align_val: int, offset: int) void {
+        self.buf.append(0x3A as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitI32Store16(align_val: int, offset: int) void {
+        self.buf.append(0x3B as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
+    // f32 memory
+    fn emitF32Load(align_val: int, offset: int) void {
+        self.buf.append(0x2A as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitF32Store(align_val: int, offset: int) void {
+        self.buf.append(0x38 as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitF64Load(align_val: int, offset: int) void {
+        self.buf.append(0x2B as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+    fn emitF64Store(align_val: int, offset: int) void {
+        self.buf.append(0x39 as u8)
+        writeULEB128(self.buf, align_val)
+        writeULEB128(self.buf, offset)
+    }
+
     // f64 extra ops
     fn emitF64Trunc() void { self.buf.append(0x9D as u8) }
     fn emitF64Abs() void { self.buf.append(0x99 as u8) }
+    fn emitF64Ceil() void { self.buf.append(0x9B as u8) }
+    fn emitF64Floor() void { self.buf.append(0x9C as u8) }
+    fn emitF64Nearest() void { self.buf.append(0x9E as u8) }
+    fn emitF64Min() void { self.buf.append(0xA4 as u8) }
+    fn emitF64Max() void { self.buf.append(0xA5 as u8) }
+    fn emitF64Copysign() void { self.buf.append(0xA6 as u8) }
 
-    // Conversions
+    // f32 arithmetic
+    fn emitF32Add() void { self.buf.append(0x92 as u8) }
+    fn emitF32Sub() void { self.buf.append(0x93 as u8) }
+    fn emitF32Mul() void { self.buf.append(0x94 as u8) }
+    fn emitF32Div() void { self.buf.append(0x95 as u8) }
+    fn emitF32Neg() void { self.buf.append(0x8C as u8) }
+    fn emitF32Abs() void { self.buf.append(0x8B as u8) }
+    fn emitF32Sqrt() void { self.buf.append(0x91 as u8) }
+    fn emitF32Ceil() void { self.buf.append(0x8D as u8) }
+    fn emitF32Floor() void { self.buf.append(0x8E as u8) }
+    fn emitF32Trunc() void { self.buf.append(0x8F as u8) }
+    fn emitF32Nearest() void { self.buf.append(0x90 as u8) }
+    fn emitF32Min() void { self.buf.append(0x96 as u8) }
+    fn emitF32Max() void { self.buf.append(0x97 as u8) }
+    fn emitF32Copysign() void { self.buf.append(0x98 as u8) }
+
+    // f32 comparisons
+    fn emitF32Eq() void { self.buf.append(0x5B as u8) }
+    fn emitF32Ne() void { self.buf.append(0x5C as u8) }
+    fn emitF32Lt() void { self.buf.append(0x5D as u8) }
+    fn emitF32Gt() void { self.buf.append(0x5E as u8) }
+    fn emitF32Le() void { self.buf.append(0x5F as u8) }
+    fn emitF32Ge() void { self.buf.append(0x60 as u8) }
+
+    // Conversions (comprehensive)
     fn emitI32WrapI64() void { self.buf.append(OP_I32_WRAP_I64) }
     fn emitI64ExtendI32S() void { self.buf.append(OP_I64_EXTEND_I32_S) }
     fn emitI64ExtendI32U() void { self.buf.append(OP_I64_EXTEND_I32_U) }
     fn emitI64TruncF64S() void { self.buf.append(0xB0 as u8) }
+    fn emitI64TruncF64U() void { self.buf.append(0xB1 as u8) }
+    fn emitI64TruncF32S() void { self.buf.append(0xAE as u8) }
+    fn emitI64TruncF32U() void { self.buf.append(0xAF as u8) }
+    fn emitI32TruncF64S() void { self.buf.append(0xAA as u8) }
+    fn emitI32TruncF64U() void { self.buf.append(0xAB as u8) }
+    fn emitI32TruncF32S() void { self.buf.append(0xA8 as u8) }
+    fn emitI32TruncF32U() void { self.buf.append(0xA9 as u8) }
     fn emitF64ConvertI64S() void { self.buf.append(0xB9 as u8) }
+    fn emitF64ConvertI64U() void { self.buf.append(0xBA as u8) }
+    fn emitF64ConvertI32S() void { self.buf.append(0xB7 as u8) }
+    fn emitF64ConvertI32U() void { self.buf.append(0xB8 as u8) }
+    fn emitF32ConvertI64S() void { self.buf.append(0xB5 as u8) }
+    fn emitF32ConvertI64U() void { self.buf.append(0xB6 as u8) }
+    fn emitF32ConvertI32S() void { self.buf.append(0xB2 as u8) }
+    fn emitF32ConvertI32U() void { self.buf.append(0xB3 as u8) }
+    fn emitF64PromoteF32() void { self.buf.append(0xBB as u8) }
+    fn emitF32DemoteF64() void { self.buf.append(0xB4 as u8) }
     fn emitF64ReinterpretI64() void { self.buf.append(0xBF as u8) }
+    fn emitI64ReinterpretF64() void { self.buf.append(0xBD as u8) }
+    fn emitF32ReinterpretI32() void { self.buf.append(0xBE as u8) }
+    fn emitI32ReinterpretF32() void { self.buf.append(0xBC as u8) }
+
+    // call_indirect
+    fn emitCallIndirect(type_idx: int, table_idx: int) void {
+        self.buf.append(0x11 as u8)
+        writeULEB128(self.buf, type_idx)
+        writeULEB128(self.buf, table_idx)
+    }
 
     // f64 constant (8 bytes, little-endian IEEE 754)
     fn emitF64Const(value: float) void {

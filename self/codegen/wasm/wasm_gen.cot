@@ -943,6 +943,417 @@ struct FuncGen {
             }
         } else if (v.op == SsaOp.const_string) {
             self.code.emitI32Const(v.aux_int)
+
+        // === i64 missing ops ===
+        } else if (v.op == SsaOp.wasm_i64_shr_u) {
+            self.emitBinaryI64(v)
+            self.code.emitI64ShrU()
+        } else if (v.op == SsaOp.wasm_i64_div_u) {
+            self.emitBinaryI64(v)
+            self.code.emitI64DivU()
+        } else if (v.op == SsaOp.wasm_i64_rem_u) {
+            self.emitBinaryI64(v)
+            self.code.emitI64RemU()
+        } else if (v.op == SsaOp.wasm_i64_rotl) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Rotl()
+        } else if (v.op == SsaOp.wasm_i64_rotr) {
+            self.emitBinaryI64(v)
+            self.code.emitI64Rotr()
+        } else if (v.op == SsaOp.wasm_i64_clz) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64Clz()
+        } else if (v.op == SsaOp.wasm_i64_ctz) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64Ctz()
+        } else if (v.op == SsaOp.wasm_i64_popcnt) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64Popcnt()
+
+        // === i32 arithmetic (wrap-operate-extend pattern from Zig gen.zig) ===
+        } else if (v.op == SsaOp.wasm_i32_add) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Add()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_sub) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Sub()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_mul) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Mul()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_div_s) {
+            self.emitBinaryI32(v)
+            self.code.emitI32DivS()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_div_u) {
+            self.emitBinaryI32(v)
+            self.code.emitI32DivU()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_rem_s) {
+            self.emitBinaryI32(v)
+            self.code.emitI32RemS()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_rem_u) {
+            self.emitBinaryI32(v)
+            self.code.emitI32RemU()
+            self.code.emitI64ExtendI32U()
+
+        // === i32 bitwise (Zig gen.zig lines 474-521) ===
+        } else if (v.op == SsaOp.wasm_i32_and) {
+            self.emitBinaryI32(v)
+            self.code.emitI32And()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_or) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Or()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_xor) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Xor()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_shl) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Shl()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_shr_s) {
+            self.emitBinaryI32(v)
+            self.code.emitI32ShrS()
+            self.code.emitI64ExtendI32S()
+        } else if (v.op == SsaOp.wasm_i32_shr_u) {
+            self.emitBinaryI32(v)
+            self.code.emitI32ShrU()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_rotl) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Rotl()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_rotr) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Rotr()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_clz) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32WrapI64()
+            self.code.emitI32Clz()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_ctz) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32WrapI64()
+            self.code.emitI32Ctz()
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i32_popcnt) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32WrapI64()
+            self.code.emitI32Popcnt()
+            self.code.emitI64ExtendI32U()
+
+        // === i32 comparisons (produce i32, no extend needed) ===
+        } else if (v.op == SsaOp.wasm_i32_eqz) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32WrapI64()
+            self.code.emitI32Eqz()
+        } else if (v.op == SsaOp.wasm_i32_eq) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Eq()
+        } else if (v.op == SsaOp.wasm_i32_ne) {
+            self.emitBinaryI32(v)
+            self.code.emitI32Ne()
+        } else if (v.op == SsaOp.wasm_i32_lt_s) {
+            self.emitBinaryI32(v)
+            self.code.emitI32LtS()
+        } else if (v.op == SsaOp.wasm_i32_lt_u) {
+            self.emitBinaryI32(v)
+            self.code.emitI32LtU()
+        } else if (v.op == SsaOp.wasm_i32_gt_s) {
+            self.emitBinaryI32(v)
+            self.code.emitI32GtS()
+        } else if (v.op == SsaOp.wasm_i32_gt_u) {
+            self.emitBinaryI32(v)
+            self.code.emitI32GtU()
+        } else if (v.op == SsaOp.wasm_i32_le_s) {
+            self.emitBinaryI32(v)
+            self.code.emitI32LeS()
+        } else if (v.op == SsaOp.wasm_i32_le_u) {
+            self.emitBinaryI32(v)
+            self.code.emitI32LeU()
+        } else if (v.op == SsaOp.wasm_i32_ge_s) {
+            self.emitBinaryI32(v)
+            self.code.emitI32GeS()
+        } else if (v.op == SsaOp.wasm_i32_ge_u) {
+            self.emitBinaryI32(v)
+            self.code.emitI32GeU()
+
+        // === f32 arithmetic ===
+        } else if (v.op == SsaOp.wasm_f32_add) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Add()
+        } else if (v.op == SsaOp.wasm_f32_sub) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Sub()
+        } else if (v.op == SsaOp.wasm_f32_mul) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Mul()
+        } else if (v.op == SsaOp.wasm_f32_div) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Div()
+        } else if (v.op == SsaOp.wasm_f32_neg) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32Neg()
+        } else if (v.op == SsaOp.wasm_f32_abs) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32Abs()
+        } else if (v.op == SsaOp.wasm_f32_sqrt) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32Sqrt()
+        } else if (v.op == SsaOp.wasm_f32_ceil) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32Ceil()
+        } else if (v.op == SsaOp.wasm_f32_floor) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32Floor()
+        } else if (v.op == SsaOp.wasm_f32_trunc) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32Trunc()
+        } else if (v.op == SsaOp.wasm_f32_nearest) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32Nearest()
+        } else if (v.op == SsaOp.wasm_f32_min) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Min()
+        } else if (v.op == SsaOp.wasm_f32_max) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Max()
+        } else if (v.op == SsaOp.wasm_f32_copysign) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Copysign()
+
+        // === f32 comparisons ===
+        } else if (v.op == SsaOp.wasm_f32_eq) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Eq()
+        } else if (v.op == SsaOp.wasm_f32_ne) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Ne()
+        } else if (v.op == SsaOp.wasm_f32_lt) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Lt()
+        } else if (v.op == SsaOp.wasm_f32_gt) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Gt()
+        } else if (v.op == SsaOp.wasm_f32_le) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Le()
+        } else if (v.op == SsaOp.wasm_f32_ge) {
+            self.emitBinaryI64(v)
+            self.code.emitF32Ge()
+
+        // === f64 extra ops ===
+        } else if (v.op == SsaOp.wasm_f64_abs) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64Abs()
+        } else if (v.op == SsaOp.wasm_f64_sqrt) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64Sqrt()
+        } else if (v.op == SsaOp.wasm_f64_ceil) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64Ceil()
+        } else if (v.op == SsaOp.wasm_f64_floor) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64Floor()
+        } else if (v.op == SsaOp.wasm_f64_trunc) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64Trunc()
+        } else if (v.op == SsaOp.wasm_f64_nearest) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64Nearest()
+        } else if (v.op == SsaOp.wasm_f64_min) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Min()
+        } else if (v.op == SsaOp.wasm_f64_max) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Max()
+        } else if (v.op == SsaOp.wasm_f64_copysign) {
+            self.emitBinaryI64(v)
+            self.code.emitF64Copysign()
+
+        // === Memory (i32) ===
+        } else if (v.op == SsaOp.wasm_i32_load8_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI32Load8S(0, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_load8_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI32Load8U(0, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_load16_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI32Load16S(1, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_load16_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI32Load16U(1, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_store8) {
+            self.getValue32(v.args.get(0))
+            self.getValue32(v.args.get(1))
+            self.code.emitI32Store8(0, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i32_store16) {
+            self.getValue32(v.args.get(0))
+            self.getValue32(v.args.get(1))
+            self.code.emitI32Store16(1, v.aux_int)
+
+        // === Memory (float) ===
+        } else if (v.op == SsaOp.wasm_f32_load) {
+            self.getValue32(v.args.get(0))
+            self.code.emitF32Load(2, v.aux_int)
+        } else if (v.op == SsaOp.wasm_f32_store) {
+            self.getValue32(v.args.get(0))
+            self.getValue64(v.args.get(1))
+            self.code.emitF32Store(2, v.aux_int)
+        } else if (v.op == SsaOp.wasm_f64_load) {
+            self.getValue32(v.args.get(0))
+            self.code.emitF64Load(3, v.aux_int)
+        } else if (v.op == SsaOp.wasm_f64_store) {
+            self.getValue32(v.args.get(0))
+            self.getValue64(v.args.get(1))
+            self.code.emitF64Store(3, v.aux_int)
+
+        // === i64 memory missing ===
+        } else if (v.op == SsaOp.wasm_i64_load8_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64Load8S(0, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_load8_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64Load8U(0, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_load16_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64Load16S(1, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_load16_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64Load16U(1, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_load32_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64Load32S(2, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_load32_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64Load32U(2, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_store8) {
+            self.getValue32(v.args.get(0))
+            self.getValue64(v.args.get(1))
+            self.code.emitI64Store8(0, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_store16) {
+            self.getValue32(v.args.get(0))
+            self.getValue64(v.args.get(1))
+            self.code.emitI64Store16(1, v.aux_int)
+        } else if (v.op == SsaOp.wasm_i64_store32) {
+            self.getValue32(v.args.get(0))
+            self.getValue64(v.args.get(1))
+            self.code.emitI64Store32(2, v.aux_int)
+
+        // === Conversions ===
+        } else if (v.op == SsaOp.wasm_i32_wrap_i64) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32WrapI64()
+        } else if (v.op == SsaOp.wasm_i64_extend_i32_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64ExtendI32S()
+        } else if (v.op == SsaOp.wasm_i64_extend_i32_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI64ExtendI32U()
+        } else if (v.op == SsaOp.wasm_i64_trunc_f64_s) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64TruncF64S()
+        } else if (v.op == SsaOp.wasm_i64_trunc_f64_u) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64TruncF64U()
+        } else if (v.op == SsaOp.wasm_i64_trunc_f32_s) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64TruncF32S()
+        } else if (v.op == SsaOp.wasm_i64_trunc_f32_u) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64TruncF32U()
+        } else if (v.op == SsaOp.wasm_i32_trunc_f64_s) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32TruncF64S()
+        } else if (v.op == SsaOp.wasm_i32_trunc_f64_u) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32TruncF64U()
+        } else if (v.op == SsaOp.wasm_i32_trunc_f32_s) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32TruncF32S()
+        } else if (v.op == SsaOp.wasm_i32_trunc_f32_u) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32TruncF32U()
+        } else if (v.op == SsaOp.wasm_f64_convert_i64_s) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64ConvertI64S()
+        } else if (v.op == SsaOp.wasm_f64_convert_i64_u) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64ConvertI64U()
+        } else if (v.op == SsaOp.wasm_f64_convert_i32_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitF64ConvertI32S()
+        } else if (v.op == SsaOp.wasm_f64_convert_i32_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitF64ConvertI32U()
+        } else if (v.op == SsaOp.wasm_f32_convert_i64_s) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32ConvertI64S()
+        } else if (v.op == SsaOp.wasm_f32_convert_i64_u) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32ConvertI64U()
+        } else if (v.op == SsaOp.wasm_f32_convert_i32_s) {
+            self.getValue32(v.args.get(0))
+            self.code.emitF32ConvertI32S()
+        } else if (v.op == SsaOp.wasm_f32_convert_i32_u) {
+            self.getValue32(v.args.get(0))
+            self.code.emitF32ConvertI32U()
+        } else if (v.op == SsaOp.wasm_f64_promote_f32) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64PromoteF32()
+        } else if (v.op == SsaOp.wasm_f32_demote_f64) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF32DemoteF64()
+        } else if (v.op == SsaOp.wasm_i64_reinterpret_f64) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI64ReinterpretF64()
+        } else if (v.op == SsaOp.wasm_f64_reinterpret_i64) {
+            self.getValue64(v.args.get(0))
+            self.code.emitF64ReinterpretI64()
+        } else if (v.op == SsaOp.wasm_i32_reinterpret_f32) {
+            self.getValue64(v.args.get(0))
+            self.code.emitI32ReinterpretF32()
+        } else if (v.op == SsaOp.wasm_f32_reinterpret_i32) {
+            self.getValue32(v.args.get(0))
+            self.code.emitF32ReinterpretI32()
+
+        // === Control flow ===
+        } else if (v.op == SsaOp.wasm_call_indirect) {
+            for ai in 0..v.args.count {
+                self.getValue64(v.args.get(ai))
+            }
+            self.code.emitCallIndirect(v.aux_int, 0)
+        } else if (v.op == SsaOp.wasm_select) {
+            self.getValue64(v.args.get(0))
+            self.getValue64(v.args.get(1))
+            self.getValue32(v.args.get(2))
+            self.code.emitSelect()
+        } else if (v.op == SsaOp.wasm_nop) {
+            self.code.emitNop()
+
+        // === Lowered ops ===
+        } else if (v.op == SsaOp.wasm_lowered_zero) {
+            self.getValue32(v.args.get(0))  // dest addr
+            self.code.emitI32Const(0)
+            self.code.emitI32Const(v.aux_int)  // size
+            // memory.fill: 0xFC 0x0B <memory_idx>
+            self.code.buf.append(0xFC as u8)
+            self.code.buf.append(0x0B as u8)
+            self.code.buf.append(0x00 as u8)
+        } else if (v.op == SsaOp.wasm_lowered_nil_check) {
+            self.getValue32(v.args.get(0))
+            self.code.emitI32Eqz()
+            self.code.emitIf(BLOCK_VOID)
+            self.code.emitUnreachable()
+            self.code.emitEnd()
         }
         // Unhandled ops silently ignored (like Zig's debug.log fallthrough)
     }
@@ -954,6 +1365,13 @@ struct FuncGen {
     fn emitBinaryI64(v: SsaValue) void {
         self.getValue64(v.args.get(0))
         self.getValue64(v.args.get(1))
+    }
+
+    fn emitBinaryI32(v: SsaValue) void {
+        self.getValue64(v.args.get(0))
+        self.code.emitI32WrapI64()
+        self.getValue64(v.args.get(1))
+        self.code.emitI32WrapI64()
     }
 
     fn emitSlicePtr(v: SsaValue) void {
