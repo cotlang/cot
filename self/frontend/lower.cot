@@ -88,22 +88,22 @@ struct GlobalInit {
     span: Span,
 }
 
-/// Map IR BinaryOp to dict helper name suffix.
+/// Map Token op to dict helper name suffix.
 /// Copied from lower.zig:8375-8390
 fn dictOpName(op: int) string {
-    const bop = @enumFromInt(op) as BinaryOp
-    return switch (bop) {
-        BinaryOp.eq => "eq",
-        BinaryOp.ne => "ne",
-        BinaryOp.lt => "lt",
-        BinaryOp.gt => "gt",
-        BinaryOp.le => "le",
-        BinaryOp.ge => "ge",
-        BinaryOp.add => "add",
-        BinaryOp.sub => "sub",
-        BinaryOp.mul => "mul",
-        BinaryOp.div => "div",
-        BinaryOp.mod => "mod",
+    const tok = @enumFromInt(op) as Token
+    return switch (tok) {
+        Token.eql => "eq",
+        Token.neq => "ne",
+        Token.lss => "lt",
+        Token.gtr => "gt",
+        Token.leq => "le",
+        Token.geq => "ge",
+        Token.add => "add",
+        Token.sub => "sub",
+        Token.mul => "mul",
+        Token.quo => "div",
+        Token.rem => "mod",
         else => "unknown",
     }
 }
@@ -150,6 +150,12 @@ struct Lowerer {
     shape_stencils: Map(string, string),      // shape_key → first stencil name
     shape_aliases: Map(string, string),       // concrete_name → stencil name (alias)
     generated_dict_helpers: Map(string, int), // dedup: helper_name → 1
+    shape_analysis_cache: Map(int, int),      // generic_node → stencil result (int)
+    stencil_dict_entries: List(DictEntry),    // entries from last analyzeStencilability
+    dict_arg_names: Map(string, string),      // concrete_name → comma-separated helper names
+    current_dict_entries: List(DictEntry),    // active dict entries during stenciled fn body
+    current_dict_params: List(int),           // active dict param locals during stenciled fn body
+    has_dict_context: bool,                   // true when inside a dict-stenciled function
     builder: Builder,
 
     fn setTestMode(enabled: bool) void {
@@ -2212,6 +2218,31 @@ struct Lowerer {
         if (left == null_node or right == null_node) { return null_node }
 
         const result_type = self.inferBinaryType(bin.op, bin.left, bin.right)
+
+        // Dict dispatch: if inside a dict-stenciled body and this op is on a type-param type,
+        // emit indirect call through the dictionary fn-ptr param instead of a direct binary op.
+        if (self.has_dict_context) {
+            const left_type_idx = self.inferExprType(bin.left)
+            if (self.chk.hasTypeSubstitution()) {
+                // Check if left type matches any substituted type param
+                for si in 0..self.chk.type_sub_vals.count {
+                    if (self.chk.type_sub_vals.get(si) == left_type_idx) {
+                        // Find matching dict entry for this binary op (entry.op is Token value)
+                        for di in 0..self.current_dict_entries.count {
+                            const entry = self.current_dict_entries.get(di)
+                            if (entry.kind == DICT_BINARY_OP and entry.op == bin.op) {
+                                const fn_ptr = fb.emitLoadLocal(self.current_dict_params.get(di), I64, bin.span)
+                                var call_args: List(int) = .{}
+                                call_args.append(left)
+                                call_args.append(right)
+                                return fb.emitCallIndirect(fn_ptr, call_args, result_type, bin.span)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const op = tokenToBinaryOp(tok)
         return fb.emitBinary(op, left, right, result_type, bin.span)
     }
@@ -3135,6 +3166,43 @@ struct Lowerer {
         }
         if (m_type_name == "" and base_type_idx == STRING) { m_type_name = "string" }
         const resolved_method = self.resolveMethodName(m_type_name, method_info.func_name, method_info.source_tree)
+
+        // Dict dispatch: if inside a dict-stenciled body and receiver is a type param,
+        // emit indirect call through the dictionary fn-ptr param.
+        if (self.has_dict_context) {
+            const recv_type = self.inferExprType(fa.base)
+            if (self.chk.hasTypeSubstitution()) {
+                for si in 0..self.chk.type_sub_vals.count {
+                    const sub_type = self.chk.type_sub_vals.get(si)
+                    // Check if receiver is T or *T
+                    var is_match = (sub_type == recv_type)
+                    if (!is_match and self.types.isPointer(recv_type)) {
+                        is_match = (sub_type == self.types.pointerElem(recv_type))
+                    }
+                    if (is_match) {
+                        for di in 0..self.current_dict_entries.count {
+                            const entry = self.current_dict_entries.get(di)
+                            if (entry.kind == DICT_METHOD_CALL and entry.method_name == fa.field) {
+                                const fn_ptr = fb.emitLoadLocal(self.current_dict_params.get(di), I64, call.span)
+                                if (self.needsSret(return_type)) {
+                                    const ret_size = self.types.sizeOf(return_type)
+                                    const sret_local = fb.addLocalWithSize("__sret_tmp", return_type, false, ret_size)
+                                    const sret_addr = fb.emitAddrLocal(sret_local, I64, call.span)
+                                    var sret_args: List(int) = .{}
+                                    sret_args.append(sret_addr)
+                                    for ai in 0..args.count {
+                                        sret_args.append(args.get(ai))
+                                    }
+                                    fb.emitCallIndirect(fn_ptr, sret_args, VOID, call.span)
+                                    return fb.emitLoadLocal(sret_local, return_type, call.span)
+                                }
+                                return fb.emitCallIndirect(fn_ptr, args, return_type, call.span)
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // SRET for method calls returning large types
         if (self.needsSret(return_type)) {
@@ -6152,7 +6220,8 @@ struct Lowerer {
     /// Copied from lower.zig:8411-8443
     fn generateBinaryOpHelper(name: string, concrete_type: int, op: int) void {
         // Comparison ops return bool, arithmetic returns T
-        const bop = @enumFromInt(op) as BinaryOp
+        // op is a Token value; convert to BinaryOp for IR emission
+        const bop = tokenToBinaryOp(op)
         const return_type = switch (bop) {
             BinaryOp.eq, BinaryOp.ne, BinaryOp.lt, BinaryOp.gt, BinaryOp.le, BinaryOp.ge => BOOL,
             else => concrete_type,
@@ -6244,22 +6313,25 @@ struct Lowerer {
         var collector: List(DictEntry) = .{}
         const ok = self.collectNodeDictEntries(body_node, type_param_types, &collector)
         if (!ok) { return STENCIL_NOT_STENCILABLE }
-        if (collector.count == 0) { return STENCIL_SHAPE_ONLY }
+        if (collector.count == 0) {
+            self.stencil_dict_entries.count = 0
+            return STENCIL_SHAPE_ONLY
+        }
 
-        // Deduplicate
-        var deduped: List(DictEntry) = .{}
+        // Deduplicate and store in stencil_dict_entries
+        self.stencil_dict_entries.count = 0
         for i in 0..collector.count {
             const entry = collector.get(i)
             var found = false
-            for j in 0..deduped.count {
-                const existing = deduped.get(j)
+            for j in 0..self.stencil_dict_entries.count {
+                const existing = self.stencil_dict_entries.get(j)
                 if (existing.kind == entry.kind and existing.op == entry.op
                     and existing.type_param_idx == entry.type_param_idx
                     and existing.method_name == entry.method_name) {
                     found = true
                 }
             }
-            if (!found) { deduped.append(entry) }
+            if (!found) { self.stencil_dict_entries.append(entry) }
         }
         return STENCIL_DICT
     }
@@ -6510,9 +6582,13 @@ struct Lowerer {
 
     /// Generate all dict helpers for a generic instance.
     /// Copied from lower.zig:8395-8408
-    fn generateDictHelpers(concrete_type: int, dict_entries: List(DictEntry)) void {
+    fn generateDictHelpers(type_args: List(int), dict_entries: List(DictEntry)) void {
         for i in 0..dict_entries.count {
             const entry = dict_entries.get(i)
+            var concrete_type = 0
+            if (entry.type_param_idx < type_args.count) {
+                concrete_type = type_args.get(entry.type_param_idx)
+            }
             const helper_name = self.dictHelperName(concrete_type, entry)
             // Dedup
             if (self.generated_dict_helpers.contains(helper_name)) { continue }
@@ -6524,6 +6600,55 @@ struct Lowerer {
                 self.generateMethodCallHelper(helper_name, concrete_type, entry.method_name)
             }
         }
+    }
+
+    /// Build the dict_arg_names mapping for a concrete generic instance.
+    /// Maps concrete_name → comma-separated helper function names.
+    /// Copied from lower.zig:8349-8356
+    fn buildDictArgNames(inst: *GenericInstInfo, dict_entries: List(DictEntry)) void {
+        // Parse type args from inst.type_args_str
+        var type_args: List(int) = .{}
+        const tas = inst.type_args_str
+        var start = 0
+        for ci in 0..tas.len {
+            if (tas[ci] == 59) {  // ';'
+                type_args.append(Lowerer.parseIntSubstr(tas, start, ci))
+                start = ci + 1
+            }
+        }
+        if (start < tas.len) {
+            type_args.append(Lowerer.parseIntSubstr(tas, start, tas.len))
+        }
+
+        // Build comma-separated helper names
+        var result = ""
+        for i in 0..dict_entries.count {
+            const entry = dict_entries.get(i)
+            var concrete_type = 0
+            if (entry.type_param_idx < type_args.count) {
+                concrete_type = type_args.get(entry.type_param_idx)
+            }
+            const helper_name = self.dictHelperName(concrete_type, entry)
+            if (i > 0) { result = result ++ "," }
+            result = result ++ helper_name
+        }
+        self.dict_arg_names.set(inst.concrete_name, result)
+    }
+
+    /// Parse type args string into a list of ints.
+    fn parseTypeArgsStr(type_args_str: string) List(int) {
+        var result: List(int) = .{}
+        var start = 0
+        for ci in 0..type_args_str.len {
+            if (type_args_str[ci] == 59) {  // ';'
+                result.append(Lowerer.parseIntSubstr(type_args_str, start, ci))
+                start = ci + 1
+            }
+        }
+        if (start < type_args_str.len) {
+            result.append(Lowerer.parseIntSubstr(type_args_str, start, type_args_str.len))
+        }
+        return result
     }
 
     // ========================================================================
@@ -7024,6 +7149,64 @@ struct Lowerer {
             self.chk.pushTypeSub(param_name, type_idx)
         }
 
+        // Shape stenciling: check if this instantiation can share code
+        // Parse type args as integers for shape analysis
+        const parsed_type_args = self.parseTypeArgsStr(inst.type_args_str)
+        var stencil_result = STENCIL_NOT_STENCILABLE
+        if (parsed_type_args.count > 0) {
+            // Check shape analysis cache, or compute and cache
+            if (self.shape_analysis_cache.getOrNull(inst.generic_node)) |cached| {
+                stencil_result = cached
+            } else {
+                stencil_result = self.analyzeStencilability(fn_d.body, parsed_type_args)
+                self.shape_analysis_cache.set(inst.generic_node, stencil_result)
+            }
+
+            if (stencil_result != STENCIL_NOT_STENCILABLE) {
+                // Build shape key: "List_append$s8in" (base name + shape suffix)
+                const paren_pos = indexOf(concrete_name, "(")
+                const base_part = if (paren_pos >= 0) { substring(concrete_name, 0, paren_pos) } else { concrete_name }
+                var method_suffix = ""
+                if (paren_pos >= 0) {
+                    const close_pos = indexOf(concrete_name, ")")
+                    if (close_pos >= 0 and close_pos + 1 < concrete_name.len) {
+                        method_suffix = substring(concrete_name, close_pos + 1, concrete_name.len)
+                    }
+                }
+                var shape_key = base_part ++ method_suffix ++ "$"
+                for ti in 0..parsed_type_args.count {
+                    if (ti > 0) { shape_key = shape_key ++ "_" }
+                    const shape = self.types.shapeOf(parsed_type_args.get(ti))
+                    shape_key = shape_key ++ shape.key()
+                }
+
+                if (self.shape_stencils.getOrNull(shape_key)) |existing_stencil| {
+                    // Already stenciled for this shape — alias, skip lowering
+                    self.shape_aliases.set(concrete_name, existing_stencil)
+                    if (stencil_result == STENCIL_DICT) {
+                        self.generateDictHelpers(parsed_type_args, self.stencil_dict_entries)
+                        self.buildDictArgNames(inst, self.stencil_dict_entries)
+                    }
+                    // Restore and return — skip lowering entirely
+                    self.chk.type_sub_keys.count = saved_sub_count
+                    self.chk.type_sub_vals.count = saved_sub_count
+                    self.tree = saved_tree
+                    return
+                }
+
+                // First instance for this shape — record as the stencil
+                self.shape_stencils.set(shape_key, concrete_name)
+                if (stencil_result == STENCIL_DICT) {
+                    self.buildDictArgNames(inst, self.stencil_dict_entries)
+                }
+            }
+        }
+
+        // Generate dict helper functions BEFORE starting the function body
+        if (stencil_result == STENCIL_DICT) {
+            self.generateDictHelpers(parsed_type_args, self.stencil_dict_entries)
+        }
+
         // Fresh expr_types for this instantiation
         const saved_expr_types = self.chk.expr_types
         var fresh_types: Map(int, int) = .{}
@@ -7044,6 +7227,19 @@ struct Lowerer {
 
             if (uses_sret) {
                 fb.addParam("__sret", I64, 8)
+            }
+
+            // Dict-stenciled functions: add extra fn-ptr params BEFORE regular params
+            if (stencil_result == STENCIL_DICT) {
+                self.current_dict_entries.count = 0
+                self.current_dict_params.count = 0
+                for di in 0..self.stencil_dict_entries.count {
+                    const param_name = "__dict_" ++ intToString(di)
+                    const dict_local = fb.addParam(param_name, I64, 8)
+                    self.current_dict_entries.append(self.stencil_dict_entries.get(di))
+                    self.current_dict_params.append(dict_local)
+                }
+                self.has_dict_context = true
             }
 
             // Add params
@@ -7090,6 +7286,10 @@ struct Lowerer {
                 }
             }
         }
+        // Clear dict context
+        self.has_dict_context = false
+        self.current_dict_entries.count = 0
+        self.current_dict_params.count = 0
         self.builder.endFunc()
 
         // Restore type substitution
@@ -8215,6 +8415,17 @@ fn initLowererMaps(lower: *Lowerer) void {
     lower.shape_aliases = sa
     var gdh: Map(string, int) = .{}
     lower.generated_dict_helpers = gdh
+    var sac: Map(int, int) = .{}
+    lower.shape_analysis_cache = sac
+    var dan: Map(string, string) = .{}
+    lower.dict_arg_names = dan
+    var sde: List(DictEntry) = .{}
+    lower.stencil_dict_entries = sde
+    var cde: List(DictEntry) = .{}
+    lower.current_dict_entries = cde
+    var cdp: List(int) = .{}
+    lower.current_dict_params = cdp
+    lower.has_dict_context = false
 }
 
 // ============================================================================
@@ -8504,20 +8715,20 @@ test "lookupComptimeValue" {
 }
 
 test "dictOpName" {
-    @assertEq(dictOpName(BinaryOp.eq as int), "eq")
-    @assertEq(dictOpName(BinaryOp.ne as int), "ne")
-    @assertEq(dictOpName(BinaryOp.lt as int), "lt")
-    @assertEq(dictOpName(BinaryOp.add as int), "add")
-    @assertEq(dictOpName(BinaryOp.sub as int), "sub")
-    @assertEq(dictOpName(BinaryOp.mul as int), "mul")
-    @assertEq(dictOpName(BinaryOp.div as int), "div")
-    @assertEq(dictOpName(BinaryOp.mod as int), "mod")
+    @assertEq(dictOpName(Token.eql as int), "eq")
+    @assertEq(dictOpName(Token.neq as int), "ne")
+    @assertEq(dictOpName(Token.lss as int), "lt")
+    @assertEq(dictOpName(Token.add as int), "add")
+    @assertEq(dictOpName(Token.sub as int), "sub")
+    @assertEq(dictOpName(Token.mul as int), "mul")
+    @assertEq(dictOpName(Token.quo as int), "div")
+    @assertEq(dictOpName(Token.rem as int), "mod")
 }
 
 test "DictEntry struct" {
     const entry = DictEntry {
         kind: DICT_BINARY_OP,
-        op: BinaryOp.eq as int,
+        op: Token.eql as int,
         method_name: "",
         type_param_idx: 0,
     }

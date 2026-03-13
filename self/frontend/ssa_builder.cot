@@ -183,7 +183,7 @@ struct SSABuilder {
     cur_pos_col: int,
     local_slot_offsets: List(int),
     shape_aliases: ?*Map(string, string),
-    dict_arg_names: ?*Map(string, List(string)),
+    dict_arg_names: ?*Map(string, string),  // concrete_name → comma-separated helper names
     logical_operands: Map(int, int),
 
     static fn init(ir_func: Func, ir_globals: List(Global), type_reg: *TypeRegistry) SSABuilder {
@@ -1002,9 +1002,24 @@ struct SSABuilder {
         // Dict dispatch: inject fn-ptr args for dict-stenciled functions
         if (self.dict_arg_names) |dan| {
             if (dan.contains(func_name)) {
-                const helper_names = dan.get(func_name)
-                for k in 0..helper_names.count {
-                    const helper_name = helper_names.get(k)
+                // Helper names are comma-separated: "name1,name2,..."
+                const helpers_csv = dan.get(func_name)
+                var start = 0
+                for ci in 0..helpers_csv.len {
+                    if (helpers_csv[ci] == 44) {  // ','
+                        const helper_name = substring(helpers_csv, start, ci)
+                        const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
+                        var adv = self.func.getValue(addr_val)
+                        adv.aux = SsaAux.str(helper_name)
+                        self.func.setValue(addr_val, adv)
+                        self.func.addValueToBlock(addr_val, cur)
+                        cv.addArg(addr_val)
+                        start = ci + 1
+                    }
+                }
+                // Last (or only) helper name
+                if (start < helpers_csv.len) {
+                    const helper_name = substring(helpers_csv, start, helpers_csv.len)
                     const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
                     var adv = self.func.getValue(addr_val)
                     adv.aux = SsaAux.str(helper_name)

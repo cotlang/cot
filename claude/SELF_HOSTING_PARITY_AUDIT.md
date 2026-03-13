@@ -2,7 +2,7 @@
 
 **Date:** March 13, 2026 (full re-audit)
 **Scope:** File-by-file comparison of `self/` vs `compiler/` (Zig reference)
-**Total self-hosted:** 40,005 lines across 36 files, 398 tests pass
+**Total self-hosted:** 40,231 lines across 36 files, 398 tests pass
 
 ---
 
@@ -17,7 +17,7 @@
 | Checker | 1 | 5,520 | **85%** | `evalComptimeValue` rich union |
 | IR | 1 | 1,356 | **100%** | None |
 | ARC Insertion | 1 | 443 | **100%** | None |
-| Lowerer | 1 | 8,570 | **78%** | WasmGC helpers, async (~1,170L) |
+| Lowerer | 1 | 8,750+ | **80%** | WasmGC helpers, async (~1,170L) |
 | SSA Builder | 1 | 2,130 | **95%** | None |
 | SSA Data | 1 | 577 | **95%** | None |
 | SSA Passes | 6 | 1,896 | **92%** | lower_wasm ~90% (LOC gap is explicit null arms), rewritedec 100% |
@@ -115,9 +115,9 @@ generic optimization (same-shape types share code). All other type infrastructur
 
 ---
 
-## 7. Lowerer — 76%
+## 7. Lowerer — 80%
 
-**File:** `lower.cot` (8,527 lines)
+**File:** `lower.cot` (8,750+ lines)
 **Reference:** `lower.zig` (11,164 lines)
 
 ### 7.1 Complete
@@ -125,6 +125,12 @@ generic optimization (same-shape types share code). All other type infrastructur
 - All 10+ statement types lowered
 - All 59 builtin intrinsics dispatched
 - Method call + generic lowering with shape stenciling
+- **Shape stenciling in lowerGenericFnInstanceInner** — Tier 1 (shape alias) + Tier 2 (dict-stenciled)
+- **buildDictArgNames** — maps concrete generic names to comma-separated helper fn names
+- **Dict dispatch in binary ops** — indirect call through fn-ptr params for type-param binary ops
+- **Dict dispatch in method calls** — indirect call through fn-ptr params for type-param method calls
+- **dictOpName fixed** — correctly maps Token values (not BinaryOp), matching Zig reference
+- **generateDictHelpers** — takes type_args list (multi-type-param support), not single type
 - Struct/array/slice/union init lowering
 - Cleanup/defer/ARC infrastructure (switch-based dispatch)
 - `maybeRegisterScopeDestroy()` — auto-deinit registration
@@ -139,8 +145,8 @@ generic optimization (same-shape types share code). All other type infrastructur
 | Function | LOC | Priority | Description |
 |----------|-----|----------|-------------|
 | WasmGC helpers | ~107 | MEDIUM | gcChunkIndex, gcFieldChunks, emitGcDefaultValue, emitGcStructNewExpanded |
-| `buildDictArgNames()` | ~30 | LOW | Dict helper argument builder |
 | `emitComptimeArray()` | ~41 | LOW | Comptime array value emission |
+| `resolveComptimeFieldAccess()` | ~27 | LOW | Comptime field access (.name, .fields, .len) |
 | Async state machine (Wasm) | ~150 | DEFERRED | WasmGC async state machine generation |
 | Full async lowering | ~1,170 | DEFERRED | Zig async ported but not to Cot (v0.4) |
 
@@ -200,22 +206,28 @@ The LOC gap is unused opcode variants not yet needed by the self-hosted compiler
 ## 11. Remaining Work (Prioritized)
 
 ### Immediate (HIGH — enables dogfooding)
-All HIGH items completed this session:
+All HIGH items completed:
 - Token: `kw_spawn`, `kw_select` added
 - Lowerer: `baseHasCleanup()`/`hasDeferCleanups()` added
 - Lowerer: `maybeRegisterScopeDestroy()` added
 - Checker: `buildStructTypeWithLayout()` fixed (correct packed/extern/auto layout)
 - Checker: `evalConstFloat()` added
 - SSA passes: rewritedec confirmed 100% complete
+- **Types: Shape stenciling struct** — COMPLETE (Shape, ArcKind, RegClass, fromType, eql, key)
+- **Lowerer: shape stenciling in lowerGenericFnInstanceInner** — COMPLETE (Tier 1+2)
+- **Lowerer: buildDictArgNames** — COMPLETE (comma-separated helper names)
+- **Lowerer: dict dispatch in binary ops and method calls** — COMPLETE
+- **Lowerer: dictOpName fixed** — uses Token values (was incorrectly using BinaryOp)
+- **SSA builder: dict_arg_names parsing** — updated to comma-separated format
 
 ### Short-term (MEDIUM — improves completeness)
-1. Types: Shape stenciling struct (~80 LOC)
-2. wasm_types.cot: additional opcode variants (~230 LOC, as-needed)
+1. wasm_types.cot: additional opcode variants (~230 LOC, as-needed)
+2. Lowerer: `emitComptimeArray()` (~41 LOC) + `resolveComptimeFieldAccess()` (~27 LOC)
 
 ### Deferred (LOW/v0.4)
 3. Checker: `evalComptimeValue()` rich union (~300 LOC)
 4. Lowerer: WasmGC helpers (~107 LOC)
 5. Lowerer: async lowering (~1,170 LOC)
 
-**Total remaining actionable: ~310 LOC** (items 1-2)
-**Grand total including deferred: ~1,887 LOC** (all items)
+**Total remaining actionable: ~298 LOC** (items 1-2)
+**Grand total including deferred: ~1,875 LOC** (all items)
