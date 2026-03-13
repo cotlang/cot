@@ -112,6 +112,7 @@ pub const GcStructSet = struct { base: NodeIndex, type_name: []const u8, field_i
 pub const GcArrayNew = struct { type_name: []const u8, init_val: NodeIndex, length: NodeIndex };
 pub const GcArrayNewDefault = struct { type_name: []const u8, length: NodeIndex };
 pub const GcArrayNewFixed = struct { type_name: []const u8, values: []const NodeIndex };
+pub const GcArrayNewData = struct { type_name: []const u8, data_idx: u32, offset: NodeIndex, length: NodeIndex };
 pub const GcArrayGet = struct { type_name: []const u8, array: NodeIndex, index: NodeIndex };
 pub const GcArraySet = struct { type_name: []const u8, array: NodeIndex, index: NodeIndex, value: NodeIndex };
 pub const GcArrayLen = struct { array: NodeIndex };
@@ -156,6 +157,7 @@ pub const Node = struct {
         gc_array_new: GcArrayNew,
         gc_array_new_default: GcArrayNewDefault,
         gc_array_new_fixed: GcArrayNewFixed,
+        gc_array_new_data: GcArrayNewData,
         gc_array_get: GcArrayGet,
         gc_array_set: GcArraySet,
         gc_array_len: GcArrayLen,
@@ -173,7 +175,7 @@ pub const Node = struct {
     pub fn init(data: Data, type_idx: TypeIndex, span: Span) Node { return .{ .type_idx = type_idx, .span = span, .block = null_block, .data = data }; }
     pub fn withBlock(self: Node, block: BlockIndex) Node { var n = self; n.block = block; return n; }
     pub fn isTerminator(self: *const Node) bool { return switch (self.data) { .ret, .jump, .branch, .trap => true, else => false }; }
-    pub fn hasSideEffects(self: *const Node) bool { return switch (self.data) { .store_local, .ptr_store, .ptr_store_value, .ptr_field_store, .store_local_field, .call, .call_indirect, .closure_call, .ret, .jump, .branch, .trap, .list_new, .list_push, .list_set, .list_free, .map_new, .map_set, .map_free, .gc_struct_new, .gc_struct_set, .gc_array_new, .gc_array_new_default, .gc_array_new_fixed, .gc_array_set, .gc_array_copy, .atomic_cas => true, else => false }; }
+    pub fn hasSideEffects(self: *const Node) bool { return switch (self.data) { .store_local, .ptr_store, .ptr_store_value, .ptr_field_store, .store_local_field, .call, .call_indirect, .closure_call, .ret, .jump, .branch, .trap, .list_new, .list_push, .list_set, .list_free, .map_new, .map_set, .map_free, .gc_struct_new, .gc_struct_set, .gc_array_new, .gc_array_new_default, .gc_array_new_fixed, .gc_array_new_data, .gc_array_set, .gc_array_copy, .atomic_cas => true, else => false }; }
     pub fn isConstant(self: *const Node) bool { return switch (self.data) { .const_int, .const_float, .const_bool, .const_null, .const_slice => true, else => false }; }
 };
 
@@ -453,6 +455,9 @@ pub const FuncBuilder = struct {
     }
     pub fn emitGcArrayNewFixed(self: *FuncBuilder, type_name: []const u8, values: []const NodeIndex, type_idx: TypeIndex, span: Span) !NodeIndex {
         return self.emit(Node.init(.{ .gc_array_new_fixed = .{ .type_name = type_name, .values = try self.allocator.dupe(NodeIndex, values) } }, type_idx, span));
+    }
+    pub fn emitGcArrayNewData(self: *FuncBuilder, type_name: []const u8, data_idx: u32, offset: NodeIndex, length: NodeIndex, type_idx: TypeIndex, span: Span) !NodeIndex {
+        return self.emit(Node.init(.{ .gc_array_new_data = .{ .type_name = type_name, .data_idx = data_idx, .offset = offset, .length = length } }, type_idx, span));
     }
     pub fn emitGcArrayGet(self: *FuncBuilder, type_name: []const u8, array: NodeIndex, index: NodeIndex, type_idx: TypeIndex, span: Span) !NodeIndex {
         return self.emit(Node.init(.{ .gc_array_get = .{ .type_name = type_name, .array = array, .index = index } }, type_idx, span));

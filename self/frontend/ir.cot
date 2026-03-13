@@ -197,6 +197,7 @@ struct GcStructSet { base: int, type_name: string, field_idx: int, value: int }
 struct GcArrayNew { type_name: string, init_val: int, length: int }
 struct GcArrayNewDefault { type_name: string, length: int }
 struct GcArrayNewFixed { type_name: string, values: List(int) }
+struct GcArrayNewData { type_name: string, data_idx: int, offset: int, length: int }
 struct GcArrayGet { type_name: string, array: int, index: int }
 struct GcArraySet { type_name: string, array: int, index: int, value: int }
 struct GcArrayLen { array: int }
@@ -306,6 +307,7 @@ union Data {
     gc_array_new: GcArrayNew,
     gc_array_new_default: GcArrayNewDefault,
     gc_array_new_fixed: GcArrayNewFixed,
+    gc_array_new_data: GcArrayNewData,
     gc_array_get: GcArrayGet,
     gc_array_set: GcArraySet,
     gc_array_len: GcArrayLen,
@@ -378,6 +380,7 @@ struct Node {
             Data.gc_array_new => { return true },
             Data.gc_array_new_default => { return true },
             Data.gc_array_new_fixed => { return true },
+            Data.gc_array_new_data => { return true },
             Data.gc_array_set => { return true },
             Data.gc_array_copy => { return true },
             Data.atomic_cas => { return true },
@@ -937,6 +940,10 @@ struct FuncBuilder {
 
     fn emitGcArrayNewFixed(type_name: string, values: List(int), type_idx: int, span: Span) int {
         return self.emit(Node.init(Data.gc_array_new_fixed(GcArrayNewFixed { type_name: type_name, values: values }), type_idx, span))
+    }
+
+    fn emitGcArrayNewData(type_name: string, data_idx: int, offset: int, length: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_new_data(GcArrayNewData { type_name: type_name, data_idx: data_idx, offset: offset, length: length }), type_idx, span))
     }
 
     fn emitGcArrayGet(type_name: string, array: int, index: int, type_idx: int, span: Span) int {

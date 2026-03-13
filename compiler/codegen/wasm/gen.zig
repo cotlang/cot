@@ -1084,6 +1084,18 @@ pub const GenState = struct {
                 p.from = prog_mod.constAddr(gc_type_idx);
             },
 
+            .wasm_gc_array_new_data => {
+                // stack: [offset, length] → [ref]
+                try self.getValue64(v.args[0]); // offset
+                try self.getValue64(v.args[1]); // length
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const data_idx = v.aux_int;
+                const p = try self.builder.append(.gc_array_new_data);
+                p.from = prog_mod.constAddr(gc_type_idx);
+                p.to = prog_mod.constAddr(data_idx);
+            },
+
             .wasm_gc_array_new_fixed => {
                 // stack: [vals...] → [ref]
                 for (v.args) |arg| {
@@ -1171,6 +1183,34 @@ pub const GenState = struct {
                 try self.getValue64(v.args[0]);
                 try self.getValue64(v.args[1]);
                 _ = try self.builder.append(.ref_eq);
+            },
+
+            // WasmGC function reference operations
+            .wasm_gc_ref_func => {
+                // ref.func $funcidx — resolve func name to index
+                const func_name = v.aux.string;
+                const func_idx: i64 = if (self.func_indices) |fi| @intCast(fi.get(func_name) orelse 0) else 0;
+                const p = try self.builder.append(.ref_func);
+                p.from = prog_mod.constAddr(func_idx);
+            },
+
+            .wasm_gc_call_ref => {
+                // Push args then func_ref, then call_ref $typeidx
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const type_idx = v.aux_int;
+                const p = try self.builder.append(.call_ref);
+                p.from = prog_mod.constAddr(type_idx);
+            },
+
+            .wasm_gc_return_call_ref => {
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const type_idx = v.aux_int;
+                const p = try self.builder.append(.return_call_ref);
+                p.from = prog_mod.constAddr(type_idx);
             },
 
             // Type conversion (int cast, float-to-int, int-to-float)
@@ -1383,7 +1423,8 @@ pub const GenState = struct {
             // causes "values remaining on stack at end of block" validation errors.
             _ = try self.builder.append(.drop);
         } else if (v.op == .wasm_gc_struct_new or v.op == .wasm_gc_array_new or
-            v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed)
+            v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed or
+            v.op == .wasm_gc_array_new_data)
         {
             // GC alloc with uses=0: result left on stack must be dropped.
             _ = try self.builder.append(.drop);
@@ -1437,7 +1478,8 @@ pub const GenState = struct {
                     v.op == .wasm_gc_array_set or v.op == .wasm_gc_array_copy) continue;
                 if (isFloatType(v.type_idx)) continue; // Skip floats for pass 2
                 if (v.op == .wasm_gc_struct_new or v.op == .wasm_gc_array_new or
-                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed) continue; // Skip GC refs for pass 3
+                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed or
+                    v.op == .wasm_gc_array_new_data) continue; // Skip GC refs for pass 3
                 if (isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map)) continue; // Skip GC ref results for pass 3
 
                 const local_idx = self.next_local;
@@ -1482,7 +1524,8 @@ pub const GenState = struct {
 
                 const is_gc_struct_new = v.op == .wasm_gc_struct_new;
                 const is_gc_array_alloc = v.op == .wasm_gc_array_new or
-                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed;
+                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed or
+                    v.op == .wasm_gc_array_new_data;
                 const is_gc_ref = isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map);
                 if (!is_gc_struct_new and !is_gc_array_alloc and !is_gc_ref) continue;
 

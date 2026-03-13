@@ -220,6 +220,7 @@ pub const Op = enum(u16) {
     wasm_gc_array_new, // args: [init_val, length], aux: string(type_name) → ref
     wasm_gc_array_new_default, // args: [length], aux: string(type_name) → ref
     wasm_gc_array_new_fixed, // args: [vals...], aux: string(type_name), aux_int: count → ref
+    wasm_gc_array_new_data, // args: [offset, length], aux: string(type_name), aux_int: data_idx → ref
     wasm_gc_array_get, // args: [ref, idx], aux: string(type_name) → value
     wasm_gc_array_set, // args: [ref, idx, value], aux: string(type_name) → void
     wasm_gc_array_len, // args: [ref] → i32
@@ -232,6 +233,11 @@ pub const Op = enum(u16) {
     wasm_gc_ref_null, // aux_int: heap_type → ref
     wasm_gc_ref_is_null, // args: [ref] → i32
     wasm_gc_ref_eq, // args: [ref1, ref2] → i32
+
+    // WasmGC function reference operations
+    wasm_gc_ref_func, // aux: string(func_name), aux_int: func_idx → (ref func)
+    wasm_gc_call_ref, // args: [fn_args..., func_ref], aux_int: type_idx → result
+    wasm_gc_return_call_ref, // args: [fn_args..., func_ref], aux_int: type_idx → void
 
     pub fn info(self: Op) OpInfo { return op_info_table[@intFromEnum(self)]; }
     pub fn isCall(self: Op) bool { return self.info().call; }
@@ -656,6 +662,7 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.wasm_gc_array_new)] = .{ .name = "WasmGcArrayNew", .generic = false, .arg_len = 2, .aux_type = .string, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_gc_array_new_default)] = .{ .name = "WasmGcArrayNewDefault", .generic = false, .arg_len = 1, .aux_type = .string, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_gc_array_new_fixed)] = .{ .name = "WasmGcArrayNewFixed", .generic = false, .arg_len = -1, .aux_type = .string, .has_side_effects = true };
+    table[@intFromEnum(Op.wasm_gc_array_new_data)] = .{ .name = "WasmGcArrayNewData", .generic = false, .arg_len = 2, .aux_type = .string, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_gc_array_get)] = .{ .name = "WasmGcArrayGet", .generic = false, .arg_len = 2, .aux_type = .string };
     table[@intFromEnum(Op.wasm_gc_array_set)] = .{ .name = "WasmGcArraySet", .generic = false, .arg_len = 3, .aux_type = .string, .has_side_effects = true };
     table[@intFromEnum(Op.wasm_gc_array_len)] = .{ .name = "WasmGcArrayLen", .generic = false, .arg_len = 1 };
@@ -668,6 +675,11 @@ const op_info_table = blk: {
     table[@intFromEnum(Op.wasm_gc_ref_null)] = .{ .name = "WasmGcRefNull", .generic = false, .aux_type = .string };
     table[@intFromEnum(Op.wasm_gc_ref_is_null)] = .{ .name = "WasmGcRefIsNull", .generic = false, .arg_len = 1 };
     table[@intFromEnum(Op.wasm_gc_ref_eq)] = .{ .name = "WasmGcRefEq", .generic = false, .arg_len = 2 };
+
+    // WasmGC function reference ops
+    table[@intFromEnum(Op.wasm_gc_ref_func)] = .{ .name = "WasmGcRefFunc", .generic = false, .aux_type = .string };
+    table[@intFromEnum(Op.wasm_gc_call_ref)] = .{ .name = "WasmGcCallRef", .generic = false, .arg_len = -1, .aux_type = .int64, .call = true, .has_side_effects = true };
+    table[@intFromEnum(Op.wasm_gc_return_call_ref)] = .{ .name = "WasmGcReturnCallRef", .generic = false, .arg_len = -1, .aux_type = .int64, .call = true, .has_side_effects = true };
 
     break :blk table;
 };

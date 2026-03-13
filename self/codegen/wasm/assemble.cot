@@ -467,6 +467,13 @@ fn encodeInstruction(w: *List(int), p: Prog, param_count: int) void {
             writeULEB128(w, p.to.offset)
         },
 
+        As.gc_array_new_data => {
+            w.append(0xFB)
+            w.append(0x09)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
         As.gc_array_get => {
             w.append(0xFB)
             w.append(0x0B)
@@ -512,6 +519,11 @@ fn encodeInstruction(w: *List(int), p: Prog, param_count: int) void {
             writeULEB128(w, p.from.offset)
         },
 
+        As.ref_func => {
+            w.append(0xD2)
+            writeULEB128(w, p.from.offset)
+        },
+
         As.ref_eq => {
             w.append(0xD3)
         },
@@ -527,6 +539,16 @@ fn encodeInstruction(w: *List(int), p: Prog, param_count: int) void {
 
         As.br_on_non_null => {
             w.append(0xD6)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.call_ref => {
+            w.append(0x14)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.return_call_ref => {
+            w.append(0x15)
             writeULEB128(w, p.from.offset)
         },
 

@@ -518,6 +518,14 @@ fn encodeInstruction(
             try writeULEB128(allocator, w, @as(u64, @intCast(p.to.offset))); // count
         },
 
+        .gc_array_new_data => {
+            // 0xFB 0x09 <type_idx> <data_idx>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_NEW_DATA);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset))); // type_idx
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.to.offset))); // data_idx
+        },
+
         .gc_array_get => {
             // 0xFB 0x0B <type_idx>
             try w.append(allocator, c.GC_PREFIX);
@@ -597,6 +605,24 @@ fn encodeInstruction(
         .ref_null => {
             // 0xD0 <heap_type>
             try w.append(allocator, c.REF_NULL);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .ref_func => {
+            // 0xD2 <funcidx>
+            try w.append(allocator, c.REF_FUNC);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .call_ref => {
+            // 0x14 <typeidx>
+            try w.append(allocator, c.CALL_REF);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .return_call_ref => {
+            // 0x15 <typeidx>
+            try w.append(allocator, c.RETURN_CALL_REF);
             try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
         },
 

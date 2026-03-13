@@ -207,13 +207,14 @@ const As = enum(u16) {
     gc_struct_new, gc_struct_get, gc_struct_set,
 
     // WasmGC array operations (GC proposal, 0xFB prefix)
-    gc_array_new, gc_array_new_default, gc_array_new_fixed,
+    gc_array_new, gc_array_new_default, gc_array_new_fixed, gc_array_new_data,
     gc_array_get, gc_array_set, gc_array_len, gc_array_copy,
 
     // WasmGC reference operations (GC proposal)
     ref_test, ref_cast, br_on_cast, br_on_cast_fail,
-    ref_null, ref_is_null, ref_eq, ref_as_not_null,
+    ref_null, ref_is_null, ref_func, ref_eq, ref_as_not_null,
     br_on_null, br_on_non_null,
+    call_ref, return_call_ref,
 
     // Misc
     word, text, func_data, pc_data, undef,
@@ -421,7 +422,7 @@ const As = enum(u16) {
     fn isGcPrefixed() bool {
         return switch (self) {
             .gc_struct_new, .gc_struct_get, .gc_struct_set,
-            .gc_array_new, .gc_array_new_default, .gc_array_new_fixed,
+            .gc_array_new, .gc_array_new_default, .gc_array_new_fixed, .gc_array_new_data,
             .gc_array_get, .gc_array_set, .gc_array_len, .gc_array_copy,
             .ref_test, .ref_cast, .br_on_cast, .br_on_cast_fail => true,
             else => false,
@@ -437,6 +438,7 @@ const As = enum(u16) {
             .gc_array_new => 0x06,
             .gc_array_new_default => 0x07,
             .gc_array_new_fixed => 0x08,
+            .gc_array_new_data => 0x09,
             .gc_array_get => 0x0B,
             .gc_array_set => 0x0E,
             .gc_array_len => 0x0F,

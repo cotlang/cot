@@ -190,10 +190,11 @@ const SsaOp = enum(u16) {
 
     // === WasmGC ===
     wasm_gc_struct_new, wasm_gc_struct_get, wasm_gc_struct_set,
-    wasm_gc_array_new, wasm_gc_array_new_default, wasm_gc_array_new_fixed,
+    wasm_gc_array_new, wasm_gc_array_new_default, wasm_gc_array_new_fixed, wasm_gc_array_new_data,
     wasm_gc_array_get, wasm_gc_array_set, wasm_gc_array_len, wasm_gc_array_copy,
     wasm_gc_ref_test, wasm_gc_ref_cast, wasm_gc_br_on_cast,
     wasm_gc_ref_null, wasm_gc_ref_is_null, wasm_gc_ref_eq,
+    wasm_gc_ref_func, wasm_gc_call_ref, wasm_gc_return_call_ref,
 }
 
 // ============================================================================

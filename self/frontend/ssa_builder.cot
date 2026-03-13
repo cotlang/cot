@@ -440,6 +440,7 @@ struct SSABuilder {
             Data.gc_array_new => null_value,
             Data.gc_array_new_default => null_value,
             Data.gc_array_new_fixed => null_value,
+            Data.gc_array_new_data => null_value,
             Data.gc_array_get => null_value,
             Data.gc_array_set => null_value,
             Data.gc_array_len => null_value,

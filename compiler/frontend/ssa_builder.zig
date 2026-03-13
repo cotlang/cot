@@ -564,6 +564,7 @@ pub const SSABuilder = struct {
             .gc_array_new => |gc| try self.convertGcArrayNew(gc, node.type_idx, cur),
             .gc_array_new_default => |gc| try self.convertGcArrayNewDefault(gc, node.type_idx, cur),
             .gc_array_new_fixed => |gc| try self.convertGcArrayNewFixed(gc, node.type_idx, cur),
+            .gc_array_new_data => |gc| try self.convertGcArrayNewData(gc, node.type_idx, cur),
             .gc_array_get => |gc| try self.convertGcArrayGet(gc, node.type_idx, cur),
             .gc_array_set => |gc| try self.convertGcArraySet(gc, cur),
             .gc_array_len => |gc| try self.convertGcArrayLen(gc, cur),
@@ -2338,6 +2339,17 @@ pub const SSABuilder = struct {
             const arg = try self.convertNode(v_idx) orelse continue;
             try val.addArgAlloc(arg, self.allocator);
         }
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcArrayNewData(self: *SSABuilder, gc: ir.GcArrayNewData, type_idx: TypeIndex, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_new_data, type_idx, cur, self.cur_pos);
+        val.aux = .{ .string = gc.type_name };
+        val.aux_int = @intCast(gc.data_idx);
+        const offset_val = try self.convertNode(gc.offset) orelse return val;
+        const length_val = try self.convertNode(gc.length) orelse return val;
+        val.addArg2(offset_val, length_val);
         try cur.addValue(self.allocator, val);
         return val;
     }
