@@ -3643,14 +3643,16 @@ struct Checker {
 
     // ---- Type building ----
 
+    /// Build struct type with layout-aware field offset calculation.
+    /// Reference: checker.zig:3958-3999 (buildStructTypeWithLayout)
     fn buildStructType(idx: int, name: string) int {
         var sd_fields: List(int) = .{}
         var sd_layout: int = 0
         switch (self.ast.getNode(idx)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_fields = sd.fields; sd_layout = sd.layout }, else => {} }, else => {} }
         const fields_count = sd_fields.count
-        var total_size: int = 0
+        var offset: int = 0
+        var max_align: int = 1
         const is_packed = sd_layout == StructLayout.@"packed"
-        const is_extern = sd_layout == StructLayout.@"extern"
 
         // Build struct fields using raw pointer array
         const fields_ptr = alloc(0, fields_count * @sizeOf(StructField))
@@ -3662,28 +3664,45 @@ struct Checker {
             switch (self.ast.getNode(field_idx)) { Node.expr |e| => switch (e) { Expr.field_def |fd| => { fname = fd.name; ftype_n = fd.type_expr; fdefault = fd.default_value }, else => {} }, else => {} }
             const ftype = self.resolveTypeExpr(ftype_n)
 
-            const sf = @intToPtr(*StructField, fields_ptr + fi * @sizeOf(StructField))
-            sf.name = fname
-            sf.type_idx = ftype
-            sf.offset = total_size
-            sf.default_value = fdefault
-
-            const field_size = self.types.sizeOf(ftype)
-            total_size += field_size
-            // Packed: no alignment padding. Extern/Auto: align to 8 bytes (Zig ref: checker.zig:3633-3674)
-            if (!is_packed) {
-                total_size = (total_size + 7) / 8 * 8
+            if (is_packed) {
+                // Packed: no alignment, contiguous fields
+                const sf = @intToPtr(*StructField, fields_ptr + fi * @sizeOf(StructField))
+                sf.name = fname
+                sf.type_idx = ftype
+                sf.offset = offset
+                sf.default_value = fdefault
+                offset = offset + self.types.sizeOf(ftype)
+            } else {
+                // Extern/Auto: align each field to its natural alignment
+                const field_align = self.types.alignmentOf(ftype)
+                if (field_align > max_align) { max_align = field_align }
+                if (field_align > 0) {
+                    offset = (offset + field_align - 1) & ~(field_align - 1)
+                }
+                const sf = @intToPtr(*StructField, fields_ptr + fi * @sizeOf(StructField))
+                sf.name = fname
+                sf.type_idx = ftype
+                sf.offset = offset
+                sf.default_value = fdefault
+                offset = offset + self.types.sizeOf(ftype)
             }
         }
 
-        // Packed structs have alignment 1, extern/auto have 8
-        const alignment = if (is_packed) { 1 } else { 8 }
+        // Final padding: packed=1, extern=max field align, auto=8
+        const alignment = switch (sd_layout) {
+            StructLayout.@"packed" => 1,
+            StructLayout.@"extern" => max_align,
+            else => 8,
+        }
+        if (!is_packed and alignment > 1) {
+            offset = (offset + alignment - 1) & ~(alignment - 1)
+        }
 
         return self.types.add(Type.struct_type(StructType {
             name: name,
             field_count: fields_count,
             fields: fields_ptr,
-            size: total_size,
+            size: offset,
             alignment: alignment,
             layout: sd_layout,
         }))
