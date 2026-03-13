@@ -1638,6 +1638,106 @@ struct GenState {
     }
 
     // ========================================================================
+    // emitGcArrayRefOp — WasmGC array, ref, and function reference operations
+    // ========================================================================
+
+    fn emitGcArrayRefOp(val_idx: int) void {
+        const v = self.ssa_func.getValue(val_idx)
+        const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+
+        // Resolve GC type index from name maps
+        var gc_type_idx = 0
+        if (self.gc_struct_name_map) |m| {
+            if (m.contains(type_name)) { gc_type_idx = m.get(type_name) }
+        }
+
+        switch (v.op) {
+            SsaOp.wasm_gc_array_new => {
+                self.getValue64(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.builder.appendFrom(As.gc_array_new, constAddr(gc_type_idx))
+            },
+            SsaOp.wasm_gc_array_new_default => {
+                self.getValue64(v.args.get(0))
+                self.builder.appendFrom(As.gc_array_new_default, constAddr(gc_type_idx))
+            },
+            SsaOp.wasm_gc_array_new_fixed => {
+                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                const pi = self.builder.appendFrom(As.gc_array_new_fixed, constAddr(gc_type_idx))
+                var pp = self.builder.get(pi)
+                pp.to = constAddr(v.aux_int)
+                self.builder.set(pi, pp)
+            },
+            SsaOp.wasm_gc_array_new_data => {
+                self.getValue64(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                const pi = self.builder.appendFrom(As.gc_array_new_data, constAddr(gc_type_idx))
+                var pp = self.builder.get(pi)
+                pp.to = constAddr(v.aux_int)
+                self.builder.set(pi, pp)
+            },
+            SsaOp.wasm_gc_array_get => {
+                self.getValue64(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.builder.appendFrom(As.gc_array_get, constAddr(gc_type_idx))
+            },
+            SsaOp.wasm_gc_array_set => {
+                self.getValue64(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.getValue64(v.args.get(2))
+                self.builder.appendFrom(As.gc_array_set, constAddr(gc_type_idx))
+            },
+            SsaOp.wasm_gc_array_len => {
+                self.getValue64(v.args.get(0))
+                self.builder.append(As.gc_array_len)
+            },
+            SsaOp.wasm_gc_array_copy => {
+                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                const pi = self.builder.appendFrom(As.gc_array_copy, constAddr(gc_type_idx))
+                var pp = self.builder.get(pi)
+                pp.to = constAddr(v.aux_int)
+                self.builder.set(pi, pp)
+            },
+            SsaOp.wasm_gc_ref_test => {
+                self.getValue64(v.args.get(0))
+                self.builder.appendFrom(As.ref_test, constAddr(gc_type_idx))
+            },
+            SsaOp.wasm_gc_ref_cast => {
+                self.getValue64(v.args.get(0))
+                self.builder.appendFrom(As.ref_cast, constAddr(gc_type_idx))
+            },
+            SsaOp.wasm_gc_ref_null => {
+                self.builder.appendFrom(As.ref_null, constAddr(gc_type_idx))
+            },
+            SsaOp.wasm_gc_ref_is_null => {
+                self.getValue64(v.args.get(0))
+                self.builder.append(As.ref_is_null)
+            },
+            SsaOp.wasm_gc_ref_eq => {
+                self.getValue64(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.builder.append(As.ref_eq)
+            },
+            SsaOp.wasm_gc_ref_func => {
+                self.builder.appendFrom(As.ref_func, constAddr(0))
+            },
+            SsaOp.wasm_gc_call_ref => {
+                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                self.builder.appendFrom(As.call_ref, constAddr(v.aux_int))
+            },
+            SsaOp.wasm_gc_return_call_ref => {
+                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                self.builder.appendFrom(As.return_call_ref, constAddr(v.aux_int))
+            },
+            SsaOp.wasm_gc_br_on_cast => {
+                self.getValue64(v.args.get(0))
+                self.builder.append(As.@"unreachable")
+            },
+            else => {},
+        }
+    }
+
+    // ========================================================================
     // emitMiscOp — Args, copy, phi, select, globals,
     //              bounds/nil checks, local get/set, drop, return, etc.
     // ========================================================================
@@ -1699,13 +1799,14 @@ struct GenState {
             },
 
             // WasmGC array/ref operations (infrastructure — codegen stubs)
+            // WasmGC array/ref/func operations — emit real codegen
             SsaOp.wasm_gc_array_new, SsaOp.wasm_gc_array_new_default, SsaOp.wasm_gc_array_new_fixed,
             SsaOp.wasm_gc_array_new_data,
             SsaOp.wasm_gc_array_get, SsaOp.wasm_gc_array_set, SsaOp.wasm_gc_array_len, SsaOp.wasm_gc_array_copy,
             SsaOp.wasm_gc_ref_test, SsaOp.wasm_gc_ref_cast, SsaOp.wasm_gc_br_on_cast,
             SsaOp.wasm_gc_ref_null, SsaOp.wasm_gc_ref_is_null, SsaOp.wasm_gc_ref_eq,
             SsaOp.wasm_gc_ref_func, SsaOp.wasm_gc_call_ref, SsaOp.wasm_gc_return_call_ref => {
-                self.builder.append(As.@"unreachable")
+                self.emitGcArrayRefOp(val_idx)
             },
 
             // Bounds check

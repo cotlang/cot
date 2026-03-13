@@ -436,21 +436,21 @@ struct SSABuilder {
             Data.gc_struct_new |gc| => self.convertGcStructNew(gc, node.type_idx),
             Data.gc_struct_get |gc| => self.convertGcStructGet(gc, node.type_idx),
             Data.gc_struct_set |gc| => self.convertGcStructSet(gc),
-            // WasmGC array operations (infrastructure stubs — not yet wired to lowerer)
-            Data.gc_array_new => null_value,
-            Data.gc_array_new_default => null_value,
-            Data.gc_array_new_fixed => null_value,
-            Data.gc_array_new_data => null_value,
-            Data.gc_array_get => null_value,
-            Data.gc_array_set => null_value,
-            Data.gc_array_len => null_value,
+            // WasmGC array operations
+            Data.gc_array_new |gc| => self.convertGcArrayNew(gc, node.type_idx),
+            Data.gc_array_new_default |gc| => self.convertGcArrayNewDefault(gc, node.type_idx),
+            Data.gc_array_new_fixed |gc| => self.convertGcArrayNewFixed(gc, node.type_idx),
+            Data.gc_array_new_data |gc| => self.convertGcArrayNewData(gc, node.type_idx),
+            Data.gc_array_get |gc| => self.convertGcArrayGet(gc, node.type_idx),
+            Data.gc_array_set |gc| => self.convertGcArraySet(gc),
+            Data.gc_array_len |gc| => self.convertGcArrayLen(gc),
             Data.gc_array_copy => null_value,
-            // WasmGC reference operations (infrastructure stubs)
-            Data.gc_ref_null => null_value,
-            Data.gc_ref_is_null => null_value,
-            Data.gc_ref_eq => null_value,
-            Data.gc_ref_cast => null_value,
-            Data.gc_ref_test => null_value,
+            // WasmGC reference operations
+            Data.gc_ref_null |gc| => self.convertGcRefNull(gc, node.type_idx),
+            Data.gc_ref_is_null |gc| => self.convertGcRefIsNull(gc),
+            Data.gc_ref_eq |gc| => self.convertGcRefEq(gc),
+            Data.gc_ref_cast |gc| => self.convertGcRefCast(gc, node.type_idx),
+            Data.gc_ref_test |gc| => self.convertGcRefTest(gc),
         }
 
         if (result != null_value) { self.node_values.set(node_idx, result) }
@@ -1704,6 +1704,161 @@ struct SSABuilder {
         if (base_val != null_value and value_val != null_value) {
             v.addArg2(base_val, value_val)
         }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    // === WasmGC array conversion helpers ===
+
+    fn convertGcArrayNew(gc: GcArrayNew, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const init_val = self.convertNode(gc.init_val)
+        const length = self.convertNode(gc.length)
+        if (init_val != null_value and length != null_value) { v.addArg2(init_val, length) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayNewDefault(gc: GcArrayNewDefault, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new_default, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const length = self.convertNode(gc.length)
+        if (length != null_value) { v.addArg(length) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayNewFixed(gc: GcArrayNewFixed, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new_fixed, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        v.aux_int = gc.values.count
+        for k in 0..gc.values.count {
+            const arg = self.convertNode(gc.values.get(k))
+            if (arg != null_value) { v.addArg(arg) }
+        }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayNewData(gc: GcArrayNewData, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_new_data, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        v.aux_int = gc.data_idx
+        const offset = self.convertNode(gc.offset)
+        const length = self.convertNode(gc.length)
+        if (offset != null_value and length != null_value) { v.addArg2(offset, length) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayGet(gc: GcArrayGet, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_get, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const array_val = self.convertNode(gc.array)
+        const index_val = self.convertNode(gc.index)
+        if (array_val != null_value and index_val != null_value) { v.addArg2(array_val, index_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArraySet(gc: GcArraySet) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_set, VOID, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const array_val = self.convertNode(gc.array)
+        const index_val = self.convertNode(gc.index)
+        const value_val = self.convertNode(gc.value)
+        if (array_val != null_value) { v.addArg(array_val) }
+        if (index_val != null_value) { v.addArg(index_val) }
+        if (value_val != null_value) { v.addArg(value_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcArrayLen(gc: GcArrayLen) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_array_len, I32, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        const array_val = self.convertNode(gc.array)
+        if (array_val != null_value) { v.addArg(array_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    // === WasmGC reference conversion helpers ===
+
+    fn convertGcRefNull(gc: GcRefNull, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_null, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefIsNull(gc: GcRefIsNull) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_is_null, BOOL, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        const ref_val = self.convertNode(gc.value)
+        if (ref_val != null_value) { v.addArg(ref_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefEq(gc: GcRefEq) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_eq, BOOL, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        const left = self.convertNode(gc.left)
+        const right = self.convertNode(gc.right)
+        if (left != null_value and right != null_value) { v.addArg2(left, right) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefCast(gc: GcRefCast, type_idx: int) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_cast, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const ref_val = self.convertNode(gc.value)
+        if (ref_val != null_value) { v.addArg(ref_val) }
+        self.func.setValue(val, v)
+        self.func.addValueToBlock(val, cur)
+        return val
+    }
+
+    fn convertGcRefTest(gc: GcRefTest) int {
+        const cur = self.cur_block
+        const val = self.func.newValue(SsaOp.wasm_gc_ref_test, BOOL, cur, self.cur_pos_line, self.cur_pos_col)
+        var v = self.func.getValue(val)
+        v.aux = SsaAux.str(gc.type_name)
+        const ref_val = self.convertNode(gc.value)
+        if (ref_val != null_value) { v.addArg(ref_val) }
         self.func.setValue(val, v)
         self.func.addValueToBlock(val, cur)
         return val

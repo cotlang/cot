@@ -156,7 +156,16 @@ struct Lowerer {
     current_dict_entries: List(DictEntry),    // active dict entries during stenciled fn body
     current_dict_params: List(int),           // active dict param locals during stenciled fn body
     has_dict_context: bool,                   // true when inside a dict-stenciled function
+    gc_mode: bool,                            // true when targeting WasmGC (structs/unions are GC refs)
     builder: Builder,
+
+    fn isWasmGC() bool {
+        return self.gc_mode
+    }
+
+    fn setGcMode(enabled: bool) void {
+        self.gc_mode = enabled
+    }
 
     fn setTestMode(enabled: bool) void {
         self.test_mode = enabled
@@ -1353,6 +1362,7 @@ struct Lowerer {
         const opt_val = self.lowerExprNode(i.condition)
         if (opt_val == null_node) { return false }
 
+        const is_gc_ref_opt = self.isGcRefOptional(opt_type_idx)
         var is_non_null = null_node
         if (is_compound_opt) {
             const opt_local = fb.addLocalWithSize("__opt_if", opt_type_idx, false, self.types.sizeOf(opt_type_idx))
@@ -1360,6 +1370,10 @@ struct Lowerer {
             const tag = fb.emitFieldLocal(opt_local, 0, 0, I64, i.span)
             const zero = fb.emitConstInt(0, I64, i.span)
             is_non_null = fb.emitBinary(BinaryOp.ne, tag, zero, BOOL, i.span)
+        } else if (is_gc_ref_opt) {
+            // WasmGC nullable ref: ref.is_null + not
+            const is_null = fb.emitGcRefIsNull(opt_val, i.span)
+            is_non_null = fb.emitUnary(UnaryOp.@"not", is_null, BOOL, i.span)
         } else {
             const null_val = fb.emitConstNull(I64, i.span)
             is_non_null = fb.emitBinary(BinaryOp.ne, opt_val, null_val, BOOL, i.span)
@@ -4722,6 +4736,11 @@ struct Lowerer {
 
     /// Union switch: extract tag, match variants, bind payloads
     fn lowerUnionSwitch(fb: *FuncBuilder, se: SwitchExpr, idx: int) int {
+        // WasmGC path: use ref.test for dispatch
+        if (self.gc_mode) {
+            return self.lowerUnionSwitchGC(fb, se, idx)
+        }
+
         const subject = self.lowerExprNode(se.subject)
         if (subject == null_node) { return null_node }
 
@@ -4794,6 +4813,127 @@ struct Lowerer {
                 // Load payload from subject_local at offset 8
                 const payload = fb.emitFieldLocal(subject_local, 1, 8, payload_type, se.span)
                 fb.emitStoreLocal(cap_local, payload, se.span)
+            }
+
+            if (sc.body != null_node) {
+                if (result_type != VOID) {
+                    const body_val = self.lowerExprNode(sc.body)
+                    if (body_val != null_node and result_local != null_local) {
+                        fb.emitStoreLocal(result_local, body_val, se.span)
+                    }
+                } else {
+                    self.lowerBlockNode(sc.body)
+                }
+            }
+
+            fb.restoreScope(scope_depth)
+            if (fb.needsTerminator()) {
+                fb.emitJump(merge_block, se.span)
+            }
+
+            fb.setBlock(next_block)
+        }
+
+        // Else body
+        if (se.else_body != null_node) {
+            if (result_type != VOID) {
+                const else_val = self.lowerExprNode(se.else_body)
+                if (else_val != null_node and result_local != null_local) {
+                    fb.emitStoreLocal(result_local, else_val, se.span)
+                }
+            } else {
+                self.lowerBlockNode(se.else_body)
+            }
+        }
+        if (fb.needsTerminator()) {
+            fb.emitJump(merge_block, se.span)
+        }
+
+        fb.setBlock(merge_block)
+        if (result_type != VOID and result_local != null_local) {
+            return fb.emitLoadLocal(result_local, result_type, se.span)
+        }
+        return null_node
+    }
+
+    /// WasmGC union switch: use ref.test for dispatch, ref.cast + struct.get for capture.
+    fn lowerUnionSwitchGC(fb: *FuncBuilder, se: SwitchExpr, idx: int) int {
+        const subject_ref = self.lowerExprNode(se.subject)
+        if (subject_ref == null_node) { return null_node }
+
+        const subject_type = self.inferExprType(se.subject)
+        const result_type = self.inferExprType(idx)
+
+        var result_local = null_local
+        if (result_type != VOID) {
+            result_local = fb.addLocalWithSize("__switch_result", result_type, true, self.types.sizeOf(result_type))
+        }
+
+        const merge_block = fb.newBlock("switch.end")
+
+        // Get union type info
+        const ut_info = self.types.get(subject_type)
+
+        for i in 0..se.cases.count {
+            const case_idx = se.cases.get(i)
+            var sc: SwitchCaseNode = undefined
+            var found = false
+            switch (self.tree.getNode(case_idx)) { Node.expr |e| => switch (e) {
+                Expr.switch_case_node |c| => { sc = c; found = true },
+                else => {},
+            }, else => {} }
+            if (!found) { continue }
+
+            const case_block = fb.newBlock("union.gc.case")
+            const next_block = fb.newBlock("union.gc.next")
+
+            // Match using ref.test for each pattern
+            var case_cond = null_node
+            for p in 0..sc.patterns.count {
+                const pat_idx = sc.patterns.get(p)
+                const variant_idx = self.resolveUnionVariantIndex(subject_type, pat_idx)
+                if (variant_idx >= 0) {
+                    switch (ut_info) { Type.union_type |ut| => {
+                        const v = ut.getVariant(variant_idx)
+                        const variant_name = "__union_" ++ ut.name ++ "_" ++ v.name
+                        const test_val = fb.emitGcRefTest(subject_ref, variant_name, se.span)
+                        if (case_cond == null_node) {
+                            case_cond = test_val
+                        } else {
+                            case_cond = fb.emitBinary(BinaryOp.@"or", case_cond, test_val, BOOL, se.span)
+                        }
+                    }, else => {} }
+                }
+            }
+
+            if (case_cond != null_node) {
+                fb.emitBranch(case_cond, case_block, next_block, se.span)
+            } else {
+                fb.emitJump(next_block, se.span)
+            }
+
+            fb.setBlock(case_block)
+            const scope_depth = fb.markScopeEntry()
+
+            // Capture handling: ref.cast + struct.get
+            if (sc.capture != "") {
+                const payload_type = self.resolveUnionPayloadType(subject_type, sc.patterns)
+                const cap_size = self.types.sizeOf(payload_type)
+                const cap_local = fb.addLocalWithSize(sc.capture, payload_type, false, cap_size)
+
+                // Get variant name for cast
+                const first_vidx = self.resolveUnionVariantIndex(subject_type, sc.patterns.get(0))
+                if (first_vidx >= 0) {
+                    switch (ut_info) { Type.union_type |ut| => {
+                        const v = ut.getVariant(first_vidx)
+                        if (v.payload_type != VOID) {
+                            const variant_name = "__union_" ++ ut.name ++ "_" ++ v.name
+                            const casted = fb.emitGcRefCast(subject_ref, variant_name, subject_type, se.span)
+                            const payload_val = fb.emitGcStructGet(casted, variant_name, 0, payload_type, se.span)
+                            fb.emitStoreLocal(cap_local, payload_val, se.span)
+                        }
+                    }, else => {} }
+                }
             }
 
             if (sc.body != null_node) {
@@ -5227,6 +5367,13 @@ struct Lowerer {
         const type_info = self.types.get(type_idx)
         if (type_info.tag != TAG_UNION) { return }
 
+        // WasmGC path: union variants are GC struct subtypes
+        if (self.gc_mode) {
+            self.lowerUnionInitGC(fb, local_idx, value_idx, type_idx, span)
+            return
+        }
+
+        // Linear memory path: tag + payload
         switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
             Expr.call |call| => {
                 // Payload variant: Result.Ok(42) → store tag + payload
@@ -5267,6 +5414,58 @@ struct Lowerer {
                 const val = self.lowerExprNode(value_idx)
                 if (val != null_node) { fb.emitStoreLocal(local_idx, val, span) }
             },
+        }, else => {} }
+    }
+
+    /// WasmGC union init: emit gc_struct_new for the variant subtype.
+    fn lowerUnionInitGC(fb: *FuncBuilder, local_idx: int, value_idx: int, type_idx: int, span: Span) void {
+        const type_info = self.types.get(type_idx)
+        switch (type_info) { Type.union_type |ut| => {
+            switch (self.tree.getNode(value_idx)) { Node.expr |e| => switch (e) {
+                Expr.call |call| => {
+                    // Payload variant call: Shape.circle(c)
+                    switch (self.tree.getNode(call.callee)) { Node.expr |ce| => switch (ce) {
+                        Expr.field_access |fa| => {
+                            for i in 0..ut.variant_count {
+                                const v = ut.getVariant(i)
+                                if (v.name == fa.field) {
+                                    const variant_name = "__union_" ++ ut.name ++ "_" ++ v.name
+                                    if (call.args.count > 0 and v.payload_type != VOID) {
+                                        const payload_val = self.lowerExprNode(call.args.get(0))
+                                        var field_values: List(int) = .{}
+                                        field_values.append(payload_val)
+                                        const ref = fb.emitGcStructNew(variant_name, field_values, type_idx, span)
+                                        fb.emitStoreLocal(local_idx, ref, span)
+                                    } else {
+                                        var empty_fields: List(int) = .{}
+                                        const ref = fb.emitGcStructNew(variant_name, empty_fields, type_idx, span)
+                                        fb.emitStoreLocal(local_idx, ref, span)
+                                    }
+                                    return
+                                }
+                            }
+                        },
+                        else => {},
+                    }, else => {} }
+                },
+                Expr.field_access |fa| => {
+                    // Unit variant: State.Running
+                    for i in 0..ut.variant_count {
+                        const v = ut.getVariant(i)
+                        if (v.name == fa.field) {
+                            const variant_name = "__union_" ++ ut.name ++ "_" ++ v.name
+                            var empty_fields: List(int) = .{}
+                            const ref = fb.emitGcStructNew(variant_name, empty_fields, type_idx, span)
+                            fb.emitStoreLocal(local_idx, ref, span)
+                            return
+                        }
+                    }
+                },
+                else => {
+                    const val = self.lowerExprNode(value_idx)
+                    if (val != null_node) { fb.emitStoreLocal(local_idx, val, span) }
+                },
+            }, else => {} }
         }, else => {} }
     }
 
@@ -7884,6 +8083,8 @@ struct Lowerer {
     fn needsSret(type_idx: int) bool {
         const info = self.types.get(type_idx)
         if (info.tag == TAG_STRUCT or info.tag == TAG_TUPLE or info.tag == TAG_UNION) {
+            // WasmGC: struct types are GC refs (single value), no SRET needed
+            if (self.gc_mode and info.tag == TAG_STRUCT) { return false }
             if (self.types.sizeOf(type_idx) > 8) {
                 return true
             }
@@ -7903,7 +8104,25 @@ struct Lowerer {
         // Extract elem type from optional
         switch (info) {
             Type.optional |opt| => {
-                return self.types.get(opt.elem).tag == TAG_POINTER
+                const elem_tag = self.types.get(opt.elem).tag
+                if (elem_tag == TAG_POINTER) { return true }
+                // WasmGC: struct and union types are GC refs, so ?T is (ref null $T)
+                if (self.gc_mode and (elem_tag == TAG_STRUCT or elem_tag == TAG_UNION)) { return true }
+                return false
+            },
+            else => { return false },
+        }
+    }
+
+    /// Returns true if the optional wraps a GC ref type (struct/union in WasmGC mode).
+    fn isGcRefOptional(type_idx: int) bool {
+        if (!self.gc_mode) { return false }
+        const info = self.types.get(type_idx)
+        if (info.tag != TAG_OPTIONAL) { return false }
+        switch (info) {
+            Type.optional |opt| => {
+                const elem_tag = self.types.get(opt.elem).tag
+                return elem_tag == TAG_STRUCT or elem_tag == TAG_UNION
             },
             else => { return false },
         }
@@ -8422,6 +8641,7 @@ fn initLowererScalars(lower: *Lowerer) void {
     lower.current_switch_enum_type = invalid_type
     lower.next_error_idx = 0
     lower.release_mode = false
+    lower.gc_mode = false
     lower.builder = Builder.init()
 }
 
