@@ -140,6 +140,7 @@ The native path translates SSA directly to CLIF IR (Cranelift's intermediate rep
 | Cot → Wasm | `references/go/src/cmd/compile/internal/wasm/` |
 | SSA → CLIF (native) | `references/rust/compiler/rustc_codegen_cranelift/src/` |
 | CLIF → ARM64 | `references/wasmtime/cranelift/codegen/src/isa/aarch64/` |
+| WasmGC patterns | `references/kotlin/wasm/` (Kotlin/Wasm compiler) |
 | Language semantics | Zig (error unions, defer, comptime) |
 
 ---

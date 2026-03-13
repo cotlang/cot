@@ -1,8 +1,8 @@
 # Self-Hosted Compiler Parity Audit
 
-**Date:** March 14, 2026 (updated after Zig compiler bug fixes + workaround reverts)
+**Date:** March 14, 2026 (updated after WasmGC improvements — 5 phases ported from Kotlin patterns)
 **Scope:** File-by-file comparison of `self/` vs `compiler/` (Zig reference)
-**Total self-hosted:** 41,417 lines across 37 files, 409 tests pass
+**Total self-hosted:** 41,813 lines across 38 files, 409 tests pass
 
 ---
 
@@ -15,28 +15,33 @@
 | Parser | 1 | 3,234 | **95%** | Minor: less detailed error messages |
 | Types | 1 | 1,609 | **95%** | Shape stenciling complete |
 | Checker | 1 | 5,864 | **86%** | Per-file scoping implemented, `evalComptimeValue` rich union remaining |
-| IR | 1 | 1,356 | **100%** | None |
+| IR | 1 | 1,450 | **100%** | WasmGC array/ref/cast nodes added |
 | ARC Insertion | 1 | 443 | **100%** | None |
-| Lowerer | 1 | 8,809 | **80%** | WasmGC helpers, async (~1,170L) |
-| SSA Builder | 1 | 2,145 | **95%** | None |
-| SSA Data | 1 | 577 | **95%** | None |
+| Lowerer | 1 | 8,834 | **80%** | async (~1,170L), WasmGC lowering is Zig-only |
+| SSA Builder | 1 | 2,160 | **95%** | WasmGC array/ref conversion stubs |
+| SSA Data | 1 | 582 | **95%** | WasmGC SSA ops added |
 | SSA Passes | 6 | 1,896 | **92%** | lower_wasm ~90%, rewritedec 100% |
-| Wasm Codegen | 17 | 10,841 | **91%** | wasm_types.cot minor edge cases |
+| Wasm Codegen | 17 | 11,051 | **93%** | WasmGC array/ref/cast assembly added |
 | Source/Errors | 2 | 860 | **100%** | None |
 | Main/CLI | 1 | 1,029 | **100%** | Per-file scoping, CheckedScopeEntry |
 
-**Overall: ~93% Wasm-frontend-complete. 41,417 lines across 37 files.**
+**Overall: ~93% Wasm-frontend-complete. 41,813 lines across 38 files.**
 
 **MILESTONE (Mar 13, 2026): selfcot type-checks itself.**
-`selfcot check self/main.cot` → passes (all 37 files, ~41,417 lines multi-file type-checking).
+`selfcot check self/main.cot` → passes (all 38 files, ~41,813 lines multi-file type-checking).
 `selfcot build foo.cot -o foo.wasm` → works for single-file programs.
 Full pipeline wired: parse → check → lower → SSA → 6 passes → wasm_gen → link → .wasm.
 All 9 CLI commands implemented: build, run, test, bench, check, parse, lex, init, help.
 
+**WasmGC (Mar 14, 2026):** 5 phases of Kotlin-pattern WasmGC ported to self-hosted:
+- GC arrays, union subtypes, nullable refs, function refs, GC strings
+- Infrastructure complete (IR nodes, SSA ops, codegen assembly)
+- Self-hosted codegen emits `unreachable` stubs (lowerer wiring is Zig-only for now)
+
 **Remaining gaps by priority:**
 1. **HIGH**: Multi-file build (checkAndLowerRecursive exists, needs wiring into build pipeline)
 2. **MEDIUM**: wasm_types opcodes (~230 LOC), comptime array emission
-3. **LOW**: evalComptimeValue (~300 LOC), WasmGC helpers (~107 LOC)
+3. **LOW**: evalComptimeValue (~300 LOC), WasmGC lowerer wiring in self-hosted
 4. **DEFERRED**: async lowering (~1,170 LOC — v0.4)
 5. **NOT STARTED**: Native backend (~72,000 LOC — CLIF IR, MachInst, regalloc, ISA, object emit)
 

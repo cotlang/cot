@@ -108,7 +108,15 @@ This document maps **every stage of the Cot compilation pipeline** to its refere
 - `references/go/src/cmd/internal/obj/wasm/wasmobj.go` — Wasm binary format encoding
 - `references/go/src/cmd/link/internal/wasm/asm.go` — Wasm section layout, import handling
 
-**Wasm uses WasmGC** — structs are GC-managed objects (`struct.new`, `struct.get`, `struct.set`), not ARC. Linear memory allocation functions (`cot_alloc`, `cot_dealloc`, `cot_realloc`) are still generated as Wasm bytecode by `arc.zig` for string buffers and List backing arrays, but `cot_retain`/`cot_release` are dead code on Wasm.
+**Wasm uses WasmGC** — structs, arrays, unions, and optionals are GC-managed objects, not ARC. Reference: Kotlin/Wasm compiler (`references/kotlin/wasm/`). Five phases implemented (Mar 2026):
+
+1. **GC Arrays**: `array.new`, `array.new_default`, `array.new_fixed`, `array.new_data`, `array.get`, `array.set`, `array.len`, `array.copy` — replaces linear-memory slices
+2. **GC Unions**: Union base type as empty GC struct, variants as subtypes (`sub $base`). `ref.test` for dispatch, `ref.cast` for capture — no tag field needed
+3. **Nullable Refs**: `?StructType` → `(ref null $T)`. Null check = `ref.is_null`. `?i64` etc. remain compound
+4. **Function Refs**: `ref.func` + `call_ref` — typed function references replace `call_indirect` table lookups
+5. **GC Strings**: `array.new_data` creates GC byte arrays from data segments
+
+Linear memory allocation (`cot_alloc`, `cot_dealloc`, `cot_realloc`) still used for non-GC types. `cot_retain`/`cot_release` are dead code on Wasm.
 
 | Runtime Function | Target | Reference | What It Does |
 |-----------------|--------|-----------|--------------|
