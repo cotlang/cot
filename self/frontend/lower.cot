@@ -1067,6 +1067,9 @@ struct Lowerer {
                     fb.emitStoreLocal(local_idx, val, v.span)
                 }
             }
+
+            // Register scope_destroy for structs with deinit() (Zig ref: lower.zig:2364-2365)
+            self.maybeRegisterScopeDestroy(local_idx, type_idx)
         }
     }
 
@@ -7444,6 +7447,56 @@ struct Lowerer {
 
         fb.emitTrap(span)
         fb.setBlock(ok_block)
+    }
+
+    /// Register scope_destroy cleanup for structs with deinit() method.
+    /// Called after lowering struct init to auto-call deinit at scope exit.
+    /// Reference: lower.zig:1995-2028
+    fn maybeRegisterScopeDestroy(local_idx: int, type_idx: int) void {
+        const type_info = self.types.get(type_idx)
+        if (type_info.tag != TAG_STRUCT) { return }
+        const struct_name = switch (type_info) { Type.struct_type |st| => st.name, else => "" }
+        if (struct_name == "") { return }
+
+        // Check if this struct has a deinit() method
+        const method_idx = self.types.lookupMethod(struct_name, "deinit")
+        if (method_idx >= 0) {
+            const method_info = self.types.getMethodInfo(method_idx)
+            // Queue generic function for lowering if needed
+            if (self.lookupGenericInst(method_info.func_name)) |inst| {
+                self.ensureGenericFnQueued(inst)
+            }
+            // Qualify deinit method name for cross-module consistency
+            const qualified_deinit = if (self.lookupGenericInst(method_info.func_name) != null) {
+                method_info.func_name
+            } else {
+                self.resolveMethodName(struct_name, method_info.func_name, method_info.source_tree)
+            }
+            self.cleanup_stack.append(CleanupEntry {
+                kind: CLEANUP_SCOPE_DESTROY,
+                value: null_node,
+                type_idx: type_idx,
+                local_idx: local_idx,
+                func_name: qualified_deinit,
+            })
+        } else {
+            // ARC Phase 4: Check for auto-generated deinit
+            for i in 0..self.pending_auto_deinits.count {
+                const auto_name = self.pending_auto_deinits.get(i)
+                if (auto_name == struct_name) {
+                    const qualified_type = self.qualifyTypeName(struct_name)
+                    const deinit_name = "${qualified_type}_deinit"
+                    self.cleanup_stack.append(CleanupEntry {
+                        kind: CLEANUP_SCOPE_DESTROY,
+                        value: null_node,
+                        type_idx: type_idx,
+                        local_idx: local_idx,
+                        func_name: deinit_name,
+                    })
+                    return
+                }
+            }
+        }
     }
 
     /// Emit pending cleanups down to the given depth (defer + ARC release).

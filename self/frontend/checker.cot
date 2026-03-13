@@ -4348,6 +4348,58 @@ struct Checker {
         return (0, 0)
     }
 
+    /// Evaluate a comptime float expression. Returns (ok, value).
+    /// Reference: checker.zig:1511-1541
+    fn evalConstFloat(idx: int) (int, float) {
+        if (idx == null_node) { return (0, 0.0) }
+        const node = self.ast.getNode(idx)
+        switch (node) { Node.expr |e| => switch (e) {
+            Expr.literal |lit| => {
+                switch (lit.kind) {
+                    LiteralKind.@"float" => {
+                        return (1, parseFloat(lit.value))
+                    },
+                    LiteralKind.@"int" => {
+                        const iv = parseInt(lit.value)
+                        return (1, @floatFromInt(f64, iv))
+                    },
+                    else => { return (0, 0.0) },
+                }
+            },
+            Expr.unary |u| => {
+                if (u.op == Token.sub) {
+                    const inner = self.evalConstFloat(u.operand)
+                    if (inner.0 != 0) { return (1, 0.0 - inner.1) }
+                }
+                return (0, 0.0)
+            },
+            Expr.binary |bin| => {
+                const lv = self.evalConstFloat(bin.left)
+                const rv = self.evalConstFloat(bin.right)
+                if (lv.0 == 0 or rv.0 == 0) { return (0, 0.0) }
+                if (bin.op == Token.add) { return (1, lv.1 + rv.1) }
+                if (bin.op == Token.sub) { return (1, lv.1 - rv.1) }
+                if (bin.op == Token.mul) { return (1, lv.1 * rv.1) }
+                if (bin.op == Token.quo) { return (1, lv.1 / rv.1) }
+                return (0, 0.0)
+            },
+            Expr.paren |p| => {
+                return self.evalConstFloat(p.inner)
+            },
+            Expr.ident |id| => {
+                const sym_idx = self.lookupSymbol(id.name)
+                if (sym_idx >= 0) {
+                    const sym = self.getSymbol(sym_idx)
+                    if (sym.kind == SYM_CONSTANT and sym.float_const_value != 0) {
+                        return (1, @bitCast(f64, sym.float_const_value))
+                    }
+                }
+                return (0, 0.0)
+            },
+            else => { return (0, 0.0) },
+        }, else => { return (0, 0.0) } }
+    }
+
     fn evalConstLiteral(idx: int) (int, int) {
         var kind = 0
         var val_str = ""
