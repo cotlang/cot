@@ -2112,27 +2112,35 @@ struct Lowerer {
 
     fn lowerLiteral(fb: *FuncBuilder, lit: Literal, idx: int) int {
         const span = lit.span
-        const kind = lit.kind
-        if (kind == LiteralKind.@"int") {
-            const type_idx = self.inferExprType(idx)
-            const val = parseIntLit(lit.value)
-            return fb.emitConstInt(val, type_idx, span)
-        } else if (kind == LiteralKind.@"float") {
-            const type_idx = self.inferExprType(idx)
-            const val = parseFloatLit(lit.value)
-            return fb.emitConstFloat(val, type_idx, span)
-        } else if (kind == LiteralKind.@"string") {
-            const str_idx = fb.addStringLiteral(lit.value)
-            return fb.emitConstSlice(str_idx, span)
-        } else if (kind == LiteralKind.true_lit) {
-            return fb.emitConstBool(true, span)
-        } else if (kind == LiteralKind.false_lit) {
-            return fb.emitConstBool(false, span)
-        } else if (kind == LiteralKind.null_lit) {
-            const type_idx = self.inferExprType(idx)
-            return fb.emitConstNull(type_idx, span)
+        switch (lit.kind) {
+            LiteralKind.@"int" => {
+                const type_idx = self.inferExprType(idx)
+                const val = parseIntLit(lit.value)
+                return fb.emitConstInt(val, type_idx, span)
+            },
+            LiteralKind.@"float" => {
+                const type_idx = self.inferExprType(idx)
+                const val = parseFloatLit(lit.value)
+                return fb.emitConstFloat(val, type_idx, span)
+            },
+            LiteralKind.@"string" => {
+                const str_idx = fb.addStringLiteral(lit.value)
+                return fb.emitConstSlice(str_idx, span)
+            },
+            LiteralKind.true_lit => {
+                return fb.emitConstBool(true, span)
+            },
+            LiteralKind.false_lit => {
+                return fb.emitConstBool(false, span)
+            },
+            LiteralKind.null_lit => {
+                const type_idx = self.inferExprType(idx)
+                return fb.emitConstNull(type_idx, span)
+            },
+            else => {
+                return null_node
+            },
         }
-        return null_node
     }
 
     fn lowerIdent(fb: *FuncBuilder, id: Ident) int {
@@ -6654,19 +6662,26 @@ struct Lowerer {
 
             // Null: lower fallback
             fb.setBlock(else_block)
-            if (oe.fallback_kind == ORELSE_EXPR) {
-                const fallback = self.lowerExprNode(oe.fallback)
-                if (fallback != null_node) {
-                    fb.emitStoreLocal(result_local, fallback, oe.span)
-                }
-            } else if (oe.fallback_kind == ORELSE_RETURN_VOID) {
-                self.lowerReturn(ReturnStmt { .value = null_node, .span = oe.span })
-            } else if (oe.fallback_kind == ORELSE_RETURN_VAL) {
-                self.lowerReturn(ReturnStmt { .value = oe.fallback, .span = oe.span })
-            } else if (oe.fallback_kind == ORELSE_BREAK_VAL) {
-                self.lowerBreak("", null_node)
-            } else if (oe.fallback_kind == ORELSE_CONTINUE_VAL) {
-                self.lowerContinue("")
+            switch (oe.fallback_kind) {
+                ORELSE_EXPR => {
+                    const fallback = self.lowerExprNode(oe.fallback)
+                    if (fallback != null_node) {
+                        fb.emitStoreLocal(result_local, fallback, oe.span)
+                    }
+                },
+                ORELSE_RETURN_VOID => {
+                    self.lowerReturn(ReturnStmt { .value = null_node, .span = oe.span })
+                },
+                ORELSE_RETURN_VAL => {
+                    self.lowerReturn(ReturnStmt { .value = oe.fallback, .span = oe.span })
+                },
+                ORELSE_BREAK_VAL => {
+                    self.lowerBreak("", null_node)
+                },
+                ORELSE_CONTINUE_VAL => {
+                    self.lowerContinue("")
+                },
+                else => {},
             }
 
             if (fb.needsTerminator()) {
@@ -6703,14 +6718,20 @@ struct Lowerer {
         fb.emitJump(merge_block, oe.span)
 
         fb.setBlock(else_block)
-        if (oe.fallback_kind == ORELSE_RETURN_VOID) {
-            self.lowerReturn(ReturnStmt { .value = null_node, .span = oe.span })
-        } else if (oe.fallback_kind == ORELSE_RETURN_VAL) {
-            self.lowerReturn(ReturnStmt { .value = oe.fallback, .span = oe.span })
-        } else if (oe.fallback_kind == ORELSE_BREAK_VAL) {
-            self.lowerBreak("", null_node)
-        } else if (oe.fallback_kind == ORELSE_CONTINUE_VAL) {
-            self.lowerContinue("")
+        switch (oe.fallback_kind) {
+            ORELSE_RETURN_VOID => {
+                self.lowerReturn(ReturnStmt { .value = null_node, .span = oe.span })
+            },
+            ORELSE_RETURN_VAL => {
+                self.lowerReturn(ReturnStmt { .value = oe.fallback, .span = oe.span })
+            },
+            ORELSE_BREAK_VAL => {
+                self.lowerBreak("", null_node)
+            },
+            ORELSE_CONTINUE_VAL => {
+                self.lowerContinue("")
+            },
+            else => {},
         }
 
         if (fb.needsTerminator()) {
@@ -7448,30 +7469,36 @@ struct Lowerer {
                 i = i - 1
                 const cleanup = self.cleanup_stack.get(i)
 
-                if (cleanup.kind == CLEANUP_RELEASE) {
-                    // ARC release — reload current value (may have been reassigned)
-                    var value = cleanup.value
-                    if (cleanup.local_idx >= 0) {
-                        value = fb.emitLoadLocal(cleanup.local_idx, cleanup.type_idx, Span.zero())
-                    }
-                    var args: List(int) = .{}
-                    args.append(value)
-                    fb.emitCall("release", args, false, VOID, Span.zero())
-                } else if (cleanup.kind == CLEANUP_DEFER) {
-                    self.lowerExprNode(cleanup.value)
-                } else if (cleanup.kind == CLEANUP_ERRDEFER) {
-                    // errdefer only fires on error exit paths
-                    if (is_error_path) {
-                        self.lowerExprNode(cleanup.value)
-                    }
-                } else if (cleanup.kind == CLEANUP_SCOPE_DESTROY) {
-                    if (cleanup.local_idx >= 0 and cleanup.func_name != "") {
-                        const ptr_type = self.types.makePointer(cleanup.type_idx)
-                        const self_addr = fb.emitAddrLocal(cleanup.local_idx, ptr_type, Span.zero())
+                switch (cleanup.kind) {
+                    CLEANUP_RELEASE => {
+                        // ARC release — reload current value (may have been reassigned)
+                        var value = cleanup.value
+                        if (cleanup.local_idx >= 0) {
+                            value = fb.emitLoadLocal(cleanup.local_idx, cleanup.type_idx, Span.zero())
+                        }
                         var args: List(int) = .{}
-                        args.append(self_addr)
-                        fb.emitCall(cleanup.func_name, args, false, VOID, Span.zero())
-                    }
+                        args.append(value)
+                        fb.emitCall("release", args, false, VOID, Span.zero())
+                    },
+                    CLEANUP_DEFER => {
+                        self.lowerExprNode(cleanup.value)
+                    },
+                    CLEANUP_ERRDEFER => {
+                        // errdefer only fires on error exit paths
+                        if (is_error_path) {
+                            self.lowerExprNode(cleanup.value)
+                        }
+                    },
+                    CLEANUP_SCOPE_DESTROY => {
+                        if (cleanup.local_idx >= 0 and cleanup.func_name != "") {
+                            const ptr_type = self.types.makePointer(cleanup.type_idx)
+                            const self_addr = fb.emitAddrLocal(cleanup.local_idx, ptr_type, Span.zero())
+                            var args: List(int) = .{}
+                            args.append(self_addr)
+                            fb.emitCall(cleanup.func_name, args, false, VOID, Span.zero())
+                        }
+                    },
+                    else => {},
                 }
             }
 
