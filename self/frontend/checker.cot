@@ -1951,29 +1951,39 @@ struct Checker {
         var field_name = ""
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.field_access |fa| => { base_n = fa.base; field_name = fa.field }, else => {} }, else => {} }
 
-        // Zig Sema pattern: .variant shorthand in switch — resolve from switch subject type
+        // .variant shorthand in switch
         if (base_n == null_node) {
-            if (self.current_switch_enum_type != invalid_type) {
-                const enum_info = self.types.get(self.current_switch_enum_type)
-                if (enum_info.tag == TAG_ENUM) {
-                    const et = switch (enum_info) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
-                    for vi in 0..et.variant_count {
-                        const ev = et.getVariant(vi)
-                        if (ev.name == field_name) {
-                            return self.current_switch_enum_type
-                        }
-                    }
-                    const sw_suggestion = self.findSimilarVariant(field_name, self.current_switch_enum_type)
-                    if (sw_suggestion) |ss| {
-                        self.reportError(idx, ErrorCode.e306, "undefined variant '${field_name}', did you mean '${ss}'?")
-                    } else {
-                        self.reportError(idx, ErrorCode.e306, "undefined variant")
-                    }
-                }
-            }
-            return invalid_type
+            return self.checkVariantShorthand(idx, field_name)
         }
 
+        return self.checkFieldAccessInner(idx, base_n, field_name)
+    }
+
+    /// .variant shorthand resolution for switch arms.
+    fn checkVariantShorthand(idx: int, field_name: string) int {
+        if (self.current_switch_enum_type != invalid_type) {
+            const enum_info = self.types.get(self.current_switch_enum_type)
+            if (enum_info.tag == TAG_ENUM) {
+                const et = switch (enum_info) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+                for vi in 0..et.variant_count {
+                    const ev = et.getVariant(vi)
+                    if (ev.name == field_name) {
+                        return self.current_switch_enum_type
+                    }
+                }
+                const sw_suggestion = self.findSimilarVariant(field_name, self.current_switch_enum_type)
+                if (sw_suggestion) |ss| {
+                    self.reportError(idx, ErrorCode.e306, "undefined variant '${field_name}', did you mean '${ss}'?")
+                } else {
+                    self.reportError(idx, ErrorCode.e306, "undefined variant")
+                }
+            }
+        }
+        return invalid_type
+    }
+
+    /// Main field access logic, split from checkFieldAccess to keep stack frames small.
+    fn checkFieldAccessInner(idx: int, base_n: int, field_name: string) int {
         // Nested type namespace: TypeName.Nested
         if (nodeTag(self.ast, base_n) == "ident") {
             var base_name = ""
@@ -1989,7 +1999,6 @@ struct Checker {
             if (sym_idx >= 0) {
                 const sym = self.getSymbol(sym_idx)
                 if (sym.is_func) {
-                    // Store base type in expr_types for method call resolution
                     const base_type_idx = self.types.lookupByName(base_name)
                     if (base_type_idx >= 0) {
                         self.expr_types.set(base_n, base_type_idx)
@@ -2011,98 +2020,20 @@ struct Checker {
 
         // Struct field access
         if (base.tag == TAG_STRUCT) {
-            const st = switch (base) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
-            // Search fields
-            for fi in 0..st.field_count {
-                const sf = st.getField(fi)
-                if (sf.name == field_name) {
-                    return sf.type_idx
-                }
-            }
-            // Check methods
-            const mi = self.types.lookupMethod(st.name, field_name)
-            if (mi >= 0) {
-                return self.types.getMethodInfo(mi).func_type
-            }
-            // "did you mean" for fields (Zig ref: checker.zig:3838-3897)
-            const field_suggestion = self.findSimilarField(field_name, base_type)
-            if (field_suggestion) |fs| {
-                self.reportError(idx, ErrorCode.e306, "no field '${field_name}', did you mean '${fs}'?")
-            } else {
-                self.reportError(idx, ErrorCode.e306, "field not found")
-            }
-            return invalid_type
+            return self.checkStructFieldAccess(idx, base_type, field_name)
         }
 
         // Enum variant access
         if (base.tag == TAG_ENUM) {
-            const et = switch (base) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
-            for vi in 0..et.variant_count {
-                const ev = et.getVariant(vi)
-                if (ev.name == field_name) {
-                    return base_type
-                }
-            }
-            // Check methods
-            const mi = self.types.lookupMethod(et.name, field_name)
-            if (mi >= 0) {
-                return self.types.getMethodInfo(mi).func_type
-            }
-            const variant_suggestion = self.findSimilarVariant(field_name, base_type)
-            if (variant_suggestion) |vs| {
-                self.reportError(idx, ErrorCode.e306, "no variant '${field_name}', did you mean '${vs}'?")
-            } else {
-                self.reportError(idx, ErrorCode.e306, "field not found")
-            }
-            return invalid_type
+            return self.checkEnumFieldAccess(idx, base_type, field_name)
         }
 
         // Union variant access
         if (base.tag == TAG_UNION) {
-            const ut = switch (base) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
-            if (field_name == "tag") { return I64 }
-            // Check if base is a type name (constructor) vs value (extraction)
-            var is_type_access = false
-            if (nodeTag(self.ast, base_n) == "ident") {
-                var ident_name = ""
-                switch (self.ast.getNode(base_n)) { Node.expr |be| => switch (be) { Expr.ident |bid| => { ident_name = bid.name }, else => {} }, else => {} }
-                const sym_idx = self.lookupSymbol(ident_name)
-                if (sym_idx >= 0) {
-                    if (self.getSymbol(sym_idx).is_type) {
-                        is_type_access = true
-                    }
-                }
-            }
-            for vi in 0..ut.variant_count {
-                const uv = ut.getVariant(vi)
-                if (uv.name == field_name) {
-                    if (uv.payload_type == invalid_type) { return base_type }
-                    if (!is_type_access) {
-                        // Payload extraction: r.Ok returns the payload type
-                        return uv.payload_type
-                    }
-                    // Constructor: Result.Ok returns function type (payload → union)
-                    const ctor_params = alloc(0, @sizeOf(FuncParam))
-                    const fp = @intToPtr(*FuncParam, ctor_params)
-                    fp.name = "payload"
-                    fp.type_idx = uv.payload_type
-                    return self.types.add(Type.func(FuncType {
-                        param_count: 1,
-                        params: ctor_params,
-                        return_type: base_type,
-                    }))
-                }
-            }
-            const union_suggestion = self.findSimilarVariant(field_name, base_type)
-            if (union_suggestion) |us| {
-                self.reportError(idx, ErrorCode.e306, "no variant '${field_name}', did you mean '${us}'?")
-            } else {
-                self.reportError(idx, ErrorCode.e306, "field not found")
-            }
-            return invalid_type
+            return self.checkUnionFieldAccess(idx, base_n, base_type, field_name)
         }
 
-        // Slice fields: .ptr, .len (Zig ref: checker.zig:2395-2437)
+        // Slice fields: .ptr, .len
         if (base.tag == TAG_SLICE or base_type == STRING) {
             if (field_name == "len") { return I64 }
             if (field_name == "ptr") {
@@ -2110,9 +2041,8 @@ struct Checker {
                     const sl = switch (base) { Type.slice |s| => s, else => SliceType { elem: invalid_type } }
                     return self.types.makePointer(sl.elem)
                 }
-                return self.types.makePointer(U8)  // string ptr → *u8
+                return self.types.makePointer(U8)
             }
-            // String methods
             if (base_type == STRING) {
                 const mi = self.types.lookupMethod("string", field_name)
                 if (mi >= 0) {
@@ -2121,45 +2051,153 @@ struct Checker {
             }
         }
 
-        // Map methods — return proper func types (Zig ref: checker.zig:2395-2437)
+        // Map methods
         if (base.tag == TAG_MAP) {
-            const mt = switch (base) { Type.map_type |m| => m, else => CotMapType { key: 0, value: 0 } }
-            if (field_name == "get") {
-                var params: List(FuncParam) = .{}
-                params.append(FuncParam { name: "key", type_idx: mt.key })
-                return self.types.makeFunc(params, mt.value)
-            }
-            if (field_name == "set") {
-                var params: List(FuncParam) = .{}
-                params.append(FuncParam { name: "key", type_idx: mt.key })
-                params.append(FuncParam { name: "value", type_idx: mt.value })
-                return self.types.makeFunc(params, VOID)
-            }
-            if (field_name == "has") {
-                var params: List(FuncParam) = .{}
-                params.append(FuncParam { name: "key", type_idx: mt.key })
-                return self.types.makeFunc(params, BOOL)
-            }
-            if (field_name == "count") { return I64 }
-            if (field_name == "capacity") { return I64 }
+            return self.checkMapFieldAccess(idx, base_type, field_name)
         }
-        // List methods — return proper func types
+        // List methods
         if (base.tag == TAG_LIST) {
-            const lt = switch (base) { Type.list_type |l| => l, else => CotListType { elem: 0 } }
-            if (field_name == "get") {
-                var params: List(FuncParam) = .{}
-                params.append(FuncParam { name: "index", type_idx: I64 })
-                return self.types.makeFunc(params, lt.elem)
-            }
-            if (field_name == "append") {
-                var params: List(FuncParam) = .{}
-                params.append(FuncParam { name: "value", type_idx: lt.elem })
-                return self.types.makeFunc(params, VOID)
-            }
-            if (field_name == "len" or field_name == "count") { return I64 }
+            return self.checkListFieldAccess(idx, base_type, field_name)
         }
 
         self.reportError(idx, ErrorCode.e306, "field not found")
+        return invalid_type
+    }
+
+    /// Enum variant/method access.
+    fn checkEnumFieldAccess(idx: int, base_type: int, field_name: string) int {
+        const base = self.types.get(base_type)
+        const et = switch (base) { Type.enum_type |e| => e, else => EnumType { name: "", variant_count: 0, variants: 0, backing_type: 0 } }
+        for vi in 0..et.variant_count {
+            const ev = et.getVariant(vi)
+            if (ev.name == field_name) {
+                return base_type
+            }
+        }
+        const mi = self.types.lookupMethod(et.name, field_name)
+        if (mi >= 0) {
+            return self.types.getMethodInfo(mi).func_type
+        }
+        const variant_suggestion = self.findSimilarVariant(field_name, base_type)
+        if (variant_suggestion) |vs| {
+            self.reportError(idx, ErrorCode.e306, "no variant '${field_name}', did you mean '${vs}'?")
+        } else {
+            self.reportError(idx, ErrorCode.e306, "field not found")
+        }
+        return invalid_type
+    }
+
+    /// Union variant/constructor access.
+    fn checkUnionFieldAccess(idx: int, base_n: int, base_type: int, field_name: string) int {
+        const base = self.types.get(base_type)
+        const ut = switch (base) { Type.union_type |u| => u, else => UnionType { name: "", variant_count: 0, variants: 0, tag_type: 0 } }
+        if (field_name == "tag") { return I64 }
+        var is_type_access = false
+        if (nodeTag(self.ast, base_n) == "ident") {
+            var ident_name = ""
+            switch (self.ast.getNode(base_n)) { Node.expr |be| => switch (be) { Expr.ident |bid| => { ident_name = bid.name }, else => {} }, else => {} }
+            const sym_idx = self.lookupSymbol(ident_name)
+            if (sym_idx >= 0) {
+                if (self.getSymbol(sym_idx).is_type) {
+                    is_type_access = true
+                }
+            }
+        }
+        for vi in 0..ut.variant_count {
+            const uv = ut.getVariant(vi)
+            if (uv.name == field_name) {
+                if (uv.payload_type == invalid_type) { return base_type }
+                if (!is_type_access) {
+                    return uv.payload_type
+                }
+                const ctor_params = alloc(0, @sizeOf(FuncParam))
+                const fp = @intToPtr(*FuncParam, ctor_params)
+                fp.name = "payload"
+                fp.type_idx = uv.payload_type
+                return self.types.add(Type.func(FuncType {
+                    param_count: 1,
+                    params: ctor_params,
+                    return_type: base_type,
+                }))
+            }
+        }
+        const union_suggestion = self.findSimilarVariant(field_name, base_type)
+        if (union_suggestion) |us| {
+            self.reportError(idx, ErrorCode.e306, "no variant '${field_name}', did you mean '${us}'?")
+        } else {
+            self.reportError(idx, ErrorCode.e306, "field not found")
+        }
+        return invalid_type
+    }
+
+    /// Map field/method access.
+    fn checkMapFieldAccess(idx: int, base_type: int, field_name: string) int {
+        const base = self.types.get(base_type)
+        const mt = switch (base) { Type.map_type |m| => m, else => CotMapType { key: 0, value: 0 } }
+        if (field_name == "get") {
+            var params: List(FuncParam) = .{}
+            params.append(FuncParam { name: "key", type_idx: mt.key })
+            return self.types.makeFunc(params, mt.value)
+        }
+        if (field_name == "set") {
+            var params: List(FuncParam) = .{}
+            params.append(FuncParam { name: "key", type_idx: mt.key })
+            params.append(FuncParam { name: "value", type_idx: mt.value })
+            return self.types.makeFunc(params, VOID)
+        }
+        if (field_name == "has") {
+            var params: List(FuncParam) = .{}
+            params.append(FuncParam { name: "key", type_idx: mt.key })
+            return self.types.makeFunc(params, BOOL)
+        }
+        if (field_name == "count") { return I64 }
+        if (field_name == "capacity") { return I64 }
+        self.reportError(idx, ErrorCode.e306, "field not found")
+        return invalid_type
+    }
+
+    /// List field/method access.
+    fn checkListFieldAccess(idx: int, base_type: int, field_name: string) int {
+        const base = self.types.get(base_type)
+        const lt = switch (base) { Type.list_type |l| => l, else => CotListType { elem: 0 } }
+        if (field_name == "get") {
+            var params: List(FuncParam) = .{}
+            params.append(FuncParam { name: "index", type_idx: I64 })
+            return self.types.makeFunc(params, lt.elem)
+        }
+        if (field_name == "append") {
+            var params: List(FuncParam) = .{}
+            params.append(FuncParam { name: "value", type_idx: lt.elem })
+            return self.types.makeFunc(params, VOID)
+        }
+        if (field_name == "len" or field_name == "count") { return I64 }
+        self.reportError(idx, ErrorCode.e306, "field not found")
+        return invalid_type
+    }
+
+    /// Extracted from checkFieldAccess to avoid stack frame corruption in large functions.
+    fn checkStructFieldAccess(idx: int, base_type: int, field_name: string) int {
+        const base = self.types.get(base_type)
+        const st = switch (base) { Type.struct_type |s| => s, else => StructType { name: "", field_count: 0, fields: 0, size: 0, alignment: 0, layout: 0 } }
+        // Search fields
+        for fi in 0..st.field_count {
+            const sf = st.getField(fi)
+            if (sf.name == field_name) {
+                return sf.type_idx
+            }
+        }
+        // Check methods
+        const mi = self.types.lookupMethod(st.name, field_name)
+        if (mi >= 0) {
+            return self.types.getMethodInfo(mi).func_type
+        }
+        // "did you mean" for fields
+        const field_suggestion = self.findSimilarField(field_name, base_type)
+        if (field_suggestion) |fs| {
+            self.reportError(idx, ErrorCode.e306, "no field '${field_name}', did you mean '${fs}'?")
+        } else {
+            self.reportError(idx, ErrorCode.e306, "field not found")
+        }
         return invalid_type
     }
 
