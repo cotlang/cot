@@ -662,113 +662,129 @@ struct FuncGen {
     fn ssaGenValue(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
 
-        if (v.op == SsaOp.wasm_lowered_static_call) {
-            // Get operands onto stack
-            for ai in 0..v.args.count {
-                self.getValue64(v.args.get(ai))
-            }
-            // Resolve function index from name via func_indices map
-            // Zig reference: gen.zig lines 943-954
-            const func_idx = self.resolveCallIndex(v)
-            self.code.emitCall(func_idx)
-            if (v.uses > 0) {
-                self.setReg(val_idx)
-            }
-        } else if (v.op == SsaOp.wasm_call) {
-            for ai in 0..v.args.count {
-                self.getValue64(v.args.get(ai))
-            }
-            const func_idx_2 = self.resolveCallIndex(v)
-            self.code.emitCall(func_idx_2)
-            if (v.uses > 0) {
-                self.setReg(val_idx)
-            }
-        } else if (v.op == SsaOp.wasm_lowered_retain or v.op == SsaOp.wasm_lowered_release) {
-            // ARC ops are native-only — trap if they appear in Wasm pipeline
-            self.code.emitUnreachable()
-        } else if (v.op == SsaOp.wasm_i64_store) {
-            self.getValue32(v.args.get(0))  // address
-            self.getValue64(v.args.get(1))  // value
-            self.code.emitI64Store(3, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_store) {
-            self.getValue32(v.args.get(0))
-            self.getValue32(v.args.get(1))
-            self.code.emitI32Store(2, v.aux_int)
-        } else if (v.op == SsaOp.wasm_drop) {
-            self.getValue64(v.args.get(0))
-            self.code.emitDrop()
-        } else if (v.op == SsaOp.wasm_return) {
-            if (v.args.count > 0) {
+        switch (v.op) {
+            SsaOp.wasm_lowered_static_call => {
+                // Get operands onto stack
+                for ai in 0..v.args.count {
+                    self.getValue64(v.args.get(ai))
+                }
+                // Resolve function index from name via func_indices map
+                // Zig reference: gen.zig lines 943-954
+                const func_idx = self.resolveCallIndex(v)
+                self.code.emitCall(func_idx)
+                if (v.uses > 0) {
+                    self.setReg(val_idx)
+                }
+            },
+            SsaOp.wasm_call => {
+                for ai in 0..v.args.count {
+                    self.getValue64(v.args.get(ai))
+                }
+                const func_idx_2 = self.resolveCallIndex(v)
+                self.code.emitCall(func_idx_2)
+                if (v.uses > 0) {
+                    self.setReg(val_idx)
+                }
+            },
+            SsaOp.wasm_lowered_retain, SsaOp.wasm_lowered_release => {
+                // ARC ops are native-only — trap if they appear in Wasm pipeline
+                self.code.emitUnreachable()
+            },
+            SsaOp.wasm_i64_store => {
+                self.getValue32(v.args.get(0))  // address
+                self.getValue64(v.args.get(1))  // value
+                self.code.emitI64Store(3, v.aux_int)
+            },
+            SsaOp.wasm_i32_store => {
+                self.getValue32(v.args.get(0))
+                self.getValue32(v.args.get(1))
+                self.code.emitI32Store(2, v.aux_int)
+            },
+            SsaOp.wasm_drop => {
                 self.getValue64(v.args.get(0))
-            }
-            self.code.emitReturn()
-        } else if (v.op == SsaOp.wasm_local_set) {
-            self.getValue64(v.args.get(0))
-            self.code.emitLocalSet(v.aux_int)
-        } else if (v.op == SsaOp.arg) {
-            // Args register their local mapping (already done in allocateLocals)
-        } else if (v.op == SsaOp.wasm_unreachable) {
-            self.code.emitUnreachable()
-        } else if (v.op == SsaOp.wasm_lowered_move) {
-            self.getValue32(v.args.get(0))  // dest addr
-            self.getValue32(v.args.get(1))  // src addr
-            self.code.emitI32Const(v.aux_int)  // size
-            self.code.emitMemoryCopy()
-        } else if (v.op == SsaOp.wasm_gc_struct_new) {
-            // WasmGC struct.new: push all field values, emit struct.new $typeidx
-            for ai in 0..v.args.count {
-                self.getValue64(v.args.get(ai))
-            }
-            const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
-            var gc_type_idx = 0
-            if (self.gc_struct_name_map) |m| {
-                if (m.contains(type_name)) { gc_type_idx = m.get(type_name) }
-            }
-            self.code.emitGcStructNew(gc_type_idx)
-            if (v.uses > 0) { self.setReg(val_idx) }
-        } else if (v.op == SsaOp.wasm_gc_struct_get) {
-            // WasmGC struct.get: push ref, emit struct.get $typeidx $fieldidx
-            self.getValue64(v.args.get(0))
-            const type_name2 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
-            var gc_type_idx2 = 0
-            if (self.gc_struct_name_map) |m| {
-                if (m.contains(type_name2)) { gc_type_idx2 = m.get(type_name2) }
-            }
-            self.code.emitGcStructGet(gc_type_idx2, v.aux_int)
-            if (v.uses > 0) { self.setReg(val_idx) }
-        } else if (v.op == SsaOp.wasm_gc_struct_set) {
-            // WasmGC struct.set: push ref + value, emit struct.set $typeidx $fieldidx
-            self.getValue64(v.args.get(0))  // ref
-            self.getValue64(v.args.get(1))  // value
-            const type_name3 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
-            var gc_type_idx3 = 0
-            if (self.gc_struct_name_map) |m| {
-                if (m.contains(type_name3)) { gc_type_idx3 = m.get(type_name3) }
-            }
-            self.code.emitGcStructSet(gc_type_idx3, v.aux_int)
-            // No result (void)
-        } else if (v.op == SsaOp.phi or v.op == SsaOp.init_mem or v.op == SsaOp.fwd_ref) {
-            // Memory ops, control flow — handled elsewhere
-        } else {
-            // Default: generate value and store to local
-            if (v.uses == 0 and !self.hasSideEffects(v)) {
-                return
-            }
-            if (self.isCmp(v)) {
-                return
-            }
-            if (self.isRematerializable(v)) {
-                return
-            }
-            if (self.isOnWasmStack(val_idx)) {
-                return
-            }
+                self.code.emitDrop()
+            },
+            SsaOp.wasm_return => {
+                if (v.args.count > 0) {
+                    self.getValue64(v.args.get(0))
+                }
+                self.code.emitReturn()
+            },
+            SsaOp.wasm_local_set => {
+                self.getValue64(v.args.get(0))
+                self.code.emitLocalSet(v.aux_int)
+            },
+            SsaOp.arg => {
+                // Args register their local mapping (already done in allocateLocals)
+            },
+            SsaOp.wasm_unreachable => {
+                self.code.emitUnreachable()
+            },
+            SsaOp.wasm_lowered_move => {
+                self.getValue32(v.args.get(0))  // dest addr
+                self.getValue32(v.args.get(1))  // src addr
+                self.code.emitI32Const(v.aux_int)  // size
+                self.code.emitMemoryCopy()
+            },
+            SsaOp.wasm_gc_struct_new => {
+                // WasmGC struct.new: push all field values, emit struct.new $typeidx
+                for ai in 0..v.args.count {
+                    self.getValue64(v.args.get(ai))
+                }
+                const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+                var gc_type_idx = 0
+                if (self.gc_struct_name_map) |m| {
+                    if (m.contains(type_name)) { gc_type_idx = m.get(type_name) }
+                }
+                self.code.emitGcStructNew(gc_type_idx)
+                if (v.uses > 0) { self.setReg(val_idx) }
+            },
+            SsaOp.wasm_gc_struct_get => {
+                // WasmGC struct.get: push ref, emit struct.get $typeidx $fieldidx
+                self.getValue64(v.args.get(0))
+                const type_name2 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+                var gc_type_idx2 = 0
+                if (self.gc_struct_name_map) |m| {
+                    if (m.contains(type_name2)) { gc_type_idx2 = m.get(type_name2) }
+                }
+                self.code.emitGcStructGet(gc_type_idx2, v.aux_int)
+                if (v.uses > 0) { self.setReg(val_idx) }
+            },
+            SsaOp.wasm_gc_struct_set => {
+                // WasmGC struct.set: push ref + value, emit struct.set $typeidx $fieldidx
+                self.getValue64(v.args.get(0))  // ref
+                self.getValue64(v.args.get(1))  // value
+                const type_name3 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+                var gc_type_idx3 = 0
+                if (self.gc_struct_name_map) |m| {
+                    if (m.contains(type_name3)) { gc_type_idx3 = m.get(type_name3) }
+                }
+                self.code.emitGcStructSet(gc_type_idx3, v.aux_int)
+            },
+            SsaOp.phi, SsaOp.init_mem, SsaOp.fwd_ref => {
+                // Memory ops, control flow — handled elsewhere
+            },
+            else => {
+                // Default: generate value and store to local
+                if (v.uses == 0 and !self.hasSideEffects(v)) {
+                    return
+                }
+                if (self.isCmp(v)) {
+                    return
+                }
+                if (self.isRematerializable(v)) {
+                    return
+                }
+                if (self.isOnWasmStack(val_idx)) {
+                    return
+                }
 
-            self.ssaGenValueOnStack(val_idx)
+                self.ssaGenValueOnStack(val_idx)
 
-            if (v.uses > 0 and !self.isRematerializable(v)) {
-                self.setReg(val_idx)
-            }
+                if (v.uses > 0 and !self.isRematerializable(v)) {
+                    self.setReg(val_idx)
+                }
+            },
         }
     }
 
@@ -780,582 +796,750 @@ struct FuncGen {
     fn ssaGenValueOnStack(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
 
-        if (v.op == SsaOp.wasm_i64_const or v.op == SsaOp.const_int or v.op == SsaOp.const_64) {
-            self.code.emitI64Const(v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_const or v.op == SsaOp.const_32) {
-            self.code.emitI32Const(v.aux_int)
-        } else if (v.op == SsaOp.wasm_f64_const or v.op == SsaOp.const_float) {
-            // f64 const: aux_int holds bit pattern, need to write raw bytes
-            self.code.emitF64Const(@bitCast(float, v.aux_int))
-        } else if (v.op == SsaOp.local_addr) {
-            // SP-relative addressing: SP + (slot * 8)
-            const offset = v.aux_int * 8
-            self.code.emitGlobalGet(SP_GLOBAL)
-            if (offset != 0) {
-                self.code.emitI32Const(offset)
-                self.code.emitI32Add()
-            }
-        } else if (v.op == SsaOp.global_addr) {
-            const addr = GLOBAL_BASE + (v.aux_int * 8)
-            self.code.emitI32Const(addr)
-        } else if (v.op == SsaOp.off_ptr) {
-            // off_ptr: base + constant offset
-            self.getValue32(v.args.get(0))
-            if (v.aux_int != 0) {
+        switch (v.op) {
+            SsaOp.wasm_i64_const, SsaOp.const_int, SsaOp.const_64 => {
+                self.code.emitI64Const(v.aux_int)
+            },
+            SsaOp.wasm_i32_const, SsaOp.const_32 => {
                 self.code.emitI32Const(v.aux_int)
+            },
+            SsaOp.wasm_f64_const, SsaOp.const_float => {
+                // f64 const: aux_int holds bit pattern, need to write raw bytes
+                self.code.emitF64Const(@bitCast(float, v.aux_int))
+            },
+            SsaOp.local_addr => {
+                // SP-relative addressing: SP + (slot * 8)
+                const offset = v.aux_int * 8
+                self.code.emitGlobalGet(SP_GLOBAL)
+                if (offset != 0) {
+                    self.code.emitI32Const(offset)
+                    self.code.emitI32Add()
+                }
+            },
+            SsaOp.global_addr => {
+                const addr = GLOBAL_BASE + (v.aux_int * 8)
+                self.code.emitI32Const(addr)
+            },
+            SsaOp.off_ptr => {
+                // off_ptr: base + constant offset
+                self.getValue32(v.args.get(0))
+                if (v.aux_int != 0) {
+                    self.code.emitI32Const(v.aux_int)
+                    self.code.emitI32Add()
+                }
+            },
+            SsaOp.add_ptr => {
+                self.getValue32(v.args.get(0))
+                self.getValue32(v.args.get(1))
                 self.code.emitI32Add()
-            }
-        } else if (v.op == SsaOp.add_ptr) {
-            self.getValue32(v.args.get(0))
-            self.getValue32(v.args.get(1))
-            self.code.emitI32Add()
-        } else if (v.op == SsaOp.sub_ptr) {
-            self.getValue32(v.args.get(0))
-            self.getValue32(v.args.get(1))
-            self.code.emitI32Sub()
-        } else if (v.op == SsaOp.wasm_i64_load) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64Load(3, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_load) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI32Load(2, v.aux_int)
-        } else if (v.op == SsaOp.wasm_local_get) {
-            self.code.emitLocalGet(v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_add) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Add()
-        } else if (v.op == SsaOp.wasm_i64_sub) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Sub()
-        } else if (v.op == SsaOp.wasm_i64_mul) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Mul()
-        } else if (v.op == SsaOp.wasm_i64_div_s) {
-            self.emitBinaryI64(v)
-            self.code.emitI64DivS()
-        } else if (v.op == SsaOp.wasm_i64_rem_s) {
-            self.emitBinaryI64(v)
-            self.code.emitI64RemS()
-        } else if (v.op == SsaOp.wasm_i64_and) {
-            self.emitBinaryI64(v)
-            self.code.emitI64And()
-        } else if (v.op == SsaOp.wasm_i64_or) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Or()
-        } else if (v.op == SsaOp.wasm_i64_xor) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Xor()
-        } else if (v.op == SsaOp.wasm_i64_shl) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Shl()
-        } else if (v.op == SsaOp.wasm_i64_shr_s) {
-            self.emitBinaryI64(v)
-            self.code.emitI64ShrS()
-        } else if (v.op == SsaOp.wasm_i64_eq) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Eq()
-        } else if (v.op == SsaOp.wasm_i64_ne) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Ne()
-        } else if (v.op == SsaOp.wasm_i64_lt_s) {
-            self.emitBinaryI64(v)
-            self.code.emitI64LtS()
-        } else if (v.op == SsaOp.wasm_i64_le_s) {
-            self.emitBinaryI64(v)
-            self.code.emitI64LeS()
-        } else if (v.op == SsaOp.wasm_i64_gt_s) {
-            self.emitBinaryI64(v)
-            self.code.emitI64GtS()
-        } else if (v.op == SsaOp.wasm_i64_ge_s) {
-            self.emitBinaryI64(v)
-            self.code.emitI64GeS()
-        } else if (v.op == SsaOp.wasm_i64_lt_u) {
-            self.emitBinaryI64(v)
-            self.code.emitI64LtU()
-        } else if (v.op == SsaOp.wasm_i64_le_u) {
-            self.emitBinaryI64(v)
-            self.code.emitI64LeU()
-        } else if (v.op == SsaOp.wasm_i64_gt_u) {
-            self.emitBinaryI64(v)
-            self.code.emitI64GtU()
-        } else if (v.op == SsaOp.wasm_i64_ge_u) {
-            self.emitBinaryI64(v)
-            self.code.emitI64GeU()
-        } else if (v.op == SsaOp.wasm_i64_eqz) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64Eqz()
-        } else if (v.op == SsaOp.wasm_f64_add) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Add()
-        } else if (v.op == SsaOp.wasm_f64_sub) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Sub()
-        } else if (v.op == SsaOp.wasm_f64_mul) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Mul()
-        } else if (v.op == SsaOp.wasm_f64_div) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Div()
-        } else if (v.op == SsaOp.wasm_f64_neg) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64Neg()
-        } else if (v.op == SsaOp.wasm_f64_eq) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Eq()
-        } else if (v.op == SsaOp.wasm_f64_ne) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Ne()
-        } else if (v.op == SsaOp.wasm_f64_lt) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Lt()
-        } else if (v.op == SsaOp.wasm_f64_le) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Le()
-        } else if (v.op == SsaOp.wasm_f64_gt) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Gt()
-        } else if (v.op == SsaOp.wasm_f64_ge) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Ge()
-        } else if (v.op == SsaOp.bounds_check) {
-            if (v.args.count >= 2) {
-                self.getValue64(v.args.get(0))  // index
-                self.getValue64(v.args.get(1))  // length
-                self.code.emitI64GeU()          // idx >= len (unsigned)
+            },
+            SsaOp.sub_ptr => {
+                self.getValue32(v.args.get(0))
+                self.getValue32(v.args.get(1))
+                self.code.emitI32Sub()
+            },
+            SsaOp.wasm_i64_load => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64Load(3, v.aux_int)
+            },
+            SsaOp.wasm_i32_load => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI32Load(2, v.aux_int)
+            },
+            SsaOp.wasm_local_get => {
+                self.code.emitLocalGet(v.aux_int)
+            },
+            SsaOp.wasm_i64_add => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Add()
+            },
+            SsaOp.wasm_i64_sub => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Sub()
+            },
+            SsaOp.wasm_i64_mul => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Mul()
+            },
+            SsaOp.wasm_i64_div_s => {
+                self.emitBinaryI64(v)
+                self.code.emitI64DivS()
+            },
+            SsaOp.wasm_i64_rem_s => {
+                self.emitBinaryI64(v)
+                self.code.emitI64RemS()
+            },
+            SsaOp.wasm_i64_and => {
+                self.emitBinaryI64(v)
+                self.code.emitI64And()
+            },
+            SsaOp.wasm_i64_or => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Or()
+            },
+            SsaOp.wasm_i64_xor => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Xor()
+            },
+            SsaOp.wasm_i64_shl => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Shl()
+            },
+            SsaOp.wasm_i64_shr_s => {
+                self.emitBinaryI64(v)
+                self.code.emitI64ShrS()
+            },
+            SsaOp.wasm_i64_eq => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Eq()
+            },
+            SsaOp.wasm_i64_ne => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Ne()
+            },
+            SsaOp.wasm_i64_lt_s => {
+                self.emitBinaryI64(v)
+                self.code.emitI64LtS()
+            },
+            SsaOp.wasm_i64_le_s => {
+                self.emitBinaryI64(v)
+                self.code.emitI64LeS()
+            },
+            SsaOp.wasm_i64_gt_s => {
+                self.emitBinaryI64(v)
+                self.code.emitI64GtS()
+            },
+            SsaOp.wasm_i64_ge_s => {
+                self.emitBinaryI64(v)
+                self.code.emitI64GeS()
+            },
+            SsaOp.wasm_i64_lt_u => {
+                self.emitBinaryI64(v)
+                self.code.emitI64LtU()
+            },
+            SsaOp.wasm_i64_le_u => {
+                self.emitBinaryI64(v)
+                self.code.emitI64LeU()
+            },
+            SsaOp.wasm_i64_gt_u => {
+                self.emitBinaryI64(v)
+                self.code.emitI64GtU()
+            },
+            SsaOp.wasm_i64_ge_u => {
+                self.emitBinaryI64(v)
+                self.code.emitI64GeU()
+            },
+            SsaOp.wasm_i64_eqz => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64Eqz()
+            },
+            SsaOp.wasm_f64_add => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Add()
+            },
+            SsaOp.wasm_f64_sub => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Sub()
+            },
+            SsaOp.wasm_f64_mul => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Mul()
+            },
+            SsaOp.wasm_f64_div => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Div()
+            },
+            SsaOp.wasm_f64_neg => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64Neg()
+            },
+            SsaOp.wasm_f64_eq => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Eq()
+            },
+            SsaOp.wasm_f64_ne => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Ne()
+            },
+            SsaOp.wasm_f64_lt => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Lt()
+            },
+            SsaOp.wasm_f64_le => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Le()
+            },
+            SsaOp.wasm_f64_gt => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Gt()
+            },
+            SsaOp.wasm_f64_ge => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Ge()
+            },
+            SsaOp.bounds_check => {
+                if (v.args.count >= 2) {
+                    self.getValue64(v.args.get(0))  // index
+                    self.getValue64(v.args.get(1))  // length
+                    self.code.emitI64GeU()          // idx >= len (unsigned)
+                    self.code.emitIf(BLOCK_VOID)
+                    self.code.emitUnreachable()     // trap
+                    self.code.emitEnd()
+                }
+            },
+            SsaOp.copy => {
+                self.getValue64(v.args.get(0))
+            },
+            SsaOp.slice_ptr => {
+                self.emitSlicePtr(v)
+            },
+            SsaOp.slice_len => {
+                self.emitSliceLen(v)
+            },
+            SsaOp.string_ptr => {
+                self.emitStringPtr(v)
+            },
+            SsaOp.string_len => {
+                self.emitStringLen(v)
+            },
+            SsaOp.string_make, SsaOp.slice_make => {
+                if (v.args.count >= 2) {
+                    self.getValue32(v.args.get(0))  // ptr
+                    self.getValue64(v.args.get(1))  // len
+                }
+            },
+            SsaOp.const_string => {
+                self.code.emitI32Const(v.aux_int)
+            },
+
+            // === i64 missing ops ===
+            SsaOp.wasm_i64_shr_u => {
+                self.emitBinaryI64(v)
+                self.code.emitI64ShrU()
+            },
+            SsaOp.wasm_i64_div_u => {
+                self.emitBinaryI64(v)
+                self.code.emitI64DivU()
+            },
+            SsaOp.wasm_i64_rem_u => {
+                self.emitBinaryI64(v)
+                self.code.emitI64RemU()
+            },
+            SsaOp.wasm_i64_rotl => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Rotl()
+            },
+            SsaOp.wasm_i64_rotr => {
+                self.emitBinaryI64(v)
+                self.code.emitI64Rotr()
+            },
+            SsaOp.wasm_i64_clz => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64Clz()
+            },
+            SsaOp.wasm_i64_ctz => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64Ctz()
+            },
+            SsaOp.wasm_i64_popcnt => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64Popcnt()
+            },
+
+            // === i32 arithmetic (wrap-operate-extend pattern from Zig gen.zig) ===
+            SsaOp.wasm_i32_add => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Add()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_sub => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Sub()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_mul => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Mul()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_div_s => {
+                self.emitBinaryI32(v)
+                self.code.emitI32DivS()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_div_u => {
+                self.emitBinaryI32(v)
+                self.code.emitI32DivU()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_rem_s => {
+                self.emitBinaryI32(v)
+                self.code.emitI32RemS()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_rem_u => {
+                self.emitBinaryI32(v)
+                self.code.emitI32RemU()
+                self.code.emitI64ExtendI32U()
+            },
+
+            // === i32 bitwise (Zig gen.zig lines 474-521) ===
+            SsaOp.wasm_i32_and => {
+                self.emitBinaryI32(v)
+                self.code.emitI32And()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_or => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Or()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_xor => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Xor()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_shl => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Shl()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_shr_s => {
+                self.emitBinaryI32(v)
+                self.code.emitI32ShrS()
+                self.code.emitI64ExtendI32S()
+            },
+            SsaOp.wasm_i32_shr_u => {
+                self.emitBinaryI32(v)
+                self.code.emitI32ShrU()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_rotl => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Rotl()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_rotr => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Rotr()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_clz => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32WrapI64()
+                self.code.emitI32Clz()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_ctz => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32WrapI64()
+                self.code.emitI32Ctz()
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i32_popcnt => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32WrapI64()
+                self.code.emitI32Popcnt()
+                self.code.emitI64ExtendI32U()
+            },
+
+            // === i32 comparisons (produce i32, no extend needed) ===
+            SsaOp.wasm_i32_eqz => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32WrapI64()
+                self.code.emitI32Eqz()
+            },
+            SsaOp.wasm_i32_eq => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Eq()
+            },
+            SsaOp.wasm_i32_ne => {
+                self.emitBinaryI32(v)
+                self.code.emitI32Ne()
+            },
+            SsaOp.wasm_i32_lt_s => {
+                self.emitBinaryI32(v)
+                self.code.emitI32LtS()
+            },
+            SsaOp.wasm_i32_lt_u => {
+                self.emitBinaryI32(v)
+                self.code.emitI32LtU()
+            },
+            SsaOp.wasm_i32_gt_s => {
+                self.emitBinaryI32(v)
+                self.code.emitI32GtS()
+            },
+            SsaOp.wasm_i32_gt_u => {
+                self.emitBinaryI32(v)
+                self.code.emitI32GtU()
+            },
+            SsaOp.wasm_i32_le_s => {
+                self.emitBinaryI32(v)
+                self.code.emitI32LeS()
+            },
+            SsaOp.wasm_i32_le_u => {
+                self.emitBinaryI32(v)
+                self.code.emitI32LeU()
+            },
+            SsaOp.wasm_i32_ge_s => {
+                self.emitBinaryI32(v)
+                self.code.emitI32GeS()
+            },
+            SsaOp.wasm_i32_ge_u => {
+                self.emitBinaryI32(v)
+                self.code.emitI32GeU()
+            },
+
+            // === f32 arithmetic ===
+            SsaOp.wasm_f32_add => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Add()
+            },
+            SsaOp.wasm_f32_sub => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Sub()
+            },
+            SsaOp.wasm_f32_mul => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Mul()
+            },
+            SsaOp.wasm_f32_div => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Div()
+            },
+            SsaOp.wasm_f32_neg => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32Neg()
+            },
+            SsaOp.wasm_f32_abs => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32Abs()
+            },
+            SsaOp.wasm_f32_sqrt => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32Sqrt()
+            },
+            SsaOp.wasm_f32_ceil => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32Ceil()
+            },
+            SsaOp.wasm_f32_floor => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32Floor()
+            },
+            SsaOp.wasm_f32_trunc => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32Trunc()
+            },
+            SsaOp.wasm_f32_nearest => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32Nearest()
+            },
+            SsaOp.wasm_f32_min => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Min()
+            },
+            SsaOp.wasm_f32_max => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Max()
+            },
+            SsaOp.wasm_f32_copysign => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Copysign()
+            },
+
+            // === f32 comparisons ===
+            SsaOp.wasm_f32_eq => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Eq()
+            },
+            SsaOp.wasm_f32_ne => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Ne()
+            },
+            SsaOp.wasm_f32_lt => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Lt()
+            },
+            SsaOp.wasm_f32_gt => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Gt()
+            },
+            SsaOp.wasm_f32_le => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Le()
+            },
+            SsaOp.wasm_f32_ge => {
+                self.emitBinaryI64(v)
+                self.code.emitF32Ge()
+            },
+
+            // === f64 extra ops ===
+            SsaOp.wasm_f64_abs => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64Abs()
+            },
+            SsaOp.wasm_f64_sqrt => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64Sqrt()
+            },
+            SsaOp.wasm_f64_ceil => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64Ceil()
+            },
+            SsaOp.wasm_f64_floor => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64Floor()
+            },
+            SsaOp.wasm_f64_trunc => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64Trunc()
+            },
+            SsaOp.wasm_f64_nearest => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64Nearest()
+            },
+            SsaOp.wasm_f64_min => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Min()
+            },
+            SsaOp.wasm_f64_max => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Max()
+            },
+            SsaOp.wasm_f64_copysign => {
+                self.emitBinaryI64(v)
+                self.code.emitF64Copysign()
+            },
+
+            // === Memory (i32) ===
+            SsaOp.wasm_i32_load8_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI32Load8S(0, v.aux_int)
+            },
+            SsaOp.wasm_i32_load8_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI32Load8U(0, v.aux_int)
+            },
+            SsaOp.wasm_i32_load16_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI32Load16S(1, v.aux_int)
+            },
+            SsaOp.wasm_i32_load16_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI32Load16U(1, v.aux_int)
+            },
+            SsaOp.wasm_i32_store8 => {
+                self.getValue32(v.args.get(0))
+                self.getValue32(v.args.get(1))
+                self.code.emitI32Store8(0, v.aux_int)
+            },
+            SsaOp.wasm_i32_store16 => {
+                self.getValue32(v.args.get(0))
+                self.getValue32(v.args.get(1))
+                self.code.emitI32Store16(1, v.aux_int)
+            },
+
+            // === Memory (float) ===
+            SsaOp.wasm_f32_load => {
+                self.getValue32(v.args.get(0))
+                self.code.emitF32Load(2, v.aux_int)
+            },
+            SsaOp.wasm_f32_store => {
+                self.getValue32(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.code.emitF32Store(2, v.aux_int)
+            },
+            SsaOp.wasm_f64_load => {
+                self.getValue32(v.args.get(0))
+                self.code.emitF64Load(3, v.aux_int)
+            },
+            SsaOp.wasm_f64_store => {
+                self.getValue32(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.code.emitF64Store(3, v.aux_int)
+            },
+
+            // === i64 memory missing ===
+            SsaOp.wasm_i64_load8_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64Load8S(0, v.aux_int)
+            },
+            SsaOp.wasm_i64_load8_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64Load8U(0, v.aux_int)
+            },
+            SsaOp.wasm_i64_load16_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64Load16S(1, v.aux_int)
+            },
+            SsaOp.wasm_i64_load16_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64Load16U(1, v.aux_int)
+            },
+            SsaOp.wasm_i64_load32_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64Load32S(2, v.aux_int)
+            },
+            SsaOp.wasm_i64_load32_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64Load32U(2, v.aux_int)
+            },
+            SsaOp.wasm_i64_store8 => {
+                self.getValue32(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.code.emitI64Store8(0, v.aux_int)
+            },
+            SsaOp.wasm_i64_store16 => {
+                self.getValue32(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.code.emitI64Store16(1, v.aux_int)
+            },
+            SsaOp.wasm_i64_store32 => {
+                self.getValue32(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.code.emitI64Store32(2, v.aux_int)
+            },
+
+            // === Conversions ===
+            SsaOp.wasm_i32_wrap_i64 => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32WrapI64()
+            },
+            SsaOp.wasm_i64_extend_i32_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64ExtendI32S()
+            },
+            SsaOp.wasm_i64_extend_i32_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI64ExtendI32U()
+            },
+            SsaOp.wasm_i64_trunc_f64_s => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64TruncF64S()
+            },
+            SsaOp.wasm_i64_trunc_f64_u => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64TruncF64U()
+            },
+            SsaOp.wasm_i64_trunc_f32_s => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64TruncF32S()
+            },
+            SsaOp.wasm_i64_trunc_f32_u => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64TruncF32U()
+            },
+            SsaOp.wasm_i32_trunc_f64_s => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32TruncF64S()
+            },
+            SsaOp.wasm_i32_trunc_f64_u => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32TruncF64U()
+            },
+            SsaOp.wasm_i32_trunc_f32_s => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32TruncF32S()
+            },
+            SsaOp.wasm_i32_trunc_f32_u => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32TruncF32U()
+            },
+            SsaOp.wasm_f64_convert_i64_s => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64ConvertI64S()
+            },
+            SsaOp.wasm_f64_convert_i64_u => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64ConvertI64U()
+            },
+            SsaOp.wasm_f64_convert_i32_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitF64ConvertI32S()
+            },
+            SsaOp.wasm_f64_convert_i32_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitF64ConvertI32U()
+            },
+            SsaOp.wasm_f32_convert_i64_s => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32ConvertI64S()
+            },
+            SsaOp.wasm_f32_convert_i64_u => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32ConvertI64U()
+            },
+            SsaOp.wasm_f32_convert_i32_s => {
+                self.getValue32(v.args.get(0))
+                self.code.emitF32ConvertI32S()
+            },
+            SsaOp.wasm_f32_convert_i32_u => {
+                self.getValue32(v.args.get(0))
+                self.code.emitF32ConvertI32U()
+            },
+            SsaOp.wasm_f64_promote_f32 => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64PromoteF32()
+            },
+            SsaOp.wasm_f32_demote_f64 => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF32DemoteF64()
+            },
+            SsaOp.wasm_i64_reinterpret_f64 => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI64ReinterpretF64()
+            },
+            SsaOp.wasm_f64_reinterpret_i64 => {
+                self.getValue64(v.args.get(0))
+                self.code.emitF64ReinterpretI64()
+            },
+            SsaOp.wasm_i32_reinterpret_f32 => {
+                self.getValue64(v.args.get(0))
+                self.code.emitI32ReinterpretF32()
+            },
+            SsaOp.wasm_f32_reinterpret_i32 => {
+                self.getValue32(v.args.get(0))
+                self.code.emitF32ReinterpretI32()
+            },
+
+            // === Control flow ===
+            SsaOp.wasm_call_indirect => {
+                for ai in 0..v.args.count {
+                    self.getValue64(v.args.get(ai))
+                }
+                self.code.emitCallIndirect(v.aux_int, 0)
+            },
+            SsaOp.wasm_select => {
+                self.getValue64(v.args.get(0))
+                self.getValue64(v.args.get(1))
+                self.getValue32(v.args.get(2))
+                self.code.emitSelect()
+            },
+            SsaOp.wasm_nop => {
+                self.code.emitNop()
+            },
+
+            // === Lowered ops ===
+            SsaOp.wasm_lowered_zero => {
+                self.getValue32(v.args.get(0))  // dest addr
+                self.code.emitI32Const(0)
+                self.code.emitI32Const(v.aux_int)  // size
+                // memory.fill: 0xFC 0x0B <memory_idx>
+                self.code.buf.append(0xFC as u8)
+                self.code.buf.append(0x0B as u8)
+                self.code.buf.append(0x00 as u8)
+            },
+            SsaOp.wasm_lowered_nil_check => {
+                self.getValue32(v.args.get(0))
+                self.code.emitI32Eqz()
                 self.code.emitIf(BLOCK_VOID)
-                self.code.emitUnreachable()     // trap
+                self.code.emitUnreachable()
                 self.code.emitEnd()
-            }
-        } else if (v.op == SsaOp.copy) {
-            self.getValue64(v.args.get(0))
-        } else if (v.op == SsaOp.slice_ptr) {
-            self.emitSlicePtr(v)
-        } else if (v.op == SsaOp.slice_len) {
-            self.emitSliceLen(v)
-        } else if (v.op == SsaOp.string_ptr) {
-            self.emitStringPtr(v)
-        } else if (v.op == SsaOp.string_len) {
-            self.emitStringLen(v)
-        } else if (v.op == SsaOp.string_make or v.op == SsaOp.slice_make) {
-            if (v.args.count >= 2) {
-                self.getValue32(v.args.get(0))  // ptr
-                self.getValue64(v.args.get(1))  // len
-            }
-        } else if (v.op == SsaOp.const_string) {
-            self.code.emitI32Const(v.aux_int)
-
-        // === i64 missing ops ===
-        } else if (v.op == SsaOp.wasm_i64_shr_u) {
-            self.emitBinaryI64(v)
-            self.code.emitI64ShrU()
-        } else if (v.op == SsaOp.wasm_i64_div_u) {
-            self.emitBinaryI64(v)
-            self.code.emitI64DivU()
-        } else if (v.op == SsaOp.wasm_i64_rem_u) {
-            self.emitBinaryI64(v)
-            self.code.emitI64RemU()
-        } else if (v.op == SsaOp.wasm_i64_rotl) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Rotl()
-        } else if (v.op == SsaOp.wasm_i64_rotr) {
-            self.emitBinaryI64(v)
-            self.code.emitI64Rotr()
-        } else if (v.op == SsaOp.wasm_i64_clz) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64Clz()
-        } else if (v.op == SsaOp.wasm_i64_ctz) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64Ctz()
-        } else if (v.op == SsaOp.wasm_i64_popcnt) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64Popcnt()
-
-        // === i32 arithmetic (wrap-operate-extend pattern from Zig gen.zig) ===
-        } else if (v.op == SsaOp.wasm_i32_add) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Add()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_sub) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Sub()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_mul) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Mul()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_div_s) {
-            self.emitBinaryI32(v)
-            self.code.emitI32DivS()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_div_u) {
-            self.emitBinaryI32(v)
-            self.code.emitI32DivU()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_rem_s) {
-            self.emitBinaryI32(v)
-            self.code.emitI32RemS()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_rem_u) {
-            self.emitBinaryI32(v)
-            self.code.emitI32RemU()
-            self.code.emitI64ExtendI32U()
-
-        // === i32 bitwise (Zig gen.zig lines 474-521) ===
-        } else if (v.op == SsaOp.wasm_i32_and) {
-            self.emitBinaryI32(v)
-            self.code.emitI32And()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_or) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Or()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_xor) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Xor()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_shl) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Shl()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_shr_s) {
-            self.emitBinaryI32(v)
-            self.code.emitI32ShrS()
-            self.code.emitI64ExtendI32S()
-        } else if (v.op == SsaOp.wasm_i32_shr_u) {
-            self.emitBinaryI32(v)
-            self.code.emitI32ShrU()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_rotl) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Rotl()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_rotr) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Rotr()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_clz) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32WrapI64()
-            self.code.emitI32Clz()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_ctz) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32WrapI64()
-            self.code.emitI32Ctz()
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i32_popcnt) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32WrapI64()
-            self.code.emitI32Popcnt()
-            self.code.emitI64ExtendI32U()
-
-        // === i32 comparisons (produce i32, no extend needed) ===
-        } else if (v.op == SsaOp.wasm_i32_eqz) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32WrapI64()
-            self.code.emitI32Eqz()
-        } else if (v.op == SsaOp.wasm_i32_eq) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Eq()
-        } else if (v.op == SsaOp.wasm_i32_ne) {
-            self.emitBinaryI32(v)
-            self.code.emitI32Ne()
-        } else if (v.op == SsaOp.wasm_i32_lt_s) {
-            self.emitBinaryI32(v)
-            self.code.emitI32LtS()
-        } else if (v.op == SsaOp.wasm_i32_lt_u) {
-            self.emitBinaryI32(v)
-            self.code.emitI32LtU()
-        } else if (v.op == SsaOp.wasm_i32_gt_s) {
-            self.emitBinaryI32(v)
-            self.code.emitI32GtS()
-        } else if (v.op == SsaOp.wasm_i32_gt_u) {
-            self.emitBinaryI32(v)
-            self.code.emitI32GtU()
-        } else if (v.op == SsaOp.wasm_i32_le_s) {
-            self.emitBinaryI32(v)
-            self.code.emitI32LeS()
-        } else if (v.op == SsaOp.wasm_i32_le_u) {
-            self.emitBinaryI32(v)
-            self.code.emitI32LeU()
-        } else if (v.op == SsaOp.wasm_i32_ge_s) {
-            self.emitBinaryI32(v)
-            self.code.emitI32GeS()
-        } else if (v.op == SsaOp.wasm_i32_ge_u) {
-            self.emitBinaryI32(v)
-            self.code.emitI32GeU()
-
-        // === f32 arithmetic ===
-        } else if (v.op == SsaOp.wasm_f32_add) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Add()
-        } else if (v.op == SsaOp.wasm_f32_sub) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Sub()
-        } else if (v.op == SsaOp.wasm_f32_mul) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Mul()
-        } else if (v.op == SsaOp.wasm_f32_div) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Div()
-        } else if (v.op == SsaOp.wasm_f32_neg) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32Neg()
-        } else if (v.op == SsaOp.wasm_f32_abs) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32Abs()
-        } else if (v.op == SsaOp.wasm_f32_sqrt) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32Sqrt()
-        } else if (v.op == SsaOp.wasm_f32_ceil) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32Ceil()
-        } else if (v.op == SsaOp.wasm_f32_floor) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32Floor()
-        } else if (v.op == SsaOp.wasm_f32_trunc) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32Trunc()
-        } else if (v.op == SsaOp.wasm_f32_nearest) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32Nearest()
-        } else if (v.op == SsaOp.wasm_f32_min) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Min()
-        } else if (v.op == SsaOp.wasm_f32_max) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Max()
-        } else if (v.op == SsaOp.wasm_f32_copysign) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Copysign()
-
-        // === f32 comparisons ===
-        } else if (v.op == SsaOp.wasm_f32_eq) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Eq()
-        } else if (v.op == SsaOp.wasm_f32_ne) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Ne()
-        } else if (v.op == SsaOp.wasm_f32_lt) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Lt()
-        } else if (v.op == SsaOp.wasm_f32_gt) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Gt()
-        } else if (v.op == SsaOp.wasm_f32_le) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Le()
-        } else if (v.op == SsaOp.wasm_f32_ge) {
-            self.emitBinaryI64(v)
-            self.code.emitF32Ge()
-
-        // === f64 extra ops ===
-        } else if (v.op == SsaOp.wasm_f64_abs) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64Abs()
-        } else if (v.op == SsaOp.wasm_f64_sqrt) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64Sqrt()
-        } else if (v.op == SsaOp.wasm_f64_ceil) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64Ceil()
-        } else if (v.op == SsaOp.wasm_f64_floor) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64Floor()
-        } else if (v.op == SsaOp.wasm_f64_trunc) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64Trunc()
-        } else if (v.op == SsaOp.wasm_f64_nearest) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64Nearest()
-        } else if (v.op == SsaOp.wasm_f64_min) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Min()
-        } else if (v.op == SsaOp.wasm_f64_max) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Max()
-        } else if (v.op == SsaOp.wasm_f64_copysign) {
-            self.emitBinaryI64(v)
-            self.code.emitF64Copysign()
-
-        // === Memory (i32) ===
-        } else if (v.op == SsaOp.wasm_i32_load8_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI32Load8S(0, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_load8_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI32Load8U(0, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_load16_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI32Load16S(1, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_load16_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI32Load16U(1, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_store8) {
-            self.getValue32(v.args.get(0))
-            self.getValue32(v.args.get(1))
-            self.code.emitI32Store8(0, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i32_store16) {
-            self.getValue32(v.args.get(0))
-            self.getValue32(v.args.get(1))
-            self.code.emitI32Store16(1, v.aux_int)
-
-        // === Memory (float) ===
-        } else if (v.op == SsaOp.wasm_f32_load) {
-            self.getValue32(v.args.get(0))
-            self.code.emitF32Load(2, v.aux_int)
-        } else if (v.op == SsaOp.wasm_f32_store) {
-            self.getValue32(v.args.get(0))
-            self.getValue64(v.args.get(1))
-            self.code.emitF32Store(2, v.aux_int)
-        } else if (v.op == SsaOp.wasm_f64_load) {
-            self.getValue32(v.args.get(0))
-            self.code.emitF64Load(3, v.aux_int)
-        } else if (v.op == SsaOp.wasm_f64_store) {
-            self.getValue32(v.args.get(0))
-            self.getValue64(v.args.get(1))
-            self.code.emitF64Store(3, v.aux_int)
-
-        // === i64 memory missing ===
-        } else if (v.op == SsaOp.wasm_i64_load8_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64Load8S(0, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_load8_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64Load8U(0, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_load16_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64Load16S(1, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_load16_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64Load16U(1, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_load32_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64Load32S(2, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_load32_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64Load32U(2, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_store8) {
-            self.getValue32(v.args.get(0))
-            self.getValue64(v.args.get(1))
-            self.code.emitI64Store8(0, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_store16) {
-            self.getValue32(v.args.get(0))
-            self.getValue64(v.args.get(1))
-            self.code.emitI64Store16(1, v.aux_int)
-        } else if (v.op == SsaOp.wasm_i64_store32) {
-            self.getValue32(v.args.get(0))
-            self.getValue64(v.args.get(1))
-            self.code.emitI64Store32(2, v.aux_int)
-
-        // === Conversions ===
-        } else if (v.op == SsaOp.wasm_i32_wrap_i64) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32WrapI64()
-        } else if (v.op == SsaOp.wasm_i64_extend_i32_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64ExtendI32S()
-        } else if (v.op == SsaOp.wasm_i64_extend_i32_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI64ExtendI32U()
-        } else if (v.op == SsaOp.wasm_i64_trunc_f64_s) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64TruncF64S()
-        } else if (v.op == SsaOp.wasm_i64_trunc_f64_u) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64TruncF64U()
-        } else if (v.op == SsaOp.wasm_i64_trunc_f32_s) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64TruncF32S()
-        } else if (v.op == SsaOp.wasm_i64_trunc_f32_u) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64TruncF32U()
-        } else if (v.op == SsaOp.wasm_i32_trunc_f64_s) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32TruncF64S()
-        } else if (v.op == SsaOp.wasm_i32_trunc_f64_u) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32TruncF64U()
-        } else if (v.op == SsaOp.wasm_i32_trunc_f32_s) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32TruncF32S()
-        } else if (v.op == SsaOp.wasm_i32_trunc_f32_u) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32TruncF32U()
-        } else if (v.op == SsaOp.wasm_f64_convert_i64_s) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64ConvertI64S()
-        } else if (v.op == SsaOp.wasm_f64_convert_i64_u) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64ConvertI64U()
-        } else if (v.op == SsaOp.wasm_f64_convert_i32_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitF64ConvertI32S()
-        } else if (v.op == SsaOp.wasm_f64_convert_i32_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitF64ConvertI32U()
-        } else if (v.op == SsaOp.wasm_f32_convert_i64_s) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32ConvertI64S()
-        } else if (v.op == SsaOp.wasm_f32_convert_i64_u) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32ConvertI64U()
-        } else if (v.op == SsaOp.wasm_f32_convert_i32_s) {
-            self.getValue32(v.args.get(0))
-            self.code.emitF32ConvertI32S()
-        } else if (v.op == SsaOp.wasm_f32_convert_i32_u) {
-            self.getValue32(v.args.get(0))
-            self.code.emitF32ConvertI32U()
-        } else if (v.op == SsaOp.wasm_f64_promote_f32) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64PromoteF32()
-        } else if (v.op == SsaOp.wasm_f32_demote_f64) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF32DemoteF64()
-        } else if (v.op == SsaOp.wasm_i64_reinterpret_f64) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI64ReinterpretF64()
-        } else if (v.op == SsaOp.wasm_f64_reinterpret_i64) {
-            self.getValue64(v.args.get(0))
-            self.code.emitF64ReinterpretI64()
-        } else if (v.op == SsaOp.wasm_i32_reinterpret_f32) {
-            self.getValue64(v.args.get(0))
-            self.code.emitI32ReinterpretF32()
-        } else if (v.op == SsaOp.wasm_f32_reinterpret_i32) {
-            self.getValue32(v.args.get(0))
-            self.code.emitF32ReinterpretI32()
-
-        // === Control flow ===
-        } else if (v.op == SsaOp.wasm_call_indirect) {
-            for ai in 0..v.args.count {
-                self.getValue64(v.args.get(ai))
-            }
-            self.code.emitCallIndirect(v.aux_int, 0)
-        } else if (v.op == SsaOp.wasm_select) {
-            self.getValue64(v.args.get(0))
-            self.getValue64(v.args.get(1))
-            self.getValue32(v.args.get(2))
-            self.code.emitSelect()
-        } else if (v.op == SsaOp.wasm_nop) {
-            self.code.emitNop()
-
-        // === Lowered ops ===
-        } else if (v.op == SsaOp.wasm_lowered_zero) {
-            self.getValue32(v.args.get(0))  // dest addr
-            self.code.emitI32Const(0)
-            self.code.emitI32Const(v.aux_int)  // size
-            // memory.fill: 0xFC 0x0B <memory_idx>
-            self.code.buf.append(0xFC as u8)
-            self.code.buf.append(0x0B as u8)
-            self.code.buf.append(0x00 as u8)
-        } else if (v.op == SsaOp.wasm_lowered_nil_check) {
-            self.getValue32(v.args.get(0))
-            self.code.emitI32Eqz()
-            self.code.emitIf(BLOCK_VOID)
-            self.code.emitUnreachable()
-            self.code.emitEnd()
+            },
+            // Unhandled ops silently ignored (like Zig's debug.log fallthrough)
+            else => {},
         }
-        // Unhandled ops silently ignored (like Zig's debug.log fallthrough)
     }
 
     // ========================================================================
