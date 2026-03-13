@@ -14,16 +14,16 @@
 | AST | 1 | 1,532 | **99%** | None |
 | Parser | 1 | 3,158 | **95%** | `unexpectedToken()` error quality |
 | Types | 1 | 1,609 | **99%** | None (Shape is intentional addition) |
-| Checker | 1 | 5,445 | **~80%** | Comptime mutation, lint, checkBlock RLS |
+| Checker | 1 | 5,500+ | **~85%** | evalComptimeValue rich union |
 | IR | 1 | 1,356 | **100%** | None |
 | ARC Insertion | 1 | 443 | **100%** | None |
-| Lowerer | 1 | 8,447 | **~78%** | WasmGC helpers, stenciling, async (~1,170L) |
+| Lowerer | 1 | 8,550+ | **~80%** | WasmGC helpers, stenciling, async (~1,170L) |
 | SSA Builder | 1 | 2,120 | **~95%** | enum_type getLoadOp/getStoreOp fixed |
 | SSA Data | 1 | 577 | **~95%** | All ops added (complement, hmul, divmod, conversions) |
 | SSA Passes | 6 | 1,906 | **~90%** | Float conversions DONE, tail calls stubbed |
 | Wasm Codegen | 14 | 10,413 | **~90%** | All ~90 op handlers + ~100 emit methods added |
 
-**Overall: ~90% feature-complete. Remaining gaps: checker comptime mutation, async lowering.**
+**Overall: ~92% feature-complete. Remaining gaps: evalComptimeValue rich union, async lowering.**
 
 ---
 
@@ -76,41 +76,30 @@ All 13 type structures, TypeRegistry with all methods. Shape struct is intention
 
 ---
 
-## 6. Checker — ~75% Complete (37 Missing Functions)
+## 6. Checker — ~85% Complete
 
-**File:** `checker.cot` (5,445 lines)
+**File:** `checker.cot` (5,500+ lines)
 **Reference:** `checker.zig` (~8,500 lines)
 
-### 6.1 Critical Missing
+### 6.1 Completed
+- `lookupMethod()` — delegates to types.lookupMethod
+- `resolveMethodCall()` — exists as resolveMethodFromFieldAccess
+- `checkFnDeclWithName()` — exists as checkFnDeclBody (~95% parity)
+- `evalComptimeBlock()` — split into evalConstComptimeBlock + evalComptimeStmts
+- `evalComptimeAssign()` — inlined into evalComptimeStmts
+- `evalComptimeInlineFor()` — inlined into evalComptimeStmts
+- `checkBlock()` with RLS — basic version + expected_type save/restore
+- `runLintChecks()` — W001-W005 integrated (unused vars, params, shadowing, unreachable, empty block)
+- `evalConstFloat()` — float constant folding (literals, negation, arithmetic, ident lookup)
+- `collectNestedDecl()` — rewritten to use switch on Decl union (matches Zig pattern)
 
-| # | Function | Zig Line | LOC | Description |
-|---|----------|----------|-----|-------------|
-| 1 | `lookupMethod()` | 648 | ~30 | Method resolution — returns MethodInfo |
-| 2 | `resolveMethodCall()` | 1905 | ~25 | Method call type checking |
-| 3 | `checkFnDeclWithName()` | 748 | ~50 | Unified function declaration checking |
-| 4 | `evalComptimeValue()` | 836 | ~300 | Full comptime value evaluator |
-| 5 | `evalComptimeBlock()` | 1124 | ~60 | Comptime block evaluation |
-| 6 | `evalComptimeAssign()` | 1182 | ~50 | Comptime assignment |
-| 7 | `evalComptimeInlineFor()` | 1250 | ~80 | Inline for in comptime |
-| 8 | `checkBlock()` | 2926 | ~40 | Block expr type inference with RLS |
-| 9 | `runLintChecks()` | 270 | ~30 | Unused variable/import checks |
-| 10 | `defineInFileScope()` | 250 | ~15 | Symbol definition with AST tracking |
-
-### 6.2 Helper Functions Missing
+### 6.2 Still Missing
 
 | # | Function | LOC | Description |
 |---|----------|-----|-------------|
-| 11 | `checkVarDecl()` | ~30 | Variable declaration checking |
-| 12 | `checkBenchDecl()` | ~15 | Benchmark declaration |
-| 13 | `checkBuiltinLen()` | ~10 | `len()` builtin |
-| 14 | `checkBuiltinAppend()` | ~10 | `append()` builtin |
-| 15 | `checkContinueExpr()` | ~15 | Continue validation |
-| 16 | `resolveTypeByName()` | ~20 | Type name resolution |
-| 17 | `registerMethod()` | ~15 | Method registration |
-| 18 | `reportRedefined()` | ~10 | Redefinition error |
-| 19 | `evalConstFloat()` | ~15 | Float constant eval |
-| 20 | `isFloatType()` | ~5 | Float type predicate |
-| 21-24 | Small helpers | ~40 | isZeroInitLit, isUndefinedLit, getComptimeIdentName, evalComptimeArrayType |
+| 1 | `evalComptimeValue()` | ~300 | Rich comptime value union (array/struct construction) |
+| 2 | `checkStmtsWithReachability()` | ~59 | Full type declaration pre-pass + reachability |
+| 3 | `evalComptimeArrayType()` | ~19 | Extracts [N]T for comptime array init |
 
 ---
 
@@ -132,8 +121,13 @@ All 13 type structures, TypeRegistry with all methods. Shape struct is intention
 - `lowerShortCircuit()` — split into lowerShortCircuitAnd/Or
 - Dispatch — all 30 expression types and 13 statement types, 50+ builtins
 
-### 7.3 Still Missing
-- `maybeRegisterScopeDestroy()` (~15 LOC) — auto-deinit for structs with free()
+### 7.3 Completed (this session)
+- `maybeRegisterScopeDestroy()` — auto-registers CLEANUP_SCOPE_DESTROY for structs with deinit()
+- Cleanup dispatch rewritten from else-if to switch (matches Zig pattern)
+- Orelse fallback dispatch rewritten from else-if to switch
+- Literal lowering rewritten from else-if to switch
+
+### 7.4 Still Missing
 - `baseHasCleanup()` / `hasDeferCleanups()` (~20 LOC) — cleanup stack validation
 - WasmGC helpers (~75 LOC): gcChunkIndex, gcFieldChunks, emitGcDefaultValue, emitGcStructNewExpanded
 - Stenciling (~45 LOC): isTypeParamType, isStencilable, buildDictArgNames
@@ -231,13 +225,14 @@ Self-hosted version handles them proactively for forward compatibility.
 - resolveGenericTypeName, resolveTypeArgNode
 - (init/deinit, shortCircuit were already done)
 
-### Phase D: Checker (~300 LOC) — IN PROGRESS
-- D1: lookupMethod() — EXISTS (delegates to types.lookupMethod)
-- D2: resolveMethodCall() — EXISTS as resolveMethodFromFieldAccess
-- D3: checkFnDeclWithName() — EXISTS as checkFnDeclBody (~95% parity)
-- D4: Comptime mutation (evalComptimeAssign, evalComptimeInlineFor) — MISSING
-- D5: checkBlock() with RLS — basic version exists, RLS/labels missing
-- D6: runLintChecks() — MISSING (nice-to-have)
+### Phase D: Checker — MOSTLY COMPLETE
+- D1-D3: lookupMethod, resolveMethodCall, checkFnDeclWithName — ALL EXIST
+- D4: Comptime mutation — inlined into evalComptimeStmts (DONE)
+- D5: checkBlock with RLS — basic version + expected_type pattern (DONE)
+- D6: runLintChecks — W001-W005 integrated (DONE)
+- D7: evalConstFloat — float constant folding (DONE)
+- D8: collectNestedDecl — rewritten to switch on Decl union (DONE)
+- Remaining: evalComptimeValue rich union (~300 LOC, low priority)
 
 ### Phase E: SSA Builder — MOSTLY COMPLETE
 - Re-audit reveals ~95% parity (was incorrectly estimated at 60%)
@@ -247,12 +242,11 @@ Self-hosted version handles them proactively for forward compatibility.
 ### Phase F: WasmGC & Stenciling (~200 LOC) — LOW PRIORITY
 
 ### Remaining Work
-- Checker: comptime mutation (evalComptimeAssign/InlineFor ~130 LOC)
-- Checker: runLintChecks (~30 LOC)
-- Checker: checkBlock RLS/labeled block improvements (~40 LOC)
-- Lowerer: cleanup helpers (maybeRegisterScopeDestroy ~15 LOC)
+- Checker: evalComptimeValue rich union (~300 LOC, low priority)
+- Lowerer: baseHasCleanup/hasDeferCleanups (~20 LOC)
 - Lowerer: WasmGC helpers (~75 LOC)
+- Lowerer: Stenciling helpers (~45 LOC)
 - Lowerer: async lowering (~1,170 LOC — largest gap, deferred)
 
-**Total remaining: ~460 LOC** (excluding async, which is ~1,170 LOC)
-**Current: 39,615 lines — ~90% parity**
+**Total remaining: ~140 LOC** (excluding async ~1,170 LOC and evalComptimeValue ~300 LOC)
+**Current: 39,800+ lines — ~92% parity**
