@@ -2,7 +2,7 @@
 
 **Date:** March 13, 2026 (full re-audit)
 **Scope:** File-by-file comparison of `self/` vs `compiler/` (Zig reference)
-**Total self-hosted:** 40,409 lines across 36 files, 398 tests pass
+**Total self-hosted:** 40,409 lines across 37 files, 398 tests pass
 
 ---
 
@@ -25,11 +25,16 @@
 | Source/Errors | 2 | 860 | **100%** | None |
 | Main/CLI | 1 | 788 | **100%** | None |
 
-**Overall: ~92% feature-complete. 40,409 lines across 36 files.**
+**Overall: ~92% feature-complete. 40,409 lines across 37 files.**
+
+**MILESTONE: Self-hosted compiler produces working Wasm binaries.**
+`selfcot build foo.cot -o foo.wasm` works for single-file programs.
+Full pipeline wired: parse → check → lower → SSA → 6 passes → wasm_gen → link → .wasm.
+All 9 CLI commands implemented: build, run, test, bench, check, parse, lex, init, help.
 
 **Remaining gaps by priority:**
-1. **HIGH**: Token keywords (5 LOC), lower_wasm pass gaps (~205 LOC), rewritedec gaps (~130 LOC)
-2. **MEDIUM**: Shape stenciling (~80 LOC), buildStructTypeWithLayout (~42 LOC), constants.cot (~500 LOC)
+1. **HIGH**: Multi-file build (imports not lowered, ~100 LOC in main.cot)
+2. **MEDIUM**: generateGlobalInits (~50 LOC), generateTestRunner (~80 LOC), wasm_types opcodes (~230 LOC)
 3. **LOW**: evalComptimeValue (~300 LOC), WasmGC helpers (~107 LOC)
 4. **DEFERRED**: async lowering (~1,170 LOC — v0.4)
 
@@ -204,20 +209,18 @@ The LOC gap is unused opcode variants not yet needed by the self-hosted compiler
 
 ## 11. Remaining Work (Prioritized)
 
-### Immediate (HIGH — enables dogfooding)
-All HIGH items completed:
-- Token: `kw_spawn`, `kw_select` added
-- Lowerer: `baseHasCleanup()`/`hasDeferCleanups()` added
-- Lowerer: `maybeRegisterScopeDestroy()` added
-- Checker: `buildStructTypeWithLayout()` fixed (correct packed/extern/auto layout)
-- Checker: `evalConstFloat()` added
-- SSA passes: rewritedec confirmed 100% complete
-- **Types: Shape stenciling struct** — COMPLETE (Shape, ArcKind, RegClass, fromType, eql, key)
-- **Lowerer: shape stenciling in lowerGenericFnInstanceInner** — COMPLETE (Tier 1+2)
-- **Lowerer: buildDictArgNames** — COMPLETE (comma-separated helper names)
-- **Lowerer: dict dispatch in binary ops and method calls** — COMPLETE
-- **Lowerer: dictOpName fixed** — uses Token values (was incorrectly using BinaryOp)
-- **SSA builder: dict_arg_names parsing** — updated to comma-separated format
+### Immediate (HIGH — enables self-compilation)
+1. **Multi-file build** (~100 LOC in main.cot): `selfcot build` only lowers top-level file. Must lower ALL imported files, merge IR, pass to generateWasmCode.
+2. **`generateGlobalInits()`** (~50 LOC in lower.cot): Emits `__cot_init_globals` for module-level variable initialization.
+3. **`generateTestRunner()`** (~80 LOC in lower.cot): Emits test harness for `selfcot test` to discover and run test blocks.
+
+### Completed (previously HIGH)
+- All 9 CLI commands: build, run, test, bench, check, parse, lex, init, help
+- Full Wasm pipeline: parse → check → lower → SSA → 6 passes → wasm_gen → link → .wasm
+- Token keywords, shape stenciling, dict dispatch, SSA builder, ARC insertion
+- 9 wasm_gen SSA op handlers: closures, globals, convert, addr, cond_select, return_call, metadata_addr
+- Saturation truncate + memory.fill CodeBuilder methods
+- enum(u8) sign extension fix in ssa_to_clif.zig
 
 ### Short-term (MEDIUM — improves completeness)
 1. wasm_types.cot: additional opcode variants (~230 LOC, as-needed)
@@ -228,5 +231,5 @@ All HIGH items completed:
 4. Lowerer: WasmGC helpers (~107 LOC)
 5. Lowerer: async lowering (~1,170 LOC)
 
-**Total remaining actionable: ~298 LOC** (items 1-2)
+**Critical path to self-compilation: ~230 LOC** (items 1-3 in HIGH)
 **Grand total including deferred: ~1,875 LOC** (all items)
