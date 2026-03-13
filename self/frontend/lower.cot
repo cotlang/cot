@@ -6637,6 +6637,42 @@ struct Lowerer {
     }
 
     /// Parse type args string into a list of ints.
+    /// Parse paired semicolon-separated type_args_str and param_names_str,
+    /// pushing type substitutions into the checker.
+    /// type_args_str: "5;17", param_names_str: "K;V" → pushTypeSub("K", 5), pushTypeSub("V", 17)
+    fn parseAndPushTypeSubs(type_args_str: string, param_names_str: string) void {
+        // Parse type arg values
+        var args: List(int) = .{}
+        var start = 0
+        for ci in 0..type_args_str.len {
+            if (type_args_str[ci] == 59) {
+                args.append(Lowerer.parseIntSubstr(type_args_str, start, ci))
+                start = ci + 1
+            }
+        }
+        if (start < type_args_str.len) {
+            args.append(Lowerer.parseIntSubstr(type_args_str, start, type_args_str.len))
+        }
+
+        // Parse param names and push substitutions
+        var arg_idx = 0
+        var nstart = 0
+        for ci in 0..param_names_str.len {
+            if (param_names_str[ci] == 59) {
+                if (arg_idx < args.count) {
+                    const name = substring(param_names_str, nstart, ci)
+                    self.chk.pushTypeSub(name, args.get(arg_idx))
+                }
+                arg_idx = arg_idx + 1
+                nstart = ci + 1
+            }
+        }
+        if (nstart < param_names_str.len and arg_idx < args.count) {
+            const name = substring(param_names_str, nstart, param_names_str.len)
+            self.chk.pushTypeSub(name, args.get(arg_idx))
+        }
+    }
+
     fn parseTypeArgsStr(type_args_str: string) List(int) {
         var result: List(int) = .{}
         var start = 0
@@ -7126,29 +7162,12 @@ struct Lowerer {
             return
         }
 
-        // Set up type substitution in checker from type_args_str
-        // type_args_str is "5" or "5;17" — semicolon-separated type indices
+        // Set up type substitution in checker from type_args_str + type_param_names
+        // Both are semicolon-separated: "5;17" and "K;V"
         const saved_sub_count = self.chk.type_sub_keys.count
         const type_args = inst.type_args_str
-        var arg_idx = 0
-        var start = 0
-        for ci in 0..type_args.len {
-            if (type_args[ci] == 59) {  // ';'
-                if (arg_idx < fn_d.type_params.count) {
-                    const param_name = fn_d.type_params.get(arg_idx)
-                    const type_idx = Lowerer.parseIntSubstr(type_args, start, ci)
-                    self.chk.pushTypeSub(param_name, type_idx)
-                }
-                arg_idx = arg_idx + 1
-                start = ci + 1
-            }
-        }
-        // Last (or only) type arg
-        if (start < type_args.len and arg_idx < fn_d.type_params.count) {
-            const param_name = fn_d.type_params.get(arg_idx)
-            const type_idx = Lowerer.parseIntSubstr(type_args, start, type_args.len)
-            self.chk.pushTypeSub(param_name, type_idx)
-        }
+        const param_names = inst.type_param_names
+        self.parseAndPushTypeSubs(type_args, param_names)
 
         // Shape stenciling: check if this instantiation can share code
         // Parse type args as integers for shape analysis
@@ -7212,6 +7231,10 @@ struct Lowerer {
         const saved_expr_types = self.chk.expr_types
         var fresh_types: Map(int, int) = .{}
         self.chk.expr_types = fresh_types
+
+        // Swap checker's AST to defining file for cross-file generic body checking
+        const saved_chk_ast = self.chk.ast
+        self.chk.ast = self.tree
 
         // Re-check the body with substitutions active
         self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
@@ -7293,10 +7316,11 @@ struct Lowerer {
         self.current_dict_params.count = 0
         self.builder.endFunc()
 
-        // Restore type substitution
+        // Restore type substitution, checker AST, and expr_types
         self.chk.type_sub_keys.count = saved_sub_count
         self.chk.type_sub_vals.count = saved_sub_count
         self.chk.expr_types = saved_expr_types
+        self.chk.ast = saved_chk_ast
         self.tree = saved_tree
     }
 

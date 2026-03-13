@@ -74,6 +74,19 @@ struct Symbol {
     }
 }
 
+/// Copy a string to a fresh heap buffer (prevents ARC use-after-free for escaping strings).
+fn copyString(s: string) string {
+    const len = @lenOf(s)
+    if (len == 0) { return "" }
+    const buf = alloc(0, len)
+    var i: i64 = 0
+    while (i < len) {
+        @intToPtr(*u8, buf + i).* = @intToPtr(*u8, @ptrOf(s) + i).*
+        i = i + 1
+    }
+    return @string(buf, len)
+}
+
 fn makeSymbol(name: string, type_idx: int, node: int, mutable: bool) Symbol {
     var sym = Symbol.base(name, type_idx, node, SYM_VARIABLE)
     sym.mutable = mutable
@@ -145,6 +158,7 @@ struct GenericInstInfo {
     concrete_name: string,    // synthesized name (cache key), e.g. "max(5)" or "List(5)_push"
     generic_node: int,        // NodeIndex of the original generic fn_decl/method
     type_args_str: string,    // serialized type args, e.g. "5" or "5;17"
+    type_param_names: string, // semicolon-separated type param names, e.g. "T" or "K;V"
     ast_ptr: int,             // @ptrToInt of defining file's *Ast
 
     fn getAst() *Ast {
@@ -3739,7 +3753,6 @@ struct Checker {
     fn resolveTypeExpr(idx: int) int {
         if (idx == null_node) { return invalid_type }
         const tag = nodeTag(self.ast, idx)
-
         if (tag == "builtin_call") { return self.resolveTypeOfExpr(idx) }
         if (tag == "ident") { return self.resolveNamedType(idx) }
         if (tag == "generic_instance") {
@@ -4041,7 +4054,7 @@ struct Checker {
 
     /// Register a generic instance so the lowerer can find it by concrete name.
     /// Zig: self.generics.generic_inst_by_name.put(name, inst)
-    fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), ast_ptr: int) void {
+    fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), type_param_names: List(string), ast_ptr: int) void {
         // Serialize type args: "5" or "5;17"
         var ta_str = ""
         for i in 0..type_args.count {
@@ -4051,13 +4064,29 @@ struct Checker {
                 ta_str = "${type_args.get(i)}"
             }
         }
+        // Serialize type param names: "T" or "K;V"
+        var tp_str = ""
+        for i in 0..type_param_names.count {
+            if (i > 0) {
+                tp_str = "${tp_str};${type_param_names.get(i)}"
+            } else {
+                tp_str = "${type_param_names.get(i)}"
+            }
+        }
+        // Manually copy strings to fresh heap buffers to avoid ARC use-after-free
+        const ta_copy = copyString(ta_str)
+        const tp_copy = copyString(tp_str)
+
         var inst = new GenericInstInfo {
             concrete_name: concrete_name,
             generic_node: generic_node,
-            type_args_str: ta_str,
+            type_args_str: ta_copy,
+            type_param_names: tp_copy,
             ast_ptr: ast_ptr,
         }
         retain(@ptrToInt(inst))
+        retain(@ptrOf(ta_copy))
+        retain(@ptrOf(tp_copy))
         self.generic_inst_by_name.set(concrete_name, @ptrToInt(inst))
     }
 
@@ -4137,8 +4166,9 @@ struct Checker {
         // Instantiate inferred impl methods (nested fn_decls in struct body)
         // Still using defining file's AST with active type substitution
         var sd_nested: List(int) = .{}
-        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested = sd.nested_decls }, else => {} }, else => {} }
-        self.instantiateNestedMethods(cache_key, sd_nested, resolved_args, info.ast_ptr)
+        var sd_type_params: List(string) = .{}
+        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested = sd.nested_decls; sd_type_params = sd.type_params }, else => {} }, else => {} }
+        self.instantiateNestedMethods(cache_key, sd_nested, resolved_args, sd_type_params, info.ast_ptr)
 
         // Restore substitution
         self.type_sub_keys.count = old_sub_count
@@ -4157,7 +4187,7 @@ struct Checker {
 
     /// Instantiate inferred impl methods (fn_decls nested in a generic struct body).
     /// Called during generic struct instantiation while defining file's AST is active.
-    fn instantiateNestedMethods(concrete_name: string, nested_decls: List(int), resolved_args: List(int), ast_ptr: int) void {
+    fn instantiateNestedMethods(concrete_name: string, nested_decls: List(int), resolved_args: List(int), type_param_names: List(string), ast_ptr: int) void {
         // Pass 1: Register all method signatures
         for ni in 0..nested_decls.count {
             const nested_idx = nested_decls.get(ni)
@@ -4198,8 +4228,16 @@ struct Checker {
                 source_tree: 0,
             })
 
-            // Register for lowerer
-            self.registerGenericInst(synth_name, nested_idx, resolved_args, ast_ptr)
+            // Register for lowerer — pass struct's type param names for methods
+            // (fn_decl.type_params is empty for struct methods; T comes from struct)
+            // Use fn's own type_params if it has any, otherwise struct's type_params
+            var fn_tp: List(string) = .{}
+            switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { fn_tp = f.type_params }, else => {} }, else => {} }
+            if (fn_tp.count > 0) {
+                self.registerGenericInst(synth_name, nested_idx, resolved_args, fn_tp, ast_ptr)
+            } else {
+                self.registerGenericInst(synth_name, nested_idx, resolved_args, type_param_names, ast_ptr)
+            }
         }
 
         // Pass 2: Skip body checking for now — bodies are checked on demand
@@ -4278,7 +4316,7 @@ struct Checker {
                 })
 
                 // Register for lowerer (Zig line 3537)
-                self.registerGenericInst(synth_name, method_idx, resolved_args, entry.ast_ptr)
+                self.registerGenericInst(synth_name, method_idx, resolved_args, impl_tp, entry.ast_ptr)
             }
 
             // Pass 2: Check all method bodies
@@ -4439,7 +4477,7 @@ struct Checker {
         release(@ptrToInt(saved_ast))
 
         // Register for lowerer: concrete_name → GenericInstInfo (Zig line 3672)
-        self.registerGenericInst(cache_key, fn_node, resolved_args, info.ast_ptr)
+        self.registerGenericInst(cache_key, fn_node, resolved_args, fn_tp, info.ast_ptr)
 
         return func_type
     }
@@ -4507,8 +4545,9 @@ struct Checker {
 
         // Instantiate inferred impl methods from struct body
         var sd_nested2: List(int) = .{}
-        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested2 = sd.nested_decls }, else => {} }, else => {} }
-        self.instantiateNestedMethods(cache_key, sd_nested2, resolved_args, info.ast_ptr)
+        var sd_tp2: List(string) = .{}
+        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested2 = sd.nested_decls; sd_tp2 = sd.type_params }, else => {} }, else => {} }
+        self.instantiateNestedMethods(cache_key, sd_nested2, resolved_args, sd_tp2, info.ast_ptr)
 
         self.type_sub_keys.count = old_sub_count
         self.type_sub_vals.count = old_sub_count
@@ -4586,8 +4625,9 @@ struct Checker {
 
         // Instantiate inferred impl methods from struct body
         var sd_nested3: List(int) = .{}
-        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested3 = sd.nested_decls }, else => {} }, else => {} }
-        self.instantiateNestedMethods(cache_key, sd_nested3, resolved_args, info.ast_ptr)
+        var sd_tp3: List(string) = .{}
+        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested3 = sd.nested_decls; sd_tp3 = sd.type_params }, else => {} }, else => {} }
+        self.instantiateNestedMethods(cache_key, sd_nested3, resolved_args, sd_tp3, info.ast_ptr)
 
         self.type_sub_keys.count = old_sub_count
         self.type_sub_vals.count = old_sub_count

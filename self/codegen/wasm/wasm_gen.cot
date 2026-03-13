@@ -432,6 +432,10 @@ struct GenState {
             SsaOp.wasm_local_get, SsaOp.wasm_local_set,
             SsaOp.wasm_drop, SsaOp.wasm_return, SsaOp.wasm_unreachable, SsaOp.wasm_nop,
             SsaOp.wasm_gc_struct_new, SsaOp.wasm_gc_struct_get, SsaOp.wasm_gc_struct_set,
+            SsaOp.wasm_gc_array_new, SsaOp.wasm_gc_array_new_default, SsaOp.wasm_gc_array_new_fixed,
+            SsaOp.wasm_gc_array_get, SsaOp.wasm_gc_array_set, SsaOp.wasm_gc_array_len, SsaOp.wasm_gc_array_copy,
+            SsaOp.wasm_gc_ref_test, SsaOp.wasm_gc_ref_cast, SsaOp.wasm_gc_br_on_cast,
+            SsaOp.wasm_gc_ref_null, SsaOp.wasm_gc_ref_is_null, SsaOp.wasm_gc_ref_eq,
             SsaOp.wasm_lowered_retain, SsaOp.wasm_lowered_release,
             SsaOp.const_string,
             SsaOp.init_mem, SsaOp.fwd_ref => { self.emitMiscOp(val_idx) },
@@ -1692,6 +1696,14 @@ struct GenState {
                 self.emitGcOp(val_idx)
             },
 
+            // WasmGC array/ref operations (infrastructure — codegen stubs)
+            SsaOp.wasm_gc_array_new, SsaOp.wasm_gc_array_new_default, SsaOp.wasm_gc_array_new_fixed,
+            SsaOp.wasm_gc_array_get, SsaOp.wasm_gc_array_set, SsaOp.wasm_gc_array_len, SsaOp.wasm_gc_array_copy,
+            SsaOp.wasm_gc_ref_test, SsaOp.wasm_gc_ref_cast, SsaOp.wasm_gc_br_on_cast,
+            SsaOp.wasm_gc_ref_null, SsaOp.wasm_gc_ref_is_null, SsaOp.wasm_gc_ref_eq => {
+                self.builder.append(As.@"unreachable")
+            },
+
             // Bounds check
             SsaOp.bounds_check => {
                 if (v.args.count >= 2) {
@@ -1872,7 +1884,8 @@ struct GenState {
             v.op == SsaOp.wasm_i32_store or v.op == SsaOp.wasm_i32_store8 or
             v.op == SsaOp.wasm_i32_store16 or
             v.op == SsaOp.wasm_f64_store or v.op == SsaOp.wasm_f32_store or
-            v.op == SsaOp.wasm_gc_struct_set) { return }
+            v.op == SsaOp.wasm_gc_struct_set or
+            v.op == SsaOp.wasm_gc_array_set or v.op == SsaOp.wasm_gc_array_copy) { return }
 
         // Compound return handling: calls returning string push 2 values
         const is_call = v.op == SsaOp.wasm_call or v.op == SsaOp.wasm_lowered_static_call
@@ -1891,8 +1904,10 @@ struct GenState {
         } else if (is_call and v.type_idx != VOID) {
             // Side-effect call with discarded non-void return: drop
             self.builder.append(As.drop)
-        } else if (v.op == SsaOp.wasm_gc_struct_new) {
-            // GC struct.new with uses=0: drop result
+        } else if (v.op == SsaOp.wasm_gc_struct_new or
+            v.op == SsaOp.wasm_gc_array_new or v.op == SsaOp.wasm_gc_array_new_default or
+            v.op == SsaOp.wasm_gc_array_new_fixed) {
+            // GC alloc with uses=0: drop result
             self.builder.append(As.drop)
         }
     }
@@ -1948,9 +1963,12 @@ struct GenState {
                     v.op == SsaOp.wasm_i32_store or v.op == SsaOp.wasm_i32_store8 or
                     v.op == SsaOp.wasm_i32_store16 or
                     v.op == SsaOp.wasm_f64_store or v.op == SsaOp.wasm_f32_store or
-                    v.op == SsaOp.wasm_gc_struct_set) { continue }
+                    v.op == SsaOp.wasm_gc_struct_set or
+                    v.op == SsaOp.wasm_gc_array_set or v.op == SsaOp.wasm_gc_array_copy) { continue }
                 if (isFloatType(v.type_idx)) { continue }
-                if (v.op == SsaOp.wasm_gc_struct_new) { continue }
+                if (v.op == SsaOp.wasm_gc_struct_new or
+                    v.op == SsaOp.wasm_gc_array_new or v.op == SsaOp.wasm_gc_array_new_default or
+                    v.op == SsaOp.wasm_gc_array_new_fixed) { continue }
 
                 const local_idx = self.next_local
                 self.next_local += 1
@@ -1995,7 +2013,10 @@ struct GenState {
                 const v = self.ssa_func.getValue(val_idx)
                 if (v.op == SsaOp.arg) { continue }
                 if (v.uses == 0) { continue }
-                if (v.op != SsaOp.wasm_gc_struct_new) { continue }
+                if (v.op != SsaOp.wasm_gc_struct_new and
+                    v.op != SsaOp.wasm_gc_array_new and
+                    v.op != SsaOp.wasm_gc_array_new_default and
+                    v.op != SsaOp.wasm_gc_array_new_fixed) { continue }
                 if (self.value_to_local.contains(val_idx)) { continue }
 
                 const local_idx = self.next_local
@@ -2123,6 +2144,8 @@ fn hasSideEffects(v: SsaValue) bool {
         SsaOp.wasm_call, SsaOp.wasm_call_indirect,
         SsaOp.wasm_lowered_retain, SsaOp.wasm_lowered_release,
         SsaOp.wasm_gc_struct_set,
+        SsaOp.wasm_gc_array_set, SsaOp.wasm_gc_array_copy,
+        SsaOp.wasm_gc_array_new, SsaOp.wasm_gc_array_new_default, SsaOp.wasm_gc_array_new_fixed,
         SsaOp.wasm_unreachable => true,
         else => false,
     }

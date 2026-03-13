@@ -436,6 +436,20 @@ struct SSABuilder {
             Data.gc_struct_new |gc| => self.convertGcStructNew(gc, node.type_idx),
             Data.gc_struct_get |gc| => self.convertGcStructGet(gc, node.type_idx),
             Data.gc_struct_set |gc| => self.convertGcStructSet(gc),
+            // WasmGC array operations (infrastructure stubs — not yet wired to lowerer)
+            Data.gc_array_new => null_value,
+            Data.gc_array_new_default => null_value,
+            Data.gc_array_new_fixed => null_value,
+            Data.gc_array_get => null_value,
+            Data.gc_array_set => null_value,
+            Data.gc_array_len => null_value,
+            Data.gc_array_copy => null_value,
+            // WasmGC reference operations (infrastructure stubs)
+            Data.gc_ref_null => null_value,
+            Data.gc_ref_is_null => null_value,
+            Data.gc_ref_eq => null_value,
+            Data.gc_ref_cast => null_value,
+            Data.gc_ref_test => null_value,
         }
 
         if (result != null_value) { self.node_values.set(node_idx, result) }

@@ -85,6 +85,13 @@ pub const GcStructType = struct {
     name: []const u8,
     field_count: u32,
     field_offset: u32, // index into gc_field_storage
+    super_type: ?u32 = null, // parent type index for subtyping (unions)
+};
+
+/// WasmGC array type definition
+pub const GcArrayType = struct {
+    name: []const u8,
+    elem_type: GcFieldType, // element type (reuse GcFieldType for encoding)
 };
 
 /// Host import definition (Go: hostImport in asm.go)
@@ -141,10 +148,14 @@ pub const Linker = struct {
     table_size: u32 = 0, // 0 means no table
     table_funcs: std.ArrayListUnmanaged(u32) = .{}, // Functions to put in table
 
-    // WasmGC struct types (type indices 0..N-1, before function types)
+    // WasmGC struct types (type indices 0..S-1)
     gc_struct_types: std.ArrayListUnmanaged(GcStructType) = .{},
     gc_field_storage: std.ArrayListUnmanaged(GcFieldType) = .{},
     gc_struct_name_map: std.StringHashMapUnmanaged(u32) = .{}, // struct name → gc type index
+
+    // WasmGC array types (type indices S..S+A-1, after structs, before function types)
+    gc_array_types: std.ArrayListUnmanaged(GcArrayType) = .{},
+    gc_array_name_map: std.StringHashMapUnmanaged(u32) = .{}, // array name → gc type index
 
     pub fn init(allocator: std.mem.Allocator) Linker {
         return .{ .allocator = allocator };
@@ -164,11 +175,13 @@ pub const Linker = struct {
         self.gc_struct_types.deinit(self.allocator);
         self.gc_field_storage.deinit(self.allocator);
         self.gc_struct_name_map.deinit(self.allocator);
+        self.gc_array_types.deinit(self.allocator);
+        self.gc_array_name_map.deinit(self.allocator);
     }
 
-    /// Get the number of GC struct types (used to offset function type indices)
+    /// Get the number of GC types (structs + arrays, used to offset function type indices)
     pub fn gcTypeCount(self: *const Linker) u32 {
-        return @intCast(self.gc_struct_types.items.len);
+        return @intCast(self.gc_struct_types.items.len + self.gc_array_types.items.len);
     }
 
     /// Convert a raw function type index to an adjusted index that accounts for
@@ -195,6 +208,26 @@ pub const Linker = struct {
             .field_offset = field_offset,
         });
         try self.gc_struct_name_map.put(self.allocator, type_name, type_idx);
+
+        return type_idx;
+    }
+
+    /// Add or find a GC array type, return its type index.
+    /// The type index is absolute (after struct types): S + array_index.
+    pub fn addGcArrayType(self: *Linker, type_name: []const u8, elem_type: GcFieldType) !u32 {
+        // Check if already registered
+        if (self.gc_array_name_map.get(type_name)) |idx| {
+            return idx;
+        }
+
+        // Array type index is after all struct types
+        const type_idx: u32 = @intCast(self.gc_struct_types.items.len + self.gc_array_types.items.len);
+
+        try self.gc_array_types.append(self.allocator, .{
+            .name = type_name,
+            .elem_type = elem_type,
+        });
+        try self.gc_array_name_map.put(self.allocator, type_name, type_idx);
 
         return type_idx;
     }
@@ -340,9 +373,10 @@ pub const Linker = struct {
         // GC struct types get indices 0..N-1, function types get N..N+M-1
         // ====================================================================
         {
-            const gc_count = self.gc_struct_types.items.len;
+            const gc_struct_count = self.gc_struct_types.items.len;
+            const gc_array_count = self.gc_array_types.items.len;
             const func_count = self.types.items.len;
-            const total_count = gc_count + func_count;
+            const total_count = gc_struct_count + gc_array_count + func_count;
 
             if (total_count > 0) {
                 var type_buf = std.ArrayListUnmanaged(u8){};
@@ -350,8 +384,14 @@ pub const Linker = struct {
 
                 try assemble.writeULEB128(self.allocator, &type_buf, total_count);
 
-                // Emit GC struct types first (indices 0..N-1)
+                // Emit GC struct types first (indices 0..S-1)
                 for (self.gc_struct_types.items) |st| {
+                    // If struct has a super type, wrap with sub/sub_final prefix
+                    if (st.super_type) |parent_idx| {
+                        try type_buf.append(self.allocator, c.GC_SUB_TYPE); // 0x50 (open subtype)
+                        try assemble.writeULEB128(self.allocator, &type_buf, @as(u64, 1)); // 1 parent
+                        try assemble.writeULEB128(self.allocator, &type_buf, parent_idx);
+                    }
                     try type_buf.append(self.allocator, c.GC_STRUCT_TYPE); // 0x5F
                     try assemble.writeULEB128(self.allocator, &type_buf, st.field_count);
                     const fields = self.gc_field_storage.items[st.field_offset .. st.field_offset + st.field_count];
@@ -365,6 +405,19 @@ pub const Linker = struct {
                         }
                         try type_buf.append(self.allocator, if (f.mutable) c.GC_FIELD_MUT else c.GC_FIELD_IMMUT);
                     }
+                }
+
+                // Emit GC array types (indices S..S+A-1)
+                for (self.gc_array_types.items) |at| {
+                    try type_buf.append(self.allocator, c.GC_ARRAY_TYPE); // 0x5E
+                    const elem = at.elem_type;
+                    if (elem.gc_ref) |gc_idx| {
+                        try type_buf.append(self.allocator, c.GC_REF_TYPE_NULL); // 0x63
+                        try assemble.writeULEB128(self.allocator, &type_buf, gc_idx);
+                    } else {
+                        try type_buf.append(self.allocator, @intFromEnum(elem.val_type));
+                    }
+                    try type_buf.append(self.allocator, if (elem.mutable) c.GC_FIELD_MUT else c.GC_FIELD_IMMUT);
                 }
 
                 // Emit function types (indices N..N+M-1)

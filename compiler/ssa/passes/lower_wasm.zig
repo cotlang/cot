@@ -287,6 +287,10 @@ fn lowerValue(v: *Value) bool {
         .wasm_lowered_retain, .wasm_lowered_release,
         // WasmGC ops (already Wasm-level, pass through)
         .wasm_gc_struct_new, .wasm_gc_struct_get, .wasm_gc_struct_set,
+        .wasm_gc_array_new, .wasm_gc_array_new_default, .wasm_gc_array_new_fixed,
+        .wasm_gc_array_get, .wasm_gc_array_set, .wasm_gc_array_len, .wasm_gc_array_copy,
+        .wasm_gc_ref_test, .wasm_gc_ref_cast, .wasm_gc_br_on_cast,
+        .wasm_gc_ref_null, .wasm_gc_ref_is_null, .wasm_gc_ref_eq,
         // Wasm->native AOT ops (used for native backend, not Wasm output)
         .sp, .store_sp,
         => null,

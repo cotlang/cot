@@ -79,6 +79,7 @@ pub fn generateFunc(
     metadata_offsets: ?*const StringOffsetMap,
     func_table_indices: ?*const std.StringHashMap(u32),
     gc_struct_name_map: ?*const std.StringHashMapUnmanaged(u32),
+    gc_array_name_map: ?*const std.StringHashMapUnmanaged(u32),
     type_reg: ?*const @import("../../frontend/types.zig").TypeRegistry,
 ) ![]u8 {
     debug.log(.codegen, "wasm: generateFunc '{s}'", .{ssa_func.name});
@@ -101,6 +102,9 @@ pub fn generateFunc(
     }
     if (gc_struct_name_map) |m| {
         gen_state.setGcStructNameMap(m);
+    }
+    if (gc_array_name_map) |m| {
+        gen_state.setGcArrayNameMap(m);
     }
     if (type_reg) |reg| {
         gen_state.setTypeReg(reg);

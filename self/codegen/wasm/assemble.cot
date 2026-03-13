@@ -445,6 +445,92 @@ fn encodeInstruction(w: *List(int), p: Prog, param_count: int) void {
         },
 
         // ====================================================================
+        // WasmGC array operations (0xFB prefix)
+        // ====================================================================
+
+        As.gc_array_new => {
+            w.append(0xFB)
+            w.append(0x06)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_new_default => {
+            w.append(0xFB)
+            w.append(0x07)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_new_fixed => {
+            w.append(0xFB)
+            w.append(0x08)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
+        As.gc_array_get => {
+            w.append(0xFB)
+            w.append(0x0B)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_set => {
+            w.append(0xFB)
+            w.append(0x0E)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.gc_array_len => {
+            w.append(0xFB)
+            w.append(0x0F)
+        },
+
+        As.gc_array_copy => {
+            w.append(0xFB)
+            w.append(0x11)
+            writeULEB128(w, p.from.offset)
+            writeULEB128(w, p.to.offset)
+        },
+
+        // ====================================================================
+        // WasmGC reference operations
+        // ====================================================================
+
+        As.ref_test => {
+            w.append(0xFB)
+            w.append(0x14)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.ref_cast => {
+            w.append(0xFB)
+            w.append(0x16)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.ref_null => {
+            w.append(0xD0)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.ref_eq => {
+            w.append(0xD3)
+        },
+
+        As.ref_as_not_null => {
+            w.append(0xD4)
+        },
+
+        As.br_on_null => {
+            w.append(0xD5)
+            writeULEB128(w, p.from.offset)
+        },
+
+        As.br_on_non_null => {
+            w.append(0xD6)
+            writeULEB128(w, p.from.offset)
+        },
+
+        // ====================================================================
         // All other instructions — direct opcode
         // ====================================================================
 

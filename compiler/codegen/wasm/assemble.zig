@@ -493,6 +493,136 @@ fn encodeInstruction(
         },
 
         // ====================================================================
+        // WasmGC array operations (0xFB prefix)
+        // ====================================================================
+
+        .gc_array_new => {
+            // 0xFB 0x06 <type_idx>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_NEW);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .gc_array_new_default => {
+            // 0xFB 0x07 <type_idx>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_NEW_DEFAULT);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .gc_array_new_fixed => {
+            // 0xFB 0x08 <type_idx> <count>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_NEW_FIXED);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset))); // type_idx
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.to.offset))); // count
+        },
+
+        .gc_array_get => {
+            // 0xFB 0x0B <type_idx>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_GET);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .gc_array_set => {
+            // 0xFB 0x0E <type_idx>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_SET);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .gc_array_len => {
+            // 0xFB 0x0F (no immediates)
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_LEN);
+        },
+
+        .gc_array_copy => {
+            // 0xFB 0x11 <dst_type_idx> <src_type_idx>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_ARRAY_COPY);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset))); // dst type
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.to.offset))); // src type
+        },
+
+        // ====================================================================
+        // WasmGC reference operations
+        // ====================================================================
+
+        .ref_test => {
+            // 0xFB 0x14 <heap_type>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_REF_TEST);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .ref_cast => {
+            // 0xFB 0x16 <heap_type>
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_REF_CAST);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .br_on_cast => {
+            // 0xFB 0x18 <flags> <label> <from_ht> <to_ht>
+            // Encoding: from.offset = flags | (from_ht << 8), to.offset = label | (to_ht << 32)
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_BR_ON_CAST);
+            const flags: u64 = @intCast(p.from.offset & 0xFF);
+            const from_ht: u64 = @intCast(@as(u64, @bitCast(p.from.offset)) >> 8);
+            const label: u64 = @intCast(p.to.offset & 0xFFFFFFFF);
+            const to_ht: u64 = @intCast(@as(u64, @bitCast(p.to.offset)) >> 32);
+            try writeULEB128(allocator, w, flags);
+            try writeULEB128(allocator, w, label);
+            try writeULEB128(allocator, w, from_ht);
+            try writeULEB128(allocator, w, to_ht);
+        },
+
+        .br_on_cast_fail => {
+            // 0xFB 0x19 <flags> <label> <from_ht> <to_ht>
+            // Same encoding as br_on_cast
+            try w.append(allocator, c.GC_PREFIX);
+            try w.append(allocator, c.GC_BR_ON_CAST_FAIL);
+            const flags: u64 = @intCast(p.from.offset & 0xFF);
+            const from_ht: u64 = @intCast(@as(u64, @bitCast(p.from.offset)) >> 8);
+            const label: u64 = @intCast(p.to.offset & 0xFFFFFFFF);
+            const to_ht: u64 = @intCast(@as(u64, @bitCast(p.to.offset)) >> 32);
+            try writeULEB128(allocator, w, flags);
+            try writeULEB128(allocator, w, label);
+            try writeULEB128(allocator, w, from_ht);
+            try writeULEB128(allocator, w, to_ht);
+        },
+
+        .ref_null => {
+            // 0xD0 <heap_type>
+            try w.append(allocator, c.REF_NULL);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .ref_eq => {
+            // 0xD3 (standalone, no GC prefix)
+            try w.append(allocator, c.REF_EQ);
+        },
+
+        .ref_as_not_null => {
+            // 0xD4 (standalone, no GC prefix)
+            try w.append(allocator, c.REF_AS_NOT_NULL);
+        },
+
+        .br_on_null => {
+            // 0xD5 <label>
+            try w.append(allocator, c.BR_ON_NULL);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        .br_on_non_null => {
+            // 0xD6 <label>
+            try w.append(allocator, c.BR_ON_NON_NULL);
+            try writeULEB128(allocator, w, @as(u64, @intCast(p.from.offset)));
+        },
+
+        // ====================================================================
         // All other instructions - direct opcode
         // ====================================================================
 

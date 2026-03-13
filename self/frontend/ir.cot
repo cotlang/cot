@@ -192,6 +192,24 @@ struct GcStructNew { type_name: string, field_values: List(int) }
 struct GcStructGet { base: int, type_name: string, field_idx: int }
 struct GcStructSet { base: int, type_name: string, field_idx: int, value: int }
 
+// --- WasmGC array operations ---
+
+struct GcArrayNew { type_name: string, init_val: int, length: int }
+struct GcArrayNewDefault { type_name: string, length: int }
+struct GcArrayNewFixed { type_name: string, values: List(int) }
+struct GcArrayGet { type_name: string, array: int, index: int }
+struct GcArraySet { type_name: string, array: int, index: int, value: int }
+struct GcArrayLen { array: int }
+struct GcArrayCopy { dst_type_name: string, src_type_name: string, dst: int, dst_offset: int, src: int, src_offset: int, length: int }
+
+// --- WasmGC reference operations ---
+
+struct GcRefNull { type_name: string }
+struct GcRefIsNull { value: int }
+struct GcRefEq { left: int, right: int }
+struct GcRefCast { value: int, type_name: string }
+struct GcRefTest { value: int, type_name: string }
+
 // ============================================================================
 // Data — tagged union of all IR node payloads
 // ============================================================================
@@ -280,10 +298,24 @@ union Data {
     // Metadata
     type_metadata: TypeMetadata,
     wasm_global_read: WasmGlobalRead,
-    // WasmGC
+    // WasmGC structs
     gc_struct_new: GcStructNew,
     gc_struct_get: GcStructGet,
     gc_struct_set: GcStructSet,
+    // WasmGC arrays
+    gc_array_new: GcArrayNew,
+    gc_array_new_default: GcArrayNewDefault,
+    gc_array_new_fixed: GcArrayNewFixed,
+    gc_array_get: GcArrayGet,
+    gc_array_set: GcArraySet,
+    gc_array_len: GcArrayLen,
+    gc_array_copy: GcArrayCopy,
+    // WasmGC references
+    gc_ref_null: GcRefNull,
+    gc_ref_is_null: GcRefIsNull,
+    gc_ref_eq: GcRefEq,
+    gc_ref_cast: GcRefCast,
+    gc_ref_test: GcRefTest,
     // Atomics
     atomic_cas: AtomicCas,
     // Void ops
@@ -343,6 +375,11 @@ struct Node {
             Data.map_free => { return true },
             Data.gc_struct_new => { return true },
             Data.gc_struct_set => { return true },
+            Data.gc_array_new => { return true },
+            Data.gc_array_new_default => { return true },
+            Data.gc_array_new_fixed => { return true },
+            Data.gc_array_set => { return true },
+            Data.gc_array_copy => { return true },
             Data.atomic_cas => { return true },
             Data.store_index_local => { return true },
             Data.store_index_value => { return true },
@@ -887,6 +924,56 @@ struct FuncBuilder {
 
     fn emitGcStructSet(base: int, type_name: string, field_idx: int, value: int, span: Span) int {
         return self.emit(Node.init(Data.gc_struct_set(GcStructSet { base: base, type_name: type_name, field_idx: field_idx, value: value }), VOID, span))
+    }
+
+    // WasmGC array operations
+    fn emitGcArrayNew(type_name: string, init_val: int, length: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_new(GcArrayNew { type_name: type_name, init_val: init_val, length: length }), type_idx, span))
+    }
+
+    fn emitGcArrayNewDefault(type_name: string, length: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_new_default(GcArrayNewDefault { type_name: type_name, length: length }), type_idx, span))
+    }
+
+    fn emitGcArrayNewFixed(type_name: string, values: List(int), type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_new_fixed(GcArrayNewFixed { type_name: type_name, values: values }), type_idx, span))
+    }
+
+    fn emitGcArrayGet(type_name: string, array: int, index: int, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_get(GcArrayGet { type_name: type_name, array: array, index: index }), type_idx, span))
+    }
+
+    fn emitGcArraySet(type_name: string, array: int, index: int, value: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_set(GcArraySet { type_name: type_name, array: array, index: index, value: value }), VOID, span))
+    }
+
+    fn emitGcArrayLen(array: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_len(GcArrayLen { array: array }), I32, span))
+    }
+
+    fn emitGcArrayCopy(dst_type_name: string, src_type_name: string, dst: int, dst_offset: int, src: int, src_offset: int, length: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_array_copy(GcArrayCopy { dst_type_name: dst_type_name, src_type_name: src_type_name, dst: dst, dst_offset: dst_offset, src: src, src_offset: src_offset, length: length }), VOID, span))
+    }
+
+    // WasmGC reference operations
+    fn emitGcRefNull(type_name: string, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_ref_null(GcRefNull { type_name: type_name }), type_idx, span))
+    }
+
+    fn emitGcRefIsNull(value: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_ref_is_null(GcRefIsNull { value: value }), BOOL, span))
+    }
+
+    fn emitGcRefEq(left: int, right: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_ref_eq(GcRefEq { left: left, right: right }), BOOL, span))
+    }
+
+    fn emitGcRefCast(value: int, type_name: string, type_idx: int, span: Span) int {
+        return self.emit(Node.init(Data.gc_ref_cast(GcRefCast { value: value, type_name: type_name }), type_idx, span))
+    }
+
+    fn emitGcRefTest(value: int, type_name: string, span: Span) int {
+        return self.emit(Node.init(Data.gc_ref_test(GcRefTest { value: value, type_name: type_name }), BOOL, span))
     }
 
     // --- Build: freeze into immutable Func ---

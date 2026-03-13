@@ -559,6 +559,22 @@ pub const SSABuilder = struct {
             .gc_struct_new => |gc| try self.convertGcStructNew(gc, node.type_idx, cur),
             .gc_struct_get => |gc| try self.convertGcStructGet(gc, node.type_idx, cur),
             .gc_struct_set => |gc| try self.convertGcStructSet(gc, cur),
+
+            // WasmGC array operations
+            .gc_array_new => |gc| try self.convertGcArrayNew(gc, node.type_idx, cur),
+            .gc_array_new_default => |gc| try self.convertGcArrayNewDefault(gc, node.type_idx, cur),
+            .gc_array_new_fixed => |gc| try self.convertGcArrayNewFixed(gc, node.type_idx, cur),
+            .gc_array_get => |gc| try self.convertGcArrayGet(gc, node.type_idx, cur),
+            .gc_array_set => |gc| try self.convertGcArraySet(gc, cur),
+            .gc_array_len => |gc| try self.convertGcArrayLen(gc, cur),
+            .gc_array_copy => |gc| try self.convertGcArrayCopy(gc, cur),
+
+            // WasmGC reference operations
+            .gc_ref_null => |gc| try self.convertGcRefNull(gc, node.type_idx, cur),
+            .gc_ref_is_null => |gc| try self.convertGcRefIsNull(gc, cur),
+            .gc_ref_eq => |gc| try self.convertGcRefEq(gc, cur),
+            .gc_ref_cast => |gc| try self.convertGcRefCast(gc, node.type_idx, cur),
+            .gc_ref_test => |gc| try self.convertGcRefTest(gc, cur),
         };
 
         if (result) |v| try self.node_values.put(node_idx, v);
@@ -686,12 +702,15 @@ pub const SSABuilder = struct {
         const value = try self.convertNode(value_idx) orelse return error.MissingValue;
         const value_type = self.type_registry.get(value.type_idx);
 
-        // WasmGC: struct values are GC refs — assign directly to local, no memory store.
+        // WasmGC: struct/array values are GC refs — assign directly to local, no memory store.
         // The Wasm codegen (setReg) emits local.set for the assigned value.
-        // Covers: struct.new, call results returning structs, managed pointer-to-struct.
+        // Covers: struct.new, array.new, call results returning structs, managed pointer-to-struct.
         // Raw pointers (@intToPtr) are i64 values, not GC refs.
         if (self.target.isWasmGC()) {
-            const is_gc_ref = value.op == .wasm_gc_struct_new or value_type == .struct_type or
+            const is_gc_ref = value.op == .wasm_gc_struct_new or
+                value.op == .wasm_gc_array_new or value.op == .wasm_gc_array_new_default or
+                value.op == .wasm_gc_array_new_fixed or
+                value_type == .struct_type or
                 (value_type == .pointer and value_type.pointer.managed and self.type_registry.get(value_type.pointer.elem) == .struct_type);
             if (is_gc_ref) {
                 self.assign(local_idx, value);
@@ -2239,6 +2258,135 @@ pub const SSABuilder = struct {
         const base_val = try self.convertNode(gc.base) orelse return val;
         const value_val = try self.convertNode(gc.value) orelse return val;
         val.addArg2(base_val, value_val);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    // === WasmGC array conversion helpers ===
+
+    fn convertGcArrayNew(self: *SSABuilder, gc: ir.GcArrayNew, type_idx: TypeIndex, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_new, type_idx, cur, self.cur_pos);
+        val.aux = .{ .string = gc.type_name };
+        const init_val = try self.convertNode(gc.init_val) orelse return val;
+        const length = try self.convertNode(gc.length) orelse return val;
+        val.addArg2(init_val, length);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcArrayNewDefault(self: *SSABuilder, gc: ir.GcArrayNewDefault, type_idx: TypeIndex, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_new_default, type_idx, cur, self.cur_pos);
+        val.aux = .{ .string = gc.type_name };
+        const length = try self.convertNode(gc.length) orelse return val;
+        val.addArg(length);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcArrayNewFixed(self: *SSABuilder, gc: ir.GcArrayNewFixed, type_idx: TypeIndex, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_new_fixed, type_idx, cur, self.cur_pos);
+        val.aux = .{ .string = gc.type_name };
+        val.aux_int = @intCast(gc.values.len);
+        for (gc.values) |v_idx| {
+            const arg = try self.convertNode(v_idx) orelse continue;
+            try val.addArgAlloc(arg, self.allocator);
+        }
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcArrayGet(self: *SSABuilder, gc: ir.GcArrayGet, type_idx: TypeIndex, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_get, type_idx, cur, self.cur_pos);
+        val.aux = .{ .string = gc.type_name };
+        const array_val = try self.convertNode(gc.array) orelse return val;
+        const index_val = try self.convertNode(gc.index) orelse return val;
+        val.addArg2(array_val, index_val);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcArraySet(self: *SSABuilder, gc: ir.GcArraySet, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_set, TypeRegistry.VOID, cur, self.cur_pos);
+        val.aux = .{ .string = gc.type_name };
+        const array_val = try self.convertNode(gc.array) orelse return val;
+        const index_val = try self.convertNode(gc.index) orelse return val;
+        const value_val = try self.convertNode(gc.value) orelse return val;
+        try val.addArgAlloc(array_val, self.allocator);
+        try val.addArgAlloc(index_val, self.allocator);
+        try val.addArgAlloc(value_val, self.allocator);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcArrayLen(self: *SSABuilder, gc: ir.GcArrayLen, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_len, TypeRegistry.I32, cur, self.cur_pos);
+        const array_val = try self.convertNode(gc.array) orelse return val;
+        val.addArg(array_val);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcArrayCopy(self: *SSABuilder, gc: ir.GcArrayCopy, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_array_copy, TypeRegistry.VOID, cur, self.cur_pos);
+        val.aux = .{ .string = gc.dst_type_name };
+        // src type index resolved at codegen via gc_array_name_map
+        const dst = try self.convertNode(gc.dst) orelse return val;
+        const dst_off = try self.convertNode(gc.dst_offset) orelse return val;
+        const src = try self.convertNode(gc.src) orelse return val;
+        const src_off = try self.convertNode(gc.src_offset) orelse return val;
+        const len = try self.convertNode(gc.length) orelse return val;
+        try val.addArgAlloc(dst, self.allocator);
+        try val.addArgAlloc(dst_off, self.allocator);
+        try val.addArgAlloc(src, self.allocator);
+        try val.addArgAlloc(src_off, self.allocator);
+        try val.addArgAlloc(len, self.allocator);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    // === WasmGC reference conversion helpers ===
+
+    fn convertGcRefNull(self: *SSABuilder, gc: ir.GcRefNull, type_idx: TypeIndex, cur: *Block) !*Value {
+        _ = gc;
+        const val = try self.func.newValue(.wasm_gc_ref_null, type_idx, cur, self.cur_pos);
+        val.aux_int = 0; // heap type resolved at codegen
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcRefIsNull(self: *SSABuilder, gc: ir.GcRefIsNull, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_ref_is_null, TypeRegistry.BOOL, cur, self.cur_pos);
+        const ref_val = try self.convertNode(gc.value) orelse return val;
+        val.addArg(ref_val);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcRefEq(self: *SSABuilder, gc: ir.GcRefEq, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_ref_eq, TypeRegistry.BOOL, cur, self.cur_pos);
+        const left = try self.convertNode(gc.left) orelse return val;
+        const right = try self.convertNode(gc.right) orelse return val;
+        val.addArg2(left, right);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcRefCast(self: *SSABuilder, gc: ir.GcRefCast, type_idx: TypeIndex, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_ref_cast, type_idx, cur, self.cur_pos);
+        val.aux_int = 0; // heap type resolved at codegen
+        _ = gc.type_name; // used at codegen to resolve heap type idx
+        const ref_val = try self.convertNode(gc.value) orelse return val;
+        val.addArg(ref_val);
+        try cur.addValue(self.allocator, val);
+        return val;
+    }
+
+    fn convertGcRefTest(self: *SSABuilder, gc: ir.GcRefTest, cur: *Block) !*Value {
+        const val = try self.func.newValue(.wasm_gc_ref_test, TypeRegistry.BOOL, cur, self.cur_pos);
+        val.aux_int = 0; // heap type resolved at codegen
+        _ = gc.type_name; // used at codegen to resolve heap type idx
+        const ref_val = try self.convertNode(gc.value) orelse return val;
+        val.addArg(ref_val);
         try cur.addValue(self.allocator, val);
         return val;
     }

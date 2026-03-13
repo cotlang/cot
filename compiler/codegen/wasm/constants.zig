@@ -430,6 +430,27 @@ pub const As = enum(u16) {
     gc_struct_get, // 0xFB 0x02 - struct.get $typeidx $fieldidx
     gc_struct_set, // 0xFB 0x05 - struct.set $typeidx $fieldidx
 
+    // WasmGC array operations (GC proposal, 0xFB prefix)
+    gc_array_new, // 0xFB 0x06 - array.new $typeidx
+    gc_array_new_default, // 0xFB 0x07 - array.new_default $typeidx
+    gc_array_new_fixed, // 0xFB 0x08 - array.new_fixed $typeidx $count
+    gc_array_get, // 0xFB 0x0B - array.get $typeidx
+    gc_array_set, // 0xFB 0x0E - array.set $typeidx
+    gc_array_len, // 0xFB 0x0F - array.len
+    gc_array_copy, // 0xFB 0x11 - array.copy $dst_typeidx $src_typeidx
+
+    // WasmGC reference operations (GC proposal)
+    ref_test, // 0xFB 0x14 - ref.test $heaptype
+    ref_cast, // 0xFB 0x16 - ref.cast $heaptype
+    br_on_cast, // 0xFB 0x18 - br_on_cast flags label from_ht to_ht
+    br_on_cast_fail, // 0xFB 0x19 - br_on_cast_fail flags label from_ht to_ht
+    ref_null, // 0xD0 - ref.null $heaptype (standalone)
+    ref_is_null, // 0xD1 - ref.is_null (standalone)
+    ref_eq, // 0xD3 - ref.eq (standalone, no GC prefix)
+    ref_as_not_null, // 0xD4 - ref.as_not_null (standalone)
+    br_on_null, // 0xD5 - br_on_null $label (standalone)
+    br_on_non_null, // 0xD6 - br_on_non_null $label (standalone)
+
     // Misc
     word, // Raw data
     text, // Function start
@@ -618,6 +639,9 @@ pub const As = enum(u16) {
             .i64_extend8_s => 0xC2,
             .i64_extend16_s => 0xC3,
             .i64_extend32_s => 0xC4,
+            .ref_is_null => 0xD1,
+            .ref_eq => 0xD3,
+            .ref_as_not_null => 0xD4,
             else => null, // Pseudo-instructions or FC-prefixed
         };
     }
@@ -651,7 +675,11 @@ pub const As = enum(u16) {
     /// Returns true if this is a GC-prefixed instruction (0xFB prefix)
     pub fn isGcPrefixed(self: As) bool {
         return switch (self) {
-            .gc_struct_new, .gc_struct_get, .gc_struct_set => true,
+            .gc_struct_new, .gc_struct_get, .gc_struct_set,
+            .gc_array_new, .gc_array_new_default, .gc_array_new_fixed,
+            .gc_array_get, .gc_array_set, .gc_array_len, .gc_array_copy,
+            .ref_test, .ref_cast, .br_on_cast, .br_on_cast_fail,
+            => true,
             else => false,
         };
     }
@@ -662,6 +690,17 @@ pub const As = enum(u16) {
             .gc_struct_new => GC_STRUCT_NEW,
             .gc_struct_get => GC_STRUCT_GET,
             .gc_struct_set => GC_STRUCT_SET,
+            .gc_array_new => GC_ARRAY_NEW,
+            .gc_array_new_default => GC_ARRAY_NEW_DEFAULT,
+            .gc_array_new_fixed => GC_ARRAY_NEW_FIXED,
+            .gc_array_get => GC_ARRAY_GET,
+            .gc_array_set => GC_ARRAY_SET,
+            .gc_array_len => GC_ARRAY_LEN,
+            .gc_array_copy => GC_ARRAY_COPY,
+            .ref_test => GC_REF_TEST,
+            .ref_cast => GC_REF_CAST,
+            .br_on_cast => GC_BR_ON_CAST,
+            .br_on_cast_fail => GC_BR_ON_CAST_FAIL,
             else => null,
         };
     }
@@ -780,15 +819,32 @@ pub const GC_STRUCT_GET_U: u8 = 0x04; // struct.get_u (unsigned)
 pub const GC_STRUCT_SET: u8 = 0x05; // struct.set $typeidx $fieldidx
 
 /// Array operations (GC-prefixed)
-pub const GC_ARRAY_NEW: u8 = 0x06;
-pub const GC_ARRAY_NEW_DEFAULT: u8 = 0x07;
-pub const GC_ARRAY_GET: u8 = 0x0B;
-pub const GC_ARRAY_SET: u8 = 0x0C;
-pub const GC_ARRAY_LEN: u8 = 0x0F;
+pub const GC_ARRAY_NEW: u8 = 0x06; // array.new $typeidx
+pub const GC_ARRAY_NEW_DEFAULT: u8 = 0x07; // array.new_default $typeidx
+pub const GC_ARRAY_NEW_FIXED: u8 = 0x08; // array.new_fixed $typeidx $count
+pub const GC_ARRAY_NEW_DATA: u8 = 0x09; // array.new_data $typeidx $dataidx
+pub const GC_ARRAY_GET: u8 = 0x0B; // array.get $typeidx
+pub const GC_ARRAY_GET_S: u8 = 0x0C; // array.get_s $typeidx (signed)
+pub const GC_ARRAY_GET_U: u8 = 0x0D; // array.get_u $typeidx (unsigned)
+pub const GC_ARRAY_SET: u8 = 0x0E; // array.set $typeidx
+pub const GC_ARRAY_LEN: u8 = 0x0F; // array.len (no immediates)
+pub const GC_ARRAY_COPY: u8 = 0x11; // array.copy $dst_typeidx $src_typeidx
+
+/// Reference casting (GC-prefixed, 0xFB prefix)
+pub const GC_REF_TEST: u8 = 0x14; // ref.test $heaptype
+pub const GC_REF_TEST_NULL: u8 = 0x15; // ref.test null $heaptype
+pub const GC_REF_CAST: u8 = 0x16; // ref.cast $heaptype
+pub const GC_REF_CAST_NULL: u8 = 0x17; // ref.cast null $heaptype
+pub const GC_BR_ON_CAST: u8 = 0x18; // br_on_cast flags label from_ht to_ht
+pub const GC_BR_ON_CAST_FAIL: u8 = 0x19; // br_on_cast_fail flags label from_ht to_ht
 
 /// Reference type opcodes (NOT GC-prefixed, standalone)
 pub const REF_NULL: u8 = 0xD0; // ref.null $heaptype
 pub const REF_IS_NULL: u8 = 0xD1; // ref.is_null
+pub const REF_EQ: u8 = 0xD3; // ref.eq
+pub const REF_AS_NOT_NULL: u8 = 0xD4; // ref.as_not_null
+pub const BR_ON_NULL: u8 = 0xD5; // br_on_null $label
+pub const BR_ON_NON_NULL: u8 = 0xD6; // br_on_non_null $label
 
 /// Type constructors for type section
 pub const GC_STRUCT_TYPE: u8 = 0x5F; // struct type tag
@@ -798,7 +854,8 @@ pub const GC_FIELD_IMMUT: u8 = 0x00; // immutable field
 pub const GC_REF_TYPE: u8 = 0x64; // (ref $ht) non-nullable
 pub const GC_REF_TYPE_NULL: u8 = 0x63; // (ref null $ht) nullable
 pub const GC_REC_TYPE: u8 = 0x4E; // rec group wrapper
-pub const GC_SUB_TYPE_FINAL: u8 = 0x4E; // sub final (no inheritance)
+pub const GC_SUB_TYPE: u8 = 0x50; // sub (open for inheritance)
+pub const GC_SUB_TYPE_FINAL: u8 = 0x4F; // sub final (sealed)
 
 // ============================================================================
 // Tests

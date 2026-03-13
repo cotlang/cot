@@ -37,6 +37,7 @@ const WASM_VERSION_2: int = 0x00
 const WASM_VERSION_3: int = 0x00
 
 const GC_STRUCT_TYPE_TAG: int = 0x5F
+const GC_ARRAY_TYPE_TAG: int = 0x5E
 const EXPORT_KIND_FUNC: int = 0x00
 const EXPORT_KIND_MEMORY: int = 0x02
 
@@ -190,6 +191,19 @@ struct GcStructType {
 }
 
 // ============================================================================
+// WasmGC array type
+// ============================================================================
+
+struct GcArrayType {
+    name: string,
+    elem_type: GcFieldType,
+
+    static fn init(name: string, elem_type: GcFieldType) GcArrayType {
+        return GcArrayType { name: name, elem_type: elem_type }
+    }
+}
+
+// ============================================================================
 // Linker — Module linker state
 // Zig reference: link.zig Linker struct
 // ============================================================================
@@ -208,6 +222,8 @@ struct Linker {
     gc_struct_types: List(GcStructType),
     gc_field_storage: List(GcFieldType),
     gc_struct_name_map: Map(string, int),
+    gc_array_types: List(GcArrayType),
+    gc_array_name_map: Map(string, int),
 
     static fn init() Linker {
         var types: List(FuncType) = .{}
@@ -220,6 +236,8 @@ struct Linker {
         var gc_struct_types: List(GcStructType) = .{}
         var gc_field_storage: List(GcFieldType) = .{}
         var gc_struct_name_map: Map(string, int) = .{}
+        var gc_array_types: List(GcArrayType) = .{}
+        var gc_array_name_map: Map(string, int) = .{}
         return Linker {
             types: types,
             type_storage: type_storage,
@@ -234,17 +252,19 @@ struct Linker {
             gc_struct_types: gc_struct_types,
             gc_field_storage: gc_field_storage,
             gc_struct_name_map: gc_struct_name_map,
+            gc_array_types: gc_array_types,
+            gc_array_name_map: gc_array_name_map,
         }
     }
 
-    /// Number of GC struct types (offsets function type indices)
+    /// Number of GC types (structs + arrays, offsets function type indices)
     fn gcTypeCount() int {
-        return self.gc_struct_types.count
+        return self.gc_struct_types.count + self.gc_array_types.count
     }
 
-    /// Adjust raw function type index for GC struct types
+    /// Adjust raw function type index for GC types
     fn funcTypeIndex(raw_idx: int) int {
-        return raw_idx + self.gc_struct_types.count
+        return raw_idx + self.gcTypeCount()
     }
 
     /// Add or find a GC struct type. Returns type index (0..N-1).
@@ -262,6 +282,17 @@ struct Linker {
         }
         self.gc_struct_types.append(GcStructType.init(name, fields.count, field_offset))
         self.gc_struct_name_map.set(name, type_idx)
+        return type_idx
+    }
+
+    /// Add or find a GC array type. Returns type index (absolute: after struct types).
+    fn addGcArrayType(name: string, elem_type: GcFieldType) int {
+        if (self.gc_array_name_map.getOrNull(name)) |existing| {
+            return existing
+        }
+        const type_idx = self.gc_struct_types.count + self.gc_array_types.count
+        self.gc_array_types.append(GcArrayType.init(name, elem_type))
+        self.gc_array_name_map.set(name, type_idx)
         return type_idx
     }
 
@@ -405,17 +436,18 @@ struct Linker {
     // ========================================================================
 
     fn emitTypeSection(output: *List(int)) void {
-        const gc_count = self.gc_struct_types.count
+        const gc_struct_count = self.gc_struct_types.count
+        const gc_array_count = self.gc_array_types.count
         const func_count = self.types.count
-        const total_count = gc_count + func_count
+        const total_count = gc_struct_count + gc_array_count + func_count
         if (total_count == 0) { return }
 
         var buf: List(int) = .{}
         writeULEB128(&buf, total_count)
 
-        // GC struct types first (indices 0..N-1)
+        // GC struct types first (indices 0..S-1)
         var gi = 0
-        while (gi < gc_count) {
+        while (gi < gc_struct_count) {
             const st = self.gc_struct_types.get(gi)
             buf.append(GC_STRUCT_TYPE_TAG)
             writeULEB128(&buf, st.field_count)
@@ -434,7 +466,23 @@ struct Linker {
             gi += 1
         }
 
-        // Function types (indices N..N+M-1)
+        // GC array types (indices S..S+A-1)
+        var ai = 0
+        while (ai < gc_array_count) {
+            const at = self.gc_array_types.get(ai)
+            buf.append(GC_ARRAY_TYPE_TAG)
+            const elem = at.elem_type
+            if (elem.gc_ref) |gc_idx| {
+                buf.append(GC_REF_TYPE_NULL)
+                writeULEB128(&buf, gc_idx)
+            } else {
+                buf.append(elem.val_type)
+            }
+            buf.append(if (elem.mutable) { GC_FIELD_MUT } else { GC_FIELD_IMMUT })
+            ai += 1
+        }
+
+        // Function types (indices S+A..S+A+M-1)
         var ti = 0
         while (ti < func_count) {
             const t = self.types.get(ti)

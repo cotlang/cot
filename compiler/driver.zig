@@ -5819,8 +5819,9 @@ pub const Driver = struct {
 
             // Generate function body code using Go-style two-pass architecture
             const gc_name_map = if (is_wasm_gc) &linker.gc_struct_name_map else null;
+            const gc_array_map = if (is_wasm_gc) &linker.gc_array_name_map else null;
             const gc_type_reg = if (is_wasm_gc) type_reg else null;
-            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets, &metadata_addrs, &func_table_indices, gc_name_map, gc_type_reg);
+            const body = try wasm.generateFunc(self.allocator, ssa_func, &func_indices, &string_offsets, &metadata_addrs, &func_table_indices, gc_name_map, gc_array_map, gc_type_reg);
             errdefer self.allocator.free(body);
 
             // Export all functions for AOT compatibility

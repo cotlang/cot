@@ -92,6 +92,9 @@ pub const GenState = struct {
     /// Maps struct type names to GC struct type indices (for WasmGC)
     gc_struct_name_map: ?*const std.StringHashMapUnmanaged(u32) = null,
 
+    /// Maps array type names to GC array type indices (for WasmGC)
+    gc_array_name_map: ?*const std.StringHashMapUnmanaged(u32) = null,
+
     /// Type registry for resolving type_idx to type info (needed for WasmGC local allocation)
     type_reg: ?*const TypeRegistry = null,
 
@@ -133,6 +136,10 @@ pub const GenState = struct {
 
     pub fn setGcStructNameMap(self: *GenState, map: *const std.StringHashMapUnmanaged(u32)) void {
         self.gc_struct_name_map = map;
+    }
+
+    pub fn setGcArrayNameMap(self: *GenState, map: *const std.StringHashMapUnmanaged(u32)) void {
+        self.gc_array_name_map = map;
     }
 
     pub fn setTypeReg(self: *GenState, reg: *const TypeRegistry) void {
@@ -1057,6 +1064,111 @@ pub const GenState = struct {
                 // No result (void)
             },
 
+            // WasmGC array operations
+            .wasm_gc_array_new => {
+                // stack: [init_val, length] → [ref]
+                try self.getValue64(v.args[0]); // init_val
+                try self.getValue64(v.args[1]); // length
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_new);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_new_default => {
+                // stack: [length] → [ref]
+                try self.getValue64(v.args[0]); // length
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_new_default);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_new_fixed => {
+                // stack: [vals...] → [ref]
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const count = v.aux_int;
+                const p = try self.builder.append(.gc_array_new_fixed);
+                p.from = prog_mod.constAddr(gc_type_idx);
+                p.to = prog_mod.constAddr(count);
+            },
+
+            .wasm_gc_array_get => {
+                // stack: [ref, idx] → [val]
+                try self.getValue64(v.args[0]); // ref
+                try self.getValue64(v.args[1]); // idx
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_get);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_set => {
+                // stack: [ref, idx, val] → []
+                try self.getValue64(v.args[0]); // ref
+                try self.getValue64(v.args[1]); // idx
+                try self.getValue64(v.args[2]); // val
+                const type_name = v.aux.string;
+                const gc_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(type_name) orelse 0) else 0;
+                const p = try self.builder.append(.gc_array_set);
+                p.from = prog_mod.constAddr(gc_type_idx);
+            },
+
+            .wasm_gc_array_len => {
+                // stack: [ref] → [i32]
+                try self.getValue64(v.args[0]); // ref
+                _ = try self.builder.append(.gc_array_len);
+            },
+
+            .wasm_gc_array_copy => {
+                // stack: [dst, dst_off, src, src_off, len] → []
+                for (v.args) |arg| {
+                    try self.getValue64(arg);
+                }
+                const dst_type_name = v.aux.string;
+                const dst_type_idx: i64 = if (self.gc_array_name_map) |m| @intCast(m.get(dst_type_name) orelse 0) else 0;
+                const src_type_idx = v.aux_int;
+                const p = try self.builder.append(.gc_array_copy);
+                p.from = prog_mod.constAddr(dst_type_idx);
+                p.to = prog_mod.constAddr(src_type_idx);
+            },
+
+            // WasmGC reference operations
+            .wasm_gc_ref_test => {
+                try self.getValue64(v.args[0]);
+                const heap_type = v.aux_int;
+                const p = try self.builder.append(.ref_test);
+                p.from = prog_mod.constAddr(heap_type);
+            },
+
+            .wasm_gc_ref_cast => {
+                try self.getValue64(v.args[0]);
+                const heap_type = v.aux_int;
+                const p = try self.builder.append(.ref_cast);
+                p.from = prog_mod.constAddr(heap_type);
+            },
+
+            .wasm_gc_ref_null => {
+                const heap_type = v.aux_int;
+                const p = try self.builder.append(.ref_null);
+                p.from = prog_mod.constAddr(heap_type);
+            },
+
+            .wasm_gc_ref_is_null => {
+                try self.getValue64(v.args[0]);
+                _ = try self.builder.append(.ref_is_null);
+            },
+
+            .wasm_gc_ref_eq => {
+                try self.getValue64(v.args[0]);
+                try self.getValue64(v.args[1]);
+                _ = try self.builder.append(.ref_eq);
+            },
+
             // Type conversion (int cast, float-to-int, int-to-float)
             // Go reference: cmd/compile/internal/wasm/ssa.go:479-501
             .convert => {
@@ -1238,7 +1350,8 @@ pub const GenState = struct {
         // Go: ssaGenValue lines 280-284 — stores have no setReg call.
         if (v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
             v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32 or
-            v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set) return;
+            v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set or
+            v.op == .wasm_gc_array_set or v.op == .wasm_gc_array_copy) return;
 
         // Compound return handling: calls returning string/slice push 2 values (ptr, len).
         // Store len to a separate local, then ptr to the value's main local.
@@ -1265,9 +1378,10 @@ pub const GenState = struct {
             // Without this, the return value remains on the Wasm value stack and
             // causes "values remaining on stack at end of block" validation errors.
             _ = try self.builder.append(.drop);
-        } else if (v.op == .wasm_gc_struct_new) {
-            // GC struct.new with uses=0: result left on stack must be dropped.
-            // struct.new has side_effects=true so it's emitted, but nobody reads the ref.
+        } else if (v.op == .wasm_gc_struct_new or v.op == .wasm_gc_array_new or
+            v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed)
+        {
+            // GC alloc with uses=0: result left on stack must be dropped.
             _ = try self.builder.append(.drop);
         }
     }
@@ -1315,9 +1429,11 @@ pub const GenState = struct {
                 // Go: ssaGenValue lines 280-284 — stores have no setReg call
                 if (v.op == .wasm_i64_store or v.op == .wasm_i64_store8 or
                     v.op == .wasm_i64_store16 or v.op == .wasm_i64_store32 or
-                    v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set) continue;
+                    v.op == .wasm_f64_store or v.op == .wasm_gc_struct_set or
+                    v.op == .wasm_gc_array_set or v.op == .wasm_gc_array_copy) continue;
                 if (isFloatType(v.type_idx)) continue; // Skip floats for pass 2
-                if (v.op == .wasm_gc_struct_new) continue; // Skip GC refs for pass 3
+                if (v.op == .wasm_gc_struct_new or v.op == .wasm_gc_array_new or
+                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed) continue; // Skip GC refs for pass 3
                 if (isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map)) continue; // Skip GC ref results for pass 3
 
                 const local_idx = self.next_local;
@@ -1361,19 +1477,25 @@ pub const GenState = struct {
                 if (v.uses == 0) continue; // GC ref locals only needed if value is actually read
 
                 const is_gc_struct_new = v.op == .wasm_gc_struct_new;
+                const is_gc_array_alloc = v.op == .wasm_gc_array_new or
+                    v.op == .wasm_gc_array_new_default or v.op == .wasm_gc_array_new_fixed;
                 const is_gc_ref = isGcRefType(v.type_idx, self.type_reg, self.gc_struct_name_map);
-                if (!is_gc_struct_new and !is_gc_ref) continue;
+                if (!is_gc_struct_new and !is_gc_array_alloc and !is_gc_ref) continue;
 
                 // Already allocated (e.g., by pass 1 before gc ref check was added)
                 if (self.value_to_local.contains(v.id)) continue;
 
                 const local_idx = self.next_local;
                 self.next_local += 1;
-                // Resolve GC type index: gc_struct_new has name in aux, others use type_reg
+                // Resolve GC type index: gc_struct_new has name in aux, array ops use gc_array_name_map
                 const gc_type_idx: u32 = blk: {
                     if (is_gc_struct_new) {
                         const type_name = v.aux.string;
                         break :blk if (self.gc_struct_name_map) |m| m.get(type_name) orelse 0 else 0;
+                    }
+                    if (is_gc_array_alloc) {
+                        const type_name = v.aux.string;
+                        break :blk if (self.gc_array_name_map) |m| m.get(type_name) orelse 0 else 0;
                     }
                     // For call results etc., look up type name from type_reg
                     if (self.type_reg) |reg| {
