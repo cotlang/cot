@@ -409,7 +409,8 @@ fn compileWithImports(path: string, project_safe: bool) CompileResult {
     }
 
     // Check and lower each file immediately (avoids use-after-free of stack locals)
-    checkAndLowerRecursive(path, shared, types, seen, in_progress, project_safe, lower_shared)
+    var checked_scopes: Map(string, CheckedScopeEntry) = .{}
+    checkAndLowerRecursive(path, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes)
 
     const ir = lower_shared.builder.getIR()
     return CompileResult { ir: ir, types: types }
@@ -530,22 +531,30 @@ fn writeByteList(path: string, bytes: List(int)) void {
 }
 
 /// Multi-file check: recursively parse and check all imports.
+/// Per-file scope entry: scope_map_ptr and ast_ptr for import copying.
+struct CheckedScopeEntry {
+    scope_map_ptr: int,
+    ast_ptr: int,
+}
+
 fn cmdCheckMultiFile(path: string) void {
     var seen: Map(string, int) = .{}
     var in_progress: Map(string, int) = .{}
+    var checked_scopes: Map(string, CheckedScopeEntry) = .{}
 
     var types = TypeRegistry.init()
     var shared = SharedCheckerState.init()
     const project_safe = isProjectSafe(path)
 
-    checkFileRecursive(path, shared, types, seen, in_progress, project_safe)
+    checkFileRecursive(path, shared, types, seen, in_progress, project_safe, checked_scopes)
 
     println("${path}: ok")
 }
 
 /// Recursively parse and type-check a file and all its imports.
 /// Dependencies are checked first (depth-first), matching driver.zig pattern.
-fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: Map(string, int), in_progress: Map(string, int), project_safe: bool) void {
+/// Per-file scoping: each file gets its own scope; imported symbols are copied in.
+fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: Map(string, int), in_progress: Map(string, int), project_safe: bool, checked_scopes: Map(string, CheckedScopeEntry)) void {
     // Circular import detection (must check BEFORE seen)
     if (in_progress.getOrDefault(file_path, 0) == 1) {
         eprintln("error: circular import detected: ${file_path}")
@@ -583,7 +592,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
     const source_dir = dirname(file_path)
     for i in 0..imports.count {
         const resolved = resolveImportPath(imports.get(i), source_dir)
-        checkFileRecursive(resolved, shared, types, seen, in_progress, project_safe)
+        checkFileRecursive(resolved, shared, types, seen, in_progress, project_safe, checked_scopes)
     }
 
     // Done with this file's imports — unmark in-progress
@@ -593,8 +602,25 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
     var check_errs = ErrorReporter.initWithSource(file_path, content)
     var checker = Checker.initShared(ast, types, check_errs, shared.global_map)
     checker.loadSharedState(shared)
+
+    // Per-file scope: push file scope, copy imported symbols (driver.zig createFileScope pattern)
+    checker.pushFileScope()
+    for i in 0..imports.count {
+        const resolved = resolveImportPath(imports.get(i), source_dir)
+        if (checked_scopes.has(resolved) != 0) {
+            const entry = checked_scopes.get(resolved)
+            checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
+        }
+    }
+
     checker.checkFile()
     checker.syncToShared(shared)
+
+    // Save this file's scope for importing files to copy from
+    checked_scopes.set(file_path, CheckedScopeEntry {
+        scope_map_ptr: checker.getFileScopeMapPtr(),
+        ast_ptr: @ptrToInt(ast),
+    })
 
     if (check_errs.hasErrors()) {
         exit(1)
@@ -603,7 +629,7 @@ fn checkFileRecursive(file_path: string, shared: SharedCheckerState, types: Type
 
 /// Recursively check and lower a file and all its imports.
 /// Each file is lowered immediately after checking, while checker/errs are still on the stack.
-fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: Map(string, int), in_progress: Map(string, int), project_safe: bool, lower_shared: SharedLowerState) void {
+fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: Map(string, int), in_progress: Map(string, int), project_safe: bool, lower_shared: SharedLowerState, checked_scopes: Map(string, CheckedScopeEntry)) void {
     if (in_progress.getOrDefault(file_path, 0) == 1) {
         eprintln("error: circular import detected: ${file_path}")
         exit(1)
@@ -631,16 +657,33 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
     const source_dir = dirname(file_path)
     for i in 0..imports.count {
         const resolved = resolveImportPath(imports.get(i), source_dir)
-        checkAndLowerRecursive(resolved, shared, types, seen, in_progress, project_safe, lower_shared)
+        checkAndLowerRecursive(resolved, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes)
     }
     in_progress.set(file_path, 0)
 
-    // Check with shared state
+    // Check with shared state + per-file scope
     var check_errs = ErrorReporter.initWithSource(file_path, content)
     var checker = Checker.initShared(ast, types, check_errs, shared.global_map)
     checker.loadSharedState(shared)
+
+    // Per-file scope: push file scope, copy imported symbols
+    checker.pushFileScope()
+    for i in 0..imports.count {
+        const resolved = resolveImportPath(imports.get(i), source_dir)
+        if (checked_scopes.has(resolved) != 0) {
+            const entry = checked_scopes.get(resolved)
+            checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
+        }
+    }
+
     checker.checkFile()
     checker.syncToShared(shared)
+
+    checked_scopes.set(file_path, CheckedScopeEntry {
+        scope_map_ptr: checker.getFileScopeMapPtr(),
+        ast_ptr: @ptrToInt(ast),
+    })
+
     if (check_errs.hasErrors()) { exit(1) }
 
     // Lower immediately while checker/errs are still on the stack

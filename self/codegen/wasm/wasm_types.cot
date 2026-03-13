@@ -115,7 +115,7 @@ const As = enum(u16) {
     call, call_indirect, return_call,
 
     // Parametric (Go: lines 47-48, opcodes 0x1A-0x1B)
-    drop, select,
+    drop, @"select",
 
     // Variable (Go: lines 50-54, opcodes 0x20-0x24)
     local_get, local_set, local_tee, global_get, global_set,
@@ -227,7 +227,7 @@ const As = enum(u16) {
             .call_indirect => 0x11,
             .return_call => 0x12,
             .drop => 0x1A,
-            .select => 0x1B,
+            .@"select" => 0x1B,
             .local_get => 0x20,
             .local_set => 0x21,
             .local_tee => 0x22,

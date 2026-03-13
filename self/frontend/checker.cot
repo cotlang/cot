@@ -323,6 +323,38 @@ struct Checker {
 
     // ---- Scope management ----
 
+    /// Push a per-file scope (child of global scope 0).
+    /// File-level declarations go here, not in the shared global scope.
+    /// Must be called BEFORE checkFile() in multi-file mode.
+    fn pushFileScope() void {
+        self.pushScope()
+    }
+
+    /// Return the file scope map pointer (scope_maps[1]) for import copying.
+    /// Only valid after pushFileScope() + checkFile().
+    fn getFileScopeMapPtr() int {
+        if (self.scope_maps.count > 1) {
+            return self.scope_maps.get(1)
+        }
+        return self.scope_maps.get(0)
+    }
+
+    /// Copy ALL symbols from an imported file's scope map into the current scope.
+    /// Includes transitive imports — matches Cot's flat import semantics.
+    /// Name collisions are resolved by import order (last wins).
+    fn copyImportedSymbols(source_map_ptr: int, source_ast_ptr: int) void {
+        const src_map = @intToPtr(*Map(string, int), source_map_ptr)
+        const key_list = src_map.keys()
+        var ki = 0
+        while (ki < key_list.count) {
+            const key = key_list.get(ki)
+            const sym_idx = src_map.get(key)
+            var map = self.getScopeMap(self.current_scope)
+            map.set(key, sym_idx)
+            ki += 1
+        }
+    }
+
     fn pushScope() int {
         const idx = self.scope_parents.count
         var new_map = allocMap()
@@ -361,16 +393,28 @@ struct Checker {
     }
 
     fn defineSymbol(sym: Symbol) void {
+        var s = sym
+        s.source_tree = @ptrToInt(self.ast)
         const idx = self.symbols.count
-        self.symbols.append(sym)
+        self.symbols.append(s)
         // Register in current scope's map
         var map = self.getScopeMap(self.current_scope)
-        map.set(sym.name, idx)
+        map.set(s.name, idx)
     }
 
     fn isDefined(name: string) bool {
         var map = self.getScopeMap(self.current_scope)
         return map.contains(name)
+    }
+
+    /// Check if name is defined in the SAME file (source_tree matches self.ast).
+    /// Cross-file redefinitions are allowed in multi-file mode.
+    fn isDefinedInSameFile(name: string) bool {
+        var map = self.getScopeMap(self.current_scope)
+        if (!map.contains(name)) { return false }
+        const sym_idx = map.get(name)
+        const sym = self.getSymbol(sym_idx)
+        return sym.source_tree == @ptrToInt(self.ast)
     }
 
     fn lookupSymbol(name: string) int {
@@ -440,7 +484,7 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => {
             const name = sd.name
-            if (self.isDefined(name)) {
+            if (self.isDefinedInSameFile(name)) {
                 self.reportError(idx, ErrorCode.e302, "redefined identifier")
                 return
             }
@@ -532,13 +576,19 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.enum_decl |ed| => {
             const name = ed.name
-            if (self.isDefined(name)) {
+            if (self.isDefinedInSameFile(name)) {
                 self.reportError(idx, ErrorCode.e302, "redefined identifier")
                 return
             }
             const enum_type = self.buildEnumType(idx)
             self.defineSymbol(makeTypeSymbol(name, enum_type, idx))
             self.types.registerNamed(name, enum_type)
+
+            // Register nested declarations (inferred impl methods)
+            for ni in 0..ed.nested_decls.count {
+                const nested_idx = ed.nested_decls.get(ni)
+                self.collectNestedDecl(name, nested_idx)
+            }
         }, else => {} }, else => {} }
     }
 
@@ -546,7 +596,7 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.union_decl |ud| => {
             const name = ud.name
-            if (self.isDefined(name)) {
+            if (self.isDefinedInSameFile(name)) {
                 self.reportError(idx, ErrorCode.e302, "redefined identifier")
                 return
             }
@@ -560,7 +610,7 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.type_alias |ta| => {
             const name = ta.name
-            if (self.isDefined(name)) {
+            if (self.isDefinedInSameFile(name)) {
                 self.reportError(idx, ErrorCode.e302, "redefined identifier")
                 return
             }
@@ -574,7 +624,7 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.error_set_decl |esd| => {
             const name = esd.name
-            if (self.isDefined(name)) {
+            if (self.isDefinedInSameFile(name)) {
                 self.reportError(idx, ErrorCode.e302, "redefined identifier")
                 return
             }
@@ -603,7 +653,7 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => {
             const name = f.name
-            if (self.isDefined(name)) {
+            if (self.isDefinedInSameFile(name)) {
                 self.reportError(idx, ErrorCode.e302, "redefined identifier")
                 return
             }
@@ -634,7 +684,7 @@ struct Checker {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.var_decl |v| => {
             const name = v.name
-            if (self.isDefined(name)) {
+            if (self.isDefinedInSameFile(name)) {
                 self.reportError(idx, ErrorCode.e302, "redefined identifier")
                 return
             }
@@ -817,6 +867,7 @@ struct Checker {
         }
         else if (tag == "var_decl") { self.checkTopVarDecl(idx) }
         else if (tag == "struct_decl") { self.checkStructNestedMethods(idx) }
+        else if (tag == "enum_decl") { self.checkEnumNestedMethods(idx) }
         else if (tag == "impl_block") { self.checkImplBlock(idx) }
         else if (tag == "impl_trait") { self.checkImplTraitBodies(idx) }
         else if (tag == "test_decl" or tag == "bench_decl") { self.checkTestDecl(idx) }
@@ -833,6 +884,22 @@ struct Checker {
                     switch (m_node) { Node.decl |md| => switch (md) { Decl.fn_decl |mf| => {
                         if (mf.type_params.count > 0) { continue }
                         self.checkFnDeclBody(nested_idx, "${sd.name}_${mf.name}")
+                    }, else => {} }, else => {} }
+                }
+            }
+        }, else => {} }, else => {} }
+    }
+
+    fn checkEnumNestedMethods(idx: int) void {
+        const node = self.ast.getNode(idx)
+        switch (node) { Node.decl |d| => switch (d) { Decl.enum_decl |ed| => {
+            for ni in 0..ed.nested_decls.count {
+                const nested_idx = ed.nested_decls.get(ni)
+                if (nodeTag(self.ast, nested_idx) == "fn_decl") {
+                    const m_node = self.ast.getNode(nested_idx)
+                    switch (m_node) { Node.decl |md| => switch (md) { Decl.fn_decl |mf| => {
+                        if (mf.type_params.count > 0) { continue }
+                        self.checkFnDeclBody(nested_idx, "${ed.name}_${mf.name}")
                     }, else => {} }, else => {} }
                 }
             }
@@ -1530,6 +1597,7 @@ struct Checker {
         if (tag == "slice_expr") { return self.checkSliceExpr(idx) }
         if (tag == "zero_init") { return self.checkZeroInit() }
         if (tag == "await_expr") { return self.checkAwaitExpr(idx) }
+        if (tag == "comptime_block") { return self.checkComptimeBlock(idx) }
         return invalid_type
     }
 
@@ -1537,29 +1605,42 @@ struct Checker {
         var name = ""
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.ident |id| => { name = id.name }, else => {} }, else => {} }
 
-        // Check type registry (enum/union used as expression for variant access)
-        const type_idx = self.types.lookupByName(name)
-        if (type_idx >= 0) {
-            const t = self.types.get(type_idx)
-            if (t.tag == TAG_ENUM or t.tag == TAG_UNION or t.tag == TAG_ERROR_SET) {
-                return type_idx
-            }
-            // Type name used as expression (Zig ref: checker.zig:1540-1547)
-            if (t.tag == TAG_STRUCT) {
-                self.reportError(idx, ErrorCode.e300, "type '${name}' used as expression")
-                return invalid_type
-            }
-        }
-
+        // Check scope first (per-file resolution, matches Zig resolveTypeByName pattern)
         const sym_idx = self.lookupSymbol(name)
         if (sym_idx >= 0) {
             const sym = self.getSymbol(sym_idx)
+            // Type symbol used as expression: allow enum/union/error_set, reject struct
+            if (sym.is_type) {
+                if (sym.type_idx != invalid_type) {
+                    const t = self.types.get(sym.type_idx)
+                    if (t.tag == TAG_ENUM or t.tag == TAG_UNION or t.tag == TAG_ERROR_SET) {
+                        return sym.type_idx
+                    }
+                    if (t.tag == TAG_STRUCT) {
+                        self.reportError(idx, ErrorCode.e300, "type '${name}' used as expression")
+                        return invalid_type
+                    }
+                }
+            }
             // Generic function used without type args (Zig ref: checker.zig:1550-1553)
             if (self.generic_functions.contains(name) and !self.hasTypeSubstitution()) {
                 self.reportError(idx, ErrorCode.e300, "generic function '${name}' requires type arguments")
                 return invalid_type
             }
             return sym.type_idx
+        }
+
+        // Fallback: check type registry (for types not in scope, e.g. builtins)
+        const type_idx = self.types.lookupByName(name)
+        if (type_idx >= 0) {
+            const t = self.types.get(type_idx)
+            if (t.tag == TAG_ENUM or t.tag == TAG_UNION or t.tag == TAG_ERROR_SET) {
+                return type_idx
+            }
+            if (t.tag == TAG_STRUCT) {
+                self.reportError(idx, ErrorCode.e300, "type '${name}' used as expression")
+                return invalid_type
+            }
         }
         // Try to suggest a similar name
         const suggestion = self.findSimilarName(name)
@@ -1764,8 +1845,8 @@ struct Checker {
             }
             return operand_type
         }
-        // .? optional unwrap (period_question token)
-        if (op == Token.period_question) {
+        // .? optional unwrap (parser stores Token.question as the op)
+        if (op == Token.question or op == Token.period_question) {
             const ot = self.types.get(operand_type)
             if (ot.tag == TAG_OPTIONAL) {
                 return switch (ot) { Type.optional |o| => o.elem, else => invalid_type }
@@ -1816,7 +1897,8 @@ struct Checker {
             if (mi >= 0) {
                 const method_info = self.types.getMethodInfo(mi)
                 func_type_idx = method_info.func_type
-                is_method = true
+                // Only subtract self for instance methods, not static methods
+                is_method = !method_info.is_static
             }
         }
 
@@ -1994,17 +2076,26 @@ struct Checker {
             if (nested_type >= 0) { return nested_type }
 
             // Check scope for associated constants and static methods
-            const sym_idx = self.lookupSymbol(qualified)
-            if (sym_idx >= 0) {
-                const sym = self.getSymbol(sym_idx)
-                if (sym.is_func) {
-                    const base_type_idx = self.types.lookupByName(base_name)
-                    if (base_type_idx >= 0) {
+            // Only match when base_name is a type name (not a variable name)
+            // to avoid false matches like args.count → args_count (extern fn)
+            // Use scope-first resolution to handle per-file type disambiguation
+            var base_type_idx = -1
+            const base_sym_idx = self.lookupSymbol(base_name)
+            if (base_sym_idx >= 0) {
+                const base_sym = self.getSymbol(base_sym_idx)
+                if (base_sym.is_type) { base_type_idx = base_sym.type_idx }
+            }
+            if (base_type_idx < 0) { base_type_idx = self.types.lookupByName(base_name) }
+            if (base_type_idx >= 0) {
+                const sym_idx = self.lookupSymbol(qualified)
+                if (sym_idx >= 0) {
+                    const sym = self.getSymbol(sym_idx)
+                    if (sym.is_func) {
                         self.expr_types.set(base_n, base_type_idx)
+                        return sym.type_idx
                     }
-                    return sym.type_idx
+                    if (sym.type_idx != invalid_type) { return sym.type_idx }
                 }
-                if (sym.type_idx != invalid_type) { return sym.type_idx }
             }
         }
 
@@ -2021,6 +2112,7 @@ struct Checker {
         if (base.tag == TAG_STRUCT) {
             return self.checkStructFieldAccess(idx, base_type, field_name)
         }
+
 
         // Enum variant access
         if (base.tag == TAG_ENUM) {
@@ -2048,6 +2140,24 @@ struct Checker {
                     return self.types.getMethodInfo(mi).func_type
                 }
             }
+        }
+
+        // Tuple field access: t.0, t.1
+        if (base.tag == TAG_TUPLE) {
+            const tup = switch (base) { Type.tuple |t| => t, else => TupleType { elem_count: 0, elem_types: 0 } }
+            // Parse field name as integer index
+            var fi: int = -1
+            if (@lenOf(field_name) > 0) {
+                const ch = field_name[0]
+                if (ch >= 48 and ch <= 57) {
+                    fi = ch - 48
+                }
+            }
+            if (fi >= 0 and fi < tup.elem_count) {
+                return tup.getElemType(fi)
+            }
+            self.reportError(idx, ErrorCode.e306, "tuple index out of range")
+            return invalid_type
         }
 
         // Map methods
@@ -2267,7 +2377,18 @@ struct Checker {
             var fname = ""
             var value_n = null_node
             switch (self.ast.getNode(fi_idx)) { Node.expr |e| => switch (e) { Expr.field_init_node |fin| => { fname = fin.name; value_n = fin.value }, else => {} }, else => {} }
+
+            // Find field type to set expected_type for zero-init and type inference
+            var field_type: int = invalid_type
+            for si in 0..st.field_count {
+                const sf = st.getField(si)
+                if (sf.name == fname) { field_type = sf.type_idx }
+            }
+
+            const saved_expected = self.expected_type
+            if (field_type != invalid_type) { self.expected_type = field_type }
             const val_type = self.checkExpr(value_n)
+            self.expected_type = saved_expected
 
             var found = false
             for si in 0..st.field_count {
@@ -3329,6 +3450,63 @@ struct Checker {
         return invalid_type
     }
 
+    fn checkComptimeBlock(idx: int) int {
+        var body_n = null_node
+        switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.comptime_block |cb| => { body_n = cb.body }, else => {} }, else => {} }
+        if (body_n == null_node) { return invalid_type }
+        const body_tag = nodeTag(self.ast, body_n)
+        // block_stmt: comptime { stmts... last_expr }
+        // The last statement that is an expression statement determines the block's type
+        if (body_tag == "block_stmt") {
+            var stmts: List(int) = .{}
+            switch (self.ast.getNode(body_n)) { Node.stmt |s| => switch (s) { Stmt.block_stmt |bs| => { stmts = bs.stmts }, else => {} }, else => {} }
+            self.pushScope()
+            const old_comptime = self.in_comptime
+            self.in_comptime = true
+            // Only check var declarations (for type inference) and the last expr_stmt (result type).
+            // Skip other statements (assignments, inline for, etc.) — comptime evaluation
+            // is handled by evalComptimeStmts, not here.
+            var result_type: int = VOID
+            for si in 0..stmts.count {
+                const stmt_idx = stmts.get(si)
+                const stag = nodeTag(self.ast, stmt_idx)
+                if (stag == "var_stmt") {
+                    self.checkStmt(stmt_idx)
+                } else if (stag == "expr_stmt") {
+                    var inner_n = null_node
+                    switch (self.ast.getNode(stmt_idx)) { Node.stmt |s| => switch (s) { Stmt.expr_stmt |es| => { inner_n = es.expr }, else => {} }, else => {} }
+                    if (inner_n != null_node) {
+                        result_type = self.checkExpr(inner_n)
+                    }
+                }
+                // Skip all other statements (assign, inline for, etc.)
+            }
+            self.in_comptime = old_comptime
+            self.popScope()
+            return result_type
+        }
+        // block_expr: evaluate result expression
+        if (body_tag == "block_expr") {
+            var stmts: List(int) = .{}
+            var result_n = null_node
+            switch (self.ast.getNode(body_n)) { Node.expr |e| => switch (e) { Expr.block_expr |blk| => { stmts = blk.stmts; result_n = blk.result_expr }, else => {} }, else => {} }
+            self.pushScope()
+            const old_comptime = self.in_comptime
+            self.in_comptime = true
+            for si in 0..stmts.count {
+                self.checkStmt(stmts.get(si))
+            }
+            var result_type = VOID
+            if (result_n != null_node) {
+                result_type = self.checkExpr(result_n)
+            }
+            self.in_comptime = old_comptime
+            self.popScope()
+            return result_type
+        }
+        return self.checkExpr(body_n)
+    }
+
     fn checkCatchExpr(idx: int) int {
         var operand_n = null_node
         var capture = ""
@@ -3594,14 +3772,15 @@ struct Checker {
             const sub = self.lookupTypeSub(name)
             if (sub >= 0) { return sub }
         }
-        const type_idx = self.types.lookupByName(name)
-        if (type_idx >= 0) { return type_idx }
-        // Check scope for type aliases
+        // Check scope first (per-file resolution, Zig resolveTypeByName pattern)
         const sym_idx = self.lookupSymbol(name)
         if (sym_idx >= 0) {
             const sym = self.getSymbol(sym_idx)
-            if (sym.is_type) { return sym.type_idx }
+            if (sym.is_type and sym.type_idx != invalid_type) { return sym.type_idx }
         }
+        // Fallback: type registry (for types not in scope)
+        const type_idx = self.types.lookupByName(name)
+        if (type_idx >= 0) { return type_idx }
         const type_suggestion = self.findSimilarType(name)
         if (type_suggestion) |ts| {
             self.reportError(idx, ErrorCode.e301, "undefined type '${name}', did you mean '${ts}'?")
@@ -3950,6 +4129,17 @@ struct Checker {
         // Build concrete struct type with substituted fields
         const concrete_type = self.buildStructType(struct_node, cache_key)
 
+        // Register in cache BEFORE instantiateNestedMethods to break recursion
+        // (methods referencing the same generic type will hit the cache)
+        self.types.registerNamed(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
+
+        // Instantiate inferred impl methods (nested fn_decls in struct body)
+        // Still using defining file's AST with active type substitution
+        var sd_nested: List(int) = .{}
+        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested = sd.nested_decls }, else => {} }, else => {} }
+        self.instantiateNestedMethods(cache_key, sd_nested, resolved_args, info.ast_ptr)
+
         // Restore substitution
         self.type_sub_keys.count = old_sub_count
         self.type_sub_vals.count = old_sub_count
@@ -3959,12 +4149,61 @@ struct Checker {
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 
-        // Register, cache, and instantiate methods
-        self.types.registerNamed(cache_key, concrete_type)
-        self.instantiation_cache.set(cache_key, concrete_type)
+        // Instantiate methods from separate impl blocks
         self.instantiateGenericImplMethods(gi_name, cache_key, resolved_args)
 
         return concrete_type
+    }
+
+    /// Instantiate inferred impl methods (fn_decls nested in a generic struct body).
+    /// Called during generic struct instantiation while defining file's AST is active.
+    fn instantiateNestedMethods(concrete_name: string, nested_decls: List(int), resolved_args: List(int), ast_ptr: int) void {
+        // Pass 1: Register all method signatures
+        for ni in 0..nested_decls.count {
+            const nested_idx = nested_decls.get(ni)
+            if (nodeTag(self.ast, nested_idx) != "fn_decl") { continue }
+
+            var method_name = ""
+            switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { method_name = f.name }, else => {} }, else => {} }
+            const synth_name = "${concrete_name}_${method_name}"
+            const func_type = self.buildFuncType(nested_idx)
+
+            // Detect static (no params or first param not named "self")
+            var is_static = true
+            var f_params: List(int) = .{}
+            switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { f_params = f.params }, else => {} }, else => {} }
+            if (f_params.count > 0) {
+                const first_param = f_params.get(0)
+                if (nodeTag(self.ast, first_param) == "field_def") {
+                    var fp_name = ""
+                    switch (self.ast.getNode(first_param)) { Node.expr |e| => switch (e) { Expr.field_def |fd| => { fp_name = fd.name }, else => {} }, else => {} }
+                    if (fp_name == "self") { is_static = false }
+                }
+            }
+
+            // Define in global scope
+            const old_scope = self.current_scope
+            self.current_scope = self.global_scope
+            if (!self.isDefined(synth_name)) {
+                self.defineSymbol(makeFuncSymbol(synth_name, func_type, nested_idx))
+            }
+            self.current_scope = old_scope
+
+            self.types.registerMethod(concrete_name, MethodInfo {
+                name: method_name,
+                func_name: synth_name,
+                func_type: func_type,
+                receiver_is_ptr: !is_static,
+                is_static: is_static,
+                source_tree: 0,
+            })
+
+            // Register for lowerer
+            self.registerGenericInst(synth_name, nested_idx, resolved_args, ast_ptr)
+        }
+
+        // Pass 2: Skip body checking for now — bodies are checked on demand
+        // (Full body checking here would require cross-file expr_types isolation)
     }
 
     /// Instantiate all methods from generic impl blocks for a concrete struct type.
@@ -4261,6 +4500,16 @@ struct Checker {
         }
 
         const concrete_type = self.buildStructType(struct_node, cache_key)
+
+        // Register in cache BEFORE instantiateNestedMethods to break recursion
+        self.types.registerNamed(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
+
+        // Instantiate inferred impl methods from struct body
+        var sd_nested2: List(int) = .{}
+        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested2 = sd.nested_decls }, else => {} }, else => {} }
+        self.instantiateNestedMethods(cache_key, sd_nested2, resolved_args, info.ast_ptr)
+
         self.type_sub_keys.count = old_sub_count
         self.type_sub_vals.count = old_sub_count
 
@@ -4269,8 +4518,6 @@ struct Checker {
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 
-        self.types.registerNamed(cache_key, concrete_type)
-        self.instantiation_cache.set(cache_key, concrete_type)
         self.instantiateGenericImplMethods(type_name, cache_key, resolved_args)
 
         return concrete_type
@@ -4332,6 +4579,16 @@ struct Checker {
         }
 
         const concrete_type = self.buildStructType(struct_node, cache_key)
+
+        // Register in cache BEFORE instantiateNestedMethods to break recursion
+        self.types.registerNamed(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
+
+        // Instantiate inferred impl methods from struct body
+        var sd_nested3: List(int) = .{}
+        switch (self.ast.getNode(struct_node)) { Node.decl |d| => switch (d) { Decl.struct_decl |sd| => { sd_nested3 = sd.nested_decls }, else => {} }, else => {} }
+        self.instantiateNestedMethods(cache_key, sd_nested3, resolved_args, info.ast_ptr)
+
         self.type_sub_keys.count = old_sub_count
         self.type_sub_vals.count = old_sub_count
 
@@ -4340,8 +4597,6 @@ struct Checker {
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 
-        self.types.registerNamed(cache_key, concrete_type)
-        self.instantiation_cache.set(cache_key, concrete_type)
         self.instantiateGenericImplMethods(type_name, cache_key, resolved_args)
 
         return concrete_type
@@ -4976,7 +5231,8 @@ struct Checker {
 
     /// Check if node is a struct declaration.
     fn isStructDeclNode(idx: int) bool {
-        return nodeTag(self.ast, idx) == "struct_decl"
+        const tag = nodeTag(self.ast, idx)
+        return tag == "struct_decl" or tag == "enum_decl"
     }
 
     /// Check a list of statements with reachability analysis.

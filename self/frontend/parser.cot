@@ -1568,10 +1568,10 @@ struct Parser {
                 // .{ expr, expr } — could be tuple or array init
                 return self.parseBlockExpr()
             }
-            if (self.tok == Token.ident) {
+            if (self.tok == Token.ident or (self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
                 const name = self.tok_text
                 self.advance()
-                return self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+                return self.ast.addExpr(Expr.field_access(FieldAccessExpr { .base = null_node, .field = name, .span = self.spanSE(start, self.tok_end) }))
             }
             return self.ast.addExpr(Expr.zero_init(ZeroInit { .span = self.spanSE(start, self.tok_end) }))
         }
