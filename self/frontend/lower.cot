@@ -531,6 +531,7 @@ struct Lowerer {
             self.resolveTypeNode(fn_decl.return_type)
         } else { VOID }
 
+
         const uses_sret = self.needsSret(return_type)
         const wasm_return_type = if (uses_sret) { VOID } else { return_type }
 

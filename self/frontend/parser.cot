@@ -2730,7 +2730,8 @@ struct Parser {
                 const inner = self.parseType()
                 return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_ERROR_UNION, .data1 = inner, .data2 = error_set, .span = self.spanSE(start, self.tok_end) }))
             }
-            return self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+            const name_idx = self.ast.addExpr(Expr.ident(Ident { .name = name, .span = self.spanSE(start, self.tok_end) }))
+            return self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_NAMED, .data1 = name_idx, .data2 = null_node, .span = self.spanSE(start, self.tok_end) }))
         }
         // fn type
         if (self.tok == Token.kw_fn) {
