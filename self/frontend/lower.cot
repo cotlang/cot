@@ -7449,6 +7449,43 @@ struct Lowerer {
         fb.setBlock(ok_block)
     }
 
+    /// Check if any active cleanup is a defer, errdefer, or scope_destroy.
+    /// Reference: lower.zig:1982-1987
+    fn hasDeferCleanups() bool {
+        for i in 0..self.cleanup_stack.count {
+            const cleanup = self.cleanup_stack.get(i)
+            if (cleanup.kind == CLEANUP_DEFER or cleanup.kind == CLEANUP_ERRDEFER or cleanup.kind == CLEANUP_SCOPE_DESTROY) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Check if a base expression (ident, field access, index, deref) has
+    /// an associated cleanup in the cleanup stack.
+    /// Reference: lower.zig:2101-2114
+    fn baseHasCleanup(base_idx: int) bool {
+        const node = self.tree.getNode(base_idx)
+        switch (node) { Node.expr |e| => switch (e) {
+            Expr.ident |id| => {
+                if (self.builder.func()) |fb| {
+                    if (fb.lookupLocal(id.name)) |local_idx| {
+                        // Check if any cleanup targets this local
+                        for j in 0..self.cleanup_stack.count {
+                            const cleanup = self.cleanup_stack.get(j)
+                            if (cleanup.local_idx == local_idx) { return true }
+                        }
+                    }
+                }
+                return false
+            },
+            Expr.field_access |fa| => { return self.baseHasCleanup(fa.base) },
+            Expr.index_expr |ix| => { return self.baseHasCleanup(ix.base) },
+            Expr.deref |d| => { return self.baseHasCleanup(d.operand) },
+            else => { return false },
+        }, else => { return false } }
+    }
+
     /// Register scope_destroy cleanup for structs with deinit() method.
     /// Called after lowering struct init to auto-call deinit at scope exit.
     /// Reference: lower.zig:1995-2028
