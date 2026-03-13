@@ -1523,13 +1523,117 @@ struct FuncGen {
             // === Lowered ops ===
             SsaOp.wasm_lowered_zero => {
                 self.getValue32(v.args.get(0))  // dest addr
-                self.code.emitI32Const(0)
+                self.code.emitI32Const(0)        // fill value = 0
                 self.code.emitI32Const(v.aux_int)  // size
-                // memory.fill: 0xFC 0x0B <memory_idx>
-                self.code.buf.append(0xFC as u8)
-                self.code.buf.append(0x0B as u8)
-                self.code.buf.append(0x00 as u8)
+                self.code.emitMemoryFill()
             },
+            // Closure call via table with CTXT global
+            // Go reference: wasm/ssa.go:229-231
+            // Args[0] = table_idx, Args[1] = context_ptr, Args[2..] = function args
+            SsaOp.wasm_lowered_closure_call => {
+                // Set CTXT global (global 1) from context pointer
+                self.getValue64(v.args.get(1))
+                self.code.emitGlobalSet(1)
+                // Push function arguments (args[2..])
+                for ai in 2..v.args.count {
+                    self.getValue64(v.args.get(ai))
+                }
+                // Push callee table index (args[0]) — must be i32 for call_indirect
+                self.getValue64(v.args.get(0))
+                self.code.emitI32WrapI64()
+                // Emit call_indirect with type signature from aux_int
+                self.code.emitCallIndirect(v.aux_int, 0)
+            },
+
+            // Plain indirect function call via table (function pointers, no CTXT)
+            // Args[0] = callee (table index), Args[1..] = function arguments
+            SsaOp.wasm_lowered_inter_call => {
+                // Push function arguments (skip arg[0] which is the callee)
+                for ai in 1..v.args.count {
+                    self.getValue64(v.args.get(ai))
+                }
+                // Push callee (table index) — must be i32 for call_indirect
+                self.getValue64(v.args.get(0))
+                self.code.emitI32WrapI64()
+                self.code.emitCallIndirect(v.aux_int, 0)
+            },
+
+            // Wasm global get/set
+            SsaOp.wasm_global_get => {
+                self.code.emitGlobalGet(v.aux_int)
+            },
+            SsaOp.wasm_global_set => {
+                self.getValue64(v.args.get(0))
+                self.code.emitGlobalSet(v.aux_int)
+            },
+
+            // Conditional select (ternary)
+            // Stack order: then_val, else_val, condition -> result
+            SsaOp.cond_select => {
+                self.getValue64(v.args.get(1))   // then_value
+                self.getValue64(v.args.get(2))   // else_value
+                self.getValue32(v.args.get(0))   // condition (must be i32)
+                self.code.emitSelect()
+            },
+
+            // Type conversion (int cast, float-to-int, int-to-float)
+            // Go reference: cmd/compile/internal/wasm/ssa.go:479-501
+            SsaOp.convert => {
+                const from_type = v.aux_int   // source type index
+                const to_type = v.type_idx    // destination type index
+
+                self.getValue64(v.args.get(0))
+
+                // TypeRegistry constants: I32=4, I64=5, F32=10, F64=11, UNTYPED_FLOAT=14
+                const from_is_float = (from_type == 10 or from_type == 11 or from_type == 14)
+                const to_is_float = (to_type == 10 or to_type == 11 or to_type == 14)
+                const from_is_32 = (from_type == 4)
+                const to_is_32 = (to_type == 4)
+
+                if (from_is_float and to_is_float) {
+                    // float -> float: precision conversion
+                    if (to_type == 10) {
+                        // f64 -> f32 precision: demote then promote (round-trip loses precision)
+                        self.code.emitF32DemoteF64()
+                        self.code.emitF64PromoteF32()
+                    }
+                    // f32 -> f64 or same: no-op
+                } else if (from_is_float and !to_is_float) {
+                    // float -> int: saturating truncate
+                    if (to_is_32) {
+                        self.code.emitI32TruncSatF64S()
+                        self.code.emitI64ExtendI32S()
+                    } else {
+                        self.code.emitI64TruncSatF64S()
+                    }
+                } else if (!from_is_float and to_is_float) {
+                    // int -> float
+                    self.code.emitF64ConvertI64S()
+                } else if (!from_is_32 and to_is_32) {
+                    // i64 -> i32: wrap then extend back for stack consistency
+                    self.code.emitI32WrapI64()
+                    self.code.emitI64ExtendI32S()
+                }
+                // i32 -> i64 or same size: no conversion needed
+            },
+
+            // Function address: push element table index as i64
+            SsaOp.addr => {
+                const fn_name = switch (v.aux) {
+                    SsaAux.str |s| => s,
+                    else => "",
+                }
+                if (@lenOf(fn_name) > 0 and self.has_func_indices) {
+                    if (self.func_indices.contains(fn_name)) {
+                        self.code.emitI64Const(self.func_indices.get(fn_name))
+                    } else {
+                        self.code.emitI64Const(0)
+                    }
+                } else {
+                    self.code.emitI64Const(0)
+                }
+            },
+
             SsaOp.wasm_lowered_nil_check => {
                 self.getValue32(v.args.get(0))
                 self.code.emitI32Eqz()

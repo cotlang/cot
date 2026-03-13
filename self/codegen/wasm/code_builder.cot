@@ -133,8 +133,17 @@ const OP_F64_SQRT: u8 = 0x9F
 const BLOCK_I32: u8 = 0x7F
 const BLOCK_I64: u8 = 0x7E
 
-// Memory copy (bulk memory proposal, FC_PREFIX already in wasm_types)
+// Bulk memory and saturation truncate opcodes (0xFC prefix)
 const FC_MEMORY_COPY: u8 = 0x0A
+const FC_MEMORY_FILL: u8 = 0x0B
+const FC_I32_TRUNC_SAT_F32_S: u8 = 0x00
+const FC_I32_TRUNC_SAT_F32_U: u8 = 0x01
+const FC_I32_TRUNC_SAT_F64_S: u8 = 0x02
+const FC_I32_TRUNC_SAT_F64_U: u8 = 0x03
+const FC_I64_TRUNC_SAT_F32_S: u8 = 0x04
+const FC_I64_TRUNC_SAT_F32_U: u8 = 0x05
+const FC_I64_TRUNC_SAT_F64_S: u8 = 0x06
+const FC_I64_TRUNC_SAT_F64_U: u8 = 0x07
 
 // SP global index
 const SP_GLOBAL: int = 0
@@ -520,6 +529,23 @@ struct CodeBuilder {
     fn emitI64ReinterpretF64() void { self.buf.append(0xBD as u8) }
     fn emitF32ReinterpretI32() void { self.buf.append(0xBE as u8) }
     fn emitI32ReinterpretF32() void { self.buf.append(0xBC as u8) }
+
+    // Saturation truncation (0xFC prefix — never traps, returns 0 for NaN)
+    fn emitI32TruncSatF64S() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I32_TRUNC_SAT_F64_S) }
+    fn emitI32TruncSatF64U() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I32_TRUNC_SAT_F64_U) }
+    fn emitI32TruncSatF32S() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I32_TRUNC_SAT_F32_S) }
+    fn emitI32TruncSatF32U() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I32_TRUNC_SAT_F32_U) }
+    fn emitI64TruncSatF64S() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I64_TRUNC_SAT_F64_S) }
+    fn emitI64TruncSatF64U() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I64_TRUNC_SAT_F64_U) }
+    fn emitI64TruncSatF32S() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I64_TRUNC_SAT_F32_S) }
+    fn emitI64TruncSatF32U() void { self.buf.append(FC_PREFIX); self.buf.append(FC_I64_TRUNC_SAT_F32_U) }
+
+    // Bulk memory fill (0xFC prefix)
+    fn emitMemoryFill() void {
+        self.buf.append(FC_PREFIX)
+        self.buf.append(FC_MEMORY_FILL)
+        self.buf.append(0x00 as u8)  // memory index
+    }
 
     // call_indirect
     fn emitCallIndirect(type_idx: int, table_idx: int) void {
