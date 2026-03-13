@@ -465,8 +465,23 @@ struct Parser {
                 if (!self.expect(Token.lbrace as int)) {
                     return null_node
                 }
+                // Set current_impl_type so @safe implicit self injection works
+                const saved_impl = self.current_impl_type
+                const saved_impl_generic = self.current_impl_is_generic
+                self.current_impl_type = name
+                self.current_impl_is_generic = false
                 var variants: List(int) = .{}
+                var nested: List(int) = .{}
                 while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                    self.collectDocComment()
+                    // Nested decls: fn, static fn, const (inferred impl)
+                    if (self.tok == Token.kw_fn or self.tok == Token.kw_static or self.tok == Token.kw_const) {
+                        const nested_idx = self.parseDecl()
+                        if (nested_idx != null_node) {
+                            nested.append(nested_idx)
+                        }
+                        continue
+                    }
                     const vstart = self.tok_start
                     if (self.tok == Token.at) {
                         self.advance()
@@ -485,7 +500,8 @@ struct Parser {
                     self.match(Token.comma as int)
                 }
                 self.expect(Token.rbrace as int)
-                var nested: List(int) = .{}
+                self.current_impl_type = saved_impl
+                self.current_impl_is_generic = saved_impl_generic
                 return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
             }
 
@@ -517,8 +533,10 @@ struct Parser {
                 }
                 var variants: List(int) = .{}
                 while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                    self.collectDocComment()
                     const vstart = self.tok_start
-                    if (self.tok != Token.ident) {
+                    // Accept identifiers and keywords as variant names
+                    if (self.tok != Token.ident and !(self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
                         self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
                         break
                     }
@@ -540,18 +558,56 @@ struct Parser {
                 var sfields: List(int) = .{}
                 var nested: List(int) = .{}
                 var type_params: List(string) = .{}
+                // Optional type parameters: struct Pair(T, U) { ... }
+                if (self.tok == Token.lparen) {
+                    self.advance()  // consume (
+                    while (self.tok != Token.rparen and self.tok != Token.eof) {
+                        if (self.tok != Token.ident) { break }
+                        type_params.append(self.tok_text)
+                        self.advance()
+                        if (!self.match(Token.comma as int)) { break }
+                    }
+                    self.expect(Token.rparen as int)
+                }
                 if (!self.expect(Token.lbrace as int)) {
                     return null_node
                 }
+                // Set current_impl_type for @safe implicit self injection
+                const saved_impl = self.current_impl_type
+                const saved_impl_generic = self.current_impl_is_generic
+                self.current_impl_type = name
+                self.current_impl_is_generic = (type_params.count > 0)
+                // Parse fields first, then nested decls (methods, consts)
                 while (self.tok != Token.rbrace and self.tok != Token.eof) {
                     self.collectDocComment()
+                    const ftok = @enumFromInt(self.tok) as Token
+                    if (ftok == Token.kw_fn or ftok == Token.kw_static or ftok == Token.kw_const or
+                        ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct) {
+                        break
+                    }
                     const fd = self.parseFieldDef()
                     if (fd != null_node) {
                         sfields.append(fd)
                     }
                     self.match(Token.comma as int)
                 }
+                // Parse nested declarations (methods, static fn, const)
+                while (self.tok != Token.rbrace and self.tok != Token.eof) {
+                    self.collectDocComment()
+                    const dtok = @enumFromInt(self.tok) as Token
+                    if (dtok == Token.kw_fn or dtok == Token.kw_static or dtok == Token.kw_const or
+                        dtok == Token.kw_enum or dtok == Token.kw_type) {
+                        const nested_decl = self.parseDecl()
+                        if (nested_decl != null_node) {
+                            nested.append(nested_decl)
+                        }
+                    } else {
+                        break
+                    }
+                }
                 self.expect(Token.rbrace as int)
+                self.current_impl_type = saved_impl
+                self.current_impl_is_generic = saved_impl_generic
                 return self.ast.addDecl(Decl.struct_decl(StructDecl { .name = name, .type_params = type_params, .fields = sfields, .layout = 0, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
             }
 
@@ -656,6 +712,7 @@ struct Parser {
         // Parse nested declarations (const, enum, struct, type, fn, static fn) before fields
         var nested: List(int) = .{}
         while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
             const tok = @enumFromInt(self.tok) as Token
             if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
                 tok == Token.kw_fn or tok == Token.kw_static) {
@@ -671,13 +728,13 @@ struct Parser {
         // Fields
         var fields: List(int) = .{}
         while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
             // Break on nested-decl keywords (methods after fields)
             const ftok = @enumFromInt(self.tok) as Token
             if (ftok == Token.kw_fn or ftok == Token.kw_static or ftok == Token.kw_const or
                 ftok == Token.kw_enum or ftok == Token.kw_type or ftok == Token.kw_struct) {
                 break
             }
-            self.collectDocComment()
             const fd = self.parseFieldDef()
             if (fd != null_node) {
                 fields.append(fd)
@@ -687,6 +744,7 @@ struct Parser {
 
         // Parse nested declarations after fields (methods, static fn, etc.)
         while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
             const tok = @enumFromInt(self.tok) as Token
             if (tok == Token.kw_const or tok == Token.kw_enum or tok == Token.kw_type or
                 tok == Token.kw_fn or tok == Token.kw_static) {
@@ -746,8 +804,23 @@ struct Parser {
         if (!self.expect(Token.lbrace as int)) {
             return null_node
         }
+        // Set current_impl_type so @safe implicit self injection works for methods inside enum bodies
+        const saved_impl = self.current_impl_type
+        const saved_impl_generic = self.current_impl_is_generic
+        self.current_impl_type = name
+        self.current_impl_is_generic = false
         var variants: List(int) = .{}
+        var nested: List(int) = .{}
         while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
+            // Nested decls: fn, static fn, const (inferred impl)
+            if (self.tok == Token.kw_fn or self.tok == Token.kw_static or self.tok == Token.kw_const) {
+                const nested_idx = self.parseDecl()
+                if (nested_idx != null_node) {
+                    nested.append(nested_idx)
+                }
+                continue
+            }
             const vstart = self.tok_start
             if (self.tok == Token.at) {
                 // Quoted identifier: @"packed"
@@ -771,7 +844,8 @@ struct Parser {
             self.match(Token.comma as int)
         }
         self.expect(Token.rbrace as int)
-        var nested: List(int) = .{}
+        self.current_impl_type = saved_impl
+        self.current_impl_is_generic = saved_impl_generic
         return self.ast.addDecl(Decl.enum_decl(EnumDecl { .name = name, .backing_type = backing, .variants = variants, .nested_decls = nested, .doc_comment = doc, .span = self.spanSE(start, self.tok_end) }))
     }
 
@@ -791,8 +865,10 @@ struct Parser {
         }
         var variants: List(int) = .{}
         while (self.tok != Token.rbrace and self.tok != Token.eof) {
+            self.collectDocComment()
             const vstart = self.tok_start
-            if (self.tok != Token.ident) {
+            // Accept identifiers and keywords as variant names (e.g. `select: Select`)
+            if (self.tok != Token.ident and !(self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
                 self.errors.report(self.tok_start, ErrorCode.e203, "expected variant name")
                 break
             }
@@ -1197,8 +1273,8 @@ struct Parser {
                     // .?  optional unwrap (two tokens)
                     self.advance()
                     node = self.ast.addExpr(Expr.unary(Unary { .op = Token.question as int, .operand = node, .span = self.spanSE(self.tok_start, self.tok_end) }))
-                } else if (self.tok == Token.ident or self.tok == Token.int_lit) {
-                    // .field or .0 (tuple index)
+                } else if (self.tok == Token.ident or self.tok == Token.int_lit or (self.tok > (Token.keyword_beg as int) and self.tok < (Token.keyword_end as int))) {
+                    // .field or .0 (tuple index) or .keyword (e.g. .select)
                     const field_name = self.tok_text
                     self.advance()
                     node = self.ast.addExpr(Expr.field_access(FieldAccessExpr { .base = node, .field = field_name, .span = self.spanSE(self.tok_start, self.tok_end) }))

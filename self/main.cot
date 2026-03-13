@@ -123,7 +123,10 @@ fn cmdCheck(path: string, content: string) void {
     var s = Scanner.initWithErrors(content, &errs)
     var ast = Ast.init(path)
     var p = Parser.init(s, ast, errs)
+    const project_safe = isProjectSafe(path)
+    if (project_safe) { p.safe_mode = true }
     p.parseFile()
+    ast.safe_mode = p.safe_mode
 
     if (errs.hasErrors()) {
         exit(1)
