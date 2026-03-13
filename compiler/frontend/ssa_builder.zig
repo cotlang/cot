@@ -717,6 +717,28 @@ pub const SSABuilder = struct {
                 self.assign(local_idx, value);
                 return value;
             }
+
+            // Storing null to a GC ref optional: emit ref.null instead of const_nil
+            if (value.op == .const_nil and local_idx < self.ir_func.locals.len) {
+                const local_type = self.ir_func.locals[local_idx].type_idx;
+                const local_info = self.type_registry.get(local_type);
+                if (local_info == .optional) {
+                    const elem_info = self.type_registry.get(local_info.optional.elem);
+                    if (elem_info == .struct_type or elem_info == .union_type) {
+                        // Emit ref.null for this GC type
+                        const type_name = switch (elem_info) {
+                            .struct_type => |st| st.name,
+                            .union_type => |ut| ut.name,
+                            else => "",
+                        };
+                        const ref_null_val = try self.func.newValue(.wasm_gc_ref_null, local_type, cur, self.cur_pos);
+                        ref_null_val.aux = .{ .string = type_name };
+                        try cur.addValue(self.allocator, ref_null_val);
+                        self.assign(local_idx, ref_null_val);
+                        return ref_null_val;
+                    }
+                }
+            }
         }
 
         // String/slice compound store: decompose into ptr@0, len@8 (and cap@16 for slices).
@@ -995,6 +1017,30 @@ pub const SSABuilder = struct {
 
         const left = try self.convertNode(b.left) orelse return error.MissingValue;
         const right = try self.convertNode(b.right) orelse return error.MissingValue;
+
+        // WasmGC: comparing a GC ref against null → use ref.is_null
+        if (self.target.isWasmGC() and (b.op == .eq or b.op == .ne)) {
+            const left_is_null = left.op == .const_nil;
+            const right_is_null = right.op == .const_nil;
+            if (left_is_null or right_is_null) {
+                const ref_val = if (left_is_null) right else left;
+                const ref_type_info = self.type_registry.get(ref_val.type_idx);
+                const is_gc_ref = ref_type_info == .struct_type or ref_type_info == .union_type;
+                if (is_gc_ref) {
+                    const is_null_val = try self.func.newValue(.wasm_gc_ref_is_null, TypeRegistry.BOOL, cur, self.cur_pos);
+                    is_null_val.addArg(ref_val);
+                    try cur.addValue(self.allocator, is_null_val);
+                    if (b.op == .ne) {
+                        // ne null → NOT ref.is_null
+                        const not_val = try self.func.newValue(.bool_not, TypeRegistry.BOOL, cur, self.cur_pos);
+                        not_val.addArg(is_null_val);
+                        try cur.addValue(self.allocator, not_val);
+                        return not_val;
+                    }
+                    return is_null_val;
+                }
+            }
+        }
 
         // For comparisons, result type is bool - check operand type instead
         const operand_type = left.type_idx;

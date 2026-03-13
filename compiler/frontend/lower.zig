@@ -136,10 +136,25 @@ pub const Lowerer = struct {
     /// Returns true if the optional type wraps a pointer (e.g., ?*T).
     /// Pointer-like optionals use null=0 sentinel representation (single value).
     /// Non-pointer-like optionals (?i64, ?f64, ?bool) use compound tag+payload.
+    /// WasmGC: ?StructType and ?UnionType are also pointer-like (nullable GC refs).
     fn isPtrLikeOptional(self: *const Lowerer, type_idx: TypeIndex) bool {
         const info = self.type_reg.get(type_idx);
         if (info != .optional) return false;
-        return self.type_reg.get(info.optional.elem) == .pointer;
+        const elem_info = self.type_reg.get(info.optional.elem);
+        if (elem_info == .pointer) return true;
+        // WasmGC: struct and union types are GC refs, so ?T is (ref null $T)
+        if (self.target.isWasmGC() and (elem_info == .struct_type or elem_info == .union_type)) return true;
+        return false;
+    }
+
+    /// Returns true if the optional wraps a GC ref type (struct/union in WasmGC mode).
+    /// These use ref.is_null for null checks instead of comparing against i64 0.
+    fn isGcRefOptional(self: *const Lowerer, type_idx: TypeIndex) bool {
+        const info = self.type_reg.get(type_idx);
+        if (info != .optional) return false;
+        if (!self.target.isWasmGC()) return false;
+        const elem_info = self.type_reg.get(info.optional.elem);
+        return elem_info == .struct_type or elem_info == .union_type;
     }
 
     /// Go LinkFuncName: qualify bare function name with module prefix.
@@ -3616,6 +3631,7 @@ pub const Lowerer = struct {
         const opt_val = try self.lowerExprNode(if_stmt.condition);
         if (opt_val == ir.null_node) return false;
 
+        const is_gc_ref_opt = self.isGcRefOptional(opt_type_idx);
         const is_non_null = if (is_compound_opt) blk: {
             // Compound optional: store to temp, read tag at field 0
             const opt_local = try fb.addLocalWithSize("__opt_if", opt_type_idx, false, self.type_reg.sizeOf(opt_type_idx));
@@ -3623,6 +3639,10 @@ pub const Lowerer = struct {
             const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, if_stmt.span);
             const zero = try fb.emitConstInt(0, TypeRegistry.I64, if_stmt.span);
             break :blk try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, if_stmt.span);
+        } else if (is_gc_ref_opt) blk: {
+            // WasmGC nullable ref: use ref.is_null then negate
+            const is_null = try fb.emitGcRefIsNull(opt_val, if_stmt.span);
+            break :blk try fb.emitUnary(.not, is_null, TypeRegistry.BOOL, if_stmt.span);
         } else blk: {
             // Pointer-like optional or legacy: compare value to null
             const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, if_stmt.span));
@@ -3762,11 +3782,16 @@ pub const Lowerer = struct {
         _ = try fb.emitStoreLocal(opt_local, opt_val, while_stmt.span);
 
         // Check if non-null
+        const is_gc_ref_opt_w = self.isGcRefOptional(opt_type_idx);
         const is_non_null = if (is_compound_opt) blk: {
             // Compound optional: read tag at field 0
             const tag = try fb.emitFieldLocal(opt_local, 0, 0, TypeRegistry.I64, while_stmt.span);
             const zero = try fb.emitConstInt(0, TypeRegistry.I64, while_stmt.span);
             break :blk try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, while_stmt.span);
+        } else if (is_gc_ref_opt_w) blk: {
+            // WasmGC nullable ref: ref.is_null + not
+            const is_null = try fb.emitGcRefIsNull(opt_val, while_stmt.span);
+            break :blk try fb.emitUnary(.not, is_null, TypeRegistry.BOOL, while_stmt.span);
         } else blk: {
             const null_val = try fb.emit(ir.Node.init(.const_null, TypeRegistry.UNTYPED_NULL, while_stmt.span));
             break :blk try fb.emitBinary(.ne, opt_val, null_val, TypeRegistry.BOOL, while_stmt.span);
