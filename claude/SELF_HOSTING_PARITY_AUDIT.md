@@ -10,10 +10,10 @@
 
 | Subsystem | Files | Lines | Parity | Critical Gaps |
 |-----------|-------|-------|--------|---------------|
-| Token/Scanner | 2 | 1,217 | **97%** | Missing `kw_spawn`, `kw_select` tokens |
+| Token/Scanner | 2 | 1,217 | **100%** | None (`kw_spawn`, `kw_select` added) |
 | AST | 1 | 1,532 | **95%** | None (SelectExpr already present) |
-| Parser | 1 | 3,158 | **87%** | Spawn/select token defs block integration |
-| Types | 1 | 1,609 | **85%** | Shape stenciling struct (~80 LOC) |
+| Parser | 1 | 3,158 | **95%** | Minor: less detailed error messages |
+| Types | 1 | 1,609 | **95%** | Shape stenciling complete |
 | Checker | 1 | 5,546 | **86%** | `evalComptimeValue` rich union |
 | IR | 1 | 1,356 | **100%** | None |
 | ARC Insertion | 1 | 443 | **100%** | None |
@@ -25,7 +25,7 @@
 | Source/Errors | 2 | 860 | **100%** | None |
 | Main/CLI | 1 | 788 | **100%** | None |
 
-**Overall: ~88% feature-complete. 40,005 lines across 36 files.**
+**Overall: ~90% feature-complete. 40,231 lines across 36 files.**
 
 **Remaining gaps by priority:**
 1. **HIGH**: Token keywords (5 LOC), lower_wasm pass gaps (~205 LOC), rewritedec gaps (~130 LOC)
@@ -35,14 +35,13 @@
 
 ---
 
-## 2. Token & Scanner — 97%
+## 2. Token & Scanner — 100%
 
-**Files:** `token.cot` (443 lines), `scanner.cot` (774 lines)
+**Files:** `token.cot` (445 lines), `scanner.cot` (774 lines)
 **Reference:** `token.zig` (333 lines), `scanner.zig` (527 lines)
 
 All token variants and scanner methods present. Scanner fully functional for all lexing.
-
-**Gap:** Token enum missing `kw_spawn` and `kw_select` (added to Zig compiler in Mar 2026 concurrency work). 5 LOC to add.
+`kw_spawn` and `kw_select` added. No remaining gaps.
 
 ---
 
@@ -57,29 +56,28 @@ Cot is 2x lines due to explicit struct definitions and inline tests.
 
 ---
 
-## 4. Parser — 87%
+## 4. Parser — 95%
 
 **File:** `parser.cot` (3,158 lines, 66 functions)
 **Reference:** `parser.zig` (2,340 lines, 55 functions)
 
 All critical parsing logic implemented. Cot has 11 extra helper methods for
 safe mode (`@safe` colon syntax, field shorthand) and concurrency (select/spawn parsing).
+Spawn/select tokens now defined and parser integration complete.
 
-**Gap:** Spawn/select parsing exists but token definitions missing (blocks integration tests).
-Minor: `unexpectedToken()` less detailed than Zig version.
+**Gap:** Minor: `unexpectedToken()` less detailed than Zig version.
 
 ---
 
-## 5. Types — 85%
+## 5. Types — 95%
 
 **File:** `types.cot` (1,609 lines)
 **Reference:** `types.zig` (941 lines)
 
 All 13 type structures, TypeRegistry with all methods, 10 type constructors,
 all type queries (sizeOf, alignOf, isPointer, isArray, etc.).
-
-**Gap:** Shape stenciling struct missing (~80 LOC). Shape is needed for 3-tier
-generic optimization (same-shape types share code). All other type infrastructure complete.
+Shape stenciling complete (Shape, ArcKind, RegClass, fromType, eql, key).
+3 tests cover basic types, pointers/slices, and key format.
 
 ---
 
