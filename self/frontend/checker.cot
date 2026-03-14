@@ -175,33 +175,27 @@ struct GenericInstInfo {
 struct SharedCheckerState {
     global_map: int,                         // raw ptr to Map(string, int) — global scope
     symbols: List(Symbol),
-    generic_structs: Map(string, int),
-    generic_functions: Map(string, int),
-    instantiation_cache: Map(string, int),
-    generic_inst_by_name: Map(string, int),  // concrete_name → @ptrToInt(*GenericInstInfo)
+    generic_structs: int,                    // raw ptr to Map(string, int) — Zig SharedGenericContext pattern
+    generic_functions: int,                  // raw ptr to Map(string, int)
+    instantiation_cache: int,               // raw ptr to Map(string, int)
+    generic_inst_by_name: int,              // raw ptr to Map(string, int)
     generic_impl_entries: List(GenericImplEntry),
-    trait_defs: Map(string, int),
-    trait_impls: Map(string, string),
+    trait_defs: int,                         // raw ptr to Map(string, int)
+    trait_impls: int,                        // raw ptr to Map(string, string)
 
     static fn init() SharedCheckerState {
         var symbols: List(Symbol) = .{}
-        var generic_structs: Map(string, int) = .{}
-        var generic_functions: Map(string, int) = .{}
-        var instantiation_cache: Map(string, int) = .{}
-        var generic_inst_by_name: Map(string, int) = .{}
         var generic_impl_entries: List(GenericImplEntry) = .{}
-        var trait_defs: Map(string, int) = .{}
-        var trait_impls: Map(string, string) = .{}
         return SharedCheckerState {
             global_map: allocMap(),
             symbols: symbols,
-            generic_structs: generic_structs,
-            generic_functions: generic_functions,
-            instantiation_cache: instantiation_cache,
-            generic_inst_by_name: generic_inst_by_name,
+            generic_structs: allocMap(),
+            generic_functions: allocMap(),
+            instantiation_cache: allocMap(),
+            generic_inst_by_name: allocMap(),
             generic_impl_entries: generic_impl_entries,
-            trait_defs: trait_defs,
-            trait_impls: trait_impls,
+            trait_defs: allocMap(),
+            trait_impls: allocMap(),
         }
     }
 }
@@ -221,19 +215,19 @@ struct Checker {
     current_scope: int,
     global_scope: int,
     expr_types: Map(int, int),
-    trait_defs: Map(string, int),   // trait name → AST node index
+    trait_defs: int,  // raw ptr to shared Map   // trait name → AST node index
     current_return_type: int,
     in_loop: bool,
     safe_mode: bool,
     // Generic support
-    generic_structs: Map(string, int),        // name → struct_decl node_idx
-    generic_functions: Map(string, int),      // name → fn_decl node_idx
+    generic_structs: int,  // raw ptr to shared Map        // name → struct_decl node_idx
+    generic_functions: int,  // raw ptr to shared Map      // name → fn_decl node_idx
     generic_impl_entries: List(GenericImplEntry),
-    instantiation_cache: Map(string, int),    // "List(5)" → concrete type_idx
-    generic_inst_by_name: Map(string, int),   // concrete_name → @ptrToInt(*GenericInstInfo)
+    instantiation_cache: int,  // raw ptr to shared Map    // "List(5)" → concrete type_idx
+    generic_inst_by_name: int,  // raw ptr to shared Map   // concrete_name → @ptrToInt(*GenericInstInfo)
     type_sub_keys: List(string),             // parallel lists = active substitution map
     type_sub_vals: List(int),
-    trait_impls: Map(string, string),        // "Trait:Type" → trait_name
+    trait_impls: int,  // raw ptr to shared Map        // "Trait:Type" → trait_name
     // Type flow
     expected_type: int,                       // Zig RLS pattern
     current_switch_enum_type: int,            // for .variant shorthand
@@ -256,15 +250,9 @@ struct Checker {
         scope_maps.append(global_map)
 
         var expr_types: Map(int, int) = .{}
-        var trait_defs: Map(string, int) = .{}
-        var generic_structs: Map(string, int) = .{}
-        var generic_functions: Map(string, int) = .{}
-        var instantiation_cache: Map(string, int) = .{}
-        var generic_inst_by_name: Map(string, int) = .{}
         var generic_impl_entries: List(GenericImplEntry) = .{}
         var type_sub_keys: List(string) = .{}
         var type_sub_vals: List(int) = .{}
-        var trait_impls: Map(string, string) = .{}
         var comptime_vars: Map(string, int) = .{}
 
         return Checker {
@@ -277,18 +265,18 @@ struct Checker {
             current_scope: 0,
             global_scope: 0,
             expr_types: expr_types,
-            trait_defs: trait_defs,
+            trait_defs: allocMap(),
             current_return_type: VOID,
             in_loop: false,
             safe_mode: false,
-            generic_structs: generic_structs,
-            generic_functions: generic_functions,
+            generic_structs: allocMap(),
+            generic_functions: allocMap(),
             generic_impl_entries: generic_impl_entries,
-            instantiation_cache: instantiation_cache,
-            generic_inst_by_name: generic_inst_by_name,
+            instantiation_cache: allocMap(),
+            generic_inst_by_name: allocMap(),
             type_sub_keys: type_sub_keys,
             type_sub_vals: type_sub_vals,
-            trait_impls: trait_impls,
+            trait_impls: allocMap(),
             expected_type: invalid_type,
             current_switch_enum_type: invalid_type,
             lint_mode: false,
@@ -311,7 +299,9 @@ struct Checker {
     }
 
     /// Load shared state from SharedCheckerState for multi-file mode.
-    /// Call AFTER initShared, BEFORE checkFile.
+    /// Zig pattern: all checkers share the SAME Maps via raw pointer.
+    /// The checker's Map fields are raw pointers to the shared Maps.
+    /// All mutations go directly to shared data — no copy-sync needed.
     fn loadSharedState(shared: *SharedCheckerState) void {
         self.symbols = shared.symbols
         self.generic_structs = shared.generic_structs
@@ -523,7 +513,7 @@ struct Checker {
                 var info = new GenericInfo { node_idx: idx, ast_ptr: @ptrToInt(self.ast) }
                 retain(@ptrToInt(self.ast))   // AST escapes as raw int — ARC can't track
                 retain(@ptrToInt(info))       // Keep GenericInfo alive past local scope
-                self.generic_structs.set(name, @ptrToInt(info))
+                @intToPtr(*Map(string, int), self.generic_structs).set(name, @ptrToInt(info))
                 self.defineSymbol(makeTypeSymbol(name, invalid_type, idx))
                 return
             }
@@ -691,7 +681,7 @@ struct Checker {
                 var info = new GenericInfo { node_idx: idx, ast_ptr: @ptrToInt(self.ast) }
                 retain(@ptrToInt(self.ast))   // AST escapes as raw int — ARC can't track
                 retain(@ptrToInt(info))       // Keep GenericInfo alive past local scope
-                self.generic_functions.set(name, @ptrToInt(info))
+                @intToPtr(*Map(string, int), self.generic_functions).set(name, @ptrToInt(info))
                 self.defineSymbol(makeTypeSymbol(name, invalid_type, idx))
                 return
             }
@@ -819,7 +809,7 @@ struct Checker {
     fn collectTraitDecl(idx: int) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.trait_decl |td| => {
-            self.trait_defs.set(td.name, idx)
+            @intToPtr(*Map(string, int), self.trait_defs).set(td.name, idx)
         }, else => {} }, else => {} }
     }
 
@@ -830,13 +820,13 @@ struct Checker {
             const target_type = it.target_type
 
             // Validate trait exists
-            if (!self.trait_defs.contains(trait_name)) {
+            if (!@intToPtr(*Map(string, int), self.trait_defs).contains(trait_name)) {
                 self.reportError(idx, ErrorCode.e301, "undefined trait")
                 return
             }
 
             // Validate all required methods are provided
-            const trait_idx = self.trait_defs.get(trait_name)
+            const trait_idx = @intToPtr(*Map(string, int), self.trait_defs).get(trait_name)
             const trait_node = self.ast.getNode(trait_idx)
             switch (trait_node) { Node.decl |td_outer| => switch (td_outer) { Decl.trait_decl |td| => {
                 for ti in 0..td.methods.count {
@@ -871,7 +861,7 @@ struct Checker {
 
             // Register trait impl for trait bound validation
             const impl_key = "${trait_name}:${target_type}"
-            self.trait_impls.set(impl_key, trait_name)
+            @intToPtr(*Map(string, string), self.trait_impls).set(impl_key, trait_name)
 
             // Register methods (same pattern as impl_block)
             for mi in 0..it.methods.count {
@@ -1650,7 +1640,7 @@ struct Checker {
                 }
             }
             // Generic function used without type args (Zig ref: checker.zig:1550-1553)
-            if (self.generic_functions.contains(name) and !self.hasTypeSubstitution()) {
+            if (@intToPtr(*Map(string, int), self.generic_functions).contains(name) and !self.hasTypeSubstitution()) {
                 self.reportError(idx, ErrorCode.e300, "generic function '${name}' requires type arguments")
                 return invalid_type
             }
@@ -1909,7 +1899,7 @@ struct Checker {
                 return INT
             }
             // Generic function instantiation: max(i64) where max is generic
-            if (self.generic_functions.contains(name)) {
+            if (@intToPtr(*Map(string, int), self.generic_functions).contains(name)) {
                 return self.instantiateGenericFunc(idx, name)
             }
         }
@@ -4100,7 +4090,7 @@ struct Checker {
         retain(@ptrToInt(inst))
         retain(@ptrOf(ta_copy))
         retain(@ptrOf(tp_copy))
-        self.generic_inst_by_name.set(concrete_name, @ptrToInt(inst))
+        @intToPtr(*Map(string, int), self.generic_inst_by_name).set(concrete_name, @ptrToInt(inst))
     }
 
     /// Resolve a generic struct instantiation: List(int) → concrete List(5) type.
@@ -4108,11 +4098,11 @@ struct Checker {
     /// Cross-file: swaps self.ast to defining file's AST (Zig: self.tree = gen_info.tree).
     fn resolveGenericInstance(idx: int, gi_name: string) int {
         // Look up generic struct definition
-        if (!self.generic_structs.contains(gi_name)) {
+        if (!@intToPtr(*Map(string, int), self.generic_structs).contains(gi_name)) {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
-        const info = @intToPtr(*GenericInfo, self.generic_structs.get(gi_name))
+        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_structs).get(gi_name))
 
         // Read type args from generic_instance AST (CURRENT file)
         var gi_type_args: List(int) = .{}
@@ -4129,8 +4119,8 @@ struct Checker {
 
         // Build cache key and check cache (before swapping AST)
         const cache_key = self.buildGenericCacheKey(gi_name, resolved_args)
-        if (self.instantiation_cache.contains(cache_key)) {
-            return self.instantiation_cache.get(cache_key)
+        if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
+            return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
         }
 
         return self.buildGenericInstance(idx, gi_name, info, resolved_args, ta_count, cache_key)
@@ -4174,7 +4164,7 @@ struct Checker {
         // Register in cache BEFORE instantiateNestedMethods to break recursion
         // (methods referencing the same generic type will hit the cache)
         self.types.registerNamed(cache_key, concrete_type)
-        self.instantiation_cache.set(cache_key, concrete_type)
+        @intToPtr(*Map(string, int), self.instantiation_cache).set(cache_key, concrete_type)
 
         // Instantiate inferred impl methods (nested fn_decls in struct body)
         // Still using defining file's AST with active type substitution
@@ -4364,7 +4354,7 @@ struct Checker {
     /// Cross-file: swaps self.ast to defining file's AST.
     fn instantiateGenericFunc(idx: int, name: string) int {
         // Look up generic function definition
-        const info = @intToPtr(*GenericInfo, self.generic_functions.get(name))
+        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_functions).get(name))
         const fn_node = info.node_idx
 
         // Read call args from CURRENT file's AST
@@ -4426,7 +4416,7 @@ struct Checker {
                 if (@lenOf(bound_name) > 0) {
                     const type_name = self.types.typeName(resolved_args.get(bi))
                     const impl_key = "${bound_name}:${type_name}"
-                    if (!self.trait_impls.contains(impl_key)) {
+                    if (!@intToPtr(*Map(string, string), self.trait_impls).contains(impl_key)) {
                         self.ast = saved_ast
                         self.safe_mode = saved_safe_mode
                         release(@ptrToInt(saved_ast))
@@ -4498,11 +4488,11 @@ struct Checker {
     /// Resolve generic struct init: Pair(int, string) { .a = 1, .b = "hi" }
     /// Cross-file: swaps self.ast to defining file's AST.
     fn resolveGenericStructInit(idx: int, type_name: string, fi_count: int, ta_count: int, si_type_args: List(int)) int {
-        if (!self.generic_structs.contains(type_name)) {
+        if (!@intToPtr(*Map(string, int), self.generic_structs).contains(type_name)) {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
-        const info = @intToPtr(*GenericInfo, self.generic_structs.get(type_name))
+        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_structs).get(type_name))
         const struct_node = info.node_idx
 
         // Resolve type args from CURRENT file's AST (passed in si_type_args)
@@ -4536,11 +4526,11 @@ struct Checker {
         }
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
-        if (self.instantiation_cache.contains(cache_key)) {
+        if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
-            return self.instantiation_cache.get(cache_key)
+            return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
         }
 
         // Set up substitution from DEFINING file's AST
@@ -4554,7 +4544,7 @@ struct Checker {
 
         // Register in cache BEFORE instantiateNestedMethods to break recursion
         self.types.registerNamed(cache_key, concrete_type)
-        self.instantiation_cache.set(cache_key, concrete_type)
+        @intToPtr(*Map(string, int), self.instantiation_cache).set(cache_key, concrete_type)
 
         // Instantiate inferred impl methods from struct body
         var sd_nested2: List(int) = .{}
@@ -4578,11 +4568,11 @@ struct Checker {
     /// Resolve generic new expr: new Pair(int, string) { a: 1, b: "hi" }
     /// Cross-file: swaps self.ast to defining file's AST.
     fn resolveGenericNewExpr(idx: int, type_name: string, fi_count: int, ta_count: int, ne_type_args: List(int)) int {
-        if (!self.generic_structs.contains(type_name)) {
+        if (!@intToPtr(*Map(string, int), self.generic_structs).contains(type_name)) {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
-        const info = @intToPtr(*GenericInfo, self.generic_structs.get(type_name))
+        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_structs).get(type_name))
         const struct_node = info.node_idx
 
         // Resolve type args from CURRENT file's AST (passed in ne_type_args)
@@ -4616,11 +4606,11 @@ struct Checker {
         }
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
-        if (self.instantiation_cache.contains(cache_key)) {
+        if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
-            return self.instantiation_cache.get(cache_key)
+            return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
         }
 
         // Set up substitution from DEFINING file's AST
@@ -4634,7 +4624,7 @@ struct Checker {
 
         // Register in cache BEFORE instantiateNestedMethods to break recursion
         self.types.registerNamed(cache_key, concrete_type)
-        self.instantiation_cache.set(cache_key, concrete_type)
+        @intToPtr(*Map(string, int), self.instantiation_cache).set(cache_key, concrete_type)
 
         // Instantiate inferred impl methods from struct body
         var sd_nested3: List(int) = .{}
@@ -5506,9 +5496,9 @@ struct Checker {
         }
 
         // Also check generic struct names
-        for ki in 0..self.generic_structs.capacity {
-            if (@intToPtr(*u8, self.generic_structs.states + ki).* != 1) { continue }
-            const candidate = @intToPtr(*string, self.generic_structs.keys + ki * @sizeOf(string)).*
+        for ki in 0..@intToPtr(*Map(string, int), self.generic_structs).capacity {
+            if (@intToPtr(*u8, @intToPtr(*Map(string, int), self.generic_structs).states + ki).* != 1) { continue }
+            const candidate = @intToPtr(*string, @intToPtr(*Map(string, int), self.generic_structs).keys + ki * @sizeOf(string)).*
             if (candidate == name) { continue }
             const d = self.editDistance(name, candidate)
             if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {
@@ -5812,7 +5802,7 @@ test "checker trait collection" {
     c.checkFile()
     @assertEq(errs.hasErrors(), false)
     // Trait should be registered
-    @assert(c.trait_defs.contains("Drawable"))
+    @assert(@intToPtr(*Map(string, int), c.trait_defs).contains("Drawable"))
 }
 
 test "checker safe wrap type" {
@@ -5902,7 +5892,7 @@ test "checker generic struct registration" {
     c.checkFile()
     @assertEq(errs.hasErrors(), false)
     // Generic struct should be stored in generic_structs map
-    @assert(c.generic_structs.contains("Box"))
+    @assert(@intToPtr(*Map(string, int), c.generic_structs).contains("Box"))
     // But not yet in the type registry (no concrete instantiation)
     @assertEq(types.lookupByName("Box"), -1)
 }

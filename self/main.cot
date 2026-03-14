@@ -695,7 +695,9 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
         }
     }
 
-    // Propagate back via field mutation (auto-ref propagates)
+    // Propagate shared state back — copy Maps then zero originals to prevent
+    // ARC from releasing the backing arrays when lower_inst goes out of scope.
+    // Zig driver uses manual memory management; Cot needs this ARC workaround.
     shared.builder = lower_inst.builder
     shared.lowered_generics = lower_inst.lowered_generics
     shared.shape_stencils = lower_inst.shape_stencils
@@ -997,9 +999,6 @@ fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedChec
     copyBytes(errs_heap, @ptrToInt(&check_errs), @sizeOf(ErrorReporter))
     const chk_heap = alloc(0, @sizeOf(Checker))
     copyBytes(chk_heap, @ptrToInt(&checker), @sizeOf(Checker))
-    // Zero the originals so ARC doesn't free the backing data
-    zeroBytes(@ptrToInt(&check_errs), @sizeOf(ErrorReporter))
-    zeroBytes(@ptrToInt(&checker), @sizeOf(Checker))
     checker_errs.append(errs_heap)
     checkers.append(chk_heap)
 }
