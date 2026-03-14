@@ -474,6 +474,19 @@ struct Checker {
         }
     }
 
+    /// Collect declarations without checking bodies.
+    /// Used in Phase 2 lowering: types are already checked from Phase 1,
+    /// just need symbol table populated for lookupSymbol during lowering.
+    fn collectDecls() void {
+        self.safe_mode = self.ast.safe_mode
+        for i in 0..self.ast.file_decls.count {
+            self.collectTypeDecl(self.ast.file_decls.get(i))
+        }
+        for i in 0..self.ast.file_decls.count {
+            self.collectNonTypeDecl(self.ast.file_decls.get(i))
+        }
+    }
+
     // ---- Declaration collection (pass 1 & 2) ----
 
     fn collectTypeDecl(idx: int) void {

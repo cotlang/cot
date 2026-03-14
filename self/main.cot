@@ -428,9 +428,15 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
         tree_module_map: .{},
     }
 
-    // Check and lower each file immediately (avoids use-after-free of stack locals)
+    // Phase 1: Check all files (no lowering) — Zig driver pattern
     var checked_scopes: Map(string, CheckedScopeEntry) = .{}
-    checkAndLowerRecursive(path, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, lower_opts)
+    var file_order: List(string) = .{}
+    checkAllFilesRecursive(path, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, &file_order)
+
+    // Phase 2: Lower all files (no re-checking)
+    for i in 0..file_order.count {
+        lowerFileByPath(file_order.get(i), types, shared, lower_shared, checked_scopes, project_safe, lower_opts)
+    }
 
     // Go init function pattern: generate master __cot_init_globals that calls all per-file inits.
     const span = Span.zero()
@@ -578,6 +584,57 @@ struct SharedLowerState {
     module_names: Map(string, string),
     // Tree → module map (maps @ptrToInt(ast) → module name for cross-module call resolution)
     tree_module_map: Map(int, string),
+}
+
+/// Phase 2: Re-parse a file and lower it using already-checked shared state.
+/// Re-creates checker from shared state (types already resolved in Phase 1).
+/// Phase 2: Re-parse, re-check, and lower a single file.
+/// Re-check is safe because Phase 1 already resolved all types/generics.
+fn lowerFileByPath(file_path: string, types: TypeRegistry, shared: SharedCheckerState, lower_shared: SharedLowerState, checked_scopes: Map(string, CheckedScopeEntry), project_safe: bool, lower_opts: LowerOptions) void {
+    const content = readFile(file_path) catch {
+        eprintln("error: cannot read file: ${file_path}")
+        exit(1)
+    }
+
+    // Re-parse (cheap — avoids keeping AST alive across all files)
+    var errs = ErrorReporter.initWithSource(file_path, content)
+    var s = Scanner.initWithErrors(content, &errs)
+    var ast = Ast.initHeap(file_path)
+    var p = Parser.init(s, ast, errs)
+    if (project_safe) { p.safe_mode = true }
+    p.parseFile()
+    ast.safe_mode = p.safe_mode
+
+    // Create checker with shared state for symbol lookup during lowering.
+    // All types already resolved from Phase 1 — full re-check via checkFile().
+    // This works because Phase 1 completed ALL checking before any lowering,
+    // so the TypeRegistry is stable and all generic instances are resolved.
+    var check_errs = ErrorReporter.initWithSource(file_path, content)
+    var checker = Checker.initShared(ast, types, check_errs, shared.global_map)
+    checker.loadSharedState(shared)
+
+    // Restore per-file scope
+    checker.pushFileScope()
+    var imports = ast.getImports()
+    const source_dir = dirname(file_path)
+    for i in 0..imports.count {
+        const resolved = resolveImportPath(imports.get(i), source_dir)
+        if (checked_scopes.contains(resolved)) {
+            const entry = checked_scopes.get(resolved)
+            checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
+        }
+    }
+
+    // Full check — needed to populate expr_types for lowering.
+    // This re-check is safe because Phase 1 already resolved all types.
+    checker.checkFile()
+
+    // Register tree → module mapping
+    if (lower_shared.module_names.contains(file_path)) {
+        lower_shared.tree_module_map.set(@ptrToInt(ast), lower_shared.module_names.get(file_path))
+    }
+
+    lowerOneFile(CheckedFile { ast: ast, errs: &check_errs, chk: &checker }, types, lower_shared, lower_opts)
 }
 
 /// Lower a single checked file into the shared builder.
@@ -791,7 +848,8 @@ fn listContainsStr(list: List(string), s: string) bool {
 
 /// Recursively check and lower a file and all its imports.
 /// Each file is lowered immediately after checking, while checker/errs are still on the stack.
-fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: List(string), in_progress: List(string), project_safe: bool, lower_shared: SharedLowerState, checked_scopes: Map(string, CheckedScopeEntry), lower_opts: LowerOptions) void {
+/// Phase 1: Recursively check all files (no lowering).
+fn checkAllFilesRecursive(file_path: string, shared: SharedCheckerState, types: TypeRegistry, seen: List(string), in_progress: List(string), project_safe: bool, lower_shared: SharedLowerState, checked_scopes: Map(string, CheckedScopeEntry), file_order: *List(string)) void {
     if (listContainsStr(in_progress, file_path)) {
         eprintln("error: circular import detected: ${file_path}")
         exit(1)
@@ -820,11 +878,10 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
     for i in 0..imports.count {
         const import_path = imports.get(i)
         const resolved = resolveImportPath(import_path, source_dir)
-        // Register module name for this import (e.g. "std/list" → "std.list")
         if (!lower_shared.module_names.contains(resolved)) {
             lower_shared.module_names.set(resolved, deriveModuleName(import_path))
         }
-        checkAndLowerRecursive(resolved, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, lower_opts)
+        checkAllFilesRecursive(resolved, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, file_order)
     }
     in_progress.pop()
 
@@ -833,7 +890,6 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
     var checker = Checker.initShared(ast, types, check_errs, shared.global_map)
     checker.loadSharedState(shared)
 
-    // Per-file scope: push file scope, copy imported symbols
     checker.pushFileScope()
     for i in 0..imports.count {
         const resolved = resolveImportPath(imports.get(i), source_dir)
@@ -858,8 +914,8 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
         lower_shared.tree_module_map.set(@ptrToInt(ast), lower_shared.module_names.get(file_path))
     }
 
-    // Lower immediately while checker/errs are still on the stack
-    lowerOneFile(CheckedFile { ast: ast, errs: &check_errs, chk: &checker }, types, lower_shared, lower_opts)
+    // Record file in dependency order for Phase 2 lowering
+    file_order.append(file_path)
 }
 
 /// Derive module name from import path: "std/list" → "std.list", "frontend/parser" → "frontend.parser".
