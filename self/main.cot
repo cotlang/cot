@@ -407,9 +407,34 @@ fn compileToIR(path: string, content: string, lower_opts: LowerOptions) CompileR
 /// lowered_generics across all files prevents duplicate generic emissions.
 fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions) CompileResult {
     var types = TypeRegistry.init()
+
+    // ================================================================
+    // Phase 1: Parse all files recursively (Zig driver.zig parseFileRecursive)
+    // Collects parsed files in dependency order (dependencies first).
+    // ================================================================
+    var parsed_files: List(ParsedFile) = .{}
     var seen: List(string) = .{}
     var in_progress: List(string) = .{}
+    parseFileRecursive(path, &parsed_files, seen, in_progress, project_safe)
+
+    // ================================================================
+    // Phase 2: Check all files — flat loop (Zig driver.zig lines 431-449)
+    // All shared state lives in this stack frame — no recursion.
+    // ================================================================
     var shared = SharedCheckerState.init()
+    var checked_scopes: Map(string, CheckedScopeEntry) = .{}
+    var checkers: List(int) = .{}  // stores @ptrToInt(*Checker) — heap-allocated
+    var checker_errs: List(int) = .{}  // stores @ptrToInt(*ErrorReporter)
+
+    for fi in 0..parsed_files.count {
+        const pf = parsed_files.get(fi)
+        checkOneFile(pf, types, &shared, &checked_scopes, &checkers, &checker_errs)
+    }
+
+    // ================================================================
+    // Phase 3: Lower all files — flat loop (Zig driver.zig lines 545-559)
+    // Uses checkers from Phase 2. All lowering state lives in this frame.
+    // ================================================================
     var lower_shared = SharedLowerState {
         builder: Builder.init(),
         lowered_generics: .{},
@@ -428,14 +453,30 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
         tree_module_map: .{},
     }
 
-    // Phase 1: Check all files (no lowering) — Zig driver pattern
-    var checked_scopes: Map(string, CheckedScopeEntry) = .{}
-    var file_order: List(string) = .{}
-    checkAllFilesRecursive(path, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, &file_order)
+    // Build module name map (Zig driver.zig lines 461-509)
+    for fi in 0..parsed_files.count {
+        const pf = parsed_files.get(fi)
+        var imports = pf.ast.getImports()
+        const source_dir = dirname(pf.path)
+        for ii in 0..imports.count {
+            const import_path = imports.get(ii)
+            const resolved = resolveImportPath(import_path, source_dir)
+            if (!lower_shared.module_names.contains(resolved)) {
+                lower_shared.module_names.set(resolved, deriveModuleName(import_path))
+            }
+        }
+        // Register tree → module mapping
+        if (lower_shared.module_names.contains(pf.path)) {
+            lower_shared.tree_module_map.set(@ptrToInt(pf.ast), lower_shared.module_names.get(pf.path))
+        }
+    }
 
-    // Phase 2: Lower all files (no re-checking)
-    for i in 0..file_order.count {
-        lowerFileByPath(file_order.get(i), types, shared, lower_shared, checked_scopes, project_safe, lower_opts)
+    // Lower each file
+    for fi in 0..parsed_files.count {
+        const pf = parsed_files.get(fi)
+        const chk_ptr = @intToPtr(*Checker, checkers.get(fi))
+        const err_ptr = @intToPtr(*ErrorReporter, checker_errs.get(fi))
+        lowerOneFile(CheckedFile { ast: pf.ast, errs: err_ptr, chk: chk_ptr }, types, lower_shared, lower_opts)
     }
 
     // Go init function pattern: generate master __cot_init_globals that calls all per-file inits.
@@ -557,6 +598,13 @@ fn lowerChecked(ast: *Ast, types: TypeRegistry, errs: ErrorReporter, checker: Ch
 }
 
 /// A checked file ready for lowering.
+/// Parsed file ready for type checking (Zig driver.zig ParsedFile pattern).
+struct ParsedFile {
+    path: string,
+    content: string,
+    ast: *Ast,
+}
+
 struct CheckedFile {
     ast: *Ast,
     errs: *ErrorReporter,
@@ -916,6 +964,95 @@ fn checkAllFilesRecursive(file_path: string, shared: SharedCheckerState, types: 
 
     // Record file in dependency order for Phase 2 lowering
     file_order.append(file_path)
+}
+
+/// Phase 1: Recursively parse a file and all its imports.
+/// Dependencies are parsed first (depth-first). No type checking.
+/// Zig reference: driver.zig parseFileRecursive
+fn parseFileRecursive(file_path: string, parsed_files: *List(ParsedFile), seen: List(string), in_progress: List(string), project_safe: bool) void {
+    if (listContainsStr(in_progress, file_path)) {
+        eprintln("error: circular import detected: ${file_path}")
+        exit(1)
+    }
+    if (listContainsStr(seen, file_path)) { return }
+    seen.append(file_path)
+    in_progress.append(file_path)
+
+    const content = readFile(file_path) catch {
+        eprintln("error: cannot read file: ${file_path}")
+        exit(1)
+    }
+
+    var errs = ErrorReporter.initWithSource(file_path, content)
+    var s = Scanner.initWithErrors(content, &errs)
+    var ast = Ast.initHeap(file_path)
+    var p = Parser.init(s, ast, errs)
+    if (project_safe) { p.safe_mode = true }
+    p.parseFile()
+    ast.safe_mode = p.safe_mode
+    if (errs.hasErrors()) { exit(1) }
+
+    // Recurse into imports first (dependencies before dependents)
+    var imports = ast.getImports()
+    const source_dir = dirname(file_path)
+    for i in 0..imports.count {
+        const resolved = resolveImportPath(imports.get(i), source_dir)
+        parseFileRecursive(resolved, parsed_files, seen, in_progress, project_safe)
+    }
+    in_progress.pop()
+
+    // Add this file AFTER all dependencies (dependency order)
+    parsed_files.append(ParsedFile { path: file_path, content: content, ast: ast })
+}
+
+/// Phase 2 helper: check a single file with shared state.
+/// Zig reference: driver.zig lines 431-449 (flat check loop body)
+fn checkOneFile(pf: ParsedFile, types: TypeRegistry, shared: *SharedCheckerState, checked_scopes: *Map(string, CheckedScopeEntry), checkers: *List(int), checker_errs: *List(int)) void {
+    var check_errs = ErrorReporter.initWithSource(pf.path, pf.content)
+    var checker = Checker.initShared(pf.ast, types, check_errs, shared.global_map)
+    checker.loadSharedState(shared)
+
+    // Per-file scope: push file scope, copy imported symbols
+    checker.pushFileScope()
+    var imports = pf.ast.getImports()
+    const source_dir = dirname(pf.path)
+    for i in 0..imports.count {
+        const resolved = resolveImportPath(imports.get(i), source_dir)
+        if (checked_scopes.contains(resolved)) {
+            const entry = checked_scopes.get(resolved)
+            checker.copyImportedSymbols(entry.scope_map_ptr, entry.ast_ptr)
+        }
+    }
+
+    checker.checkFile()
+    checker.syncToShared(shared)
+
+    checked_scopes.set(pf.path, CheckedScopeEntry {
+        scope_map_ptr: checker.getFileScopeMapPtr(),
+        ast_ptr: @ptrToInt(pf.ast),
+    })
+
+    if (check_errs.hasErrors()) { exit(1) }
+
+    // Heap-allocate checker and errs so they survive past this function.
+    // The lowerer needs them in Phase 3. Use alloc + byte-by-byte copy.
+    const errs_size = @sizeOf(ErrorReporter)
+    const errs_heap = alloc(0, errs_size)
+    copyBytes(errs_heap, @ptrToInt(&check_errs), errs_size)
+    const chk_size = @sizeOf(Checker)
+    const chk_heap = alloc(0, chk_size)
+    copyBytes(chk_heap, @ptrToInt(&checker), chk_size)
+    checker_errs.append(errs_heap)
+    checkers.append(chk_heap)
+}
+
+/// Copy n bytes from src to dst (byte-by-byte). Used to heap-allocate struct copies.
+fn copyBytes(dst: int, src: int, n: int) void {
+    var i = 0
+    while (i < n) {
+        @intToPtr(*u8, dst + i).* = @intToPtr(*u8, src + i).*
+        i += 1
+    }
 }
 
 /// Derive module name from import path: "std/list" → "std.list", "frontend/parser" → "frontend.parser".
