@@ -366,7 +366,7 @@ struct SSABuilder {
     fn convertNode(node_idx: int) int {
         if (self.node_values.contains(node_idx)) { return self.node_values.get(node_idx) }
         if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) {
-            @panic("convertNode: node index out of bounds in " ++ self.ir_func.name)
+            @panic("convertNode: idx ${node_idx} >= ${self.ir_func.nodes.count} in ${self.ir_func.name}")
         }
         const node = self.ir_func.getNode(node_idx)
         const cur = self.cur_block
@@ -1411,6 +1411,7 @@ struct SSABuilder {
     }
 
     fn convertPtrLoadValue(ptr_idx: int, type_idx: int) int {
+        if (ptr_idx < 0 or ptr_idx == null_node) { return null_value }
         const cur = self.cur_block
         const ptr_val = self.convertNode(ptr_idx)
         if (ptr_val == null_value) { return null_value }

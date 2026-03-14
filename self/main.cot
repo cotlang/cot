@@ -650,9 +650,9 @@ fn lowerFileWithSharedState(pf: ParsedFile, types: TypeRegistry, shared: *Shared
         }
     }
 
-    // Collect declarations for symbol lookup during lowering.
-    // Full checkFile() not needed — types already resolved in Phase 2.
-    checker.collectDecls()
+    // Full re-check: needed to populate expr_types for lowering.
+    // Types are stable from Phase 2. Cross-file generics resolved.
+    checker.checkFile()
 
     // Register tree → module mapping
     if (lower_shared.module_names.contains(pf.path)) {

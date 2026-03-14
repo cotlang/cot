@@ -2576,12 +2576,10 @@ struct Lowerer {
                 }
             }
 
-            // Expression base
+            // Expression base — Zig reference: emitFieldValue (lower.zig line 5248)
             const base = self.lowerExprNode(fa.base)
             if (base == null_node) { return null_node }
-            const offset_const = fb.emitConstInt(field.offset, I64, fa.span)
-            const field_addr = fb.emitBinary(BinaryOp.add, base, offset_const, I64, fa.span)
-            return fb.emitPtrLoadValue(field_addr, field.type_idx, fa.span)
+            return fb.emitFieldValue(base, field_idx, field.offset, field.type_idx, fa.span)
         }
         return null_node
     }

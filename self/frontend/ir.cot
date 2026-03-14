@@ -819,6 +819,7 @@ struct FuncBuilder {
     }
 
     fn emitPtrLoadValue(ptr: int, type_idx: int, span: Span) int {
+        if (ptr == null_node) { return null_node }
         return self.emit(Node.init(Data.ptr_load_value(PtrLoadValue { ptr: ptr }), type_idx, span))
     }
 
