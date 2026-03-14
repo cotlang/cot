@@ -1,249 +1,111 @@
 # Self-Hosted Compiler Parity Audit
 
-**Date:** March 14, 2026 (updated after WasmGC improvements — 5 phases ported from Kotlin patterns)
-**Scope:** File-by-file comparison of `self/` vs `compiler/` (Zig reference)
-**Total self-hosted:** 42,289 lines across 38 files, 409 tests pass
+**Date:** March 14, 2026
+**Total self-hosted:** 42,575 lines across 38 files, 409 tests pass
 
 ---
 
 ## 1. Executive Summary
 
-| Subsystem | Files | Lines | Parity | Critical Gaps |
-|-----------|-------|-------|--------|---------------|
-| Token/Scanner | 2 | 1,222 | **100%** | None |
-| AST | 1 | 1,532 | **95%** | None |
-| Parser | 1 | 3,234 | **95%** | Minor: less detailed error messages |
-| Types | 1 | 1,609 | **95%** | Shape stenciling complete |
-| Checker | 1 | 5,864 | **86%** | Per-file scoping implemented, `evalComptimeValue` rich union remaining |
-| IR | 1 | 1,450 | **100%** | WasmGC array/ref/cast nodes added |
-| ARC Insertion | 1 | 443 | **100%** | None |
-| Lowerer | 1 | 9,054 | **82%** | async (~1,170L) |
-| SSA Builder | 1 | 2,315 | **95%** | Full WasmGC array/ref conversions |
-| SSA Data | 1 | 582 | **95%** | WasmGC SSA ops added |
-| SSA Passes | 6 | 1,896 | **92%** | lower_wasm ~90%, rewritedec 100% |
-| Wasm Codegen | 17 | 11,152 | **93%** | Full WasmGC codegen (real emission) |
-| Source/Errors | 2 | 860 | **100%** | None |
-| Main/CLI | 1 | 1,029 | **100%** | Per-file scoping, CheckedScopeEntry |
+| Subsystem | Files | Lines | Parity |
+|-----------|-------|-------|--------|
+| Token/Scanner | 2 | 1,222 | **100%** |
+| AST | 1 | 1,532 | **95%** |
+| Parser | 1 | 3,234 | **95%** |
+| Types | 1 | 1,609 | **95%** |
+| Checker | 1 | 5,904 | **86%** |
+| IR | 1 | 1,450 | **100%** |
+| ARC Insertion | 1 | 443 | **100%** |
+| Lowerer | 1 | 9,100+ | **85%** |
+| SSA Builder | 1 | 2,315 | **95%** |
+| SSA Data | 1 | 582 | **95%** |
+| SSA Passes | 6 | 1,896 | **92%** |
+| Wasm Codegen | 17 | 11,152 | **93%** |
+| Source/Errors | 2 | 860 | **100%** |
+| Main/CLI | 1 | 1,100+ | **100%** |
 
-**Overall: ~93% Wasm-frontend-complete. 42,289 lines across 38 files.**
-
-**MILESTONE (Mar 13, 2026): selfcot type-checks itself.**
-`selfcot check self/main.cot` → passes (all 38 files, ~42,289 lines multi-file type-checking).
-`selfcot build foo.cot -o foo.wasm` → works for single-file programs.
-Full pipeline wired: parse → check → lower → SSA → 6 passes → wasm_gen → link → .wasm.
-All 9 CLI commands implemented: build, run, test, bench, check, parse, lex, init, help.
-
-**WasmGC (Mar 14, 2026):** 5 phases of Kotlin-pattern WasmGC ported to self-hosted:
-- GC arrays, union subtypes, nullable refs, function refs, GC strings
-- Full pipeline: lowering logic, SSA conversions, real codegen (no stubs)
-- Lowerer has `gc_mode` + `isWasmGC()` for target-aware code paths
-
-**Remaining gaps by priority:**
-1. **HIGH**: Multi-file build (checkAndLowerRecursive exists, needs wiring into build pipeline)
-2. **MEDIUM**: wasm_types opcodes (~230 LOC), comptime array emission
-3. **LOW**: evalComptimeValue (~300 LOC)
-4. **DEFERRED**: async lowering (~1,170 LOC — v0.4)
-5. **NOT STARTED**: Native backend (~72,000 LOC — CLIF IR, MachInst, regalloc, ISA, object emit)
+**Overall: ~93% Wasm-frontend-complete. 42,575 lines across 38 files.**
 
 ---
 
-## 2. Token & Scanner — 100%
+## 2. Self-Compilation Status
 
-**Files:** `token.cot` (445 lines), `scanner.cot` (774 lines)
-**Reference:** `token.zig` (333 lines), `scanner.zig` (527 lines)
+**`selfcot check self/main.cot`** → **PASSES** (38 files, 42,575 lines)
+**`selfcot build self/main.cot`** → **Crashes in SSA builder** (Phase 3)
 
-All token variants and scanner methods present. Scanner fully functional for all lexing.
-`kw_spawn` and `kw_select` added. No remaining gaps.
+### What works end-to-end:
+- Phase 1 (parse all files recursively) — PASS
+- Phase 2 (check all files with shared state) — PASS
+- Phase 3 (lower + SSA build + codegen) — crashes during SSA building
 
----
+### Current crash:
+```
+List(2310)_get + 128 (@trap — bounds check)
+← ir.Func_getNode
+← SSABuilder_convertNode
+← SSABuilder_convertPtrLoadValue
+← SSABuilder_convertNode
+← SSABuilder_build
+← generateAndAddFunc
+← generateAllFunctions
+← generateWasmCode
+```
 
-## 3. AST — 95%
-
-**File:** `ast.cot` (1,532 lines)
-**Reference:** `ast.zig` (696 lines)
-
-All 13 declaration types, 29+ expression types, 8+ statement types present.
-All 59 builtins mapped. SelectExpr/SelectCase already present.
-Cot is 2x lines due to explicit struct definitions and inline tests.
-
----
-
-## 4. Parser — 95%
-
-**File:** `parser.cot` (3,234 lines, 66 functions)
-**Reference:** `parser.zig` (2,340 lines, 55 functions)
-
-All critical parsing logic implemented. Cot has 11 extra helper methods for
-safe mode (`@safe` colon syntax, field shorthand) and concurrency (select/spawn parsing).
-Spawn/select tokens now defined and parser integration complete.
-
-**Gap:** Minor: `unexpectedToken()` less detailed than Zig version.
+An IR node index is out of bounds during SSA conversion. `convertPtrLoadValue` calls `convertNode` with a node index that doesn't exist in the IR function's node list. This is likely a divergence in how the self-hosted SSA builder handles `ptr_load_value` IR nodes compared to the Zig reference (`compiler/frontend/ssa_builder.zig`).
 
 ---
 
-## 5. Types — 95%
+## 3. Remaining Blockers (Priority Order)
 
-**File:** `types.cot` (1,609 lines)
-**Reference:** `types.zig` (941 lines)
+### BLOCKER 1: SSA Builder node index out of bounds
+- **Crash:** `Func.getNode(idx)` — `List.get` bounds check fails
+- **Location:** `self/frontend/ssa_builder.cot:convertPtrLoadValue`
+- **Reference:** `compiler/frontend/ssa_builder.zig:convertPtrLoadValue`
+- **Action:** Line-by-line comparison of `convertPtrLoadValue` and its callers. The IR node index stored in `PtrLoadValue.ptr` may reference a node from a different function or a stale index.
 
-All 13 type structures, TypeRegistry with all methods, 10 type constructors,
-all type queries (sizeOf, alignOf, isPointer, isArray, etc.).
-Shape stenciling complete (Shape, ArcKind, RegClass, fromType, eql, key).
-3 tests cover basic types, pointers/slices, and key format.
+### BLOCKER 2: Potential further divergences in SSA builder
+- The self-hosted SSA builder was ported from Zig but may have other `convertX` functions that diverge from the reference.
+- **Action:** Systematic audit of ALL `convertX` functions in `ssa_builder.cot` vs `ssa_builder.zig`.
 
----
+### BLOCKER 3: collectDecls() in Phase 3
+- Phase 3 uses `collectDecls()` (declarations only, no body checking) to populate the symbol table for lowering.
+- This may miss symbols that are only available after full type checking (e.g., generic instantiations).
+- If lowering calls `inferExprType` → `checkExpr` lazily, the checker may not have enough context.
+- **Action:** Compare with Zig driver Phase 3 pattern. The Zig driver stores fully-checked `Checker` objects in an ArrayList and reuses them directly.
 
-## 6. Checker — 86%
-
-**File:** `checker.cot` (5,864 lines)
-**Reference:** `checker.zig` (4,350 lines)
-
-### 6.1 Complete
-- All expression checking (binary, unary, call, index, field access, etc.)
-- All statement checking (if, while, for, block, return, etc.)
-- Type resolution (`resolveTypeExpr`)
-- Generic instantiation (`instantiateGenericFunc`, `instantiateGenericImplMethods`)
-- Comptime evaluation (evalConstExpr, evalConstFloat, evalConstBinary, evalConstUnary, etc.)
-- Comptime block/assign/inline-for (inlined into evalComptimeStmts)
-- Lint checks W001-W005 (unused vars/params, shadowing, unreachable, empty block)
-- Method resolution (delegates to types.lookupMethod)
-- RLS (Result Location Semantics) via expected_type save/restore
-- collectNestedDecl — switch on Decl union (matches Zig pattern)
-- Multi-file scope management (loadSharedState/syncToShared)
-- **checkStmtsWithReachability** — full type pre-pass for block-scoped decls + reachability
-
-### 6.2 Missing
-
-| Function | LOC | Priority | Description |
-|----------|-----|----------|-------------|
-| `evalComptimeValue()` | ~300 | LOW | Rich comptime value union (array/struct construction) |
-| Typo suggestions | ~60 | LOW | editDistSuggest, errWithSuggestion |
-
-**Previously missing, now complete:**
-- `buildStructTypeWithLayout()` — correct packed/extern/auto field offset calculation
-- `checkBenchDecl()` — handled by checkTestDecl (supports both test_decl and bench_decl)
-- `checkStmtsWithReachability()` — type decl pre-pass + struct method body checking
+### NOT BLOCKING (deferred):
+- Async lowering (~1,170 LOC) — v0.4
+- Native backend (~72,000 LOC) — not started
+- LSP, formatter, project config — not started
 
 ---
 
-## 7. Lowerer — 80%
+## 4. Completed Work (This Session)
 
-**File:** `lower.cot` (8,809 lines)
-**Reference:** `lower.zig` (11,164 lines)
+### Pipeline Architecture (matches Zig driver.zig 1:1):
+- 3-phase pipeline: parseFileRecursive → checkOneFileDirect loop → lowerFileWithSharedState loop
+- Module name qualification via `deriveModuleName` + `tree_module_map`
+- SharedCheckerState passed by pointer across phases
 
-### 7.1 Complete
-- All 28 expression types lowered
-- All 10+ statement types lowered
-- All 59 builtin intrinsics dispatched
-- Method call + generic lowering with shape stenciling
-- **Shape stenciling in lowerGenericFnInstanceInner** — Tier 1 (shape alias) + Tier 2 (dict-stenciled)
-- **buildDictArgNames** — maps concrete generic names to comma-separated helper fn names
-- **Dict dispatch in binary ops** — indirect call through fn-ptr params for type-param binary ops
-- **Dict dispatch in method calls** — indirect call through fn-ptr params for type-param method calls
-- **dictOpName fixed** — correctly maps Token values (not BinaryOp), matching Zig reference
-- **generateDictHelpers** — takes type_args list (multi-type-param support), not single type
-- Struct/array/slice/union init lowering
-- Cleanup/defer/ARC infrastructure (switch-based dispatch)
-- `maybeRegisterScopeDestroy()` — auto-deinit registration
-- Auto-deinit generation (emitPendingAutoDeinits)
-- Test/bench runner generation
-- Module qualification and import resolution
-- Global variable init generation
-- Async spawn/select/await (native fiber pattern)
+### Lowerer Fixes:
+- `@trap()` dead block: expr_stmt now detects block change from trap, returns terminated
+- field_access receiver: `b.field.method()` pattern takes address of field (was loading value)
+- fb parameter removal: all 90+ lowering functions now use `self.builder.func()` (matches Zig pattern)
+- WasmGC lowering: full pipeline ported (unions, optionals, arrays, refs)
 
-### 7.2 Missing
-
-| Function | LOC | Priority | Description |
-|----------|-----|----------|-------------|
-| WasmGC helpers | ~107 | MEDIUM | gcChunkIndex, gcFieldChunks, emitGcDefaultValue, emitGcStructNewExpanded |
-| `emitComptimeArray()` | ~41 | LOW | Comptime array value emission |
-| `resolveComptimeFieldAccess()` | ~27 | LOW | Comptime field access (.name, .fields, .len) |
-| Async state machine (Wasm) | ~150 | DEFERRED | WasmGC async state machine generation |
-| Full async lowering | ~1,170 | DEFERRED | Zig async ported but not to Cot (v0.4) |
+### Types Fix:
+- `TypeRegistry.equal` had nested union switches (16×16=256 arms) diverging from Zig reference (single switch with direct field access). Replaced with tag-based dispatch using helper functions.
 
 ---
 
-## 8. SSA Data & Builder — 95%
+## 5. Key File Locations
 
-**Files:** `ssa.cot` (577 lines), `ssa_builder.cot` (2,145 lines)
-**Reference:** `ssa.zig` (1,523 lines combined), `ssa_builder.zig` (2,242 lines)
-
-All 220+ SSA operations, phi handling (Braun et al. 2013), all type conversions,
-call handling, memory ops, dict-stenciling. enum_type delegation fixed in getLoadOp/getStoreOp.
-
----
-
-## 9. SSA Passes — 84%
-
-| Pass | Cot LOC | Zig LOC | Parity | Gaps |
-|------|---------|---------|--------|------|
-| decompose.cot | 316 | 273 | **100%** | None |
-| rewritegeneric.cot | 171 | 154 | **100%** | None |
-| layout.cot | 259 | 291 | **95%** | Minor peephole optimizations |
-| schedule.cot | 255 | 264 | **95%** | Slight scheduling variation |
-| rewritedec.cot | 524 | 654 | **100%** | All patterns complete (Cot uses combined extractStringComponent helper) |
-| lower_wasm.cot | 371 | 576 | **~90%** | LOC gap is explicit `=> null` arms in Zig; all functional mappings present |
-
-**Note:** rewritedec.cot was re-audited and found to be functionally complete.
-lower_wasm.cot LOC gap is Zig's explicit null arms for ops that don't need lowering —
-Cot's `else => SsaOp.invalid` achieves the same result. Cot's `isSliceType()` is
-actually MORE correct (includes F64/F32 checks missing from Zig).
-
----
-
-## 10. Wasm Codegen — 91%
-
-**17 files, 10,841 total lines**
-
-| Component | LOC | Parity | Notes |
-|-----------|-----|--------|-------|
-| wasm_gen.cot | 2,277 | **92%** | All call types, convert, cond_select, globals, addr, ~100 op handlers |
-| code_builder.cot | 731 | **95%** | ~115 emit methods incl. saturation truncate, return_call, memory.fill |
-| assemble.cot | 806 | **95%** | LEB128, alignment, opcode emission, AddrVal union matching for br_table |
-| link.cot | 896 | **95%** | Module imports/exports, type dedup |
-| preprocess.cot | 578 | **90%** | Pass1-6 dispatch loop, br_table indices stored in Prog AddrVal (matches Zig) |
-| constants.cot | 152 | **100%** | LEB128/alignment/opcode encoding utilities (NOT Zig's constants.zig) |
-| driver.cot | 585 | **90%** | Pipeline orchestration |
-| prog.cot | 473 | **95%** | Prog/Addr/AddrVal/Symbol data structures |
-| wasm_types.cot | 599 | **95%** | Wasm type wrappers |
-| ssa_passes.cot | 13 | **100%** | SSA pass dispatch (delegates to individual passes) |
-| ssa_passes_dec.cot | 11 | **100%** | Decompose pass dispatch |
-| Runtimes (6 files) | 3,720 | **95%** | mem(556), print(909), test(538), bench(536), wasi(931), slice(250) |
-
-**Note:** `constants.cot` is LEB128/alignment encoding (parity with assemble.zig utilities).
-Zig's `constants.zig` (opcodes/registers) maps to Cot's `wasm_types.cot` (599 vs 829 lines, ~72%).
-The LOC gap is unused opcode variants not yet needed by the self-hosted compiler.
-
-**Mar 14, 2026 — Workarounds reverted:** Two Zig compiler bugs were fixed (overlapping memcpy
-in native codegen, stack overflow from switch arm local over-allocation), allowing the
-self-hosted code to use idiomatic patterns: br_table data stored in Prog's AddrVal union
-(not Symbol side-channel), assemble uses AddrVal union matching (not Symbol bypass).
-
----
-
-## 11. Remaining Work (Prioritized)
-
-### Immediate (HIGH — enables self-compilation)
-1. **Multi-file build** (~100 LOC in main.cot): `selfcot build` only lowers top-level file. Must lower ALL imported files, merge IR, pass to generateWasmCode.
-2. **`generateGlobalInits()`** (~50 LOC in lower.cot): Emits `__cot_init_globals` for module-level variable initialization.
-3. **`generateTestRunner()`** (~80 LOC in lower.cot): Emits test harness for `selfcot test` to discover and run test blocks.
-
-### Completed (previously HIGH)
-- All 9 CLI commands: build, run, test, bench, check, parse, lex, init, help
-- Full Wasm pipeline: parse → check → lower → SSA → 6 passes → wasm_gen → link → .wasm
-- Token keywords, shape stenciling, dict dispatch, SSA builder, ARC insertion
-- 9 wasm_gen SSA op handlers: closures, globals, convert, addr, cond_select, return_call, metadata_addr
-- Saturation truncate + memory.fill CodeBuilder methods
-- enum(u8) sign extension fix in ssa_to_clif.zig
-
-### Short-term (MEDIUM — improves completeness)
-1. wasm_types.cot: additional opcode variants (~230 LOC, as-needed)
-2. Lowerer: `emitComptimeArray()` (~41 LOC) + `resolveComptimeFieldAccess()` (~27 LOC)
-
-### Deferred (LOW/v0.4)
-3. Checker: `evalComptimeValue()` rich union (~300 LOC)
-4. Lowerer: WasmGC helpers (~107 LOC)
-5. Lowerer: async lowering (~1,170 LOC)
-
-**Critical path to self-compilation: ~230 LOC** (items 1-3 in HIGH)
-**Grand total including deferred: ~1,875 LOC** (all items)
+| Self-Hosted | Zig Reference | Purpose |
+|-------------|---------------|---------|
+| `self/main.cot` | `compiler/driver.zig` | Pipeline orchestrator |
+| `self/frontend/lower.cot` | `compiler/frontend/lower.zig` | AST→IR lowering |
+| `self/frontend/ssa_builder.cot` | `compiler/frontend/ssa_builder.zig` | IR→SSA conversion |
+| `self/frontend/checker.cot` | `compiler/frontend/checker.zig` | Type checker |
+| `self/frontend/types.cot` | `compiler/frontend/types.zig` | Type registry |
+| `self/codegen/wasm/driver.cot` | `compiler/driver.zig` (lines 5262+) | Wasm code generation |
+| `self/codegen/wasm/wasm_gen.cot` | `compiler/codegen/wasm/gen.zig` | SSA→Wasm codegen |
