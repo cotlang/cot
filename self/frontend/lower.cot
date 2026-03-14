@@ -948,7 +948,16 @@ struct Lowerer {
                 return true
             },
             Stmt.expr_stmt |es| => {
+                // Track current block before lowering — @trap()/@panic() create dead blocks
+                var prev_block = null_block
+                if (self.builder.func()) |fb2| { prev_block = fb2.currentBlock() }
                 self.lowerExprNode(es.expr)
+                // If block changed (e.g. @trap() switched to dead block), treat as terminated
+                if (self.builder.func()) |fb2| {
+                    if (prev_block != null_block and fb2.currentBlock() != prev_block) {
+                        return true
+                    }
+                }
                 return false
             },
             Stmt.defer_stmt |ds| => {
