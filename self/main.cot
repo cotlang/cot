@@ -424,6 +424,8 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
         all_test_display_names: .{},
         all_bench_names: .{},
         all_bench_display_names: .{},
+        module_names: .{},
+        tree_module_map: .{},
     }
 
     // Check and lower each file immediately (avoids use-after-free of stack locals)
@@ -572,6 +574,10 @@ struct SharedLowerState {
     all_test_display_names: List(string),
     all_bench_names: List(string),
     all_bench_display_names: List(string),
+    // Module name qualification (maps canonical path → module name)
+    module_names: Map(string, string),
+    // Tree → module map (maps @ptrToInt(ast) → module name for cross-module call resolution)
+    tree_module_map: Map(int, string),
 }
 
 /// Lower a single checked file into the shared builder.
@@ -582,7 +588,13 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
     lower_inst.types = types
     lower_inst.err = cf.errs
     lower_inst.chk = cf.chk
-    lower_inst.module_name = ""
+    // Set module name from shared map (computed during import resolution)
+    const lower_file_path = cf.ast.filename
+    if (shared.module_names.contains(lower_file_path)) {
+        lower_inst.module_name = shared.module_names.get(lower_file_path)
+    } else {
+        lower_inst.module_name = ""
+    }
     initLowererScalars(lower_inst)
     lower_inst.builder = shared.builder
     initLowererLists(lower_inst)
@@ -593,6 +605,7 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
     lower_inst.generated_dict_helpers = shared.generated_dict_helpers
     lower_inst.dict_arg_names = shared.dict_arg_names
     lower_inst.shape_analysis_cache = shared.shape_analysis_cache
+    lower_inst.tree_module_map = shared.tree_module_map
 
     // Set modes before lowering
     lower_inst.setTestMode(lower_opts.test_mode)
@@ -801,11 +814,16 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
     ast.safe_mode = p.safe_mode
     if (errs.hasErrors()) { exit(1) }
 
-    // Recurse into imports first
+    // Recurse into imports first, registering module names
     var imports = ast.getImports()
     const source_dir = dirname(file_path)
     for i in 0..imports.count {
-        const resolved = resolveImportPath(imports.get(i), source_dir)
+        const import_path = imports.get(i)
+        const resolved = resolveImportPath(import_path, source_dir)
+        // Register module name for this import (e.g. "std/list" → "std.list")
+        if (!lower_shared.module_names.contains(resolved)) {
+            lower_shared.module_names.set(resolved, deriveModuleName(import_path))
+        }
         checkAndLowerRecursive(resolved, shared, types, seen, in_progress, project_safe, lower_shared, checked_scopes, lower_opts)
     }
     in_progress.pop()
@@ -835,8 +853,25 @@ fn checkAndLowerRecursive(file_path: string, shared: SharedCheckerState, types: 
 
     if (check_errs.hasErrors()) { exit(1) }
 
+    // Register tree → module mapping for cross-module call resolution
+    if (lower_shared.module_names.contains(file_path)) {
+        lower_shared.tree_module_map.set(@ptrToInt(ast), lower_shared.module_names.get(file_path))
+    }
+
     // Lower immediately while checker/errs are still on the stack
     lowerOneFile(CheckedFile { ast: ast, errs: &check_errs, chk: &checker }, types, lower_shared, lower_opts)
+}
+
+/// Derive module name from import path: "std/list" → "std.list", "frontend/parser" → "frontend.parser".
+/// Strips .cot extension, replaces '/' with '.'.
+fn deriveModuleName(import_path: string) string {
+    // Strip .cot extension if present
+    var path = import_path
+    if (endsWith(path, ".cot")) {
+        path = substring(path, 0, @lenOf(path) - 4)
+    }
+    // Replace '/' with '.'
+    return replace(path, "/", ".")
 }
 
 /// Resolve an import path to a file path.
