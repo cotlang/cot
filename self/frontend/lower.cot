@@ -3113,7 +3113,30 @@ struct Lowerer {
                             receiver_val = self.lowerExprNode(fa.base)
                         }
                     } else {
-                        receiver_val = self.lowerExprNode(fa.base)
+                        // Field access base (e.g. b.local_map.set()) — take address of
+                        // the struct field directly. Zig reference: lower.zig line 8929.
+                        // Without this, the field value is loaded (copied) and mutations
+                        // to the copy are lost (double-pointer chain mutation bug).
+                        var is_fa = false
+                        switch (self.tree.getNode(fa.base)) { Node.expr |be| => switch (be) {
+                            Expr.field_access => { is_fa = true },
+                            else => {},
+                        }, else => {} }
+                        if (is_fa) {
+                            const addr = self.resolveStructFieldAddr(fb, fa.base)
+                            if (addr != null_node) {
+                                receiver_val = addr
+                            } else {
+                                receiver_val = self.lowerExprNode(fa.base)
+                            }
+                        } else {
+                            // Non-lvalue expression — spill to temp local
+                            const val = self.lowerExprNode(fa.base)
+                            const ptr_type = self.types.makePointer(base_type_idx)
+                            const tmp_local = fb.addLocalWithSize("__method_recv", base_type_idx, true, self.types.sizeOf(base_type_idx))
+                            fb.emitStoreLocal(tmp_local, val, fa.span)
+                            receiver_val = fb.emitAddrLocal(tmp_local, ptr_type, fa.span)
+                        }
                     }
                 }
             } else {
