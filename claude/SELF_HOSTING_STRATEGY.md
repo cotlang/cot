@@ -9,15 +9,15 @@
 
 | Subsystem | Zig Lines | Cot Lines | Status |
 |-----------|-----------|-----------|--------|
-| **Frontend** (scanner, parser, checker, lower, SSA builder, IR, types, AST, errors, arc_insertion) | 24,188 | 25,106 | **~100%** |
+| **Frontend** (scanner, parser, checker, lower, SSA builder, IR, types, AST, errors, arc_insertion) | 24,188 | 25,582 | **~100%** |
 | SSA passes (rewritedec, layout, schedule, decompose, lower_wasm, rewritegeneric) | 4,557 | 1,896 | **92%** |
 | Driver (pipeline orchestrator) | 5,913 | (in main.cot) | **partial** |
-| Wasm codegen (wasm_gen, arc, wasi_runtime, link, assemble, constants) | 9,993 | 11,051 | **93%** |
+| Wasm codegen (wasm_gen, arc, wasi_runtime, link, assemble, constants) | 9,993 | 11,152 | **93%** |
 | Native codegen (CLIF, MachInst, ARM64, x64, regalloc, runtime) | 70,934 | - | 0% |
 | CLI / main / project | 2,971 | 1,029 | **100%** |
 | LSP | 4,973 | - | 0% |
 | Formatter | 1,234 | - | 0% |
-| **Total** | **~139K** | **~41.8K** | **30%** |
+| **Total** | **~139K** | **~42.3K** | **30%** |
 
 **MILESTONE (Mar 13):** `selfcot check self/main.cot` passes — self-hosted type-checks itself.
 **WasmGC (Mar 14):** 5 phases ported from Kotlin patterns (arrays, union subtypes, nullable refs, call_ref, GC strings).
