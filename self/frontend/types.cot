@@ -951,102 +951,65 @@ struct TypeRegistry {
         const ta = self.get(a)
         const tb = self.get(b)
         if (ta.tag != tb.tag) { return false }
-        return switch (ta) {
-            Type.basic |ka| => {
-                return switch (tb) {
-                    Type.basic |kb| => ka == kb,
-                    else => false,
-                }
-            },
-            Type.pointer |pa| => {
-                return switch (tb) {
-                    Type.pointer |pb| => self.equal(pa.elem, pb.elem),
-                    else => false,
-                }
-            },
-            Type.optional |oa| => {
-                return switch (tb) {
-                    Type.optional |ob| => self.equal(oa.elem, ob.elem),
-                    else => false,
-                }
-            },
-            Type.error_union |ea| => {
-                return switch (tb) {
-                    Type.error_union |eb| => self.equal(ea.elem, eb.elem),
-                    else => false,
-                }
-            },
-            Type.slice |sa| => {
-                return switch (tb) {
-                    Type.slice |sb| => self.equal(sa.elem, sb.elem),
-                    else => false,
-                }
-            },
-            Type.array |aa| => {
-                return switch (tb) {
-                    Type.array |ab| => aa.length == ab.length and self.equal(aa.elem, ab.elem),
-                    else => false,
-                }
-            },
-            Type.map_type |ma| => {
-                return switch (tb) {
-                    Type.map_type |mb| => self.equal(ma.key, mb.key) and self.equal(ma.value, mb.value),
-                    else => false,
-                }
-            },
-            Type.list_type |la| => {
-                return switch (tb) {
-                    Type.list_type |lb| => self.equal(la.elem, lb.elem),
-                    else => false,
-                }
-            },
-            Type.struct_type |sa| => {
-                return switch (tb) {
-                    Type.struct_type |sb| => sa.name == sb.name,
-                    else => false,
-                }
-            },
-            Type.enum_type |ea| => {
-                return switch (tb) {
-                    Type.enum_type |eb| => ea.name == eb.name,
-                    else => false,
-                }
-            },
-            Type.union_type |ua| => {
-                return switch (tb) {
-                    Type.union_type |ub| => ua.name == ub.name,
-                    else => false,
-                }
-            },
-            Type.error_set |es| => {
-                return switch (tb) {
-                    Type.error_set |esb| => es.name == esb.name,
-                    else => false,
-                }
-            },
-            Type.future |fa| => {
-                return switch (tb) {
-                    Type.future |fb| => self.equal(fa.result_type, fb.result_type),
-                    else => false,
-                }
-            },
-            // T4: Tuple equality — compare elem count and each element type (Zig types.zig:528-534)
-            Type.tuple |ta_tup| => {
-                return switch (tb) {
-                    Type.tuple |tb_tup| => {
-                        if (ta_tup.elem_count != tb_tup.elem_count) { return false }
-                        for i in 0..ta_tup.elem_count {
-                            if (!self.equal(ta_tup.getElemType(i), tb_tup.getElemType(i))) { return false }
-                        }
-                        return true
-                    },
-                    else => false,
-                }
-            },
-            // T6: Function types are not structurally compared (Zig types.zig:535)
-            Type.func |_| => false,
-            else => false,
+        // Zig reference: types.zig lines 543-565
+        // Tag-based dispatch with extractElem — NO nested union switch.
+        if (ta.tag == TAG_BASIC) { return a == b }
+        if (ta.tag == TAG_POINTER or ta.tag == TAG_OPTIONAL or ta.tag == TAG_ERROR_UNION or
+            ta.tag == TAG_SLICE or ta.tag == TAG_LIST or ta.tag == TAG_FUTURE) {
+            return self.equal(self.extractElem(a), self.extractElem(b))
         }
+        if (ta.tag == TAG_ARRAY) {
+            return self.arrayLength(a) == self.arrayLength(b) and self.equal(self.extractElem(a), self.extractElem(b))
+        }
+        if (ta.tag == TAG_MAP) {
+            return self.equal(self.mapKey(a), self.mapKey(b)) and self.equal(self.mapValue(a), self.mapValue(b))
+        }
+        if (ta.tag == TAG_STRUCT or ta.tag == TAG_ENUM or ta.tag == TAG_UNION or ta.tag == TAG_ERROR_SET) {
+            return self.typeName(a) == self.typeName(b)
+        }
+        if (ta.tag == TAG_TUPLE) { return self.equalTuple(a, b) }
+        return false
+    }
+
+    fn equalTuple(a: int, b: int) bool {
+        const ta = self.get(a)
+        const tb = self.get(b)
+        const ta_tup = switch (ta) { Type.tuple |t| => t, else => TupleType { elem_count: 0, elem_types: 0 } }
+        const tb_tup = switch (tb) { Type.tuple |t| => t, else => TupleType { elem_count: 0, elem_types: 0 } }
+        if (ta_tup.elem_count != tb_tup.elem_count) { return false }
+        for i in 0..ta_tup.elem_count {
+            if (!self.equal(ta_tup.getElemType(i), tb_tup.getElemType(i))) { return false }
+        }
+        return true
+    }
+
+    fn extractElem(type_idx: int) int {
+        const t = self.get(type_idx)
+        switch (t) {
+            Type.pointer |p| => { return p.elem },
+            Type.optional |o| => { return o.elem },
+            Type.error_union |eu| => { return eu.elem },
+            Type.slice |s| => { return s.elem },
+            Type.array |a| => { return a.elem },
+            Type.list_type |l| => { return l.elem },
+            Type.future |f| => { return f.result_type },
+            else => { return 0 },
+        }
+    }
+
+    fn arrayLength(type_idx: int) int {
+        const t = self.get(type_idx)
+        switch (t) { Type.array |a| => { return a.length }, else => { return 0 } }
+    }
+
+    fn mapKey(type_idx: int) int {
+        const t = self.get(type_idx)
+        switch (t) { Type.map_type |m| => { return m.key }, else => { return 0 } }
+    }
+
+    fn mapValue(type_idx: int) int {
+        const t = self.get(type_idx)
+        switch (t) { Type.map_type |m| => { return m.value }, else => { return 0 } }
     }
 
     // ---- Type assignability ----
