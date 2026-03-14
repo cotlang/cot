@@ -365,6 +365,9 @@ struct SSABuilder {
 
     fn convertNode(node_idx: int) int {
         if (self.node_values.contains(node_idx)) { return self.node_values.get(node_idx) }
+        if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) {
+            @panic("convertNode: node index out of bounds in " ++ self.ir_func.name)
+        }
         const node = self.ir_func.getNode(node_idx)
         const cur = self.cur_block
         if (cur == null_block) { return null_value }
