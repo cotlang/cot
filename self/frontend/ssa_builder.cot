@@ -1890,7 +1890,6 @@ struct SSABuilder {
 
     fn insertPhis() void {
         var fwd_refs: List(int) = .{}
-
         for i in 0..self.func.blocks.count {
             const blk = self.func.getBlock(i)
             for j in 0..blk.values.count {
@@ -1978,26 +1977,41 @@ struct SSABuilder {
     fn verify() void {
         for i in 0..self.func.blocks.count {
             const blk = self.func.getBlock(i)
+            // Skip unreachable blocks (no predecessors, not entry) — they may have
+            // unresolved fwd_refs that can never be resolved.
+            if (blk.preds.count == 0 and i != self.func.entry) { continue }
             var seen_non_phi = false
             for j in 0..blk.values.count {
                 const v = self.func.getValue(blk.values.get(j))
                 if (v.op == SsaOp.phi) {
                     // phi must be at block start
-                    @assert(!seen_non_phi)
+                    if (seen_non_phi) {
+                        @panic("verify: phi after non-phi in block ${i} of ${self.ir_func.name}")
+                    }
                     // phi arg count must match pred count
-                    @assertEq(v.argsLen(), blk.preds.count)
+                    if (v.argsLen() != blk.preds.count) {
+                        @panic("verify: phi args=${v.argsLen()} != preds=${blk.preds.count} in block ${i} of ${self.ir_func.name}")
+                    }
                 } else {
                     seen_non_phi = true
                 }
                 // No unresolved forward refs
-                @assert(v.op != SsaOp.fwd_ref)
+                if (v.op == SsaOp.fwd_ref) {
+                    @panic("verify: unresolved fwd_ref in block ${i} of ${self.ir_func.name}")
+                }
             }
             if (blk.kind == SsaBlockKind.ret) {
-                @assertEq(blk.succs.count, 0)
+                if (blk.succs.count != 0) {
+                    @panic("verify: ret block ${i} has ${blk.succs.count} succs in ${self.ir_func.name}")
+                }
             }
             if (blk.kind == SsaBlockKind.if_) {
-                @assertEq(blk.succs.count, 2)
-                @assert(blk.controls.count > 0)
+                if (blk.succs.count != 2) {
+                    @panic("verify: if block ${i} has ${blk.succs.count} succs (want 2) in ${self.ir_func.name}")
+                }
+                if (blk.controls.count == 0) {
+                    @panic("verify: if block ${i} has no controls in ${self.ir_func.name}")
+                }
             }
         }
     }
@@ -2043,7 +2057,9 @@ struct SSABuilder {
         while (true) {
             const blk = self.func.getBlock(cur)
             const result = self.lookupDefvar(blk.id, local_idx)
-            if (result != null_value) { return result }
+            if (result != null_value) {
+                return result
+            }
             if (blk.preds.count == 1) {
                 cur = blk.preds.get(0).block
                 continue

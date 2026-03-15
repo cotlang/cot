@@ -342,13 +342,19 @@ struct SsaBlock {
     }
 
     fn addEdgeTo(target_idx: int, blocks: *List(SsaBlock)) void {
-        // Add successor edge: self → target
+        // Add successor edge: self → target (stores target's block INDEX)
         const succ_edge = SsaEdge { block: target_idx, index: 0 }
         self.succs.append(succ_edge)
 
         // Add predecessor edge: target ← self
+        // Must store self's block INDEX (not ID) so lookupVarOutgoing can use
+        // func.getBlock(pred.block) correctly. Find self's index by scanning.
+        var self_idx = 0
+        for si in 0..blocks.count {
+            if (blocks.get(si).id == self.id) { self_idx = si; break }
+        }
         var target = blocks.get(target_idx)
-        const pred_edge = SsaEdge { block: self.id, index: target.preds.count }
+        const pred_edge = SsaEdge { block: self_idx, index: target.preds.count }
         target.preds.append(pred_edge)
         blocks.set(target_idx, target)
     }
