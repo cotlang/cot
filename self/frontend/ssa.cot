@@ -261,6 +261,10 @@ struct SsaValue {
     fn argsLen() int {
         return self.args.count
     }
+
+    fn free() void {
+        self.args.free()
+    }
 }
 
 // ============================================================================
@@ -328,6 +332,13 @@ struct SsaBlock {
         } else {
             self.controls.set(0, val_idx)
         }
+    }
+
+    fn free() void {
+        self.succs.free()
+        self.preds.free()
+        self.controls.free()
+        self.values.free()
     }
 
     fn addEdgeTo(target_idx: int, blocks: *List(SsaBlock)) void {
@@ -447,6 +458,32 @@ struct SsaFunc {
         self.addValueToBlock(idx, block)
         self.constants.set(value, idx)
         return idx
+    }
+
+    /// Free all memory owned by this function.
+    /// Must be called after codegen is done with the function.
+    fn free() void {
+        // Free each value's args list
+        var i = 0
+        while (i < self.values.count) {
+            var v = self.values.get(i)
+            v.free()
+            i += 1
+        }
+        // Free each block's internal lists
+        i = 0
+        while (i < self.blocks.count) {
+            var b = self.blocks.get(i)
+            b.free()
+            i += 1
+        }
+        // Free the top-level containers
+        self.values.free()
+        self.blocks.free()
+        self.local_sizes.free()
+        self.local_offsets.free()
+        self.string_literals.free()
+        self.constants.free()
     }
 }
 

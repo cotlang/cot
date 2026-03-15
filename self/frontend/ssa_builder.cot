@@ -259,6 +259,18 @@ struct SSABuilder {
         return self.func
     }
 
+    /// Free all builder-owned memory (does NOT free the SsaFunc — caller owns that after build()).
+    fn free() void {
+        self.vars.free()
+        self.fwd_vars.free()
+        self.defvars.free()
+        self.block_map.free()
+        self.node_values.free()
+        self.loop_stack.free()
+        self.local_slot_offsets.free()
+        self.logical_operands.free()
+    }
+
     // === Block management ===
 
     fn startBlock(block: int) void {
@@ -329,8 +341,14 @@ struct SSABuilder {
         // Pre-scan for logical operands
         for i in 0..self.ir_func.blocks.count {
             const ir_block = self.ir_func.blocks.get(i)
+            if (ir_block.nodes.count < 0 or ir_block.nodes.count > 100000) {
+                @panic("CORRUPT block[${i}] in ${self.ir_func.name}: nodes.count=${ir_block.nodes.count}")
+            }
             for j in 0..ir_block.nodes.count {
                 const node_idx = ir_block.nodes.get(j)
+                if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) {
+                    @panic("BAD node_idx ${node_idx} in block[${i}] of ${self.ir_func.name} (nodes.count=${self.ir_func.nodes.count})")
+                }
                 const node = self.ir_func.getNode(node_idx)
                 switch (node.data) {
                     Data.binary |b| => {
@@ -364,10 +382,10 @@ struct SSABuilder {
     // === Dispatch ===
 
     fn convertNode(node_idx: int) int {
+        // null_node is -1 but may appear as 0xFFFFFFFF due to 32-bit field truncation.
+        // Treat any out-of-range index as null to handle both representations.
+        if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) { return null_value }
         if (self.node_values.contains(node_idx)) { return self.node_values.get(node_idx) }
-        if (node_idx < 0 or node_idx >= self.ir_func.nodes.count) {
-            @panic("convertNode: idx ${node_idx} >= ${self.ir_func.nodes.count} in ${self.ir_func.name}")
-        }
         const node = self.ir_func.getNode(node_idx)
         const cur = self.cur_block
         if (cur == null_block) { return null_value }

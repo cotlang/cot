@@ -150,6 +150,13 @@ fn layout(func: *SsaFunc) void {
     }
     func.blocks = new_blocks
 
+    // Free per-function temporaries
+    scheduled.free()
+    indegree.free()
+    order.free()
+    zerodegree.free()
+    succs_list.free()
+    is_exit.free()
 }
 
 // ============================================================================

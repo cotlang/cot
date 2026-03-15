@@ -355,20 +355,12 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     const ssa_func = builder.build()
 
     // Run Wasm-specific SSA passes (Go pass order)
-    // 1. rewritegeneric — ConstString → StringMake
     passRewriteGeneric(ssa_func, string_offsets)
-    // 2. decompose — phi decomposition for slices/strings
     decompose(ssa_func)
-    // 3. rewritedec — string/slice decomposition
     passRewriteDec(ssa_func)
-    // 4. schedule — value ordering
     schedule(ssa_func)
-    // 5. layout — block ordering
     layout(ssa_func)
-    // 6. lower_wasm — generic → wasm ops
     lower(ssa_func)
-
-
 
     // Determine function type
     const type_idx = registerFuncType(linker, ir_func, types)
@@ -377,6 +369,10 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
     var sym = generateFunc(ssa_func, func_indices, string_offsets, func_table_indices)
     preprocess(&sym)
     const body = assemble(&sym)
+
+    // Free all per-function SSA data — mirrors Zig compiler's arena.deinit() pattern
+    ssa_func.free()
+    builder.free()
 
     // Add to linker
     linker.addFunc(WasmFunc.init(ir_func.name, type_idx, body, true))
@@ -391,7 +387,10 @@ fn registerFuncType(linker: *Linker, ir_func: Func, types: *TypeRegistry) int {
     var results: List(int) = .{}
     buildFuncResults(&results, ir_func, types)
 
-    return linker.addType(params, results)
+    const idx = linker.addType(params, results)
+    params.free()
+    results.free()
+    return idx
 }
 
 /// Build Wasm param types from IR function parameters.

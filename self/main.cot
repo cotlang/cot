@@ -169,7 +169,6 @@ fn cmdBuildWithOutput(path: string, user_output: string) void {
     // Compile to IR (handles imports via compileToIR → compileWithImports)
     const lo = LowerOptions { test_mode: false, bench_mode: false, fail_fast: false }
     const result = compileToIR(path, content, lo)
-
     // Generate Wasm binary
     const opts = CompileOptions {
         is_wasi: true,

@@ -7457,8 +7457,6 @@ struct Lowerer {
     }
 
     fn lowerGenericFnInstanceInner(inst: *GenericInstInfo, concrete_name: string) void {
-        const fb = self.builder.func() orelse return null_node
-
         // Swap to the defining file's AST for cross-file generic resolution
         const saved_tree = self.tree
         self.tree = inst.getAst()

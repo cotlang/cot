@@ -39,6 +39,7 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
                 rewritten += 1
             }
         }
+        to_rewrite.free()
     }
 }
 

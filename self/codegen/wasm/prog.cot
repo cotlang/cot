@@ -217,6 +217,10 @@ struct ProgBuilder {
         }
     }
 
+    fn free() void {
+        self.progs.free()
+    }
+
     fn append(instr: As) int {
         const idx = self.count
         self.progs.append(Prog.init(instr))

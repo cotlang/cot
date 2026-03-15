@@ -91,6 +91,15 @@ struct GenState {
     /// The main local stores ptr, this stores len.
     compound_len_locals: Map(int, int),
 
+    /// Free Maps/Lists NOT transferred to the returned Symbol.
+    /// builder.progs and gc_ref_locals are aliased by the Symbol — do NOT free them here.
+    fn free() void {
+        self.value_to_local.free()
+        self.branches.free()
+        self.bstart.free()
+        self.compound_len_locals.free()
+    }
+
     static fn init(func: *SsaFunc) GenState {
         var value_to_local: Map(int, int) = .{}
         var branches: List(Branch) = .{}
@@ -2286,7 +2295,9 @@ fn generateFunc(func: *SsaFunc, func_indices: *Map(string, int), string_offsets:
     gen.setFuncIndices(func_indices)
     gen.setStringOffsets(string_offsets)
     gen.setFuncTableIndices(func_table_indices)
-    return gen.generate()
+    const sym = gen.generate()
+    gen.free()
+    return sym
 }
 
 // ============================================================================
