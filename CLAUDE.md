@@ -1,5 +1,16 @@
 # Claude AI Instructions
 
+## 🚨 CRITICAL: `self/` uses `@safe` mode via `self/cot.json` (`"safe": true`)
+
+**ALL files in `self/` are compiled in `@safe` mode.** This is set at the project level in `self/cot.json`, NOT per-file. You do NOT need `@safe` at the top of each file — it applies automatically. This means:
+- `self` is auto-injected in struct/enum methods (no explicit `self: *Type` parameter)
+- `+` on strings auto-desugars to `++`
+- All `@safe` mode behaviors apply
+
+**DO NOT add `@safe` to individual files in `self/`.** It's already set project-wide.
+
+---
+
 ## 🚨🚨🚨 ABSOLUTE #1 RULE — NEVER WORKAROUND, NEVER SIMPLIFY 🚨🚨🚨
 
 **NEVER implement workarounds for Cot compiler bugs or missing features.** If the Cot compiler doesn't support a pattern you need, or if compiled code behaves incorrectly at runtime, **STOP and report the bug to the user** so they can fix the Zig compiler. The self-hosted compiler must use idiomatic Cot — every workaround is tech debt that defeats the purpose of dogfooding.

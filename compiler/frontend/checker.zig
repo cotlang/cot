@@ -3313,7 +3313,14 @@ pub const Checker = struct {
             .index, .field_access, .deref => {},
             else => { self.err.errorWithCode(as_stmt.span.start, .e300, "invalid assignment target"); return; },
         }
-        if (!self.types.isAssignable(value_type, target_type)) self.err.errorWithCode(as_stmt.span.start, .e300, "type mismatch");
+        // @safe mode auto-ref: if value is *T and target is T, allow (auto-deref assignment).
+        // This handles ptr.* = v where v is auto-ref'd from T to *T.
+        if (!self.types.isAssignable(value_type, target_type)) {
+            const value_info = self.types.get(value_type);
+            if (value_info != .pointer or !self.types.isAssignable(value_info.pointer.elem, target_type)) {
+                self.err.errorWithCode(as_stmt.span.start, .e300, "type mismatch");
+            }
+        }
     }
 
     fn checkIfStmt(self: *Checker, is: ast.IfStmt) CheckError!void {

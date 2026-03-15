@@ -1,5 +1,11 @@
 # Cot Troubleshooting Framework
 
+## 🚨 `self/` uses `@safe` mode project-wide (`self/cot.json` has `"safe": true`)
+
+ALL files in `self/` are `@safe`. You do NOT need `@safe` at the top of individual files. `self` is auto-injected in struct methods. Do NOT add explicit `self: *Type` parameters in `self/` code.
+
+---
+
 ## Why This Document Exists
 
 Cot has been rewritten 5 times. Each time, the failure mode is the same:

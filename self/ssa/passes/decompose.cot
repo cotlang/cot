@@ -70,7 +70,7 @@ fn decomposeBuiltinPhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 ///         result = slice_make(ptr_phi, len_phi, cap_phi)
 fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
     const val = func.getValue(val_idx)
-    if (val.args.count == 0) { return false }
+    if (val.args_len == 0) { return false }
 
     const line = val.pos_line
     const col = val.pos_col
@@ -86,8 +86,8 @@ fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
     func.addValueToBlock(cap_phi_idx, block_idx)
 
     // For each arg of the original phi, extract ptr, len, cap
-    for ai in 0..val.args.count {
-        const arg_idx = val.args.get(ai)
+    for ai in 0..val.args_len {
+        const arg_idx = val.getArg(ai)
         const arg_val = func.getValue(arg_idx)
         const arg_block = arg_val.block
 
@@ -144,7 +144,7 @@ fn decomposeSlicePhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
 ///         result = string_make(ptr_phi, len_phi)
 fn decomposeStringPhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
     const val = func.getValue(val_idx)
-    if (val.args.count == 0) { return false }
+    if (val.args_len == 0) { return false }
 
     const line = val.pos_line
     const col = val.pos_col
@@ -157,8 +157,8 @@ fn decomposeStringPhi(func: *SsaFunc, block_idx: int, val_idx: int) bool {
     func.addValueToBlock(len_phi_idx, block_idx)
 
     // For each arg of the original phi, extract ptr and len
-    for ai in 0..val.args.count {
-        const arg_idx = val.args.get(ai)
+    for ai in 0..val.args_len {
+        const arg_idx = val.getArg(ai)
         const arg_val = func.getValue(arg_idx)
         const arg_block = arg_val.block
 
@@ -212,9 +212,9 @@ fn copyOf(func: *SsaFunc, val_idx: int, src_idx: int) void {
     var val = func.getValue(val_idx)
     val.op = SsaOp.copy
     val.aux_int = 0
-    val.aux = SsaAux.none
-    val.args.clear()
-    val.args.append(src_idx)
+    val.aux_str = ""
+    val.args_len = 0
+    val.addArg(src_idx)
     func.setValue(val_idx, val)
 
     // Increment uses on src
@@ -255,7 +255,7 @@ test "decompose string phi" {
     // Verify: phi should become copy
     const result = func.getValue(phi_idx)
     @assertEq(result.op == SsaOp.copy, true)
-    @assertEq(result.args.count, 1)
+    @assertEq(result.args_len, 1)
 }
 
 test "decompose ignores non-compound phi" {

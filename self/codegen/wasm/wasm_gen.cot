@@ -118,6 +118,15 @@ struct GenState {
         }
     }
 
+    /// Free internal maps/lists not transferred to Symbol.
+    fn deinit() void {
+        self.value_to_local.free()
+        self.branches.free()
+        self.bstart.free()
+        self.compound_len_locals.free()
+        // builder.progs and gc_ref_locals are owned by Symbol — don't free
+    }
+
     fn setFuncIndices(indices: *Map(string, int)) void {
         self.func_indices = indices
     }
@@ -203,9 +212,9 @@ struct GenState {
 
                 if (ret_val.op == SsaOp.string_make or ret_val.op == SsaOp.slice_make) {
                     // Compound return: push both components (ptr, len)
-                    if (ret_val.args.count >= 2) {
-                        self.getValue64(ret_val.args.get(0))
-                        self.getValue64(ret_val.args.get(1))
+                    if (ret_val.args_len >= 2) {
+                        self.getValue64(ret_val.getArg(0))
+                        self.getValue64(ret_val.getArg(1))
                     }
                 } else if (ret_val.type_idx == STRING and self.compound_len_locals.contains(ret_val_idx)) {
                     // Compound return from call result — push ptr then len
@@ -248,8 +257,8 @@ struct GenState {
                 const val_idx = succ.values.get(vi)
                 const v = self.ssa_func.getValue(val_idx)
                 if (v.op != SsaOp.phi) { continue }
-                if (pred_idx >= v.args.count) { continue }
-                const arg_idx = v.args.get(pred_idx)
+                if (pred_idx >= v.args_len) { continue }
+                const arg_idx = v.getArg(pred_idx)
                 self.getValue64(arg_idx)
                 if (self.value_to_local.contains(val_idx)) {
                     const local_idx = self.value_to_local.get(val_idx)
@@ -492,11 +501,11 @@ struct GenState {
             // Extraction ops for compound types
             SsaOp.string_ptr, SsaOp.slice_ptr => {
                 // Get ptr component: stored in arg's main local
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
             },
             SsaOp.string_len, SsaOp.slice_len => {
                 // Get len component: stored in arg's compound len local
-                const arg_idx = v.args.get(0)
+                const arg_idx = v.getArg(0)
                 if (self.compound_len_locals.contains(arg_idx)) {
                     const len_local = self.compound_len_locals.get(arg_idx)
                     self.builder.appendFrom(As.local_get, constAddr(len_local))
@@ -517,100 +526,100 @@ struct GenState {
         switch (v.op) {
             // i64 arithmetic
             SsaOp.wasm_i64_add => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_add)
             },
             SsaOp.wasm_i64_sub => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_sub)
             },
             SsaOp.wasm_i64_mul => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_mul)
             },
             SsaOp.wasm_i64_div_s => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_div_s)
             },
             SsaOp.wasm_i64_div_u => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_div_u)
             },
             SsaOp.wasm_i64_rem_s => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_rem_s)
             },
             SsaOp.wasm_i64_rem_u => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_rem_u)
             },
 
             // i64 bitwise
             SsaOp.wasm_i64_and => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_and)
             },
             SsaOp.wasm_i64_or => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_or)
             },
             SsaOp.wasm_i64_xor => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_xor)
             },
             SsaOp.wasm_i64_shl => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_shl)
             },
             SsaOp.wasm_i64_shr_s => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_shr_s)
             },
             SsaOp.wasm_i64_shr_u => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_shr_u)
             },
             SsaOp.wasm_i64_rotl => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_rotl)
             },
             SsaOp.wasm_i64_rotr => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_rotr)
             },
 
             // i64 bit counting
             SsaOp.wasm_i64_clz => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_clz)
             },
             SsaOp.wasm_i64_ctz => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_ctz)
             },
             SsaOp.wasm_i64_popcnt => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_popcnt)
             },
 
             // Bitwise NOT — x XOR -1 (Wasm has no NOT)
             SsaOp.@"not" => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.appendFrom(As.i64_const, constAddr(-1))
                 self.builder.append(As.i64_xor)
             },
@@ -618,63 +627,63 @@ struct GenState {
             // Integer negation — 0 - x (Wasm has no i64.neg)
             SsaOp.neg => {
                 self.builder.appendFrom(As.i64_const, constAddr(0))
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_sub)
             },
 
             // i64 comparisons (produce i32)
             SsaOp.wasm_i64_eq => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_eq)
             },
             SsaOp.wasm_i64_ne => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_ne)
             },
             SsaOp.wasm_i64_lt_s => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_lt_s)
             },
             SsaOp.wasm_i64_le_s => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_le_s)
             },
             SsaOp.wasm_i64_gt_s => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_gt_s)
             },
             SsaOp.wasm_i64_ge_s => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_ge_s)
             },
             SsaOp.wasm_i64_lt_u => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_lt_u)
             },
             SsaOp.wasm_i64_le_u => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_le_u)
             },
             SsaOp.wasm_i64_gt_u => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_gt_u)
             },
             SsaOp.wasm_i64_ge_u => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_ge_u)
             },
             SsaOp.wasm_i64_eqz => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_eqz)
             },
             else => {},
@@ -690,65 +699,65 @@ struct GenState {
         switch (v.op) {
             // i32 bitwise (wrap-operate-extend pattern from Zig gen.zig)
             SsaOp.wasm_i32_and => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_and)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_or => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_or)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_xor => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_xor)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_shl => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_shl)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_shr_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_shr_s)
                 self.builder.append(As.i64_extend_i32_s)
             },
             SsaOp.wasm_i32_shr_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_shr_u)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_rotl => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_rotl)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_rotr => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_rotr)
                 self.builder.append(As.i64_extend_i32_u)
@@ -756,57 +765,57 @@ struct GenState {
 
             // i32 arithmetic (wrap-operate-extend)
             SsaOp.wasm_i32_add => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_add)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_sub => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_sub)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_mul => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_mul)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_div_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_div_s)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_div_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_div_u)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_rem_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_rem_s)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_rem_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_rem_u)
                 self.builder.append(As.i64_extend_i32_u)
@@ -814,19 +823,19 @@ struct GenState {
 
             // i32 bit counting (wrap-operate-extend)
             SsaOp.wasm_i32_clz => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_clz)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_ctz => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_ctz)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i32_popcnt => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_popcnt)
                 self.builder.append(As.i64_extend_i32_u)
@@ -834,77 +843,77 @@ struct GenState {
 
             // i32 comparisons
             SsaOp.wasm_i32_eqz => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_eqz)
             },
             SsaOp.wasm_i32_eq => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_eq)
             },
             SsaOp.wasm_i32_ne => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_ne)
             },
             SsaOp.wasm_i32_lt_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_lt_s)
             },
             SsaOp.wasm_i32_lt_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_lt_u)
             },
             SsaOp.wasm_i32_gt_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_gt_s)
             },
             SsaOp.wasm_i32_gt_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_gt_u)
             },
             SsaOp.wasm_i32_le_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_le_s)
             },
             SsaOp.wasm_i32_le_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_le_u)
             },
             SsaOp.wasm_i32_ge_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_ge_s)
             },
             SsaOp.wasm_i32_ge_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_ge_u)
             },
@@ -921,195 +930,195 @@ struct GenState {
         switch (v.op) {
             // f64 arithmetic
             SsaOp.wasm_f64_add => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_add)
             },
             SsaOp.wasm_f64_sub => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_sub)
             },
             SsaOp.wasm_f64_mul => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_mul)
             },
             SsaOp.wasm_f64_div => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_div)
             },
             SsaOp.wasm_f64_neg => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_neg)
             },
             SsaOp.wasm_f64_abs => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_abs)
             },
             SsaOp.wasm_f64_ceil => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_ceil)
             },
             SsaOp.wasm_f64_floor => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_floor)
             },
             SsaOp.wasm_f64_trunc => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_trunc)
             },
             SsaOp.wasm_f64_nearest => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_nearest)
             },
             SsaOp.wasm_f64_sqrt => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_sqrt)
             },
             SsaOp.wasm_f64_min => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_min)
             },
             SsaOp.wasm_f64_max => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_max)
             },
             SsaOp.wasm_f64_copysign => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_copysign)
             },
 
             // f64 comparisons (produce i32)
             SsaOp.wasm_f64_eq => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_eq)
             },
             SsaOp.wasm_f64_ne => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_ne)
             },
             SsaOp.wasm_f64_lt => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_lt)
             },
             SsaOp.wasm_f64_le => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_le)
             },
             SsaOp.wasm_f64_gt => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_gt)
             },
             SsaOp.wasm_f64_ge => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f64_ge)
             },
 
             // f32 arithmetic
             SsaOp.wasm_f32_add => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_add)
             },
             SsaOp.wasm_f32_sub => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_sub)
             },
             SsaOp.wasm_f32_mul => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_mul)
             },
             SsaOp.wasm_f32_div => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_div)
             },
             SsaOp.wasm_f32_neg => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_neg)
             },
             SsaOp.wasm_f32_abs => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_abs)
             },
             SsaOp.wasm_f32_ceil => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_ceil)
             },
             SsaOp.wasm_f32_floor => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_floor)
             },
             SsaOp.wasm_f32_trunc => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_trunc)
             },
             SsaOp.wasm_f32_nearest => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_nearest)
             },
             SsaOp.wasm_f32_sqrt => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_sqrt)
             },
             SsaOp.wasm_f32_min => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_min)
             },
             SsaOp.wasm_f32_max => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_max)
             },
             SsaOp.wasm_f32_copysign => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_copysign)
             },
 
             // f32 comparisons
             SsaOp.wasm_f32_eq => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_eq)
             },
             SsaOp.wasm_f32_ne => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_ne)
             },
             SsaOp.wasm_f32_lt => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_lt)
             },
             SsaOp.wasm_f32_gt => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_gt)
             },
             SsaOp.wasm_f32_le => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_le)
             },
             SsaOp.wasm_f32_ge => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.f32_ge)
             },
             else => {},
@@ -1120,62 +1129,62 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             SsaOp.wasm_i64_load => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i64_load, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_load8_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i64_load8_s, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_load8_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i64_load8_u, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_load16_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i64_load16_s, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_load16_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i64_load16_u, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_load32_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i64_load32_s, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_load32_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i64_load32_u, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_store => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.appendTo(As.i64_store, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_store8 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.appendTo(As.i64_store8, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_store16 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.appendTo(As.i64_store16, constAddr(v.aux_int))
             },
             SsaOp.wasm_i64_store32 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.appendTo(As.i64_store32, constAddr(v.aux_int))
             },
             else => {},
@@ -1186,48 +1195,48 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             SsaOp.wasm_i32_load => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i32_load, constAddr(v.aux_int))
             },
             SsaOp.wasm_i32_store => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendTo(As.i32_store, constAddr(v.aux_int))
             },
             SsaOp.wasm_i32_load8_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i32_load8_s, constAddr(v.aux_int))
             },
             SsaOp.wasm_i32_load8_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i32_load8_u, constAddr(v.aux_int))
             },
             SsaOp.wasm_i32_load16_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i32_load16_s, constAddr(v.aux_int))
             },
             SsaOp.wasm_i32_load16_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i32_load16_u, constAddr(v.aux_int))
             },
             SsaOp.wasm_i32_store8 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendTo(As.i32_store8, constAddr(v.aux_int))
             },
             SsaOp.wasm_i32_store16 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendTo(As.i32_store16, constAddr(v.aux_int))
             },
@@ -1239,25 +1248,25 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             SsaOp.wasm_f64_load => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.f64_load, constAddr(v.aux_int))
             },
             SsaOp.wasm_f64_store => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.appendTo(As.f64_store, constAddr(v.aux_int))
             },
             SsaOp.wasm_f32_load => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.f32_load, constAddr(v.aux_int))
             },
             SsaOp.wasm_f32_store => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.appendTo(As.f32_store, constAddr(v.aux_int))
             },
             else => {},
@@ -1268,15 +1277,15 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             SsaOp.wasm_lowered_move => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i32_const, constAddr(v.aux_int))
                 self.builder.append(As.memory_copy)
             },
             SsaOp.wasm_lowered_zero => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendFrom(As.i32_const, constAddr(0))
                 self.builder.appendFrom(As.i32_const, constAddr(v.aux_int))
@@ -1294,52 +1303,52 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             SsaOp.wasm_call => {
-                for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                for ai in 0..v.args_len {
+                    self.getValue64(v.getArg(ai))
                 }
                 const func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.call, constAddr(func_idx))
             },
             SsaOp.wasm_return_call => {
-                for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                for ai in 0..v.args_len {
+                    self.getValue64(v.getArg(ai))
                 }
                 const rc_func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.return_call, constAddr(rc_func_idx))
             },
             SsaOp.wasm_lowered_static_call => {
-                for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                for ai in 0..v.args_len {
+                    self.getValue64(v.getArg(ai))
                 }
                 const sc_func_idx = self.resolveCallIndex(v)
                 self.builder.appendTo(As.call, constAddr(sc_func_idx))
             },
             SsaOp.wasm_lowered_closure_call => {
                 // Set CTXT global from context pointer
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(1))
                 self.builder.appendTo(As.global_set, constAddr(1))
                 // Push function arguments (args[2..])
-                for ai in 2..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                for ai in 2..v.args_len {
+                    self.getValue64(v.getArg(ai))
                 }
                 // Push callee table index — must be i32 for call_indirect
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendTo(As.call_indirect, constAddr(v.aux_int))
             },
             SsaOp.wasm_lowered_inter_call => {
                 // Push function arguments (skip arg[0])
-                for ai in 1..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                for ai in 1..v.args_len {
+                    self.getValue64(v.getArg(ai))
                 }
                 // Push callee (table index) — must be i32
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.appendTo(As.call_indirect, constAddr(v.aux_int))
             },
             SsaOp.wasm_call_indirect => {
-                for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                for ai in 0..v.args_len {
+                    self.getValue64(v.getArg(ai))
                 }
                 self.builder.appendTo(As.call_indirect, constAddr(v.aux_int))
             },
@@ -1358,7 +1367,7 @@ struct GenState {
             SsaOp.convert => {
                 const from_type = v.aux_int
                 const to_type = v.type_idx
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 const from_is_float = (from_type == 10 or from_type == 11 or from_type == 14)
                 const to_is_float = (to_type == 10 or to_type == 11 or to_type == 14)
                 const from_is_32 = (from_type == 4)
@@ -1385,109 +1394,109 @@ struct GenState {
 
             // Conversions (explicit Wasm ops)
             SsaOp.wasm_i32_wrap_i64 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
             },
             SsaOp.wasm_i64_extend_i32_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i64_extend_i32_s)
             },
             SsaOp.wasm_i64_extend_i32_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i64_extend_i32_u)
             },
             SsaOp.wasm_i64_trunc_f64_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_trunc_f64_s)
             },
             SsaOp.wasm_i64_trunc_f64_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_trunc_f64_u)
             },
             SsaOp.wasm_i64_trunc_f32_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_trunc_f32_s)
             },
             SsaOp.wasm_i64_trunc_f32_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_trunc_f32_u)
             },
             SsaOp.wasm_i32_trunc_f64_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_trunc_f64_s)
             },
             SsaOp.wasm_i32_trunc_f64_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_trunc_f64_u)
             },
             SsaOp.wasm_i32_trunc_f32_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_trunc_f32_s)
             },
             SsaOp.wasm_i32_trunc_f32_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_trunc_f32_u)
             },
             SsaOp.wasm_f64_convert_i64_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_convert_i64_s)
             },
             SsaOp.wasm_f64_convert_i64_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_convert_i64_u)
             },
             SsaOp.wasm_f64_convert_i32_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f64_convert_i32_s)
             },
             SsaOp.wasm_f64_convert_i32_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f64_convert_i32_u)
             },
             SsaOp.wasm_f32_convert_i64_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_convert_i64_s)
             },
             SsaOp.wasm_f32_convert_i64_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_convert_i64_u)
             },
             SsaOp.wasm_f32_convert_i32_s => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f32_convert_i32_s)
             },
             SsaOp.wasm_f32_convert_i32_u => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f32_convert_i32_u)
             },
             SsaOp.wasm_f64_promote_f32 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_promote_f32)
             },
             SsaOp.wasm_f32_demote_f64 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f32_demote_f64)
             },
             SsaOp.wasm_i64_reinterpret_f64 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i64_reinterpret_f64)
             },
             SsaOp.wasm_f64_reinterpret_i64 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.f64_reinterpret_i64)
             },
             SsaOp.wasm_i32_reinterpret_f32 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_reinterpret_f32)
             },
             SsaOp.wasm_f32_reinterpret_i32 => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.f32_reinterpret_i32)
             },
@@ -1522,20 +1531,20 @@ struct GenState {
                 self.emitFuncAddr(val_idx)
             },
             SsaOp.off_ptr => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 if (v.aux_int != 0) {
                     self.builder.appendFrom(As.i64_const, constAddr(v.aux_int))
                     self.builder.append(As.i64_add)
                 }
             },
             SsaOp.add_ptr => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_add)
             },
             SsaOp.sub_ptr => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.i64_sub)
             },
             else => {},
@@ -1544,7 +1553,7 @@ struct GenState {
 
     fn emitMetadataAddr(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
-        const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+        const type_name = v.aux_str
         if (@lenOf(type_name) > 0) {
             if (self.metadata_offsets) |offsets| {
                 if (offsets.contains(type_name)) {
@@ -1562,7 +1571,7 @@ struct GenState {
 
     fn emitFuncAddr(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
-        const fn_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+        const fn_name = v.aux_str
         if (@lenOf(fn_name) > 0) {
             if (self.func_table_indices) |fti| {
                 if (fti.contains(fn_name)) {
@@ -1598,10 +1607,10 @@ struct GenState {
         const v = self.ssa_func.getValue(val_idx)
         switch (v.op) {
             SsaOp.wasm_gc_struct_new => {
-                for ai in 0..v.args.count {
-                    self.getValue64(v.args.get(ai))
+                for ai in 0..v.args_len {
+                    self.getValue64(v.getArg(ai))
                 }
-                const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+                const type_name = v.aux_str
                 var gc_type_idx = 0
                 if (self.gc_struct_name_map) |m| {
                     if (m.contains(type_name)) { gc_type_idx = m.get(type_name) }
@@ -1609,8 +1618,8 @@ struct GenState {
                 self.builder.appendFrom(As.gc_struct_new, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_struct_get => {
-                self.getValue64(v.args.get(0))
-                const type_name2 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+                self.getValue64(v.getArg(0))
+                const type_name2 = v.aux_str
                 var gc_type_idx2 = 0
                 if (self.gc_struct_name_map) |m| {
                     if (m.contains(type_name2)) { gc_type_idx2 = m.get(type_name2) }
@@ -1621,9 +1630,9 @@ struct GenState {
                 self.builder.set(gsg_idx, gsg_p)
             },
             SsaOp.wasm_gc_struct_set => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
-                const type_name3 = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
+                const type_name3 = v.aux_str
                 var gc_type_idx3 = 0
                 if (self.gc_struct_name_map) |m| {
                     if (m.contains(type_name3)) { gc_type_idx3 = m.get(type_name3) }
@@ -1643,7 +1652,7 @@ struct GenState {
 
     fn emitGcArrayRefOp(val_idx: int) void {
         const v = self.ssa_func.getValue(val_idx)
-        const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+        const type_name = v.aux_str
 
         // Resolve GC type index from name maps
         var gc_type_idx = 0
@@ -1653,84 +1662,84 @@ struct GenState {
 
         switch (v.op) {
             SsaOp.wasm_gc_array_new => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.appendFrom(As.gc_array_new, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_array_new_default => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.appendFrom(As.gc_array_new_default, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_array_new_fixed => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args_len { self.getValue64(v.getArg(ai)) }
                 const pi = self.builder.appendFrom(As.gc_array_new_fixed, constAddr(gc_type_idx))
                 var pp = self.builder.get(pi)
                 pp.to = constAddr(v.aux_int)
                 self.builder.set(pi, pp)
             },
             SsaOp.wasm_gc_array_new_data => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 const pi = self.builder.appendFrom(As.gc_array_new_data, constAddr(gc_type_idx))
                 var pp = self.builder.get(pi)
                 pp.to = constAddr(v.aux_int)
                 self.builder.set(pi, pp)
             },
             SsaOp.wasm_gc_array_get => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.appendFrom(As.gc_array_get, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_array_set => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
-                self.getValue64(v.args.get(2))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
+                self.getValue64(v.getArg(2))
                 self.builder.appendFrom(As.gc_array_set, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_array_len => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.gc_array_len)
             },
             SsaOp.wasm_gc_array_copy => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args_len { self.getValue64(v.getArg(ai)) }
                 const pi = self.builder.appendFrom(As.gc_array_copy, constAddr(gc_type_idx))
                 var pp = self.builder.get(pi)
                 pp.to = constAddr(v.aux_int)
                 self.builder.set(pi, pp)
             },
             SsaOp.wasm_gc_ref_test => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.appendFrom(As.ref_test, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_ref_cast => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.appendFrom(As.ref_cast, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_ref_null => {
                 self.builder.appendFrom(As.ref_null, constAddr(gc_type_idx))
             },
             SsaOp.wasm_gc_ref_is_null => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.ref_is_null)
             },
             SsaOp.wasm_gc_ref_eq => {
-                self.getValue64(v.args.get(0))
-                self.getValue64(v.args.get(1))
+                self.getValue64(v.getArg(0))
+                self.getValue64(v.getArg(1))
                 self.builder.append(As.ref_eq)
             },
             SsaOp.wasm_gc_ref_func => {
                 self.builder.appendFrom(As.ref_func, constAddr(0))
             },
             SsaOp.wasm_gc_call_ref => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args_len { self.getValue64(v.getArg(ai)) }
                 self.builder.appendFrom(As.call_ref, constAddr(v.aux_int))
             },
             SsaOp.wasm_gc_return_call_ref => {
-                for ai in 0..v.args.count { self.getValue64(v.args.get(ai)) }
+                for ai in 0..v.args_len { self.getValue64(v.getArg(ai)) }
                 self.builder.appendFrom(As.return_call_ref, constAddr(v.aux_int))
             },
             SsaOp.wasm_gc_br_on_cast => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.@"unreachable")
             },
             else => {},
@@ -1760,7 +1769,7 @@ struct GenState {
 
             // Copy
             SsaOp.copy => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
             },
 
             // Phi — load from local (populated by emitPhiMoves)
@@ -1773,9 +1782,9 @@ struct GenState {
 
             // Conditional select (ternary)
             SsaOp.cond_select, SsaOp.wasm_select => {
-                self.getValue64(v.args.get(1))
-                self.getValue64(v.args.get(2))
-                self.getValue32(v.args.get(0))
+                self.getValue64(v.getArg(1))
+                self.getValue64(v.getArg(2))
+                self.getValue32(v.getArg(0))
                 self.builder.append(As.@"select")
             },
 
@@ -1784,7 +1793,7 @@ struct GenState {
                 self.builder.appendFrom(As.global_get, constAddr(v.aux_int))
             },
             SsaOp.wasm_global_set => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.appendTo(As.global_set, constAddr(v.aux_int))
             },
 
@@ -1811,9 +1820,9 @@ struct GenState {
 
             // Bounds check
             SsaOp.bounds_check => {
-                if (v.args.count >= 2) {
-                    self.getValue64(v.args.get(0))
-                    self.getValue64(v.args.get(1))
+                if (v.args_len >= 2) {
+                    self.getValue64(v.getArg(0))
+                    self.getValue64(v.getArg(1))
                     self.builder.append(As.i64_ge_u)
                     self.builder.append(As.@"if")
                     self.builder.append(As.@"unreachable")
@@ -1823,7 +1832,7 @@ struct GenState {
 
             // Nil check
             SsaOp.wasm_lowered_nil_check => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.i32_wrap_i64)
                 self.builder.append(As.i32_eqz)
                 self.builder.append(As.@"if")
@@ -1836,18 +1845,18 @@ struct GenState {
                 self.builder.appendFrom(As.local_get, constAddr(v.aux_int))
             },
             SsaOp.wasm_local_set => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.appendTo(As.local_set, constAddr(v.aux_int))
             },
 
             // Drop / Return / Unreachable / Nop / Select
             SsaOp.wasm_drop => {
-                self.getValue64(v.args.get(0))
+                self.getValue64(v.getArg(0))
                 self.builder.append(As.drop)
             },
             SsaOp.wasm_return => {
-                if (v.args.count > 0) {
-                    self.getValue64(v.args.get(0))
+                if (v.args_len > 0) {
+                    self.getValue64(v.getArg(0))
                 }
                 self.builder.append(As.@"return")
             },
@@ -1877,7 +1886,7 @@ struct GenState {
 
     fn resolveCallIndex(v: SsaValue) int {
         if (self.func_indices) |fi| {
-            const name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+            const name = v.aux_str
             if (@lenOf(name) > 0 and fi.contains(name)) {
                 return fi.get(name)
             }
@@ -2127,7 +2136,7 @@ struct GenState {
 
                 const local_idx = self.next_local
                 self.next_local += 1
-                const type_name = switch (v.aux) { SsaAux.str |s| => s, else => "" }
+                const type_name = v.aux_str
                 var gc_idx = 0
                 if (self.gc_struct_name_map) |m| {
                     if (m.contains(type_name)) { gc_idx = m.get(type_name) }
@@ -2171,8 +2180,8 @@ struct GenState {
             for vi in 0..blk.values.count {
                 const val_idx = blk.values.get(vi)
                 const val = self.ssa_func.getValue(val_idx)
-                for ai in 0..val.args.count {
-                    const arg_idx = val.args.get(ai)
+                for ai in 0..val.args_len {
+                    const arg_idx = val.getArg(ai)
                     var arg_val = self.ssa_func.getValue(arg_idx)
                     arg_val.uses += 1
                     self.ssa_func.setValue(arg_idx, arg_val)
@@ -2286,7 +2295,9 @@ fn generateFunc(func: *SsaFunc, func_indices: *Map(string, int), string_offsets:
     gen.setFuncIndices(func_indices)
     gen.setStringOffsets(string_offsets)
     gen.setFuncTableIndices(func_table_indices)
-    return gen.generate()
+    const sym = gen.generate()
+    gen.deinit()
+    return sym
 }
 
 // ============================================================================

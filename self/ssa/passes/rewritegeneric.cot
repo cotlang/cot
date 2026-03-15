@@ -39,6 +39,7 @@ fn rewrite(func: *SsaFunc, string_offsets: *Map(string, int)) void {
                 rewritten += 1
             }
         }
+        to_rewrite.free()
     }
 }
 
@@ -86,9 +87,9 @@ fn rewriteConstString(func: *SsaFunc, block_idx: int, val_idx: int, string_offse
     // Transform const_string to string_make
     val.op = SsaOp.string_make
     val.aux_int = 0
-    val.args.clear()
-    val.args.append(ptr_val_idx)
-    val.args.append(len_val_idx)
+    val.args_len = 0
+    val.addArg(ptr_val_idx)
+    val.addArg(len_val_idx)
     func.setValue(val_idx, val)
 
     return true
@@ -122,15 +123,15 @@ test "rewriteConstString basic" {
     // Verify transformation
     const result = func.getValue(v)
     @assertEq(result.op == SsaOp.string_make, true)
-    @assertEq(result.args.count, 2)
+    @assertEq(result.args_len, 2)
 
     // Check ptr constant
-    const ptr_val = func.getValue(result.args.get(0))
+    const ptr_val = func.getValue(result.getArg(0))
     @assertEq(ptr_val.op == SsaOp.const_64, true)
     @assertEq(ptr_val.aux_int, 100)
 
     // Check len constant
-    const len_val = func.getValue(result.args.get(1))
+    const len_val = func.getValue(result.getArg(1))
     @assertEq(len_val.op == SsaOp.const_64, true)
     @assertEq(len_val.aux_int, 5)
 

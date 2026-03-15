@@ -1279,7 +1279,18 @@ struct Checker {
                 }
             } else {
                 if (!self.types.isAssignable(value_type, target_type)) {
-                    self.reportError(idx, ErrorCode.e300, "type mismatch")
+                    // @safe auto-ref: if value is *T and target is T, allow (auto-deref)
+                    var auto_deref_ok = false
+                    const vt = self.types.get(value_type)
+                    if (vt.tag == TAG_POINTER) {
+                        const ptr_elem = self.types.pointerElem(value_type)
+                        if (self.types.isAssignable(ptr_elem, target_type)) {
+                            auto_deref_ok = true
+                        }
+                    }
+                    if (!auto_deref_ok) {
+                        self.reportError(idx, ErrorCode.e300, "type mismatch")
+                    }
                 }
             }
         }, else => {} }, else => {} }

@@ -11,6 +11,9 @@ pub const Phase = enum {
     check,
     lower,
     ssa,
+    deadcode,
+    copyelim,
+    phielim,
     schedule,
     regalloc,
     codegen,
@@ -23,6 +26,9 @@ pub const DebugPhases = struct {
     check: bool = false,
     lower: bool = false,
     ssa: bool = false,
+    deadcode: bool = false,
+    copyelim: bool = false,
+    phielim: bool = false,
     schedule: bool = false,
     regalloc: bool = false,
     codegen: bool = false,
@@ -45,6 +51,9 @@ pub const DebugPhases = struct {
             if (std.mem.eql(u8, trimmed, "check")) result.check = true;
             if (std.mem.eql(u8, trimmed, "lower")) result.lower = true;
             if (std.mem.eql(u8, trimmed, "ssa")) result.ssa = true;
+            if (std.mem.eql(u8, trimmed, "deadcode")) result.deadcode = true;
+            if (std.mem.eql(u8, trimmed, "copyelim")) result.copyelim = true;
+            if (std.mem.eql(u8, trimmed, "phielim")) result.phielim = true;
             if (std.mem.eql(u8, trimmed, "schedule")) result.schedule = true;
             if (std.mem.eql(u8, trimmed, "regalloc")) result.regalloc = true;
             if (std.mem.eql(u8, trimmed, "codegen")) result.codegen = true;
@@ -61,6 +70,9 @@ pub const DebugPhases = struct {
             .check => self.check,
             .lower => self.lower,
             .ssa => self.ssa,
+            .deadcode => self.deadcode,
+            .copyelim => self.copyelim,
+            .phielim => self.phielim,
             .schedule => self.schedule,
             .regalloc => self.regalloc,
             .codegen => self.codegen,

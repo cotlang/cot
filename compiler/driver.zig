@@ -21,6 +21,10 @@ const decompose_builtin = @import("ssa/passes/decompose.zig");
 const rewritedec = @import("ssa/passes/rewritedec.zig");
 const lower_wasm = @import("ssa/passes/lower_wasm.zig");
 const lower_native = @import("ssa/passes/lower_native.zig");
+const deadcode = @import("ssa/passes/deadcode.zig");
+const copyelim = @import("ssa/passes/copyelim.zig");
+const phielim = @import("ssa/passes/phielim.zig");
+const cse_pass = @import("ssa/passes/cse.zig");
 const ssa_to_clif = @import("codegen/native/ssa_to_clif.zig");
 const arc_native = @import("codegen/native/arc_native.zig");
 const io_native = @import("codegen/native/io_native.zig");
@@ -1439,26 +1443,28 @@ pub const Driver = struct {
             }
             try func_names.append(self.allocator, ir_func.name);
 
+            // Per-function arena: all SSA data allocated here, freed at once after codegen
+            var func_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer func_arena.deinit();
+            const func_alloc = func_arena.allocator();
+
             // Build SSA from IR
-            var ssa_builder = try ssa_builder_mod.SSABuilder.init(self.allocator, ir_func, globals, type_reg, self.target);
+            var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
             ssa_builder.shape_aliases = self.shape_aliases; // Shape stenciling: resolve aliased calls
             ssa_builder.dict_arg_names = self.dict_arg_names; // Dict dispatch: inject fn-ptr args
             errdefer ssa_builder.deinit();
 
             const ssa_func = try ssa_builder.build();
-            defer {
-                ssa_func.deinit();
-                self.allocator.destroy(ssa_func);
-            }
+            // No need for individual deinit — arena frees everything at once
             ssa_builder.deinit();
 
             // Set function type for CLIF signature building (not set by SSA builder)
             ssa_func.type_idx = ir_func.type_idx;
 
-            // Run SSA passes — same as Wasm path except lower_native instead of lower_wasm
-            try rewritegeneric.rewrite(self.allocator, ssa_func, &string_offsets);
-            try decompose_builtin.decompose(self.allocator, ssa_func);
-            try rewritedec.rewrite(self.allocator, ssa_func);
+            // Run SSA passes (native path — copyelim TODO after CLIF translation fix)
+            try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            try decompose_builtin.decompose(func_alloc, ssa_func);
+            try rewritedec.rewrite(func_alloc, ssa_func);
             try schedule.schedule(ssa_func);
             try layout.layout(ssa_func);
             try lower_native.lower(ssa_func);
@@ -5703,31 +5709,29 @@ pub const Driver = struct {
         // Pass 2: Generate code for each function
         // ====================================================================
         for (funcs) |*ir_func| {
+            // Per-function arena: all SSA data allocated here, freed at once after codegen
+            var func_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer func_arena.deinit();
+            const func_alloc = func_arena.allocator();
+
             // Build SSA
-            var ssa_builder = try ssa_builder_mod.SSABuilder.init(self.allocator, ir_func, globals, type_reg, self.target);
+            var ssa_builder = try ssa_builder_mod.SSABuilder.init(func_alloc, ir_func, globals, type_reg, self.target);
             ssa_builder.shape_aliases = self.shape_aliases; // Shape stenciling: resolve aliased calls
             ssa_builder.dict_arg_names = self.dict_arg_names; // Dict dispatch: inject fn-ptr args
             errdefer ssa_builder.deinit();
 
             const ssa_func = try ssa_builder.build();
-            defer {
-                ssa_func.deinit();
-                self.allocator.destroy(ssa_func);
-            }
+            // No need for individual deinit — arena frees everything at once
             ssa_builder.deinit();
 
-            // Run Wasm-specific passes (no regalloc needed!)
-            // Following Go's pass order:
-            // 1. rewritegeneric - ConstString → StringMake (Go: rewritegeneric.go)
-            // 2. decompose - phi decomposition for slices/strings (Go: decompose.go)
-            // 3. rewritedec - string/slice decomposition (Go: rewritedec.go)
-            // 4. schedule - value ordering
-            // 5. layout - block ordering (Go: layout.go)
-            // 6. lower_wasm - generic → wasm ops (Go: lower.go)
-            // NOTE: phi lowering removed - Wasm stack machine handles phis differently
-            try rewritegeneric.rewrite(self.allocator, ssa_func, &string_offsets);
-            try decompose_builtin.decompose(self.allocator, ssa_func);
-            try rewritedec.rewrite(self.allocator, ssa_func);
+            // Run Wasm-specific passes with optimization (Go pass order)
+            try copyelim.copyelim(ssa_func);
+            try rewritegeneric.rewrite(func_alloc, ssa_func, &string_offsets);
+            try decompose_builtin.decompose(func_alloc, ssa_func);
+            try rewritedec.rewrite(func_alloc, ssa_func);
+            try copyelim.copyelim(ssa_func);
+            try cse_pass.cse(ssa_func);
+            try deadcode.deadcode(ssa_func);
             try schedule.schedule(ssa_func);
             try layout.layout(ssa_func);
             try lower_wasm.lower(ssa_func);

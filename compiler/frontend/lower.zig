@@ -3168,6 +3168,20 @@ pub const Lowerer = struct {
             .index => |idx| try self.lowerIndexAssign(idx, value_node, assign.value, assign.span),
             .deref => |d| {
                 const ptr_node = try self.lowerExprNode(d.operand);
+
+                // @safe auto-ref fix: if RHS is *T (auto-ref'd) but target is T,
+                // load through the pointer to get the actual value before storing.
+                const target_type_idx = self.inferExprType(assign.target);
+                const rhs_type_idx = self.inferExprType(assign.value);
+                var store_value = value_node;
+                if (target_type_idx != rhs_type_idx) {
+                    const rhs_info = self.type_reg.get(rhs_type_idx);
+                    if (rhs_info == .pointer and rhs_info.pointer.elem == target_type_idx) {
+                        // RHS is *T, target is T — auto-deref: load value from pointer
+                        store_value = try fb.emitPtrLoadValue(value_node, target_type_idx, assign.span);
+                    }
+                }
+
                 // ARC: release old value at *ptr before storing new (skip for WasmGC)
                 // Reference: Swift SILGenLValue.cpp — assign into lvalue releases old, consumes +1 / retains +0
                 if (!self.target.isWasmGC()) {
@@ -3175,34 +3189,27 @@ pub const Lowerer = struct {
                     const ptr_type_info = self.type_reg.get(ptr_type_idx);
                     if (ptr_type_info == .pointer and ptr_type_info.pointer.managed) {
                         const pointee_type = ptr_type_info.pointer.elem;
-                        // ARC Phase 4: Type-based guard — retain/release for ARC pointees via managed ptrs.
-                        // Skip for @intToPtr-derived pointers (unmanaged) — stdlib manages ARC explicitly.
-                        // Swift SILGen pattern: copy_value %new; store %new; destroy_value %old
-                        // Retain-before-release prevents use-after-free when old == new.
                         if (self.type_reg.couldBeARC(pointee_type)) {
-                            // Load old value BEFORE store (needed for release after)
                             const old_val = try fb.emitPtrLoadValue(ptr_node, pointee_type, assign.span);
 
-                            // Retain new value if borrowed (+0), then store
                             const rhs_node = self.tree.getNode(assign.value);
                             const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
                             const is_owned = if (rhs_expr) |e| (e == .new_expr or e == .call) else false;
                             if (!is_owned) {
-                                var retain_args = [_]ir.NodeIndex{value_node};
+                                var retain_args = [_]ir.NodeIndex{store_value};
                                 const retained = try fb.emitCall("retain", &retain_args, false, pointee_type, assign.span);
                                 _ = try fb.emitPtrStoreValue(ptr_node, retained, assign.span);
                             } else {
-                                _ = try fb.emitPtrStoreValue(ptr_node, value_node, assign.span);
+                                _ = try fb.emitPtrStoreValue(ptr_node, store_value, assign.span);
                             }
 
-                            // Release old value AFTER store (safe even if old == new)
                             var release_args = [_]ir.NodeIndex{old_val};
                             _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, assign.span);
                             return;
                         }
                     }
                 }
-                _ = try fb.emitPtrStoreValue(ptr_node, value_node, assign.span);
+                _ = try fb.emitPtrStoreValue(ptr_node, store_value, assign.span);
             },
             else => {},
         }
