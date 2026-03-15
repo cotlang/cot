@@ -1354,7 +1354,8 @@ pub const Driver = struct {
             "dup2",          "execve",        "kill",
             "c_openpty",     "setsid",        "ioctl",
             "c_mkdir",       "opendir",       "readdir",       "closedir",
-            "c_stat",        "c_unlink",      "signal",        "backtrace",
+            "c_stat",        "c_unlink",      "signal",
+            "backtrace",     "backtrace_symbols_fd",
             // pthread symbols — external references resolved by linker (-lpthread/-lSystem)
             "pthread_create", "pthread_join",  "pthread_detach",
             "pthread_mutex_init", "pthread_mutex_lock", "pthread_mutex_unlock",

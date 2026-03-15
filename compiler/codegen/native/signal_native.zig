@@ -254,10 +254,13 @@ fn generateInstallSignals(
 
 /// Generate __cot_print_backtrace() -> void
 ///
-/// Calls libc backtrace() to capture up to 32 return addresses, then prints
-/// each as "  0x<hex>\n" to stderr.
+/// Calls libc backtrace() to capture up to 64 return addresses, then calls
+/// backtrace_symbols_fd() to print resolved symbol names to stderr.
+/// This produces output like:
+///   0   selfcot  0x100146da8 _SSABuilder_convertStoreLocalField + 284
+///   1   selfcot  0x100140108 _SSABuilder_convertNode + 1180
 ///
-/// Reference: macOS/Linux backtrace(3)
+/// Reference: macOS/Linux backtrace(3), backtrace_symbols_fd(3)
 fn generatePrintBacktrace(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
@@ -280,9 +283,9 @@ fn generatePrintBacktrace(
     // Import backtrace(buf, size) -> int
     const bt_idx = func_index_map.get("backtrace") orelse 0;
     var bt_sig = clif.Signature.init(.system_v);
-    try bt_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // buf
-    try bt_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // size
-    try bt_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64)); // count
+    try bt_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try bt_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try bt_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
     const bt_sig_ref = try builder.importSignature(bt_sig);
     const bt_func = try builder.importFunction(.{
         .name = .{ .user = .{ .namespace = 0, .index = bt_idx } },
@@ -290,119 +293,47 @@ fn generatePrintBacktrace(
         .colocated = false,
     });
 
-    // Import write(fd, buf, len)
-    const write_idx = func_index_map.get("write") orelse 0;
-    var write_sig = clif.Signature.init(.system_v);
-    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try write_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
-    const write_sig_ref = try builder.importSignature(write_sig);
-    const write_func = try builder.importFunction(.{
-        .name = .{ .user = .{ .namespace = 0, .index = write_idx } },
-        .signature = write_sig_ref,
+    // Import backtrace_symbols_fd(buf, size, fd) -> void
+    const btsf_idx = func_index_map.get("backtrace_symbols_fd") orelse 0;
+    var btsf_sig = clif.Signature.init(.system_v);
+    try btsf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // buf
+    try btsf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // size
+    try btsf_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
+    const btsf_sig_ref = try builder.importSignature(btsf_sig);
+    const btsf_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = btsf_idx } },
+        .signature = btsf_sig_ref,
         .colocated = false,
     });
 
-    // Stack slot for backtrace buffer: 32 pointers × 8 bytes = 256 bytes
+    // Stack slot for backtrace buffer: 64 pointers × 8 bytes = 512 bytes
     const bt_slot = try clif_func.createStackSlot(allocator, .{
         .kind = .explicit_slot,
-        .size = 256,
+        .size = 512,
         .align_shift = 3,
     });
 
-    // Stack slot for hex output: "  0x" + 16 hex chars + "\n" = 21 bytes
-    const hex_slot = try clif_func.createStackSlot(allocator, .{
-        .kind = .explicit_slot,
-        .size = 24,
-        .align_shift = 3,
-    });
+    const ins = builder.ins();
 
-    const ins0 = builder.ins();
-
-    // Call backtrace(buf, 32)
-    const bt_buf = try ins0.stackAddr(clif.Type.I64, bt_slot, 0);
-    const v_32 = try ins0.iconst(clif.Type.I64, 32);
-    const bt_result = try ins0.call(bt_func, &[_]clif.Value{ bt_buf, v_32 });
+    // Call backtrace(buf, 64)
+    const bt_buf = try ins.stackAddr(clif.Type.I64, bt_slot, 0);
+    const v_64 = try ins.iconst(clif.Type.I64, 64);
+    const bt_result = try ins.call(bt_func, &[_]clif.Value{ bt_buf, v_64 });
     const count = bt_result.results[0];
 
-    // Write "  0x" prefix into hex buffer
-    const hex_addr0 = try ins0.stackAddr(clif.Type.I64, hex_slot, 0);
-    const prefix_chars = [_]u8{ ' ', ' ', '0', 'x' };
-    for (prefix_chars, 0..) |byte, offset| {
-        const ch = try ins0.iconst(clif.Type.I8, @intCast(byte));
-        _ = try ins0.store(clif.MemFlags.DEFAULT, ch, hex_addr0, @intCast(offset));
-    }
+    // Skip first 2 frames (__cot_print_backtrace + @trap/@panic lowering)
+    // Adjust buffer pointer and count
+    const v_16 = try ins.iconst(clif.Type.I64, 16); // 2 * 8 bytes
+    const adjusted_buf = try ins.iadd(bt_buf, v_16);
+    const v_2 = try ins.iconst(clif.Type.I64, 2);
+    const adjusted_count = try ins.isub(count, v_2);
 
-    // Loop: for i in 2..count (skip first 2 frames: backtrace + __cot_print_backtrace)
-    const block_loop = try builder.createBlock();
-    _ = try builder.appendBlockParam(block_loop, clif.Type.I64); // i
-    const block_done = try builder.createBlock();
+    // Call backtrace_symbols_fd(adjusted_buf, adjusted_count, 2)
+    // fd=2 is stderr
+    const v_fd = try ins.iconst(clif.Type.I64, 2);
+    _ = try ins.call(btsf_func, &[_]clif.Value{ adjusted_buf, adjusted_count, v_fd });
 
-    const v_2 = try ins0.iconst(clif.Type.I64, 2); // skip 2 frames
-    _ = try ins0.jump(block_loop, &[_]clif.Value{v_2});
-
-    // Loop header
-    builder.switchToBlock(block_loop);
-    try builder.ensureInsertedBlock();
-    const ins_l = builder.ins();
-    const loop_params = builder.blockParams(block_loop);
-    const idx = loop_params[0];
-
-    const at_end = try ins_l.icmp(.uge, idx, count);
-    const block_body = try builder.createBlock();
-    _ = try ins_l.brif(at_end, block_done, &.{}, block_body, &.{});
-
-    // Loop body: load bt_buf[i], print as hex
-    builder.switchToBlock(block_body);
-    try builder.ensureInsertedBlock();
-    const ins_b = builder.ins();
-
-    // Load PC: bt_buf[i * 8]
-    const v_8 = try ins_b.iconst(clif.Type.I64, 8);
-    const byte_offset = try ins_b.imul(idx, v_8);
-    const pc_addr = try ins_b.iadd(bt_buf, byte_offset);
-    const pc = try ins_b.load(clif.Type.I64, clif.MemFlags.DEFAULT, pc_addr, 0);
-
-    // Convert PC to 16 hex digits at offsets 4..19
-    const hex_buf = try ins_b.stackAddr(clif.Type.I64, hex_slot, 0);
-    const v_0xf = try ins_b.iconst(clif.Type.I64, 0xF);
-    const v_4 = try ins_b.iconst(clif.Type.I64, 4);
-
-    var shift_val = pc;
-    var digit_offset: i32 = 19;
-    for (0..16) |_| {
-        const nibble = try ins_b.band(shift_val, v_0xf);
-        const v_10 = try ins_b.iconst(clif.Type.I64, 10);
-        const is_letter = try ins_b.icmp(.uge, nibble, v_10);
-        const v_0x30 = try ins_b.iconst(clif.Type.I64, 0x30);
-        const v_0x57 = try ins_b.iconst(clif.Type.I64, 0x57);
-        const digit_base = try ins_b.select(clif.Type.I64, is_letter, v_0x57, v_0x30);
-        const digit_ch = try ins_b.iadd(nibble, digit_base);
-        const digit_i8 = try ins_b.ireduce(clif.Type.I8, digit_ch);
-        _ = try ins_b.store(clif.MemFlags.DEFAULT, digit_i8, hex_buf, digit_offset);
-        shift_val = try ins_b.ushr(shift_val, v_4);
-        digit_offset -= 1;
-    }
-
-    // Newline at offset 20
-    const nl = try ins_b.iconst(clif.Type.I8, 0x0A);
-    _ = try ins_b.store(clif.MemFlags.DEFAULT, nl, hex_buf, 20);
-
-    // write(2, hex_buf, 21)
-    const v_fd = try ins_b.iconst(clif.Type.I64, 2);
-    const v_21 = try ins_b.iconst(clif.Type.I64, 21);
-    _ = try ins_b.call(write_func, &[_]clif.Value{ v_fd, hex_buf, v_21 });
-
-    // i += 1, jump back
-    const v_one = try ins_b.iconst(clif.Type.I64, 1);
-    const next_idx = try ins_b.iadd(idx, v_one);
-    _ = try ins_b.jump(block_loop, &[_]clif.Value{next_idx});
-
-    // Done
-    builder.switchToBlock(block_done);
-    try builder.ensureInsertedBlock();
-    _ = try builder.ins().return_(&.{});
+    _ = try ins.return_(&.{});
 
     try builder.sealAllBlocks();
     builder.finalize();
