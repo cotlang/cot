@@ -11,14 +11,10 @@
 import "std/list"
 import "std/map"
 import "std/string"
-import "std/sys"
 import "../../frontend/ir"
 import "../../frontend/types"
 import "../../frontend/ssa"
 import "../../frontend/ssa_builder"
-import "../../ssa/passes/copyelim"
-import "../../ssa/passes/cse"
-import "../../ssa/passes/deadcode"
 import "../../ssa/passes/decompose"
 import "../../ssa/passes/schedule"
 import "../../ssa/passes/layout"
@@ -343,61 +339,36 @@ fn stringToData(s: string) List(int) {
 // ============================================================================
 
 /// Generate code for all IR functions and add them to the linker.
-/// Go pattern: single SsaCache reused across all functions via cache.reset().
 fn generateAllFunctions(linker: *Linker, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int), runtime_func_count: int) void {
-    // Go: single Cache allocated once, reused for all functions
-    var cache = SsaCache.init()
-
-    var total_values: int = 0
-    var total_blocks: int = 0
-    var max_values: int = 0
-
     var i = 0
     while (i < ir.funcs.count) {
         const ir_func = ir.funcs.get(i)
-        generateAndAddFunc(linker, ir_func, ir, types, func_indices, string_offsets, func_table_indices, &cache)
-
-        // Track stats
-        total_values += cache.values_count
-        if (cache.values_count > max_values) { max_values = cache.values_count }
-
-        // Go: Cache.Reset() between functions — O(1), reuse same arrays
-        cache.reset()
+        generateAndAddFunc(linker, ir_func, ir, types, func_indices, string_offsets, func_table_indices)
         i += 1
     }
-
-    // Print compilation stats to stderr
-    write(2, @ptrOf("[ssa] funcs="), 12)
-    eprint_int(ir.funcs.count)
-    write(2, @ptrOf(" total_values="), 14)
-    eprint_int(total_values)
-    write(2, @ptrOf(" max_values_per_func="), 21)
-    eprint_int(max_values)
-    write(2, @ptrOf(" cache_size="), 12)
-    eprint_int(CACHE_VALUES)
-    write(2, @ptrOf("\n"), 1)
-
-    cache.deinit()
 }
 
 /// Build SSA, run passes, generate Wasm bytecode, and add function to linker.
-fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int), cache: *SsaCache) void {
-    // Build SSA from IR — uses cache for zero-alloc values/blocks
-    var builder = SSABuilder.initWithCache(ir_func, ir.globals, types, cache)
-    var ssa_func = builder.build()
-    builder.deinit()
+fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegistry, func_indices: *Map(string, int), string_offsets: *Map(string, int), func_table_indices: *Map(string, int)) void {
+    // Build SSA from IR
+    var builder = SSABuilder.init(ir_func, ir.globals, types)
+    const ssa_func = builder.build()
 
-    // Run Wasm-specific SSA passes with optimization (Go pass order)
-    copyelim(ssa_func)
+    // Run Wasm-specific SSA passes (Go pass order)
+    // 1. rewritegeneric — ConstString → StringMake
     passRewriteGeneric(ssa_func, string_offsets)
+    // 2. decompose — phi decomposition for slices/strings
     decompose(ssa_func)
+    // 3. rewritedec — string/slice decomposition
     passRewriteDec(ssa_func)
-    copyelim(ssa_func)
-    cse(ssa_func)
-    deadcode(ssa_func)
+    // 4. schedule — value ordering
     schedule(ssa_func)
+    // 5. layout — block ordering
     layout(ssa_func)
+    // 6. lower_wasm — generic → wasm ops
     lower(ssa_func)
+
+
 
     // Determine function type
     const type_idx = registerFuncType(linker, ir_func, types)
@@ -409,11 +380,6 @@ fn generateAndAddFunc(linker: *Linker, ir_func: Func, ir: IR, types: *TypeRegist
 
     // Add to linker
     linker.addFunc(WasmFunc.init(ir_func.name, type_idx, body, true))
-
-    // Free per-function temporaries (overflow args, block sub-lists, etc.)
-    ssa_func.deinit()
-    sym.text.free()
-    sym.gc_ref_locals.free()
 }
 
 /// Register a function's type signature with the linker.

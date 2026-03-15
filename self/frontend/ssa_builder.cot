@@ -187,15 +187,7 @@ struct SSABuilder {
     logical_operands: Map(int, int),
 
     static fn init(ir_func: Func, ir_globals: List(Global), type_reg: *TypeRegistry) SSABuilder {
-        return SSABuilder.initImpl(ir_func, ir_globals, type_reg, null)
-    }
-
-    static fn initWithCache(ir_func: Func, ir_globals: List(Global), type_reg: *TypeRegistry, cache: *SsaCache) SSABuilder {
-        return SSABuilder.initImpl(ir_func, ir_globals, type_reg, cache)
-    }
-
-    static fn initImpl(ir_func: Func, ir_globals: List(Global), type_reg: *TypeRegistry, cache: ?*SsaCache) SSABuilder {
-        var func = if (cache) |c| { SsaFunc.initWithCache(ir_func.name, c) } else { SsaFunc.init(ir_func.name) }
+        var func = SsaFunc.init(ir_func.name)
         func.is_export = ir_func.is_export
 
         // Create entry block
@@ -265,18 +257,6 @@ struct SSABuilder {
 
     fn takeFunc() SsaFunc {
         return self.func
-    }
-
-    /// Free builder-internal data (maps, lists). Call after build().
-    fn deinit() void {
-        self.vars.free()
-        self.fwd_vars.free()
-        self.defvars.free()
-        self.block_map.free()
-        self.node_values.free()
-        self.loop_stack.free()
-        self.local_slot_offsets.free()
-        self.logical_operands.free()
     }
 
     // === Block management ===
@@ -486,7 +466,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.global_addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = name
+        v.aux = SsaAux.str(name)
         self.func.setValue(val, v)
         self.func.addValueToBlock(val, cur)
         return val
@@ -496,7 +476,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.metadata_addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = type_name
+        v.aux = SsaAux.str(type_name)
         self.func.setValue(val, v)
         self.func.addValueToBlock(val, cur)
         return val
@@ -516,7 +496,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.addr, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = name
+        v.aux = SsaAux.str(name)
         self.func.setValue(val, v)
         self.func.addValueToBlock(val, cur)
         return val
@@ -782,9 +762,9 @@ struct SSABuilder {
 
             const is_decomposed = (val_v.op == SsaOp.slice_make or val_v.op == SsaOp.string_make) and val_v.argsLen() >= 2
             if (is_decomposed) {
-                ptr_component = val_v.getArg(0)
-                len_component = val_v.getArg(1)
-                if (val_v.op == SsaOp.slice_make and val_v.argsLen() >= 3) { cap_component = val_v.getArg(2) }
+                ptr_component = val_v.args.get(0)
+                len_component = val_v.args.get(1)
+                if (val_v.op == SsaOp.slice_make and val_v.argsLen() >= 3) { cap_component = val_v.args.get(2) }
             } else {
                 ptr_component = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, value)
                 len_component = self.emitNewValueWithArg(SsaOp.slice_len, I64, value)
@@ -849,7 +829,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const addr_val = self.func.newValue(SsaOp.global_addr, VOID, cur, self.cur_pos_line, self.cur_pos_col)
         var av = self.func.getValue(addr_val)
-        av.aux_str = name
+        av.aux = SsaAux.str(name)
         self.func.setValue(addr_val, av)
         self.func.addValueToBlock(addr_val, cur)
 
@@ -885,7 +865,7 @@ struct SSABuilder {
 
         const gaddr = self.func.newValue(SsaOp.global_addr, VOID, cur, self.cur_pos_line, self.cur_pos_col)
         var ga = self.func.getValue(gaddr)
-        ga.aux_str = name
+        ga.aux = SsaAux.str(name)
         self.func.setValue(gaddr, ga)
         self.func.addValueToBlock(gaddr, cur)
 
@@ -900,8 +880,8 @@ struct SSABuilder {
             var len_component: int = null_value
 
             if ((val_v.op == SsaOp.string_make or val_v.op == SsaOp.slice_make) and val_v.argsLen() >= 2) {
-                ptr_component = val_v.getArg(0)
-                len_component = val_v.getArg(1)
+                ptr_component = val_v.args.get(0)
+                len_component = val_v.args.get(1)
             } else {
                 ptr_component = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, value)
                 len_component = self.emitNewValueWithArg(SsaOp.slice_len, I64, value)
@@ -913,7 +893,7 @@ struct SSABuilder {
 
             if (val_v.op == SsaOp.slice_make and val_v.argsLen() >= 3) {
                 const cap_addr = self.emitOffPtr(gaddr, 16)
-                self.emitStore(cap_addr, val_v.getArg(2))
+                self.emitStore(cap_addr, val_v.args.get(2))
             }
             return value
         }
@@ -1035,7 +1015,7 @@ struct SSABuilder {
 
         const call_val = self.func.newValue(SsaOp.static_call, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var cv = self.func.getValue(call_val)
-        cv.aux_str = resolved_name
+        cv.aux = SsaAux.str(resolved_name)
 
         // Dict dispatch: inject fn-ptr args for dict-stenciled functions
         if (self.dict_arg_names) |dan| {
@@ -1048,7 +1028,7 @@ struct SSABuilder {
                         const helper_name = substring(helpers_csv, start, ci)
                         const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
                         var adv = self.func.getValue(addr_val)
-                        adv.aux_str = helper_name
+                        adv.aux = SsaAux.str(helper_name)
                         self.func.setValue(addr_val, adv)
                         self.func.addValueToBlock(addr_val, cur)
                         cv.addArg(addr_val)
@@ -1060,7 +1040,7 @@ struct SSABuilder {
                     const helper_name = substring(helpers_csv, start, helpers_csv.len)
                     const addr_val = self.func.newValue(SsaOp.addr, I64, cur, self.cur_pos_line, self.cur_pos_col)
                     var adv = self.func.getValue(addr_val)
-                    adv.aux_str = helper_name
+                    adv.aux = SsaAux.str(helper_name)
                     self.func.setValue(addr_val, adv)
                     self.func.addValueToBlock(addr_val, cur)
                     cv.addArg(addr_val)
@@ -1134,7 +1114,7 @@ struct SSABuilder {
             return val
         }
         if (v.op == SsaOp.load and v.argsLen() > 0) {
-            return v.getArg(0)
+            return v.args.get(0)
         }
         // Search backwards for a store that stored this value
         const cur = self.cur_block
@@ -1142,8 +1122,8 @@ struct SSABuilder {
         for i in 0..blk.values.count {
             const vid = blk.values.get(i)
             const sv = self.func.getValue(vid)
-            if (sv.op == SsaOp.store and sv.argsLen() >= 2 and sv.getArg(1) == val) {
-                return sv.getArg(0)
+            if (sv.op == SsaOp.store and sv.argsLen() >= 2 and sv.args.get(1) == val) {
+                return sv.args.get(0)
             }
         }
         return null_value
@@ -1553,7 +1533,7 @@ struct SSABuilder {
         const val = self.func.newValue(SsaOp.convert, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
         v.addArg(operand)
-        v.aux_type_ref = c.from_type
+        v.aux = SsaAux.type_ref(c.from_type)
         self.func.setValue(val, v)
         self.func.addValueToBlock(val, cur)
         return val
@@ -1694,7 +1674,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_struct_new, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         for k in 0..gc.field_values.count {
             const arg = self.convertNode(gc.field_values.get(k))
             if (arg != null_value) { v.addArg(arg) }
@@ -1708,7 +1688,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_struct_get, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         v.aux_int = gc.field_idx
         const base_val = self.convertNode(gc.base)
         if (base_val != null_value) { v.addArg(base_val) }
@@ -1721,7 +1701,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_struct_set, VOID, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         v.aux_int = gc.field_idx
         const base_val = self.convertNode(gc.base)
         const value_val = self.convertNode(gc.value)
@@ -1739,7 +1719,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_array_new, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         const init_val = self.convertNode(gc.init_val)
         const length = self.convertNode(gc.length)
         if (init_val != null_value and length != null_value) { v.addArg2(init_val, length) }
@@ -1752,7 +1732,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_array_new_default, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         const length = self.convertNode(gc.length)
         if (length != null_value) { v.addArg(length) }
         self.func.setValue(val, v)
@@ -1764,7 +1744,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_array_new_fixed, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         v.aux_int = gc.values.count
         for k in 0..gc.values.count {
             const arg = self.convertNode(gc.values.get(k))
@@ -1779,7 +1759,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_array_new_data, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         v.aux_int = gc.data_idx
         const offset = self.convertNode(gc.offset)
         const length = self.convertNode(gc.length)
@@ -1793,7 +1773,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_array_get, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         const array_val = self.convertNode(gc.array)
         const index_val = self.convertNode(gc.index)
         if (array_val != null_value and index_val != null_value) { v.addArg2(array_val, index_val) }
@@ -1806,7 +1786,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_array_set, VOID, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         const array_val = self.convertNode(gc.array)
         const index_val = self.convertNode(gc.index)
         const value_val = self.convertNode(gc.value)
@@ -1835,7 +1815,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_ref_null, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         self.func.setValue(val, v)
         self.func.addValueToBlock(val, cur)
         return val
@@ -1868,7 +1848,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_ref_cast, type_idx, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         const ref_val = self.convertNode(gc.value)
         if (ref_val != null_value) { v.addArg(ref_val) }
         self.func.setValue(val, v)
@@ -1880,7 +1860,7 @@ struct SSABuilder {
         const cur = self.cur_block
         const val = self.func.newValue(SsaOp.wasm_gc_ref_test, BOOL, cur, self.cur_pos_line, self.cur_pos_col)
         var v = self.func.getValue(val)
-        v.aux_str = gc.type_name
+        v.aux = SsaAux.str(gc.type_name)
         const ref_val = self.convertNode(gc.value)
         if (ref_val != null_value) { v.addArg(ref_val) }
         self.func.setValue(val, v)
@@ -2138,7 +2118,7 @@ struct SSABuilder {
     fn emitMove(dst_addr: int, src: int, type_size: int, ir_node_idx: int) int {
         const cur = self.cur_block
         const val_v = self.func.getValue(src)
-        const src_addr = if (val_v.op == SsaOp.load and val_v.argsLen() > 0) { val_v.getArg(0) } else { src }
+        const src_addr = if (val_v.op == SsaOp.load and val_v.argsLen() > 0) { val_v.args.get(0) } else { src }
         const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
         var mv = self.func.getValue(move_val)
         mv.addArg2(dst_addr, src_addr)
@@ -2170,8 +2150,8 @@ struct SSABuilder {
         var len_component: int = null_value
 
         if ((val_v.op == SsaOp.string_make or val_v.op == SsaOp.slice_make) and val_v.argsLen() >= 2) {
-            ptr_component = val_v.getArg(0)
-            len_component = val_v.getArg(1)
+            ptr_component = val_v.args.get(0)
+            len_component = val_v.args.get(1)
         } else {
             ptr_component = self.emitNewValueWithArg(SsaOp.slice_ptr, I64, value)
             len_component = self.emitNewValueWithArg(SsaOp.slice_len, I64, value)

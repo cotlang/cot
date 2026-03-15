@@ -335,7 +335,6 @@ fn pass6ResolveBranches(sym: *Symbol, entryPointLoopIdx: int, entryPointLoopBran
             sym.text.set(br_idx, br_prog)
         }
     }
-    blockDepths.free()
 }
 
 // ============================================================================
@@ -359,10 +358,6 @@ fn preprocess(sym: *Symbol) void {
     var tblIdxs = tableIdxs
     const loopIdx = pass5DispatchLoop(sym, numResumePoints, &tblIdxs, &entryPointLoopBranches)
     pass6ResolveBranches(sym, loopIdx, &entryPointLoopBranches)
-
-    // Free temporaries
-    tblIdxs.free()
-    entryPointLoopBranches.free()
 }
 
 // ============================================================================

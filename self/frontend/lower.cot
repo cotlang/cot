@@ -1151,18 +1151,6 @@ struct Lowerer {
                     const ptr_val = self.lowerExprNode(dr.operand)
                     const val = self.lowerExprNode(a.value)
                     if (ptr_val != null_node and val != null_node) {
-                        // @safe auto-ref: if val is *T (auto-ref'd) but target is T,
-                        // load through the pointer to get the actual value.
-                        const target_type = self.inferExprType(a.target)
-                        const rhs_type = self.inferExprType(a.value)
-                        if (target_type != rhs_type) {
-                            const rhs_info = self.types.get(rhs_type)
-                            if (rhs_info.tag == TAG_POINTER and self.types.pointerElem(rhs_type) == target_type) {
-                                const derefed = fb.emitPtrLoadValue(val, target_type, a.span)
-                                fb.emitPtrStoreValue(ptr_val, derefed, a.span)
-                                return
-                            }
-                        }
                         fb.emitPtrStoreValue(ptr_val, val, a.span)
                     }
                     return

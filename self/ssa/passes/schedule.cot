@@ -107,8 +107,8 @@ fn scheduleBlock(func: *SsaFunc, block_idx: int) void {
         const val_idx = blk.values.get(vi)
         const val = func.getValue(val_idx)
         if (val.op == SsaOp.phi) { continue }
-        for ai in 0..val.args_len {
-            const arg_idx = val.getArg(ai)
+        for ai in 0..val.args.count {
+            const arg_idx = val.args.get(ai)
             if (in_block.contains(arg_idx)) {
                 edge_from.append(arg_idx)
                 edge_to.append(val_idx)
@@ -201,17 +201,6 @@ fn scheduleBlock(func: *SsaFunc, block_idx: int) void {
         new_blk.values.append(result.get(ri))
     }
     func.setBlock(block_idx, new_blk)
-
-    // Free temporaries
-    scores.free()
-    orig_pos.free()
-    in_edges.free()
-    edge_from.free()
-    edge_to.free()
-    control_set.free()
-    in_block.free()
-    ready.free()
-    result.free()
 }
 
 // ============================================================================

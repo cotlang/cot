@@ -232,8 +232,8 @@ fn isFloatType(type_idx: int) bool {
 /// Check if a store value's second argument is a float type.
 fn isStoreFloatType(func: *SsaFunc, val_idx: int) bool {
     const val = func.getValue(val_idx)
-    if (val.args_len >= 2) {
-        const arg1 = func.getValue(val.getArg(1))
+    if (val.args.count >= 2) {
+        const arg1 = func.getValue(val.args.get(1))
         return isFloatType(arg1.type_idx)
     }
     return false

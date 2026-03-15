@@ -1,15 +1,12 @@
 /// SSA (Static Single Assignment) data structures.
 /// Ported from compiler/ssa/{op,value,block,func}.zig
 ///
-/// Go Cache pattern: static arrays for values/blocks, inline arg storage,
-/// Cache.Reset() between functions. Zero per-value allocation for most functions.
-///
-/// Reference: Go cmd/compile/internal/ssa/cache.go, func.go, value.go, block.go
+/// Consolidates all SSA types into one file, using index-based design
+/// matching ir.cot (int indices into Lists, not raw pointers).
 
 import "std/list"
 import "std/map"
 import "std/string"
-import "std/sys"
 import "types"
 
 // ============================================================================
@@ -18,13 +15,6 @@ import "types"
 
 const null_value: int = -1
 const null_block: int = -1
-
-// ============================================================================
-// Cache constants (Go: cache.go)
-// ============================================================================
-
-const CACHE_VALUES: int = 2000   // Go: [2000]Value
-const CACHE_BLOCKS: int = 200    // Go: [200]Block
 
 // ============================================================================
 // SsaOp — SSA operation kind (generic ops emitted by ssa_builder)
@@ -208,11 +198,17 @@ const SsaOp = enum(u16) {
 }
 
 // ============================================================================
+// SsaAux — auxiliary data for SSA values
+// ============================================================================
+
+union SsaAux {
+    none,
+    str: string,
+    type_ref: int,
+}
+
+// ============================================================================
 // SsaValue — single SSA value (instruction)
-// Go: value.go — inline argstorage[3] eliminates allocation for most values
-//
-// Aux data stored as flat fields (no union) to enable ptr.* = SsaValue.
-// Go: Value.AuxInt + Value.Aux (separate fields, not a union).
 // ============================================================================
 
 struct SsaValue {
@@ -221,100 +217,50 @@ struct SsaValue {
     type_idx: int,
     aux_int: int,
     aux_float: f64,
-    aux_str: string,       // Go: Aux (string payload for calls, type names)
-    aux_type_ref: int,     // Go: AuxInt variant (type reference index)
-    // Go pattern: inline storage for first 3 args (argstorage[3]*Value)
-    // Most SSA values have 0-3 args — zero allocation.
-    arg0: int,
-    arg1: int,
-    arg2: int,
-    args_len: int,          // number of args (0-3 = inline, >3 = overflow)
-    args_overflow: int,     // raw pointer to overflow array (allocated from cache)
-    args_overflow_cap: int, // capacity of overflow array
-    block: int,             // index into SsaFunc.blocks
+    aux: SsaAux,
+    args: List(int),      // indices into SsaFunc.values
+    block: int,           // index into SsaFunc.blocks
     pos_line: int,
     pos_col: int,
     uses: int,
     in_cache: bool,
 
     static fn init(id: int, op: SsaOp, type_idx: int, block: int) SsaValue {
+        var args: List(int) = .{}
         return SsaValue {
-            .id = id,
-            .op = op,
-            .type_idx = type_idx,
-            .aux_int = 0,
-            .aux_float = 0.0,
-            .aux_str = "",
-            .aux_type_ref = 0,
-            .arg0 = null_value,
-            .arg1 = null_value,
-            .arg2 = null_value,
-            .args_len = 0,
-            .args_overflow = 0,
-            .args_overflow_cap = 0,
-            .block = block,
-            .pos_line = 0,
-            .pos_col = 0,
-            .uses = 0,
-            .in_cache = false,
+            id: id,
+            op: op,
+            type_idx: type_idx,
+            aux_int: 0,
+            aux_float: 0.0,
+            aux: SsaAux.none,
+            args: args,
+            block: block,
+            pos_line: 0,
+            pos_col: 0,
+            uses: 0,
+            in_cache: false,
         }
     }
 
     fn addArg(arg: int) void {
-        if (self.args_len == 0) {
-            self.arg0 = arg
-        } else if (self.args_len == 1) {
-            self.arg1 = arg
-        } else if (self.args_len == 2) {
-            self.arg2 = arg
-        } else {
-            // Overflow: store in heap-allocated array
-            const overflow_idx = self.args_len - 3
-            if (overflow_idx >= self.args_overflow_cap) {
-                var new_cap = self.args_overflow_cap * 2
-                if (new_cap == 0) { new_cap = 4 }
-                const new_buf = alloc(0, new_cap * 8)
-                if (self.args_overflow_cap > 0) {
-                    memcpy(new_buf, self.args_overflow, self.args_overflow_cap * 8)
-                    dealloc(self.args_overflow)
-                }
-                self.args_overflow = new_buf
-                self.args_overflow_cap = new_cap
-            }
-            @intToPtr(*int, self.args_overflow + overflow_idx * 8).* = arg
-        }
-        self.args_len += 1
+        self.args.append(arg)
     }
 
     fn addArg2(a: int, b: int) void {
-        self.addArg(a)
-        self.addArg(b)
+        self.args.append(a)
+        self.args.append(b)
     }
 
     fn addArg3(a: int, b: int, c: int) void {
-        self.addArg(a)
-        self.addArg(b)
-        self.addArg(c)
+        self.args.append(a)
+        self.args.append(b)
+        self.args.append(c)
     }
 
     fn argsLen() int {
-        return self.args_len
+        return self.args.count
     }
-
-    fn getArg(idx: int) int {
-        if (idx == 0) { return self.arg0 }
-        if (idx == 1) { return self.arg1 }
-        if (idx == 2) { return self.arg2 }
-        return @intToPtr(*int, self.args_overflow + (idx - 3) * 8).*
-    }
-
-    fn setArg(idx: int, val: int) void {
-        if (idx == 0) { self.arg0 = val }
-        else if (idx == 1) { self.arg1 = val }
-        else if (idx == 2) { self.arg2 = val }
-        else { @intToPtr(*int, self.args_overflow + (idx - 3) * 8).* = val }
-    }
-
 }
 
 // ============================================================================
@@ -343,7 +289,6 @@ struct SsaEdge {
 
 // ============================================================================
 // SsaBlock — basic block in the SSA control flow graph
-// Go: block.go — inline succstorage[2], predstorage[4], valstorage[9]
 // ============================================================================
 
 struct SsaBlock {
@@ -362,14 +307,14 @@ struct SsaBlock {
         var controls: List(int) = .{}
         var values: List(int) = .{}
         return SsaBlock {
-            .id = id,
-            .kind = kind,
-            .succs = succs,
-            .preds = preds,
-            .controls = controls,
-            .values = values,
-            .pos_line = 0,
-            .pos_col = 0,
+            id: id,
+            kind: kind,
+            succs: succs,
+            preds: preds,
+            controls: controls,
+            values: values,
+            pos_line: 0,
+            pos_col: 0,
         }
     }
 
@@ -387,75 +332,19 @@ struct SsaBlock {
 
     fn addEdgeTo(target_idx: int, blocks: *List(SsaBlock)) void {
         // Add successor edge: self → target
-        const succ_edge = SsaEdge { .block = target_idx, .index = 0 }
+        const succ_edge = SsaEdge { block: target_idx, index: 0 }
         self.succs.append(succ_edge)
 
         // Add predecessor edge: target ← self
         var target = blocks.get(target_idx)
-        const pred_edge = SsaEdge { .block = self.id, .index = target.preds.count }
+        const pred_edge = SsaEdge { block: self.id, index: target.preds.count }
         target.preds.append(pred_edge)
         blocks.set(target_idx, target)
     }
 }
 
 // ============================================================================
-// SsaCache — Go Cache pattern: static arrays reused across functions.
-// Go: cache.go — [2000]Value, [200]Block, Reset() between functions.
-//
-// Allocated ONCE per compilation, reused for every function.
-// SsaFunc borrows the cache; after codegen, cache.reset() makes it
-// ready for the next function. Zero per-function allocation for most functions.
-// ============================================================================
-
-struct SsaCache {
-    // Go: Cache.values[2000] — pre-allocated raw buffer reused across functions.
-    // Direct @intToPtr access — no List overhead, no realloc, no copying.
-    values_buf: int,      // raw pointer to SsaValue[CACHE_VALUES]
-    values_count: int,    // how many values stored this function
-
-    static fn init() SsaCache {
-        const buf = alloc(0, CACHE_VALUES * @sizeOf(SsaValue))
-        memset_zero(buf, CACHE_VALUES * @sizeOf(SsaValue))
-        return SsaCache {
-            .values_buf = buf,
-            .values_count = 0,
-        }
-    }
-
-    fn getValue(idx: int) SsaValue {
-        return @intToPtr(*SsaValue, self.values_buf + idx * @sizeOf(SsaValue)).*
-    }
-
-    fn setValue(idx: int, v: SsaValue) void {
-        var ptr = @intToPtr(*SsaValue, self.values_buf + idx * @sizeOf(SsaValue))
-        ptr.* = v
-    }
-
-    fn appendValue(v: SsaValue) int {
-        const idx = self.values_count
-        self.setValue(idx, v)
-        self.values_count += 1
-        return idx
-    }
-
-    /// Reset cache for next function — O(1).
-    /// Go: Cache.Reset() — clear only used portion, keep array.
-    fn reset() void {
-        if (self.values_count > 0) {
-            memset_zero(self.values_buf, self.values_count * @sizeOf(SsaValue))
-        }
-        self.values_count = 0
-    }
-
-    /// Free cache memory. Called once at end of compilation.
-    fn deinit() void {
-        dealloc(self.values_buf)
-    }
-}
-
-// ============================================================================
 // SsaFunc — SSA function (collection of blocks and values)
-// Go: func.go — uses Cache for value/block storage, freelist for recycling
 // ============================================================================
 
 struct SsaFunc {
@@ -471,7 +360,6 @@ struct SsaFunc {
     string_literals: List(string),
     is_export: bool,
     constants: Map(int, int),    // constant value → value index (dedup)
-    cache: ?*SsaCache,           // borrowed from driver, null = no cache (tests)
 
     static fn init(name: string) SsaFunc {
         var blocks: List(SsaBlock) = .{}
@@ -481,51 +369,35 @@ struct SsaFunc {
         var string_literals: List(string) = .{}
         var constants: Map(int, int) = .{}
         return SsaFunc {
-            .name = name,
-            .type_idx = 0,
-            .blocks = blocks,
-            .values = values,
-            .entry = null_block,
-            .next_block_id = 0,
-            .next_value_id = 0,
-            .local_sizes = local_sizes,
-            .local_offsets = local_offsets,
-            .string_literals = string_literals,
-            .is_export = false,
-            .constants = constants,
-            .cache = null,
+            name: name,
+            type_idx: 0,
+            blocks: blocks,
+            values: values,
+            entry: null_block,
+            next_block_id: 0,
+            next_value_id: 0,
+            local_sizes: local_sizes,
+            local_offsets: local_offsets,
+            string_literals: string_literals,
+            is_export: false,
+            constants: constants,
         }
     }
 
-    static fn initWithCache(name: string, cache: *SsaCache) SsaFunc {
-        var func = SsaFunc.init(name)
-        func.cache = cache
-        return func
-    }
-
-    /// Create a new SSA value. Returns the value's index.
-    /// Go: Func.newValue — cache for first CACHE_VALUES, List for overflow.
+    /// Create a new SSA value and add it to the values list.
+    /// Returns the value's index.
     fn newValue(op: SsaOp, type_idx: int, block: int, line: int, col: int) int {
         const id = self.next_value_id
         self.next_value_id += 1
         var val = SsaValue.init(id, op, type_idx, block)
         val.pos_line = line
         val.pos_col = col
-        if (self.cache) |c| {
-            if (id < CACHE_VALUES) {
-                return c.appendValue(val)
-            }
-            // Overflow: store in List, offset by CACHE_VALUES
-            self.values.append(val)
-            return id
-        }
         const idx = self.values.count
         self.values.append(val)
         return idx
     }
 
     /// Create a new SSA block. Returns the block's index.
-    /// Blocks always use List (layout pass reorders them).
     fn newBlock(kind: SsaBlockKind) int {
         const id = self.next_block_id
         self.next_block_id += 1
@@ -537,21 +409,12 @@ struct SsaFunc {
 
     /// Get a value by index.
     fn getValue(idx: int) SsaValue {
-        if (self.cache) |c| {
-            if (idx < CACHE_VALUES) { return c.getValue(idx) }
-            return self.values.get(idx - CACHE_VALUES)
-        }
         return self.values.get(idx)
     }
 
     /// Mutate a value by index.
-    fn setValue(idx: int, v: SsaValue) void {
-        if (self.cache) |c| {
-            if (idx < CACHE_VALUES) { c.setValue(idx, v); return }
-            self.values.set(idx - CACHE_VALUES, v)
-            return
-        }
-        self.values.set(idx, v)
+    fn setValue(idx: int, val: SsaValue) void {
+        self.values.set(idx, val)
     }
 
     /// Get a block by index.
@@ -564,47 +427,11 @@ struct SsaFunc {
         self.blocks.set(idx, blk)
     }
 
-
     /// Add a value to a block's value list, and update the block in storage.
     fn addValueToBlock(val_idx: int, block_idx: int) void {
         var blk = self.blocks.get(block_idx)
         blk.addValue(val_idx)
         self.blocks.set(block_idx, blk)
-    }
-
-    /// Free all SSA data (values, blocks, auxiliary lists).
-    /// When using cache: only free overflow args and block sub-lists.
-    /// The cache arrays themselves are reset by SsaCache.reset().
-    fn deinit() void {
-        // Free overflow args for values that exceeded 3 inline args
-        const total_values = self.next_value_id
-        var vi = 0
-        while (vi < total_values) {
-            var val = self.getValue(vi)
-            if (val.args_overflow_cap > 0) {
-                dealloc(val.args_overflow)
-            }
-            vi += 1
-        }
-        // Free each block's internal lists
-        var bi = 0
-        while (bi < self.blocks.count) {
-            var blk = self.blocks.get(bi)
-            blk.succs.free()
-            blk.preds.free()
-            blk.controls.free()
-            blk.values.free()
-            bi += 1
-        }
-        self.blocks.free()
-        // Only free values list if not using cache
-        if (self.cache == null) {
-            self.values.free()
-        }
-        self.local_sizes.free()
-        self.local_offsets.free()
-        self.string_literals.free()
-        self.constants.free()
     }
 
     /// Create a constant integer value, deduplicating by value.
@@ -642,51 +469,8 @@ test "SsaValue init and addArg" {
     val.addArg(1)
     val.addArg(2)
     @assertEq(val.argsLen(), 2)
-    @assertEq(val.getArg(0), 1)
-    @assertEq(val.getArg(1), 2)
-}
-
-test "SsaValue inline args (0-3)" {
-    var val = SsaValue.init(0, SsaOp.add, I64, 0)
-    val.addArg(10)
-    val.addArg(20)
-    val.addArg(30)
-    @assertEq(val.argsLen(), 3)
-    @assertEq(val.arg0, 10)
-    @assertEq(val.arg1, 20)
-    @assertEq(val.arg2, 30)
-    @assertEq(val.getArg(0), 10)
-    @assertEq(val.getArg(1), 20)
-    @assertEq(val.getArg(2), 30)
-    // No overflow allocated
-    @assertEq(val.args_overflow_cap, 0)
-}
-
-test "SsaValue overflow args (>3)" {
-    var val = SsaValue.init(0, SsaOp.call, I64, 0)
-    val.addArg(10)
-    val.addArg(20)
-    val.addArg(30)
-    val.addArg(40)
-    val.addArg(50)
-    @assertEq(val.argsLen(), 5)
-    @assertEq(val.getArg(0), 10)
-    @assertEq(val.getArg(1), 20)
-    @assertEq(val.getArg(2), 30)
-    @assertEq(val.getArg(3), 40)
-    @assertEq(val.getArg(4), 50)
-    // Overflow was allocated
-    @assert(val.args_overflow_cap > 0)
-}
-
-test "SsaValue setArg" {
-    var val = SsaValue.init(0, SsaOp.add, I64, 0)
-    val.addArg(1)
-    val.addArg(2)
-    val.setArg(0, 99)
-    val.setArg(1, 88)
-    @assertEq(val.getArg(0), 99)
-    @assertEq(val.getArg(1), 88)
+    @assertEq(val.args.get(0), 1)
+    @assertEq(val.args.get(1), 2)
 }
 
 test "SsaBlock init and addValue" {
@@ -769,9 +553,9 @@ test "SsaValue addArg2 and addArg3" {
     var val = SsaValue.init(0, SsaOp.cond_select, I64, 0)
     val.addArg3(10, 20, 30)
     @assertEq(val.argsLen(), 3)
-    @assertEq(val.getArg(0), 10)
-    @assertEq(val.getArg(1), 20)
-    @assertEq(val.getArg(2), 30)
+    @assertEq(val.args.get(0), 10)
+    @assertEq(val.args.get(1), 20)
+    @assertEq(val.args.get(2), 30)
 }
 
 test "SsaFunc getValue and setValue" {
@@ -788,33 +572,11 @@ test "SsaFunc getValue and setValue" {
     @assertEq(updated.aux_int, 42)
 }
 
-test "SsaValue aux fields" {
+test "SsaAux union" {
     var val = SsaValue.init(0, SsaOp.const_int, I64, 0)
-    @assertEq(val.aux_str, "")
-    @assertEq(val.aux_type_ref, 0)
-    val.aux_str = "hello"
-    @assertEq(val.aux_str, "hello")
-    val.aux_type_ref = 5
-    @assertEq(val.aux_type_ref, 5)
-}
-
-test "SsaCache init and reset" {
-    var cache = SsaCache.init()
-    @assert(cache.values_buf > 0)
-    @assertEq(cache.values_count, 0)
-    cache.reset()
-    @assertEq(cache.values_count, 0)
-    cache.deinit()
-}
-
-test "SsaFunc with cache" {
-    var cache = SsaCache.init()
-    var func = SsaFunc.initWithCache("cached_fn", &cache)
-    @assert(func.cache != null)
-    const blk = func.newBlock(SsaBlockKind.plain)
-    const v = func.newValue(SsaOp.const_int, I64, blk, 0, 0)
-    @assertEq(v, 0)
-    func.deinit()
-    cache.reset()
-    cache.deinit()
+    // Default aux is none
+    val.aux = SsaAux.str("hello")
+    val.aux = SsaAux.type_ref(5)
+    // Just verify construction doesn't crash
+    @assertEq(val.id, 0)
 }
