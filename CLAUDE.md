@@ -63,6 +63,38 @@ Read `claude/BR_TABLE_ARCHITECTURE.md` if confused. br_table is copied from Go's
 **Pitch:** Write like TypeScript, run like Rust, deploy anywhere, never think about memory.
 **Compiler:** Currently written in Zig, being ported to Cot (full self-hosting). Zig becomes bootstrap-only.
 
+### Self-Hosted Compiler (selfcot)
+
+The self-hosted compiler lives in `self/` and is written in Cot. It compiles `.cot` files to `.wasm` binaries.
+
+**How to build selfcot:**
+```bash
+# 1. Build the Zig compiler first (if not already done)
+zig build
+
+# 2. Build selfcot as a native binary using the Zig compiler
+cot build self/main.cot -o /tmp/selfcot
+```
+
+**How to test selfcot:**
+```bash
+# Use selfcot to compile a file and measure memory
+/usr/bin/time -l /tmp/selfcot build self/frontend/scanner.cot -o /tmp/out.wasm
+
+# Compare with Zig compiler for the same file (baseline)
+/usr/bin/time -l cot build self/frontend/scanner.cot --target=wasm32 -o /tmp/out_zig.wasm
+```
+
+**Key facts:**
+- `self/cot.json` sets `"safe": true` project-wide — all `self/` files use `@safe` mode
+- selfcot only emits Wasm (no native target yet) — entry point is `self/main.cot`
+- selfcot is compiled to a native binary by the Zig `cot` compiler
+- The pipeline: `self/main.cot` → `self/frontend/` (scanner, parser, checker, lowerer, ssa) → `self/codegen/wasm/` (driver, wasm_gen, preprocess, assemble, linker)
+- `self/test_tiny.cot` is a minimal test file for smoke-testing selfcot
+- 43,364 lines across 42 files, 418 tests — frontend, codegen, SSA passes, runtime all complete
+
+**Current status (as of 2026-03-16):** selfcot type-checks itself (`selfcot check self/main.cot` passes all 38 files). Compiles simple files to valid Wasm (`test_tiny.cot`, `token.cot`, files with string/list imports). **Blocker:** methods with struct-by-value parameters crash in SSA builder (e.g. `Span_merge(other: Span)`). Free functions with struct params work. The bug is in how the SSA builder handles `self` pointer + compound param decomposition together.
+
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 
 **🚨 SUBMODULE COMMIT RULE:** When committing changes in the parent repo, **NEVER include `stdlib` in `git add`** unless you are intentionally updating the submodule reference. The `stdlib` directory will frequently show as "modified" in `git status`/`git diff` because the local checkout may be ahead of the tracked ref. **Always stage files by explicit name** (e.g., `git add compiler/foo.zig compiler/bar.zig`). **NEVER use `git add .` or `git add -A`**. If you accidentally commit a stdlib ref change pointing to a commit that doesn't exist on the remote, CI will break for ALL jobs because `actions/checkout` can't fetch the submodule.
