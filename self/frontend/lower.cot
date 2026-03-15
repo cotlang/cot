@@ -8405,7 +8405,13 @@ struct Lowerer {
         var kind = -1
         var d1 = null_node
         var d2 = null_node
-        switch (self.tree.getNode(idx)) { Node.expr |e| => switch (e) { Expr.type_expr |te| => { kind = te.kind; d1 = te.data1; d2 = te.data2 }, else => {} }, else => {} }
+        switch (self.tree.getNode(idx)) { Node.expr |e| => switch (e) {
+            Expr.type_expr |te| => { kind = te.kind; d1 = te.data1; d2 = te.data2 },
+            // In @safe mode, the parser creates self params with Expr.ident type (not type_expr).
+            // Resolve idents through the checker (Zig lower.zig uses chk.resolveTypeExpr for all).
+            Expr.ident |id| => { return self.chk.resolveTypeExpr(idx) },
+            else => {},
+        }, else => {} }
         if (kind < 0) { return VOID }
         // Resolve type_expr by kind (Zig lower.zig:10066-10136)
         if (kind == TYPE_NAMED) {
@@ -8453,6 +8459,8 @@ struct Lowerer {
         switch (self.tree.getNode(param_idx)) { Node.expr |e| => switch (e) { Expr.field_def |fd| => { fd_name = fd.name; fd_type_expr = fd.type_expr; found = true }, else => {} }, else => {} }
         if (found) {
             var param_type = self.resolveTypeNode(fd_type_expr)
+            // Zig lower.zig:793 — safeWrapType converts struct self to *Struct in @safe mode
+            param_type = self.chk.safeWrapType(param_type)
             const size = self.types.sizeOf(param_type)
             fb.addParam(fd_name, param_type, size)
         }

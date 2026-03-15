@@ -331,8 +331,11 @@ struct Parser {
                 }
             }
             if (needs_self) {
-                // Create self param with type = current_impl_type
-                const self_type = self.ast.addExpr(Expr.ident(Ident { .name = self.current_impl_type, .span = self.spanSE(start, start) }))
+                // Create self param with type_expr(TYPE_NAMED) pointing to an ident for the impl type.
+                // Zig parser.zig:295 creates a type_expr with .named kind; checker's safeWrapType
+                // then wraps struct types to *Struct.
+                const name_ident = self.ast.addExpr(Expr.ident(Ident { .name = self.current_impl_type, .span = self.spanSE(start, start) }))
+                const self_type = self.ast.addExpr(Expr.type_expr(TypeExprNode { .kind = TYPE_NAMED, .data1 = name_ident, .data2 = null_node, .span = self.spanSE(start, start) }))
                 const self_param = self.ast.addExpr(Expr.field_def(FieldDef { .name = "self", .type_expr = self_type, .default_value = null_node, .doc_comment = "", .span = self.spanSE(start, start) }))
                 // Prepend self to params
                 var new_params: List(int) = .{}
