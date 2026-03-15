@@ -9637,6 +9637,18 @@ pub const Lowerer = struct {
                 return try fb.emitSliceLen(str_val, bc.span);
             },
             .trap => {
+                // Emit file:line before trap so crashes are diagnosable.
+                // Pattern: same as @panic but with "trap" message.
+                const fd_arg = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
+                const pos = self.err.src.position(bc.span.start);
+                const loc_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap\n", .{ pos.filename, pos.line });
+                const loc_idx = try fb.addStringLiteral(loc_str);
+                const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
+                var loc_args = [_]ir.NodeIndex{ fd_arg, loc_val };
+                _ = try fb.emitCall("write", &loc_args, true, TypeRegistry.I64, bc.span);
+                const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
+                var exit_args = [_]ir.NodeIndex{exit_code};
+                _ = try fb.emitCall("exit", &exit_args, false, TypeRegistry.VOID, bc.span);
                 _ = try fb.emitTrap(bc.span);
                 const dead_block = try fb.newBlock("trap.dead");
                 fb.setBlock(dead_block);
