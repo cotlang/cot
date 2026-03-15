@@ -1336,7 +1336,7 @@ pub const Driver = struct {
             "sched_init",    "sched_worker_spawn", "sched_worker_loop",
             "sched_join_workers", "sched_select",
             // Signal handler runtime (signal_native.generate order)
-            "__cot_signal_handler", "__cot_install_signals",
+            "__cot_signal_handler", "__cot_install_signals", "__cot_print_backtrace",
             // Test runtime (test_native.generate order)
             "__test_begin",  "__test_print_name", "__test_pass",
             "__test_fail",   "__test_summary",    "__test_store_fail_values",
@@ -1354,7 +1354,7 @@ pub const Driver = struct {
             "dup2",          "execve",        "kill",
             "c_openpty",     "setsid",        "ioctl",
             "c_mkdir",       "opendir",       "readdir",       "closedir",
-            "c_stat",        "c_unlink",      "signal",
+            "c_stat",        "c_unlink",      "signal",        "backtrace",
             // pthread symbols — external references resolved by linker (-lpthread/-lSystem)
             "pthread_create", "pthread_join",  "pthread_detach",
             "pthread_mutex_init", "pthread_mutex_lock", "pthread_mutex_unlock",

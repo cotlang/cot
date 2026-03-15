@@ -9637,8 +9637,7 @@ pub const Lowerer = struct {
                 return try fb.emitSliceLen(str_val, bc.span);
             },
             .trap => {
-                // Emit file:line before trap so crashes are diagnosable.
-                // Pattern: same as @panic but with "trap" message.
+                // Emit file:line + backtrace before trap so crashes are diagnosable.
                 const fd_arg = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
                 const pos = self.err.src.position(bc.span.start);
                 const loc_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap\n", .{ pos.filename, pos.line });
@@ -9646,6 +9645,11 @@ pub const Lowerer = struct {
                 const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
                 var loc_args = [_]ir.NodeIndex{ fd_arg, loc_val };
                 _ = try fb.emitCall("write", &loc_args, true, TypeRegistry.I64, bc.span);
+                // Print backtrace (native only — Wasm doesn't have backtrace())
+                if (!self.target.isWasm()) {
+                    var bt_args = [_]ir.NodeIndex{};
+                    _ = try fb.emitCall("__cot_print_backtrace", &bt_args, false, TypeRegistry.VOID, bc.span);
+                }
                 const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
                 var exit_args = [_]ir.NodeIndex{exit_code};
                 _ = try fb.emitCall("exit", &exit_args, false, TypeRegistry.VOID, bc.span);
@@ -10096,6 +10100,12 @@ pub const Lowerer = struct {
                 const nl_val = try fb.emitConstSlice(nl_idx, bc.span);
                 var nl_args = [_]ir.NodeIndex{ fd_arg, nl_val };
                 _ = try fb.emitCall("write", &nl_args, true, TypeRegistry.I64, bc.span);
+
+                // Print backtrace (native only)
+                if (!self.target.isWasm()) {
+                    var bt_args = [_]ir.NodeIndex{};
+                    _ = try fb.emitCall("__cot_print_backtrace", &bt_args, false, TypeRegistry.VOID, bc.span);
+                }
 
                 // Exit with code 2 (Go crash exit code)
                 const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);

@@ -21,9 +21,10 @@ const RuntimeFunc = arc_native.RuntimeFunc;
 const target_mod = @import("../../frontend/target.zig");
 
 /// Generate signal handler runtime functions.
-/// Returns two functions:
+/// Returns three functions:
 ///   1. __cot_signal_handler(sig: i64) — writes signal name to stderr, exits
 ///   2. __cot_install_signals() — calls sigaction for 5 signals
+///   3. __cot_print_backtrace() — calls libc backtrace(), prints PCs as hex
 pub fn generate(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
@@ -49,13 +50,18 @@ pub fn generate(
         .compiled = try generateInstallSignals(allocator, isa, ctrl_plane, func_index_map, target_os),
     });
 
+    // __cot_print_backtrace() — calls libc backtrace() + prints hex PCs
+    try result.append(allocator, .{
+        .name = "__cot_print_backtrace",
+        .compiled = try generatePrintBacktrace(allocator, isa, ctrl_plane, func_index_map),
+    });
+
     return result;
 }
 
 /// Generate __cot_signal_handler(sig: i64) -> void
 ///
-/// Dispatches on signal number, writes "fatal error: SIG...\n" to stderr, exits(128+sig).
-/// Pattern: Go runtime/signal_unix.go sigtrampgo → crash.
+/// Writes "fatal error: signal N\n" to stderr, exits(128+sig).
 fn generateSignalHandler(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
@@ -83,9 +89,9 @@ fn generateSignalHandler(
     // Import write and _exit
     const write_idx = func_index_map.get("write") orelse 0;
     var write_sig = clif.Signature.init(.system_v);
-    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // fd
-    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // buf
-    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // len
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
     try write_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
     const write_sig_ref = try builder.importSignature(write_sig);
     const write_func = try builder.importFunction(.{
@@ -104,160 +110,76 @@ fn generateSignalHandler(
         .colocated = false,
     });
 
-    // Stack slot for the message string
-    // "fatal error: SIGSEGV\n" = 21 chars (longest)
+    // Stack slot for message: "fatal error: signal NN\n" (max 23 bytes)
     const msg_slot = try clif_func.createStackSlot(allocator, .{
         .kind = .explicit_slot,
         .size = 24,
         .align_shift = 3,
     });
 
-    // Write "fatal error: " prefix (13 chars)
+    // Store "fatal error: signal " prefix (20 chars)
     const msg_addr = try ins.stackAddr(clif.Type.I64, msg_slot, 0);
-    // "fatal error: " = 66 61 74 61 6c 20 65 72 72 6f 72 3a 20
-    const prefix_bytes = [_]u8{ 'f', 'a', 't', 'a', 'l', ' ', 'e', 'r', 'r', 'o', 'r', ':', ' ' };
-    for (prefix_bytes, 0..) |byte, offset| {
+    const prefix = "fatal error: signal ";
+    for (prefix, 0..) |byte, offset| {
         const ch = try ins.iconst(clif.Type.I8, @intCast(byte));
         _ = try ins.store(clif.MemFlags.DEFAULT, ch, msg_addr, @intCast(offset));
     }
 
-    // Dispatch on signal number to write the signal name
-    // SIGILL=4, SIGABRT=6, SIGFPE=8, SIGBUS=10, SIGSEGV=11
-    // Default: write "SIG???\n" (6 chars)
+    // Convert signal number to 1-2 digit ASCII
+    const v_10 = try ins.iconst(clif.Type.I64, 10);
+    const tens = try ins.udiv(sig, v_10);
+    const ones = try ins.urem(sig, v_10);
+    const v_0x30 = try ins.iconst(clif.Type.I64, 0x30);
+    const v_zero = try ins.iconst(clif.Type.I64, 0);
+    const has_tens = try ins.icmp(.ne, tens, v_zero);
 
-    // Blocks for each signal
-    const block_sigill = try builder.createBlock();
-    const block_sigabrt = try builder.createBlock();
-    const block_sigfpe = try builder.createBlock();
-    const block_sigbus = try builder.createBlock();
-    const block_sigsegv = try builder.createBlock();
-    const block_default = try builder.createBlock();
-    const block_write = try builder.createBlock();
-    _ = try builder.appendBlockParam(block_write, clif.Type.I64); // msg length
+    const block_two = try builder.createBlock();
+    const block_one = try builder.createBlock();
 
-    // Check sig == 11 (SIGSEGV)
-    const v_11 = try ins.iconst(clif.Type.I64, 11);
-    const is_segv = try ins.icmp(.eq, sig, v_11);
-    _ = try ins.brif(is_segv, block_sigsegv, &.{}, block_sigill, &.{});
+    _ = try ins.brif(has_tens, block_two, &.{}, block_one, &.{});
 
-    // Actually, a simpler approach: just write the signal number as decimal
-    // and "SIGNAL\n" suffix. Avoids complex branching.
-    // Let me use a simpler approach: write "fatal error: signal N\n"
-
-    // block_sigill is actually our "not SIGSEGV" fallback — but let's simplify.
-    // Write signal number after prefix using the print_int pattern.
-
-    // SIMPLIFIED APPROACH: Just write "fatal error: signal " + digit(s) + "\n"
-    // This avoids needing a jump table for signal names.
-
-    // Actually, let me use the simplest possible approach:
-    // Store the full message for each signal in the stack slot.
-    // Only 5 signals, and we can share the prefix.
-
-    // Even simpler: just write fixed strings. Use separate code paths.
-
-    // Let me restart with the simplest working approach:
-    // Write "fatal error: signal N\n" where N is the signal number.
-    // This is what we need for Phase 1 — signal names can come later.
-
-    // Abandon the block structure above. Let me use a single block.
-    // Switch to block_sigill (which we'll repurpose as the "write number" block)
-    builder.switchToBlock(block_sigill);
+    // Two-digit: tens at 20, ones at 21, '\n' at 22, write 23 bytes
+    builder.switchToBlock(block_two);
     try builder.ensureInsertedBlock();
-    const ins2 = builder.ins();
-
-    // Write prefix "fatal error: signal " (20 chars)
-    // Store additional chars after "fatal error: " (offset 13)
-    const msg_addr2 = try ins2.stackAddr(clif.Type.I64, msg_slot, 0);
-    const extra_bytes = [_]u8{ 's', 'i', 'g', 'n', 'a', 'l', ' ' };
-    for (extra_bytes, 0..) |byte, offset| {
-        const ch = try ins2.iconst(clif.Type.I8, @intCast(byte));
-        _ = try ins2.store(clif.MemFlags.DEFAULT, ch, msg_addr2, @intCast(13 + offset));
+    {
+        const i = builder.ins();
+        const addr = try i.stackAddr(clif.Type.I64, msg_slot, 0);
+        const t_ch = try i.iadd(tens, v_0x30);
+        const t_i8 = try i.ireduce(clif.Type.I8, t_ch);
+        _ = try i.store(clif.MemFlags.DEFAULT, t_i8, addr, 20);
+        const o_ch = try i.iadd(ones, v_0x30);
+        const o_i8 = try i.ireduce(clif.Type.I8, o_ch);
+        _ = try i.store(clif.MemFlags.DEFAULT, o_i8, addr, 21);
+        const nl = try i.iconst(clif.Type.I8, 0x0A);
+        _ = try i.store(clif.MemFlags.DEFAULT, nl, addr, 22);
+        const fd = try i.iconst(clif.Type.I64, 2);
+        const len = try i.iconst(clif.Type.I64, 23);
+        _ = try i.call(write_func, &[_]clif.Value{ fd, addr, len });
+        const v128 = try i.iconst(clif.Type.I64, 128);
+        const ec = try i.iadd(sig, v128);
+        _ = try i.call(exit_func, &[_]clif.Value{ec});
+        _ = try i.trap(.unreachable_code_reached);
     }
 
-    // Offset 20: write signal number as decimal
-    // For simplicity, divide by 10 for tens digit, mod 10 for ones digit
-    const v_10 = try ins2.iconst(clif.Type.I64, 10);
-    const tens = try ins2.udiv(sig, v_10);
-    const ones = try ins2.urem(sig, v_10);
-    const v_0x30 = try ins2.iconst(clif.Type.I64, 0x30); // '0'
-
-    // Check if tens > 0 (2-digit number)
-    const v_zero = try ins2.iconst(clif.Type.I64, 0);
-    const has_tens = try ins2.icmp(.ne, tens, v_zero);
-
-    const block_two_digit = try builder.createBlock();
-    const block_one_digit = try builder.createBlock();
-
-    _ = try ins2.brif(has_tens, block_two_digit, &.{}, block_one_digit, &.{});
-
-    // Two-digit path: write tens digit at offset 20, ones at 21, '\n' at 22
-    builder.switchToBlock(block_two_digit);
+    // One-digit: ones at 20, '\n' at 21, write 22 bytes
+    builder.switchToBlock(block_one);
     try builder.ensureInsertedBlock();
-    const ins3 = builder.ins();
-    const msg_addr3 = try ins3.stackAddr(clif.Type.I64, msg_slot, 0);
-    const tens_ch = try ins3.iadd(tens, v_0x30);
-    const tens_i8 = try ins3.ireduce(clif.Type.I8, tens_ch);
-    _ = try ins3.store(clif.MemFlags.DEFAULT, tens_i8, msg_addr3, 20);
-    const ones_ch = try ins3.iadd(ones, v_0x30);
-    const ones_i8 = try ins3.ireduce(clif.Type.I8, ones_ch);
-    _ = try ins3.store(clif.MemFlags.DEFAULT, ones_i8, msg_addr3, 21);
-    const newline = try ins3.iconst(clif.Type.I8, 0x0A);
-    _ = try ins3.store(clif.MemFlags.DEFAULT, newline, msg_addr3, 22);
-    // Write 23 bytes
-    const v_23 = try ins3.iconst(clif.Type.I64, 23);
-    const v_fd3 = try ins3.iconst(clif.Type.I64, 2);
-    _ = try ins3.call(write_func, &[_]clif.Value{ v_fd3, msg_addr3, v_23 });
-    // exit(128 + sig)
-    const v_128 = try ins3.iconst(clif.Type.I64, 128);
-    const exit_code = try ins3.iadd(sig, v_128);
-    _ = try ins3.call(exit_func, &[_]clif.Value{exit_code});
-    _ = try ins3.trap(.unreachable_code_reached);
-
-    // One-digit path: write ones digit at offset 20, '\n' at 21
-    builder.switchToBlock(block_one_digit);
-    try builder.ensureInsertedBlock();
-    const ins4 = builder.ins();
-    const msg_addr4 = try ins4.stackAddr(clif.Type.I64, msg_slot, 0);
-    const ones_ch4 = try ins4.iadd(ones, v_0x30);
-    const ones_i8_4 = try ins4.ireduce(clif.Type.I8, ones_ch4);
-    _ = try ins4.store(clif.MemFlags.DEFAULT, ones_i8_4, msg_addr4, 20);
-    const newline4 = try ins4.iconst(clif.Type.I8, 0x0A);
-    _ = try ins4.store(clif.MemFlags.DEFAULT, newline4, msg_addr4, 21);
-    // Write 22 bytes
-    const v_22 = try ins4.iconst(clif.Type.I64, 22);
-    const v_fd4 = try ins4.iconst(clif.Type.I64, 2);
-    _ = try ins4.call(write_func, &[_]clif.Value{ v_fd4, msg_addr4, v_22 });
-    // exit(128 + sig)
-    const v_128_4 = try ins4.iconst(clif.Type.I64, 128);
-    const exit_code4 = try ins4.iadd(sig, v_128_4);
-    _ = try ins4.call(exit_func, &[_]clif.Value{exit_code4});
-    _ = try ins4.trap(.unreachable_code_reached);
-
-    // Seal remaining unused blocks
-    builder.switchToBlock(block_sigabrt);
-    try builder.ensureInsertedBlock();
-    _ = try builder.ins().trap(.unreachable_code_reached);
-
-    builder.switchToBlock(block_sigfpe);
-    try builder.ensureInsertedBlock();
-    _ = try builder.ins().trap(.unreachable_code_reached);
-
-    builder.switchToBlock(block_sigbus);
-    try builder.ensureInsertedBlock();
-    _ = try builder.ins().trap(.unreachable_code_reached);
-
-    builder.switchToBlock(block_sigsegv);
-    try builder.ensureInsertedBlock();
-    _ = try builder.ins().trap(.unreachable_code_reached);
-
-    builder.switchToBlock(block_default);
-    try builder.ensureInsertedBlock();
-    _ = try builder.ins().trap(.unreachable_code_reached);
-
-    builder.switchToBlock(block_write);
-    try builder.ensureInsertedBlock();
-    _ = try builder.ins().trap(.unreachable_code_reached);
+    {
+        const i = builder.ins();
+        const addr = try i.stackAddr(clif.Type.I64, msg_slot, 0);
+        const o_ch = try i.iadd(ones, v_0x30);
+        const o_i8 = try i.ireduce(clif.Type.I8, o_ch);
+        _ = try i.store(clif.MemFlags.DEFAULT, o_i8, addr, 20);
+        const nl = try i.iconst(clif.Type.I8, 0x0A);
+        _ = try i.store(clif.MemFlags.DEFAULT, nl, addr, 21);
+        const fd = try i.iconst(clif.Type.I64, 2);
+        const len = try i.iconst(clif.Type.I64, 22);
+        _ = try i.call(write_func, &[_]clif.Value{ fd, addr, len });
+        const v128 = try i.iconst(clif.Type.I64, 128);
+        const ec = try i.iadd(sig, v128);
+        _ = try i.call(exit_func, &[_]clif.Value{ec});
+        _ = try i.trap(.unreachable_code_reached);
+    }
 
     try builder.sealAllBlocks();
     builder.finalize();
@@ -267,17 +189,7 @@ fn generateSignalHandler(
 
 /// Generate __cot_install_signals() -> void
 ///
-/// Calls sigaction() for SIGILL(4), SIGABRT(6), SIGFPE(8), SIGBUS(10), SIGSEGV(11).
-/// Uses the C sigaction struct layout:
-///   macOS ARM64: { handler: fn ptr, mask: sigset_t (4 bytes), flags: i32 }
-///     → struct size = 16 bytes at minimum (handler ptr + mask + flags)
-///     → Actually: sa_handler is at offset 0 (8 bytes), sa_mask at +8 (4 bytes),
-///       sa_flags at +12 (4 bytes) — total 16 bytes
-///   Linux x64: { handler: fn ptr, flags: u64, restorer: fn ptr, mask: [16]u8 }
-///     → Different layout — use SA_SIGINFO variant
-///
-/// For simplicity, use the "signal()" function which is simpler than sigaction:
-///   signal(signum, handler) -> old_handler
+/// Calls signal() for SIGILL(4), SIGABRT(6), SIGFPE(8), SIGBUS(10), SIGSEGV(11).
 fn generateInstallSignals(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
@@ -293,8 +205,6 @@ fn generateInstallSignals(
     defer func_ctx.deinit();
     var builder = FunctionBuilder.init(&clif_func, &func_ctx);
 
-    // Signature: () -> void (no params, no return)
-
     const block_entry = try builder.createBlock();
     builder.switchToBlock(block_entry);
     try builder.appendBlockParamsForFunctionParams(block_entry);
@@ -303,12 +213,11 @@ fn generateInstallSignals(
     const ins = builder.ins();
 
     // Import signal(signum, handler) -> old_handler
-    // We use signal() instead of sigaction() for simplicity — it's available on all platforms.
     const signal_idx = func_index_map.get("signal") orelse 0;
     var signal_sig = clif.Signature.init(.system_v);
-    try signal_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // signum
-    try signal_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // handler
-    try signal_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64)); // old handler
+    try signal_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try signal_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try signal_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
     const signal_sig_ref = try builder.importSignature(signal_sig);
     const signal_func = try builder.importFunction(.{
         .name = .{ .user = .{ .namespace = 0, .index = signal_idx } },
@@ -316,7 +225,7 @@ fn generateInstallSignals(
         .colocated = false,
     });
 
-    // Get the address of __cot_signal_handler
+    // Get address of __cot_signal_handler
     const handler_idx = func_index_map.get("__cot_signal_handler") orelse 0;
     var handler_sig = clif.Signature.init(.system_v);
     try handler_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
@@ -328,14 +237,172 @@ fn generateInstallSignals(
     });
     const handler_addr = try ins.funcAddr(clif.Type.I64, handler_func_ref);
 
-    // Install for each signal: signal(SIGNUM, handler)
-    const signals = [_]i64{ 4, 6, 8, 10, 11 }; // SIGILL, SIGABRT, SIGFPE, SIGBUS, SIGSEGV
+    // Install for each signal
+    const signals = [_]i64{ 4, 6, 8, 10, 11 };
     for (signals) |signum| {
         const v_sig = try ins.iconst(clif.Type.I64, signum);
         _ = try ins.call(signal_func, &[_]clif.Value{ v_sig, handler_addr });
     }
 
     _ = try ins.return_(&.{});
+
+    try builder.sealAllBlocks();
+    builder.finalize();
+
+    return try native_compile.compile(allocator, &clif_func, isa, ctrl_plane);
+}
+
+/// Generate __cot_print_backtrace() -> void
+///
+/// Calls libc backtrace() to capture up to 32 return addresses, then prints
+/// each as "  0x<hex>\n" to stderr.
+///
+/// Reference: macOS/Linux backtrace(3)
+fn generatePrintBacktrace(
+    allocator: Allocator,
+    isa: native_compile.TargetIsa,
+    ctrl_plane: *native_compile.ControlPlane,
+    func_index_map: *const std.StringHashMapUnmanaged(u32),
+) !native_compile.CompiledCode {
+    var clif_func = clif.Function.init(allocator);
+    defer clif_func.deinit();
+    var func_ctx = FunctionBuilderContext.init(allocator);
+    defer func_ctx.deinit();
+    var builder = FunctionBuilder.init(&clif_func, &func_ctx);
+
+    // Signature: () -> void (no params)
+
+    const block_entry = try builder.createBlock();
+    builder.switchToBlock(block_entry);
+    try builder.appendBlockParamsForFunctionParams(block_entry);
+    try builder.ensureInsertedBlock();
+
+    // Import backtrace(buf, size) -> int
+    const bt_idx = func_index_map.get("backtrace") orelse 0;
+    var bt_sig = clif.Signature.init(.system_v);
+    try bt_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // buf
+    try bt_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // size
+    try bt_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64)); // count
+    const bt_sig_ref = try builder.importSignature(bt_sig);
+    const bt_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = bt_idx } },
+        .signature = bt_sig_ref,
+        .colocated = false,
+    });
+
+    // Import write(fd, buf, len)
+    const write_idx = func_index_map.get("write") orelse 0;
+    var write_sig = clif.Signature.init(.system_v);
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try write_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const write_sig_ref = try builder.importSignature(write_sig);
+    const write_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = write_idx } },
+        .signature = write_sig_ref,
+        .colocated = false,
+    });
+
+    // Stack slot for backtrace buffer: 32 pointers × 8 bytes = 256 bytes
+    const bt_slot = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 256,
+        .align_shift = 3,
+    });
+
+    // Stack slot for hex output: "  0x" + 16 hex chars + "\n" = 21 bytes
+    const hex_slot = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 24,
+        .align_shift = 3,
+    });
+
+    const ins0 = builder.ins();
+
+    // Call backtrace(buf, 32)
+    const bt_buf = try ins0.stackAddr(clif.Type.I64, bt_slot, 0);
+    const v_32 = try ins0.iconst(clif.Type.I64, 32);
+    const bt_result = try ins0.call(bt_func, &[_]clif.Value{ bt_buf, v_32 });
+    const count = bt_result.results[0];
+
+    // Write "  0x" prefix into hex buffer
+    const hex_addr0 = try ins0.stackAddr(clif.Type.I64, hex_slot, 0);
+    const prefix_chars = [_]u8{ ' ', ' ', '0', 'x' };
+    for (prefix_chars, 0..) |byte, offset| {
+        const ch = try ins0.iconst(clif.Type.I8, @intCast(byte));
+        _ = try ins0.store(clif.MemFlags.DEFAULT, ch, hex_addr0, @intCast(offset));
+    }
+
+    // Loop: for i in 2..count (skip first 2 frames: backtrace + __cot_print_backtrace)
+    const block_loop = try builder.createBlock();
+    _ = try builder.appendBlockParam(block_loop, clif.Type.I64); // i
+    const block_done = try builder.createBlock();
+
+    const v_2 = try ins0.iconst(clif.Type.I64, 2); // skip 2 frames
+    _ = try ins0.jump(block_loop, &[_]clif.Value{v_2});
+
+    // Loop header
+    builder.switchToBlock(block_loop);
+    try builder.ensureInsertedBlock();
+    const ins_l = builder.ins();
+    const loop_params = builder.blockParams(block_loop);
+    const idx = loop_params[0];
+
+    const at_end = try ins_l.icmp(.uge, idx, count);
+    const block_body = try builder.createBlock();
+    _ = try ins_l.brif(at_end, block_done, &.{}, block_body, &.{});
+
+    // Loop body: load bt_buf[i], print as hex
+    builder.switchToBlock(block_body);
+    try builder.ensureInsertedBlock();
+    const ins_b = builder.ins();
+
+    // Load PC: bt_buf[i * 8]
+    const v_8 = try ins_b.iconst(clif.Type.I64, 8);
+    const byte_offset = try ins_b.imul(idx, v_8);
+    const pc_addr = try ins_b.iadd(bt_buf, byte_offset);
+    const pc = try ins_b.load(clif.Type.I64, clif.MemFlags.DEFAULT, pc_addr, 0);
+
+    // Convert PC to 16 hex digits at offsets 4..19
+    const hex_buf = try ins_b.stackAddr(clif.Type.I64, hex_slot, 0);
+    const v_0xf = try ins_b.iconst(clif.Type.I64, 0xF);
+    const v_4 = try ins_b.iconst(clif.Type.I64, 4);
+
+    var shift_val = pc;
+    var digit_offset: i32 = 19;
+    for (0..16) |_| {
+        const nibble = try ins_b.band(shift_val, v_0xf);
+        const v_10 = try ins_b.iconst(clif.Type.I64, 10);
+        const is_letter = try ins_b.icmp(.uge, nibble, v_10);
+        const v_0x30 = try ins_b.iconst(clif.Type.I64, 0x30);
+        const v_0x57 = try ins_b.iconst(clif.Type.I64, 0x57);
+        const digit_base = try ins_b.select(clif.Type.I64, is_letter, v_0x57, v_0x30);
+        const digit_ch = try ins_b.iadd(nibble, digit_base);
+        const digit_i8 = try ins_b.ireduce(clif.Type.I8, digit_ch);
+        _ = try ins_b.store(clif.MemFlags.DEFAULT, digit_i8, hex_buf, digit_offset);
+        shift_val = try ins_b.ushr(shift_val, v_4);
+        digit_offset -= 1;
+    }
+
+    // Newline at offset 20
+    const nl = try ins_b.iconst(clif.Type.I8, 0x0A);
+    _ = try ins_b.store(clif.MemFlags.DEFAULT, nl, hex_buf, 20);
+
+    // write(2, hex_buf, 21)
+    const v_fd = try ins_b.iconst(clif.Type.I64, 2);
+    const v_21 = try ins_b.iconst(clif.Type.I64, 21);
+    _ = try ins_b.call(write_func, &[_]clif.Value{ v_fd, hex_buf, v_21 });
+
+    // i += 1, jump back
+    const v_one = try ins_b.iconst(clif.Type.I64, 1);
+    const next_idx = try ins_b.iadd(idx, v_one);
+    _ = try ins_b.jump(block_loop, &[_]clif.Value{next_idx});
+
+    // Done
+    builder.switchToBlock(block_done);
+    try builder.ensureInsertedBlock();
+    _ = try builder.ins().return_(&.{});
 
     try builder.sealAllBlocks();
     builder.finalize();
