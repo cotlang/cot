@@ -35,8 +35,8 @@ pub const Target = struct {
 
     pub const arm64_macos = Target{ .arch = .arm64, .os = .macos };
     pub const amd64_linux = Target{ .arch = .amd64, .os = .linux };
-    pub const wasm32 = Target{ .arch = .wasm32, .os = .freestanding, .gc = true };
-    pub const wasm32_wasi = Target{ .arch = .wasm32, .os = .wasi, .gc = true };
+    pub const wasm32 = Target{ .arch = .wasm32, .os = .freestanding, .gc = false };
+    pub const wasm32_wasi = Target{ .arch = .wasm32, .os = .wasi, .gc = false };
 
     pub fn native() Target {
         const arch: Arch = switch (builtin.cpu.arch) {
@@ -119,21 +119,21 @@ test "Target.parse" {
 }
 
 test "Target.isWasmGC" {
-    // All wasm targets are GC
-    try std.testing.expect(Target.wasm32.isWasmGC());
+    // wasm32 targets use linear memory (gc=false), not WasmGC
+    try std.testing.expect(!Target.wasm32.isWasmGC());
     try std.testing.expect(Target.wasm32.isWasm());
-    try std.testing.expect(Target.wasm32.gc);
+    try std.testing.expect(!Target.wasm32.gc);
     try std.testing.expect(!Target.arm64_macos.isWasmGC());
     try std.testing.expectEqualStrings("wasm32", Target.wasm32.name());
 }
 
 test "Target.parse wasm32" {
     const t = Target.parse("wasm32").?;
-    try std.testing.expect(t.isWasmGC());
-    try std.testing.expect(t.gc);
+    try std.testing.expect(!t.isWasmGC());
+    try std.testing.expect(!t.gc);
     try std.testing.expectEqualStrings("wasm32", t.name());
     const t2 = Target.parse("wasm").?;
-    try std.testing.expect(t2.isWasmGC());
+    try std.testing.expect(!t2.isWasmGC());
     try std.testing.expect(Target.parse("wasm32-gc") == null);
 }
 
