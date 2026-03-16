@@ -4460,25 +4460,28 @@ struct Checker {
         // Build concrete function type from DEFINING file's AST
         const func_type = self.buildFuncType(fn_node)
 
-        // Define in global scope
+        // Define in global scope + check body only if NOT already defined.
+        // Zig pattern: define + check in one if-block prevents re-checking.
         const old_scope = self.current_scope
         self.current_scope = self.global_scope
         if (!self.isDefined(cache_key)) {
             self.defineSymbol(makeFuncSymbol(cache_key, func_type, fn_node))
-        }
-        self.current_scope = old_scope
+            self.current_scope = old_scope
 
-        // Check the function body (still using DEFINING file's AST)
-        // Cross-file: save/restore expr_types to avoid NodeIndex collision (Zig lines 3539-3548)
-        const is_cross_file = (info.ast_ptr != @ptrToInt(saved_ast))
-        var saved_expr_types = self.expr_types
-        if (is_cross_file) {
-            var fresh_et: Map(int, int) = .{}
-            self.expr_types = fresh_et
-        }
-        self.checkFnDeclBody(fn_node, cache_key)
-        if (is_cross_file) {
-            self.expr_types = saved_expr_types
+            // Check the function body (still using DEFINING file's AST)
+            // Cross-file: save/restore expr_types to avoid NodeIndex collision (Zig lines 3539-3548)
+            const is_cross_file = (info.ast_ptr != @ptrToInt(saved_ast))
+            var saved_expr_types = self.expr_types
+            if (is_cross_file) {
+                var fresh_et: Map(int, int) = .{}
+                self.expr_types = fresh_et
+            }
+            self.checkFnDeclBody(fn_node, cache_key)
+            if (is_cross_file) {
+                self.expr_types = saved_expr_types
+            }
+        } else {
+            self.current_scope = old_scope
         }
 
         // Restore substitution
