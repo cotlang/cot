@@ -9642,8 +9642,17 @@ pub const Lowerer = struct {
                 // Wasm: just trap (backtrace/exit not available, write changes stack)
                 if (!self.target.isWasm()) {
                     const fd_arg = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
-                    const pos = self.err.src.position(bc.span.start);
-                    const loc_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap\n", .{ pos.filename, pos.line });
+                    // Source location: use err.src only if the span is within bounds (same file).
+                    // For cross-file generics, self.err.src is the host file but bc.span is
+                    // from the generic's defining file — offset would be out of range.
+                    const loc_str = if (bc.span.start.offset < self.err.src.content.len) blk: {
+                        const pos = self.err.src.position(bc.span.start);
+                        break :blk try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap\n", .{ pos.filename, pos.line });
+                    } else blk: {
+                        // Cross-file generic: use tree filename + raw offset
+                        const fname = if (self.tree.file) |f| f.filename else "unknown";
+                        break :blk try std.fmt.allocPrint(self.allocator, "{s}:offset({d}): trap\n", .{ fname, bc.span.start.offset });
+                    };
                     const loc_idx = try fb.addStringLiteral(loc_str);
                     const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
                     var loc_args = [_]ir.NodeIndex{ fd_arg, loc_val };

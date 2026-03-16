@@ -998,6 +998,10 @@ fn checkAndStoreChecker(pf: ParsedFile, types: TypeRegistry, shared: *SharedChec
     copyBytes(errs_heap, @ptrToInt(&check_errs), @sizeOf(ErrorReporter))
     const chk_heap = alloc(0, @sizeOf(Checker))
     copyBytes(chk_heap, @ptrToInt(&checker), @sizeOf(Checker))
+    // Zero the stack locals so ARC doesn't free the shared backing arrays
+    // when they go out of scope. The heap copies own the data now.
+    zeroBytes(@ptrToInt(&check_errs), @sizeOf(ErrorReporter))
+    zeroBytes(@ptrToInt(&checker), @sizeOf(Checker))
     checker_errs.append(errs_heap)
     checkers.append(chk_heap)
 }
