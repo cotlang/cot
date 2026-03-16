@@ -981,6 +981,7 @@ struct Checker {
 
         // Get return type from func type
         var return_type: int = VOID
+        if (sym.type_idx < 0 or sym.type_idx >= self.types.types.count) { return }
         const func_t = self.types.get(sym.type_idx)
         if (func_t.tag == TAG_FUNC) {
             const ft = switch (func_t) {

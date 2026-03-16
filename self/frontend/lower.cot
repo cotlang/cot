@@ -8410,8 +8410,18 @@ struct Lowerer {
         switch (self.tree.getNode(idx)) { Node.expr |e| => switch (e) {
             Expr.type_expr |te| => { kind = te.kind; d1 = te.data1; d2 = te.data2 },
             // In @safe mode, the parser creates self params with Expr.ident type (not type_expr).
-            // Resolve idents through the checker (Zig lower.zig uses chk.resolveTypeExpr for all).
-            Expr.ident |id| => { return self.chk.resolveTypeExpr(idx) },
+            // Resolve by NAME directly — avoids AST mismatch between lowerer and checker.
+            Expr.ident |id| => {
+                // Check type substitution first (active during generic instantiation)
+                if (self.chk.hasTypeSubstitution()) {
+                    const sub = self.chk.lookupTypeSub(id.name)
+                    if (sub >= 0) { return sub }
+                }
+                // Look up in type registry by name
+                const tid = self.types.lookupByName(id.name)
+                if (tid >= 0) { return tid }
+                return VOID
+            },
             else => {},
         }, else => {} }
         if (kind < 0) { return VOID }
