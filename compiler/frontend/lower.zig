@@ -9490,11 +9490,27 @@ pub const Lowerer = struct {
                 }
                 const value = try self.lowerExprNode(bc.args[0]);
                 // WasmGC: GC refs have no linear memory address — return 0.
-                // Tests using @ptrToInt on GC refs need restructuring (use ?*T fields).
                 if (self.target.isWasmGC()) {
                     const is_gc_ref = arg_info == .struct_type or
                         (arg_info == .pointer and arg_info.pointer.managed and self.type_reg.get(arg_info.pointer.elem) == .struct_type);
                     if (is_gc_ref) return try fb.emitConstInt(0, TypeRegistry.I64, bc.span);
+                }
+                // Swift Unmanaged.passRetained pattern: when converting a managed pointer
+                // to a raw integer, disable the ARC cleanup for the source local.
+                // The caller takes ownership of the +1 refcount — ARC must NOT release
+                // the object when the local goes out of scope.
+                // Reference: swift/lib/SILGen/Cleanup.h forwardCleanup()
+                if (self.type_reg.couldBeARC(arg_type)) {
+                    // Find the source local and disable its cleanup
+                    if (self.tree.getNode(bc.args[0])) |src_node| {
+                        if (src_node.asExpr()) |src_expr| {
+                            if (src_expr == .ident) {
+                                if (fb.lookupLocal(src_expr.ident.name)) |local_idx| {
+                                    _ = self.cleanup_stack.disableForLocal(local_idx);
+                                }
+                            }
+                        }
+                    }
                 }
                 return try fb.emitPtrToInt(value, TypeRegistry.I64, bc.span);
             },
