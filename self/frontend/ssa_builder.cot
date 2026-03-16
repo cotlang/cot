@@ -388,7 +388,10 @@ struct SSABuilder {
         if (self.node_values.contains(node_idx)) { return self.node_values.get(node_idx) }
         const node = self.ir_func.getNode(node_idx)
         const cur = self.cur_block
-        if (cur == null_block) { return null_value }
+        if (cur == null_block) {
+            // Block terminated (e.g. after return/jump). Skip remaining nodes.
+            return null_value
+        }
         self.cur_pos_line = node.span.start
         self.cur_pos_col = 0
 
@@ -1210,7 +1213,9 @@ struct SSABuilder {
 
     fn convertStoreLocalField(f: StoreLocalField) int {
         const cur = self.cur_block
+
         const value = self.convertNode(f.value)
+
         if (value == null_value) { return null_value }
         const addr_val = self.emitLocalAddr(f.local_idx, VOID)
         const off_val = self.emitOffPtr(addr_val, f.offset)
@@ -2156,7 +2161,10 @@ struct SSABuilder {
         const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
         var mv = self.func.getValue(move_val)
         mv.addArg2(dst_addr, src_addr)
-        const move_size = if (type_size > 0) { type_size } else { self.type_reg.sizeOf(self.ir_func.getNode(ir_node_idx).type_idx) }
+        var move_size = type_size
+        if (move_size == 0) {
+            move_size = self.type_reg.sizeOf(self.ir_func.getNode(ir_node_idx).type_idx)
+        }
         mv.aux_int = move_size
         self.func.setValue(move_val, mv)
         self.func.addValueToBlock(move_val, cur)
