@@ -1928,7 +1928,7 @@ pub const Lowerer = struct {
             // a no-op for non-heap pointers, but avoiding the call is better).
             // Divergence from Swift: Swift prevents this at the type level (structs are
             // value types). Cot's *T can be heap or stack — see arc_native.zig header comment.
-            if (!self.target.isWasmGC() and value_node != null) {
+            if (!self.target.isWasm() and value_node != null) {
                 const fn_ret_type = fb.return_type;
                 if (self.type_reg.couldBeARC(fn_ret_type)) {
                     const is_plus_one = forwarded or
@@ -2165,7 +2165,7 @@ pub const Lowerer = struct {
             if (cleanup.isActive()) {
                 switch (cleanup.kind) {
                     .release => {
-                        if (self.target.isWasmGC()) continue; // GC handles lifetimes
+                        if (self.target.isWasm()) continue; // Wasm: no ARC runtime
                         // For locals: reload current value (may have been reassigned)
                         const value = if (cleanup.local_idx) |lidx|
                             try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
@@ -2175,7 +2175,7 @@ pub const Lowerer = struct {
                         _ = try fb.emitCall("release", &args, false, TypeRegistry.VOID, Span.zero);
                     },
                     .unowned_release => {
-                        if (self.target.isWasmGC()) continue;
+                        if (self.target.isWasm()) continue;
                         const value = if (cleanup.local_idx) |lidx|
                             try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
                         else
@@ -2424,7 +2424,7 @@ pub const Lowerer = struct {
                     // `weak var`: form side table reference, store side_table_ptr, register weak_release.
                     // `unowned var`: increments unowned RC and registers unowned_release cleanup.
                     // Reference: Swift's `weak` and `unowned` modifiers + WeakReference.h.
-                    if (!self.target.isWasmGC() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
+                    if (!self.target.isWasm() and var_stmt.is_weak and self.type_reg.couldBeARC(type_idx)) {
                         // weak: allocate/reuse side table, store side_table_ptr in local
                         var wargs = [_]ir.NodeIndex{value_node};
                         const side_table_ptr = try fb.emitCall("weak_form_reference", &wargs, false, TypeRegistry.I64, var_stmt.span);
@@ -2432,13 +2432,13 @@ pub const Lowerer = struct {
                         const cleanup = arc.Cleanup.initForLocal(.weak_release, side_table_ptr, type_idx, local_idx);
                         _ = try self.cleanup_stack.push(cleanup);
                         try self.weak_locals.put(self.allocator, local_idx, {});
-                    } else if (!self.target.isWasmGC() and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
+                    } else if (!self.target.isWasm() and var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
                         // unowned: increment unowned RC, register unowned_release cleanup
                         var uargs = [_]ir.NodeIndex{value_node};
                         _ = try fb.emitCall("unowned_retain", &uargs, false, type_idx, var_stmt.span);
                         const cleanup = arc.Cleanup.initForLocal(.unowned_release, value_node, type_idx, local_idx);
                         _ = try self.cleanup_stack.push(cleanup);
-                    } else if (!self.target.isWasmGC() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
+                    } else if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
                         const is_owned = if (value_expr) |e| (e == .new_expr or e == .call) else false;
 
                         if (is_owned) {
@@ -3087,7 +3087,7 @@ pub const Lowerer = struct {
                 if (fb.lookupLocal(id.name)) |local_idx| {
                     // ARC: Release old value before storing new if local has cleanup
                     // WasmGC: skip retain/release — GC handles lifetimes
-                    if (!self.target.isWasmGC() and self.cleanup_stack.hasCleanupForLocal(local_idx)) {
+                    if (!self.target.isWasm() and self.cleanup_stack.hasCleanupForLocal(local_idx)) {
                         const local_type = fb.locals.items[local_idx].type_idx;
                         const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
                         var release_args = [_]ir.NodeIndex{old_value};
@@ -3184,7 +3184,7 @@ pub const Lowerer = struct {
 
                 // ARC: release old value at *ptr before storing new (skip for WasmGC)
                 // Reference: Swift SILGenLValue.cpp — assign into lvalue releases old, consumes +1 / retains +0
-                if (!self.target.isWasmGC()) {
+                if (!self.target.isWasm()) {
                     const ptr_type_idx = self.inferExprType(d.operand);
                     const ptr_type_info = self.type_reg.get(ptr_type_idx);
                     if (ptr_type_info == .pointer and ptr_type_info.pointer.managed) {
@@ -3271,7 +3271,7 @@ pub const Lowerer = struct {
                     // (parameters have no cleanup). Swift: field assignments always do retain/release.
                     // Swift SILGen pattern: copy_value %new; store %new; destroy_value %old
                     // Retain-before-release prevents use-after-free when old == new.
-                    if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasmGC()) {
+                    if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
                         // Load old value BEFORE store (needed for release after)
                         const old_val = try fb.emitFieldValue(ptr_val, field_idx, field_offset, field.type_idx, span);
 
@@ -5948,7 +5948,7 @@ pub const Lowerer = struct {
 
         // ARC Phase 4: Queue synthetic deinit for structs with ARC fields but no user deinit.
         // This ensures owned references in fields are released when the object is freed.
-        if (!self.target.isWasmGC()) {
+        if (!self.target.isWasm()) {
             var has_arc_fields = false;
             for (struct_type.fields) |field| {
                 if (self.type_reg.couldBeARC(field.type_idx)) {
@@ -9638,21 +9638,22 @@ pub const Lowerer = struct {
             },
             .trap => {
                 // Emit file:line + backtrace before trap so crashes are diagnosable.
-                const fd_arg = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
-                const pos = self.err.src.position(bc.span.start);
-                const loc_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap\n", .{ pos.filename, pos.line });
-                const loc_idx = try fb.addStringLiteral(loc_str);
-                const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
-                var loc_args = [_]ir.NodeIndex{ fd_arg, loc_val };
-                _ = try fb.emitCall("write", &loc_args, true, TypeRegistry.I64, bc.span);
-                // Print backtrace (native only — Wasm doesn't have backtrace())
+                // Native: write + backtrace + exit + trap
+                // Wasm: just trap (backtrace/exit not available, write changes stack)
                 if (!self.target.isWasm()) {
+                    const fd_arg = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
+                    const pos = self.err.src.position(bc.span.start);
+                    const loc_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}: trap\n", .{ pos.filename, pos.line });
+                    const loc_idx = try fb.addStringLiteral(loc_str);
+                    const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
+                    var loc_args = [_]ir.NodeIndex{ fd_arg, loc_val };
+                    _ = try fb.emitCall("write", &loc_args, true, TypeRegistry.I64, bc.span);
                     var bt_args = [_]ir.NodeIndex{};
                     _ = try fb.emitCall("__cot_print_backtrace", &bt_args, false, TypeRegistry.VOID, bc.span);
+                    const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
+                    var exit_args = [_]ir.NodeIndex{exit_code};
+                    _ = try fb.emitCall("exit", &exit_args, false, TypeRegistry.VOID, bc.span);
                 }
-                const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
-                var exit_args = [_]ir.NodeIndex{exit_code};
-                _ = try fb.emitCall("exit", &exit_args, false, TypeRegistry.VOID, bc.span);
                 _ = try fb.emitTrap(bc.span);
                 const dead_block = try fb.newBlock("trap.dead");
                 fb.setBlock(dead_block);
@@ -10055,8 +10056,8 @@ pub const Lowerer = struct {
             // In Cot, monomorphization makes the concrete type known at compile time.
             .arc_retain => {
                 const arg = try self.lowerExprNode(bc.args[0]);
-                // WasmGC: GC handles lifetimes — retain is a no-op
-                if (self.target.isWasmGC()) return arg;
+                // Wasm: no ARC runtime (bump allocator, no reference counting)
+                if (self.target.isWasm()) return arg;
                 const arg_type = self.inferExprType(bc.args[0]);
                 if (self.type_reg.couldBeARC(arg_type)) {
                     var args = [_]ir.NodeIndex{arg};
@@ -10065,8 +10066,8 @@ pub const Lowerer = struct {
                 return arg;
             },
             .arc_release => {
-                // WasmGC: GC handles lifetimes — release is a no-op
-                if (self.target.isWasmGC()) return ir.null_node;
+                // Wasm: no ARC runtime (bump allocator, no reference counting)
+                if (self.target.isWasm()) return ir.null_node;
                 const arg = try self.lowerExprNode(bc.args[0]);
                 const arg_type = self.inferExprType(bc.args[0]);
                 if (self.type_reg.couldBeARC(arg_type)) {
