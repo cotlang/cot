@@ -276,6 +276,7 @@ struct GenState {
 
     /// Get 32-bit value onto wasm stack
     fn getValue32(val_idx: int) void {
+        if (val_idx < 0 or val_idx >= self.ssa_func.values.count) { return }
         const v = self.ssa_func.getValue(val_idx)
         // Zig: check isRematerializable before local lookup
         if (!isRematerializable(v)) {
@@ -294,6 +295,7 @@ struct GenState {
 
     /// Get 64-bit value onto wasm stack
     fn getValue64(val_idx: int) void {
+        if (val_idx < 0 or val_idx >= self.ssa_func.values.count) { return }
         const v = self.ssa_func.getValue(val_idx)
         // Check if rematerializable (constants)
         if (isRematerializable(v)) {
@@ -2182,6 +2184,7 @@ struct GenState {
                 const val = self.ssa_func.getValue(val_idx)
                 for ai in 0..val.args.count {
                     const arg_idx = val.args.get(ai)
+                    if (arg_idx < 0 or arg_idx >= self.ssa_func.values.count) { continue }
                     var arg_val = self.ssa_func.getValue(arg_idx)
                     arg_val.uses += 1
                     self.ssa_func.setValue(arg_idx, arg_val)
@@ -2189,6 +2192,7 @@ struct GenState {
             }
             for ci in 0..blk.controls.count {
                 const ctrl_idx = blk.controls.get(ci)
+                if (ctrl_idx < 0 or ctrl_idx >= self.ssa_func.values.count) { continue }
                 var ctrl_val = self.ssa_func.getValue(ctrl_idx)
                 ctrl_val.uses += 1
                 self.ssa_func.setValue(ctrl_idx, ctrl_val)
