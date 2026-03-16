@@ -99,7 +99,9 @@ const PURE_SWIFT_DEALLOC: i64 = 1; // 0x0000000000000001
 // Swift RefCount.h:751 — RefCountBits(0, 1) = (0 << 33) | (1 << 0) | (1 << 1) = 3
 // NOTE: Unowned uses DIRECT count (physical=logical), NOT extra count.
 // Only StrongExtra uses extra count (physical 0 = logical 1).
-const INITIAL_REFCOUNT: i64 = PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE; // = 3
+// Swift HeapObject.cpp: swift_allocObject sets refcount to STRONG_RC_ONE (one strong retain).
+// The allocation IS the first ownership — the object starts with refcount 1.
+const INITIAL_REFCOUNT: i64 = STRONG_RC_ONE | PURE_SWIFT_DEALLOC | UNOWNED_RC_ONE;
 // Immortal: all 64 bits set — passes Swift's IsImmortal mask (low 32 bits all set)
 const IMMORTAL_REFCOUNT: i64 = @bitCast(@as(u64, 0xFFFFFFFF_FFFFFFFF));
 const STRONG_EXTRA_MASK: i64 = @bitCast(@as(u64, 0x7FFFFFFE_00000000)); // bits 33-62

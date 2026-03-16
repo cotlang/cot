@@ -274,19 +274,12 @@ struct Lowerer {
 
     /// Lower all root declarations into the builder.
     fn lowerToBuilder() void {
-        eprintln("  decls: ${self.tree.file_decls.count}")
         for i in 0..self.tree.file_decls.count {
             const decl_idx = self.tree.file_decls.get(i)
-            if (i == 98) {
-                eprintln("    d[98] TREE nodes=${self.tree.nodes.count} CHK nodes=${self.chk.ast.nodes.count}")
-            }
             self.lowerDecl(decl_idx)
         }
-        eprintln("  decls done, queued generics...")
         self.lowerQueuedGenericFunctions()
-        eprintln("  generics done, auto deinits...")
         self.emitPendingAutoDeinits()
-        eprintln("  lowerToBuilder complete")
     }
 
     /// Generate test runner: main() that calls each test and reports pass/fail.
@@ -7434,7 +7427,6 @@ struct Lowerer {
     fn lowerQueuedGenericFunctions() void {
         var made_progress = true
         var iter_count = 0
-        const types_before = self.types.types.count
         while (made_progress) {
             made_progress = false
             iter_count += 1
@@ -7446,23 +7438,14 @@ struct Lowerer {
                 if (self.builder.hasFunc(key)) { continue }
                 pending.append(key)
             }
-            if (pending.count > 0) {
-                eprintln("    generic iter ${iter_count}: ${pending.count} pending (all_keys=${all_keys.count})")
-            }
             // Process collected snapshot (safe — no iterator active)
             for i in 0..pending.count {
                 const name = pending.get(i)
                 if (self.builder.hasFunc(name)) { continue }
-                eprintln("      gen: ${name}")
                 self.lowerGenericFnInstance(name)
-                if (!self.builder.hasFunc(name)) {
-                    eprintln("      FAILED to add: ${name}")
-                }
                 made_progress = true
             }
         }
-        const types_after = self.types.types.count
-        eprintln("    generic: ${iter_count} iterations, types ${types_before} -> ${types_after}")
     }
 
     /// Lower one concrete generic function as a top-level function.
@@ -7470,23 +7453,12 @@ struct Lowerer {
         // Look up the GenericInstInfo
         if (self.lookupGenericInst(concrete_name)) |inst| {
             self.lowerGenericFnInstanceInner(inst, concrete_name)
-        } else {
-            // Not registered — skip. This happens for generic instantiations
-            // discovered during Phase 3 lowering that weren't in Phase 2.
-            // Mark as "done" by adding a dummy function to prevent infinite retries.
-            const span = Span.zero()
-            self.builder.startFunc(concrete_name, VOID, VOID, span)
-            if (self.builder.func()) |fb| {
-                fb.emitRet(null_node, span)
-            }
-            self.builder.endFunc()
         }
     }
 
     fn lowerGenericFnInstanceInner(inst: *GenericInstInfo, concrete_name: string) void {
         // Swap to the defining file's AST for cross-file generic resolution
         const saved_tree = self.tree
-        @arcRetain(self.tree)
         self.tree = inst.getAst()
 
         // Get the fn_decl node from the defining file's AST
@@ -7498,7 +7470,6 @@ struct Lowerer {
             else => {},
         }, else => {} }
         if (!found) {
-            @arcRetain(self.tree)
             self.tree = saved_tree
             return
         }
@@ -7551,7 +7522,6 @@ struct Lowerer {
                     // Restore and return — skip lowering entirely
                     self.chk.type_sub_keys.count = saved_sub_count
                     self.chk.type_sub_vals.count = saved_sub_count
-                    @arcRetain(self.tree)
                     self.tree = saved_tree
                     return
                 }
@@ -7579,7 +7549,6 @@ struct Lowerer {
         // the original. ARC's field assignment would release the old AST (freeing it if
         // refcount hits 0), causing use-after-free when other generics reference it.
         const saved_chk_ast = self.chk.ast
-        @arcRetain(self.chk.ast)
         self.chk.ast = self.tree
 
         // Re-check the body with substitutions active to populate expr_types.
@@ -7666,9 +7635,7 @@ struct Lowerer {
         self.chk.type_sub_keys.count = saved_sub_count
         self.chk.type_sub_vals.count = saved_sub_count
         self.chk.expr_types = saved_expr_types
-        @arcRetain(self.chk.ast)
         self.chk.ast = saved_chk_ast
-        @arcRetain(self.tree)
         self.tree = saved_tree
     }
 

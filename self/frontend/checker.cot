@@ -238,7 +238,6 @@ struct Checker {
     // Comptime
     comptime_vars: Map(string, int),
     in_comptime: bool,
-    in_body_recheck: bool,
 
     static fn init(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter) Checker {
         var symbols: List(Symbol) = .{}
@@ -284,7 +283,6 @@ struct Checker {
             in_async_fn: false,
             comptime_vars: comptime_vars,
             in_comptime: false,
-            in_body_recheck: false,
         }
     }
 
@@ -977,11 +975,7 @@ struct Checker {
     }
 
     fn checkFnDeclBody(idx: int, lookup_name: string) void {
-        // Prevent recursive body checking — callees are queued, not checked inline.
-        // Without this, the stack overflows from deep generic chains.
-        const was_in_recheck = self.in_body_recheck
-        self.in_body_recheck = true
-        const sym_idx = self.lookupSymbol(lookup_name)
+const sym_idx = self.lookupSymbol(lookup_name)
         if (sym_idx < 0) {
             // Symbol not found — skip re-checking (function will be lowered without body check)
             return
@@ -1061,7 +1055,6 @@ struct Checker {
             self.current_return_type = old_ret
             self.popScope()
         }, else => {} }, else => {} }
-        self.in_body_recheck = was_in_recheck
     }
 
     fn checkTopVarDecl(idx: int) void {
@@ -4095,20 +4088,14 @@ struct Checker {
         const tp_copy = copyString(tp_str)
 
         // Copy concrete_name so the map key survives ARC cleanup of caller's scope
-        const name_copy = copyString(concrete_name)
         var inst = new GenericInstInfo {
-            concrete_name: name_copy,
+            concrete_name: concrete_name,
             generic_node: generic_node,
             type_args_str: ta_copy,
             type_param_names: tp_copy,
             ast_ptr: ast_ptr,
         }
-        retain(@ptrToInt(inst))
-        retain(@ptrOf(name_copy))
-        retain(@ptrOf(ta_copy))
-        retain(@ptrOf(tp_copy))
-        // Use retained name_copy as map key (original concrete_name may be freed by ARC)
-        @intToPtr(*Map(string, int), self.generic_inst_by_name).set(name_copy, @ptrToInt(inst))
+        @intToPtr(*Map(string, int), self.generic_inst_by_name).set(concrete_name, @ptrToInt(inst))
     }
 
     /// Resolve a generic struct instantiation: List(int) → concrete List(5) type.
@@ -4154,7 +4141,6 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @arcRetain(self.ast)
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4164,7 +4150,6 @@ struct Checker {
         const tp_count = s_tp.count
 
         if (ta_count != tp_count) {
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4198,7 +4183,6 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @arcRetain(self.ast)
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
@@ -4285,7 +4269,6 @@ struct Checker {
             const saved_ast = self.ast
             retain(@ptrToInt(saved_ast))
             const saved_safe_mode = self.safe_mode
-            @arcRetain(self.ast)
             self.ast = entry.getAst()
             self.safe_mode = self.ast.safe_mode
 
@@ -4352,9 +4335,7 @@ struct Checker {
                 var method_name2 = ""
                 switch (self.ast.getNode(method_idx)) { Node.decl |md| => switch (md) { Decl.fn_decl |mf| => { method_name2 = mf.name }, else => {} }, else => {} }
                 const synth_name = "${concrete_name}_${method_name2}"
-                if (!self.in_body_recheck) {
-                    self.checkFnDeclBody(method_idx, synth_name)
-                }
+                self.checkFnDeclBody(method_idx, synth_name)
             }
 
             // Restore substitution
@@ -4367,7 +4348,6 @@ struct Checker {
             }
 
             // Restore caller's AST and safe_mode
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4414,7 +4394,6 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @arcRetain(self.ast)
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4427,7 +4406,6 @@ struct Checker {
         const tp_count = fn_tp.count
 
         if (call_args_count != tp_count) {
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4444,7 +4422,6 @@ struct Checker {
                     const type_name = self.types.typeName(resolved_args.get(bi))
                     const impl_key = "${bound_name}:${type_name}"
                     if (!@intToPtr(*Map(string, string), self.trait_impls).contains(impl_key)) {
-                        @arcRetain(self.ast)
                         self.ast = saved_ast
                         self.safe_mode = saved_safe_mode
                         release(@ptrToInt(saved_ast))
@@ -4461,7 +4438,6 @@ struct Checker {
         // Check if already instantiated — return cached func type
         const cached_sym = self.lookupSymbol(cache_key)
         if (cached_sym >= 0) {
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4496,9 +4472,7 @@ struct Checker {
             }
             // Skip body check if we're already in a re-check (prevents stack overflow
             // from deep generic recursion: A checks B checks C checks A...)
-            if (!self.in_body_recheck) {
-                self.checkFnDeclBody(fn_node, cache_key)
-            }
+            self.checkFnDeclBody(fn_node, cache_key)
             if (is_cross_file) {
                 self.expr_types = saved_expr_types
             }
@@ -4511,7 +4485,6 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @arcRetain(self.ast)
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
@@ -4544,7 +4517,6 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @arcRetain(self.ast)
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4556,7 +4528,6 @@ struct Checker {
         const tp_count = s_tp.count
 
         if (ta_count != tp_count) {
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4566,7 +4537,6 @@ struct Checker {
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
         if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4596,7 +4566,6 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @arcRetain(self.ast)
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
@@ -4628,7 +4597,6 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @arcRetain(self.ast)
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4640,7 +4608,6 @@ struct Checker {
         const tp_count = s_tp_ne.count
 
         if (ta_count != tp_count) {
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4650,7 +4617,6 @@ struct Checker {
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
         if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
-            @arcRetain(self.ast)
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4680,7 +4646,6 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @arcRetain(self.ast)
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
