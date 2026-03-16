@@ -7467,7 +7467,7 @@ struct Lowerer {
     fn lowerGenericFnInstanceInner(inst: *GenericInstInfo, concrete_name: string) void {
         // Swap to the defining file's AST for cross-file generic resolution
         const saved_tree = self.tree
-        self.tree = inst.getAst()
+        @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(inst.getAst())
 
         // Get the fn_decl node from the defining file's AST
         const fn_node = self.tree.getNode(inst.generic_node)
@@ -7478,7 +7478,7 @@ struct Lowerer {
             else => {},
         }, else => {} }
         if (!found) {
-            self.tree = saved_tree
+            @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(saved_tree)
             return
         }
 
@@ -7530,7 +7530,7 @@ struct Lowerer {
                     // Restore and return — skip lowering entirely
                     self.chk.type_sub_keys.count = saved_sub_count
                     self.chk.type_sub_vals.count = saved_sub_count
-                    self.tree = saved_tree
+                    @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(saved_tree)
                     return
                 }
 
@@ -7552,9 +7552,12 @@ struct Lowerer {
         var fresh_types: Map(int, int) = .{}
         self.chk.expr_types = fresh_types
 
-        // Swap checker's AST to defining file for cross-file generic body checking
+        // Swap checker's AST to defining file for cross-file generic body checking.
+        // Use raw pointer write to BYPASS ARC — these are temporary swaps that restore
+        // the original. ARC's field assignment would release the old AST (freeing it if
+        // refcount hits 0), causing use-after-free when other generics reference it.
         const saved_chk_ast = self.chk.ast
-        self.chk.ast = self.tree
+        @intToPtr(*int, @ptrToInt(&self.chk.ast)).* = @ptrToInt(self.tree)
 
         // Re-check the body with substitutions active to populate expr_types.
         self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
@@ -7640,8 +7643,8 @@ struct Lowerer {
         self.chk.type_sub_keys.count = saved_sub_count
         self.chk.type_sub_vals.count = saved_sub_count
         self.chk.expr_types = saved_expr_types
-        self.chk.ast = saved_chk_ast
-        self.tree = saved_tree
+        @intToPtr(*int, @ptrToInt(&self.chk.ast)).* = @ptrToInt(saved_chk_ast)
+        @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(saved_tree)
     }
 
     /// Parse an integer from a substring of s[start..end].

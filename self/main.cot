@@ -466,6 +466,15 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
         }
     }
 
+    // Validate all checkers' AST pointers before lowering
+    for vi in 0..checkers.count {
+        const chk = @intToPtr(*Checker, checkers.get(vi))
+        if (chk.ast.nodes.count < 0 or chk.ast.nodes.count > 100000) {
+            @panic("CHECKER AST FREED for file ${vi}: nodes.count=${chk.ast.nodes.count}")
+        }
+    }
+    eprintln("=== All ${checkers.count} checker ASTs valid ===")
+
     // Lower each file using stored checkers (Zig driver.zig line 547: &checkers.items[i])
     for fi in 0..parsed_files.count {
         const pf = parsed_files.get(fi)
@@ -706,6 +715,14 @@ fn lowerOneFile(cf: CheckedFile, types: TypeRegistry, shared: SharedLowerState, 
     shared.generated_dict_helpers = lower_inst.generated_dict_helpers
     shared.dict_arg_names = lower_inst.dict_arg_names
     shared.shape_analysis_cache = lower_inst.shape_analysis_cache
+
+    // Zero only the managed pointer fields to prevent ARC from releasing them.
+    // tree (*Ast) and chk (*Checker) are owned by parsed_files/checkers.
+    // err (*ErrorReporter) is owned by checker_errs.
+    // Don't zero the entire struct — shared state (builder, Maps) must survive.
+    @intToPtr(*int, @ptrToInt(&lower_inst.tree)).* = 0
+    @intToPtr(*int, @ptrToInt(&lower_inst.chk)).* = 0
+    @intToPtr(*int, @ptrToInt(&lower_inst.err)).* = 0
 }
 
 /// Compute .wasm output path from source path.
@@ -941,6 +958,10 @@ fn parseFileRecursive(file_path: string, parsed_files: *List(ParsedFile), seen: 
     var errs = ErrorReporter.initWithSource(file_path, content)
     var s = Scanner.initWithErrors(content, &errs)
     var ast = Ast.initHeap(file_path)
+    // Make AST effectively immortal — retain enough times to counteract all ARC
+    // releases from field assignments, scope exits, etc. across multi-file compilation.
+    var ri = 0
+    while (ri < 20) { retain(@ptrToInt(ast)); ri += 1 }
     var p = Parser.init(s, ast, errs)
     if (project_safe) { p.safe_mode = true }
     p.parseFile()
@@ -956,7 +977,12 @@ fn parseFileRecursive(file_path: string, parsed_files: *List(ParsedFile), seen: 
     }
     in_progress.pop()
 
-    // Add this file AFTER all dependencies (dependency order)
+    // Add this file AFTER all dependencies (dependency order).
+    // Retain the AST so it survives past this function's scope exit.
+    // Without this, ARC decrements the refcount to 0 and frees the AST,
+    // leaving parsed_files with a dangling pointer.
+    // Swift pattern: Unmanaged.passRetained — transfer ownership to the container.
+    retain(@ptrToInt(ast))
     parsed_files.append(ParsedFile { path: file_path, content: content, ast: ast })
 }
 
