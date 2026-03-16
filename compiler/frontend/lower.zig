@@ -9657,8 +9657,9 @@ pub const Lowerer = struct {
                     const loc_val = try fb.emitConstSlice(loc_idx, bc.span);
                     var loc_args = [_]ir.NodeIndex{ fd_arg, loc_val };
                     _ = try fb.emitCall("write", &loc_args, true, TypeRegistry.I64, bc.span);
-                    var bt_args = [_]ir.NodeIndex{};
-                    _ = try fb.emitCall("__cot_print_backtrace", &bt_args, false, TypeRegistry.VOID, bc.span);
+                    // NOTE: backtrace_symbols_fd can SIGBUS if heap is corrupt (ARC use-after-free).
+                    // Only call backtrace from @panic (user-initiated), not from @trap (bounds checks).
+                    // @trap is the hot path — bounds checks in List.get/set, assertions, etc.
                     const exit_code = try fb.emitConstInt(2, TypeRegistry.I64, bc.span);
                     var exit_args = [_]ir.NodeIndex{exit_code};
                     _ = try fb.emitCall("exit", &exit_args, false, TypeRegistry.VOID, bc.span);

@@ -7551,8 +7551,12 @@ struct Lowerer {
         const saved_chk_ast = self.chk.ast
         self.chk.ast = self.tree
 
-        // Re-check the body with substitutions active
-        self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
+        // Re-check the body with substitutions active.
+        // Skip if already checked — prevents exponential re-checking when generic
+        // bodies call other generics (Zig: isDefined guard in checkGenericCall).
+        if (!self.builder.hasFunc(concrete_name)) {
+            self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
+        }
 
         // Lower the concrete function body
         const return_type = self.resolveTypeNode(fn_d.return_type)
