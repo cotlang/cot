@@ -277,6 +277,7 @@ struct Lowerer {
         eprintln("  decls: ${self.tree.file_decls.count}")
         for i in 0..self.tree.file_decls.count {
             const decl_idx = self.tree.file_decls.get(i)
+            eprintln("    d[${i}]")
             self.lowerDecl(decl_idx)
         }
         eprintln("  decls done, queued generics...")
@@ -7431,6 +7432,7 @@ struct Lowerer {
     fn lowerQueuedGenericFunctions() void {
         var made_progress = true
         var iter_count = 0
+        const types_before = self.types.types.count
         while (made_progress) {
             made_progress = false
             iter_count += 1
@@ -7449,11 +7451,16 @@ struct Lowerer {
             for i in 0..pending.count {
                 const name = pending.get(i)
                 if (self.builder.hasFunc(name)) { continue }
+                eprintln("      gen: ${name}")
                 self.lowerGenericFnInstance(name)
+                if (!self.builder.hasFunc(name)) {
+                    eprintln("      FAILED to add: ${name}")
+                }
                 made_progress = true
             }
         }
-        eprintln("    generic: ${iter_count} iterations total")
+        const types_after = self.types.types.count
+        eprintln("    generic: ${iter_count} iterations, types ${types_before} -> ${types_after}")
     }
 
     /// Lower one concrete generic function as a top-level function.
