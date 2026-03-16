@@ -274,12 +274,16 @@ struct Lowerer {
 
     /// Lower all root declarations into the builder.
     fn lowerToBuilder() void {
+        eprintln("  decls: ${self.tree.file_decls.count}")
         for i in 0..self.tree.file_decls.count {
             const decl_idx = self.tree.file_decls.get(i)
             self.lowerDecl(decl_idx)
         }
+        eprintln("  decls done, queued generics...")
         self.lowerQueuedGenericFunctions()
+        eprintln("  generics done, auto deinits...")
         self.emitPendingAutoDeinits()
+        eprintln("  lowerToBuilder complete")
     }
 
     /// Generate test runner: main() that calls each test and reports pass/fail.
@@ -7425,14 +7429,11 @@ struct Lowerer {
     // ========================================================================
 
     fn lowerQueuedGenericFunctions() void {
-        // Go pattern: deferred actions run after all call sites processed.
-        // We must loop until no new instantiations are queued, because lowering
-        // one generic body may queue new ones (e.g. List_append → List_ensureCapacity).
-        // Zig pattern: snapshot-then-process to avoid iterator invalidation.
         var made_progress = true
+        var iter_count = 0
         while (made_progress) {
             made_progress = false
-            // Snapshot: collect all inst_infos that need lowering
+            iter_count += 1
             var pending: List(string) = .{}
             const all_keys = @intToPtr(*Map(string, int), self.chk.generic_inst_by_name).keys()
             for i in 0..all_keys.count {
@@ -7440,6 +7441,9 @@ struct Lowerer {
                 if (!self.lowered_generics.contains(key)) { continue }
                 if (self.builder.hasFunc(key)) { continue }
                 pending.append(key)
+            }
+            if (pending.count > 0) {
+                eprintln("    generic iter ${iter_count}: ${pending.count} pending (all_keys=${all_keys.count})")
             }
             // Process collected snapshot (safe — no iterator active)
             for i in 0..pending.count {
@@ -7449,6 +7453,7 @@ struct Lowerer {
                 made_progress = true
             }
         }
+        eprintln("    generic: ${iter_count} iterations total")
     }
 
     /// Lower one concrete generic function as a top-level function.
@@ -7551,12 +7556,8 @@ struct Lowerer {
         const saved_chk_ast = self.chk.ast
         self.chk.ast = self.tree
 
-        // Re-check the body with substitutions active.
-        // Skip if already checked — prevents exponential re-checking when generic
-        // bodies call other generics (Zig: isDefined guard in checkGenericCall).
-        if (!self.builder.hasFunc(concrete_name)) {
-            self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
-        }
+        // Re-check the body with substitutions active to populate expr_types.
+        self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
 
         // Lower the concrete function body
         const return_type = self.resolveTypeNode(fn_d.return_type)

@@ -469,6 +469,7 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     // Lower each file using stored checkers (Zig driver.zig line 547: &checkers.items[i])
     for fi in 0..parsed_files.count {
         const pf = parsed_files.get(fi)
+        eprintln("[lower ${fi}/${parsed_files.count}] ${pf.path}")
         const chk_ptr = @intToPtr(*Checker, checkers.get(fi))
         const err_ptr = @intToPtr(*ErrorReporter, checker_errs.get(fi))
         // Register tree → module mapping
@@ -476,6 +477,7 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
             lower_shared.tree_module_map.set(@ptrToInt(pf.ast), lower_shared.module_names.get(pf.path))
         }
         lowerOneFile(CheckedFile { ast: pf.ast, errs: err_ptr, chk: chk_ptr }, types, lower_shared, lower_opts)
+        eprintln("[lower ${fi}] done, ${lower_shared.builder.funcs.count} funcs")
     }
 
     // Go init function pattern: generate master __cot_init_globals that calls all per-file inits.
