@@ -4095,17 +4095,21 @@ struct Checker {
         const ta_copy = copyString(ta_str)
         const tp_copy = copyString(tp_str)
 
+        // Copy concrete_name so the map key survives ARC cleanup of caller's scope
+        const name_copy = copyString(concrete_name)
         var inst = new GenericInstInfo {
-            concrete_name: concrete_name,
+            concrete_name: name_copy,
             generic_node: generic_node,
             type_args_str: ta_copy,
             type_param_names: tp_copy,
             ast_ptr: ast_ptr,
         }
         retain(@ptrToInt(inst))
+        retain(@ptrOf(name_copy))
         retain(@ptrOf(ta_copy))
         retain(@ptrOf(tp_copy))
-        @intToPtr(*Map(string, int), self.generic_inst_by_name).set(concrete_name, @ptrToInt(inst))
+        // Use retained name_copy as map key (original concrete_name may be freed by ARC)
+        @intToPtr(*Map(string, int), self.generic_inst_by_name).set(name_copy, @ptrToInt(inst))
     }
 
     /// Resolve a generic struct instantiation: List(int) → concrete List(5) type.

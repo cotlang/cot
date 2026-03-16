@@ -1,5 +1,18 @@
 # Claude AI Instructions
 
+## 🚨🚨🚨 NEVER USE DESTRUCTIVE GIT COMMANDS ON UNCOMMITTED WORK 🚨🚨🚨
+
+**DOZENS OF HOURS of work have been lost from Claude running `git checkout <file>` or `git restore <file>` to discard uncommitted changes.** This is the single most destructive behavior. NEVER do it.
+
+- **NEVER** run `git checkout -- <file>` or `git checkout HEAD -- <file>` on modified files
+- **NEVER** run `git restore <file>` on modified files
+- **To save work temporarily:** `git stash` (can be recovered with `git stash pop`)
+- **To compare with clean state:** `git stash && <test> && git stash pop`
+- **To abandon changes:** ASK THE USER FIRST — never decide unilaterally
+- Uncommitted changes often contain hours of debugging, partial fixes, and diagnostic code
+
+---
+
 ## 🚨 CRITICAL: `self/` uses `@safe` mode via `self/cot.json` (`"safe": true`)
 
 **ALL files in `self/` are compiled in `@safe` mode.** This is set at the project level in `self/cot.json`, NOT per-file. You do NOT need `@safe` at the top of each file — it applies automatically. This means:

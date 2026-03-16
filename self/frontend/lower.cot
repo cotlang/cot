@@ -7339,6 +7339,7 @@ struct Lowerer {
 
     /// Ensure a generic function instance is queued for lowering.
     fn ensureGenericFnQueued(inst: *GenericInstInfo) void {
+        if (@ptrToInt(inst) == 0 or @ptrToInt(inst) < 4096) { return }
         if (self.lowered_generics.contains(inst.concrete_name)) { return }
         self.lowered_generics.set(inst.concrete_name, 1)
         // Will be processed in lowerQueuedGenericFunctions
