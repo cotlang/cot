@@ -2156,8 +2156,9 @@ struct SSABuilder {
 
     fn emitMove(dst_addr: int, src: int, type_size: int, ir_node_idx: int) int {
         const cur = self.cur_block
-        const val_v = self.func.getValue(src)
-        const src_addr = if (val_v.op == SsaOp.load and val_v.argsLen() > 0) { val_v.args.get(0) } else { src }
+        // Zig reference: use src directly as source address.
+        // Do NOT unwrap load ops — that was an invention not in the reference.
+        const src_addr = src
         const move_val = self.func.newValue(SsaOp.move, VOID, cur, self.cur_pos_line, self.cur_pos_col)
         var mv = self.func.getValue(move_val)
         mv.addArg2(dst_addr, src_addr)
