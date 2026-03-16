@@ -674,6 +674,12 @@ struct Ast {
     }
 
     fn getNode(idx: int) Node {
+        if (self.nodes.count < 0 or self.nodes.count > 1000000) {
+            @panic("FREED AST detected in getNode")
+        }
+        if (idx < 0 or idx >= self.nodes.count) {
+            @panic("getNode OOB")
+        }
         return self.nodes.get(idx)
     }
 

@@ -238,6 +238,7 @@ struct Checker {
     // Comptime
     comptime_vars: Map(string, int),
     in_comptime: bool,
+    ast_swap_count: int,
 
     static fn init(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter) Checker {
         var symbols: List(Symbol) = .{}
@@ -283,6 +284,7 @@ struct Checker {
             in_async_fn: false,
             comptime_vars: comptime_vars,
             in_comptime: false,
+            ast_swap_count: 0,
         }
     }
 
@@ -4141,6 +4143,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4150,6 +4154,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const tp_count = s_tp.count
 
         if (ta_count != tp_count) {
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4183,6 +4189,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
@@ -4269,6 +4277,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
             const saved_ast = self.ast
             retain(@ptrToInt(saved_ast))
             const saved_safe_mode = self.safe_mode
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = entry.getAst()
             self.safe_mode = self.ast.safe_mode
 
@@ -4348,6 +4358,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
             }
 
             // Restore caller's AST and safe_mode
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4394,6 +4406,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4406,6 +4420,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const tp_count = fn_tp.count
 
         if (call_args_count != tp_count) {
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4422,6 +4438,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
                     const type_name = self.types.typeName(resolved_args.get(bi))
                     const impl_key = "${bound_name}:${type_name}"
                     if (!@intToPtr(*Map(string, string), self.trait_impls).contains(impl_key)) {
+                        self.ast_swap_count = self.ast_swap_count + 1
+                        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
                         self.ast = saved_ast
                         self.safe_mode = saved_safe_mode
                         release(@ptrToInt(saved_ast))
@@ -4438,6 +4456,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         // Check if already instantiated — return cached func type
         const cached_sym = self.lookupSymbol(cache_key)
         if (cached_sym >= 0) {
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4485,6 +4505,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
@@ -4517,6 +4539,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4528,6 +4552,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const tp_count = s_tp.count
 
         if (ta_count != tp_count) {
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4537,6 +4563,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
         if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4566,6 +4594,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
@@ -4597,6 +4627,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
@@ -4608,6 +4640,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         const tp_count = s_tp_ne.count
 
         if (ta_count != tp_count) {
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4617,6 +4651,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
         if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
+            self.ast_swap_count = self.ast_swap_count + 1
+            eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
@@ -4646,6 +4682,8 @@ const sym_idx = self.lookupSymbol(lookup_name)
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
+        self.ast_swap_count = self.ast_swap_count + 1
+        eprintln("  ast_swap #${self.ast_swap_count}: old=${@ptrToInt(self.ast)}")
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
