@@ -4147,7 +4147,8 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(info.getAst())
+        @arcRetain(self.ast)
+        self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
         // Read struct definition from DEFINING file's AST
@@ -4156,7 +4157,8 @@ struct Checker {
         const tp_count = s_tp.count
 
         if (ta_count != tp_count) {
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
@@ -4189,7 +4191,8 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+        @arcRetain(self.ast)
+        self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 
@@ -4275,7 +4278,8 @@ struct Checker {
             const saved_ast = self.ast
             retain(@ptrToInt(saved_ast))
             const saved_safe_mode = self.safe_mode
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(entry.getAst())
+            @arcRetain(self.ast)
+            self.ast = entry.getAst()
             self.safe_mode = self.ast.safe_mode
 
             // Extract impl_block fields from DEFINING file's AST
@@ -4354,7 +4358,8 @@ struct Checker {
             }
 
             // Restore caller's AST and safe_mode
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
         }
@@ -4400,7 +4405,8 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(info.getAst())
+        @arcRetain(self.ast)
+        self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
         // Extract fn_decl fields from DEFINING file's AST
@@ -4412,7 +4418,8 @@ struct Checker {
         const tp_count = fn_tp.count
 
         if (call_args_count != tp_count) {
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
@@ -4428,7 +4435,8 @@ struct Checker {
                     const type_name = self.types.typeName(resolved_args.get(bi))
                     const impl_key = "${bound_name}:${type_name}"
                     if (!@intToPtr(*Map(string, string), self.trait_impls).contains(impl_key)) {
-                        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+                        @arcRetain(self.ast)
+                        self.ast = saved_ast
                         self.safe_mode = saved_safe_mode
                         release(@ptrToInt(saved_ast))
                         self.reportError(idx, ErrorCode.e300, "type does not satisfy trait bound")
@@ -4444,7 +4452,8 @@ struct Checker {
         // Check if already instantiated — return cached func type
         const cached_sym = self.lookupSymbol(cache_key)
         if (cached_sym >= 0) {
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
             return self.getSymbol(cached_sym).type_idx
@@ -4489,7 +4498,8 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+        @arcRetain(self.ast)
+        self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 
@@ -4521,7 +4531,8 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(info.getAst())
+        @arcRetain(self.ast)
+        self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
         // Extract struct_decl fields from DEFINING file's AST
@@ -4532,7 +4543,8 @@ struct Checker {
         const tp_count = s_tp.count
 
         if (ta_count != tp_count) {
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
@@ -4541,7 +4553,8 @@ struct Checker {
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
         if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
             return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
@@ -4570,7 +4583,8 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+        @arcRetain(self.ast)
+        self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 
@@ -4601,7 +4615,8 @@ struct Checker {
         const saved_ast = self.ast
         retain(@ptrToInt(saved_ast))
         const saved_safe_mode = self.safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(info.getAst())
+        @arcRetain(self.ast)
+        self.ast = info.getAst()
         self.safe_mode = self.ast.safe_mode
 
         // Extract struct_decl fields from DEFINING file's AST
@@ -4612,7 +4627,8 @@ struct Checker {
         const tp_count = s_tp_ne.count
 
         if (ta_count != tp_count) {
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
@@ -4621,7 +4637,8 @@ struct Checker {
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
         if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
-            @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+            @arcRetain(self.ast)
+            self.ast = saved_ast
             self.safe_mode = saved_safe_mode
             release(@ptrToInt(saved_ast))
             return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
@@ -4650,7 +4667,8 @@ struct Checker {
         self.type_sub_vals.count = old_sub_count
 
         // Restore caller's AST and safe_mode
-        @intToPtr(*int, @ptrToInt(&self.ast)).* = @ptrToInt(saved_ast)
+        @arcRetain(self.ast)
+        self.ast = saved_ast
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 

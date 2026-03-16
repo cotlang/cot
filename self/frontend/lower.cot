@@ -7467,7 +7467,8 @@ struct Lowerer {
     fn lowerGenericFnInstanceInner(inst: *GenericInstInfo, concrete_name: string) void {
         // Swap to the defining file's AST for cross-file generic resolution
         const saved_tree = self.tree
-        @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(inst.getAst())
+        @arcRetain(self.tree)
+        self.tree = inst.getAst()
 
         // Get the fn_decl node from the defining file's AST
         const fn_node = self.tree.getNode(inst.generic_node)
@@ -7478,7 +7479,8 @@ struct Lowerer {
             else => {},
         }, else => {} }
         if (!found) {
-            @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(saved_tree)
+            @arcRetain(self.tree)
+            self.tree = saved_tree
             return
         }
 
@@ -7530,7 +7532,8 @@ struct Lowerer {
                     // Restore and return — skip lowering entirely
                     self.chk.type_sub_keys.count = saved_sub_count
                     self.chk.type_sub_vals.count = saved_sub_count
-                    @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(saved_tree)
+                    @arcRetain(self.tree)
+                    self.tree = saved_tree
                     return
                 }
 
@@ -7557,7 +7560,8 @@ struct Lowerer {
         // the original. ARC's field assignment would release the old AST (freeing it if
         // refcount hits 0), causing use-after-free when other generics reference it.
         const saved_chk_ast = self.chk.ast
-        @intToPtr(*int, @ptrToInt(&self.chk.ast)).* = @ptrToInt(self.tree)
+        @arcRetain(self.chk.ast)
+        self.chk.ast = self.tree
 
         // Re-check the body with substitutions active to populate expr_types.
         self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
@@ -7643,8 +7647,10 @@ struct Lowerer {
         self.chk.type_sub_keys.count = saved_sub_count
         self.chk.type_sub_vals.count = saved_sub_count
         self.chk.expr_types = saved_expr_types
-        @intToPtr(*int, @ptrToInt(&self.chk.ast)).* = @ptrToInt(saved_chk_ast)
-        @intToPtr(*int, @ptrToInt(&self.tree)).* = @ptrToInt(saved_tree)
+        @arcRetain(self.chk.ast)
+        self.chk.ast = saved_chk_ast
+        @arcRetain(self.tree)
+        self.tree = saved_tree
     }
 
     /// Parse an integer from a substring of s[start..end].

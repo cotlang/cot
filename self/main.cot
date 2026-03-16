@@ -958,10 +958,6 @@ fn parseFileRecursive(file_path: string, parsed_files: *List(ParsedFile), seen: 
     var errs = ErrorReporter.initWithSource(file_path, content)
     var s = Scanner.initWithErrors(content, &errs)
     var ast = Ast.initHeap(file_path)
-    // Make AST effectively immortal — retain enough times to counteract all ARC
-    // releases from field assignments, scope exits, etc. across multi-file compilation.
-    var ri = 0
-    while (ri < 20) { retain(@ptrToInt(ast)); ri += 1 }
     var p = Parser.init(s, ast, errs)
     if (project_safe) { p.safe_mode = true }
     p.parseFile()
