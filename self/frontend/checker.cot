@@ -219,7 +219,6 @@ struct Checker {
     current_return_type: int,
     in_loop: bool,
     safe_mode: bool,
-    check_depth: int,
     // Generic support
     generic_structs: int,  // raw ptr to shared Map        // name → struct_decl node_idx
     generic_functions: int,  // raw ptr to shared Map      // name → fn_decl node_idx
@@ -284,7 +283,6 @@ struct Checker {
             in_async_fn: false,
             comptime_vars: comptime_vars,
             in_comptime: false,
-            check_depth: 0,
         }
     }
 
@@ -977,11 +975,6 @@ struct Checker {
     }
 
     fn checkFnDeclBody(idx: int, lookup_name: string) void {
-        self.check_depth = self.check_depth + 1
-        if (self.check_depth > 100) {
-            self.check_depth = self.check_depth - 1
-            return  // Recursion limit — skip deep re-checks
-        }
         const sym_idx = self.lookupSymbol(lookup_name)
         if (sym_idx < 0) {
             // Symbol not found — skip re-checking (function will be lowered without body check)
@@ -1062,7 +1055,6 @@ struct Checker {
             self.current_return_type = old_ret
             self.popScope()
         }, else => {} }, else => {} }
-        self.check_depth = self.check_depth - 1
     }
 
     fn checkTopVarDecl(idx: int) void {
