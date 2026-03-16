@@ -485,6 +485,8 @@ struct Lowerer {
             self.clearPerFunctionState()
             for i in 0..self.pending_global_inits.count {
                 const gi = self.pending_global_inits.get(i)
+                // Skip invalid node indices (can happen with cross-file generic globals)
+                if (gi.value_node < 0 or gi.value_node >= self.tree.nodes.count) { continue }
                 const node = self.tree.getNode(gi.value_node)
                 switch (node) { Node.expr |e| => {
                     const value = self.lowerExpr(e, gi.value_node)
