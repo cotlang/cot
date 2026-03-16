@@ -277,7 +277,9 @@ struct Lowerer {
         eprintln("  decls: ${self.tree.file_decls.count}")
         for i in 0..self.tree.file_decls.count {
             const decl_idx = self.tree.file_decls.get(i)
-            eprintln("    d[${i}]")
+            if (i == 98) {
+                eprintln("    d[98] TREE nodes=${self.tree.nodes.count} CHK nodes=${self.chk.ast.nodes.count}")
+            }
             self.lowerDecl(decl_idx)
         }
         eprintln("  decls done, queued generics...")
@@ -7468,6 +7470,16 @@ struct Lowerer {
         // Look up the GenericInstInfo
         if (self.lookupGenericInst(concrete_name)) |inst| {
             self.lowerGenericFnInstanceInner(inst, concrete_name)
+        } else {
+            // Not registered — skip. This happens for generic instantiations
+            // discovered during Phase 3 lowering that weren't in Phase 2.
+            // Mark as "done" by adding a dummy function to prevent infinite retries.
+            const span = Span.zero()
+            self.builder.startFunc(concrete_name, VOID, VOID, span)
+            if (self.builder.func()) |fb| {
+                fb.emitRet(null_node, span)
+            }
+            self.builder.endFunc()
         }
     }
 

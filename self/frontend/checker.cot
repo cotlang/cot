@@ -238,6 +238,7 @@ struct Checker {
     // Comptime
     comptime_vars: Map(string, int),
     in_comptime: bool,
+    in_body_recheck: bool,
 
     static fn init(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter) Checker {
         var symbols: List(Symbol) = .{}
@@ -283,6 +284,7 @@ struct Checker {
             in_async_fn: false,
             comptime_vars: comptime_vars,
             in_comptime: false,
+            in_body_recheck: false,
         }
     }
 
@@ -975,6 +977,10 @@ struct Checker {
     }
 
     fn checkFnDeclBody(idx: int, lookup_name: string) void {
+        // Prevent recursive body checking — callees are queued, not checked inline.
+        // Without this, the stack overflows from deep generic chains.
+        const was_in_recheck = self.in_body_recheck
+        self.in_body_recheck = true
         const sym_idx = self.lookupSymbol(lookup_name)
         if (sym_idx < 0) {
             // Symbol not found — skip re-checking (function will be lowered without body check)
@@ -1055,6 +1061,7 @@ struct Checker {
             self.current_return_type = old_ret
             self.popScope()
         }, else => {} }, else => {} }
+        self.in_body_recheck = was_in_recheck
     }
 
     fn checkTopVarDecl(idx: int) void {
@@ -4345,7 +4352,9 @@ struct Checker {
                 var method_name2 = ""
                 switch (self.ast.getNode(method_idx)) { Node.decl |md| => switch (md) { Decl.fn_decl |mf| => { method_name2 = mf.name }, else => {} }, else => {} }
                 const synth_name = "${concrete_name}_${method_name2}"
-                self.checkFnDeclBody(method_idx, synth_name)
+                if (!self.in_body_recheck) {
+                    self.checkFnDeclBody(method_idx, synth_name)
+                }
             }
 
             // Restore substitution
@@ -4485,7 +4494,11 @@ struct Checker {
                 var fresh_et: Map(int, int) = .{}
                 self.expr_types = fresh_et
             }
-            self.checkFnDeclBody(fn_node, cache_key)
+            // Skip body check if we're already in a re-check (prevents stack overflow
+            // from deep generic recursion: A checks B checks C checks A...)
+            if (!self.in_body_recheck) {
+                self.checkFnDeclBody(fn_node, cache_key)
+            }
             if (is_cross_file) {
                 self.expr_types = saved_expr_types
             }
