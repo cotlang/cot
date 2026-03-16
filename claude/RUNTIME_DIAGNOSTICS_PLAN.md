@@ -1,8 +1,22 @@
 # Runtime Diagnostics Enhancement Plan
 
-**Date:** 2026-03-16
-**Context:** Self-hosting dogfooding exposed that native binary crashes are nearly impossible to diagnose. Hours wasted on binary-search-with-@panic to find crash sites.
+**Date:** 2026-03-16 (updated end of session)
+**Context:** Self-hosting dogfooding exposed that native binary crashes are nearly impossible to diagnose.
 **Goal:** Any crash in a Cot native binary should immediately print a stack trace with file:line information.
+
+## Implementation Status
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 1: Signal handlers | ✅ DONE | `signal_native.zig`: `__cot_signal_handler` + `__cot_install_signals` |
+| Phase 2: @trap file:line | ✅ DONE | Shows source location before halt. Cross-file generics show filename+offset |
+| Phase 3: Stack traces | ⚠️ PARTIAL | `backtrace_symbols_fd` works for @panic but removed from @trap (can SIGBUS on corrupt heap) |
+| Phase 4: Symbol resolution | ✅ DONE | `backtrace_symbols_fd` resolves ASLR-aware function names |
+
+**Known issues:**
+- @trap backtrace removed because `backtrace_symbols_fd` crashes when heap is corrupt (ARC use-after-free). Only @panic gets backtraces now.
+- Cross-file generic @trap shows `filename:offset(N)` instead of `filename:line` (no source text for imported files in lowerer)
+- Signal handler can't print backtrace (not async-signal-safe)
 
 ---
 

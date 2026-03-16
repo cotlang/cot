@@ -106,7 +106,7 @@ cot build self/main.cot -o /tmp/selfcot
 - `self/test_tiny.cot` is a minimal test file for smoke-testing selfcot
 - 43,364 lines across 42 files, 418 tests — frontend, codegen, SSA passes, runtime all complete
 
-**Current status (as of 2026-03-16):** selfcot type-checks itself (`selfcot check self/main.cot` passes all 38 files). Compiles simple files to valid Wasm (`test_tiny.cot`, `token.cot`, files with string/list imports). **Blocker:** methods with struct-by-value parameters crash in SSA builder (e.g. `Span_merge(other: Span)`). Free functions with struct params work. The bug is in how the SSA builder handles `self` pointer + compound param decomposition together.
+**Current status (as of 2026-03-16):** selfcot compiles 6 of 12 frontend files to valid Wasm: token.cot, source.cot, errors.cot, types.cot (1572 lines), scanner.cot (774 lines), ast.cot (1532 lines). ir.cot compiles in 0.5s/15MB but crashes in `retain()` — ARC use-after-free where `@ptrToInt` strips management from pointers stored in Maps, then the original object is freed at scope exit. Remaining files (ssa, ssa_builder, parser, checker, lower) untested. **Blocker:** Zig compiler ARC doesn't track `@ptrToInt` as an ownership transfer — managed pointers stored as raw ints in Maps get freed when the local goes out of scope.
 
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 
