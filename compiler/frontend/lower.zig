@@ -2453,6 +2453,11 @@ pub const Lowerer = struct {
                             // must ALWAYS retain because the field can be overwritten later
                             // (triggering release of old value). The baseHasCleanup check
                             // misses this case since method params have no cleanup entry.
+                            // Swift ensurePlusOne (ManagedValue.cpp:289-299):
+                            // Any +0 non-trivial value must be copied (retained) when
+                            // binding to a new variable. Default to true for safety.
+                            // Only skip retain for known-unmanaged sources (ident with
+                            // no cleanup = unmanaged local like loop counter).
                             const needs_retain = blk: {
                                 if (e == .ident) {
                                     if (fb.lookupLocal(e.ident.name)) |src_local_idx| {
@@ -2469,7 +2474,10 @@ pub const Lowerer = struct {
                                 }
                                 if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                                 if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                                break :blk false;
+                                // Default: retain any +0 ARC value from complex expressions
+                                // (if-expr, switch-expr, block-expr, etc.).
+                                // Swift ensurePlusOne copies unconditionally for non-trivial types.
+                                break :blk true;
                             };
                             if (needs_retain) {
                                 var retain_args = [_]ir.NodeIndex{value_node};
@@ -3098,16 +3106,18 @@ pub const Lowerer = struct {
         switch (target_expr) {
             .ident => |id| {
                 if (fb.lookupLocal(id.name)) |local_idx| {
-                    // ARC: Release old value before storing new if local has cleanup
-                    // WasmGC: skip retain/release — GC handles lifetimes
+                    // ARC: Retain-before-release for local assignment.
+                    // Swift SILGen pattern (SILLowerAggregateInstrs.cpp:75-96, TypeLowering.cpp:1213-1216):
+                    //   load old → retain new → store new → release old
+                    // Retain-before-release prevents use-after-free when old == new.
+                    // Same pattern as field assignment (line ~3287). Swift makes no distinction.
                     if (!self.target.isWasm() and self.cleanup_stack.hasCleanupForLocal(local_idx)) {
                         const local_type = fb.locals.items[local_idx].type_idx;
+                        // 1. Load old value BEFORE store (needed for release after)
                         const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
-                        var release_args = [_]ir.NodeIndex{old_value};
-                        _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, assign.span);
 
-                        // Check if RHS is +1 (owned) or +0 (borrowed)
-                        // Reference: Swift SILGenAssign.cpp — assignment consumes +1, retains +0
+                        // 2. Retain new value if borrowed (+0), then store
+                        // Swift ensurePlusOne (ManagedValue.cpp:289): copies +0 to +1 before assignment
                         const rhs_node = self.tree.getNode(assign.value);
                         const rhs_expr = if (rhs_node) |n| n.asExpr() else null;
                         const is_owned = if (rhs_expr) |e| (e == .new_expr or e == .call) else false;
@@ -3122,6 +3132,10 @@ pub const Lowerer = struct {
                             _ = try fb.emitStoreLocal(local_idx, value_node, assign.span);
                             self.cleanup_stack.updateValueForLocal(local_idx, value_node);
                         }
+
+                        // 3. Release old value AFTER store (safe even if old == new)
+                        var release_args = [_]ir.NodeIndex{old_value};
+                        _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, assign.span);
                     } else {
                         const local_type = fb.locals.items[local_idx].type_idx;
                         const local_info = self.type_reg.get(local_type);

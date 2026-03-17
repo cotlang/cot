@@ -416,10 +416,6 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     var in_progress: List(string) = .{}
     parseFileRecursive(path, &parsed_files, seen, in_progress, project_safe)
 
-    // ================================================================
-    // Phase 2: Check all files — flat loop (Zig driver.zig lines 431-449)
-    // Store checkers for reuse in Phase 3 (Zig: checkers ArrayList).
-    // ================================================================
     var shared = SharedCheckerState.init()
     var checked_scopes: Map(string, CheckedScopeEntry) = .{}
     var checkers: List(int) = .{}  // @ptrToInt of heap-allocated Checkers
@@ -471,7 +467,6 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
         const pf = parsed_files.get(fi)
         const chk_ptr = @intToPtr(*Checker, checkers.get(fi))
         const err_ptr = @intToPtr(*ErrorReporter, checker_errs.get(fi))
-        // Register tree → module mapping
         if (lower_shared.module_names.contains(pf.path)) {
             lower_shared.tree_module_map.set(@ptrToInt(pf.ast), lower_shared.module_names.get(pf.path))
         }
