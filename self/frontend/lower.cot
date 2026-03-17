@@ -8409,7 +8409,6 @@ struct Lowerer {
     /// Resolve a type expression AST node to a type index.
     fn resolveTypeNode(idx: int) int {
         if (idx == null_node) { return VOID }
-        // Prefer checker's per-file scoped resolution (Zig lower.zig:10060)
         if (self.chk.expr_types.contains(idx)) {
             return self.chk.expr_types.get(idx)
         }
@@ -8425,12 +8424,10 @@ struct Lowerer {
             // In @safe mode, the parser creates self params with Expr.ident type (not type_expr).
             // Resolve by NAME directly — avoids AST mismatch between lowerer and checker.
             Expr.ident |id| => {
-                // Check type substitution first (active during generic instantiation)
                 if (self.chk.hasTypeSubstitution()) {
                     const sub = self.chk.lookupTypeSub(id.name)
                     if (sub >= 0) { return sub }
                 }
-                // Look up in type registry by name
                 const tid = self.types.lookupByName(id.name)
                 if (tid >= 0) { return tid }
                 return VOID

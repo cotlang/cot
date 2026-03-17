@@ -176,7 +176,7 @@ struct GenericInstInfo {
 
 struct SharedCheckerState {
     global_map: int,                         // raw ptr to Map(string, int) — global scope
-    symbols: List(Symbol),
+    symbols: *List(Symbol),                  // shared pointer — NOT value-copied
     generic_structs: int,                    // raw ptr to Map(string, int) — Zig SharedGenericContext pattern
     generic_functions: int,                  // raw ptr to Map(string, int)
     instantiation_cache: int,               // raw ptr to Map(string, int)
@@ -186,11 +186,10 @@ struct SharedCheckerState {
     trait_impls: int,                        // raw ptr to Map(string, string)
 
     static fn init() SharedCheckerState {
-        var symbols: List(Symbol) = .{}
         var generic_impl_entries: List(GenericImplEntry) = .{}
         return SharedCheckerState {
             global_map: allocMap(),
-            symbols: symbols,
+            symbols: allocSymbolList(),
             generic_structs: allocMap(),
             generic_functions: allocMap(),
             instantiation_cache: allocMap(),
@@ -210,7 +209,7 @@ struct Checker {
     types: *TypeRegistry,
     ast: *Ast,
     err: *ErrorReporter,
-    symbols: List(Symbol),
+    symbols: *List(Symbol),
     // Scope chain (parallel List(int) arrays)
     scope_parents: List(int),
     scope_maps: List(int),       // raw pointers to heap-allocated Map(string, int)
@@ -243,7 +242,7 @@ struct Checker {
     body_check_depth: int,
 
     static fn init(ast: *Ast, types: *TypeRegistry, err: *ErrorReporter) Checker {
-        var symbols: List(Symbol) = .{}
+        var symbols = allocSymbolList()
         var scope_parents: List(int) = .{}
         var scope_maps: List(int) = .{}
 
@@ -3803,19 +3802,18 @@ struct Checker {
     fn resolveNamedType(idx: int) int {
         var name = ""
         switch (self.ast.getNode(idx)) { Node.expr |e| => switch (e) { Expr.ident |id| => { name = id.name }, else => {} }, else => {} }
-        // Check type substitution first (active during generic instantiation)
         if (self.hasTypeSubstitution()) {
             const sub = self.lookupTypeSub(name)
             if (sub >= 0) { return sub }
         }
-        // Check scope first (per-file resolution, Zig resolveTypeByName pattern)
         const sym_idx = self.lookupSymbol(name)
         if (sym_idx >= 0) {
             const sym = self.getSymbol(sym_idx)
             if (sym.is_type and sym.type_idx != invalid_type) { return sym.type_idx }
         }
-        // Fallback: type registry (for types not in scope)
         const type_idx = self.types.lookupByName(name)
+
+
         if (type_idx >= 0) { return type_idx }
         const type_suggestion = self.findSimilarType(name)
         if (type_suggestion) |ts| {
@@ -4045,6 +4043,8 @@ struct Checker {
 
     fn safeWrapType(type_idx: int) int {
         if (!self.safe_mode) { return type_idx }
+
+
         const t = self.types.get(type_idx)
         if (t.tag == TAG_STRUCT) {
             return self.types.makePointer(type_idx)
@@ -5591,6 +5591,16 @@ fn allocMap() int {
     mp.count = 0
     mp.capacity = 0
     return ptr
+}
+
+/// Allocate a shared List(Symbol) on the heap.
+/// All checkers share this through a pointer — prevents value-copy aliasing bugs.
+/// Uses alloc+zero because selfcot can't resolve `new List(Symbol)` in free functions.
+/// TODO: fix selfcot's type resolution for generic types in free functions.
+fn allocSymbolList() *List(Symbol) {
+    const ptr = alloc(0, 24)
+    memset_zero(ptr, 24)
+    return @intToPtr(*List(Symbol), ptr)
 }
 
 // ============================================================================
