@@ -86,6 +86,8 @@ pub const SSABuilder = struct {
                     const num_slots = @max(1, (local.size + 7) / 8);
                     next_slot += num_slots;
                 }
+
+
             } else {
                 // Overlap group path: compute max arm sizes, share stack regions
                 // Pass 1: compute per-arm sizes within each group
@@ -148,6 +150,8 @@ pub const SSABuilder = struct {
                         aentry.value_ptr.* += num_slots;
                     }
                 }
+
+
             }
         }
 

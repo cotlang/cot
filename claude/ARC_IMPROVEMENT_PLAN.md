@@ -1,6 +1,8 @@
 # ARC Improvement Plan — Proper Fix Per Swift Reference
 
 **Date:** 2026-03-17
+**Status:** PARTIALLY RESOLVED — RC1 (copy witness) confirmed NOT a bug, RC2 (field assignment ARC) FIXED via `load [copy]` pattern in lower.zig:2448-2470, RC3 (stack overflow) root-caused to native codegen stack frame bloat (see STACK_FRAME_ANALYSIS.md).
+
 **Context:** Self-hosting dogfooding exposed that the Zig compiler's ARC implementation doesn't properly handle managed pointer lifetimes in three scenarios. Instead of fixing these in the Zig compiler, 15+ hacks were added to self/ code. This plan reverts all hacks and fixes the root causes.
 
 ---

@@ -2447,13 +2447,26 @@ pub const Lowerer = struct {
                             _ = try self.cleanup_stack.push(cleanup);
                         } else if (value_expr) |e| {
                             // +0 value (borrowed): retain + register cleanup
+                            // Swift SILGen pattern: load [copy] — loading a managed pointer
+                            // from any source that could be mutated requires a retain.
+                            // Field access through pointer dereference (self.field in @safe)
+                            // must ALWAYS retain because the field can be overwritten later
+                            // (triggering release of old value). The baseHasCleanup check
+                            // misses this case since method params have no cleanup entry.
                             const needs_retain = blk: {
                                 if (e == .ident) {
                                     if (fb.lookupLocal(e.ident.name)) |src_local_idx| {
                                         break :blk self.cleanup_stack.hasCleanupForLocal(src_local_idx);
                                     }
                                 }
-                                if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
+                                if (e == .field_access) {
+                                    // Always retain when loading ARC field through pointer deref.
+                                    // The field may be overwritten (releasing old value) before
+                                    // this local goes out of scope. Matches Swift load [copy].
+                                    const base_type = self.inferExprType(e.field_access.base);
+                                    if (self.type_reg.get(base_type) == .pointer) break :blk true;
+                                    break :blk self.baseHasCleanup(e.field_access.base);
+                                }
                                 if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                                 if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
                                 break :blk false;
@@ -3569,12 +3582,17 @@ pub const Lowerer = struct {
         const cond_node = try self.lowerExprNode(if_stmt.condition);
         if (cond_node == ir.null_node) return false;
         _ = try fb.emitBranch(cond_node, then_block, else_block orelse merge_block, if_stmt.span);
+        // Overlap group: then/else arms are mutually exclusive, share stack slots.
+        fb.beginOverlapGroup();
+        fb.nextOverlapArm();
         fb.setBlock(then_block);
         if (!try self.lowerBlockNode(if_stmt.then_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
         if (else_block) |eb| {
+            fb.nextOverlapArm();
             fb.setBlock(eb);
             if (!try self.lowerBlockNode(if_stmt.else_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
         }
+        fb.endOverlapGroup();
         fb.setBlock(merge_block);
         return false;
     }
@@ -3612,6 +3630,9 @@ pub const Lowerer = struct {
             const merge_block = try fb.newBlock("if.opt.end");
             _ = try fb.emitBranch(is_non_null, then_block, else_block orelse merge_block, if_stmt.span);
 
+            // Overlap group: then/else arms share stack slots.
+            fb.beginOverlapGroup();
+            fb.nextOverlapArm();
             // Then block: bind capture to payload address
             fb.setBlock(then_block);
             const scope_depth = fb.markScopeEntry();
@@ -3626,9 +3647,11 @@ pub const Lowerer = struct {
             fb.restoreScope(scope_depth);
 
             if (else_block) |eb| {
+                fb.nextOverlapArm();
                 fb.setBlock(eb);
                 if (!try self.lowerBlockNode(if_stmt.else_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
             }
+            fb.endOverlapGroup();
 
             fb.setBlock(merge_block);
             return false;
@@ -3661,6 +3684,9 @@ pub const Lowerer = struct {
         const merge_block = try fb.newBlock("if.opt.end");
         _ = try fb.emitBranch(is_non_null, then_block, else_block orelse merge_block, if_stmt.span);
 
+        // Overlap group: then/else arms share stack slots.
+        fb.beginOverlapGroup();
+        fb.nextOverlapArm();
         // Then block: unwrap and bind capture variable
         fb.setBlock(then_block);
         const scope_depth = fb.markScopeEntry();
@@ -3679,9 +3705,11 @@ pub const Lowerer = struct {
 
         // Else block
         if (else_block) |eb| {
+            fb.nextOverlapArm();
             fb.setBlock(eb);
             if (!try self.lowerBlockNode(if_stmt.else_branch)) _ = try fb.emitJump(merge_block, if_stmt.span);
         }
+        fb.endOverlapGroup();
 
         fb.setBlock(merge_block);
         return false;
@@ -6904,6 +6932,8 @@ pub const Lowerer = struct {
             const merge_block = try fb.newBlock("if.opt.end");
             _ = try fb.emitBranch(is_non_null, then_block, else_block, if_expr.span);
 
+            fb.beginOverlapGroup();
+            fb.nextOverlapArm();
             fb.setBlock(then_block);
             const scope_depth = fb.markScopeEntry();
             const ptr_type = self.type_reg.makePointer(elem_type) catch TypeRegistry.VOID;
@@ -6918,12 +6948,14 @@ pub const Lowerer = struct {
             fb.restoreScope(scope_depth);
             _ = try fb.emitJump(merge_block, if_expr.span);
 
+            fb.nextOverlapArm();
             fb.setBlock(else_block);
             if (if_expr.else_branch != null_node) {
                 const else_val = try self.lowerExprNode(if_expr.else_branch);
                 _ = try fb.emitStoreLocal(result_local, else_val, if_expr.span);
             }
             _ = try fb.emitJump(merge_block, if_expr.span);
+            fb.endOverlapGroup();
 
             fb.setBlock(merge_block);
             return try fb.emitLoadLocal(result_local, result_type, if_expr.span);
@@ -6955,6 +6987,8 @@ pub const Lowerer = struct {
         const merge_block = try fb.newBlock("if.opt.end");
         _ = try fb.emitBranch(is_non_null, then_block, else_block, if_expr.span);
 
+        fb.beginOverlapGroup();
+        fb.nextOverlapArm();
         // Then block: unwrap and bind capture, evaluate then-branch
         fb.setBlock(then_block);
         const scope_depth = fb.markScopeEntry();
@@ -6972,12 +7006,14 @@ pub const Lowerer = struct {
         _ = try fb.emitJump(merge_block, if_expr.span);
 
         // Else block
+        fb.nextOverlapArm();
         fb.setBlock(else_block);
         if (if_expr.else_branch != null_node) {
             const else_val = try self.lowerExprNode(if_expr.else_branch);
             _ = try fb.emitStoreLocal(result_local, else_val, if_expr.span);
         }
         _ = try fb.emitJump(merge_block, if_expr.span);
+        fb.endOverlapGroup();
 
         // Merge: load result
         fb.setBlock(merge_block);
@@ -7956,10 +7992,10 @@ pub const Lowerer = struct {
                     }
                 }
                 const ret_type = if (concrete_info == .func) concrete_info.func.return_type else TypeRegistry.VOID;
-                // SRET for generic function calls
+                // SRET for generic function calls — reuse shared SRET local
                 if (self.needsSret(ret_type)) {
                     const ret_size = self.type_reg.sizeOf(ret_type);
-                    const sret_local = try fb.addLocalWithSize("__sret_tmp", ret_type, false, ret_size);
+                    const sret_local = try fb.getOrCreateSretLocal(ret_type, ret_size);
                     const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
                     var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
                     defer sret_args.deinit(self.allocator);
@@ -8182,16 +8218,15 @@ pub const Lowerer = struct {
 
         // SRET: caller allocates temp, passes address as hidden first arg
         // Zig pattern: firstParamSRet() — caller allocates, callee writes
+        // Optimization: reuse shared SRET local across calls to avoid stack bloat.
         if (self.needsSret(return_type)) {
             const ret_size = self.type_reg.sizeOf(return_type);
-            const sret_local = try fb.addLocalWithSize("__sret_tmp", return_type, false, ret_size);
+            const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
             const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
-            // Prepend SRET address as first argument
             var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
             defer sret_args.deinit(self.allocator);
             try sret_args.append(self.allocator, sret_addr);
             try sret_args.appendSlice(self.allocator, args.items);
-            // Call returns void; result is in sret_local
             _ = try fb.emitCall(link_name, sret_args.items, false, TypeRegistry.VOID, call.span);
             return try fb.emitLoadLocal(sret_local, return_type, call.span);
         }
@@ -9150,7 +9185,7 @@ pub const Lowerer = struct {
                                             const fn_ptr = try fb.emitLoadLocal(params[di], TypeRegistry.I64, call.span);
                                             if (self.needsSret(return_type)) {
                                                 const ret_size = self.type_reg.sizeOf(return_type);
-                                                const sret_local = try fb.addLocalWithSize("__sret_tmp", return_type, false, ret_size);
+                                                const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
                                                 const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
                                                 var sret_args2 = std.ArrayListUnmanaged(ir.NodeIndex){};
                                                 defer sret_args2.deinit(self.allocator);
@@ -9176,10 +9211,10 @@ pub const Lowerer = struct {
             method_info.func_name // generic instance: keep bare (TypeIndex makes it unique)
         else
             try self.resolveMethodName(receiver_type_name, method_info.func_name, method_info.source_tree);
-        // SRET for method calls returning large types
+        // SRET for method calls returning large types — reuse shared SRET local
         if (self.needsSret(return_type)) {
             const ret_size = self.type_reg.sizeOf(return_type);
-            const sret_local = try fb.addLocalWithSize("__sret_tmp", return_type, false, ret_size);
+            const sret_local = try fb.getOrCreateSretLocal(return_type, ret_size);
             const sret_addr = try fb.emitAddrLocal(sret_local, TypeRegistry.I64, call.span);
             var sret_args = std.ArrayListUnmanaged(ir.NodeIndex){};
             defer sret_args.deinit(self.allocator);
@@ -10793,6 +10828,8 @@ pub const Lowerer = struct {
         const merge_block = try fb.newBlock("catch.merge");
         _ = try fb.emitBranch(is_ok, ok_block, err_block, ce.span);
 
+        fb.beginOverlapGroup();
+        fb.nextOverlapArm();
         // OK block: read success payload from [ptr + 8], store to result
         fb.setBlock(ok_block);
         if (is_compound) {
@@ -10832,6 +10869,7 @@ pub const Lowerer = struct {
         _ = try fb.emitJump(merge_block, ce.span);
 
         // Error block: evaluate fallback
+        fb.nextOverlapArm();
         fb.setBlock(err_block);
         var fallback_is_noreturn = false;
         if (ce.capture.len > 0 and ce.capture_is_ptr) {
@@ -10886,6 +10924,7 @@ pub const Lowerer = struct {
         if (fb.needsTerminator()) {
             _ = try fb.emitJump(merge_block, ce.span);
         }
+        fb.endOverlapGroup();
 
         // Merge block: load result
         fb.setBlock(merge_block);

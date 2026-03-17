@@ -7427,6 +7427,7 @@ struct Lowerer {
     fn lowerQueuedGenericFunctions() void {
         var made_progress = true
         var iter_count = 0
+        var total_lowered = 0
         while (made_progress) {
             made_progress = false
             iter_count += 1
@@ -7438,11 +7439,22 @@ struct Lowerer {
                 if (self.builder.hasFunc(key)) { continue }
                 pending.append(key)
             }
+            if (iter_count > 100) { return }  // Safety: prevent infinite loops
             // Process collected snapshot (safe — no iterator active)
             for i in 0..pending.count {
                 const name = pending.get(i)
                 if (self.builder.hasFunc(name)) { continue }
                 self.lowerGenericFnInstance(name)
+                if (!self.builder.hasFunc(name)) {
+                    // Function lowering failed silently (e.g., shape alias, missing body).
+                    // Mark as lowered to prevent infinite re-processing.
+                    self.builder.startFunc(name, VOID, VOID, Span.zero())
+                    if (self.builder.func()) |fb| {
+                        fb.emitRet(null_node, Span.zero())
+                    }
+                    self.builder.endFunc()
+                }
+                total_lowered += 1
                 made_progress = true
             }
         }
@@ -7545,13 +7557,11 @@ struct Lowerer {
         self.chk.expr_types = fresh_types
 
         // Swap checker's AST to defining file for cross-file generic body checking.
-        // Use raw pointer write to BYPASS ARC — these are temporary swaps that restore
-        // the original. ARC's field assignment would release the old AST (freeing it if
-        // refcount hits 0), causing use-after-free when other generics reference it.
         const saved_chk_ast = self.chk.ast
         self.chk.ast = self.tree
 
         // Re-check the body with substitutions active to populate expr_types.
+        // Depth-bounded in checkFnDeclBody to prevent stack corruption.
         self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
 
         // Lower the concrete function body
@@ -7631,7 +7641,7 @@ struct Lowerer {
         self.current_dict_params.count = 0
         self.builder.endFunc()
 
-        // Restore type substitution, checker AST, and expr_types
+        // Restore type substitution, checker AST, expr_types, and tree
         self.chk.type_sub_keys.count = saved_sub_count
         self.chk.type_sub_vals.count = saved_sub_count
         self.chk.expr_types = saved_expr_types

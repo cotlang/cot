@@ -249,6 +249,10 @@ pub const FuncBuilder = struct {
     /// without scanning function names (which false-positives on generic methods).
     is_destructor: bool = false,
     is_export: bool = false,
+    /// Shared SRET local: reused across function calls returning large structs.
+    /// Avoids allocating a new __sret_tmp for every call. Grown to max needed size.
+    shared_sret_local: ?LocalIdx = null,
+    shared_sret_size: u32 = 0,
     /// Overlap group tracking for stack slot sharing across mutually-exclusive arms.
     current_overlap_group: u16 = 0,
     current_overlap_arm: u16 = 0,
@@ -301,6 +305,30 @@ pub const FuncBuilder = struct {
 
     pub fn lookupLocal(self: *const FuncBuilder, name: []const u8) ?LocalIdx { return self.local_map.get(name); }
     pub fn markScopeEntry(self: *const FuncBuilder) usize { return self.shadow_stack.items.len; }
+
+    /// Get or create a shared SRET local for function call returns.
+    /// Reuses the same stack slot across calls, growing it if a larger return type is needed.
+    /// This eliminates one 176-byte allocation per getNode() call in the selfcot.
+    pub fn getOrCreateSretLocal(self: *FuncBuilder, ret_type: TypeIndex, ret_size: u32) !LocalIdx {
+        if (self.shared_sret_local) |existing| {
+            if (ret_size <= self.shared_sret_size) {
+                return existing;
+            }
+            // Need to grow — update the existing local's size
+            self.locals.items[@intCast(existing)].size = ret_size;
+            self.shared_sret_size = ret_size;
+            return existing;
+        }
+        // Create new shared SRET local
+        const idx: LocalIdx = @intCast(self.locals.items.len);
+        var local = Local.initWithSize("__sret_shared", ret_type, false, ret_size);
+        local.overlap_group = 0; // not in any overlap group — shared across all paths
+        try self.locals.append(self.allocator, local);
+        // Don't add to local_map — this is an internal temp
+        self.shared_sret_local = idx;
+        self.shared_sret_size = ret_size;
+        return idx;
+    }
 
     /// Begin an overlap group for mutually-exclusive arms (switch/if-else).
     /// All locals created while a group is active share stack space across arms.

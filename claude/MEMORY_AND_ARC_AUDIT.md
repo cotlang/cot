@@ -1,7 +1,9 @@
 # Memory & ARC Audit — Proper Debugging Plan
 
 **Date:** 2026-03-17
-**Problem:** ir.cot compilation either crashes (MallocScribble) or runs to 1GB+ (without). Zero measurements taken. All previous analysis was speculation.
+**Status:** RESOLVED — ir.cot now compiles in 17MB/0.5s. Memory explosion was from exponential generic re-checking (fixed by isDefined guard + depth limit). ARC use-after-free fixed by `load [copy]` retain in lower.zig:2448-2470. Remaining crash is stack overflow from native codegen frame bloat (see STACK_FRAME_ANALYSIS.md).
+
+**Original problem:** ir.cot compilation either crashes (MallocScribble) or runs to 1GB+ (without). Zero measurements taken. All previous analysis was speculation.
 
 ---
 

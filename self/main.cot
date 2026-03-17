@@ -415,7 +415,6 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
     var seen: List(string) = .{}
     var in_progress: List(string) = .{}
     parseFileRecursive(path, &parsed_files, seen, in_progress, project_safe)
-    eprintln("[phase1] parse done: ${parsed_files.count} files, types=${types.types.count}")
 
     // ================================================================
     // Phase 2: Check all files — flat loop (Zig driver.zig lines 431-449)
@@ -428,12 +427,8 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
 
     for fi in 0..parsed_files.count {
         const pf = parsed_files.get(fi)
-        eprintln("[phase2] file ${fi} pf.ast=${@ptrToInt(pf.ast)}")
         checkAndStoreChecker(pf, types, &shared, &checked_scopes, &checkers, &checker_errs)
-        const chk_ptr_debug = @intToPtr(*Checker, checkers.get(fi))
-        eprintln("[phase2] checked ${fi}: ${pf.path}, types=${types.types.count}, ast_swaps=${chk_ptr_debug.ast_swap_count}")
     }
-    eprintln("[phase2] done: ${checkers.count} checkers, types=${types.types.count}")
 
     // ================================================================
     // Phase 3: Lower all files — flat loop (Zig driver.zig lines 545-559)
@@ -471,41 +466,16 @@ fn compileWithImports(path: string, project_safe: bool, lower_opts: LowerOptions
         }
     }
 
-    // Check refcount of ALL ASTs before Phase 3
-    for ai in 0..parsed_files.count {
-        const apf = parsed_files.get(ai)
-        const aptr = @ptrToInt(apf.ast)
-        const arc = @intToPtr(*int, aptr - 8).*
-        const strong = arc / 8589934592  // STRONG_RC_ONE = 1<<33 = 8589934592
-        eprintln("[debug] AST ${ai}: strong=${strong} raw=${arc} file=${apf.path}")
-    }
-
     // Lower each file using stored checkers (Zig driver.zig line 547: &checkers.items[i])
     for fi in 0..parsed_files.count {
         const pf = parsed_files.get(fi)
-        eprintln("[phase3] lower ${fi}: ${pf.path}")
         const chk_ptr = @intToPtr(*Checker, checkers.get(fi))
-        // Validate checker is alive
-        if (chk_ptr.symbols.count < 0 or chk_ptr.symbols.count > 100000) {
-            @panic("CHECKER ${fi} FREED: symbols.count=${chk_ptr.symbols.count}")
-        }
         const err_ptr = @intToPtr(*ErrorReporter, checker_errs.get(fi))
         // Register tree → module mapping
         if (lower_shared.module_names.contains(pf.path)) {
             lower_shared.tree_module_map.set(@ptrToInt(pf.ast), lower_shared.module_names.get(pf.path))
         }
         lowerOneFile(CheckedFile { ast: pf.ast, errs: err_ptr, chk: chk_ptr }, types, lower_shared, lower_opts)
-        eprintln("[phase3] done ${fi}: funcs=${lower_shared.builder.funcs.count}")
-        // Check AST refcounts after each file
-        for ai in 0..parsed_files.count {
-            const apf = parsed_files.get(ai)
-            const aptr = @ptrToInt(apf.ast)
-            const arc = @intToPtr(*int, aptr - 8).*
-            const strong = arc / 8589934592
-            if (strong < 1) {
-                eprintln("[ALERT] AST ${ai} strong=${strong} AFTER file ${fi}")
-            }
-        }
     }
 
     // Go init function pattern: generate master __cot_init_globals that calls all per-file inits.

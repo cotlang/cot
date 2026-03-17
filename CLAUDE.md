@@ -104,9 +104,9 @@ cot build self/main.cot -o /tmp/selfcot
 - selfcot is compiled to a native binary by the Zig `cot` compiler
 - The pipeline: `self/main.cot` → `self/frontend/` (scanner, parser, checker, lowerer, ssa) → `self/codegen/wasm/` (driver, wasm_gen, preprocess, assemble, linker)
 - `self/test_tiny.cot` is a minimal test file for smoke-testing selfcot
-- 43,364 lines across 42 files, 418 tests — frontend, codegen, SSA passes, runtime all complete
+- 44,716 lines across 42 files — frontend, codegen, SSA passes, runtime all complete
 
-**Current status (as of 2026-03-16):** selfcot compiles 6 of 12 frontend files to valid Wasm: token.cot, source.cot, errors.cot, types.cot (1572 lines), scanner.cot (774 lines), ast.cot (1532 lines). ir.cot compiles in 0.5s/15MB but crashes in `retain()` — ARC use-after-free where `@ptrToInt` strips management from pointers stored in Maps, then the original object is freed at scope exit. Remaining files (ssa, ssa_builder, parser, checker, lower) untested. **Blocker:** Zig compiler ARC doesn't track `@ptrToInt` as an ownership transfer — managed pointers stored as raw ints in Maps get freed when the local goes out of scope.
+**Current status (as of 2026-03-17):** selfcot compiles **9 of 13 frontend files** to valid Wasm: token, scanner, source, errors, types, ast, ir (17MB/0.5s), parser, ssa. Four remaining: checker (5947 lines), lower (9177 lines), ssa_builder (2337 lines), arc_insertion (414 lines) — all crash from stack overflow during deep generic re-checking chains. **Blocker:** Native codegen generates stack frames ~2x larger than the Zig compiler's own (e.g., `checkFnDeclBody`: 2,528 bytes vs Zig's 1,648 bytes). Deep call chains during complex file lowering overflow the 8MB stack. See `claude/STACK_FRAME_ANALYSIS.md` and `claude/COT_IMPROVEMENT_PLAN.md`.
 
 **Stdlib** is a separate repo (`cotlang/std`) included as a git submodule at `stdlib/`. After cloning: `git submodule update --init stdlib`. When modifying stdlib files, changes must be committed in the submodule first (`cd stdlib && git add . && git commit && git push`), then the updated submodule ref committed in the parent repo.
 

@@ -1,8 +1,10 @@
 # Wasm Self-Hosting Plan
 
-**Date:** 2026-03-16 (updated end of session)
+**Date:** 2026-03-17 (updated)
 **Goal:** `selfcot build self/main.cot -o /tmp/selfcot.wasm` produces a working Wasm binary that can compile itself.
 **Metric:** `wasmtime /tmp/selfcot.wasm build self/test_tiny.cot -o /tmp/out.wasm` succeeds.
+
+> **STATUS (Mar 17):** 9 of 13 frontend files compile. 4 remaining (checker, lower, ssa_builder, arc_insertion) blocked by native codegen stack frame bloat. See `COT_IMPROVEMENT_PLAN.md` and `STACK_FRAME_ANALYSIS.md` for the fix plan.
 
 ---
 
