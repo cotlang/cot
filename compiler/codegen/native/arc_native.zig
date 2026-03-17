@@ -810,7 +810,7 @@ fn generateRelease(
         _ = try ins.jump(block_decrement, &[_]clif.Value{rc_addr});
     }
 
-    // ---- Decrement: atomic fetch-sub, check if was last strong ref ----
+    // ---- Decrement: check IsDeiniting, then atomic fetch-sub ----
     // Swift doDecrementSlow pattern (RefCount.h:1040-1048)
     // swift_release uses __atomic_fetch_sub_n release + acquire fence before dealloc.
     // ARM64 ldaddal is acquire+release, x64 lock xadd is seq_cst — both cover the fence.
@@ -819,23 +819,92 @@ fn generateRelease(
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
+        const obj = builder.blockParams(block_entry)[0];
         const rc_addr = builder.blockParams(block_decrement)[0];
 
-        // Atomic fetch-sub: old_rc = atomicRmwAdd(rc_addr, -STRONG_RC_ONE)
-        const v_neg_strong_one = try ins.iconst(clif.Type.I64, -STRONG_RC_ONE);
-        const old_rc = try ins.atomicRmwAdd(clif.Type.I64, rc_addr, v_neg_strong_one);
+        // Check IsDeiniting BEFORE decrement — catches double-free.
+        // Swift: SWIFT_OBJECT_IS_BEING_DEINITIALIZED assertion in swift_release.
+        const pre_rc = try ins.load(clif.Type.I64, clif.MemFlags.DEFAULT, rc_addr, 0);
+        const v_deinit_bit = try ins.iconst(clif.Type.I64, IS_DEINITING_BIT);
+        const deinit_check = try ins.band(pre_rc, v_deinit_bit);
+        const v_zero_check = try ins.iconst(clif.Type.I64, 0);
+        const is_deiniting = try ins.icmp(.ne, deinit_check, v_zero_check);
 
-        // Extract StrongExtra from OLD value: (old_rc >> 33) & 0x3FFFFFFF
-        const v_shift = try ins.iconst(clif.Type.I64, @as(i64, STRONG_EXTRA_SHIFT));
-        const shifted = try ins.ushr(old_rc, v_shift);
-        const v_mask = try ins.iconst(clif.Type.I64, 0x3FFFFFFF);
-        const strong_extra = try ins.band(shifted, v_mask);
+        const block_underflow = try builder.createBlock();
+        const block_do_decrement = try builder.createBlock();
+        _ = try ins.brif(is_deiniting, block_underflow, &.{}, block_do_decrement, &[_]clif.Value{rc_addr});
 
-        // If StrongExtra was 0 in OLD → this was the last strong reference
-        // (old had exactly 1 logical strong ref, now decremented to 0)
-        const v_zero = try ins.iconst(clif.Type.I64, 0);
-        const was_last = try ins.icmp(.eq, strong_extra, v_zero);
-        _ = try ins.brif(was_last, block_check_destructor, &[_]clif.Value{rc_addr}, block_return, &.{});
+        // ---- Underflow: print diagnostic and return (don't decrement) ----
+        builder.switchToBlock(block_underflow);
+        try builder.ensureInsertedBlock();
+        {
+            const uf_ins = builder.ins();
+            // Print "ARC: double-free " + pointer value
+            const eprint_idx = func_index_map.get("eprint_int") orelse 0;
+            var eprint_sig = clif.Signature.init(.system_v);
+            try eprint_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            const eprint_sig_ref = try builder.importSignature(eprint_sig);
+            const eprint_func = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = eprint_idx } },
+                .signature = eprint_sig_ref,
+                .colocated = false,
+            });
+
+            const write_idx3 = func_index_map.get("write") orelse 0;
+            var write_sig3 = clif.Signature.init(.system_v);
+            try write_sig3.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig3.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig3.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+            try write_sig3.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+            const write_sig_ref3 = try builder.importSignature(write_sig3);
+            const write_func3 = try builder.importFunction(.{
+                .name = .{ .user = .{ .namespace = 0, .index = write_idx3 } },
+                .signature = write_sig_ref3,
+                .colocated = false,
+            });
+
+            const uf_slot = try clif_func.createStackSlot(allocator, .{
+                .kind = .explicit_slot,
+                .size = 24,
+                .align_shift = 3,
+            });
+            const uf_addr = try uf_ins.stackAddr(clif.Type.I64, uf_slot, 0);
+            const uf_prefix = "ARC: double-free ";
+            for (uf_prefix, 0..) |byte, offset| {
+                const ch = try uf_ins.iconst(clif.Type.I8, @intCast(byte));
+                _ = try uf_ins.store(clif.MemFlags.DEFAULT, ch, uf_addr, @intCast(offset));
+            }
+            const fd = try uf_ins.iconst(clif.Type.I64, 2);
+            const prefix_len = try uf_ins.iconst(clif.Type.I64, @intCast(uf_prefix.len));
+            _ = try uf_ins.call(write_func3, &[_]clif.Value{ fd, uf_addr, prefix_len });
+            _ = try uf_ins.call(eprint_func, &[_]clif.Value{obj});
+
+            _ = try uf_ins.jump(block_return, &.{});
+        }
+
+        // ---- Do the actual decrement ----
+        _ = try builder.appendBlockParam(block_do_decrement, clif.Type.I64); // rc_addr
+        builder.switchToBlock(block_do_decrement);
+        try builder.ensureInsertedBlock();
+        {
+            const dec_ins = builder.ins();
+            const dec_rc_addr = builder.blockParams(block_do_decrement)[0];
+
+            // Atomic fetch-sub: old_rc = atomicRmwAdd(rc_addr, -STRONG_RC_ONE)
+            const v_neg_strong_one = try dec_ins.iconst(clif.Type.I64, -STRONG_RC_ONE);
+            const old_rc = try dec_ins.atomicRmwAdd(clif.Type.I64, dec_rc_addr, v_neg_strong_one);
+
+            // Extract StrongExtra from OLD value: (old_rc >> 33) & 0x3FFFFFFF
+            const v_shift = try dec_ins.iconst(clif.Type.I64, @as(i64, STRONG_EXTRA_SHIFT));
+            const shifted = try dec_ins.ushr(old_rc, v_shift);
+            const v_mask = try dec_ins.iconst(clif.Type.I64, 0x3FFFFFFF);
+            const strong_extra = try dec_ins.band(shifted, v_mask);
+
+            // If StrongExtra was 0 in OLD → this was the last strong reference
+            const v_zero = try dec_ins.iconst(clif.Type.I64, 0);
+            const was_last = try dec_ins.icmp(.eq, strong_extra, v_zero);
+            _ = try dec_ins.brif(was_last, block_check_destructor, &[_]clif.Value{dec_rc_addr}, block_return, &.{});
+        }
     }
 
     // block_store_and_return is no longer needed — atomic decrement already stored
