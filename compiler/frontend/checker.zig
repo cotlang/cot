@@ -446,9 +446,19 @@ pub const Checker = struct {
                     }
                     return;
                 }
+                // Register name BEFORE resolving fields to support self-referential types
+                // (e.g., LinkedList with next: ?*LinkedList). Placeholder type index is updated after.
+                const placeholder = try self.types.add(.{ .struct_type = .{ .name = s.name, .fields = &.{}, .size = 0, .alignment = 8 } });
+                try self.types.registerNamed(s.name, placeholder);
+                try self.defineInFileScope(Symbol.init(s.name, .type_name, placeholder, idx, false));
                 const struct_type = try self.buildStructTypeWithLayout(s.name, s.fields, s.layout);
-                try self.defineInFileScope(Symbol.init(s.name, .type_name, struct_type, idx, false));
-                try self.types.registerNamed(s.name, struct_type);
+                // Update the placeholder with the real type
+                self.types.types.items[@intCast(placeholder)] = .{ .struct_type = .{ .name = s.name, .fields = self.types.get(struct_type).struct_type.fields, .size = self.types.get(struct_type).struct_type.size, .alignment = self.types.get(struct_type).struct_type.alignment, .layout = s.layout } };
+                // Update symbol with real type
+                if (self.scope.lookupLocal(s.name)) |sym| {
+                    var m_sym = sym;
+                    m_sym.type_idx = placeholder; // already correct since we used placeholder
+                }
                 // Register nested declarations with qualified names (e.g. Parser.Error → Parser_Error)
                 for (s.nested_decls) |nested_idx| {
                     const nested = (self.tree.getNode(nested_idx) orelse continue).asDecl() orelse continue;
