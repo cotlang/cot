@@ -175,28 +175,28 @@ struct GenericInstInfo {
 // passes to each Checker. After checkFile(), caller syncs back.
 
 struct SharedCheckerState {
-    global_map: int,                         // raw ptr to Map(string, int) — global scope
-    symbols: *List(Symbol),                  // shared pointer — NOT value-copied
-    generic_structs: int,                    // raw ptr to Map(string, int) — Zig SharedGenericContext pattern
-    generic_functions: int,                  // raw ptr to Map(string, int)
-    instantiation_cache: int,               // raw ptr to Map(string, int)
-    generic_inst_by_name: int,              // raw ptr to Map(string, int)
+    global_map: *Map(string, int),
+    symbols: *List(Symbol),
+    generic_structs: *Map(string, *GenericInfo),
+    generic_functions: *Map(string, *GenericInfo),
+    instantiation_cache: *Map(string, int),
+    generic_inst_by_name: *Map(string, *GenericInstInfo),
     generic_impl_entries: List(GenericImplEntry),
-    trait_defs: int,                         // raw ptr to Map(string, int)
-    trait_impls: int,                        // raw ptr to Map(string, string)
+    trait_defs: *Map(string, int),
+    trait_impls: *Map(string, string),
 
     static fn init() SharedCheckerState {
         var generic_impl_entries: List(GenericImplEntry) = .{}
         return SharedCheckerState {
-            global_map: allocMap(),
+            global_map: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             symbols: allocSymbolList(),
-            generic_structs: allocMap(),
-            generic_functions: allocMap(),
-            instantiation_cache: allocMap(),
-            generic_inst_by_name: allocMap(),
+            generic_structs: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            generic_functions: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            instantiation_cache: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            generic_inst_by_name: new Map(string, *GenericInstInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             generic_impl_entries: generic_impl_entries,
-            trait_defs: allocMap(),
-            trait_impls: allocMap(),
+            trait_defs: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            trait_impls: new Map(string, string) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
         }
     }
 }
@@ -216,19 +216,19 @@ struct Checker {
     current_scope: int,
     global_scope: int,
     expr_types: Map(int, int),
-    trait_defs: int,  // raw ptr to shared Map
+    trait_defs: *Map(string, int),
     current_return_type: int,
     in_loop: bool,
     safe_mode: bool,
-    // Generic support
-    generic_structs: int,  // raw ptr to shared Map
-    generic_functions: int,  // raw ptr to shared Map
+    // Generic support — typed pointers matching Zig's SharedGenericContext
+    generic_structs: *Map(string, *GenericInfo),
+    generic_functions: *Map(string, *GenericInfo),
     generic_impl_entries: List(GenericImplEntry),
-    instantiation_cache: int,  // raw ptr to shared Map
-    generic_inst_by_name: int,  // raw ptr to shared Map
+    instantiation_cache: *Map(string, int),
+    generic_inst_by_name: *Map(string, *GenericInstInfo),
     type_sub_keys: List(string),
     type_sub_vals: List(int),
-    trait_impls: int,  // raw ptr to shared Map
+    trait_impls: *Map(string, string),
     // Type flow
     expected_type: int,                       // Zig RLS pattern
     current_switch_enum_type: int,            // for .variant shorthand
@@ -267,18 +267,18 @@ struct Checker {
             current_scope: 0,
             global_scope: 0,
             expr_types: expr_types,
-            trait_defs: allocMap(),
+            trait_defs: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             current_return_type: VOID,
             in_loop: false,
             safe_mode: false,
-            generic_structs: allocMap(),
-            generic_functions: allocMap(),
+            generic_structs: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            generic_functions: new Map(string, *GenericInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             generic_impl_entries: generic_impl_entries,
-            instantiation_cache: allocMap(),
-            generic_inst_by_name: allocMap(),
+            instantiation_cache: new Map(string, int) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
+            generic_inst_by_name: new Map(string, *GenericInstInfo) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             type_sub_keys: type_sub_keys,
             type_sub_vals: type_sub_vals,
-            trait_impls: allocMap(),
+            trait_impls: new Map(string, string) { keys: 0, values: 0, states: 0, count: 0, capacity: 0 },
             expected_type: invalid_type,
             current_switch_enum_type: invalid_type,
             lint_mode: false,
@@ -514,9 +514,7 @@ struct Checker {
                 // Store GenericInfo with AST pointer for cross-file resolution
                 // Zig: self.generics.generic_structs.put(name, .{ .node_idx = idx, .tree = self.tree })
                 var info = new GenericInfo { node_idx: idx, ast_ptr: @ptrToInt(self.ast) }
-                retain(@ptrToInt(self.ast))   // AST escapes as raw int — ARC can't track
-                retain(@ptrToInt(info))       // Keep GenericInfo alive past local scope
-                @intToPtr(*Map(string, int), self.generic_structs).set(name, @ptrToInt(info))
+                self.generic_structs.set(name, info)
                 self.defineSymbol(makeTypeSymbol(name, invalid_type, idx))
                 return
             }
@@ -682,9 +680,7 @@ struct Checker {
             if (f.type_params.count > 0) {
                 // Store GenericInfo with AST pointer for cross-file resolution
                 var info = new GenericInfo { node_idx: idx, ast_ptr: @ptrToInt(self.ast) }
-                retain(@ptrToInt(self.ast))   // AST escapes as raw int — ARC can't track
-                retain(@ptrToInt(info))       // Keep GenericInfo alive past local scope
-                @intToPtr(*Map(string, int), self.generic_functions).set(name, @ptrToInt(info))
+                self.generic_functions.set(name, info)
                 self.defineSymbol(makeTypeSymbol(name, invalid_type, idx))
                 return
             }
@@ -719,8 +715,8 @@ struct Checker {
 
             // Generic impl blocks: store for deferred instantiation
             if (ib.type_params.count > 0) {
-                // Retain the AST so it survives after checkFileRecursive returns
-                retain(@ptrToInt(self.ast))
+
+
                 self.generic_impl_entries.append(GenericImplEntry {
                     base_name: type_name,
                     node_idx: idx,
@@ -812,7 +808,7 @@ struct Checker {
     fn collectTraitDecl(idx: int) void {
         const node = self.ast.getNode(idx)
         switch (node) { Node.decl |d| => switch (d) { Decl.trait_decl |td| => {
-            @intToPtr(*Map(string, int), self.trait_defs).set(td.name, idx)
+            self.trait_defs.set(td.name, idx)
         }, else => {} }, else => {} }
     }
 
@@ -823,13 +819,13 @@ struct Checker {
             const target_type = it.target_type
 
             // Validate trait exists
-            if (!@intToPtr(*Map(string, int), self.trait_defs).contains(trait_name)) {
+            if (!self.trait_defs.contains(trait_name)) {
                 self.reportError(idx, ErrorCode.e301, "undefined trait")
                 return
             }
 
             // Validate all required methods are provided
-            const trait_idx = @intToPtr(*Map(string, int), self.trait_defs).get(trait_name)
+            const trait_idx = self.trait_defs.get(trait_name)
             const trait_node = self.ast.getNode(trait_idx)
             switch (trait_node) { Node.decl |td_outer| => switch (td_outer) { Decl.trait_decl |td| => {
                 for ti in 0..td.methods.count {
@@ -864,7 +860,7 @@ struct Checker {
 
             // Register trait impl for trait bound validation
             const impl_key = "${trait_name}:${target_type}"
-            @intToPtr(*Map(string, string), self.trait_impls).set(impl_key, trait_name)
+            self.trait_impls.set(impl_key, trait_name)
 
             // Register methods (same pattern as impl_block)
             for mi in 0..it.methods.count {
@@ -1659,7 +1655,7 @@ struct Checker {
                 }
             }
             // Generic function used without type args (Zig ref: checker.zig:1550-1553)
-            if (@intToPtr(*Map(string, int), self.generic_functions).contains(name) and !self.hasTypeSubstitution()) {
+            if (self.generic_functions.contains(name) and !self.hasTypeSubstitution()) {
                 self.reportError(idx, ErrorCode.e300, "generic function '${name}' requires type arguments")
                 return invalid_type
             }
@@ -1918,7 +1914,7 @@ struct Checker {
                 return INT
             }
             // Generic function instantiation: max(i64) where max is generic
-            if (@intToPtr(*Map(string, int), self.generic_functions).contains(name)) {
+            if (self.generic_functions.contains(name)) {
                 return self.instantiateGenericFunc(idx, name)
             }
         }
@@ -4109,7 +4105,7 @@ struct Checker {
             ast_ptr: ast_ptr,
             expr_types_ptr: expr_types_ptr,
         }
-        @intToPtr(*Map(string, int), self.generic_inst_by_name).set(concrete_name, @ptrToInt(inst))
+        self.generic_inst_by_name.set(concrete_name, inst)
     }
 
     /// Resolve a generic struct instantiation: List(int) → concrete List(5) type.
@@ -4121,7 +4117,7 @@ struct Checker {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
-        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_structs).get(gi_name))
+        const info = self.generic_structs.get(gi_name)
 
         // Read type args from generic_instance AST (CURRENT file)
         var gi_type_args: List(int) = .{}
@@ -4138,8 +4134,8 @@ struct Checker {
 
         // Build cache key and check cache (before swapping AST)
         const cache_key = self.buildGenericCacheKey(gi_name, resolved_args)
-        if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
-            return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
+        if (self.instantiation_cache.contains(cache_key)) {
+            return self.instantiation_cache.get(cache_key)
         }
 
         return self.buildGenericInstance(idx, gi_name, info, resolved_args, ta_count, cache_key)
@@ -4153,7 +4149,8 @@ struct Checker {
         // Swap to defining file's AST and safe_mode
         // CRITICAL: retain saved_ast to prevent ARC from freeing it during swap
         const saved_ast = self.ast
-        retain(@ptrToInt(saved_ast))
+
+
         const saved_safe_mode = self.safe_mode
 
         self.ast = info.getAst()
@@ -4169,7 +4166,8 @@ struct Checker {
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
+    
+
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
             return invalid_type
         }
@@ -4186,7 +4184,7 @@ struct Checker {
         // Register in cache BEFORE instantiateNestedMethods to break recursion
         // (methods referencing the same generic type will hit the cache)
         self.types.registerNamed(cache_key, concrete_type)
-        @intToPtr(*Map(string, int), self.instantiation_cache).set(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
 
         // Instantiate inferred impl methods (nested fn_decls in struct body)
         // Still using defining file's AST with active type substitution
@@ -4203,7 +4201,8 @@ struct Checker {
 
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
-        release(@ptrToInt(saved_ast))
+
+
 
         // Instantiate methods from separate impl blocks
         self.instantiateGenericImplMethods(gi_name, cache_key, resolved_args)
@@ -4285,7 +4284,8 @@ struct Checker {
 
             // Swap to defining file's AST and safe_mode (Zig lines 3379-3387)
             const saved_ast = self.ast
-            retain(@ptrToInt(saved_ast))
+    
+
             const saved_safe_mode = self.safe_mode
 
 
@@ -4372,7 +4372,8 @@ struct Checker {
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
+    
+
         }
     }
 
@@ -4381,7 +4382,7 @@ struct Checker {
     /// Cross-file: swaps self.ast to defining file's AST.
     fn instantiateGenericFunc(idx: int, name: string) int {
         // Look up generic function definition
-        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_functions).get(name))
+        const info = self.generic_functions.get(name)
         const fn_node = info.node_idx
 
         // Read call args from CURRENT file's AST
@@ -4414,7 +4415,8 @@ struct Checker {
         // Swap to defining file's AST and safe_mode (Zig lines 3506-3513)
         // CRITICAL: retain saved_ast to prevent ARC from freeing it during swap
         const saved_ast = self.ast
-        retain(@ptrToInt(saved_ast))
+
+
         const saved_safe_mode = self.safe_mode
 
         self.ast = info.getAst()
@@ -4433,7 +4435,8 @@ struct Checker {
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
+    
+
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
             return invalid_type
         }
@@ -4446,12 +4449,13 @@ struct Checker {
                 if (@lenOf(bound_name) > 0) {
                     const type_name = self.types.typeName(resolved_args.get(bi))
                     const impl_key = "${bound_name}:${type_name}"
-                    if (!@intToPtr(*Map(string, string), self.trait_impls).contains(impl_key)) {
+                    if (!self.trait_impls.contains(impl_key)) {
 
 
                         self.ast = saved_ast
                         self.safe_mode = saved_safe_mode
-                        release(@ptrToInt(saved_ast))
+                
+
                         self.reportError(idx, ErrorCode.e300, "type does not satisfy trait bound")
                         return invalid_type
                     }
@@ -4469,7 +4473,8 @@ struct Checker {
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
+    
+
             return self.getSymbol(cached_sym).type_idx
         }
 
@@ -4515,7 +4520,8 @@ struct Checker {
 
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
-        release(@ptrToInt(saved_ast))
+
+
 
         // Register for lowerer with preserved expr_types (Go pattern)
         self.registerGenericInst(cache_key, fn_node, resolved_args, fn_tp, info.ast_ptr, et_ptr)
@@ -4530,7 +4536,7 @@ struct Checker {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
-        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_structs).get(type_name))
+        const info = self.generic_structs.get(type_name)
         const struct_node = info.node_idx
 
         // Resolve type args from CURRENT file's AST (passed in si_type_args)
@@ -4543,7 +4549,8 @@ struct Checker {
 
         // Swap to defining file's AST and safe_mode (Zig pattern)
         const saved_ast = self.ast
-        retain(@ptrToInt(saved_ast))
+
+
         const saved_safe_mode = self.safe_mode
 
         self.ast = info.getAst()
@@ -4561,19 +4568,21 @@ struct Checker {
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
+    
+
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
             return invalid_type
         }
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
-        if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
+        if (self.instantiation_cache.contains(cache_key)) {
 
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
-            return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
+    
+
+            return self.instantiation_cache.get(cache_key)
         }
 
         // Set up substitution from DEFINING file's AST
@@ -4587,7 +4596,7 @@ struct Checker {
 
         // Register in cache BEFORE instantiateNestedMethods to break recursion
         self.types.registerNamed(cache_key, concrete_type)
-        @intToPtr(*Map(string, int), self.instantiation_cache).set(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
 
         // Instantiate inferred impl methods from struct body
         var sd_nested2: List(int) = .{}
@@ -4602,7 +4611,8 @@ struct Checker {
 
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
-        release(@ptrToInt(saved_ast))
+
+
 
         self.instantiateGenericImplMethods(type_name, cache_key, resolved_args)
 
@@ -4616,7 +4626,7 @@ struct Checker {
             self.reportError(idx, ErrorCode.e301, "undefined generic type")
             return invalid_type
         }
-        const info = @intToPtr(*GenericInfo, @intToPtr(*Map(string, int), self.generic_structs).get(type_name))
+        const info = self.generic_structs.get(type_name)
         const struct_node = info.node_idx
 
         // Resolve type args from CURRENT file's AST (passed in ne_type_args)
@@ -4629,7 +4639,8 @@ struct Checker {
 
         // Swap to defining file's AST and safe_mode (Zig pattern)
         const saved_ast = self.ast
-        retain(@ptrToInt(saved_ast))
+
+
         const saved_safe_mode = self.safe_mode
 
         self.ast = info.getAst()
@@ -4647,19 +4658,21 @@ struct Checker {
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
+    
+
             self.reportError(idx, ErrorCode.e300, "wrong number of type arguments")
             return invalid_type
         }
 
         const cache_key = self.buildGenericCacheKey(type_name, resolved_args)
-        if (@intToPtr(*Map(string, int), self.instantiation_cache).contains(cache_key)) {
+        if (self.instantiation_cache.contains(cache_key)) {
 
 
             self.ast = saved_ast
             self.safe_mode = saved_safe_mode
-            release(@ptrToInt(saved_ast))
-            return @intToPtr(*Map(string, int), self.instantiation_cache).get(cache_key)
+    
+
+            return self.instantiation_cache.get(cache_key)
         }
 
         // Set up substitution from DEFINING file's AST
@@ -4673,7 +4686,7 @@ struct Checker {
 
         // Register in cache BEFORE instantiateNestedMethods to break recursion
         self.types.registerNamed(cache_key, concrete_type)
-        @intToPtr(*Map(string, int), self.instantiation_cache).set(cache_key, concrete_type)
+        self.instantiation_cache.set(cache_key, concrete_type)
 
         // Instantiate inferred impl methods from struct body
         var sd_nested3: List(int) = .{}
@@ -4688,7 +4701,8 @@ struct Checker {
 
         self.ast = saved_ast
         self.safe_mode = saved_safe_mode
-        release(@ptrToInt(saved_ast))
+
+
 
         self.instantiateGenericImplMethods(type_name, cache_key, resolved_args)
 

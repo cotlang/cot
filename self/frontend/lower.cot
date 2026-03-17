@@ -7432,7 +7432,7 @@ struct Lowerer {
             made_progress = false
             iter_count += 1
             var pending: List(string) = .{}
-            const all_keys = @intToPtr(*Map(string, int), self.chk.generic_inst_by_name).keys()
+            const all_keys = self.chk.generic_inst_by_name.keys()
             for i in 0..all_keys.count {
                 const key = all_keys.get(i)
                 if (!self.lowered_generics.contains(key)) { continue }
@@ -7681,9 +7681,8 @@ struct Lowerer {
 
     /// Look up a generic instantiation by concrete name.
     fn lookupGenericInst(name: string) ?*GenericInstInfo {
-        if (!@intToPtr(*Map(string, int), self.chk.generic_inst_by_name).contains(name)) { return null }
-        const ptr = @intToPtr(*Map(string, int), self.chk.generic_inst_by_name).get(name)
-        return @intToPtr(*GenericInstInfo, ptr)
+        if (!self.chk.generic_inst_by_name.contains(name)) { return null }
+        return self.chk.generic_inst_by_name.get(name)
     }
 
     /// Execute a deferred cleanup expression (defer/errdefer body).
