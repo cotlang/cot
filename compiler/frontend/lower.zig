@@ -1930,7 +1930,10 @@ pub const Lowerer = struct {
             // value types). Cot's *T can be heap or stack — see arc_native.zig header comment.
             if (!self.target.isWasm() and value_node != null) {
                 const fn_ret_type = fb.return_type;
-                if (self.type_reg.couldBeARC(fn_ret_type)) {
+                // Only retain direct managed pointers, not optionals (?*T).
+                // ?*T has compound layout (tag+ptr) — retain/release expect raw ptr.
+                const fn_ret_info = self.type_reg.get(fn_ret_type);
+                if (fn_ret_info == .pointer and fn_ret_info.pointer.managed) {
                     const is_plus_one = forwarded or
                         (if (ret_node) |n| if (n.asExpr()) |e| (e == .new_expr or e == .call or e == .addr_of) else false else false);
                     if (!is_plus_one) {
@@ -2056,7 +2059,13 @@ pub const Lowerer = struct {
         const struct_type = type_info.struct_type;
 
         for (struct_type.fields, 0..) |field, i| {
-            if (self.type_reg.couldBeARC(field.type_idx)) {
+            // Only release DIRECT managed pointers (*T), not optional pointers (?*T).
+            // Optional pointers have compound layout (tag+ptr); passing the whole
+            // optional to release() is wrong. Swift: destroy_addr uses type-aware
+            // destruction that unwraps optionals before releasing.
+            const fld_type = self.type_reg.get(field.type_idx);
+            if (fld_type == .pointer and fld_type.pointer.managed) {
+                // Direct managed pointer: load and release
                 const self_local = fb.lookupLocal("self") orelse continue;
                 const self_type_idx = fb.locals.items[self_local].type_idx;
                 const self_ptr = try fb.emitLoadLocal(self_local, self_type_idx, span);
@@ -2064,6 +2073,27 @@ pub const Lowerer = struct {
                 const field_val = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, field.type_idx, span);
                 var release_args = [_]ir.NodeIndex{field_val};
                 _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, span);
+            } else if (fld_type == .optional and self.type_reg.couldBeARC(field.type_idx)) {
+                // Optional managed pointer (?*T): unwrap then conditionally release.
+                // Swift LoadableEnumTypeLowering::emitDestroyValue (TypeLowering.cpp:1603)
+                const self_local = fb.lookupLocal("self") orelse continue;
+                const self_type_idx = fb.locals.items[self_local].type_idx;
+                const self_ptr = try fb.emitLoadLocal(self_local, self_type_idx, span);
+                const field_offset: i64 = @intCast(field.offset);
+                // Load tag at field offset + 0
+                const tag = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, TypeRegistry.I64, span);
+                const zero = try fb.emitConstInt(0, TypeRegistry.I64, span);
+                const is_some = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, span);
+                const then_blk = try fb.newBlock("deinit.opt.then");
+                const end_blk = try fb.newBlock("deinit.opt.end");
+                _ = try fb.emitBranch(is_some, then_blk, end_blk, span);
+                fb.setBlock(then_blk);
+                // Load payload at field offset + 8
+                const inner = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset + 8, fld_type.optional.elem, span);
+                var rel_args = [_]ir.NodeIndex{inner};
+                _ = try fb.emitCall("release", &rel_args, false, TypeRegistry.VOID, span);
+                _ = try fb.emitJump(end_blk, span);
+                fb.setBlock(end_blk);
             }
         }
     }
@@ -2093,13 +2123,32 @@ pub const Lowerer = struct {
 
                 // Release each ARC field
                 for (struct_type.fields, 0..) |field, i| {
-                    if (self.type_reg.couldBeARC(field.type_idx)) {
-                        const self_local: ir.LocalIdx = 0; // first param
+                    const fld_type = self.type_reg.get(field.type_idx);
+                    if (fld_type == .pointer and fld_type.pointer.managed) {
+                        // Direct managed pointer: load and release
+                        const self_local: ir.LocalIdx = 0;
                         const self_ptr = try fb.emitLoadLocal(self_local, ptr_type, Span.zero);
                         const field_offset: i64 = @intCast(field.offset);
                         const field_val = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, field.type_idx, Span.zero);
                         var release_args = [_]ir.NodeIndex{field_val};
                         _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, Span.zero);
+                    } else if (fld_type == .optional and self.type_reg.couldBeARC(field.type_idx)) {
+                        // Optional managed pointer (?*T): unwrap then conditionally release
+                        const self_local: ir.LocalIdx = 0;
+                        const self_ptr = try fb.emitLoadLocal(self_local, ptr_type, Span.zero);
+                        const field_offset: i64 = @intCast(field.offset);
+                        const tag = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset, TypeRegistry.I64, Span.zero);
+                        const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+                        const is_some = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, Span.zero);
+                        const then_blk = try fb.newBlock("adeinit.opt.then");
+                        const end_blk = try fb.newBlock("adeinit.opt.end");
+                        _ = try fb.emitBranch(is_some, then_blk, end_blk, Span.zero);
+                        fb.setBlock(then_blk);
+                        const inner = try fb.emitFieldValue(self_ptr, @intCast(i), field_offset + 8, fld_type.optional.elem, Span.zero);
+                        var rel_args = [_]ir.NodeIndex{inner};
+                        _ = try fb.emitCall("release", &rel_args, false, TypeRegistry.VOID, Span.zero);
+                        _ = try fb.emitJump(end_blk, Span.zero);
+                        fb.setBlock(end_blk);
                     }
                 }
 
@@ -2166,6 +2215,33 @@ pub const Lowerer = struct {
                 switch (cleanup.kind) {
                     .release => {
                         if (self.target.isWasm()) continue; // Wasm: no ARC runtime
+                        const ctype = self.type_reg.get(cleanup.type_idx);
+                        // Optional managed pointers (?*T): unwrap then conditionally release.
+                        // Swift LoadableEnumTypeLowering::emitDestroyValue (TypeLowering.cpp:1603-1609)
+                        // uses release_value which is type-aware. We emit the unwrap manually:
+                        // load tag → if non-null → load payload ptr → release(ptr)
+                        if (ctype == .optional and self.type_reg.couldBeARC(cleanup.type_idx)) {
+                            if (cleanup.local_idx) |lidx| {
+                                const ptr_type = self.type_reg.makePointer(TypeRegistry.U8) catch TypeRegistry.VOID;
+                                const local_addr = try fb.emitAddrLocal(lidx, ptr_type, Span.zero);
+                                // Tag at offset 0
+                                const tag = try fb.emitPtrLoadValue(local_addr, TypeRegistry.I64, Span.zero);
+                                const zero = try fb.emitConstInt(0, TypeRegistry.I64, Span.zero);
+                                const is_some = try fb.emitBinary(.ne, tag, zero, TypeRegistry.BOOL, Span.zero);
+                                const then_blk = try fb.newBlock("opt.release.then");
+                                const end_blk = try fb.newBlock("opt.release.end");
+                                _ = try fb.emitBranch(is_some, then_blk, end_blk, Span.zero);
+                                fb.setBlock(then_blk);
+                                // Payload at offset 8
+                                const payload_addr = try fb.emitAddrOffset(local_addr, 8, ptr_type, Span.zero);
+                                const inner_ptr = try fb.emitPtrLoadValue(payload_addr, ctype.optional.elem, Span.zero);
+                                var rel_args = [_]ir.NodeIndex{inner_ptr};
+                                _ = try fb.emitCall("release", &rel_args, false, TypeRegistry.VOID, Span.zero);
+                                _ = try fb.emitJump(end_blk, Span.zero);
+                                fb.setBlock(end_blk);
+                            }
+                            continue;
+                        }
                         // For locals: reload current value (may have been reassigned)
                         const value = if (cleanup.local_idx) |lidx|
                             try fb.emitLoadLocal(lidx, cleanup.type_idx, Span.zero)
@@ -2438,7 +2514,7 @@ pub const Lowerer = struct {
                         _ = try fb.emitCall("unowned_retain", &uargs, false, type_idx, var_stmt.span);
                         const cleanup = arc.Cleanup.initForLocal(.unowned_release, value_node, type_idx, local_idx);
                         _ = try self.cleanup_stack.push(cleanup);
-                    } else if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx)) {
+                    } else if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx) and self.type_reg.get(type_idx) != .optional) {
                         const is_owned = if (value_expr) |e| (e == .new_expr or e == .call) else false;
 
                         if (is_owned) {
@@ -3118,6 +3194,12 @@ pub const Lowerer = struct {
                     // Same pattern as field assignment (line ~3287). Swift makes no distinction.
                     if (!self.target.isWasm() and self.cleanup_stack.hasCleanupForLocal(local_idx)) {
                         const local_type = fb.locals.items[local_idx].type_idx;
+                        const lt_info = self.type_reg.get(local_type);
+                        // Skip ARC for optional types (?*T) — handled by cleanup unwrap.
+                        // Only direct managed pointers (*T) get retain/release on assignment.
+                        if (lt_info == .optional) {
+                            _ = try fb.emitStoreLocal(local_idx, value_node, assign.span);
+                        } else {
                         // 1. Load old value BEFORE store (needed for release after)
                         const old_value = try fb.emitLoadLocal(local_idx, local_type, assign.span);
 
@@ -3141,6 +3223,7 @@ pub const Lowerer = struct {
                         // 3. Release old value AFTER store (safe even if old == new)
                         var release_args = [_]ir.NodeIndex{old_value};
                         _ = try fb.emitCall("release", &release_args, false, TypeRegistry.VOID, assign.span);
+                        }
                     } else {
                         const local_type = fb.locals.items[local_idx].type_idx;
                         const local_info = self.type_reg.get(local_type);
@@ -3303,8 +3386,11 @@ pub const Lowerer = struct {
                     // (parameters have no cleanup). Swift: field assignments always do retain/release.
                     // Swift SILGen pattern: copy_value %new; store %new; destroy_value %old
                     // Retain-before-release prevents use-after-free when old == new.
-                    if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
-                        // Load old value BEFORE store (needed for release after)
+                    if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
+                        // ARC: retain/release for DIRECT managed pointer fields only.
+                        // Optional pointers (?*T) have compound layout (tag+ptr) — passing
+                        // the whole optional to release() is wrong (release expects raw ptr).
+                        // Swift: destroy_addr handles optionals via type-aware destruction.
                         const old_val = try fb.emitFieldValue(ptr_val, field_idx, field_offset, field.type_idx, span);
 
                         // Retain new value if borrowed (+0), then store
@@ -3349,9 +3435,12 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptField(fb, local_idx, field_idx, field_offset, value_node, rhs_ast, span);
-                        } else if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
-                            // ARC: Same retain-before-release as pointer-base path (line ~3306).
-                            // Swift SILGen: field assign always does copy_value + store + destroy_value.
+                        } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm() and self.cleanup_stack.hasCleanupForLocal(local_idx)) {
+                            // ARC: retain-before-release for local field REASSIGNMENT.
+                            // Only when local has active cleanup (initialized). For undefined/
+                            // uninitialized locals, old field value is garbage — must not release.
+                            // Swift: store [assign] vs store [init] — assign loads+destroys old,
+                            // init skips the destroy. ManagedValue::hasCleanup() is the guard.
                             const old_val = try fb.emitFieldLocal(local_idx, field_idx, field_offset, field.type_idx, span);
                             const rhs_node = self.tree.getNode(rhs_ast);
                             const rhs_expr2 = if (rhs_node) |n| n.asExpr() else null;
@@ -3374,7 +3463,7 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptFieldPtr(fb, global_addr, field_idx, field_offset, value_node, rhs_ast, span);
-                        } else if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
+                        } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
                             // ARC: retain-before-release for global field assignment (Swift SILGen pattern)
                             const old_val = try fb.emitFieldValue(global_addr, field_idx, field_offset, field.type_idx, span);
                             const rhs_node = self.tree.getNode(rhs_ast);
@@ -3411,7 +3500,7 @@ pub const Lowerer = struct {
                         const fld_info = self.type_reg.get(field.type_idx);
                         if (fld_info == .optional and !self.isPtrLikeOptional(field.type_idx)) {
                             try self.storeCompoundOptFieldPtr(fb, base_addr, field_idx, field_offset, value_node, rhs_ast, span);
-                        } else if (self.type_reg.couldBeARC(field.type_idx) and !self.target.isWasm()) {
+                        } else if (self.type_reg.get(field.type_idx) == .pointer and self.type_reg.get(field.type_idx).pointer.managed and !self.target.isWasm()) {
                             // ARC: retain-before-release for nested field assignment (Swift SILGen pattern)
                             const old_val = try fb.emitFieldValue(base_addr, field_idx, field_offset, field.type_idx, span);
                             const rhs_node = self.tree.getNode(rhs_ast);
