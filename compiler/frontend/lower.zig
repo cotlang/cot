@@ -1899,46 +1899,36 @@ pub const Lowerer = struct {
                 _ = try fb.emitRet(null, ret.span); // return void
                 return;
             } else {
-                const lowered = try self.lowerExprNode(ret.value);
-                if (lowered != ir.null_node) value_node = lowered;
-            }
-
-            // Forward ownership: if returning a local with ARC cleanup, disable it.
-            // The caller receives ownership - we don't release here.
-            // Reference: Swift's ManagedValue::forward() pattern
-            var forwarded = false;
-            if (ret_node) |node| {
-                if (node.asExpr()) |expr| {
-                    if (expr == .ident) {
-                        if (fb.lookupLocal(expr.ident.name)) |local_idx| {
-                            forwarded = self.cleanup_stack.disableForLocal(local_idx);
-                        }
+                // Swift SILGen: emitReturnExpr returns ManagedValue, forwarded to caller.
+                // +1 values are forwarded (cleanup disabled, ownership transferred).
+                // +0 values are retained to produce +1 for caller.
+                const managed = try self.lowerExprManaged(ret.value);
+                if (managed.hasCleanup()) {
+                    // +1 value: forward ownership to caller (disable cleanup)
+                    var mv = managed;
+                    value_node = mv.forward(&self.cleanup_stack);
+                } else if (managed.getValue() != ir.null_node) {
+                    const fn_ret_type = fb.return_type;
+                    const fn_ret_info = self.type_reg.get(fn_ret_type);
+                    if (!self.target.isWasm() and fn_ret_info == .pointer and fn_ret_info.pointer.managed) {
+                        // +0 value with managed return type: retain to produce +1
+                        var retain_args = [_]ir.NodeIndex{managed.getValue()};
+                        value_node = try fb.emitCall("retain", &retain_args, false, fn_ret_type, ret.span);
+                    } else {
+                        value_node = managed.getValue();
                     }
                 }
             }
 
-            // ARC Phase 4: Ensure +1 return for ARC types.
-            // Swift pattern: callee always produces +1 for @owned return convention.
-            // If the return value is already +1 (new_expr, call, or forwarded from cleanup),
-            // skip. Otherwise retain to produce +1. This fixes returning field accesses,
-            // parameters, or other borrowed (+0) values.
-            // addr_of expressions (&x, &x.field) produce raw pointers to existing memory
-            // (stack or embedded fields) — NOT heap-allocated ARC objects. Skip retain as
-            // an optimization (the ARC_HEAP_MAGIC guard in arc_native.zig also makes retain
-            // a no-op for non-heap pointers, but avoiding the call is better).
-            // Divergence from Swift: Swift prevents this at the type level (structs are
-            // value types). Cot's *T can be heap or stack — see arc_native.zig header comment.
-            if (!self.target.isWasm() and value_node != null) {
-                const fn_ret_type = fb.return_type;
-                // Only retain direct managed pointers, not optionals (?*T).
-                // ?*T has compound layout (tag+ptr) — retain/release expect raw ptr.
-                const fn_ret_info = self.type_reg.get(fn_ret_type);
-                if (fn_ret_info == .pointer and fn_ret_info.pointer.managed) {
-                    const is_plus_one = forwarded or
-                        (if (ret_node) |n| if (n.asExpr()) |e| (e == .new_expr or e == .call or e == .addr_of) else false else false);
-                    if (!is_plus_one) {
-                        var retain_args = [_]ir.NodeIndex{value_node.?};
-                        value_node = try fb.emitCall("retain", &retain_args, false, fn_ret_type, ret.span);
+            // Also check: if return expression is an ident with a local cleanup,
+            // forward that cleanup (the local won't need its own release since
+            // we're transferring the value to the caller).
+            if (ret_node) |node| {
+                if (node.asExpr()) |expr| {
+                    if (expr == .ident) {
+                        if (fb.lookupLocal(expr.ident.name)) |local_idx| {
+                            _ = self.cleanup_stack.disableForLocal(local_idx);
+                        }
                     }
                 }
             }
