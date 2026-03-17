@@ -2005,6 +2005,33 @@ pub const Lowerer = struct {
         if (type_info != .struct_type) return;
         const struct_name = type_info.struct_type.name;
 
+        // Swift auto-generated memberwise destroy: if a struct has ARC fields
+        // but no user deinit, queue an auto-deinit. This ensures stack-allocated
+        // structs with managed pointer fields get their fields released.
+        // Reference: Swift IRGen — auto-synthesizes value witness destroy.
+        if (self.chk.lookupMethod(struct_name, "deinit") == null and !self.target.isWasm()) {
+            const struct_type = type_info.struct_type;
+            var has_arc_fields = false;
+            for (struct_type.fields) |field| {
+                if (self.type_reg.couldBeARC(field.type_idx)) {
+                    has_arc_fields = true;
+                    break;
+                }
+            }
+            if (has_arc_fields) {
+                var already_queued = false;
+                for (self.pending_auto_deinits.items) |name| {
+                    if (std.mem.eql(u8, name, struct_name)) {
+                        already_queued = true;
+                        break;
+                    }
+                }
+                if (!already_queued) {
+                    try self.pending_auto_deinits.append(self.allocator, struct_name);
+                }
+            }
+        }
+
         // Check if this struct has a deinit() method (automatic destructor).
         // Note: free() is manual cleanup — only deinit() triggers scope_destroy.
         if (self.chk.lookupMethod(struct_name, "deinit")) |method_info| {
