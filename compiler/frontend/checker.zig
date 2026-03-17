@@ -115,6 +115,11 @@ pub const GenericInstInfo = struct {
     type_param_names: []const []const u8 = &.{}, // For impl block methods (type params come from impl, not fn)
     tree: *const Ast, // which file's AST this generic_node belongs to (for cross-file generics)
     scope: ?*Scope = null, // defining file's scope (for cross-file generic resolution in lowerer re-check)
+    /// Go pattern: expr_types from Phase 2 body checking, preserved for Phase 3 lowering.
+    /// Eliminates the need for Phase 3 re-checking (checkFnDeclBody), which causes stack
+    /// overflow for complex files. Go's type checker fully resolves all types during checking;
+    /// codegen just reads the results. Same pattern here.
+    expr_types: ?std.AutoHashMap(NodeIndex, TypeIndex) = null,
 };
 
 /// Info about a trait definition.
@@ -3882,14 +3887,15 @@ pub const Checker = struct {
             try self.global_scope.define(Symbol.init(cache_key, .function, func_type, gen_info.node_idx, false));
         }
 
-        // Always save/restore expr_types during generic function body checking.
-        // Generic bodies use the declaring file's AST, whose NodeIndexes can collide
-        // with the host file's — even for same-file generics during nested instantiation.
+        // Go pattern: check body with fresh expr_types and PRESERVE them for Phase 3 lowering.
+        // Go's type checker fully resolves all types during checking; codegen reads the results.
+        // This eliminates Phase 3 re-checking (checkFnDeclBody) which causes stack overflow.
+        var inst_expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
         {
             const saved_et = self.expr_types;
-            self.expr_types = std.AutoHashMap(NodeIndex, TypeIndex).init(self.allocator);
+            self.expr_types = inst_expr_types;
             defer {
-                self.expr_types.deinit();
+                inst_expr_types = self.expr_types; // capture the populated map
                 self.expr_types = saved_et;
             }
             try self.checkFnDeclWithName(f, gen_info.node_idx, cache_key);
@@ -3903,6 +3909,7 @@ pub const Checker = struct {
             .type_args = try self.allocator.dupe(TypeIndex, resolved_args.items),
             .tree = gen_info.tree,
             .scope = gen_info.scope,
+            .expr_types = inst_expr_types, // preserved from Phase 2
         };
         try self.generic_instantiations.put(c.callee, inst);
         // Also store by concrete name (never overwritten, for nested generic calls)

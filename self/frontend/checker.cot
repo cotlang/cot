@@ -155,11 +155,13 @@ struct GenericInfo {
 // Zig: GenericInstInfo { concrete_name, generic_node, type_args, tree, scope }.
 // The lowerer looks these up by concrete name to find the original generic function.
 struct GenericInstInfo {
-    concrete_name: string,    // synthesized name (cache key), e.g. "max(5)" or "List(5)_push"
-    generic_node: int,        // NodeIndex of the original generic fn_decl/method
-    type_args_str: string,    // serialized type args, e.g. "5" or "5;17"
-    type_param_names: string, // semicolon-separated type param names, e.g. "T" or "K;V"
-    ast_ptr: int,             // @ptrToInt of defining file's *Ast
+    concrete_name: string,
+    generic_node: int,
+    type_args_str: string,
+    type_param_names: string,
+    ast_ptr: int,             // @ptrToInt of defining file's *Ast (raw — ARC doesn't track)
+    /// Go pattern: expr_types from Phase 2 body checking, preserved for Phase 3 lowering.
+    expr_types_ptr: int,      // @ptrToInt of heap-allocated Map(int, int), 0 = none
 
     fn getAst() *Ast {
         return @intToPtr(*Ast, self.ast_ptr)
@@ -215,19 +217,19 @@ struct Checker {
     current_scope: int,
     global_scope: int,
     expr_types: Map(int, int),
-    trait_defs: int,  // raw ptr to shared Map   // trait name → AST node index
+    trait_defs: int,  // raw ptr to shared Map
     current_return_type: int,
     in_loop: bool,
     safe_mode: bool,
     // Generic support
-    generic_structs: int,  // raw ptr to shared Map        // name → struct_decl node_idx
-    generic_functions: int,  // raw ptr to shared Map      // name → fn_decl node_idx
+    generic_structs: int,  // raw ptr to shared Map
+    generic_functions: int,  // raw ptr to shared Map
     generic_impl_entries: List(GenericImplEntry),
-    instantiation_cache: int,  // raw ptr to shared Map    // "List(5)" → concrete type_idx
-    generic_inst_by_name: int,  // raw ptr to shared Map   // concrete_name → @ptrToInt(*GenericInstInfo)
-    type_sub_keys: List(string),             // parallel lists = active substitution map
+    instantiation_cache: int,  // raw ptr to shared Map
+    generic_inst_by_name: int,  // raw ptr to shared Map
+    type_sub_keys: List(string),
     type_sub_vals: List(int),
-    trait_impls: int,  // raw ptr to shared Map        // "Trait:Type" → trait_name
+    trait_impls: int,  // raw ptr to shared Map
     // Type flow
     expected_type: int,                       // Zig RLS pattern
     current_switch_enum_type: int,            // for .variant shorthand
@@ -4075,7 +4077,7 @@ struct Checker {
 
     /// Register a generic instance so the lowerer can find it by concrete name.
     /// Zig: self.generics.generic_inst_by_name.put(name, inst)
-    fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), type_param_names: List(string), ast_ptr: int) void {
+    fn registerGenericInst(concrete_name: string, generic_node: int, type_args: List(int), type_param_names: List(string), ast_ptr: int, expr_types_ptr: int) void {
         // Serialize type args: "5" or "5;17"
         var ta_str = ""
         for i in 0..type_args.count {
@@ -4105,6 +4107,7 @@ struct Checker {
             type_args_str: ta_copy,
             type_param_names: tp_copy,
             ast_ptr: ast_ptr,
+            expr_types_ptr: expr_types_ptr,
         }
         @intToPtr(*Map(string, int), self.generic_inst_by_name).set(concrete_name, @ptrToInt(inst))
     }
@@ -4257,9 +4260,9 @@ struct Checker {
             var fn_tp: List(string) = .{}
             switch (self.ast.getNode(nested_idx)) { Node.decl |d| => switch (d) { Decl.fn_decl |f| => { fn_tp = f.type_params }, else => {} }, else => {} }
             if (fn_tp.count > 0) {
-                self.registerGenericInst(synth_name, nested_idx, resolved_args, fn_tp, ast_ptr)
+                self.registerGenericInst(synth_name, nested_idx, resolved_args, fn_tp, ast_ptr, 0)
             } else {
-                self.registerGenericInst(synth_name, nested_idx, resolved_args, type_param_names, ast_ptr)
+                self.registerGenericInst(synth_name, nested_idx, resolved_args, type_param_names, ast_ptr, 0)
             }
         }
 
@@ -4341,7 +4344,7 @@ struct Checker {
                 })
 
                 // Register for lowerer (Zig line 3537)
-                self.registerGenericInst(synth_name, method_idx, resolved_args, impl_tp, entry.ast_ptr)
+                self.registerGenericInst(synth_name, method_idx, resolved_args, impl_tp, entry.ast_ptr, 0)
             }
 
             // Pass 2: Check all method bodies
@@ -4484,24 +4487,22 @@ struct Checker {
         // Zig pattern: define + check in one if-block prevents re-checking.
         const old_scope = self.current_scope
         self.current_scope = self.global_scope
+        var et_ptr: int = 0
         if (!self.isDefined(cache_key)) {
             self.defineSymbol(makeFuncSymbol(cache_key, func_type, fn_node))
             self.current_scope = old_scope
 
-            // Check the function body (still using DEFINING file's AST)
-            // Cross-file: save/restore expr_types to avoid NodeIndex collision (Zig lines 3539-3548)
-            const is_cross_file = (info.ast_ptr != @ptrToInt(saved_ast))
+            // Go pattern: check body with fresh expr_types, PRESERVE them for Phase 3 lowering.
+            // Go's type checker fully resolves all types during checking; codegen reads results.
+            // This eliminates Phase 3 re-checking which causes stack overflow.
             var saved_expr_types = self.expr_types
-            if (is_cross_file) {
-                var fresh_et: Map(int, int) = .{}
-                self.expr_types = fresh_et
-            }
-            // Skip body check if we're already in a re-check (prevents stack overflow
-            // from deep generic recursion: A checks B checks C checks A...)
+            var fresh_et: Map(int, int) = .{}
+            self.expr_types = fresh_et
             self.checkFnDeclBody(fn_node, cache_key)
-            if (is_cross_file) {
-                self.expr_types = saved_expr_types
-            }
+            // Heap-copy the populated expr_types so they survive this scope
+            et_ptr = alloc(0, @sizeOf(Map(int, int)))
+            @intToPtr(*Map(int, int), et_ptr).* = self.expr_types
+            self.expr_types = saved_expr_types
         } else {
             self.current_scope = old_scope
         }
@@ -4516,8 +4517,8 @@ struct Checker {
         self.safe_mode = saved_safe_mode
         release(@ptrToInt(saved_ast))
 
-        // Register for lowerer: concrete_name → GenericInstInfo (Zig line 3672)
-        self.registerGenericInst(cache_key, fn_node, resolved_args, fn_tp, info.ast_ptr)
+        // Register for lowerer with preserved expr_types (Go pattern)
+        self.registerGenericInst(cache_key, fn_node, resolved_args, fn_tp, info.ast_ptr, et_ptr)
 
         return func_type
     }
@@ -5545,9 +5546,10 @@ struct Checker {
         }
 
         // Also check generic struct names
-        for ki in 0..@intToPtr(*Map(string, int), self.generic_structs).capacity {
-            if (@intToPtr(*u8, @intToPtr(*Map(string, int), self.generic_structs).states + ki).* != 1) { continue }
-            const candidate = @intToPtr(*string, @intToPtr(*Map(string, int), self.generic_structs).keys + ki * @sizeOf(string)).*
+        const _gs = @intToPtr(*Map(string, int), self.generic_structs)
+        for ki in 0.._gs.capacity {
+            if (@intToPtr(*u8, _gs.states + ki).* != 1) { continue }
+            const candidate = @intToPtr(*string, _gs.keys + ki * @sizeOf(string)).*
             if (candidate == name) { continue }
             const d = self.editDistance(name, candidate)
             if (d < best_dist and d <= 2 and d * 2 <= @lenOf(name)) {

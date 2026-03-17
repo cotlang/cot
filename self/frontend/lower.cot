@@ -7551,18 +7551,20 @@ struct Lowerer {
             self.generateDictHelpers(parsed_type_args, self.stencil_dict_entries)
         }
 
-        // Fresh expr_types for this instantiation
+        // Go pattern: use expr_types preserved from Phase 2 instead of re-checking.
+        // This eliminates checkFnDeclBody during lowering, avoiding stack overflow.
         const saved_expr_types = self.chk.expr_types
-        var fresh_types: Map(int, int) = .{}
-        self.chk.expr_types = fresh_types
-
-        // Swap checker's AST to defining file for cross-file generic body checking.
         const saved_chk_ast = self.chk.ast
-        self.chk.ast = self.tree
-
-        // Re-check the body with substitutions active to populate expr_types.
-        // Depth-bounded in checkFnDeclBody to prevent stack corruption.
-        self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
+        self.chk.ast = self.tree  // swap checker AST to defining file
+        if (inst.expr_types_ptr != 0) {
+            // Use Phase 2 expr_types directly — no re-checking needed
+            self.chk.expr_types = @intToPtr(*Map(int, int), inst.expr_types_ptr).*
+        } else {
+            // Fallback: fresh expr_types with re-check (for impl method generics)
+            var fresh_types: Map(int, int) = .{}
+            self.chk.expr_types = fresh_types
+            self.chk.checkFnDeclBody(inst.generic_node, concrete_name)
+        }
 
         // Lower the concrete function body
         const return_type = self.resolveTypeNode(fn_d.return_type)

@@ -8614,27 +8614,28 @@ pub const Lowerer = struct {
             }
         }
 
-        // Zig pattern: ensureFuncBodyUpToDate (Zcu.zig:3522-3543) — re-analyze per instance.
-        // AST nodes are shared across instantiations, so expr_types must be refreshed
-        // before lowering each concrete instance (e.g., add(i64) vs add(i32) share the
-        // same body AST but need different expr_types). The checker already eagerly checked
-        // the body during instantiateGenericFunc; this re-check updates expr_types for the
-        // current instantiation's concrete types.
-        //
-        // Zig pattern: each instantiation gets completely fresh analysis state.
-        // Fresh Sema per analysis (Zig: Zcu/PerThread.zig:2856-2883).
-        // Shared ZIR (our AST) is read-only. Analysis results are per-instance.
+        // Go pattern: use expr_types preserved from Phase 2 instead of re-checking.
+        // Go's type checker resolves all types during checking; codegen reads the results.
+        // This eliminates checkFnDeclWithName during lowering, avoiding stack overflow from
+        // deep generic chains (checkFnDeclBody + checkBlockExpr + instantiateGenericFunc = 18KB+).
         const saved_expr_types = self.chk.expr_types;
-        self.chk.expr_types = std.AutoHashMap(ir.NodeIndex, TypeIndex).init(self.allocator);
+        if (inst_info.expr_types) |et| {
+            // Use Phase 2 expr_types directly — no re-checking needed
+            self.chk.expr_types = et;
+        } else {
+            // Fallback: re-check if no preserved expr_types (shouldn't happen for well-formed code)
+            self.chk.expr_types = std.AutoHashMap(ir.NodeIndex, TypeIndex).init(self.allocator);
+            self.chk.type_substitution = sub_map;
+            self.chk.checkFnDeclWithName(f, inst_info.generic_node, inst_info.concrete_name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            self.chk.type_substitution = null;
+        }
         defer {
-            self.chk.expr_types.deinit();
+            // Only deinit if we created fresh expr_types (fallback path)
+            if (inst_info.expr_types == null) self.chk.expr_types.deinit();
             self.chk.expr_types = saved_expr_types;
         }
-        self.chk.type_substitution = sub_map;
-        self.chk.checkFnDeclWithName(f, inst_info.generic_node, inst_info.concrete_name) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        self.chk.type_substitution = null;
 
         // Shape stenciling: after re-check populates expr_types, check if this function
         // can be shared across types with the same shape (size, alignment, ARC kind).
