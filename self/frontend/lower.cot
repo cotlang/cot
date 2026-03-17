@@ -267,6 +267,7 @@ struct Lowerer {
     fn lowerToBuilder() void {
         for i in 0..self.tree.file_decls.count {
             const decl_idx = self.tree.file_decls.get(i)
+            eprintln("[lower] decl ${i}/${self.tree.file_decls.count}")
             self.lowerDecl(decl_idx)
         }
         self.lowerQueuedGenericFunctions()
@@ -574,6 +575,7 @@ struct Lowerer {
     }
 
     fn lowerMethodWithName(fn_decl: FnDecl, synth_name: string, is_destructor: bool) void {
+        eprintln("[lower] lmwn: resolve return type")
         const return_type = if (fn_decl.return_type != null_node) {
             self.resolveTypeNode(fn_decl.return_type)
         } else { VOID }
@@ -581,22 +583,26 @@ struct Lowerer {
         const uses_sret = self.needsSret(return_type)
         const wasm_return_type = if (uses_sret) { VOID } else { return_type }
 
+        eprintln("[lower] lmwn: startFunc")
         self.builder.startFunc(synth_name, VOID, wasm_return_type, fn_decl.span)
         if (self.builder.func()) |fb| {
             fb.is_destructor = is_destructor
             if (uses_sret) { fb.sret_return_type = return_type }
+            eprintln("[lower] lmwn: clearPerFunctionState")
             self.clearPerFunctionState()
 
             if (uses_sret) {
                 fb.addParam("__sret", I64, 8)
             }
 
+            eprintln("[lower] lmwn: adding ${fn_decl.params.count} params")
             for i in 0..fn_decl.params.count {
                 const param_idx = fn_decl.params.get(i)
                 self.addParamFromNode(param_idx)
             }
 
             if (fn_decl.body != null_node) {
+                eprintln("[lower] lmwn: lowerBlockNode")
                 self.lowerBlockNode(fn_decl.body)
 
                 if (is_destructor) {
@@ -639,7 +645,9 @@ struct Lowerer {
                     },
                     Decl.fn_decl |fd| => {
                         const synth_name = struct_decl.name ++ "_" ++ fd.name
+                        eprintln("[lower] method: ${synth_name}")
                         self.lowerMethodWithName(fd, synth_name, fd.name == "deinit")
+                        eprintln("[lower] method done: ${synth_name}")
                     },
                     else => {},
                 },
@@ -832,9 +840,11 @@ struct Lowerer {
     /// Lower a block node — dispatches to statement or expression lowering.
     /// Returns true if the block terminated (return/break/continue).
     fn lowerBlockNode(idx: int) bool {
+        eprintln("[lower] lowerBlockNode: ${idx}")
         const fb = self.builder.func() orelse return false
         if (idx == null_node) { return false }
         const node = self.tree.getNode(idx)
+        eprintln("[lower] lowerBlockNode: got node")
 
         // Statement
         const maybe_stmt = asStmt(node)

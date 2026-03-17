@@ -1355,6 +1355,7 @@ pub const Driver = struct {
             "c_openpty",     "setsid",        "ioctl",
             "c_mkdir",       "opendir",       "readdir",       "closedir",
             "c_stat",        "c_unlink",      "signal",
+            "sigaction",     "sigaltstack",
             "backtrace",     "backtrace_symbols_fd",
             // pthread symbols — external references resolved by linker (-lpthread/-lSystem)
             "pthread_create", "pthread_join",  "pthread_detach",

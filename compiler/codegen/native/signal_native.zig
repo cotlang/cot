@@ -201,7 +201,16 @@ fn generateSignalHandler(
 
 /// Generate __cot_install_signals() -> void
 ///
-/// Calls signal() for SIGILL(4), SIGABRT(6), SIGFPE(8), SIGBUS(10), SIGSEGV(11).
+/// Sets up alternate signal stack (sigaltstack) then installs signal handlers
+/// using sigaction with SA_ONSTACK for SIGILL(4), SIGABRT(6), SIGFPE(8),
+/// SIGBUS(10), SIGSEGV(11).
+///
+/// The alternate stack allows the signal handler to run even during stack
+/// overflow, where the main stack's guard page has been hit and there's no
+/// space for a normal signal handler frame.
+///
+/// Reference: Go runtime/signal_unix.go:signalstack — uses sigaltstack for
+/// crash recovery during goroutine stack overflow.
 fn generateInstallSignals(
     allocator: Allocator,
     isa: native_compile.TargetIsa,
@@ -224,17 +233,62 @@ fn generateInstallSignals(
 
     const ins = builder.ins();
 
-    // Import signal(signum, handler) -> old_handler
-    const signal_idx = func_index_map.get("signal") orelse 0;
-    var signal_sig = clif.Signature.init(.system_v);
-    try signal_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try signal_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
-    try signal_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
-    const signal_sig_ref = try builder.importSignature(signal_sig);
-    const signal_func = try builder.importFunction(.{
-        .name = .{ .user = .{ .namespace = 0, .index = signal_idx } },
-        .signature = signal_sig_ref,
+    // ---- Step 1: Allocate alternate signal stack via malloc ----
+    // Go runtime: signalstack allocates _g_.m.gsignal stack for signal handling.
+    // We use malloc(SIGSTKSZ=65536) for the alternate stack buffer.
+    const malloc_idx = func_index_map.get("malloc") orelse func_index_map.get("_malloc") orelse 0;
+    var malloc_sig = clif.Signature.init(.system_v);
+    try malloc_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
+    try malloc_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const malloc_sig_ref = try builder.importSignature(malloc_sig);
+    const malloc_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = malloc_idx } },
+        .signature = malloc_sig_ref,
         .colocated = false,
+    });
+
+    const SIGSTKSZ: i64 = 65536; // 64KB alternate stack
+    const v_stksz = try ins.iconst(clif.Type.I64, SIGSTKSZ);
+    const malloc_result = try ins.call(malloc_func, &[_]clif.Value{v_stksz});
+    const alt_stack_buf = malloc_result.results[0];
+
+    // ---- Step 2: Call sigaltstack to register the alternate stack ----
+    // struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; }
+    // On ARM64 macOS: ss_sp at offset 0 (8 bytes), ss_flags at 8 (4 bytes, padded to 8), ss_size at 16 (8 bytes)
+    // Total: 24 bytes
+    const ss_slot = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 24,
+        .align_shift = 3,
+    });
+    const ss_addr = try ins.stackAddr(clif.Type.I64, ss_slot, 0);
+    _ = try ins.store(clif.MemFlags.DEFAULT, alt_stack_buf, ss_addr, 0); // ss_sp
+    const v_zero_flags = try ins.iconst(clif.Type.I64, 0);
+    _ = try ins.store(clif.MemFlags.DEFAULT, v_zero_flags, ss_addr, 8); // ss_flags = 0
+    _ = try ins.store(clif.MemFlags.DEFAULT, v_stksz, ss_addr, 16); // ss_size
+
+    const sigaltstack_idx = func_index_map.get("sigaltstack") orelse 0;
+    var sigaltstack_sig = clif.Signature.init(.system_v);
+    try sigaltstack_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // new stack_t*
+    try sigaltstack_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // old stack_t* (null)
+    try sigaltstack_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const sigaltstack_sig_ref = try builder.importSignature(sigaltstack_sig);
+    const sigaltstack_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = sigaltstack_idx } },
+        .signature = sigaltstack_sig_ref,
+        .colocated = false,
+    });
+    const v_null = try ins.iconst(clif.Type.I64, 0);
+    _ = try ins.call(sigaltstack_func, &[_]clif.Value{ ss_addr, v_null });
+
+    // ---- Step 3: Install handlers via sigaction with SA_ONSTACK ----
+    // struct sigaction { void (*sa_handler)(int); sigset_t sa_mask; int sa_flags; }
+    // macOS ARM64: sa_handler at 0 (8 bytes), sa_mask at 8 (4 bytes), sa_flags at 12 (4 bytes)
+    // Total: 16 bytes (we allocate 16)
+    const sa_slot = try clif_func.createStackSlot(allocator, .{
+        .kind = .explicit_slot,
+        .size = 16,
+        .align_shift = 3,
     });
 
     // Get address of __cot_signal_handler
@@ -249,11 +303,37 @@ fn generateInstallSignals(
     });
     const handler_addr = try ins.funcAddr(clif.Type.I64, handler_func_ref);
 
+    // Import sigaction(signum, act, oldact) -> int
+    const sigaction_idx = func_index_map.get("sigaction") orelse 0;
+    var sigaction_sig = clif.Signature.init(.system_v);
+    try sigaction_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // signum
+    try sigaction_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // act*
+    try sigaction_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64)); // oldact*
+    try sigaction_sig.addReturn(allocator, clif.AbiParam.init(clif.Type.I64));
+    const sigaction_sig_ref = try builder.importSignature(sigaction_sig);
+    const sigaction_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = sigaction_idx } },
+        .signature = sigaction_sig_ref,
+        .colocated = false,
+    });
+
+    // SA_ONSTACK = 0x1 on macOS, 0x08000000 on Linux
+    // For now use macOS value. TODO: conditional on target_os.
+    const SA_ONSTACK: i64 = 0x1;
+
+    // Fill sigaction struct: handler + (sa_mask | sa_flags<<32) as combined i64
+    // macOS ARM64 struct __sigaction: sa_handler(8) + sa_mask(4) + sa_flags(4) = 16
+    const sa_addr = try ins.stackAddr(clif.Type.I64, sa_slot, 0);
+    _ = try ins.store(clif.MemFlags.DEFAULT, handler_addr, sa_addr, 0); // sa_handler
+    // Pack sa_mask(0) in low 32 bits + sa_flags(SA_ONSTACK) in high 32 bits
+    const v_mask_flags = try ins.iconst(clif.Type.I64, SA_ONSTACK << 32);
+    _ = try ins.store(clif.MemFlags.DEFAULT, v_mask_flags, sa_addr, 8); // sa_mask + sa_flags
+
     // Install for each signal
     const signals = [_]i64{ 4, 6, 8, 10, 11 };
     for (signals) |signum| {
         const v_sig = try ins.iconst(clif.Type.I64, signum);
-        _ = try ins.call(signal_func, &[_]clif.Value{ v_sig, handler_addr });
+        _ = try ins.call(sigaction_func, &[_]clif.Value{ v_sig, sa_addr, v_null });
     }
 
     _ = try ins.return_(&.{});
