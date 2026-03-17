@@ -2714,12 +2714,15 @@ pub const Lowerer = struct {
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
                         // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
                         // Raw pointers (&x, @intToPtr) have no cleanup and must not be retained.
-                        if (!self.target.isWasmGC() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
                             if (!fi_owned) {
-                                // +0 value: only retain if source has active ARC cleanup (managed)
+                                // +0 value: retain when stored in struct field during init.
+                                // Swift ensurePlusOne (ManagedValue.cpp:289-299): always copies
+                                // +0 non-trivial values. Default true for safety — only skip
+                                // for known-unmanaged sources (ident with no cleanup).
                                 const needs_retain = if (fi_expr) |e| blk: {
                                     if (e == .ident) {
                                         if (fb.lookupLocal(e.ident.name)) |src_local_idx| {
@@ -2729,7 +2732,9 @@ pub const Lowerer = struct {
                                     if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
                                     if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                                     if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                                    break :blk false;
+                                    // Default: retain any +0 ARC value from complex expressions.
+                                    // Swift ensurePlusOne copies unconditionally for non-trivial types.
+                                    break :blk true;
                                 } else false;
                                 if (needs_retain) {
                                     var retain_args = [_]ir.NodeIndex{actual_value};
@@ -2773,7 +2778,7 @@ pub const Lowerer = struct {
             } else {
                 // ARC Phase 4: Retain +0 managed default values stored in struct fields.
                 // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                if (!self.target.isWasmGC() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
@@ -2787,7 +2792,7 @@ pub const Lowerer = struct {
                             if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
                             if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                             if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                            break :blk false;
+                            break :blk true; // Swift ensurePlusOne: default retain for +0 non-trivial
                         } else false;
                         if (needs_retain) {
                             var retain_args = [_]ir.NodeIndex{value_node_ir};
@@ -5697,7 +5702,7 @@ pub const Lowerer = struct {
                         }
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
                         // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                        if (!self.target.isWasmGC() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
@@ -5711,7 +5716,7 @@ pub const Lowerer = struct {
                                     if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
                                     if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                                     if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                                    break :blk false;
+                                    break :blk true; // Swift ensurePlusOne: default retain for +0 non-trivial
                                 } else false;
                                 if (needs_retain) {
                                     var retain_args = [_]ir.NodeIndex{actual_value};
@@ -5756,7 +5761,7 @@ pub const Lowerer = struct {
             } else {
                 // ARC Phase 4: Retain +0 managed default values stored in struct fields.
                 // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                if (!self.target.isWasmGC() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
@@ -5770,7 +5775,7 @@ pub const Lowerer = struct {
                             if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
                             if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                             if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                            break :blk false;
+                            break :blk true; // Swift ensurePlusOne: default retain for +0 non-trivial
                         } else false;
                         if (needs_retain) {
                             var retain_args = [_]ir.NodeIndex{value_node};
@@ -6052,7 +6057,7 @@ pub const Lowerer = struct {
                         // Simple field: store value at offset
                         // ARC Phase 4: Retain +0 managed values stored in struct fields during init.
                         // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
-                        if (!self.target.isWasmGC() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                        if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
                             const fi_node = self.tree.getNode(field_init.value);
                             const fi_expr = if (fi_node) |n| n.asExpr() else null;
                             const fi_owned = if (fi_expr) |e| (e == .new_expr or e == .call) else false;
@@ -6068,7 +6073,7 @@ pub const Lowerer = struct {
                                     if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
                                     if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                                     if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                                    break :blk false;
+                                    break :blk true; // Swift ensurePlusOne: default retain for +0 non-trivial
                                 } else false;
                                 if (needs_retain) {
                                     var retain_args = [_]ir.NodeIndex{value_node};
@@ -6116,7 +6121,7 @@ pub const Lowerer = struct {
                 // ARC Phase 4: Retain +0 ARC default values stored in struct fields.
                 // Swift: ManagedValue::hasCleanup() — only retain if source is managed.
                 // Raw pointers (&x, @intToPtr) have no cleanup and must not be retained.
-                if (!self.target.isWasmGC() and self.type_reg.couldBeARC(struct_field.type_idx)) {
+                if (!self.target.isWasm() and self.type_reg.couldBeARC(struct_field.type_idx)) {
                     const def_node = self.tree.getNode(struct_field.default_value);
                     const def_expr = if (def_node) |n| n.asExpr() else null;
                     const def_owned = if (def_expr) |e| (e == .new_expr or e == .call) else false;
@@ -6133,7 +6138,7 @@ pub const Lowerer = struct {
                             if (e == .field_access) break :blk self.baseHasCleanup(e.field_access.base);
                             if (e == .index) break :blk self.baseHasCleanup(e.index.base);
                             if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                            break :blk false;
+                            break :blk true; // Swift ensurePlusOne: default retain for +0 non-trivial
                         } else false;
                         if (needs_retain) {
                             var retain_args = [_]ir.NodeIndex{value_node};
