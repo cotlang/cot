@@ -840,11 +840,9 @@ struct Lowerer {
     /// Lower a block node — dispatches to statement or expression lowering.
     /// Returns true if the block terminated (return/break/continue).
     fn lowerBlockNode(idx: int) bool {
-        eprintln("[lower] lowerBlockNode: ${idx}")
-        const fb = self.builder.func() orelse return false
+        if (self.builder.func() == null) { return false }
         if (idx == null_node) { return false }
         const node = self.tree.getNode(idx)
-        eprintln("[lower] lowerBlockNode: got node")
 
         // Statement
         const maybe_stmt = asStmt(node)

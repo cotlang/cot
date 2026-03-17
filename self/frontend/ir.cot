@@ -561,6 +561,7 @@ struct FuncBuilder {
     /// Heap-allocate a FuncBuilder so mutations through a pointer persist.
     /// Matches Zig's ?*FuncBuilder pattern in Builder.func().
     static fn initHeap(name: string, type_idx: int, return_type: int, span: Span) *FuncBuilder {
+        eprintln("[ir] initHeap: @sizeOf(FuncBuilder) = ${@sizeOf(FuncBuilder)}")
         var fb = FuncBuilder.init(name, type_idx, return_type, span)
         const ptr = new FuncBuilder {
             name: fb.name,
@@ -598,8 +599,11 @@ struct FuncBuilder {
     }
 
     fn addLocalWithSize(name: string, type_idx: int, mutable: bool, size: int) int {
+        eprintln("[ir] addLocal: ${name} self=${@ptrToInt(self)} map.cap=${self.local_map.capacity} map.keys=${self.local_map.keys} map.states=${self.local_map.states} locals=${self.locals.count}")
         const idx = self.locals.count
+        eprintln("[ir] addLocal: before append, locals.items=${self.locals.items} locals.cap=${self.locals.capacity}")
         self.locals.append(Local.initWithSize(name, type_idx, mutable, size))
+        eprintln("[ir] addLocal: after append, map.keys=${self.local_map.keys} map.states=${self.local_map.states}")
         self.shadow_stack.append(ShadowEntry { name: name, old_idx: self.local_map.getOrNull(name) })
         self.local_map.set(name, idx)
         return idx
