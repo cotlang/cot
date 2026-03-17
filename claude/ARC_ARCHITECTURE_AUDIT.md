@@ -97,14 +97,14 @@ All ARC guarded by `!self.target.isWasm()`. Wasm uses bump allocator — nothing
 
 ## Fix Priority for Self-Hosting
 
-| Priority | Gap | Impact | Effort |
+| Priority | Gap | Impact | Status |
 |----------|-----|--------|--------|
-| 1 | Fix `isTrivial` for managed pointers (#2) | Immediate — unifies type checks | 15 min |
-| 2 | Remove optional exclusion from ARC (#6) | Fixes optional leaks/crashes | 1 hour |
-| 3 | Auto-synthesize destructors for ARC structs (#4) | Fixes field leaks | 2 hours |
-| 4 | Integrate ManagedValue into lowering (#1) | Eliminates all heuristic bugs | 2-3 days |
-| 5 | Define parameter ownership convention (#5) | Prevents stored-param crashes | 1 hour |
-| 6 | Implement move semantics for return (#3) | Fixes non-ident return bugs | 1 hour |
+| 1 | Fix `isTrivial` for managed pointers (#2) | Immediate | DONE (59d31e0) |
+| 2 | Remove optional exclusion from ARC (#6) | Fixes optional leaks/crashes | DONE (89c6ff1) |
+| 3 | Auto-synthesize destructors for ARC structs (#4) | Fixes field leaks | DONE (ac39faa) |
+| 4 | Integrate ManagedValue into lowering (#1) | Eliminates all heuristic bugs | DONE (9b3b1a1) |
+| 5 | Define parameter ownership convention (#5) | Prevents stored-param crashes | DONE (via ManagedValue) |
+| 6 | Implement move semantics for return (#3) | Fixes non-ident return bugs | DONE (fd36a74) |
 
 **The ManagedValue integration (#4) is the correct long-term fix.** It eliminates ALL heuristic-based ownership guessing. But it's a major refactor — every `lowerExprNode` call changes signature.
 
