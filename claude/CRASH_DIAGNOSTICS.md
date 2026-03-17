@@ -155,7 +155,7 @@ After freeing an object, overwrite the user data with a pattern (0xDEADBEEF). Th
 | 2 | ARC pointer range check | Critical | 30 min | DONE (25ece9c) |
 | 3 | ARC diagnostic messages | High | 1 hour | DONE (3b87ffc) |
 | 4 | Phase tracking in selfcot | High | 30 min | DONE (b954e2f) |
-| 5 | Refcount underflow detection | Medium | 30 min | Not started |
+| 5 | Refcount underflow detection | Medium | 30 min | DONE (ff187c2) |
 | 6 | Function name in @trap | Medium | 15 min | DONE (9a8106b) |
 | 7 | Debug build mode | Low | 1 hour | Not started |
 | 8 | MallocScribble in dealloc | Low | 30 min | DONE (9a8106b) |
