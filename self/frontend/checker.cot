@@ -124,6 +124,42 @@ fn makeParamSymbol(name: string, type_idx: int, node: int) Symbol {
 }
 
 // ============================================================================
+// Scope — per-scope symbol table (matches Zig checker.zig:70-98)
+// ============================================================================
+
+struct Scope {
+    parent: ?*Scope,
+    symbols: Map(string, *Symbol),
+
+    fn define(sym: Symbol) void {
+        var s = new Symbol {
+            name: sym.name, type_idx: sym.type_idx, node: sym.node,
+            mutable: sym.mutable, is_func: sym.is_func, is_type: sym.is_type,
+            is_const_val: sym.is_const_val, const_value: sym.const_value,
+            float_const_value: sym.float_const_value, kind: sym.kind,
+            is_extern: sym.is_extern, is_export: sym.is_export,
+            used: sym.used, source_tree: sym.source_tree,
+        }
+        self.symbols.set(sym.name, s)
+    }
+
+    fn lookup(name: string) ?*Symbol {
+        const local = self.symbols.getOrNull(name)
+        if (local) |s| { return s }
+        if (self.parent) |p| { return p.lookup(name) }
+        return null
+    }
+
+    fn isDefined(name: string) bool {
+        return self.symbols.contains(name)
+    }
+}
+
+fn newScope(parent: ?*Scope) *Scope {
+    return new Scope { parent: parent, symbols: .{} }
+}
+
+// ============================================================================
 // GenericImplEntry — stored during collection for deferred instantiation
 // ============================================================================
 
