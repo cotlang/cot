@@ -1981,7 +1981,11 @@ pub const SSABuilder = struct {
     fn convertSelect(self: *SSABuilder, s: ir.Select, type_idx: TypeIndex, cur: *Block) !*Value {
         const cond = try self.convertNode(s.condition) orelse return error.MissingValue;
         const then_val = try self.convertNode(s.then_value) orelse return error.MissingValue;
-        const else_val = try self.convertNode(s.else_value) orelse return error.MissingValue;
+        // else_value can be null_node for if-optional without else branch
+        const else_val = if (s.else_value == ir.null_node)
+            try self.func.constInt(type_idx, 0)
+        else
+            try self.convertNode(s.else_value) orelse return error.MissingValue;
 
         // Compound type decomposition: string/slice are (ptr, len) pairs.
         // Wasm `select` only works on single i64, so decompose into
