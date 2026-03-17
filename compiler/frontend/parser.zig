@@ -975,8 +975,12 @@ pub const Parser = struct {
                 if (self.check(.kw_return)) {
                     self.advance();
                     // Optional return value: orelse return expr
-                    // Try to parse an expression — if the next token can't start one, ret_val stays null_node
-                    const ret_val = if (!self.check(.eof) and !self.check(.rbrace) and !self.check(.rparen))
+                    // Only parse a return value if the next token can start an expression.
+                    // Statement-starting tokens (const, var, if, for, while) are NOT return values.
+                    const ret_val = if (!self.check(.eof) and !self.check(.rbrace) and !self.check(.rparen) and
+                        !self.check(.kw_const) and !self.check(.kw_var) and !self.check(.kw_if) and
+                        !self.check(.kw_for) and !self.check(.kw_while) and !self.check(.kw_return) and
+                        !self.check(.kw_defer) and !self.check(.kw_switch))
                         try self.parseBinaryExpr(2) orelse ast.null_node
                     else
                         ast.null_node;
