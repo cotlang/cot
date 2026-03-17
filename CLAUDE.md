@@ -1,5 +1,13 @@
 # Claude AI Instructions
 
+## 🚨🚨🚨 `self/` IS `@safe` MODE — ALL STRUCT PARAMS ARE INFERRED POINTERS 🚨🚨🚨
+
+**ALL files in `self/` use `@safe` mode (set in `self/cot.json`).** In `@safe` mode, struct parameters to functions are **automatically passed as pointers**. You do NOT need `*Type` — just write `Type` and it becomes a pointer. This is by design so Cot looks like TypeScript to users. **NEVER change `Type` to `*Type` in `self/` function signatures.** The compiler handles it.
+
+Example: `fn foo(list: List(int))` in `@safe` mode is equivalent to `fn foo(list: *List(int))`. Mutations through `list` are visible to the caller. **Do NOT add `&` at call sites or `*` in parameter types.**
+
+---
+
 ## 🚨🚨🚨 NEVER USE DESTRUCTIVE GIT COMMANDS ON UNCOMMITTED WORK 🚨🚨🚨
 
 **DOZENS OF HOURS of work have been lost from Claude running `git checkout <file>` or `git restore <file>` to discard uncommitted changes.** This is the single most destructive behavior. NEVER do it.

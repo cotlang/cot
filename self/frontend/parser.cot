@@ -84,6 +84,25 @@ struct Parser {
         }
     }
 
+    /// True if current token starts a statement (can't be a return value).
+    fn isStmtStart() bool {
+        return self.tok == Token.kw_const as int
+            or self.tok == Token.kw_var as int
+            or self.tok == Token.kw_if as int
+            or self.tok == Token.kw_for as int
+            or self.tok == Token.kw_while as int
+            or self.tok == Token.kw_return as int
+            or self.tok == Token.kw_defer as int
+            or self.tok == Token.kw_switch as int
+    }
+
+    /// True if current token ends a block (can't be a return value).
+    fn isBlockEnd() bool {
+        return self.tok == Token.eof as int
+            or self.tok == Token.rbrace as int
+            or self.tok == Token.rparen as int
+    }
+
     /// Peek at the next token without consuming it.
     fn peekToken() int {
         if (!self.has_peek) {
@@ -1149,9 +1168,10 @@ struct Parser {
                 // orelse return [expr]
                 if (self.tok == Token.kw_return as int) {
                     self.advance()
-                    // Check if there's a return value expression
+                    // Optional return value — only parse if next token can start an expr.
+                    // Port of Zig compiler fix 5c3bd49 (parser.zig:975-982)
                     var ret_val = null_node
-                    if (self.tok != Token.eof as int and self.tok != Token.rbrace as int and self.tok != Token.rparen as int) {
+                    if (!self.isStmtStart() and !self.isBlockEnd()) {
                         ret_val = self.parseBinaryExpr(2)
                     }
                     const kind = if (ret_val != null_node) { ORELSE_RETURN_VAL } else { ORELSE_RETURN_VOID }
