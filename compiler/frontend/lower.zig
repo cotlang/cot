@@ -2515,53 +2515,28 @@ pub const Lowerer = struct {
                         const cleanup = arc.Cleanup.initForLocal(.unowned_release, value_node, type_idx, local_idx);
                         _ = try self.cleanup_stack.push(cleanup);
                     } else if (!self.target.isWasm() and !var_stmt.is_weak and !var_stmt.is_unowned and self.type_reg.couldBeARC(type_idx) and self.type_reg.get(type_idx) != .optional) {
-                        const is_owned = if (value_expr) |e| (e == .new_expr or e == .call) else false;
-
-                        if (is_owned) {
-                            // +1 value (new or call returning owned): just register cleanup
-                            const cleanup = arc.Cleanup.initForLocal(.release, value_node, type_idx, local_idx);
-                            _ = try self.cleanup_stack.push(cleanup);
-                        } else if (value_expr) |e| {
-                            // +0 value (borrowed): retain + register cleanup
-                            // Swift SILGen pattern: load [copy] — loading a managed pointer
-                            // from any source that could be mutated requires a retain.
-                            // Field access through pointer dereference (self.field in @safe)
-                            // must ALWAYS retain because the field can be overwritten later
-                            // (triggering release of old value). The baseHasCleanup check
-                            // misses this case since method params have no cleanup entry.
-                            // Swift ensurePlusOne (ManagedValue.cpp:289-299):
-                            // Any +0 non-trivial value must be copied (retained) when
-                            // binding to a new variable. Default to true for safety.
-                            // Only skip retain for known-unmanaged sources (ident with
-                            // no cleanup = unmanaged local like loop counter).
-                            const needs_retain = blk: {
-                                if (e == .ident) {
-                                    if (fb.lookupLocal(e.ident.name)) |src_local_idx| {
-                                        break :blk self.cleanup_stack.hasCleanupForLocal(src_local_idx);
-                                    }
-                                }
-                                if (e == .field_access) {
-                                    // Always retain when loading ARC field through pointer deref.
-                                    // The field may be overwritten (releasing old value) before
-                                    // this local goes out of scope. Matches Swift load [copy].
-                                    const base_type = self.inferExprType(e.field_access.base);
-                                    if (self.type_reg.get(base_type) == .pointer) break :blk true;
-                                    break :blk self.baseHasCleanup(e.field_access.base);
-                                }
-                                if (e == .index) break :blk self.baseHasCleanup(e.index.base);
-                                if (e == .deref) break :blk self.baseHasCleanup(e.deref.operand);
-                                // Default: retain any +0 ARC value from complex expressions
-                                // (if-expr, switch-expr, block-expr, etc.).
-                                // Swift ensurePlusOne copies unconditionally for non-trivial types.
-                                break :blk true;
+                        // Swift ManagedValue pattern: use lowerExprManaged to get ownership info.
+                        // +1 values (new_expr, call) already have a cleanup registered by lowerExprManaged.
+                        // +0 values (borrowed) need retain to produce +1 before binding to a local.
+                        // Reference: Swift SILGenDecl.cpp:323-353 (InitAccessor, store [init])
+                        const managed = try self.lowerExprManaged(var_stmt.value);
+                        if (managed.hasCleanup()) {
+                            // +1 value: forward ownership to this local's cleanup
+                            const fwd_value = blk: {
+                                var mv = managed;
+                                break :blk mv.forward(&self.cleanup_stack);
                             };
-                            if (needs_retain) {
-                                var retain_args = [_]ir.NodeIndex{value_node};
-                                const retained = try fb.emitCall("retain", &retain_args, false, type_idx, var_stmt.span);
-                                _ = try fb.emitStoreLocal(local_idx, retained, var_stmt.span);
-                                const cleanup = arc.Cleanup.initForLocal(.release, retained, type_idx, local_idx);
-                                _ = try self.cleanup_stack.push(cleanup);
-                            }
+                            _ = try fb.emitStoreLocal(local_idx, fwd_value, var_stmt.span);
+                            const cleanup = arc.Cleanup.initForLocal(.release, fwd_value, type_idx, local_idx);
+                            _ = try self.cleanup_stack.push(cleanup);
+                        } else if (managed.getValue() != ir.null_node) {
+                            // +0 value: retain to produce +1, then register cleanup
+                            // Swift ensurePlusOne (ManagedValue.cpp:289)
+                            var retain_args = [_]ir.NodeIndex{managed.getValue()};
+                            const retained = try fb.emitCall("retain", &retain_args, false, type_idx, var_stmt.span);
+                            _ = try fb.emitStoreLocal(local_idx, retained, var_stmt.span);
+                            const cleanup = arc.Cleanup.initForLocal(.release, retained, type_idx, local_idx);
+                            _ = try self.cleanup_stack.push(cleanup);
                         }
                     }
                 }
@@ -4527,6 +4502,33 @@ pub const Lowerer = struct {
     // ============================================================================
     // Expression Lowering
     // ============================================================================
+
+    /// Lower an expression and return a ManagedValue with correct ownership.
+    /// +1 (owned) for: new_expr, call results
+    /// +0 (trivial/borrowed) for: literals, idents, field access, index, operators
+    /// Swift SILGen: every emitRValue returns ManagedValue (ManagedValue.h:40)
+    fn lowerExprManaged(self: *Lowerer, idx: NodeIndex) Error!arc.ManagedValue {
+        const node = self.tree.getNode(idx) orelse return arc.ManagedValue.forTrivial(ir.null_node, TypeRegistry.VOID);
+        const expr = node.asExpr() orelse return arc.ManagedValue.forTrivial(ir.null_node, TypeRegistry.VOID);
+
+        // Determine ownership from expression kind
+        // Swift SILGen: SGFContext + AbstractionPattern determine ownership
+        const value = try self.lowerExprNode(idx);
+        const type_idx = self.inferExprType(idx);
+
+        // +1 expressions: caller owns the result
+        if (expr == .new_expr or expr == .call) {
+            if (self.type_reg.couldBeARC(type_idx) and !self.target.isWasm()) {
+                // Register cleanup so scope exit releases it
+                const cleanup = arc.Cleanup.init(.release, value, type_idx);
+                const handle = try self.cleanup_stack.push(cleanup);
+                return arc.ManagedValue.forOwned(value, type_idx, handle);
+            }
+        }
+
+        // +0 expressions: borrowed or trivial
+        return arc.ManagedValue.forTrivial(value, type_idx);
+    }
 
     fn lowerExprNode(self: *Lowerer, idx: NodeIndex) Error!ir.NodeIndex {
         const node = self.tree.getNode(idx) orelse return ir.null_node;
