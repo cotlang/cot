@@ -405,24 +405,28 @@ fn generateRetain(
     // Shared increment block: takes rc_addr as block param
     const block_do_increment = try builder.createBlock();
 
-    // Entry: null check
+    // Entry: null check + range check
+    // Swift isValidPointerForNativeRetain (EmbeddedRuntime.swift:431-439):
+    // Returns false for null (0) and small values (< page size).
+    // Small values catch optional tags (0, 1), type indices, and other non-pointers.
     builder.switchToBlock(block_entry);
     try builder.appendBlockParamsForFunctionParams(block_entry);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
-        const v_zero = try ins.iconst(clif.Type.I64, 0);
-        const is_null = try ins.icmp(.eq, obj, v_zero);
-        _ = try ins.brif(is_null, block_return_zero, &.{}, block_check_magic, &.{});
+        // Skip if obj < 4096 (null page — catches null, optional tags, small ints)
+        const v_page = try ins.iconst(clif.Type.I64, 4096);
+        const is_small = try ins.icmp(.ult, obj, v_page);
+        _ = try ins.brif(is_small, block_return_zero, &.{}, block_check_magic, &.{});
     }
 
-    // Return zero (null case)
+    // Return zero/obj unchanged (null/small value case)
     builder.switchToBlock(block_return_zero);
     try builder.ensureInsertedBlock();
     {
-        const v_zero2 = try builder.ins().iconst(clif.Type.I64, 0);
-        _ = try builder.ins().return_(&[_]clif.Value{v_zero2});
+        const obj = builder.blockParams(block_entry)[0];
+        _ = try builder.ins().return_(&[_]clif.Value{obj});
     }
 
     // Check magic: verify ARC_HEAP_MAGIC at header to guard against non-heap pointers.
@@ -587,16 +591,17 @@ fn generateRelease(
     const block_call_destructor = try builder.createBlock();
     const block_dealloc = try builder.createBlock();
 
-    // ---- Entry: null check ----
+    // ---- Entry: null + range check ----
+    // Swift isValidPointerForNativeRetain: skip null and small values.
     builder.switchToBlock(block_entry);
     try builder.appendBlockParamsForFunctionParams(block_entry);
     try builder.ensureInsertedBlock();
     {
         const ins = builder.ins();
         const obj = builder.blockParams(block_entry)[0];
-        const v_zero = try ins.iconst(clif.Type.I64, 0);
-        const is_null = try ins.icmp(.eq, obj, v_zero);
-        _ = try ins.brif(is_null, block_return, &.{}, block_check_magic, &.{});
+        const v_page = try ins.iconst(clif.Type.I64, 4096);
+        const is_small = try ins.icmp(.ult, obj, v_page);
+        _ = try ins.brif(is_small, block_return, &.{}, block_check_magic, &.{});
     }
 
     // ---- Check magic: verify ARC_HEAP_MAGIC to guard against non-heap pointers ----
