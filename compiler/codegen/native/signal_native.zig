@@ -86,7 +86,17 @@ fn generateSignalHandler(
     const params = builder.blockParams(block_entry);
     const sig = params[0];
 
-    // Import write and _exit
+    // Import write, _exit, and __cot_print_backtrace
+    // Go pattern: signal handler calls traceback before exit (runtime/signal_unix.go)
+    const bt_print_idx = func_index_map.get("__cot_print_backtrace") orelse 0;
+    const bt_print_sig = clif.Signature.init(.system_v);
+    const bt_print_sig_ref = try builder.importSignature(bt_print_sig);
+    const bt_print_func = try builder.importFunction(.{
+        .name = .{ .user = .{ .namespace = 0, .index = bt_print_idx } },
+        .signature = bt_print_sig_ref,
+        .colocated = true,
+    });
+
     const write_idx = func_index_map.get("write") orelse 0;
     var write_sig = clif.Signature.init(.system_v);
     try write_sig.addParam(allocator, clif.AbiParam.init(clif.Type.I64));
@@ -155,6 +165,7 @@ fn generateSignalHandler(
         const fd = try i.iconst(clif.Type.I64, 2);
         const len = try i.iconst(clif.Type.I64, 23);
         _ = try i.call(write_func, &[_]clif.Value{ fd, addr, len });
+        _ = try i.call(bt_print_func, &[_]clif.Value{});
         const v128 = try i.iconst(clif.Type.I64, 128);
         const ec = try i.iadd(sig, v128);
         _ = try i.call(exit_func, &[_]clif.Value{ec});
@@ -175,6 +186,7 @@ fn generateSignalHandler(
         const fd = try i.iconst(clif.Type.I64, 2);
         const len = try i.iconst(clif.Type.I64, 22);
         _ = try i.call(write_func, &[_]clif.Value{ fd, addr, len });
+        _ = try i.call(bt_print_func, &[_]clif.Value{});
         const v128 = try i.iconst(clif.Type.I64, 128);
         const ec = try i.iadd(sig, v128);
         _ = try i.call(exit_func, &[_]clif.Value{ec});
